@@ -159,6 +159,19 @@ class BridgeClient:
         """Отменить последнюю активную запись (группы group, если задана)."""
         return self._post("void_last", group=group)
 
+    # === Мозг (Brain): синк git → Drive ===
+    def write_doc(self, text: str, name: Optional[str] = None, id: Optional[str] = None) -> dict:
+        """Перезаписать тело Google Doc «мозга» (KB_*) новым текстом — синк git→Drive.
+        Указывать name (логическое имя из BRAIN_MANIFEST, напр. 'park_list') ИЛИ id (doc id).
+        Только перезапись существующего дока; doc_id и манифест не меняются.
+        Пустой text запрещён на стороне Bridge (защита от затирки)."""
+        fields = {"text": text}
+        if name:
+            fields["name"] = name
+        if id:
+            fields["id"] = id
+        return self._post("write_doc", **fields)
+
     # === Бронирование (предв.бронь → активация после выдачи) ===
     def create_booking(self, **fields) -> dict:
         """Поставить предварительную бронь (статус 'Бронь' в листе 'клиенты').

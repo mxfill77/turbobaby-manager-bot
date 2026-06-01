@@ -127,6 +127,53 @@ function handleListBrain_(e) {
   }
 }
 
+/**
+ * write_doc — синк git→Drive: перезаписать ТЕЛО существующего KB_-дока новым текстом.
+ * Вызывается из doPost (Bridge.gs), поэтому ВОЗВРАЩАЕТ ОБЪЕКТ (не ContentService) —
+ * doPost оборачивает через jsonResponse(Object.assign({action}, ...)). Токен уже проверен
+ * verifyToken в doPost до switch.
+ *
+ * body: { name | id, text }. Только перезапись по существующему id из манифеста:
+ * не создаёт документы, не меняет манифест/doc_id. Пустой text запрещён (защита от затирки).
+ */
+function writeDoc_(body) {
+  try {
+    var b = body || {};
+    var id = b.id;
+    var name = b.name;
+
+    if (!id && name) {
+      var man = getBrainManifest_();
+      id = man[name];
+      if (!id) {
+        return { ok: false, error: 'unknown_name',
+          message: 'Нет имени "' + name + '" в манифесте. См. list_brain.' };
+      }
+    }
+    if (!id) {
+      return { ok: false, error: 'missing_param', message: 'Нужен name или id' };
+    }
+
+    var text = b.text;
+    if (text === undefined || text === null) {
+      return { ok: false, error: 'missing_text', message: 'Нужен параметр text' };
+    }
+    if (text === '') {
+      return { ok: false, error: 'empty_text', message: 'Пустой text запрещён — это затёрло бы документ' };
+    }
+
+    var doc = DocumentApp.openById(id);
+    var docBody = doc.getBody();
+    docBody.clear();            // полная замена тела (как setupBrain), иначе текст допишется
+    docBody.setText(text);
+    doc.saveAndClose();
+
+    return { ok: true, name: name || null, id: id, chars: text.length };
+  } catch (err) {
+    return { ok: false, error: 'write_failed', message: String(err) };
+  }
+}
+
 
 // ============================================================
 //  ХЕЛПЕРЫ (namespace с _ — не конфликтуют с Bridge.gs)
