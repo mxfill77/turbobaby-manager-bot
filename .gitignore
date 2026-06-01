@@ -1,0 +1,41 @@
+# === СЕКРЕТЫ — НИКОГДА не коммитить ===
+.env
+.env.*
+*.env
+.env\ ex.txt
+*.session
+*.session-journal
+.wwebjs_auth/
+.wwebjs_cache/
+
+# === Память / данные бота (не нужны в репо, переезжают отдельно) ===
+memory.db
+memory.db-journal
+*.sqlite
+*.sqlite3
+
+# === Python ===
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# === Логи ===
+*.log
+logs/
+
+# === Выгрузки / временное ===
+topics_map.json
+data_export/
+exporttg*/
+chats/
+*.zip
+
+# === IDE / ОС ===
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

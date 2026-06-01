@@ -1,0 +1,247 @@
+"""
+TurboBaby Bridge HTTP клиент.
+Дёргает Apps Script Web App для чтения данных из Google Sheets.
+"""
+
+import os
+import json
+import logging
+import requests
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+
+class BridgeClient:
+    """Клиент к Apps Script Bridge Web App."""
+
+    def __init__(self, url: str = None, token: str = None, timeout: int = 30):
+        self.url = url or os.getenv("BRIDGE_URL")
+        self.token = token or os.getenv("BRIDGE_TOKEN")
+        self.timeout = timeout
+
+        if not self.url or not self.token:
+            raise ValueError("BRIDGE_URL и BRIDGE_TOKEN обязательны (см. .env)")
+
+    def _call(self, action: str, **params) -> dict:
+        """Выполняет GET запрос к Bridge."""
+        query = {"token": self.token, "action": action, **params}
+        try:
+            log.debug(f"Bridge call: action={action} params={params}")
+            r = requests.get(self.url, params=query, timeout=self.timeout, allow_redirects=True)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                log.warning(f"Bridge returned error: {data.get('error')} — {data.get('message')}")
+            return data
+        except requests.exceptions.Timeout:
+            log.error(f"Bridge timeout (>{self.timeout}s) for action={action}")
+            return {"ok": False, "error": "timeout", "message": f"Timeout >{self.timeout}s"}
+        except requests.exceptions.RequestException as e:
+            log.error(f"Bridge request error: {e}")
+            return {"ok": False, "error": "request_failed", "message": str(e)}
+        except json.JSONDecodeError as e:
+            log.error(f"Bridge JSON parse error: {e}")
+            return {"ok": False, "error": "json_parse_error", "message": str(e)}
+
+    # === Удобные методы для отдельных endpoint'ов ===
+
+    def ping(self) -> dict:
+        return self._call("ping")
+
+    def fleet(self) -> dict:
+        return self._call("fleet")
+
+    def find_bike(self, query: str) -> dict:
+        """Найти байк в парке по НОМЕРУ (последние 3-4 цифры названия).
+        Игнорирует кубатуру (300/350/650/750/125/155) — это не номер."""
+        if not query:
+            return {}
+        import re
+        # кубатуры моторов — НЕ номера байков
+        CC = {"125", "150", "155", "300", "350", "400", "500", "650", "700", "750", "900"}
+
+        def plate(text):
+            """Последнее число, не являющееся кубатурой = номерной знак байка."""
+            nums = re.findall(r"\d{3,}", str(text).lower())
+            nums = [n for n in nums if n not in CC]
+            return nums[-1] if nums else None
+
+        q_plate = plate(query)
+        try:
+            bikes = self.fleet().get("data", {}).get("bikes", [])
+        except Exception:
+            return {}
+
+        # 1) точное совпадение по номеру байка — самое надёжное
+        if q_plate:
+            for b in bikes:
+                if plate(b.get("name", "")) == q_plate:
+                    return b
+        # 2) запасной вариант — вхождение очищенного названия
+        q = str(query).lower()
+        for b in bikes:
+            name = str(b.get("name", "")).lower()
+            if q and (q in name or name in q):
+                return b
+        return {}
+
+    def clients(self, filter: str = "active") -> dict:
+        return self._call("clients", filter=filter)
+
+    def anomalies(self) -> dict:
+        return self._call("anomalies")
+
+    def client_history(self, phone: Optional[str] = None, name: Optional[str] = None) -> dict:
+        params = {}
+        if phone:
+            params["phone"] = phone
+        if name:
+            params["name"] = name
+        return self._call("client_history", **params)
+
+    def finance(self, period: str = "month") -> dict:
+        return self._call("finance", period=period)
+
+    def returns_soon(self, days: int = 3) -> dict:
+        return self._call("returns_soon", days=days)
+
+    def daily_pulse(self) -> dict:
+        return self._call("daily_pulse")
+
+
+    def _post(self, action: str, **fields) -> dict:
+        """POST запрос к Bridge (запись данных Splinter)."""
+        body = {"token": self.token, "action": action, **fields}
+        try:
+            log.debug(f"Bridge POST: action={action}")
+            r = requests.post(self.url, json=body, timeout=self.timeout, allow_redirects=True)
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                log.warning(f"Bridge POST error: {data.get('error')} — {data.get('message')}")
+            return data
+        except requests.exceptions.Timeout:
+            log.error(f"Bridge POST timeout for action={action}")
+            return {"ok": False, "error": "timeout"}
+        except requests.exceptions.RequestException as e:
+            log.error(f"Bridge POST request error: {e}")
+            return {"ok": False, "error": "request_failed", "message": str(e)}
+        except json.JSONDecodeError as e:
+            log.error(f"Bridge POST JSON error: {e}")
+            return {"ok": False, "error": "json_parse_error", "message": str(e)}
+
+    # === Запись (Splinter) ===
+
+    def add_transaction(self, **fields) -> dict:
+        """Записать приход/расход. Поля: msg_date, group, sender, amount,
+        currency, category, bike, deposit, description, raw, msg_id."""
+        return self._post("add_transaction", **fields)
+
+    def add_event(self, **fields) -> dict:
+        """Записать событие по байку. Поля: msg_date, group, bike, event_type,
+        fuel, mileage, photos, notes, msg_id."""
+        return self._post("add_event", **fields)
+
+    def check_balance(self, currency: str, pym_balance, group: str = "", note: str = "") -> dict:
+        """Сверить баланс кошелька (group) с названным Пымом."""
+        return self._post("check_balance", currency=currency,
+                           pym_balance=pym_balance, group=group, note=note)
+
+    def get_balance(self, group: str = "") -> dict:
+        """Баланс кошелька (group) или всех кошельков если group пустой."""
+        return self._post("get_balance", group=group)
+
+    def tx_summary(self, period: str = "today") -> dict:
+        return self._post("tx_summary", period=period)
+
+    def void_last(self, group: str = "") -> dict:
+        """Отменить последнюю активную запись (группы group, если задана)."""
+        return self._post("void_last", group=group)
+
+    # === Бронирование (предв.бронь → активация после выдачи) ===
+    def create_booking(self, **fields) -> dict:
+        """Поставить предварительную бронь (статус 'Бронь' в листе 'клиенты').
+        Поля: bike, name (обяз.); date_start, date_end, pay_day, pay_month,
+        deposit (число или 'passport'), helmets, contacts, note, initial_pay, km.
+        Долг по брони НЕ начисляется, пока не вызван activate_booking."""
+        return self._post("create_booking", **fields)
+
+    def activate_booking(self, bike: str, name: str) -> dict:
+        """Активировать бронь: 'Бронь' → 'В аренде'. Вызывать после фото выдачи (этап 6).
+        С этого момента формулы долга/оплаты начинают считать."""
+        return self._post("activate_booking", bike=bike, name=name)
+
+    # === ТО-трекер ===
+    def service_upsert(self, **fields) -> dict:
+        """Обновить/создать запись ТО байка. None-поля не шлём (чтобы не затирать существующие)."""
+        clean = {k: v for k, v in fields.items() if v is not None}
+        return self._post("service_upsert", **clean)
+
+    def service_list(self) -> dict:
+        """Все записи ТО + те что требуют внимания (due/overdue)."""
+        return self._post("service_list")
+
+    def service_set_pin(self, **fields) -> dict:
+        """Записать pinned_msg_id / last_reminded_at для записи ТО."""
+        return self._post("service_set_pin", **fields)
+
+    # === Надзиратель важного ===
+    def important_add(self, **fields) -> dict:
+        """Добавить важный пункт (ДТП, ремонт, просрочка). Статус open."""
+        return self._post("important_add", **fields)
+
+    def important_list(self, status: str = "") -> dict:
+        """Список важного. status='open'/'done' или пусто (все)."""
+        return self._post("important_list", status=status)
+
+    def important_due(self, days: int = 3) -> dict:
+        """Открытые пункты, которым пора напомнить (прошло >= days дней)."""
+        return self._post("important_due", days=days)
+
+    def important_touch(self, row: int, pinned_msg_id=None) -> dict:
+        """Отметить что напомнили (обновить дату, опц. новый msg_id закрепа)."""
+        return self._post("important_touch", row=row, pinned_msg_id=pinned_msg_id)
+
+    def important_close(self, row: int, confirmed_by: str = "") -> dict:
+        """Закрыть важный пункт (выполнено)."""
+        return self._post("important_close", row=row, confirmed_by=confirmed_by)
+
+    # === Аудитор ===
+    def audit_log(self, **fields) -> dict:
+        """Записать действие бота + вердикт надзора в журнал аудита."""
+        return self._post("audit_log", **fields)
+
+    def audit_list(self, verdict: str = "", status: str = "", since: str = "") -> dict:
+        """Список записей аудита (фильтры опц)."""
+        return self._post("audit_list", verdict=verdict, status=status, since=since)
+
+    def audit_update(self, row: int, status: str = "") -> dict:
+        """Обновить статус записи аудита."""
+        return self._post("audit_update", row=row, status=status)
+
+
+# === Тест запуск ===
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    client = BridgeClient()
+
+    print("=== PING ===")
+    print(json.dumps(client.ping(), indent=2, ensure_ascii=False))
+
+    print("\n=== DAILY PULSE (summary) ===")
+    pulse = client.daily_pulse()
+    if pulse.get("ok"):
+        s = pulse["data"]["summary"]
+        print(f"  Активные аренды: {s['active_rentals']}")
+        print(f"  Просрочки:       {s['overdue_returns']}")
+        print(f"  Общий долг:      {s['total_debt']:,.0f} ฿")
+        print(f"  Дома:            {s['bikes_home']}")
+        print(f"  В аренде:        {s['bikes_rented']}")
+        print(f"  Аномалий:        {pulse['data']['anomalies_count']}")
+    else:
+        print("ERROR:", pulse)
