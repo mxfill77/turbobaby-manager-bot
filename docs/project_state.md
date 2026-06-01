@@ -236,3 +236,36 @@ Splinter работает 24/7 на VPS Hetzner, независимо от ПК.
 
 ВЫВОД: "всё в одном месте для двоих" достижимо для ЗНАНИЙ (Drive), НЕ для кода. Полный live-доступ
 Claude-сайт к серверу невозможен (изоляция + приватность) — и это правильно для безопасности.
+
+## ✅ ОБЩИЙ «МОЗГ» (Brain) — СДЕЛАНО (1 июня)
+База знаний живёт на Google Drive как Google Docs, читают оба Claude:
+- Claude-сайт — через Drive-коннектор (папка «TurboBaby Brain»).
+- Claude Code (сервер) — через Bridge: `read_doc` (по `id` или `name`) и `list_brain`.
+
+Реализация:
+- Новый файл Bridge **ReadDocs.gs** (зона: read_doc/list_brain + одноразовая setupBrain).
+  В Bridge.gs добавлено ТОЛЬКО два case в роутер doGet. Деплой — NEW VERSION.
+- Манифест {логическое_имя → doc_id} хранится в Script Properties (ключ `BRAIN_MANIFEST`),
+  без хардкода ID в коде. Дубликат-оглавление — Google Doc «KB_index» в папке Brain.
+- Проверено через Bridge: list_brain отдаёт манифест; read_doc читает все 4 дока по name и по id;
+  ошибки мягкие (unknown_name / missing_param).
+
+ID базы знаний (Brain):
+- Папка Brain : `1uWqHsxk7aEWoSNqaUBMmqkYOh2UKYLkY`
+- knowledge_base (KB_knowledge_base): `1TwNzB_bGw1aHD1ThEuT9V6EgG7p70Tud6WeB0sKDt1Y`
+- project_state (KB_project_state) : `1cRedmoltyntz5oNqjB3S3MloLftefEN9HlY7QPOHMQ8`
+- faq           (KB_faq)           : `1tv8Y-K3gLyT9Y0mXyYXZLf2c2rEzPMLHPzvg4lGqs98`
+- park_list     (KB_park_list)     : `1jD3VJGeoET8Yf5ma6iZPmwwmuw_yIYyP2A4N5RAEZho`
+- index         (KB_index)         : `1klCUC5domgR6t-3hu-Yc7UC75hgf-y6-rCILFnN7JJs`
+
+### 🔁 ПРАВИЛО СИНКА (источник правды = git, Drive = генерируемое зеркало)
+- Истина живёт в репозитории: `docs/knowledge_base.md`, `docs/project_state.md`,
+  `docs/turbobaby_faq_v1.md`, `docs/park_list.md`. Правим — здесь, через Claude Code (дифф+коммит).
+- Google Docs в папке Brain — это ЗЕРКАЛО, которое генерит `setupBrain()`. Руками их не редактируем
+  (иначе при следующем синке перезатрутся).
+- Как обновить Drive после правки .md:
+  1) залить изменённые `*.md` в папку Brain (имена точь-в-точь, без авто-конвертации при загрузке);
+  2) в редакторе Apps Script запустить `setupBrain()` — он перезапишет тело KB_* и KB_index
+     (идемпотентно, дубли не плодит, doc_id и манифест сохраняются);
+  3) ре-деплой Bridge НЕ нужен (код не менялся), только если правился сам ReadDocs.gs.
+- Манифест не редактируем вручную — его пишет setupBrain. Свериться: `?action=list_brain`.
