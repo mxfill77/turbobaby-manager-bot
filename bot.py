@@ -67,6 +67,12 @@ claude = ClaudeClient(bridge=bridge, memory=memory)
 from auditor import Auditor
 auditor = Auditor(bridge=bridge, memory=memory, claude=claude)
 
+# Подключаем аудитор к единой точке отправки Splinter (splinter._send):
+# служебные двуязычные сообщения тоже прогоняются через check_response_text
+# (журнально, отправку не глушит). Без этого вызова хук _send молчит.
+splinter.set_auditor(auditor)
+log.info("  Auditor: ✅ подключён к splinter._send (надзор за языком исходящих)")
+
 
 # === HANDLERS ===
 
