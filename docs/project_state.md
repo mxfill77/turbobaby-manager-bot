@@ -260,12 +260,25 @@ ID базы знаний (Brain):
 
 ### 🔁 ПРАВИЛО СИНКА (источник правды = git, Drive = генерируемое зеркало)
 - Истина живёт в репозитории: `docs/knowledge_base.md`, `docs/project_state.md`,
-  `docs/turbobaby_faq_v1.md`, `docs/park_list.md`. Правим — здесь, через Claude Code (дифф+коммит).
-- Google Docs в папке Brain — это ЗЕРКАЛО, которое генерит `setupBrain()`. Руками их не редактируем
-  (иначе при следующем синке перезатрутся).
-- Как обновить Drive после правки .md:
-  1) залить изменённые `*.md` в папку Brain (имена точь-в-точь, без авто-конвертации при загрузке);
-  2) в редакторе Apps Script запустить `setupBrain()` — он перезапишет тело KB_* и KB_index
-     (идемпотентно, дубли не плодит, doc_id и манифест сохраняются);
-  3) ре-деплой Bridge НЕ нужен (код не менялся), только если правился сам ReadDocs.gs.
-- Манифест не редактируем вручную — его пишет setupBrain. Свериться: `?action=list_brain`.
+  `docs/turbobaby_faq_v1.md`, `docs/park_list.md`. Правим — здесь, через Claude Code (дифф+коммит+push).
+- Google Docs в папке Brain (KB_*) — это ЗЕРКАЛО. Руками их не редактируем (перезатрутся при синке).
+- ОБЫЧНЫЙ СИНК после правки .md = одна команда Claude Code «синкни мозг» (или конкретный док):
+  Claude Code читает docs/*.md → для каждого вызывает write_doc(name=<ключ>, text=<содержимое>) через
+  Bridge POST. Тело KB_-дока перезаписывается (clear+setText), doc_id и манифест НЕ меняются.
+  Ре-деплой Bridge НЕ нужен (код не трогается). Никаких ручных действий в Drive.
+  Ключи: knowledge_base, project_state, faq, park_list.
+- write_doc (POST в Bridge, файл ReadDocs.gs): защита от затирки — пустой text запрещён
+  (empty_text); неизвестное имя → unknown_name; перезапись только существующего дока по id из манифеста.
+- setupBrain() — ТОЛЬКО аварийное пересоздание с нуля (если папку Brain/доки удалили или манифест
+  потерян). В обычном цикле НЕ используется. Процедура аварийного: залить .md в папку Brain
+  (имена точь-в-точь, без авто-конвертации) → Run setupBrain → пересоздаст доки + манифест.
+- Манифест (BRAIN_MANIFEST в Script Properties) не редактируем вручную. Свериться: ?action=list_brain.
+- Проверка после синка: read_doc name=<ключ> → длина по code points = длине git-исходника.
+
+### ID базы знаний (Brain) — дубль для быстрого доступа
+- Папка Brain : `1uWqHsxk7aEWoSNqaUBMmqkYOh2UKYLkY`
+- knowledge_base : `1TwNzB_bGw1aHD1ThEuT9V6EgG7p70Tud6WeB0sKDt1Y`
+- project_state  : `1cRedmoltyntz5oNqjB3S3MloLftefEN9HlY7QPOHMQ8`
+- faq            : `1tv8Y-K3gLyT9Y0mXyYXZLf2c2rEzPMLHPzvg4lGqs98`
+- park_list      : `1jD3VJGeoET8Yf5ma6iZPmwwmuw_yIYyP2A4N5RAEZho`
+- index          : `1klCUC5domgR6t-3hu-Yc7UC75hgf-y6-rCILFnN7JJs`
