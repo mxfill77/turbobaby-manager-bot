@@ -118,14 +118,21 @@ MONEY_SYSTEM = """Ты разбираешь ОДНО сообщение из к�
 Поля:
   type: "transaction" | "balance_check" | "balance_set" | "undo" | "question" | "none"
 
-  transaction — проводка прихода/расхода:
-    amount: число (ОТРИЦАТЕЛЬНОЕ для расхода/списания, ПОЛОЖИТЕЛЬНОЕ для прихода) — уважай знак автора
-    currency: "THB" | "EUR"
-    category: "rental" | "salary" | "advance" | "fuel" | "taxi" | "topup" | "other"
-    bike: строка или null
-    deposit: "passport" | "cash" | null
+  transaction — проводка прихода/расхода. Может содержать НЕСКОЛЬКО движений
+      (например деньги + возврат паспорта в одном сообщении):
+    moves: массив движений (минимум одно), каждое движение:
+        amount: число (ОТРИЦАТЕЛЬНОЕ для расхода/списания/возврата, ПОЛОЖИТЕЛЬНОЕ для прихода) — уважай знак автора
+        currency: "THB" | "EUR" | "PASSPORT"
+        category: "rental" | "salary" | "advance" | "fuel" | "taxi" | "topup" | "other"
+        bike: строка или null
+        deposit: "passport" | "cash" | null  — ТОЛЬКО описание денежной строки, на счётчик НЕ влияет
     transfer_to_pettycash: true ТОЛЬКО если перенос в мелкую кассу/самоорганизацию
         (фразы "в самоорганизацию", "в кассу", "top up management", "пополнение кассы"). Иначе false.
+
+    ВАЖНО про паспорта: паспорт — это валюта PASSPORT (amount = ±количество паспортов),
+        а НЕ деньги. "-1 passport" = вернули паспорт клиенту -> движение {"amount":-1,"currency":"PASSPORT"}.
+        "+1 passport" = приняли паспорт в залог -> {"amount":1,"currency":"PASSPORT"}.
+        Если в сообщении И деньги, И паспорт — верни ОБА движения в moves.
 
   balance_check — автор ПРОСТО называет текущий баланс чтобы сверить (без слов «зафиксируй/установи»):
     balance: {"THB": число|null, "EUR": число|null, "PASSPORT": число|null}
@@ -142,13 +149,16 @@ MONEY_SYSTEM = """Ты разбираешь ОДНО сообщение из к�
 
   none — болтовня/не относится к учёту.
 
-Валюта: Bath/Baht/฿ = THB; Euro = EUR.
+Валюта: Bath/Baht/฿ = THB; Euro = EUR; passport/паспорт = PASSPORT.
 
 Примеры:
-"ADV 8004  +4,900 Bath  1 passport" -> {"type":"transaction","amount":4900,"currency":"THB","category":"rental","bike":"ADV 8004","deposit":"passport","transfer_to_pettycash":false}
-"Earth salary  -5,000 Bath" -> {"type":"transaction","amount":-5000,"currency":"THB","category":"salary","bike":null,"deposit":null,"transfer_to_pettycash":false}
-"-1000 в самоорганизацию" -> {"type":"transaction","amount":-1000,"currency":"THB","category":"topup","bike":null,"deposit":null,"transfer_to_pettycash":true}
-"-290" -> {"type":"transaction","amount":-290,"currency":"THB","category":"other","bike":null,"deposit":null,"transfer_to_pettycash":false}
+"ADV 8004  +4,900 Bath  1 passport" -> {"type":"transaction","moves":[{"amount":4900,"currency":"THB","category":"rental","bike":"ADV 8004","deposit":"passport"},{"amount":1,"currency":"PASSPORT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
+"ADV 6004  +700 Bath  -1 passport" -> {"type":"transaction","moves":[{"amount":700,"currency":"THB","category":"rental","bike":"ADV 6004","deposit":"passport"},{"amount":-1,"currency":"PASSPORT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
+"-1 passport" -> {"type":"transaction","moves":[{"amount":-1,"currency":"PASSPORT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
+"+1 passport" -> {"type":"transaction","moves":[{"amount":1,"currency":"PASSPORT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
+"Earth salary  -5,000 Bath" -> {"type":"transaction","moves":[{"amount":-5000,"currency":"THB","category":"salary","bike":null,"deposit":null}],"transfer_to_pettycash":false}
+"-1000 в самоорганизацию" -> {"type":"transaction","moves":[{"amount":-1000,"currency":"THB","category":"topup","bike":null,"deposit":null}],"transfer_to_pettycash":true}
+"-290" -> {"type":"transaction","moves":[{"amount":-290,"currency":"THB","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
 "Balance 5,715 Bath 150 Euro 1 Passport" -> {"type":"balance_check","balance":{"THB":5715,"EUR":150,"PASSPORT":1}}
 "Balance 5,715 Bath 150 Euro 1 Passport. Зафиксируй" -> {"type":"balance_set","balance":{"THB":5715,"EUR":150,"PASSPORT":1}}
 "Прими как есть 5715 бат" -> {"type":"balance_set","balance":{"THB":5715,"EUR":null,"PASSPORT":null}}
@@ -668,30 +678,44 @@ async def _handle_money(msg, context, bridge, claude):
     ptype = parsed.get("type")
     chat_id = msg.chat_id
     wallet = group_label(chat_id)
-    log.info(f"  → parsed type={ptype} amount={parsed.get('amount')} cur={parsed.get('currency')} transfer={parsed.get('transfer_to_pettycash')}")
+    log.info(f"  → parsed type={ptype} transfer={parsed.get('transfer_to_pettycash')}")
 
     if ptype == "transaction":
-        bridge.add_transaction(
-            msg_date=str(msg.date.date()) if msg.date else "",
-            group=wallet,
-            sender="@" + (msg.from_user.username or ""),
-            amount=parsed.get("amount", 0),
-            currency=parsed.get("currency", "THB"),
-            category=parsed.get("category", "other"),
-            bike=parsed.get("bike") or "",
-            deposit=parsed.get("deposit") or "",
-            description=text[:200],
-            raw=text,
-            msg_id=f"{chat_id}:{msg.message_id}",
-        )
+        moves = parsed.get("moves") or []
+        if not moves:
+            log.info("  → skipped: transaction без moves")
+            return
+        log.info(f"  → moves={[(m.get('amount'), m.get('currency')) for m in moves]}")
+        # Одно сообщение → 1..N проводок (деньги + паспорт и т.п.).
+        # msg_id уникален на движение (:m{i}) — иначе дедуп botMsgExists_ отбросит вторую строку.
+        for i, mv in enumerate(moves):
+            bridge.add_transaction(
+                msg_date=str(msg.date.date()) if msg.date else "",
+                group=wallet,
+                sender="@" + (msg.from_user.username or ""),
+                amount=mv.get("amount", 0),
+                currency=mv.get("currency", "THB"),
+                category=mv.get("category", "other"),
+                bike=mv.get("bike") or "",
+                deposit=mv.get("deposit") or "",
+                description=text[:200],
+                raw=text,
+                msg_id=f"{chat_id}:{msg.message_id}:m{i}",
+            )
 
-        # Если приложен чек — сверяем сумму на чеке с написанной
-        if msg.photo:
+        # Денежное движение (THB/EUR) — для сверки чека, переноса в кассу и подтверждения.
+        # Паспорт (PASSPORT) в этих расчётах не участвует — он виден через wallet_bal.
+        money_move = next((m for m in moves if m.get("currency") != "PASSPORT"), None)
+        money_amount = money_move.get("amount", 0) if money_move else 0
+        money_currency = money_move.get("currency", "THB") if money_move else "THB"
+
+        # Если приложен чек — сверяем сумму на чеке с написанной (денежной)
+        if msg.photo and money_move:
             img = await _download_photo(msg)
             if img:
                 rec = _parse_json(claude.vision(VISION_RECEIPT_SYSTEM, img, max_tokens=300))
                 ramount = rec.get("amount")
-                wamount = abs(parsed.get("amount") or 0)
+                wamount = abs(money_amount or 0)
                 if ramount and abs(abs(float(ramount)) - wamount) >= 1:
                     await _send(context, 
                         chat_id=chat_id,
@@ -705,16 +729,16 @@ async def _handle_money(msg, context, bridge, claude):
         # Полный баланс ИМЕННО этого кошелька (THB+EUR+паспорта)
         wallet_bal = bridge.get_balance(group=wallet).get("balance", {})
 
-        # === Перенос в мелкую кассу ===
-        is_transfer = parsed.get("transfer_to_pettycash") and chat_id != PETTYCASH_CHAT_ID
+        # === Перенос в мелкую кассу === (только денежное движение, паспорт не переносим)
+        is_transfer = parsed.get("transfer_to_pettycash") and money_move and chat_id != PETTYCASH_CHAT_ID
         if is_transfer:
-            plus = abs(parsed.get("amount") or 0)
+            plus = abs(money_amount or 0)
             bridge.add_transaction(
                 msg_date=str(msg.date.date()) if msg.date else "",
                 group=PETTYCASH_LABEL,
                 sender="@" + (msg.from_user.username or "") + " (авто-перенос)",
                 amount=plus,
-                currency=parsed.get("currency", "THB"),
+                currency=money_currency,
                 category="topup",
                 bike="", deposit="",
                 description=f"пополнение переносом из {wallet}",
@@ -732,13 +756,13 @@ async def _handle_money(msg, context, bridge, claude):
         if chat_id in MONEY_CONFIRM_EACH:
             await _send(context, 
                 chat_id=chat_id,
-                text=msg_recorded_each(parsed.get("amount", 0), wallet_bal),
+                text=msg_recorded_each(money_amount, wallet_bal),
             )
             _entry_counts[chat_id] = 0
         else:
             await _send(context, 
                 chat_id=chat_id,
-                text=msg_recorded_cf(parsed.get("amount", 0), wallet_bal),
+                text=msg_recorded_cf(money_amount, wallet_bal),
             )
             if _entry_counts[chat_id] >= RECONCILE_EVERY:
                 await _send(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
