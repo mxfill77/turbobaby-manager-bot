@@ -501,18 +501,24 @@ def _fmt_count(n):
         return str(n)
 
 
-def _fmt_balance(bal, show_passport: bool = False) -> str:
-    """Полный баланс кошелька: THB + EUR + паспорта. Без эмодзи-замены слов (правило Филиппа).
-    show_passport=True — показать строку паспортов даже при 0 (когда сообщение их касалось)."""
+def _balance_parts(bal):
+    """Строки баланса кошелька, по одной валюте. THB показываем всегда (даже 0 —
+    осмысленно для пустого/нового кошелька). EUR и PASSPORT — только если != 0
+    (нулевой остаток в этих валютах = шум, не показываем). Без эмодзи-замены слов."""
     bal = bal or {}
     parts = [f"{_fmt(bal.get('THB', 0))} ฿"]
     eur = bal.get("EUR")
     if eur:
         parts.append(f"{_fmt(eur)} EUR")
     pas = bal.get("PASSPORT")
-    if pas or show_passport:
-        parts.append(f"{_fmt_count(pas or 0)} passport")
-    return " · ".join(parts)
+    if pas:  # != 0 (включая отрицательные); 0 не показываем
+        parts.append(f"{_fmt_count(pas)} passport")
+    return parts
+
+
+def _balance_block(label, bal):
+    """Баланс столбиком: строка-метка «<label>:», затем валюты с отступом 2 пробела."""
+    return [f"{label}:", *[f"  {p}" for p in _balance_parts(bal)]]
 
 
 # ============================================================
@@ -540,61 +546,55 @@ def _recorded_unit(amount, currency):
     return f"{sign}{_fmt(abs(amount or 0))} ฿"
 
 
-def msg_recorded_each(amount, bal, currency: str = "THB", show_passport: bool = False,
-                      wallet: str = "Самоорганизация"):
+def msg_recorded_each(amount, bal, currency: str = "THB", wallet: str = "Самоорганизация"):
     """Касса (Самоорганизация): подтверждение каждой записи."""
     rec = _recorded_unit(amount, currency)
-    b = _fmt_balance(bal, show_passport=show_passport)
     return _bilingual(
         wallet,
-        [f"บันทึกแล้ว  {rec}", f"ยอดคงเหลือ:  {b}"],
-        [f"Учтено  {rec}", f"Баланс:  {b}"],
+        [f"บันทึกแล้ว  {rec}", *_balance_block("ยอดคงเหลือ", bal)],
+        [f"Учтено  {rec}", *_balance_block("Баланс", bal)],
     )
 
 
-def msg_recorded_cf(amount, bal, currency: str = "THB", show_passport: bool = False,
-                    wallet: str = "Money Cashflow"):
+def msg_recorded_cf(amount, bal, currency: str = "THB", wallet: str = "Money Cashflow"):
     """Money Cashflow: подтверждение записи."""
     rec = _recorded_unit(amount, currency)
-    b = _fmt_balance(bal, show_passport=show_passport)
     return _bilingual(
         wallet,
-        [f"บันทึกแล้ว  {rec}", f"ยอดคงเหลือ:  {b}"],
-        [f"Записал  {rec}", f"Баланс:  {b}"],
+        [f"บันทึกแล้ว  {rec}", *_balance_block("ยอดคงเหลือ", bal)],
+        [f"Записал  {rec}", *_balance_block("Баланс", bal)],
     )
 
 
 def msg_topup_pettycash(amount, bal, wallet: str = "Самоорганизация", source: str = "Money Cashflow"):
     """Пополнение кассы переносом из другого кошелька (в группе Самоорганизации)."""
     a = _fmt(abs(amount or 0))
-    b = _fmt_balance(bal)
     return _bilingual(
         wallet,
-        [f"เติมเงิน  +{a} ฿  (โอนมาจาก {source})", f"ยอดคงเหลือ:  {b}",
+        [f"เติมเงิน  +{a} ฿  (โอนมาจาก {source})", *_balance_block("ยอดคงเหลือ", bal),
          "", "พี่ Pleum ถูกต้องไหมครับ?"],
-        [f"Пополнение  +{a} ฿  (перенос из {source})", f"Баланс:  {b}",
+        [f"Пополнение  +{a} ฿  (перенос из {source})", *_balance_block("Баланс", bal),
          "", "Пым, всё верно?"],
     )
 
 
 def msg_reconcile(wallet, bal):
     """Периодическая сверка с Пымом — только по текущему кошельку."""
-    b = _fmt_balance(bal)
     return _bilingual(
         wallet,
-        [f"ยอดคงเหลือ:  {b}", "",
+        [*_balance_block("ยอดคงเหลือ", bal), "",
          "@Pleummmm เงินสดในมือตรงกับยอดในระบบไหมครับ? มีรายการตกหล่นไหม? 🙏"],
-        [f"Баланс:  {b}", "",
+        [*_balance_block("Баланс", bal), "",
          "@Pleummmm наличные на руках сходятся с балансом? Ничего не упустили? 🙏"],
     )
 
 
 def msg_balance_set(wallet, parts):
-    body = " · ".join(parts) if parts else "0 ฿"
+    rows = [f"  {p}" for p in (parts or ["0 ฿"])]
     return _bilingual(
         wallet,
-        [f"ตั้งยอดเริ่มต้น:  {body}", "จากนี้จะนับต่อจากยอดนี้ครับ"],
-        [f"Зафиксировал баланс:  {body}", "Дальше считаю отсюда"],
+        ["ตั้งยอดเริ่มต้น:", *rows, "จากนี้จะนับต่อจากยอดนี้ครับ"],
+        ["Зафиксировал баланс:", *rows, "Дальше считаю отсюда"],
     )
 
 
@@ -602,21 +602,29 @@ def msg_undo(amount, description, bal, wallet: str = "Money Cashflow"):
     sign = "+" if (amount or 0) >= 0 else "-"
     a = _fmt(abs(amount or 0))
     desc = f" ({description})" if description else ""
-    b = _fmt_balance(bal)
     return _bilingual(
         wallet,
-        [f"ยกเลิกรายการล่าสุดแล้ว:  {sign}{a} ฿", f"ยอดคงเหลือ:  {b}"],
-        [f"Отменил последнюю запись:  {sign}{a} ฿{desc}", f"Баланс:  {b}"],
+        [f"ยกเลิกรายการล่าสุดแล้ว:  {sign}{a} ฿", *_balance_block("ยอดคงเหลือ", bal)],
+        [f"Отменил последнюю запись:  {sign}{a} ฿{desc}", *_balance_block("Баланс", bal)],
     )
+
+
+def _overview_rows(wallets):
+    """Список кошельков столбиком: «• Имя:» и валюты с отступом под ним."""
+    rows = []
+    for name, cur in wallets.items():
+        rows.append(f"• {name}:")
+        rows.extend(f"    {p}" for p in _balance_parts(cur))
+    return rows
 
 
 def msg_balances_overview(wallets):
     """Все кошельки. Список языконезависим (имена собственные + коды валют),
     поэтому повторяем его в каждом блоке под локализованным заголовком."""
     if not wallets:
-        return _bilingual(None, ["ยอดเงินทุกกระเป๋า:", "(ว่างเปล่า)"],
-                                ["Балансы кошельков:", "(пусто)"])
-    rows = [f"• {name}:  {_fmt_balance(cur)}" for name, cur in wallets.items()]
+        return _bilingual(None, ["ยอดเงินทุกกระเป๋า:", "  (ว่างเปล่า)"],
+                                ["Балансы кошельков:", "  (пусто)"])
+    rows = _overview_rows(wallets)
     return _bilingual(None, ["ยอดเงินทุกกระเป๋า:", *rows],
                             ["Балансы кошельков:", *rows])
 
@@ -735,7 +743,6 @@ async def _handle_money(msg, context, bridge, claude):
         display_move = money_move or passport_move
         disp_amount = display_move.get("amount", 0) if display_move else money_amount
         disp_currency = display_move.get("currency", "THB") if display_move else money_currency
-        had_passport = passport_move is not None
 
         # Если приложен чек — сверяем сумму на чеке с написанной (денежной)
         if msg.photo and money_move:
@@ -784,13 +791,13 @@ async def _handle_money(msg, context, bridge, claude):
         if chat_id in MONEY_CONFIRM_EACH:
             await _send(context,
                 chat_id=chat_id,
-                text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, had_passport, wallet=wallet),
+                text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet),
             )
             _entry_counts[chat_id] = 0
         else:
             await _send(context,
                 chat_id=chat_id,
-                text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, had_passport, wallet=wallet),
+                text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet),
             )
             if _entry_counts[chat_id] >= RECONCILE_EVERY:
                 await _send(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
@@ -839,10 +846,10 @@ async def _handle_money(msg, context, bridge, claude):
     elif ptype == "question":
         # Отвечаем балансом ТОЛЬКО этого кошелька (не палим другие кошельки)
         this_bal = bridge.get_balance(group=wallet).get("balance", {})
-        _b = _fmt_balance(this_bal)
         await _send(context,
             chat_id=chat_id,
-            text=_bilingual(wallet, [f"ยอดคงเหลือ:  {_b}"], [f"Баланс:  {_b}"]),
+            text=_bilingual(wallet, _balance_block("ยอดคงเหลือ", this_bal),
+                            _balance_block("Баланс", this_bal)),
         )
 
     elif ptype == "undo":
