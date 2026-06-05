@@ -492,17 +492,26 @@ def _fmt(n) -> str:
         return str(n)
 
 
-def _fmt_balance(bal) -> str:
-    """Полный баланс кошелька: THB + EUR + паспорта. Без эмодзи-замены слов (правило Филиппа)."""
+def _fmt_count(n):
+    """Целое число (паспорта) без хвоста «.0»."""
+    try:
+        f = float(n)
+        return str(int(f)) if f.is_integer() else str(n)
+    except (ValueError, TypeError):
+        return str(n)
+
+
+def _fmt_balance(bal, show_passport: bool = False) -> str:
+    """Полный баланс кошелька: THB + EUR + паспорта. Без эмодзи-замены слов (правило Филиппа).
+    show_passport=True — показать строку паспортов даже при 0 (когда сообщение их касалось)."""
     bal = bal or {}
     parts = [f"{_fmt(bal.get('THB', 0))} ฿"]
     eur = bal.get("EUR")
     if eur:
         parts.append(f"{_fmt(eur)} EUR")
     pas = bal.get("PASSPORT")
-    if pas:
-        n = int(pas) if float(pas).is_integer() else pas
-        parts.append(f"{n} паспорт./passport")
+    if pas or show_passport:
+        parts.append(f"{_fmt_count(pas or 0)} passport")
     return " · ".join(parts)
 
 
@@ -514,91 +523,102 @@ def _sign(amount):
     return "+" if (amount or 0) >= 0 else "-"
 
 
-def msg_recorded_each(amount, bal):
+def _bilingual(wallet, th_lines, ru_lines):
+    """Двуязычное сообщение по правилу Филиппа: НЕ чередовать языки построчно.
+    Одна шапка «🐀 Splinter · <ИмяКошелька>», затем монолитный тайский блок,
+    затем монолитный русский. Флаг — отдельной строкой в начале блока.
+    th_lines/ru_lines — строки контента своего языка (без флагов)."""
+    head = f"🐀 Splinter · {wallet}" if wallet else "🐀 Splinter"
+    return "\n".join([head, "", "🇹🇭", *th_lines, "", "🇷🇺", *ru_lines])
+
+
+def _recorded_unit(amount, currency):
+    """Подпись записанного движения. PASSPORT — код единицы (как ฿/EUR), один для обоих языков."""
+    sign = _sign(amount)
+    if currency == "PASSPORT":
+        return f"{sign}{_fmt_count(abs(amount or 0))} passport"
+    return f"{sign}{_fmt(abs(amount or 0))} ฿"
+
+
+def msg_recorded_each(amount, bal, currency: str = "THB", show_passport: bool = False,
+                      wallet: str = "Самоорганизация"):
     """Касса (Самоорганизация): подтверждение каждой записи."""
-    a = _fmt(abs(amount or 0))
-    sign = _sign(amount)
-    return (
-        f"🐀 Splinter · กล่องเงินสด / Касса\n"
-        f"🇹🇭 บันทึกแล้ว  {sign}{a} ฿\n"
-        f"🇷🇺 Учтено  {sign}{a} ฿\n"
-        f"💰 ยอดคงเหลือ / Баланс:  {_fmt_balance(bal)}"
+    rec = _recorded_unit(amount, currency)
+    b = _fmt_balance(bal, show_passport=show_passport)
+    return _bilingual(
+        wallet,
+        [f"บันทึกแล้ว  {rec}", f"ยอดคงเหลือ:  {b}"],
+        [f"Учтено  {rec}", f"Баланс:  {b}"],
     )
 
 
-def msg_recorded_cf(amount, bal):
+def msg_recorded_cf(amount, bal, currency: str = "THB", show_passport: bool = False,
+                    wallet: str = "Money Cashflow"):
     """Money Cashflow: подтверждение записи."""
-    a = _fmt(abs(amount or 0))
-    sign = _sign(amount)
-    return (
-        f"🐀 Splinter · Cashflow\n"
-        f"🇹🇭 บันทึกแล้ว  {sign}{a} ฿\n"
-        f"🇷🇺 Записал  {sign}{a} ฿\n"
-        f"💰 ยอดคงเหลือ / Баланс:  {_fmt_balance(bal)}"
+    rec = _recorded_unit(amount, currency)
+    b = _fmt_balance(bal, show_passport=show_passport)
+    return _bilingual(
+        wallet,
+        [f"บันทึกแล้ว  {rec}", f"ยอดคงเหลือ:  {b}"],
+        [f"Записал  {rec}", f"Баланс:  {b}"],
     )
 
 
-def msg_topup_pettycash(amount, bal):
-    """Пополнение кассы переносом из Cashflow (в группе Самоорганизации)."""
+def msg_topup_pettycash(amount, bal, wallet: str = "Самоорганизация", source: str = "Money Cashflow"):
+    """Пополнение кассы переносом из другого кошелька (в группе Самоорганизации)."""
     a = _fmt(abs(amount or 0))
-    return (
-        f"🐀 Splinter · กล่องเงินสด / Касса\n"
-        f"💵 เติมเงิน  +{a} ฿  (โอนมาจาก Cashflow)\n"
-        f"💵 Пополнение  +{a} ฿  (перенос из Cashflow)\n"
-        f"💰 ยอดคงเหลือ / Баланс:  {_fmt_balance(bal)}\n"
-        f"\n"
-        f"🇹🇭 พี่ Pleum ถูกต้องไหมครับ?\n"
-        f"🇷🇺 Пым, всё верно?"
+    b = _fmt_balance(bal)
+    return _bilingual(
+        wallet,
+        [f"เติมเงิน  +{a} ฿  (โอนมาจาก {source})", f"ยอดคงเหลือ:  {b}",
+         "", "พี่ Pleum ถูกต้องไหมครับ?"],
+        [f"Пополнение  +{a} ฿  (перенос из {source})", f"Баланс:  {b}",
+         "", "Пым, всё верно?"],
     )
 
 
-def msg_reconcile(label, bal):
+def msg_reconcile(wallet, bal):
     """Периодическая сверка с Пымом — только по текущему кошельку."""
-    return (
-        f"🐀 Splinter · ตรวจสอบยอด / Сверка\n"
-        f"💰 {label}:  {_fmt_balance(bal)}\n"
-        f"\n"
-        f"🇹🇭 @Pleummmm เงินสดในมือตรงกับยอดในระบบไหมครับ? มีรายการตกหล่นไหม? 🙏\n"
-        f"🇷🇺 @Pleummmm наличные на руках сходятся с балансом? Ничего не упустили? 🙏"
+    b = _fmt_balance(bal)
+    return _bilingual(
+        wallet,
+        [f"ยอดคงเหลือ:  {b}", "",
+         "@Pleummmm เงินสดในมือตรงกับยอดในระบบไหมครับ? มีรายการตกหล่นไหม? 🙏"],
+        [f"Баланс:  {b}", "",
+         "@Pleummmm наличные на руках сходятся с балансом? Ничего не упустили? 🙏"],
     )
 
 
 def msg_balance_set(wallet, parts):
     body = " · ".join(parts) if parts else "0 ฿"
-    return (
-        f"🐀 Splinter\n"
-        f"📌 ตั้งยอดเริ่มต้นของ «{wallet}»\n"
-        f"📌 Зафиксировал баланс «{wallet}»\n"
-        f"💰 {body}\n"
-        f"\n"
-        f"🇹🇭 จากนี้จะนับต่อจากยอดนี้ครับ\n"
-        f"🇷🇺 Дальше считаю отсюда"
+    return _bilingual(
+        wallet,
+        [f"ตั้งยอดเริ่มต้น:  {body}", "จากนี้จะนับต่อจากยอดนี้ครับ"],
+        [f"Зафиксировал баланс:  {body}", "Дальше считаю отсюда"],
     )
 
 
-def msg_undo(amount, description, bal):
+def msg_undo(amount, description, bal, wallet: str = "Money Cashflow"):
     sign = "+" if (amount or 0) >= 0 else "-"
     a = _fmt(abs(amount or 0))
     desc = f" ({description})" if description else ""
-    return (
-        f"🐀 Splinter · ยกเลิก / Отмена\n"
-        f"🇹🇭 ยกเลิกรายการล่าสุดแล้ว: {sign}{a} ฿\n"
-        f"🇷🇺 Отменил последнюю запись: {sign}{a} ฿{desc}\n"
-        f"💰 ยอดคงเหลือ / Баланс:  {_fmt_balance(bal)}"
+    b = _fmt_balance(bal)
+    return _bilingual(
+        wallet,
+        [f"ยกเลิกรายการล่าสุดแล้ว:  {sign}{a} ฿", f"ยอดคงเหลือ:  {b}"],
+        [f"Отменил последнюю запись:  {sign}{a} ฿{desc}", f"Баланс:  {b}"],
     )
 
 
 def msg_balances_overview(wallets):
-    lines = [
-        "🐀 Splinter · ยอดเงินทุกกระเป๋า / Балансы кошельков",
-        ""
-    ]
+    """Все кошельки. Список языконезависим (имена собственные + коды валют),
+    поэтому повторяем его в каждом блоке под локализованным заголовком."""
     if not wallets:
-        lines.append("(ว่างเปล่า / пока пусто)")
-    for name, cur in wallets.items():
-        lines.append(f"• {name}")
-        lines.append(f"   {_fmt_balance(cur)}")
-    return "\n".join(lines)
+        return _bilingual(None, ["ยอดเงินทุกกระเป๋า:", "(ว่างเปล่า)"],
+                                ["Балансы кошельков:", "(пусто)"])
+    rows = [f"• {name}:  {_fmt_balance(cur)}" for name, cur in wallets.items()]
+    return _bilingual(None, ["ยอดเงินทุกกระเป๋า:", *rows],
+                            ["Балансы кошельков:", *rows])
 
 
 def msg_balance_match(cur, bal):
@@ -709,6 +729,14 @@ async def _handle_money(msg, context, bridge, claude):
         money_amount = money_move.get("amount", 0) if money_move else 0
         money_currency = money_move.get("currency", "THB") if money_move else "THB"
 
+        # Для подтверждения в группу: денежное движение приоритетнее паспортного,
+        # но если в сообщении ТОЛЬКО паспорт — показываем его (а не «+0 ฿»).
+        passport_move = next((m for m in moves if m.get("currency") == "PASSPORT"), None)
+        display_move = money_move or passport_move
+        disp_amount = display_move.get("amount", 0) if display_move else money_amount
+        disp_currency = display_move.get("currency", "THB") if display_move else money_currency
+        had_passport = passport_move is not None
+
         # Если приложен чек — сверяем сумму на чеке с написанной (денежной)
         if msg.photo and money_move:
             img = await _download_photo(msg)
@@ -748,21 +776,21 @@ async def _handle_money(msg, context, bridge, claude):
             pc_bal = bridge.get_balance(group=PETTYCASH_LABEL).get("balance", {})
             await _send(context, 
                 chat_id=PETTYCASH_CHAT_ID,
-                text=msg_topup_pettycash(plus, pc_bal),
+                text=msg_topup_pettycash(plus, pc_bal, wallet=PETTYCASH_LABEL, source=wallet),
             )
 
         # === Подтверждение записи ===
         _entry_counts[chat_id] = _entry_counts.get(chat_id, 0) + 1
         if chat_id in MONEY_CONFIRM_EACH:
-            await _send(context, 
+            await _send(context,
                 chat_id=chat_id,
-                text=msg_recorded_each(money_amount, wallet_bal),
+                text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, had_passport, wallet=wallet),
             )
             _entry_counts[chat_id] = 0
         else:
-            await _send(context, 
+            await _send(context,
                 chat_id=chat_id,
-                text=msg_recorded_cf(money_amount, wallet_bal),
+                text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, had_passport, wallet=wallet),
             )
             if _entry_counts[chat_id] >= RECONCILE_EVERY:
                 await _send(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
@@ -811,11 +839,10 @@ async def _handle_money(msg, context, bridge, claude):
     elif ptype == "question":
         # Отвечаем балансом ТОЛЬКО этого кошелька (не палим другие кошельки)
         this_bal = bridge.get_balance(group=wallet).get("balance", {})
-        await _send(context, 
+        _b = _fmt_balance(this_bal)
+        await _send(context,
             chat_id=chat_id,
-            text=(f"🐀 Splinter · {wallet}\n"
-                  f"🇹🇭 ยอดคงเหลือ: {_fmt_balance(this_bal)}\n"
-                  f"🇷🇺 Баланс: {_fmt_balance(this_bal)}"),
+            text=_bilingual(wallet, [f"ยอดคงเหลือ:  {_b}"], [f"Баланс:  {_b}"]),
         )
 
     elif ptype == "undo":
@@ -825,14 +852,13 @@ async def _handle_money(msg, context, bridge, claude):
         if res.get("voided"):
             await _send(context, 
                 chat_id=chat_id,
-                text=msg_undo(res.get("amount", 0), res.get("description", ""), res.get("balance", {})),
+                text=msg_undo(res.get("amount", 0), res.get("description", ""), res.get("balance", {}), wallet=wallet),
             )
         else:
-            await _send(context, 
+            await _send(context,
                 chat_id=chat_id,
-                text=("🐀 Splinter\n"
-                      "🇹🇭 ไม่มีรายการให้ยกเลิกครับ\n"
-                      "🇷🇺 Нечего отменять — активных записей нет."),
+                text=_bilingual(wallet, ["ไม่มีรายการให้ยกเลิกครับ"],
+                                ["Нечего отменять — активных записей нет."]),
             )
 
     else:
