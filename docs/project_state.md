@@ -65,8 +65,7 @@
 ### 🔴 НЕЗАКРЫТЫЕ ХВОСТЫ (с 1 июня)
 - ✅ Безопасность: проверено с Филиппом 5.06 — GitHub-токен фактически НЕ светился;
   EdenAI-ключ некритичен (ничего ценного). Отзыв НЕ требуется. Пункт снят.
-- requirements.txt: ptb==21.7 несовместим с Python 3.14 (на сервере вручную новее),
-  при pip install -r requirements.txt сломается. Обновить версию в репо.
+- ✅ requirements.txt: ptb 21.7 → 22.7 (совместимо с Python 3.14) — СДЕЛАНО 5.06, коммит 60ac562.
 - clasp: завести clasp для Bridge Apps Script — деплой/синк .gs из репо, чтобы не
   путать проекты (как 5.06) и иметь воспроизводимый деплой. НЕ СДЕЛАНО.
 
@@ -218,7 +217,7 @@ Splinter работает 24/7 на VPS Hetzner, независимо от ПК.
 - Код: GitHub приватный https://github.com/mxfill77/turbobaby-manager-bot
 - На сервере: /root/turbobaby-manager-bot, venv, .env + memory.db перенесены через scp (НЕ в git).
 - ⚠️ python-telegram-bot пришлось обновить (21.7 несовместим с Python 3.14) — обновлён до свежей.
-  NB: requirements.txt на ПК всё ещё ==21.7; на сервере новее. При след. деплое учесть.
+  NB: requirements.txt в репо обновлён до ==22.7 (сделано 5.06, коммит 60ac562) — совпадает с сервером.
 - systemd-сервис splinter.service: active(running), Restart=always, enable (автозапуск).
 - Логи: /root/turbobaby-manager-bot/splinter.log
 - ⚠️ Бот на ПК ДОЛЖЕН быть выключен (один токен = один бот). Рабочий теперь серверный.
