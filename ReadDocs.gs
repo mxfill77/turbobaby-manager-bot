@@ -4,6 +4,8 @@
  * Зона ответственности этого файла (правило проекта: 1 файл Bridge = своя зона):
  *   - setupBrain()        — одноразовая настройка: папка Brain + 4 Google Docs из .md +
  *                           манифест в Script Properties + KB_index. Запускать ИЗ РЕДАКТОРА.
+ *   - setupCcLog()        — одноразово: создать Doc KB_claude_code_log + ключ cc_log
+ *                           в манифесте (лог задач Claude Code). Запускать ИЗ РЕДАКТОРА.
  *   - handleReadDoc_(e)   — endpoint read_doc  (по id или name через манифест).
  *   - handleListBrain_(e) — endpoint list_brain (отдаёт весь манифест).
  *
@@ -33,7 +35,10 @@ function setupBrain() {
   var brain = getOrCreateFolder_(parent, BRAIN_FOLDER_NAME);
   Logger.log('Папка Brain: ' + brain.getId());
 
-  var manifest = { folder_id: brain.getId() };
+  // Сохраняем уже существующие ключи манифеста (например cc_log), чтобы повторный
+  // запуск setupBrain их не затёр — ниже пересобираются только KB_* из BRAIN_MAP.
+  var manifest = getBrainManifest_();
+  manifest.folder_id = brain.getId();
   var indexLines = [
     'TurboBaby Brain — оглавление базы знаний',
     '',
@@ -86,6 +91,37 @@ function setupBrain() {
   }
   Logger.log('BRAIN_MANIFEST: ' + JSON.stringify(manifest));
   return manifest;
+}
+
+
+// ============================================================
+//  ОДНОРАЗОВАЯ НАСТРОЙКА cc_log — запускать ИЗ РЕДАКТОРА Apps Script
+//  Создаёт Doc «KB_claude_code_log» и добавляет ключ cc_log в манифест.
+//  НЕ трогает другие KB_* — только cc_log. Идемпотентна: повторный запуск
+//  не пересоздаёт документ (getOrCreateDoc_ вернёт существующий).
+// ============================================================
+function setupCcLog() {
+  var DOC_NAME = 'KB_claude_code_log';
+  var KEY = 'cc_log';
+
+  var manifest = getBrainManifest_();
+  if (!manifest.folder_id) {
+    Logger.log('ОШИБКА: в манифесте нет folder_id — сначала запустите setupBrain().');
+    return { ok: false, error: 'no_folder' };
+  }
+
+  var brain = DriveApp.getFolderById(manifest.folder_id);
+  var doc = getOrCreateDoc_(brain, DOC_NAME);  // вернёт существующий, если уже создан
+  doc.saveAndClose();
+  var id = doc.getId();
+
+  manifest[KEY] = id;
+  PropertiesService.getScriptProperties().setProperty(BRAIN_PROP_KEY, JSON.stringify(manifest));
+
+  Logger.log('================ setupCcLog завершён ================');
+  Logger.log(DOC_NAME + ' (' + KEY + '): ' + id);
+  Logger.log('BRAIN_MANIFEST: ' + JSON.stringify(manifest));
+  return { ok: true, key: KEY, doc: DOC_NAME, id: id };
 }
 
 
