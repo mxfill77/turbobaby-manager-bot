@@ -28,6 +28,48 @@
 **Ключевые ID/доступы:** VPS 5.223.94.179 (root, пароль у Фила) · GitHub mxfill77/turbobaby-manager-bot (приватный) · Bridge Web App (URL в KB) · таблица "менеджеру Байки" 1sL-rw0klRcJKtWKpgIzLVge6U1GswtBUacJ_jo0JgL0 · форма-проект 17OTrEgB... · код на сервере /root/turbobaby-manager-bot.
 ---
 
+## ✅ СЕССИЯ 5 июня 2026 — UX кассы + каналы связи Claude↔Claude
+
+### UX-блок Money Cashflow (DONE, в проде)
+- Двуязычные сообщения: монолитные блоки (один флаг 🇹🇭/🇷🇺 на блок, НЕ чередовать
+  построчно), баланс столбиком (метка на строке, валюты под ней с отступом).
+- passport = латинский код единицы (как ฿/EUR) в обоих блоках; паспорт в балансе
+  показывается ТОЛЬКО при значении !=0 (нулевой = шум, убран). THB всегда.
+- Коммиты e3b9478 + 4a5988c, оба в main и в проде, рантайм-тест подтверждён.
+- Открыто отдельно: msg_undo/EUR печатают ฿ для любой валюты; balance_match/
+  mismatch, expense_high, photo_reminder, service_due ещё чередуют языки.
+
+### Каналы связи между Claude Code и Claude-на-сайте (DONE)
+- cc_log (KB_claude_code_log, id 1o0be0v9xGI7L0tmpzpefgXBgq4jgmg2eM9lxL_Rlj2E):
+  Claude Code пишет PLAN (перед действием) / DONE (после) / NOTE (диагностика).
+  Филипп говорит «проверь» → Claude-на-сайте читает через коннектор и комментирует.
+- KB_review (KB_claude_review, id 1NYh2XSeojiaAOWhJxeG69d7Sg2sykcP83Xyiy58G7y8):
+  прямой буфер ревью. Claude Code пишет «PLAN <UTC> ждёт ревью: <суть>»;
+  Claude-на-сайте читает через коннектор, отвечает Филиппу одной строкой
+  «передай в KB_review: ОК/правки»; Филипп переносит в терминал. Новые записи СВЕРХУ.
+- Правило логирования cc_log (PLAN/DONE/NOTE) + правило KB_review с пунктом
+  «ОЖИДАНИЕ ПОСЛЕ PLAN» (не действовать пока Филипп явно не сказал «да») —
+  в memory.db (id 17) + память-файлы review-policy.md / cc-log-logging-policy.md.
+- ТРЕБУЮТ явного «да» Филиппа даже после ОК Claude-на-сайте: git push,
+  systemctl restart, deploy Apps Script, проводки Bot Data, SQL по memory.db,
+  запись в рабочие таблицы (CRM/Зарплаты/Байки).
+
+### ⚠️ ПРИЗНАК ПРАВИЛЬНОГО Bridge-проекта (важно, потеряли время 5.06)
+- В Apps Script НЕСКОЛЬКО проектов. Рабочий Bridge = проект «TurboBaby Bridge».
+- Опознать: в его ReadDocs.gs ЕСТЬ функция setupCcLog (и setupReview).
+  Файлы: Config/Bridge/BotData/ReadFleet/ReadClients/ReadFinance/ReadDocs/Booking.gs.
+  Надёжнее всего — сверить deployment ID из BRIDGE_URL с Deploy→Manage deployments.
+- setup-функции (setupBrain/setupCcLog/setupReview) запускать ТОЛЬКО в этом проекте,
+  иначе ключ уйдёт в манифест чужого проекта (Script Properties у проектов раздельные).
+
+### 🔴 НЕЗАКРЫТЫЕ ХВОСТЫ (с 1 июня, всё ещё актуально)
+- ⚠️ БЕЗОПАСНОСТЬ: отозвать засветившиеся GitHub-токен (ghp_...) и EdenAI-ключ,
+  выпустить новые. EdenAI → Script Properties EDENAI_API_KEY. НЕ СДЕЛАНО.
+- requirements.txt: ptb==21.7 несовместим с Python 3.14 (на сервере вручную новее),
+  при pip install -r requirements.txt сломается. Обновить версию в репо.
+
+---
+
 ## Что это
 AI-команда ботов для TurboBaby (премиум аренда мотобайков, Пхукет, владелец Филипп, 38 байков). Владелец — не программист, работает на Windows (VS Code + Python 3.12 + Node.js). Рабочие папки на ПК: `D:\turbobaby-bot\` (userbot-скрипты) и `D:\turbobaby-bot\manager-bot\` (бот Splinter).
 

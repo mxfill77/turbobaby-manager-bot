@@ -26,3 +26,18 @@ Splinter — Telegram-бот учёта для аренды мотобайков
 - auditor.py — надзор (факты + язык RU/TH).
 - memory.py — SQLite memory.db (правила/история).
 - prompts.py — системные промпты.
+
+## Apps Script Bridge — какой проект «правильный»
+Bridge — это Google Apps Script. Проектов несколько, легко перепутать. Признаки ВЕРНОГО:
+- проект называется **«TurboBaby Bridge»**;
+- его deployment обслуживает **BRIDGE_URL** (из .env); надёжнее всего — сверить deployment ID из BRIDGE_URL с Deploy→Manage deployments;
+- его `ReadDocs.gs` содержит **И `setupCcLog`, И `setupReview`** (+ `setupBrain`, `handleReadDoc_`, `handleListBrain_`);
+- файлы проекта: `Config/Bridge/BotData/ReadFleet/ReadClients/ReadFinance/ReadDocs/Booking.gs`.
+Локальные `bridge_client.py` / `ReadDocs.gs` в репо — зеркало именно этого проекта.
+Setup-функции (`setupBrain`/`setupCcLog`/`setupReview`) запускаются ВРУЧНУЮ из редактора —
+строго в этом проекте, иначе ключ уйдёт в манифест чужого проекта (Script Properties у каждого свои).
+Проверка после запуска: `list_brain` через Bridge должен показать новый ключ рядом с `cc_log`.
+
+## Каналы «мозга» (Brain на Drive)
+- `cc_log` (KB_claude_code_log) — журнал задач Claude Code: PLAN/DONE/NOTE, новые записи СВЕРХУ.
+- `review` (KB_claude_review) — канал ревью Claude Code ↔ Claude на сайте (см. memory: review-policy).
