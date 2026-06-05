@@ -6,6 +6,8 @@
  *                           манифест в Script Properties + KB_index. Запускать ИЗ РЕДАКТОРА.
  *   - setupCcLog()        — одноразово: создать Doc KB_claude_code_log + ключ cc_log
  *                           в манифесте (лог задач Claude Code). Запускать ИЗ РЕДАКТОРА.
+ *   - setupReview()       — одноразово: создать Doc KB_claude_review + ключ review
+ *                           (канал ревью Claude-на-сайте). Запускать ИЗ РЕДАКТОРА.
  *   - handleReadDoc_(e)   — endpoint read_doc  (по id или name через манифест).
  *   - handleListBrain_(e) — endpoint list_brain (отдаёт весь манифест).
  *
@@ -119,6 +121,37 @@ function setupCcLog() {
   PropertiesService.getScriptProperties().setProperty(BRAIN_PROP_KEY, JSON.stringify(manifest));
 
   Logger.log('================ setupCcLog завершён ================');
+  Logger.log(DOC_NAME + ' (' + KEY + '): ' + id);
+  Logger.log('BRAIN_MANIFEST: ' + JSON.stringify(manifest));
+  return { ok: true, key: KEY, doc: DOC_NAME, id: id };
+}
+
+
+// ============================================================
+//  ОДНОРАЗОВАЯ НАСТРОЙКА KB_review — запускать ИЗ РЕДАКТОРА Apps Script
+//  Создаёт Doc «KB_claude_review» и добавляет ключ review в манифест.
+//  Канал прямого ревью Claude-на-сайте <-> Claude Code. НЕ трогает другие KB_* —
+//  только review. Идемпотентна: повторный запуск не пересоздаёт документ.
+// ============================================================
+function setupReview() {
+  var DOC_NAME = 'KB_claude_review';
+  var KEY = 'review';
+
+  var manifest = getBrainManifest_();
+  if (!manifest.folder_id) {
+    Logger.log('ОШИБКА: в манифесте нет folder_id — сначала запустите setupBrain().');
+    return { ok: false, error: 'no_folder' };
+  }
+
+  var brain = DriveApp.getFolderById(manifest.folder_id);
+  var doc = getOrCreateDoc_(brain, DOC_NAME);  // вернёт существующий, если уже создан
+  doc.saveAndClose();
+  var id = doc.getId();
+
+  manifest[KEY] = id;
+  PropertiesService.getScriptProperties().setProperty(BRAIN_PROP_KEY, JSON.stringify(manifest));
+
+  Logger.log('================ setupReview завершён ================');
   Logger.log(DOC_NAME + ' (' + KEY + '): ' + id);
   Logger.log('BRAIN_MANIFEST: ' + JSON.stringify(manifest));
   return { ok: true, key: KEY, doc: DOC_NAME, id: id };
