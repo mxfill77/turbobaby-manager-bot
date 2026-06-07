@@ -57,12 +57,14 @@ class Auditor:
         # LLM-надзор за логикой: включается только для allowlist старт-групп (chat_id).
         # Пока множество пустое — LLM-слой выключен (старое детерминир. поведение).
         self.audit_groups = set()   # {chat_id, ...} — Самоорганизация/Cashflow/Обслуживание
-        self.audit_chat_id = 0      # группа «Аудит» для карточек правок (0 = не слать)
+        self.audit_chat_id = 0      # форум «Аудит» для карточек правок (0 = не слать)
+        self.audit_thread_id = 0    # тема внутри форума (0 = весь чат)
 
-    def set_audit_config(self, groups=None, audit_chat_id=0):
-        """Подключить LLM-надзор: allowlist групп + chat_id группы «Аудит». Зовётся из bot.py."""
+    def set_audit_config(self, groups=None, audit_chat_id=0, audit_thread_id=0):
+        """Подключить LLM-надзор: allowlist групп + (chat_id форума, thread_id темы) «Аудит». Зовётся из bot.py."""
         self.audit_groups = set(int(g) for g in (groups or []) if str(g).strip())
         self.audit_chat_id = int(audit_chat_id or 0)
+        self.audit_thread_id = int(audit_thread_id or 0)
 
     # ── Слой 1+2: проверка ОДНОГО действия сразу после выполнения ──
     def check_action(self, *, tool: str, args: dict, claimed: str,
@@ -309,8 +311,9 @@ class Auditor:
                     "fix": result["fix"],
                     "verdict": result["verdict"],
                     "severity": result["severity"],
-                    "chat_id": chat_id,
+                    "chat_id": chat_id,            # где найдена странность (аудируемая группа)
                     "topic_id": topic_id,
+                    "audit_thread_id": self.audit_thread_id,  # куда слать карточку (тема Аудит)
                 }
         except Exception as e:
             log.warning(f"auditor.review_logic error: {e}")

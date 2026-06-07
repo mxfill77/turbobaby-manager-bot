@@ -52,7 +52,8 @@ DAILY_MINUTE = int(os.getenv("DAILY_PULSE_MINUTE", "0"))
 
 # LLM-надзор аудитора: группа «Аудит» для карточек правок + allowlist старт-групп.
 # Пока не заданы в .env — LLM-слой и канал правок ВЫКЛЮЧЕНЫ (Филипп даст AUDIT_CHAT_ID).
-AUDIT_CHAT_ID = int(os.getenv("AUDIT_CHAT_ID", "0"))
+AUDIT_CHAT_ID = int(os.getenv("AUDIT_CHAT_ID", "0"))     # форум HQ (TurboControl)
+AUDIT_THREAD_ID = int(os.getenv("AUDIT_THREAD_ID", "0")) # тема «Аудит» внутри форума (0 = весь чат)
 AUDIT_GROUPS = [g.strip() for g in os.getenv("AUDIT_GROUPS", "").split(",") if g.strip()]
 
 # === Логирование ===
@@ -81,7 +82,8 @@ splinter.set_auditor(auditor)
 log.info("  Auditor: ✅ подключён к splinter._send (надзор за языком исходящих)")
 
 # LLM-надзор за логикой ответов: включается только если заданы старт-группы в .env.
-auditor.set_audit_config(groups=AUDIT_GROUPS, audit_chat_id=AUDIT_CHAT_ID)
+auditor.set_audit_config(groups=AUDIT_GROUPS, audit_chat_id=AUDIT_CHAT_ID,
+                         audit_thread_id=AUDIT_THREAD_ID)
 if auditor.audit_groups:
     log.info(f"  Auditor LLM: ✅ надзор логики для групп {sorted(auditor.audit_groups)}; "
              f"канал правок «Аудит»={'on '+str(AUDIT_CHAT_ID) if AUDIT_CHAT_ID else 'off'}")
@@ -114,8 +116,11 @@ async def post_audit_card(context, card: dict):
         InlineKeyboardButton("✏️ дописать", callback_data=f"aud:edit:{token}"),
         InlineKeyboardButton("👎 отклонить", callback_data=f"aud:no:{token}"),
     ]])
+    kw = {"chat_id": AUDIT_CHAT_ID, "text": text, "reply_markup": kb}
+    if AUDIT_THREAD_ID:                      # шлём в тему «Аудит», не в General форума
+        kw["message_thread_id"] = AUDIT_THREAD_ID
     try:
-        await context.bot.send_message(chat_id=AUDIT_CHAT_ID, text=text, reply_markup=kb)
+        await context.bot.send_message(**kw)
     except Exception as e:
         log.warning(f"post_audit_card error: {e}")
 
@@ -164,8 +169,8 @@ async def on_audit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await q.edit_message_text("⚠️ Правка пустая — нечего записывать. Используй ✏️ чтобы дописать.")
     elif action == "edit":
-        _audit_pending_edit[AUDIT_CHAT_ID] = token
-        await q.edit_message_text("✏️ Пришли СЛЕДУЮЩИМ сообщением точный текст правила — запишу его в память.")
+        _audit_pending_edit[(AUDIT_CHAT_ID, AUDIT_THREAD_ID)] = token
+        await q.edit_message_text("✏️ Пришли СЛЕДУЮЩИМ сообщением (в этой теме) точный текст правила — запишу его в память.")
     elif action == "no":
         await q.edit_message_text("👎 Отклонено. Ничего не записал.")
         log.info("  🔎 АУДИТ: находка отклонена Филиппом")
@@ -524,10 +529,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = msg.chat_id
 
-    # Группа «Аудит» — управляющая, мозг Splinter тут НЕ работает.
-    # Если ждём ✏️-правку правила — следующий текст Филиппа = новый текст правила.
-    if AUDIT_CHAT_ID and chat_id == AUDIT_CHAT_ID:
-        token = _audit_pending_edit.pop(AUDIT_CHAT_ID, None)
+    # ТЕМА «Аудит» (chat==форум И thread==тема) — управляющая, мозг Splinter тут НЕ работает.
+    # ВАЖНО: глушим ТОЛЬКО эту тему, а не весь форум HQ — в General/прочих темах мозг работает.
+    # Если ждём ✏️-правку правила — следующий текст Филиппа в этой теме = новый текст правила.
+    _msg_thread = getattr(msg, "message_thread_id", None)
+    if AUDIT_CHAT_ID and chat_id == AUDIT_CHAT_ID and _msg_thread == AUDIT_THREAD_ID:
+        token = _audit_pending_edit.pop((AUDIT_CHAT_ID, AUDIT_THREAD_ID), None)
         if token is not None:
             rule = msg.text.strip()
             rid = memory.add_rule(rule, context="из аудита логики (✏️ правка Филиппа)", source="auditor")
