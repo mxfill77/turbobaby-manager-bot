@@ -100,6 +100,9 @@ else:
 _audit_cards = {}
 _audit_seq = [0]
 _audit_pending_edit = {}   # {audit_chat_id: token} — ждём текст нового правила от Филиппа
+# Сильные ссылки на фоновые задачи аудита — иначе GC может убить задачу на await
+# (asyncio держит на task только слабую ссылку). add_done_callback(discard) чистит набор.
+_bg_tasks = set()
 
 
 async def post_audit_card(context, card: dict):
@@ -126,6 +129,8 @@ async def post_audit_card(context, card: dict):
         kw["message_thread_id"] = AUDIT_THREAD_ID
     try:
         await context.bot.send_message(**kw)
+        log.info(f"  🔎 АУДИТ: ✅ карточка отправлена в тему {AUDIT_THREAD_ID or '—'} "
+                 f"(chat {AUDIT_CHAT_ID}), token={token}")
     except Exception as e:
         log.warning(f"post_audit_card error: {e}")
 
@@ -146,6 +151,10 @@ async def _run_logic_audit(context, chat_id, topic_id, user_request, answer, gro
             log.warning(f"  🔎 АУДИТ логики: {res['verdict']} [{res.get('severity')}] {res.get('detail')}")
             if res.get("card"):
                 await post_audit_card(context, res["card"])
+    except asyncio.CancelledError:
+        # раньше пряталось за `except Exception` (CancelledError = BaseException) → тихая недоставка
+        log.warning("  🔎 АУДИТ логики: задача ОТМЕНЕНА (CancelledError) — карточка могла не уйти")
+        raise
     except Exception as e:
         log.warning(f"_run_logic_audit error: {e}")
 
@@ -454,9 +463,11 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
         # LLM-надзор за ЛОГИКОЙ ответа в контексте группы — постфактум, в ФОНЕ
         # (не блокирует), только для старт-групп allowlist. При находке → карточка в «Аудит».
         if chat_id in getattr(auditor, "audit_groups", set()):
-            asyncio.create_task(
+            _t = asyncio.create_task(
                 _run_logic_audit(context, chat_id, _topic, text, answer, _grp)
             )
+            _bg_tasks.add(_t)                     # держим ссылку, чтобы GC не убил задачу
+            _t.add_done_callback(_bg_tasks.discard)
     except Exception as e:
         log.warning(f"auditor check error: {e}")
     pins = getattr(claude, "pending_pins", None) or []
