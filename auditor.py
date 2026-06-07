@@ -54,6 +54,15 @@ class Auditor:
         self.bridge = bridge
         self.memory = memory
         self.claude = claude  # для LLM-слоя (опц.)
+        # LLM-надзор за логикой: включается только для allowlist старт-групп (chat_id).
+        # Пока множество пустое — LLM-слой выключен (старое детерминир. поведение).
+        self.audit_groups = set()   # {chat_id, ...} — Самоорганизация/Cashflow/Обслуживание
+        self.audit_chat_id = 0      # группа «Аудит» для карточек правок (0 = не слать)
+
+    def set_audit_config(self, groups=None, audit_chat_id=0):
+        """Подключить LLM-надзор: allowlist групп + chat_id группы «Аудит». Зовётся из bot.py."""
+        self.audit_groups = set(int(g) for g in (groups or []) if str(g).strip())
+        self.audit_chat_id = int(audit_chat_id or 0)
 
     # ── Слой 1+2: проверка ОДНОГО действия сразу после выполнения ──
     def check_action(self, *, tool: str, args: dict, claimed: str,
@@ -209,6 +218,103 @@ class Auditor:
                 log.warning(f"audit_log(style) error: {e}")
 
         return {"verdict": verdict, "severity": severity, "detail": detail, "fix": fix}
+
+    # ── Слой LLM: надзор за ЛОГИКОЙ ответа в КОНТЕКСТЕ группы ──
+    # Постфактум (не глушит). Только для allowlist старт-групп. Зовётся из bot.py
+    # в фоне ПОСЛЕ отправки ответа, чтобы не блокировать основной поток.
+
+    # Шаблоны рутины — НЕ гоняем через LLM (мягкий префильтр, калибруется по логам)
+    _ROUTINE_RE = re.compile(
+        r"баланс сошёлся|сошлось|записал|зафиксировал|✅|принял|ок,? готово|сохранил",
+        re.IGNORECASE,
+    )
+
+    def _prefilter(self, answer: str) -> bool:
+        """True = ответ стоит проверить LLM. Мягкий: пропускаем рутину/короткое.
+        В LLM идёт содержательное (есть числа/деньги/бизнес-термины или длинный ответ)."""
+        a = (answer or "").strip()
+        if len(a) < 25:
+            return False                      # короткие ack/реакции
+        if self._ROUTINE_RE.search(a) and len(a) < 120:
+            return False                      # короткое служебное подтверждение
+        has_signal = bool(re.search(
+            r"\d|฿|деньг|цен|депозит|залог|доставк|бронь|клиент|байк|click|nmax|pcx|adv|паспорт",
+            a, re.IGNORECASE))
+        return has_signal or len(a) > 200     # содержательное или длинное
+
+    def _context_window(self, chat_id, topic_id, limit: int = 12) -> str:
+        """Последние сообщения группы/темы из memory.db, старые сверху.
+        topic_id есть (обслуживание: тема=байк) → по теме; нет → по группе."""
+        if not self.memory or chat_id is None:
+            return ""
+        try:
+            tid = topic_id if (topic_id is not None and str(topic_id) != "") else None
+            msgs = self.memory.recent_messages(chat_id, limit=limit, topic_id=tid)
+        except Exception as e:
+            log.warning(f"auditor._context_window error: {e}")
+            return ""
+        # recent_messages отдаёт DESC (новые сверху) — развернём в хронологию
+        lines = []
+        for m in reversed(msgs or []):
+            role = "Бот" if m.get("role") == "assistant" else "Человек"
+            txt = str(m.get("content", "")).strip().replace("\n", " ")
+            if txt:
+                lines.append(f"{role}: {txt[:200]}")
+        return "\n".join(lines)
+
+    def review_logic(self, *, answer: str, chat_id, topic_id=None,
+                     user_request: str = "", group: str = "") -> dict:
+        """LLM-надзор за логикой ответа. Возвращает dict:
+        {verdict, severity, detail, fix, card}. card != None если найдена странность
+        (готовая карточка для группы «Аудит»). Логирует находку в журнал аудита.
+        Безопасно: при выключенном слое / ошибке возвращает verdict ok без шума."""
+        from prompts import AUDITOR_SYSTEM, auditor_user_prompt
+        result = {"verdict": "ok", "severity": "", "detail": "", "fix": "", "card": None}
+        # Гейт: слой включён только для старт-групп, есть claude, ответ прошёл префильтр
+        if chat_id is None or chat_id not in self.audit_groups:
+            return result
+        if not self.claude or not self._prefilter(answer):
+            return result
+        try:
+            context = self._context_window(chat_id, topic_id)
+            verdict = self.claude.judge(
+                system=AUDITOR_SYSTEM,
+                user=auditor_user_prompt(answer, context, user_request),
+            )
+            v = str(verdict.get("verdict", "ok")).strip() if verdict else "ok"
+            if not v or v == "ok":
+                return result
+            result.update(
+                verdict=v,
+                severity=str(verdict.get("severity", "med")),
+                detail=str(verdict.get("detail", "")),
+                fix=str(verdict.get("fix", "")),
+            )
+            # журнал аудита
+            try:
+                self.bridge.audit_log(
+                    group=group, topic_id=topic_id or "",
+                    user_request=user_request, tool="logic_review",
+                    tool_args="", claimed_result=(answer or "")[:500],
+                    verdict=result["verdict"], severity=result["severity"],
+                    detail=result["detail"], suggested_fix=result["fix"], status="new",
+                )
+            except Exception as e:
+                log.warning(f"auditor.review_logic audit_log error: {e}")
+            # карточка для группы «Аудит» (если та подключена)
+            if self.audit_chat_id:
+                result["card"] = {
+                    "answer": (answer or "")[:600],
+                    "detail": result["detail"],
+                    "fix": result["fix"],
+                    "verdict": result["verdict"],
+                    "severity": result["severity"],
+                    "chat_id": chat_id,
+                    "topic_id": topic_id,
+                }
+        except Exception as e:
+            log.warning(f"auditor.review_logic error: {e}")
+        return result
 
     # ── Слой 3: суточная сводка (детерминир. находки + LLM на сложное) ──
     def daily_report(self, since_iso: str = "") -> str:

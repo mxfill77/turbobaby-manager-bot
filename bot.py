@@ -18,16 +18,18 @@ import os
 import logging
 import json
 import asyncio
+import functools
 import tempfile
 from datetime import time as dtime, datetime
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -47,6 +49,11 @@ USER_NAME = os.getenv("USER_NAME", "Филипп")
 TZ_NAME = os.getenv("TIMEZONE", "Asia/Bangkok")
 DAILY_HOUR = int(os.getenv("DAILY_PULSE_HOUR", "9"))
 DAILY_MINUTE = int(os.getenv("DAILY_PULSE_MINUTE", "0"))
+
+# LLM-надзор аудитора: группа «Аудит» для карточек правок + allowlist старт-групп.
+# Пока не заданы в .env — LLM-слой и канал правок ВЫКЛЮЧЕНЫ (Филипп даст AUDIT_CHAT_ID).
+AUDIT_CHAT_ID = int(os.getenv("AUDIT_CHAT_ID", "0"))
+AUDIT_GROUPS = [g.strip() for g in os.getenv("AUDIT_GROUPS", "").split(",") if g.strip()]
 
 # === Логирование ===
 logging.basicConfig(
@@ -72,6 +79,96 @@ auditor = Auditor(bridge=bridge, memory=memory, claude=claude)
 # (журнально, отправку не глушит). Без этого вызова хук _send молчит.
 splinter.set_auditor(auditor)
 log.info("  Auditor: ✅ подключён к splinter._send (надзор за языком исходящих)")
+
+# LLM-надзор за логикой ответов: включается только если заданы старт-группы в .env.
+auditor.set_audit_config(groups=AUDIT_GROUPS, audit_chat_id=AUDIT_CHAT_ID)
+if auditor.audit_groups:
+    log.info(f"  Auditor LLM: ✅ надзор логики для групп {sorted(auditor.audit_groups)}; "
+             f"канал правок «Аудит»={'on '+str(AUDIT_CHAT_ID) if AUDIT_CHAT_ID else 'off'}")
+else:
+    log.info("  Auditor LLM: выключен (AUDIT_GROUPS не задан в .env)")
+
+# Хранилище карточек аудита {token: card} + счётчик (callback_data ограничен 64 байтами,
+# поэтому в кнопку кладём короткий токен, а не сам fix). pending — ожидание ✏️-правки.
+_audit_cards = {}
+_audit_seq = [0]
+_audit_pending_edit = {}   # {audit_chat_id: token} — ждём текст нового правила от Филиппа
+
+
+async def post_audit_card(context, card: dict):
+    """Отправить карточку странности в группу «Аудит» с кнопками 👍/✏️/👎."""
+    if not AUDIT_CHAT_ID or not card:
+        return
+    _audit_seq[0] += 1
+    token = _audit_seq[0]
+    _audit_cards[token] = card
+    sev = (card.get("severity") or "").upper()
+    text = (
+        f"🔎 АУДИТ [{sev}] {card.get('verdict')}\n\n"
+        f"Ответ Splinter:\n{card.get('answer', '')[:600]}\n\n"
+        f"Что смущает: {card.get('detail', '')}\n"
+        f"Предлагаю правило: {card.get('fix', '') or '(не предложено)'}"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("👍 принять", callback_data=f"aud:ok:{token}"),
+        InlineKeyboardButton("✏️ дописать", callback_data=f"aud:edit:{token}"),
+        InlineKeyboardButton("👎 отклонить", callback_data=f"aud:no:{token}"),
+    ]])
+    try:
+        await context.bot.send_message(chat_id=AUDIT_CHAT_ID, text=text, reply_markup=kb)
+    except Exception as e:
+        log.warning(f"post_audit_card error: {e}")
+
+
+async def _run_logic_audit(context, chat_id, topic_id, user_request, answer, group):
+    """Фоновый LLM-надзор логики (постфактум). Не блокирует основной ответ.
+    review_logic синхронный (HTTP к Haiku) → в executor; при находке шлёт карточку."""
+    try:
+        loop = asyncio.get_event_loop()
+        res = await loop.run_in_executor(
+            None,
+            functools.partial(
+                auditor.review_logic, answer=answer, chat_id=chat_id,
+                topic_id=topic_id, user_request=user_request, group=group,
+            ),
+        )
+        if res.get("verdict") not in ("ok", ""):
+            log.warning(f"  🔎 АУДИТ логики: {res['verdict']} [{res.get('severity')}] {res.get('detail')}")
+            if res.get("card"):
+                await post_audit_card(context, res["card"])
+    except Exception as e:
+        log.warning(f"_run_logic_audit error: {e}")
+
+
+async def on_audit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Реакция Филиппа на карточку аудита: 👍 принять (→ memory.add_rule) / ✏️ дописать / 👎 отклонить."""
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    try:
+        _, action, tok = (q.data or "").split(":", 2)
+        token = int(tok)
+    except Exception:
+        return
+    card = _audit_cards.get(token)
+    if not card:
+        await q.edit_message_text("⚠️ Карточка устарела (перезапуск бота). Сформулируй правило вручную.")
+        return
+    if action == "ok":
+        fix = (card.get("fix") or "").strip()
+        if fix:
+            rid = memory.add_rule(fix, context="из аудита логики", source="auditor")
+            await q.edit_message_text(f"✅ Принято. Правило #{rid} в памяти:\n{fix}")
+            log.info(f"  🔎 АУДИТ: правило принято Филиппом → memory.add_rule #{rid}")
+        else:
+            await q.edit_message_text("⚠️ Правка пустая — нечего записывать. Используй ✏️ чтобы дописать.")
+    elif action == "edit":
+        _audit_pending_edit[AUDIT_CHAT_ID] = token
+        await q.edit_message_text("✏️ Пришли СЛЕДУЮЩИМ сообщением точный текст правила — запишу его в память.")
+    elif action == "no":
+        await q.edit_message_text("👎 Отклонено. Ничего не записал.")
+        log.info("  🔎 АУДИТ: находка отклонена Филиппом")
 
 
 # === HANDLERS ===
@@ -344,6 +441,12 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
         )
         if rstyle.get("verdict") not in ("ok", ""):
             log.warning(f"  🔎 АУДИТ стиль: {rstyle.get('detail')}")
+        # LLM-надзор за ЛОГИКОЙ ответа в контексте группы — постфактум, в ФОНЕ
+        # (не блокирует), только для старт-групп allowlist. При находке → карточка в «Аудит».
+        if chat_id in getattr(auditor, "audit_groups", set()):
+            asyncio.create_task(
+                _run_logic_audit(context, chat_id, _topic, text, answer, _grp)
+            )
     except Exception as e:
         log.warning(f"auditor check error: {e}")
     pins = getattr(claude, "pending_pins", None) or []
@@ -420,6 +523,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = msg.chat_id
+
+    # Группа «Аудит» — управляющая, мозг Splinter тут НЕ работает.
+    # Если ждём ✏️-правку правила — следующий текст Филиппа = новый текст правила.
+    if AUDIT_CHAT_ID and chat_id == AUDIT_CHAT_ID:
+        token = _audit_pending_edit.pop(AUDIT_CHAT_ID, None)
+        if token is not None:
+            rule = msg.text.strip()
+            rid = memory.add_rule(rule, context="из аудита логики (✏️ правка Филиппа)", source="auditor")
+            await msg.reply_text(f"✅ Записал правило #{rid}:\n{rule}")
+            log.info(f"  🔎 АУДИТ: ✏️ правило от Филиппа → memory.add_rule #{rid}")
+        return
 
     # Операционные группы
     if splinter.is_splinter_group(chat_id):
@@ -824,6 +938,9 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+
+    # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
+    app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))
 
     # Сообщения
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))

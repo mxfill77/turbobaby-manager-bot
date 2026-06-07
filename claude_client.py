@@ -535,6 +535,29 @@ class ClaudeClient:
             log.error(f"Claude quick() error: {e}")
             return ""
 
+    def judge(self, system: str, user: str, max_tokens: int = 400,
+              model: str = "claude-haiku-4-5") -> dict:
+        """Дешёвый LLM-судья для аудитора. Отдельная МОДЕЛЬ (Haiku 4.5), НЕ self.model.
+        Просит строгий JSON, парсит в dict. При любой ошибке/мусоре — пустой dict (мягко,
+        аудит не должен ронять основной поток). thinking off, без инструментов."""
+        import json as _json
+        import re as _re
+        try:
+            resp = self.client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            text = "\n".join(b.text for b in resp.content if b.type == "text").strip()
+            m = _re.search(r"\{.*\}", text, _re.DOTALL)   # вытащить JSON-объект
+            if not m:
+                return {}
+            return _json.loads(m.group(0))
+        except Exception as e:
+            log.error(f"Claude judge() error: {e}")
+            return {}
+
     def vision(self, system: str, image_bytes: bytes, prompt: str = "",
                media_type: str = "image/jpeg", max_tokens: int = 500) -> str:
         """
