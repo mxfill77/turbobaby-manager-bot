@@ -199,6 +199,15 @@ class BridgeClient:
         """Записать pinned_msg_id / last_reminded_at для записи ТО."""
         return self._post("service_set_pin", **fields)
 
+    def set_fleet_oil(self, number, oil_km, confirmed: bool = False) -> dict:
+        """GUARDED: записать «ТО Oil» (Лист1 Байки, колонка I) по НОМЕРУ байка.
+        Резолв только по номеру (last 3-4 цифры, как find_bike). Пишет одну ячейку (col I).
+        Требует confirmed=True. Откат (новое<старого) и неоднозначный номер — отказ без записи.
+        Ошибки: missing_number / bad_oil_km / not_confirmed / not_found / ambiguous /
+        oil_decreasing / write_failed."""
+        return self._post("set_fleet_oil", number=str(number),
+                          oil_km=oil_km, confirmed=bool(confirmed))
+
     # === Надзиратель важного ===
     def important_add(self, **fields) -> dict:
         """Добавить важный пункт (ДТП, ремонт, просрочка). Статус open."""
