@@ -62,6 +62,11 @@ OWNER_USERNAMES = {"turbophuket", "turbophuket1"}
 # Доверенные авторы: их записи Splinter учитывает и на них реагирует
 TRUSTED_AUTHORS = PYM_USERNAMES | OWNER_USERNAMES
 
+# Авторизаторы approve брони в группе «Входящие брони» (intake) — ОТДЕЛЬНОЕ множество.
+# Менеджерам (Даня/Даша) даём право approve ТОЛЬКО на бронь в intake; прав внутреннего
+# контура (касса/обслуживание) у них НЕТ — те остаются на Пыме + владельце. Пым сюда НЕ входит.
+INTAKE_APPROVERS = {"turbophuket", "turbophuket1", "deramor", "rogova_darya"}  # lower, без @
+
 # === Группы и их режим (chat_id → mode) ===
 GROUPS = {
     -1003873906891:    "money",       # Money Cashflow — главный журнал
@@ -69,7 +74,10 @@ GROUPS = {
     -1002751134848: "servicing",   # การบำรุงรักษา / Обслуживание
     -1002445921469: "delivery",    # Delivery cooperation
     -1003966216195: "attendance",  # Отметка сотрудников / การลงเวลาเข้า
+    -1003997419806: "intake",      # TurboBaby — Входящие брони (клиентский контур, RU)
 }
+
+INTAKE_CHAT = -1003997419806      # группа «Входящие брони» (язык RU, без тайского)
 
 # Стабильные имена кошельков/групп (chat_id → метка для учёта).
 # ВАЖНО: баланс считается по этой метке, не по TG-названию (оно может меняться).
@@ -79,6 +87,7 @@ GROUP_NAMES = {
     -1002751134848: "Обслуживание",
     -1002445921469: "Delivery",
     -1003966216195: "Отметка",
+    -1003997419806: "Входящие брони",
 }
 
 
@@ -170,6 +179,54 @@ MONEY_SYSTEM = """Ты разбираешь ОДНО сообщение из к�
 "Do you have work today?" -> {"type":"none"}
 
 Верни ТОЛЬКО JSON-объект."""
+
+
+# === INTAKE (приём карточек брони, клиентский контур) ===
+INTAKE_SYSTEM = """Тебе дают КАРТОЧКУ БРОНИ из служебной группы (формат стабильный, начинается с «🆕 БРОНЬ»).
+Извлеки поля в СТРОГИЙ JSON. Если поля нет — пустая строка.
+{
+  "client": "<имя клиента>",
+  "contacts": "<ВСЕ контакты ОДНОЙ строкой: @username + телефон из профиля + телефон от клиента — собрать ВСЁ, не терять>",
+  "model": "<модель/байк как в карточке>",
+  "date_start": "<дата начала как в карточке, как есть>",
+  "date_end": "<дата конца как в карточке, как есть>",
+  "date_start_iso": "<дата начала в формате YYYY-MM-DD; если год не указан — текущий>",
+  "date_end_iso": "<дата конца в формате YYYY-MM-DD>",
+  "term": "<срок словами, напр. '7 дней'>",
+  "experience": "<опыт вождения кратко>",
+  "deposit_type": "деньги|паспорт|<пусто если не ясно>",
+  "delivery_name": "<район/название точки доставки>",
+  "delivery_url": "<ссылка Google Maps>",
+  "helmets": "<число шлемов>"
+}
+Контакты — собери ВСЕ части (username + все телефоны). Верни ТОЛЬКО JSON."""
+
+# Черновики intake в памяти: {chat_id: {поля, ts, passport_photo, status}}. Один активный на группу.
+_INTAKE_DRAFTS = {}
+
+# Стандартный денежный депозит по модели (из прайса) — для ПОКАЗА в резюме (этап A не пишет).
+# Порядок важен: специфичные/дорогие выше, иначе короткий ключ перехватит.
+_DEPOSIT_BY_MODEL = [
+    (("xadv",), 25000),
+    (("ninja", "vulcan", "cbr 650", "cbr650", "cb 650", "cb650", "xsr 900", "xsr900", "r7"), 20000),
+    (("cb 300", "cb300", "rebel", "mt-03", "mt03", "mt 03"), 15000),
+    (("xmax 300 new", "xmax new", "adv 350", "adv350", "xsr 155", "xsr155"), 7000),
+    (("pcx 160", "pcx160", "adv 160", "adv160", "forza", "xmax"), 5000),
+    (("pcx 150", "pcx150", "adv 150", "adv150", "nmax"), 3000),
+]
+
+# Детект района доставки: Пхукет / вне Пхукета / неизвестно (короткая ссылка ничего не выдаёт).
+_PHUKET_HINTS = ("пхукет", "phuket", "kamala", "камала", "bangtao", "бангтао", "таланг", "thalang",
+                 "патонг", "patong", "kata", "ката", "karon", "карон", "rawai", "раваи", "chalong",
+                 "чалонг", "найхарн", "nai harn", "surin", "сурин", "laguna", "лагуна", "cherng talay")
+_NON_PHUKET = ("бангкок", "bangkok", "krabi", "краби", "phang", "пхангнга", "samui", "самуи",
+               "pattaya", "паттайя", "chiang", "чианг", "ко самуи", "koh samui")
+
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _BKK_TZ = _ZoneInfo("Asia/Bangkok")
+except Exception:
+    _BKK_TZ = None
 
 SERVICING_SYSTEM = """Ты следишь за группой обслуживания мотобайков.
 Верни СТРОГО JSON, без пояснений.
@@ -509,6 +566,15 @@ def _is_owner(msg) -> bool:
     if not u or not u.username:
         return False
     return u.username.lower() in OWNER_USERNAMES
+
+
+def _intake_can_approve(msg) -> bool:
+    """Может ли автор подтвердить (approve) бронь в группе intake:
+    владелец + менеджеры Даня/Даша (INTAKE_APPROVERS). Пым сюда НЕ входит."""
+    u = msg.from_user
+    if not u or not u.username:
+        return False
+    return u.username.lower() in INTAKE_APPROVERS
 
 
 def _bot_mentioned(msg, context) -> bool:
@@ -1170,6 +1236,203 @@ async def _check_service(context, bridge, chat_id, topic_id, bike, mileage):
         log.exception("  → ошибка отправки/закрепа ТО")
 
 
+# ===================== INTAKE — приём карточек брони (ЭТАП A) =====================
+# Только: парсинг карточки → проверка полноты/наличия/района → резюме + вопрос approve.
+# НЕ пишет в CRM и НЕ шлёт задачи тайцам (это этап B). Язык — RU.
+
+def _intake_is_card(text) -> bool:
+    return bool(text) and text.lstrip().startswith("🆕 БРОНЬ")
+
+
+def _intake_parse(claude, text) -> dict:
+    return _parse_json(claude.quick(INTAKE_SYSTEM, text, max_tokens=500)) or {}
+
+
+def _deposit_for_model(model):
+    """Стандартный денежный депозит (฿) по модели или None. Для показа в резюме (этап A)."""
+    m = (model or "").lower()
+    for keys, amount in _DEPOSIT_BY_MODEL:
+        if any(k in m for k in keys):
+            return amount
+    return None
+
+
+def _delivery_phuket_status(name, url) -> str:
+    """'ok' | 'out' | 'unknown' — район доставки. Короткая Maps-ссылка без адреса → unknown."""
+    blob = ((name or "") + " " + (url or "")).lower()
+    if any(k in blob for k in _NON_PHUKET):
+        return "out"
+    if any(k in blob for k in _PHUKET_HINTS):
+        return "ok"
+    return "unknown"
+
+
+def _intake_validate(d) -> list:
+    """Чего не хватает в пакете для брони (список меток). Пусто = полный пакет."""
+    missing = []
+    if not d.get("model"):                              missing.append("модель")
+    if not (d.get("date_start") or d.get("date_start_iso")): missing.append("даты/срок")
+    if not d.get("contacts"):                           missing.append("контакт")
+    if not d.get("delivery_url"):                       missing.append("ссылка Google Maps на доставку")
+    if not d.get("helmets"):                            missing.append("кол-во шлемов")
+    if not d.get("deposit_type"):                       missing.append("способ депозита")
+    if not d.get("passport_photo"):                     missing.append("фото паспорта")
+    return missing
+
+
+def _model_match(model, bike) -> bool:
+    if not model or not bike:
+        return False
+    p = plateFromName_(model)
+    if p:
+        return plateFromName_(bike) == p
+    tokens = [w for w in str(model).lower().split() if len(w) >= 3 and not w.isdigit()]
+    bl = str(bike).lower()
+    return any(w in bl for w in tokens)
+
+
+def _intake_availability(bridge, model, date_start_iso, date_end_iso) -> str:
+    """READ-ONLY проверка наличия по листу «клиенты». Никогда не блокирует — информирует.
+    День-в-день → требует тайцев. Иначе — пересечения по модели на запрошенные даты."""
+    from datetime import datetime
+    today = None
+    if _BKK_TZ:
+        try:
+            today = datetime.now(_BKK_TZ).date().isoformat()
+        except Exception:
+            today = None
+    if date_start_iso and today and date_start_iso == today:
+        return ("день-в-день — НЕ подтверждать автоматически, нужен живой запрос тайцам "
+                "в Обслуживание («что есть готовое»)")
+    if not date_start_iso or not date_end_iso:
+        return "даты не распознаны — проверить наличие вручную"
+    try:
+        res = bridge.clients(filter="active")
+        clients = (res.get("data") or res).get("clients") or res.get("clients") or []
+    except Exception as e:
+        return f"не смог прочитать CRM ({e}) — проверить вручную"
+    conflicts = []
+    for c in clients:
+        st = str(c.get("status", "")).strip().lower()
+        if not (c.get("is_active") or st == "бронь"):
+            continue
+        if not _model_match(model, c.get("bike", "")):
+            continue
+        cs = str(c.get("date_start") or "")[:10]
+        ce = str(c.get("date_end") or "")[:10]
+        if cs and ce and date_start_iso <= ce and date_end_iso >= cs:
+            conflicts.append(f"{c.get('name', '?')} ({cs}…{ce}, {st or 'активна'})")
+    if conflicts:
+        return ("по модели есть пересечения на эти даты: " + "; ".join(conflicts[:3]) +
+                ". Уточнить свободный борт / предложить альтернативу (не глухое «нет»).")
+    return "пересечений по модели на эти даты в листе «клиенты» не найдено (предварительно свободна)"
+
+
+def _intake_summary(d, availability, delivery_status) -> str:
+    dep = d.get("deposit_type", "")
+    if dep == "паспорт":
+        dep_line = "паспорт"
+    elif dep == "деньги":
+        amt = _deposit_for_model(d.get("model"))
+        dep_line = f"деньги ≈{amt}฿ (по модели)" if amt else "деньги (сумму уточнить по модели)"
+    else:
+        dep_line = dep or "не указан"
+    url = d.get("delivery_url", "")
+    nm = d.get("delivery_name", "") or "—"
+    if delivery_status == "out":
+        deliv_line = f"{nm} ({url}) ⚠️ ВНЕ Пхукета — не доставляем, нужен САМОВЫВОЗ"
+    elif delivery_status == "unknown":
+        deliv_line = f"{nm} ({url}) ⚠️ район не определён — проверить вручную"
+    else:
+        deliv_line = f"{nm} ({url})"
+    dates = (str(d.get("date_start", "")) + " — " + str(d.get("date_end", ""))).strip(" —")
+    term = f" ({d.get('term')})" if d.get("term") else ""
+    return (
+        "🐀 Splinter · Карточка принята.\n"
+        f"Клиент: {d.get('client', '—')} · контакты: {d.get('contacts', '—')}\n"
+        f"Модель: {d.get('model', '—')} · даты {dates or '—'}{term}\n"
+        f"Опыт: {d.get('experience', '—')}\n"
+        f"Депозит: {dep_line}\n"
+        f"Доставка: {deliv_line}\n"
+        f"Шлемы: {d.get('helmets', '—')} · паспорт-фото: {'да' if d.get('passport_photo') else 'нет'}\n"
+        f"Наличие: {availability}\n"
+        "\nСтавлю бронь? да / нет / правки"
+    )
+
+
+async def _intake_finalize(draft, msg, context, bridge):
+    """Ре-валидация пакета → если неполный, сказать чего не хватает; если полный — резюме+approve."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    missing = _intake_validate(draft)
+    if missing:
+        draft["status"] = "incomplete"
+        await _send(context, chat_id=chat_id,
+                    text="🐀 Splinter\n⚠️ Для брони не хватает: " + ", ".join(missing) +
+                         ".\nДополните — продолжу.", bilingual=False, message_thread_id=tid)
+        return
+    deliv = _delivery_phuket_status(draft.get("delivery_name"), draft.get("delivery_url"))
+    avail = _intake_availability(bridge, draft.get("model"),
+                                 draft.get("date_start_iso"), draft.get("date_end_iso"))
+    draft["status"] = "awaiting_approval"
+    await _send(context, chat_id=chat_id, text=_intake_summary(draft, avail, deliv),
+                bilingual=False, message_thread_id=tid)
+
+
+async def _handle_intake(msg, context, bridge, claude):
+    """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only."""
+    chat_id = msg.chat_id
+    text = (msg.text or msg.caption or "").strip()
+    has_photo = bool(msg.photo)
+    now = _time.time()
+
+    # 1) Фото паспорта отдельным сообщением → связать с последней карточкой (окно 5 мин)
+    if has_photo and not _intake_is_card(text):
+        d = _INTAKE_DRAFTS.get(chat_id)
+        if d and now - d.get("ts", 0) <= 300:
+            d["passport_photo"] = True
+            await _send(context, chat_id=chat_id,
+                        text="🐀 Splinter\n📎 Фото паспорта получено — привязал к последней карточке.",
+                        bilingual=False, message_thread_id=getattr(msg, "message_thread_id", None))
+            await _intake_finalize(d, msg, context, bridge)   # вдруг теперь пакет полный
+        return
+
+    # 2) Карточка брони
+    if _intake_is_card(text):
+        parsed = _intake_parse(claude, text)
+        prev = _INTAKE_DRAFTS.get(chat_id)
+        # фото могло прийти ДО карточки (в пределах 5 мин) — наследуем флаг
+        passport = bool(prev and prev.get("passport_photo") and now - prev.get("ts", 0) <= 300)
+        draft = dict(parsed)
+        draft.update(ts=now, passport_photo=passport, status="new")
+        _INTAKE_DRAFTS[chat_id] = draft
+        log.info(f"  🆕 INTAKE: карточка — модель={draft.get('model')} клиент={draft.get('client')}")
+        await _intake_finalize(draft, msg, context, bridge)
+        return
+
+    # 3) approve / нет / правки — только от авторизатора и только по карточке в ожидании
+    d = _INTAKE_DRAFTS.get(chat_id)
+    if d and d.get("status") == "awaiting_approval" and _intake_can_approve(msg):
+        low = text.lower()
+        tid = getattr(msg, "message_thread_id", None)
+        if any(w in low for w in ("да", "ок", "ставь", "подтвержд")):
+            d["status"] = "approved"
+            _who = msg.from_user.username if msg.from_user else "?"
+            log.info(f"  🆕 INTAKE: approve получен (@{_who}) для брони {d.get('model')} "
+                     f"— ЭТАП B (createBooking + задача тайцам) НЕ реализован")
+            await _send(context, chat_id=chat_id,
+                        text="🐀 Splinter\n✅ Approve принят. (Этап B — постановка брони и задача "
+                             "тайцам — пока не подключён, бронь НЕ ставлю.)", bilingual=False, message_thread_id=tid)
+        elif any(w in low for w in ("нет", "отмена", "не ставь", "отклон")):
+            d["status"] = "rejected"
+            await _send(context, chat_id=chat_id, text="🐀 Splinter\n❌ Бронь отклонена.",
+                        bilingual=False, message_thread_id=tid)
+        elif "правк" in low or "исправ" in low:
+            await _send(context, chat_id=chat_id,
+                        text="🐀 Splinter\n✏️ Принял, жду исправленную карточку.", bilingual=False, message_thread_id=tid)
+        return
+
+
 async def _handle_delivery(msg, context, bridge, claude):
     """Delivery cooperation — фиксируем ход доставок (пока просто лог)."""
     text = msg.text or msg.caption or ""
@@ -1244,5 +1507,7 @@ async def handle(update, context, bridge, claude):
             await _handle_delivery(msg, context, bridge, claude)
         elif mode == "attendance":
             await _handle_attendance(msg, context, bridge, claude)
+        elif mode == "intake":
+            await _handle_intake(msg, context, bridge, claude)
     except Exception:
         log.exception(f"Splinter error in {mode} ({msg.chat_id})")
