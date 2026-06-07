@@ -257,8 +257,35 @@ def clear_awaiting(chat_id, topic_id=None):
     _AWAITING_REPLY.pop((chat_id, topic_id), None)
 
 # Кэш названий форум-тем: {(chat_id, topic_id): "название темы"}
-# В названии темы записан байк (по договорённости Филиппа)
+# В названии темы записан байк (по договорённости Филиппа).
+# ВНИМАНИЕ: кэш в памяти, стирается рестартом → персистится в memory.db (таблица topic_bike),
+# при старте seed-ится обратно (seed_topic_bikes). Источник правды = БД, _TOPIC_NAMES = её кэш.
 _TOPIC_NAMES = {}
+
+# Память (memory.db) для персиста привязки тема→байк. Подключается из bot.py через set_memory().
+_MEMORY = None
+
+
+def set_memory(memory):
+    """Подключить memory.db (персист тема→байк). Зовётся из bot.py при старте."""
+    global _MEMORY
+    _MEMORY = memory
+
+
+def seed_topic_bikes():
+    """Загрузить персистентные привязки тема→байк из memory.db в _TOPIC_NAMES при старте,
+    чтобы пережить рестарт (иначе бот слепнет по темам). Возвращает кол-во загруженных."""
+    if _MEMORY is None:
+        return 0
+    try:
+        for (cid, tid), name in _MEMORY.all_topic_bikes().items():
+            if name:
+                _TOPIC_NAMES[(int(cid), int(tid))] = name
+        log.info(f"Привязки тема→байк загружены из memory.db: {len(_TOPIC_NAMES)} тем")
+    except Exception as e:
+        log.warning(f"seed_topic_bikes error: {e}")
+    return len(_TOPIC_NAMES)
+
 
 SERVICING_CHAT = -1002751134848
 
@@ -316,32 +343,49 @@ def _topic_name_from_msg(msg):
 
 
 def _remember_topic_name(chat_id, topic_id, msg):
-    """Запоминает название темы если оно встретилось."""
+    """Запоминает название темы если оно встретилось — в память И в memory.db (write-through),
+    чтобы привязка пережила рестарт."""
     name = _topic_name_from_msg(msg)
     if name and topic_id:
         _TOPIC_NAMES[(chat_id, topic_id)] = name
+        if _MEMORY is not None:
+            try:
+                _MEMORY.set_topic_bike(chat_id, topic_id, name, source="forum_created")
+            except Exception as e:
+                log.warning(f"persist topic_bike error: {e}")
     return _TOPIC_NAMES.get((chat_id, topic_id))
 
 
 def bike_from_topic(chat_id, topic_id):
-    """Имя байка темы. Приоритет: ручной override → карта из topics_map.json → автодетект из названия."""
+    """Имя байка темы. Приоритет: ручной override → memory.db/кэш _TOPIC_NAMES (персист,
+    seed-ится из БД при старте) → карта topics_map.json (вторичный fallback)."""
     if not topic_id:
         return ""
     ov = _TOPIC_BIKE_OVERRIDE.get((chat_id, topic_id))
     if ov:
         return ov
-    # карта применима только к группе обслуживания
+    # Персистентный слой: _TOPIC_NAMES seed-нут из memory.db при старте + пополняется write-through.
+    cached = _TOPIC_NAMES.get((chat_id, topic_id))
+    if cached:
+        return cached
+    # topics_map.json — вторичный fallback (только обслуживание; на сервере может отсутствовать).
     if chat_id == SERVICING_CHAT:
         mapped = _load_topic_map().get(topic_id)
         if mapped:
             return mapped
-    return _TOPIC_NAMES.get((chat_id, topic_id), "")
+    return ""
 
 
 def set_topic_bike(chat_id, topic_id, bike):
-    """Ручная привязка байка к теме (override в памяти на эту сессию)."""
+    """Ручная привязка байка к теме — override в памяти + персист в memory.db (source='manual')."""
     if topic_id and bike:
         _TOPIC_BIKE_OVERRIDE[(chat_id, topic_id)] = bike
+        _TOPIC_NAMES[(chat_id, topic_id)] = bike
+        if _MEMORY is not None:
+            try:
+                _MEMORY.set_topic_bike(chat_id, topic_id, bike, source="manual")
+            except Exception as e:
+                log.warning(f"persist topic_bike(manual) error: {e}")
         return True
     return False
 

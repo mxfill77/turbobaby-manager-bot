@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS entity_notes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notes_entity ON entity_notes(entity_type, entity_key);
+
+CREATE TABLE IF NOT EXISTS topic_bike (
+    chat_id    INTEGER NOT NULL,
+    topic_id   INTEGER NOT NULL,
+    bike_name  TEXT NOT NULL,
+    source     TEXT DEFAULT 'auto',   -- forum_created / resolved / manual / bootstrap
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, topic_id)
+);
 """
 
 
@@ -164,6 +173,55 @@ class Memory:
                 {"id": r[0], "rule": r[1], "context": r[2], "created_at": r[3]}
                 for r in cursor.fetchall()
             ]
+        finally:
+            conn.close()
+
+    # === Привязка тема→байк (персист, переживает рестарт) ===
+
+    def set_topic_bike(self, chat_id, topic_id, bike_name: str, source: str = "auto"):
+        """Upsert привязки тема→байк. Пустое имя НЕ пишем. Ручной override (source='manual')
+        автоматическим источником НЕ перезатираем."""
+        name = (bike_name or "").strip()
+        if not (chat_id and topic_id and name):
+            return
+        conn = self._conn()
+        try:
+            if source != "manual":
+                row = conn.execute(
+                    "SELECT source FROM topic_bike WHERE chat_id=? AND topic_id=?",
+                    (int(chat_id), int(topic_id))
+                ).fetchone()
+                if row and row[0] == "manual":
+                    return   # не затираем ручную привязку авто-резолвом
+            conn.execute(
+                "INSERT INTO topic_bike (chat_id, topic_id, bike_name, source, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, topic_id) DO UPDATE SET "
+                "bike_name=excluded.bike_name, source=excluded.source, updated_at=excluded.updated_at",
+                (int(chat_id), int(topic_id), name, source, datetime.now().isoformat())
+            )
+        finally:
+            conn.close()
+
+    def get_topic_bike(self, chat_id, topic_id) -> str:
+        if not (chat_id and topic_id):
+            return ""
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT bike_name FROM topic_bike WHERE chat_id=? AND topic_id=?",
+                (int(chat_id), int(topic_id))
+            ).fetchone()
+            return row[0] if row else ""
+        finally:
+            conn.close()
+
+    def all_topic_bikes(self) -> Dict:
+        """{(chat_id, topic_id): bike_name} — для seed _TOPIC_NAMES при старте."""
+        conn = self._conn()
+        try:
+            rows = conn.execute("SELECT chat_id, topic_id, bike_name FROM topic_bike").fetchall()
+            return {(int(r[0]), int(r[1])): r[2] for r in rows}
         finally:
             conn.close()
 

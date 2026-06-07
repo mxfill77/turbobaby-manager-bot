@@ -81,6 +81,11 @@ auditor = Auditor(bridge=bridge, memory=memory, claude=claude)
 splinter.set_auditor(auditor)
 log.info("  Auditor: ✅ подключён к splinter._send (надзор за языком исходящих)")
 
+# Персист привязки тема→байк: подключаем memory.db и seed-им кэш тем из БД (переживает рестарт).
+splinter.set_memory(memory)
+_seeded = splinter.seed_topic_bikes()
+log.info(f"  Топики: ✅ привязок тема→байк из memory.db загружено: {_seeded}")
+
 # LLM-надзор за логикой ответов: включается только если заданы старт-группы в .env.
 auditor.set_audit_config(groups=AUDIT_GROUPS, audit_chat_id=AUDIT_CHAT_ID,
                          audit_thread_id=AUDIT_THREAD_ID)
