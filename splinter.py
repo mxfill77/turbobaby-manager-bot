@@ -233,6 +233,11 @@ _RECENT_PHOTOS = {}
 _RECENT_LIMIT = 12          # сколько последних фото помнить на группу
 _RECENT_TTL = 3 * 3600      # 3 часа — потом считаем устаревшим
 
+# Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
+# не повторять чаще раза в 10 мин на тему. {(chat_id, topic_id): ts}. Волатильный — ок для троттлинга.
+_ODOMETER_ASK_TS = {}
+_ODOMETER_ASK_COOLDOWN = 600   # сек
+
 # Трекер «бот ждёт ответа»: (chat_id, topic_id) -> время вопроса бота.
 # Если бот недавно задал вопрос в теме — следующее сообщение владельца/Пыма
 # без тега считаем ответом ему (не нужно тегать/реплаить).
@@ -730,6 +735,42 @@ def msg_dirty_care(bike):
     )
 
 
+# Признаки замены масла (вкл. gear oil — тот же интервал, отдельно НЕ делим).
+_OIL_KEYWORDS = ("масл", "oil", "น้ำมัน", "моторн", "редуктор",
+                 "เปลี่ยนน้ำมัน", "ถ่ายน้ำมัน", "gear oil")
+
+
+def _is_oil_context(text, vis):
+    """True если речь/фото про замену масла (по словам в тексте/подписи и vis.notes)."""
+    blob = ((text or "") + " " + str((vis or {}).get("notes", ""))).lower()
+    return any(kw in blob for kw in _OIL_KEYWORDS)
+
+
+def _should_ask_odometer(chat_id, topic_id):
+    """Анти-спам для просьбы про одометр: НЕ просим если по теме уже есть уверенный (high)
+    пробег в недавнем буфере, и не повторяем чаще раза в _ODOMETER_ASK_COOLDOWN."""
+    lm = last_mileage_in_topic(chat_id, topic_id)
+    if lm and lm[1] == "high":
+        return False   # чёткий пробег уже получен — просить незачем
+    key = (chat_id, topic_id)
+    now = _time.time()
+    if now - _ODOMETER_ASK_TS.get(key, 0) < _ODOMETER_ASK_COOLDOWN:
+        return False   # недавно уже просили — не спамим
+    _ODOMETER_ASK_TS[key] = now
+    return True
+
+
+def msg_ask_odometer(bike):
+    """Просьба прислать ЧЁТКОЕ фото одометра при замене масла без читаемого пробега.
+    Двуязычно RU/TH (TH первым), БЕЗ тега Пыма. Ничего в ТО не пишем — только просьба."""
+    b = f" {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 เห็นว่ากำลังเปลี่ยนน้ำมัน{b} — รบกวนถ่ายรูปเลขไมล์ (ODO) ให้ชัด ๆ หน่อยครับ เพื่อบันทึกการเปลี่ยนถ่าย 🙏\n"
+        f"🇷🇺 Вижу замену масла{b} — пришлите, пожалуйста, ЧЁТКОЕ фото пробега (одометр, ODO), чтобы зафиксировать замену 🙏"
+    )
+
+
 # ============================================================
 #  ОБРАБОТЧИКИ ПО РЕЖИМАМ
 # ============================================================
@@ -1001,6 +1042,16 @@ async def _handle_servicing(msg, context, bridge, claude):
                   f"⚠️ Пым, на фото видны повреждения: {vis['damage']} — глянь. "
                   f"Если это возврат — посмотри по депозиту 🙏"),
             message_thread_id=topic_id,
+        )
+        return
+
+    # Контекст замены масла, но БЕЗ чёткого пробега → САМ просим ЧЁТКОЕ фото одометра.
+    # (damage уже отработан выше и сделал return — повреждение приоритетнее.)
+    # Ничего в ТО не пишем, число не выдумываем. Анти-спам: буфер high-пробега + троттлинг.
+    no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
+    if _is_oil_context(text, vis) and no_clear_km and _should_ask_odometer(chat_id, topic_id):
+        await _send(context,
+            chat_id=chat_id, text=msg_ask_odometer(bike), message_thread_id=topic_id
         )
         return
 
