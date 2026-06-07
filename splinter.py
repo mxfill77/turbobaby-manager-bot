@@ -1280,6 +1280,16 @@ def _intake_validate(d) -> list:
     return missing
 
 
+import re as _re_pl
+_CC_PLATES = {"125", "150", "155", "300", "350", "400", "500", "650", "700", "750", "900"}
+
+
+def plateFromName_(text):
+    """Номер байка из имени (логика find_bike): последнее число 3+ цифр, НЕ кубатура. None если нет."""
+    nums = [n for n in _re_pl.findall(r"\d{3,}", str(text or "").lower()) if n not in _CC_PLATES]
+    return nums[-1] if nums else None
+
+
 def _model_match(model, bike) -> bool:
     if not model or not bike:
         return False
