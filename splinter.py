@@ -1038,6 +1038,68 @@ async def _handle_money(msg, context, bridge, claude):
             )
 
 
+# === Фикс B: подтверждение пробега с ФОТО приборки перед сверкой ТО ===
+# vision врёт на LCD → распознанную цифру подтверждаем у человека, потом _check_service.
+_PENDING_MILEAGE = {}   # (chat_id, topic_id) -> (mileage:str, bike:str)
+_CONFIRM_YES = {"да", "ага", "верно", "ок", "окей", "yes", "ใช่", "ถูก", "ถูกต้อง", "ถูกต้องครับ"}
+_CONFIRM_NO = {"нет", "не", "no", "ไม่", "ไม่ใช่"}
+
+
+def pending_mileage_for(chat_id, topic_id):
+    """Есть ли открытое подтверждение пробега для этой темы (для перехвата в handle_text)."""
+    return _PENDING_MILEAGE.get((chat_id, topic_id))
+
+
+async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage):
+    """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting."""
+    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "")
+    mark_awaiting(chat_id, topic_id)
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    await _send(
+        context,
+        chat_id=chat_id,
+        text=(f"🐀 Splinter\n"
+              f"🇹🇭 อ่านเลขไมล์ได้ {mileage} กม.{b_th} ถูกต้องไหมครับ? ตอบ «ใช่» หรือส่งเลขที่ถูกต้อง 🙏\n"
+              f"🇷🇺 📟 Вижу пробег {mileage} км{b_ru} (с фото). Верно? Ответь «да» или пришли правильное число 🙏"),
+        message_thread_id=topic_id,
+    )
+
+
+async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
+    """Перехват ответа на подтверждение пробега. Возвращает True если обработал (был pending
+    и ответ распознан как да/число/нет). Иначе False → обычный путь (гейт не трогаем)."""
+    key = (msg.chat_id, getattr(msg, "message_thread_id", None))
+    pend = _PENDING_MILEAGE.get(key)
+    if not pend:
+        return False
+    mileage, bike = pend
+    t = (text or "").strip().lower()
+    m = _re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", ""))
+    if t in _CONFIRM_YES:
+        num = mileage
+    elif m:
+        num = m.group(0)            # правка: человек прислал правильное число
+    elif t in _CONFIRM_NO:
+        _PENDING_MILEAGE.pop(key, None)
+        clear_awaiting(*key)
+        await _send(context, chat_id=msg.chat_id,
+                    text=("🐀 Splinter\n"
+                          "🇹🇭 โอเค ส่งรูปเลขไมล์ชัดๆ อีกครั้งนะครับ 🙏\n"
+                          "🇷🇺 Ок, пришли, пожалуйста, чёткое фото одометра ещё раз 🙏"),
+                    message_thread_id=key[1])
+        return True
+    else:
+        return False                # не подтверждение — отдаём обычному пути
+    _PENDING_MILEAGE.pop(key, None)
+    clear_awaiting(*key)
+    try:
+        await _check_service(context, bridge, msg.chat_id, key[1], bike, num)
+    except Exception:
+        log.exception("  → ошибка ТО-трекера (подтверждение пробега)")
+    return True
+
+
 async def _handle_servicing(msg, context, bridge, claude):
     """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения)."""
     text = msg.text or msg.caption or ""
@@ -1095,8 +1157,14 @@ async def _handle_servicing(msg, context, bridge, claude):
         msg_id=f"{chat_id}:{msg.message_id}",
     )
 
-    # === ТО-трекер: если уверенно прочитан пробег — обновляем и проверяем ТО ===
-    if mileage and str(vis.get("mileage_confidence", "")) != "low":
+    # === ТО-трекер ===
+    _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
+    if vis.get("mileage") and not parsed.get("mileage") and _conf_ok:
+        # Пробег с ФОТО приборки → СНАЧАЛА подтверждаем цифру у человека (vision врёт на LCD),
+        # _check_service вызовется после «да»/правки в handle_mileage_confirm (фикс B).
+        await _ask_mileage_confirm(context, chat_id, topic_id, bike, str(vis.get("mileage")))
+    elif mileage and _conf_ok:
+        # Пробег из ТЕКСТА (человек ввёл руками) — доверяем, сверяем сразу.
         try:
             await _check_service(context, bridge, chat_id, topic_id, bike, mileage)
         except Exception:

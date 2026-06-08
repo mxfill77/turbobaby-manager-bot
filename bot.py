@@ -591,6 +591,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Операционные группы
     if splinter.is_splinter_group(chat_id):
+        # Фикс B: перехват ответа на подтверждение пробега — ТОЛЬКО если для темы открыт pending.
+        # Иначе гейт вступления (фикс 07:51) работает как обычно — pending не трогает его.
+        _tid_sv = getattr(msg, "message_thread_id", None)
+        if splinter.GROUPS.get(chat_id) == "servicing" and splinter.pending_mileage_for(chat_id, _tid_sv):
+            if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
+                return
         # Владелец обращается к Splinter напрямую (тег/ответ/ждём ответа) → диалог-мозг
         if _owner_addresses_bot(msg, context):
             wallet = splinter.group_label(chat_id)
@@ -936,15 +942,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cap = (msg.caption or "")
     _tid = getattr(msg, "message_thread_id", None)
     _trusted = splinter._is_trusted(msg)
-    # Фото = обращение к боту, если:
-    #  - подпись содержит тег/ответ на бота, ИЛИ
-    #  - бот ждёт ответа в этой теме (только что задал вопрос), ИЛИ
-    #  - фото БЕЗ подписи от владельца/Пыма в теме обслуживания (очевидно «вот пробег/чек»)
-    _addressed = (
-        _owner_addresses_bot_caption(msg, context, cap)
-        or (_trusted and splinter.is_awaiting(msg.chat_id, _tid))
-        or (_trusted and not cap and splinter.GROUPS.get(msg.chat_id) == "servicing")
-    )
+    # Фикс B: в ОБСЛУЖИВАНИИ фото → авто-сверка ТО (_handle_servicing) ПО УМОЛЧАНИЮ.
+    # В мозг — ТОЛЬКО если подпись содержательно тегает бота (явный запрос «@bot проверь резину»).
+    # Голый тег / без подписи / открытый awaiting → авто-сверка (не мозг).
+    if splinter.GROUPS.get(msg.chat_id) == "servicing":
+        _addressed = _servicing_caption_to_brain(msg, context, cap)
+    else:
+        # Прочие группы — как раньше: подпись-обращение к боту ИЛИ открытый awaiting.
+        _addressed = (
+            _owner_addresses_bot_caption(msg, context, cap)
+            or (_trusted and splinter.is_awaiting(msg.chat_id, _tid))
+        )
     if _addressed:
         # У фото нет msg.text — подставим подпись (или нейтральный запрос) чтобы мозг прочитал
         msg.text = cap or "Фото в теме — проверь, что на нём (пробег/чек/состояние)."
@@ -956,6 +964,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _owner_addresses_bot_caption(msg, context, cap: str) -> bool:
     """Вступление для подписи к ФОТО — та же логика, что и для текста (_addresses_bot)."""
     return _addresses_bot(msg, context, cap)
+
+
+def _servicing_caption_to_brain(msg, context, cap: str) -> bool:
+    """Фикс B: фото в ОБСЛУЖИВАНИИ уходит в мозг ТОЛЬКО если подпись содержательно тегает бота
+    (явный текст-запрос, напр. «@bot проверь резину»). Голый тег / без подписи / awaiting → авто-сверка.
+    Только от владельца/Пыма (таец фото → авто-сверка)."""
+    if not cap or not splinter._is_trusted(msg):
+        return False
+    if not _bot_tag_in(cap.lower(), context):
+        return False
+    rest = re.sub(r"@\w+", "", cap).strip()      # текст сверх тега
+    return len(rest) >= 3
 
 
 async def on_forum_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
