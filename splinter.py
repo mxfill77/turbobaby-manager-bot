@@ -395,6 +395,10 @@ def _topic_name_from_msg(msg):
     fc = getattr(msg, "forum_topic_created", None)
     if fc and getattr(fc, "name", None):
         return fc.name
+    # 1b) сообщение о ПЕРЕИМЕНОВАНИИ темы — новое имя
+    fe = getattr(msg, "forum_topic_edited", None)
+    if fe and getattr(fe, "name", None):
+        return fe.name
     # 2) reply на сообщение создания темы
     r = getattr(msg, "reply_to_message", None)
     if r:

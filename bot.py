@@ -958,6 +958,44 @@ def _owner_addresses_bot_caption(msg, context, cap: str) -> bool:
     return _addresses_bot(msg, context, cap)
 
 
+async def on_forum_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сервис-сообщение форума (создание/переименование темы) → сохраняем имя темы=байк
+    в _TOPIC_NAMES + memory.db topic_bike. Ловит создание надёжно (раньше терялось на not msg.text)
+    и переименование. Только в splinter-группах."""
+    msg = update.message
+    if not msg or not splinter.is_splinter_group(msg.chat_id):
+        return
+    thread = getattr(msg, "message_thread_id", None)
+    name = splinter._remember_topic_name(msg.chat_id, thread, msg)
+    if name:
+        log.info(f"  🧩 Тема→байк (сервис-событие): {_topic_label(msg.chat_id, thread)}")
+
+
+async def cmd_bike(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручная привязка темы к байку: /bike <номер или название>. Только owner/Пым, только В теме.
+    Резолв по номеру через find_bike; пишет source='manual' (userbot-импорт его не затрёт)."""
+    msg = update.message
+    if not msg:
+        return
+    if not (splinter._is_owner(msg) or splinter._is_pym(msg)):
+        return  # чужой автор → игнор
+    thread = getattr(msg, "message_thread_id", None)
+    if not thread:
+        await msg.reply_text("Используй /bike В теме байка (внутри темы обслуживания).")
+        return
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await msg.reply_text("Укажи байк: /bike <номер или название>, напр. /bike 3503")
+        return
+    fb = bridge.find_bike(query)
+    bike = (fb or {}).get("name")
+    if not bike:
+        await msg.reply_text(f"Не нашёл байк по запросу «{query}», проверь номер.")
+        return
+    splinter.set_topic_bike(msg.chat_id, thread, bike)
+    await msg.reply_text(f"✅ Тема привязана к {bike}.")
+
+
 def main():
     if not BOT_TOKEN:
         log.error("BOT_TOKEN не задан в .env")
@@ -979,9 +1017,15 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+    app.add_handler(CommandHandler("bike", cmd_bike))
 
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
     app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))
+
+    # Сервис-события форума (создание/переименование темы) → привязка тема→байк
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
+        on_forum_topic))
 
     # Сообщения
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
