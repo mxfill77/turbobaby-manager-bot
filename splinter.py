@@ -1100,10 +1100,53 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     return True
 
 
-async def _handle_servicing(msg, context, bridge, claude):
-    """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения)."""
+def _aggregate_album_vis(vis_list):
+    """Слить разборы фото АЛЬБОМА в ОДИН вердикт (чтобы ответить один раз, без дублей):
+    - пробег → берём фото с наибольшей уверенностью одометра (лучшее фото приборки);
+    - топливо → первое непустое;
+    - повреждение/грязь → OR по альбому (упоминаем агрегированно, один раз);
+    - notes → склейка уникальных."""
+    if not vis_list:
+        return {}
+    if len(vis_list) == 1:
+        return vis_list[0]
+
+    def _conf_rank(v):
+        c = str(v.get("mileage_confidence", "")).lower()
+        return {"high": 2, "medium": 1, "mid": 1}.get(c, 0)
+
+    agg = {}
+    mil = [v for v in vis_list if v.get("mileage")]
+    if mil:
+        best = max(mil, key=_conf_rank)   # лучшее фото приборки альбома
+        agg["mileage"] = best.get("mileage")
+        agg["mileage_confidence"] = best.get("mileage_confidence")
+    for v in vis_list:
+        if v.get("fuel"):
+            agg["fuel"] = v.get("fuel")
+            break
+    for v in vis_list:
+        if v.get("tire"):
+            agg["tire"] = v.get("tire")
+            break
+    dmgs = [str(v.get("damage")) for v in vis_list if v.get("damage")]
+    if dmgs:
+        agg["damage"] = "; ".join(dict.fromkeys(dmgs))[:200]
+    agg["dirt"] = any(v.get("dirt") for v in vis_list)
+    notes = [str(v.get("notes")) for v in vis_list if v.get("notes")]
+    if notes:
+        agg["notes"] = " | ".join(dict.fromkeys(notes))[:200]
+    return agg
+
+
+async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
+    """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения).
+    photo_msgs — пачка сообщений-фото (альбом склеен по media_group_id; для одиночного = [msg]).
+    Альбом разбираем по каждому фото, но СЛИВАЕМ в один вердикт → один ответ."""
     text = msg.text or msg.caption or ""
-    has_photo = bool(msg.photo)
+    if photo_msgs is None:
+        photo_msgs = [msg] if msg.photo else []
+    has_photo = bool(photo_msgs)
     chat_id = msg.chat_id
     group_name = group_label(chat_id)
     topic_id = getattr(msg, "message_thread_id", None)
@@ -1115,18 +1158,26 @@ async def _handle_servicing(msg, context, bridge, claude):
     if text.strip():
         parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300))
 
-    # Разбираем фото через vision (топливо/пробег/повреждения)
+    # Разбираем фото через vision (топливо/пробег/повреждения). На альбом — каждое фото,
+    # затем агрегируем в ОДИН вердикт (один ответ вместо дубля на каждое фото).
     vis = {}
     if has_photo:
-        img = await _download_photo(msg)
-        if img:
-            vis = _parse_json(claude.vision(VISION_BIKE_SYSTEM, img, max_tokens=400))
-            log.info(f"  → vision: fuel={vis.get('fuel')} mileage={vis.get('mileage')} "
-                     f"conf={vis.get('mileage_confidence')} tire={vis.get('tire')} damage={vis.get('damage')}")
+        vis_list = []
+        for pm in photo_msgs:
+            img = await _download_photo(pm)
+            if not img:
+                log.warning(f"  → photo download failed")
+                continue
+            v = _parse_json(claude.vision(VISION_BIKE_SYSTEM, img, max_tokens=400))
+            log.info(f"  → vision: fuel={v.get('fuel')} mileage={v.get('mileage')} "
+                     f"conf={v.get('mileage_confidence')} tire={v.get('tire')} damage={v.get('damage')}")
             # Копим разбор в буфер недавних фото ЭТОЙ ТЕМЫ (для вопросов "проверь фото резины/пробега")
-            _remember_recent_photo(chat_id, vis, msg, topic_id=topic_id)
-        else:
-            log.warning(f"  → photo download failed")
+            _remember_recent_photo(chat_id, v, pm, topic_id=topic_id)
+            vis_list.append(v)
+        vis = _aggregate_album_vis(vis_list)
+        if len(vis_list) > 1:
+            log.info(f"  → альбом: склеил {len(vis_list)} фото → mileage={vis.get('mileage')} "
+                     f"conf={vis.get('mileage_confidence')} damage={vis.get('damage')} dirt={vis.get('dirt')}")
 
     # Если ни текст-событие, ни осмысленное фото — выходим
     is_event = parsed.get("type") == "event"
@@ -1461,11 +1512,14 @@ async def _intake_finalize(draft, msg, context, bridge):
                 bilingual=False, message_thread_id=tid)
 
 
-async def _handle_intake(msg, context, bridge, claude):
-    """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only."""
+async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
+    """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only.
+    photo_msgs — пачка фото (альбом склеен по media_group_id) → один «паспорт получен» + один finalize."""
     chat_id = msg.chat_id
     text = (msg.text or msg.caption or "").strip()
-    has_photo = bool(msg.photo)
+    if photo_msgs is None:
+        photo_msgs = [msg] if msg.photo else []
+    has_photo = bool(photo_msgs)
     now = _time.time()
 
     # 1) Фото паспорта отдельным сообщением → связать с последней карточкой (окно 5 мин)
@@ -1556,14 +1610,18 @@ def is_splinter_group(chat_id: int) -> bool:
     return chat_id in GROUPS
 
 
-async def handle(update, context, bridge, claude):
-    """Вызывается из bot.py для сообщений из операционных групп."""
+async def handle(update, context, bridge, claude, album_msgs=None):
+    """Вызывается из bot.py для сообщений из операционных групп.
+    album_msgs — список сообщений-фото альбома (склейка по media_group_id); для одиночного
+    фото/текста = None (тогда берём photo из самого msg). Обработка альбома = ОДИН прогон."""
     msg = update.message
     if not msg:
         return
     mode = GROUPS.get(msg.chat_id)
     if not mode:
         return
+    # Пачка фото: альбом (album_msgs) ИЛИ одиночное фото ([msg]) ИЛИ нет фото ([]).
+    photo_msgs = album_msgs if album_msgs else ([msg] if msg.photo else [])
 
     # Диагностический лог — видно что сообщение долетело до Splinter
     _u = msg.from_user.username if msg.from_user else "?"
@@ -1584,12 +1642,12 @@ async def handle(update, context, bridge, claude):
         if mode == "money":
             await _handle_money(msg, context, bridge, claude)
         elif mode == "servicing":
-            await _handle_servicing(msg, context, bridge, claude)
+            await _handle_servicing(msg, context, bridge, claude, photo_msgs)
         elif mode == "delivery":
             await _handle_delivery(msg, context, bridge, claude)
         elif mode == "attendance":
             await _handle_attendance(msg, context, bridge, claude)
         elif mode == "intake":
-            await _handle_intake(msg, context, bridge, claude)
+            await _handle_intake(msg, context, bridge, claude, photo_msgs)
     except Exception:
         log.exception(f"Splinter error in {mode} ({msg.chat_id})")

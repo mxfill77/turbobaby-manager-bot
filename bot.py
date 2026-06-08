@@ -105,6 +105,16 @@ _audit_pending_edit = {}   # {audit_chat_id: token} — ждём текст но
 # (asyncio держит на task только слабую ссылку). add_done_callback(discard) чистит набор.
 _bg_tasks = set()
 
+# === Буфер альбомов (media_group_id) ===
+# Telegram шлёт альбом как N отдельных Update с общим media_group_id. Без склейки
+# бот реагирует на каждое фото (дубли: грязь ×N, intake «паспорт получен» ×N).
+# Решение: копим фото альбома в _ALBUM_BUF, дебаунс-таймер ~1.8с (пере-взводится на
+# каждое новое фото) → ОДНА обработка всей пачки → один ответ.
+_ALBUM_BUF = {}          # mgid -> {"updates": [Update,...], "context": ctx}
+_ALBUM_TIMERS = {}       # mgid -> asyncio.Task (дебаунс; держим ссылку, см. _bg_tasks-правило)
+_ALBUM_PROCESSING = set()  # mgid в обработке — защита от двойного прогона одного альбома
+ALBUM_WINDOW = 1.8       # окно склейки альбома, сек
+
 
 async def post_audit_card(context, card: dict):
     """Отправить карточку странности в группу «Аудит» с кнопками 👍/✏️/👎."""
@@ -932,13 +942,64 @@ async def on_startup(app: Application):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Фото в операционных группах → Splinter (чеки, фото байков).
-    Если владелец приложил подпись с обращением к боту — отдаём мозгу (он подтянет фото через vision)."""
+    Если владелец приложил подпись с обращением к боту — отдаём мозгу (он подтянет фото через vision).
+    Альбом (media_group_id) → буферизуем и обрабатываем пачкой одним прогоном (анти-дубль)."""
     msg = update.message
     if not msg or not msg.photo:
         return
     if not splinter.is_splinter_group(msg.chat_id):
         return
-    # Владелец прислал фото с подписью-обращением к боту → диалог-мозг
+    mgid = getattr(msg, "media_group_id", None)
+    if mgid:
+        # Альбом — не обрабатываем сразу: копим фото и пере-взводим дебаунс-таймер.
+        buf = _ALBUM_BUF.setdefault(mgid, {"updates": []})
+        buf["updates"].append(update)
+        buf["context"] = context
+        _arm_album_timer(mgid)
+        return
+    # Одиночное фото — маршрутизируем сразу (поведение как раньше).
+    await _route_photos(context, [update])
+
+
+def _arm_album_timer(mgid):
+    """(Пере)взвести дебаунс-таймер альбома: отменяем прошлый, ставим новый на ALBUM_WINDOW.
+    Ссылку держим в _bg_tasks (иначе asyncio молча убьёт задачу на await)."""
+    old = _ALBUM_TIMERS.get(mgid)
+    if old and not old.done():
+        old.cancel()
+    t = asyncio.create_task(_album_flush(mgid))
+    _ALBUM_TIMERS[mgid] = t
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+
+
+async def _album_flush(mgid):
+    """Сработка таймера: забрать накопленный альбом и обработать ОДИН раз пачкой фото."""
+    try:
+        await asyncio.sleep(ALBUM_WINDOW)
+    except asyncio.CancelledError:
+        return  # пришло ещё фото — таймер пере-взведён, этот прогон отменён
+    _ALBUM_TIMERS.pop(mgid, None)
+    if mgid in _ALBUM_PROCESSING:
+        return  # уже обрабатывается — защита от двойного прогона
+    entry = _ALBUM_BUF.pop(mgid, None)
+    if not entry or not entry.get("updates"):
+        return
+    _ALBUM_PROCESSING.add(mgid)
+    try:
+        await _route_photos(entry["context"], entry["updates"])
+    except Exception:
+        log.exception(f"album flush error (mgid={mgid})")
+    finally:
+        _ALBUM_PROCESSING.discard(mgid)
+
+
+async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):
+    """Маршрутизация фото (одиночного или альбома) — решение мозг/Splinter принимаем по
+    «представителю» (фото с подписью, иначе первое), а в Splinter отдаём ВСЮ пачку фото."""
+    # Представитель: сообщение с подписью (Telegram обычно кладёт подпись на 1-е фото альбома).
+    rep = next((u for u in updates if (u.message.caption or "").strip()), updates[0])
+    msg = rep.message
     cap = (msg.caption or "")
     _tid = getattr(msg, "message_thread_id", None)
     _trusted = splinter._is_trusted(msg)
@@ -958,7 +1019,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg.text = cap or "Фото в теме — проверь, что на нём (пробег/чек/состояние)."
         await manager_reply(msg, context, context_note="Владелец/Пым прислал фото.", bilingual=True)
         return
-    await splinter.handle(update, context, bridge, claude)
+    photo_msgs = [u.message for u in updates]
+    await splinter.handle(rep, context, bridge, claude, album_msgs=photo_msgs)
 
 
 def _owner_addresses_bot_caption(msg, context, cap: str) -> bool:
