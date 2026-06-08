@@ -19,6 +19,7 @@ import logging
 import json
 import asyncio
 import functools
+import re
 import tempfile
 from datetime import time as dtime, datetime
 from zoneinfo import ZoneInfo
@@ -265,30 +266,60 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _owner_addresses_bot(msg, context) -> bool:
-    """Владелец (Филипп) ИЛИ Пым обращаются к Splinter: тег бота, ответ на его сообщение,
-    ИЛИ бот сам недавно задал вопрос в этой теме и ждёт ответа (тег не нужен).
-    Пым включена по правилу Филиппа: всегда реагировать на @Pleummmm."""
-    u = msg.from_user
-    allowed = splinter.OWNER_USERNAMES | splinter.PYM_USERNAMES
-    if not u or not u.username or u.username.lower() not in allowed:
-        return False
-    r = msg.reply_to_message
-    if r and r.from_user and context.bot and r.from_user.id == context.bot.id:
-        return True
-    t = (msg.text or "").lower()
+def _bot_tag_in(t: str, context) -> bool:
+    """В тексте (lower) есть явный тег бота."""
     uname = ""
     try:
         uname = (context.bot.username or "").lower()
     except Exception:
         pass
-    if (uname and ("@" + uname) in t) or ("turbobaby_manager_bot" in t):
+    return bool((uname and ("@" + uname) in t) or ("turbobaby_manager_bot" in t))
+
+
+def _other_person_tag_in(t: str, context) -> bool:
+    """В тексте (lower) есть тег @username ДРУГОГО человека (не бота)."""
+    uname = ""
+    try:
+        uname = (context.bot.username or "").lower()
+    except Exception:
+        pass
+    bot_names = {uname, "turbobaby_manager_bot"} - {""}
+    return any(m not in bot_names for m in re.findall(r"@([a-z0-9_]+)", t))
+
+
+def _addresses_bot(msg, context, text: str) -> bool:
+    """Финальная логика вступления (для текста И подписи к фото).
+    Автор ∈ {владелец, Пым} И одно из:
+      1) явный тег @бота (с другими тегами или без);
+      2) reply на бота, где НЕТ тега другого человека;
+      3) reply на бота, где есть тег @бота (даже если рядом тегнут кто-то ещё) — покрыт п.1;
+      4) открытый awaiting в теме (КРОМЕ случая «тегнут другой человек без тега бота»).
+    Простое упоминание @Pleummmm/чужого тега без тега бота и без reply боту → False (молчит)."""
+    u = msg.from_user
+    allowed = splinter.OWNER_USERNAMES | splinter.PYM_USERNAMES
+    if not u or not u.username or u.username.lower() not in allowed:
+        return False
+    t = (text or "").lower()
+    bot_tagged = _bot_tag_in(t, context)
+    other_tagged = _other_person_tag_in(t, context)
+    # 1) явный тег бота → вступаем (даже если тегнут ещё кто-то)
+    if bot_tagged:
         return True
-    # Без тега: если бот сам задал вопрос в этой теме и ждёт ответа
+    r = msg.reply_to_message
+    is_reply_to_bot = bool(r and r.from_user and context.bot and r.from_user.id == context.bot.id)
+    # 2,3) reply на бота: вступаем, ЕСЛИ не тегнут другой человек (тег бота уже выше)
+    if is_reply_to_bot:
+        return not other_tagged
+    # 4) awaiting: вступаем, КРОМЕ «тегнут другой человек без тега бота» (адресовано ему, не боту)
     _tid = getattr(msg, "message_thread_id", None)
     if splinter.is_awaiting(msg.chat_id, _tid):
-        return True
+        return not other_tagged
     return False
+
+
+def _owner_addresses_bot(msg, context) -> bool:
+    """Вступление для ТЕКСТОВОГО сообщения — см. _addresses_bot."""
+    return _addresses_bot(msg, context, msg.text or "")
 
 
 def _topic_label(chat_id, topic_id) -> str:
@@ -923,21 +954,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _owner_addresses_bot_caption(msg, context, cap: str) -> bool:
-    """Как _owner_addresses_bot, но для подписи к фото. Владелец + Пым."""
-    u = msg.from_user
-    allowed = splinter.OWNER_USERNAMES | splinter.PYM_USERNAMES
-    if not u or not u.username or u.username.lower() not in allowed:
-        return False
-    r = msg.reply_to_message
-    if r and r.from_user and context.bot and r.from_user.id == context.bot.id:
-        return True
-    t = cap.lower()
-    uname = ""
-    try:
-        uname = (context.bot.username or "").lower()
-    except Exception:
-        pass
-    return bool((uname and ("@" + uname) in t) or ("turbobaby_manager_bot" in t))
+    """Вступление для подписи к ФОТО — та же логика, что и для текста (_addresses_bot)."""
+    return _addresses_bot(msg, context, cap)
 
 
 def main():
