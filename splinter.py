@@ -820,6 +820,43 @@ def _is_oil_context(text, vis):
     return any(kw in blob for kw in _OIL_KEYWORDS)
 
 
+# Фикс A2: слова «замена ВЫПОЛНЕНА» (прошедшее время/факт) — НЕ будущее «надо заменить».
+# Маркер взводит окно ожидания фиксации замены по теме (см. _OIL_MARKER).
+_OIL_DONE_WORDS = ("заменил", "заменен", "заменён", "заменены", "заменено", "замена",
+                   "поменял", "поменян", "готов", "сделал", "сделан",
+                   "เปลี่ยนแล้ว", "แล้ว", "เสร็จ")
+_OIL_MARKER = {}            # (chat_id, topic_id) -> ts последнего маркера замены
+_OIL_MARKER_TTL = 15 * 60   # 15 мин — окно собрать маркер + фото-с-пробегом из разных сообщений
+
+
+def _is_oil_done_marker(text, vis):
+    """True если в тексте/подписи — МАРКЕР выполненной замены масла: масло-контекст И слово
+    прошедшего времени/факта (заменили/заменено/поменяли/готово/сделано/เปลี่ยนแล้ว/เสร็จ).
+    Будущее «надо заменить масло» НЕ ловится (нет done-слова: 'заменить'∌'заменил')."""
+    blob = ((text or "") + " " + str((vis or {}).get("notes", ""))).lower()
+    return _is_oil_context(text, vis) and any(w in blob for w in _OIL_DONE_WORDS)
+
+
+def _arm_oil_marker(chat_id, topic_id):
+    _OIL_MARKER[(chat_id, topic_id)] = _time.time()
+
+
+def _oil_marker_active(chat_id, topic_id):
+    """Активно ли окно ожидания фиксации замены (не протухло). Протухшее — снимаем."""
+    key = (chat_id, topic_id)
+    ts = _OIL_MARKER.get(key)
+    if ts is None:
+        return False
+    if _time.time() - ts > _OIL_MARKER_TTL:
+        _OIL_MARKER.pop(key, None)
+        return False
+    return True
+
+
+def _clear_oil_marker(chat_id, topic_id):
+    _OIL_MARKER.pop((chat_id, topic_id), None)
+
+
 def _should_ask_odometer(chat_id, topic_id):
     """Анти-спам для просьбы про одометр: НЕ просим если по теме уже есть уверенный (high)
     пробег в недавнем буфере, и не повторяем чаще раза в _ODOMETER_ASK_COOLDOWN."""
@@ -1257,6 +1294,7 @@ async def handle_oil_write_confirm(msg, context, bridge, text) -> bool:
 
     if t in _CONFIRM_NO:
         _PENDING_OIL_WRITE.pop(key, None)
+        _clear_oil_marker(*key)   # фикс A2: окно ожидания фиксации закрыто
         clear_awaiting(*key)
         # «нет, не заменили» от любого → трактуем как обычный контрольный замер (сверка/просрочка).
         try:
@@ -1302,6 +1340,7 @@ async def handle_oil_write_confirm(msg, context, bridge, text) -> bool:
                     text=(f"🐀 Splinter\n"
                           f"🇹🇭 ✅ อัปเดต «ТО Oil» แล้ว: {res.get('bike_name', bike)} → {km_int} กม. ปิดเตือนเกินกำหนดแล้วครับ\n"
                           f"🇷🇺 ✅ ТО Oil обновлено: {res.get('bike_name', bike)} → {km_int} км, просрочка закрыта"))
+        _clear_oil_marker(*key)   # фикс A2: замена зафиксирована — окно закрыто
         await _close_service_reminder(context, bridge, msg.chat_id, key[1], bike)
     else:
         err = res.get("error", "")
@@ -1432,9 +1471,13 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
 
     # === ТО-трекер ===
     _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
-    # Фикс A: «масло заменили» (слова про масло) + есть распознанный пробег → это закрытие ТО,
-    # а не контрольный замер. После подтверждения пробега предложим записать новое ТО Oil.
-    oil_done = _is_oil_context(text, vis) and bool(mileage)
+    # Фикс A/A2: «масло ЗАМЕНИЛИ» (маркер прошедшего времени) + распознанный пробег → закрытие ТО.
+    # Маркер и фото-с-пробегом могут прийти РАЗНЫМИ сообщениями → маркер взводит окно по теме
+    # (TTL 15 мин); пока окно активно, следующее фото с пробегом тоже = oil_done.
+    if _is_oil_done_marker(text, vis):
+        _arm_oil_marker(chat_id, topic_id)
+    oil_done = bool(mileage) and (_is_oil_done_marker(text, vis)
+                                  or _oil_marker_active(chat_id, topic_id))
     if vis.get("mileage") and not parsed.get("mileage") and _conf_ok:
         # Пробег с ФОТО приборки → СНАЧАЛА подтверждаем цифру у человека (vision врёт на LCD),
         # затем фикс B (сторож) и, если oil_done, фикс A (запись ТО) — в handle_mileage_confirm.
@@ -1464,10 +1507,18 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         )
         return
 
-    # Контекст замены масла, но БЕЗ чёткого пробега → САМ просим ЧЁТКОЕ фото одометра.
+    # Контекст замены масла, но БЕЗ чёткого пробега в ЭТОМ сообщении.
     # (damage уже отработан выше и сделал return — повреждение приоритетнее.)
-    # Ничего в ТО не пишем, число не выдумываем. Анти-спам: буфер high-пробега + троттлинг.
     no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
+    # Фикс A2 (симметрия): маркер «замена выполнена» пришёл БЕЗ пробега, но фото пробега уже было
+    # в теме раньше (high) → предлагаем записать ТО Oil сразу, не ждём нового фото.
+    if _is_oil_done_marker(text, vis) and no_clear_km:
+        prev = last_mileage_in_topic(chat_id, topic_id)
+        if prev and prev[1] == "high":
+            await _ask_oil_write(context, chat_id, topic_id, bike, str(prev[0]))
+            return
+    # Иначе — общий масло-контекст без чёткого пробега → САМ просим ЧЁТКОЕ фото одометра.
+    # Ничего в ТО не пишем, число не выдумываем. Анти-спам: буфер high-пробега + троттлинг.
     if _is_oil_context(text, vis) and no_clear_km and _should_ask_odometer(chat_id, topic_id):
         await _send(context,
             chat_id=chat_id, text=msg_ask_odometer(bike), message_thread_id=topic_id
@@ -1478,7 +1529,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Фикс C: в сервис-контексте (замена масла/ремонт/чек сервиса/идёт запись ТО фикса A)
     # совет «помыть/воск/чехол» неуместен — байк чинят, а не моют → подавляем (грязь распознаём как есть).
     _service_ctx = (oil_done or _is_oil_context(text, vis)
-                    or event_type == "repair" or vis.get("kind") == "receipt")
+                    or event_type == "repair" or vis.get("kind") == "receipt"
+                    or _oil_marker_active(chat_id, topic_id))
     if vis.get("dirt") and not _service_ctx:
         await _send(context,
             chat_id=chat_id,
