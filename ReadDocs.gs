@@ -128,6 +128,36 @@ function setupCcLog() {
 
 
 // ============================================================
+//  ОДНОРАЗОВАЯ НАСТРОЙКА KB_claude_userbot_log — журнал задач userbot/агента.
+//  Создаёт Doc «KB_claude_userbot_log» и ключ cc_userbot_log в манифесте.
+//  НЕ трогает другие KB_* — только cc_userbot_log. Идемпотентна (getOrCreateDoc_).
+// ============================================================
+function setupCcUserbotLog() {
+  var DOC_NAME = 'KB_claude_userbot_log';
+  var KEY = 'cc_userbot_log';
+
+  var manifest = getBrainManifest_();
+  if (!manifest.folder_id) {
+    Logger.log('ОШИБКА: в манифесте нет folder_id — сначала запустите setupBrain().');
+    return { ok: false, error: 'no_folder' };
+  }
+
+  var brain = DriveApp.getFolderById(manifest.folder_id);
+  var doc = getOrCreateDoc_(brain, DOC_NAME);  // вернёт существующий, если уже создан
+  doc.saveAndClose();
+  var id = doc.getId();
+
+  manifest[KEY] = id;
+  PropertiesService.getScriptProperties().setProperty(BRAIN_PROP_KEY, JSON.stringify(manifest));
+
+  Logger.log('============= setupCcUserbotLog завершён =============');
+  Logger.log(DOC_NAME + ' (' + KEY + '): ' + id);
+  Logger.log('BRAIN_MANIFEST: ' + JSON.stringify(manifest));
+  return { ok: true, key: KEY, doc: DOC_NAME, id: id };
+}
+
+
+// ============================================================
 //  ОДНОРАЗОВАЯ НАСТРОЙКА KB_review — запускать ИЗ РЕДАКТОРА Apps Script
 //  Создаёт Doc «KB_claude_review» и добавляет ключ review в манифест.
 //  Канал прямого ревью Claude-на-сайте <-> Claude Code. НЕ трогает другие KB_* —
