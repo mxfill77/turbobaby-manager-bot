@@ -465,11 +465,13 @@ def _remember_recent_photo(chat_id, vis, msg, topic_id=None):
     buf.append({"vis": vis, "sender": sender, "ts": _time.time()})
 
 
-def last_mileage_in_topic(chat_id, topic_id=None):
+def last_mileage_in_topic(chat_id, topic_id=None, exclude_km=None):
     """Самый свежий пробег из фото ЭТОЙ темы, или None.
     Возвращает (km, confidence) где confidence 'high'/'low'/''.
     Берём даже low (лучше показать цифру с оговоркой, чем 'нет данных'),
-    но приоритет — самому свежему high, если он есть в окне TTL."""
+    но приоритет — самому свежему high, если он есть в окне TTL.
+    exclude_km — пропустить замеры с этим значением (чтобы при сторже пробега
+    не сравнивать текущее фото само с собой: оно уже в буфере)."""
     buf = _RECENT_PHOTOS.get((chat_id, topic_id))
     if not buf:
         return None
@@ -487,6 +489,8 @@ def last_mileage_in_topic(chat_id, topic_id=None):
             km_int = int(str(km).replace(" ", "").replace(",", ""))
         except ValueError:
             continue
+        if exclude_km is not None and km_int == exclude_km:
+            continue   # это текущий замер — не сравниваем с собой
         conf = v.get("mileage_confidence", "") or ""
         if newest_any is None:
             newest_any = (km_int, conf)
@@ -1050,10 +1054,45 @@ def pending_mileage_for(chat_id, topic_id):
     return _PENDING_MILEAGE.get((chat_id, topic_id))
 
 
+def msg_mileage_drop(bike, new_km, last_km):
+    """Фикс B (сторож): распознанный пробег МЕНЬШЕ последнего известного — физически
+    невозможно (одометр не убывает). Просим правильное число / переснять. В ТО НЕ пишем."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 อ่านเลขไมล์ได้ {new_km} กม.{b_th} แต่ครั้งก่อนคือ {last_km} กม. "
+        f"เลขไมล์ลดลงไม่ได้ — น่าจะอ่านผิด ส่งเลขที่ถูกต้องหรือถ่ายรูปใหม่ให้ชัด ๆ นะครับ 🙏\n"
+        f"🇷🇺 📟 Вижу пробег {new_km} км{b_ru}, но последний известный — {last_km} км. "
+        f"Пробег не может уменьшиться — похоже на ошибку распознавания. "
+        f"Пришли правильное число или переснимите фото 🙏"
+    )
+
+
 async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage):
-    """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting."""
-    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "")
+    """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting.
+    Фикс B (сторож пробега): если распознанное число МЕНЬШЕ последнего известного по теме —
+    это ошибка vision (одометр не убывает). Тогда вместо «верно?» шлём флаг и НЕ пишем в ТО
+    до корректной цифры; floor в pending не даёт «да» подтвердить заведомо неверное число."""
+    floor = None
+    try:
+        new_km = int(str(mileage).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        new_km = None
+    if new_km is not None:
+        prev = last_mileage_in_topic(chat_id, topic_id, exclude_km=new_km)
+        if prev and new_km < prev[0]:
+            floor = prev[0]
+
+    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor)
     mark_awaiting(chat_id, topic_id)
+
+    if floor is not None:
+        await _send(context, chat_id=chat_id,
+                    text=msg_mileage_drop(bike, new_km, floor),
+                    message_thread_id=topic_id)
+        return
+
     b_th = f" ({bike})" if bike else ""
     b_ru = f" по {bike}" if bike else ""
     await _send(
@@ -1073,7 +1112,8 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     pend = _PENDING_MILEAGE.get(key)
     if not pend:
         return False
-    mileage, bike = pend
+    mileage, bike = pend[0], pend[1]
+    floor = pend[2] if len(pend) > 2 else None   # фикс B: пол пробега (флаг-режим)
     t = (text or "").strip().lower()
     m = _re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", ""))
     if t in _CONFIRM_YES:
@@ -1091,6 +1131,17 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
         return True
     else:
         return False                # не подтверждение — отдаём обычному пути
+    # Сторож (фикс B): не подтверждаем «да» и не принимаем число НИЖЕ последнего известного —
+    # пробег не убывает. Держим pending (floor сохраняется), ждём корректную цифру/фото.
+    if floor is not None:
+        try:
+            if int(str(num).replace(" ", "").replace(",", "")) < floor:
+                await _send(context, chat_id=msg.chat_id,
+                            text=msg_mileage_drop(bike, num, floor),
+                            message_thread_id=key[1])
+                return True
+        except (ValueError, TypeError):
+            pass
     _PENDING_MILEAGE.pop(key, None)
     clear_awaiting(*key)
     try:
