@@ -1239,6 +1239,19 @@ def msg_oil_need_trusted(bike, km):
     )
 
 
+def msg_km_ack(bike, km, overdue=False):
+    """Квитанция на [Просто пробег]: текущий пробег принят, в кол.I не писали (RU/TH).
+    overdue=True → добавляем, что напоминание о ТО оставлено."""
+    b = f" · 📌 {bike}" if bike else ""
+    note_th = " เตือนครบกำหนด ТО ยังอยู่" if overdue else ""
+    note_ru = " Напоминание о ТО оставил." if overdue else ""
+    return (
+        f"🐀 Splinter{b}\n"
+        f"🇹🇭 📷 รับเลขไมล์ปัจจุบัน {km} กม. แล้วครับ — ไม่ได้บันทึกการเปลี่ยนน้ำมัน.{note_th}\n"
+        f"🇷🇺 📷 Принято, текущий пробег {km} км. Замену не записывал.{note_ru}"
+    )
+
+
 def _run_service_tracker(bridge, chat_id, topic_id, bike, mileage):
     """service_upsert(current_km) → словарь статуса ТО. None если байк/число невалидны. НЕ шлёт сообщений."""
     if not bike:
@@ -1264,10 +1277,11 @@ async def _ask_oil_or_km(context, chat_id, topic_id, bike, km, status, next_km, 
     """Задать вопрос кнопками [После замены]/[Просто пробег] (фиксация через явный ответ)."""
     tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike or "", "km": str(km),
                     "status": status, "next_km": next_km, "km_left": km_left})
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔧 После замены / หลังเปลี่ยน", callback_data=f"svc:oil:{tok}"),
-        InlineKeyboardButton("📟 Просто пробег / แค่เลขไมล์", callback_data=f"svc:km:{tok}"),
-    ]])
+    # Кнопки в ДВА ряда, тайский ПЕРВЫМ (тайцы — основные в обслуживании; RU не теряется на узком экране).
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔧 หลังเปลี่ยนน้ำมัน / После замены", callback_data=f"svc:oil:{tok}")],
+        [InlineKeyboardButton("📷 แค่เลขไมล์ / Просто пробег", callback_data=f"svc:km:{tok}")],
+    ])
     await context.bot.send_message(chat_id=chat_id, text=msg_oil_or_km(bike, km),
                                    message_thread_id=topic_id, reply_markup=kb)
 
@@ -1423,8 +1437,9 @@ async def handle_service_button(update, context, bridge) -> None:
         _SVC_TOKENS.pop(token, None)
         await _write_oil(context, bridge, chat_id, topic_id, bike, km)
     elif action == "km":
-        # [Просто пробег] → в кол.I НЕ пишем. due/overdue → закреп просрочки, иначе квитанция.
-        await q.answer("Принято — просто пробег")
+        # [Просто пробег] → в кол.I НЕ пишем. Квитанцию шлём ВСЕГДА (раньше при уже-закреплённой
+        # просрочке _pin_overdue_reminder выходил молча → человек видел тишину).
+        await q.answer()
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -1434,10 +1449,14 @@ async def handle_service_button(update, context, bridge) -> None:
             km_int = int(str(km).replace(" ", ""))
         except (ValueError, TypeError):
             km_int = km
-        if data.get("status") in ("due", "overdue"):
+        overdue = data.get("status") in ("due", "overdue")
+        if overdue:
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=msg_km_ack(bike, km_int, overdue=True))
             await _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike,
                                         km_int, data.get("next_km"), data.get("status"))
         else:
+            # ТО в норме — полная квитанция «пробег принят, ТО в норме, следующее на Y».
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=msg_mileage_ok(bike, km_int, data.get("next_km"), data.get("km_left")))
     else:
