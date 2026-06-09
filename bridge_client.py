@@ -224,6 +224,23 @@ class BridgeClient:
         доки локально в Apps Script. Регулярно вызывается time-trigger (см. setupPruneTrigger)."""
         return self._post("prune_cc_log")
 
+    def prune_review(self, keep_headers: list) -> dict:
+        """Разовое прореживание KB_review на стороне Bridge: записи, чья первая строка ∈ keep_headers,
+        остаются; остальные (закрытые/задеплоенные) → KB_claude_review_archive (бутстрап + ключ
+        review_archive в манифесте). Делёж локальный (DocumentApp), без HTTP-флапа. Гард: если хоть
+        один keep_header не найден — НИЧЕГО не пишет (отказ). Зона: только Brain-доки review/архив."""
+        return self._post("prune_review", keep_headers=keep_headers)
+
+    def prune_review_size(self) -> dict:
+        """Разовый прогон БАЙТОВОГО автопрореживания KB_review (зеркало prune_cc_log): если review
+        > REVIEW_MAX_BYTES — новейшие записи остаются, старые → KB_claude_review_archive. Идемпотентно."""
+        return self._post("prune_review_size")
+
+    def setup_review_prune_trigger(self) -> dict:
+        """Установить ежедневный триггер автопрореживания KB_review по размеру (~13:10 UTC).
+        Засевает REVIEW_MAX_BYTES (дефолт 50000) и регистрирует review_archive в манифесте."""
+        return self._post("setup_review_prune_trigger")
+
     def setup_prune_trigger(self) -> dict:
         """Установить ежедневный time-trigger прореживания. ПРИМ.: требует scope script.scriptapp —
         из веб-аппа НЕ проходит; запускать setupPruneTrigger() ИЗ РЕДАКТОРА Apps Script (как setupBrain)."""
