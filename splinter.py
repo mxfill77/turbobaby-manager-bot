@@ -1795,7 +1795,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         km_part = f" | пробег {mileage}" if mileage else ""
         notes = (f"работы: {works_str}{km_part}" + (f" | {notes}" if notes else "")).strip()[:200]
 
-    bridge.add_event(
+    _ev_msg_id = f"{chat_id}:{msg.message_id}"
+    _ev_r = bridge.add_event(
         msg_date=str(msg.date.date()) if msg.date else "",
         group=group_name + (f" / тема {topic_id}" if topic_id else ""),
         bike=bike,
@@ -1804,8 +1805,13 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         mileage=str(mileage),
         photos=1 if has_photo else 0,
         notes=notes,
-        msg_id=f"{chat_id}:{msg.message_id}",
+        msg_id=_ev_msg_id,
     )
+    # ДИАГ (закрываем последнее слепое пятно записи событий): бот раньше ВЫБРАСЫВАЛ return add_event —
+    # не видно было saved/duplicate/error. Теперь видно ровно что вернул Bridge на РЕАЛЬНЫЙ вызов.
+    log.info(f"  → add_event: ok={(_ev_r or {}).get('ok')} saved={(_ev_r or {}).get('saved')} "
+             f"duplicate={(_ev_r or {}).get('duplicate')} error={(_ev_r or {}).get('error')} "
+             f"msg_id={_ev_msg_id} event_type={event_type}")
 
     # === ТО-трекер ===
     _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
