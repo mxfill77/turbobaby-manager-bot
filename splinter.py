@@ -1555,6 +1555,29 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         )
 
 
+def msg_mileage_ok(bike, km, next_km, km_left):
+    """Короткая квитанция на подтверждённый текущий пробег, когда ТО в норме (не due/overdue).
+    Двуязычно RU/TH. Если next_km неизвестен (нет ТО Oil в кол.I) — без ТО-детали."""
+    head = f"🐀 Splinter · 📌 {bike}" if bike else "🐀 Splinter"
+    if next_km:
+        try:
+            left = int(km_left)
+            left_th = f" (เหลือ ~{left} กม.)"
+            left_ru = f" (осталось ~{left} км)"
+        except (ValueError, TypeError):
+            left_th = left_ru = ""
+        return (
+            f"{head}\n"
+            f"🇹🇭 ✅ รับเลขไมล์ {km} กม. แล้วครับ — ТО ปกติ ครบกำหนดถัดไปที่ {next_km} กม.{left_th}\n"
+            f"🇷🇺 ✅ Пробег {km} км принят. ТО в норме, следующее на {next_km} км{left_ru}"
+        )
+    return (
+        f"{head}\n"
+        f"🇹🇭 ✅ รับเลขไมล์ {km} กม. แล้วครับ\n"
+        f"🇷🇺 ✅ Пробег {km} км принят"
+    )
+
+
 def msg_service_due(bike, stype, current_km, next_km, status):
     """Двуязычное напоминание о ТО для закрепа в теме байка."""
     type_th = {"oil": "เปลี่ยนน้ำมันเครื่อง", "tire": "เปลี่ยนยาง", "tyre": "เปลี่ยนยาง"}.get(stype, stype)
@@ -1620,7 +1643,11 @@ async def _check_service(context, bridge, chat_id, topic_id, bike, mileage):
     next_km = res.get("next_km")
     stype = res.get("service_type", "oil")
     if status not in ("due", "overdue"):
-        return  # ничего не надо
+        # ТО в норме — короткая квитанция (раньше молчал, человек не понимал, принято ли).
+        await _send(context, chat_id=chat_id,
+                    text=msg_mileage_ok(bike, km, next_km, res.get("km_left")),
+                    message_thread_id=topic_id)
+        return
 
     # Нужно напомнить. Проверяем — не закреплено ли уже / прошло ли 5 дней.
     # Матчим строку ТО по НОМЕРУ (имя в листе — каноничное из Лист1, отличается от имени темы).
