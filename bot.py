@@ -590,6 +590,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
+    # Чужой контур userbot/агента (HQ тема 205) — Splinter молчит ДО мозга/учёта/аудитора.
+    if splinter.is_ignored_thread(msg.chat_id, getattr(msg, "message_thread_id", None)):
+        return
+
     chat_id = msg.chat_id
 
     # ТЕМА «Аудит» (chat==форум И thread==тема) — управляющая, мозг Splinter тут НЕ работает.
@@ -722,6 +726,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка голосовых сообщений через Claude (он умеет принимать аудио)."""
     msg = update.message
     if not msg or not msg.voice:
+        return
+
+    # Чужой контур userbot/агента (HQ тема 205) — Splinter молчит.
+    if splinter.is_ignored_thread(msg.chat_id, getattr(msg, "message_thread_id", None)):
         return
 
     chat_id = msg.chat_id
@@ -953,6 +961,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Альбом (media_group_id) → буферизуем и обрабатываем пачкой одним прогоном (анти-дубль)."""
     msg = update.message
     if not msg or not msg.photo:
+        return
+    # Чужой контур userbot/агента (HQ тема 205) — Splinter молчит.
+    if splinter.is_ignored_thread(msg.chat_id, getattr(msg, "message_thread_id", None)):
         return
     if not splinter.is_splinter_group(msg.chat_id):
         return
