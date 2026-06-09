@@ -1359,6 +1359,82 @@ def msg_oil_need_trusted(bike, km):
     )
 
 
+# ===================== ИНТЕРВАЛЫ ТО из книги знаний (Brain) с фоллбэком на хардкод =====================
+# Бот читает блок ```json SERVICE_INTERVALS``` из knowledge_base через read_doc, кэширует ~10 мин.
+# Docs флапает → ЛЮБАЯ ошибка чтения/парса = фоллбэк на хардкод (расчёт ТО НЕ должен падать).
+# Хардкод-дубли (_oil_interval / oil_interval_for) НЕ удалены — это и есть фоллбэк.
+_SVC_INTERVALS_CACHE = {"data": None, "ts": 0.0}
+_SVC_INTERVALS_TTL = 600   # 10 мин
+_SVC_INTERVALS_FALLBACK = {
+    "oil": {"scooter": 4000, "moto": 5000},
+    "gear": {"scooter": 4000, "moto": None},
+    "abs": 10000,
+    "airfilter": 20000,
+    "oilfilter": {"ref": 20000},
+    "scooter_keywords": ["nmax", "xmax", "adv", "forza", "pcx", "click"],
+    "moto_default": 5000,
+}
+
+
+def _parse_service_intervals_block(text):
+    """Достать JSON из блока ```…SERVICE_INTERVALS\\n{...}``` в knowledge_base. None если нет/кривой.
+    Захватываем ВСЁ между маркером и закрывающим ``` (вложенные {} — поэтому не \\{.*?\\})."""
+    m = _re_pl.search(r"SERVICE_INTERVALS[^\n]*\n(.*?)```", text or "", _re_pl.DOTALL)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(1).strip())
+        return d if isinstance(d, dict) and "oil" in d else None
+    except Exception:
+        return None
+
+
+def _load_service_intervals(bridge):
+    """dict интервалов: из книги знаний (кэш ~10 мин) ИЛИ фоллбэк-хардкод. НЕ кидает исключений."""
+    now = _time.time()
+    c = _SVC_INTERVALS_CACHE
+    if c["data"] is not None and now - c["ts"] < _SVC_INTERVALS_TTL:
+        return c["data"]
+    data = None
+    try:
+        r = bridge._call("read_doc", name="knowledge_base")
+        if r.get("ok"):
+            data = _parse_service_intervals_block(r.get("text", ""))
+            if data:
+                log.info("  → интервалы ТО: прочитаны из книги знаний")
+    except Exception:
+        log.warning("  → интервалы ТО: read_doc упал — фоллбэк на хардкод")
+    if not data:
+        data = _SVC_INTERVALS_FALLBACK
+    c["data"], c["ts"] = data, now
+    return data
+
+
+def _bike_class(bike_name, intervals):
+    """'scooter' / 'moto' по ключевым словам блока. XADV → moto (его интервал масла = мото)."""
+    n = str(bike_name).lower().replace("-", "").replace(" ", "")
+    if "xadv" in n:
+        return "moto"
+    kws = intervals.get("scooter_keywords") or _SVC_INTERVALS_FALLBACK["scooter_keywords"]
+    return "scooter" if any(k in n for k in kws) else "moto"
+
+
+def _service_interval(kind, bike_name, bridge):
+    """Интервал ТО (км) для типа kind (oil/gear/abs/airfilter) и байка. None = НЕ трекать
+    (напр. gear на мото/XADV). Источник — книга знаний с фоллбэком на хардкод."""
+    iv = _load_service_intervals(bridge)
+    spec = iv.get(kind)
+    if spec is None:
+        return None
+    if isinstance(spec, dict):                       # oil/gear: по типу байка
+        val = spec.get(_bike_class(bike_name, iv))
+        return int(val) if val else None
+    try:                                             # abs/airfilter: одно число на всех
+        return int(spec)
+    except (ValueError, TypeError):
+        return None
+
+
 def _run_service_tracker(bridge, chat_id, topic_id, bike, mileage):
     """service_upsert(current_km) → словарь статуса ТО. None если байк/число невалидны. НЕ шлёт сообщений."""
     if not bike:
@@ -1370,7 +1446,8 @@ def _run_service_tracker(bridge, chat_id, topic_id, bike, mileage):
     fleet_bike = bridge.find_bike(bike)
     oil_last = fleet_bike.get("oil_last_km") if fleet_bike else None
     name_l = str(fleet_bike.get("name", bike)).lower() if fleet_bike else str(bike).lower()
-    interval = _oil_interval(name_l)
+    # Интервал масла — из книги знаний (Фаза 2 ЧАСТЬ A), фоллбэк на хардкод _oil_interval при флапе Docs.
+    interval = _service_interval("oil", name_l, bridge) or _oil_interval(name_l)
     up = dict(bike=bike, topic_id=topic_id or "", current_km=km, interval_km=interval)
     if oil_last:
         up["last_service_km"] = oil_last
