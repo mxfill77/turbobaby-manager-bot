@@ -1475,8 +1475,12 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         return
 
     # Только ГРЯЗЬ (без повреждений) → мягко просим помыть/обработать. Пыма НЕ тегаем.
-    if vis.get("dirt"):
-        await _send(context, 
+    # Фикс C: в сервис-контексте (замена масла/ремонт/чек сервиса/идёт запись ТО фикса A)
+    # совет «помыть/воск/чехол» неуместен — байк чинят, а не моют → подавляем (грязь распознаём как есть).
+    _service_ctx = (oil_done or _is_oil_context(text, vis)
+                    or event_type == "repair" or vis.get("kind") == "receipt")
+    if vis.get("dirt") and not _service_ctx:
+        await _send(context,
             chat_id=chat_id,
             text=msg_dirty_care(bike),
             message_thread_id=topic_id,
