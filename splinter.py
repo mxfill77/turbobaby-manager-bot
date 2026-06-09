@@ -1483,6 +1483,43 @@ async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_
         await _send(context, chat_id=chat_id,
                     text=msg_mileage_ok(bike, info["km"], info["next_km"], info["km_left"]),
                     message_thread_id=topic_id)
+    # Фаза 2: на приходе пробега прогнать и НЕ-масляные ТО (gear/abs/возд.фильтр), по кому есть запись.
+    await _check_other_services(context, bridge, chat_id, topic_id, bike, info["km"])
+
+
+async def _check_other_services(context, bridge, chat_id, topic_id, bike, km):
+    """Фаза 2 (зеркало масла): на приходе пробега пересчитать НЕ-масляные ТО (gear/abs/airfilter),
+    по кому есть SERVICE-запись для этого байка; при просрочке — закрепить напоминание (stype-aware).
+    До первой фиксации J/K/L записей нет → ничего не делает. Масло обрабатывается своим флоу выше."""
+    try:
+        recs = bridge.service_list().get("items", [])
+    except Exception:
+        log.exception("  → ТО (доп.типы): не смог прочитать service_list")
+        return
+    try:
+        km_int = int(str(km).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return
+    for rec in recs:
+        kind = str(rec.get("service_type", ""))
+        if kind in ("", "oil") or not _same_bike(rec.get("bike"), bike):
+            continue
+        iv = _service_interval(kind, rec.get("bike") or bike, bridge)
+        if not iv:
+            continue
+        try:
+            res = bridge.service_upsert(bike=rec.get("bike") or bike, topic_id=topic_id or "",
+                                        service_type=kind, current_km=km_int, interval_km=iv)
+        except Exception:
+            log.exception(f"  → ТО {kind}: service_upsert на пробеге упал")
+            continue
+        if res.get("status") in ("due", "overdue"):
+            log.info(f"  → ТО {kind} {res.get('status')}: next_km={res.get('next_km')} → напоминание")
+            try:
+                await _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike,
+                                            km_int, res.get("next_km"), res.get("status"), stype=kind)
+            except Exception:
+                log.exception(f"  → ТО {kind}: ошибка напоминания")
 
 
 async def _close_service_reminder(context, bridge, chat_id, topic_id, bike):
@@ -1620,6 +1657,19 @@ async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km)
                     text=(f"🐀 Splinter\n"
                           f"🇹🇭 ✅ บันทึก «{th_lbl}» แล้ว: {res.get('bike_name', bike)} → {km_int} กม.\n"
                           f"🇷🇺 ✅ Записано «{ru_lbl}»: {res.get('bike_name', bike)} → {km_int} км"))
+        # Фаза 2: трекинг срока этого ТО (зеркало масла). service_upsert сбрасывает цикл:
+        # last_service_km=km → next_km=km+интервал, статус ok. gear на мото/XADV (iv=None) — НЕ трекаем.
+        canon = res.get("bike_name", bike)
+        iv = _service_interval(kind, canon, bridge)
+        if iv:
+            try:
+                up = bridge.service_upsert(bike=canon, topic_id=topic_id or "", service_type=kind,
+                                           current_km=km_int, last_service_km=km_int, interval_km=iv)
+                log.info(f"  → ТО {kind} трекинг: service_upsert(interval={iv}) → next_km={up.get('next_km')} status={up.get('status')}")
+            except Exception:
+                log.exception(f"  → ТО {kind}: service_upsert при фиксации упал (столбец записан)")
+        else:
+            log.info(f"  → ТО {kind}: не трекаем (нет интервала по типу байка — напр. gear на мото)")
     else:
         err = res.get("error", "")
         if err == "km_decreasing":
