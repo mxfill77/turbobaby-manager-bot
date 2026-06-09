@@ -1069,11 +1069,13 @@ def msg_mileage_drop(bike, new_km, last_km):
     )
 
 
-async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage):
+async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_done=False):
     """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting.
     Фикс B (сторож пробега): если распознанное число МЕНЬШЕ последнего известного по теме —
     это ошибка vision (одометр не убывает). Тогда вместо «верно?» шлём флаг и НЕ пишем в ТО
-    до корректной цифры; floor в pending не даёт «да» подтвердить заведомо неверное число."""
+    до корректной цифры; floor в pending не даёт «да» подтвердить заведомо неверное число.
+    oil_done (фикс A): контекст «масло заменили» — после подтверждения пробега не сверяем на
+    просрочку, а предлагаем записать новое ТО Oil (через handle_mileage_confirm → _ask_oil_write)."""
     floor = None
     try:
         new_km = int(str(mileage).replace(" ", "").replace(",", ""))
@@ -1084,7 +1086,7 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage):
         if prev and new_km < prev[0]:
             floor = prev[0]
 
-    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor)
+    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor, bool(oil_done))
     mark_awaiting(chat_id, topic_id)
 
     if floor is not None:
@@ -1114,6 +1116,7 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
         return False
     mileage, bike = pend[0], pend[1]
     floor = pend[2] if len(pend) > 2 else None   # фикс B: пол пробега (флаг-режим)
+    oil_done = pend[3] if len(pend) > 3 else False   # фикс A: контекст «масло заменили»
     t = (text or "").strip().lower()
     m = _re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", ""))
     if t in _CONFIRM_YES:
@@ -1144,10 +1147,178 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
             pass
     _PENDING_MILEAGE.pop(key, None)
     clear_awaiting(*key)
+    # Фикс A: пробег подтверждён И прошёл сторож B. Если контекст «масло заменили» —
+    # не сверяем на просрочку, а предлагаем записать новое ТО Oil. Иначе обычная сверка.
+    if oil_done:
+        await _ask_oil_write(context, msg.chat_id, key[1], bike, num)
+        return True
     try:
         await _check_service(context, bridge, msg.chat_id, key[1], bike, num)
     except Exception:
         log.exception("  → ошибка ТО-трекера (подтверждение пробега)")
+    return True
+
+
+# === Фикс A: запись нового ТО Oil в Лист1 после подтверждённой замены масла ===
+# Срабатывает после сторожа B (пробег уже подтверждён и не упал). Спрашивает «записать ТО Oil?»,
+# по «да» пишет ГОЛЫЙ номер байка в Лист1 кол.I через set_fleet_oil(confirmed=True) — КРАСНАЯ зона.
+_PENDING_OIL_WRITE = {}     # (chat_id, topic_id) -> (bike:str, km:str, ts:float)
+_OIL_WRITE_TTL = 30 * 60    # 30 мин — окно ожидания «да» от доверенного (Пым/владелец)
+
+# Кубатуры моторов — НЕ номер байка (зеркало plateFromName_ в ReadFleet.js).
+_CC_PLATE = {"125", "150", "155", "300", "350", "400", "500", "650", "700", "750", "900"}
+
+
+def _plate_from_name(text):
+    """Голый номер байка из названия: последнее число ≥3 цифр, кроме кубатуры. Иначе None.
+    Зеркало plateFromName_ (ReadFleet.js) — set_fleet_oil резолвит строку Лист1 именно по нему."""
+    nums = [n for n in _re_pl.findall(r"\d{3,}", str(text or "").lower()) if n not in _CC_PLATE]
+    return nums[-1] if nums else None
+
+
+def pending_oil_write_for(chat_id, topic_id):
+    """Открыт ли вопрос «записать ТО Oil?» по теме (для перехвата в bot.py).
+    Протух (> TTL) → снимаем pending, чтобы не висел вечно, и возвращаем None."""
+    key = (chat_id, topic_id)
+    pend = _PENDING_OIL_WRITE.get(key)
+    if not pend:
+        return None
+    ts = pend[2] if len(pend) > 2 else 0
+    if _time.time() - ts > _OIL_WRITE_TTL:
+        _PENDING_OIL_WRITE.pop(key, None)
+        clear_awaiting(*key)
+        return None
+    return pend
+
+
+def msg_oil_write_ask(bike, km):
+    """Вопрос «масло заменили? записать новое ТО Oil = X?» (двуязычно RU/TH)."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" на {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 🔧 เปลี่ยนน้ำมันเครื่อง{b_th} แล้วใช่ไหมครับ? บันทึก «ТО Oil» ใหม่ = {km} กม. ไหม? ตอบ «ใช่» หรือ «ไม่»\n"
+        f"🇷🇺 🔧 Масло заменили{b_ru}? Записать новое ТО Oil = {km} км? Ответь «да» или «нет»"
+    )
+
+
+def msg_oil_need_trusted(bike, km):
+    """«Да» пришло от недоверенного (техник) → запись в журнал подтверждает Пым/владелец."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" на {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 🔧 การบันทึก «ТО Oil» ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้น. "
+        f"@Pleummmm ยืนยันการเปลี่ยนน้ำมัน{b_th} = {km} กม. ไหมครับ? ตอบ «ใช่» หรือ «ไม่»\n"
+        f"🇷🇺 🔧 Запись ТО в журнал подтверждает @Pleummmm или владелец. "
+        f"@Pleummmm, подтвердите замену масла{b_ru} = {km} км? да/нет"
+    )
+
+
+async def _ask_oil_write(context, chat_id, topic_id, bike, km):
+    """Поставить pending записи ТО Oil + спросить подтверждение (фикс A)."""
+    _PENDING_OIL_WRITE[(chat_id, topic_id)] = (bike or "", str(km), _time.time())
+    mark_awaiting(chat_id, topic_id)
+    await _send(context, chat_id=chat_id, text=msg_oil_write_ask(bike, km),
+                message_thread_id=topic_id)
+
+
+async def _close_service_reminder(context, bridge, chat_id, topic_id, bike):
+    """После записи ТО — снять закреплённое напоминание о просрочке (best-effort):
+    открепляем pinned сообщение из ТО-трекера + закрываем открытые «важное» по этой теме."""
+    try:
+        rec = next((r for r in bridge.service_list().get("items", [])
+                    if str(r.get("bike")).strip() == str(bike).strip()), {})
+        pin = rec.get("pinned_msg_id")
+        if pin:
+            try:
+                await context.bot.unpin_chat_message(chat_id=chat_id, message_id=int(pin))
+            except Exception as e:
+                log.warning(f"  → ТО: не смог открепить напоминание: {e}")
+    except Exception:
+        log.exception("  → ТО: ошибка снятия pinned напоминания")
+    try:
+        for it in bridge.important_list(status="open").get("items", []):
+            if topic_id is not None and str(it.get("topic_id")) == str(topic_id):
+                bridge.important_close(row=it.get("_row"), confirmed_by="Splinter (ТО Oil закрыто)")
+    except Exception:
+        log.exception("  → ТО: ошибка закрытия important")
+
+
+async def handle_oil_write_confirm(msg, context, bridge, text) -> bool:
+    """Перехват ответа на «записать ТО Oil?». True если обработал (да/нет). Иначе False.
+    «да» → set_fleet_oil(plate, km, confirmed=True) в Лист1 кол.I (КРАСНАЯ зона). «нет» → обычный замер."""
+    key = (msg.chat_id, getattr(msg, "message_thread_id", None))
+    pend = _PENDING_OIL_WRITE.get(key)
+    if not pend:
+        return False
+    bike, km = pend[0], pend[1]
+    t = (text or "").strip().lower()
+
+    if t in _CONFIRM_NO:
+        _PENDING_OIL_WRITE.pop(key, None)
+        clear_awaiting(*key)
+        # «нет, не заменили» от любого → трактуем как обычный контрольный замер (сверка/просрочка).
+        try:
+            await _check_service(context, bridge, msg.chat_id, key[1], bike, km)
+        except Exception:
+            log.exception("  → ошибка ТО-трекера (oil_write=нет)")
+        return True
+    if t not in _CONFIRM_YES:
+        return False   # не да/нет — отдаём обычному пути
+
+    # «да». Боевую запись в Лист1 авторизует ТОЛЬКО доверенный (Пым/владелец). «Да» от техника
+    # (Earth и пр.) НЕ пишет — просим подтверждение у Пыма, pending держим открытым (TTL).
+    if not _is_trusted(msg):
+        # обновляем ts → Пыму даём полное окно TTL с момента запроса.
+        _PENDING_OIL_WRITE[key] = (bike, str(km), _time.time())
+        mark_awaiting(*key)
+        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+                    text=msg_oil_need_trusted(bike, km))
+        return True
+
+    # Доверенный подтвердил → боевая запись. Резолвим ГОЛЫЙ номер (иначе set_fleet_oil вернёт not_found).
+    _PENDING_OIL_WRITE.pop(key, None)
+    clear_awaiting(*key)
+    plate = _plate_from_name(bike)
+    if not plate:
+        fb = bridge.find_bike(bike) or {}
+        plate = _plate_from_name(fb.get("name", ""))
+    if not plate:
+        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+                    text=("🐀 Splinter\n"
+                          "🇹🇭 ขอโทษครับ ไม่พบเลขทะเบียนรถ — บอกชื่อรุ่น+เลขให้หน่อยครับ 🙏\n"
+                          "🇷🇺 Не смог определить номер байка для записи ТО — уточни модель+номер 🙏"))
+        return True
+    try:
+        km_int = int(str(km).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return True
+
+    res = bridge.set_fleet_oil(number=plate, oil_km=km_int, confirmed=True)
+    log.info(f"  → ТО Oil set_fleet_oil({plate},{km_int},confirmed=True) → {res}")
+    if res.get("ok"):
+        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+                    text=(f"🐀 Splinter\n"
+                          f"🇹🇭 ✅ อัปเดต «ТО Oil» แล้ว: {res.get('bike_name', bike)} → {km_int} กม. ปิดเตือนเกินกำหนดแล้วครับ\n"
+                          f"🇷🇺 ✅ ТО Oil обновлено: {res.get('bike_name', bike)} → {km_int} км, просрочка закрыта"))
+        await _close_service_reminder(context, bridge, msg.chat_id, key[1], bike)
+    else:
+        err = res.get("error", "")
+        if err == "oil_decreasing":
+            detail_ru = f"новое {km_int} меньше прошлого ТО {res.get('old_oil')} — не записал, проверь число"
+            detail_th = f"ค่าใหม่ {km_int} น้อยกว่าครั้งก่อน {res.get('old_oil')} — ไม่บันทึก"
+        elif err == "ambiguous":
+            detail_ru = f"несколько байков с номером {plate} — уточни какой"
+            detail_th = f"มีรถหลายคันเลข {plate} — ระบุให้ชัด"
+        elif err == "not_found":
+            detail_ru = f"не нашёл байк с номером {plate} в Лист1"
+            detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
+        else:
+            detail_ru = f"не удалось записать ({err or 'ошибка'})"
+            detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
+        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+                    text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
     return True
 
 
@@ -1261,16 +1432,24 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
 
     # === ТО-трекер ===
     _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
+    # Фикс A: «масло заменили» (слова про масло) + есть распознанный пробег → это закрытие ТО,
+    # а не контрольный замер. После подтверждения пробега предложим записать новое ТО Oil.
+    oil_done = _is_oil_context(text, vis) and bool(mileage)
     if vis.get("mileage") and not parsed.get("mileage") and _conf_ok:
         # Пробег с ФОТО приборки → СНАЧАЛА подтверждаем цифру у человека (vision врёт на LCD),
-        # _check_service вызовется после «да»/правки в handle_mileage_confirm (фикс B).
-        await _ask_mileage_confirm(context, chat_id, topic_id, bike, str(vis.get("mileage")))
+        # затем фикс B (сторож) и, если oil_done, фикс A (запись ТО) — в handle_mileage_confirm.
+        await _ask_mileage_confirm(context, chat_id, topic_id, bike,
+                                   str(vis.get("mileage")), oil_done=oil_done)
     elif mileage and _conf_ok:
-        # Пробег из ТЕКСТА (человек ввёл руками) — доверяем, сверяем сразу.
-        try:
-            await _check_service(context, bridge, chat_id, topic_id, bike, mileage)
-        except Exception:
-            log.exception("  → ошибка ТО-трекера")
+        # Пробег из ТЕКСТА (человек ввёл руками) — доверяем числу.
+        if oil_done:
+            # «заменил масло, пробег X» → сразу предлагаем записать ТО Oil (фикс A).
+            await _ask_oil_write(context, chat_id, topic_id, bike, mileage)
+        else:
+            try:
+                await _check_service(context, bridge, chat_id, topic_id, bike, mileage)
+            except Exception:
+                log.exception("  → ошибка ТО-трекера")
 
     # Реальное ПОВРЕЖДЕНИЕ → зовём Пыма (это к осмотру / возможным вычетам).
     # Грязь сюда НЕ попадает — она отсекается на уровне vision (damage=null, dirt=true).

@@ -607,6 +607,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if splinter.GROUPS.get(chat_id) == "servicing" and splinter.pending_mileage_for(chat_id, _tid_sv):
             if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
                 return
+        # Фикс A: перехват ответа «да/нет» на «записать новое ТО Oil?» — только при открытом pending.
+        if splinter.GROUPS.get(chat_id) == "servicing" and splinter.pending_oil_write_for(chat_id, _tid_sv):
+            if await splinter.handle_oil_write_confirm(msg, context, bridge, msg.text):
+                return
         # Владелец обращается к Splinter напрямую (тег/ответ/ждём ответа) → диалог-мозг
         if _owner_addresses_bot(msg, context):
             wallet = splinter.group_label(chat_id)
