@@ -201,6 +201,12 @@ async def on_audit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("  🔎 АУДИТ: находка отклонена Филиппом")
 
 
+async def on_service_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки [После замены]/[Просто пробег] по фото пробега → splinter.handle_service_button.
+    [После замены] пишет ТО Oil в Лист1 ТОЛЬКО доверенным (Пым/владелец)."""
+    await splinter.handle_service_button(update, context, bridge)
+
+
 # === HANDLERS ===
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -607,10 +613,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if splinter.GROUPS.get(chat_id) == "servicing" and splinter.pending_mileage_for(chat_id, _tid_sv):
             if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
                 return
-        # Фикс A: перехват ответа «да/нет» на «записать новое ТО Oil?» — только при открытом pending.
-        if splinter.GROUPS.get(chat_id) == "servicing" and splinter.pending_oil_write_for(chat_id, _tid_sv):
-            if await splinter.handle_oil_write_confirm(msg, context, bridge, msg.text):
-                return
+        # (Вопрос «после замены / просто пробег?» теперь на кнопках → on_service_button, не текстом.)
         # Владелец обращается к Splinter напрямую (тег/ответ/ждём ответа) → диалог-мозг
         if _owner_addresses_bot(msg, context):
             wallet = splinter.group_label(chat_id)
@@ -1107,6 +1110,7 @@ def main():
 
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
     app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))
+    app.add_handler(CallbackQueryHandler(on_service_button, pattern=r"^svc:"))
 
     # Сервис-события форума (создание/переименование темы) → привязка тема→байк
     app.add_handler(MessageHandler(

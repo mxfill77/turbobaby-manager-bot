@@ -16,6 +16,7 @@
 
 import json
 import logging
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 log = logging.getLogger("splinter")
 
@@ -820,41 +821,19 @@ def _is_oil_context(text, vis):
     return any(kw in blob for kw in _OIL_KEYWORDS)
 
 
-# Фикс A2: слова «замена ВЫПОЛНЕНА» (прошедшее время/факт) — НЕ будущее «надо заменить».
-# Маркер взводит окно ожидания фиксации замены по теме (см. _OIL_MARKER).
+# Слова «замена ВЫПОЛНЕНА» (прошедшее время/факт) — НЕ будущее «надо заменить».
+# Используется ТОЛЬКО как ПОДСКАЗКА (oil_hint) «стоит спросить про замену», не как решение.
+# Решение всегда — явный вопрос человеку (кнопки [После замены]/[Просто пробег]).
 _OIL_DONE_WORDS = ("заменил", "заменен", "заменён", "заменены", "заменено", "замена",
                    "поменял", "поменян", "готов", "сделал", "сделан",
                    "เปลี่ยนแล้ว", "แล้ว", "เสร็จ")
-_OIL_MARKER = {}            # (chat_id, topic_id) -> ts последнего маркера замены
-_OIL_MARKER_TTL = 15 * 60   # 15 мин — окно собрать маркер + фото-с-пробегом из разных сообщений
 
 
 def _is_oil_done_marker(text, vis):
-    """True если в тексте/подписи — МАРКЕР выполненной замены масла: масло-контекст И слово
-    прошедшего времени/факта (заменили/заменено/поменяли/готово/сделано/เปลี่ยนแล้ว/เสร็จ).
-    Будущее «надо заменить масло» НЕ ловится (нет done-слова: 'заменить'∌'заменил')."""
+    """Подсказка: в тексте/подписи — маркер выполненной замены масла (масло-контекст И слово
+    прошедшего времени). Не решает само — лишь повод задать вопрос «после замены или просто пробег?»."""
     blob = ((text or "") + " " + str((vis or {}).get("notes", ""))).lower()
     return _is_oil_context(text, vis) and any(w in blob for w in _OIL_DONE_WORDS)
-
-
-def _arm_oil_marker(chat_id, topic_id):
-    _OIL_MARKER[(chat_id, topic_id)] = _time.time()
-
-
-def _oil_marker_active(chat_id, topic_id):
-    """Активно ли окно ожидания фиксации замены (не протухло). Протухшее — снимаем."""
-    key = (chat_id, topic_id)
-    ts = _OIL_MARKER.get(key)
-    if ts is None:
-        return False
-    if _time.time() - ts > _OIL_MARKER_TTL:
-        _OIL_MARKER.pop(key, None)
-        return False
-    return True
-
-
-def _clear_oil_marker(chat_id, topic_id):
-    _OIL_MARKER.pop((chat_id, topic_id), None)
 
 
 def _should_ask_odometer(chat_id, topic_id):
@@ -1079,8 +1058,8 @@ async def _handle_money(msg, context, bridge, claude):
             )
 
 
-# === Фикс B: подтверждение пробега с ФОТО приборки перед сверкой ТО ===
-# vision врёт на LCD → распознанную цифру подтверждаем у человека, потом _check_service.
+# === Фикс B: подтверждение пробега с ФОТО приборки перед решением по ТО ===
+# vision врёт на LCD → распознанную цифру подтверждаем у человека, потом _after_mileage.
 _PENDING_MILEAGE = {}   # (chat_id, topic_id) -> (mileage:str, bike:str)
 _CONFIRM_YES = {"да", "ага", "верно", "ок", "окей", "yes", "ใช่", "ถูก", "ถูกต้อง", "ถูกต้องครับ"}
 _CONFIRM_NO = {"нет", "не", "no", "ไม่", "ไม่ใช่"}
@@ -1106,13 +1085,13 @@ def msg_mileage_drop(bike, new_km, last_km):
     )
 
 
-async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_done=False):
+async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hint=False):
     """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting.
     Фикс B (сторож пробега): если распознанное число МЕНЬШЕ последнего известного по теме —
     это ошибка vision (одометр не убывает). Тогда вместо «верно?» шлём флаг и НЕ пишем в ТО
     до корректной цифры; floor в pending не даёт «да» подтвердить заведомо неверное число.
-    oil_done (фикс A): контекст «масло заменили» — после подтверждения пробега не сверяем на
-    просрочку, а предлагаем записать новое ТО Oil (через handle_mileage_confirm → _ask_oil_write)."""
+    oil_hint: подсказка «в сообщении был маркер замены» — пробросится в _after_mileage, чтобы
+    задать вопрос «после замены или просто пробег?» даже если ТО формально ещё не подошло."""
     floor = None
     try:
         new_km = int(str(mileage).replace(" ", "").replace(",", ""))
@@ -1123,7 +1102,7 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_do
         if prev and new_km < prev[0]:
             floor = prev[0]
 
-    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor, bool(oil_done))
+    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor, bool(oil_hint))
     mark_awaiting(chat_id, topic_id)
 
     if floor is not None:
@@ -1153,7 +1132,7 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
         return False
     mileage, bike = pend[0], pend[1]
     floor = pend[2] if len(pend) > 2 else None   # фикс B: пол пробега (флаг-режим)
-    oil_done = pend[3] if len(pend) > 3 else False   # фикс A: контекст «масло заменили»
+    oil_hint = pend[3] if len(pend) > 3 else False   # подсказка «был маркер замены»
     t = (text or "").strip().lower()
     m = _re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", ""))
     if t in _CONFIRM_YES:
@@ -1184,23 +1163,18 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
             pass
     _PENDING_MILEAGE.pop(key, None)
     clear_awaiting(*key)
-    # Фикс A: пробег подтверждён И прошёл сторож B. Если контекст «масло заменили» —
-    # не сверяем на просрочку, а предлагаем записать новое ТО Oil. Иначе обычная сверка.
-    if oil_done:
-        await _ask_oil_write(context, msg.chat_id, key[1], bike, num)
-        return True
+    # Пробег подтверждён И прошёл сторож B → решаем: спросить «после замены?» или просто квитанция.
     try:
-        await _check_service(context, bridge, msg.chat_id, key[1], bike, num)
+        await _after_mileage(context, bridge, msg.chat_id, key[1], bike, num, oil_hint)
     except Exception:
         log.exception("  → ошибка ТО-трекера (подтверждение пробега)")
     return True
 
 
-# === Фикс A: запись нового ТО Oil в Лист1 после подтверждённой замены масла ===
-# Срабатывает после сторожа B (пробег уже подтверждён и не упал). Спрашивает «записать ТО Oil?»,
-# по «да» пишет ГОЛЫЙ номер байка в Лист1 кол.I через set_fleet_oil(confirmed=True) — КРАСНАЯ зона.
-_PENDING_OIL_WRITE = {}     # (chat_id, topic_id) -> (bike:str, km:str, ts:float)
-_OIL_WRITE_TTL = 30 * 60    # 30 мин — окно ожидания «да» от доверенного (Пым/владелец)
+# === Фиксация замены масла: ЯВНЫЙ ВОПРОС кнопками (без угадывания маркер/TTL/окно) ===
+# После подтверждения пробега, если замена осмысленна (ТО due/overdue или была подсказка-маркер),
+# бот спрашивает кнопками: [После замены] / [Просто пробег]. [После замены] от ДОВЕРЕННОГО →
+# set_fleet_oil(confirmed=True) в Лист1 кол.I (КРАСНАЯ зона). [Просто пробег] → квитанция/закреп, в кол.I НЕ пишем.
 
 # Кубатуры моторов — НЕ номер байка (зеркало plateFromName_ в ReadFleet.js).
 _CC_PLATE = {"125", "150", "155", "300", "350", "400", "500", "650", "700", "750", "900"}
@@ -1222,29 +1196,33 @@ def _same_bike(a, b):
     return str(a).strip() == str(b).strip()
 
 
-def pending_oil_write_for(chat_id, topic_id):
-    """Открыт ли вопрос «записать ТО Oil?» по теме (для перехвата в bot.py).
-    Протух (> TTL) → снимаем pending, чтобы не висел вечно, и возвращаем None."""
-    key = (chat_id, topic_id)
-    pend = _PENDING_OIL_WRITE.get(key)
-    if not pend:
-        return None
-    ts = pend[2] if len(pend) > 2 else 0
-    if _time.time() - ts > _OIL_WRITE_TTL:
-        _PENDING_OIL_WRITE.pop(key, None)
-        clear_awaiting(*key)
-        return None
-    return pend
+def _is_trusted_user(u):
+    """Доверенный ли автор (для callback-кнопок): Пым/владелец. u = telegram User."""
+    return bool(u and u.username and u.username.lower() in TRUSTED_AUTHORS)
 
 
-def msg_oil_write_ask(bike, km):
-    """Вопрос «масло заменили? записать новое ТО Oil = X?» (двуязычно RU/TH)."""
-    b_th = f" ({bike})" if bike else ""
-    b_ru = f" на {bike}" if bike else ""
+# Хранилище токенов вопроса «после замены/просто пробег» (callback_data ≤64б → короткий int-токен).
+_SVC_TOKENS = {}   # token(int) -> {chat,topic,bike,km,status,next_km,km_left}
+_SVC_SEQ = [0]
+
+
+def _svc_put(data):
+    _SVC_SEQ[0] += 1
+    tok = _SVC_SEQ[0]
+    _SVC_TOKENS[tok] = data
+    if len(_SVC_TOKENS) > 200:                       # держим последние 200
+        for k in sorted(_SVC_TOKENS)[:-200]:
+            _SVC_TOKENS.pop(k, None)
+    return tok
+
+
+def msg_oil_or_km(bike, km):
+    """Вопрос с двумя вариантами: фото ПОСЛЕ замены масла или просто текущий пробег (RU/TH)."""
+    b = f" · 📌 {bike}" if bike else ""
     return (
-        f"🐀 Splinter\n"
-        f"🇹🇭 🔧 เปลี่ยนน้ำมันเครื่อง{b_th} แล้วใช่ไหมครับ? บันทึก «ТО Oil» ใหม่ = {km} กม. ไหม? ตอบ «ใช่» หรือ «ไม่»\n"
-        f"🇷🇺 🔧 Масло заменили{b_ru}? Записать новое ТО Oil = {km} км? Ответь «да» или «нет»"
+        f"🐀 Splinter{b}\n"
+        f"🇹🇭 📟 {km} กม. — รูปนี้ถ่าย «หลังเปลี่ยนน้ำมัน» หรือ «แค่เลขไมล์ปัจจุบัน» ครับ? กดปุ่มด้านล่าง 👇\n"
+        f"🇷🇺 📟 {km} км — это фото ПОСЛЕ замены масла или просто текущий пробег? Нажми кнопку 👇"
     )
 
 
@@ -1261,12 +1239,52 @@ def msg_oil_need_trusted(bike, km):
     )
 
 
-async def _ask_oil_write(context, chat_id, topic_id, bike, km):
-    """Поставить pending записи ТО Oil + спросить подтверждение (фикс A)."""
-    _PENDING_OIL_WRITE[(chat_id, topic_id)] = (bike or "", str(km), _time.time())
-    mark_awaiting(chat_id, topic_id)
-    await _send(context, chat_id=chat_id, text=msg_oil_write_ask(bike, km),
-                message_thread_id=topic_id)
+def _run_service_tracker(bridge, chat_id, topic_id, bike, mileage):
+    """service_upsert(current_km) → словарь статуса ТО. None если байк/число невалидны. НЕ шлёт сообщений."""
+    if not bike:
+        return None
+    try:
+        km = int(str(mileage).replace(" ", ""))
+    except (ValueError, TypeError):
+        return None
+    fleet_bike = bridge.find_bike(bike)
+    oil_last = fleet_bike.get("oil_last_km") if fleet_bike else None
+    name_l = str(fleet_bike.get("name", bike)).lower() if fleet_bike else str(bike).lower()
+    interval = _oil_interval(name_l)
+    up = dict(bike=bike, topic_id=topic_id or "", current_km=km, interval_km=interval)
+    if oil_last:
+        up["last_service_km"] = oil_last
+    res = bridge.service_upsert(**up)
+    log.info(f"  → ТО {bike}: oil_last(I)={oil_last} interval={interval} → {res}")
+    return {"km": km, "status": res.get("status"), "next_km": res.get("next_km"),
+            "km_left": res.get("km_left"), "stype": res.get("service_type", "oil")}
+
+
+async def _ask_oil_or_km(context, chat_id, topic_id, bike, km, status, next_km, km_left):
+    """Задать вопрос кнопками [После замены]/[Просто пробег] (фиксация через явный ответ)."""
+    tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike or "", "km": str(km),
+                    "status": status, "next_km": next_km, "km_left": km_left})
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔧 После замены / หลังเปลี่ยน", callback_data=f"svc:oil:{tok}"),
+        InlineKeyboardButton("📟 Просто пробег / แค่เลขไมล์", callback_data=f"svc:km:{tok}"),
+    ]])
+    await context.bot.send_message(chat_id=chat_id, text=msg_oil_or_km(bike, km),
+                                   message_thread_id=topic_id, reply_markup=kb)
+
+
+async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint=False):
+    """Пробег подтверждён (прошёл сторож B). Прогоняем ТО-трекер; если замена осмысленна
+    (ТО due/overdue ИЛИ была подсказка-маркер) — спрашиваем кнопками. Иначе — квитанция «пробег принят»."""
+    info = _run_service_tracker(bridge, chat_id, topic_id, bike, mileage)
+    if not info:
+        return
+    if info["status"] in ("due", "overdue") or oil_hint:
+        await _ask_oil_or_km(context, chat_id, topic_id, bike, info["km"],
+                             info["status"], info["next_km"], info["km_left"])
+    else:
+        await _send(context, chat_id=chat_id,
+                    text=msg_mileage_ok(bike, info["km"], info["next_km"], info["km_left"]),
+                    message_thread_id=topic_id)
 
 
 async def _close_service_reminder(context, bridge, chat_id, topic_id, bike):
@@ -1291,66 +1309,32 @@ async def _close_service_reminder(context, bridge, chat_id, topic_id, bike):
         log.exception("  → ТО: ошибка закрытия important")
 
 
-async def handle_oil_write_confirm(msg, context, bridge, text) -> bool:
-    """Перехват ответа на «записать ТО Oil?». True если обработал (да/нет). Иначе False.
-    «да» → set_fleet_oil(plate, km, confirmed=True) в Лист1 кол.I (КРАСНАЯ зона). «нет» → обычный замер."""
-    key = (msg.chat_id, getattr(msg, "message_thread_id", None))
-    pend = _PENDING_OIL_WRITE.get(key)
-    if not pend:
-        return False
-    bike, km = pend[0], pend[1]
-    t = (text or "").strip().lower()
-
-    if t in _CONFIRM_NO:
-        _PENDING_OIL_WRITE.pop(key, None)
-        _clear_oil_marker(*key)   # фикс A2: окно ожидания фиксации закрыто
-        clear_awaiting(*key)
-        # «нет, не заменили» от любого → трактуем как обычный контрольный замер (сверка/просрочка).
-        try:
-            await _check_service(context, bridge, msg.chat_id, key[1], bike, km)
-        except Exception:
-            log.exception("  → ошибка ТО-трекера (oil_write=нет)")
-        return True
-    if t not in _CONFIRM_YES:
-        return False   # не да/нет — отдаём обычному пути
-
-    # «да». Боевую запись в Лист1 авторизует ТОЛЬКО доверенный (Пым/владелец). «Да» от техника
-    # (Earth и пр.) НЕ пишет — просим подтверждение у Пыма, pending держим открытым (TTL).
-    if not _is_trusted(msg):
-        # обновляем ts → Пыму даём полное окно TTL с момента запроса.
-        _PENDING_OIL_WRITE[key] = (bike, str(km), _time.time())
-        mark_awaiting(*key)
-        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
-                    text=msg_oil_need_trusted(bike, km))
-        return True
-
-    # Доверенный подтвердил → боевая запись. Резолвим ГОЛЫЙ номер (иначе set_fleet_oil вернёт not_found).
-    _PENDING_OIL_WRITE.pop(key, None)
-    clear_awaiting(*key)
+async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
+    """Боевая запись ТО Oil в Лист1 кол.I (set_fleet_oil confirmed=True) + снять закреп + отчёт.
+    Вызывается ТОЛЬКО после [После замены] от доверенного. Резолвит ГОЛЫЙ номер байка."""
     plate = _plate_from_name(bike)
     if not plate:
         fb = bridge.find_bike(bike) or {}
         plate = _plate_from_name(fb.get("name", ""))
     if not plate:
-        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                     text=("🐀 Splinter\n"
                           "🇹🇭 ขอโทษครับ ไม่พบเลขทะเบียนรถ — บอกชื่อรุ่น+เลขให้หน่อยครับ 🙏\n"
                           "🇷🇺 Не смог определить номер байка для записи ТО — уточни модель+номер 🙏"))
-        return True
+        return
     try:
         km_int = int(str(km).replace(" ", "").replace(",", ""))
     except (ValueError, TypeError):
-        return True
+        return
 
     res = bridge.set_fleet_oil(number=plate, oil_km=km_int, confirmed=True)
     log.info(f"  → ТО Oil set_fleet_oil({plate},{km_int},confirmed=True) → {res}")
     if res.get("ok"):
-        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                     text=(f"🐀 Splinter\n"
                           f"🇹🇭 ✅ อัปเดต «ТО Oil» แล้ว: {res.get('bike_name', bike)} → {km_int} กม. ปิดเตือนเกินกำหนดแล้วครับ\n"
                           f"🇷🇺 ✅ ТО Oil обновлено: {res.get('bike_name', bike)} → {km_int} км, просрочка закрыта"))
-        _clear_oil_marker(*key)   # фикс A2: замена зафиксирована — окно закрыто
-        await _close_service_reminder(context, bridge, msg.chat_id, key[1], bike)
+        await _close_service_reminder(context, bridge, chat_id, topic_id, bike)
     else:
         err = res.get("error", "")
         if err == "oil_decreasing":
@@ -1365,9 +1349,99 @@ async def handle_oil_write_confirm(msg, context, bridge, text) -> bool:
         else:
             detail_ru = f"не удалось записать ({err or 'ошибка'})"
             detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
-        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                     text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
-    return True
+
+
+async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, next_km, status, stype="oil"):
+    """Закрепить/обновить напоминание о просрочке ТО (раз в 5 дней). Без записи в кол.I.
+    Матчит строку ТО по НОМЕРУ; pin сохраняет КАНОНИЧНЫМ именем (как serviceUpsert)."""
+    lst = bridge.service_list().get("items", [])
+    rec = next((r for r in lst if _same_bike(r.get("bike"), bike) and str(r.get("service_type")) == stype), {})
+    pinned = rec.get("pinned_msg_id")
+    last_reminded = rec.get("last_reminded_at")
+    now = _time.time()
+    need_remind = True
+    if last_reminded:
+        try:
+            need_remind = (now - float(last_reminded)) >= 5 * 24 * 3600
+        except (ValueError, TypeError):
+            need_remind = True
+    if pinned and not need_remind:
+        return
+    canon = rec.get("bike") or bike
+    text = msg_service_due(bike, stype, km, next_km, status)
+    try:
+        sent = await context.bot.send_message(chat_id=chat_id, text=text, message_thread_id=topic_id)
+        try:
+            await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=False)
+        except Exception as e:
+            log.warning(f"  → не смог закрепить (нужны права админа боту?): {e}")
+        bridge.service_set_pin(bike=canon, service_type=stype,
+                               pinned_msg_id=sent.message_id, last_reminded_at=str(now))
+        log.info(f"  → ТО напоминание закреплено: {bike} {stype} {status}")
+    except Exception:
+        log.exception("  → ошибка отправки/закрепа ТО")
+
+
+async def handle_service_button(update, context, bridge) -> None:
+    """Обработка кнопок [После замены]/[Просто пробег] (CallbackQueryHandler '^svc:' в bot.py).
+    [После замены] — запись в Лист1 ТОЛЬКО доверенным (Пым/владелец); техник → просим Пыма нажать.
+    [Просто пробег] — в кол.I НЕ пишем: due/overdue → закреп просрочки, иначе квитанция."""
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        _, action, tok = (q.data or "").split(":", 2)
+        token = int(tok)
+    except Exception:
+        await q.answer()
+        return
+    data = _SVC_TOKENS.get(token)
+    if not data:
+        await q.answer()
+        try:
+            await q.edit_message_text("⚠️ Кнопка устарела (перезапуск бота). Пришли фото пробега ещё раз 🙏")
+        except Exception:
+            pass
+        return
+    chat_id, topic_id = data["chat"], data["topic"]
+    bike, km = data["bike"], data["km"]
+
+    if action == "oil":
+        # [После замены] → боевая запись кол.I. ТОЛЬКО доверенный.
+        if not _is_trusted_user(q.from_user):
+            await q.answer("Подтверждает @Pleummmm или владелец", show_alert=False)
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=msg_oil_need_trusted(bike, km))
+            return   # токен и кнопки живут — Пым нажмёт [После замены] позже
+        await q.answer("Записываю ТО Oil…")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        await _write_oil(context, bridge, chat_id, topic_id, bike, km)
+    elif action == "km":
+        # [Просто пробег] → в кол.I НЕ пишем. due/overdue → закреп просрочки, иначе квитанция.
+        await q.answer("Принято — просто пробег")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        try:
+            km_int = int(str(km).replace(" ", ""))
+        except (ValueError, TypeError):
+            km_int = km
+        if data.get("status") in ("due", "overdue"):
+            await _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike,
+                                        km_int, data.get("next_km"), data.get("status"))
+        else:
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=msg_mileage_ok(bike, km_int, data.get("next_km"), data.get("km_left")))
+    else:
+        await q.answer()
 
 
 def _aggregate_album_vis(vis_list):
@@ -1480,28 +1554,20 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
 
     # === ТО-трекер ===
     _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
-    # Фикс A/A2: «масло ЗАМЕНИЛИ» (маркер прошедшего времени) + распознанный пробег → закрытие ТО.
-    # Маркер и фото-с-пробегом могут прийти РАЗНЫМИ сообщениями → маркер взводит окно по теме
-    # (TTL 15 мин); пока окно активно, следующее фото с пробегом тоже = oil_done.
-    if _is_oil_done_marker(text, vis):
-        _arm_oil_marker(chat_id, topic_id)
-    oil_done = bool(mileage) and (_is_oil_done_marker(text, vis)
-                                  or _oil_marker_active(chat_id, topic_id))
+    # Подсказка (НЕ решение): в сообщении маркер «масло заменили» → после подтверждения пробега
+    # зададим вопрос «после замены или просто пробег?» даже если ТО формально ещё не подошло.
+    oil_hint = _is_oil_done_marker(text, vis)
     if vis.get("mileage") and not parsed.get("mileage") and _conf_ok:
-        # Пробег с ФОТО приборки → СНАЧАЛА подтверждаем цифру у человека (vision врёт на LCD),
-        # затем фикс B (сторож) и, если oil_done, фикс A (запись ТО) — в handle_mileage_confirm.
+        # Пробег с ФОТО приборки → СНАЧАЛА подтверждаем цифру (vision врёт на LCD) + сторож B,
+        # затем _after_mileage решит: спросить кнопками или просто квитанция.
         await _ask_mileage_confirm(context, chat_id, topic_id, bike,
-                                   str(vis.get("mileage")), oil_done=oil_done)
+                                   str(vis.get("mileage")), oil_hint=oil_hint)
     elif mileage and _conf_ok:
-        # Пробег из ТЕКСТА (человек ввёл руками) — доверяем числу.
-        if oil_done:
-            # «заменил масло, пробег X» → сразу предлагаем записать ТО Oil (фикс A).
-            await _ask_oil_write(context, chat_id, topic_id, bike, mileage)
-        else:
-            try:
-                await _check_service(context, bridge, chat_id, topic_id, bike, mileage)
-            except Exception:
-                log.exception("  → ошибка ТО-трекера")
+        # Пробег из ТЕКСТА (человек ввёл руками) — доверяем числу, сразу решаем (спросить/квитанция).
+        try:
+            await _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint)
+        except Exception:
+            log.exception("  → ошибка ТО-трекера")
 
     # Реальное ПОВРЕЖДЕНИЕ → зовём Пыма (это к осмотру / возможным вычетам).
     # Грязь сюда НЕ попадает — она отсекается на уровне vision (damage=null, dirt=true).
@@ -1516,18 +1582,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         )
         return
 
-    # Контекст замены масла, но БЕЗ чёткого пробега в ЭТОМ сообщении.
+    # Масло-контекст, но БЕЗ чёткого пробега в ЭТОМ сообщении → САМ просим ЧЁТКОЕ фото одометра.
     # (damage уже отработан выше и сделал return — повреждение приоритетнее.)
-    no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
-    # Фикс A2 (симметрия): маркер «замена выполнена» пришёл БЕЗ пробега, но фото пробега уже было
-    # в теме раньше (high) → предлагаем записать ТО Oil сразу, не ждём нового фото.
-    if _is_oil_done_marker(text, vis) and no_clear_km:
-        prev = last_mileage_in_topic(chat_id, topic_id)
-        if prev and prev[1] == "high":
-            await _ask_oil_write(context, chat_id, topic_id, bike, str(prev[0]))
-            return
-    # Иначе — общий масло-контекст без чёткого пробега → САМ просим ЧЁТКОЕ фото одометра.
     # Ничего в ТО не пишем, число не выдумываем. Анти-спам: буфер high-пробега + троттлинг.
+    no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
     if _is_oil_context(text, vis) and no_clear_km and _should_ask_odometer(chat_id, topic_id):
         await _send(context,
             chat_id=chat_id, text=msg_ask_odometer(bike), message_thread_id=topic_id
@@ -1535,11 +1593,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         return
 
     # Только ГРЯЗЬ (без повреждений) → мягко просим помыть/обработать. Пыма НЕ тегаем.
-    # Фикс C: в сервис-контексте (замена масла/ремонт/чек сервиса/идёт запись ТО фикса A)
-    # совет «помыть/воск/чехол» неуместен — байк чинят, а не моют → подавляем (грязь распознаём как есть).
-    _service_ctx = (oil_done or _is_oil_context(text, vis)
-                    or event_type == "repair" or vis.get("kind") == "receipt"
-                    or _oil_marker_active(chat_id, topic_id))
+    # Фикс C: в сервис-контексте (замена масла/ремонт/чек сервиса) совет «помыть/воск/чехол»
+    # неуместен — байк чинят, а не моют → подавляем (грязь распознаём как есть).
+    _service_ctx = (oil_hint or _is_oil_context(text, vis)
+                    or event_type == "repair" or vis.get("kind") == "receipt")
     if vis.get("dirt") and not _service_ctx:
         await _send(context,
             chat_id=chat_id,
@@ -1614,73 +1671,6 @@ def _oil_interval(bike_name):
     if "nmax" in n or "xmax" in n or "adv" in n or "forza" in n or "pcx" in n or "click" in n:
         return 4000
     return 5000
-
-
-async def _check_service(context, bridge, chat_id, topic_id, bike, mileage):
-    """Обновляет ТО-трекер по новому пробегу и крепит/обновляет напоминание если ТО подошло.
-    Пробег на замене масла берёт из колонки I Листа1 Байки (oil_last_km),
-    текущий пробег — из фото одометра (mileage)."""
-    if not bike:
-        return
-    try:
-        km = int(str(mileage).replace(" ", ""))
-    except (ValueError, TypeError):
-        return
-
-    # Подтягиваем из парка пробег последней замены масла (колонка I) + интервал по правилу
-    fleet_bike = bridge.find_bike(bike)
-    oil_last = fleet_bike.get("oil_last_km") if fleet_bike else None
-    name_l = str(fleet_bike.get("name", bike)).lower() if fleet_bike else str(bike).lower()
-    interval = _oil_interval(name_l)
-
-    # Обновляем ТО-трекер: текущий пробег из фото + last_service_km из колонки I
-    up = dict(bike=bike, topic_id=topic_id or "", current_km=km, interval_km=interval)
-    if oil_last:
-        up["last_service_km"] = oil_last
-    res = bridge.service_upsert(**up)
-    log.info(f"  → ТО {bike}: oil_last(I)={oil_last} interval={interval} → {res}")
-    status = res.get("status")
-    next_km = res.get("next_km")
-    stype = res.get("service_type", "oil")
-    if status not in ("due", "overdue"):
-        # ТО в норме — короткая квитанция (раньше молчал, человек не понимал, принято ли).
-        await _send(context, chat_id=chat_id,
-                    text=msg_mileage_ok(bike, km, next_km, res.get("km_left")),
-                    message_thread_id=topic_id)
-        return
-
-    # Нужно напомнить. Проверяем — не закреплено ли уже / прошло ли 5 дней.
-    # Матчим строку ТО по НОМЕРУ (имя в листе — каноничное из Лист1, отличается от имени темы).
-    canon = res.get("bike") or bike   # каноничное имя строки (как записал serviceUpsert)
-    lst = bridge.service_list().get("items", [])
-    rec = next((r for r in lst if _same_bike(r.get("bike"), bike) and str(r.get("service_type")) == stype), {})
-    pinned = rec.get("pinned_msg_id")
-    last_reminded = rec.get("last_reminded_at")
-
-    now = _time.time()
-    need_remind = True
-    if last_reminded:
-        try:
-            need_remind = (now - float(last_reminded)) >= 5 * 24 * 3600  # раз в 5 дней (правило #12)
-        except (ValueError, TypeError):
-            need_remind = True
-    if pinned and not need_remind:
-        return  # уже закреплено и 5 дней не прошло
-
-    # Шлём + крепим напоминание в теме
-    text = msg_service_due(bike, stype, km, next_km, status)
-    try:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text, message_thread_id=topic_id)
-        # открепляем старое, крепим новое
-        try:
-            await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=False)
-        except Exception as e:
-            log.warning(f"  → не смог закрепить (нужны права админа боту?): {e}")
-        bridge.service_set_pin(bike=canon, service_type=stype,
-                               pinned_msg_id=sent.message_id, last_reminded_at=str(now))
-        log.info(f"  → ТО напоминание закреплено: {bike} {stype} {status}")
-    except Exception:
-        log.exception("  → ошибка отправки/закрепа ТО")
 
 
 # ===================== INTAKE — приём карточек брони (ЭТАП A) =====================
