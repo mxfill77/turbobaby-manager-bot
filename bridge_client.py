@@ -216,6 +216,19 @@ class BridgeClient:
         return self._post("set_fleet_service", number=str(number), kind=str(kind),
                           km=km, confirmed=bool(confirmed))
 
+    # === Архивация журнала cc_log (Archive.gs на Bridge) ===
+    def prune_cc_log(self) -> dict:
+        """Разовый прогон автопрореживания cc_log на стороне Bridge: если cc_log > порога
+        (Script Property CCLOG_MAX_BYTES, дефолт 50000) — старые записи уходят в архив
+        KB_claude_code_log_archive. Идемпотентно (no-op если уже компактный). Читает/пишет
+        доки локально в Apps Script. Регулярно вызывается time-trigger (см. setupPruneTrigger)."""
+        return self._post("prune_cc_log")
+
+    def setup_prune_trigger(self) -> dict:
+        """Установить ежедневный time-trigger прореживания. ПРИМ.: требует scope script.scriptapp —
+        из веб-аппа НЕ проходит; запускать setupPruneTrigger() ИЗ РЕДАКТОРА Apps Script (как setupBrain)."""
+        return self._post("setup_prune_trigger")
+
     # === Надзиратель важного ===
     def important_add(self, **fields) -> dict:
         """Добавить важный пункт (ДТП, ремонт, просрочка). Статус open."""
