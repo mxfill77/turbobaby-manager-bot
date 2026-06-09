@@ -1316,7 +1316,7 @@ def msg_oil_need_trusted(bike, km):
     b_ru = f" на {bike}" if bike else ""
     return (
         f"🐀 Splinter\n"
-        f"🇹🇭 🔧 การบันทึก «ТО Oil» ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้น. "
+        f"🇹🇭 🔧 การบันทึกการเปลี่ยนน้ำมันเครื่อง ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้น. "
         f"@Pleummmm ยืนยันการเปลี่ยนน้ำมัน{b_th} = {km} กม. ไหมครับ? ตอบ «ใช่» หรือ «ไม่»\n"
         f"🇷🇺 🔧 Запись ТО в журнал подтверждает @Pleummmm или владелец. "
         f"@Pleummmm, подтвердите замену масла{b_ru} = {km} км? да/нет"
@@ -1434,7 +1434,7 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
     if res.get("ok"):
         await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                     text=(f"🐀 Splinter\n"
-                          f"🇹🇭 ✅ อัปเดต «ТО Oil» แล้ว: {res.get('bike_name', bike)} → {km_int} กม. ปิดเตือนเกินกำหนดแล้วครับ\n"
+                          f"🇹🇭 ✅ อัปเดตการเปลี่ยนน้ำมันเครื่องแล้ว: {res.get('bike_name', bike)} → {km_int} กม. ปิดเตือนเกินกำหนดแล้วครับ\n"
                           f"🇷🇺 ✅ ТО Oil обновлено: {res.get('bike_name', bike)} → {km_int} км, просрочка закрыта"))
         await _close_service_reminder(context, bridge, chat_id, topic_id, bike)
     else:
@@ -1926,7 +1926,7 @@ def msg_mileage_ok(bike, km, next_km, km_left):
             left_th = left_ru = ""
         return (
             f"{head}\n"
-            f"🇹🇭 ✅ รับเลขไมล์ {km} กม. แล้วครับ — ТО ปกติ ครบกำหนดถัดไปที่ {next_km} กม.{left_th}\n"
+            f"🇹🇭 ✅ รับเลขไมล์ {km} กม. แล้วครับ — รอบเปลี่ยนน้ำมันปกติ ครบกำหนดถัดไปที่ {next_km} กม.{left_th}\n"
             f"🇷🇺 ✅ Пробег {km} км принят. ТО в норме, следующее на {next_km} км{left_ru}"
         )
     return (
