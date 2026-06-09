@@ -856,12 +856,16 @@ def _is_oil_done_marker(text, vis):
     return _is_oil_context(text, vis) and any(w in blob for w in _OIL_DONE_WORDS)
 
 
-def _should_ask_odometer(chat_id, topic_id):
+def _should_ask_odometer(chat_id, topic_id, ignore_buffer=False):
     """Анти-спам для просьбы про одометр: НЕ просим если по теме уже есть уверенный (high)
-    пробег в недавнем буфере, и не повторяем чаще раза в _ODOMETER_ASK_COOLDOWN."""
-    lm = last_mileage_in_topic(chat_id, topic_id)
-    if lm and lm[1] == "high":
-        return False   # чёткий пробег уже получен — просить незачем
+    пробег в недавнем буфере, и не повторяем чаще раза в _ODOMETER_ASK_COOLDOWN.
+    ignore_buffer=True — при ЯВНОМ маркере выполненной работы (доработочный замер из буфера
+    НЕ считается пост-ремонтным одометром) игнорируем high-буфер, уважаем ТОЛЬКО cooldown 10 мин.
+    Так чинится ложное подавление (кейс NINJA 6334 09.06: пробег сверки 71-мин давности глушил переспрос)."""
+    if not ignore_buffer:
+        lm = last_mileage_in_topic(chat_id, topic_id)
+        if lm and lm[1] == "high":
+            return False   # чёткий пробег уже получен — просить незачем
     key = (chat_id, topic_id)
     now = _time.time()
     if now - _ODOMETER_ASK_TS.get(key, 0) < _ODOMETER_ASK_COOLDOWN:
@@ -878,6 +882,19 @@ def msg_ask_odometer(bike):
         f"🐀 Splinter\n"
         f"🇹🇭 เห็นว่ากำลังเปลี่ยนน้ำมัน{b} — รบกวนถ่ายรูปเลขไมล์ (ODO) ให้ชัด ๆ หน่อยครับ เพื่อบันทึกการเปลี่ยนถ่าย 🙏\n"
         f"🇷🇺 Вижу замену масла{b} — пришлите, пожалуйста, ЧЁТКОЕ фото пробега (одометр, ODO), чтобы зафиксировать замену 🙏"
+    )
+
+
+def msg_work_receipt(bike, works):
+    """Квитанция: подтверждаем вслух, что перечисленные работы записаны в историю
+    (Bot Data «события»). Двуязычно RU/TH (TH первым). Чтобы пояснение работ ТЕКСТОМ
+    не выглядело как игнор (кейс NINJA 6334 09.06 — бот молчал на текст-перечень работ)."""
+    b = f" {bike}" if bike else ""
+    works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 บันทึกงานที่ทำลงประวัติแล้วครับ{b}: {works_str} 🛠️\n"
+        f"🇷🇺 Записал работы в историю{b}: {works_str} 🛠️"
     )
 
 
@@ -1739,10 +1756,19 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             log.info(f"  → альбом: склеил {len(vis_list)} фото → mileage={vis.get('mileage')} "
                      f"conf={vis.get('mileage_confidence')} damage={vis.get('damage')} dirt={vis.get('dirt')}")
 
-    # Если ни текст-событие, ни осмысленное фото — выходим
+    # Работы из разбора — отдельно от type (техник может перечислить работы, а parse вернуть
+    # type≠"event": так и было в кейсе NINJA 6334 09.06 — works был, но в события не записалось и молчали).
+    works = [str(w).strip() for w in (parsed.get("works") or []) if w and str(w).strip()]
+
+    # Диагностика parse (закрываем пробел: раньше результат разбора в лог НЕ писался — кейс
+    # «молчание на текст-работ» был невидим в splinter.log). Пишем ДО любых ранних return.
+    log.info(f"  → parse: type={parsed.get('type')} event_type={parsed.get('event_type')} "
+             f"mileage={parsed.get('mileage')} works={works}")
+
+    # Если ни текст-событие, ни работы, ни осмысленное фото — выходим.
     is_event = parsed.get("type") == "event"
     has_vis = bool(vis and (vis.get("fuel") or vis.get("mileage") or vis.get("damage")))
-    if not is_event and not has_vis and not has_photo:
+    if not is_event and not works and not has_vis and not has_photo:
         return
 
     # Сливаем: текст приоритетнее для типа события, фото — для топлива/пробега
@@ -1758,8 +1784,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
 
     # История работ техника: масло фиксируется отдельно (кол.I через кнопочный флоу), а ПРОЧИЕ
     # работы (колодки/цепь/масляный фильтр/…) копим в Bot Data «события» как пояснение: что+пробег.
-    works = parsed.get("works") or []
-    non_oil_works = [str(w).strip() for w in works if w and not _is_oil_work(w)]
+    # works уже определён выше (до ранних return) — не переопределяем.
+    non_oil_works = [w for w in works if not _is_oil_work(w)]
     if non_oil_works:
         event_type = "repair"
         works_str = ", ".join(dict.fromkeys(non_oil_works))
@@ -1822,6 +1848,28 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                   f"Если это возврат — посмотри по депозиту 🙏"),
             message_thread_id=topic_id,
         )
+        return
+
+    # === Пояснение работ ТЕКСТОМ без свежего пробега В ЭТОМ сообщении ===
+    # Кейс NINJA 6334 09.06: техник перечислил работы текстом, фото пробега в ЭТОМ сообщении нет
+    #   → раньше бот молчал (ни события, ни реплики). Теперь НЕ молчим:
+    #   квитанция «записал работы» + при работах СО своим столбцом (масло/gear/abs/возд.фильтр) — переспрос пробега.
+    # «Свежий пробег в ЭТОМ сообщении» = чёткое число из текста ИЛИ high-ODO с фото ЭТОГО сообщения
+    #   (mileage уже = parsed.mileage или vis.mileage; буфер сюда НЕ входит — он и давал ложное подавление).
+    # В столбец БЕЗ пробега НЕ пишем: запись группы B/масла выше по потоку требует mileage — её не трогаем.
+    km_this_msg = bool(mileage) and _conf_ok
+    if works and not km_this_msg:
+        await _send(context, chat_id=chat_id,
+                    text=msg_work_receipt(bike, works), message_thread_id=topic_id)
+        col_kinds = {k for k in (_classify_work(w) for w in works)
+                     if k in ("oil", "gear", "abs", "airfilter")}
+        if col_kinds:
+            # Обходим ложное подавление high-буфером доработочного замера ТОЛЬКО при ЯВНОМ маркере
+            # выполненной работы (repair-событие или oil-done); cooldown 10 мин уважаем всегда.
+            force = (event_type == "repair") or oil_hint
+            if _should_ask_odometer(chat_id, topic_id, ignore_buffer=force):
+                await _send(context, chat_id=chat_id,
+                            text=msg_ask_odometer(bike), message_thread_id=topic_id)
         return
 
     # Масло-контекст, но БЕЗ чёткого пробега в ЭТОМ сообщении → САМ просим ЧЁТКОЕ фото одометра.
