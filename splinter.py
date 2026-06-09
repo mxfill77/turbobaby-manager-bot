@@ -311,6 +311,12 @@ _RECENT_PHOTOS = {}
 _RECENT_LIMIT = 12          # сколько последних фото помнить на группу
 _RECENT_TTL = 3 * 3600      # 3 часа — потом считаем устаревшим
 
+# Отложенные ИНФО-работы (колодки/цепь/масл.фильтр/вилка/прочее) — техник назвал работы ТЕКСТОМ
+# без пробега; пишем их в историю «события» строкой-на-работу, КОГДА в теме придёт чёткий пробег
+# (фото/число). {(chat_id, topic_id): {"works":[...], "bike":str, "msg_id_base":str, "ts":float}}
+_PENDING_WORKS = {}
+_PENDING_WORKS_TTL = 3 * 3600   # 3 часа — потом перечень протух, не пишем
+
 # Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
 # не повторять чаще раза в 10 мин на тему. {(chat_id, topic_id): ts}. Волатильный — ок для троттлинга.
 _ODOMETER_ASK_TS = {}
@@ -899,6 +905,36 @@ def msg_work_receipt(bike, works):
         f"🇹🇭 บันทึกงานที่ทำลงประวัติเรียบร้อยแล้วครับ{b} 🛠️\n"
         f"🇷🇺 Записал работы в историю{b}: {works_str} 🛠️"
     )
+
+
+def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date=""):
+    """Вариант A (разбор перечня по адресам): КАЖДУЮ инфо-работу — отдельной строкой в «события»
+    с привязкой пробега. msg_id с суффиксом :wN — уникальность строк (дедуп Bridge не схлопывает их
+    в одну) и идемпотентность отложенного flush. Колоночные работы сюда НЕ попадают — у них свой адрес."""
+    grp = group_name + (f" / тема {topic_id}" if topic_id else "")
+    n = 0
+    for i, w in enumerate(dict.fromkeys(info_works)):
+        note = (f"{w} — {km} км" if km else f"{w}")[:200]
+        r = bridge.add_event(msg_date=msg_date, group=grp, bike=bike, event_type="repair",
+                             fuel="", mileage=str(km or ""), photos=0, notes=note,
+                             msg_id=f"{msg_id_base}:w{i}")
+        log.info(f"  → инфо-работа в историю: «{note}» add_event ok={(r or {}).get('ok')} "
+                 f"saved={(r or {}).get('saved')} dup={(r or {}).get('duplicate')}")
+        n += 1
+    return n
+
+
+def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_date=""):
+    """Пришёл чёткий пробег в теме → дописать ОТЛОЖЕННЫЕ инфо-работы (буфер прошлого сообщения) с этим
+    км. pop() = ровно один раз (без задвоения). Протухший (> TTL) буфер не пишем."""
+    pend = _PENDING_WORKS.pop((chat_id, topic_id), None)
+    if not pend:
+        return 0
+    if _time.time() - pend.get("ts", 0) > _PENDING_WORKS_TTL:
+        log.info(f"  → отложенные инфо-работы протухли (>{_PENDING_WORKS_TTL//3600}ч), не пишу: {pend.get('works')}")
+        return 0
+    return _write_info_works(bridge, group_name, topic_id, bike or pend.get("bike", ""),
+                             pend["works"], km, pend["msg_id_base"], msg_date)
 
 
 # ============================================================
@@ -1785,33 +1821,46 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     elif vis.get("dirt"):
         notes = (notes + " | грязный").strip()[:200]
 
-    # История работ техника: масло фиксируется отдельно (кол.I через кнопочный флоу), а ПРОЧИЕ
-    # работы (колодки/цепь/масляный фильтр/…) копим в Bot Data «события» как пояснение: что+пробег.
-    # works уже определён выше (до ранних return) — не переопределяем.
+    # === РАЗБОР ПЕРЕЧНЯ РАБОТ ПО АДРЕСАМ (вариант A: строка-на-работу) ===
+    # Масло → кол.I (флоу ниже), gear/abs/возд.фильтр → группа B (кол.J/K/L, флоу ниже).
+    # ИНФО-работы (колодки/цепь/масл.фильтр/вилка/прочее) → история «события» ОТДЕЛЬНОЙ строкой на
+    # работу, с привязкой пробега. Перечень в одну repair-строку БОЛЬШЕ не валим — разносим.
     non_oil_works = [w for w in works if not _is_oil_work(w)]
     if non_oil_works:
-        event_type = "repair"
-        works_str = ", ".join(dict.fromkeys(non_oil_works))
-        km_part = f" | пробег {mileage}" if mileage else ""
-        notes = (f"работы: {works_str}{km_part}" + (f" | {notes}" if notes else "")).strip()[:200]
-
+        event_type = "repair"   # для force/_service_ctx ниже (перечень в notes НЕ лепим)
+    info_works = [w for w in works if _classify_work(w) == "info"]
+    _km_conf_ok = str(vis.get("mileage_confidence", "")) != "low"
+    km_now = parsed.get("mileage") or (vis.get("mileage") if _km_conf_ok else "") or ""
     _ev_msg_id = f"{chat_id}:{msg.message_id}"
-    _ev_r = bridge.add_event(
-        msg_date=str(msg.date.date()) if msg.date else "",
-        group=group_name + (f" / тема {topic_id}" if topic_id else ""),
-        bike=bike,
-        event_type=event_type,
-        fuel=str(fuel),
-        mileage=str(mileage),
-        photos=1 if has_photo else 0,
-        notes=notes,
-        msg_id=_ev_msg_id,
-    )
-    # ДИАГ (закрываем последнее слепое пятно записи событий): бот раньше ВЫБРАСЫВАЛ return add_event —
-    # не видно было saved/duplicate/error. Теперь видно ровно что вернул Bridge на РЕАЛЬНЫЙ вызов.
+    _msg_date = str(msg.date.date()) if msg.date else ""
+
+    # Пришёл чёткий пробег в теме → дописать ОТЛОЖЕННЫЕ инфо-работы прошлого сообщения с этим км.
+    if km_now:
+        _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, str(km_now), _msg_date)
+
+    _ev_r = None
+    if info_works:
+        if km_now:
+            # Пробег есть В ЭТОМ сообщении → пишем инфо-работы СРАЗУ, по строке на работу, с км.
+            _write_info_works(bridge, group_name, topic_id, bike, info_works, str(km_now), _ev_msg_id, _msg_date)
+        else:
+            # Пробега нет → буферизуем перечень; запишем при приходе пробега (flush). Ниже уйдёт переспрос.
+            _PENDING_WORKS[(chat_id, topic_id)] = {
+                "works": info_works, "bike": bike, "msg_id_base": _ev_msg_id, "ts": _time.time(),
+            }
+            log.info(f"  → инфо-работы отложены до пробега: {info_works} (тема {topic_id})")
+    else:
+        # Нет инфо-работ — обычное событие сообщения (фото/возврат/топливо/только колоночные) пишем как раньше.
+        _ev_r = bridge.add_event(
+            msg_date=_msg_date,
+            group=group_name + (f" / тема {topic_id}" if topic_id else ""),
+            bike=bike, event_type=event_type, fuel=str(fuel), mileage=str(mileage),
+            photos=1 if has_photo else 0, notes=notes, msg_id=_ev_msg_id,
+        )
+    # ДИАГ: бот раньше ВЫБРАСЫВАЛ return add_event — теперь видно saved/duplicate/error + разбор работ.
     log.info(f"  → add_event: ok={(_ev_r or {}).get('ok')} saved={(_ev_r or {}).get('saved')} "
              f"duplicate={(_ev_r or {}).get('duplicate')} error={(_ev_r or {}).get('error')} "
-             f"msg_id={_ev_msg_id} event_type={event_type}")
+             f"msg_id={_ev_msg_id} info_works={len(info_works)} km_now={km_now or '-'} event_type={event_type}")
 
     # === ТО-трекер ===
     _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
@@ -1872,7 +1921,9 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                     text=msg_work_receipt(bike, works), message_thread_id=topic_id)
         col_kinds = {k for k in (_classify_work(w) for w in works)
                      if k in ("oil", "gear", "abs", "airfilter")}
-        if col_kinds:
+        # Пробег нужен И колоночным (масло/gear/abs/возд.фильтр для записи в столбец), И инфо-работам
+        # (колодки/цепь/фильтр — они отложены в буфер и ждут пробег для привязки «работа — км»).
+        if col_kinds or info_works:
             # Обходим ложное подавление high-буфером доработочного замера ТОЛЬКО при ЯВНОМ маркере
             # выполненной работы (repair-событие или oil-done); cooldown 10 мин уважаем всегда.
             force = (event_type == "repair") or oil_hint
