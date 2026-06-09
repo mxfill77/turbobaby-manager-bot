@@ -269,6 +269,18 @@ NINJA 6334: разбор этой замены (37844) ВСКРЫЛ три ба�
   (KB+решение Филиппа): масло скутеры 4000/мото 5000; gear=как масло (скутеры); ABS 10000; возд.фильтр 20000.
   В KB дописать строку «воздушный фильтр (кол.L) = 20000, все» (сейчас в KB только масляный фильтр 20000).
 
+### 🧹 Автопрореживание cc_log (Apps Script) — в проде 9.06
+cc_log распух до 162KB → Google Docs флапал на чтении/записи (тормоз дня). Решение в 2 части:
+- **Часть A** (разово, Python+Drive MCP): создан архив `KB_claude_code_log_archive` (id 19hO_c8FRD…894OBfY)
+  в папке Brain; cc_log ужат до ~50KB (27 новейших записей), 98 старых → в архив, без потерь (125=27+98).
+- **Часть B** (Apps Script, Bridge redeploy @25): новый `Archive.gs` — `pruneCcLog_()` читает cc_log
+  ЛОКАЛЬНО (без HTTP-флапа), держит его <= `CCLOG_MAX_BYTES` (Script Property, дефолт 50000), старое →
+  архив (newest-first). Экшены `prune_cc_log` / `setup_prune_trigger`; `bridge_client` — одноимённые методы.
+  Архив зарегистрирован в BRAIN_MANIFEST (ключ `cc_log_archive`). Порог меняется без редеплоя (Script Property).
+  **ОСТАЁТСЯ 1 ручной шаг Филиппа** (как setupBrain): запустить `setupPruneTrigger()` из редактора Apps Script
+  (нужен scope script.scriptapp) → ставит ежедневный триггер ~13:00 UTC. До этого авто-расписания нет, разовый
+  `prune_cc_log` работает. Откат Bridge = `clasp redeploy AKfycbxNC9…NOqw -V 22`.
+
 ---
 
 ## 🚀 ЗАДАЧА clasp — ✅ ВЫПОЛНЕНО 6 июня 2026 (автоправка+деплой Bridge .gs без копипасты)
