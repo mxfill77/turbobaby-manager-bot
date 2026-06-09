@@ -1216,6 +1216,12 @@ def _svc_put(data):
     return tok
 
 
+def _svc_question_open(chat_id, topic_id):
+    """Открыт ли по этой теме вопрос [После замены]/[Просто пробег] (ждём нажатия кнопки)."""
+    return any(d.get("chat") == chat_id and d.get("topic") == topic_id
+               for d in _SVC_TOKENS.values())
+
+
 def msg_oil_or_km(bike, km):
     """Вопрос с двумя вариантами: фото ПОСЛЕ замены масла или просто текущий пробег (RU/TH)."""
     b = f" · 📌 {bike}" if bike else ""
@@ -1236,19 +1242,6 @@ def msg_oil_need_trusted(bike, km):
         f"@Pleummmm ยืนยันการเปลี่ยนน้ำมัน{b_th} = {km} กม. ไหมครับ? ตอบ «ใช่» หรือ «ไม่»\n"
         f"🇷🇺 🔧 Запись ТО в журнал подтверждает @Pleummmm или владелец. "
         f"@Pleummmm, подтвердите замену масла{b_ru} = {km} км? да/нет"
-    )
-
-
-def msg_km_ack(bike, km, overdue=False):
-    """Квитанция на [Просто пробег]: текущий пробег принят, в кол.I не писали (RU/TH).
-    overdue=True → добавляем, что напоминание о ТО оставлено."""
-    b = f" · 📌 {bike}" if bike else ""
-    note_th = " เตือนครบกำหนด ТО ยังอยู่" if overdue else ""
-    note_ru = " Напоминание о ТО оставил." if overdue else ""
-    return (
-        f"🐀 Splinter{b}\n"
-        f"🇹🇭 📷 รับเลขไมล์ปัจจุบัน {km} กม. แล้วครับ — ไม่ได้บันทึกการเปลี่ยนน้ำมัน.{note_th}\n"
-        f"🇷🇺 📷 Принято, текущий пробег {km} км. Замену не записывал.{note_ru}"
     )
 
 
@@ -1367,9 +1360,11 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
                     text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
 
-async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, next_km, status, stype="oil"):
-    """Закрепить/обновить напоминание о просрочке ТО (раз в 5 дней). Без записи в кол.I.
-    Матчит строку ТО по НОМЕРУ; pin сохраняет КАНОНИЧНЫМ именем (как serviceUpsert)."""
+async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, next_km, status,
+                                stype="oil", always_notify=False):
+    """Полное напоминание о просрочке ТО (msg_service_due) + закреп. Без записи в кол.I.
+    always_notify=True (ответ на кнопку [Просто пробег]) — текст шлём ВСЕГДА, даже если закреп
+    свежий; в этом случае не рекрепим. Иначе крепим раз в 5 дней. Матч строки по НОМЕРУ."""
     lst = bridge.service_list().get("items", [])
     rec = next((r for r in lst if _same_bike(r.get("bike"), bike) and str(r.get("service_type")) == stype), {})
     pinned = rec.get("pinned_msg_id")
@@ -1381,19 +1376,22 @@ async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, ne
             need_remind = (now - float(last_reminded)) >= 5 * 24 * 3600
         except (ValueError, TypeError):
             need_remind = True
-    if pinned and not need_remind:
+    if pinned and not need_remind and not always_notify:
         return
     canon = rec.get("bike") or bike
     text = msg_service_due(bike, stype, km, next_km, status)
     try:
         sent = await context.bot.send_message(chat_id=chat_id, text=text, message_thread_id=topic_id)
-        try:
-            await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=False)
-        except Exception as e:
-            log.warning(f"  → не смог закрепить (нужны права админа боту?): {e}")
-        bridge.service_set_pin(bike=canon, service_type=stype,
-                               pinned_msg_id=sent.message_id, last_reminded_at=str(now))
-        log.info(f"  → ТО напоминание закреплено: {bike} {stype} {status}")
+        if need_remind or not pinned:   # крепим/обновляем ТОЛЬКО когда реально нужно
+            try:
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=False)
+            except Exception as e:
+                log.warning(f"  → не смог закрепить (нужны права админа боту?): {e}")
+            bridge.service_set_pin(bike=canon, service_type=stype,
+                                   pinned_msg_id=sent.message_id, last_reminded_at=str(now))
+            log.info(f"  → ТО напоминание закреплено: {bike} {stype} {status}")
+        else:
+            log.info(f"  → ТО напоминание (повтор по запросу, без рекрепа): {bike} {stype} {status}")
     except Exception:
         log.exception("  → ошибка отправки/закрепа ТО")
 
@@ -1449,14 +1447,14 @@ async def handle_service_button(update, context, bridge) -> None:
             km_int = int(str(km).replace(" ", ""))
         except (ValueError, TypeError):
             km_int = km
-        overdue = data.get("status") in ("due", "overdue")
-        if overdue:
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=msg_km_ack(bike, km_int, overdue=True))
+        if data.get("status") in ("due", "overdue"):
+            # Просрочка/срок → ПОЛНОЕ напоминание (msg_service_due): что просрочено, текущий/срок,
+            # после замены — фото пробега + чек. always_notify → текст придёт даже при свежем закрепе.
             await _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike,
-                                        km_int, data.get("next_km"), data.get("status"))
+                                        km_int, data.get("next_km"), data.get("status"),
+                                        always_notify=True)
         else:
-            # ТО в норме — полная квитанция «пробег принят, ТО в норме, следующее на Y».
+            # ТО в норме — короткая квитанция «пробег принят, ТО в норме, следующее на Y».
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=msg_mileage_ok(bike, km_int, data.get("next_km"), data.get("km_left")))
     else:
@@ -1612,10 +1610,12 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         return
 
     # Только ГРЯЗЬ (без повреждений) → мягко просим помыть/обработать. Пыма НЕ тегаем.
-    # Фикс C: в сервис-контексте (замена масла/ремонт/чек сервиса) совет «помыть/воск/чехол»
-    # неуместен — байк чинят, а не моют → подавляем (грязь распознаём как есть).
+    # Фикс C: в сервис-контексте совет «помыть/воск/чехол» неуместен — идёт работа по ТО, не мойка.
+    # Сервис-контекст = масло/ремонт/чек ИЛИ фото приборки с пробегом (ТО-флоу) ИЛИ открыт вопрос svc по теме.
     _service_ctx = (oil_hint or _is_oil_context(text, vis)
-                    or event_type == "repair" or vis.get("kind") == "receipt")
+                    or event_type == "repair" or vis.get("kind") == "receipt"
+                    or bool(vis.get("mileage"))
+                    or _svc_question_open(chat_id, topic_id))
     if vis.get("dirt") and not _service_ctx:
         await _send(context,
             chat_id=chat_id,
