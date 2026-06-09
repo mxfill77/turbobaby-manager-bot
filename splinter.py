@@ -31,7 +31,7 @@ def set_auditor(auditor):
     _auditor = auditor
 
 
-async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group=""):
+async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group="", reply_markup=None):
     """Единая точка отправки сообщений Splinter в группы.
     Перед отправкой прогоняет текст через auditor.check_response_text — тот
     детерминированно ловит смешение RU/TH и пишет находки в журнал аудита.
@@ -51,6 +51,8 @@ async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=Tru
     kw = {"chat_id": chat_id, "text": text}
     if message_thread_id is not None:
         kw["message_thread_id"] = message_thread_id
+    if reply_markup is not None:
+        kw["reply_markup"] = reply_markup
     return await context.bot.send_message(**kw)
 
 
@@ -239,13 +241,17 @@ SERVICING_SYSTEM = """Ты следишь за группой обслужива
   bike: строка или null
   fuel: строка или null (если упомянут уровень топлива)
   mileage: строка или null (если упомянут пробег/км)
+  works: массив строк — КОНКРЕТНЫЕ выполненные работы, если техник перечислил что СДЕЛАНО
+    (напр. ["замена масла","замена масляного фильтра","задние колодки","регулировка цепи"]).
+    Каждый пункт — отдельной строкой. Если про выполненные работы ничего нет — пустой массив [].
   notes: короткое описание на русском
 
 Если просто болтовня без события: type "none".
 
 Примеры:
-"Надо проверить вариатор когда вернется в офис" -> {"type":"event","event_type":"repair","bike":null,"fuel":null,"mileage":null,"notes":"проверить вариатор по возвращении"}
-"N-max 7530 вернулся, пробег 12450, бензин полный" -> {"type":"event","event_type":"return","bike":"N-max 7530","fuel":"полный","mileage":"12450","notes":"байк вернулся"}
+"Надо проверить вариатор когда вернется в офис" -> {"type":"event","event_type":"repair","bike":null,"fuel":null,"mileage":null,"works":[],"notes":"проверить вариатор по возвращении"}
+"N-max 7530 вернулся, пробег 12450, бензин полный" -> {"type":"event","event_type":"return","bike":"N-max 7530","fuel":"полный","mileage":"12450","works":[],"notes":"байк вернулся"}
+"На байке сделали: замена масла, масляный фильтр, задние колодки, регулировка цепи" -> {"type":"event","event_type":"repair","bike":null,"fuel":null,"mileage":null,"works":["замена масла","масляный фильтр","задние колодки","регулировка цепи"],"notes":"выполнены работы по обслуживанию"}
 
 Верни ТОЛЬКО JSON-объект."""
 
@@ -1111,15 +1117,23 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
                     message_thread_id=topic_id)
         return
 
+    # Кнопка [✅ ใช่/Да] — быстрое подтверждение распознанного числа. Текст-ответ «да»/правильное
+    # число тоже работает (handle_mileage_confirm). floor/oil_hint кладём в токен (сторож B сохранён).
+    tok = _svc_put({"kind": "mileconf", "chat": chat_id, "topic": topic_id, "bike": bike or "",
+                    "mileage": str(mileage), "floor": floor, "oil_hint": bool(oil_hint)})
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ใช่ / Да", callback_data=f"svc:mok:{tok}")],
+    ])
     b_th = f" ({bike})" if bike else ""
     b_ru = f" по {bike}" if bike else ""
     await _send(
         context,
         chat_id=chat_id,
         text=(f"🐀 Splinter\n"
-              f"🇹🇭 อ่านเลขไมล์ได้ {mileage} กม.{b_th} ถูกต้องไหมครับ? ตอบ «ใช่» หรือส่งเลขที่ถูกต้อง 🙏\n"
-              f"🇷🇺 📟 Вижу пробег {mileage} км{b_ru} (с фото). Верно? Ответь «да» или пришли правильное число 🙏"),
+              f"🇹🇭 อ่านเลขไมล์ได้ {mileage} กม.{b_th} ถูกต้องไหมครับ? กดปุ่ม «ใช่» หรือส่งเลขที่ถูกต้อง 🙏\n"
+              f"🇷🇺 📟 Вижу пробег {mileage} км{b_ru} (с фото). Верно? Нажми «Да» или пришли правильное число 🙏"),
         message_thread_id=topic_id,
+        reply_markup=kb,
     )
 
 
@@ -1185,6 +1199,16 @@ def _plate_from_name(text):
     Зеркало plateFromName_ (ReadFleet.js) — set_fleet_oil резолвит строку Лист1 именно по нему."""
     nums = [n for n in _re_pl.findall(r"\d{3,}", str(text or "").lower()) if n not in _CC_PLATE]
     return nums[-1] if nums else None
+
+
+def _is_oil_work(w):
+    """Пункт работ — про замену МАСЛА (он фиксируется отдельно в кол.I через кнопочный флоу).
+    Прочие работы (колодки/цепь/фильтр) идут в историю Bot Data «события»."""
+    s = str(w).lower()
+    # «масляный фильтр» — это НЕ замена масла (отдельная работа) → не считаем масляной.
+    if "фильтр" in s or "filter" in s or "กรอง" in s:
+        return False
+    return any(k in s for k in ("масл", "oil", "น้ำมัน"))
 
 
 def _same_bike(a, b):
@@ -1295,19 +1319,36 @@ async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_
 
 
 async def _close_service_reminder(context, bridge, chat_id, topic_id, bike):
-    """После записи ТО — снять закреплённое напоминание о просрочке (best-effort):
-    открепляем pinned сообщение из ТО-трекера + закрываем открытые «важное» по этой теме."""
+    """После записи ТО — снять ВСЕ закреплённые ТО-напоминания (они копились по циклам) +
+    очистить pinned_msg_id записи + закрыть открытые «важное» по этой теме (best-effort)."""
+    canon, pin = None, None
     try:
         rec = next((r for r in bridge.service_list().get("items", [])
                     if _same_bike(r.get("bike"), bike)), {})
+        canon = rec.get("bike") or bike
         pin = rec.get("pinned_msg_id")
+    except Exception:
+        log.exception("  → ТО: ошибка чтения записи для снятия закрепа")
+    # Снять закрепы: в теме (форум) тема = ОДИН байк → там только наши ТО-пины; снимаем ВСЕ разом
+    # (одиночный unpin оставлял старые накопленные пины висеть). Фоллбэк — открепить последний id.
+    try:
+        if topic_id is not None:
+            await context.bot.unpin_all_forum_topic_messages(chat_id=chat_id, message_thread_id=topic_id)
+        elif pin:
+            await context.bot.unpin_chat_message(chat_id=chat_id, message_id=int(pin))
+    except Exception as e:
+        log.warning(f"  → ТО: не смог открепить напоминания темы: {e}")
         if pin:
             try:
                 await context.bot.unpin_chat_message(chat_id=chat_id, message_id=int(pin))
-            except Exception as e:
-                log.warning(f"  → ТО: не смог открепить напоминание: {e}")
-    except Exception:
-        log.exception("  → ТО: ошибка снятия pinned напоминания")
+            except Exception as e2:
+                log.warning(f"  → ТО: фоллбэк-открепление не вышло: {e2}")
+    # Очистить pinned_msg_id записи (идемпотентность: повторное закрытие не дёргает старый id).
+    if canon:
+        try:
+            bridge.service_set_pin(bike=canon, service_type="oil", pinned_msg_id="")
+        except Exception:
+            log.exception("  → ТО: не смог очистить pinned_msg_id записи")
     try:
         for it in bridge.important_list(status="open").get("items", []):
             if topic_id is not None and str(it.get("topic_id")) == str(topic_id):
@@ -1383,6 +1424,11 @@ async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, ne
     try:
         sent = await context.bot.send_message(chat_id=chat_id, text=text, message_thread_id=topic_id)
         if need_remind or not pinned:   # крепим/обновляем ТОЛЬКО когда реально нужно
+            if pinned:   # не копим: снимаем ПРОШЛЫЙ закреп перед новым
+                try:
+                    await context.bot.unpin_chat_message(chat_id=chat_id, message_id=int(pinned))
+                except Exception as e:
+                    log.warning(f"  → не смог снять прошлый закреп перед новым: {e}")
             try:
                 await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=False)
             except Exception as e:
@@ -1418,7 +1464,36 @@ async def handle_service_button(update, context, bridge) -> None:
             pass
         return
     chat_id, topic_id = data["chat"], data["topic"]
-    bike, km = data["bike"], data["km"]
+    bike, km = data.get("bike", ""), data.get("km", "")
+
+    if action == "mok":
+        # [✅ Да] на подтверждение распознанного пробега — эквивалент текстового «да».
+        # Сторож B сохранён: если число < floor — не принимаем, шлём msg_mileage_drop.
+        await q.answer()
+        mileage = data.get("mileage", "")
+        floor = data.get("floor")
+        oil_hint = bool(data.get("oil_hint"))
+        key = (chat_id, topic_id)
+        if floor is not None:
+            try:
+                if int(str(mileage).replace(" ", "").replace(",", "")) < floor:
+                    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                                text=msg_mileage_drop(bike, mileage, floor))
+                    return
+            except (ValueError, TypeError):
+                pass
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        _PENDING_MILEAGE.pop(key, None)
+        clear_awaiting(*key)
+        try:
+            await _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint)
+        except Exception:
+            log.exception("  → ошибка ТО-трекера (кнопка Да)")
+        return
 
     if action == "oil":
         # [После замены] → боевая запись кол.I. ТОЛЬКО доверенный.
@@ -1556,6 +1631,16 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         notes = (notes + f" | повреждения: {vis['damage']}").strip()[:200]
     elif vis.get("dirt"):
         notes = (notes + " | грязный").strip()[:200]
+
+    # История работ техника: масло фиксируется отдельно (кол.I через кнопочный флоу), а ПРОЧИЕ
+    # работы (колодки/цепь/масляный фильтр/…) копим в Bot Data «события» как пояснение: что+пробег.
+    works = parsed.get("works") or []
+    non_oil_works = [str(w).strip() for w in works if w and not _is_oil_work(w)]
+    if non_oil_works:
+        event_type = "repair"
+        works_str = ", ".join(dict.fromkeys(non_oil_works))
+        km_part = f" | пробег {mileage}" if mileage else ""
+        notes = (f"работы: {works_str}{km_part}" + (f" | {notes}" if notes else "")).strip()[:200]
 
     bridge.add_event(
         msg_date=str(msg.date.date()) if msg.date else "",
