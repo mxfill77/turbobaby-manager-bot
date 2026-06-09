@@ -143,6 +143,12 @@ class BridgeClient:
         fuel, mileage, photos, notes, msg_id."""
         return self._post("add_event", **fields)
 
+    def delete_event(self, msg_id: str = "", group: str = "", max: int = 50) -> dict:
+        """Удалить строки листа «события» ТОЛЬКО по точному ключу (msg_id и/или group).
+        Защита на стороне Bridge: без ключа / широкий фильтр / больше лимита → отказ.
+        Возвращает {ok, deleted, rows:[...]} — сверять по return/логу, НЕ по кэш-экспорту."""
+        return self._post("delete_event", msg_id=msg_id, group=group, max=max)
+
     def check_balance(self, currency: str, pym_balance, group: str = "", note: str = "") -> dict:
         """Сверить баланс кошелька (group) с названным Пымом."""
         return self._post("check_balance", currency=currency,
