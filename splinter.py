@@ -98,6 +98,20 @@ def group_label(chat_id):
     return GROUP_NAMES.get(chat_id, str(chat_id))
 
 
+# === Темы чужого контура в HQ — Splinter ПОЛНОСТЬЮ игнорирует ===
+# В HQ (-1003853365891) тема 205 «Обучение юзербота»: там сидит pc_agent (управление userbot).
+# Команды старт/стоп/статус userbot адресованы агенту, не Splinter. Splinter туда не лезет:
+# не отвечает, мозг не запускает, учёт/аудитор в этой теме НЕ работают — это не опергруппа.
+HQ_CHAT_ID = -1003853365891
+IGNORED_THREADS = {205}
+
+
+def is_ignored_thread(chat_id, topic_id) -> bool:
+    """True → Splinter полностью молчит в этой теме (чужой контур userbot/агента в HQ).
+    Проверять РАНО, до мозга/учёта/аудитора/любой реакции."""
+    return chat_id == HQ_CHAT_ID and topic_id in IGNORED_THREADS
+
+
 # Через сколько записей звать Пыма проверить (для накопительного режима)
 NUDGE_EVERY = 5
 
@@ -1201,21 +1215,34 @@ def _plate_from_name(text):
     return nums[-1] if nums else None
 
 
-def _is_oil_work(w):
-    """True ТОЛЬКО для замены МОТОРНОГО масла — единственная работа с записываемым ботом столбцом
-    (Лист1 кол.I «ТО Oil», set_fleet_oil). Прочее идёт в Bot Data «события» как справка:
-      группа B (столбец ЕСТЬ, но бот ПОКА не пишет): gear/редуктор→кол.J, ABS→кол.K, аир фильтр→кол.L;
-      группа C (столбца нет): масляный фильтр, тормозные колодки, цепь.
-    Будущий шаг — guarded-экшены set_fleet_gear/abs/airfilter, тогда группа B пойдёт в свои столбцы."""
+def _classify_work(w):
+    """Класс работы для маршрутизации (Фаза 1) → адрес записи:
+      'oil'       — моторное масло → Лист1 кол.I (set_fleet_oil, отдельный кнопочный флоу);
+      'gear'      — масло редуктора/трансмиссии/ремень/шестерни → кол.J (set_fleet_service);
+      'abs'       — ABS oil → кол.K;
+      'airfilter' — воздушный (аир) фильтр → кол.L;
+      'info'      — без столбца (масляный фильтр, колодки, цепь, вилка, прочее) → «события».
+    Порядок проверок важен: воздушный фильтр → airfilter; иной фильтр → info (раньше масла)."""
     s = str(w).lower()
-    # фильтр (масляный/воздушный) — НЕ замена масла → события.
-    if "фильтр" in s or "filter" in s or "กรอง" in s:
-        return False
-    # немоторные масла: gear/редуктор/трансмиссия (кол.J), ABS (кол.K), вилка — НЕ кол.I → события.
-    if any(k in s for k in ("gear", "ремн", "шестер", "редуктор", "трансмис",
-                            "abs", "абс", "เกียร์", "вилк", "fork")):
-        return False
-    return any(k in s for k in ("масл", "oil", "น้ำมัน"))
+    is_filter = ("фильтр" in s or "filter" in s or "กรอง" in s)
+    if is_filter and ("возд" in s or "air" in s or "аир" in s or "อากาศ" in s):
+        return "airfilter"          # воздушный фильтр → кол.L
+    if is_filter:
+        return "info"               # масляный/прочий фильтр — столбца нет → события
+    if "abs" in s or "абс" in s:
+        return "abs"                # ABS oil → кол.K
+    if any(k in s for k in ("gear", "ремн", "шестер", "редуктор", "трансмис", "เกียร์")):
+        return "gear"               # масло редуктора → кол.J
+    if "вилк" in s or "fork" in s:
+        return "info"               # масло вилки — столбца нет → события
+    if any(k in s for k in ("масл", "oil", "น้ำมัน")):
+        return "oil"                # моторное масло → кол.I
+    return "info"                   # колодки/цепь/прочее → события
+
+
+def _is_oil_work(w):
+    """True ТОЛЬКО для замены МОТОРНОГО масла (кол.I). Делегирует в _classify_work — единый источник."""
+    return _classify_work(w) == "oil"
 
 
 def _same_bike(a, b):
@@ -1408,6 +1435,76 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
                     text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
 
+# Метки видов ТО группы B (TH, RU) — для кнопок/квитанций. kind → (тайский, русский).
+_SVC_COL_LABEL = {
+    "gear":      ("น้ำมันเกียร์", "редуктор (gear)"),
+    "abs":       ("น้ำมัน ABS", "ABS"),
+    "airfilter": ("ไส้กรองอากาศ", "возд. фильтр"),
+}
+
+
+async def _ask_service_col(context, chat_id, topic_id, bike, kind, km):
+    """Кнопка-фиксация регламента группы B (gear→J/abs→K/airfilter→L) в свой столбец Лист1.
+    Боевая запись — ТОЛЬКО доверенным (как масло). Пробег показываем в кнопке — человек сверяет."""
+    th_lbl, ru_lbl = _SVC_COL_LABEL.get(kind, (kind, kind))
+    tok = _svc_put({"kind": "svc_col", "chat": chat_id, "topic": topic_id,
+                    "bike": bike or "", "svc_kind": kind, "km": str(km)})
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ บันทึก {th_lbl} / Зафиксировать {ru_lbl}", callback_data=f"svc:col:{tok}")],
+    ])
+    b = f" · 📌 {bike}" if bike else ""
+    await context.bot.send_message(
+        chat_id=chat_id, message_thread_id=topic_id,
+        text=(f"🐀 Splinter{b}\n"
+              f"🇹🇭 🔧 บันทึก «{th_lbl}» = {km} กม. ไหมครับ? กดปุ่ม (ยืนยันโดย @Pleummmm/เจ้าของ) 👇\n"
+              f"🇷🇺 🔧 Зафиксировать «{ru_lbl}» = {km} км? Нажми кнопку (подтверждает @Pleummmm/владелец) 👇"),
+        reply_markup=kb)
+
+
+async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km):
+    """Боевая запись регламента группы B в Лист1 (gear→J/abs→K/airfilter→L) через set_fleet_service.
+    Вызывается ТОЛЬКО после [Зафиксировать] от доверенного. Резолвит ГОЛЫЙ номер байка.
+    Кол.I «ТО Oil» и H не трогает (это set_fleet_oil/стартовый)."""
+    th_lbl, ru_lbl = _SVC_COL_LABEL.get(kind, (kind, kind))
+    plate = _plate_from_name(bike)
+    if not plate:
+        fb = bridge.find_bike(bike) or {}
+        plate = _plate_from_name(fb.get("name", ""))
+    if not plate:
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=("🐀 Splinter\n"
+                          "🇹🇭 ขอโทษครับ ไม่พบเลขทะเบียนรถ — บอกชื่อรุ่น+เลขให้หน่อยครับ 🙏\n"
+                          "🇷🇺 Не смог определить номер байка для записи — уточни модель+номер 🙏"))
+        return
+    try:
+        km_int = int(str(km).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return
+    res = bridge.set_fleet_service(number=plate, kind=kind, km=km_int, confirmed=True)
+    log.info(f"  → ТО {kind} set_fleet_service({plate},{kind},{km_int},confirmed=True) → {res}")
+    if res.get("ok"):
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=(f"🐀 Splinter\n"
+                          f"🇹🇭 ✅ บันทึก «{th_lbl}» แล้ว: {res.get('bike_name', bike)} → {km_int} กม.\n"
+                          f"🇷🇺 ✅ Записано «{ru_lbl}»: {res.get('bike_name', bike)} → {km_int} км"))
+    else:
+        err = res.get("error", "")
+        if err == "km_decreasing":
+            detail_ru = f"новое {km_int} меньше прошлого {res.get('old_km')} — не записал, проверь число"
+            detail_th = f"ค่าใหม่ {km_int} น้อยกว่าครั้งก่อน {res.get('old_km')} — ไม่บันทึก"
+        elif err == "ambiguous":
+            detail_ru = f"несколько байков с номером {plate} — уточни какой"
+            detail_th = f"มีรถหลายคันเลข {plate} — ระบุให้ชัด"
+        elif err == "not_found":
+            detail_ru = f"не нашёл байк с номером {plate} в Лист1"
+            detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
+        else:
+            detail_ru = f"не удалось записать ({err or 'ошибка'})"
+            detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+
+
 async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, next_km, status,
                                 stype="oil", always_notify=False):
     """Полное напоминание о просрочке ТО (msg_service_due) + закреп. Без записи в кол.I.
@@ -1500,6 +1597,26 @@ async def handle_service_button(update, context, bridge) -> None:
             await _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint)
         except Exception:
             log.exception("  → ошибка ТО-трекера (кнопка Да)")
+        return
+
+    if action == "col":
+        # [Зафиксировать <тип>] группы B (gear/abs/airfilter) → set_fleet_service. ТОЛЬКО доверенный.
+        svc_kind = data.get("svc_kind", "")
+        if not _is_trusted_user(q.from_user):
+            await q.answer("Подтверждает @Pleummmm или владелец", show_alert=False)
+            th_lbl, ru_lbl = _SVC_COL_LABEL.get(svc_kind, (svc_kind, svc_kind))
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=(f"🐀 Splinter\n"
+                              f"🇹🇭 🔧 การบันทึก «{th_lbl}» ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้น\n"
+                              f"🇷🇺 🔧 Запись «{ru_lbl}» подтверждает @Pleummmm или владелец"))
+            return   # токен и кнопка живут — Пым нажмёт позже
+        await q.answer("Записываю…")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        await _write_service_col(context, bridge, chat_id, topic_id, bike, svc_kind, km)
         return
 
     if action == "oil":
@@ -1677,6 +1794,22 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             await _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint)
         except Exception:
             log.exception("  → ошибка ТО-трекера")
+
+    # === Группа B (Фаза 1): запись регламента в СВОЙ столбец Лист1 (gear→J/abs→K/airfilter→L) ===
+    # Техник назвал работу группы B + есть пробег → кнопка-фиксация (боевая запись ТОЛЬКО доверенным).
+    # Масло (кол.I) идёт своим флоу выше; info-работы (масл.фильтр/колодки/цепь) — только в «события».
+    # Пробег показываем в кнопке — человек сверяет цифру перед записью; set_fleet_service хранит откат.
+    if works and bike and mileage and _conf_ok:
+        seen_kinds = []
+        for w in works:
+            k = _classify_work(w)
+            if k in ("gear", "abs", "airfilter") and k not in seen_kinds:
+                seen_kinds.append(k)
+        for k in seen_kinds:
+            try:
+                await _ask_service_col(context, chat_id, topic_id, bike, k, str(mileage))
+            except Exception:
+                log.exception(f"  → ошибка кнопки фиксации группы B ({k})")
 
     # Реальное ПОВРЕЖДЕНИЕ → зовём Пыма (это к осмотру / возможным вычетам).
     # Грязь сюда НЕ попадает — она отсекается на уровне vision (damage=null, dirt=true).

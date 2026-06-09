@@ -208,6 +208,14 @@ class BridgeClient:
         return self._post("set_fleet_oil", number=str(number),
                           oil_km=oil_km, confirmed=bool(confirmed))
 
+    def set_fleet_service(self, number, kind, km, confirmed: bool = False) -> dict:
+        """GUARDED: записать регламент ТО группы B в Лист1 Байки по НОМЕРУ:
+        kind='gear'→кол.J, 'abs'→кол.K, 'airfilter'→кол.L. Зеркало set_fleet_oil; кол.I (масло) и H
+        НЕ трогает. Требует confirmed=True. Ошибки: missing_number / bad_kind / bad_km / not_confirmed /
+        not_found / ambiguous / km_decreasing / write_failed."""
+        return self._post("set_fleet_service", number=str(number), kind=str(kind),
+                          km=km, confirmed=bool(confirmed))
+
     # === Надзиратель важного ===
     def important_add(self, **fields) -> dict:
         """Добавить важный пункт (ДТП, ремонт, просрочка). Статус open."""
