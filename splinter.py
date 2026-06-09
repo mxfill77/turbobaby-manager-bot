@@ -1213,6 +1213,15 @@ def _plate_from_name(text):
     return nums[-1] if nums else None
 
 
+def _same_bike(a, b):
+    """Один ли это байк: по НОМЕРУ (plate), как serviceUpsert. Иначе fallback на точное имя.
+    Чинит рассинхрон 'имя темы' vs 'каноничное имя из Лист1' при матчинге строк ТО-трекера."""
+    pa, pb = _plate_from_name(a), _plate_from_name(b)
+    if pa and pb:
+        return pa == pb
+    return str(a).strip() == str(b).strip()
+
+
 def pending_oil_write_for(chat_id, topic_id):
     """Открыт ли вопрос «записать ТО Oil?» по теме (для перехвата в bot.py).
     Протух (> TTL) → снимаем pending, чтобы не висел вечно, и возвращаем None."""
@@ -1265,7 +1274,7 @@ async def _close_service_reminder(context, bridge, chat_id, topic_id, bike):
     открепляем pinned сообщение из ТО-трекера + закрываем открытые «важное» по этой теме."""
     try:
         rec = next((r for r in bridge.service_list().get("items", [])
-                    if str(r.get("bike")).strip() == str(bike).strip()), {})
+                    if _same_bike(r.get("bike"), bike)), {})
         pin = rec.get("pinned_msg_id")
         if pin:
             try:
@@ -1613,9 +1622,11 @@ async def _check_service(context, bridge, chat_id, topic_id, bike, mileage):
     if status not in ("due", "overdue"):
         return  # ничего не надо
 
-    # Нужно напомнить. Проверяем — не закреплено ли уже / прошло ли 5 дней
+    # Нужно напомнить. Проверяем — не закреплено ли уже / прошло ли 5 дней.
+    # Матчим строку ТО по НОМЕРУ (имя в листе — каноничное из Лист1, отличается от имени темы).
+    canon = res.get("bike") or bike   # каноничное имя строки (как записал serviceUpsert)
     lst = bridge.service_list().get("items", [])
-    rec = next((r for r in lst if str(r.get("bike")).strip() == bike and str(r.get("service_type")) == stype), {})
+    rec = next((r for r in lst if _same_bike(r.get("bike"), bike) and str(r.get("service_type")) == stype), {})
     pinned = rec.get("pinned_msg_id")
     last_reminded = rec.get("last_reminded_at")
 
@@ -1638,7 +1649,7 @@ async def _check_service(context, bridge, chat_id, topic_id, bike, mileage):
             await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id, disable_notification=False)
         except Exception as e:
             log.warning(f"  → не смог закрепить (нужны права админа боту?): {e}")
-        bridge.service_set_pin(bike=bike, service_type=stype,
+        bridge.service_set_pin(bike=canon, service_type=stype,
                                pinned_msg_id=sent.message_id, last_reminded_at=str(now))
         log.info(f"  → ТО напоминание закреплено: {bike} {stype} {status}")
     except Exception:
