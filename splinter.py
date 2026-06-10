@@ -31,6 +31,29 @@ def set_auditor(auditor):
     _auditor = auditor
 
 
+_SEP = "➖➖➖➖➖➖➖➖"   # единый разделитель между 🇹🇭 и 🇷🇺 блоками
+
+
+def _with_separator(text):
+    """Вставить разделитель-линию между 🇹🇭 и 🇷🇺 блоками двуязычного сообщения. ИДЕМПОТЕНТНО:
+    если перед 🇷🇺 уже линия — не трогаем; если пустая строка — заменяем её на линию (единообразие).
+    Одноязычные (нет одного из флагов) — не трогаем."""
+    if "🇹🇭" not in text or "🇷🇺" not in text:
+        return text
+    lines = text.split("\n")
+    for i, l in enumerate(lines):
+        if l.lstrip().startswith("🇷🇺"):
+            prev = lines[i - 1].strip() if i > 0 else None
+            if prev == _SEP:
+                return text                  # уже с линией
+            if prev == "":
+                lines[i - 1] = _SEP          # пустую строку (денежные) → линия, для единообразия
+            else:
+                lines.insert(i, _SEP)         # слипшиеся блоки → вставить линию
+            return "\n".join(lines)
+    return text
+
+
 async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group="", reply_markup=None):
     """Единая точка отправки сообщений Splinter в группы.
     Перед отправкой прогоняет текст через auditor.check_response_text — тот
@@ -38,6 +61,8 @@ async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=Tru
     Сообщение отправляется в любом случае (вариант А: только журналируем, не глушим),
     чтобы тайцы не остались без уведомления из-за ложного срабатывания.
     """
+    if bilingual:
+        text = _with_separator(text)   # единый разделитель 🇹🇭/🇷🇺 централизованно
     if _auditor is not None:
         try:
             r = _auditor.check_response_text(
@@ -1724,8 +1749,8 @@ async def _ask_oil_or_km(context, chat_id, topic_id, bike, km, status, next_km, 
         [InlineKeyboardButton("🔧 หลังเปลี่ยนน้ำมัน / После замены", callback_data=f"svc:oil:{tok}")],
         [InlineKeyboardButton("📷 แค่เลขไมล์ / Просто пробег", callback_data=f"svc:km:{tok}")],
     ])
-    sent = await context.bot.send_message(chat_id=chat_id, text=msg_oil_or_km(bike, km),
-                                          message_thread_id=topic_id, reply_markup=kb)
+    sent = await _send(context, chat_id=chat_id, text=msg_oil_or_km(bike, km),
+                       message_thread_id=topic_id, reply_markup=kb)
     _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
 
 
@@ -1902,8 +1927,7 @@ async def _ask_service_col(context, chat_id, topic_id, bike, kind, km):
         [InlineKeyboardButton(f"✅ บันทึก {th_lbl} / Зафиксировать {ru_lbl}", callback_data=f"svc:col:{tok}")],
     ])
     b = f" · 📌 {bike}" if bike else ""
-    sent = await context.bot.send_message(
-        chat_id=chat_id, message_thread_id=topic_id,
+    sent = await _send(context, chat_id=chat_id, message_thread_id=topic_id,
         text=(f"🐀 Splinter{b}\n"
               f"🇹🇭 🔧 บันทึก «{th_lbl}» = {km} กม. ไหมครับ? กดปุ่ม (ยืนยันโดย @Pleummmm/เจ้าของ) 👇\n"
               f"🇷🇺 🔧 Зафиксировать «{ru_lbl}» = {km} км? Нажми кнопку (подтверждает @Pleummmm/владелец) 👇"),
@@ -1993,7 +2017,7 @@ async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, ne
     canon = rec.get("bike") or bike
     text = msg_service_due(bike, stype, km, next_km, status)
     try:
-        sent = await context.bot.send_message(chat_id=chat_id, text=text, message_thread_id=topic_id)
+        sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id)
         if need_remind or not pinned:   # крепим/обновляем ТОЛЬКО когда реально нужно
             if pinned:   # не копим: снимаем ПРОШЛЫЙ закреп перед новым
                 try:
@@ -2030,7 +2054,11 @@ async def handle_service_button(update, context, bridge) -> None:
     if not data:
         await q.answer()
         try:
-            await q.edit_message_text("⚠️ Кнопка устарела (перезапуск бота). Пришли фото пробега ещё раз 🙏")
+            await q.edit_message_text(
+                "🐀 Splinter\n"
+                "🇹🇭 ⚠️ ปุ่มหมดอายุ (บอทรีสตาร์ท) — รบกวนส่งรูปเลขไมล์อีกครั้งนะครับ 🙏\n"
+                f"{_SEP}\n"
+                "🇷🇺 ⚠️ Кнопка устарела (перезапуск бота). Пришли фото пробега ещё раз 🙏")
         except Exception:
             pass
         return
@@ -2070,14 +2098,14 @@ async def handle_service_button(update, context, bridge) -> None:
         # [Зафиксировать <тип>] группы B (gear/abs/airfilter) → set_fleet_service. ТОЛЬКО доверенный.
         svc_kind = data.get("svc_kind", "")
         if not _is_trusted_user(q.from_user):
-            await q.answer("Подтверждает @Pleummmm или владелец", show_alert=False)
+            await q.answer("ยืนยันโดย @Pleummmm/เจ้าของ · Подтверждает @Pleummmm или владелец", show_alert=False)
             th_lbl, ru_lbl = _SVC_COL_LABEL.get(svc_kind, (svc_kind, svc_kind))
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=(f"🐀 Splinter\n"
                               f"🇹🇭 🔧 การบันทึก «{th_lbl}» ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้น\n"
                               f"🇷🇺 🔧 Запись «{ru_lbl}» подтверждает @Pleummmm или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
-        await q.answer("Записываю…")
+        await q.answer("กำลังบันทึก… · Записываю…")
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -2089,11 +2117,11 @@ async def handle_service_button(update, context, bridge) -> None:
     if action == "oil":
         # [После замены] → боевая запись кол.I. ТОЛЬКО доверенный.
         if not _is_trusted_user(q.from_user):
-            await q.answer("Подтверждает @Pleummmm или владелец", show_alert=False)
+            await q.answer("ยืนยันโดย @Pleummmm/เจ้าของ · Подтверждает @Pleummmm или владелец", show_alert=False)
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=msg_oil_need_trusted(bike, km))
             return   # токен и кнопки живут — Пым нажмёт [После замены] позже
-        await q.answer("Записываю ТО Oil…")
+        await q.answer("กำลังบันทึกน้ำมันเครื่อง… · Записываю ТО Oil…")
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
