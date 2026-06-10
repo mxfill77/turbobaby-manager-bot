@@ -317,6 +317,35 @@ _RECENT_TTL = 3 * 3600      # 3 часа — потом считаем уста�
 _PENDING_WORKS = {}
 _PENDING_WORKS_TTL = 3 * 3600   # 3 часа — потом перечень протух, не пишем
 
+# ЧАСТЬ D: message_id ПРОМЕЖУТОЧНЫХ бот-вопросов ТО-цикла (пробег? замена? фото одометра?) —
+# копим по теме, удаляем на ФИНАЛЕ цикла (✅ записано/принято). Финал и закреп-просрочку НЕ копим.
+# {(chat_id, topic_id): [(message_id, ts), ...]}. Волатильный; TTL от утечек.
+_SVC_CYCLE_MSGS = {}
+_SVC_CYCLE_TTL = 3 * 3600
+
+
+def _remember_cycle_msg(chat_id, topic_id, sent):
+    """Запомнить message_id промежуточного бот-вопроса (для удаления на финале цикла)."""
+    mid = getattr(sent, "message_id", None) if sent else None
+    if mid is None:
+        return
+    _SVC_CYCLE_MSGS.setdefault((chat_id, topic_id), []).append((mid, _time.time()))
+
+
+async def _clear_cycle_msgs(context, chat_id, topic_id):
+    """ФИНАЛ цикла ТО → удалить накопленные промежуточные бот-вопросы (best-effort).
+    Закреп-просрочку и финальные сообщения НЕ трогаем — их id сюда не попадают.
+    delete_message может упасть (>48ч / уже удалено / нет прав) → ловим, флоу не роняем."""
+    msgs = _SVC_CYCLE_MSGS.pop((chat_id, topic_id), [])
+    now = _time.time()
+    for mid, ts in msgs:
+        if now - ts > _SVC_CYCLE_TTL:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception as e:
+            log.info(f"  → чистка ТО: не удалил вопрос {mid} (best-effort): {e}")
+
 # Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
 # не повторять чаще раза в 10 мин на тему. {(chat_id, topic_id): ts}. Волатильный — ок для троттлинга.
 _ODOMETER_ASK_TS = {}
@@ -892,18 +921,27 @@ def msg_ask_odometer(bike):
 
 
 def msg_work_receipt(bike, works):
-    """Квитанция: подтверждаем вслух, что перечисленные работы записаны в историю
-    (Bot Data «события»). Двуязычно RU/TH (TH первым). Чтобы пояснение работ ТЕКСТОМ
-    не выглядело как игнор (кейс NINJA 6334 09.06 — бот молчал на текст-перечень работ)."""
+    """Квитанция на ЭТАПЕ ТЕКСТА: работы ПРИНЯТЫ (ещё в буфере, НЕ записаны) — просим пробег.
+    Факт записи подтверждается ОТДЕЛЬНО (msg_works_logged) ПОСЛЕ прихода пробега, чтобы не
+    выглядело «записал», когда записи ещё нет. Список работ по-русски → только в 🇷🇺-строке."""
     b = f" {bike}" if bike else ""
     works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
-    # ВАЖНО: список работ приходит по-русски — держим его ТОЛЬКО в 🇷🇺-строке.
-    # В 🇹🇭-блоке кириллицы быть НЕ должно (правило аудитора: тайский блок — только тайский;
-    # bike — латинский номер, это ок). Иначе style_issue (поймано аудитором 20:52, NINJA 6334).
     return (
         f"🐀 Splinter\n"
-        f"🇹🇭 บันทึกงานที่ทำลงประวัติเรียบร้อยแล้วครับ{b} 🛠️\n"
-        f"🇷🇺 Записал работы в историю{b}: {works_str} 🛠️"
+        f"🇹🇭 รับงานแล้วครับ{b} — รบกวนส่งเลขไมล์ด้วยครับ 🙏\n"
+        f"🇷🇺 Принял работы{b}: {works_str} — пришли пробег 🙏"
+    )
+
+
+def msg_works_logged(bike, km, works):
+    """Пост-квитанция ПО ФАКТУ записи инфо-работ в историю (после flush/записи с км).
+    Список работ по-русски → ТОЛЬКО в 🇷🇺-строке (🇹🇭 без кириллицы; km — цифры, bike — латиница)."""
+    b = f" {bike}" if bike else ""
+    works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 ✅ บันทึกงานลงประวัติที่เลขไมล์ {km} กม. แล้วครับ{b} 🛠️\n"
+        f"🇷🇺 ✅ Записал работы на пробеге {km} км{b}: {works_str} 🛠️"
     )
 
 
@@ -912,7 +950,7 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
     с привязкой пробега. msg_id с суффиксом :wN — уникальность строк (дедуп Bridge не схлопывает их
     в одну) и идемпотентность отложенного flush. Колоночные работы сюда НЕ попадают — у них свой адрес."""
     grp = group_name + (f" / тема {topic_id}" if topic_id else "")
-    n = 0
+    written = []
     for i, w in enumerate(dict.fromkeys(info_works)):
         note = (f"{w} — {km} км" if km else f"{w}")[:200]
         r = bridge.add_event(msg_date=msg_date, group=grp, bike=bike, event_type="repair",
@@ -920,19 +958,20 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
                              msg_id=f"{msg_id_base}:w{i}")
         log.info(f"  → инфо-работа в историю: «{note}» add_event ok={(r or {}).get('ok')} "
                  f"saved={(r or {}).get('saved')} dup={(r or {}).get('duplicate')}")
-        n += 1
-    return n
+        written.append(w)
+    return written   # список фактически записанных работ (для пост-квитанции по факту)
 
 
 def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_date=""):
     """Пришёл чёткий пробег в теме → дописать ОТЛОЖЕННЫЕ инфо-работы (буфер прошлого сообщения) с этим
-    км. pop() = ровно один раз (без задвоения). Протухший (> TTL) буфер не пишем."""
+    км. pop() = ровно один раз (без задвоения). Протухший (> TTL) буфер не пишем.
+    Возвращает СПИСОК записанных работ (для пост-квитанции) или []."""
     pend = _PENDING_WORKS.pop((chat_id, topic_id), None)
     if not pend:
-        return 0
+        return []
     if _time.time() - pend.get("ts", 0) > _PENDING_WORKS_TTL:
         log.info(f"  → отложенные инфо-работы протухли (>{_PENDING_WORKS_TTL//3600}ч), не пишу: {pend.get('works')}")
-        return 0
+        return []
     return _write_info_works(bridge, group_name, topic_id, bike or pend.get("bike", ""),
                              pend["works"], km, pend["msg_id_base"], msg_date)
 
@@ -1196,7 +1235,7 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
     ])
     b_th = f" ({bike})" if bike else ""
     b_ru = f" по {bike}" if bike else ""
-    await _send(
+    sent = await _send(
         context,
         chat_id=chat_id,
         text=(f"🐀 Splinter\n"
@@ -1205,6 +1244,7 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
         message_thread_id=topic_id,
         reply_markup=kb,
     )
+    _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
 
 
 async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
@@ -1466,8 +1506,9 @@ async def _ask_oil_or_km(context, chat_id, topic_id, bike, km, status, next_km, 
         [InlineKeyboardButton("🔧 หลังเปลี่ยนน้ำมัน / После замены", callback_data=f"svc:oil:{tok}")],
         [InlineKeyboardButton("📷 แค่เลขไมล์ / Просто пробег", callback_data=f"svc:km:{tok}")],
     ])
-    await context.bot.send_message(chat_id=chat_id, text=msg_oil_or_km(bike, km),
-                                   message_thread_id=topic_id, reply_markup=kb)
+    sent = await context.bot.send_message(chat_id=chat_id, text=msg_oil_or_km(bike, km),
+                                          message_thread_id=topic_id, reply_markup=kb)
+    _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
 
 
 async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint=False):
@@ -1479,10 +1520,12 @@ async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_
     if info["status"] in ("due", "overdue") or oil_hint:
         await _ask_oil_or_km(context, chat_id, topic_id, bike, info["km"],
                              info["status"], info["next_km"], info["km_left"])
+        # НЕ финал — задали вопрос [После замены]/[Просто пробег], цикл продолжается. Промежутки НЕ чистим.
     else:
         await _send(context, chat_id=chat_id,
                     text=msg_mileage_ok(bike, info["km"], info["next_km"], info["km_left"]),
                     message_thread_id=topic_id)
+        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: ТО в норме = финал → чистим вопросы
     # Фаза 2: на приходе пробега прогнать и НЕ-масляные ТО (gear/abs/возд.фильтр), по кому есть запись.
     await _check_other_services(context, bridge, chat_id, topic_id, bike, info["km"])
 
@@ -1587,6 +1630,7 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
                           f"🇹🇭 ✅ อัปเดตการเปลี่ยนน้ำมันเครื่องแล้ว: {res.get('bike_name', bike)} → {km_int} กม. ปิดเตือนเกินกำหนดแล้วครับ\n"
                           f"🇷🇺 ✅ ТО Oil обновлено: {res.get('bike_name', bike)} → {km_int} км, просрочка закрыта"))
         await _close_service_reminder(context, bridge, chat_id, topic_id, bike)
+        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: ТО Oil записано = финал → чистим вопросы
     else:
         err = res.get("error", "")
         if err == "oil_decreasing":
@@ -1623,12 +1667,13 @@ async def _ask_service_col(context, chat_id, topic_id, bike, kind, km):
         [InlineKeyboardButton(f"✅ บันทึก {th_lbl} / Зафиксировать {ru_lbl}", callback_data=f"svc:col:{tok}")],
     ])
     b = f" · 📌 {bike}" if bike else ""
-    await context.bot.send_message(
+    sent = await context.bot.send_message(
         chat_id=chat_id, message_thread_id=topic_id,
         text=(f"🐀 Splinter{b}\n"
               f"🇹🇭 🔧 บันทึก «{th_lbl}» = {km} กม. ไหมครับ? กดปุ่ม (ยืนยันโดย @Pleummmm/เจ้าของ) 👇\n"
               f"🇷🇺 🔧 Зафиксировать «{ru_lbl}» = {km} км? Нажми кнопку (подтверждает @Pleummmm/владелец) 👇"),
         reply_markup=kb)
+    _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
 
 
 async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km):
@@ -1670,6 +1715,7 @@ async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km)
                 log.exception(f"  → ТО {kind}: service_upsert при фиксации упал (столбец записан)")
         else:
             log.info(f"  → ТО {kind}: не трекаем (нет интервала по типу байка — напр. gear на мото)")
+        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: J/K/L записано = финал → чистим вопросы
     else:
         err = res.get("error", "")
         if err == "km_decreasing":
@@ -1839,6 +1885,8 @@ async def handle_service_button(update, context, bridge) -> None:
             # ТО в норме — короткая квитанция «пробег принят, ТО в норме, следующее на Y».
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=msg_mileage_ok(bike, km_int, data.get("next_km"), data.get("km_left")))
+        # ЧАСТЬ D: [Просто пробег] = финал цикла (закреп-просрочку оставляем, вопросы убираем).
+        await _clear_cycle_msgs(context, chat_id, topic_id)
     else:
         await q.answer()
 
@@ -1962,14 +2010,15 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     _msg_date = str(msg.date.date()) if msg.date else ""
 
     # Пришёл чёткий пробег в теме → дописать ОТЛОЖЕННЫЕ инфо-работы прошлого сообщения с этим км.
+    _logged_works = []
     if km_now:
-        _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, str(km_now), _msg_date)
+        _logged_works += _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, str(km_now), _msg_date)
 
     _ev_r = None
     if info_works:
         if km_now:
             # Пробег есть В ЭТОМ сообщении → пишем инфо-работы СРАЗУ, по строке на работу, с км.
-            _write_info_works(bridge, group_name, topic_id, bike, info_works, str(km_now), _ev_msg_id, _msg_date)
+            _logged_works += _write_info_works(bridge, group_name, topic_id, bike, info_works, str(km_now), _ev_msg_id, _msg_date)
         else:
             # Пробега нет → буферизуем перечень; запишем при приходе пробега (flush). Ниже уйдёт переспрос.
             _PENDING_WORKS[(chat_id, topic_id)] = {
@@ -1988,6 +2037,12 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     log.info(f"  → add_event: ok={(_ev_r or {}).get('ok')} saved={(_ev_r or {}).get('saved')} "
              f"duplicate={(_ev_r or {}).get('duplicate')} error={(_ev_r or {}).get('error')} "
              f"msg_id={_ev_msg_id} info_works={len(info_works)} km_now={km_now or '-'} event_type={event_type}")
+
+    # ПОСТ-КВИТАНЦИЯ ПО ФАКТУ записи инфо-работ (flush ИЛИ немедленная запись с км). Не на этапе текста —
+    # именно после реальной записи, чтобы человек видел «✅ записал работы на пробеге X», а не молчание.
+    if _logged_works:
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=msg_works_logged(bike, km_now, _logged_works))
 
     # === ТО-трекер ===
     _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
@@ -2055,8 +2110,9 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             # выполненной работы (repair-событие или oil-done); cooldown 10 мин уважаем всегда.
             force = (event_type == "repair") or oil_hint
             if _should_ask_odometer(chat_id, topic_id, ignore_buffer=force):
-                await _send(context, chat_id=chat_id,
-                            text=msg_ask_odometer(bike), message_thread_id=topic_id)
+                sent = await _send(context, chat_id=chat_id,
+                                   text=msg_ask_odometer(bike), message_thread_id=topic_id)
+                _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос
         return
 
     # Масло-контекст, но БЕЗ чёткого пробега в ЭТОМ сообщении → САМ просим ЧЁТКОЕ фото одометра.
@@ -2064,9 +2120,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Ничего в ТО не пишем, число не выдумываем. Анти-спам: буфер high-пробега + троттлинг.
     no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
     if _is_oil_context(text, vis) and no_clear_km and _should_ask_odometer(chat_id, topic_id):
-        await _send(context,
+        sent = await _send(context,
             chat_id=chat_id, text=msg_ask_odometer(bike), message_thread_id=topic_id
         )
+        _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос
         return
 
     # Только ГРЯЗЬ (без повреждений) → мягко просим помыть/обработать. Пыма НЕ тегаем.
