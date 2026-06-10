@@ -149,6 +149,11 @@ class BridgeClient:
         Возвращает {ok, deleted, rows:[...]} — сверять по return/логу, НЕ по кэш-экспорту."""
         return self._post("delete_event", msg_id=msg_id, group=group, max=max)
 
+    def read_events(self, bike: str, limit: int = 8) -> dict:
+        """Последние обслуживания байка из листа «события» (read-only, сервис-на-пробеге для карточки).
+        Резолв по номеру, newest-first. → {ok, bike, items:[{recorded_at,msg_date,event_type,mileage,notes}]}."""
+        return self._call("read_events", bike=bike, limit=limit)
+
     def check_balance(self, currency: str, pym_balance, group: str = "", note: str = "") -> dict:
         """Сверить баланс кошелька (group) с названным Пымом."""
         return self._post("check_balance", currency=currency,
