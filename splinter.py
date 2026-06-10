@@ -346,6 +346,39 @@ async def _clear_cycle_msgs(context, chat_id, topic_id):
         except Exception as e:
             log.info(f"  → чистка ТО: не удалил вопрос {mid} (best-effort): {e}")
 
+
+# ЕДИНОЕ ИТОГОВОЕ сообщение ТО-цикла: накопитель по теме. Записи (работы/масло/столбцы) кладут сюда
+# результат, НЕ шлют по отдельности; в терминальной точке цикла — ОДНА сводка _emit_summary, накопитель
+# очищается. {(chat_id, topic_id): {current_km, works:[], works_km, oil:{km,next,status}|None, cols:[...], ts}}
+_SVC_SUMMARY = {}
+_SVC_SUMMARY_TTL = 3 * 3600
+
+
+def _summary_acc(chat_id, topic_id):
+    """Накопитель сводки для темы (создаёт/обновляет ts; протухший пересоздаёт)."""
+    acc = _SVC_SUMMARY.get((chat_id, topic_id))
+    if acc is None or _time.time() - acc.get("ts", 0) > _SVC_SUMMARY_TTL:
+        acc = {"current_km": "", "works": [], "works_km": "", "oil": None, "cols": []}
+        _SVC_SUMMARY[(chat_id, topic_id)] = acc
+    acc["ts"] = _time.time()
+    return acc
+
+
+async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False):
+    """ТЕРМИНАЛ цикла → собрать ОДНУ сводку из накопителя, отправить, накопитель очистить.
+    skip_oil=True (overdue [Просто пробег]) — масло уже в закрепе, в сводке его не дублируем;
+    тогда шлём сводку ТОЛЬКО если есть работы/столбцы. Возвращает True если что-то отправили."""
+    acc = _SVC_SUMMARY.pop((chat_id, topic_id), None)
+    if not acc:
+        return False
+    has = bool(acc.get("works") or acc.get("cols") or (acc.get("oil") and not skip_oil))
+    if not has:
+        return False
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=msg_service_summary(bike, acc, skip_oil=skip_oil))
+    return True
+
+
 # Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
 # не повторять чаще раза в 10 мин на тему. {(chat_id, topic_id): ts}. Волатильный — ок для троттлинга.
 _ODOMETER_ASK_TS = {}
@@ -945,6 +978,43 @@ def msg_works_logged(bike, km, works):
     )
 
 
+def msg_service_summary(bike, acc, skip_oil=False):
+    """ЕДИНАЯ сводка в конце ТО-цикла: столбцы (масло/gear/abs/возд.фильтр) + история + пробег.
+    🇹🇭 ЧИСТЫЙ тайский (метки столбцов из _SVC_COL_LABEL; история обобщённо «บันทึกลงประวัติ»);
+    🇷🇺 чистый русский (пословный список работ). Секции без данных опускаем. Cyrillic в 🇹🇭 НЕТ."""
+    km = acc.get("current_km") or acc.get("works_km") or (acc.get("oil") or {}).get("km") or ""
+    head = f"🐀 Splinter · 📌 {bike}" if bike else "🐀 Splinter"
+    th = [f"🇹🇭 ✅ บันทึกครบแล้วครับ" + (f" — เลขไมล์ปัจจุบัน {km} กม." if km else "")]
+    ru = [f"🇷🇺 ✅ Готово" + (f" — текущий пробег {km} км." if km else "")]
+    oil = acc.get("oil")
+    if oil and not skip_oil:
+        nxt, st = oil.get("next"), str(oil.get("status", "ok"))
+        if st in ("due", "overdue") and nxt:
+            try:
+                over = int(oil.get("km")) - int(nxt)
+            except (ValueError, TypeError):
+                over = None
+            tail_th = f" เกินกำหนด {over} กม. (ครบ {nxt})" if over and over > 0 else f" ใกล้ครบ (ครบ {nxt})"
+            tail_ru = f" просрочка {over} км (срок {nxt})" if over and over > 0 else f" скоро срок ({nxt})"
+            th.append(f"   • เปลี่ยนน้ำมันเครื่อง:{tail_th}")
+            ru.append(f"   • ТО Oil:{tail_ru}")
+        else:
+            th.append("   • เปลี่ยนน้ำมันเครื่อง: ปกติ" + (f" ครบกำหนดถัดไป {nxt} กม." if nxt else ""))
+            ru.append("   • ТО Oil: в норме" + (f", следующее {nxt} км" if nxt else ""))
+    for c in acc.get("cols", []):
+        th_lbl, ru_lbl = _SVC_COL_LABEL.get(c.get("kind"), (c.get("kind"), c.get("kind")))
+        nxt = c.get("next")
+        th.append(f"   • {th_lbl}: {c.get('km')} กม." + (f" (ครบ {nxt})" if nxt else ""))
+        ru.append(f"   • {ru_lbl}: {c.get('km')} км" + (f" (след. {nxt})" if nxt else ""))
+    works = acc.get("works")
+    if works:
+        wkm = acc.get("works_km", "")
+        works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
+        th.append("   • บันทึกงานลงประวัติแล้ว" + (f" (ที่ {wkm} กม.)" if wkm else "") + " 🛠️")
+        ru.append("   • В историю" + (f" (на {wkm} км)" if wkm else "") + f": {works_str} 🛠️")
+    return head + "\n" + "\n".join(th) + "\n" + "\n".join(ru)
+
+
 def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date=""):
     """Вариант A (разбор перечня по адресам): КАЖДУЮ инфо-работу — отдельной строкой в «события»
     с привязкой пробега. msg_id с суффиксом :wN — уникальность строк (дедуп Bridge не схлопывает их
@@ -1522,10 +1592,14 @@ async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_
                              info["status"], info["next_km"], info["km_left"])
         # НЕ финал — задали вопрос [После замены]/[Просто пробег], цикл продолжается. Промежутки НЕ чистим.
     else:
-        await _send(context, chat_id=chat_id,
-                    text=msg_mileage_ok(bike, info["km"], info["next_km"], info["km_left"]),
-                    message_thread_id=topic_id)
-        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: ТО в норме = финал → чистим вопросы
+        # ТО в норме = ТЕРМИНАЛ цикла. Масло → накопитель; ОДНА сводка (масло+история+столбцы) вместо
+        # отдельного msg_mileage_ok. Если в накопителе ничего (чистый пробег без работ) — сводка сама даст
+        # «пробег + ТО в норме» (как раньше msg_mileage_ok).
+        acc = _summary_acc(chat_id, topic_id)
+        acc["current_km"] = str(info["km"])
+        acc["oil"] = {"km": info["km"], "next": info["next_km"], "status": info.get("status", "ok")}
+        await _emit_summary(context, chat_id, topic_id, bike)
+        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: финал → чистим вопросы
     # Фаза 2: на приходе пробега прогнать и НЕ-масляные ТО (gear/abs/возд.фильтр), по кому есть запись.
     await _check_other_services(context, bridge, chat_id, topic_id, bike, info["km"])
 
@@ -1625,12 +1699,16 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
     res = bridge.set_fleet_oil(number=plate, oil_km=km_int, confirmed=True)
     log.info(f"  → ТО Oil set_fleet_oil({plate},{km_int},confirmed=True) → {res}")
     if res.get("ok"):
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=(f"🐀 Splinter\n"
-                          f"🇹🇭 ✅ อัปเดตการเปลี่ยนน้ำมันเครื่องแล้ว: {res.get('bike_name', bike)} → {km_int} กม. ปิดเตือนเกินกำหนดแล้วครับ\n"
-                          f"🇷🇺 ✅ ТО Oil обновлено: {res.get('bike_name', bike)} → {km_int} км, просрочка закрыта"))
+        # Масло записано (замена) = ТЕРМИНАЛ цикла. Отдельное «✅ ТО Oil обновлено» НЕ шлём — копим в
+        # накопитель, ниже одна сводка. next = km + интервал (из книги знаний, фоллбэк на хардкод).
+        _canon = res.get("bike_name", bike)
+        _iv = _service_interval("oil", _canon, bridge) or _oil_interval(_canon)
+        acc = _summary_acc(chat_id, topic_id)
+        acc["current_km"] = str(km_int)
+        acc["oil"] = {"km": km_int, "next": (km_int + _iv) if _iv else None, "status": "ok"}
         await _close_service_reminder(context, bridge, chat_id, topic_id, bike)
-        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: ТО Oil записано = финал → чистим вопросы
+        await _emit_summary(context, chat_id, topic_id, bike)
+        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: финал → чистим вопросы
     else:
         err = res.get("error", "")
         if err == "oil_decreasing":
@@ -1698,24 +1776,27 @@ async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km)
     res = bridge.set_fleet_service(number=plate, kind=kind, km=km_int, confirmed=True)
     log.info(f"  → ТО {kind} set_fleet_service({plate},{kind},{km_int},confirmed=True) → {res}")
     if res.get("ok"):
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=(f"🐀 Splinter\n"
-                          f"🇹🇭 ✅ บันทึก «{th_lbl}» แล้ว: {res.get('bike_name', bike)} → {km_int} กม.\n"
-                          f"🇷🇺 ✅ Записано «{ru_lbl}»: {res.get('bike_name', bike)} → {km_int} км"))
-        # Фаза 2: трекинг срока этого ТО (зеркало масла). service_upsert сбрасывает цикл:
-        # last_service_km=km → next_km=km+интервал, статус ok. gear на мото/XADV (iv=None) — НЕ трекаем.
+        # Столбец записан = ТЕРМИНАЛ. Отдельное «✅ Записано» НЕ шлём — копим в накопитель, ниже одна сводка.
+        # Фаза 2: трекинг срока (зеркало масла). service_upsert сбрасывает цикл (next_km=km+интервал).
+        # gear на мото/XADV (iv=None) — НЕ трекаем, но столбец записан (next в сводке тогда без срока).
         canon = res.get("bike_name", bike)
         iv = _service_interval(kind, canon, bridge)
+        _col_next = None
         if iv:
             try:
                 up = bridge.service_upsert(bike=canon, topic_id=topic_id or "", service_type=kind,
                                            current_km=km_int, last_service_km=km_int, interval_km=iv)
-                log.info(f"  → ТО {kind} трекинг: service_upsert(interval={iv}) → next_km={up.get('next_km')} status={up.get('status')}")
+                _col_next = up.get("next_km")
+                log.info(f"  → ТО {kind} трекинг: service_upsert(interval={iv}) → next_km={_col_next} status={up.get('status')}")
             except Exception:
                 log.exception(f"  → ТО {kind}: service_upsert при фиксации упал (столбец записан)")
         else:
             log.info(f"  → ТО {kind}: не трекаем (нет интервала по типу байка — напр. gear на мото)")
-        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: J/K/L записано = финал → чистим вопросы
+        acc = _summary_acc(chat_id, topic_id)
+        acc["current_km"] = str(km_int)
+        acc["cols"].append({"kind": kind, "km": km_int, "next": _col_next})
+        await _emit_summary(context, chat_id, topic_id, bike)
+        await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: финал → чистим вопросы
     else:
         err = res.get("error", "")
         if err == "km_decreasing":
@@ -1876,15 +1957,18 @@ async def handle_service_button(update, context, bridge) -> None:
         except (ValueError, TypeError):
             km_int = km
         if data.get("status") in ("due", "overdue"):
-            # Просрочка/срок → ПОЛНОЕ напоминание (msg_service_due): что просрочено, текущий/срок,
-            # после замены — фото пробега + чек. always_notify → текст придёт даже при свежем закрепе.
+            # Просрочка/срок → ПОЛНОЕ напоминание-закреп (msg_service_due). Масло — в закрепе; в сводке
+            # его НЕ дублируем (skip_oil), сводку шлём ТОЛЬКО если есть работы/столбцы.
             await _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike,
                                         km_int, data.get("next_km"), data.get("status"),
                                         always_notify=True)
+            await _emit_summary(context, chat_id, topic_id, bike, skip_oil=True)
         else:
-            # ТО в норме — короткая квитанция «пробег принят, ТО в норме, следующее на Y».
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=msg_mileage_ok(bike, km_int, data.get("next_km"), data.get("km_left")))
+            # ТО в норме = ТЕРМИНАЛ. Масло → накопитель; ОДНА сводка (масло+история+столбцы).
+            acc = _summary_acc(chat_id, topic_id)
+            acc["current_km"] = str(km_int)
+            acc["oil"] = {"km": km_int, "next": data.get("next_km"), "status": "ok"}
+            await _emit_summary(context, chat_id, topic_id, bike)
         # ЧАСТЬ D: [Просто пробег] = финал цикла (закреп-просрочку оставляем, вопросы убираем).
         await _clear_cycle_msgs(context, chat_id, topic_id)
     else:
@@ -2038,11 +2122,13 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
              f"duplicate={(_ev_r or {}).get('duplicate')} error={(_ev_r or {}).get('error')} "
              f"msg_id={_ev_msg_id} info_works={len(info_works)} km_now={km_now or '-'} event_type={event_type}")
 
-    # ПОСТ-КВИТАНЦИЯ ПО ФАКТУ записи инфо-работ (flush ИЛИ немедленная запись с км). Не на этапе текста —
-    # именно после реальной записи, чтобы человек видел «✅ записал работы на пробеге X», а не молчание.
+    # ЕДИНАЯ СВОДКА: инфо-работы записаны (flush/немедленно) → НЕ шлём отдельно, копим в накопитель.
+    # Сводка уйдёт ОДНИМ сообщением в терминальной точке цикла (после масла/столбцов).
     if _logged_works:
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=msg_works_logged(bike, km_now, _logged_works))
+        acc = _summary_acc(chat_id, topic_id)
+        acc["works"] += _logged_works
+        acc["works_km"] = str(km_now)
+        acc["current_km"] = str(km_now)
 
     # === ТО-трекер ===
     _conf_ok = str(vis.get("mileage_confidence", "")) != "low"
