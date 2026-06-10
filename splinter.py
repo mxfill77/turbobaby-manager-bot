@@ -1044,6 +1044,92 @@ def msg_service_summary(bike, acc, skip_oil=False):
     return head + "\n" + "\n".join(th) + "\n" + "\n".join(ru)
 
 
+# ЗАХОД 2: распознавание запроса карточки байка («инфа/статус/что по байку»).
+_STATUS_KEYWORDS = ("инф", "статус", "состояни", "что по байк", "что с байк",
+                    "как байк", "сводка по", "карточк", "status", "info")
+
+
+def _is_status_request(text):
+    """Короткий свободный запрос статуса/карточки байка (не длинное сообщение о работах)."""
+    t = (text or "").strip().lower()
+    if not t or len(t) > 60:
+        return False
+    return any(k in t for k in _STATUS_KEYWORDS)
+
+
+def msg_bike_card(bike, cur_km, oil, cols, rental):
+    """КАРТОЧКА байка по запросу (ЗАХОД 2): пробег + ТО Oil + J/K/L + аренда. История работ — ЗАХОД 3.
+    🇹🇭 чистый тайский (метки/статусы тайскими), 🇷🇺 русский. Секции без данных опускаем."""
+    head = f"🐀 Splinter · 📌 {bike}" if bike else "🐀 Splinter"
+    km_th = f" · ไมล์ {cur_km} กม." if cur_km else ""
+    km_ru = f" · пробег {cur_km} км" if cur_km else ""
+    th = [f"🇹🇭 📋 สถานะรถ{km_th}"]
+    ru = [f"🇷🇺 📋 Статус байка{km_ru}"]
+
+    def _oil_lines(o):
+        nxt, st = o.get("next"), str(o.get("status") or "")
+        if st in ("due", "overdue") and nxt:
+            try:
+                over = int(o.get("km")) - int(nxt)
+            except (ValueError, TypeError):
+                over = None
+            t = f" เกินกำหนด {over} กม. (ครบ {nxt})" if over and over > 0 else f" ใกล้ครบ (ครบ {nxt})"
+            r = f" просрочка {over} км (срок {nxt})" if over and over > 0 else f" скоро срок ({nxt})"
+        else:
+            t = " ปกติ" + (f" ครบกำหนดถัดไป {nxt} กม." if nxt else "")
+            r = " в норме" + (f", следующее {nxt} км" if nxt else "")
+        return t, r
+
+    if oil:
+        ot, orr = _oil_lines(oil)
+        th.append(f"   • เปลี่ยนน้ำมันเครื่อง:{ot}")
+        ru.append(f"   • ТО Oil:{orr}")
+    for c in cols or []:
+        th_lbl, ru_lbl = _SVC_COL_LABEL.get(c.get("kind"), (c.get("kind"), c.get("kind")))
+        nxt = c.get("next")
+        th.append(f"   • {th_lbl}:" + (f" ครบกำหนด {nxt} กม." if nxt else " บันทึกแล้ว"))
+        ru.append(f"   • {ru_lbl}:" + (f" следующее {nxt} км" if nxt else " ведётся"))
+    if rental:
+        state = str(rental.get("state", ""))
+        cl = rental.get("client", "")
+        if state.lower().startswith("в аренд"):
+            th.append("   • เช่า: ให้เช่าอยู่" + (f" (ลูกค้า {cl})" if cl else ""))
+            ru.append("   • аренда: у клиента" + (f" {cl}" if cl else ""))
+        elif state.lower() == "дома":
+            th.append("   • เช่า: อยู่ที่ออฟฟิศ")
+            ru.append("   • аренда: дома (в офисе)")
+        elif state:
+            th.append(f"   • สถานะ: {state}")
+            ru.append(f"   • статус: {state}")
+    return head + "\n" + "\n".join(th) + "\n" + "\n".join(ru)
+
+
+async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
+    """Собрать карточку байка из ЧИТАЕМЫХ источников (find_bike + service_list) и отправить. Ничего не пишет."""
+    fb = bridge.find_bike(bike) or {}
+    canon = fb.get("name") or bike
+    try:
+        recs = [r for r in (bridge.service_list().get("items", []) or []) if _same_bike(r.get("bike"), bike)]
+    except Exception:
+        recs = []
+    oil_rec = next((r for r in recs if str(r.get("service_type")) == "oil"), {})
+    cur_km = oil_rec.get("current_km") or ""
+    oil = None
+    if oil_rec:
+        oil = {"km": cur_km, "next": oil_rec.get("next_km"), "status": oil_rec.get("status")}
+    elif fb.get("oil_last_km"):
+        iv = _service_interval("oil", canon, bridge)
+        oil = {"km": cur_km, "next": (int(fb["oil_last_km"]) + iv) if iv else None, "status": None}
+    cols = [{"kind": str(r.get("service_type")), "next": r.get("next_km"),
+             "status": r.get("status"), "km": r.get("current_km")}
+            for r in recs if str(r.get("service_type")) in ("gear", "abs", "airfilter")]
+    rental = None
+    if fb.get("status"):
+        rental = {"state": fb.get("status"), "client": (fb.get("current_rental") or {}).get("client", "")}
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=msg_bike_card(canon, cur_km, oil, cols, rental))
+
+
 def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date=""):
     """Вариант A (разбор перечня по адресам): КАЖДУЮ инфо-работу — отдельной строкой в «события»
     с привязкой пробега. msg_id с суффиксом :wN — уникальность строк (дедуп Bridge не схлопывает их
@@ -2065,6 +2151,18 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     topic_id = getattr(msg, "message_thread_id", None)
     # Название темы = байк (по договорённости). Запоминаем когда встречается.
     _remember_topic_name(chat_id, topic_id, msg)
+
+    # ЗАХОД 2: запрос КАРТОЧКИ байка («инфа/статус/что по байку») — отвечаем карточкой из ЧИТАЕМЫХ
+    # источников (пробег, ТО Oil, J/K/L, аренда), НИЧЕГО не пишем. Только текст без фото.
+    if text.strip() and not has_photo and _is_status_request(text):
+        _card_bike = bike_from_topic(chat_id, topic_id) or ""
+        if _card_bike:
+            log.info(f"  → запрос карточки байка: {_card_bike}")
+            try:
+                await _send_bike_card(context, bridge, chat_id, topic_id, _card_bike)
+            except Exception:
+                log.exception("  → ошибка карточки байка")
+            return
 
     # Разбираем текст (если есть) на событие
     parsed = {}
