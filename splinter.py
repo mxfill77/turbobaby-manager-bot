@@ -367,16 +367,16 @@ def _summary_acc(chat_id, topic_id):
 async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False):
     """ТЕРМИНАЛ цикла → собрать ОДНУ сводку из накопителя, отправить, накопитель очистить.
     skip_oil=True (overdue [Просто пробег]) — масло уже в закрепе, в сводке его не дублируем;
-    тогда шлём сводку ТОЛЬКО если есть работы/столбцы. Возвращает True если что-то отправили."""
+    тогда шлём сводку ТОЛЬКО если есть работы/столбцы. Возвращает отправленный Message (для закрепа
+    итога) ИЛИ None если ничего не отправили."""
     acc = _SVC_SUMMARY.pop((chat_id, topic_id), None)
     if not acc:
-        return False
+        return None
     has = bool(acc.get("works") or acc.get("cols") or (acc.get("oil") and not skip_oil))
     if not has:
-        return False
-    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                text=msg_service_summary(bike, acc, skip_oil=skip_oil))
-    return True
+        return None
+    return await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                       text=msg_service_summary(bike, acc, skip_oil=skip_oil))
 
 
 # Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
@@ -978,10 +978,37 @@ def msg_works_logged(bike, km, works):
     )
 
 
+# Словарь русских названий работ → тайские (для пословного списка в 🇹🇭-блоке, без кириллицы).
+# Стартовый набор согласован с Филиппом; пополняется. Неизвестная работа → 'งานอื่น ๆ' (прочее).
+_WORK_TH = {
+    "замена моторного масла": "เปลี่ยนน้ำมันเครื่อง", "моторное масло": "เปลี่ยนน้ำมันเครื่อง",
+    "замена масляного фильтра": "ไส้กรองน้ำมันเครื่อง", "масляный фильтр": "ไส้กรองน้ำมันเครื่อง",
+    "воздушный фильтр": "ไส้กรองอากาศ",
+    "задние тормозные колодки": "ผ้าเบรกหลัง", "задние колодки": "ผ้าเบรกหลัง",
+    "передние тормозные колодки": "ผ้าเบรกหน้า", "передние колодки": "ผ้าเบรกหน้า",
+    "тормозные колодки": "ผ้าเบรก", "колодки": "ผ้าเบรก",
+    "регулировка цепи": "ปรับโซ่", "замена цепи": "เปลี่ยนโซ่", "цепь": "โซ่",
+    "тормозная жидкость": "น้ำมันเบรก", "свечи": "หัวเทียน", "свеча": "หัวเทียน",
+    "аккумулятор": "แบตเตอรี่", "масло редуктора": "น้ำมันเกียร์", "редуктор": "น้ำมันเกียร์",
+    "ремень": "สายพาน", "вариатор": "ชุดสายพาน", "шины": "ยาง", "покрышка": "ยาง", "abs": "น้ำมัน ABS",
+}
+
+
+def _work_th(w):
+    """Тайское название работы по словарю (точное → частичное вхождение); неизвестная → 'งานอื่น ๆ'."""
+    s = str(w).strip().lower()
+    if s in _WORK_TH:
+        return _WORK_TH[s]
+    for k in sorted(_WORK_TH, key=len, reverse=True):   # длинные ключи раньше (точнее)
+        if k in s:
+            return _WORK_TH[k]
+    return "งานอื่น ๆ"
+
+
 def msg_service_summary(bike, acc, skip_oil=False):
     """ЕДИНАЯ сводка в конце ТО-цикла: столбцы (масло/gear/abs/возд.фильтр) + история + пробег.
-    🇹🇭 ЧИСТЫЙ тайский (метки столбцов из _SVC_COL_LABEL; история обобщённо «บันทึกลงประวัติ»);
-    🇷🇺 чистый русский (пословный список работ). Секции без данных опускаем. Cyrillic в 🇹🇭 НЕТ."""
+    Работы — ПО ПУНКТАМ (буллет « — »), в ОБОИХ блоках: 🇹🇭 тайские названия (_WORK_TH), 🇷🇺 русские.
+    🇹🇭 ЧИСТЫЙ тайский (метки столбцов из _SVC_COL_LABEL). Секции без данных опускаем. Cyrillic в 🇹🇭 НЕТ."""
     km = acc.get("current_km") or acc.get("works_km") or (acc.get("oil") or {}).get("km") or ""
     head = f"🐀 Splinter · 📌 {bike}" if bike else "🐀 Splinter"
     th = [f"🇹🇭 ✅ บันทึกครบแล้วครับ" + (f" — เลขไมล์ปัจจุบัน {km} กม." if km else "")]
@@ -1006,12 +1033,14 @@ def msg_service_summary(bike, acc, skip_oil=False):
         nxt = c.get("next")
         th.append(f"   • {th_lbl}: {c.get('km')} กม." + (f" (ครบ {nxt})" if nxt else ""))
         ru.append(f"   • {ru_lbl}: {c.get('km')} км" + (f" (след. {nxt})" if nxt else ""))
-    works = acc.get("works")
+    works = [w for w in (dict.fromkeys(str(x).strip() for x in (acc.get("works") or []))) if w]
     if works:
         wkm = acc.get("works_km", "")
-        works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
-        th.append("   • บันทึกงานลงประวัติแล้ว" + (f" (ที่ {wkm} กม.)" if wkm else "") + " 🛠️")
-        ru.append("   • В историю" + (f" (на {wkm} км)" if wkm else "") + f": {works_str} 🛠️")
+        th.append("   • บันทึกลงประวัติ" + (f" (ที่ {wkm} กม.)" if wkm else "") + ": 🛠️")
+        ru.append("   • В историю" + (f" (на {wkm} км)" if wkm else "") + ": 🛠️")
+        for w in works:                       # КАЖДАЯ работа отдельной строкой, буллет « — »
+            th.append(f"      — {_work_th(w)}")
+            ru.append(f"      — {w}")
     return head + "\n" + "\n".join(th) + "\n" + "\n".join(ru)
 
 
@@ -1706,9 +1735,18 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
         acc = _summary_acc(chat_id, topic_id)
         acc["current_km"] = str(km_int)
         acc["oil"] = {"km": km_int, "next": (km_int + _iv) if _iv else None, "status": "ok"}
-        await _close_service_reminder(context, bridge, chat_id, topic_id, bike)
-        await _emit_summary(context, chat_id, topic_id, bike)
+        await _close_service_reminder(context, bridge, chat_id, topic_id, bike)   # снимает ВСЕ старые пины (unpin_all)
+        _sum_msg = await _emit_summary(context, chat_id, topic_id, bike)
         await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: финал → чистим вопросы
+        # П.3: ЗАКРЕП ИТОГА после замены масла. Старый итог/просрочка-пин уже сняты unpin_all выше →
+        # не копятся. Сводку (итог) закрепляем сверху; на следующей замене unpin_all снимет её перед новой.
+        if _sum_msg is not None:
+            try:
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=_sum_msg.message_id,
+                                                   disable_notification=True)
+                log.info(f"  → итог ТО закреплён: {bike} msg={_sum_msg.message_id}")
+            except Exception as e:
+                log.warning(f"  → не смог закрепить итог ТО (права админа?): {e}")
     else:
         err = res.get("error", "")
         if err == "oil_decreasing":
