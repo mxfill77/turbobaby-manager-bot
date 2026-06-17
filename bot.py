@@ -368,7 +368,7 @@ async def _keep_typing(context, chat_id, topic_id, stop_event):
             pass  # 4 сек прошло — повторяем typing (Telegram гасит ~5 сек)
 
 
-async def manager_reply(msg, context, context_note: str = "", bilingual: bool = False, force_bike: str = "", force_mileage=None, force_mileage_conf: str = ""):
+async def manager_reply(msg, context, context_note: str = "", bilingual: bool = False, force_bike: str = "", force_mileage=None, force_mileage_conf: str = "", user_text: str = ""):
     """Диалог через Claude-мозг (память, правила, инструменты). Работает в HQ, личке и
     в операционных группах когда к Splinter обращается владелец.
     bilingual=True — отвечать на двух языках и дублировать запрос (для групп с тайцами).
@@ -376,7 +376,9 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
     chat_id = msg.chat_id
     user_id = msg.from_user.id if msg.from_user else None
     user_name = (msg.from_user.first_name or USER_NAME) if msg.from_user else "User"
-    text = msg.text
+    # user_text подставляется когда у сообщения нет .text (фото с подписью): Message в PTB
+    # immutable, поэтому текст передаём параметром, а не присваиванием msg.text.
+    text = user_text or msg.text or ""
     _topic = getattr(msg, "message_thread_id", None)
 
     log.info(f"[{chat_id}] {user_name} ({_topic_label(chat_id, _topic)}) → мозг: {text[:100]}")
@@ -1033,9 +1035,10 @@ async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):
             or (_trusted and splinter.is_awaiting(msg.chat_id, _tid))
         )
     if _addressed:
-        # У фото нет msg.text — подставим подпись (или нейтральный запрос) чтобы мозг прочитал
-        msg.text = cap or "Фото в теме — проверь, что на нём (пробег/чек/состояние)."
-        await manager_reply(msg, context, context_note="Владелец/Пым прислал фото.", bilingual=True)
+        # У фото нет msg.text — передаём подпись (или нейтральный запрос) мозгу ПАРАМЕТРОМ.
+        # Message в PTB immutable: msg.text=... бросает AttributeError (был краш в горячем пути фото).
+        await manager_reply(msg, context, context_note="Владелец/Пым прислал фото.", bilingual=True,
+                            user_text=cap or "Фото в теме — проверь, что на нём (пробег/чек/состояние).")
         return
     photo_msgs = [u.message for u in updates]
     await splinter.handle(rep, context, bridge, claude, album_msgs=photo_msgs)
