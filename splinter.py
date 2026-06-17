@@ -1422,6 +1422,53 @@ _PENDING_MILEAGE = {}   # (chat_id, topic_id) -> (mileage:str, bike:str)
 _CONFIRM_YES = {"да", "ага", "верно", "ок", "окей", "yes", "ใช่", "ถูก", "ถูกต้อง", "ถูกต้องครับ"}
 _CONFIRM_NO = {"нет", "не", "no", "ไม่", "ไม่ใช่"}
 
+# === Фикс _row22: текстовая КОРРЕКЦИЯ пробега после уже сделанной записи ===
+# Кейс: vision/«да» записали неверный пробег (напр. 39374 вместо 33974), человек поправляет
+# ТЕКСТОМ «не верно пробег 33974». Раньше это уходило в мозг (болтал, не переписывал), а правка
+# ВНИЗ упёрлась бы в монотонного сторожа B. Решение: ловим коррекцию → переспрос → ТОЛЬКО по «да»
+# перезаписываем service_upsert(new) В ОБХОД сторожа B (санкционированная человеком правка вниз).
+# Сторож B для ФОТО НЕ ослабляется — обход живёт только на этом подтверждённом текстовом пути.
+_LAST_RECORDED_KM = {}    # (chat_id, topic_id) -> (km:int, ts) — что реально записали через service_upsert
+_LAST_REC_TTL = 3600      # коррекцию принимаем только если запись была недавно (1 ч)
+_PENDING_CORRECTION = {}  # (chat_id, topic_id) -> (old_km:int, new_km:int, bike:str, ts)
+# негатор правки: «не верно / неверно / неправильно / ошибся / wrong»
+_CORRECTION_RE = r"(не\s*верн|неверн|неправильн|ошиб|не\s*прав|wrong|ผิด)"
+
+
+def pending_correction_for(chat_id, topic_id):
+    """Есть ли открытый переспрос коррекции пробега для этой темы (перехват в handle_text)."""
+    return _PENDING_CORRECTION.get((chat_id, topic_id))
+
+
+def detect_mileage_correction(text):
+    """Текст — это коррекция пробега? Нужен негатор + число 4-6 цифр. Вернуть new_km:int или None."""
+    t = str(text or "").strip()
+    if not _re_pl.search(_CORRECTION_RE, t.lower()):
+        return None
+    m = _re_pl.search(r"\d[\d  ,]{2,}\d", t)   # 4+ цифр (с пробелами/запятыми)
+    if not m:
+        return None
+    try:
+        n = int(m.group(0).replace(" ", "").replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+    return n if 1000 <= n <= 999999 else None
+
+
+def msg_correction_ask(bike, old_km, new_km):
+    """Двуязычный переспрос правки пробега (🇹🇭 первым / 🇷🇺, единый разделитель)."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    less = new_km < old_km
+    th_note = " (น้อยกว่าที่บันทึกไว้ ยืนยันว่าถูกต้อง)" if less else ""
+    ru_note = " Это меньше записанного — подтверди, что верно." if less else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 แก้เลขไมล์{b_th} {old_km} → {new_km} กม. ไหมครับ?{th_note} กดปุ่ม «ใช่» หรือพิมพ์ «да» 🙏\n"
+        f"{_SEP}\n"
+        f"🇷🇺 📟 Исправить пробег{b_ru} {old_km} → {new_km} км?{ru_note} Нажми «Да» или напиши «да» 🙏"
+    )
+
 
 def pending_mileage_for(chat_id, topic_id):
     """Есть ли открытое подтверждение пробега для этой темы (для перехвата в handle_text)."""
@@ -1536,6 +1583,88 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     except Exception:
         log.exception("  → ошибка ТО-трекера (подтверждение пробега)")
     return True
+
+
+async def handle_mileage_correction(msg, context, bridge, text) -> bool:
+    """Текстовая КОРРЕКЦИЯ пробега ПОСЛЕ недавней записи (фикс _row22). Если поймали — НЕ пишем
+    сразу: ставим _PENDING_CORRECTION + двуязычный переспрос. True если перехватили."""
+    chat_id = msg.chat_id
+    topic_id = getattr(msg, "message_thread_id", None)
+    key = (chat_id, topic_id)
+    rec = _LAST_RECORDED_KM.get(key)
+    if not rec or _time.time() - rec[1] > _LAST_REC_TTL:
+        return False                      # нет недавней записи — нечего исправлять
+    if not _is_trusted(msg):
+        return False                      # правку принимаем только от доверенных
+    new_km = detect_mileage_correction(text)
+    if new_km is None:
+        return False
+    old_km = rec[0]
+    if new_km == old_km:
+        return False
+    bike = bike_from_topic(chat_id, topic_id) or ""
+    if str(new_km) in _re_pl.findall(r"\d{3,4}", bike):   # не спутать с номером байка (plate)
+        return False
+    _PENDING_CORRECTION[key] = (old_km, new_km, bike, _time.time())
+    mark_awaiting(chat_id, topic_id)
+    tok = _svc_put({"kind": "correction", "chat": chat_id, "topic": topic_id,
+                    "bike": bike, "old_km": old_km, "new_km": new_km})
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ ใช่ / Да", callback_data=f"svc:fix:{tok}")]])
+    sent = await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                       text=msg_correction_ask(bike, old_km, new_km), reply_markup=kb)
+    _remember_cycle_msg(chat_id, topic_id, sent)
+    log.info(f"  → коррекция пробега: переспрос {old_km}→{new_km} (тема {topic_id})")
+    return True
+
+
+async def handle_correction_confirm(msg, context, bridge, text) -> bool:
+    """Перехват ответа на переспрос коррекции пробега. True если обработал (да/нет)."""
+    chat_id = msg.chat_id
+    topic_id = getattr(msg, "message_thread_id", None)
+    key = (chat_id, topic_id)
+    pend = _PENDING_CORRECTION.get(key)
+    if not pend:
+        return False
+    t = (text or "").strip().lower()
+    if t in _CONFIRM_YES:
+        old_km, new_km, bike = pend[0], pend[1], pend[2]
+        _PENDING_CORRECTION.pop(key, None)
+        clear_awaiting(*key)
+        await _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, new_km)
+        return True
+    if t in _CONFIRM_NO:
+        old_km = pend[0]
+        _PENDING_CORRECTION.pop(key, None)
+        clear_awaiting(*key)
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=(f"🐀 Splinter\n"
+                          f"🇹🇭 โอเค เก็บค่าเดิม {old_km} กม. ไว้ครับ\n"
+                          f"{_SEP}\n"
+                          f"🇷🇺 Ок, оставил прежний пробег {old_km} км."))
+        return True
+    return False                          # не да/нет — отдаём дальше (мозг/новая коррекция)
+
+
+async def _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, new_km):
+    """САНКЦИОНИРОВАННАЯ правка (после «да»/кнопки): перезапись service_upsert(new) В ОБХОД сторожа B.
+    Сторож B (floor) здесь НЕ применяется — это явное подтверждённое человеком исправление вниз.
+    Сторож B для ФОТО не затрагивается. Кол.H/I (set_fleet_*) не пишем — только обслуживание."""
+    info = _run_service_tracker(bridge, chat_id, topic_id, bike, new_km)   # service_upsert(new)
+    # Новый last-known = исправленное значение: будущие ФОТО сравнивает сторож B уже от него
+    # (_run_service_tracker обновил _LAST_RECORDED_KM; дублируем в буфер фото как свежий high).
+    buf = _RECENT_PHOTOS.setdefault((chat_id, topic_id), deque(maxlen=_RECENT_LIMIT))
+    buf.append({"vis": {"mileage": str(new_km), "mileage_confidence": "high"},
+                "sender": "correction", "ts": _time.time()})
+    b_ru = f" по {bike}" if bike else ""
+    b_th = f" ({bike})" if bike else ""
+    extra_ru = f" Следующее ТО на {info['next_km']} км." if (info and info.get("next_km")) else ""
+    extra_th = f" ТО ครั้งถัดไปที่ {info['next_km']} กม." if (info and info.get("next_km")) else ""
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=(f"🐀 Splinter\n"
+                      f"🇹🇭 ✅ แก้เลขไมล์แล้ว{b_th}: {old_km} → {new_km} กม.{extra_th}\n"
+                      f"{_SEP}\n"
+                      f"🇷🇺 ✅ Пробег исправлен{b_ru}: {old_km} → {new_km} км.{extra_ru}"))
+    log.info(f"  → коррекция пробега ПРИМЕНЕНА (обход сторожа B): {old_km}→{new_km} (тема {topic_id})")
 
 
 # === Фиксация замены масла: ЯВНЫЙ ВОПРОС кнопками (без угадывания маркер/TTL/окно) ===
@@ -1736,6 +1865,9 @@ def _run_service_tracker(bridge, chat_id, topic_id, bike, mileage):
         up["last_service_km"] = oil_last
     res = bridge.service_upsert(**up)
     log.info(f"  → ТО {bike}: oil_last(I)={oil_last} interval={interval} → {res}")
+    # Запомнить что реально записали — для текстовой коррекции пробега (фикс _row22).
+    if res.get("ok"):
+        _LAST_RECORDED_KM[(chat_id, topic_id)] = (km, _time.time())
     return {"km": km, "status": res.get("status"), "next_km": res.get("next_km"),
             "km_left": res.get("km_left"), "stype": res.get("service_type", "oil")}
 
@@ -2064,6 +2196,25 @@ async def handle_service_button(update, context, bridge) -> None:
         return
     chat_id, topic_id = data["chat"], data["topic"]
     bike, km = data.get("bike", ""), data.get("km", "")
+
+    if action == "fix":
+        # [✅ Да] на переспрос текстовой КОРРЕКЦИИ пробега (фикс _row22) — эквивалент текстового «да».
+        # Санкционированная человеком правка → перезапись в обход сторожа B (только этот путь).
+        await q.answer("กำลังแก้… · Исправляю…")
+        old_km, new_km = data.get("old_km"), data.get("new_km")
+        key = (chat_id, topic_id)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        _PENDING_CORRECTION.pop(key, None)
+        clear_awaiting(*key)
+        try:
+            await _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, new_km)
+        except Exception:
+            log.exception("  → ошибка применения коррекции пробега (кнопка)")
+        return
 
     if action == "mok":
         # [✅ Да] на подтверждение распознанного пробега — эквивалент текстового «да».

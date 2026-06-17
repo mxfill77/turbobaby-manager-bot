@@ -616,8 +616,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Фикс B: перехват ответа на подтверждение пробега — ТОЛЬКО если для темы открыт pending.
         # Иначе гейт вступления (фикс 07:51) работает как обычно — pending не трогает его.
         _tid_sv = getattr(msg, "message_thread_id", None)
-        if splinter.GROUPS.get(chat_id) == "servicing" and splinter.pending_mileage_for(chat_id, _tid_sv):
-            if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
+        if splinter.GROUPS.get(chat_id) == "servicing":
+            # 1) ответ на переспрос текстовой коррекции пробега (фикс _row22)
+            if splinter.pending_correction_for(chat_id, _tid_sv):
+                if await splinter.handle_correction_confirm(msg, context, bridge, msg.text):
+                    return
+            # 2) ответ на подтверждение распознанного с фото пробега (сущ. Фикс B)
+            if splinter.pending_mileage_for(chat_id, _tid_sv):
+                if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
+                    return
+            # 3) НОВАЯ текстовая коррекция пробега после недавней записи → переспрос (не пишем сразу)
+            if await splinter.handle_mileage_correction(msg, context, bridge, msg.text):
                 return
         # (Вопрос «после замены / просто пробег?» теперь на кнопках → on_service_button, не текстом.)
         # Владелец обращается к Splinter напрямую (тег/ответ/ждём ответа) → диалог-мозг
