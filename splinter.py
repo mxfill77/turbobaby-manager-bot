@@ -173,7 +173,7 @@ MONEY_SYSTEM = """Ты разбираешь ОДНО сообщение из к�
       (например деньги + возврат паспорта в одном сообщении):
     moves: массив движений (минимум одно), каждое движение:
         amount: число (ОТРИЦАТЕЛЬНОЕ для расхода/списания/возврата, ПОЛОЖИТЕЛЬНОЕ для прихода) — уважай знак автора
-        currency: "THB" | "EUR" | "PASSPORT"
+        currency: "THB" | "EUR" | "USD" | "USDT" | "PASSPORT" | "UNKNOWN" | null
         category: "rental" | "salary" | "advance" | "fuel" | "taxi" | "topup" | "other"
         bike: строка или null
         deposit: "passport" | "cash" | null  — ТОЛЬКО описание денежной строки, на счётчик НЕ влияет
@@ -200,7 +200,13 @@ MONEY_SYSTEM = """Ты разбираешь ОДНО сообщение из к�
 
   none — болтовня/не относится к учёту.
 
-Валюта: Bath/Baht/฿ = THB; Euro = EUR; passport/паспорт = PASSPORT.
+Валюта: Bath/Baht/บาท/฿ = THB; Euro/евро/€ = EUR; Dollar/dollar/доллар/USD/$ = USD;
+USDT/Tether = USDT; passport/паспорт = PASSPORT.
+ВАЖНО про валюту движения:
+ - Валюта в тексте НЕ упомянута вообще → currency: null (по умолчанию баты, переспроса НЕ будет).
+ - Упомянута и понятна → ставь её код (THB/EUR/USD/USDT).
+ - Упомянута, но это НЕ из списка (странное/непонятное слово, неясная валюта) → currency: "UNKNOWN"
+   (бот переспросит, НЕ запишет вслепую). UNKNOWN ставь ТОЛЬКО когда валюта реально названа, но непонятна.
 
 Примеры:
 "ADV 8004  +4,900 Bath  1 passport" -> {"type":"transaction","moves":[{"amount":4900,"currency":"THB","category":"rental","bike":"ADV 8004","deposit":"passport"},{"amount":1,"currency":"PASSPORT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
@@ -208,6 +214,9 @@ MONEY_SYSTEM = """Ты разбираешь ОДНО сообщение из к�
 "-1 passport" -> {"type":"transaction","moves":[{"amount":-1,"currency":"PASSPORT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
 "+1 passport" -> {"type":"transaction","moves":[{"amount":1,"currency":"PASSPORT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
 "Earth salary  -5,000 Bath" -> {"type":"transaction","moves":[{"amount":-5000,"currency":"THB","category":"salary","bike":null,"deposit":null}],"transfer_to_pettycash":false}
+"Ninja 6334  +700 Dollar" -> {"type":"transaction","moves":[{"amount":700,"currency":"USD","category":"rental","bike":"Ninja 6334","deposit":null}],"transfer_to_pettycash":false}
+"+500 USDT" -> {"type":"transaction","moves":[{"amount":500,"currency":"USDT","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
+"+700 рупий" -> {"type":"transaction","moves":[{"amount":700,"currency":"UNKNOWN","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
 "-1000 в самоорганизацию" -> {"type":"transaction","moves":[{"amount":-1000,"currency":"THB","category":"topup","bike":null,"deposit":null}],"transfer_to_pettycash":true}
 "-290" -> {"type":"transaction","moves":[{"amount":-290,"currency":"THB","category":"other","bike":null,"deposit":null}],"transfer_to_pettycash":false}
 "Balance 5,715 Bath 150 Euro 1 Passport" -> {"type":"balance_check","balance":{"THB":5715,"EUR":150,"PASSPORT":1}}
@@ -319,13 +328,15 @@ VISION_BIKE_SYSTEM = """На фото — мотобайк, его прибор�
   notes: короткая заметка на русском
 Если не разобрать — ставь null. Лучше null, чем выдумка. Верни ТОЛЬКО JSON."""
 
-VISION_RECEIPT_SYSTEM = """На фото — чек/квитанция об оплате.
+VISION_RECEIPT_SYSTEM = """На фото — чек/квитанция ИЛИ купюры (наличные).
 Верни СТРОГО JSON:
   amount: сумма числом или null
-  currency: "THB" | "EUR" | null
+  currency: "THB" | "EUR" | "USD" | "USDT" | null  — какая валюта на фото (฿/บาท=THB, €=EUR,
+     доллары $=USD, USDT=USDT). Если не уверен/не видно — null. НЕ угадывай.
+  currency_confidence: "high" | "low"  — high только если валюта явно различима
   vendor: за что (бензин/АЗС/магазин/такси) или null
   notes: короткая заметка на русском
-Верни ТОЛЬКО JSON."""
+Верни ТОЛЬКО JSON. Купюры часто мятые/частичные — если сомневаешься в валюте, ставь null/low."""
 
 
 # === Буфер недавних фото-разборов (для вопросов "проверь фото резины/пробега") ===
@@ -738,15 +749,25 @@ def _fmt_count(n):
         return str(n)
 
 
+# Единицы валют для подписи/баланса (один код на оба языка). UNKNOWN сюда не попадает —
+# он перехватывается переспросом ДО записи.
+_CUR_UNIT = {"THB": "฿", "EUR": "EUR", "USD": "$", "USDT": "USDT", "PASSPORT": "passport"}
+
+
+def _cur_unit(currency):
+    return _CUR_UNIT.get(str(currency or "THB").upper(), str(currency or "THB").upper())
+
+
 def _balance_parts(bal):
     """Строки баланса кошелька, по одной валюте. THB показываем всегда (даже 0 —
-    осмысленно для пустого/нового кошелька). EUR и PASSPORT — только если != 0
-    (нулевой остаток в этих валютах = шум, не показываем). Без эмодзи-замены слов."""
+    осмысленно для пустого/нового кошелька). EUR/USD/USDT и PASSPORT — только если != 0
+    (нулевой остаток = шум). Без эмодзи-замены слов."""
     bal = bal or {}
     parts = [f"{_fmt(bal.get('THB', 0))} ฿"]
-    eur = bal.get("EUR")
-    if eur:
-        parts.append(f"{_fmt(eur)} EUR")
+    for code in ("EUR", "USD", "USDT"):
+        v = bal.get(code)
+        if v:
+            parts.append(f"{_fmt(v)} {_cur_unit(code)}")
     pas = bal.get("PASSPORT")
     if pas:  # != 0 (включая отрицательные); 0 не показываем
         parts.append(f"{_fmt_count(pas)} passport")
@@ -776,11 +797,13 @@ def _bilingual(wallet, th_lines, ru_lines):
 
 
 def _recorded_unit(amount, currency):
-    """Подпись записанного движения. PASSPORT — код единицы (как ฿/EUR), один для обоих языков."""
+    """Подпись записанного движения. Печатаем РЕАЛЬНУЮ единицу валюты (฿/EUR/$/USDT/passport),
+    один код для обоих языков. Раньше хардкодили ฿ для любой валюты — отсюда «+700 ฿» на доллары."""
     sign = _sign(amount)
-    if currency == "PASSPORT":
+    cur = str(currency or "THB").upper()
+    if cur == "PASSPORT":
         return f"{sign}{_fmt_count(abs(amount or 0))} passport"
-    return f"{sign}{_fmt(abs(amount or 0))} ฿"
+    return f"{sign}{_fmt(abs(amount or 0))} {_cur_unit(cur)}"
 
 
 def msg_recorded_each(amount, bal, currency: str = "THB", wallet: str = "Самоорганизация"):
@@ -1235,6 +1258,11 @@ async def _handle_money(msg, context, bridge, claude):
         log.info(f"  → skipped: пустой текст (есть фото? {bool(msg.photo)})")
         return
 
+    # Перехват ответа на переспрос валюты (фикс валюты): если для кошелька открыт pending — резолвим.
+    if pending_currency_for(msg.chat_id, getattr(msg, "message_thread_id", None)):
+        if await handle_currency_confirm(msg, context, bridge, claude, text):
+            return
+
     parsed = _parse_json(claude.quick(MONEY_SYSTEM, text, max_tokens=400))
     ptype = parsed.get("type")
     chat_id = msg.chat_id
@@ -1246,95 +1274,32 @@ async def _handle_money(msg, context, bridge, claude):
         if not moves:
             log.info("  → skipped: transaction без moves")
             return
+        # Нет валюты в тексте = баты (правильный дефолт, БЕЗ переспроса). Нормализуем null/пусто → THB.
+        for m in moves:
+            if not m.get("currency"):
+                m["currency"] = "THB"
         log.info(f"  → moves={[(m.get('amount'), m.get('currency')) for m in moves]}")
-        # Одно сообщение → 1..N проводок (деньги + паспорт и т.п.).
-        # msg_id уникален на движение (:m{i}) — иначе дедуп botMsgExists_ отбросит вторую строку.
-        for i, mv in enumerate(moves):
-            bridge.add_transaction(
-                msg_date=str(msg.date.date()) if msg.date else "",
-                group=wallet,
-                sender="@" + (msg.from_user.username or ""),
-                amount=mv.get("amount", 0),
-                currency=mv.get("currency", "THB"),
-                category=mv.get("category", "other"),
-                bike=mv.get("bike") or "",
-                deposit=mv.get("deposit") or "",
-                description=text[:200],
-                raw=text,
-                msg_id=f"{chat_id}:{msg.message_id}:m{i}",
-            )
 
-        # Денежное движение (THB/EUR) — для сверки чека, переноса в кассу и подтверждения.
-        # Паспорт (PASSPORT) в этих расчётах не участвует — он виден через wallet_bal.
+        # Валюта НАЗВАНА, но непонятна (UNKNOWN) → НЕ пишем вслепую, переспрашиваем.
+        if any(str(m.get("currency")).upper() == "UNKNOWN" for m in moves):
+            await _ask_currency(context, bridge, claude, msg, parsed, wallet)
+            return
+
+        # РАЗДЕЛ B: фото-хинт валюты. Vision ПРЕДЛАГАЕТ валюту по фото; при РАСХОЖДЕНИИ с текстом
+        # (текст = баты, а на фото уверенно инвалюта) — переспрос (НЕ запись вслепую). Vision = слабый хинт.
         money_move = next((m for m in moves if m.get("currency") != "PASSPORT"), None)
-        money_amount = money_move.get("amount", 0) if money_move else 0
-        money_currency = money_move.get("currency", "THB") if money_move else "THB"
-
-        # Для подтверждения в группу: денежное движение приоритетнее паспортного,
-        # но если в сообщении ТОЛЬКО паспорт — показываем его (а не «+0 ฿»).
-        passport_move = next((m for m in moves if m.get("currency") == "PASSPORT"), None)
-        display_move = money_move or passport_move
-        disp_amount = display_move.get("amount", 0) if display_move else money_amount
-        disp_currency = display_move.get("currency", "THB") if display_move else money_currency
-
-        # Если приложен чек — сверяем сумму на чеке с написанной (денежной)
+        receipt = None
         if msg.photo and money_move:
-            img = await _download_photo(msg)
-            if img:
-                rec = _parse_json(claude.vision(VISION_RECEIPT_SYSTEM, img, max_tokens=300))
-                ramount = rec.get("amount")
-                wamount = abs(money_amount or 0)
-                if ramount and abs(abs(float(ramount)) - wamount) >= 1:
-                    await _send(context, 
-                        chat_id=chat_id,
-                        text=(f"🐀 Splinter\n"
-                              f"🧾 พี่ Pleum ในใบเสร็จ {_fmt(ramount)} ฿ แต่เขียนไว้ {_fmt(wamount)} ฿ "
-                              f"ต่างกันนะครับ ตรวจหน่อย 🙏\n"
-                              f"🧾 Пым, на чеке {_fmt(ramount)} ฿, а записано {_fmt(wamount)} ฿ — "
-                              f"не сходится, глянь пожалуйста 🙏"),
-                    )
+            receipt = await _vision_receipt(claude, msg)
+            hint = (receipt or {}).get("currency")
+            hconf = str((receipt or {}).get("currency_confidence", "")).lower()
+            if (hint and str(hint).upper() in ("USD", "USDT", "EUR") and hconf == "high"
+                    and str(money_move.get("currency")).upper() == "THB"):
+                await _ask_currency(context, bridge, claude, msg, parsed, wallet,
+                                    suggested=str(hint).upper())
+                return
 
-        # Полный баланс ИМЕННО этого кошелька (THB+EUR+паспорта)
-        wallet_bal = bridge.get_balance(group=wallet).get("balance", {})
-
-        # === Перенос в мелкую кассу === (только денежное движение, паспорт не переносим)
-        is_transfer = parsed.get("transfer_to_pettycash") and money_move and chat_id != PETTYCASH_CHAT_ID
-        if is_transfer:
-            plus = abs(money_amount or 0)
-            bridge.add_transaction(
-                msg_date=str(msg.date.date()) if msg.date else "",
-                group=PETTYCASH_LABEL,
-                sender="@" + (msg.from_user.username or "") + " (авто-перенос)",
-                amount=plus,
-                currency=money_currency,
-                category="topup",
-                bike="", deposit="",
-                description=f"пополнение переносом из {wallet}",
-                raw=text,
-                msg_id=f"{chat_id}:{msg.message_id}:topup",
-            )
-            pc_bal = bridge.get_balance(group=PETTYCASH_LABEL).get("balance", {})
-            await _send(context, 
-                chat_id=PETTYCASH_CHAT_ID,
-                text=msg_topup_pettycash(plus, pc_bal, wallet=PETTYCASH_LABEL, source=wallet),
-            )
-
-        # === Подтверждение записи ===
-        _entry_counts[chat_id] = _entry_counts.get(chat_id, 0) + 1
-        if chat_id in MONEY_CONFIRM_EACH:
-            await _send(context,
-                chat_id=chat_id,
-                text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet),
-            )
-            _entry_counts[chat_id] = 0
-        else:
-            await _send(context,
-                chat_id=chat_id,
-                text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet),
-            )
-            if _entry_counts[chat_id] >= RECONCILE_EVERY:
-                await _send(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
-                _entry_counts[chat_id] = 0
+        await _record_transaction(context, bridge, claude, msg, parsed, wallet, receipt=receipt)
 
     elif ptype == "balance_check":
         bal = parsed.get("balance", {}) or {}
@@ -1414,6 +1379,172 @@ async def _handle_money(msg, context, bridge, claude):
                       "• зафиксировать баланс — то же + «зафиксируй»\n"
                       "• спросить — «какой баланс?»"),
             )
+
+
+# === Фикс валюты: USD/USDT + переспрос на названную-но-непонятную валюту + фото-хинт ===
+# Нет валюты в тексте = баты (дефолт, без переспроса). Названа явно → пишем её. Названа, но
+# непонятна (UNKNOWN) ИЛИ фото уверенно противоречит тексту → переспрос, запись только после ответа.
+_PENDING_CURRENCY = {}     # (chat_id, topic_id) -> {"parsed":dict, "wallet":str, "ts":float}
+_PENDING_CUR_TTL = 3600
+# ответ человека на «в какой валюте?» → код валюты
+_CUR_WORDS = {
+    "thb": "THB", "฿": "THB", "baht": "THB", "bath": "THB", "бат": "THB", "บาท": "THB",
+    "eur": "EUR", "euro": "EUR", "евро": "EUR", "€": "EUR",
+    "usd": "USD", "dollar": "USD", "доллар": "USD", "$": "USD", "бакс": "USD",
+    "usdt": "USDT", "tether": "USDT", "юсдт": "USDT", "тезер": "USDT",
+}
+
+
+def pending_currency_for(chat_id, topic_id):
+    """Есть ли открытый переспрос валюты для кошелька (с авто-протуханием по TTL)."""
+    p = _PENDING_CURRENCY.get((chat_id, topic_id))
+    if p and _time.time() - p.get("ts", 0) > _PENDING_CUR_TTL:
+        _PENDING_CURRENCY.pop((chat_id, topic_id), None)
+        return None
+    return p
+
+
+def _currency_from_reply(text):
+    """Ответ человека → код валюты (THB/EUR/USD/USDT) или None если валюта не распознана."""
+    t = (" " + (text or "").strip().lower() + " ")
+    for w, code in _CUR_WORDS.items():
+        if w in t:
+            return code
+    return None
+
+
+async def _vision_receipt(claude, msg):
+    """Разбор фото (чек/купюры) через vision → dict {amount, currency, currency_confidence,...} или None."""
+    img = await _download_photo(msg)
+    if not img:
+        return None
+    try:
+        return _parse_json(claude.vision(VISION_RECEIPT_SYSTEM, img, max_tokens=300))
+    except Exception:
+        return None
+
+
+async def _ask_currency(context, bridge, claude, msg, parsed, wallet, suggested=""):
+    """Переспрос валюты (НЕ записываем): кладём parsed в pending, шлём двуязычный вопрос."""
+    chat_id = msg.chat_id
+    topic = getattr(msg, "message_thread_id", None)
+    mv = next((m for m in (parsed.get("moves") or []) if m.get("currency") != "PASSPORT"), None)
+    amt = abs(mv.get("amount", 0)) if mv else 0
+    _PENDING_CURRENCY[(chat_id, topic)] = {"parsed": parsed, "wallet": wallet, "ts": _time.time()}
+    mark_awaiting(chat_id, topic)
+    sug_th = f" (น่าจะ {suggested}?)" if suggested else ""
+    sug_ru = f" (похоже {suggested}?)" if suggested else ""
+    await _send(context, chat_id=chat_id, message_thread_id=topic,
+                text=(f"🐀 Splinter\n"
+                      f"🇹🇭 💱 จำนวน {_fmt(amt)} เป็นสกุลเงินอะไรครับ{sug_th}? พิมพ์ THB / USD / EUR / USDT 🙏\n"
+                      f"{_SEP}\n"
+                      f"🇷🇺 💱 Сумма {_fmt(amt)} — в какой валюте{sug_ru}? Напиши THB / USD / EUR / USDT 🙏"))
+    log.info(f"  → переспрос валюты (сумма {amt}, hint='{suggested}')")
+
+
+async def handle_currency_confirm(msg, context, bridge, claude, text) -> bool:
+    """Перехват ответа на переспрос валюты. True если обработал (валюта распознана → запись)."""
+    chat_id = msg.chat_id
+    topic = getattr(msg, "message_thread_id", None)
+    pend = _PENDING_CURRENCY.get((chat_id, topic))
+    if not pend:
+        return False
+    code = _currency_from_reply(text)
+    if not code:
+        return False                      # не валюта — отдаём обычному пути (человек уточнит/новое сообщение)
+    _PENDING_CURRENCY.pop((chat_id, topic), None)
+    clear_awaiting(chat_id, topic)
+    parsed = pend["parsed"]
+    # Проставляем подтверждённую валюту на денежные движения (UNKNOWN/THB-дефолт), паспорт не трогаем.
+    for m in (parsed.get("moves") or []):
+        if m.get("currency") != "PASSPORT":
+            m["currency"] = code
+    await _record_transaction(context, bridge, claude, msg, parsed, pend["wallet"])
+    log.info(f"  → валюта подтверждена: {code} → запись")
+    return True
+
+
+async def _record_transaction(context, bridge, claude, msg, parsed, wallet, receipt=None):
+    """Запись проводок + сверка чека + перенос в кассу + подтверждение. Валюта уже разрешена
+    (THB по умолчанию / явная / подтверждённая). receipt — предзагруженный разбор фото (без 2-го vision)."""
+    chat_id = msg.chat_id
+    text = msg.text or msg.caption or ""
+    moves = parsed.get("moves") or []
+    for i, mv in enumerate(moves):
+        bridge.add_transaction(
+            msg_date=str(msg.date.date()) if msg.date else "",
+            group=wallet,
+            sender="@" + (msg.from_user.username or ""),
+            amount=mv.get("amount", 0),
+            currency=(mv.get("currency") or "THB"),
+            category=mv.get("category", "other"),
+            bike=mv.get("bike") or "",
+            deposit=mv.get("deposit") or "",
+            description=text[:200],
+            raw=text,
+            msg_id=f"{chat_id}:{msg.message_id}:m{i}",
+        )
+
+    money_move = next((m for m in moves if m.get("currency") != "PASSPORT"), None)
+    money_amount = money_move.get("amount", 0) if money_move else 0
+    money_currency = (money_move.get("currency") or "THB") if money_move else "THB"
+    passport_move = next((m for m in moves if m.get("currency") == "PASSPORT"), None)
+    display_move = money_move or passport_move
+    disp_amount = display_move.get("amount", 0) if display_move else money_amount
+    disp_currency = (display_move.get("currency") or "THB") if display_move else money_currency
+
+    # Сверка суммы чека (если фото). Ярлык — реальная единица валюты движения.
+    if msg.photo and money_move:
+        rec = receipt if receipt is not None else await _vision_receipt(claude, msg)
+        ramount = (rec or {}).get("amount")
+        wamount = abs(money_amount or 0)
+        try:
+            mismatch = ramount and abs(abs(float(ramount)) - wamount) >= 1
+        except (ValueError, TypeError):
+            mismatch = False
+        if mismatch:
+            u = _cur_unit(money_currency)
+            await _send(context, chat_id=chat_id,
+                        text=(f"🐀 Splinter\n"
+                              f"🧾 พี่ Pleum ในใบเสร็จ {_fmt(ramount)} {u} แต่เขียนไว้ {_fmt(wamount)} {u} "
+                              f"ต่างกันนะครับ ตรวจหน่อย 🙏\n"
+                              f"🧾 Пым, на чеке {_fmt(ramount)} {u}, а записано {_fmt(wamount)} {u} — "
+                              f"не сходится, глянь пожалуйста 🙏"))
+
+    wallet_bal = bridge.get_balance(group=wallet).get("balance", {})
+
+    # === Перенос в мелкую кассу === (только денежное движение, паспорт не переносим)
+    is_transfer = parsed.get("transfer_to_pettycash") and money_move and chat_id != PETTYCASH_CHAT_ID
+    if is_transfer:
+        plus = abs(money_amount or 0)
+        bridge.add_transaction(
+            msg_date=str(msg.date.date()) if msg.date else "",
+            group=PETTYCASH_LABEL,
+            sender="@" + (msg.from_user.username or "") + " (авто-перенос)",
+            amount=plus,
+            currency=money_currency,
+            category="topup",
+            bike="", deposit="",
+            description=f"пополнение переносом из {wallet}",
+            raw=text,
+            msg_id=f"{chat_id}:{msg.message_id}:topup",
+        )
+        pc_bal = bridge.get_balance(group=PETTYCASH_LABEL).get("balance", {})
+        await _send(context, chat_id=PETTYCASH_CHAT_ID,
+                    text=msg_topup_pettycash(plus, pc_bal, wallet=PETTYCASH_LABEL, source=wallet))
+
+    # === Подтверждение записи ===
+    _entry_counts[chat_id] = _entry_counts.get(chat_id, 0) + 1
+    if chat_id in MONEY_CONFIRM_EACH:
+        await _send(context, chat_id=chat_id,
+                    text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet))
+        _entry_counts[chat_id] = 0
+    else:
+        await _send(context, chat_id=chat_id,
+                    text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet))
+        if _entry_counts[chat_id] >= RECONCILE_EVERY:
+            await _send(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
+            _entry_counts[chat_id] = 0
 
 
 # === Фикс B: подтверждение пробега с ФОТО приборки перед решением по ТО ===
