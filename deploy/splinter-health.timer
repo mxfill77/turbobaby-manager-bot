@@ -1,0 +1,13 @@
+[Unit]
+Description=Запуск TurboBaby health check каждые 4 часа
+
+[Timer]
+# первая проверка через 10 мин после загрузки, далее каждые 4 часа
+OnBootSec=10min
+OnUnitActiveSec=4h
+# если сервер спал/был выключен в момент срабатывания — догнать пропущенную проверку
+Persistent=true
+Unit=splinter-health.service
+
+[Install]
+WantedBy=timers.target

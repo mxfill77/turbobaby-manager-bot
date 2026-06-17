@@ -1,0 +1,11 @@
+[Unit]
+Description=TurboBaby health check (пинг компонентов + пуш владельцу при проблеме)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/turbobaby-manager-bot
+ExecStart=/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/health.py --push
+User=root
+# read-only проверка: ничего не пишет, не рестартит, не деплоит.

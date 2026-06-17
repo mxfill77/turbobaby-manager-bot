@@ -3,7 +3,9 @@
 
 Пункт 2 «лестницы фундамента» (docs/project_state.md → «ФУНДАМЕНТ ПЕРЕД АВТОНОМИЕЙ»).
 Ничего НЕ пишет, НЕ рестартит, НЕ деплоит. Запуск одной командой:
-    venv/bin/python3 health.py
+    venv/bin/python3 health.py                 # печать сводки в терминал
+    venv/bin/python3 health.py --push          # + пуш Филиппу, ТОЛЬКО если проблема (❌)
+    venv/bin/python3 health.py --push-always   # + пуш всегда (даже «всё ок») — для теста/расписания
 
 Проверяет:
   • Splinter   — systemctl active/running + uptime + счётчик рестартов;
@@ -14,7 +16,9 @@
                  + ошибки/Traceback ПОСЛЕ старта сервиса;
   • Прод       — последний коммит (что сейчас в проде).
 
-Exit 0 = всё ок, 1 = есть проблема. (--push пока НЕ реализован — предложен отдельным шагом.)
+Exit 0 = ок/предупреждение, 1 = есть проблема (лежит компонент).
+Пуш идёт через notify.py (личка Филиппа). Предупреждение (⚠️ ошибки в логе) пушем НЕ дёргает —
+только реальный ❌. Авто-проверка по расписанию (systemd timer) зовёт `health.py --push`.
 """
 import os
 import re
@@ -75,15 +79,25 @@ def check_service():
     return ok, detail, start_dt, nrestarts
 
 
-def check_bridge():
+def check_bridge(attempts=3):
+    """Ping Bridge. Bridge временами флапает (таймауты) — ретраим до `attempts` раз,
+    чтобы авто-проверка по расписанию НЕ будила Филиппа ложным «Bridge не отвечает»."""
+    last = "?"
     try:
         from dotenv import load_dotenv
         load_dotenv(os.path.join(ROOT, ".env"))
         from bridge_client import BridgeClient
-        r = BridgeClient().ping()
-        if r.get("ok"):
-            return True, "alive v" + str(r.get("version", "?"))
-        return False, "ответ без ok: " + str(r.get("error", r))
+        bc = BridgeClient()
+        for i in range(attempts):
+            try:
+                r = bc.ping()
+                if r.get("ok"):
+                    suffix = "" if i == 0 else " (со " + str(i + 1) + "-й попытки)"
+                    return True, "alive v" + str(r.get("version", "?")) + suffix
+                last = "ответ без ok: " + str(r.get("error", r))
+            except Exception as e:
+                last = type(e).__name__ + " " + str(e)
+        return False, last + " (после " + str(attempts) + " попыток)"
     except Exception as e:
         return False, type(e).__name__ + " " + str(e)
 
@@ -163,7 +177,9 @@ def check_commit():
     return (bool(out), out or "git недоступен")
 
 
-def main():
+def build_report():
+    """Собрать отчёт здоровья. Вернуть (report:str, summary:str, code:int).
+    code: 0 = ок/предупреждение, 1 = реальная проблема (лежит компонент)."""
     lines = _read_log_lines()
     svc_ok, svc_d, start_dt, _ = check_service()
     br_ok, br_d = check_bridge()
@@ -178,14 +194,14 @@ def main():
         (au_ok, "Аудитор       ", au_d),
         (pl_ok, "Polling       ", pl_d),
     ]
-    print("🩺 TurboBaby — здоровье системы (" + _utcnow().strftime("%Y-%m-%d %H:%M UTC") + ")")
-    print("─" * 46)
+    out = ["🩺 TurboBaby — здоровье системы (" + _utcnow().strftime("%Y-%m-%d %H:%M UTC") + ")",
+           "─" * 46]
     for ok, name, detail in rows:
-        print((OK if ok else BAD) + " " + name + "  " + detail)
+        out.append((OK if ok else BAD) + " " + name + "  " + detail)
     # лог — мягкий сигнал: свежесть инфо, ошибки — предупреждение
-    print((WARN if errors else INFO) + "Лог            " + log_d)
-    print(INFO + "Прод           " + commit_d)
-    print("─" * 46)
+    out.append((WARN if errors else INFO) + "Лог            " + log_d)
+    out.append(INFO + "Прод           " + commit_d)
+    out.append("─" * 46)
 
     # ❌ ПРОБЛЕМА — только реально лежащие компоненты (бот не работает / недоступен).
     problems = []
@@ -200,19 +216,33 @@ def main():
 
     if problems:
         summary = BAD + " ПРОБЛЕМА: " + "; ".join(problems)
-        print(summary)
-        return summary, 1
-    # Ошибки в логе текущего запуска — мягкий сигнал: бот жив, но стоит глянуть.
-    if errors:
+        code = 1
+    elif errors:
+        # Ошибки в логе текущего запуска — мягкий сигнал: бот жив, но стоит глянуть.
         summary = WARN + "РАБОТАЕТ, но " + str(errors) + " ошибок в логе с старта — стоит глянуть"
-        print(summary)
-        return summary, 0
-    summary = OK + " ВСЁ ОК"
-    print(summary)
-    return summary, 0
+        code = 0
+    else:
+        summary = OK + " ВСЁ ОК"
+        code = 0
+    out.append(summary)
+    return "\n".join(out), summary, code
+
+
+def main(argv):
+    push = "--push" in argv            # пуш Филиппу ТОЛЬКО при проблеме (❌)
+    push_always = "--push-always" in argv  # пуш всегда, даже когда всё ✅
+    report, summary, code = build_report()
+    print(report)
+    if push_always or (push and code != 0):
+        try:
+            from notify import notify
+            ok = notify(report)
+            print("[push] " + ("отправлен" if ok else "НЕ отправлен"))
+        except Exception as e:
+            print("[push] ошибка: " + type(e).__name__ + " " + str(e))
+    return code
 
 
 if __name__ == "__main__":
     import sys
-    _, code = main()
-    sys.exit(code)
+    sys.exit(main(sys.argv[1:]))
