@@ -1,7 +1,7 @@
 """Дев-бот (полу-оркестратор), пункт 5 лестницы — первый заход.
 
 ТОЛЬКО зелёные read-only задачи по ЖЁСТКОМУ allowlist (БЕЗ LLM, детерминированно). Живёт в HQ
-topic 205 (Splinter там молчит). Команды ТОЛЬКО от Филиппа (504608015), чужие — игнор.
+topic 328 (Splinter там молчит). 205 = pc_agent/userbot на ПК — НЕ наша тема. Команды ТОЛЬКО от Филиппа (504608015).
 origin=agent → ЛЮБАЯ попытка красной записи ловится токен-замком 4.2 (rejected+пуш), деплой —
 тесты-гейтом 4.3. Красное/вне-allowlist → НЕ выполняет, просит «да». Не новый процесс — на bot.py.
 """
@@ -19,7 +19,7 @@ PY = os.path.join(ROOT, "venv", "bin", "python3")
 
 DEVBOT_USER = 504608015                 # Филипп — единственный, кто командует дев-ботом
 HQ_CHAT_ID = -1003853365891
-DEVBOT_TOPIC = 205
+DEVBOT_TOPIC = 328                      # тема dev-bot (VPS). 205 = pc_agent/userbot (ПК) — НЕ наша
 CC_LOG_ID = "1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF"
 
 BRIDGE = None   # выставляется из bot.py при старте (devbot.BRIDGE = bridge)
@@ -130,11 +130,13 @@ def _chunks(s, n=3500):
 
 # ===================== ТОЧКИ ВХОДА =====================
 async def handle_command(msg, context, bridge) -> None:
-    """Команда дев-боту в topic 205. ТОЛЬКО от Филиппа; только зелёное из allowlist.
+    """Команда дев-боту в его теме (328). ТОЛЬКО от Филиппа; только зелёное из allowlist.
     Вне-allowlist/красное → НЕ выполняет, просит «да». Зелёное гоняет как origin=agent (без билета):
     любая попытка красной записи внутри → ловится токен-замком 4.2."""
+    if getattr(msg, "message_thread_id", None) != DEVBOT_TOPIC:
+        return   # не тема dev-bot (напр. 205 = pc_agent на ПК) — НЕ реагируем вообще
     if not msg.from_user or msg.from_user.id != DEVBOT_USER:
-        return   # чужой в 205 — игнор (Splinter сюда тоже не лезет)
+        return   # чужой — игнор
     tid = getattr(msg, "message_thread_id", None)
     fn = _match(msg.text or "")
     if fn is None:
@@ -153,7 +155,7 @@ async def handle_command(msg, context, bridge) -> None:
 
 
 async def morning_summary(context) -> None:
-    """Утренняя авто-сводка в topic 205 (health + открытый аудит + латентность Brain). read-only, agent."""
+    """Утренняя авто-сводка в topic 328 (health + открытый аудит + латентность Brain). read-only, agent."""
     bridge = BRIDGE
     if bridge is None:
         log.warning("devbot.morning_summary: BRIDGE не выставлен")

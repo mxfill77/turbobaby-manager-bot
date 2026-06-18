@@ -594,7 +594,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    # HQ тема 205 — контур дев-бота (Splinter молчит). Команды только от Филиппа; только зелёное.
+    # HQ игнор-темы (Splinter молчит): 328 = dev-bot (VPS), 205 = pc_agent (ПК).
+    # Зовём dev-bot для всех ignored-тем; он сам реагирует ТОЛЬКО на 328 (205 пропускает — там pc_agent).
     if splinter.is_ignored_thread(msg.chat_id, getattr(msg, "message_thread_id", None)):
         try:
             await devbot.handle_command(msg, context, bridge)
@@ -1177,7 +1178,7 @@ def main():
         )
         log.info("Scheduled audit report at 09:30")
 
-        # Дев-бот (п.5): утренняя авто-сводка в HQ topic 205 — health + аудит + Brain (read-only)
+        # Дев-бот (п.5): утренняя авто-сводка в HQ topic 328 — health + аудит + Brain (read-only)
         app.job_queue.run_daily(
             devbot.morning_summary,
             time=dtime(hour=8, minute=0, tzinfo=tz),
