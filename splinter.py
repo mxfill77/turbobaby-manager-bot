@@ -2645,11 +2645,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Реальное ПОВРЕЖДЕНИЕ → зовём Пыма (это к осмотру / возможным вычетам).
     # Грязь сюда НЕ попадает — она отсекается на уровне vision (damage=null, dirt=true).
     if vis.get("damage"):
-        await _send(context, 
+        await _send(context,
             chat_id=chat_id,
             text=(f"🐀 Splinter\n"
-                  f"⚠️ พี่ Pleum เห็นความเสียหายในรูป ตรวจสอบหน่อยครับ 🙏\n"
-                  f"⚠️ Пым, на фото видны повреждения: {vis['damage']} — глянь. "
+                  f"🇹🇭 ⚠️ พี่ Pleum เห็นความเสียหายในรูป ตรวจสอบหน่อยครับ 🙏\n"
+                  f"🇷🇺 ⚠️ Пым, на фото видны повреждения: {vis['damage']} — глянь. "
                   f"Если это возврат — посмотри по депозиту 🙏"),
             message_thread_id=topic_id,
         )
