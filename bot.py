@@ -40,6 +40,7 @@ from claude_client import ClaudeClient
 from memory import Memory
 from prompts import SYSTEM_PROMPT, daily_pulse_prompt
 import splinter
+import devbot
 
 # === Загружаем конфиг ===
 load_dotenv()
@@ -73,6 +74,7 @@ log = logging.getLogger("turbobaby")
 bridge = BridgeClient()
 memory = Memory()
 claude = ClaudeClient(bridge=bridge, memory=memory)
+devbot.BRIDGE = bridge   # дев-бот (п.5): использует тот же Bridge для зелёных чтений
 from auditor import Auditor
 auditor = Auditor(bridge=bridge, memory=memory, claude=claude)
 
@@ -592,8 +594,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    # Чужой контур userbot/агента (HQ тема 205) — Splinter молчит ДО мозга/учёта/аудитора.
+    # HQ тема 205 — контур дев-бота (Splinter молчит). Команды только от Филиппа; только зелёное.
     if splinter.is_ignored_thread(msg.chat_id, getattr(msg, "message_thread_id", None)):
+        try:
+            await devbot.handle_command(msg, context, bridge)
+        except Exception:
+            log.exception("devbot handle_command error")
         return
 
     chat_id = msg.chat_id
@@ -1170,6 +1176,14 @@ def main():
             name="audit_report",
         )
         log.info("Scheduled audit report at 09:30")
+
+        # Дев-бот (п.5): утренняя авто-сводка в HQ topic 205 — health + аудит + Brain (read-only)
+        app.job_queue.run_daily(
+            devbot.morning_summary,
+            time=dtime(hour=8, minute=0, tzinfo=tz),
+            name="devbot_morning",
+        )
+        log.info("Scheduled devbot morning summary at 08:00")
 
     log.info("Bot polling started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
