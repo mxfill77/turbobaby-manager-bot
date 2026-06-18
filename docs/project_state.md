@@ -129,6 +129,15 @@
 - Мок 10/10: билет lifecycle, human проходит (red-zone+память), agent без билета→rejected, с
   билетом→проходит, повтор/истёк→rejected. H/I/trust/сторож по поведению не трогали. **Дальше:** 4.3 тесты-гейт.
 
+### 📄 base-доки project_state + knowledge_base → plain-text (18.06)
+health дал ⚠️ по латентности base-доков (project_state 42с, knowledge_base timeout — оставались
+Google-Doc и изнашивались, тот же класс что у журналов). Мигрировали и их на **plain-text** тем же
+обкатанным `migrate_journal` (key-agnostic, БЕЗ правок .gs / без redeploy). Новые id: project_state
+`1fuptOFp2bqZva7eJRlEanaCO6eRkAO20`, knowledge_base `1Mv_zi1P33jNM0MFUBX_UEf9CnzOvCFeZ`; старые →
+`KB_project_state_OLD` / `KB_knowledge_base_OLD` (бэкап). `read_doc`/`write_doc` детектят plain
+автоматически; автосинк `docs/*.md`→`write_doc(name=…)` пишет в новый plain (резолв по name). Теперь
+все 4 Brain-дока + 2 журнала — plain-text (faq/park_list — мелкие, при желании тоже). Износа нет.
+
 ---
 
 ## 🗓️ СЕССИЯ 10-11 июня 2026 — система ТО/обслуживания достроена + UX сводки + двуязычие
