@@ -114,7 +114,20 @@
 - **Формат строки:** `logged_at | initiator | action | args(кратко) | result(ok/fail) | critical`.
 - **Bridge @35:** `log_write` (поле `act` — `action` занят роутингом) + `read_write_log(limit=N)` для
   проверки с сайта/Claude Code; лист трим до 3000 строк. Поведение записи (H/I/trust/сторож/деньги) НЕ
-  трогали — только наблюдение. **Заложено на будущее:** 4.2 токен-замок боевой записи, 4.3 тесты-гейт.
+  трогали — только наблюдение.
+
+### 🔒 Пункт 4.2 лестницы — ТОКЕН-ЗАМОК боевой записи (18.06) — Apps Script @36, commit `d658406`
+Защищает ТОЛЬКО agent-записи (будущий оркестратор/дев-бот); люди (Пым/владелец/кнопки) пишут как сейчас.
+Автономного агента ещё НЕТ → замок **СПИТ** (0 отклонений сегодня).
+- **origin:** contextvar `WRITE_ORIGIN` дефолт `human` (всё сегодня → human). Будущий агент оборачивает
+  вызовы в `agent_write(ticket)` → `origin=agent` + одноразовый билет.
+- **Билет:** Bridge `issue_write_ticket` (одноразовый, TTL 120с, CacheService) + `consume_write_ticket`.
+- **Гейт на Bridge** (централизованно в `doPost`, до switch): красный экшен + `origin=agent` → нужен
+  валидный билет; нет/повтор/истёк → `403 no_ticket` + боевой_лог `result=rejected` + пуш Филиппу.
+  `origin=human`/отсутствует → пропуск. **Память** (memory.db, без Bridge) — гейт client-side
+  `claude_client._agent_gate` (через `consume_write_ticket`).
+- Мок 10/10: билет lifecycle, human проходит (red-zone+память), agent без билета→rejected, с
+  билетом→проходит, повтор/истёк→rejected. H/I/trust/сторож по поведению не трогали. **Дальше:** 4.3 тесты-гейт.
 
 ---
 
