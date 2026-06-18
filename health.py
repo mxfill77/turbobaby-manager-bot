@@ -24,10 +24,24 @@ import os
 import re
 import subprocess
 import datetime
+import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(ROOT, "splinter.log")
 OK, BAD, INFO, WARN = "✅", "❌", "ℹ️ ", "⚠️ "
+
+# Ранний детектор деградации Brain-доков (износ Google-Doc → рост latency чтения).
+# ПЕР-ДОКОВЫЙ порог: журналы (cc_log/review) должны читаться ~1с → порог 10с ловит ранний износ;
+# base-доки (project_state/knowledge_base) законно большие (норм. 17-35с, синк из git, не изнашиваются)
+# → порог высокий, тревога только при реальном выходе за норму (иначе ложный ⚠️ каждые 4ч).
+# Формат: (label, read_doc-kwargs, порог_сек). Зонд читает с таймаутом порог+margin.
+_BRAIN_DOCS = [
+    ("cc_log",         {"id": "1o0be0v9xGI7L0tmpzpefgXBgq4jgmg2eM9lxL_Rlj2E"}, 10),
+    ("review",         {"id": "1NYh2XSeojiaAOWhJxeG69d7Sg2sykcP83Xyiy58G7y8"}, 10),
+    ("project_state",  {"name": "project_state"}, 45),
+    ("knowledge_base", {"name": "knowledge_base"}, 40),
+]
+_BRAIN_PROBE_MARGIN = 4   # сек сверх порога: «дочитал, но медленно» vs «не дочитал (timeout)»
 
 
 def _utcnow():
@@ -177,15 +191,52 @@ def check_commit():
     return (bool(out), out or "git недоступен")
 
 
+def check_brain_latency():
+    """Замер latency чтения Brain-доков (ранний детектор износа). Вернуть (warn:bool, detail:str).
+    warn=True если док читается > СВОЕГО порога ИЛИ не прочитался — сигнал деградации.
+    Порог пер-доковый (журналы 10с, base-доки большие → высокий), чтобы не ложно тревожить."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(ROOT, ".env"))
+        from bridge_client import BridgeClient
+    except Exception as e:
+        return True, "зонд не запустился: " + type(e).__name__
+    parts = []
+    warn = False
+    for label, kw, thr in _BRAIN_DOCS:
+        try:
+            bc = BridgeClient(timeout=thr + _BRAIN_PROBE_MARGIN)
+        except Exception as e:
+            return True, "зонд не запустился: " + type(e).__name__
+        t0 = time.time()
+        try:
+            r = bc._call("read_doc", **kw)
+            dt = time.time() - t0
+            if not r.get("ok"):
+                warn = True
+                parts.append(label + " ✗(" + str(r.get("error", "?")) + ")")
+            elif dt > thr:
+                warn = True
+                parts.append(label + " " + ("%.0f" % dt) + "с⚠️(>" + str(thr) + ")")
+            else:
+                parts.append(label + " " + ("%.1f" % dt) + "с")
+        except Exception:
+            warn = True
+            parts.append(label + " ✗(timeout>" + str(thr) + "с)")
+    return warn, "; ".join(parts)
+
+
 def build_report():
-    """Собрать отчёт здоровья. Вернуть (report:str, summary:str, code:int).
-    code: 0 = ок/предупреждение, 1 = реальная проблема (лежит компонент)."""
+    """Собрать отчёт здоровья. Вернуть (report:str, summary:str, code:int, brain_warn:bool).
+    code: 0 = ок/предупреждение, 1 = реальная проблема (лежит компонент).
+    brain_warn: ранняя деградация чтения Brain-дока (>10с/ошибка) — повод для пуша."""
     lines = _read_log_lines()
     svc_ok, svc_d, start_dt, _ = check_service()
     br_ok, br_d = check_bridge()
     au_ok, au_d = check_auditor(lines)
     pl_ok, pl_d = check_polling(lines)
     log_ok, log_d, errors = check_log_health(lines, start_dt)
+    brain_warn, brain_d = check_brain_latency()
     _, commit_d = check_commit()
 
     rows = [
@@ -200,6 +251,8 @@ def build_report():
         out.append((OK if ok else BAD) + " " + name + "  " + detail)
     # лог — мягкий сигнал: свежесть инфо, ошибки — предупреждение
     out.append((WARN if errors else INFO) + "Лог            " + log_d)
+    # Brain-латентность — ранний детектор износа доков (порог 10с)
+    out.append((WARN if brain_warn else OK) + " Brain read     " + brain_d)
     out.append(INFO + "Прод           " + commit_d)
     out.append("─" * 46)
 
@@ -217,6 +270,10 @@ def build_report():
     if problems:
         summary = BAD + " ПРОБЛЕМА: " + "; ".join(problems)
         code = 1
+    elif brain_warn:
+        # Деградация чтения Brain-дока (>10с / ошибка) — ранний симптом износа, пушим Филиппу.
+        summary = WARN + "Brain-док читается медленно/с ошибкой — ранний симптом, глянь (см. Brain read)"
+        code = 0
     elif errors:
         # Ошибки в логе текущего запуска — мягкий сигнал: бот жив, но стоит глянуть.
         summary = WARN + "РАБОТАЕТ, но " + str(errors) + " ошибок в логе с старта — стоит глянуть"
@@ -225,15 +282,15 @@ def build_report():
         summary = OK + " ВСЁ ОК"
         code = 0
     out.append(summary)
-    return "\n".join(out), summary, code
+    return "\n".join(out), summary, code, brain_warn
 
 
 def main(argv):
-    push = "--push" in argv            # пуш Филиппу ТОЛЬКО при проблеме (❌)
+    push = "--push" in argv            # пуш Филиппу при проблеме (❌) или деградации Brain (ранний детектор)
     push_always = "--push-always" in argv  # пуш всегда, даже когда всё ✅
-    report, summary, code = build_report()
+    report, summary, code, brain_warn = build_report()
     print(report)
-    if push_always or (push and code != 0):
+    if push_always or (push and (code != 0 or brain_warn)):
         try:
             from notify import notify
             ok = notify(report)
