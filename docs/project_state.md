@@ -86,6 +86,23 @@
   переспрос; сумма всегда из ТЕКСТА, vision = слабый хинт (null/low не триггерит). H/I/trust/сторож
   не трогали. Мок 5/5, рестарт чистый.
 
+### 🩺 Bridge: лечение деградации журналов + детектор (18.06) — Apps Script @33
+Корень флапа Bridge: журналы **cc_log/review** велись как Google-Doc, сотни циклов
+`DocumentApp clear+setText` изнашивали структуру → `read_doc` рос (1.5с→60→98с+`read_failed`,
+внутр. ошибка сервиса «Документы»); review того же размера 49k читался 1с → дело в износе дока, не размере.
+Закрыто КЛАССОВО (3 части):
+- **Часть 3 (health.py, commit `9451c76`, 🟢):** ранний детектор latency Brain-доков — пер-доковый порог
+  (журналы 10с, base-доки 40-45с), превышение/ошибка → ⚠️ + пуш Филиппу; едет в таймере health 4ч.
+- **Части 1+2 (Bridge Apps Script @33, clasp redeploy):** журналы cc_log+review мигрированы на
+  **plain-text Drive-файлы** (вместо Google-Doc). Type-aware хелперы `brainTextRead_`/`brainTextWrite_`
+  в `read_doc`/`write_doc`/`prune` (plain→DriveApp blob/`setContent`, Doc→DocumentApp). Новый экшен
+  `migrate_journal` (создаёт plain, переливает текст, старый Doc→`_OLD` бэкап, свопает `BRAIN_MANIFEST`).
+  base-доки (project_state/knowledge_base/faq/park_list) пока остаются Google-Doc.
+  Результат: read cc_log **2-3с** (было 60-120с+/ошибка), prune на plain работает, износа больше нет.
+  Новые id: cc_log `1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF`, review `1vDfD_n8i-8cSvJmqqvvEaLZ1YC639-in`;
+  старые сохранены как `KB_claude_code_log_OLD` / `KB_claude_review_OLD`. prune-триггеры (cap 50k,
+  ежедн.) авто-перешли на новые id (резолв из манифеста). Откат Bridge: `clasp redeploy <prodId> 31`.
+
 ---
 
 ## 🗓️ СЕССИЯ 10-11 июня 2026 — система ТО/обслуживания достроена + UX сводки + двуязычие
