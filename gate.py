@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""ТЕСТЫ-ГЕЙТ перед прод-деплоем (пункт 4.3 лестницы фундамента).
+
+Гоняет набор тестов tests/test_*.py (быстрый, ~1.6с, всё мокнуто — нет ложного красного от флапа).
+Все зелёные → exit 0 (прод-операция идёт). Хоть один красный → exit 1 (ДЕПЛОЙ БЛОКИРОВАН) +
+пуш Филиппу + запись в боевой_лог result=blocked_by_tests.
+
+Использование:
+    venv/bin/python3 gate.py                 # прогон гейта (перед clasp redeploy / git push / restart)
+    venv/bin/python3 gate.py --for push      # пометить операцию в логе (push/clasp/restart)
+    venv/bin/python3 gate.py --override "причина"   # ОБХОД — ТОЛЬКО по явному «да» Филиппа
+
+ЭНФОРСМЕНТ: git push — нативный pre-push hook (deploy/hooks/pre-push) зовёт gate.py автоматически.
+clasp redeploy / systemctl restart — по правилу CLAUDE.md (дисциплинарно). Будущий дев-бот/оркестратор
+зовёт gate.py в деплой-пути и обойти НЕ может — обход только Филипп («да» → --override).
+"""
+import os
+import sys
+import glob
+import time
+import subprocess
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PY = os.path.join(ROOT, "venv", "bin", "python3")
+TESTS_DIR = os.path.join(ROOT, "tests")
+
+
+def _arg(flag):
+    a = sys.argv[1:]
+    if flag in a:
+        i = a.index(flag)
+        return a[i + 1] if i + 1 < len(a) else ""
+    return None
+
+
+def _log(result, args_str):
+    """Best-effort запись в боевой_лог (не валит гейт, если Bridge недоступен)."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(ROOT, ".env"))
+        from bridge_client import BridgeClient
+        BridgeClient(timeout=20).log_write(initiator="gate.py", act="prod_deploy",
+                                           args=args_str[:480], result=result, critical="тесты-гейт")
+    except Exception as e:
+        print(f"[gate] лог не записан ({e}) — решение гейта не затронуто")
+
+
+def _push(text):
+    try:
+        from notify import notify
+        notify(text)
+    except Exception:
+        pass
+
+
+def run_tests():
+    """Прогнать все tests/test_*.py. Вернуть (failed:list, total:int, dt:float)."""
+    env = dict(os.environ, PYTHONPATH=ROOT)   # чтобы import splinter работал из tests/
+    tests = sorted(glob.glob(os.path.join(TESTS_DIR, "test_*.py")))
+    failed = []
+    t0 = time.time()
+    for t in tests:
+        name = os.path.basename(t)
+        try:
+            r = subprocess.run([PY, t], cwd=ROOT, env=env,
+                               capture_output=True, text=True, timeout=90)
+            if r.returncode != 0:
+                failed.append(name)
+        except subprocess.TimeoutExpired:
+            failed.append(name + "(timeout)")
+    return failed, len(tests), time.time() - t0
+
+
+def main():
+    op = _arg("--for") or "prod"
+    override = _arg("--override")
+
+    if override is not None:
+        # ОБХОД — только по явному «да» Филиппа. Claude Code сам этот флаг не ставит.
+        msg = f"причина: {override or '(не указана)'}"
+        _log("test_override", f"op={op}; обход тестов; {msg}")
+        print(f"⚠️ ГЕЙТ ОБОЙДЁН (по «да» Филиппа). op={op}. {msg}. Записано в боевой_лог: test_override.")
+        return 0
+
+    failed, total, dt = run_tests()
+    if not failed:
+        print(f"✅ ГЕЙТ: {total} тестов зелёные ({dt:.1f}с) — прод-операция «{op}» разрешена.")
+        return 0
+
+    # КРАСНЫЙ → блок + пуш + лог
+    flist = ", ".join(failed)
+    print(f"❌ ГЕЙТ: КРАСНЫЕ ТЕСТЫ ({len(failed)}/{total}): {flist}")
+    print(f"   ДЕПЛОЙ «{op}» ЗАБЛОКИРОВАН. Обход только по «да» Филиппа: gate.py --override «причина».")
+    _log("blocked_by_tests", f"op={op}; упали: {flist}")
+    _push(f"🔴 ТЕСТЫ КРАСНЫЕ ({len(failed)}/{total}): {flist}. Деплой «{op}» ЗАБЛОКИРОВАН (тесты-гейт 4.3). "
+          f"Обход только твоим «да».")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

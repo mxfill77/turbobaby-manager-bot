@@ -1,0 +1,4 @@
+#!/bin/sh
+# ТЕСТЫ-ГЕЙТ (4.3): перед КАЖДЫМ git push гоняем gate.py. Красные тесты → exit≠0 → git РВЁТ push.
+# Обход (только по «да» Филиппа): git push --no-verify (+ gate.py --override «причина» для записи).
+exec /root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/gate.py --for push
