@@ -6,10 +6,32 @@ TurboBaby Bridge HTTP клиент.
 import os
 import json
 import logging
+import contextlib
+import contextvars
 import requests
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# === ТОКЕН-ЗАМОК боевой записи (4.2) ===
+# origin записи: 'human' (по умолчанию — люди/кнопки, замок СПИТ) | 'agent' (автономный процесс).
+# Сегодня agent НЕ ставится нигде → все записи human → 0 отклонений. Будущий оркестратор/дев-бот
+# оборачивает свои вызовы в agent_write(ticket) → origin=agent + билет; Bridge проверит билет.
+WRITE_ORIGIN = contextvars.ContextVar("write_origin", default="human")
+WRITE_TICKET = contextvars.ContextVar("write_ticket", default=None)
+
+
+@contextlib.contextmanager
+def agent_write(ticket: str):
+    """Контекст автономной (agent) боевой записи: origin=agent + одноразовый билет.
+    Для БУДУЩЕГО оркестратора/дев-бота. Сегодня не используется (замок спит)."""
+    t1 = WRITE_ORIGIN.set("agent")
+    t2 = WRITE_TICKET.set(ticket)
+    try:
+        yield
+    finally:
+        WRITE_ORIGIN.reset(t1)
+        WRITE_TICKET.reset(t2)
 
 
 class BridgeClient:
@@ -123,6 +145,13 @@ class BridgeClient:
     def _post(self, action: str, **fields) -> dict:
         """POST запрос к Bridge (запись данных Splinter)."""
         body = {"token": self.token, "action": action, **fields}
+        # Токен-замок 4.2: помечаем origin (дефолт human). Для agent — прикладываем билет.
+        origin = WRITE_ORIGIN.get()
+        body["origin"] = origin
+        if origin == "agent":
+            tk = WRITE_TICKET.get()
+            if tk:
+                body["ticket"] = tk
         try:
             log.debug(f"Bridge POST: action={action}")
             r = requests.post(self.url, json=body, timeout=self.timeout, allow_redirects=True)
@@ -151,6 +180,12 @@ class BridgeClient:
             return
         try:
             self._in_blackbox = True
+            # Токен-замок 4.2: agent-запись отклонена Bridge (no_ticket) — Bridge УЖЕ залогировал
+            # rejected server-side; клиент не дублирует лог, только шлёт ПУШ Филиппу (тревога).
+            if data.get("error") == "no_ticket":
+                self._push_blackbox(f"🔴 ОТКЛОНЕНО (токен-замок 4.2): agent-запись «{action}» без "
+                                    f"валидного билета. В боевой_лог: rejected.")
+                return
             initiator = str(fields.get("confirmed_by") or fields.get("sender") or "bot")
             parts = [f"{k}={fields[k]}" for k in self._BRIEF_KEYS
                      if fields.get(k) not in (None, "")]
@@ -172,6 +207,22 @@ class BridgeClient:
     def read_write_log(self, limit: int = 50) -> dict:
         """Прочитать последние записи боевого лога (для проверки с сайта/Claude Code)."""
         return self._post("read_write_log", limit=limit)
+
+    def issue_write_ticket(self) -> dict:
+        """Выдать одноразовый билет (TTL ~120с) на санкционированную agent-запись (токен-замок 4.2)."""
+        return self._post("issue_write_ticket")
+
+    def consume_write_ticket(self, ticket: str) -> dict:
+        """Проверить+погасить билет (для client-side гейта памяти). {ok:true/false}."""
+        return self._post("consume_write_ticket", ticket=ticket or "")
+
+    def _push_blackbox(self, text: str) -> None:
+        """Пуш Филиппу о событии чёрного ящика (отклонение токен-замка). Best-effort, не бросает."""
+        try:
+            import notify
+            notify.notify(text)
+        except Exception:
+            pass
 
     # === Запись (Splinter) ===
 

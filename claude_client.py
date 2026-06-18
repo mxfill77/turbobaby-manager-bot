@@ -235,6 +235,32 @@ class ClaudeClient:
         "валют", "касс", "деньг", "usd", "usdt", "баланс", "депозит",
     )
 
+    def _agent_gate(self, action: str) -> bool:
+        """Токен-замок 4.2 для ПАМЯТИ (memory.db локальна, Bridge-гейта нет → проверка client-side).
+        human → True (замок спит). agent → нужен валидный одноразовый билет (через Bridge), иначе
+        False + лог rejected + пуш. Сегодня origin всегда human → всегда True."""
+        try:
+            import bridge_client as _bc
+            if _bc.WRITE_ORIGIN.get() != "agent":
+                return True
+            tok = _bc.WRITE_TICKET.get()
+            try:
+                ok = bool(tok and self.bridge and self.bridge.consume_write_ticket(tok).get("ok"))
+            except Exception:
+                ok = False
+            if not ok and self.bridge:
+                try:
+                    self.bridge.log_write(initiator="agent", act=action,
+                                          args="origin=agent, ticket=" + ("invalid/expired" if tok else "none"),
+                                          result="rejected", critical="токен-замок 4.2")
+                    self.bridge._push_blackbox(f"🔴 ОТКЛОНЕНО (токен-замок 4.2): agent-память «{action}» без билета.")
+                except Exception:
+                    pass
+            return ok
+        except Exception:
+            # сбой гейта: human (дефолт) не должен страдать; agent без явного контекста сюда не попадёт
+            return True
+
     def _blackbox_mem(self, action: str, text: str, key: str = "") -> None:
         """Чёрный ящик (4.1): лог memory-записи (remember_rule/save_note) в боевой_лог.
         НИКОГДА не бросает — если лог упал, запись правила всё равно прошла."""
@@ -430,6 +456,9 @@ class ClaudeClient:
             elif tool_name == "remember_rule":
                 if not self.memory:
                     result = {"ok": False, "error": "memory not configured"}
+                elif not self._agent_gate("remember_rule"):
+                    result = {"ok": False, "error": "no_ticket",
+                              "message": "agent-запись в память без валидного билета отклонена (токен-замок 4.2)"}
                 else:
                     rule_id = self.memory.add_rule(
                         rule=tool_input["rule"],
@@ -443,6 +472,9 @@ class ClaudeClient:
             elif tool_name == "save_note":
                 if not self.memory:
                     result = {"ok": False, "error": "memory not configured"}
+                elif not self._agent_gate("save_note"):
+                    result = {"ok": False, "error": "no_ticket",
+                              "message": "agent-запись в память без валидного билета отклонена (токен-замок 4.2)"}
                 else:
                     self.memory.add_note(
                         entity_type=tool_input["entity_type"],
