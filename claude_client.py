@@ -226,6 +226,29 @@ class ClaudeClient:
 
         self.client = Anthropic(api_key=self.api_key)
 
+    # Защищённый список для крит-флага чёрного ящика (4.1): правило/заметка задевает trust-авторов,
+    # интервалы ТО, сторож одометра, денежные правила → пометка «критичное правило» (best-effort).
+    _CRIT_KEYWORDS = (
+        "довер", "trust", "@pleummmm", "@turbophuket", "пым",
+        "интервал", "oil_interval", " то ", "тех обслуж", "5000",
+        "одометр", "сторож", "пробег не убыв", "km_decreas",
+        "валют", "касс", "деньг", "usd", "usdt", "баланс", "депозит",
+    )
+
+    def _blackbox_mem(self, action: str, text: str, key: str = "") -> None:
+        """Чёрный ящик (4.1): лог memory-записи (remember_rule/save_note) в боевой_лог.
+        НИКОГДА не бросает — если лог упал, запись правила всё равно прошла."""
+        try:
+            if not self.bridge:
+                return
+            low = (str(text) or "").lower()
+            crit = "критичное правило" if any(k in low for k in self._CRIT_KEYWORDS) else ""
+            args = (("[" + key + "] ") if key else "") + str(text)[:400]
+            self.bridge.log_write(initiator="memory(claude)", act=action,
+                                  args=args, result="ok", critical=crit)
+        except Exception as e:
+            log.warning(f"  → чёрный ящик memory: лог не записан ({e}) — запись не затронута")
+
     def _execute_tool(self, tool_name: str, tool_input: dict) -> str:
         """Выполняет вызов инструмента и возвращает результат как строку."""
         log.info(f"Tool call: {tool_name}({tool_input})")
@@ -415,6 +438,7 @@ class ClaudeClient:
                     )
                     result = {"ok": True, "saved": True, "rule_id": rule_id, "rule": tool_input["rule"]}
                     log.info(f"💾 Rule saved (#{rule_id}): {tool_input['rule']}")
+                    self._blackbox_mem("remember_rule", tool_input["rule"])   # 4.1 чёрный ящик
 
             elif tool_name == "save_note":
                 if not self.memory:
@@ -427,6 +451,8 @@ class ClaudeClient:
                     )
                     result = {"ok": True, "saved": True, "entity": tool_input["entity_key"]}
                     log.info(f"💾 Note saved for {tool_input['entity_key']}: {tool_input['note']}")
+                    self._blackbox_mem("save_note", tool_input["note"],
+                                       key=tool_input.get("entity_key", ""))   # 4.1 чёрный ящик
 
             else:
                 result = {"error": f"Unknown tool: {tool_name}"}

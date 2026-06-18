@@ -110,6 +110,16 @@ class BridgeClient:
         return self._call("daily_pulse")
 
 
+    # === ЧЁРНЫЙ ЯЩИК боевых записей (4.1): какие действия логируем в боевой_лог ===
+    _REDZONE_ACTIONS = {
+        "set_fleet_oil", "set_fleet_service",   # Байки H/I/J/K/L
+        "add_transaction", "void_last",          # касса (проводки + отмена)
+        "create_booking", "activate_booking",    # CRM «клиенты»
+        "delete_event",                          # удаление
+    }
+    _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
+                   "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
+
     def _post(self, action: str, **fields) -> dict:
         """POST запрос к Bridge (запись данных Splinter)."""
         body = {"token": self.token, "action": action, **fields}
@@ -120,16 +130,48 @@ class BridgeClient:
             data = r.json()
             if not data.get("ok"):
                 log.warning(f"Bridge POST error: {data.get('error')} — {data.get('message')}")
-            return data
         except requests.exceptions.Timeout:
             log.error(f"Bridge POST timeout for action={action}")
-            return {"ok": False, "error": "timeout"}
+            data = {"ok": False, "error": "timeout"}
         except requests.exceptions.RequestException as e:
             log.error(f"Bridge POST request error: {e}")
-            return {"ok": False, "error": "request_failed", "message": str(e)}
+            data = {"ok": False, "error": "request_failed", "message": str(e)}
         except json.JSONDecodeError as e:
             log.error(f"Bridge POST JSON error: {e}")
-            return {"ok": False, "error": "json_parse_error", "message": str(e)}
+            data = {"ok": False, "error": "json_parse_error", "message": str(e)}
+        self._blackbox_log(action, fields, data)   # 4.1: лог постфактум, НЕ блокирует
+        return data
+
+    def _blackbox_log(self, action: str, fields: dict, data: dict) -> None:
+        """Чёрный ящик: атомарный appendRow в боевой_лог для красных экшенов. НИКОГДА не бросает
+        (try/except) — если лог упал, боевая операция всё равно прошла. Reentrancy-guard от самолога."""
+        if action not in self._REDZONE_ACTIONS:
+            return
+        if getattr(self, "_in_blackbox", False):
+            return
+        try:
+            self._in_blackbox = True
+            initiator = str(fields.get("confirmed_by") or fields.get("sender") or "bot")
+            parts = [f"{k}={fields[k]}" for k in self._BRIEF_KEYS
+                     if fields.get(k) not in (None, "")]
+            args = ", ".join(parts)[:480]
+            result = "ok" if data.get("ok") else ("fail:" + str(data.get("error", "")))
+            # логируемое действие шлём как 'act' — ключ 'action' занят маршрутизацией _post.
+            self._post("log_write", initiator=initiator, act=action, args=args,
+                       result=result, critical="")
+        except Exception as e:
+            log.warning(f"  → чёрный ящик: лог не записан ({e}) — боевая операция не затронута")
+        finally:
+            self._in_blackbox = False
+
+    def log_write(self, **fields) -> dict:
+        """Записать строку в боевой_лог (чёрный ящик). Обычно зовётся хуком _blackbox_log,
+        но доступен и для memory-записей из claude_client."""
+        return self._post("log_write", **fields)
+
+    def read_write_log(self, limit: int = 50) -> dict:
+        """Прочитать последние записи боевого лога (для проверки с сайта/Claude Code)."""
+        return self._post("read_write_log", limit=limit)
 
     # === Запись (Splinter) ===
 
