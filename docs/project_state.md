@@ -103,6 +103,19 @@
   старые сохранены как `KB_claude_code_log_OLD` / `KB_claude_review_OLD`. prune-триггеры (cap 50k,
   ежедн.) авто-перешли на новые id (резолв из манифеста). Откат Bridge: `clasp redeploy <prodId> 31`.
 
+### ⬛ Пункт 4.1 лестницы — ЧЁРНЫЙ ЯЩИК боевых записей (18.06) — Apps Script @35, commit `80839cf`
+Каждая боевая запись в живые данные логируется в лист **«боевой_лог»** (Bot Data) атомарным
+`appendRow` — read-only добавка, НИЧЕГО не блокирует (видимость + фундамент под тех-гейт 4.2/4.3).
+- **Охват (красная зона лога):** `set_fleet_oil`/`set_fleet_service` (Байки H/I/J/K/L), `add_transaction`
+  (+корректировки), `void_last`, `create_booking`/`activate_booking` (CRM), `delete_event`; memory
+  `remember_rule`/`save_note` (с крит-флагом если задевают trust/интервалы ТО/сторож/деньги).
+- **Хук единый, НЕ блокирующий:** `bridge_client._post` (allowlist `_REDZONE_ACTIONS`, reentrancy-guard) +
+  `claude_client._blackbox_mem`; всё в `try/except` — если лог упал, боевая операция всё равно проходит.
+- **Формат строки:** `logged_at | initiator | action | args(кратко) | result(ok/fail) | critical`.
+- **Bridge @35:** `log_write` (поле `act` — `action` занят роутингом) + `read_write_log(limit=N)` для
+  проверки с сайта/Claude Code; лист трим до 3000 строк. Поведение записи (H/I/trust/сторож/деньги) НЕ
+  трогали — только наблюдение. **Заложено на будущее:** 4.2 токен-замок боевой записи, 4.3 тесты-гейт.
+
 ---
 
 ## 🗓️ СЕССИЯ 10-11 июня 2026 — система ТО/обслуживания достроена + UX сводки + двуязычие
