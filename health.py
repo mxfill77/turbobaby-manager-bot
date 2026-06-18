@@ -35,9 +35,10 @@ OK, BAD, INFO, WARN = "✅", "❌", "ℹ️ ", "⚠️ "
 # base-доки (project_state/knowledge_base) законно большие (норм. 17-35с, синк из git, не изнашиваются)
 # → порог высокий, тревога только при реальном выходе за норму (иначе ложный ⚠️ каждые 4ч).
 # Формат: (label, read_doc-kwargs, порог_сек). Зонд читает с таймаутом порог+margin.
+# Резолв по name= через манифест (НЕ хардкод id) — переживает миграции (cc_log/review на plain-text).
 _BRAIN_DOCS = [
-    ("cc_log",         {"id": "1o0be0v9xGI7L0tmpzpefgXBgq4jgmg2eM9lxL_Rlj2E"}, 10),
-    ("review",         {"id": "1NYh2XSeojiaAOWhJxeG69d7Sg2sykcP83Xyiy58G7y8"}, 10),
+    ("cc_log",         {"name": "cc_log"}, 10),
+    ("review",         {"name": "review"}, 10),
     ("project_state",  {"name": "project_state"}, 45),
     ("knowledge_base", {"name": "knowledge_base"}, 40),
 ]
