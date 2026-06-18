@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 class BridgeClient:
     """Клиент к Apps Script Bridge Web App."""
 
-    def __init__(self, url: str = None, token: str = None, timeout: int = 30):
+    def __init__(self, url: str = None, token: str = None, timeout: int = 60):
         self.url = url or os.getenv("BRIDGE_URL")
         self.token = token or os.getenv("BRIDGE_TOKEN")
         self.timeout = timeout
