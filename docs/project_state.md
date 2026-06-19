@@ -120,10 +120,19 @@ Splinter (учёт/ТО/касса/аудитор), фундамент авто�
   LockService), `complete_task`, `set_needs_approval`, `approve_task`. Обёртки в `bridge_client.py`.
   Это служебный лист — НЕ боевые данные (вне токен-замка 4.2). CRUD проверен руками, переходы ОК.
   Демона НЕТ — ничего не исполняется автоматически.
-- **Заход 2 — ДЕМОН (НЕ начат).** loop `get_pending→claim_task→claude -p→complete_task` (опрос HTTP
-  без токенов, `claude -p` только на задачу); systemd-юнит ОТДЕЛЬНО от splinter (Restart=always +
-  рубильник `systemctl stop`); интеграция `enqueue_task` в дев-бот 328 (только от Филиппа 504608015);
-  таймаут-возврат зависшего in_progress. Старт — после обкатки захода 1.
+- **Заход 2а — ДЕМОН изолированно ✅ СДЕЛАНО (19.06).** `orchestrator_daemon.py` (репо): цикл
+  `get_pending(new)` каждые 60с (плоский HTTP, без токенов LLM) → `claim_task` (атомарно) →
+  `claude -p "<task_text>"` (headless, cwd=репо, таймаут 600с, аргументы списком — без shell-инъекции,
+  БЕЗ `--dangerously-skip-permissions`) → `complete_task` done/failed (таймаут→failed). SIGTERM→мягкая
+  остановка. Лог `orchestrator_daemon.log`. systemd-юнит `orchestrator-daemon.service` (ОТДЕЛЬНО от
+  splinter, Restart=always, версионирован в `deploy/`), установлен+enabled+active. **Рубильник:**
+  `systemctl stop orchestrator-daemon` (splinter не задет); полный откат — `systemctl disable --now
+  orchestrator-daemon` + `git revert 0a11aea`. Защита: красную зону (ask в `.claude/settings.json`)
+  headless `claude -p` не подтверждает → отказ, демон сам красное не проходит. Обкатан на read-only
+  health-задаче: new→in_progress→done за ~25с, health-сводка в result, демон не завис. commit `0a11aea`.
+- **Заход 2б — ИНТЕГРАЦИЯ В ДЕВ-БОТ (НЕ начат).** `enqueue_task` из дев-бота 328 (только от Филиппа
+  504608015); needs_approval-флоу через ТГ (демон ставит needs_approval на красное → оркестратор
+  спрашивает Филиппа → `approve_task`); отчёт демона в ТГ. Старт — после обкатки захода 2а.
 
 **ПРИНЦИП:** автономию строим на ОБКАТАННОМ фундаменте, не параллельно. Приборы + тормоза +
 чёрный ящик до автопилота.
