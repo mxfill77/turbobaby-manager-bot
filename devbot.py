@@ -24,6 +24,74 @@ CC_LOG_ID = "1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF"
 
 BRIDGE = None   # выставляется из bot.py при старте (devbot.BRIDGE = bridge)
 
+# === ОРКЕСТРАТОР (ступень1 заход2б-1): дев-бот ↔ очередь ===
+# Префикс в 328 → кладём задачу в очередь оркестратора; фоновый job приносит результат обратно.
+QUEUE_FROM = "Filipp-328"               # метка источника задач из ТГ (фильтр для отчёта)
+_TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
+_reported = set()                       # id задач, уже отрапортованных (дедуп, память процесса)
+_report_seeded = False                  # seed-on-start: не спамим историей done/failed при рестарте
+
+
+def _try_enqueue(text, bridge):
+    """Если текст начинается с префикса задачи — кладём в очередь оркестратора. Иначе None.
+    Проверяется ДО allowlist (иначе ключевые слова в тексте задачи перехватили бы зелёную команду)."""
+    t = (text or "").strip()
+    low = t.lower()
+    for p in _TASK_PREFIXES:
+        if low.startswith(p):
+            task_text = t[len(p):].strip()
+            if not task_text:
+                return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
+            r = bridge.enqueue_task(QUEUE_FROM, task_text)
+            if r.get("ok"):
+                return (f"✅ Задача {r.get('id')} поставлена в очередь — демон возьмёт её (опрос ~60с). "
+                        f"Принесу результат сюда, когда будет done/failed.")
+            return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
+    return None
+
+
+async def report_results(context) -> None:
+    """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
+    Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
+    как отрапортованные, чтобы при рестарте не присылать всю историю заново."""
+    global _report_seeded
+    bridge = BRIDGE
+    if bridge is None:
+        return
+    finished = []
+    try:
+        for st in ("done", "failed"):
+            r = bridge.get_pending(st)
+            if not r.get("ok"):
+                continue
+            for it in r.get("items", []):
+                if str(it.get("from")) == QUEUE_FROM:
+                    finished.append((st, it))
+    except Exception as e:
+        log.warning("devbot.report_results: опрос очереди упал (%s)", e)
+        return
+    finished.sort(key=lambda x: int(x[1].get("id") or 0))   # старые задачи рапортуем первыми
+
+    if not _report_seeded:
+        for _st, it in finished:
+            _reported.add(it.get("id"))
+        _report_seeded = True
+        return
+
+    for st, it in finished:
+        qid = it.get("id")
+        if qid in _reported:
+            continue
+        _reported.add(qid)
+        emoji = "✅" if st == "done" else "❌"
+        body = it.get("result") or "(пустой результат)"
+        head = f"{emoji} Задача {qid} — {st}\n\n{body}"
+        for chunk in _chunks(head):
+            try:
+                await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+            except Exception as e:
+                log.warning("devbot.report_results: отправка результата задачи %s упала (%s)", qid, e)
+
 
 # ===================== ЗЕЛЁНЫЕ ЗАДАЧИ (read-only) =====================
 def _g_health():
@@ -100,6 +168,9 @@ def _g_help():
             "  ошибки — сводка splinter.log\n"
             "  мозг / brain — латентность Brain\n"
             "  помощь\n"
+            "\n🎻 Оркестратор (демон исполняет через claude -p):\n"
+            "  задача: <что сделать> — поставить задачу в очередь; результат принесу сюда\n"
+            "  (красную зону демон сам НЕ проходит — headless-гейт; вернётся failed)\n"
             "Красное (запись/деплой) сам НЕ делаю — нужно твоё «да».")
 
 
@@ -138,6 +209,16 @@ async def handle_command(msg, context, bridge) -> None:
     if not msg.from_user or msg.from_user.id != DEVBOT_USER:
         return   # чужой — игнор
     tid = getattr(msg, "message_thread_id", None)
+
+    # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
+    #    (служебный лист очереди), origin=human по умолчанию — гейт 4.2 не трогаем.
+    enq = _try_enqueue(msg.text or "", bridge)
+    if enq is not None:
+        for chunk in _chunks(enq):
+            await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
+        return
+
+    # 2) Зелёная read-only команда из allowlist
     fn = _match(msg.text or "")
     if fn is None:
         await context.bot.send_message(

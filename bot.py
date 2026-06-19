@@ -1186,6 +1186,15 @@ def main():
         )
         log.info("Scheduled devbot morning summary at 08:00")
 
+    # Оркестратор 2б-1: дев-бот приносит результаты задач (done/failed) из очереди в topic 328.
+    # Раз в 45с (read-only get_pending), вне блока GROUP_CHAT_ID — HQ_CHAT_ID жёстко в devbot.
+    app.job_queue.run_repeating(
+        devbot.report_results,
+        interval=45, first=20,
+        name="devbot_report",
+    )
+    log.info("Scheduled devbot orchestrator result reporting every 45s")
+
     log.info("Bot polling started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
