@@ -69,7 +69,7 @@ Splinter (учёт/ТО/касса/аудитор), фундамент авто�
   `Booking.js` (Bridge @39) + splinter `_handle_intake`. Чёрный ящик 4.1 логирует. Обкатан на живом листе
   (тест-строка, формулы посчитались, долг 0). Только «Бронь» — активация (Бронь→В аренде) = этап 6
   (activateBooking, после фото выдачи), пока не подключён в intake.
-- **Этап B2 — OCR паспорта ✅ В ПРОДЕ (19.06, ждёт обкатки на реальном фото).** Фото паспорта в intake
+- **Этап B2 — OCR паспорта ✅ В ПРОДЕ И ОБКАТАН на реальном фото (19.06).** Фото паспорта в intake
   (отдельным сообщением, окно 5 мин, обе стороны фото↔карточка) → `upload_passport_photo` (Drive папка
   «Паспорта» `1OhIwNe9…`) → `ocr_passport` (EdenAI identity_parser, provider microsoft, ключ в Script
   Property `EDENAI_API_KEY`, **страны как EdenAI без countryMappings**) → `save_passport` (лист Bot Data
