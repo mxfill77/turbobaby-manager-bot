@@ -16,6 +16,7 @@
 
 import json
 import logging
+import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 log = logging.getLogger("splinter")
@@ -2970,11 +2971,53 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
         if any(w in low for w in ("да", "ок", "ставь", "подтвержд")):
             d["status"] = "approved"
             _who = msg.from_user.username if msg.from_user else "?"
-            log.info(f"  🆕 INTAKE: approve получен (@{_who}) для брони {d.get('model')} "
-                     f"— ЭТАП B (createBooking + задача тайцам) НЕ реализован")
-            await _send(context, chat_id=chat_id,
-                        text="🐀 Splinter\n✅ Approve принят. (Этап B — постановка брони и задача "
-                             "тайцам — пока не подключён, бронь НЕ ставлю.)", bilingual=False, message_thread_id=tid)
+            # --- собрать поля брони из распарсенной карточки ---
+            dep_type = d.get("deposit_type")
+            if dep_type == "паспорт":
+                deposit = "passport"
+            elif dep_type == "деньги":
+                deposit = _deposit_for_model(d.get("model"))   # сумма по модели (число) или None
+            else:
+                deposit = None
+            note_bits = []
+            if d.get("experience"):    note_bits.append("опыт: " + str(d["experience"]))
+            if d.get("delivery_name"): note_bits.append("доставка: " + str(d["delivery_name"]))
+            if d.get("term"):          note_bits.append("срок: " + str(d["term"]))
+            booking_fields = dict(
+                bike=d.get("model"), name=(d.get("client") or "—"),
+                date_start=d.get("date_start"), date_end=d.get("date_end"),
+                deposit=deposit, helmets=d.get("helmets"),
+                contacts=d.get("contacts"), note=(" | ".join(note_bits) or None),
+            )
+            # --- КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write → create_booking) ---
+            try:
+                ticket = (bridge.issue_write_ticket() or {}).get("ticket")
+                with bridge_client.agent_write(ticket):
+                    res = bridge.create_booking(**booking_fields)
+            except Exception as e:
+                res = {"ok": False, "error": "exception", "message": str(e)}
+            if res.get("ok"):
+                d["status"] = "booked"
+                _row = res.get("row")
+                log.info(f"  🆕 INTAKE: бронь записана (строка {_row}, @{_who}) {d.get('model')}")
+                await _send(context, chat_id=chat_id,
+                            text=(f"🐀 Splinter\n✅ Бронь записана, строка {_row}, статус «Бронь».\n"
+                                  f"✅ จองแล้ว แถว {_row} สถานะ «จอง»"),
+                            bilingual=False, message_thread_id=tid)
+            elif res.get("error") == "duplicate":
+                _row = res.get("row")
+                await _send(context, chat_id=chat_id,
+                            text=(f"🐀 Splinter\n⚠️ Уже есть такая бронь (строка {_row}).\n"
+                                  f"⚠️ มีการจองนี้แล้ว (แถว {_row})"),
+                            bilingual=False, message_thread_id=tid)
+            else:
+                _err = res.get("error") or "?"
+                _emsg = res.get("message") or ""
+                log.warning(f"  🆕 INTAKE: бронь НЕ записана ({_err}: {_emsg}) {d.get('model')}")
+                await _send(context, chat_id=chat_id,
+                            text=(f"🐀 Splinter\n❌ Не записалось: {_err}. {_emsg}\n"
+                                  f"❌ บันทึกไม่สำเร็จ: {_err}"),
+                            bilingual=False, message_thread_id=tid)
         elif any(w in low for w in ("нет", "отмена", "не ставь", "отклон")):
             d["status"] = "rejected"
             await _send(context, chat_id=chat_id, text="🐀 Splinter\n❌ Бронь отклонена.",
