@@ -6,6 +6,7 @@ origin=agent → ЛЮБАЯ попытка красной записи лови�
 тесты-гейтом 4.3. Красное/вне-allowlist → НЕ выполняет, просит «да». Не новый процесс — на bot.py.
 """
 import os
+import re
 import time
 import logging
 import subprocess
@@ -28,8 +29,40 @@ BRIDGE = None   # выставляется из bot.py при старте (devb
 # Префикс в 328 → кладём задачу в очередь оркестратора; фоновый job приносит результат обратно.
 QUEUE_FROM = "Filipp-328"               # метка источника задач из ТГ (фильтр для отчёта)
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
-_reported = set()                       # id задач, уже отрапортованных (дедуп, память процесса)
+_reported = set()                       # id задач, уже отрапортованных (done/failed; дедуп, память процесса)
 _report_seeded = False                  # seed-on-start: не спамим историей done/failed при рестарте
+_asked = set()                          # id задач needs_approval, по которым УЖЕ задан вопрос (дедуп)
+
+# «да N» / «нет N» (+ англ., + опц. # и пунктуация) — ответ Филиппа на запрос подтверждения (заход 2б-2)
+_APPROVAL_RE = re.compile(r"^(да|нет|yes|no)\b[\s,.:]*#?\s*(\d+)\s*$", re.IGNORECASE)
+_YES = ("да", "yes")
+
+
+def _try_approval_reply(text, bridge):
+    """«да N» → approve_task(N); «нет N» → complete_task(N, failed). Иначе None.
+    Проверяется ПЕРВОЙ в handle_command (специфичный паттерн ответа на запрос подтверждения)."""
+    m = _APPROVAL_RE.match((text or "").strip())
+    if not m:
+        return None
+    word = m.group(1).lower()
+    qid = int(m.group(2))
+    if word in _YES:
+        r = bridge.approve_task(qid, "Filipp")
+        if r.get("ok"):
+            _reported.discard(qid)   # пусть дальнейший done/failed по ней отрапортуется штатно
+            return (f"✅ Задача {qid} одобрена — статус approved. (Доведение approved-красного шага — "
+                    f"заход 2б-2 п.4, пока на ревью штаба; демон approved ещё не доводит.)")
+        if r.get("error") == "not_awaiting":
+            return f"🤖 Задача {qid} не ждёт подтверждения (статус {r.get('status')}). Ничего не сделал."
+        if r.get("error") == "not_found":
+            return f"🤖 Задачи {qid} нет в очереди."
+        return f"🤖 approve не прошёл: {r.get('error')}"
+    else:
+        r = bridge.complete_task(qid, "failed", "отклонено Филиппом")
+        if r.get("ok"):
+            _reported.add(qid)       # уже сообщили «отклонена» — не дублируем failed-рапортом
+            return f"🚫 Задача {qid} отклонена — статус failed."
+        return f"🤖 Не удалось отклонить задачу {qid}: {r.get('error')}"
 
 
 def _try_enqueue(text, bridge):
@@ -91,6 +124,31 @@ async def report_results(context) -> None:
                 await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
             except Exception as e:
                 log.warning("devbot.report_results: отправка результата задачи %s упала (%s)", qid, e)
+
+    # needs_approval (заход 2б-2): задача упёрлась в красную зону — спрашиваем «да N»/«нет N».
+    # БЕЗ seed (незакрытый вопрос после рестарта стоит переспросить); дедуп = _asked в памяти процесса.
+    try:
+        na = bridge.get_pending("needs_approval")
+    except Exception as e:
+        log.warning("devbot.report_results: опрос needs_approval упал (%s)", e)
+        return
+    if not na.get("ok"):
+        return
+    pend = sorted((it for it in na.get("items", []) if str(it.get("from")) == QUEUE_FROM),
+                  key=lambda x: int(x.get("id") or 0))
+    for it in pend:
+        qid = it.get("id")
+        if qid in _asked:
+            continue
+        _asked.add(qid)
+        what = it.get("result") or "(не уточнено)"
+        q = (f"⚠️ Задача {qid} требует подтверждения красной зоны:\n\n{what}\n\n"
+             f"Подтвердить? Ответь «да {qid}» (разрешить) или «нет {qid}» (отклонить).")
+        for chunk in _chunks(q):
+            try:
+                await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+            except Exception as e:
+                log.warning("devbot.report_results: вопрос по задаче %s не ушёл (%s)", qid, e)
 
 
 # ===================== ЗЕЛЁНЫЕ ЗАДАЧИ (read-only) =====================
@@ -170,7 +228,8 @@ def _g_help():
             "  помощь\n"
             "\n🎻 Оркестратор (демон исполняет через claude -p):\n"
             "  задача: <что сделать> — поставить задачу в очередь; результат принесу сюда\n"
-            "  (красную зону демон сам НЕ проходит — headless-гейт; вернётся failed)\n"
+            "  да N / нет N — ответ на запрос подтверждения красной зоны по задаче N\n"
+            "  (красную зону демон сам НЕ проходит — спросит «да N»)\n"
             "Красное (запись/деплой) сам НЕ делаю — нужно твоё «да».")
 
 
@@ -209,6 +268,13 @@ async def handle_command(msg, context, bridge) -> None:
     if not msg.from_user or msg.from_user.id != DEVBOT_USER:
         return   # чужой — игнор
     tid = getattr(msg, "message_thread_id", None)
+
+    # 0) Ответ на запрос подтверждения «да N» / «нет N» — ПЕРВЫМ (специфичный паттерн).
+    appr = _try_approval_reply(msg.text or "", bridge)
+    if appr is not None:
+        for chunk in _chunks(appr):
+            await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
+        return
 
     # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
     #    (служебный лист очереди), origin=human по умолчанию — гейт 4.2 не трогаем.

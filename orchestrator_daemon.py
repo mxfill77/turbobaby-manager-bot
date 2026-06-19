@@ -59,15 +59,54 @@ signal.signal(signal.SIGTERM, _stop)
 signal.signal(signal.SIGINT, _stop)
 
 
+# Маркер самодекларации красной зоны (заход 2б-2). Демон НЕ угадывает формулировки отказа —
+# инструктирует claude -p вывести этот маркер вместо попытки обойти гейт.
+NA_MARKER = "NEEDS_APPROVAL:"
+# Преамбула к задаче: red-zone → claude выводит маркер и останавливается, НЕ обходит гейт.
+APPROVAL_PREAMBLE = (
+    "Ты выполняешь задачу автономно в headless-режиме (без интерактивного подтверждения).\n"
+    "ПРАВИЛО БЕЗОПАСНОСТИ: если для выполнения нужно КРАСНОЕ действие — запись в рабочие таблицы "
+    "(CRM/Лист1/Байки/Зарплаты), деньги/транзакции, clasp deploy/redeploy/push, sqlite3 на memory.db, "
+    "git push, systemctl restart/stop, set_fleet_oil/set_fleet_service, confirmed=true, delete_event, "
+    "любое удаление — НЕ пытайся его выполнить и НЕ ищи обходных путей. Вместо этого выведи РОВНО одну "
+    "строку вида:\n"
+    "NEEDS_APPROVAL: <кратко: какое именно красное действие/команда нужны>\n"
+    "и заверши работу. Зелёные read-only шаги (чтение, диагностика) выполняй как обычно.\n"
+    "Если задача целиком read-only — просто выполни её и верни результат, без маркера.\n\n"
+    "ЗАДАЧА:\n"
+)
+# Фоллбэк-фразы (если claude описал блокировку гейта без маркера) — тоже эскалируем (эскалация
+# безопасна: лишь спрашивает Филиппа, красное НЕ исполняется).
+_NA_FALLBACK = ("требует подтверждения", "нужно подтверждение", "нужно «да»", "нужно \"да\"",
+                "requires approval", "needs approval", "permission to use", "не разрешено гейтом")
+
+
+def _detect_needs_approval(text):
+    """Вернуть текст красного действия (what), если claude самодекларировал маркер или явно описал
+    блок гейта. Иначе None. Эскалация предпочтительнее тихого failed (так требует задача)."""
+    t = text or ""
+    for line in t.splitlines():
+        i = line.find(NA_MARKER)
+        if i >= 0:
+            what = line[i + len(NA_MARKER):].strip()
+            return what or "(claude не уточнил красное действие — см. полный вывод задачи)"
+    low = t.lower()
+    if any(p in low for p in _NA_FALLBACK):
+        return "(гейт заблокировал красное действие; claude не дал маркер — вывод:)\n" + t[:1500]
+    return None
+
+
 def run_task(task_id, task_text):
-    """Исполнить задачу через claude -p (headless). Возврат: (status, result_text)."""
+    """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
+    status ∈ done|failed|needs_approval (красная зона — самодекларация claude через маркер)."""
     log.info("ИСПОЛНЕНИЕ id=%s через claude -p (timeout=%ss)", task_id, TASK_TIMEOUT)
     child_env = dict(os.environ)
     child_env.setdefault("HOME", "/root")
     child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    prompt = APPROVAL_PREAMBLE + task_text
     try:
         proc = subprocess.run(
-            [CLAUDE_BIN, "-p", task_text],   # список аргументов, БЕЗ shell → нет инъекции через task_text
+            [CLAUDE_BIN, "-p", prompt],      # список аргументов, БЕЗ shell → нет инъекции через task_text
             cwd=REPO,
             capture_output=True, text=True,
             timeout=TASK_TIMEOUT,
@@ -82,6 +121,13 @@ def run_task(task_id, task_text):
 
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
+
+    # Красная зона: claude самодекларировал, что нужно «да» Филиппа → needs_approval (НЕ failed).
+    what = _detect_needs_approval(out)
+    if what is not None:
+        log.info("id=%s NEEDS_APPROVAL: %.140s", task_id, what)
+        return "needs_approval", what[:RESULT_MAX]
+
     if proc.returncode != 0:
         log.warning("id=%s claude -p exit=%s", task_id, proc.returncode)
         msg = (out + ("\n" + err if err else "")).strip() or f"exit={proc.returncode}"
@@ -112,8 +158,13 @@ def cycle():
         return
 
     status, result = run_task(tid, text)
-    cm = bc.complete_task(tid, status, result)
-    log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
+    if status == "needs_approval":
+        # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
+        rr = bc.set_needs_approval(tid, result)
+        log.info("NEEDS_APPROVAL id=%s bridge_ok=%s", tid, rr.get("ok"))
+    else:
+        cm = bc.complete_task(tid, status, result)
+        log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
 
 
 def main():
