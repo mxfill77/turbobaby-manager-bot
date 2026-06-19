@@ -15,8 +15,9 @@
 """
 
 import json
+import base64
 import logging
-import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM
+import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM + паспорт B2
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 log = logging.getLogger("splinter")
@@ -256,6 +257,10 @@ INTAKE_SYSTEM = """Тебе дают КАРТОЧКУ БРОНИ из служе
 
 # Черновики intake в памяти: {chat_id: {поля, ts, passport_photo, status}}. Один активный на группу.
 _INTAKE_DRAFTS = {}
+
+# B2: буфер OCR паспорта по чату: {chat_id: {file_id, fields|None, ocr_status, ts}}.
+# Связывает фото↔карточку в обе стороны (фото могло прийти ДО или ПОСЛЕ карточки, окно 5 мин).
+_INTAKE_PASSPORT = {}
 
 # Стандартный денежный депозит по модели (из прайса) — для ПОКАЗА в резюме (этап A не пишет).
 # Порядок важен: специфичные/дорогие выше, иначе короткий ключ перехватит.
@@ -2905,9 +2910,25 @@ def _intake_summary(d, availability, delivery_status) -> str:
         f"Депозит: {dep_line}\n"
         f"Доставка: {deliv_line}\n"
         f"Шлемы: {d.get('helmets', '—')} · паспорт-фото: {'да' if d.get('passport_photo') else 'нет'}\n"
+        f"{_intake_passport_line(d)}"
         f"Наличие: {availability}\n"
         "\nСтавлю бронь? да / нет / правки"
     )
+
+
+def _intake_passport_line(d) -> str:
+    """Строка резюме по OCR паспорта (двуязычно RU+TH). Поля ПРЕДВАРИТЕЛЬНЫЕ — «проверьте». Пусто, если фото нет."""
+    pp = d.get("passport_ocr")
+    if not pp:
+        return ""
+    if pp.get("ocr_status") == "ok" and pp.get("fields"):
+        f = pp["fields"]
+        fn = f.get("full_name") or "?"
+        co = f.get("country") or "?"
+        ex = f.get("expire_date") or "?"
+        return (f"Паспорт распознал (проверьте): {fn}, {co}, до {ex}\n"
+                f"หนังสือเดินทาง: {fn}, {co}, ถึง {ex}\n")
+    return "⚠️ Паспорт НЕ распознан — проверьте фото / ⚠️ อ่านหนังสือเดินทางไม่ได้\n"
 
 
 async def _intake_finalize(draft, msg, context, bridge):
@@ -2929,6 +2950,55 @@ async def _intake_finalize(draft, msg, context, bridge):
                 bilingual=False, message_thread_id=tid)
 
 
+async def _intake_passport_ocr(photo_msg, chat_id, context, bridge):
+    """B2: скачать фото паспорта → Drive (папка «Паспорта») → EdenAI OCR. Результат в _INTAKE_PASSPORT.
+    Каждый красный вызов (upload/ocr) — через токен-замок 4.2. Возврат (ok_ocr, fields|None)."""
+    raw = await _download_photo(photo_msg)
+    if not raw:
+        return (False, None)
+    b64 = base64.b64encode(raw).decode()
+    # 1) залить в Drive (4.2)
+    try:
+        with bridge_client.agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
+            up = bridge.upload_passport_photo(b64, filename="passport")
+    except Exception as e:
+        up = {"ok": False, "error": "exception", "message": str(e)}
+    file_id = up.get("file_id") if up.get("ok") else None
+    # 2) OCR (4.2)
+    fields, ocr_status = None, "failed"
+    if file_id:
+        try:
+            with bridge_client.agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
+                ocr = bridge.ocr_passport(file_id=file_id)
+        except Exception as e:
+            ocr = {"ok": False, "error": "exception", "message": str(e)}
+        if ocr.get("ok"):
+            fields, ocr_status = ocr.get("fields"), "ok"
+        else:
+            log.info(f"  🆕 INTAKE: OCR паспорта не удался: {ocr.get('error')}")
+    else:
+        log.info(f"  🆕 INTAKE: загрузка фото паспорта в Drive не удалась: {up.get('error')}")
+    _INTAKE_PASSPORT[chat_id] = {"file_id": file_id, "fields": fields,
+                                 "ocr_status": ocr_status, "ts": _time.time()}
+    return (ocr_status == "ok", fields)
+
+
+def _intake_passport_save(chat_id, draft, bridge):
+    """B2: сохранить распознанный паспорт в лист «паспорта» (booking_key=model|client|date_start). 4.2."""
+    pp = _INTAKE_PASSPORT.get(chat_id)
+    if not pp or not pp.get("file_id"):
+        return
+    key = f"{draft.get('model','')}|{draft.get('client','')}|{draft.get('date_start','')}"
+    f = pp.get("fields") or {}
+    try:
+        with bridge_client.agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
+            bridge.save_passport(booking_key=key, bike=draft.get("model"), name=draft.get("client"),
+                                 date_start=draft.get("date_start"), drive_file_id=pp.get("file_id"),
+                                 ocr_status=pp.get("ocr_status"), **f)
+    except Exception as e:
+        log.warning(f"  🆕 INTAKE: save_passport не прошёл: {e}")
+
+
 async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only.
     photo_msgs — пачка фото (альбом склеен по media_group_id) → один «паспорт получен» + один finalize."""
@@ -2939,26 +3009,37 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     has_photo = bool(photo_msgs)
     now = _time.time()
 
-    # 1) Фото паспорта отдельным сообщением → связать с последней карточкой (окно 5 мин)
+    # 1) Фото паспорта отдельным сообщением → OCR (B2) + связать с карточкой (окно 5 мин, обе стороны)
     if has_photo and not _intake_is_card(text):
+        tid_ = getattr(msg, "message_thread_id", None)
+        ok_ocr, _fields = await _intake_passport_ocr(photo_msgs[0], chat_id, context, bridge)
         d = _INTAKE_DRAFTS.get(chat_id)
         if d and now - d.get("ts", 0) <= 300:
             d["passport_photo"] = True
-            await _send(context, chat_id=chat_id,
-                        text="🐀 Splinter\n📎 Фото паспорта получено — привязал к последней карточке.",
-                        bilingual=False, message_thread_id=getattr(msg, "message_thread_id", None))
-            await _intake_finalize(d, msg, context, bridge)   # вдруг теперь пакет полный
+            d["passport_ocr"] = _INTAKE_PASSPORT.get(chat_id)
+            _intake_passport_save(chat_id, d, bridge)
+            await _intake_finalize(d, msg, context, bridge)   # резюме покажет распознан/нет + полноту пакета
+        else:
+            # фото пришло ДО карточки — подтвердим, привяжем когда придёт карточка
+            ack = ("🐀 Splinter\n📎 Паспорт получен и распознан — привяжу к карточке."
+                   if ok_ocr else
+                   "🐀 Splinter\n📎 Паспорт получен, но не распознался — пришлите карточку/перефото.")
+            await _send(context, chat_id=chat_id, text=ack, bilingual=False, message_thread_id=tid_)
         return
 
     # 2) Карточка брони
     if _intake_is_card(text):
         parsed = _intake_parse(claude, text)
-        prev = _INTAKE_DRAFTS.get(chat_id)
-        # фото могло прийти ДО карточки (в пределах 5 мин) — наследуем флаг
-        passport = bool(prev and prev.get("passport_photo") and now - prev.get("ts", 0) <= 300)
         draft = dict(parsed)
-        draft.update(ts=now, passport_photo=passport, status="new")
+        draft.update(ts=now, passport_photo=False, status="new")
+        # B2: паспорт мог прийти ДО карточки (буфер свежий <5 мин) — привязать + сохранить в лист «паспорта»
+        pp = _INTAKE_PASSPORT.get(chat_id)
+        if pp and now - pp.get("ts", 0) <= 300:
+            draft["passport_photo"] = True
+            draft["passport_ocr"] = pp
         _INTAKE_DRAFTS[chat_id] = draft
+        if pp and now - pp.get("ts", 0) <= 300:
+            _intake_passport_save(chat_id, draft, bridge)
         log.info(f"  🆕 INTAKE: карточка — модель={draft.get('model')} клиент={draft.get('client')}")
         await _intake_finalize(draft, msg, context, bridge)
         return

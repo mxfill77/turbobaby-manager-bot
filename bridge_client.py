@@ -138,6 +138,7 @@ class BridgeClient:
         "add_transaction", "void_last",          # касса (проводки + отмена)
         "create_booking", "activate_booking",    # CRM «клиенты»
         "delete_event",                          # удаление
+        "ocr_passport", "save_passport", "upload_passport_photo",  # B2: EdenAI + Drive + Bot Data
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
                    "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
@@ -314,6 +315,27 @@ class BridgeClient:
         """Активировать бронь: 'Бронь' → 'В аренде'. Вызывать после фото выдачи (этап 6).
         С этого момента формулы долга/оплаты начинают считать."""
         return self._post("activate_booking", bike=bike, name=name)
+
+    # === Паспорт (этап B2): OCR через EdenAI + хранение в Bot Data «паспорта». КРАСНАЯ зона. ===
+    def upload_passport_photo(self, image_b64: str, filename: str = "passport", mime: str = "image/jpeg") -> dict:
+        """Залить фото паспорта (base64) в папку Drive «Паспорта» → {ok, file_id, url}."""
+        return self._post("upload_passport_photo", image_b64=image_b64, filename=filename, mime=mime)
+
+    def ocr_passport(self, file_id: str = None, image_b64: str = None) -> dict:
+        """Распознать паспорт через EdenAI (provider microsoft). Передать file_id (Drive) ИЛИ image_b64.
+        Страны как EdenAI. → {ok, fields:{...}} | {ok:false, error:'no_api_key'/'ocr_failed'/'edenai_error'}."""
+        fields = {}
+        if file_id:
+            fields["file_id"] = file_id
+        if image_b64:
+            fields["image_b64"] = image_b64
+        return self._post("ocr_passport", **fields)
+
+    def save_passport(self, **fields) -> dict:
+        """Сохранить/обновить строку в листе «паспорта» (upsert по booking_key). Поля: booking_key
+        (или bike+name+date_start), bike, name, drive_file_id, last_name, given_names, full_name,
+        document_id, nationality, country, birth_date, expire_date, ocr_status."""
+        return self._post("save_passport", **fields)
 
     # === ТО-трекер ===
     def service_upsert(self, **fields) -> dict:
