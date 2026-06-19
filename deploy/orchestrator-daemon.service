@@ -1,0 +1,19 @@
+[Unit]
+Description=TurboBaby Orchestrator Daemon (ступень1 заход2а — исполнитель очереди задач)
+# ОТДЕЛЬНО от splinter.service. Рубильник: systemctl stop orchestrator-daemon (splinter не трогает).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/turbobaby-manager-bot
+ExecStart=/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/orchestrator_daemon.py
+Restart=always
+RestartSec=15
+User=root
+# Демон опрашивает очередь (HTTP, без токенов) и исполняет задачи через `claude -p` (headless).
+# НЕ использует --dangerously-skip-permissions: красную зону (ask в .claude/settings.json) headless
+# не подтверждает → отказ. Логи демона — orchestrator_daemon.log (пишет сам через logging).
+
+[Install]
+WantedBy=multi-user.target
