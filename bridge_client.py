@@ -216,6 +216,32 @@ class BridgeClient:
         """Проверить+погасить билет (для client-side гейта памяти). {ok:true/false}."""
         return self._post("consume_write_ticket", ticket=ticket or "")
 
+    # === ОЧЕРЕДЬ ОРКЕСТРАТОРА (ступень 1, заход 1 — служебный лист, НЕ боевые данные) ===
+
+    def enqueue_task(self, from_: str, task_text: str) -> dict:
+        """Положить задачу в очередь → {ok, id}. status=new."""
+        return self._post("enqueue_task", **{"from": from_, "task_text": task_text})
+
+    def get_pending(self, status: str = "new") -> dict:
+        """Задачи по статусу (деф. new), newest-first → {ok, items}. Дешёвое чтение (GET)."""
+        return self._call("get_pending", status=status)
+
+    def claim_task(self, task_id) -> dict:
+        """Атомарно new→in_progress → {ok, task} | {ok:false, error:'already_claimed'/...}."""
+        return self._post("claim_task", id=task_id)
+
+    def complete_task(self, task_id, status: str, result: str = "") -> dict:
+        """Финал задачи: status='done'|'failed' + result → {ok}."""
+        return self._post("complete_task", id=task_id, status=status, result=result)
+
+    def set_needs_approval(self, task_id, what: str) -> dict:
+        """Задача упёрлась в красную зону: status=needs_approval + result=<что собирается> → {ok}."""
+        return self._post("set_needs_approval", id=task_id, what=what)
+
+    def approve_task(self, task_id, approved_by: str) -> dict:
+        """Филипп дал «да»: needs_approval→approved + approved_by → {ok}."""
+        return self._post("approve_task", id=task_id, approved_by=approved_by)
+
     def _push_blackbox(self, text: str) -> None:
         """Пуш Филиппу о событии чёрного ящика (отклонение токен-замка). Best-effort, не бросает."""
         try:
