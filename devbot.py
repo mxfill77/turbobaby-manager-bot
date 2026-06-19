@@ -50,8 +50,8 @@ def _try_approval_reply(text, bridge):
         r = bridge.approve_task(qid, "Filipp")
         if r.get("ok"):
             _reported.discard(qid)   # пусть дальнейший done/failed по ней отрапортуется штатно
-            return (f"✅ Задача {qid} одобрена — статус approved. (Доведение approved-красного шага — "
-                    f"заход 2б-2 п.4, пока на ревью штаба; демон approved ещё не доводит.)")
+            return (f"✅ Задача {qid} одобрена — демон выполнит approved-операцию по op-коду "
+                    f"(git_push / restart_splinter) и принесёт результат сюда. Вне авто-перечня → failed «сделай в Termux».")
         if r.get("error") == "not_awaiting":
             return f"🤖 Задача {qid} не ждёт подтверждения (статус {r.get('status')}). Ничего не сделал."
         if r.get("error") == "not_found":
