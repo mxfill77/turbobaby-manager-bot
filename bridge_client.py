@@ -339,11 +339,13 @@ class BridgeClient:
         return self._post("save_passport", **fields)
 
     # === Договор (этап B3): шаблон → replaceText → папка договоров. КРАСНАЯ зона (Drive + чтение CRM). ===
-    def make_contract(self, booking_key: str = None, bike: str = None,
+    def make_contract(self, booking_id: str = None, booking_key: str = None, bike: str = None,
                       name: str = None, date_start: str = None) -> dict:
-        """Сгенерировать договор: джойн «паспорта»+CRM по name+date_start → шаблон → файл в папке.
-        Передать booking_key ИЛИ (name+date_start [+bike]). → {ok, file_id, url} | {ok:false, error}."""
+        """Сгенерировать/перегенерировать договор (один живой Doc на бронь). Ключ: booking_id (кол.Y,
+        предпочтительно) ЛИБО booking_key/name+date_start (фоллбэк). → {ok, file_id, url, regenerated}."""
         fields = {}
+        if booking_id:
+            fields["booking_id"] = booking_id
         if booking_key:
             fields["booking_key"] = booking_key
         if bike:

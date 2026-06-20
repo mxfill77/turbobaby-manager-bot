@@ -35,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-from bridge_client import BridgeClient
+from bridge_client import BridgeClient, agent_write
 from claude_client import ClaudeClient
 from memory import Memory
 from prompts import SYSTEM_PROMPT, daily_pulse_prompt
@@ -888,6 +888,37 @@ async def scheduled_audit_report(context: ContextTypes.DEFAULT_TYPE):
         log.warning(f"audit report error: {e}")
 
 
+async def scheduled_contract_km(context: ContextTypes.DEFAULT_TYPE):
+    """Галка v1: брони status=Бронь с date_start==сегодня → перегенерация договора (авто-KM по правилу).
+    make_contract сам ключует regen по booking_id (кол.Y) строки → один живой Doc на бронь."""
+    try:
+        data = bridge._call("clients", filter="all").get("data", {})
+        clients = data.get("clients", []) if isinstance(data, dict) else (data or [])
+    except Exception as e:
+        log.warning(f"contract_km: чтение clients не удалось: {e}")
+        return
+    today = datetime.now(ZoneInfo(TZ_NAME)).strftime("%Y-%m-%d")
+    done = 0
+    for c in clients:
+        if str(c.get("status", "")).strip().lower() != "бронь":
+            continue
+        if not str(c.get("date_start", "")).startswith(today):   # «YYYY-MM-DD HH:MM»
+            continue
+        try:
+            with agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
+                r = bridge.make_contract(name=c.get("name"), date_start=c.get("date_start"))
+        except Exception as e:
+            r = {"ok": False, "error": str(e)}
+        if r.get("ok"):
+            done += 1
+            log.info(f"  📄 contract_km: договор брони «{c.get('name')}» ({c.get('bike')}) перегенерён, "
+                     f"km_request={r.get('flags', {}).get('km_request')}")
+        else:
+            log.info(f"  📄 contract_km: бронь «{c.get('name')}» — {r.get('error')}")
+    if done:
+        log.info(f"  📄 contract_km: обновлено договоров в день выдачи: {done}")
+
+
 async def scheduled_important_reminders(context: ContextTypes.DEFAULT_TYPE):
     """Раз в сутки: повторяет закреп важного, которому пора (>=3 дней)."""
     try:
@@ -1177,6 +1208,14 @@ def main():
             name="audit_report",
         )
         log.info("Scheduled audit report at 09:30")
+
+        # Галка v1: KM в день выдачи — брони Бронь с date_start=сегодня → перегенерация договора (08:30)
+        app.job_queue.run_daily(
+            scheduled_contract_km,
+            time=dtime(hour=8, minute=30, tzinfo=tz),
+            name="contract_km_daily",
+        )
+        log.info("Scheduled contract KM (day-of-pickup regen) at 08:30")
 
         # Дев-бот (п.5): утренняя авто-сводка в HQ topic 328 — health + аудит + Brain (read-only)
         app.job_queue.run_daily(
