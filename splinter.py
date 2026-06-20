@@ -2488,6 +2488,95 @@ def _aggregate_album_vis(vis_list):
     return agg
 
 
+# ===================== ЛИСТ ЗАКРЫТИЯ =====================
+# Ручные поля команды «закрытие <байк> поле=значение»: рус-ключ → колонка листа.
+_CLOSING_FIELDS = {"топливо": "fuel_level", "доплата_дни": "surcharge_days",
+                   "доплата_топливо": "surcharge_fuel", "ущерб": "damage", "прочее": "other",
+                   "депозит": "deposit_action", "заметка": "note", "статус": "status"}
+
+
+def _closing_resolve_booking(bridge, bike):
+    """Последняя не-«Завершена» бронь (Бронь/В аренде) по байку → (booking_id, name, date_end).
+    Активация (этап 6) не построена → берём последнюю Бронь/В аренде. Нет → (None, '', '')."""
+    try:
+        cl = bridge._call("clients", filter="all").get("data", {})
+        rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
+    except Exception:
+        return (None, "", "")
+    want = plateFromName_(bike)
+    cand = [c for c in rows if plateFromName_(str(c.get("bike", ""))) == want
+            and str(c.get("status", "")).strip().lower() in ("бронь", "в аренде")]
+    if not cand:
+        return (None, "", "")
+    last = cand[-1]   # getClients в порядке строк (свежие ниже) → последняя
+    return (last.get("booking_id") or None, last.get("name") or "", last.get("date_end") or "")
+
+
+def _closing_crm_debt(bridge, bike):
+    """Долг (CRM I/J) активной брони байка для чек-листа. None если не нашли."""
+    try:
+        rows = bridge._call("clients", filter="all").get("data", {}).get("clients", [])
+        want = plateFromName_(bike)
+        cand = [c for c in rows if plateFromName_(str(c.get("bike", ""))) == want
+                and str(c.get("status", "")).strip().lower() in ("бронь", "в аренде")]
+        return cand[-1].get("debt") if cand else None
+    except Exception:
+        return None
+
+
+def _closing_card(it, debt):
+    """Карточка закрытия RU+TH (тайцам — что собрать; нам — итого/чек-лист). Не блокирует."""
+    g = lambda k: (str(it.get(k)) if it.get(k) not in (None, "") else "—")
+    total = g("total_due")
+    debt_s = "—" if debt is None else str(debt)
+    th = ("🇹🇭 ปิดสัญญา — รถ " + g("bike") + "\n"
+          "  น้ำมัน: " + g("fuel_level") + " · คืนรถ: " + g("date_return") + "\n"
+          "  ส่วนเพิ่ม: วัน " + g("surcharge_days") + " · น้ำมัน " + g("surcharge_fuel") +
+          " · เสียหาย " + g("damage") + " · อื่นๆ " + g("other") + "\n"
+          "  รวมเก็บเพิ่ม: " + total + " ฿ · มัดจำ: " + g("deposit_action"))
+    ru = ("🇷🇺 Закрытие — байк " + g("bike") + "\n"
+          "  Топливо: " + g("fuel_level") + " · возврат: " + g("date_return") + "\n"
+          "  Доплаты: дни " + g("surcharge_days") + " · топливо " + g("surcharge_fuel") +
+          " · ущерб " + g("damage") + " · прочее " + g("other") + "\n"
+          "  ИТОГО к доплате: " + total + " ฿ · депозит: " + g("deposit_action") + "\n"
+          "  Чек-лист: долг CRM=" + debt_s + " · статус=" + g("status"))
+    return "🐀 Splinter\n" + th + "\n" + ru
+
+
+async def _handle_closing_cmd(msg, context, bridge, text):
+    """Команда «закрытие <байк> [поле=значение ...]» — дозаполнить ручные поля + показать карточку RU+TH."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    import re as _re_c
+    rest = _re_c.sub(r"^\s*(закрыти[ея]|closing)\b", "", text, flags=_re_c.I).strip()
+    pairs = _re_c.findall(r"(\w+)\s*[=:]\s*(\"[^\"]*\"|\S+)", rest)
+    fields = {}
+    for k, v in pairs:
+        col = _CLOSING_FIELDS.get(k.lower())
+        if col:
+            fields[col] = v.strip('"')
+    bikepart = _re_c.sub(r"(\w+)\s*[=:]\s*(\"[^\"]*\"|\S+)", "", rest).strip()
+    bike = bikepart or bike_from_topic(chat_id, tid) or ""
+    if not bike:
+        await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                    text="🐀 Splinter\nУкажи байк: «закрытие <байк> [доплата_дни=300 ущерб=500 топливо=half]».")
+        return
+    bid, bname, _bend = _closing_resolve_booking(bridge, bike)
+    try:
+        bridge.closing_upsert(booking_id=(bid or ""), bike=bike, name=bname, **fields)
+        cg = bridge.closing_get(booking_id=bid) if bid else bridge.closing_get(bike=bike)
+    except Exception as e:
+        await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                    text=f"🐀 Splinter\n❌ Закрытие: ошибка {type(e).__name__}: {e}")
+        return
+    if not cg.get("ok"):
+        await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                    text=f"🐀 Splinter\n⚠️ Строки закрытия по «{bike}» нет (байк ещё не возвращён?).")
+        return
+    await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                text=_closing_card(cg["item"], _closing_crm_debt(bridge, bike)))
+
+
 async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения).
     photo_msgs — пачка сообщений-фото (альбом склеен по media_group_id; для одиночного = [msg]).
@@ -2501,6 +2590,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     topic_id = getattr(msg, "message_thread_id", None)
     # Название темы = байк (по договорённости). Запоминаем когда встречается.
     _remember_topic_name(chat_id, topic_id, msg)
+
+    # Лист закрытия: команда «закрытие <байк> [поле=значение]» (ручные доплаты + показ карточки)
+    if (text or "").strip().lower().startswith(("закрыти", "closing")):
+        await _handle_closing_cmd(msg, context, bridge, text)
+        return
 
     # ЗАХОД 2: запрос КАРТОЧКИ байка («инфа/статус/что по байку») — отвечаем карточкой из ЧИТАЕМЫХ
     # источников (пробег, ТО Oil, J/K/L, аренда), НИЧЕГО не пишем. Только текст без фото.
@@ -2607,6 +2701,19 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     log.info(f"  → add_event: ok={(_ev_r or {}).get('ok')} saved={(_ev_r or {}).get('saved')} "
              f"duplicate={(_ev_r or {}).get('duplicate')} error={(_ev_r or {}).get('error')} "
              f"msg_id={_ev_msg_id} info_works={len(info_works)} km_now={km_now or '-'} event_type={event_type}")
+
+    # Лист закрытия: на ВОЗВРАТЕ авто-создаём/обновляем строку закрытия (seed bike/fuel/date + booking_id).
+    if event_type == "return" and (_ev_r or {}).get("ok") and bike:
+        try:
+            _bid, _bname, _bend = _closing_resolve_booking(bridge, bike)
+            _dret = _msg_date or _bend or ""
+            _cu = bridge.closing_upsert(booking_id=(_bid or ""), bike=bike, name=_bname,
+                                        date_return=_dret, fuel_level=str(fuel or ""),
+                                        note=("" if _bid else "бронь не найдена"))
+            log.info(f"  → closing авто: bike={bike} booking_id={_bid} ok={(_cu or {}).get('ok')} "
+                     f"total_due={(_cu or {}).get('total_due')}")
+        except Exception as e:
+            log.warning(f"  → closing авто-создание не удалось: {e}")
 
     # ЕДИНАЯ СВОДКА: инфо-работы записаны (flush/немедленно) → НЕ шлём отдельно, копим в накопитель.
     # Сводка уйдёт ОДНИМ сообщением в терминальной точке цикла (после масла/столбцов).

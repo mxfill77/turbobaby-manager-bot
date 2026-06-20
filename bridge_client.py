@@ -140,6 +140,7 @@ class BridgeClient:
         "delete_event",                          # удаление
         "ocr_passport", "save_passport", "upload_passport_photo",  # B2: EdenAI + Drive + Bot Data
         "make_contract",                         # B3: договор (Drive-запись + чтение CRM)
+        "closing_upsert",                        # Лист закрытия (деньги-доплаты → аудит 4.1, НЕ 4.2)
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
                    "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
@@ -355,6 +356,26 @@ class BridgeClient:
         if date_start:
             fields["date_start"] = date_start
         return self._post("make_contract", **fields)
+
+    # === Лист закрытия (расчёт доплат перед закрытием; Bot Data, НЕ CRM; аудит 4.1) ===
+    def closing_upsert(self, **fields) -> dict:
+        """Создать/обновить строку закрытия (merge; total_due пересчитывается). Поля: booking_id (или
+        bike), name, date_return, fuel_level, surcharge_days, surcharge_fuel, damage, other,
+        deposit_action, status, note. → {ok, row, total_due}."""
+        return self._post("closing_upsert", **fields)
+
+    def closing_get(self, booking_id: str = None, bike: str = None) -> dict:
+        """Строка закрытия по booking_id или bike. → {ok, item} | {ok:false, error:'not_found'}."""
+        f = {}
+        if booking_id:
+            f["booking_id"] = booking_id
+        if bike:
+            f["bike"] = bike
+        return self._post("closing_get", **f)
+
+    def closing_list(self, status: str = None) -> dict:
+        """Список закрытий (фильтр по status, опц.). → {ok, items}."""
+        return self._post("closing_list", **({"status": status} if status else {}))
 
     # === ТО-трекер ===
     def service_upsert(self, **fields) -> dict:
