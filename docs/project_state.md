@@ -76,7 +76,16 @@ Splinter (учёт/ТО/касса/аудитор), фундамент авто�
   «паспорта», upsert по booking_key) — всё через токен-замок 4.2, чёрный ящик 4.1. Резюме intake:
   «распознал: ФИО, страна, до expire — проверьте» (RU+TH, поля предварительные). Паспорт **НЕ в CRM
   «клиенты»**. Код: `Passport.js` (Bridge @41) + splinter `_handle_intake`. commit `5dadca2`.
-- **B3 (НЕ начат):** договор (Google Doc из шаблона) + Drive-папки клиента. Отдельным заходом.
+- **Этап B3 — договор ✅ В ПРОДЕ И ОБКАТАН (20.06).** Команда «договор [booking_key|Имя дата]» в intake
+  (только INTAKE_APPROVERS, без аргументов → последняя бронь чата) → `make_contract` через токен-замок 4.2:
+  джойн «паспорта»+CRM «клиенты» по name+date_start (normalizeDate_: Sheets хранит даты Date-объектом) →
+  `fleet.cost` (Лист1 F) → DriveApp.makeCopy шаблона `1Hh2Gl…` в папку договоров `1GX7SIqoskzSuThS4e4Ebje
+  X-B0N_CKxK` → DocumentApp replaceText всех 26 плейсхолдеров → имя «<full_name> <dd-MM-yyyy>» → URL.
+  Расчёты: Cost of hire=H, TH=J (computed CRM), DF=район из note→тариф, CT=TH+DF+Deposit; нет ставки→
+  прочерк (черновик); выдача (KM/FUEL/Pbt) + адреса = прочерк (инкремент 1); страны как EdenAI. Только
+  ЧИТАЕТ CRM, пишет только Drive. По команде (НЕ авто-на-approve). Код: `Contract.js` (Bridge @45) +
+  splinter trigger. commit `18e365a`. Обкатан на [ТЕСТ]-паре (26 плейсхолдеров, makeCopy в папку, деньги
+  прочерк). Хвосты: ставка L/M (тариф вносит менеджер), адреса, авто-на-approve — отдельно.
 
 ### 🌐 ПРАВИЛО ЯЗЫКОВ
 Внутренний контур — **RU+TH** (тайцы). Клиентский контур — **RU+EN** (без тайского, тайцы с клиентами
