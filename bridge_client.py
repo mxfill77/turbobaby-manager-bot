@@ -139,6 +139,7 @@ class BridgeClient:
         "create_booking", "activate_booking",    # CRM «клиенты»
         "delete_event",                          # удаление
         "ocr_passport", "save_passport", "upload_passport_photo",  # B2: EdenAI + Drive + Bot Data
+        "make_contract",                         # B3: договор (Drive-запись + чтение CRM)
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
                    "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
@@ -336,6 +337,22 @@ class BridgeClient:
         (или bike+name+date_start), bike, name, drive_file_id, last_name, given_names, full_name,
         document_id, nationality, country, birth_date, expire_date, ocr_status."""
         return self._post("save_passport", **fields)
+
+    # === Договор (этап B3): шаблон → replaceText → папка договоров. КРАСНАЯ зона (Drive + чтение CRM). ===
+    def make_contract(self, booking_key: str = None, bike: str = None,
+                      name: str = None, date_start: str = None) -> dict:
+        """Сгенерировать договор: джойн «паспорта»+CRM по name+date_start → шаблон → файл в папке.
+        Передать booking_key ИЛИ (name+date_start [+bike]). → {ok, file_id, url} | {ok:false, error}."""
+        fields = {}
+        if booking_key:
+            fields["booking_key"] = booking_key
+        if bike:
+            fields["bike"] = bike
+        if name:
+            fields["name"] = name
+        if date_start:
+            fields["date_start"] = date_start
+        return self._post("make_contract", **fields)
 
     # === ТО-трекер ===
     def service_upsert(self, **fields) -> dict:

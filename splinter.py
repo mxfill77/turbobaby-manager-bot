@@ -3026,6 +3026,45 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             await _send(context, chat_id=chat_id, text=ack, bilingual=False, message_thread_id=tid_)
         return
 
+    # 1b) Команда «договор [booking_key | Имя дата]» (B3, по команде, только аппруверы; НЕ авто-на-approve).
+    #     Без аргументов → берёт последнюю бронь чата (model|client|date_start) — удобно reply'ем после карточки.
+    low0 = text.lower()
+    if (low0.startswith("договор") or low0.startswith("contract")) and _intake_can_approve(msg):
+        tid = getattr(msg, "message_thread_id", None)
+        sp = text.split(None, 1)
+        args = sp[1].strip() if len(sp) > 1 else ""
+        bk = nm = ds = None
+        if "|" in args:
+            bk = args
+        elif args:
+            toks = args.rsplit(None, 1)
+            if len(toks) == 2:
+                nm, ds = toks[0].strip(), toks[1].strip()
+            else:
+                nm = args
+        else:
+            d2 = _INTAKE_DRAFTS.get(chat_id)
+            if d2 and d2.get("model") and d2.get("client") and d2.get("date_start"):
+                bk = f"{d2['model']}|{d2['client']}|{d2['date_start']}"
+        if not bk and not (nm and ds):
+            await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                        text=("🐀 Splinter\nУкажи бронь: «договор <booking_key>» или «договор <Имя> <дата>», "
+                              "либо отправь после карточки брони."))
+            return
+        try:
+            with bridge_client.agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
+                res = bridge.make_contract(booking_key=bk, name=nm, date_start=ds)
+        except Exception as e:
+            res = {"ok": False, "error": "exception", "message": str(e)}
+        if res.get("ok"):
+            log.info(f"  🆕 INTAKE: договор готов {res.get('name')} → {res.get('url')}")
+            await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                        text=f"🐀 Splinter\n✅ Договор готов: {res.get('url')}")
+        else:
+            await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                        text=f"🐀 Splinter\n❌ Договор не сделан: {res.get('error')}. {res.get('message','')}")
+        return
+
     # 2) Карточка брони
     if _intake_is_card(text):
         parsed = _intake_parse(claude, text)
