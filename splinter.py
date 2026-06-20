@@ -3058,8 +3058,12 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             res = {"ok": False, "error": "exception", "message": str(e)}
         if res.get("ok"):
             log.info(f"  🆕 INTAKE: договор готов {res.get('name')} → {res.get('url')}")
+            reminder = ""
+            if (res.get("flags") or {}).get("km_request"):
+                reminder += "⚠️ Пробег под запрос — впиши вручную.\n"
+            reminder += "Проверь перед печатью: топливо, время выдачи, пробег."
             await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
-                        text=f"🐀 Splinter\n✅ Договор готов: {res.get('url')}")
+                        text=f"🐀 Splinter\n✅ Договор готов: {res.get('url')}\n{reminder}")
         else:
             await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
                         text=f"🐀 Splinter\n❌ Договор не сделан: {res.get('error')}. {res.get('message','')}")
