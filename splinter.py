@@ -2926,9 +2926,8 @@ def _intake_passport_line(d) -> str:
         fn = f.get("full_name") or "?"
         co = f.get("country") or "?"
         ex = f.get("expire_date") or "?"
-        return (f"Паспорт распознал (проверьте): {fn}, {co}, до {ex}\n"
-                f"หนังสือเดินทาง: {fn}, {co}, ถึง {ex}\n")
-    return "⚠️ Паспорт НЕ распознан — проверьте фото / ⚠️ อ่านหนังสือเดินทางไม่ได้\n"
+        return f"Паспорт распознал (проверьте): {fn}, {co}, до {ex}\n"
+    return "⚠️ Паспорт НЕ распознан — проверьте фото\n"
 
 
 async def _intake_finalize(draft, msg, context, bridge):
@@ -3082,22 +3081,19 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                 _row = res.get("row")
                 log.info(f"  🆕 INTAKE: бронь записана (строка {_row}, @{_who}) {d.get('model')}")
                 await _send(context, chat_id=chat_id,
-                            text=(f"🐀 Splinter\n✅ Бронь записана, строка {_row}, статус «Бронь».\n"
-                                  f"✅ จองแล้ว แถว {_row} สถานะ «จอง»"),
+                            text=f"🐀 Splinter\n✅ Бронь записана, строка {_row}, статус «Бронь».",
                             bilingual=False, message_thread_id=tid)
             elif res.get("error") == "duplicate":
                 _row = res.get("row")
                 await _send(context, chat_id=chat_id,
-                            text=(f"🐀 Splinter\n⚠️ Уже есть такая бронь (строка {_row}).\n"
-                                  f"⚠️ มีการจองนี้แล้ว (แถว {_row})"),
+                            text=f"🐀 Splinter\n⚠️ Уже есть такая бронь (строка {_row}).",
                             bilingual=False, message_thread_id=tid)
             else:
                 _err = res.get("error") or "?"
                 _emsg = res.get("message") or ""
                 log.warning(f"  🆕 INTAKE: бронь НЕ записана ({_err}: {_emsg}) {d.get('model')}")
                 await _send(context, chat_id=chat_id,
-                            text=(f"🐀 Splinter\n❌ Не записалось: {_err}. {_emsg}\n"
-                                  f"❌ บันทึกไม่สำเร็จ: {_err}"),
+                            text=f"🐀 Splinter\n❌ Не записалось: {_err}. {_emsg}",
                             bilingual=False, message_thread_id=tid)
         elif any(w in low for w in ("нет", "отмена", "не ставь", "отклон")):
             d["status"] = "rejected"
