@@ -335,6 +335,15 @@ def _addresses_bot(msg, context, text: str) -> bool:
     return False
 
 
+def _looks_like_txn(text) -> bool:
+    """Похоже ли сообщение на проводку (для роутинга в кассе): сумма-первой ИЛИ число+валюта.
+    Снимаем @-теги (тег боту в кассе = всё равно проводка). Fix A инцидента «-360 @bot»."""
+    t = re.sub(r"@\w+", " ", str(text or "")).strip()
+    if re.match(r"^[+\-]?\d", t):
+        return True
+    return bool(re.search(r"\d\s*(฿|บาท|baht|bath|eur|евро|usd|\$|usdt|бат|доллар)", t, re.I))
+
+
 def _owner_addresses_bot(msg, context) -> bool:
     """Вступление для ТЕКСТОВОГО сообщения — см. _addresses_bot."""
     return _addresses_bot(msg, context, msg.text or "")
@@ -636,6 +645,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await splinter.handle_mileage_correction(msg, context, bridge, msg.text):
                 return
         # (Вопрос «после замены / просто пробег?» теперь на кнопках → on_service_button, не текстом.)
+        # Fix A: в ДЕНЕЖНОЙ группе проводка с тегом боту = всё равно проводка (не уводить в мозг).
+        # ТОЛЬКО mode=='money'; в HQ/прочих тег боту остаётся обращением (ниже).
+        if (splinter.GROUPS.get(chat_id) == "money"
+                and _owner_addresses_bot(msg, context)
+                and _looks_like_txn(msg.text)):
+            await splinter.handle(update, context, bridge, claude)
+            return
         # Владелец обращается к Splinter напрямую (тег/ответ/ждём ответа) → диалог-мозг
         if _owner_addresses_bot(msg, context):
             wallet = splinter.group_label(chat_id)

@@ -83,6 +83,28 @@ async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=Tru
     return await context.bot.send_message(**kw)
 
 
+async def _send_retry(context, *, attempts=3, delay=1.5, **kw):
+    """Отправка с ретраем на СЕТЕВОЙ таймаут — для ПОДТВЕРЖДЕНИЙ (запись уже прошла и идемпотентна по
+    msg_id). Ретраит ТОЛЬКО доставку сообщения, транзакцию НЕ трогает (нет задвоения). Все попытки
+    упали → лог, не бросает (баланс уже верен). Причина: инцидент 09:43 — add_transaction ok, но
+    _send подтверждения упал httpx.ConnectTimeout → Пым не увидел."""
+    import asyncio
+    from telegram.error import TimedOut, NetworkError
+    last = None
+    for i in range(attempts):
+        try:
+            return await _send(context, **kw)
+        except (TimedOut, NetworkError) as e:
+            last = e
+            log.warning(f"  → _send_retry: попытка {i + 1}/{attempts} упала ({type(e).__name__}); "
+                        f"повтор через {delay}s")
+            if i < attempts - 1:
+                await asyncio.sleep(delay)
+    log.error(f"  → _send_retry: подтверждение НЕ доставлено после {attempts} попыток ({last}); "
+              f"запись и баланс верны (идемпотентно по msg_id)")
+    return None
+
+
 # === Кто такой Пым (главный по деньгам) ===
 PYM_USERNAMES = {"pleummmm"}  # lower-case, без @
 
@@ -1543,14 +1565,14 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
     # === Подтверждение записи ===
     _entry_counts[chat_id] = _entry_counts.get(chat_id, 0) + 1
     if chat_id in MONEY_CONFIRM_EACH:
-        await _send(context, chat_id=chat_id,
-                    text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet))
+        await _send_retry(context, chat_id=chat_id,
+                          text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet))
         _entry_counts[chat_id] = 0
     else:
-        await _send(context, chat_id=chat_id,
-                    text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet))
+        await _send_retry(context, chat_id=chat_id,
+                          text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet))
         if _entry_counts[chat_id] >= RECONCILE_EVERY:
-            await _send(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
+            await _send_retry(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
             _entry_counts[chat_id] = 0
 
 
