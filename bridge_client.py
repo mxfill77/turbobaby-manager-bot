@@ -141,6 +141,7 @@ class BridgeClient:
         "ocr_passport", "save_passport", "upload_passport_photo",  # B2: EdenAI + Drive + Bot Data
         "make_contract",                         # B3: договор (Drive-запись + чтение CRM)
         "closing_upsert",                        # Лист закрытия (деньги-доплаты → аудит 4.1, НЕ 4.2)
+        "service_upsert",                        # ТО-трекер «обслуживание» (часть пути записи ТО → аудит 4.1, НЕ 4.2)
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
                    "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
@@ -390,6 +391,24 @@ class BridgeClient:
     def service_set_pin(self, **fields) -> dict:
         """Записать pinned_msg_id / last_reminded_at для записи ТО."""
         return self._post("service_set_pin", **fields)
+
+    # === ТО-заявки (двухфазный сервис, Bot Data «то_заявки» — своя таблица, НЕ redzone) ===
+    def service_pending_upsert(self, **fields) -> dict:
+        """Создать/обновить открытую заявку ТО (merge). None-поля не шлём."""
+        clean = {k: v for k, v in fields.items() if v is not None}
+        return self._post("service_pending_upsert", **clean)
+
+    def service_pending_get(self, chat_id, topic_id, bike) -> dict:
+        """Открытая заявка по chat_id+topic_id+bike, или {ok:false, error:'not_found'}."""
+        return self._post("service_pending_get", chat_id=chat_id, topic_id=topic_id, bike=bike)
+
+    def service_pending_list(self, **fields) -> dict:
+        """Список заявок: status / open=true / older_than_min (для висяка)."""
+        return self._post("service_pending_list", **fields)
+
+    def service_pending_close(self, **fields) -> dict:
+        """Закрыть заявку (status='закрыто')."""
+        return self._post("service_pending_close", **fields)
 
     def set_fleet_oil(self, number, oil_km, confirmed: bool = False) -> dict:
         """GUARDED: записать «ТО Oil» (Лист1 Байки, колонка I) по НОМЕРУ байка.

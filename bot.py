@@ -633,6 +633,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Иначе гейт вступления (фикс 07:51) работает как обычно — pending не трогает его.
         _tid_sv = getattr(msg, "message_thread_id", None)
         if splinter.GROUPS.get(chat_id) == "servicing":
+            # 0) ДВУХФАЗНЫЙ ТО (фаза 2): ответ механика по открытой заявке (готово/перечень/одометр),
+            #    либо доверенное число вместо кнопки. Запись в Лист1 — ТОЛЬКО по «да» доверенного.
+            if msg.text and await splinter.handle_service_result(msg, context, bridge, claude, msg.text):
+                return
             # 1) ответ на переспрос текстовой коррекции пробега (фикс _row22)
             if splinter.pending_correction_for(chat_id, _tid_sv):
                 if await splinter.handle_correction_confirm(msg, context, bridge, msg.text):
@@ -933,6 +937,14 @@ async def scheduled_contract_km(context: ContextTypes.DEFAULT_TYPE):
             log.info(f"  📄 contract_km: бронь «{c.get('name')}» — {r.get('error')}")
     if done:
         log.info(f"  📄 contract_km: обновлено договоров в день выдачи: {done}")
+
+
+async def scheduled_service_pending_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Висяк двухфазного ТО: заявки без отписки результата старше порога → напоминание механику."""
+    try:
+        await splinter.scheduled_service_pending_reminder(context, bridge)
+    except Exception:
+        log.exception("service_pending reminder упал")
 
 
 async def scheduled_important_reminders(context: ContextTypes.DEFAULT_TYPE):
@@ -1249,6 +1261,14 @@ def main():
         name="devbot_report",
     )
     log.info("Scheduled devbot orchestrator result reporting every 45s")
+
+    # Двухфазный ТО: висяк-напоминание по незакрытым заявкам (раз в час, read-only список + _send).
+    app.job_queue.run_repeating(
+        scheduled_service_pending_reminder,
+        interval=3600, first=300,
+        name="service_pending_reminder",
+    )
+    log.info("Scheduled service-pending (ТО заявки) reminder every 1h")
 
     log.info("Bot polling started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

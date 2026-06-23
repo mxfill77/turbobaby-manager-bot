@@ -2052,7 +2052,10 @@ async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_
     info = _run_service_tracker(bridge, chat_id, topic_id, bike, mileage)
     if not info:
         return
-    if info["status"] in ("due", "overdue") or oil_hint:
+    # Сосуществование с двухфазным потоком: если по теме открыта ТО-заявка — старый одно-фазный
+    # вопрос [После замены]/[Просто пробег] НЕ задаём (запись по заявке владеет фаза-2 + «да» Пыма).
+    _sp_owns = bool(_sp_open(bridge, chat_id, topic_id, bike))
+    if (info["status"] in ("due", "overdue") or oil_hint) and not _sp_owns:
         await _ask_oil_or_km(context, chat_id, topic_id, bike, info["km"],
                              info["status"], info["next_km"], info["km_left"])
         # НЕ финал — задали вопрос [После замены]/[Просто пробег], цикл продолжается. Промежутки НЕ чистим.
@@ -2439,6 +2442,37 @@ async def handle_service_button(update, context, bridge) -> None:
             pass
         _SVC_TOKENS.pop(token, None)
         await _write_oil(context, bridge, chat_id, topic_id, bike, km)
+    elif action == "done":
+        # ШАГ 5 (КРАСНЫЙ): подтверждение записи факта ТО по заявке. ТОЛЬКО доверенный (trust не ослаблен).
+        # Пишет СДЕЛАННЫЕ позиции (кол.I/J/K/L set_fleet_* confirmed=True под сторожем + синк «обслуживание»),
+        # прочее → событие. Earth сам нажать НЕ может — бот ждёт Пыма/владельца (токен+кнопка живут).
+        if not _is_trusted_user(q.from_user):
+            await q.answer("ยืนยันโดย @Pleummmm/เจ้าของ · Подтверждает @Pleummmm или владелец", show_alert=False)
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=("🐀 Splinter\n"
+                              "🇹🇭 🔧 บันทึกผล ТО ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้นครับ\n"
+                              f"{_SEP}\n"
+                              "🇷🇺 🔧 Запись результата ТО подтверждает @Pleummmm или владелец"))
+            return   # токен и кнопка живут — Пым нажмёт позже
+        await q.answer("กำลังบันทึก… · Записываю ТО…")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        done = data.get("done", []) or []
+        odo = data.get("odo", "")
+        cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
+        written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=cb)
+        rep_ru = (f"✅ Записано: {_sp_labels_ru(written)} на {odo} км" if written else "⚠️ ничего не записано")
+        if failed:
+            rep_ru += f" · не прошло: {', '.join(k for k, _ in failed)}"
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=(f"🐀 Splinter · 📌 {bike}\n"
+                          f"🇹🇭 ✅ บันทึกแล้ว: {_sp_labels_th(written)} ที่ {odo} กม.\n"
+                          f"{_SEP}\n"
+                          f"🇷🇺 {rep_ru}"))
+        log.info(f"  → ТО фаза2 запись по «да» {cb}: written={written} failed={failed} odo={odo}")
     elif action == "km":
         # [Просто пробег] → в кол.I НЕ пишем. Квитанцию шлём ВСЕГДА (раньше при уже-закреплённой
         # просрочке _pin_overdue_reminder выходил молча → человек видел тишину).
@@ -2599,6 +2633,298 @@ async def _handle_closing_cmd(msg, context, bridge, text):
                 text=_closing_card(cg["item"], _closing_crm_debt(bridge, bike)))
 
 
+# ============================================================
+#  ДВУХФАЗНЫЙ СЕРВИСНЫЙ ПОТОК ТО (заявка → факт → «да» доверенного)
+#  Механик (не trusted) ТРИГГЕРИТ обе фазы; запись в Лист1 — ТОЛЬКО по «да» Пыма/владельца.
+#  Хранилище состояния: Bot Data «то_заявки» (переживает рестарт). trust НЕ ослаблен.
+# ============================================================
+
+# kind → (TH, RU) для перечней заявки/факта. oil/gear/abs/airfilter имеют столбец; остальные — события.
+_SP_KIND_LABEL = {
+    "oil": ("น้ำมันเครื่อง", "моторное масло"),
+    "gear": ("น้ำมันเฟืองท้าย", "масло редуктора"),
+    "abs": ("น้ำมัน ABS", "масло ABS"),
+    "airfilter": ("ไส้กรองอากาศ", "воздушный фильтр"),
+    "filter": ("ไส้กรองน้ำมัน", "масляный фильтр"),
+    "pads": ("ผ้าเบรก", "тормозные колодки"),
+    "chain": ("โซ่", "цепь"),
+    "other": ("งานอื่น ๆ", "прочие работы"),
+}
+_SP_COL_KINDS = ("oil", "gear", "abs", "airfilter")   # пишутся в Лист1 (столбец); прочее — событийно
+_SP_REMIND_AFTER_MIN = 6 * 60   # висяк: заявка без закрытия старше 6ч → напоминание
+_SP_REMIND_THROTTLE_MIN = 6 * 60
+
+
+def _service_kind(w):
+    """Тонкий классификатор работы для перечней заявки/факта (различает фильтр/колодки/цепь,
+    которых _classify_work сводит в 'info'). Возвращает ключ _SP_KIND_LABEL."""
+    s = str(w).lower()
+    base = _classify_work(w)
+    if base in ("oil", "gear", "abs", "airfilter"):
+        return base
+    if "фильтр" in s or "filter" in s or "กรอง" in s:
+        return "filter"
+    if any(k in s for k in ("колод", "тормоз", "brake", "ผ้าเบรก")):
+        return "pads"
+    if any(k in s for k in ("цеп", "chain", "โซ่")):
+        return "chain"
+    return "other"
+
+
+# Ключевые слова перечня из СВОБОДНОГО текста (когда parse не дал works) — для declared/done.
+_SP_TEXT_KINDS = (
+    ("oil", ("моторн", "เครื่อง", "motor oil")),
+    ("gear", ("редуктор", "gear", "เฟือง", "трансмис")),
+    ("filter", ("фильтр", "filter", "กรองน้ำมัน")),
+    ("airfilter", ("возд", "air", "อากาศ")),
+    ("abs", ("abs", "абс")),
+    ("pads", ("колод", "тормоз", "ผ้าเบรก")),
+    ("chain", ("цеп", "chain", "โซ่")),
+)
+
+
+def _declared_kinds(text, works, vis):
+    """Список kind-ов из works (точный) + скан свободного текста/notes. Сохраняет порядок, без дублей.
+    Если есть общий 'масло' без уточнения и нет gear-маркера — трактуем как oil."""
+    out = []
+    def add(k):
+        if k not in out:
+            out.append(k)
+    for w in (works or []):
+        add(_service_kind(w))
+    blob = ((text or "") + " " + str((vis or {}).get("notes", ""))).lower()
+    for k, kws in _SP_TEXT_KINDS:
+        if any(kw in blob for kw in kws):
+            add(k)
+    # любой масло-маркер → моторное масло как кандидат (declared информативен; пишем ТОЛЬКО факт с «да»)
+    if any(kw in blob for kw in ("масл", "oil", "น้ำมัน")) and "oil" not in out:
+        add("oil")
+    return out
+
+
+def _sp_join(kinds):
+    return ",".join(kinds)
+
+
+def _sp_split(s):
+    return [k for k in str(s or "").split(",") if k]
+
+
+def _sp_labels_ru(kinds):
+    return ", ".join(_SP_KIND_LABEL.get(k, (k, k))[1] for k in kinds) or "—"
+
+
+def _sp_labels_th(kinds):
+    return ", ".join(_SP_KIND_LABEL.get(k, (k, k))[0] for k in kinds) or "—"
+
+
+def _sp_open(bridge, chat_id, topic_id, bike):
+    """Открытая заявка по теме/байку или None (best-effort, не кидает)."""
+    try:
+        r = bridge.service_pending_get(chat_id, topic_id or "", bike or "")
+        return r.get("item") if r.get("ok") else None
+    except Exception:
+        log.exception("  → service_pending_get упал")
+        return None
+
+
+def msg_sp_intake_ack(bike, kinds):
+    """Фаза 1: заявка принята — НИЧЕГО не пишем в ТО, ждём «готово»."""
+    b = f" · 📌 {bike}" if bike else ""
+    return (f"🐀 Splinter{b}\n"
+            f"🇹🇭 ✅ รับเรื่องแล้วครับ: {_sp_labels_th(kinds)} — เริ่มงานได้เลย แล้วแจ้งตอนเสร็จนะครับ\n"
+            f"{_SEP}\n"
+            f"🇷🇺 ✅ Принял заявку на ТО: {_sp_labels_ru(kinds)}. Отпишись, когда закончишь — тогда зафиксируем.")
+
+
+def msg_sp_ask_done(bike, declared):
+    """Фаза 2 без перечня факта: переспрос механику что сделал/не сделал."""
+    b = f" · 📌 {bike}" if bike else ""
+    return (f"🐀 Splinter{b}\n"
+            f"🇹🇭 จากที่แจ้งไว้ ({_sp_labels_th(declared)}) — ทำอะไรเสร็จบ้าง อะไรยังครับ? และเลขไมล์ตอนนี้เท่าไหร่?\n"
+            f"{_SEP}\n"
+            f"🇷🇺 Из заявленного ({_sp_labels_ru(declared)}) — что сделал, что нет? И какой сейчас одометр?")
+
+
+def msg_sp_confirm_pym(bike, done, notdone, odo):
+    """Фаза 2: запрос доверенному на подтверждение записи (кнопка)."""
+    b = f" · 📌 {bike}" if bike else ""
+    nd = f"\n🇷🇺 Не сделано: {_sp_labels_ru(notdone)}" if notdone else ""
+    nd_th = f"\n🇹🇭 ยังไม่ได้ทำ: {_sp_labels_th(notdone)}" if notdone else ""
+    return (f"🐀 Splinter{b}\n"
+            f"🇹🇭 Earth จบงาน {bike} แล้ว ทำ: {_sp_labels_th(done)}{nd_th}\n"
+            f"🇹🇭 เลขไมล์ {odo} กม. — ถูกไหม? ยืนยันบันทึก? @Pleummmm\n"
+            f"{_SEP}\n"
+            f"🇷🇺 Earth закончил {bike}. Сделано: {_sp_labels_ru(done)}{nd}\n"
+            f"🇷🇺 Одометр {odo} км — верно? Подтвердить запись? @Pleummmm (или пришли правильное число)")
+
+
+async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declared):
+    """Фаза 1: фиксируем НАМЕРЕНИЕ (заявка). В Лист1/обслуживание НИЧЕГО не пишем."""
+    try:
+        bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                      bike=bike, declared=_sp_join(declared), status="заявлено")
+    except Exception:
+        log.exception("  → service_pending_upsert (фаза1) упал")
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=msg_sp_intake_ack(bike, declared))
+    mark_awaiting(chat_id, topic_id)
+    log.info(f"  → ТО фаза1: заявка {bike} declared={declared}")
+
+
+async def handle_service_result(msg, context, bridge, claude, text) -> bool:
+    """Фаза 2: ответ механика по открытой заявке (status заявлено/ждёт_факт).
+    Нет перечня факта → переспрос «что сделал?»; есть факт+одометр → запрос Пыму (кнопка).
+    Возвращает True если перехватили. Запись в Лист1 здесь НЕ делается (только по «да» доверенного)."""
+    chat_id = msg.chat_id
+    topic_id = getattr(msg, "message_thread_id", None)
+    bike = bike_from_topic(chat_id, topic_id) or ""
+    sp = _sp_open(bridge, chat_id, topic_id, bike)
+    if not sp:
+        return False
+    status = str(sp.get("status"))
+    # Запасной путь (ответ 2): заявка ждёт подтверждения, ДОВЕРЕННЫЙ прислал голое число вместо кнопки →
+    # берём его число одометром и пишем факт (trust соблюдён — это Пым/владелец, не механик).
+    if status == "ждёт_подтверждения":
+        m = _re_pl.fullmatch(r"\s*(\d{4,6})\s*", str(text or ""))
+        if m and _is_trusted_user(getattr(msg, "from_user", None)):
+            done = _sp_split(sp.get("done"))
+            cb = ("@" + msg.from_user.username) if (msg.from_user and msg.from_user.username) else "trusted"
+            written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, m.group(1), confirmed_by=cb)
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=(f"🐀 Splinter · 📌 {bike}\n"
+                              f"🇹🇭 ✅ บันทึกแล้ว: {_sp_labels_th(written)} ที่ {m.group(1)} กม.\n"
+                              f"{_SEP}\n"
+                              f"🇷🇺 ✅ Записано: {_sp_labels_ru(written)} на {m.group(1)} км"
+                              + (f" · не прошло: {', '.join(k for k,_ in failed)}" if failed else "")))
+            log.info(f"  → ТО фаза2 запись по числу-да {cb}: written={written} odo={m.group(1)}")
+            return True
+        return False
+    if status not in ("заявлено", "ждёт_факт"):
+        return False
+    declared = _sp_split(sp.get("declared"))
+    # Распознаём перечень факта и одометр из ответа.
+    parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300)) if text else {}
+    works = [str(w).strip() for w in (parsed.get("works") or []) if w and str(w).strip()]
+    done = _declared_kinds(text, works, {})
+    odo = parsed.get("mileage") or ""
+    if not odo:
+        m = _re_pl.search(r"\b(\d{4,6})\b", str(text or ""))
+        odo = m.group(1) if m else ""
+    # Нет ни перечня факта, ни явного «всё/готово» → переспрашиваем механика.
+    all_done = any(w in str(text or "").lower() for w in ("всё", "все", "全部", "ทั้งหมด", "เสร็จหมด"))
+    if not done and not all_done:
+        bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                      bike=bike, status="ждёт_факт")
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=msg_sp_ask_done(bike, declared))
+        mark_awaiting(chat_id, topic_id)
+        return True
+    if all_done and not done:
+        done = list(declared)
+    if not odo:
+        # факт есть, пробега нет → просим одометр (в том же статусе ждёт_факт)
+        bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                      bike=bike, done=_sp_join(done), status="ждёт_факт")
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id, text=msg_ask_odometer(bike))
+        mark_awaiting(chat_id, topic_id)
+        return True
+    notdone = [k for k in declared if k not in done]
+    bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                  done=_sp_join(done), odometer=str(odo), status="ждёт_подтверждения")
+    tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike,
+                    "done": done, "odo": str(odo), "kind": "sp_done"})
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "✅ ยืนยันบันทึก / Подтвердить запись", callback_data=f"svc:done:{tok}")]])
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=msg_sp_confirm_pym(bike, done, notdone, odo), reply_markup=kb)
+    mark_awaiting(chat_id, topic_id)
+    log.info(f"  → ТО фаза2: {bike} done={done} odo={odo} → запрос Пыму (tok={tok})")
+    return True
+
+
+async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=""):
+    """ШАГ 5 (КРАСНЫЙ): по «да» доверенного пишем СДЕЛАННЫЕ позиции. Сторож km_decreasing НЕ трогаем
+    (он на стороне set_fleet_*). Каждая колоночная позиция: set_fleet_* (кол.I/J/K/L, confirmed=True)
+    + service_upsert (синк «обслуживание» — закрывает разрыв _write_oil→обслуживание). Прочее → событие.
+    Возвращает (written:list, failed:list)."""
+    plate = _plate_from_name(bike) or _plate_from_name((bridge.find_bike(bike) or {}).get("name", ""))
+    try:
+        odo_int = int(str(odo).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return [], [("odo", "bad_odometer")]
+    written, failed = [], []
+    for k in done:
+        try:
+            if k in _SP_COL_KINDS:
+                iv = _service_interval(k, bike, bridge) or 4000
+                if k == "oil":
+                    r = bridge.set_fleet_oil(number=plate, oil_km=odo_int, confirmed=True)
+                else:
+                    r = bridge.set_fleet_service(number=plate, kind=k, km=odo_int, confirmed=True)
+                if r.get("ok"):
+                    bridge.service_upsert(bike=bike, service_type=k, current_km=odo_int,
+                                          last_service_km=odo_int, interval_km=iv)
+                    written.append(k)
+                else:
+                    failed.append((k, r.get("error")))
+            else:
+                # фильтр/колодки/цепь/прочее — регистра нет → событие с одометром (фаза2 scope)
+                lbl = _SP_KIND_LABEL.get(k, (k, k))[1]
+                bridge.add_event(group="обслуживание" + (f" / тема {topic_id}" if topic_id else ""),
+                                 bike=bike, event_type="repair", mileage=str(odo_int),
+                                 notes=f"{lbl} — {odo_int} км", sender=str(confirmed_by or ""),
+                                 msg_id=f"sp:{chat_id}:{topic_id}:{k}:{odo_int}")
+                written.append(k)
+        except Exception:
+            log.exception(f"  → ТО фаза2 запись {k} упала")
+            failed.append((k, "exception"))
+    try:
+        bridge.service_pending_close(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                     note=f"written={','.join(written)} by {confirmed_by}")
+    except Exception:
+        log.exception("  → service_pending_close упал")
+    return written, failed
+
+
+async def scheduled_service_pending_reminder(context, bridge):
+    """Висяк: открытые заявки (заявлено/ждёт_факт) старше порога без отписки → напоминание (throttle)."""
+    try:
+        r = bridge.service_pending_list(open=True, older_than_min=_SP_REMIND_AFTER_MIN)
+        items = r.get("items", []) if r.get("ok") else []
+    except Exception:
+        log.exception("  → service_pending_list (висяк) упал")
+        return
+    now = _time.time()
+    for it in items:
+        if str(it.get("status")) == "ждёт_подтверждения":
+            continue   # ждёт Пыма, не механика — отдельный канал (кнопка висит)
+        # throttle по last_reminded_at
+        lr = it.get("last_reminded_at")
+        if lr:
+            try:
+                import datetime as _dt
+                ts = _dt.datetime.fromisoformat(str(lr).replace("Z", "+00:00")).timestamp()
+                if (now - ts) / 60 < _SP_REMIND_THROTTLE_MIN:
+                    continue
+            except Exception:
+                pass
+        bike = it.get("bike", "")
+        chat_id = it.get("chat_id"); topic_id = it.get("topic_id") or None
+        declared = _sp_split(it.get("declared"))
+        try:
+            await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
+                        text=(f"🐀 Splinter · 📌 {bike}\n"
+                              f"🇹🇭 ⏳ {bike} แจ้งเข้า ТО ({_sp_labels_th(declared)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
+                              f"{_SEP}\n"
+                              f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(declared)}), результат не отписан — закончили?"))
+            bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                          last_reminded_at=__import__("datetime").datetime.now(
+                                              __import__("datetime").timezone.utc).isoformat())
+        except Exception:
+            log.exception(f"  → висяк-напоминание {bike} упало")
+
+
 async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения).
     photo_msgs — пачка сообщений-фото (альбом склеен по media_group_id; для одиночного = [msg]).
@@ -2682,6 +3008,28 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     elif vis.get("dirt"):
         notes = (notes + " | грязный").strip()[:200]
 
+    _u_sp = getattr(msg, "from_user", None)
+    _sender = ("@" + _u_sp.username) if (_u_sp and getattr(_u_sp, "username", None)) else ""
+
+    # === ФАЗА 1 (двухфазный ТО): механик ЗАЯВИЛ работы (intake/масло-контекст, БЕЗ маркера «готово»
+    # и без свежего пробега) → фиксируем НАМЕРЕНИЕ в «то_заявки», в Лист1/обслуживание НИЧЕГО.
+    # Записываем intake-событие для истории и НЕ продолжаем (заявка != факт). Факт = отдельное «готово».
+    # Сигнал заявки = СТРОГО event_type=="intake" («привёз/пригнал на ТО» — будущее намерение, как в
+    # реальном логе 06-20). НЕ ловим оил-контекст в общем — иначе перехватим пояснения работ (буфер-флоу).
+    _sp_declared = _declared_kinds(text, works, vis)
+    _sp_is_intake = (parsed.get("event_type") == "intake") and not _is_oil_done_marker(text, vis)
+    if _sp_is_intake and _sp_declared and bike and not _sp_open(bridge, chat_id, topic_id, bike):
+        try:
+            bridge.add_event(msg_date=(str(msg.date.date()) if msg.date else ""),
+                             group=group_name + (f" / тема {topic_id}" if topic_id else ""),
+                             bike=bike, event_type="intake", notes=notes[:200],
+                             photos=1 if has_photo else 0, sender=_sender,
+                             msg_id=f"{chat_id}:{msg.message_id}")
+            await service_phase1_intake(context, bridge, chat_id, topic_id, bike, _sp_declared)
+        except Exception:
+            log.exception("  → ТО фаза1 (intake) упала")
+        return
+
     # === РАЗБОР ПЕРЕЧНЯ РАБОТ ПО АДРЕСАМ (вариант A: строка-на-работу) ===
     # Масло → кол.I (флоу ниже), gear/abs/возд.фильтр → группа B (кол.J/K/L, флоу ниже).
     # ИНФО-работы (колодки/цепь/масл.фильтр/вилка/прочее) → история «события» ОТДЕЛЬНОЙ строкой на
@@ -2717,7 +3065,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             msg_date=_msg_date,
             group=group_name + (f" / тема {topic_id}" if topic_id else ""),
             bike=bike, event_type=event_type, fuel=str(fuel), mileage=str(mileage),
-            photos=1 if has_photo else 0, notes=notes, msg_id=_ev_msg_id,
+            photos=1 if has_photo else 0, notes=notes, msg_id=_ev_msg_id, sender=_sender,
         )
     # ДИАГ: бот раньше ВЫБРАСЫВАЛ return add_event — теперь видно saved/duplicate/error + разбор работ.
     log.info(f"  → add_event: ok={(_ev_r or {}).get('ok')} saved={(_ev_r or {}).get('saved')} "
