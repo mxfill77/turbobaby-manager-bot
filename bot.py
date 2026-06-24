@@ -535,6 +535,8 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
         _tid = getattr(msg, "message_thread_id", None)
         for pin_text in pins:
             try:
+                # Контракт: LLM даёт RU-текст → собираем двуязычный (🇹🇭 перевод + 🇷🇺) детерминированно.
+                pin_text = splinter.bilingual_pin(claude, pin_text)
                 sent = await context.bot.send_message(
                     chat_id=chat_id, text=pin_text, message_thread_id=_tid
                 )
@@ -557,8 +559,10 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
         _sender = ("@" + msg.from_user.username) if (msg.from_user and msg.from_user.username) else ""
         for item in important:
             try:
+                # Контракт: LLM даёт RU pin_text → двуязычный (🇹🇭 перевод + 🇷🇺) детерминированно.
+                _pin = splinter.bilingual_pin(claude, item["pin_text"])
                 sent = await context.bot.send_message(
-                    chat_id=chat_id, text=item["pin_text"], message_thread_id=_tid
+                    chat_id=chat_id, text=_pin, message_thread_id=_tid
                 )
                 await context.bot.pin_chat_message(
                     chat_id=chat_id, message_id=sent.message_id, disable_notification=False

@@ -189,6 +189,12 @@ class Auditor:
                         problems.append("есть тайский блок, но нет русского")
                     if ru_lines and not thai_lines:
                         problems.append("есть русский блок, но нет тайского")
+                    # Расхождение ДЛИН: тайский сильно короче русского → вероятно обрезан/неполный перевод.
+                    # (Дешёвая эвристика; смысловое LLM-сравнение — отдельная задача П8, сюда НЕ тащим.)
+                    th_clean = _strip_allowed(" ".join(thai_lines).replace("🇹🇭", "")).strip()
+                    ru_clean = " ".join(ru_lines).replace("🇷🇺", "").strip()
+                    if thai_lines and ru_lines and len(ru_clean) >= 40 and len(th_clean) < 0.4 * len(ru_clean):
+                        problems.append(f"тайский блок сильно короче русского ({len(th_clean)} симв < 40% от {len(ru_clean)}) — вероятно неполный перевод")
 
             # Эмодзи вместо слов (правило KB: паспорт/доллар — словами)
             # ловим явные подмены: 🛂 (паспорт), 💵/💲/💰 (деньги) в тексте
@@ -197,6 +203,11 @@ class Auditor:
                 if emo in a:
                     problems.append(f"эмодзи {emo} вместо слова «{word}»")
                     break
+
+            # Байк назван «автомобилем» — это мотопрокат (страховка против LLM/авто-перевода)
+            _low = a.lower()
+            if "автомобил" in _low or "รถยนต์" in a or re.search(r"\bмашин[ауыеой]?\b", _low):
+                problems.append("техника названа автомобилем/машиной/รถยนต์ — это мотопрокат (байк/มอเตอร์ไซค์)")
 
             if problems:
                 verdict = "style_issue"
