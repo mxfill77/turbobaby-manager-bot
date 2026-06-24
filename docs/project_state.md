@@ -307,6 +307,13 @@ AI-команда ботов для TurboBaby (премиум аренда мо�
   без хардкода ID в коде. Дубликат-оглавление — Google Doc «KB_index» в папке Brain.
 - Проверено через Bridge: list_brain отдаёт манифест; read_doc читает все 4 дока по name и по id;
   ошибки мягкие (unknown_name / missing_param).
+- **План-листы в манифесте (24.06.2026):** `roadmap_master` / `executors_map` / `orchestrator_plan` /
+  `orchestrator_safety` / `payments_plan` зарегистрированы в BRAIN_MANIFEST новым экшеном
+  `register_brain_doc` (мерж, не затирает существующие; защиты exists/bad_name/not_in_brain; аудит 4.1).
+  Теперь `read_doc(name=<ключ>)` достаёт их по имени (раньше были Drive-only). Манифест = **18 ключей**.
+- ⚠️ **ЖИВОЙ источник имён→id = `list_brain`** (не хардкод). Список ID ниже — ИСТОРИЧЕСКИЙ снимок 01.06:
+  часть указывает на старые/перемещённые доки (после сплита 18.06 + чистки мозга 23-24.06 актуальные id
+  другие, см. `list_brain`). При сомнении — `list_brain`, не этот список.
 
 ID базы знаний (Brain):
 - Папка Brain : `1uWqHsxk7aEWoSNqaUBMmqkYOh2UKYLkY`
