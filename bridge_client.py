@@ -144,6 +144,7 @@ class BridgeClient:
         "service_upsert",                        # ТО-трекер «обслуживание» (часть пути записи ТО → аудит 4.1, НЕ 4.2)
         "trash_brain_file",                      # удаление файла в Brain (housekeeping → аудит 4.1)
         "register_brain_doc",                    # регистрация ключа в BRAIN_MANIFEST (конфиг → аудит 4.1)
+        "service_delete",                        # удаление service-строки «обслуживание» (необратимо → аудит 4.1)
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
                    "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
@@ -393,6 +394,12 @@ class BridgeClient:
     def service_set_pin(self, **fields) -> dict:
         """Записать pinned_msg_id / last_reminded_at для записи ТО."""
         return self._post("service_set_pin", **fields)
+
+    def service_delete(self, bike, service_type, updated_at) -> dict:
+        """Удалить ОДНУ строку «обслуживание» по якорю (bike+type+updated_at). Необратимо.
+        not_found если 0, ambiguous (без удаления) если >1, удаляет только при ровно 1 матче."""
+        return self._post("service_delete", bike=str(bike),
+                          service_type=str(service_type), updated_at=str(updated_at))
 
     # === ТО-заявки (двухфазный сервис, Bot Data «то_заявки» — своя таблица, НЕ redzone) ===
     def service_pending_upsert(self, **fields) -> dict:
