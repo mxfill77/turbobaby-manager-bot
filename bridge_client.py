@@ -143,6 +143,7 @@ class BridgeClient:
         "closing_upsert",                        # Лист закрытия (деньги-доплаты → аудит 4.1, НЕ 4.2)
         "service_upsert",                        # ТО-трекер «обслуживание» (часть пути записи ТО → аудит 4.1, НЕ 4.2)
         "trash_brain_file",                      # удаление файла в Brain (housekeeping → аудит 4.1)
+        "register_brain_doc",                    # регистрация ключа в BRAIN_MANIFEST (конфиг → аудит 4.1)
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
                    "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
@@ -414,6 +415,11 @@ class BridgeClient:
     def trash_brain_file(self, id) -> dict:
         """Удалить (в корзину) файл ВНУТРИ Brain-папки по id. not_in_brain если файл вне Brain."""
         return self._post("trash_brain_file", id=str(id))
+
+    def register_brain_doc(self, name, id, overwrite: bool = False) -> dict:
+        """Зарегистрировать Brain-файл в BRAIN_MANIFEST (ключ name→id, мерж). Существующий ключ
+        не меняется без overwrite=True. Файл должен быть в Brain-папке."""
+        return self._post("register_brain_doc", name=str(name), id=str(id), overwrite=bool(overwrite))
 
     def set_fleet_oil(self, number, oil_km, confirmed: bool = False) -> dict:
         """GUARDED: записать «ТО Oil» (Лист1 Байки, колонка I) по НОМЕРУ байка.
