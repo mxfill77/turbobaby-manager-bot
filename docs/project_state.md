@@ -307,6 +307,10 @@ AI-команда ботов для TurboBaby (премиум аренда мо�
   без хардкода ID в коде. Дубликат-оглавление — Google Doc «KB_index» в папке Brain.
 - Проверено через Bridge: list_brain отдаёт манифест; read_doc читает все 4 дока по name и по id;
   ошибки мягкие (unknown_name / missing_param).
+- **ЧИСТКА МОЗГА завершена (23-24.06.2026):** дубли userbot/cowork сведены в манифест-доки, OLD/presplit/
+  корневые .md убраны в корзину, ревью развязан (канон `review`=1vDfD). В папке Brain = 21 файл, дублей нет.
+  **`KB_TODO_brain_cleanup_and_cowork_bridge` ЗАКРЫТ** пометкой ✅выполнено (хвост «cowork_bridge» —
+  Cowork пишет в Brain через Bridge — отдельная будущая задача, не из этой чистки).
 - **План-листы в манифесте (24.06.2026):** `roadmap_master` / `executors_map` / `orchestrator_plan` /
   `orchestrator_safety` / `payments_plan` зарегистрированы в BRAIN_MANIFEST новым экшеном
   `register_brain_doc` (мерж, не затирает существующие; защиты exists/bad_name/not_in_brain; аудит 4.1).
