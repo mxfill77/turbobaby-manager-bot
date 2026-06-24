@@ -142,6 +142,7 @@ class BridgeClient:
         "make_contract",                         # B3: договор (Drive-запись + чтение CRM)
         "closing_upsert",                        # Лист закрытия (деньги-доплаты → аудит 4.1, НЕ 4.2)
         "service_upsert",                        # ТО-трекер «обслуживание» (часть пути записи ТО → аудит 4.1, НЕ 4.2)
+        "trash_brain_file",                      # удаление файла в Brain (housekeeping → аудит 4.1)
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
                    "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
@@ -409,6 +410,10 @@ class BridgeClient:
     def service_pending_close(self, **fields) -> dict:
         """Закрыть заявку (status='закрыто')."""
         return self._post("service_pending_close", **fields)
+
+    def trash_brain_file(self, id) -> dict:
+        """Удалить (в корзину) файл ВНУТРИ Brain-папки по id. not_in_brain если файл вне Brain."""
+        return self._post("trash_brain_file", id=str(id))
 
     def set_fleet_oil(self, number, oil_km, confirmed: bool = False) -> dict:
         """GUARDED: записать «ТО Oil» (Лист1 Байки, колонка I) по НОМЕРУ байка.
