@@ -66,9 +66,10 @@ res.append(ok(len(SENDS)==1 and "ТО Oil: в норме, следующее 428
 # 4) _handle_servicing: запрос статуса → карточка, НИЧЕГО не пишет, parse не как событие
 SENDS.clear()
 br=BR()
-loop.run_until_complete(S._handle_servicing(Msg2("дай инфу по байку"),context=None,bridge=br,claude=FakeClaude(),photo_msgs=[]))
+# Пакет Б: карточка теперь под гейтом — явный статус-запрос (начинается со статус-слова) ИЛИ обращение к боту.
+loop.run_until_complete(S._handle_servicing(Msg2("статус по байку"),context=None,bridge=br,claude=FakeClaude(),photo_msgs=[]))
 print("(4) хук в _handle_servicing:")
-res.append(ok(len(SENDS)==1 and "Статус байка" in SENDS[0], "на запрос → карточка отправлена"))
+res.append(ok(len(SENDS)==1 and "Статус байка" in SENDS[0], "на ЯВНЫЙ запрос → карточка отправлена"))
 res.append(ok(len(br.events)==0, "ничего НЕ записано (только чтение)"))
 
 loop.close()

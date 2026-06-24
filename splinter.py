@@ -813,6 +813,73 @@ def _bot_mentioned(msg, context) -> bool:
     return (uname and ("@" + uname) in t) or ("turbobaby_manager_bot" in t)
 
 
+def _addressed_bot(msg, context) -> bool:
+    """К боту ОБРАЩАЮТСЯ: тег @bot ИЛИ реплай на сообщение бота."""
+    if _bot_mentioned(msg, context):
+        return True
+    r = getattr(msg, "reply_to_message", None)
+    fu = getattr(r, "from_user", None) if r else None
+    if fu is not None:
+        if getattr(fu, "is_bot", False):
+            return True
+        try:
+            if (fu.username or "").lower() == (context.bot.username or "").lower():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# Анти-спам карточки байка (пакет Б): не слать ту же карточку чаще раза в окно на тему.
+_CARD_LAST = {}            # (chat_id, topic_id) -> ts последней отправленной карточки
+_CARD_COOLDOWN = 180       # сек
+
+
+def _is_explicit_status_query(text):
+    """«Явный» короткий статус-запрос: сообщение фактически И ЕСТЬ запрос карточки
+    (начинается со статус-слова / очень короткое), а не слово, утонувшее в общем трёпе."""
+    t = (text or "").strip().lower()
+    if len(t) > 30:
+        return False
+    return any(t.startswith(k) for k in _STATUS_KEYWORDS)
+
+
+def _card_allowed(chat_id, topic_id):
+    """Троттл+дедуп карточки: не чаще раза в _CARD_COOLDOWN на тему."""
+    key = (chat_id, topic_id)
+    now = _time.time()
+    if now - _CARD_LAST.get(key, 0) < _CARD_COOLDOWN:
+        return False
+    _CARD_LAST[key] = now
+    return True
+
+
+# RETURN-контекст (пакет Б): сигналы возврата аренды (приоритет над ремонтом/ТО-заявкой).
+_RETURN_WORDS = ("верну", "вернул", "вернулся", "возврат", "сдал", "сдаёт", "сдает",
+                 "приёмк", "приемк", "забрал", "отдал", "клиент верн")
+
+
+def _is_return_context(parsed, text, vis, bridge, bike):
+    """True если это ВОЗВРАТ аренды (а не плановый сервис/ремонт). Дёшево сначала (event_type/слова),
+    CRM-проверка статуса «В аренде» — read-only и ТОЛЬКО при handback-сигнале (damage/топливо+пробег/handover)."""
+    et = (parsed or {}).get("event_type")
+    if et == "return":
+        return True
+    blob = (text or "").lower()
+    if any(w in blob for w in _RETURN_WORDS):
+        return True
+    handback = (bool((vis or {}).get("damage")) or et == "handover"
+                or ((parsed or {}).get("fuel") and (parsed or {}).get("mileage")))
+    if handback and bike:
+        try:
+            st = str((bridge.find_bike(bike) or {}).get("status", "")).strip().lower()
+            if "аренде" in st:   # байк В АРЕНДЕ + признак сдачи → это возврат, не плановое ТО
+                return True
+        except Exception:
+            log.exception("  → return-ctx: CRM-проверка статуса упала")
+    return False
+
+
 async def _download_photo(msg) -> bytes:
     """Скачивает самое крупное фото сообщения в bytes (или None)."""
     if not msg.photo:
@@ -1189,7 +1256,7 @@ def msg_service_summary(bike, acc, skip_oil=False):
 
 
 # ЗАХОД 2: распознавание запроса карточки байка («инфа/статус/что по байку»).
-_STATUS_KEYWORDS = ("инф", "статус", "состояни", "что по байк", "что с байк",
+_STATUS_KEYWORDS = ("инфа", "инфо", "инфу", "статус", "состояни", "что по байк", "что с байк",
                     "как байк", "сводка по", "карточк", "status", "info")
 
 
@@ -3010,14 +3077,21 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
 
     # ЗАХОД 2: запрос КАРТОЧКИ байка («инфа/статус/что по байку») — отвечаем карточкой из ЧИТАЕМЫХ
     # источников (пробег, ТО Oil, J/K/L, аренда), НИЧЕГО не пишем. Только текст без фото.
-    if text.strip() and not has_photo and _is_status_request(text):
+    # Анти-спам (пакет Б): карточку шлём ТОЛЬКО когда к боту ОБРАЩАЮТСЯ (@tag/reply) ИЛИ это ЯВНЫЙ
+    # короткий статус-запрос, и не чаще раза в окно на тему (троттл). Раньше — на любое статус-слово
+    # в общем трёпе без дедупа → троила карточку.
+    if (text.strip() and not has_photo and _is_status_request(text)
+            and (_addressed_bot(msg, context) or _is_explicit_status_query(text))):
         _card_bike = bike_from_topic(chat_id, topic_id) or ""
-        if _card_bike:
+        if _card_bike and _card_allowed(chat_id, topic_id):
             log.info(f"  → запрос карточки байка: {_card_bike}")
             try:
                 await _send_bike_card(context, bridge, chat_id, topic_id, _card_bike)
             except Exception:
                 log.exception("  → ошибка карточки байка")
+            return
+        if _card_bike:
+            log.info(f"  → карточка {_card_bike} подавлена троттлом (<{_CARD_COOLDOWN}s)")
             return
 
     # Разбираем текст (если есть) на событие
@@ -3075,6 +3149,13 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     _u_sp = getattr(msg, "from_user", None)
     _sender = ("@" + _u_sp.username) if (_u_sp and getattr(_u_sp, "username", None)) else ""
 
+    # === RETURN-КОНТЕКСТ (пакет Б): возврат аренды имеет ПРИОРИТЕТ над ремонтом/ТО-заявкой ===
+    # При возврате гасим phase-1 intake и repair-наряд (works→ниже в «события» инфо, не наряд),
+    # а ведём ветку ПРИЁМКИ (closing_upsert + пинг Пыму). Сигнал read-only (event_type/слова/CRM-статус).
+    _ret_ctx = _is_return_context(parsed, text, vis, bridge, bike)
+    if _ret_ctx:
+        log.info(f"  → RETURN-контекст по {bike or '?'}: ветка приёмки (phase-1/наряд погашены)")
+
     # === ФАЗА 1 (двухфазный ТО): механик ЗАЯВИЛ работы (intake/масло-контекст, БЕЗ маркера «готово»
     # и без свежего пробега) → фиксируем НАМЕРЕНИЕ в «то_заявки», в Лист1/обслуживание НИЧЕГО.
     # Записываем intake-событие для истории и НЕ продолжаем (заявка != факт). Факт = отдельное «готово».
@@ -3082,7 +3163,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # реальном логе 06-20). НЕ ловим оил-контекст в общем — иначе перехватим пояснения работ (буфер-флоу).
     _sp_declared = _declared_kinds(text, works, vis)
     _sp_is_intake = (parsed.get("event_type") == "intake") and not _is_oil_done_marker(text, vis)
-    if _sp_is_intake and _sp_declared and bike and not _sp_open(bridge, chat_id, topic_id, bike):
+    if _sp_is_intake and _sp_declared and bike and not _ret_ctx and not _sp_open(bridge, chat_id, topic_id, bike):
         try:
             bridge.add_event(msg_date=(str(msg.date.date()) if msg.date else ""),
                              group=group_name + (f" / тема {topic_id}" if topic_id else ""),
@@ -3137,15 +3218,26 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
              f"msg_id={_ev_msg_id} info_works={len(info_works)} km_now={km_now or '-'} event_type={event_type}")
 
     # Лист закрытия: на ВОЗВРАТЕ авто-создаём/обновляем строку закрытия (seed bike/fuel/date + booking_id).
-    if event_type == "return" and (_ev_r or {}).get("ok") and bike:
+    # Ветка ПРИЁМКИ — на ЛЮБОМ return-контексте (не только точном event_type=="return"): сид Лист закрытия
+    # (топливо/пробег/booking) + пинг Пыму по депозиту/ущербу. closing_upsert = Bot Data (своя таблица).
+    # НЕ зависим от _ev_r (при info-работах событие пишет _write_info_works, _ev_r=None).
+    if _ret_ctx and bike:
         try:
             _bid, _bname, _bend = _closing_resolve_booking(bridge, bike)
             _dret = _msg_date or _bend or ""
             _cu = bridge.closing_upsert(booking_id=(_bid or ""), bike=bike, name=_bname,
                                         date_return=_dret, fuel_level=str(fuel or ""),
                                         note=("" if _bid else "бронь не найдена"))
-            log.info(f"  → closing авто: bike={bike} booking_id={_bid} ok={(_cu or {}).get('ok')} "
+            log.info(f"  → closing авто (return-ctx): bike={bike} booking_id={_bid} ok={(_cu or {}).get('ok')} "
                      f"total_due={(_cu or {}).get('total_due')}")
+            # Пинг Пыму ПРИЁМКИ — только если нет damage (damage-ветка ниже пингует сама, без дубля).
+            if not vis.get("damage"):
+                _ru_intake = (f"Принял возврат {bike}"
+                              + (f", топливо {fuel}" if fuel else "")
+                              + (f", пробег {mileage}" if mileage else "")
+                              + ". Занёс в лист закрытия. @Pleummmm — глянь депозит/ущерб 🙏")
+                await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                            text=bilingual_from_ru(claude, _ru_intake))
         except Exception as e:
             log.warning(f"  → closing авто-создание не удалось: {e}")
 
@@ -3178,7 +3270,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Техник назвал работу группы B + есть пробег → кнопка-фиксация (боевая запись ТОЛЬКО доверенным).
     # Масло (кол.I) идёт своим флоу выше; info-работы (масл.фильтр/колодки/цепь) — только в «события».
     # Пробег показываем в кнопке — человек сверяет цифру перед записью; set_fleet_service хранит откат.
-    if works and bike and mileage and _conf_ok:
+    # RETURN-контекст: НЕ наряд на ремонт — works на возврате уже легли в «события» (инфо) выше; кнопки-фиксацию ТО гасим.
+    if works and bike and mileage and _conf_ok and not _ret_ctx:
         seen_kinds = []
         for w in works:
             k = _classify_work(w)
