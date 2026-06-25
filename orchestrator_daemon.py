@@ -26,6 +26,7 @@ import signal
 import logging
 import datetime
 import subprocess
+import threading
 
 REPO = "/root/turbobaby-manager-bot"
 BRIDGE_GS = "/root/turbobaby-bridge-gs"
@@ -36,6 +37,7 @@ sys.path.insert(0, REPO)
 from bridge_client import BridgeClient
 
 POLL_SEC = 60            # пауза между опросами очереди
+HEARTBEAT_SEC = 45       # как часто фон-поток бьёт updated, пока claude -p исполняется (детект зависания)
 TASK_TIMEOUT = 600       # таймаут одной задачи (10 мин) — claude -p не должен висеть вечно
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
@@ -122,6 +124,17 @@ def _detect_needs_approval(text):
     return None
 
 
+def _heartbeat_loop(task_id, stop_event):
+    """Фон-поток: пока задача исполняется, каждые HEARTBEAT_SEC бьёт updated в Bridge
+    (доказывает, что демон жив → report_results на стороне Splinter не поднимет «завис»).
+    Ошибки heartbeat ГЛУШИМ — heartbeat не должен валить исполнение задачи."""
+    while not stop_event.wait(HEARTBEAT_SEC):
+        try:
+            bc.task_heartbeat(task_id)
+        except Exception as e:
+            log.warning("id=%s heartbeat упал (глушу): %s", task_id, e)
+
+
 def run_task(task_id, task_text):
     """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
     status ∈ done|failed|needs_approval (красная зона — самодекларация claude через маркер)."""
@@ -135,6 +148,10 @@ def run_task(task_id, task_text):
     child_env.pop("ANTHROPIC_API_KEY", None)
     child_env.pop("OPENAI_API_KEY", None)
     prompt = APPROVAL_PREAMBLE + task_text
+    # Heartbeat: фон-поток бьёт updated, пока claude -p блокирующе исполняется. Останавливаем в finally.
+    _hb_stop = threading.Event()
+    _hb = threading.Thread(target=_heartbeat_loop, args=(task_id, _hb_stop), daemon=True)
+    _hb.start()
     try:
         proc = subprocess.run(
             [CLAUDE_BIN, "-p", prompt],      # список аргументов, БЕЗ shell → нет инъекции через task_text
@@ -149,6 +166,9 @@ def run_task(task_id, task_text):
     except Exception as e:
         log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
         return "failed", f"ошибка запуска claude -p: {e}"
+    finally:
+        _hb_stop.set()
+        _hb.join(timeout=5)
 
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()

@@ -241,6 +241,11 @@ class BridgeClient:
         """Финал задачи: status='done'|'failed' + result → {ok}."""
         return self._post("complete_task", id=task_id, status=status, result=result)
 
+    def task_heartbeat(self, task_id) -> dict:
+        """Heartbeat задачи in_progress: бьёт updated=now (только если ещё in_progress) → {ok}.
+        Бьётся фоновым потоком демона, пока claude -p блокирующе исполняется (детект зависания)."""
+        return self._post("task_heartbeat", id=task_id)
+
     def set_needs_approval(self, task_id, what: str) -> dict:
         """Задача упёрлась в красную зону: status=needs_approval + result=<что собирается> → {ok}."""
         return self._post("set_needs_approval", id=task_id, what=what)

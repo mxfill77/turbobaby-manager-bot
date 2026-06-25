@@ -8,6 +8,7 @@ origin=agent → ЛЮБАЯ попытка красной записи лови�
 import os
 import re
 import time
+import datetime
 import logging
 import subprocess
 from collections import Counter
@@ -32,6 +33,10 @@ _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
 _reported = set()                       # id задач, уже отрапортованных (done/failed; дедуп, память процесса)
 _report_seeded = False                  # seed-on-start: не спамим историей done/failed при рестарте
 _asked = set()                          # id задач needs_approval, по которым УЖЕ задан вопрос (дедуп)
+# heartbeat/детект-зависания (части 1-2): анонс «в работе» и предупреждение «зависла» — по разу на задачу
+_inprogress_seen = set()                # id задач in_progress, по которым УЖЕ слали «🔄 в работе» (дедуп)
+_stalled = set()                        # id задач, по которым УЖЕ слали «⚠️ зависла» (дедуп)
+STALL_SEC = 720                         # in_progress с updated старше → демон завис/умер (TASK_TIMEOUT 600 + запас 120)
 
 # «да N» / «нет N» (+ англ., + опц. # и пунктуация) — ответ Филиппа на запрос подтверждения (заход 2б-2)
 _APPROVAL_RE = re.compile(r"^(да|нет|yes|no)\b[\s,.:]*#?\s*(\d+)\s*$", re.IGNORECASE)
@@ -81,6 +86,19 @@ def _try_enqueue(text, bridge):
                         f"Принесу результат сюда, когда будет done/failed.")
             return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
     return None
+
+
+def _task_age_sec(updated_iso):
+    """Возраст последнего updated задачи в секундах (по ISO из очереди). None при ошибке разбора
+    → зависание НЕ объявляем (лучше не пугать ложняком, чем поднять тревогу из-за парсинга)."""
+    try:
+        s = str(updated_iso).replace("Z", "+00:00")
+        t = datetime.datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
 
 
 async def report_results(context) -> None:
@@ -149,6 +167,41 @@ async def report_results(context) -> None:
                 await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
             except Exception as e:
                 log.warning("devbot.report_results: вопрос по задаче %s не ушёл (%s)", qid, e)
+
+    # in_progress (heartbeat/детект-зависания, части 1-2): «🔄 в работе» один раз + «⚠️ зависла» один раз.
+    # Анти-спам: дедуп _inprogress_seen / _stalled — НЕ шлём на каждом 45с-проходе.
+    try:
+        ip = bridge.get_pending("in_progress")
+    except Exception as e:
+        log.warning("devbot.report_results: опрос in_progress упал (%s)", e)
+        return
+    if not ip.get("ok"):
+        return
+    running = sorted((it for it in ip.get("items", []) if str(it.get("from")) == QUEUE_FROM),
+                     key=lambda x: int(x.get("id") or 0))
+    for it in running:
+        qid = it.get("id")
+        if qid not in _inprogress_seen:        # анонс «в работе» — один раз на задачу
+            _inprogress_seen.add(qid)
+            task_text = str(it.get("task_text") or "")[:120]
+            msg = f"🔄 Задача {qid} в работе…\n\n{task_text}"
+            for chunk in _chunks(msg):
+                try:
+                    await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+                except Exception as e:
+                    log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
+        if qid not in _stalled:                # детект зависания — один раз на задачу
+            age = _task_age_sec(it.get("updated"))
+            if age is not None and age > STALL_SEC:
+                _stalled.add(qid)
+                mins = int(age // 60)
+                w = (f"⚠️ Задача {qid} зависла — нет heartbeat ~{mins} мин (демон оркестратора не отвечает).\n"
+                     f"Проверь: systemctl status orchestrator-daemon")
+                for chunk in _chunks(w):
+                    try:
+                        await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+                    except Exception as e:
+                        log.warning("devbot.report_results: warn о зависании %s не ушло (%s)", qid, e)
 
 
 # ===================== ЗЕЛЁНЫЕ ЗАДАЧИ (read-only) =====================
