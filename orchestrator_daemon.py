@@ -129,6 +129,11 @@ def run_task(task_id, task_text):
     child_env = dict(os.environ)
     child_env.setdefault("HOME", "/root")
     child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    # Фикс утечки баланса: демон load_dotenv'ит .env (ради BRIDGE) → ANTHROPIC_API_KEY коллатерально
+    # попадает в os.environ. Снимаем его (и OPENAI) из child_env, чтобы claude -p шёл по ~/.claude (Max),
+    # а НЕ по платному API. Splinter не затронут (он ключ берёт из своего процесса, не через claude -p).
+    child_env.pop("ANTHROPIC_API_KEY", None)
+    child_env.pop("OPENAI_API_KEY", None)
     prompt = APPROVAL_PREAMBLE + task_text
     try:
         proc = subprocess.run(
