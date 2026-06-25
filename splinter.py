@@ -858,6 +858,21 @@ def _card_allowed(chat_id, topic_id):
 _RETURN_WORDS = ("верну", "вернул", "вернулся", "возврат", "сдал", "сдаёт", "сдает",
                  "приёмк", "приемк", "забрал", "отдал", "клиент верн")
 
+# HANDOVER-контекст (пакет «гейт выдачи»): байк ВЫДАЁТСЯ клиенту (НЕ возврат, НЕ стоянка, НЕ ремонт).
+# Дешёвый гейт: event_type=="handover" ИЛИ слова выдачи. Гасит советы по уходу/стоянке и нудёж «нет фото».
+_HANDOVER_WORDS = ("выда", "повезу клиент", "везу клиент", "доставлю клиент", "доставляю клиент",
+                   "отвезу клиент", "клиент забира", "клиент забер", "вручаю", "передаю клиент",
+                   "повёз клиент", "повез клиент", "уезжает к клиент", "уходит клиент")
+
+
+def _is_handover_context(parsed, text):
+    """True если байк ВЫДАЁТСЯ клиенту. Дёшево: event_type==handover ИЛИ слова выдачи в тексте.
+    (CRM/Delivery-сверка — отдельный «дорогой» этап, сюда НЕ тащим.)"""
+    if (parsed or {}).get("event_type") == "handover":
+        return True
+    blob = (text or "").lower()
+    return any(w in blob for w in _HANDOVER_WORDS)
+
 
 def _is_return_context(parsed, text, vis, bridge, bike):
     """True если это ВОЗВРАТ аренды (а не плановый сервис/ремонт). Дёшево сначала (event_type/слова),
@@ -868,7 +883,8 @@ def _is_return_context(parsed, text, vis, bridge, bike):
     blob = (text or "").lower()
     if any(w in blob for w in _RETURN_WORDS):
         return True
-    handback = (bool((vis or {}).get("damage")) or et == "handover"
+    # handover (выдача) УБРАН из handback — это НЕ возврат (отделён, гасится своим _ho_ctx на месте вызова).
+    handback = (bool((vis or {}).get("damage"))
                 or ((parsed or {}).get("fuel") and (parsed or {}).get("mileage")))
     if handback and bike:
         try:
@@ -3149,10 +3165,15 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     _u_sp = getattr(msg, "from_user", None)
     _sender = ("@" + _u_sp.username) if (_u_sp and getattr(_u_sp, "username", None)) else ""
 
-    # === RETURN-КОНТЕКСТ (пакет Б): возврат аренды имеет ПРИОРИТЕТ над ремонтом/ТО-заявкой ===
+    # === HANDOVER-КОНТЕКСТ (выдача клиенту) — ПРИОРИТЕТ над return; гасит советы ухода/стоянки и нудёж «нет фото» ===
+    _ho_ctx = _is_handover_context(parsed, text)
+    if _ho_ctx:
+        log.info(f"  → HANDOVER-контекст по {bike or '?'}: выдача клиенту (советы ухода/стоянки/нудёж-фото погашены)")
+
+    # === RETURN-КОНТЕКСТ (пакет Б): возврат аренды — ПРИОРИТЕТ над ремонтом/ТО-заявкой. НЕ при handover (выдача ≠ возврат) ===
     # При возврате гасим phase-1 intake и repair-наряд (works→ниже в «события» инфо, не наряд),
     # а ведём ветку ПРИЁМКИ (closing_upsert + пинг Пыму). Сигнал read-only (event_type/слова/CRM-статус).
-    _ret_ctx = _is_return_context(parsed, text, vis, bridge, bike)
+    _ret_ctx = (not _ho_ctx) and _is_return_context(parsed, text, vis, bridge, bike)
     if _ret_ctx:
         log.info(f"  → RETURN-контекст по {bike or '?'}: ветка приёмки (phase-1/наряд погашены)")
 
@@ -3336,7 +3357,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                     or event_type == "repair" or vis.get("kind") == "receipt"
                     or bool(vis.get("mileage"))
                     or _svc_question_open(chat_id, topic_id))
-    if vis.get("dirt") and not _service_ctx:
+    # HANDOVER: байк выдаётся клиенту — совет «помыть/воск/чехол» (стоянка) неуместен → гасим.
+    if vis.get("dirt") and not _service_ctx and not _ho_ctx:
         await _send(context,
             chat_id=chat_id,
             text=msg_dirty_care(bike),
@@ -3344,9 +3366,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         )
         return
 
-    # Возврат/сдача без топлива или пробега → напоминаем команде + Пыма
-    if event_type in ("return", "handover") and (not fuel or not mileage):
-        await _send(context, 
+    # Возврат без топлива/пробега → напоминаем фото. НЕ при handover (выдача — свой флоу) и НЕ если
+    # пробег темы уже свежий в буфере (бот уже видел одометр — не нудим повторно).
+    if (event_type in ("return", "handover") and (not fuel or not mileage)
+            and not _ho_ctx and not last_mileage_in_topic(chat_id, topic_id)):
+        await _send(context,
             chat_id=chat_id, text=msg_photo_reminder(bike), message_thread_id=topic_id
         )
 
