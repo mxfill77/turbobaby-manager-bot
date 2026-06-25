@@ -69,13 +69,13 @@ def test_dirt_fires_without_handover():
                             FakeClaude({"type": "none"}, vis={"dirt": True})))
     assert any("помыть" in s or "чехл" in s for s in SENDS), "вне выдачи грязь-совет должен сработать"
 
-# ---- handover НЕ возврат (не запускает closing-приёмку) ----
+# ---- ЧИСТАЯ выдача (байк ДОМА, без handback-сигнала) НЕ заводит closing ----
 def test_handover_not_return():
-    reset(); b = FakeBridge(status="В аренде")
-    run(S._handle_servicing(Msg("выдаю клиенту, бензин полный, пробег 33797"), Ctx(), b,
+    reset(); b = FakeBridge(status="ДОМА")   # выдача: байк был ДОМА/Бронь, не «В аренде»
+    run(S._handle_servicing(Msg("выдаю клиенту, повезу"), Ctx(), b,
                             FakeClaude({"type": "event", "event_type": "handover", "bike": BIKE,
-                                        "fuel": "полный", "mileage": "33797", "works": []})))
-    assert b.closing == [], f"выдача НЕ должна заводить лист закрытия: {b.closing}"
+                                        "fuel": "", "mileage": "", "works": []})))
+    assert b.closing == [], f"чистая выдача НЕ должна заводить лист закрытия: {b.closing}"
 
 def test_return_still_creates_closing():
     reset(); b = FakeBridge(status="В аренде")

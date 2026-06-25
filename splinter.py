@@ -3165,17 +3165,19 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     _u_sp = getattr(msg, "from_user", None)
     _sender = ("@" + _u_sp.username) if (_u_sp and getattr(_u_sp, "username", None)) else ""
 
-    # === HANDOVER-КОНТЕКСТ (выдача клиенту) — ПРИОРИТЕТ над return; гасит советы ухода/стоянки и нудёж «нет фото» ===
-    _ho_ctx = _is_handover_context(parsed, text)
-    if _ho_ctx:
-        log.info(f"  → HANDOVER-контекст по {bike or '?'}: выдача клиенту (советы ухода/стоянки/нудёж-фото погашены)")
-
-    # === RETURN-КОНТЕКСТ (пакет Б): возврат аренды — ПРИОРИТЕТ над ремонтом/ТО-заявкой. НЕ при handover (выдача ≠ возврат) ===
-    # При возврате гасим phase-1 intake и repair-наряд (works→ниже в «события» инфо, не наряд),
-    # а ведём ветку ПРИЁМКИ (closing_upsert + пинг Пыму). Сигнал read-only (event_type/слова/CRM-статус).
-    _ret_ctx = (not _ho_ctx) and _is_return_context(parsed, text, vis, bridge, bike)
+    # === RETURN-КОНТЕКСТ (пакет Б) — СЧИТАЕМ ПЕРВЫМ, ВОЗВРАТ ВЫИГРЫВАЕТ (Слой 1 наблюдателя выдач) ===
+    # Принцип: лучше лишний раз завести closing, чем ПОТЕРЯТЬ реальный возврат (деньги/закрытие важнее
+    # косметики советов). Поэтому _ret_ctx НЕ зависит от handover. При возврате гасим phase-1 intake и
+    # repair-наряд (works→в «события» инфо), ведём ветку ПРИЁМКИ (closing_upsert + пинг Пыму).
+    _ret_ctx = _is_return_context(parsed, text, vis, bridge, bike)
     if _ret_ctx:
         log.info(f"  → RETURN-контекст по {bike or '?'}: ветка приёмки (phase-1/наряд погашены)")
+
+    # === HANDOVER-КОНТЕКСТ (выдача клиенту) — ТОЛЬКО если это НЕ возврат. Гасит советы ухода/стоянки и нудёж «нет фото».
+    # Развязка: возврат имеет приоритет → конфликт «вернул…выдам» трактуется как ВОЗВРАТ (closing не теряем).
+    _ho_ctx = (not _ret_ctx) and _is_handover_context(parsed, text)
+    if _ho_ctx:
+        log.info(f"  → HANDOVER-контекст по {bike or '?'}: выдача клиенту (советы ухода/стоянки/нудёж-фото погашены)")
 
     # === ФАЗА 1 (двухфазный ТО): механик ЗАЯВИЛ работы (intake/масло-контекст, БЕЗ маркера «готово»
     # и без свежего пробега) → фиксируем НАМЕРЕНИЕ в «то_заявки», в Лист1/обслуживание НИЧЕГО.
