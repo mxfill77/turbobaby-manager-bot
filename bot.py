@@ -209,6 +209,11 @@ async def on_service_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await splinter.handle_service_button(update, context, bridge)
 
 
+async def on_devbot_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline-кнопки дев-бота (approve/reject/check/next) — вместо «да N». Только Филипп; → devbot."""
+    await devbot.handle_callback(update, context, bridge)
+
+
 # === HANDLERS ===
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1204,6 +1209,7 @@ def main():
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
     app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))
     app.add_handler(CallbackQueryHandler(on_service_button, pattern=r"^svc:"))
+    app.add_handler(CallbackQueryHandler(on_devbot_button, pattern=r"^(approve|reject|check|next):"))
 
     # Сервис-события форума (создание/переименование темы) → привязка тема→байк
     app.add_handler(MessageHandler(

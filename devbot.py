@@ -13,6 +13,8 @@ import logging
 import subprocess
 from collections import Counter
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 import bridge_client
 
 log = logging.getLogger(__name__)
@@ -88,6 +90,168 @@ def _try_enqueue(text, bridge):
     return None
 
 
+# ===================== INLINE-КНОПКИ (вместо «да N») =====================
+# Спека: KB_DEVBOT_BUTTONS_SPEC. Под needs_approval — ✅/❌ (одноразовые) + 🔄/📋 (многоразовые);
+# под done — только 🔄/📋. callback_data: approve|reject|check|next : <id>. Зелёная зона (UI Splinter).
+def _kb_approval(qid):
+    """Кнопки под needs_approval: одноразовые ✅ Да, деплой / ❌ Нет + многоразовые 🔄 Проверь / 📋 Дальше."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, деплой", callback_data=f"approve:{qid}"),
+         InlineKeyboardButton("❌ Нет", callback_data=f"reject:{qid}")],
+        [InlineKeyboardButton("🔄 Проверь", callback_data=f"check:{qid}"),
+         InlineKeyboardButton("📋 Дальше", callback_data=f"next:{qid}")],
+    ])
+
+
+def _kb_done(qid):
+    """Кнопки под done: многоразовые 🔄 Проверь / 📋 Дальше (✅/❌ тут не нужны — задача уже завершена)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Проверь", callback_data=f"check:{qid}"),
+         InlineKeyboardButton("📋 Дальше", callback_data=f"next:{qid}")],
+    ])
+
+
+def _find_task(bridge, qid):
+    """Найти задачу по id среди всех статусов очереди → (status, item) | (None, None). read-only (get_pending)."""
+    for st in ("needs_approval", "approved", "in_progress", "new", "done", "failed"):
+        try:
+            r = bridge.get_pending(st)
+        except Exception:
+            continue
+        if not r.get("ok"):
+            continue
+        for it in r.get("items", []):
+            if str(it.get("id")) == str(qid):
+                return st, it
+    return None, None
+
+
+async def _strip_and_mark(q, mark):
+    """Одноразовые ✅/❌: убрать кнопки и дописать пометку к тексту сообщения.
+    editMessageText заодно снимает reply_markup; если упало — хотя бы снять кнопки."""
+    base = (q.message.text or "") if q.message else ""
+    new_text = f"{base}\n\n{mark}" if base else mark
+    try:
+        await q.edit_message_text(text=new_text)
+    except Exception as e:
+        log.warning("devbot._strip_and_mark: edit_message_text упал (%s)", e)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def _send_thread(context, q, text):
+    """Отдельным сообщением в ту же тему (для многоразовых 🔄/📋 — исходные кнопки остаются)."""
+    tid = getattr(q.message, "message_thread_id", None) or DEVBOT_TOPIC
+    for chunk in _chunks(text):
+        try:
+            await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=tid, text=chunk)
+        except Exception as e:
+            log.warning("devbot._send_thread: отправка не прошла (%s)", e)
+
+
+async def _cb_approve(q, qid, bridge):
+    """approve:<id> → approve_task (та же логика «да N»). ОДНОРАЗОВО + идемпотентность."""
+    r = bridge.approve_task(qid, "Filipp")
+    if r.get("ok"):
+        _reported.discard(qid)            # пусть дальнейший done/failed отрапортуется штатно
+        await q.answer("✅ одобрено")
+        await _strip_and_mark(q, "✅ одобрено")
+    elif r.get("error") == "not_awaiting":
+        # уже approved/done/failed → идемпотентно: сообщить + убрать кнопки (гонка/повторный тап)
+        await q.answer("уже обработано")
+        await _strip_and_mark(q, f"✅ уже обработано (статус {r.get('status')})")
+    elif r.get("error") == "not_found":
+        await q.answer("задачи нет в очереди")
+        await _strip_and_mark(q, "🤖 задачи нет в очереди")
+    else:
+        await q.answer(f"approve не прошёл: {r.get('error')}")
+
+
+async def _cb_reject(q, qid, bridge):
+    """reject:<id> → complete_task failed (как «нет N»). ОДНОРАЗОВО."""
+    r = bridge.complete_task(qid, "failed", "отклонено Филиппом (кнопка)")
+    if r.get("ok"):
+        _reported.add(qid)                # уже сообщили «отклонена» — не дублируем failed-рапортом
+        await q.answer("❌ отклонено")
+        await _strip_and_mark(q, "❌ отклонено")
+    elif r.get("error") == "not_found":
+        await q.answer("задачи нет в очереди")
+        await _strip_and_mark(q, "🤖 задачи нет в очереди")
+    else:
+        await q.answer(f"reject не прошёл: {r.get('error')}")
+
+
+async def _cb_check(context, q, qid, bridge):
+    """check:<id> → свежий статус задачи. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
+    await q.answer("проверяю…")
+    status, item = _find_task(bridge, qid)
+    if status is None:
+        txt = f"🔄 Задача {qid}: не найдена в очереди."
+    else:
+        res = (item.get("result") or "").strip()
+        upd = item.get("updated") or ""
+        txt = f"🔄 Задача {qid}: статус {status}" + (f"\nupdated: {upd}" if upd else "")
+        if res:
+            txt += f"\n\n{res[:1500]}"
+    await _send_thread(context, q, txt)
+
+
+async def _cb_next(context, q, qid, bridge):
+    """next:<id> → подсказка по следующему шагу. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
+    await q.answer("📋")
+    status, _item = _find_task(bridge, qid)
+    if status is None:
+        txt = f"📋 Задача {qid}: не найдена — поставь новую командой «задача: <что сделать>»."
+    elif status == "done":
+        txt = (f"📋 Задача {qid} — done. Следующий шаг: новой командой «задача: <что дальше>» "
+               f"или 🔄 Проверь для свежего статуса.")
+    elif status == "needs_approval":
+        txt = f"📋 Задача {qid} ждёт твоего решения (красная зона). Тапни ✅ Да, деплой / ❌ Нет."
+    elif status in ("approved", "in_progress", "new"):
+        txt = f"📋 Задача {qid}: статус {status} — в работе. Жди завершения или 🔄 Проверь."
+    else:
+        txt = f"📋 Задача {qid}: статус {status}."
+    await _send_thread(context, q, txt)
+
+
+async def handle_callback(update, context, bridge) -> None:
+    """Inline-кнопки дев-бота (вместо «да N»). ТОЛЬКО Филипп (504608015); чужой → answer «не для тебя».
+    answerCallbackQuery на каждый тап. approve/reject — одноразовые; check/next — многоразовые."""
+    q = update.callback_query
+    if not q:
+        return
+    uid = q.from_user.id if q.from_user else None
+    if uid != DEVBOT_USER:
+        await q.answer("не для тебя", show_alert=False)
+        return
+    try:
+        action, sid = (q.data or "").split(":", 1)
+        qid = int(sid)
+    except Exception:
+        await q.answer()
+        return
+    # origin=human (как «да N»): тап Филиппа = ручное действие, токен-замок 4.2 не вмешивается.
+    try:
+        if action == "approve":
+            await _cb_approve(q, qid, bridge)
+        elif action == "reject":
+            await _cb_reject(q, qid, bridge)
+        elif action == "check":
+            await _cb_check(context, q, qid, bridge)
+        elif action == "next":
+            await _cb_next(context, q, qid, bridge)
+        else:
+            await q.answer()
+    except Exception as e:
+        log.exception("devbot.handle_callback error (%s:%s)", action, qid)
+        try:
+            await q.answer(f"ошибка: {type(e).__name__}")
+        except Exception:
+            pass
+
+
 def _task_age_sec(updated_iso):
     """Возраст последнего updated задачи в секундах (по ISO из очереди). None при ошибке разбора
     → зависание НЕ объявляем (лучше не пугать ложняком, чем поднять тревогу из-за парсинга)."""
@@ -137,9 +301,13 @@ async def report_results(context) -> None:
         emoji = "✅" if st == "done" else "❌"
         body = it.get("result") or "(пустой результат)"
         head = f"{emoji} Задача {qid} — {st}\n\n{body}"
-        for chunk in _chunks(head):
+        chunks = _chunks(head)
+        for i, chunk in enumerate(chunks):
+            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": DEVBOT_TOPIC, "text": chunk}
+            if st == "done" and i == len(chunks) - 1:   # 🔄/📋 только под done, на последнем чанке
+                kw["reply_markup"] = _kb_done(qid)
             try:
-                await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+                await context.bot.send_message(**kw)
             except Exception as e:
                 log.warning("devbot.report_results: отправка результата задачи %s упала (%s)", qid, e)
 
@@ -161,10 +329,14 @@ async def report_results(context) -> None:
         _asked.add(qid)
         what = it.get("result") or "(не уточнено)"
         q = (f"⚠️ Задача {qid} требует подтверждения красной зоны:\n\n{what}\n\n"
-             f"Подтвердить? Ответь «да {qid}» (разрешить) или «нет {qid}» (отклонить).")
-        for chunk in _chunks(q):
+             f"Подтвердить? Тапни кнопку ниже — или ответь «да {qid}» / «нет {qid}».")
+        chunks = _chunks(q)
+        for i, chunk in enumerate(chunks):
+            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": DEVBOT_TOPIC, "text": chunk}
+            if i == len(chunks) - 1:   # кнопки ✅/❌/🔄/📋 на последнем чанке
+                kw["reply_markup"] = _kb_approval(qid)
             try:
-                await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+                await context.bot.send_message(**kw)
             except Exception as e:
                 log.warning("devbot.report_results: вопрос по задаче %s не ушёл (%s)", qid, e)
 
