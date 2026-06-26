@@ -424,6 +424,22 @@ class BridgeClient:
         """Закрыть заявку (status='закрыто')."""
         return self._post("service_pending_close", **fields)
 
+    # === Состояние байка (Этап 1 трекинга — bot-owned слой «состояние_байка», НЕ CRM/Лист1) ===
+    def state_set(self, **fields) -> dict:
+        """Upsert состояния байка по bike (точное название = ключ). Переданные поля
+        перезаписывают, остальные сохраняются. status ∈ {в аренде/к возврату/дома/офис/ремонт}
+        (валидируется на Bridge). Поля: bike(обяз.), status, location, booking_id, client,
+        date_out, date_due, date_back, service_name, last_event_msg_id."""
+        return self._post("state_set", **fields)
+
+    def state_get(self, bike: str) -> dict:
+        """Состояние одного байка по точному названию. → {ok, item} | {ok:false, error:'not_found'}."""
+        return self._post("state_get", bike=bike)
+
+    def state_list(self) -> dict:
+        """Срез состояния всего парка (кто где сейчас). → {ok, items, total}."""
+        return self._post("state_list")
+
     def trash_brain_file(self, id) -> dict:
         """Удалить (в корзину) файл ВНУТРИ Brain-папки по id. not_in_brain если файл вне Brain."""
         return self._post("trash_brain_file", id=str(id))
