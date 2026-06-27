@@ -3264,6 +3264,25 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         except Exception as e:
             log.warning(f"  → closing авто-создание не удалось: {e}")
 
+    # === ВЫДАЧА (этап 2 трекинга): на handover-контексте фиксируем state «в аренде» в bot-owned
+    # вкладке состояния. Зеркало ветки возврата выше (_ret_ctx). Источник деталей = CRM
+    # (_closing_resolve_booking), текст = только триггер. Защита от дубля = простой upsert по bike
+    # (идемпотентно, без гейта на смену статуса). guard: пустой bike → пропуск + лог (не пишем мусор).
+    if _ho_ctx and bike:
+        try:
+            _bid, _bname, _bend = _closing_resolve_booking(bridge, bike)
+            _bk = (bridge.find_bike(bike) or {}).get("name") or bike   # каноничное имя = ключ вкладки
+            bridge.state_set(bike=_bk, status="в аренде", client=_bname,
+                             date_due=_bend, booking_id=(_bid or ""),
+                             last_event_msg_id=_ev_msg_id)
+            log.info(f"  → state выдача (handover-ctx): bike={_bk} status=в аренде "
+                     f"booking_id={_bid} client={_bname or '-'} date_due={_bend or '-'}"
+                     + ("" if _bid else " | бронь не найдена (детали добьются позже)"))
+        except Exception as e:
+            log.warning(f"  → state выдача не удалась: {e}")
+    elif _ho_ctx and not bike:
+        log.info("  → state выдача пропущена: handover-ctx, но bike пуст (не пишем мусор)")
+
     # ЕДИНАЯ СВОДКА: инфо-работы записаны (flush/немедленно) → НЕ шлём отдельно, копим в накопитель.
     # Сводка уйдёт ОДНИМ сообщением в терминальной точке цикла (после масла/столбцов).
     if _logged_works:
