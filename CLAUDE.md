@@ -66,9 +66,37 @@ Claude Code правит `.gs` локально и деплоит Bridge сам 
   - Нужен включённый Apps Script API: https://script.google.com/home/usersettings (одноразово).
 - Прод важнее зеркала: при расхождении `/root/turbobaby-bridge-gs` (= прод) важнее `ReadDocs.gs` в репо.
 
-## Каналы «мозга» (Brain на Drive)
-- `cc_log` (KB_claude_code_log) — журнал задач Claude Code: PLAN/DONE/NOTE, новые записи СВЕРХУ.
-- `review` (KB_claude_review) — канал ревью Claude Code ↔ Claude на сайте (см. memory: review-policy).
+## Каналы «мозга» (Brain на Drive) — обновлено 27.06.2026 (перестройка мозга)
+
+**ТОЧКА ВХОДА №1 = `KB_MASTER`** (id `1-bH3b6c_oamqST551iLxn-voSDragdV0rUZkFwgmAqc`) — единая карта проекта:
+сверх-цель, главная ось (оркестратор-дирижёр), архитектура/исполнители/маршрутизация, что в проде / что строится /
+что тупиково / куда дальше, навигация по мозгу, РАЗДЕЛ 6 «РИТМ РЕВИЗИИ». Новую тему/разворот сверять с KB_MASTER ДО действия.
+
+ЖИВЫЕ СВОДЫ (ведёт Claude Code через `write_doc(id/name)`, точечно, без дублей):
+- `KB_RULES` (key `rules`) — свод правил работы (маршрутизация recon→Termux, не сечь паузы, проверять через мозг,
+  Dispatch ASK-строки, «штаб не плодит файлы»).
+- `KB_INFRA` (key `infra`) — свод карты инфраструктуры таблиц (форма→клиенты→Байки, формулы CRM/Байки, прайсы, формы Apps Script).
+- `KB_STATE_MODEL` (key `state_model`) — свод модели состояний байка и цикла бронь→аренда→возврат.
+- `KB_ROADMAP_v2` / `KB_NORTH_STAR` / `KB_executors_map` / `KB_ORCHESTRATOR_PLAN` / `KB_ORCHESTRATOR_SAFETY` —
+  план со статусами / ось / исполнители / лестница оркестратора.
+
+БАЗА (git → Drive зеркало, истина = `docs/*.md`): `project_state` / `knowledge_base` / `faq` / `park_list`.
+
+ЖУРНАЛЫ (Brain-only, новые записи СВЕРХУ):
+- `cc_log` (KB_claude_code_log) — журнал Claude Code: PLAN/DONE/NOTE/BLOCKED.
+- `review` (KB_claude_review) — ревью Claude Code ↔ Claude на сайте (см. memory: review-policy).
+- `sessions_log` — хроника сессий (+ `*_archive` у журналов).
+
+**ПРАВИЛО ГИГИЕНЫ МОЗГА (перестройка 27.06):** штаб НЕ плодит файлы в Drive россыпью. ЖИВЫЕ доки
+(KB_MASTER / своды / роадмап / правила) ведёт **Claude Code через `write_doc(id)`**, точечно, в существующий док.
+ЭФЕМЕРНОЕ (спеки/разведки/планы конкретных задач) → в `cc_log`, НЕ в вечные KB; его живой ВЫВОД поднимается
+в нужный свод/KB_MASTER, а оболочка уходит в подпапку **`Brain/_archive`** (обратимый move через Bridge `move_brain_file`).
+Слитые источники (`KB_RULE_*` / `KB_INFRA_*` / `KB_STATE_*` / `KB_*_SPEC` / `*_DONE` / `KB_RECON_*`) и старые дубли
+(старый `KB_ROADMAP_v2`, `KB_ROADMAP_MASTER`, пустой `KB_index`) — УЖЕ в `_archive` / удалены, по имени их не искать.
+
+**РИТМ РЕВИЗИИ (KB_MASTER §6):** по триггерам (закрыта веха оси O1-O4 / накопилось ~10+ эфемерных / ~2 недели /
+замечено расхождение мозг↔код) прогонять чек-лист [1-8]. **Пункт 7 = синхронизировать ЭТОТ CLAUDE.md** с рамкой
+штаба и сводами (как сделано 27.06: добавлены KB_MASTER-точка-входа, своды, правило гигиены).
 
 ## РЕЖИМ РАБОТЫ (применять во ВСЕХ задачах TurboBaby) — заведено 7 июня 2026
 Этот раздел — главный над «Главными правилами» выше: он уточняет, где автономия, а где стоп.
