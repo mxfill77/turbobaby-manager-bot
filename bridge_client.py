@@ -444,6 +444,11 @@ class BridgeClient:
         """Удалить (в корзину) файл ВНУТРИ Brain-папки по id. not_in_brain если файл вне Brain."""
         return self._post("trash_brain_file", id=str(id))
 
+    def move_brain_file(self, id, folder: str = "_archive") -> dict:
+        """Переместить файл из Brain-папки в подпапку (по умолч. _archive). Обратимо (файл цел).
+        not_in_brain если файл не лежит прямо в Brain-папке."""
+        return self._post("move_brain_file", id=str(id), folder=str(folder))
+
     def register_brain_doc(self, name, id, overwrite: bool = False) -> dict:
         """Зарегистрировать Brain-файл в BRAIN_MANIFEST (ключ name→id, мерж). Существующий ключ
         не меняется без overwrite=True. Файл должен быть в Brain-папке."""
