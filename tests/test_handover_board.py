@@ -1,6 +1,6 @@
 """Моки ТАБЛО ВЫДАЧИ (Delivery, слой 1 O3) — упрощённый флоу БЕЗ переспроса.
-Доска: под каждой бронью 2 кнопки в ряд — «✅ Выдан» (выдать плановый СРАЗУ) и «🔁 Другой» (подмена).
-Проверяет: доска 2 кнопки/бронь, «Выдан»→state_set 1 раз+разъём 💵 (без переспроса, новым сообщением),
+ОДНА бронь = ОТДЕЛЬНАЯ КАРТОЧКА (отдельный пост) с данными брони + её 2 кнопки: «✅ Выдан» и «🔁 Другой».
+Проверяет: N броней → N карточек + шапка дня, «Выдан»→state_set 1 раз+разъём 💵 (без переспроса, новым сообщением),
 «Другой»→список байков дома кнопками→pick→замена байка+state, pay не пишет, устаревший токен, тест-режим/префикс."""
 import os, sys, asyncio
 sys.path.insert(0, "/root/turbobaby-manager-bot")
@@ -65,29 +65,43 @@ def _reset():
     S._HB_TOKENS.clear(); S._HB_SEQ[0] = 0
     S.HB_TEST_MODE = False   # 6 тестов ниже — БОЕВОЙ путь (clients/fleet/find_bike)
 
+def _cards(ctx):
+    """Карточки = сообщения С кнопками (шапка дня — без кнопок, не карточка)."""
+    return [m for m in ctx.bot.sent if m.get("reply_markup") is not None]
+
 def _post_board(br, ctx):
     asyncio.run(S.hb_post_board(ctx, br))
-    return ctx.bot.sent[-1]["reply_markup"]
+    return _cards(ctx)
 
 def _hand_tok(markup):
-    # первая строка доски = [✅ Выдан (hand), 🔁 Другой (other)] → берём hand-токен
+    # карточка одной брони = [✅ Выдан (hand)], [🔁 Другой (other)] → берём hand-токен
     return int([c for c in _cbs(markup) if c.startswith("delivery:hand:")][0].split(":")[2])
 
+def _first_tok(cards):
+    return _hand_tok(cards[0]["reply_markup"])
 
-def test_board_two_buttons_per_booking():
+
+def test_board_separate_cards():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
-    mk = _post_board(br, ctx)
-    cbs = _cbs(mk)
-    assert len(cbs) == 4, f"2 брони × 2 кнопки = 4, а {len(cbs)}"   # XMAX/ADV отсеяны
-    assert sum(c.startswith("delivery:hand:") for c in cbs) == 2, cbs
-    assert sum(c.startswith("delivery:other:") for c in cbs) == 2, cbs
-    body = ctx.bot.sent[-1]["text"]
-    assert "Выдачи на сегодня" in body and "Другой байк" in body   # легенда: ✅ и 🔁 (без 💵)
-    assert "Оплата" not in body, "на доске 💵 в легенде быть НЕ должно"
+    cards = _post_board(br, ctx)
+    assert len(cards) == 2, f"2 брони = 2 ОТДЕЛЬНЫЕ карточки, а {len(cards)}"   # XMAX/ADV отсеяны
+    for m in cards:
+        cbs = _cbs(m["reply_markup"])
+        assert len(cbs) == 2, f"под карточкой ровно 2 кнопки (✅ + 🔁), а {len(cbs)}"
+        assert sum(c.startswith("delivery:hand:") for c in cbs) == 1, cbs
+        assert sum(c.startswith("delivery:other:") for c in cbs) == 1, cbs
+        kb = m["reply_markup"].inline_keyboard
+        assert kb[0][0].text.startswith("✅ "), "кнопка выдачи = эмодзи+данные её байка"
+        assert kb[1][0].text == "🔁", "под ней голая 🔁 (подмена ЭТОГО байка)"
+        assert "Выдача" in m["text"] and "Оплата" not in m["text"], m["text"]
+    # шапка дня — ПЕРВЫМ сообщением, БЕЗ кнопок, с числом выдач
+    header = ctx.bot.sent[0]
+    assert header.get("reply_markup") is None, "шапка дня без кнопок"
+    assert "Выдачи на сегодня" in header["text"] and "(2)" in header["text"], header["text"]
 
 def test_hand_direct_state_once_money_no_reask():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
-    tok = _hand_tok(_post_board(br, ctx))
+    tok = _first_tok(_post_board(br, ctx))
     n_before = len(ctx.bot.sent)
     q = FakeQuery(f"delivery:hand:{tok}")
     asyncio.run(S.handle_delivery_button(FakeUpdate(q), ctx, br))
@@ -103,7 +117,7 @@ def test_hand_direct_state_once_money_no_reask():
 
 def test_other_then_pick_replaces_bike():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
-    tok = _hand_tok(_post_board(br, ctx))
+    tok = _first_tok(_post_board(br, ctx))
     qo = FakeQuery(f"delivery:other:{tok}")
     asyncio.run(S.handle_delivery_button(FakeUpdate(qo), ctx, br))
     lst = ctx.bot.sent[-1]                      # список замены — НОВЫМ сообщением
@@ -122,7 +136,7 @@ def test_other_then_pick_replaces_bike():
 
 def test_back_cancels_no_write():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
-    tok = _hand_tok(_post_board(br, ctx))
+    tok = _first_tok(_post_board(br, ctx))
     asyncio.run(S.handle_delivery_button(FakeUpdate(FakeQuery(f"delivery:other:{tok}")), ctx, br))  # открыли список замены
     assert any(c == f"delivery:back:{tok}" for c in _cbs(ctx.bot.sent[-1]["reply_markup"])), "на списке есть ◀️ Назад"
     qb = FakeQuery(f"delivery:back:{tok}")
@@ -134,7 +148,7 @@ def test_back_cancels_no_write():
 
 def test_pay_inactive_no_write():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
-    tok = _hand_tok(_post_board(br, ctx))
+    tok = _first_tok(_post_board(br, ctx))
     asyncio.run(S.handle_delivery_button(FakeUpdate(FakeQuery(f"delivery:hand:{tok}")), ctx, br))
     n = len(br.state_calls)
     qp = FakeQuery(f"delivery:pay:{tok}")
@@ -153,13 +167,14 @@ def test_zz_test_mode_hq_mock_prefix():
     _reset(); S.HB_TEST_MODE = True
     br = FakeBridge(); ctx = FakeCtx()
     try:
-        asyncio.run(S.hb_post_board(ctx, br))
-        sent = ctx.bot.sent[-1]
-        assert sent["chat_id"] == S.HB_TEST_CHAT_ID, "тест-доска в HQ"
-        assert "ТЕСТ" in sent["text"]
-        cbs = _cbs(sent["reply_markup"])
-        assert len(cbs) == 6, f"3 выдуманные брони × 2 кнопки = 6, а {len(cbs)}"
-        tok = _hand_tok(sent["reply_markup"])
+        cards = _post_board(br, ctx)
+        assert len(cards) == 3, f"3 выдуманные брони = 3 ОТДЕЛЬНЫЕ карточки, а {len(cards)}"
+        for m in cards:
+            assert m["chat_id"] == S.HB_TEST_CHAT_ID, "тест-карточки в HQ"
+            assert "ТЕСТ" in m["text"]
+            assert len(_cbs(m["reply_markup"])) == 2, "под каждой карточкой 2 кнопки (✅ + 🔁)"
+        assert ctx.bot.sent[0]["chat_id"] == S.HB_TEST_CHAT_ID, "шапка дня тоже в HQ"
+        tok = _first_tok(cards)
         asyncio.run(S.handle_delivery_button(FakeUpdate(FakeQuery(f"delivery:hand:{tok}")), ctx, br))
         assert len(br.state_calls) == 1, br.state_calls
         assert br.state_calls[0]["bike"].startswith("🧪ТЕСТ "), br.state_calls[0]

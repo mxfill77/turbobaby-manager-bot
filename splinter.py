@@ -2730,10 +2730,18 @@ def _hb_home_bikes(bridge):
             if str(b.get("status", "")).strip().upper() == "ДОМА" and b.get("name")]
 
 
+def _hb_area(note):
+    """Район доставки из note брони (атрибут карточки), если указан. Пусто — если нет.
+    Карточка ВЫДАЧИ район показывает опционально; у карточки ЗАБОРА он станет обязательной ЛОКАЦИЕЙ."""
+    import re
+    m = re.search(r"(?:доставка|район|delivery|area)\s*[:：]\s*([^|;\n]+)", str(note or ""), re.I)
+    return m.group(1).strip() if m else ""
+
+
 async def hb_post_board(context, bridge):
-    """РУЧНОЙ репост «доски броней дня». Под каждой бронью — кнопка «✅ Выдан».
-    ТЕСТ-РЕЖИМ (HB_TEST_MODE): постит в HQ на ВЫДУМАННЫХ бронях (реальный CRM не читаем).
-    БОЕВОЙ: постит в Delivery, брони из clients(сегодня). (morning-job — следующий слой.)"""
+    """РУЧНОЙ репост выдач дня. ОДНА бронь = ОТДЕЛЬНАЯ КАРТОЧКА (отдельный пост) с данными
+    ЭТОЙ брони (байк·клиент·дата·[район]) + её 2 кнопки (✅ Выдан / 🔁 Другой). Утром бот постит N карточек.
+    ТЕСТ-РЕЖИМ (HB_TEST_MODE): в HQ на ВЫДУМАННЫХ бронях. БОЕВОЙ: в Delivery, брони из clients(сегодня)."""
     target = HB_TEST_CHAT_ID if HB_TEST_MODE else DELIVERY_CHAT_ID
     bookings = _HB_TEST_BOOKINGS if HB_TEST_MODE else _hb_bookings_today(bridge)
     _tth = ["🧪 ทดสอบ"] if HB_TEST_MODE else []
@@ -2743,22 +2751,37 @@ async def hb_post_board(context, bridge):
             _tth + ["📋 รายการส่งมอบวันนี้", "ไม่มีรายการส่งมอบวันนี้"],
             _tru + ["📋 Выдачи на сегодня", "Броней на выдачу сегодня нет."]))
         return
-    rows = []
+    n = len(bookings)
+    # ШАПКА дня (отдельным сообщением, БЕЗ кнопок). «Итог дня» (сводка неподтверждённых выдач) —
+    # МЕСТО заложено (футер-строка ПОСЛЕ карточек); сам свод строится в следующем слое, не сейчас.
+    await _send(context, chat_id=target, text=_bilingual(None,
+        _tth + [f"📋 รายการส่งมอบวันนี้ ({n})"],
+        _tru + [f"📋 Выдачи на сегодня ({n})"]))
+    # ОТДЕЛЬНАЯ КАРТОЧКА на КАЖДУЮ бронь (отдельный пост) — НЕ общий список.
     for c in bookings:
         bike = str(c.get("bike") or "").strip()
         client = str(c.get("name") or "").strip()
+        due = str(c.get("date_end") or "").strip()
+        area = _hb_area(c.get("note"))
         tok = _hb_put({"chat": target, "msg_id": None, "bike": bike, "client": client,
-                       "date_due": str(c.get("date_end") or ""), "booking_id": str(c.get("booking_id") or ""),
+                       "date_due": due, "booking_id": str(c.get("booking_id") or ""),
                        "handed": False, "candidates": [], "test": HB_TEST_MODE})
-        # ВЕРТИКАЛЬНО: широкая кнопка выдачи (эмодзи+данные, во всю ширину — модель не режется),
-        # под ней голая 🔁 (подмена). Слова — в легенде поста, НЕ на кнопках.
-        rows.append([InlineKeyboardButton(f"✅ {bike} · {client}"[:64], callback_data=f"delivery:hand:{tok}")])
-        rows.append([InlineKeyboardButton("🔁", callback_data=f"delivery:other:{tok}")])
-    txt = _bilingual(None,            # легенда актуальная: на доске есть ✅ и 🔁 (оплата 💵 — только после выдачи)
-        _tth + ["📋 รายการส่งมอบวันนี้", "", "✅ ส่งมอบ", "🔁 เปลี่ยนรถ"],
-        _tru + ["📋 Выдачи на сегодня", "", "✅ Выдан", "🔁 Другой байк"])
-    await _send(context, chat_id=target, text=txt, reply_markup=InlineKeyboardMarkup(rows))
-    log.info(f"  → HB: доска выдач запощена ({len(bookings)} броней, test={HB_TEST_MODE}, chat={target})")
+        th_d = [f"{bike} · {client}"]; ru_d = [f"{bike} · {client}"]
+        if due:
+            th_d.append(f"ถึง {due}"); ru_d.append(f"до {due}")
+        if area:
+            th_d.append(f"📍 {area}"); ru_d.append(f"📍 {area}")
+        # КАРТОЧКА ОДНОЙ брони: данные брони + легенда (✅ и 🔁 — только актуальные эмодзи карточки).
+        txt = _bilingual(None,
+            _tth + ["🛵 ส่งมอบรถ"] + th_d + ["", "✅ ส่งมอบ", "🔁 เปลี่ยนรถ"],
+            _tru + ["🛵 Выдача"]    + ru_d + ["", "✅ Выдан", "🔁 Другой байк"])
+        # ВЕРТИКАЛЬНО, под ЕЁ ОДИН байк: широкая ✅ (эмодзи+данные) + голая 🔁 (подмена ЭТОГО байка).
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ {bike} · {client}"[:64], callback_data=f"delivery:hand:{tok}")],
+            [InlineKeyboardButton("🔁", callback_data=f"delivery:other:{tok}")],
+        ])
+        await _send(context, chat_id=target, text=txt, reply_markup=kb)
+    log.info(f"  → HB: {n} карточек выдач запощено (по одной на бронь, test={HB_TEST_MODE}, chat={target})")
 
 
 async def _hb_mark(q, mark, kb=None):
