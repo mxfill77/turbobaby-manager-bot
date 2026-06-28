@@ -2744,17 +2744,21 @@ async def hb_post_board(context, bridge):
             _tru + ["📋 Выдачи на сегодня", "Броней на выдачу сегодня нет."]))
         return
     rows = []
+    _tp = "🧪 " if HB_TEST_MODE else ""
     for c in bookings:
         bike = str(c.get("bike") or "").strip()
         client = str(c.get("name") or "").strip()
         tok = _hb_put({"chat": target, "msg_id": None, "bike": bike, "client": client,
                        "date_due": str(c.get("date_end") or ""), "booking_id": str(c.get("booking_id") or ""),
                        "handed": False, "candidates": [], "test": HB_TEST_MODE})
-        lbl = ("🧪 " if HB_TEST_MODE else "") + f"✅ {bike} · {client}"   # кнопка = эмодзи + ДАННЫЕ (смысл — в легенде)
-        rows.append([InlineKeyboardButton(lbl[:60], callback_data=f"delivery:hand:{tok}")])
-    txt = _bilingual(None,            # легенда ТОЛЬКО актуальная: на доске кнопки только ✅ Выдан
-        _tth + ["📋 รายการส่งมอบวันนี้", "", "✅ ส่งมอบ"],
-        _tru + ["📋 Выдачи на сегодня", "", "✅ Выдан"])
+        # две кнопки в ряд: выдать ПЛАНОВЫЙ байк сразу / подмена на другой (без промежуточного переспроса)
+        rows.append([
+            InlineKeyboardButton((_tp + f"✅ Выдан · {bike} · {client}")[:60], callback_data=f"delivery:hand:{tok}"),
+            InlineKeyboardButton((_tp + f"🔁 Другой · {client}")[:40], callback_data=f"delivery:other:{tok}"),
+        ])
+    txt = _bilingual(None,            # легенда актуальная: на доске есть ✅ и 🔁 (оплата 💵 — только после выдачи)
+        _tth + ["📋 รายการส่งมอบวันนี้", "", "✅ ส่งมอบ", "🔁 เปลี่ยนรถ"],
+        _tru + ["📋 Выдачи на сегодня", "", "✅ Выдан", "🔁 Другой байк"])
     await _send(context, chat_id=target, text=txt, reply_markup=InlineKeyboardMarkup(rows))
     log.info(f"  → HB: доска выдач запощена ({len(bookings)} броней, test={HB_TEST_MODE}, chat={target})")
 
@@ -2773,11 +2777,11 @@ async def _hb_mark(q, mark, kb=None):
             pass
 
 
-async def _hb_do_handover(q, bridge, tok, d, bike):
-    """Подтверждение выдачи: state_set('в аренде') — ВЕРБАТИМ паттерн splinter.py (handover-ветка):
-    каноничное имя из find_bike; client/date_due/booking_id из резолва, захваченного на доске (для замены
-    байка бронь та же, меняется только байк). Зелёная (state_set НЕ в REDZONE_LOCK).
-    После — денежный РАЗЪЁМ (НЕ активен, следующий слой)."""
+async def _hb_do_handover(q, context, bridge, tok, d, bike, edit):
+    """Подтверждение выдачи: state_set('в аренде') — каноничное имя из find_bike; client/date_due/booking_id
+    из резолва, захваченного на доске (для замены байка бронь та же, меняется только байк). Зелёная (не REDZONE).
+    edit=False → подтверждение НОВЫМ сообщением (путь «✅ Выдан» с доски — доску не трогаем);
+    edit=True → правим ТЕКУЩЕЕ сообщение (путь «🔁 Другой»→список→pick). После — денежный РАЗЪЁМ (НЕ активен, след.слой)."""
     if d.get("test"):
         _bk = _HB_TEST_PREFIX + bike      # ТЕСТ-выдача: НЕ резолвим реальный байк; явно-тестовый ключ (чистить по префиксу)
     else:
@@ -2796,20 +2800,23 @@ async def _hb_do_handover(q, bridge, tok, d, bike):
     _tth = ["🧪 ทดสอบ"] if d.get("test") else []
     _tru = ["🧪 ТЕСТ"] if d.get("test") else []
     # Подтверждение по эталону _bilingual: 🇹🇭-блок целиком, затем 🇷🇺-блок (нестираемый след выдачи).
-    txt = _with_separator(_bilingual(None,            # после выдачи появился разъём 💵 → легенда 💵
+    body = _bilingual(None,            # после выдачи появился разъём 💵 → легенда 💵
         _tth + ["✅ ส่งมอบให้ลูกค้าแล้ว", f"{_bk} · {_cl}", f"{_sndr} · {_hb_phuket('%H:%M')} (ภูเก็ต)", "", "💵 รับเงิน"],
-        _tru + ["✅ выдал клиенту", f"{_bk} · {_cl}", f"{_sndr} · {_hb_phuket('%H:%M')} (Пхукет)", "", "💵 Оплата получена"]))
+        _tru + ["✅ выдал клиенту", f"{_bk} · {_cl}", f"{_sndr} · {_hb_phuket('%H:%M')} (Пхукет)", "", "💵 Оплата получена"])
     # ГЕЙТ выдача→деньги: денежный РАЗЪЁМ ТОЛЬКО ЗДЕСЬ (после факта выдачи), НЕ активен (следующий слой). Кнопка=💵 (смысл в легенде).
     # РАЗЪЁМ под клиентскую дорожку (СЛЕДУЮЩИЙ слой): «🚗 Выезжаем» + гейт «жду» — здесь НЕ рендерим.
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("💵", callback_data=f"delivery:pay:{tok}")]])
-    try:
-        await q.edit_message_text(text=txt, reply_markup=kb)
-    except Exception as e:
-        log.warning(f"  → HB confirm edit упал: {e}")
+    if edit:
         try:
-            await q.edit_message_reply_markup(reply_markup=kb)
-        except Exception:
-            pass
+            await q.edit_message_text(text=_with_separator(body), reply_markup=kb)
+        except Exception as e:
+            log.warning(f"  → HB confirm edit упал: {e}")
+            try:
+                await q.edit_message_reply_markup(reply_markup=kb)
+            except Exception:
+                pass
+    else:
+        await _send(context, chat_id=d["chat"], text=body, reply_markup=kb)   # НОВОЕ сообщение (доску не трогаем)
 
 
 async def handle_delivery_button(update, context, bridge) -> None:
@@ -2843,27 +2850,14 @@ async def handle_delivery_button(update, context, bridge) -> None:
         return
 
     if action == "hand":
-        # с доски: открыть карточку этой выдачи + переспрос байка (он/другой)
-        await q.answer()
-        _bk = d['bike']; _cl = d.get('client') or '—'; _dd = d.get('date_due') or '—'
-        _tth = ["🧪 ทดสอบ"] if d.get("test") else []
-        _tru = ["🧪 ТЕСТ"] if d.get("test") else []
-        txt = _bilingual(None,            # легенда: на этой карточке кнопки ✅ (этот) и 🔁 (другой)
-            _tth + ["🛵 ส่งมอบรถ", f"{_bk} · {_cl} · {_dd}", "", f"รถ {_bk} — คันนี้ใช่ไหม หรือคันอื่น?", "", "✅ คันนี้", "🔁 คันอื่น"],
-            _tru + ["🛵 Выдача", f"{_bk} · {_cl} · {_dd}", "", f"Байк {_bk} — он, или другой?", "", "✅ это он", "🔁 другой"])
-        # кнопки: ✅ + ДАННЫЕ (этот байк) и 🔁 другой — чисто, без пустых соседей
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ {_bk}"[:50], callback_data=f"delivery:ok:{tok}"),
-                                    InlineKeyboardButton("🔁 другой", callback_data=f"delivery:other:{tok}")]])
-        sent = await _send(context, chat_id=d["chat"], text=txt, reply_markup=kb)
-        d["msg_id"] = sent.message_id if sent else None
-        return
-
-    if action == "ok":
-        await q.answer()
-        await _hb_do_handover(q, bridge, tok, d, d["bike"])
+        # доска: выдать ПЛАНОВЫЙ байк СРАЗУ (без переспроса — байк/клиент видны на кнопке).
+        # Доску НЕ редактируем (там другие брони) → подтверждение НОВЫМ сообщением (edit=False).
+        await q.answer("✅")
+        await _hb_do_handover(q, context, bridge, tok, d, d["bike"], edit=False)
         return
 
     if action == "other":
+        # доска: подмена байка → список байков ДОМА кнопками, НОВЫМ сообщением (доску не трогаем)
         d["candidates"] = _hb_home_bikes(bridge)[:12]   # cap 12 (пагинация — следующий слой)
         if not d["candidates"]:
             await q.answer("Нет байков «дома» для замены")
@@ -2873,24 +2867,22 @@ async def handle_delivery_button(update, context, bridge) -> None:
                 for i, nm in enumerate(d["candidates"])]   # кнопки замены = эмодзи + ДАННЫЕ (как кнопки выдачи)
         _tth = ["🧪 ทดสอบ"] if d.get("test") else []
         _tru = ["🧪 ТЕСТ"] if d.get("test") else []
-        txt = _with_separator(_bilingual(None,            # легенда: на этом экране кнопки только ✅ (выбрать)
+        txt = _bilingual(None,            # легенда: на этом экране кнопки только ✅ (выбрать)
             _tth + ["🔁 เลือกรถคันอื่น (อยู่บ้าน)", "", "✅ เลือก"],
-            _tru + ["🔁 Выберите другой байк (дома)", "", "✅ Выбрать"]))
-        try:
-            await q.edit_message_text(text=txt, reply_markup=InlineKeyboardMarkup(rows))
-        except Exception as e:
-            log.warning(f"  → HB other: edit упал: {e}")
+            _tru + ["🔁 Выберите другой байк (дома)", "", "✅ Выбрать"])
+        await _send(context, chat_id=d["chat"], text=txt, reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if action == "pick":
+        # выбран байк на замену → выдача; правим ЭТО сообщение-список (edit=True)
         try:
             idx = int(parts[3])
             bike = d["candidates"][idx]
         except Exception:
             await q.answer("Не понял выбор")
             return
-        await q.answer()
-        await _hb_do_handover(q, bridge, tok, d, bike)
+        await q.answer("✅")
+        await _hb_do_handover(q, context, bridge, tok, d, bike, edit=True)
         return
 
     await q.answer()
