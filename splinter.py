@@ -2849,6 +2849,18 @@ async def handle_delivery_button(update, context, bridge) -> None:
         await q.answer("💵 ได้รับเงินแล้ว · Оплата — следующий слой (пока не активна)")   # РАЗЪЁМ-тост: ничего не пишем
         return
 
+    if action == "back":
+        # выход из выбора замены ДО записи — ЧИСТАЯ отмена (ничего не записано). Доска остаётся выше.
+        await q.answer("↩️ Отменено")
+        txt = _with_separator(_bilingual(None,
+            ["↩️ ยกเลิกการเปลี่ยนรถ", "กลับไปที่รายการส่งมอบด้านบน"],
+            ["↩️ Замена отменена", "Вернитесь к списку выдач выше"]))
+        try:
+            await q.edit_message_text(text=txt, reply_markup=None)   # кнопки убраны, ничего не записано
+        except Exception:
+            pass
+        return
+
     if action == "hand":
         # доска: выдать ПЛАНОВЫЙ байк СРАЗУ (без переспроса — байк/клиент видны на кнопке).
         # Доску НЕ редактируем (там другие брони) → подтверждение НОВЫМ сообщением (edit=False).
@@ -2865,11 +2877,12 @@ async def handle_delivery_button(update, context, bridge) -> None:
         await q.answer()
         rows = [[InlineKeyboardButton(f"✅ {nm}"[:50], callback_data=f"delivery:pick:{tok}:{i}")]
                 for i, nm in enumerate(d["candidates"])]   # кнопки замены = эмодзи + ДАННЫЕ (как кнопки выдачи)
+        rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"delivery:back:{tok}")])   # выход без записи
         _tth = ["🧪 ทดสอบ"] if d.get("test") else []
         _tru = ["🧪 ТЕСТ"] if d.get("test") else []
-        txt = _bilingual(None,            # легенда: на этом экране кнопки только ✅ (выбрать)
-            _tth + ["🔁 เลือกรถคันอื่น (อยู่บ้าน)", "", "✅ เลือก"],
-            _tru + ["🔁 Выберите другой байк (дома)", "", "✅ Выбрать"])
+        txt = _bilingual(None,            # легенда актуальная: на экране кнопки ✅ (выбрать) и ◀️ (назад)
+            _tth + ["🔁 เลือกรถคันอื่น (อยู่บ้าน)", "", "✅ เลือก", "◀️ ย้อนกลับ"],
+            _tru + ["🔁 Выберите другой байк (дома)", "", "✅ Выбрать", "◀️ Назад"])
         await _send(context, chat_id=d["chat"], text=txt, reply_markup=InlineKeyboardMarkup(rows))
         return
 

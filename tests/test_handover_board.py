@@ -108,7 +108,7 @@ def test_other_then_pick_replaces_bike():
     asyncio.run(S.handle_delivery_button(FakeUpdate(qo), ctx, br))
     lst = ctx.bot.sent[-1]                      # список замены — НОВЫМ сообщением
     pick_cbs = _cbs(lst["reply_markup"])
-    assert pick_cbs == [f"delivery:pick:{tok}:0", f"delivery:pick:{tok}:1"], pick_cbs  # 2 байка ДОМА
+    assert pick_cbs == [f"delivery:pick:{tok}:0", f"delivery:pick:{tok}:1", f"delivery:back:{tok}"], pick_cbs  # 2 байка ДОМА + Назад
     assert all(c for c in [lst["reply_markup"].inline_keyboard[0][0].text]), "кнопка замены не пустая"
     assert lst["reply_markup"].inline_keyboard[0][0].text.startswith("✅ "), "кнопка замены = ✅ + данные"
     assert br.state_calls == [], "до выбора байка state_set не вызывается"
@@ -119,6 +119,18 @@ def test_other_then_pick_replaces_bike():
     assert c["bike"] == "FORZA 350 5050 CANON", c       # выбран кандидат idx1
     assert c["client"] == "Ivan" and c["booking_id"] == "B1", "бронь та же, сменился только байк"
     assert _cbs(qp.edits[-1][1]) == [f"delivery:pay:{tok}"], "разъём 💵 после выдачи (правка списка-сообщения)"
+
+def test_back_cancels_no_write():
+    _reset(); br = FakeBridge(); ctx = FakeCtx()
+    tok = _hand_tok(_post_board(br, ctx))
+    asyncio.run(S.handle_delivery_button(FakeUpdate(FakeQuery(f"delivery:other:{tok}")), ctx, br))  # открыли список замены
+    assert any(c == f"delivery:back:{tok}" for c in _cbs(ctx.bot.sent[-1]["reply_markup"])), "на списке есть ◀️ Назад"
+    qb = FakeQuery(f"delivery:back:{tok}")
+    asyncio.run(S.handle_delivery_button(FakeUpdate(qb), ctx, br))
+    assert br.state_calls == [], "Назад до выдачи — чистая отмена, ничего не пишет"
+    last_text, last_kb = qb.edits[-1]
+    assert last_kb is None, "кнопки убраны после Назад"
+    assert "Замена отменена" in (last_text or ""), last_text
 
 def test_pay_inactive_no_write():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
