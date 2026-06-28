@@ -2735,12 +2735,15 @@ async def hb_post_board(context, bridge):
     ТЕСТ-РЕЖИМ (HB_TEST_MODE): постит в HQ на ВЫДУМАННЫХ бронях (реальный CRM не читаем).
     БОЕВОЙ: постит в Delivery, брони из clients(сегодня). (morning-job — следующий слой.)"""
     target = HB_TEST_CHAT_ID if HB_TEST_MODE else DELIVERY_CHAT_ID
-    _tm = "🧪 ТЕСТ / 🧪 ทดสอบ · " if HB_TEST_MODE else ""
+    _th = "🧪 ทดสอบ · " if HB_TEST_MODE else ""
+    _ru = "🧪 ТЕСТ · " if HB_TEST_MODE else ""
     bookings = _HB_TEST_BOOKINGS if HB_TEST_MODE else _hb_bookings_today(bridge)
-    head = f"🐀 Splinter · {_tm}📋 รายการส่งมอบวันนี้ / Выдачи на сегодня:"
+    head = (f"🐀 Splinter\n"
+            f"{_th}📋 รายการส่งมอบวันนี้\n"
+            f"{_ru}📋 Выдачи на сегодня")          # тайская строка, под ней русская — РАЗДЕЛЬНО
     if not bookings:
         await _send(context, chat_id=target, bilingual=False,
-                    text=head + "\nไม่มีรายการส่งมอบวันนี้ / Броней на выдачу сегодня нет.")
+                    text=head + "\nไม่มีรายการส่งมอบวันนี้\nБроней на выдачу сегодня нет.")
         return
     rows = []
     for c in bookings:
@@ -2749,9 +2752,12 @@ async def hb_post_board(context, bridge):
         tok = _hb_put({"chat": target, "msg_id": None, "bike": bike, "client": client,
                        "date_due": str(c.get("date_end") or ""), "booking_id": str(c.get("booking_id") or ""),
                        "handed": False, "candidates": [], "test": HB_TEST_MODE})
-        lbl = ("🧪 " if HB_TEST_MODE else "") + f"✅ ส่งมอบ/Выдан · {bike} · {client}"
+        lbl = ("🧪 " if HB_TEST_MODE else "") + f"✅ {bike} · {client}"   # кнопка = эмодзи + ДАННЫЕ (без слов-действий)
         rows.append([InlineKeyboardButton(lbl[:60], callback_data=f"delivery:hand:{tok}")])
-    legend = "\n\nℹ️ ✅ ส่งมอบแล้ว/выдан · 🔁 เปลี่ยนรถ/другой байк · 💵 ได้รับเงิน/оплата"
+    legend = ("\n\nℹ️ คำอธิบาย / Легенда:\n"     # расшифровка эмодзи СТОЛБИКОМ (тай / рус построчно)
+              "✅ ส่งมอบ / Выдан\n"
+              "🔁 เปลี่ยนรถ / Другой байк\n"
+              "💵 ได้รับเงิน / Оплата получена")
     await _send(context, chat_id=target, text=head + legend, bilingual=False,
                 reply_markup=InlineKeyboardMarkup(rows))
     log.info(f"  → HB: доска выдач запощена ({len(bookings)} броней, test={HB_TEST_MODE}, chat={target})")
@@ -2790,12 +2796,14 @@ async def _hb_do_handover(q, bridge, tok, d, bike):
         log.exception("  → HB state_set (выдача) упал")
     d["handed"] = True
     d["bike"] = _bk
-    mark = (f"✅ {_hb_sender(q)} ส่งมอบให้ลูกค้าแล้ว / выдал клиенту · {_bk} · {d.get('client') or '—'} · "
-            f"{_hb_phuket('%H:%M')} (ภูเก็ต/Пхукет)")
+    _sndr = _hb_sender(q)
+    mark = (f"✅ {_sndr} ส่งมอบให้ลูกค้าแล้ว\n"                 # тай
+            f"✅ {_sndr} выдал клиенту\n"                       # рус
+            f"{_bk} · {d.get('client') or '—'} · {_hb_phuket('%H:%M')} (ภูเก็ต/Пхукет)")   # данные
     # ГЕЙТ выдача→деньги: денежный РАЗЪЁМ появляется ТОЛЬКО ЗДЕСЬ (после факта выдачи), НЕ активен (следующий слой).
     # РАЗЪЁМ под клиентскую дорожку (СЛЕДУЮЩИЙ слой, изолированный контур) встанет рядом:
-    # «🚗 Выезжаем» + гейт «жду» от клиента — здесь НЕ рендерим.
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💵 ได้รับเงินแล้ว / Оплата получена", callback_data=f"delivery:pay:{tok}")]])
+    # «🚗 Выезжаем» + гейт «жду» от клиента — здесь НЕ рендерим. Кнопка = только эмодзи 💵 (смысл — в легенде).
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💵", callback_data=f"delivery:pay:{tok}")]])
     await _hb_mark(q, mark, kb)
 
 
@@ -2832,12 +2840,19 @@ async def handle_delivery_button(update, context, bridge) -> None:
     if action == "hand":
         # с доски: открыть карточку этой выдачи + переспрос байка (он/другой)
         await q.answer()
-        _tm = "🧪 ТЕСТ / 🧪 ทดสอบ · " if d.get("test") else ""
-        txt = (f"🐀 Splinter · {_tm}🛵 ส่งมอบรถ / Выдача\n"
-               f"รถ/байк {d['bike']} · ลูกค้า/клиент {d.get('client') or '—'} · ถึง/до {d.get('date_due') or '—'}\n\n"
-               f"รถ {d['bike']} — คันนี้ใช่ไหม หรือคันอื่น? / Байк {d['bike']} — он, или другой?")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ คันนี้ / он", callback_data=f"delivery:ok:{tok}"),
-                                    InlineKeyboardButton("🔁 คันอื่น / другой", callback_data=f"delivery:other:{tok}")]])
+        _bk = d['bike']; _cl = d.get('client') or '—'; _dd = d.get('date_due') or '—'
+        _tt = ("🧪 ทดสอบ\n🧪 ТЕСТ\n") if d.get("test") else ""
+        txt = (f"🐀 Splinter\n"
+               f"{_tt}"
+               f"🛵 ส่งมอบรถ\n"               # тайская строка
+               f"🛵 Выдача\n"                  # русская строка
+               f"{_bk} · {_cl} · {_dd}\n\n"   # данные (латиница/цифры как есть)
+               f"รถ {_bk} — คันนี้ใช่ไหม หรือคันอื่น?\n"   # вопрос: тай
+               f"Байк {_bk} — он, или другой?\n\n"        # вопрос: рус
+               f"✅ คันนี้ / он\n"            # легенда кнопок столбиком
+               f"🔁 คันอื่น / другой")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ {_bk}"[:40], callback_data=f"delivery:ok:{tok}"),
+                                    InlineKeyboardButton("🔁", callback_data=f"delivery:other:{tok}")]])
         sent = await _send(context, chat_id=d["chat"], text=txt, bilingual=False, reply_markup=kb)
         d["msg_id"] = sent.message_id if sent else None
         return
@@ -2857,7 +2872,7 @@ async def handle_delivery_button(update, context, bridge) -> None:
                 for i, nm in enumerate(d["candidates"])]
         base = (q.message.text or "") if q.message else ""
         try:
-            await q.edit_message_text(text=base + "\n\nเลือกรถ / Выберите байк (дома):", reply_markup=InlineKeyboardMarkup(rows))
+            await q.edit_message_text(text=base + "\n\nเลือกรถ (อยู่บ้าน)\nВыберите байк (дома):", reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             log.warning(f"  → HB other: edit упал: {e}")
         return
