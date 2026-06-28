@@ -65,6 +65,7 @@ def _cbs(markup):
 
 def _reset():
     S._HB_TOKENS.clear(); S._HB_SEQ[0] = 0
+    S.HB_TEST_MODE = False   # 6 тестов ниже проверяют БОЕВОЙ путь (clients/fleet/find_bike)
 
 def _post_board(br, ctx):
     asyncio.run(S.hb_post_board(ctx, br))
@@ -145,6 +146,29 @@ def test_stale_token_graceful():
     asyncio.run(S.handle_delivery_button(FakeUpdate(q), ctx, br))
     assert br.state_calls == [], "устаревший токен ничего не пишет"
     assert any("устарела" in (t or "") for t, _ in q.edits), q.edits
+
+
+def test_zz_test_mode_hq_mock():
+    _reset(); S.HB_TEST_MODE = True
+    br = FakeBridge(); ctx = FakeCtx()
+    try:
+        asyncio.run(S.hb_post_board(ctx, br))
+        sent = ctx.bot.sent[-1]
+        assert sent["chat_id"] == S.HB_TEST_CHAT_ID, "тест-доска постится в HQ"
+        assert "ТЕСТ" in sent["text"], sent["text"]
+        cbs = _cbs(sent["reply_markup"])
+        assert len(cbs) == 3, f"3 выдуманные брони (моки, не из clients), а {len(cbs)}"
+        tok = int(cbs[0].split(":")[2])
+        asyncio.run(S.handle_delivery_button(FakeUpdate(FakeQuery(f"delivery:hand:{tok}")), ctx, br))
+        q = FakeQuery(f"delivery:ok:{tok}")
+        asyncio.run(S.handle_delivery_button(FakeUpdate(q), ctx, br))
+        assert len(br.state_calls) == 1, br.state_calls
+        c = br.state_calls[0]
+        assert c["bike"].startswith("🧪ТЕСТ "), f"тест-выдача пишет тест-префикс в состояние_байка: {c['bike']}"
+        assert c["status"] == "в аренде" and c["client"] == "Ivan", c
+        assert _cbs(q.edits[-1][1]) == [f"delivery:pay:{tok}"], "денежный разъём после выдачи (неактивен)"
+    finally:
+        S.HB_TEST_MODE = False
 
 
 if __name__ == "__main__":

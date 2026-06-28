@@ -2659,8 +2659,20 @@ async def handle_service_button(update, context, bridge) -> None:
 #  Касса/CRM-A/closing/апрув НЕ трогаем. Единственная персист-запись = state_set (зелёная, не REDZONE).
 # ============================================================
 DELIVERY_CHAT_ID = -1002445921469
-_HB_TOKENS = {}   # token(int) -> {chat,msg_id,bike,client,date_due,booking_id,handed,candidates}
+_HB_TOKENS = {}   # token(int) -> {chat,msg_id,bike,client,date_due,booking_id,handed,candidates,test}
 _HB_SEQ = [0]
+
+# --- ТЕСТ-РЕЖИМ табло выдачи: обкатка в HQ без тайцев, на ВЫДУМАННЫХ бронях (реальный CRM не читаем). ---
+# Вернуть в боевой Delivery: HB_TEST_MODE = False + restart. Delivery командой /board в тест-режиме НЕ трогается.
+HB_TEST_MODE = True
+HB_TEST_CHAT_ID = -1003853365891          # HQ / TurboControl (тестовая лента)
+_HB_TEST_PREFIX = "🧪ТЕСТ "               # префикс байка в состояние_байка для тест-выдач (легко найти и вычистить)
+_HB_TEST_BOOKINGS = [
+    {"bike": "NMAX 4957", "name": "Ivan",  "date_end": "2026-07-05 13:00", "booking_id": "TEST-1"},
+    {"bike": "XMAX 5773", "name": "Petr",  "date_end": "2026-07-03 11:00", "booking_id": "TEST-2"},
+    {"bike": "PCX 3081",  "name": "Maria", "date_end": "2026-07-08 10:00", "booking_id": "TEST-3"},
+]
+_HB_TEST_HOME = ["CB 300CC R 9011", "FORZA 350 5050", "NINJA 400 8080"]   # мок-кандидаты «дома» для «другой»
 
 
 def _hb_put(data):
@@ -2706,7 +2718,9 @@ def _hb_bookings_today(bridge):
 
 
 def _hb_home_bikes(bridge):
-    """Имена байков статуса ДОМА (кандидаты на замену при «другой»)."""
+    """Имена байков статуса ДОМА (кандидаты на замену при «другой»). В ТЕСТ-режиме — мок-список (CRM не читаем)."""
+    if HB_TEST_MODE:
+        return list(_HB_TEST_HOME)
     try:
         bikes = ((bridge.fleet().get("data") or {}).get("bikes")) or []
     except Exception:
@@ -2717,26 +2731,32 @@ def _hb_home_bikes(bridge):
 
 
 async def hb_post_board(context, bridge):
-    """РУЧНОЙ репост «доски броней дня» в Delivery. Под каждой бронью — кнопка «✅ Выдан».
-    (morning-job НЕ в этом слое; это ручной триггер для теста.)"""
-    bookings = _hb_bookings_today(bridge)
+    """РУЧНОЙ репост «доски броней дня». Под каждой бронью — кнопка «✅ Выдан».
+    ТЕСТ-РЕЖИМ (HB_TEST_MODE): постит в HQ на ВЫДУМАННЫХ бронях (реальный CRM не читаем).
+    БОЕВОЙ: постит в Delivery, брони из clients(сегодня). (morning-job — следующий слой.)"""
+    target = HB_TEST_CHAT_ID if HB_TEST_MODE else DELIVERY_CHAT_ID
+    if HB_TEST_MODE:
+        bookings = _HB_TEST_BOOKINGS
+        head = "🐀 Splinter · 🧪 ТЕСТ · 📋 Выдачи (ВЫДУМАННЫЕ брони, обкатка в HQ — жми «Выдан»):"
+    else:
+        bookings = _hb_bookings_today(bridge)
+        head = "🐀 Splinter · 📋 Выдачи на сегодня (жми «Выдан», когда отдал байк клиенту):"
     if not bookings:
-        await _send(context, chat_id=DELIVERY_CHAT_ID, bilingual=False,
-                    text="🐀 Splinter · 📋 Выдачи на сегодня\nБроней на выдачу сегодня нет.")
+        await _send(context, chat_id=target, bilingual=False,
+                    text="🐀 Splinter · 📋 Выдачи\nБроней на выдачу сегодня нет.")
         return
-    head = "🐀 Splinter · 📋 Выдачи на сегодня (жми «Выдан», когда отдал байк клиенту):"
     rows = []
     for c in bookings:
         bike = str(c.get("bike") or "").strip()
         client = str(c.get("name") or "").strip()
-        tok = _hb_put({"chat": DELIVERY_CHAT_ID, "msg_id": None, "bike": bike, "client": client,
+        tok = _hb_put({"chat": target, "msg_id": None, "bike": bike, "client": client,
                        "date_due": str(c.get("date_end") or ""), "booking_id": str(c.get("booking_id") or ""),
-                       "handed": False, "candidates": []})
-        rows.append([InlineKeyboardButton(f"✅ Выдан · {bike} · {client}"[:60],
-                                          callback_data=f"delivery:hand:{tok}")])
-    await _send(context, chat_id=DELIVERY_CHAT_ID, text=head, bilingual=False,
+                       "handed": False, "candidates": [], "test": HB_TEST_MODE})
+        lbl = ("🧪 " if HB_TEST_MODE else "") + f"✅ Выдан · {bike} · {client}"
+        rows.append([InlineKeyboardButton(lbl[:60], callback_data=f"delivery:hand:{tok}")])
+    await _send(context, chat_id=target, text=head, bilingual=False,
                 reply_markup=InlineKeyboardMarkup(rows))
-    log.info(f"  → HB: доска выдач запощена ({len(bookings)} броней)")
+    log.info(f"  → HB: доска выдач запощена ({len(bookings)} броней, test={HB_TEST_MODE}, chat={target})")
 
 
 async def _hb_mark(q, mark, kb=None):
@@ -2758,7 +2778,10 @@ async def _hb_do_handover(q, bridge, tok, d, bike):
     каноничное имя из find_bike; client/date_due/booking_id из резолва, захваченного на доске (для замены
     байка бронь та же, меняется только байк). Зелёная (state_set НЕ в REDZONE_LOCK).
     После — денежный РАЗЪЁМ (НЕ активен, следующий слой)."""
-    _bk = (bridge.find_bike(bike) or {}).get("name") or bike
+    if d.get("test"):
+        _bk = _HB_TEST_PREFIX + bike      # ТЕСТ-выдача: НЕ резолвим реальный байк; явно-тестовый ключ (чистить по префиксу)
+    else:
+        _bk = (bridge.find_bike(bike) or {}).get("name") or bike
     try:
         bridge.state_set(bike=_bk, status="в аренде", client=d.get("client", ""),
                          date_due=d.get("date_due", ""), booking_id=(d.get("booking_id") or ""),
@@ -2810,7 +2833,8 @@ async def handle_delivery_button(update, context, bridge) -> None:
     if action == "hand":
         # с доски: открыть карточку этой выдачи + переспрос байка (он/другой)
         await q.answer()
-        txt = (f"🐀 Splinter · 🛵 Выдача\n"
+        _tm = "🧪 ТЕСТ · " if d.get("test") else ""
+        txt = (f"🐀 Splinter · {_tm}🛵 Выдача\n"
                f"байк {d['bike']} · клиент {d.get('client') or '—'} · до {d.get('date_due') or '—'}\n\n"
                f"Байк {d['bike']} — он, или другой?")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ он", callback_data=f"delivery:ok:{tok}"),
