@@ -214,6 +214,19 @@ async def on_devbot_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await devbot.handle_callback(update, context, bridge)
 
 
+async def on_delivery_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки табло выдачи (Delivery, слой 1 O3): доска → «Выдан» → переспрос байка → state. → splinter."""
+    await splinter.handle_delivery_button(update, context, bridge)
+
+
+async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """РУЧНОЙ репост доски выдач в Delivery (тест слоя 1 O3). Только владелец."""
+    u = update.effective_user
+    if not u or not u.username or u.username.lower() not in splinter.OWNER_USERNAMES:
+        return
+    await splinter.hb_post_board(context, bridge)
+
+
 # === HANDLERS ===
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1205,11 +1218,13 @@ def main():
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("bike", cmd_bike))
+    app.add_handler(CommandHandler("board", cmd_board))   # ручной репост доски выдач (Delivery, слой 1 O3)
 
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
     app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))
     app.add_handler(CallbackQueryHandler(on_service_button, pattern=r"^svc:"))
     app.add_handler(CallbackQueryHandler(on_devbot_button, pattern=r"^(approve|reject|check|next):"))
+    app.add_handler(CallbackQueryHandler(on_delivery_button, pattern=r"^delivery:"))   # табло выдачи (слой 1 O3)
 
     # Сервис-события форума (создание/переименование темы) → привязка тема→байк
     app.add_handler(MessageHandler(

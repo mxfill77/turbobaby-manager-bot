@@ -2652,6 +2652,207 @@ async def handle_service_button(update, context, bridge) -> None:
         await q.answer()
 
 
+# ============================================================
+#  ТАБЛО ВЫДАЧИ (Delivery) — слой 1 площадки O3
+#  ТОЛЬКО факт выдачи: доска броней дня → «✅ Выдан» → переспрос байка (он/другой) →
+#  state_set('в аренде'). Денежный РАЗЪЁМ появляется ПОСЛЕ выдачи и НЕ активен (следующий слой).
+#  Касса/CRM-A/closing/апрув НЕ трогаем. Единственная персист-запись = state_set (зелёная, не REDZONE).
+# ============================================================
+DELIVERY_CHAT_ID = -1002445921469
+_HB_TOKENS = {}   # token(int) -> {chat,msg_id,bike,client,date_due,booking_id,handed,candidates}
+_HB_SEQ = [0]
+
+
+def _hb_put(data):
+    _HB_SEQ[0] += 1
+    tok = _HB_SEQ[0]
+    _HB_TOKENS[tok] = data
+    if len(_HB_TOKENS) > 200:                       # держим последние 200 (как _SVC_TOKENS)
+        for k in sorted(_HB_TOKENS)[:-200]:
+            _HB_TOKENS.pop(k, None)
+    return tok
+
+
+def _hb_phuket(fmt):
+    """Время/дата Пхукета (UTC+7) — для пометок и фильтра «сегодня»."""
+    from datetime import datetime, timedelta
+    return (datetime.utcnow() + timedelta(hours=7)).strftime(fmt)
+
+
+def _hb_sender(q):
+    u = getattr(q, "from_user", None)
+    if u and getattr(u, "username", None):
+        return "@" + u.username
+    return (getattr(u, "first_name", None) or "кто-то") if u else "кто-то"
+
+
+def _hb_bookings_today(bridge):
+    """Брони на выдачу СЕГОДНЯ: clients(all) → status='бронь' + date_start=сегодня (Пхукет).
+    date_start формат 'yyyy-MM-dd HH:mm' (Bridge formatDate) → сравниваем первые 10 символов."""
+    try:
+        rows = ((bridge._call("clients", filter="all").get("data") or {}).get("clients")) or []
+    except Exception:
+        log.exception("  → HB: чтение clients упало")
+        return []
+    today = _hb_phuket("%Y-%m-%d")
+    out = []
+    for c in rows:
+        if str(c.get("status", "")).strip().lower() != "бронь":
+            continue
+        if str(c.get("date_start") or "")[:10] != today:
+            continue
+        out.append(c)
+    return out
+
+
+def _hb_home_bikes(bridge):
+    """Имена байков статуса ДОМА (кандидаты на замену при «другой»)."""
+    try:
+        bikes = ((bridge.fleet().get("data") or {}).get("bikes")) or []
+    except Exception:
+        log.exception("  → HB: чтение fleet упало")
+        return []
+    return [str(b.get("name") or "").strip() for b in bikes
+            if str(b.get("status", "")).strip().upper() == "ДОМА" and b.get("name")]
+
+
+async def hb_post_board(context, bridge):
+    """РУЧНОЙ репост «доски броней дня» в Delivery. Под каждой бронью — кнопка «✅ Выдан».
+    (morning-job НЕ в этом слое; это ручной триггер для теста.)"""
+    bookings = _hb_bookings_today(bridge)
+    if not bookings:
+        await _send(context, chat_id=DELIVERY_CHAT_ID, bilingual=False,
+                    text="🐀 Splinter · 📋 Выдачи на сегодня\nБроней на выдачу сегодня нет.")
+        return
+    head = "🐀 Splinter · 📋 Выдачи на сегодня (жми «Выдан», когда отдал байк клиенту):"
+    rows = []
+    for c in bookings:
+        bike = str(c.get("bike") or "").strip()
+        client = str(c.get("name") or "").strip()
+        tok = _hb_put({"chat": DELIVERY_CHAT_ID, "msg_id": None, "bike": bike, "client": client,
+                       "date_due": str(c.get("date_end") or ""), "booking_id": str(c.get("booking_id") or ""),
+                       "handed": False, "candidates": []})
+        rows.append([InlineKeyboardButton(f"✅ Выдан · {bike} · {client}"[:60],
+                                          callback_data=f"delivery:hand:{tok}")])
+    await _send(context, chat_id=DELIVERY_CHAT_ID, text=head, bilingual=False,
+                reply_markup=InlineKeyboardMarkup(rows))
+    log.info(f"  → HB: доска выдач запощена ({len(bookings)} броней)")
+
+
+async def _hb_mark(q, mark, kb=None):
+    """Дописать НЕСТИРАЕМУЮ пометку в тело карточки + выставить клавиатуру (паттерн devbot._strip_and_mark)."""
+    base = (q.message.text or "") if q.message else ""
+    new_text = f"{base}\n\n{mark}" if base else mark
+    try:
+        await q.edit_message_text(text=new_text, reply_markup=kb)
+    except Exception as e:
+        log.warning(f"  → HB _hb_mark edit упал: {e}")
+        try:
+            await q.edit_message_reply_markup(reply_markup=kb)
+        except Exception:
+            pass
+
+
+async def _hb_do_handover(q, bridge, tok, d, bike):
+    """Подтверждение выдачи: state_set('в аренде') — ВЕРБАТИМ паттерн splinter.py (handover-ветка):
+    каноничное имя из find_bike; client/date_due/booking_id из резолва, захваченного на доске (для замены
+    байка бронь та же, меняется только байк). Зелёная (state_set НЕ в REDZONE_LOCK).
+    После — денежный РАЗЪЁМ (НЕ активен, следующий слой)."""
+    _bk = (bridge.find_bike(bike) or {}).get("name") or bike
+    try:
+        bridge.state_set(bike=_bk, status="в аренде", client=d.get("client", ""),
+                         date_due=d.get("date_due", ""), booking_id=(d.get("booking_id") or ""),
+                         last_event_msg_id=f"{d.get('chat')}:{d.get('msg_id')}")
+        log.info(f"  → HB выдача: bike={_bk} status=в аренде booking_id={d.get('booking_id')} "
+                 f"client={d.get('client') or '-'} date_due={d.get('date_due') or '-'}")
+    except Exception:
+        log.exception("  → HB state_set (выдача) упал")
+    d["handed"] = True
+    d["bike"] = _bk
+    mark = f"✅ {_hb_sender(q)} выдал клиенту · {_bk} · {d.get('client') or '—'} · {_hb_phuket('%H:%M')} (Пхукет)"
+    # ГЕЙТ выдача→деньги: денежный РАЗЪЁМ появляется ТОЛЬКО ЗДЕСЬ (после факта выдачи), НЕ активен (следующий слой).
+    # РАЗЪЁМ под клиентскую дорожку (СЛЕДУЮЩИЙ слой, изолированный контур) встанет рядом:
+    # «🚗 Выезжаем» + гейт «жду» от клиента — здесь НЕ рендерим.
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("💵 Принять оплату", callback_data=f"delivery:pay:{tok}")]])
+    await _hb_mark(q, mark, kb)
+
+
+async def handle_delivery_button(update, context, bridge) -> None:
+    """Кнопки табло выдачи (CallbackQueryHandler '^delivery:' в bot.py). Слой 1: только факт выдачи.
+    hand (с доски) → переспрос байка; ok (он)/other (другой)/pick (выбор замены) → выдача;
+    pay (денежный разъём) — НЕ активен (следующий слой)."""
+    q = update.callback_query
+    if not q:
+        return
+    parts = (q.data or "").split(":")
+    if len(parts) < 3 or parts[0] != "delivery":
+        await q.answer()
+        return
+    action = parts[1]
+    try:
+        tok = int(parts[2])
+    except Exception:
+        await q.answer()
+        return
+    d = _HB_TOKENS.get(tok)
+    if not d:
+        await q.answer()
+        try:
+            await q.edit_message_text("🐀 Splinter\n⚠️ Карточка устарела (перезапуск бота). Перепостите доску выдач 🙏")
+        except Exception:
+            pass
+        return
+
+    if action == "pay":
+        await q.answer("💵 Оплата — следующий слой, пока не активна")   # РАЗЪЁМ: ничего не пишем
+        return
+
+    if action == "hand":
+        # с доски: открыть карточку этой выдачи + переспрос байка (он/другой)
+        await q.answer()
+        txt = (f"🐀 Splinter · 🛵 Выдача\n"
+               f"байк {d['bike']} · клиент {d.get('client') or '—'} · до {d.get('date_due') or '—'}\n\n"
+               f"Байк {d['bike']} — он, или другой?")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ он", callback_data=f"delivery:ok:{tok}"),
+                                    InlineKeyboardButton("🔁 другой", callback_data=f"delivery:other:{tok}")]])
+        sent = await _send(context, chat_id=d["chat"], text=txt, bilingual=False, reply_markup=kb)
+        d["msg_id"] = sent.message_id if sent else None
+        return
+
+    if action == "ok":
+        await q.answer()
+        await _hb_do_handover(q, bridge, tok, d, d["bike"])
+        return
+
+    if action == "other":
+        d["candidates"] = _hb_home_bikes(bridge)[:12]   # cap 12 (пагинация — следующий слой)
+        if not d["candidates"]:
+            await q.answer("Нет байков «дома» для замены")
+            return
+        await q.answer()
+        rows = [[InlineKeyboardButton(nm[:40], callback_data=f"delivery:pick:{tok}:{i}")]
+                for i, nm in enumerate(d["candidates"])]
+        base = (q.message.text or "") if q.message else ""
+        try:
+            await q.edit_message_text(text=base + "\n\nВыбери байк (дома):", reply_markup=InlineKeyboardMarkup(rows))
+        except Exception as e:
+            log.warning(f"  → HB other: edit упал: {e}")
+        return
+
+    if action == "pick":
+        try:
+            idx = int(parts[3])
+            bike = d["candidates"][idx]
+        except Exception:
+            await q.answer("Не понял выбор")
+            return
+        await q.answer()
+        await _hb_do_handover(q, bridge, tok, d, bike)
+        return
+
+    await q.answer()
+
+
 def _aggregate_album_vis(vis_list):
     """Слить разборы фото АЛЬБОМА в ОДИН вердикт (чтобы ответить один раз, без дублей):
     - пробег → берём фото с наибольшей уверенностью одометра (лучшее фото приборки);
