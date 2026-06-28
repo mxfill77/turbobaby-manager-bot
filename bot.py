@@ -220,10 +220,15 @@ async def on_delivery_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """РУЧНОЙ репост доски выдач в Delivery (тест слоя 1 O3). Только владелец."""
+    """РУЧНОЙ репост доски выдач (тест слоя 1 O3). Владелец = Филипп по USER ID 504608015
+    (он командует с личного аккаунта в HQ; username там НЕ turbophuket) ИЛИ бизнес-аккаунт по username."""
     u = update.effective_user
-    if not u or not u.username or u.username.lower() not in splinter.OWNER_USERNAMES:
+    uname = (u.username or "").lower() if u else ""
+    is_owner = bool(u) and (u.id == 504608015 or uname in splinter.OWNER_USERNAMES)
+    if not is_owner:
+        log.info("  → /board отклонён (не владелец): id=%s @%s", getattr(u, "id", None), uname or "-")
         return
+    log.info("  → /board от владельца id=%s @%s → пощу доску выдач", u.id, uname or "-")
     await splinter.hb_post_board(context, bridge)
 
 
