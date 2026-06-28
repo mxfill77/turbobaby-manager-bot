@@ -2772,10 +2772,11 @@ async def hb_post_board(context, bridge):
         txt = _bilingual(None,
             _tth + ["🛵 ส่งมอบรถ"] + th_d + ["", "✅ ส่งมอบ", "🔁 เปลี่ยนรถ"],
             _tru + ["🛵 Выдача"]    + ru_d + ["", "✅ Выдан", "🔁 Другой байк"])
-        # ВЕРТИКАЛЬНО, под ЕЁ ОДИН байк: широкая ✅ (эмодзи+данные) + голая 🔁 (подмена ЭТОГО байка).
+        # ВЕРТИКАЛЬНО, под ЕЁ ОДИН байк: широкая ✅ (эмодзи+данные) + 🔁 С БАЙКОМ (подмена ЭТОГО байка).
+        # 🔁 подписана байком (НЕ голая): между карточками безымянная иконка читалась как пустая оторванная кнопка.
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"✅ {bike} · {client}"[:64], callback_data=f"delivery:hand:{tok}")],
-            [InlineKeyboardButton("🔁", callback_data=f"delivery:other:{tok}")],
+            [InlineKeyboardButton(f"🔁 {bike}"[:64], callback_data=f"delivery:other:{tok}")],
         ])
         await _send(context, chat_id=target, text=txt, reply_markup=kb)
     log.info(f"  → HB: {n} карточек выдач запощено (по одной на бронь, test={HB_TEST_MODE}, chat={target})")
@@ -2834,7 +2835,9 @@ async def _hb_do_handover(q, context, bridge, tok, d, bike, edit):
             except Exception:
                 pass
     else:
-        await _send(context, chat_id=d["chat"], text=body, reply_markup=kb)   # НОВОЕ сообщение (доску не трогаем)
+        # НОВОЕ сообщение (доску не трогаем). РЕТРАЙ на сетевой таймаут: state_set уже прошёл и идемпотентен,
+        # переотправка подтверждения безопасна. Без ретрая ConnectTimeout «съедал» подтверждение → «ничего не происходит».
+        await _send_retry(context, chat_id=d["chat"], text=body, reply_markup=kb)
 
 
 async def handle_delivery_button(update, context, bridge) -> None:

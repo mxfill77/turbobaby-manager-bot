@@ -92,7 +92,7 @@ def test_board_separate_cards():
         assert sum(c.startswith("delivery:other:") for c in cbs) == 1, cbs
         kb = m["reply_markup"].inline_keyboard
         assert kb[0][0].text.startswith("✅ "), "кнопка выдачи = эмодзи+данные её байка"
-        assert kb[1][0].text == "🔁", "под ней голая 🔁 (подмена ЭТОГО байка)"
+        assert kb[1][0].text.startswith("🔁 ") and len(kb[1][0].text) > 2, "🔁 подписана байком, НЕ голая/пустая"
         assert "Выдача" in m["text"] and "Оплата" not in m["text"], m["text"]
     # ОБЩЕЙ шапки больше нет: каждое сообщение = карточка (первое уже с кнопками)
     assert len(ctx.bot.sent) == 2, f"только карточки, без шапки, а {len(ctx.bot.sent)} сообщений"
@@ -114,6 +114,32 @@ def test_hand_direct_state_once_money_no_reask():
     assert _cbs(conf["reply_markup"]) == [f"delivery:pay:{tok}"], "разъём 💵 после выдачи"
     # переспроса «он/другой» НЕТ:
     assert "или другой?" not in conf["text"], conf["text"]
+
+def test_handover_survives_transient_timeout():
+    # БАГ HQ 28.06: ConnectTimeout на отправке подтверждения «съедал» его → «ничего не происходит».
+    # Фикс: подтверждение идёт через _send_retry (state_set уже прошёл, переотправка идемпотентна).
+    from telegram.error import TimedOut
+    _reset(); br = FakeBridge(); ctx = FakeCtx()
+    tok = _first_tok(_post_board(br, ctx))
+    n_before = len(ctx.bot.sent)
+    real_send = ctx.bot.send_message; calls = {"n": 0}
+    async def flaky(**kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimedOut("сетевой блип")     # первая попытка — таймаут
+        return await real_send(**kw)
+    ctx.bot.send_message = flaky
+    import asyncio as _a
+    orig_sleep = _a.sleep
+    async def _noslp(*a, **k): return None      # не ждём реальные 1.5с ретрая в тесте
+    _a.sleep = _noslp
+    try:
+        asyncio.run(S.handle_delivery_button(FakeUpdate(FakeQuery(f"delivery:hand:{tok}")), ctx, br))
+    finally:
+        _a.sleep = orig_sleep
+    assert len(br.state_calls) == 1, "state_set один раз (запись прошла до отправки)"
+    assert len(ctx.bot.sent) == n_before + 1, "подтверждение ВСЁ РАВНО доставлено (ретрай пережил таймаут)"
+    assert _cbs(ctx.bot.sent[-1]["reply_markup"]) == [f"delivery:pay:{tok}"], "разъём 💵 на подтверждении"
 
 def test_other_then_pick_replaces_bike():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
