@@ -94,10 +94,10 @@ def test_board_separate_cards():
         assert kb[0][0].text.startswith("✅ "), "кнопка выдачи = эмодзи+данные её байка"
         assert kb[1][0].text == "🔁", "под ней голая 🔁 (подмена ЭТОГО байка)"
         assert "Выдача" in m["text"] and "Оплата" not in m["text"], m["text"]
-    # шапка дня — ПЕРВЫМ сообщением, БЕЗ кнопок, с числом выдач
-    header = ctx.bot.sent[0]
-    assert header.get("reply_markup") is None, "шапка дня без кнопок"
-    assert "Выдачи на сегодня" in header["text"] and "(2)" in header["text"], header["text"]
+    # ОБЩЕЙ шапки больше нет: каждое сообщение = карточка (первое уже с кнопками)
+    assert len(ctx.bot.sent) == 2, f"только карточки, без шапки, а {len(ctx.bot.sent)} сообщений"
+    assert all(s.get("reply_markup") is not None for s in ctx.bot.sent), "нет постов без кнопок (шапка убрана)"
+    assert not any("Выдачи на сегодня" in s["text"] for s in ctx.bot.sent), "видимой шапки «Выдачи на сегодня» нет"
 
 def test_hand_direct_state_once_money_no_reask():
     _reset(); br = FakeBridge(); ctx = FakeCtx()
@@ -173,7 +173,7 @@ def test_zz_test_mode_hq_mock_prefix():
             assert m["chat_id"] == S.HB_TEST_CHAT_ID, "тест-карточки в HQ"
             assert "ТЕСТ" in m["text"]
             assert len(_cbs(m["reply_markup"])) == 2, "под каждой карточкой 2 кнопки (✅ + 🔁)"
-        assert ctx.bot.sent[0]["chat_id"] == S.HB_TEST_CHAT_ID, "шапка дня тоже в HQ"
+        assert len(ctx.bot.sent) == 3, "только 3 карточки, без общей шапки"
         tok = _first_tok(cards)
         asyncio.run(S.handle_delivery_button(FakeUpdate(FakeQuery(f"delivery:hand:{tok}")), ctx, br))
         assert len(br.state_calls) == 1, br.state_calls
