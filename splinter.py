@@ -2752,9 +2752,9 @@ async def hb_post_board(context, bridge):
                        "handed": False, "candidates": [], "test": HB_TEST_MODE})
         lbl = ("🧪 " if HB_TEST_MODE else "") + f"✅ {bike} · {client}"   # кнопка = эмодзи + ДАННЫЕ (смысл — в легенде)
         rows.append([InlineKeyboardButton(lbl[:60], callback_data=f"delivery:hand:{tok}")])
-    txt = _bilingual(None,
-        _tth + ["📋 รายการส่งมอบวันนี้", "", "✅ ส่งมอบ", "🔁 เปลี่ยนรถ", "💵 ได้รับเงิน"],
-        _tru + ["📋 Выдачи на сегодня", "", "✅ Выдан", "🔁 Другой байк", "💵 Оплата получена"])
+    txt = _bilingual(None,            # легенда ТОЛЬКО актуальная: на доске кнопки только ✅ Выдан
+        _tth + ["📋 รายการส่งมอบวันนี้", "", "✅ ส่งมอบ"],
+        _tru + ["📋 Выдачи на сегодня", "", "✅ Выдан"])
     await _send(context, chat_id=target, text=txt, reply_markup=InlineKeyboardMarkup(rows))
     log.info(f"  → HB: доска выдач запощена ({len(bookings)} броней, test={HB_TEST_MODE}, chat={target})")
 
@@ -2796,9 +2796,9 @@ async def _hb_do_handover(q, bridge, tok, d, bike):
     _tth = ["🧪 ทดสอบ"] if d.get("test") else []
     _tru = ["🧪 ТЕСТ"] if d.get("test") else []
     # Подтверждение по эталону _bilingual: 🇹🇭-блок целиком, затем 🇷🇺-блок (нестираемый след выдачи).
-    txt = _with_separator(_bilingual(None,
-        _tth + ["✅ ส่งมอบให้ลูกค้าแล้ว", f"{_bk} · {_cl}", f"{_sndr} · {_hb_phuket('%H:%M')} (ภูเก็ต)"],
-        _tru + ["✅ выдал клиенту", f"{_bk} · {_cl}", f"{_sndr} · {_hb_phuket('%H:%M')} (Пхукет)"]))
+    txt = _with_separator(_bilingual(None,            # после выдачи появился разъём 💵 → легенда 💵
+        _tth + ["✅ ส่งมอบให้ลูกค้าแล้ว", f"{_bk} · {_cl}", f"{_sndr} · {_hb_phuket('%H:%M')} (ภูเก็ต)", "", "💵 รับเงิน"],
+        _tru + ["✅ выдал клиенту", f"{_bk} · {_cl}", f"{_sndr} · {_hb_phuket('%H:%M')} (Пхукет)", "", "💵 Оплата получена"]))
     # ГЕЙТ выдача→деньги: денежный РАЗЪЁМ ТОЛЬКО ЗДЕСЬ (после факта выдачи), НЕ активен (следующий слой). Кнопка=💵 (смысл в легенде).
     # РАЗЪЁМ под клиентскую дорожку (СЛЕДУЮЩИЙ слой): «🚗 Выезжаем» + гейт «жду» — здесь НЕ рендерим.
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("💵", callback_data=f"delivery:pay:{tok}")]])
@@ -2848,9 +2848,9 @@ async def handle_delivery_button(update, context, bridge) -> None:
         _bk = d['bike']; _cl = d.get('client') or '—'; _dd = d.get('date_due') or '—'
         _tth = ["🧪 ทดสอบ"] if d.get("test") else []
         _tru = ["🧪 ТЕСТ"] if d.get("test") else []
-        txt = _bilingual(None,
-            _tth + ["🛵 ส่งมอบรถ", f"{_bk} · {_cl} · {_dd}", "", f"รถ {_bk} — คันนี้ใช่ไหม หรือคันอื่น?"],
-            _tru + ["🛵 Выдача", f"{_bk} · {_cl} · {_dd}", "", f"Байк {_bk} — он, или другой?"])
+        txt = _bilingual(None,            # легенда: на этой карточке кнопки ✅ (этот) и 🔁 (другой)
+            _tth + ["🛵 ส่งมอบรถ", f"{_bk} · {_cl} · {_dd}", "", f"รถ {_bk} — คันนี้ใช่ไหม หรือคันอื่น?", "", "✅ คันนี้", "🔁 คันอื่น"],
+            _tru + ["🛵 Выдача", f"{_bk} · {_cl} · {_dd}", "", f"Байк {_bk} — он, или другой?", "", "✅ это он", "🔁 другой"])
         # кнопки: ✅ + ДАННЫЕ (этот байк) и 🔁 другой — чисто, без пустых соседей
         kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ {_bk}"[:50], callback_data=f"delivery:ok:{tok}"),
                                     InlineKeyboardButton("🔁 другой", callback_data=f"delivery:other:{tok}")]])
@@ -2869,13 +2869,13 @@ async def handle_delivery_button(update, context, bridge) -> None:
             await q.answer("Нет байков «дома» для замены")
             return
         await q.answer()
-        rows = [[InlineKeyboardButton(nm[:40], callback_data=f"delivery:pick:{tok}:{i}")]
-                for i, nm in enumerate(d["candidates"])]
+        rows = [[InlineKeyboardButton(f"✅ {nm}"[:50], callback_data=f"delivery:pick:{tok}:{i}")]
+                for i, nm in enumerate(d["candidates"])]   # кнопки замены = эмодзи + ДАННЫЕ (как кнопки выдачи)
         _tth = ["🧪 ทดสอบ"] if d.get("test") else []
         _tru = ["🧪 ТЕСТ"] if d.get("test") else []
-        txt = _with_separator(_bilingual(None,
-            _tth + ["🔁 เลือกรถคันอื่น (อยู่บ้าน)"],
-            _tru + ["🔁 Выберите другой байк (дома)"]))
+        txt = _with_separator(_bilingual(None,            # легенда: на этом экране кнопки только ✅ (выбрать)
+            _tth + ["🔁 เลือกรถคันอื่น (อยู่บ้าน)", "", "✅ เลือก"],
+            _tru + ["🔁 Выберите другой байк (дома)", "", "✅ Выбрать"]))
         try:
             await q.edit_message_text(text=txt, reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
