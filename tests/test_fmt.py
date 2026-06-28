@@ -48,7 +48,7 @@ loop.close()
 src=open("/root/turbobaby-manager-bot/splinter.py",encoding="utf-8").read()
 print("(6) служебные двуязычны:")
 res.append(ok("ปุ่มหมดอายุ" in src and "Кнопка устарела (перезапуск бота)" in src, "«Кнопка устарела» 🇹🇭+🇷🇺"))
-res.append(ok("กำลังบันทึก… · Записываю…" in src and "ยืนยันโดย @Pleummmm/เจ้าของ · Подтверждает" in src, "тосты двуязычны"))
+res.append(ok("กำลังบันทึก… · Записываю…" in src and "ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает" in src, "тосты двуязычны (адресация тайца через PYM_HANDLE)"))
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

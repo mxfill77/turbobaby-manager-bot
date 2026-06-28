@@ -72,6 +72,46 @@ print("(4) хук в _handle_servicing:")
 res.append(ok(len(SENDS)==1 and "Статус байка" in SENDS[0], "на ЯВНЫЙ запрос → карточка отправлена"))
 res.append(ok(len(br.events)==0, "ничего НЕ записано (только чтение)"))
 
+# 5) НОВЫЕ секции: в работе (Z1+Z4 дословно) / последний сервис / устаревшая аренда (Z3) / пусто
+print("(5) то_заявки секции + Z3/Z4:")
+m2=S.msg_bike_card("NMAX 4255","24302",{"km":"24302","next":28094,"status":"ok"},[],
+   {"state":"В аренде","client":"Gamza","expired":True,"end":"17.06.2026"},
+   sp_open={"kinds":["pads"],"works":["подшипник переднего колеса"],"odo":"24302","status":"ждёт_факт"},
+   sp_last={"done":["oil"],"odo":"24094","date":"2026-06-07"})
+res.append(ok("🔧 В работе:" in m2 and "подшипник переднего колеса" in m2, "Z4: дословная работа в RU «В работе»"))
+res.append(ok("ждёт результат" in m2 and "одометр 24302" in m2, "статус заявки читаемый + одометр"))
+res.append(ok("Последний сервис:" in m2 and "24094" in m2, "секция «Последний сервис» из закрытой заявки"))
+res.append(ok("аренда истекла 17.06.2026" in m2, "Z3: флаг устаревшей аренды"))
+res.append(ok(th_clean(m2), "🇹🇭 чистый (дословная кириллица только в RU)"))
+res.append(ok("กำลังทำ: ผ้าเบรก" in m2, "TH «в работе» тайскими лейблами (без дословной кириллицы)"))
+
+m3=S.msg_bike_card("X","100",{"km":"100","next":4100,"status":"ok"},[],{"state":"дома","client":""})
+res.append(ok("В работе" not in m3 and "Последний сервис" not in m3, "нет заявок → секции опущены"))
+
+# не устаревшая аренда (дата в будущем) → без флага
+m4=S.msg_bike_card("Y","1",None,[],{"state":"В аренде","client":"Z","expired":False,"end":"01.01.2099"})
+res.append(ok("истекла" not in m4 and "у клиента Z" in m4, "аренда в силе → без флага «истекла»"))
+
+# _send_bike_card подтягивает то_заявки из bridge (открытая дословная + закрытая)
+class BR2(BR):
+    def read_events(s,b,limit=8): return {"items":[]}
+    def service_pending_get(s,c,t,b): return {"ok":True,"item":{"status":"ждёт_факт","declared":"pads",
+        "done":"","odometer":"24302","note":"WORKS:{подшипник переднего колеса} | escalated"}}
+    def service_pending_list(s,**k): return {"items":[{"bike":"NINJA 400СС PHUKET 6334","status":"закрыто",
+        "done":"oil","odometer":"37000","updated_at":"2026-06-01T00:00:00Z"}]}
+SENDS.clear()
+loop.run_until_complete(S._send_bike_card(None,BR2(),CHAT,TOPIC,"NINJA 6334"))
+res.append(ok(len(SENDS)==1 and "🔧 В работе:" in SENDS[0] and "подшипник переднего колеса" in SENDS[0],
+              "_send_bike_card подтянул открытую заявку с дословной работой (note WORKS:)"))
+res.append(ok("Последний сервис:" in SENDS[0], "_send_bike_card подтянул закрытую заявку по plate"))
+
+# Z4 хелперы note: запись/чтение/слияние без потери прочего текста
+n1=S._sp_note_set_works("", ["колодки","подшипник"])
+res.append(ok(S._sp_works_from_note(n1)==["колодки","подшипник"], "Z4 note: запись+чтение работ"))
+n2=S._sp_note_set_works("WORKS:{колодки} | escalated", ["подшипник"])
+res.append(ok(S._sp_works_from_note(n2)==["колодки","подшипник"] and "escalated" in n2, "Z4 note: слияние + прочий текст сохранён"))
+res.append(ok(S._rental_expired("В аренде","17.06.2026 , 14:00") and not S._rental_expired("дома","17.06.2026"), "Z3 _rental_expired логика"))
+
 loop.close()
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

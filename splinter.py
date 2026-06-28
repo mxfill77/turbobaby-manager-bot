@@ -108,6 +108,16 @@ async def _send_retry(context, *, attempts=3, delay=1.5, **kw):
 # === Кто такой Пым (главный по деньгам) ===
 PYM_USERNAMES = {"pleummmm"}  # lower-case, без @
 
+# === ОБРАЩЕНИЕ К ТАЙЦАМ В ИСХОДЯЩИХ — ТОЛЬКО @username, без имени (правило 28.06) ===
+# Единая точка: в любом исходящем тексте бота таец упоминается/адресуется ТОЛЬКО через эти хэндлы,
+# имя («Пым»/«Earth»/«Pleum»…) в тексте бота НЕ писать. Новых тайцев добавлять сюда (ключ→@username),
+# не хардкодить хэндл по тексту.
+THAI_HANDLES = {
+    "pym": "@Pleummmm",   # Пым — главный по деньгам/визирование ТО (id/username из PYM_USERNAMES)
+    # сюда добавлять остальных тайцев по мере появления их @username (механики и т.д.)
+}
+PYM_HANDLE = THAI_HANDLES["pym"]
+
 # === Аккаунты владельца (Филипп пишет из них) — тоже доверенные ===
 OWNER_USERNAMES = {"turbophuket", "turbophuket1"}
 
@@ -1008,9 +1018,9 @@ def msg_topup_pettycash(amount, bal, wallet: str = "Самоорганизаци
     return _bilingual(
         wallet,
         [f"เติมเงิน  +{a} ฿  (โอนมาจาก {source})", *_balance_block("ยอดคงเหลือ", bal),
-         "", "พี่ Pleum ถูกต้องไหมครับ?"],
+         "", f"{PYM_HANDLE} ถูกต้องไหมครับ?"],
         [f"Пополнение  +{a} ฿  (перенос из {source})", *_balance_block("Баланс", bal),
-         "", "Пым, всё верно?"],
+         "", f"{PYM_HANDLE}, всё верно?"],
     )
 
 
@@ -1019,9 +1029,9 @@ def msg_reconcile(wallet, bal):
     return _bilingual(
         wallet,
         [*_balance_block("ยอดคงเหลือ", bal), "",
-         "@Pleummmm เงินสดในมือตรงกับยอดในระบบไหมครับ? มีรายการตกหล่นไหม? 🙏"],
+         f"{PYM_HANDLE} เงินสดในมือตรงกับยอดในระบบไหมครับ? มีรายการตกหล่นไหม? 🙏"],
         [*_balance_block("Баланс", bal), "",
-         "@Pleummmm наличные на руках сходятся с балансом? Ничего не упустили? 🙏"],
+         f"{PYM_HANDLE} наличные на руках сходятся с балансом? Ничего не упустили? 🙏"],
     )
 
 
@@ -1081,8 +1091,8 @@ def msg_balance_mismatch(cur, bot_bal, pym_bal, diff):
         f"   บันทึก / записано:  {_fmt(pym_bal)} {cur}\n"
         f"   ส่วนต่าง / разница:   {_fmt(abs(diff))} {cur}\n"
         f"\n"
-        f"🇹🇭 พี่ Pleum ผมอาจตกหล่นรายการบางอย่าง ช่วยตรวจสอบหน่อยครับ 🙏\n"
-        f"🇷🇺 Пым, возможно я пропустил запись — глянь 🙏"
+        f"🇹🇭 {PYM_HANDLE} ผมอาจตกหล่นรายการบางอย่าง ช่วยตรวจสอบหน่อยครับ 🙏\n"
+        f"🇷🇺 {PYM_HANDLE}, возможно я пропустил запись — глянь 🙏"
     )
 
 
@@ -1094,8 +1104,8 @@ def msg_expense_high(category, amount, avg):
         f"⛽ {cat_th}วันนี้ {_fmt(amount)} ฿  (ปกติ ~{_fmt(avg)} ฿)\n"
         f"⛽ {cat_ru.capitalize()} сегодня {_fmt(amount)} ฿  (обычно ~{_fmt(avg)} ฿)\n"
         f"\n"
-        f"🇹🇭 พี่ Pleum ปกติไหมครับ?\n"
-        f"🇷🇺 Пым, всё ок или разберём?"
+        f"🇹🇭 {PYM_HANDLE} ปกติไหมครับ?\n"
+        f"🇷🇺 {PYM_HANDLE}, всё ок или разберём?"
     )
 
 
@@ -1106,8 +1116,8 @@ def msg_photo_reminder(bike):
         f"📸 รถคันนี้{b} ขาดรูปน้ำมันและเลขไมล์\n"
         f"📸 По байку{b} не хватает фото топлива и пробега\n"
         f"\n"
-        f"🇹🇭 รบกวนทีมส่งรูปด้วยครับ @Pleummmm ช่วยดูหน่อยนะครับ 🙏\n"
-        f"🇷🇺 Команда, пришлите фото. @Pleummmm проконтролируй 🙏"
+        f"🇹🇭 รบกวนทีมส่งรูปด้วยครับ {PYM_HANDLE} ช่วยดูหน่อยนะครับ 🙏\n"
+        f"🇷🇺 Команда, пришлите фото. {PYM_HANDLE} проконтролируй 🙏"
     )
 
 
@@ -1301,9 +1311,10 @@ def _parse_service_items(items, limit=6):
     return out
 
 
-def msg_bike_card(bike, cur_km, oil, cols, rental, service=None):
-    """КАРТОЧКА байка по запросу: пробег + ТО Oil + J/K/L + аренда + сервис-на-пробеге (ЗАХОД 3).
-    🇹🇭 чистый тайский (метки/статусы/работы тайскими через _work_th), 🇷🇺 русский. Секции без данных опускаем."""
+def msg_bike_card(bike, cur_km, oil, cols, rental, service=None, sp_open=None, sp_last=None):
+    """КАРТОЧКА байка по запросу: пробег + ТО Oil + J/K/L + аренда + сервис-на-пробеге (ЗАХОД 3)
+    + ОТКРЫТАЯ заявка ТО «в работе» (Z1) + последний сервис (закрытая заявка) + флаг устаревшей аренды (Z3).
+    🇹🇭 чистый тайский (метки/статусы/работы тайскими; дословные RU-работы Z4 — ТОЛЬКО в 🇷🇺), 🇷🇺 русский. Секции без данных опускаем."""
     head = f"🐀 Splinter · 📌 {bike}" if bike else "🐀 Splinter"
     km_th = f" · ไมล์ {cur_km} กม." if cur_km else ""
     km_ru = f" · пробег {cur_km} км" if cur_km else ""
@@ -1333,12 +1344,32 @@ def msg_bike_card(bike, cur_km, oil, cols, rental, service=None):
         nxt = c.get("next")
         th.append(f"   • {th_lbl}:" + (f" ครบกำหนด {nxt} กม." if nxt else " บันทึกแล้ว"))
         ru.append(f"   • {ru_lbl}:" + (f" следующее {nxt} км" if nxt else " ведётся"))
+    # Z1: ОТКРЫТАЯ заявка ТО — «в работе» (текущий ремонт, ещё не закрытый). TH = тайские лейблы kinds;
+    # RU = дословные работы (Z4 из note) ИЛИ лейблы. Кириллица дословных работ идёт ТОЛЬКО в 🇷🇺-блок.
+    if sp_open and (sp_open.get("kinds") or sp_open.get("works")):
+        _st = str(sp_open.get("status") or "")
+        _odo = str(sp_open.get("odo") or "")
+        _th_w = _sp_labels_th(sp_open.get("kinds") or [])
+        _ru_w = ", ".join(sp_open.get("works") or []) or _sp_labels_ru(sp_open.get("kinds") or [])
+        th.append(f"   🔧 กำลังทำ: {_th_w}" + (f" · ไมล์ {_odo}" if _odo else "")
+                  + f" · {_SP_STATUS_TH.get(_st, _st)}")
+        ru.append(f"   🔧 В работе: {_ru_w}" + (f", одометр {_odo}" if _odo else ", одометр —")
+                  + f" · {_SP_STATUS_RU.get(_st, _st)}")
+    # Последний сервис (последняя ЗАКРЫТАЯ заявка) — сводка прошлого визита.
+    if sp_last and sp_last.get("done"):
+        _dl_th = _sp_labels_th(sp_last["done"]); _dl_ru = _sp_labels_ru(sp_last["done"])
+        _lo = str(sp_last.get("odo") or ""); _ld = str(sp_last.get("date") or "")
+        th.append(f"   ✅ ครั้งล่าสุด: {_dl_th}" + (f" ที่ {_lo} กม." if _lo else "") + (f" ({_ld})" if _ld else ""))
+        ru.append(f"   ✅ Последний сервис: {_dl_ru}" + (f", {_lo} км" if _lo else "") + (f" ({_ld})" if _ld else ""))
     if rental:
         state = str(rental.get("state", ""))
         cl = rental.get("client", "")
+        _exp = rental.get("expired"); _end = str(rental.get("end") or "")
         if state.lower().startswith("в аренд"):
-            th.append("   • เช่า: ให้เช่าอยู่" + (f" (ลูกค้า {cl})" if cl else ""))
-            ru.append("   • аренда: у клиента" + (f" {cl}" if cl else ""))
+            th.append("   • เช่า: ให้เช่าอยู่" + (f" (ลูกค้า {cl})" if cl else "")
+                      + (f" — หมดสัญญาแล้ว {_end}" if _exp else ""))
+            ru.append("   • аренда: у клиента" + (f" {cl}" if cl else "")
+                      + (f" — аренда истекла {_end}" if _exp else ""))
         elif state.lower() == "дома":
             th.append("   • เช่า: อยู่ที่ออฟฟิศ")
             ru.append("   • аренда: дома (в офисе)")
@@ -1375,7 +1406,9 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
             for r in recs if str(r.get("service_type")) in ("gear", "abs", "airfilter")]
     rental = None
     if fb.get("status"):
-        rental = {"state": fb.get("status"), "client": (fb.get("current_rental") or {}).get("client", "")}
+        _end = (fb.get("current_rental") or {}).get("end_date", "")
+        rental = {"state": fb.get("status"), "client": (fb.get("current_rental") or {}).get("client", ""),
+                  "expired": _rental_expired(fb.get("status"), _end), "end": _end}   # Z3
     # ЗАХОД 3: сервис-на-пробеге — 6 последних инфо-работ из истории «события» (read_events, фильтр по паттерну).
     service = []
     try:
@@ -1383,8 +1416,29 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
         service = _parse_service_items(ev.get("items", []), limit=6)
     except Exception:
         log.exception("  → read_events для карточки упал")
+    # Z1: то_заявки — ОТКРЫТАЯ (в работе) + последняя ЗАКРЫТАЯ (последний сервис). read-only, мягко (методов может не быть в моках).
+    sp_open = None; sp_last = None
+    try:
+        _g = bridge.service_pending_get(chat_id, topic_id, bike)
+        _it = _g.get("item") if _g.get("ok") else None
+        if _it and str(_it.get("status")) not in ("закрыто", ""):
+            sp_open = {"kinds": (_sp_split(_it.get("declared")) or _sp_split(_it.get("done"))),
+                       "works": _sp_works_from_note(_it.get("note")),
+                       "odo": str(_it.get("odometer") or ""), "status": str(_it.get("status") or "")}
+    except Exception:
+        log.exception("  → карточка: чтение открытой то_заявки упало")
+    try:
+        _closed = [r for r in (bridge.service_pending_list(status="закрыто").get("items") or [])
+                   if _same_bike(r.get("bike"), bike)]
+        _closed.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+        if _closed:
+            _c0 = _closed[0]
+            sp_last = {"done": _sp_split(_c0.get("done")), "odo": str(_c0.get("odometer") or ""),
+                       "date": str(_c0.get("updated_at") or "")[:10]}
+    except Exception:
+        log.exception("  → карточка: чтение закрытых то_заявки упало")
     await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                text=msg_bike_card(canon, cur_km, oil, cols, rental, service))
+                text=msg_bike_card(canon, cur_km, oil, cols, rental, service, sp_open=sp_open, sp_last=sp_last))
 
 
 def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date=""):
@@ -1682,9 +1736,9 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
             u = _cur_unit(money_currency)
             await _send(context, chat_id=chat_id,
                         text=(f"🐀 Splinter\n"
-                              f"🧾 พี่ Pleum ในใบเสร็จ {_fmt(ramount)} {u} แต่เขียนไว้ {_fmt(wamount)} {u} "
+                              f"🧾 {PYM_HANDLE} ในใบเสร็จ {_fmt(ramount)} {u} แต่เขียนไว้ {_fmt(wamount)} {u} "
                               f"ต่างกันนะครับ ตรวจหน่อย 🙏\n"
-                              f"🧾 Пым, на чеке {_fmt(ramount)} {u}, а записано {_fmt(wamount)} {u} — "
+                              f"🧾 {PYM_HANDLE}, на чеке {_fmt(ramount)} {u}, а записано {_fmt(wamount)} {u} — "
                               f"не сходится, глянь пожалуйста 🙏"))
 
     wallet_bal = bridge.get_balance(group=wallet).get("balance", {})
@@ -2083,10 +2137,10 @@ def msg_oil_need_trusted(bike, km):
     b_ru = f" на {bike}" if bike else ""
     return (
         f"🐀 Splinter\n"
-        f"🇹🇭 🔧 การบันทึกการเปลี่ยนน้ำมันเครื่อง ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้น. "
-        f"@Pleummmm ยืนยันการเปลี่ยนน้ำมัน{b_th} = {km} กม. ไหมครับ? ตอบ «ใช่» หรือ «ไม่»\n"
-        f"🇷🇺 🔧 Запись ТО в журнал подтверждает @Pleummmm или владелец. "
-        f"@Pleummmm, подтвердите замену масла{b_ru} = {km} км? да/нет"
+        f"🇹🇭 🔧 การบันทึกการเปลี่ยนน้ำมันเครื่อง ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้น. "
+        f"{PYM_HANDLE} ยืนยันการเปลี่ยนน้ำมัน{b_th} = {km} กม. ไหมครับ? ตอบ «ใช่» หรือ «ไม่»\n"
+        f"🇷🇺 🔧 Запись ТО в журнал подтверждает {PYM_HANDLE} или владелец. "
+        f"{PYM_HANDLE}, подтвердите замену масла{b_ru} = {km} км? да/нет"
     )
 
 
@@ -2383,8 +2437,8 @@ async def _ask_service_col(context, chat_id, topic_id, bike, kind, km):
     b = f" · 📌 {bike}" if bike else ""
     sent = await _send(context, chat_id=chat_id, message_thread_id=topic_id,
         text=(f"🐀 Splinter{b}\n"
-              f"🇹🇭 🔧 บันทึก «{th_lbl}» = {km} กม. ไหมครับ? กดปุ่ม (ยืนยันโดย @Pleummmm/เจ้าของ) 👇\n"
-              f"🇷🇺 🔧 Зафиксировать «{ru_lbl}» = {km} км? Нажми кнопку (подтверждает @Pleummmm/владелец) 👇"),
+              f"🇹🇭 🔧 บันทึก «{th_lbl}» = {km} กม. ไหมครับ? กดปุ่ม (ยืนยันโดย {PYM_HANDLE}/เจ้าของ) 👇\n"
+              f"🇷🇺 🔧 Зафиксировать «{ru_lbl}» = {km} км? Нажми кнопку (подтверждает {PYM_HANDLE}/владелец) 👇"),
         reply_markup=kb)
     _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
 
@@ -2571,12 +2625,12 @@ async def handle_service_button(update, context, bridge) -> None:
         # [Зафиксировать <тип>] группы B (gear/abs/airfilter) → set_fleet_service. ТОЛЬКО доверенный.
         svc_kind = data.get("svc_kind", "")
         if not _is_trusted_user(q.from_user):
-            await q.answer("ยืนยันโดย @Pleummmm/เจ้าของ · Подтверждает @Pleummmm или владелец", show_alert=False)
+            await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             th_lbl, ru_lbl = _SVC_COL_LABEL.get(svc_kind, (svc_kind, svc_kind))
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=(f"🐀 Splinter\n"
-                              f"🇹🇭 🔧 การบันทึก «{th_lbl}» ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้น\n"
-                              f"🇷🇺 🔧 Запись «{ru_lbl}» подтверждает @Pleummmm или владелец"))
+                              f"🇹🇭 🔧 การบันทึก «{th_lbl}» ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้น\n"
+                              f"🇷🇺 🔧 Запись «{ru_lbl}» подтверждает {PYM_HANDLE} или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
         await q.answer("กำลังบันทึก… · Записываю…")
         try:
@@ -2590,7 +2644,7 @@ async def handle_service_button(update, context, bridge) -> None:
     if action == "oil":
         # [После замены] → боевая запись кол.I. ТОЛЬКО доверенный.
         if not _is_trusted_user(q.from_user):
-            await q.answer("ยืนยันโดย @Pleummmm/เจ้าของ · Подтверждает @Pleummmm или владелец", show_alert=False)
+            await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=msg_oil_need_trusted(bike, km))
             return   # токен и кнопки живут — Пым нажмёт [После замены] позже
@@ -2606,12 +2660,12 @@ async def handle_service_button(update, context, bridge) -> None:
         # Пишет СДЕЛАННЫЕ позиции (кол.I/J/K/L set_fleet_* confirmed=True под сторожем + синк «обслуживание»),
         # прочее → событие. Earth сам нажать НЕ может — бот ждёт Пыма/владельца (токен+кнопка живут).
         if not _is_trusted_user(q.from_user):
-            await q.answer("ยืนยันโดย @Pleummmm/เจ้าของ · Подтверждает @Pleummmm или владелец", show_alert=False)
+            await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=("🐀 Splinter\n"
-                              "🇹🇭 🔧 บันทึกผล ТО ยืนยันโดย @Pleummmm หรือเจ้าของเท่านั้นครับ\n"
+                              f"🇹🇭 🔧 บันทึกผล ТО ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
                               f"{_SEP}\n"
-                              "🇷🇺 🔧 Запись результата ТО подтверждает @Pleummmm или владелец"))
+                              f"🇷🇺 🔧 Запись результата ТО подтверждает {PYM_HANDLE} или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
         await q.answer("กำลังบันทึก… · Записываю ТО…")
         try:
@@ -3187,6 +3241,47 @@ def _sp_age_hours(created_at, now_ts):
         return None
 
 
+# Карточка байка: читаемые статусы заявки (RU/TH) для секции «в работе». Хэндл тайца — через PYM_HANDLE.
+_SP_STATUS_RU = {"заявлено": "заявлено", "ждёт_факт": "ждёт результат",
+                 "ждёт_подтверждения": f"ждёт подтверждения {PYM_HANDLE}"}
+_SP_STATUS_TH = {"заявлено": "รับเรื่องแล้ว", "ждёт_факт": "รอแจ้งผล",
+                 "ждёт_подтверждения": f"รอ {PYM_HANDLE} ยืนยัน"}
+
+
+def _sp_works_from_note(note):
+    """Z4: дословный список работ из note (сегмент WORKS:{...}). Пусто, если нет."""
+    m = _re_pl.search(r"WORKS:\{(.*?)\}", str(note or ""))
+    return [w.strip() for w in m.group(1).split(";") if w.strip()] if m else []
+
+
+def _sp_note_set_works(base_note, raw_works):
+    """Z4: встроить/обновить дословные работы в note сегментом WORKS:{...}, СОХРАНИВ прочий текст note
+    (напр. ' | escalated'). Объединяет с уже записанными работами, без дублей."""
+    existing = _sp_works_from_note(base_note)
+    clean = [str(w).strip().replace("}", "").replace(";", ",") for w in (raw_works or []) if str(w).strip()]
+    merged = list(dict.fromkeys(existing + clean))
+    rest = _re_pl.sub(r"WORKS:\{.*?\}\s*\|?\s*", "", str(base_note or "")).strip(" |")
+    seg = ("WORKS:{" + "; ".join(merged) + "}") if merged else ""
+    if seg and rest:
+        return seg + " | " + rest
+    return seg or rest
+
+
+def _rental_expired(status, end_date):
+    """Z3: True если Лист1 статус 'В аренде', но дата конца аренды (формат DD.MM.YYYY[...]) уже в прошлом."""
+    if not str(status or "").strip().lower().startswith("в аренд"):
+        return False
+    m = _re_pl.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", str(end_date or ""))
+    if not m:
+        return False
+    try:
+        import datetime as _dt
+        d = _dt.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        return d < _dt.datetime.utcnow().date()
+    except Exception:
+        return False
+
+
 def _sp_open(bridge, chat_id, topic_id, bike):
     """Открытая заявка по теме/байку или None (best-effort, не кидает)."""
     try:
@@ -3221,11 +3316,11 @@ def msg_sp_confirm_pym(bike, done, notdone, odo):
     nd = f"\n🇷🇺 Не сделано: {_sp_labels_ru(notdone)}" if notdone else ""
     nd_th = f"\n🇹🇭 ยังไม่ได้ทำ: {_sp_labels_th(notdone)}" if notdone else ""
     return (f"🐀 Splinter{b}\n"
-            f"🇹🇭 Earth จบงาน {bike} แล้ว ทำ: {_sp_labels_th(done)}{nd_th}\n"
-            f"🇹🇭 เลขไมล์ {odo} กม. — ถูกไหม? ยืนยันบันทึก? @Pleummmm\n"
+            f"🇹🇭 งาน {bike} เสร็จแล้ว ทำ: {_sp_labels_th(done)}{nd_th}\n"
+            f"🇹🇭 เลขไมล์ {odo} กม. — ถูกไหม? ยืนยันบันทึก? {PYM_HANDLE}\n"
             f"{_SEP}\n"
-            f"🇷🇺 Earth закончил {bike}. Сделано: {_sp_labels_ru(done)}{nd}\n"
-            f"🇷🇺 Одометр {odo} км — верно? Подтвердить запись? @Pleummmm (или пришли правильное число)")
+            f"🇷🇺 По {bike} работы завершены. Сделано: {_sp_labels_ru(done)}{nd}\n"
+            f"🇷🇺 Одометр {odo} км — верно? Подтвердить запись? {PYM_HANDLE} (или пришли правильное число)")
 
 
 async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo):
@@ -3245,11 +3340,14 @@ async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, decla
     log.info(f"  → ТО фаза2 → подтверждение Пыму: {bike} done={done} odo={odo} (tok={tok})")
 
 
-async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declared):
-    """Фаза 1: фиксируем НАМЕРЕНИЕ (заявка). В Лист1/обслуживание НИЧЕГО не пишем."""
+async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declared, works_raw=None):
+    """Фаза 1: фиксируем НАМЕРЕНИЕ (заявка). В Лист1/обслуживание НИЧЕГО не пишем.
+    Z4: дословные работы (works_raw) кладём в note (для правдивой карточки «в работе»)."""
     try:
+        _note = _sp_note_set_works("", works_raw) if works_raw else ""
+        _extra = {"note": _note} if _note else {}
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
-                                      bike=bike, declared=_sp_join(declared), status="заявлено")
+                                      bike=bike, declared=_sp_join(declared), status="заявлено", **_extra)
     except Exception:
         log.exception("  → service_pending_upsert (фаза1) упал")
     await _send(context, chat_id=chat_id, message_thread_id=topic_id,
@@ -3297,6 +3395,14 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     if not odo:
         m = _re_pl.search(r"\b(\d{4,6})\b", str(text or ""))
         odo = m.group(1) if m else ""
+    # Z4: дословные работы из ответа → в note (для правдивой карточки «в работе»). Отдельный upsert по note;
+    # последующие upsert'ы статуса/done не передают note → pick('note') сохранит этот сегмент. Зелёная (Bot Data).
+    if works:
+        try:
+            bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                          note=_sp_note_set_works(sp.get("note"), works))
+        except Exception:
+            log.exception("  → Z4 запись дословных работ в note упала")
     # B2: естественный маркер завершения (закончил/готово/да/เสร็จแล้ว/…), не только всё/เสร็จหมด.
     completed = _is_done_marker(text)
     # B3: завершение БЕЗ называния конкретных ЗАЯВЛЕННЫХ работ → считаем все заявленные сделанными;
@@ -3385,9 +3491,9 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
     try:
         await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
                     text=(f"🐀 Splinter · 📌 {bike}\n"
-                          f"🇹🇭 ⚠️ งาน ТО ({_sp_labels_th(declared)}) ค้างนาน {age_txt} ยังไม่ปิด — @Pleummmm ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
+                          f"🇹🇭 ⚠️ งาน ТО ({_sp_labels_th(declared)}) ค้างนาน {age_txt} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
                           f"{_SEP}\n"
-                          f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_txt} без закрытия — @Pleummmm, закрой/подтверди вручную 🙏"))
+                          f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_txt} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
     except Exception:
         log.exception(f"  → B4 эскалация в тему {bike} упала")
     try:
@@ -3574,7 +3680,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                              bike=bike, event_type="intake", notes=notes[:200],
                              photos=1 if has_photo else 0, sender=_sender,
                              msg_id=f"{chat_id}:{msg.message_id}")
-            await service_phase1_intake(context, bridge, chat_id, topic_id, bike, _sp_declared)
+            await service_phase1_intake(context, bridge, chat_id, topic_id, bike, _sp_declared, works_raw=works)
         except Exception:
             log.exception("  → ТО фаза1 (intake) упала")
         return
@@ -3639,7 +3745,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                 _ru_intake = (f"Принял возврат {bike}"
                               + (f", топливо {fuel}" if fuel else "")
                               + (f", пробег {mileage}" if mileage else "")
-                              + ". Занёс в лист закрытия. @Pleummmm — глянь депозит/ущерб 🙏")
+                              + f". Занёс в лист закрытия. {PYM_HANDLE} — глянь депозит/ущерб 🙏")
                 await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                             text=bilingual_from_ru(claude, _ru_intake))
         except Exception as e:
@@ -3710,7 +3816,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Грязь сюда НЕ попадает — она отсекается на уровне vision (damage=null, dirt=true).
     if vis.get("damage"):
         # RU — основа (с конкретикой повреждения + депозит), TH = точный перевод этого RU (вариант 1).
-        _ru_dmg = (f"⚠️ Пым, на фото повреждения: {vis['damage']} — глянь. "
+        _ru_dmg = (f"⚠️ {PYM_HANDLE}, на фото повреждения: {vis['damage']} — глянь. "
                    f"Если это возврат — посмотри по депозиту 🙏")
         await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                     text=bilingual_from_ru(claude, _ru_dmg))

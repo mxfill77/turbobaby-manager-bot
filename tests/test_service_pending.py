@@ -231,6 +231,25 @@ def test_b5_inmemory_antidup():
     assert len(reminders) == 1, f"два тика → одно напоминание, а {len(reminders)}"
 
 
+# G) ОБРАЩЕНИЕ К ТАЙЦАМ — ТОЛЬКО @username, без имени (правило 28.06)
+def test_thai_handle_only_no_name():
+    # единая точка
+    assert S.PYM_HANDLE == "@Pleummmm" and S.THAI_HANDLES["pym"] == "@Pleummmm"
+    # ключевые исходящие, адресующие/называющие тайца → @username, БЕЗ имени
+    msgs = [
+        S.msg_sp_confirm_pym("NMAX 4255", ["pads"], [], "24302"),
+        S.msg_oil_need_trusted("NMAX 4255", "24302"),
+        S.msg_topup_pettycash(500, {}),
+        S.msg_reconcile("Самоорганизация", {}),
+        S._SP_STATUS_RU["ждёт_подтверждения"],
+        S._SP_STATUS_TH["ждёт_подтверждения"],
+    ]
+    for m in msgs:
+        assert "@Pleummmm" in m, f"таец адресован через @username: {m[:70]!r}"
+        for bad in ("Пым", "Earth", "พี่ Pleum"):
+            assert bad not in m, f"имя тайца «{bad}» в исходящем тексте: {m!r}"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
