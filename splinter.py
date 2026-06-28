@@ -1884,6 +1884,18 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
             pass
     _PENDING_MILEAGE.pop(key, None)
     clear_awaiting(*key)
+    # B1 (вариант б): по байку ОТКРЫТА заявка ТО в статусе 'ждёт_факт' (механик уже отписался о работе,
+    # ждали ТОЛЬКО одометр) → подтверждённый фото-одометр доводит заявку до подтверждения Пыму.
+    # Сторож убывания B уже пройден выше (берём проверенное число). Запись — по-прежнему по «да» Пыма (гейт сохранён).
+    try:
+        _sp = _sp_open(bridge, msg.chat_id, key[1], bike) if bike else None
+        if _sp and str(_sp.get("status")) == "ждёт_факт":
+            _declared = _sp_split(_sp.get("declared"))
+            _done = _sp_split(_sp.get("done")) or list(_declared)   # B3: нет done → заявленное считаем сделанным
+            await _sp_advance_to_confirm(context, bridge, msg.chat_id, key[1], bike, _declared, _done, num)
+            return True
+    except Exception:
+        log.exception("  → B1: довод заявки фото-одометром упал")
     # Пробег подтверждён И прошёл сторож B → решаем: спросить «после замены?» или просто квитанция.
     try:
         await _after_mileage(context, bridge, msg.chat_id, key[1], bike, num, oil_hint)
@@ -3070,6 +3082,14 @@ _SP_KIND_LABEL = {
 _SP_COL_KINDS = ("oil", "gear", "abs", "airfilter")   # пишутся в Лист1 (столбец); прочее — событийно
 _SP_REMIND_AFTER_MIN = 6 * 60   # висяк: заявка без закрытия старше 6ч → напоминание
 _SP_REMIND_THROTTLE_MIN = 6 * 60
+_SP_REMIND_MAX_AGE_H = 48       # B4: заявка старше этого (ч) → ОДНА эскалация владельцу/Пыму, тайцам больше не долбим
+_SP_LAST_SENT = {}              # B5: in-memory анти-дубль напоминаний (key=(chat,topic,bike) → ts последней отправки)
+
+# B2: маркеры «работа завершена» (ДОВОДЯТ заявку к гейту Пыма, САМИ в Лист1 НЕ пишут).
+# Длинные/distinctive — подстрокой; короткие/неоднозначные (да/ок/все) — ТОЛЬКО как целое слово (без ложных срабатываний).
+_SP_DONE_SUBSTR = ("закончил", "законч", "готов", "сделал", "сделан", "поменял", "заменил", "замен",
+                   "เสร็จ", "แล้ว", "เรียบร้อย", "ทั้งหมด", "finished", "完成")
+_SP_DONE_WORDS = {"да", "ок", "окей", "все", "всё", "ok", "okay", "done", "ready", "全部"}
 
 
 def _service_kind(w):
@@ -3135,6 +3155,38 @@ def _sp_labels_th(kinds):
     return ", ".join(_SP_KIND_LABEL.get(k, (k, k))[0] for k in kinds) or "—"
 
 
+def _is_done_marker(text):
+    """B2: ответ механика содержит маркер «работа завершена» (закончил/готово/да/เสร็จแล้ว/…).
+    Длинные формы — подстрокой; короткие (да/ок/все) — целым словом (без ложных срабатываний).
+    НЕГАТИВ («ещё НЕ закончил» / «ยังไม่เสร็จ» / «not done») → НЕ завершение (консервативно: переспросим)."""
+    low = str(text or "").lower()
+    toks = set(_re_pl.findall(r"\w+", low))
+    if ({"не", "нет", "not"} & toks) or ("ยัง" in low) or ("ไม่" in low):
+        return False
+    if any(s in low for s in _SP_DONE_SUBSTR):
+        return True
+    return bool(toks & _SP_DONE_WORDS)
+
+
+def _sp_merge_done(declared, done):
+    """B3: слить заявленное и распознанное-сделанное, сохраняя порядок и без дублей (declared первыми)."""
+    out = list(declared)
+    for k in done:
+        if k not in out:
+            out.append(k)
+    return out
+
+
+def _sp_age_hours(created_at, now_ts):
+    """Возраст заявки в часах по created_at (ISO Z/+00:00). None при ошибке разбора."""
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
+        return (now_ts - ts) / 3600.0
+    except Exception:
+        return None
+
+
 def _sp_open(bridge, chat_id, topic_id, bike):
     """Открытая заявка по теме/байку или None (best-effort, не кидает)."""
     try:
@@ -3174,6 +3226,23 @@ def msg_sp_confirm_pym(bike, done, notdone, odo):
             f"{_SEP}\n"
             f"🇷🇺 Earth закончил {bike}. Сделано: {_sp_labels_ru(done)}{nd}\n"
             f"🇷🇺 Одометр {odo} км — верно? Подтвердить запись? @Pleummmm (или пришли правильное число)")
+
+
+async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo):
+    """B1: довести заявку до 'ждёт_подтверждения' и показать кнопку Пыму. Общий хвост фазы-2 —
+    зовётся И из текстового ответа (handle_service_result), И из подтверждённого фото-одометра
+    (handle_mileage_confirm). САМ в Лист1 НЕ пишет: запись только по svc:done от доверенного (гейт сохранён)."""
+    notdone = [k for k in declared if k not in done]
+    bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                  done=_sp_join(done), odometer=str(odo), status="ждёт_подтверждения")
+    tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike,
+                    "done": done, "odo": str(odo), "kind": "sp_done"})
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "✅ ยืนยันบันทึก / Подтвердить запись", callback_data=f"svc:done:{tok}")]])
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=msg_sp_confirm_pym(bike, done, notdone, odo), reply_markup=kb)
+    mark_awaiting(chat_id, topic_id)
+    log.info(f"  → ТО фаза2 → подтверждение Пыму: {bike} done={done} odo={odo} (tok={tok})")
 
 
 async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declared):
@@ -3228,35 +3297,34 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     if not odo:
         m = _re_pl.search(r"\b(\d{4,6})\b", str(text or ""))
         odo = m.group(1) if m else ""
-    # Нет ни перечня факта, ни явного «всё/готово» → переспрашиваем механика.
-    all_done = any(w in str(text or "").lower() for w in ("всё", "все", "全部", "ทั้งหมด", "เสร็จหมด"))
-    if not done and not all_done:
+    # B2: естественный маркер завершения (закончил/готово/да/เสร็จแล้ว/…), не только всё/เสร็จหมด.
+    completed = _is_done_marker(text)
+    # B3: завершение БЕЗ называния конкретных ЗАЯВЛЕННЫХ работ → считаем все заявленные сделанными;
+    # названные доп.работы (подшипник=other сверх колодок) ДОБАВЛЯЕМ, заявленное не теряем.
+    if completed:
+        named_declared = [k for k in done if k in declared]
+        if not named_declared:
+            done = _sp_merge_done(declared, done)
+    # Нет ни перечня факта, ни маркера завершения → переспрашиваем механика.
+    if not done and not completed:
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, status="ждёт_факт")
         await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                     text=msg_sp_ask_done(bike, declared))
         mark_awaiting(chat_id, topic_id)
         return True
-    if all_done and not done:
+    if completed and not done:
         done = list(declared)
     if not odo:
-        # факт есть, пробега нет → просим одометр (в том же статусе ждёт_факт)
+        # факт есть, пробега в ТЕКСТЕ нет → просим одометр; фото-одометр доведёт заявку через
+        # handle_mileage_confirm (B1) — в статусе ждёт_факт. done сохраняем в строке заявки.
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, done=_sp_join(done), status="ждёт_факт")
         await _send(context, chat_id=chat_id, message_thread_id=topic_id, text=msg_ask_odometer(bike))
         mark_awaiting(chat_id, topic_id)
         return True
-    notdone = [k for k in declared if k not in done]
-    bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
-                                  done=_sp_join(done), odometer=str(odo), status="ждёт_подтверждения")
-    tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike,
-                    "done": done, "odo": str(odo), "kind": "sp_done"})
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-        "✅ ยืนยันบันทึก / Подтвердить запись", callback_data=f"svc:done:{tok}")]])
-    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                text=msg_sp_confirm_pym(bike, done, notdone, odo), reply_markup=kb)
-    mark_awaiting(chat_id, topic_id)
-    log.info(f"  → ТО фаза2: {bike} done={done} odo={odo} → запрос Пыму (tok={tok})")
+    # B1 (общий хвост): довести до 'ждёт_подтверждения' + кнопка Пыму (запись только по его «да»).
+    await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo)
     return True
 
 
@@ -3304,8 +3372,35 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     return written, failed
 
 
+async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note):
+    """B4: заявка висит дольше TTL → ОДНА эскалация владельцу (notify) + тег Пыма в теме; пометить note=escalated.
+    После этого тайцам напоминания прекращаются (см. reminder). Запись в Лист1 НЕ трогаем."""
+    age_txt = f"{int(age_h)}ч" if age_h is not None else "долго"
+    try:
+        import notify
+        notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(declared)}) — заявка открыта {age_txt} без закрытия. "
+                      f"Глянь/закрой вручную или дожми подтверждение.")
+    except Exception:
+        log.exception("  → B4 эскалация владельцу (notify) упала")
+    try:
+        await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
+                    text=(f"🐀 Splinter · 📌 {bike}\n"
+                          f"🇹🇭 ⚠️ งาน ТО ({_sp_labels_th(declared)}) ค้างนาน {age_txt} ยังไม่ปิด — @Pleummmm ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
+                          f"{_SEP}\n"
+                          f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_txt} без закрытия — @Pleummmm, закрой/подтверди вручную 🙏"))
+    except Exception:
+        log.exception(f"  → B4 эскалация в тему {bike} упала")
+    try:
+        new_note = (str(note) + " | escalated").strip(" |") if note else "escalated"
+        bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike, note=new_note)
+    except Exception:
+        log.exception("  → B4 пометка note=escalated упала")
+    log.info(f"  → ТО висяк ЭСКАЛАЦИЯ: {bike} age={age_txt} declared={declared} → владельцу+Пыму, тайцам стоп")
+
+
 async def scheduled_service_pending_reminder(context, bridge):
-    """Висяк: открытые заявки (заявлено/ждёт_факт) старше порога без отписки → напоминание (throttle)."""
+    """Висяк: открытые заявки (заявлено/ждёт_факт) старше порога без отписки → напоминание (throttle + TTL).
+    B4: старше _SP_REMIND_MAX_AGE_H → ОДНА эскалация владельцу, тайцам стоп. B5: in-memory анти-дубль. B6: лог отправок."""
     try:
         r = bridge.service_pending_list(open=True, older_than_min=_SP_REMIND_AFTER_MIN)
         items = r.get("items", []) if r.get("ok") else []
@@ -3314,9 +3409,24 @@ async def scheduled_service_pending_reminder(context, bridge):
         return
     now = _time.time()
     for it in items:
-        if str(it.get("status")) == "ждёт_подтверждения":
+        status = str(it.get("status"))
+        if status == "ждёт_подтверждения":
             continue   # ждёт Пыма, не механика — отдельный канал (кнопка висит)
-        # throttle по last_reminded_at
+        bike = it.get("bike", "")
+        chat_id = it.get("chat_id"); topic_id = it.get("topic_id") or None
+        declared = _sp_split(it.get("declared"))
+        note = str(it.get("note") or "")
+        # B4: TTL по возрасту заявки → одна эскалация владельцу/Пыму, дальше тайцам не долбим
+        age_h = _sp_age_hours(it.get("created_at"), now)
+        if age_h is not None and age_h >= _SP_REMIND_MAX_AGE_H:
+            if "escalated" not in note:
+                await _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note)
+            continue
+        # B5: in-memory анти-дубль (две близкие итерации в одном процессе — рестарт first=300 рядом с часовым тиком)
+        _k = (str(chat_id), str(topic_id or ""), bike)
+        if now - _SP_LAST_SENT.get(_k, 0) < _SP_REMIND_THROTTLE_MIN * 60:
+            continue
+        # throttle по last_reminded_at (персист между рестартами)
         lr = it.get("last_reminded_at")
         if lr:
             try:
@@ -3326,18 +3436,19 @@ async def scheduled_service_pending_reminder(context, bridge):
                     continue
             except Exception:
                 pass
-        bike = it.get("bike", "")
-        chat_id = it.get("chat_id"); topic_id = it.get("topic_id") or None
-        declared = _sp_split(it.get("declared"))
         try:
             await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
                         text=(f"🐀 Splinter · 📌 {bike}\n"
                               f"🇹🇭 ⏳ {bike} แจ้งเข้า ТО ({_sp_labels_th(declared)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
                               f"{_SEP}\n"
                               f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(declared)}), результат не отписан — закончили?"))
+            _SP_LAST_SENT[_k] = now
             bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
                                           last_reminded_at=__import__("datetime").datetime.now(
                                               __import__("datetime").timezone.utc).isoformat())
+            _att = (int(age_h // (_SP_REMIND_THROTTLE_MIN / 60)) + 1) if age_h is not None else 1
+            log.info(f"  → ТО висяк-напоминание {bike} attempt≈{_att} "
+                     f"age={(f'{age_h:.1f}ч' if age_h is not None else '?')} status={status}")  # B6
         except Exception:
             log.exception(f"  → висяк-напоминание {bike} упало")
 

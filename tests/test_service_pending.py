@@ -158,6 +158,79 @@ def test_done_button_trusted_writes():
     assert b.closed is True
     assert tok not in S._SVC_TOKENS
 
+# ============ F) ФИКСЫ B1-B6 (закрытие доходит до конца) ============
+def _iso_ago(hours):
+    return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+
+# B2: лексикон завершения (естественные слова) + защита от негатива
+def test_b2_done_lexicon_and_negation():
+    for w in ("готово", "закончили", "сделал", "поменял", "да", "เสร็จแล้ว", "เรียบร้อย", "ok"):
+        assert S._is_done_marker(w), f"{w!r} — должно быть маркером завершения"
+    for w in ("ещё не закончил", "пока не готово", "ยังไม่เสร็จ", "not done", "когда привезли", "сдал позже"):
+        assert not S._is_done_marker(w), f"{w!r} — НЕ маркер (негатив/ложное срабатывание)"
+
+# B3: declared не теряем, доп.работу добавляем («Закончили да и подшипник» при заявке pads)
+def test_b3_declared_kept_plus_extra():
+    reset()
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "", "status": "ждёт_факт", "odometer": ""}
+    msg = Msg("Закончили да и подшипник переднего колеса")
+    handled = run(S.handle_service_result(msg, context=None, bridge=b,
+                                          claude=FakeClaude({"works": ["подшипник переднего колеса"]}), text=msg.text))
+    assert handled is True
+    done = S._sp_split(b.sp["done"])
+    assert "pads" in done and "other" in done, f"заявленное pads + доп. other, а {done}"
+    assert not b.oil_calls and not b.svc_calls and not b.events, "до «да» Пыма в Лист1/события не пишем"
+
+# B3: «готово» без перечня → заявленное считаем сделанным
+def test_b3_bare_done_means_declared():
+    reset()
+    b = FakeBridge(); b.sp = {"declared": "oil", "done": "", "status": "ждёт_факт", "odometer": ""}
+    run(S.handle_service_result(Msg("готово"), context=None, bridge=b, claude=FakeClaude({}), text="готово"))
+    assert "oil" in S._sp_split(b.sp["done"]), f"«готово» → заявленное (oil) сделано, а {b.sp['done']!r}"
+
+# B1: подтверждённый ФОТО-одометр доводит заявку до подтверждения Пыму (запись — по гейту)
+def test_b1_photo_odometer_advances():
+    reset(); S._SP_LAST_SENT.clear(); S._PENDING_MILEAGE.clear()
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "pads,other", "status": "ждёт_факт", "odometer": "", "bike": BIKE}
+    S._PENDING_MILEAGE[(CHAT, TOPIC)] = ("24302", BIKE, None, False)
+    handled = run(S.handle_mileage_confirm(Msg("да"), context=None, bridge=b, text="да"))
+    assert handled is True
+    assert b.sp["status"] == "ждёт_подтверждения" and b.sp["odometer"] == "24302", b.sp
+    toks = [d for d in S._SVC_TOKENS.values() if d.get("kind") == "sp_done"]
+    assert toks and toks[0]["odo"] == "24302", toks
+    assert not b.oil_calls and not b.svc_calls and not b.closed, "запись/закрытие — ТОЛЬКО по «да» Пыма (гейт сохранён)"
+
+# B4: TTL → ОДНА эскалация владельцу/Пыму, тайцам стоп
+def test_b4_ttl_escalates_once():
+    reset(); S._SP_LAST_SENT.clear()
+    import notify
+    _orig = notify.notify; cnt = {"n": 0}
+    notify.notify = lambda *a, **k: (cnt.__setitem__("n", cnt["n"] + 1), True)[1]
+    try:
+        b = FakeBridge()
+        b.sp = {"created_at": _iso_ago(100), "updated_at": _iso_ago(7), "chat_id": CHAT, "topic_id": TOPIC,
+                "bike": BIKE, "declared": "pads", "status": "ждёт_факт", "last_reminded_at": "", "note": ""}
+        run(S.scheduled_service_pending_reminder(None, b))
+        assert cnt["n"] == 1, "эскалация владельцу ровно ОДИН раз"
+        assert "escalated" in str(b.sp.get("note", "")), f"note помечен escalated, а {b.sp.get('note')!r}"
+        assert not any("результат не отписан" in s for s in SENDS), "обычное напоминание тайцам после TTL НЕ шлём"
+        run(S.scheduled_service_pending_reminder(None, b))     # повтор — уже escalated
+        assert cnt["n"] == 1, "повторно НЕ эскалируем (тишина после первого раза)"
+    finally:
+        notify.notify = _orig
+
+# B5: два близких тика в одном процессе → одно напоминание
+def test_b5_inmemory_antidup():
+    reset(); S._SP_LAST_SENT.clear()
+    b = FakeBridge()
+    b.sp = {"created_at": _iso_ago(8), "updated_at": _iso_ago(7), "chat_id": CHAT, "topic_id": TOPIC,
+            "bike": BIKE, "declared": "pads", "status": "ждёт_факт", "last_reminded_at": _iso_ago(7), "note": ""}
+    run(S.scheduled_service_pending_reminder(None, b))
+    run(S.scheduled_service_pending_reminder(None, b))
+    reminders = [s for s in SENDS if "результат не отписан" in s]
+    assert len(reminders) == 1, f"два тика → одно напоминание, а {len(reminders)}"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
