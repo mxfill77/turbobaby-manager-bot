@@ -2663,7 +2663,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=("🐀 Splinter\n"
-                              f"🇹🇭 🔧 บันทึกผล ТО ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
+                              f"🇹🇭 🔧 บันทึกผลเซอร์วิส ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
                               f"{_SEP}\n"
                               f"🇷🇺 🔧 Запись результата ТО подтверждает {PYM_HANDLE} или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
@@ -3481,19 +3481,21 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
 async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note):
     """B4: заявка висит дольше TTL → ОДНА эскалация владельцу (notify) + тег Пыма в теме; пометить note=escalated.
     После этого тайцам напоминания прекращаются (см. reminder). Запись в Лист1 НЕ трогаем."""
-    age_txt = f"{int(age_h)}ч" if age_h is not None else "долго"
+    # единицы времени по языку: 🇹🇭 «ชม.» (без кириллицы), 🇷🇺 «ч»
+    age_ru = f"{int(age_h)}ч" if age_h is not None else "долго"
+    age_th = f"{int(age_h)} ชม." if age_h is not None else "นาน"
     try:
         import notify
-        notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(declared)}) — заявка открыта {age_txt} без закрытия. "
+        notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(declared)}) — заявка открыта {age_ru} без закрытия. "
                       f"Глянь/закрой вручную или дожми подтверждение.")
     except Exception:
         log.exception("  → B4 эскалация владельцу (notify) упала")
     try:
         await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
                     text=(f"🐀 Splinter · 📌 {bike}\n"
-                          f"🇹🇭 ⚠️ งาน ТО ({_sp_labels_th(declared)}) ค้างนาน {age_txt} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
+                          f"🇹🇭 ⚠️ งานเซอร์วิส ({_sp_labels_th(declared)}) ค้างนาน {age_th} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
                           f"{_SEP}\n"
-                          f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_txt} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
+                          f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_ru} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
     except Exception:
         log.exception(f"  → B4 эскалация в тему {bike} упала")
     try:
@@ -3501,7 +3503,7 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike, note=new_note)
     except Exception:
         log.exception("  → B4 пометка note=escalated упала")
-    log.info(f"  → ТО висяк ЭСКАЛАЦИЯ: {bike} age={age_txt} declared={declared} → владельцу+Пыму, тайцам стоп")
+    log.info(f"  → ТО висяк ЭСКАЛАЦИЯ: {bike} age={age_ru} declared={declared} → владельцу+Пыму, тайцам стоп")
 
 
 async def scheduled_service_pending_reminder(context, bridge):
@@ -3545,7 +3547,7 @@ async def scheduled_service_pending_reminder(context, bridge):
         try:
             await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
                         text=(f"🐀 Splinter · 📌 {bike}\n"
-                              f"🇹🇭 ⏳ {bike} แจ้งเข้า ТО ({_sp_labels_th(declared)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
+                              f"🇹🇭 ⏳ {bike} แจ้งเข้าเซอร์วิส ({_sp_labels_th(declared)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
                               f"{_SEP}\n"
                               f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(declared)}), результат не отписан — закончили?"))
             _SP_LAST_SENT[_k] = now
