@@ -2744,18 +2744,16 @@ async def hb_post_board(context, bridge):
             _tru + ["📋 Выдачи на сегодня", "Броней на выдачу сегодня нет."]))
         return
     rows = []
-    _tp = "🧪 " if HB_TEST_MODE else ""
     for c in bookings:
         bike = str(c.get("bike") or "").strip()
         client = str(c.get("name") or "").strip()
         tok = _hb_put({"chat": target, "msg_id": None, "bike": bike, "client": client,
                        "date_due": str(c.get("date_end") or ""), "booking_id": str(c.get("booking_id") or ""),
                        "handed": False, "candidates": [], "test": HB_TEST_MODE})
-        # две кнопки в ряд: выдать ПЛАНОВЫЙ байк сразу / подмена на другой (без промежуточного переспроса)
-        rows.append([
-            InlineKeyboardButton((_tp + f"✅ Выдан · {bike} · {client}")[:60], callback_data=f"delivery:hand:{tok}"),
-            InlineKeyboardButton((_tp + f"🔁 Другой · {client}")[:40], callback_data=f"delivery:other:{tok}"),
-        ])
+        # ВЕРТИКАЛЬНО: широкая кнопка выдачи (эмодзи+данные, во всю ширину — модель не режется),
+        # под ней голая 🔁 (подмена). Слова — в легенде поста, НЕ на кнопках.
+        rows.append([InlineKeyboardButton(f"✅ {bike} · {client}"[:64], callback_data=f"delivery:hand:{tok}")])
+        rows.append([InlineKeyboardButton("🔁", callback_data=f"delivery:other:{tok}")])
     txt = _bilingual(None,            # легенда актуальная: на доске есть ✅ и 🔁 (оплата 💵 — только после выдачи)
         _tth + ["📋 รายการส่งมอบวันนี้", "", "✅ ส่งมอบ", "🔁 เปลี่ยนรถ"],
         _tru + ["📋 Выдачи на сегодня", "", "✅ Выдан", "🔁 Другой байк"])
@@ -2877,7 +2875,7 @@ async def handle_delivery_button(update, context, bridge) -> None:
         await q.answer()
         rows = [[InlineKeyboardButton(f"✅ {nm}"[:50], callback_data=f"delivery:pick:{tok}:{i}")]
                 for i, nm in enumerate(d["candidates"])]   # кнопки замены = эмодзи + ДАННЫЕ (как кнопки выдачи)
-        rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"delivery:back:{tok}")])   # выход без записи
+        rows.append([InlineKeyboardButton("◀️", callback_data=f"delivery:back:{tok}")])   # голая ◀️ (смысл в легенде)
         _tth = ["🧪 ทดสอบ"] if d.get("test") else []
         _tru = ["🧪 ТЕСТ"] if d.get("test") else []
         txt = _bilingual(None,            # легенда актуальная: на экране кнопки ✅ (выбрать) и ◀️ (назад)
