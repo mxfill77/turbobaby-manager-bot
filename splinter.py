@@ -1176,14 +1176,21 @@ def _should_ask_odometer(chat_id, topic_id, ignore_buffer=False):
     return True
 
 
-def msg_ask_odometer(bike):
-    """Просьба прислать ЧЁТКОЕ фото одометра при замене масла без читаемого пробега.
-    Двуязычно RU/TH (TH первым), БЕЗ тега Пыма. Ничего в ТО не пишем — только просьба."""
+def msg_ask_odometer(bike, kinds=None):
+    """Просьба прислать ЧЁТКОЕ фото одометра — для привязки пробега к работам. Текст ПО ФАКТУ работ
+    (kinds), БЕЗ хардкода «масло». 🇹🇭 — тайские лейблы kinds (без кириллицы), 🇷🇺 — русские.
+    Без kinds → нейтрально. БЕЗ тега Пыма. Ничего в ТО не пишем — только просьба."""
     b = f" {bike}" if bike else ""
+    if kinds:
+        return (
+            f"🐀 Splinter\n"
+            f"🇹🇭 เพื่อบันทึก ({_sp_labels_th(kinds)}){b} — รบกวนถ่ายรูปเลขไมล์ (ODO) ให้ชัด ๆ หน่อยครับ 🙏\n"
+            f"🇷🇺 Для записи ({_sp_labels_ru(kinds)}){b} — пришлите, пожалуйста, ЧЁТКОЕ фото пробега (одометр, ODO) 🙏"
+        )
     return (
         f"🐀 Splinter\n"
-        f"🇹🇭 เห็นว่ากำลังเปลี่ยนน้ำมัน{b} — รบกวนถ่ายรูปเลขไมล์ (ODO) ให้ชัด ๆ หน่อยครับ เพื่อบันทึกการเปลี่ยนถ่าย 🙏\n"
-        f"🇷🇺 Вижу замену масла{b} — пришлите, пожалуйста, ЧЁТКОЕ фото пробега (одометр, ODO), чтобы зафиксировать замену 🙏"
+        f"🇹🇭 รบกวนถ่ายรูปเลขไมล์ (ODO){b} ให้ชัด ๆ หน่อยครับ 🙏\n"
+        f"🇷🇺 Пришлите, пожалуйста, ЧЁТКОЕ фото пробега (одометр, ODO){b} 🙏"
     )
 
 
@@ -3505,7 +3512,8 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, done=_sp_join(done), status="ждёт_факт")
         if _sp_ask_ok(chat_id, topic_id):
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id, text=msg_ask_odometer(bike))
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=msg_ask_odometer(bike, kinds=(done or declared)))   # (b) текст по факту работ заявки
             log.info("  → ТО фаза2: переспрос одометра")
         else:
             log.info("  → ТО фаза2: переспрос одометра ПОДАВЛЕН (троттл E4)")
@@ -3915,20 +3923,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # В столбец БЕЗ пробега НЕ пишем: запись группы B/масла выше по потоку требует mileage — её не трогаем.
     km_this_msg = bool(mileage) and _conf_ok
     if works and not km_this_msg:
+        # (a) НЕ ЗАДВАИВАТЬ: ОДНО сообщение. msg_work_receipt уже называет работы И просит пробег
+        # («Принял работы {works} — пришли пробег») → пробег покрыт для ВСЕХ работ (правило «пробег всегда»).
+        # Дублирующий msg_ask_odometer (блок2, к тому же с хардкод-«масло») убран.
         await _send(context, chat_id=chat_id,
                     text=msg_work_receipt(bike, works), message_thread_id=topic_id)
-        col_kinds = {k for k in (_classify_work(w) for w in works)
-                     if k in ("oil", "gear", "abs", "airfilter")}
-        # Пробег нужен И колоночным (масло/gear/abs/возд.фильтр для записи в столбец), И инфо-работам
-        # (колодки/цепь/фильтр — они отложены в буфер и ждут пробег для привязки «работа — км»).
-        if col_kinds or info_works:
-            # Обходим ложное подавление high-буфером доработочного замера ТОЛЬКО при ЯВНОМ маркере
-            # выполненной работы (repair-событие или oil-done); cooldown 10 мин уважаем всегда.
-            force = (event_type == "repair") or oil_hint
-            if _should_ask_odometer(chat_id, topic_id, ignore_buffer=force):
-                sent = await _send(context, chat_id=chat_id,
-                                   text=msg_ask_odometer(bike), message_thread_id=topic_id)
-                _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос
         return
 
     # Масло-контекст, но БЕЗ чёткого пробега в ЭТОМ сообщении → САМ просим ЧЁТКОЕ фото одометра.
@@ -3937,7 +3936,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
     if _is_oil_context(text, vis) and no_clear_km and _should_ask_odometer(chat_id, topic_id):
         sent = await _send(context,
-            chat_id=chat_id, text=msg_ask_odometer(bike), message_thread_id=topic_id
+            chat_id=chat_id, text=msg_ask_odometer(bike, kinds=["oil"]), message_thread_id=topic_id  # (b) масло по факту oil-контекста
         )
         _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос
         return

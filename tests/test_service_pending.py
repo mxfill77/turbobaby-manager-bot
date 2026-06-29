@@ -322,6 +322,40 @@ def test_e4_ask_throttle():
     assert len(asks) == 1, f"два сообщения → один переспрос (троттл E4), а {len(asks)}"
 
 
+# ============ I) ФИКС ЗАДВОЕНИЯ ИНФО-РАБОТ (msg_ask_odometer динамический) ============
+def _th_no_cyrillic(m):
+    import re as _re
+    inth = False
+    for ln in m.split("\n"):
+        s = ln.lstrip()
+        if s.startswith("🇷🇺"): inth = False
+        if s.startswith("🇹🇭"): inth = True
+        if inth and _re.search(r"[А-Яа-яЁё]", ln):
+            return False
+    return True
+
+def test_ask_odometer_dynamic_text():
+    # (b) текст ПО ФАКТУ работ, без хардкод-«масло»; 🇹🇭 без кириллицы
+    m = S.msg_ask_odometer("NMAX 4255", ["pads"])
+    assert "тормозные колодки" in m and "масл" not in m.lower(), m
+    assert "Вижу замену масла" not in m, m
+    assert _th_no_cyrillic(m), "🇹🇭 без кириллицы (работы тайскими лейблами)"
+    m2 = S.msg_ask_odometer("NMAX 4255")   # без kinds → нейтрально
+    assert "масл" not in m2.lower() and ("ODO" in m2 or "пробег" in m2.lower()), m2
+    m3 = S.msg_ask_odometer("NMAX 4255", ["oil"])   # oil-контекст корректен
+    assert "моторное масло" in m3, m3
+
+def test_ask_odometer_in_phase2_names_works_not_oil():
+    # НЕ регресс: двухфазный переспрос одометра по работам заявки (колодки) → НЕ «масло»
+    reset()
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "", "status": "ждёт_факт", "odometer": ""}
+    run(S.handle_service_result(Msg("колодки заменил"), context=None, bridge=b,
+                                claude=FakeClaude({"works": ["замена колодок"], "mileage": ""}), text="колодки заменил"))
+    asks = [s for s in SENDS if "пробег" in s.lower() or "ODO" in s]
+    assert asks, "переспрос одометра отправлен"
+    assert "тормозные колодки" in asks[-1] and "Вижу замену масла" not in asks[-1], asks[-1]
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

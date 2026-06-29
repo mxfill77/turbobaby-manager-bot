@@ -70,7 +70,7 @@ print("(b) работы без км → буфер, затем фото км →
 res.append(ok(len(br1.events)==0, "b1: НЕ записано сразу (инфо-работы отложены)"))
 res.append(ok((CHAT,TOPIC) in S._PENDING_WORKS, "b1: перечень в буфере _PENDING_WORKS"))
 res.append(ok(any("Принял работы" in s for s in SENDS), "b1: квитанция (смягчённая) отправлена"))
-res.append(ok(any("ODO" in s or "одометр" in s.lower() for s in SENDS), "b1: переспрос пробега отправлен"))
+res.append(ok(any("ODO" in s or "одометр" in s.lower() or "пробег" in s.lower() for s in SENDS), "b1: переспрос пробега отправлен"))
 SENDS.clear()
 vb={"mileage":"37823","mileage_confidence":"high","fuel":"empty"}
 br2=loop.run_until_complete(run(Msg(photo=True, mid=203), parsed={"type":"None","works":[]}, vis=vb))
@@ -92,7 +92,7 @@ pc={"type":"event","event_type":"repair","bike":"NINJA 400 6334","mileage":None,
 br=loop.run_until_complete(run(Msg("поменял колодки и цепь", mid=205), pc))
 print("(c) только инфо-работы без км:")
 res.append(ok(len(br.events)==0 and (CHAT,TOPIC) in S._PENDING_WORKS, "буфер выставлен, сразу не пишем"))
-res.append(ok(any("ODO" in s or "одометр" in s.lower() for s in SENDS), "переспрос пробега ЕСТЬ (инфо-работы тоже ждут км)"))
+res.append(ok(any("ODO" in s or "одометр" in s.lower() or "пробег" in s.lower() for s in SENDS), "переспрос пробега ЕСТЬ (инфо-работы тоже ждут км)"))
 
 # (d) gear+пробег → группа B (сторож/trust путь цел), инфо-строк нет
 reset()

@@ -54,7 +54,8 @@ async def run(text, parsed):
     return bridge
 
 def has_receipt(): return any("Принял работы" in s for s in SENDS)
-def has_odo():     return any("ODO" in s or "одометр" in s.lower() for s in SENDS)
+# просьба пробега теперь ВНУТРИ квитанции («пришли пробег»/«ส่งเลขไมล์») — отдельного msg_ask_odometer в инфо-ветке больше нет
+def has_odo():     return any("ODO" in s or "одометр" in s.lower() or "пробег" in s.lower() or "เลขไมล์" in s for s in SENDS)
 
 def ok(cond, label):
     print(("  PASS " if cond else "  FAIL ") + label)
@@ -104,16 +105,13 @@ print("(d) works(gear)+пробег текстом — путь группы B �
 results.append(ok(any(k=="gear" for k,_ in SVC_COL), "_ask_service_col(gear) вызван (запись группы B доступна)"))
 results.append(ok(not has_receipt(), "квитанция-без-пробега НЕ перехватила (mileage есть → обычный флоу)"))
 
-# ---- (e) cooldown: повторный переспрос в 10 мин подавлен ----
+# ---- (e) НЕ ЗАДВАИВАНИЕ: инфо-работы без км → РОВНО ОДНО исходящее (квитанция), без дубля-«масло» ----
 reset(); seed_high_buffer()
-loop.run_until_complete(run("выполнены работы: замена масла, колодки", parsed_a))
-first_odo = has_odo()
-SENDS.clear()  # второй заход, cooldown НЕ сбрасываем
-seed_high_buffer()
-loop.run_until_complete(run("выполнены работы: замена масла, колодки", parsed_a))
-print("(e) cooldown 10мин на повторный переспрос:")
-results.append(ok(first_odo, "первый переспрос пробега прошёл"))
-results.append(ok(has_receipt() and not has_odo(), "второй: квитанция есть, переспрос пробега ПОДАВЛЕН (cooldown)"))
+loop.run_until_complete(run("выполнены работы: задние колодки, регулировка цепи", parsed_b))
+print("(e) фикс задвоения: одно сообщение, без хардкод-«масло»:")
+results.append(ok(len(SENDS) == 1, f"ровно ОДНО исходящее (квитанция), дубля msg_ask_odometer нет — а {len(SENDS)}"))
+results.append(ok(has_receipt() and has_odo(), "квитанция называет работы И просит пробег (в одном сообщении)"))
+results.append(ok(not any("Вижу замену масла" in s for s in SENDS), "НЕТ ложного «Вижу замену масла» (масла в работах нет)"))
 
 loop.close()
 print("\nИТОГ:", "ВСЕ PASS" if all(results) else f"ЕСТЬ FAIL ({sum(results)}/{len(results)})")

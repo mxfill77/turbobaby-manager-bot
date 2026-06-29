@@ -52,7 +52,8 @@ print("(1) текст работ без км:")
 res.append(ok(any("Принял работы" in s for s in SENDS), "квитанция СМЯГЧЕНА: «Принял работы … пришли пробег»"))
 res.append(ok(not any("Записал работы" in s for s in SENDS), "НЕТ преждевременного «Записал работы»"))
 res.append(ok(len(b1.events)==0 and (CHAT,TOPIC) in S._PENDING_WORKS, "работы НЕ записаны (в буфере)"))
-res.append(ok(len(S._SVC_CYCLE_MSGS.get((CHAT,TOPIC),[]))>=1, "вопрос одометра → message_id в _SVC_CYCLE_MSGS (ЧАСТЬ D)"))
+res.append(ok(any("пробег" in s.lower() for s in SENDS) and (CHAT,TOPIC) not in S._SVC_CYCLE_MSGS,
+              "пробег спрошен В КВИТАНЦИИ (одно сообщение); отдельный transient вопрос-одометр убран (фикс задвоения)"))
 
 # 2) затем фото км 37823 → flush → работы КОПЯТСЯ в накопитель сводки (НЕ шлются сразу — терминал мокнут)
 SENDS.clear()
