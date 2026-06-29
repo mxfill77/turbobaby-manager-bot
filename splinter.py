@@ -514,8 +514,10 @@ async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False):
     has = bool(acc.get("works") or acc.get("cols") or (acc.get("oil") and not skip_oil))
     if not has:
         return None
-    return await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                       text=msg_service_summary(bike, acc, skip_oil=skip_oil))
+    # КЛАСС-ФИКС кнопочных подтверждений: сводка-квитанция через _send_retry — ConnectTimeout (сетевой блип)
+    # не оставляет владельца в тишине после нажатия кнопки. Действие уже выполнено, переотправка идемпотентна.
+    return await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                             text=msg_service_summary(bike, acc, skip_oil=skip_oil))
 
 
 # Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
@@ -2043,11 +2045,11 @@ async def _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, ne
     b_th = f" ({bike})" if bike else ""
     extra_ru = f" Следующее ТО на {info['next_km']} км." if (info and info.get("next_km")) else ""
     extra_th = f" ТО ครั้งถัดไปที่ {info['next_km']} กม." if (info and info.get("next_km")) else ""
-    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                text=(f"🐀 Splinter\n"
-                      f"🇹🇭 ✅ แก้เลขไมล์แล้ว{b_th}: {old_km} → {new_km} กม.{extra_th}\n"
-                      f"{_SEP}\n"
-                      f"🇷🇺 ✅ Пробег исправлен{b_ru}: {old_km} → {new_km} км.{extra_ru}"))
+    await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: подтверждение кнопки svc:fix
+                      text=(f"🐀 Splinter\n"
+                            f"🇹🇭 ✅ แก้เลขไมล์แล้ว{b_th}: {old_km} → {new_km} กม.{extra_th}\n"
+                            f"{_SEP}\n"
+                            f"🇷🇺 ✅ Пробег исправлен{b_ru}: {old_km} → {new_km} км.{extra_ru}"))
     log.info(f"  → коррекция пробега ПРИМЕНЕНА (обход сторожа B): {old_km}→{new_km} (тема {topic_id})")
 
 
@@ -2378,10 +2380,10 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
         fb = bridge.find_bike(bike) or {}
         plate = _plate_from_name(fb.get("name", ""))
     if not plate:
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=("🐀 Splinter\n"
-                          "🇹🇭 ขอโทษครับ ไม่พบเลขทะเบียนรถ — บอกชื่อรุ่น+เลขให้หน่อยครับ 🙏\n"
-                          "🇷🇺 Не смог определить номер байка для записи ТО — уточни модель+номер 🙏"))
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
+                          text=("🐀 Splinter\n"
+                                "🇹🇭 ขอโทษครับ ไม่พบเลขทะเบียนรถ — บอกชื่อรุ่น+เลขให้หน่อยครับ 🙏\n"
+                                "🇷🇺 Не смог определить номер байка для записи ТО — уточни модель+номер 🙏"))
         return
     try:
         km_int = int(str(km).replace(" ", "").replace(",", ""))
@@ -2424,8 +2426,8 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
         else:
             detail_ru = f"не удалось записать ({err or 'ошибка'})"
             detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
+                          text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
 
 # Метки видов ТО группы B (TH, RU) — для кнопок/квитанций. kind → (тайский, русский).
@@ -2511,8 +2513,8 @@ async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km)
         else:
             detail_ru = f"не удалось записать ({err or 'ошибка'})"
             detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
+                          text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
 
 async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, next_km, status,
@@ -2614,8 +2616,8 @@ async def handle_service_button(update, context, bridge) -> None:
         if floor is not None:
             try:
                 if int(str(mileage).replace(" ", "").replace(",", "")) < floor:
-                    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                                text=msg_mileage_drop(bike, mileage, floor))
+                    await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс
+                                      text=msg_mileage_drop(bike, mileage, floor))
                     return
             except (ValueError, TypeError):
                 pass
@@ -2626,6 +2628,17 @@ async def handle_service_button(update, context, bridge) -> None:
         _SVC_TOKENS.pop(token, None)
         _PENDING_MILEAGE.pop(key, None)
         clear_awaiting(*key)
+        # (2) B1-хук в КНОПОЧНОМ пути (зеркало текстового handle_mileage_confirm): открытая 'ждёт_факт' заявка →
+        # подтверждённый фото-пробег доводит её до кнопки Пыма (запись только по svc:done от доверенного — гейт сохранён).
+        try:
+            _sp = _sp_open(bridge, chat_id, topic_id, bike) if bike else None
+            if _sp and str(_sp.get("status")) == "ждёт_факт":
+                _declared = _sp_split(_sp.get("declared"))
+                _done = _sp_split(_sp.get("done")) or list(_declared)
+                await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, _declared, _done, mileage)
+                return
+        except Exception:
+            log.exception("  → B1(кнопка svc:mok): довод заявки фото-пробегом упал")
         try:
             await _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint)
         except Exception:
@@ -2638,10 +2651,10 @@ async def handle_service_button(update, context, bridge) -> None:
         if not _is_trusted_user(q.from_user):
             await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             th_lbl, ru_lbl = _SVC_COL_LABEL.get(svc_kind, (svc_kind, svc_kind))
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=(f"🐀 Splinter\n"
-                              f"🇹🇭 🔧 การบันทึก «{th_lbl}» ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้น\n"
-                              f"🇷🇺 🔧 Запись «{ru_lbl}» подтверждает {PYM_HANDLE} или владелец"))
+            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс
+                              text=(f"🐀 Splinter\n"
+                                    f"🇹🇭 🔧 การบันทึก «{th_lbl}» ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้น\n"
+                                    f"🇷🇺 🔧 Запись «{ru_lbl}» подтверждает {PYM_HANDLE} или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
         await q.answer("กำลังบันทึก… · Записываю…")
         try:
@@ -2656,8 +2669,8 @@ async def handle_service_button(update, context, bridge) -> None:
         # [После замены] → боевая запись кол.I. ТОЛЬКО доверенный.
         if not _is_trusted_user(q.from_user):
             await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=msg_oil_need_trusted(bike, km))
+            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс
+                              text=msg_oil_need_trusted(bike, km))
             return   # токен и кнопки живут — Пым нажмёт [После замены] позже
         await q.answer("กำลังบันทึกน้ำมันเครื่อง… · Записываю ТО Oil…")
         try:
@@ -2672,11 +2685,11 @@ async def handle_service_button(update, context, bridge) -> None:
         # прочее → событие. Earth сам нажать НЕ может — бот ждёт Пыма/владельца (токен+кнопка живут).
         if not _is_trusted_user(q.from_user):
             await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=("🐀 Splinter\n"
-                              f"🇹🇭 🔧 บันทึกผลเซอร์วิส ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
-                              f"{_SEP}\n"
-                              f"🇷🇺 🔧 Запись результата ТО подтверждает {PYM_HANDLE} или владелец"))
+            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс
+                              text=("🐀 Splinter\n"
+                                    f"🇹🇭 🔧 บันทึกผลเซอร์วิส ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
+                                    f"{_SEP}\n"
+                                    f"🇷🇺 🔧 Запись результата ТО подтверждает {PYM_HANDLE} или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
         await q.answer("กำลังบันทึก… · Записываю ТО…")
         try:

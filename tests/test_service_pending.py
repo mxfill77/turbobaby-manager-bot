@@ -356,6 +356,50 @@ def test_ask_odometer_in_phase2_names_works_not_oil():
     assert "тормозные колодки" in asks[-1] and "Вижу замену масла" not in asks[-1], asks[-1]
 
 
+# ============ J) КЛАСС-ФИКС кнопочных подтверждений (ConnectTimeout) ============
+def test_emit_summary_retry_survives_timeout():
+    # (1) сводка-квитанция после кнопки переживает TimedOut (_send_retry) — не тишина
+    from telegram.error import TimedOut
+    import asyncio as _a
+    reset()
+    S._SVC_SUMMARY[(CHAT, TOPIC)] = {"works": ["замена колодок", "замена переднего подшипника"], "current_km": "24302"}
+    calls = {"n": 0}; orig = S._send
+    async def flaky(context, *, chat_id, text, message_thread_id=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimedOut("сетевой блип")
+        SENDS.append(text)
+        return type("M", (), {"message_id": 1})()
+    S._send = flaky
+    orig_sleep = _a.sleep
+    async def _nos(*a, **k): return None
+    _a.sleep = _nos
+    try:
+        res = run(S._emit_summary(None, CHAT, TOPIC, BIKE))
+    finally:
+        S._send = orig; _a.sleep = orig_sleep
+    assert calls["n"] >= 2, f"сводка переотправлена после TimedOut, попыток={calls['n']}"
+    assert res is not None and any("24302" in s for s in SENDS), "квитанция доставлена (не тишина)"
+
+def test_svc_mok_button_advances_open_request():
+    # (2) B1-хук в КНОПОЧНОМ svc:mok: открытая ждёт_факт заявка → доведена до кнопки Пыма, БЕЗ записи в Лист1
+    reset()
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "", "status": "ждёт_факт", "odometer": ""}
+    tok = S._svc_put({"kind": "mileconf", "chat": CHAT, "topic": TOPIC, "bike": BIKE,
+                      "mileage": "24302", "floor": None, "oil_hint": False})
+    run(S.handle_service_button(_mk_update(FakeQ(f"svc:mok:{tok}", "earthmechanic")), context=None, bridge=b))
+    assert b.sp["status"] == "ждёт_подтверждения" and str(b.sp.get("odometer")) == "24302", b.sp
+    assert any(d.get("kind") == "sp_done" for d in S._SVC_TOKENS.values()), "кнопка Пыму (svc:done) создана"
+    assert not b.oil_calls and not b.svc_calls, "в Лист1 НЕ пишем (гейт Пыма сохранён)"
+
+def test_summary_names_works_or_neutral():
+    # (3) квитанция называет записанные работы; без работ — нейтральная (пробег)
+    m = S.msg_service_summary(BIKE, {"works": ["замена колодок", "замена переднего подшипника"], "current_km": "24302"})
+    assert "колод" in m.lower() and "подшип" in m.lower() and "24302" in m, m
+    m2 = S.msg_service_summary(BIKE, {"current_km": "24302", "oil": {"km": "24302", "next": 28094, "status": "ok"}})
+    assert "24302" in m2 and "колод" not in m2.lower(), m2
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
