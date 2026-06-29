@@ -42,7 +42,7 @@ async def run(msg, parsed=None, vis=None):
                               claude=FakeClaude(parsed,vis), photo_msgs=pm)
     return br
 
-def info_rows(br): return [e for e in br.events if str(e.get("msg_id","")).find(":w")>=0]
+def info_rows(br): return [e for e in br.events if str(e.get("msg_id","")).startswith("info:")]
 def lumped(br):    return [e for e in br.events if str(e.get("notes","")).startswith("работы:")]
 def ok(c,l): print(("  PASS " if c else "  FAIL ")+l); return c
 
@@ -57,7 +57,7 @@ ir=info_rows(br)
 print("(a) работы+пробег в одном сообщении:")
 res.append(ok(len(ir)==2, "2 инфо-строки (колодки+цепь), по строке на работу"))
 res.append(ok(all("37900" in e["notes"] for e in ir), "у каждой привязан пробег 37900"))
-res.append(ok({e["msg_id"][-3:] for e in ir}=={":w0",":w1"}, "msg_id с суффиксом :wN (уникальность)"))
+res.append(ok({e["msg_id"] for e in ir}=={"info:6334:колодки:37900","info:6334:цепь:37900"}, "msg_id по КОНТЕНТУ (info:plate:стем:км) — идемпотентно"))
 res.append(ok(len(lumped(br))==0, "лумп-строки «работы: …» НЕТ"))
 res.append(ok(any("колодки" in e["notes"] for e in ir) and any("цеп" in e["notes"] for e in ir), "колодки и цепь — отдельно"))
 

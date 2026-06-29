@@ -400,6 +400,37 @@ def test_summary_names_works_or_neutral():
     assert "24302" in m2 and "колод" not in m2.lower(), m2
 
 
+# ============ K) ФИКС A — дедуп ТО-событий (идемпотентность + рендер) ============
+def test_a_work_stem_stable():
+    assert S._work_stem("замена колодок") == S._work_stem("колодки") == S._work_stem("тормозные колодки") == "колодки"
+    assert S._work_stem("замена переднего подшипника") == S._work_stem("подшипник") == "подшипник"
+    assert S._work_stem("регулировка цепи") == "цепь"
+
+def test_a1_write_idempotent_content_msgid():
+    # A1: msg_id по контенту info:plate:стем:км → повторный прогон (др.формулировка) = тот же ключ
+    reset()
+    b = FakeBridge()
+    S._write_info_works(b, "обслуживание", TOPIC, "NMAX 4255", ["замена колодок", "замена переднего подшипника"], "24302", "base:1")
+    mids1 = [e["msg_id"] for e in b.events]
+    assert mids1 == ["info:4255:колодки:24302", "info:4255:подшипник:24302"], mids1
+    n = len(b.events)
+    S._write_info_works(b, "обслуживание", TOPIC, "NMAX 4255", ["колодки", "подшипник переднего колеса"], "24302", "base:2")
+    assert [e["msg_id"] for e in b.events[n:]] == mids1, "повторный прогон → ТЕ ЖЕ ключи (Bridge задедупит)"
+    S._write_info_works(b, "обслуживание", TOPIC, "NMAX 4255", ["замена колодок"], "30000", "b3")
+    assert b.events[-1]["msg_id"] == "info:4255:колодки:30000", "разный км → разный ключ"
+    S._write_info_works(b, "обслуживание", TOPIC, "PCX 1122", ["замена колодок"], "24302", "b4")
+    assert b.events[-1]["msg_id"] == "info:1122:колодки:24302", "разный plate → разный ключ"
+
+def test_a2_render_dedup_by_work_km():
+    # A2: дедуп карточки по (стем-работы, км) — точный повтор один раз; разные км — обе
+    items = [{"notes": "замена колодок — 24302 км"}, {"notes": "замена переднего подшипника — 24302 км"},
+             {"notes": "замена колодок — 24302 км"}, {"notes": "замена переднего подшипника — 24302 км"}]
+    out = S._parse_service_items(items, limit=6)
+    assert len(out) == 2 and {o["work"] for o in out} == {"замена колодок", "замена переднего подшипника"}, out
+    out2 = S._parse_service_items([{"notes": "замена колодок — 24302 км"}, {"notes": "замена колодок — 30000 км"}], limit=6)
+    assert len(out2) == 2, "та же работа на РАЗНЫХ км → обе (реальная история)"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

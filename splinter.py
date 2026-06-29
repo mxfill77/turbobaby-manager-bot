@@ -1303,20 +1303,52 @@ def _is_status_request(text):
     return any(k in t for k in _STATUS_KEYWORDS)
 
 
+# Стабильный СТЕМ работы — единый ключ для идемпотентности записи (A1) и дедупа рендера (A2):
+# «замена колодок»/«тормозные колодки»/«колодки» → один ключ «колодки». Известные работы по keyword;
+# неизвестные → нормализованный текст (стабильно, но различимо).
+_WORK_STEMS = (
+    ("колод", "колодки"), ("тормоз", "колодки"), ("brake", "колодки"),
+    ("подшип", "подшипник"), ("bearing", "подшипник"), ("ลูกปืน", "подшипник"),
+    ("цеп", "цепь"), ("chain", "цепь"), ("โซ่", "цепь"),
+    ("вилк", "вилка"),
+    ("воздушн", "воздфильтр"),
+    ("редуктор", "редуктор"), ("gear", "редуктор"),
+    ("фильтр", "фильтр"),
+    ("моторн", "масло"), ("масл", "масло"),
+    ("abs", "abs"),
+)
+
+
+def _work_stem(w):
+    """Стабильный стем работы (ключ дедупа по контенту). Известные → канонический ключ; иначе — нормализованный текст."""
+    s = str(w).lower()
+    for kw, stem in _WORK_STEMS:
+        if kw in s:
+            return stem
+    return _re_pl.sub(r"[^0-9a-zа-яё]+", "", s) or "work"
+
+
 # Инфо-работа из истории «события»: notes вида «<работа> — <км> км/กม». Отсекает шум (фото-описания,
 # напоминания) — для секции «сервис на пробеге» в карточке (ЗАХОД 3).
 _SVC_HIST_RE = r"^(.+?)\s*—\s*(\d+)\s*(?:км|กม)"   # _re_pl импортирован ниже — compile в рантайме
 
 
 def _parse_service_items(items, limit=6):
-    """Из read_events отобрать ИНФО-работы «<работа> — <км> км» → [{work, km}], newest-first, до limit."""
+    """Из read_events отобрать ИНФО-работы «<работа> — <км> км» → [{work, km}], newest-first, до limit.
+    A2: ДЕДУП по (стем-работы, км) — точный повтор (та же работа на том же км) показывается ОДИН раз;
+    та же работа на РАЗНЫХ км — обе (реальная история, не дубль)."""
     out = []
+    seen = set()
     for it in items or []:
         m = _re_pl.match(_SVC_HIST_RE, str(it.get("notes") or "").strip(), _re_pl.IGNORECASE)
         if m:
-            out.append({"work": m.group(1).strip(), "km": m.group(2)})
-        if len(out) >= limit:
-            break
+            work = m.group(1).strip(); km = m.group(2)
+            key = (_work_stem(work), km)
+            if key not in seen:
+                seen.add(key)
+                out.append({"work": work, "km": km})
+                if len(out) >= limit:
+                    break
     return out
 
 
@@ -1456,16 +1488,20 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
 
 def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date=""):
     """Вариант A (разбор перечня по адресам): КАЖДУЮ инфо-работу — отдельной строкой в «события»
-    с привязкой пробега. msg_id с суффиксом :wN — уникальность строк (дедуп Bridge не схлопывает их
-    в одну) и идемпотентность отложенного flush. Колоночные работы сюда НЕ попадают — у них свой адрес."""
+    с привязкой пробега. msg_id = info:{plate}:{стем-работы}:{км} (КОНТЕНТНЫЙ ключ) → повторный прогон той
+    же работы на том же км дедупится Bridge'ом. Колоночные работы сюда НЕ попадают — у них свой адрес."""
     grp = group_name + (f" / тема {topic_id}" if topic_id else "")
+    plate = _plate_from_name(bike) or "?"
     written = []
-    for i, w in enumerate(dict.fromkeys(info_works)):
+    for w in dict.fromkeys(info_works):
         note = (f"{w} — {km} км" if km else f"{w}")[:200]
+        # A1 ИДЕМПОТЕНТНОСТЬ по КОНТЕНТУ: msg_id = info:{plate}:{стем-работы}:{км}. Повторный прогон/повторное
+        # фото на ту же работу+км даёт ТОТ ЖЕ ключ → Bridge.addEvent дедупит (botMsgExists_ по msg_id, BotData.js).
+        # msg_id_base (per-сообщение) больше НЕ используем — он плодил новое событие на каждый прогон.
+        mid = f"info:{plate}:{_work_stem(w)}:{km or '-'}"
         r = bridge.add_event(msg_date=msg_date, group=grp, bike=bike, event_type="repair",
-                             fuel="", mileage=str(km or ""), photos=0, notes=note,
-                             msg_id=f"{msg_id_base}:w{i}")
-        log.info(f"  → инфо-работа в историю: «{note}» add_event ok={(r or {}).get('ok')} "
+                             fuel="", mileage=str(km or ""), photos=0, notes=note, msg_id=mid)
+        log.info(f"  → инфо-работа в историю: «{note}» msg_id={mid} add_event ok={(r or {}).get('ok')} "
                  f"saved={(r or {}).get('saved')} dup={(r or {}).get('duplicate')}")
         written.append(w)
     return written   # список фактически записанных работ (для пост-квитанции по факту)
