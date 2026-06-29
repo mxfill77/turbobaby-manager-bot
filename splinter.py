@@ -1433,8 +1433,12 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
         _closed.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
         if _closed:
             _c0 = _closed[0]
-            sp_last = {"done": _sp_split(_c0.get("done")), "odo": str(_c0.get("odometer") or ""),
-                       "date": str(_c0.get("updated_at") or "")[:10]}
+            # E3(e): валидируем kind перед показом — НЕ показываем невалидный «масляный фильтр» (filter)
+            # и НЕ дублируем регламент (oil/gear/abs/airfilter — у них свои секции выше). Улику не правим.
+            _done_last = [k for k in _sp_split(_c0.get("done")) if k not in _SP_COL_KINDS and k != "filter"]
+            if _done_last:
+                sp_last = {"done": _done_last, "odo": str(_c0.get("odometer") or ""),
+                           "date": str(_c0.get("updated_at") or "")[:10]}
     except Exception:
         log.exception("  → карточка: чтение закрытых то_заявки упало")
     await _send(context, chat_id=chat_id, message_thread_id=topic_id,
@@ -2680,11 +2684,13 @@ async def handle_service_button(update, context, bridge) -> None:
         rep_ru = (f"✅ Записано: {_sp_labels_ru(written)} на {odo} км" if written else "⚠️ ничего не записано")
         if failed:
             rep_ru += f" · не прошло: {', '.join(k for k, _ in failed)}"
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=(f"🐀 Splinter · 📌 {bike}\n"
-                          f"🇹🇭 ✅ บันทึกแล้ว: {_sp_labels_th(written)} ที่ {odo} กม.\n"
-                          f"{_SEP}\n"
-                          f"🇷🇺 {rep_ru}"))
+        # E1: подтверждение через _send_retry — запись (_sp_write_done) УЖЕ прошла и идемпотентна,
+        # переотправка безопасна. Без retry ConnectTimeout «съедал» подтверждение → владелец дублировал «Да».
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=(f"🐀 Splinter · 📌 {bike}\n"
+                                f"🇹🇭 ✅ บันทึกแล้ว: {_sp_labels_th(written)} ที่ {odo} กม.\n"
+                                f"{_SEP}\n"
+                                f"🇷🇺 {rep_ru}"))
         log.info(f"  → ТО фаза2 запись по «да» {cb}: written={written} failed={failed} odo={odo}")
     elif action == "km":
         # [Просто пробег] → в кол.I НЕ пишем. Квитанцию шлём ВСЕГДА (раньше при уже-закреплённой
@@ -3138,6 +3144,10 @@ _SP_REMIND_AFTER_MIN = 6 * 60   # висяк: заявка без закрыти
 _SP_REMIND_THROTTLE_MIN = 6 * 60
 _SP_REMIND_MAX_AGE_H = 48       # B4: заявка старше этого (ч) → ОДНА эскалация владельцу/Пыму, тайцам больше не долбим
 _SP_LAST_SENT = {}              # B5: in-memory анти-дубль напоминаний (key=(chat,topic,bike) → ts последней отправки)
+_SP_RECENT_CLOSE_MIN = 15       # E2a: окно «недавно закрыта заявка» — голые «да/число» в нём гасим (не в мозг)
+_SP_BARE_CONFIRM = {"да", "ок", "окей", "угу", "ага", "yes", "ok", "okay", "готово", "принято", "+", "👍"}
+_SP_ASK_TS = {}                 # E4: in-memory троттл переспросов фазы-2 (key=(chat,topic) → ts последнего ask)
+_SP_ASK_THROTTLE_SEC = 90       # E4: не переспрашивать чаще, чем раз в N сек на тему
 
 # B2: маркеры «работа завершена» (ДОВОДЯТ заявку к гейту Пыма, САМИ в Лист1 НЕ пишут).
 # Длинные/distinctive — подстрокой; короткие/неоднозначные (да/ок/все) — ТОЛЬКО как целое слово (без ложных срабатываний).
@@ -3147,14 +3157,17 @@ _SP_DONE_WORDS = {"да", "ок", "окей", "все", "всё", "ok", "okay", 
 
 
 def _service_kind(w):
-    """Тонкий классификатор работы для перечней заявки/факта (различает фильтр/колодки/цепь,
-    которых _classify_work сводит в 'info'). Возвращает ключ _SP_KIND_LABEL."""
+    """Тонкий классификатор работы для перечней заявки/факта. Возвращает ключ _SP_KIND_LABEL,
+    либо '' если работа НЕВАЛИДНА как kind (E3: «масляный фильтр» — такого на NMAX/инд.моделях НЕТ)."""
     s = str(w).lower()
     base = _classify_work(w)
     if base in ("oil", "gear", "abs", "airfilter"):
         return base
+    # E3(a): фильтр — валиден ТОЛЬКО воздушный (airfilter). Масляного фильтра нет → невалидно ('').
     if "фильтр" in s or "filter" in s or "กรอง" in s:
-        return "filter"
+        if any(a in s for a in ("возд", "air", "อากาศ")):
+            return "airfilter"
+        return ""   # «масляный фильтр» / неуточнённый фильтр — НЕ записываем (невалидная работа)
     if any(k in s for k in ("колод", "тормоз", "brake", "ผ้าเบรก")):
         return "pads"
     if any(k in s for k in ("цеп", "chain", "โซ่")):
@@ -3166,7 +3179,6 @@ def _service_kind(w):
 _SP_TEXT_KINDS = (
     ("oil", ("моторн", "เครื่อง", "motor oil")),
     ("gear", ("редуктор", "gear", "เฟือง", "трансмис")),
-    ("filter", ("фильтр", "filter", "กรองน้ำมัน")),
     ("airfilter", ("возд", "air", "อากาศ")),
     ("abs", ("abs", "абс")),
     ("pads", ("колод", "тормоз", "ผ้าเบรก")),
@@ -3174,12 +3186,14 @@ _SP_TEXT_KINDS = (
 )
 
 
-def _declared_kinds(text, works, vis):
+def _declared_kinds(text, works, vis, strict_oil=False):
     """Список kind-ов из works (точный) + скан свободного текста/notes. Сохраняет порядок, без дублей.
-    Если есть общий 'масло' без уточнения и нет gear-маркера — трактуем как oil."""
+    strict_oil=False (ЗАЯВКА/intake): oil от явного слова «масло/моторное» («привёз на масло»).
+    strict_oil=True (ФАКТ/done): oil ТОЛЬКО при глаголе замены — мягкое упоминание (карточка ТО Oil,
+    «масло в норме», «масляный фильтр») oil НЕ даёт."""
     out = []
     def add(k):
-        if k not in out:
+        if k and k not in out:   # E3(a): пустой kind ('' от невалидной работы, напр. масляный фильтр) — отбрасываем
             out.append(k)
     for w in (works or []):
         add(_service_kind(w))
@@ -3187,8 +3201,13 @@ def _declared_kinds(text, works, vis):
     for k, kws in _SP_TEXT_KINDS:
         if any(kw in blob for kw in kws):
             add(k)
-    # любой масло-маркер → моторное масло как кандидат (declared информативен; пишем ТОЛЬКО факт с «да»)
-    if any(kw in blob for kw in ("масл", "oil", "น้ำมัน")) and "oil" not in out:
+    # E3(b): oil как kind — ТОЛЬКО при ЯВНОМ масле + глаголе замены. «масляный фильтр» (масля…) и
+    # «масло в норме»/карточка ТО Oil — НЕ дают oil (мягкий контекст ≠ замена масла).
+    _oil_word = _re_pl.search(r"масл[оаы]|моторн|น้ำมันเครื่อง|\boil\b", blob)
+    _oil_repl = any(v in blob for v in ("замен", "помен", "сменил", "залил", "เปลี่ยน"))
+    # strict (факт/done): нужен и глагол замены; intake/заявка: достаточно явного слова масла.
+    _oil_ok = bool(_oil_word) and (_oil_repl if strict_oil else True)
+    if _oil_ok and "oil" not in out:
         add("oil")
     return out
 
@@ -3356,6 +3375,56 @@ async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declar
     log.info(f"  → ТО фаза1: заявка {bike} declared={declared}")
 
 
+def _sp_ask_ok(chat_id, topic_id):
+    """E4(a): троттл переспросов фазы-2 — не чаще раза в _SP_ASK_THROTTLE_SEC на тему (не дёргать на каждое сообщение)."""
+    key = (chat_id, topic_id)
+    now = _time.time()
+    if now - _SP_ASK_TS.get(key, 0) < _SP_ASK_THROTTLE_SEC:
+        return False
+    _SP_ASK_TS[key] = now
+    return True
+
+
+def _is_bare_confirm(text):
+    """E2a: сообщение = голое подтверждение/число без иного смысла (да/ок/угу/yes/цифры)."""
+    t = str(text or "").strip().lower().rstrip("!. ")
+    if not t:
+        return False
+    if t in _SP_BARE_CONFIRM:
+        return True
+    return bool(_re_pl.fullmatch(r"\d{3,6}", t))   # голое число (пробег)
+
+
+async def handle_post_close_ack(msg, context, bridge, text) -> bool:
+    """E2a [гейт]: если по теме/байку заявка ТО ЗАКРЫТА за последние _SP_RECENT_CLOSE_MIN минут И входящее —
+    голое «да/ок/число», НЕ пускаем сообщение в мозг (иначе claude.ask пишет ТО мимо двухфазного гейта —
+    каскад 4255). Шлём ack «уже записано». Возвращает True если перехватили."""
+    if not _is_bare_confirm(text):
+        return False
+    chat_id = msg.chat_id
+    topic_id = getattr(msg, "message_thread_id", None)
+    bike = bike_from_topic(chat_id, topic_id) or ""
+    if not bike:
+        return False
+    try:
+        closed = [r for r in (bridge.service_pending_list(status="закрыто").get("items") or [])
+                  if _same_bike(r.get("bike"), bike)]
+    except Exception:
+        log.exception("  → E2a: чтение закрытых заявок упало")
+        return False
+    now = _time.time()
+    fresh = any((_sp_age_hours(r.get("updated_at"), now) or 1e9) * 60 <= _SP_RECENT_CLOSE_MIN for r in closed)
+    if not fresh:
+        return False
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=(f"🐀 Splinter · 📌 {bike}\n"
+                      f"🇹🇭 ✅ บันทึกแล้วครับ — ผลเซอร์วิสยืนยันโดย {PYM_HANDLE} ด้วยปุ่ม ไม่ใช่แชท\n"
+                      f"{_SEP}\n"
+                      f"🇷🇺 ✅ Уже записано. Результат сервиса подтверждает {PYM_HANDLE} кнопкой, не в чате."))
+    log.info(f"  → E2a: голое подтверждение по {bike} после недавнего закрытия — погашено (не в мозг)")
+    return True
+
+
 async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     """Фаза 2: ответ механика по открытой заявке (status заявлено/ждёт_факт).
     Нет перечня факта → переспрос «что сделал?»; есть факт+одометр → запрос Пыму (кнопка).
@@ -3390,7 +3459,9 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     # Распознаём перечень факта и одометр из ответа.
     parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300)) if text else {}
     works = [str(w).strip() for w in (parsed.get("works") or []) if w and str(w).strip()]
-    done = _declared_kinds(text, works, {})
+    done = _declared_kinds(text, works, {}, strict_oil=True)   # E3(b): в ФАКТЕ oil только при явной замене
+    # E3(c): накопительно — НЕ теряем ранее распознанное (подшипник и т.п.); объединяем со stored done строки.
+    done = _sp_merge_done(_sp_split(sp.get("done")), done)
     odo = parsed.get("mileage") or ""
     if not odo:
         m = _re_pl.search(r"\b(\d{4,6})\b", str(text or ""))
@@ -3405,18 +3476,25 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             log.exception("  → Z4 запись дословных работ в note упала")
     # B2: естественный маркер завершения (закончил/готово/да/เสร็จแล้ว/…), не только всё/เสร็จหมด.
     completed = _is_done_marker(text)
+    # E4(b): видимость фазы-2 (закрываем слепое пятно — раньше переспросы были не видны в логе).
+    log.info(f"  → ТО фаза2 разбор: status={status} works={works} done={done} odo={odo or '-'} "
+             f"completed={completed} text={str(text)[:50]!r}")
     # B3: завершение БЕЗ называния конкретных ЗАЯВЛЕННЫХ работ → считаем все заявленные сделанными;
     # названные доп.работы (подшипник=other сверх колодок) ДОБАВЛЯЕМ, заявленное не теряем.
     if completed:
         named_declared = [k for k in done if k in declared]
         if not named_declared:
             done = _sp_merge_done(declared, done)
-    # Нет ни перечня факта, ни маркера завершения → переспрашиваем механика.
+    # Нет ни перечня факта, ни маркера завершения → переспрашиваем механика (E4(a): троттл — не на каждое сообщение).
     if not done and not completed:
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, status="ждёт_факт")
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=msg_sp_ask_done(bike, declared))
+        if _sp_ask_ok(chat_id, topic_id):
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=msg_sp_ask_done(bike, declared))
+            log.info("  → ТО фаза2: переспрос «что сделал»")
+        else:
+            log.info("  → ТО фаза2: переспрос «что сделал» ПОДАВЛЕН (троттл E4)")
         mark_awaiting(chat_id, topic_id)
         return True
     if completed and not done:
@@ -3426,7 +3504,11 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
         # handle_mileage_confirm (B1) — в статусе ждёт_факт. done сохраняем в строке заявки.
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, done=_sp_join(done), status="ждёт_факт")
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id, text=msg_ask_odometer(bike))
+        if _sp_ask_ok(chat_id, topic_id):
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id, text=msg_ask_odometer(bike))
+            log.info("  → ТО фаза2: переспрос одометра")
+        else:
+            log.info("  → ТО фаза2: переспрос одометра ПОДАВЛЕН (троттл E4)")
         mark_awaiting(chat_id, topic_id)
         return True
     # B1 (общий хвост): довести до 'ждёт_подтверждения' + кнопка Пыму (запись только по его «да»).

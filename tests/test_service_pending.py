@@ -59,6 +59,7 @@ S._send = rec_send; S._download_photo = rec_dl
 def reset():
     SENDS.clear(); S._SVC_TOKENS.clear(); S._AWAITING_REPLY.clear()
     S._RECENT_PHOTOS.clear(); S._PENDING_WORKS.clear(); S._ODOMETER_ASK_TS.clear()
+    S._SP_ASK_TS.clear(); S._SP_LAST_SENT.clear()   # E4/B5 in-memory троттлы — чистим между тестами
     S._TOPIC_BIKE_OVERRIDE[(CHAT, TOPIC)] = BIKE
     S._TOPIC_NAMES[(CHAT, TOPIC)] = BIKE
 
@@ -66,13 +67,15 @@ def run(coro): return asyncio.run(coro)
 
 # ============ A) declared-парсер ============
 def test_declared_from_works():
+    # E3(a): «масляный фильтр» больше НЕ kind (невалиден) → только oil+gear
     got = S._declared_kinds("", ["замена моторного масла", "масло в редукторе", "масляный фильтр"], {})
-    assert set(got) == {"oil", "gear", "filter"}, got
+    assert set(got) == {"oil", "gear"}, got
     assert got[0] == "oil"
 
 def test_declared_from_text():
+    # «фильтр» без «воздушн» больше не даёт filter-kind (масляного фильтра нет)
     got = S._declared_kinds("привёз на масло, фильтр и редуктор", [], {})
-    assert set(got) == {"oil", "gear", "filter"}, got
+    assert set(got) == {"oil", "gear"}, got
 
 def test_declared_gear_only_text_adds_oil_marker():
     # «масло в редукторе» → gear + oil-кандидат (declared информативен)
@@ -248,6 +251,75 @@ def test_thai_handle_only_no_name():
         assert "@Pleummmm" in m, f"таец адресован через @username: {m[:70]!r}"
         for bad in ("Пым", "Earth", "พี่ Pleum"):
             assert bad not in m, f"имя тайца «{bad}» в исходящем тексте: {m!r}"
+
+
+# ============ H) ФИКС КЛАССА B (E1-E4) ============
+def test_e1_svc_done_confirm_survives_timeout():
+    # E1: подтверждение svc:done через _send_retry — ConnectTimeout не теряет его, запись 1 раз.
+    from telegram.error import TimedOut
+    import asyncio as _a
+    reset()
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "pads", "status": "ждёт_подтверждения", "odometer": "24302"}
+    tok = S._svc_put({"chat": CHAT, "topic": TOPIC, "bike": BIKE, "done": ["pads"], "odo": "24302", "kind": "sp_done"})
+    calls = {"n": 0}; orig = S._send
+    async def flaky(context, *, chat_id, text, message_thread_id=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimedOut("сетевой блип")
+        SENDS.append(text)
+    S._send = flaky
+    orig_sleep = _a.sleep
+    async def _nos(*a, **k): return None
+    _a.sleep = _nos
+    try:
+        run(S.handle_service_button(_mk_update(FakeQ(f"svc:done:{tok}", "Pleummmm")), context=None, bridge=b))
+    finally:
+        S._send = orig; _a.sleep = orig_sleep
+    assert calls["n"] >= 2, f"подтверждение переотправлено после TimedOut, попыток={calls['n']}"
+    assert len(b.events) == 1 and b.closed, "_sp_write_done отработал РОВНО раз (pads→событие + close)"
+    assert not b.oil_calls, "set_fleet_oil не зван (pads — событие)"
+
+def test_e2b_brain_set_service_gated_in_servicing():
+    # E2b: в servicing-теме (_force_bike) мозг НЕ пишет ТО — set_service возвращает advisory, не пишет.
+    import claude_client
+    b = FakeBridge()
+    cc = claude_client.ClaudeClient(api_key="test", bridge=b, memory=None)
+    cc._force_bike = BIKE
+    out = cc._execute_tool("set_service", {"bike": BIKE, "service_type": "oil", "current_km": 24302, "confirmed": True})
+    assert ("service_gate" in out or "blocked" in out), f"set_service должен быть заблокирован: {out[:80]}"
+    assert b.upserts == [], "service_upsert НЕ должен быть вызван (мозг не пишет ТО в servicing)"
+
+def test_e3_kind_validation():
+    # E3(a): масляный фильтр невалиден; (e) воздушный→airfilter; подшипник→other.
+    assert "filter" not in S._declared_kinds("заменил масляный фильтр", [], {}, strict_oil=True), "масляный фильтр — НЕ kind"
+    assert "oil" not in S._declared_kinds("заменил масляный фильтр", [], {}, strict_oil=True), "масляный фильтр НЕ даёт oil"
+    assert "airfilter" in S._declared_kinds("воздушный фильтр", [], {}), "воздушный фильтр → airfilter"
+    assert S._service_kind("подшипник переднего колеса") == "other", "подшипник → other (не теряем)"
+    # E3(b) ФАКТ (strict_oil): oil ТОЛЬКО при явной замене
+    assert S._declared_kinds("колодки заменил", [], {}, strict_oil=True) == ["pads"], "колодки → только pads (без oil)"
+    assert "oil" not in S._declared_kinds("масло в норме, ничего не трогал", [], {}, strict_oil=True), "мягкое масло ≠ oil (факт)"
+    assert "oil" in S._declared_kinds("заменил моторное масло", [], {}, strict_oil=True), "явная замена масла → oil"
+    # intake (нестрого): «привёз на масло» — oil как намерение сохраняется
+    assert "oil" in S._declared_kinds("привёз на масло", [], {}), "intake: oil-намерение от явного слова масла"
+
+def test_e3_write_done_no_false_oil():
+    # E3(d): done=[pads,other] → 2 события, set_fleet_oil НЕ зван (в кол I не пишем не-регламент).
+    reset()
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "pads,other", "status": "ждёт_подтверждения", "odometer": "24302"}
+    written, failed = run(S._sp_write_done(None, b, CHAT, TOPIC, BIKE, ["pads", "other"], "24302", confirmed_by="@Pleummmm"))
+    assert len(b.events) == 2, f"pads+other → 2 события, а {len(b.events)}"
+    assert not b.oil_calls and not b.svc_calls, "set_fleet_* НЕ зван (только события)"
+    assert b.closed is True
+
+def test_e4_ask_throttle():
+    # E4(a): два сообщения подряд на ждёт_факт без факта → один переспрос (троттл), не плодим.
+    reset(); S._SP_ASK_TS.clear()
+    b = FakeBridge(); b.sp = {"declared": "oil,gear", "done": "", "status": "ждёт_факт", "odometer": ""}
+    c = FakeClaude({"works": [], "mileage": ""})
+    run(S.handle_service_result(Msg("ещё вожусь"), context=None, bridge=b, claude=c, text="ещё вожусь"))
+    run(S.handle_service_result(Msg("почти"), context=None, bridge=b, claude=c, text="почти"))
+    asks = [s for s in SENDS if "что сделал" in s or "ทำอะไร" in s]
+    assert len(asks) == 1, f"два сообщения → один переспрос (троттл E4), а {len(asks)}"
 
 
 if __name__ == "__main__":

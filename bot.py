@@ -675,6 +675,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 3) НОВАЯ текстовая коррекция пробега после недавней записи → переспрос (не пишем сразу)
             if await splinter.handle_mileage_correction(msg, context, bridge, msg.text):
                 return
+            # 4) E2a [гейт]: голое «да/ок/число» ПОСЛЕ недавнего закрытия заявки → НЕ слать в мозг
+            #    (иначе мозг пишет ТО мимо гейта — каскад 4255). Ack «уже записано», не no-op в мозг.
+            if msg.text and await splinter.handle_post_close_ack(msg, context, bridge, msg.text):
+                return
         # (Вопрос «после замены / просто пробег?» теперь на кнопках → on_service_button, не текстом.)
         # Fix A: в ДЕНЕЖНОЙ группе проводка с тегом боту = всё равно проводка (не уводить в мозг).
         # ТОЛЬКО mode=='money'; в HQ/прочих тег боту остаётся обращением (ниже).

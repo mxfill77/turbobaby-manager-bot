@@ -398,6 +398,17 @@ class ClaudeClient:
                     self.pending_unpin.append(int(_row))
 
             elif tool_name == "set_service":
+                # E2b [гейт]: в servicing-теме (_force_bike задан) мозг НЕ пишет ТО/обслуживание —
+                # запись регламента ТОЛЬКО через кнопку подтверждения Пыма (двухфазный флоу). Закрывает
+                # путь «Да»→мозг→set_service(oil) мимо гейта (каскад 4255).
+                if getattr(self, "_force_bike", ""):
+                    log.info("  set_service: ЗАБЛОКИРОВАН в servicing-теме (E2b) — запись ТО только кнопкой Пыма")
+                    return json.dumps({
+                        "ok": False, "blocked": "service_gate",
+                        "ОБЯЗАТЕЛЬНО": ("Запись ТО/пробега в servicing-теме оформляется ТОЛЬКО кнопкой подтверждения "
+                                        "@Pleummmm (двухфазный сервисный флоу), НЕ диалогом. НЕ вызывай set_service здесь. "
+                                        "Ответь механику: результат ТО зафиксирует @Pleummmm кнопкой подтверждения."),
+                    }, ensure_ascii=False)
                 _bike = tool_input.get("bike", "")
                 # ЗАЩИТА: в теме обслуживания байк ВСЕГДА из темы, не из выбора модели
                 _forced = getattr(self, "_force_bike", "")

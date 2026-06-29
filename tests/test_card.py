@@ -97,13 +97,17 @@ class BR2(BR):
     def read_events(s,b,limit=8): return {"items":[]}
     def service_pending_get(s,c,t,b): return {"ok":True,"item":{"status":"ждёт_факт","declared":"pads",
         "done":"","odometer":"24302","note":"WORKS:{подшипник переднего колеса} | escalated"}}
+    # E3(e): закрытая заявка с done='pads,oil,filter' (как улика 4255) — карточка валидирует:
+    # показывает ТОЛЬКО колодки (oil/gear/abs/airfilter — в своих секциях; масляный фильтр невалиден).
     def service_pending_list(s,**k): return {"items":[{"bike":"NINJA 400СС PHUKET 6334","status":"закрыто",
-        "done":"oil","odometer":"37000","updated_at":"2026-06-01T00:00:00Z"}]}
+        "done":"pads,oil,filter","odometer":"37000","updated_at":"2026-06-01T00:00:00Z"}]}
 SENDS.clear()
 loop.run_until_complete(S._send_bike_card(None,BR2(),CHAT,TOPIC,"NINJA 6334"))
 res.append(ok(len(SENDS)==1 and "🔧 В работе:" in SENDS[0] and "подшипник переднего колеса" in SENDS[0],
               "_send_bike_card подтянул открытую заявку с дословной работой (note WORKS:)"))
-res.append(ok("Последний сервис:" in SENDS[0], "_send_bike_card подтянул закрытую заявку по plate"))
+res.append(ok("Последний сервис: тормозные колодки" in SENDS[0]
+              and "Последний сервис: тормозные колодки, моторное масло" not in SENDS[0],
+              "E3(e): «Последний сервис» из done='pads,oil,filter' → ТОЛЬКО колодки (без масла/масляного фильтра)"))
 
 # Z4 хелперы note: запись/чтение/слияние без потери прочего текста
 n1=S._sp_note_set_works("", ["колодки","подшипник"])
