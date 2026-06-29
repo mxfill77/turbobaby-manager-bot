@@ -88,6 +88,8 @@ log.info("  Auditor: ✅ подключён к splinter._send (надзор за
 splinter.set_memory(memory)
 _seeded = splinter.seed_topic_bikes()
 log.info(f"  Топики: ✅ привязок тема→байк из memory.db загружено: {_seeded}")
+_seeded_pins = splinter.seed_info_pins()   # закрепы кнопки «ℹ️ Инфо» — чтобы рестарт не плодил дубли
+log.info(f"  Инфо-кнопки: ✅ закрепов из memory.db загружено: {_seeded_pins}")
 
 # LLM-надзор за логикой ответов: включается только если заданы старт-группы в .env.
 auditor.set_audit_config(groups=AUDIT_GROUPS, audit_chat_id=AUDIT_CHAT_ID,
@@ -217,6 +219,24 @@ async def on_devbot_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_delivery_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопки табло выдачи (Delivery, слой 1 O3): доска → «Выдан» → переспрос байка → state. → splinter."""
     await splinter.handle_delivery_button(update, context, bridge)
+
+
+async def on_info_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Постоянная кнопка «ℹ️ Инфо по байку» в темах обслуживания → карточка байка (чтение, ЗЕЛЁНОЕ, без гейта)."""
+    await splinter.handle_info_button(update, context, bridge)
+
+
+async def cmd_pin_info_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """РУЧНОЙ засев кнопки «ℹ️ Инфо» во ВСЕ темы обслуживания (Q1). ТОЛЬКО владелец (id 504608015)."""
+    u = update.effective_user
+    if not (u and u.id == 504608015):
+        log.info("  → /pin_info_all отклонён (не владелец): id=%s", getattr(u, "id", None))
+        return
+    n = await splinter.pin_info_all(context)
+    try:
+        await update.message.reply_text(f"ℹ️ Кнопка «Инфо» засеяна в {n} тем обслуживания.")
+    except Exception:
+        pass
 
 
 async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -660,6 +680,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Иначе гейт вступления (фикс 07:51) работает как обычно — pending не трогает его.
         _tid_sv = getattr(msg, "message_thread_id", None)
         if splinter.GROUPS.get(chat_id) == "servicing":
+            # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» в этой теме (дедуп, O(1) после первого раза)
+            await splinter.ensure_info_pin(context, chat_id, _tid_sv)
             # 0) ДВУХФАЗНЫЙ ТО (фаза 2): ответ механика по открытой заявке (готово/перечень/одометр),
             #    либо доверенное число вместо кнопки. Запись в Лист1 — ТОЛЬКО по «да» доверенного.
             if msg.text and await splinter.handle_service_result(msg, context, bridge, claude, msg.text):
@@ -1136,6 +1158,8 @@ async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):
     # В мозг — ТОЛЬКО если подпись содержательно тегает бота (явный запрос «@bot проверь резину»).
     # Голый тег / без подписи / открытый awaiting → авто-сверка (не мозг).
     if splinter.GROUPS.get(msg.chat_id) == "servicing":
+        # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» и в фото-пути обслуживания
+        await splinter.ensure_info_pin(context, msg.chat_id, _tid)
         _addressed = _servicing_caption_to_brain(msg, context, cap)
     else:
         # Прочие группы — как раньше: подпись-обращение к боту ИЛИ открытый awaiting.
@@ -1231,12 +1255,14 @@ def main():
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("bike", cmd_bike))
     app.add_handler(CommandHandler("board", cmd_board))   # ручной репост доски выдач (Delivery, слой 1 O3)
+    app.add_handler(CommandHandler("pin_info_all", cmd_pin_info_all))   # засев кнопки «ℹ️ Инфо» во все темы (владелец)
 
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
     app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))
     app.add_handler(CallbackQueryHandler(on_service_button, pattern=r"^svc:"))
     app.add_handler(CallbackQueryHandler(on_devbot_button, pattern=r"^(approve|reject|check|next):"))
     app.add_handler(CallbackQueryHandler(on_delivery_button, pattern=r"^delivery:"))   # табло выдачи (слой 1 O3)
+    app.add_handler(CallbackQueryHandler(on_info_button, pattern=r"^info:"))   # кнопка «ℹ️ Инфо по байку» в обслуживании
 
     # Сервис-события форума (создание/переименование темы) → привязка тема→байк
     app.add_handler(MessageHandler(

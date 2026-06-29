@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS topic_bike (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (chat_id, topic_id)
 );
+
+CREATE TABLE IF NOT EXISTS info_pin (
+    chat_id    INTEGER NOT NULL,
+    topic_id   INTEGER NOT NULL,
+    msg_id     INTEGER NOT NULL,      -- id закреплённого сообщения с кнопкой «ℹ️ Инфо»
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, topic_id)
+);
 """
 
 
@@ -222,6 +230,47 @@ class Memory:
         try:
             rows = conn.execute("SELECT chat_id, topic_id, bike_name FROM topic_bike").fetchall()
             return {(int(r[0]), int(r[1])): r[2] for r in rows}
+        finally:
+            conn.close()
+
+    # === Info-pin (закреп кнопки «ℹ️ Инфо» в темах обслуживания; зеркало topic_bike) ===
+
+    def set_info_pin(self, chat_id, topic_id, msg_id):
+        """Upsert id закреплённого сообщения-кнопки «ℹ️ Инфо» для темы."""
+        if not (chat_id and topic_id and msg_id):
+            return
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO info_pin (chat_id, topic_id, msg_id, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, topic_id) DO UPDATE SET "
+                "msg_id=excluded.msg_id, updated_at=excluded.updated_at",
+                (int(chat_id), int(topic_id), int(msg_id), datetime.now().isoformat())
+            )
+        finally:
+            conn.close()
+
+    def get_info_pin(self, chat_id, topic_id):
+        """id закреплённого сообщения-кнопки темы или None."""
+        if not (chat_id and topic_id):
+            return None
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT msg_id FROM info_pin WHERE chat_id=? AND topic_id=?",
+                (int(chat_id), int(topic_id))
+            ).fetchone()
+            return int(row[0]) if row else None
+        finally:
+            conn.close()
+
+    def all_info_pins(self) -> Dict:
+        """{(chat_id, topic_id): msg_id} — для seed _INFO_PINNED при старте."""
+        conn = self._conn()
+        try:
+            rows = conn.execute("SELECT chat_id, topic_id, msg_id FROM info_pin").fetchall()
+            return {(int(r[0]), int(r[1])): int(r[2]) for r in rows}
         finally:
             conn.close()
 

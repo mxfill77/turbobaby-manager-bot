@@ -579,6 +579,141 @@ def seed_topic_bikes():
     return len(_TOPIC_NAMES)
 
 
+# ===================== КНОПКА «ℹ️ Инфо по байку» в темах обслуживания (pinned-inline, токен-free) =====================
+# Постоянная закреп-кнопка: таец жмёт вместо печати → та же карточка, что текст «дай инфу». Чтение карточки =
+# ЗЕЛЁНОЕ (без гейта). callback статичный 'info:card', байк резолвится из ТЕМЫ → переживает рестарт (нет токен-буфера).
+_INFO_PINNED = set()     # {(chat_id, topic_id)} — где кнопка уже закреплена (seed из memory.db на старте)
+_INFO_TAP_TS = {}        # {(chat_id, topic_id): ts} — debounce 5с показа карточки по кнопке (Q6)
+_INFO_PIN_TEXT = ("🐀 Splinter · ℹ️\n"
+                  "🇹🇭 กดปุ่มเพื่อดูข้อมูลรถคันนี้\n"
+                  "🇷🇺 Нажми кнопку — покажу инфо по байку")
+
+
+def _info_keyboard():
+    """Клавиатура кнопки «Инфо» — из МАССИВА строк (расширяемо). Активна ТОЛЬКО «ℹ️ Инфо»;
+    три будущие кнопки пред-размечены комментом (НЕ рендерятся — раскомментить при сборке их веток)."""
+    rows = [
+        [InlineKeyboardButton("🇹🇭 ข้อมูล / 🇷🇺 Инфо", callback_data="info:card")],
+        # РАЗЪЁМ под будущие кнопки тайцев (механизм пина/резолва тот же; добавить = раскомментить + ветка в handle_info_button):
+        # [InlineKeyboardButton("🇹🇭 ส่งมอบ / 🇷🇺 Выдал клиенту", callback_data="info:handover")],
+        # [InlineKeyboardButton("🇹🇭 คืนรถ / 🇷🇺 Возврат",        callback_data="info:return")],
+        # [InlineKeyboardButton("🇹🇭 บันทึกงาน / 🇷🇺 Записать работу", callback_data="info:work")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def seed_info_pins():
+    """Загрузить закрепы кнопки из memory.db в _INFO_PINNED при старте → рестарт не плодит дубли."""
+    if _MEMORY is None:
+        return 0
+    try:
+        for key in _MEMORY.all_info_pins().keys():
+            _INFO_PINNED.add((int(key[0]), int(key[1])))
+        log.info(f"Инфо-кнопки (закрепы) загружены из memory.db: {len(_INFO_PINNED)} тем")
+    except Exception as e:
+        log.warning(f"seed_info_pins error: {e}")
+    return len(_INFO_PINNED)
+
+
+async def ensure_info_pin(context, chat_id, topic_id):
+    """ЛЕНИВО (Q1): на активности в servicing-теме гарантировать закреп кнопки «ℹ️ Инфо».
+    Дедуп через _INFO_PINNED (O(1), без I/O после первого раза). bike нет → пропустить (кнопке нечего показывать)."""
+    if not topic_id:
+        return
+    key = (int(chat_id), int(topic_id))
+    if key in _INFO_PINNED:
+        return
+    bike = bike_from_topic(chat_id, topic_id)
+    if not bike:
+        return
+    try:
+        sent = await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                           text=_INFO_PIN_TEXT, bilingual=False, reply_markup=_info_keyboard())
+    except Exception:
+        log.exception("  → инфо-кнопка: не смог отправить сообщение")
+        return
+    if sent is None:
+        return
+    _INFO_PINNED.add(key)   # сообщение отправлено один раз — больше не шлём (даже если пин ниже упадёт)
+    if _MEMORY is not None:
+        try:
+            _MEMORY.set_info_pin(chat_id, topic_id, sent.message_id)
+        except Exception as e:
+            log.warning(f"  → инфо-кнопка: персист msg_id не удался: {e}")
+    try:
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent.message_id,
+                                           disable_notification=True)
+        log.info(f"  → инфо-кнопка закреплена: тема {topic_id} ({bike}) msg={sent.message_id}")
+    except Exception as e:
+        log.warning(f"  → инфо-кнопка: не смог закрепить (права админа?): {e}")
+
+
+async def _repin_info(context, chat_id, topic_id):
+    """Пере-закрепить кнопку «ℹ️ Инфо» ПОСЛЕ unpin_all (закрытие ТО Oil снимает ВСЕ пины темы).
+    ИНВАРИАНТ: любой unpin_all в теме → следом _repin_info. Сообщение живо (откреплено), msg_id в memory.db.
+    Зовётся ПОСЛЕ пина ТО-сводки → кнопка оказывается СВЕРХУ (Q2 — всегда видна). Идемпотентно."""
+    if _MEMORY is None or not topic_id:
+        return
+    try:
+        mid = _MEMORY.get_info_pin(chat_id, topic_id)
+    except Exception:
+        mid = None
+    if not mid:
+        return
+    try:
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=int(mid),
+                                           disable_notification=True)
+        log.info(f"  → инфо-кнопка пере-закреплена сверху после ТО: тема {topic_id} msg={mid}")
+    except Exception as e:
+        log.warning(f"  → инфо-кнопка: пере-закреп не удался: {e}")
+
+
+async def handle_info_button(update, context, bridge):
+    """Кнопка «ℹ️ Инфо по байку» (CallbackQueryHandler '^info:' в bot.py). Чтение карточки — ЗЕЛЁНОЕ,
+    тайцам БЕЗ гейта. Байк резолвится ИЗ ТЕМЫ (статичный callback, без токен-буфера → переживает рестарт)."""
+    q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    action = data.split(":", 1)[1] if ":" in data else ""
+    msg = q.message
+    chat_id = msg.chat.id if msg else None
+    topic_id = getattr(msg, "message_thread_id", None) if msg else None
+    if action != "card":
+        await q.answer()   # будущие info:handover/return/work — пока не обслуживаем
+        return
+    # Debounce 5с на (chat,topic) (Q6): два быстрых тапа → одна карточка
+    key = (chat_id, topic_id)
+    if _time.time() - _INFO_TAP_TS.get(key, 0) < 5:
+        await q.answer("⏳")
+        return
+    _INFO_TAP_TS[key] = _time.time()
+    await q.answer()
+    bike = bike_from_topic(chat_id, topic_id)
+    if not bike:
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id, bilingual=False,
+                    text="🐀 Splinter\n🇹🇭 ยังไม่ได้ผูกรถกับหัวข้อนี้\n🇷🇺 Тема пока не привязана к байку")
+        return
+    # ОБХОД _card_allowed: явный тап кнопки ВСЕГДА отвечает (тротл — против карточка-спама на болтовне, не на тапе).
+    try:
+        await _send_bike_card(context, bridge, chat_id, topic_id, bike)
+    except Exception:
+        log.exception("  → инфо-кнопка: ошибка карточки")
+
+
+async def pin_info_all(context):
+    """Q1 ручной засев (команда /pin_info_all владельца): пройтись по ВСЕМ известным темам обслуживания
+    и гарантировать кнопку «ℹ️ Инфо». Возвращает число тем обслуживания, где кнопка теперь есть."""
+    n = 0
+    for (cid, tid) in list(_TOPIC_NAMES.keys()):
+        if int(cid) != SERVICING_CHAT:
+            continue
+        await ensure_info_pin(context, cid, tid)
+        if (int(cid), int(tid)) in _INFO_PINNED:
+            n += 1
+    return n
+
+
 SERVICING_CHAT = -1002751134848
 
 # Карта тема→байк, собранная userbot-скриптом fetch_topics.py в файл topics_map.json.
@@ -2468,6 +2603,9 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
                 log.info(f"  → итог ТО закреплён: {bike} msg={_sum_msg.message_id}")
             except Exception as e:
                 log.warning(f"  → не смог закрепить итог ТО (права админа?): {e}")
+        # ИНВАРИАНТ: unpin_all выше снял ВСЕ пины темы, в т.ч. кнопку «ℹ️ Инфо» → пере-закрепить её
+        # ПОСЛЕ итога, чтобы кнопка была СВЕРХУ (Q2 — всегда видна). Любой unpin_all в теме → следом _repin_info.
+        await _repin_info(context, chat_id, topic_id)
     else:
         err = res.get("error", "")
         if err == "oil_decreasing":
