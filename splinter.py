@@ -2204,7 +2204,10 @@ def msg_oil_need_trusted(bike, km):
 # Docs флапает → ЛЮБАЯ ошибка чтения/парса = фоллбэк на хардкод (расчёт ТО НЕ должен падать).
 # Хардкод-дубли (_oil_interval / oil_interval_for) НЕ удалены — это и есть фоллбэк.
 _SVC_INTERVALS_CACHE = {"data": None, "ts": 0.0}
-_SVC_INTERVALS_TTL = 600   # 10 мин
+# Интервалы статичны (меняются раз в месяцы) → длинный TTL: read_doc книги знаний почти никогда
+# не попадает в КРИТИЧЕСКИЙ путь ответа на «Да» (фикс D «задержка после Да»). Правка интервалов в книге
+# подхватится в пределах часа без рестарта; рестарт/prewarm_service_intervals() перечитывают сразу.
+_SVC_INTERVALS_TTL = 3600   # 1 час (было 10 мин)
 _SVC_INTERVALS_FALLBACK = {
     "oil": {"scooter": 4000, "moto": 5000},
     "gear": {"scooter": 4000, "moto": None},
@@ -2248,6 +2251,17 @@ def _load_service_intervals(bridge):
         data = _SVC_INTERVALS_FALLBACK
     c["data"], c["ts"] = data, now
     return data
+
+
+def prewarm_service_intervals(bridge):
+    """Фикс D: прогреть кэш интервалов на старте (один read_doc книги знаний), чтобы ПЕРВЫЙ ответ
+    на «Да» после рестарта не платил холодное чтение Drive в критическом пути квитанции.
+    Зовётся из bot.on_startup после ping Bridge. Best-effort: при ошибке тихо живём на фоллбэке."""
+    try:
+        _load_service_intervals(bridge)
+        log.info("  → интервалы ТО: кэш прогрет на старте (фикс D)")
+    except Exception:
+        log.warning("  → интервалы ТО: прогрев на старте не удался (фоллбэк/ленивое чтение)")
 
 
 def _bike_class(bike_name, intervals):

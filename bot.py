@@ -1043,6 +1043,9 @@ async def on_startup(app: Application):
     else:
         log.warning(f"  Bridge: ⚠️ {ping.get('error')}")
 
+    # Фикс D: прогреть кэш интервалов ТО (один read_doc) — первый ответ на «Да» не платит холодное чтение.
+    splinter.prewarm_service_intervals(bridge)
+
     # Шлём приветствие в группу
     if GROUP_CHAT_ID:
         try:
