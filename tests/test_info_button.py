@@ -5,6 +5,8 @@ import os, sys, asyncio
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 import splinter as S
+async def _noop_sleep(*a, **k): return None   # pin_info_all троттл-паузы → no-op в тесте (быстро)
+asyncio.sleep = _noop_sleep
 
 CHAT = S.SERVICING_CHAT
 TOPIC = 4255
@@ -143,9 +145,9 @@ S._TOPIC_NAMES[(CHAT, 111)] = "PCX 160 1111"
 S._TOPIC_NAMES[(CHAT, 222)] = "ADV 350 2222"
 S._TOPIC_NAMES[(-999, 333)] = "не-обслуживание"   # другой чат → скип
 ctx = FakeCtx()
-n = loop.run_until_complete(S.pin_info_all(ctx))
+st = loop.run_until_complete(S.pin_info_all(ctx))
 print("(h) /pin_info_all засев:")
-res.append(ok(n == 3, f"засеяно 3 servicing-темы (4255/111/222), чужой чат скип — n={n}"))
+res.append(ok(st["pinned"] == 3 and st["total"] == 3, f"засеяно 3/3 servicing-темы (4255/111/222), чужой чат скип — {st}"))
 res.append(ok((-999, 333) not in S._INFO_PINNED, "тема чужого чата НЕ пиннута"))
 res.append(ok(len(ctx.bot.pinned) == 3, "ровно 3 пина (по servicing-темам)"))
 

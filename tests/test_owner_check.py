@@ -14,11 +14,12 @@ def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
 
 print("OWNER_IDS =", S.OWNER_IDS)
-res.append(ok(S.OWNER_IDS == {504608015, 6879003264}, "OWNER_IDS = оба аккаунта владельца"))
+res.append(ok(S.OWNER_IDS == {504608015, 6879003264, 5466425480}, "OWNER_IDS = ТРИ аккаунта владельца"))
 
 print("is_owner_user — по id:")
-res.append(ok(S.is_owner_user(U(6879003264)) is True, "id 6879003264 (@turbophuket1, БЫЛ баг) → владелец"))
+res.append(ok(S.is_owner_user(U(6879003264)) is True, "id 6879003264 (@turbophuket1) → владелец"))
 res.append(ok(S.is_owner_user(U(504608015)) is True, "id 504608015 (HQ-личный, без username) → владелец"))
+res.append(ok(S.is_owner_user(U(5466425480)) is True, "id 5466425480 (@samhold, 3-й — добавлен 30.06) → владелец"))
 
 print("is_owner_user — по username (id чужой):")
 res.append(ok(S.is_owner_user(U(999, "turbophuket1")) is True, "username turbophuket1 → владелец"))

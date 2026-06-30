@@ -233,9 +233,16 @@ async def cmd_pin_info_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("  → /pin_info_all отклонён (не владелец): id=%s @%s",
                  getattr(u, "id", None), (getattr(u, "username", "") or "-"))
         return
-    n = await splinter.pin_info_all(context)
+    st = await splinter.pin_info_all(context)
+    done = st["pinned"] + st["already"]
+    parts = [f"запинено {st['pinned']}", f"уже было {st['already']}"]
+    if st["nobike"]:
+        parts.append(f"без байка {st['nobike']}")
+    if st["fail"]:
+        parts.append(f"не вышло {st['fail']}")
     try:
-        await update.message.reply_text(f"ℹ️ Кнопка «Инфо» засеяна в {n} тем обслуживания.")
+        await update.message.reply_text(
+            f"ℹ️ Кнопка «Инфо»: {done}/{st['total']} тем обслуживания готовы ({', '.join(parts)}).")
     except Exception:
         pass
 

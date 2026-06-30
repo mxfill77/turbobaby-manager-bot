@@ -89,19 +89,28 @@ async def _send_retry(context, *, attempts=3, delay=1.5, **kw):
     упали → лог, не бросает (баланс уже верен). Причина: инцидент 09:43 — add_transaction ok, но
     _send подтверждения упал httpx.ConnectTimeout → Пым не увидел."""
     import asyncio
-    from telegram.error import TimedOut, NetworkError
+    from telegram.error import TimedOut, NetworkError, RetryAfter
     last = None
     for i in range(attempts):
         try:
             return await _send(context, **kw)
+        except RetryAfter as e:
+            # ФЛУД-КОНТРОЛЬ Telegram (массовая рассылка по темам): ждём РОВНО окно, что просит Telegram,
+            # + запас, потом повтор ЭТОЙ ЖЕ отправки (тему не теряем). Класс-фикс: единый retry на флуд.
+            last = e
+            wait = getattr(e, "retry_after", delay) + 1
+            log.warning(f"  → _send_retry: флуд-контроль (RetryAfter {getattr(e,'retry_after','?')}s), "
+                        f"попытка {i + 1}/{attempts}, ждём {wait}s")
+            if i < attempts - 1:
+                await asyncio.sleep(wait)
         except (TimedOut, NetworkError) as e:
             last = e
             log.warning(f"  → _send_retry: попытка {i + 1}/{attempts} упала ({type(e).__name__}); "
                         f"повтор через {delay}s")
             if i < attempts - 1:
                 await asyncio.sleep(delay)
-    log.error(f"  → _send_retry: подтверждение НЕ доставлено после {attempts} попыток ({last}); "
-              f"запись и баланс верны (идемпотентно по msg_id)")
+    log.error(f"  → _send_retry: НЕ доставлено после {attempts} попыток ({last}); "
+              f"запись/баланс верны (идемпотентно по msg_id)")
     return None
 
 
@@ -120,10 +129,11 @@ PYM_HANDLE = THAI_HANDLES["pym"]
 
 # === Аккаунты владельца (Филипп пишет из них) — тоже доверенные ===
 OWNER_USERNAMES = {"turbophuket", "turbophuket1"}
-# Владелец ДВУХАККАУНТНЫЙ: 504608015 (HQ-личный, БЕЗ owner-username) + 6879003264 (@turbophuket1, бизнес).
-# ЕДИНЫЙ источник owner-id для ВСЕХ owner-команд — строгий «==id» молча отвергал второй аккаунт
-# (баг /pin_info_all 29.06: команда с @turbophuket1 id=6879003264 отвергнута). Узнавать ОБА — через is_owner_user.
-OWNER_IDS = {504608015, 6879003264}
+# Владелец МНОГОАККАУНТНЫЙ: 504608015 (HQ-личный) + 6879003264 (@turbophuket1, бизнес) + 5466425480 (@samhold, личный).
+# ЕДИНЫЙ источник owner-id для ВСЕХ owner-команд — строгий «==id» молча отвергал другой аккаунт
+# (баг /pin_info_all 29.06: @turbophuket1 6879003264 отвергнут; 30.06 добавлен 3-й @samhold 5466425480).
+# Новый аккаунт владельца добавлять ТОЛЬКО сюда — все команды на is_owner_user подхватят автоматически.
+OWNER_IDS = {504608015, 6879003264, 5466425480}
 
 # Доверенные авторы: их записи Splinter учитывает и на них реагирует
 TRUSTED_AUTHORS = PYM_USERNAMES | OWNER_USERNAMES
@@ -588,6 +598,7 @@ def seed_topic_bikes():
 # ЗЕЛЁНОЕ (без гейта). callback статичный 'info:card', байк резолвится из ТЕМЫ → переживает рестарт (нет токен-буфера).
 _INFO_PINNED = set()     # {(chat_id, topic_id)} — где кнопка уже закреплена (seed из memory.db на старте)
 _INFO_TAP_TS = {}        # {(chat_id, topic_id): ts} — debounce 5с показа карточки по кнопке (Q6)
+_INFO_PIN_PAUSE = 0.5    # сек между пинами в pin_info_all — ровный темп против флуд-контроля (RetryAfter — страховка)
 _INFO_PIN_TEXT = ("🐀 Splinter · ℹ️\n"
                   "🇹🇭 กดปุ่มเพื่อดูข้อมูลรถคันนี้\n"
                   "🇷🇺 Нажми кнопку — покажу инфо по байку")
@@ -621,23 +632,25 @@ def seed_info_pins():
 
 async def ensure_info_pin(context, chat_id, topic_id):
     """ЛЕНИВО (Q1): на активности в servicing-теме гарантировать закреп кнопки «ℹ️ Инфо».
-    Дедуп через _INFO_PINNED (O(1), без I/O после первого раза). bike нет → пропустить (кнопке нечего показывать)."""
+    Дедуп через _INFO_PINNED (O(1), без I/O после первого раза). bike нет → пропустить (кнопке нечего показывать).
+    Возвращает статус: 'already' / 'nobike' / 'pinned' / 'fail' (для итога /pin_info_all). Отправка через
+    _send_retry → переживает флуд-контроль (RetryAfter) и сетевой блип — тему не теряем при массовом засеве."""
     if not topic_id:
-        return
+        return "nobike"
     key = (int(chat_id), int(topic_id))
     if key in _INFO_PINNED:
-        return
+        return "already"
     bike = bike_from_topic(chat_id, topic_id)
     if not bike:
-        return
+        return "nobike"
     try:
-        sent = await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                           text=_INFO_PIN_TEXT, bilingual=False, reply_markup=_info_keyboard())
+        sent = await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                                 text=_INFO_PIN_TEXT, bilingual=False, reply_markup=_info_keyboard())
     except Exception:
         log.exception("  → инфо-кнопка: не смог отправить сообщение")
-        return
+        return "fail"
     if sent is None:
-        return
+        return "fail"
     _INFO_PINNED.add(key)   # сообщение отправлено один раз — больше не шлём (даже если пин ниже упадёт)
     if _MEMORY is not None:
         try:
@@ -650,6 +663,7 @@ async def ensure_info_pin(context, chat_id, topic_id):
         log.info(f"  → инфо-кнопка закреплена: тема {topic_id} ({bike}) msg={sent.message_id}")
     except Exception as e:
         log.warning(f"  → инфо-кнопка: не смог закрепить (права админа?): {e}")
+    return "pinned"   # сообщение+персист есть; в _INFO_PINNED → повторный засев тему не тронет (дедуп)
 
 
 async def _repin_info(context, chat_id, topic_id):
@@ -706,16 +720,23 @@ async def handle_info_button(update, context, bridge):
 
 
 async def pin_info_all(context):
-    """Q1 ручной засев (команда /pin_info_all владельца): пройтись по ВСЕМ известным темам обслуживания
-    и гарантировать кнопку «ℹ️ Инфо». Возвращает число тем обслуживания, где кнопка теперь есть."""
-    n = 0
+    """Q1 ручной засев (команда /pin_info_all владельца): пройтись по ВСЕМ темам обслуживания и закрепить
+    кнопку «ℹ️ Инфо». РОВНЫМ ТЕМПОМ (пауза между отправками) против флуд-контроля; RetryAfter ловится в
+    _send_retry (тему не теряем). Дедуп: уже закреплённые (в _INFO_PINNED) — без отправки. Возвращает
+    разбивку {pinned, already, nobike, fail, total} для итога владельцу."""
+    import asyncio
+    st = {"pinned": 0, "already": 0, "nobike": 0, "fail": 0, "total": 0}
     for (cid, tid) in list(_TOPIC_NAMES.keys()):
         if int(cid) != SERVICING_CHAT:
             continue
-        await ensure_info_pin(context, cid, tid)
-        if (int(cid), int(tid)) in _INFO_PINNED:
-            n += 1
-    return n
+        st["total"] += 1
+        res = await ensure_info_pin(context, cid, tid)
+        st[res] = st.get(res, 0) + 1
+        if res in ("pinned", "fail"):   # реальная отправка была → выдержать темп (already/nobike — без отправки, без паузы)
+            await asyncio.sleep(_INFO_PIN_PAUSE)
+    log.info(f"  → /pin_info_all итог: запинено {st['pinned']} / уже {st['already']} / "
+             f"без байка {st['nobike']} / не вышло {st['fail']} (всего {st['total']})")
+    return st
 
 
 SERVICING_CHAT = -1002751134848
