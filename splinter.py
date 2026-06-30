@@ -1549,61 +1549,60 @@ def _hb(s):
 
 
 def _mand_line(kind, last, interval, cur):
-    """Строка обязательного вида ТО (HTML): (th, ru) ИЛИ None (gear на мото, interval None). Минимум эмодзи —
-    ОДИН статус-маркер ✅/⚠️/❗; важное (просрочено / не делалось / остаток в км) выделено <b>.
-    Остаток = (last_km + interval) − текущий пробег. last_km — из Лист1 (find_bike *_last_km)."""
+    """Строка обязательного вида ТО (HTML, БЕЗ отступа — компактно): (th, ru) ИЛИ None (gear на мото). ОДИН
+    статус-маркер; важное (просрочено/не делалось/остаток) — <b>. Данные те же — только формат."""
     if interval is None:
-        return None                              # не применимо (gear на мото) → скрываем
+        return None
     th_lbl, ru_lbl = _MAND_LABEL.get(kind, (str(kind), str(kind)))
     try:
         last_i = int(str(last).replace(" ", "").replace(",", ""))
     except (ValueError, TypeError):
         last_i = 0
-    if last_i <= 0:                              # 0/пусто = нет записи → ЯВНО «не делалось» (жирным)
-        return (f"   {th_lbl} — ❗ <b>ยังไม่เคยทำ</b>",
-                f"   {ru_lbl} — ❗ <b>не делалось</b>")
+    if last_i <= 0:
+        return (f"{th_lbl} — ❗ <b>ยังไม่เคยทำ</b>",
+                f"{ru_lbl} — ❗ <b>не делалось</b>")
     nxt = last_i + int(interval)
     try:
         rem = nxt - int(str(cur).replace(" ", "").replace(",", ""))
-    except (ValueError, TypeError):             # есть замена, но текущий пробег неизвестен → срок без остатка
-        return (f"   {th_lbl} — เปลี่ยน {last_i} · ครบ {nxt} กม.",
-                f"   {ru_lbl} — замена {last_i} · срок {nxt} км")
+    except (ValueError, TypeError):
+        return (f"{th_lbl} — เปลี่ยน {last_i} · ครบ {nxt} กม.",
+                f"{ru_lbl} — замена {last_i} · срок {nxt} км")
     if rem > 0:
-        return (f"   {th_lbl} — ✅ อีก <b>{rem}</b> กม. (ครบ {nxt})",
-                f"   {ru_lbl} — ✅ ещё <b>{rem}</b> км (срок {nxt})")
+        return (f"{th_lbl} — ✅ อีก <b>{rem}</b> กม. (ครบ {nxt})",
+                f"{ru_lbl} — ✅ ещё <b>{rem}</b> км (срок {nxt})")
     if rem == 0:
-        return (f"   {th_lbl} — ⚠️ <b>ครบกำหนดแล้ว</b> (ครบ {nxt})",
-                f"   {ru_lbl} — ⚠️ <b>пора сейчас</b> (срок {nxt})")
-    return (f"   {th_lbl} — ⚠️ <b>เกินกำหนด {abs(rem)} กม.</b>",
-            f"   {ru_lbl} — ⚠️ <b>просрочено на {abs(rem)} км</b>")
+        return (f"{th_lbl} — ⚠️ <b>ครบกำหนดแล้ว</b> (ครบ {nxt})",
+                f"{ru_lbl} — ⚠️ <b>пора сейчас</b> (срок {nxt})")
+    return (f"{th_lbl} — ⚠️ <b>เกินกำหนด {abs(rem)} กม.</b>",
+            f"{ru_lbl} — ⚠️ <b>просрочено на {abs(rem)} км</b>")
 
 
 def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_last=None):
-    """КАРТОЧКА байка (parse_mode=HTML, шлётся через _send(parse_mode='HTML')): пробег + аренда + ПЛАНОВОЕ ТО
-    (4 обязательных вида ВСЕГДА: масло/редуктор/ABS/возд.фильтр из Лист1; ❗ где нет записи) + текущий ремонт +
-    история. СТИЛЬ: эмодзи минимум (флаги 🇹🇭/🇷🇺 + статус ✅/⚠️/❗), важное (имя/пробег/просрочка) — <b>; тонкие
-    разделители ─────. 🇹🇭 чистый тайский, 🇷🇺 русский; дословные RU-работы (Z4) — ТОЛЬКО в 🇷🇺."""
-    head = f"🐀 <b>{_hb(bike)}</b>" if bike else "🐀 Splinter"
-    km_th = f" · ไมล์ <b>{cur_km}</b> กม." if cur_km else ""
-    km_ru = f" · пробег <b>{cur_km}</b> км" if cur_km else ""
-    th = [f"🇹🇭 สถานะรถ{km_th}"]
-    ru = [f"🇷🇺 Статус байка{km_ru}"]
+    """КАРТОЧКА байка (HTML) — аккуратная двуязычная справка (фикс вёрстки 30.06).
+    \U0001f400 имя → пустая → [\U0001f1f9\U0001f1ed блок] → пустая → _SEP (вставляет _send) → [\U0001f1f7\U0001f1fa блок].
+    Каждый блок: ШАПКА (флаг + <b>пробег</b> сверху) → аренда → Плановое ТО → В работе → История.
+    Секции = жирная МЕТКА + пустая строка-отступ (без ─────-линий); вид ТО на своей строке. Данные те же — только вёрстка."""
+    head = f"\U0001f400 <b>{_hb(bike)}</b>" if bike else "\U0001f400 Splinter"
 
-    # Аренда (контекст — сверху)
-    if rental:
+    def _rent(th):
+        if not rental:
+            return []
         state = str(rental.get("state", "")); cl = _hb(rental.get("client", ""))
-        _exp = rental.get("expired"); _end = _hb(rental.get("end") or "")
+        _exp = rental.get("expired"); _end = _hb(str(rental.get("end") or "").replace(" , ", ", "))
         if state.lower().startswith("в аренд"):
-            th.append("   เช่า: ให้เช่าอยู่" + (f" · ลูกค้า {cl}" if cl else "")
-                      + (f" · ⚠️ <b>หมดสัญญา {_end}</b>" if _exp else ""))
-            ru.append("   аренда: у клиента" + (f" {cl}" if cl else "")
-                      + (f" · ⚠️ <b>аренда истекла {_end}</b>" if _exp else ""))
-        elif state.lower() == "дома":
-            th.append("   เช่า: อยู่ที่ออฟฟิศ"); ru.append("   аренда: дома (в офисе)")
-        elif state:
-            th.append(f"   สถานะ: {_hb(state)}"); ru.append(f"   статус: {_hb(state)}")
+            if th:
+                out = [f"เช่า: ลูกค้า {cl}" if cl else "เช่า: ให้เช่าอยู่"]
+                if _exp: out.append(f"⚠️ <b>หมดสัญญา {_end}</b>")
+            else:
+                out = [f"аренда: у клиента {cl}" if cl else "аренда: у клиента"]
+                if _exp: out.append(f"⚠️ <b>истекла {_end}</b>")
+            return out
+        if state.lower() == "дома":
+            return ["เช่า: อยู่ที่ออฟฟิศ"] if th else ["аренда: дома (в офисе)"]
+        if state:
+            return [f"สถานะ: {_hb(state)}"] if th else [f"статус: {_hb(state)}"]
+        return []
 
-    # ПЛАНОВОЕ ТО — ВСЕ обязательные виды всегда (даже без данных → «не делалось»)
     by_kind = {m.get("kind"): m for m in (mand or [])}
     to_th, to_ru = [], []
     for kind in _MAND_KINDS:
@@ -1613,33 +1612,46 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
         line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km)
         if line:
             to_th.append(line[0]); to_ru.append(line[1])
-    if to_th:
-        th.append(f"   {_SEP_LINE} เซอร์วิสตามกำหนด {_SEP_LINE}"); th += to_th
-        ru.append(f"   {_SEP_LINE} Плановое ТО {_SEP_LINE}"); ru += to_ru
 
-    # Текущий ремонт (открытая заявка) — Z1+Z4
+    work_th, work_ru = [], []
     if sp_open and (sp_open.get("kinds") or sp_open.get("works")):
         _st = str(sp_open.get("status") or ""); _odo = str(sp_open.get("odo") or "")
         _th_w = _sp_labels_th(sp_open.get("kinds") or [])
         _ru_w = ", ".join(_hb(w) for w in (sp_open.get("works") or [])) or _sp_labels_ru(sp_open.get("kinds") or [])
-        th.append(f"   กำลังทำ: <b>{_th_w}</b>" + (f" · ไมล์ {_odo}" if _odo else "") + f" · {_SP_STATUS_TH.get(_st, _st)}")
-        ru.append(f"   В работе: <b>{_ru_w}</b>" + (f", одометр {_odo}" if _odo else ", одометр —") + f" · {_SP_STATUS_RU.get(_st, _st)}")
+        work_th = [f"<b>{_th_w}</b>" + (f" · ไมล์ {_odo}" if _odo else "") + f" · {_SP_STATUS_TH.get(_st, _st)}"]
+        work_ru = [f"<b>{_ru_w}</b>" + (f" · одометр {_odo}" if _odo else "") + f" · {_SP_STATUS_RU.get(_st, _st)}"]
 
-    # История (последний сервис + на пробеге) — под разделителем
     hist_th, hist_ru = [], []
     if sp_last and sp_last.get("done"):
         _dl_th = _sp_labels_th(sp_last["done"]); _dl_ru = _sp_labels_ru(sp_last["done"])
         _lo = str(sp_last.get("odo") or ""); _ld = str(sp_last.get("date") or "")
-        hist_th.append(f"   ล่าสุด: {_dl_th}" + (f" · {_lo} กม." if _lo else "") + (f" ({_ld})" if _ld else ""))
-        hist_ru.append(f"   Последний сервис: {_dl_ru}" + (f" · {_lo} км" if _lo else "") + (f" ({_ld})" if _ld else ""))
+        hist_th.append(f"ล่าสุด: {_dl_th}" + (f" · {_lo} กม." if _lo else "") + (f" ({_ld})" if _ld else ""))
+        hist_ru.append(f"Последний сервис: {_dl_ru}" + (f" · {_lo} км" if _lo else "") + (f" ({_ld})" if _ld else ""))
     if service:
-        hist_th.append("   ตามไมล์: " + ", ".join(f"{_hb(_work_th(s.get('work')))} ({s.get('km')})" for s in service))
-        hist_ru.append("   На пробеге: " + ", ".join(f"{_hb(s.get('work'))} ({s.get('km')})" for s in service))
-    if hist_th:
-        th.append(f"   {_SEP_LINE} ประวัติ {_SEP_LINE}"); th += hist_th
-        ru.append(f"   {_SEP_LINE} История {_SEP_LINE}"); ru += hist_ru
+        hist_th.append("ตามไมล์: " + ", ".join(f"{_hb(_work_th(s.get('work')))} ({s.get('km')})" for s in service))
+        hist_ru.append("На пробеге: " + ", ".join(f"{_hb(s.get('work'))} ({s.get('km')})" for s in service))
 
-    return head + "\n" + "\n".join(th) + "\n" + "\n".join(ru)
+    def _block(th):
+        if th:
+            L = ["\U0001f1f9\U0001f1ed " + (f"<b>ไมล์ {cur_km} กม.</b>" if cur_km else "<b>สถานะรถ</b>")]
+            rl, tos, wk, hs = _rent(True), to_th, work_th, hist_th
+            sec_to, sec_wk, sec_hs = "<b>เซอร์วิสตามกำหนด</b>", "<b>กำลังทำ</b>", "<b>ประวัติ</b>"
+        else:
+            L = ["\U0001f1f7\U0001f1fa " + (f"<b>пробег {cur_km} км</b>" if cur_km else "<b>Статус байка</b>")]
+            rl, tos, wk, hs = _rent(False), to_ru, work_ru, hist_ru
+            sec_to, sec_wk, sec_hs = "<b>Плановое ТО</b>", "<b>В работе</b>", "<b>История</b>"
+        if rl:
+            L += rl
+        if tos:
+            L += ["", sec_to] + tos
+        if wk:
+            L += ["", sec_wk] + wk
+        if hs:
+            L += ["", sec_hs] + hs
+        return L
+
+    out = [head, ""] + _block(True) + ["", ""] + _block(False)
+    return "\n".join(out)
 
 
 async def _send_bike_card(context, bridge, chat_id, topic_id, bike):

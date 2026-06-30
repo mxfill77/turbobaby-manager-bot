@@ -55,8 +55,8 @@ m=S.msg_bike_card("NMAX 155 4255","27000",
    [{"kind":"oil","last":24094,"interval":4000},{"kind":"gear","last":20000,"interval":4000}],
    {"state":"В аренде","client":"Jack"})
 print("(2) карточка:")
-res.append(ok("пробег <b>27000</b>" in m and "Масло —" in m and "Редуктор —" in m and "аренда: у клиента Jack" in m, "RU: пробег+масло+редуктор+аренда"))
-res.append(ok("น้ำมันเครื่อง" in m and "น้ำมันเกียร์" in m and "ให้เช่าอยู่" in m, "TH: масло+редуктор+аренда тайскими"))
+res.append(ok("<b>пробег 27000 км</b>" in m and "Масло —" in m and "Редуктор —" in m and "аренда: у клиента Jack" in m, "RU: пробег+масло+редуктор+аренда"))
+res.append(ok("น้ำมันเครื่อง" in m and "น้ำมันเกียร์" in m and "ลูกค้า Jack" in m, "TH: масло+редуктор+аренда тайскими"))
 res.append(ok(th_clean(m), "🇹🇭 без кириллицы"))
 
 # 3) _send_bike_card собирает из bridge (NINJA=мото: масло считается, gear скрыт, abs/фильтр «не делалось»)
@@ -71,7 +71,7 @@ br=BR()
 # Пакет Б: карточка теперь под гейтом — явный статус-запрос (начинается со статус-слова) ИЛИ обращение к боту.
 loop.run_until_complete(S._handle_servicing(Msg2("статус по байку"),context=None,bridge=br,claude=FakeClaude(),photo_msgs=[]))
 print("(4) хук в _handle_servicing:")
-res.append(ok(len(SENDS)==1 and "Статус байка" in SENDS[0], "на ЯВНЫЙ запрос → карточка отправлена"))
+res.append(ok(len(SENDS)==1 and "🇷🇺" in SENDS[0], "на ЯВНЫЙ запрос → карточка отправлена"))
 res.append(ok(len(br.events)==0, "ничего НЕ записано (только чтение)"))
 
 # 5) НОВЫЕ секции: в работе (Z1+Z4 дословно) / последний сервис / устаревшая аренда (Z3) / пусто
@@ -80,12 +80,12 @@ m2=S.msg_bike_card("NMAX 4255","24302",[],
    {"state":"В аренде","client":"Gamza","expired":True,"end":"17.06.2026"},
    sp_open={"kinds":["pads"],"works":["подшипник переднего колеса"],"odo":"24302","status":"ждёт_факт"},
    sp_last={"done":["oil"],"odo":"24094","date":"2026-06-07"})
-res.append(ok("В работе:" in m2 and "подшипник переднего колеса" in m2, "Z4: дословная работа в RU «В работе»"))
+res.append(ok("В работе" in m2 and "подшипник переднего колеса" in m2, "Z4: дословная работа в RU «В работе»"))
 res.append(ok("ждёт результат" in m2 and "одометр 24302" in m2, "статус заявки читаемый + одометр"))
 res.append(ok("Последний сервис:" in m2 and "24094" in m2, "секция «Последний сервис» из закрытой заявки"))
-res.append(ok("аренда истекла 17.06.2026" in m2, "Z3: флаг устаревшей аренды"))
+res.append(ok("истекла 17.06.2026" in m2, "Z3: флаг устаревшей аренды"))
 res.append(ok(th_clean(m2), "🇹🇭 чистый (дословная кириллица только в RU)"))
-res.append(ok("กำลังทำ: <b>ผ้าเบรก" in m2, "TH «в работе» тайскими лейблами (без дословной кириллицы)"))
+res.append(ok(("กำลังทำ" in m2 and "ผ้าเบรก" in m2), "TH «в работе» тайскими лейблами (без дословной кириллицы)"))
 
 m3=S.msg_bike_card("X","100",[],{"state":"дома","client":""})
 res.append(ok("В работе" not in m3 and "Последний сервис" not in m3, "нет заявок → секции опущены"))
@@ -105,7 +105,7 @@ class BR2(BR):
         "done":"pads,oil,filter","odometer":"37000","updated_at":"2026-06-01T00:00:00Z"}]}
 SENDS.clear()
 loop.run_until_complete(S._send_bike_card(None,BR2(),CHAT,TOPIC,"NINJA 6334"))
-res.append(ok(len(SENDS)==1 and "В работе:" in SENDS[0] and "подшипник переднего колеса" in SENDS[0],
+res.append(ok(len(SENDS)==1 and "В работе" in SENDS[0] and "подшипник переднего колеса" in SENDS[0],
               "_send_bike_card подтянул открытую заявку с дословной работой (note WORKS:)"))
 res.append(ok("Последний сервис: тормозные колодки" in SENDS[0]
               and "Последний сервис: тормозные колодки, моторное масло" not in SENDS[0],

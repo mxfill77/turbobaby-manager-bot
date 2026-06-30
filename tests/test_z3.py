@@ -51,7 +51,7 @@ res.append(ok(th_clean(m), "🇹🇭 без кириллицы"))
 SENDS.clear()
 loop.run_until_complete(S._send_bike_card(None,BR(ev=[]),CHAT,TOPIC,"NINJA 6334"))
 print("(4) нет истории:")
-res.append(ok("На пробеге" not in SENDS[-1] and "Статус байка" in SENDS[-1], "карточка без секции сервиса (есть записи ТО)"))
+res.append(ok("На пробеге" not in SENDS[-1] and "🇷🇺" in SENDS[-1], "карточка без секции сервиса (есть записи ТО)"))
 
 # 5) read_events упал → карточка всё равно (без секции), не падает
 class BRfail(BR):
