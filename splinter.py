@@ -120,6 +120,10 @@ PYM_HANDLE = THAI_HANDLES["pym"]
 
 # === Аккаунты владельца (Филипп пишет из них) — тоже доверенные ===
 OWNER_USERNAMES = {"turbophuket", "turbophuket1"}
+# Владелец ДВУХАККАУНТНЫЙ: 504608015 (HQ-личный, БЕЗ owner-username) + 6879003264 (@turbophuket1, бизнес).
+# ЕДИНЫЙ источник owner-id для ВСЕХ owner-команд — строгий «==id» молча отвергал второй аккаунт
+# (баг /pin_info_all 29.06: команда с @turbophuket1 id=6879003264 отвергнута). Узнавать ОБА — через is_owner_user.
+OWNER_IDS = {504608015, 6879003264}
 
 # Доверенные авторы: их записи Splinter учитывает и на них реагирует
 TRUSTED_AUTHORS = PYM_USERNAMES | OWNER_USERNAMES
@@ -934,11 +938,21 @@ def _is_trusted(msg) -> bool:
     return u.username.lower() in TRUSTED_AUTHORS
 
 
-def _is_owner(msg) -> bool:
-    u = msg.from_user
-    if not u or not u.username:
+def is_owner_user(u) -> bool:
+    """Владелец по id ИЛИ username (двухаккаунтный: HQ-личный 504608015 + бизнес @turbophuket1 6879003264).
+    ЕДИНЫЙ гейт owner-команд — чтобы строгий «==id» не отвергал второй аккаунт. Принимает telegram.User
+    (update.effective_user / msg.from_user). Узнаёт по id (OWNER_IDS) ЛИБО по username (OWNER_USERNAMES:
+    HQ-личный username не имеет → ловится по id)."""
+    if not u:
         return False
-    return u.username.lower() in OWNER_USERNAMES
+    if getattr(u, "id", None) in OWNER_IDS:
+        return True
+    return (getattr(u, "username", "") or "").lower() in OWNER_USERNAMES
+
+
+def _is_owner(msg) -> bool:
+    """Владелец по сообщению — делегирует в единый is_owner_user (id ИЛИ username)."""
+    return is_owner_user(getattr(msg, "from_user", None))
 
 
 def _intake_can_approve(msg) -> bool:

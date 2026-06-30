@@ -227,10 +227,11 @@ async def on_info_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_pin_info_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """РУЧНОЙ засев кнопки «ℹ️ Инфо» во ВСЕ темы обслуживания (Q1). ТОЛЬКО владелец (id 504608015)."""
+    """РУЧНОЙ засев кнопки «ℹ️ Инфо» во ВСЕ темы обслуживания (Q1). ТОЛЬКО владелец (оба аккаунта, is_owner_user)."""
     u = update.effective_user
-    if not (u and u.id == 504608015):
-        log.info("  → /pin_info_all отклонён (не владелец): id=%s", getattr(u, "id", None))
+    if not splinter.is_owner_user(u):
+        log.info("  → /pin_info_all отклонён (не владелец): id=%s @%s",
+                 getattr(u, "id", None), (getattr(u, "username", "") or "-"))
         return
     n = await splinter.pin_info_all(context)
     try:
@@ -244,8 +245,7 @@ async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (он командует с личного аккаунта в HQ; username там НЕ turbophuket) ИЛИ бизнес-аккаунт по username."""
     u = update.effective_user
     uname = (u.username or "").lower() if u else ""
-    is_owner = bool(u) and (u.id == 504608015 or uname in splinter.OWNER_USERNAMES)
-    if not is_owner:
+    if not splinter.is_owner_user(u):   # единый гейт (оба аккаунта владельца) — тот же, что /pin_info_all
         log.info("  → /board отклонён (не владелец): id=%s @%s", getattr(u, "id", None), uname or "-")
         return
     log.info("  → /board от владельца id=%s @%s → пощу доску выдач", u.id, uname or "-")
