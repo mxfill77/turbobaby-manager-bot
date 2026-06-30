@@ -38,7 +38,7 @@ class Ctx:
 loop=asyncio.new_event_loop()
 acc={"current_km":"37823","works":["замена масляного фильтра"],"works_km":"37823","oil":{"km":37823,"next":42823,"status":"ok"},"cols":[]}
 loop.run_until_complete(S._send(Ctx(),chat_id=-1,text=S.msg_service_summary("NINJA 6334",acc)))
-loop.run_until_complete(S._send(Ctx(),chat_id=-1,text=S.msg_bike_card("NINJA 6334","37823",{"km":"37823","next":42823,"status":"ok"},[],None,[{"work":"масляный фильтр","km":"37823"}])))
+loop.run_until_complete(S._send(Ctx(),chat_id=-1,text=S.msg_bike_card("NINJA 6334","37823",[],None,[{"work":"масляный фильтр","km":"37823"}])))
 print("(5) _send централизованно:")
 res.append(ok(all(S._SEP in t for t in CAP), "сводка И карточка через _send → с разделителем"))
 res.append(ok(all(th_clean(t) for t in CAP), "🇹🇭 без кириллицы (разделитель нейтрален)"))

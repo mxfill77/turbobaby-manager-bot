@@ -1,4 +1,5 @@
-"""Карточка байка: блок остатка до след. ТО по видам (next − текущий пробег). Чистый рендер msg_bike_card."""
+"""Карточка: ПЛАНОВОЕ ТО — все 4 обязательных вида ВСЕГДА (масло/редуктор/ABS/возд.фильтр), статусы
+✅ ещё / ⚠️ просрочено / ⚠️ пора сейчас / ❗ не делалось; gear только скутер. Чистый рендер msg_bike_card."""
 import os, sys, re
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
@@ -7,39 +8,63 @@ import splinter as S
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
 
-# (1) _svc_remaining — единичные случаи (граничные включительно)
-print("(1) _svc_remaining:")
-res.append(ok(S._svc_remaining(42823, "37823") == (" (อีก 5000 กม.)", " (ещё 5000 км)"), ">0 → ещё N км"))
-res.append(ok(S._svc_remaining(38000, "38000") == (" (⚠️ ครบกำหนดแล้ว)", " (⚠️ пора сейчас)"), "==0 → пора сейчас (граница)"))
-res.append(ok(S._svc_remaining(44000, "45000") == (" (⚠️ เกิน 1000 กม.)", " (⚠️ просрочено на 1000 км)"), "<0 → просрочено на N км"))
-res.append(ok(S._svc_remaining(None, "100") is None and S._svc_remaining(4000, "") is None, "нет next/пробега → None (не выдумываем)"))
-res.append(ok(S._svc_remaining(4000, "1 200") == (" (อีก 2800 กม.)", " (ещё 2800 км)"), "пробег с пробелом парсится"))
+# (1) _mand_line — статусы по видам (граничные включительно)
+print("(1) _mand_line:")
+res.append(ok(S._mand_line("oil", 24094, 4000, "27000")[1] == "   🛢 Масло: ✅ ещё 1094 км (срок 28094)", ">0 → ✅ ещё N км"))
+res.append(ok(S._mand_line("oil", 24094, 4000, "29275")[1] == "   🛢 Масло: ⚠️ просрочено на 1181 км", "<0 → ⚠️ просрочено на N"))
+res.append(ok(S._mand_line("oil", 24094, 4000, "28094")[1] == "   🛢 Масло: ⚠️ пора сейчас (срок 28094)", "==0 → ⚠️ пора сейчас (граница)"))
+res.append(ok(S._mand_line("abs", 0, 10000, "29275")[1] == "   🛡 ABS oil: ❗ не делалось (нет записи)", "last 0 → ❗ не делалось"))
+res.append(ok(S._mand_line("airfilter", None, 20000, "29275")[1] == "   💨 Возд. фильтр: ❗ не делалось (нет записи)", "last None → ❗ не делалось"))
+res.append(ok(S._mand_line("gear", 17000, None, "29275") is None, "gear interval None (мото) → None (скрыт)"))
+res.append(ok(S._mand_line("oil", 24094, 4000, "")[1] == "   🛢 Масло: замена 24094 · срок 28094 км", "нет текущего пробега → срок без остатка"))
 
-# (2) карточка: oil в норме → остаток; gear просрочен; abs нет данных; airfilter ровно 0
-oil = {"km": "37823", "next": 42823, "status": "ok"}
-cols = [
-    {"kind": "gear", "next": 37000, "status": "ok", "km": 37823},      # 37000-37823 = -823 → просрочено
-    {"kind": "abs", "next": None, "status": None, "km": 37823},        # нет данных
-    {"kind": "airfilter", "next": 37823, "status": "ok", "km": 37823}, # ровно 0 → пора сейчас
+# (2) скутер vs мото — gear применяется только скутеру (_bike_class + интервал из фоллбэка)
+print("(2) скутер/мото:")
+fb = S._SVC_INTERVALS_FALLBACK
+res.append(ok(S._bike_class("NMAX 155 4255", fb) == "scooter" and S._bike_class("NINJA 400 6334", fb) == "moto", "NMAX=скутер, NINJA=мото"))
+res.append(ok(fb["gear"]["scooter"] == 4000 and fb["gear"]["moto"] is None, "gear: скутер 4000, мото — не применимо"))
+
+# (3) карточка: все 4 вида ВСЕГДА (масло просрочен / gear просрочен / abs ок / фильтр не делалось)
+mand = [
+    {"kind": "oil", "last": 24094, "interval": 4000},        # 28094-29275 = просрочено 1181
+    {"kind": "gear", "last": 17000, "interval": 4000},       # 21000-29275 = просрочено 8275 (скутер)
+    {"kind": "abs", "last": 29300, "interval": 10000},       # 39300-29275 = ещё 10025
+    {"kind": "airfilter", "last": 0, "interval": 20000},     # нет записи → не делалось
 ]
-m = S.msg_bike_card("NMAX 155 4255", "37823", oil, cols, None)
-print("\n(2) карточка с остатками (RU):")
-res.append(ok("ТО Oil: в норме, следующее 42823 км (ещё 5000 км)" in m, "масло: остаток «ещё 5000 км»"))
-res.append(ok("редуктор (gear): следующее 37000 км (⚠️ просрочено на 823 км)" in m, "gear: «⚠️ просрочено на 823 км»"))
-res.append(ok("ABS: нет данных" in m, "abs без next → «нет данных»"))
-res.append(ok("возд. фильтр: следующее 37823 км (⚠️ пора сейчас)" in m, "airfilter ровно 0 → «пора сейчас»"))
+m = S.msg_bike_card("NMAX 155 4255", "29275", mand,
+                    {"state": "В аренде", "client": "Gamza", "expired": True, "end": "17.06.2026"})
+print("\n(3) карточка — все 4 вида + статусы (RU):")
+res.append(ok("🛢 Масло: ⚠️ просрочено на 1181 км" in m, "масло просрочено"))
+res.append(ok("⚙️ Редуктор (gear): ⚠️ просрочено на 8275 км" in m, "редуктор просрочен (скрытая просрочка теперь видна)"))
+res.append(ok("🛡 ABS oil: ✅ ещё 10025 км (срок 39300)" in m, "ABS ещё 10025"))
+res.append(ok("💨 Возд. фильтр: ❗ не делалось (нет записи)" in m, "фильтр без записи → ❗ не делалось"))
+res.append(ok("─── 🔧 Плановое ТО ───" in m, "разделитель секции «Плановое ТО»"))
+res.append(ok("⚠️ аренда истекла 17.06.2026" in m, "аренда истекла с ⚠️"))
 
-print("(2) карточка TH-блок без кириллицы:")
-th_block = m[m.index("🇹🇭"):m.index("🇷🇺")] if "🇹🇭" in m and "🇷🇺" in m else ""
-res.append(ok("อีก" in m and "เกิน" in m, "TH суффиксы (อีก/เกิน) присутствуют"))
-res.append(ok(not re.search(r"[А-Яа-яЁё]", th_block), "в 🇹🇭-блоке остатка НЕТ кириллицы (двуязычность цела)"))
+# (4) мото-байк: gear НЕ показан (interval None)
+mand_moto = [
+    {"kind": "oil", "last": 30000, "interval": 5000},
+    {"kind": "gear", "last": 0, "interval": None},           # мото → скрыт
+    {"kind": "abs", "last": 0, "interval": 10000},
+    {"kind": "airfilter", "last": 0, "interval": 20000},
+]
+m2 = S.msg_bike_card("NINJA 400 6334", "31000", mand_moto, {"state": "дома", "client": ""})
+print("(4) мото — gear скрыт:")
+res.append(ok("Редуктор" not in m2 and "น้ำมันเกียร์" not in m2, "gear НЕ показан на мото (не применимо)"))
+res.append(ok("🛢 Масло: ✅ ещё 4000 км" in m2, "масло мото считается (30000+5000-31000=4000)"))
+res.append(ok("🛡 ABS oil: ❗ не делалось" in m2 and "💨 Возд. фильтр: ❗ не делалось" in m2, "abs/фильтр без записи → не делалось"))
 
-# (3) регресс: старый ассерт карточки (подстроки целы после добавления остатка)
-m2 = S.msg_bike_card("NINJA 400 6334", "37823", {"km": "37823", "next": 42823, "status": "ok"},
-                     [{"kind": "gear", "next": 44000, "status": "ok", "km": 40000}],
-                     {"state": "В аренде", "client": "Jack"})
-print("(3) регресс старых подстрок:")
-res.append(ok("ТО Oil: в норме, следующее 42823" in m2 and "редуктор (gear): следующее 44000" in m2, "старые подстроки целы (тест_card не сломан)"))
+# (5) TH-блок без кириллицы
+print("(5) TH без кириллицы:")
+def th_block(s):
+    out, inth = [], False
+    for l in s.split("\n"):
+        if l.lstrip().startswith("🇷🇺"): inth = False
+        if l.lstrip().startswith("🇹🇭"): inth = True
+        if inth: out.append(l)
+    return "\n".join(out)
+res.append(ok(not re.search(r"[А-Яа-яЁё]", th_block(m)), "в 🇹🇭-блоке нет кириллицы (двуязычность цела)"))
+res.append(ok("เกินกำหนด" in m and "ยังไม่เคยทำ" in m and "─── 🔧 เซอร์วิสตามกำหนด ───" in m, "TH статусы/разделитель тайскими"))
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

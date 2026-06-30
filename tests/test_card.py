@@ -22,6 +22,7 @@ class BR:
     def _call(s,a,**k): return {"ok":False}
     def add_event(s,**kw): s.events.append(kw); return {"ok":True}
     def find_bike(s,b): return {"name":"NINJA 400СС PHUKET 6334","status":"В аренде","oil_last_km":37823,
+                                "gear_last_km":0,"abs_last_km":0,"airfilter_last_km":0,"mileage":0,
                                 "current_rental":{"client":"Jack"}}
     def service_list(s): return {"items":[
         {"bike":"NINJA 400СС PHUKET 6334","service_type":"oil","current_km":37823,"next_km":42823,"status":"ok"},
@@ -49,19 +50,20 @@ res.append(ok(S._is_status_request("что по байку"), "«что по б�
 res.append(ok(S._is_status_request("карточка"), "«карточка» → да"))
 res.append(ok(not S._is_status_request("заменил масло, колодки, цепь, пробег 37823 фото приложил позже"), "длинное сообщение о работах → НЕТ"))
 
-# 2) карточка: содержимое + 🇹🇭 чистота
-m=S.msg_bike_card("NINJA 400 6334","37823",{"km":"37823","next":42823,"status":"ok"},
-   [{"kind":"gear","next":44000,"status":"ok","km":40000}],{"state":"В аренде","client":"Jack"})
+# 2) карточка: содержимое + 🇹🇭 чистота (скутер → масло+редуктор оба видны)
+m=S.msg_bike_card("NMAX 155 4255","27000",
+   [{"kind":"oil","last":24094,"interval":4000},{"kind":"gear","last":20000,"interval":4000}],
+   {"state":"В аренде","client":"Jack"})
 print("(2) карточка:")
-res.append(ok("пробег 37823" in m and "ТО Oil: в норме, следующее 42823" in m and "редуктор (gear): следующее 44000" in m and "аренда: у клиента Jack" in m, "RU: пробег+ТО Oil+gear+аренда"))
-res.append(ok("เปลี่ยนน้ำมันเครื่อง" in m and "น้ำมันเกียร์" in m and "ให้เช่าอยู่" in m, "TH: масло+gear+аренда тайскими"))
+res.append(ok("пробег 27000" in m and "🛢 Масло:" in m and "⚙️ Редуктор (gear):" in m and "аренда: у клиента Jack" in m, "RU: пробег+масло+редуктор+аренда"))
+res.append(ok("น้ำมันเครื่อง" in m and "น้ำมันเกียร์" in m and "ให้เช่าอยู่" in m, "TH: масло+редуктор+аренда тайскими"))
 res.append(ok(th_clean(m), "🇹🇭 без кириллицы"))
 
-# 3) _send_bike_card собирает из bridge
+# 3) _send_bike_card собирает из bridge (NINJA=мото: масло считается, gear скрыт, abs/фильтр «не делалось»)
 SENDS.clear()
 loop.run_until_complete(S._send_bike_card(None,BR(),CHAT,TOPIC,"NINJA 6334"))
 print("(3) _send_bike_card:")
-res.append(ok(len(SENDS)==1 and "ТО Oil: в норме, следующее 42823" in SENDS[0] and "редуктор" in SENDS[0], "карточка собрана из find_bike+service_list"))
+res.append(ok(len(SENDS)==1 and "🛢 Масло: ✅ ещё 2823 км" in SENDS[0] and "Плановое ТО" in SENDS[0], "карточка собрана из find_bike(Лист1)+service_list (пробег=max)"))
 
 # 4) _handle_servicing: запрос статуса → карточка, НИЧЕГО не пишет, parse не как событие
 SENDS.clear()
@@ -74,7 +76,7 @@ res.append(ok(len(br.events)==0, "ничего НЕ записано (тольк
 
 # 5) НОВЫЕ секции: в работе (Z1+Z4 дословно) / последний сервис / устаревшая аренда (Z3) / пусто
 print("(5) то_заявки секции + Z3/Z4:")
-m2=S.msg_bike_card("NMAX 4255","24302",{"km":"24302","next":28094,"status":"ok"},[],
+m2=S.msg_bike_card("NMAX 4255","24302",[],
    {"state":"В аренде","client":"Gamza","expired":True,"end":"17.06.2026"},
    sp_open={"kinds":["pads"],"works":["подшипник переднего колеса"],"odo":"24302","status":"ждёт_факт"},
    sp_last={"done":["oil"],"odo":"24094","date":"2026-06-07"})
@@ -85,11 +87,11 @@ res.append(ok("аренда истекла 17.06.2026" in m2, "Z3: флаг ус
 res.append(ok(th_clean(m2), "🇹🇭 чистый (дословная кириллица только в RU)"))
 res.append(ok("กำลังทำ: ผ้าเบรก" in m2, "TH «в работе» тайскими лейблами (без дословной кириллицы)"))
 
-m3=S.msg_bike_card("X","100",{"km":"100","next":4100,"status":"ok"},[],{"state":"дома","client":""})
+m3=S.msg_bike_card("X","100",[],{"state":"дома","client":""})
 res.append(ok("В работе" not in m3 and "Последний сервис" not in m3, "нет заявок → секции опущены"))
 
 # не устаревшая аренда (дата в будущем) → без флага
-m4=S.msg_bike_card("Y","1",None,[],{"state":"В аренде","client":"Z","expired":False,"end":"01.01.2099"})
+m4=S.msg_bike_card("Y","1",[],{"state":"В аренде","client":"Z","expired":False,"end":"01.01.2099"})
 res.append(ok("истекла" not in m4 and "у клиента Z" in m4, "аренда в силе → без флага «истекла»"))
 
 # _send_bike_card подтягивает то_заявки из bridge (открытая дословная + закрытая)

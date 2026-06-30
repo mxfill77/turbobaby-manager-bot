@@ -43,22 +43,22 @@ res.append(ok(len(S._parse_service_items(EV,limit=2))==2, "лимит работ
 loop.run_until_complete(S._send_bike_card(None,BR(),CHAT,TOPIC,"NINJA 6334"))
 m=SENDS[-1]
 print("(3) карточка с сервисом:")
-res.append(ok("🔧 Сервис на пробеге:" in m and "— регулировка цепи (37823)" in m and "— замена масляного фильтра (37823)" in m, "RU: секция сервис-на-пробеге буллетами с км"))
-res.append(ok("🔧 ประวัติซ่อมบำรุง" in m and "ปรับโซ่ (37823)" in m and "ไส้กรองน้ำมันเครื่อง (37823)" in m, "TH: то же тайскими названиями"))
+res.append(ok("📜 На пробеге:" in m and "регулировка цепи (37823)" in m and "замена масляного фильтра (37823)" in m, "RU: секция «на пробеге» с км"))
+res.append(ok("📜 ตามไมล์:" in m and "ปรับโซ่ (37823)" in m and "ไส้กรองน้ำมันเครื่อง (37823)" in m, "TH: то же тайскими названиями"))
 res.append(ok(th_clean(m), "🇹🇭 без кириллицы"))
 
 # 4) нет записей → секции нет
 SENDS.clear()
 loop.run_until_complete(S._send_bike_card(None,BR(ev=[]),CHAT,TOPIC,"NINJA 6334"))
 print("(4) нет истории:")
-res.append(ok("Сервис на пробеге" not in SENDS[-1] and "Статус байка" in SENDS[-1], "карточка без секции сервиса (есть записи ТО)"))
+res.append(ok("На пробеге" not in SENDS[-1] and "Статус байка" in SENDS[-1], "карточка без секции сервиса (есть записи ТО)"))
 
 # 5) read_events упал → карточка всё равно (без секции), не падает
 class BRfail(BR):
     def read_events(s,bike,limit=8): raise RuntimeError("bridge down")
 SENDS.clear()
 loop.run_until_complete(S._send_bike_card(None,BRfail(),CHAT,TOPIC,"NINJA 6334"))
-res.append(ok(len(SENDS)==1 and "Сервис на пробеге" not in SENDS[-1], "read_events упал → карточка без секции, не падает"))
+res.append(ok(len(SENDS)==1 and "На пробеге" not in SENDS[-1], "read_events упал → карточка без секции, не падает"))
 
 loop.close()
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
