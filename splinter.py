@@ -1528,6 +1528,21 @@ def _parse_service_items(items, limit=6):
     return out
 
 
+def _svc_remaining(nxt, cur):
+    """Остаток до след. ТО по виду = next_km − текущий пробег. Возвращает (th_suffix, ru_suffix) ИЛИ None
+    (если посчитать нельзя — нет next или пробега → НЕ выдумываем). >0 = ещё N км; ==0 = пора сейчас;
+    <0 = просрочено на N км (помечаем ⚠️). next_km = пробег_последнего_ТО_вида + интервал (даёт Bridge)."""
+    try:
+        rem = int(nxt) - int(str(cur).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+    if rem > 0:
+        return (f" (อีก {rem} กม.)", f" (ещё {rem} км)")
+    if rem == 0:
+        return (" (⚠️ ครบกำหนดแล้ว)", " (⚠️ пора сейчас)")
+    return (f" (⚠️ เกิน {abs(rem)} กม.)", f" (⚠️ просрочено на {abs(rem)} км)")
+
+
 def msg_bike_card(bike, cur_km, oil, cols, rental, service=None, sp_open=None, sp_last=None):
     """КАРТОЧКА байка по запросу: пробег + ТО Oil + J/K/L + аренда + сервис-на-пробеге (ЗАХОД 3)
     + ОТКРЫТАЯ заявка ТО «в работе» (Z1) + последний сервис (закрытая заявка) + флаг устаревшей аренды (Z3).
@@ -1550,6 +1565,9 @@ def msg_bike_card(bike, cur_km, oil, cols, rental, service=None, sp_open=None, s
         else:
             t = " ปกติ" + (f" ครบกำหนดถัดไป {nxt} กม." if nxt else "")
             r = " в норме" + (f", следующее {nxt} км" if nxt else "")
+            _rem = _svc_remaining(nxt, o.get("km")) if nxt else None   # «масло через N км»
+            if _rem:
+                t += _rem[0]; r += _rem[1]
         return t, r
 
     if oil:
@@ -1559,8 +1577,13 @@ def msg_bike_card(bike, cur_km, oil, cols, rental, service=None, sp_open=None, s
     for c in cols or []:
         th_lbl, ru_lbl = _SVC_COL_LABEL.get(c.get("kind"), (c.get("kind"), c.get("kind")))
         nxt = c.get("next")
-        th.append(f"   • {th_lbl}:" + (f" ครบกำหนด {nxt} กม." if nxt else " บันทึกแล้ว"))
-        ru.append(f"   • {ru_lbl}:" + (f" следующее {nxt} км" if nxt else " ведётся"))
+        if nxt:
+            _rem = _svc_remaining(nxt, cur_km or c.get("km"))   # остаток по виду = next − текущий пробег
+            th.append(f"   • {th_lbl}: ครบกำหนด {nxt} กม." + (_rem[0] if _rem else ""))
+            ru.append(f"   • {ru_lbl}: следующее {nxt} км" + (_rem[1] if _rem else ""))
+        else:
+            th.append(f"   • {th_lbl}: ไม่มีข้อมูล")        # нет данных по сроку (вид не зафиксирован)
+            ru.append(f"   • {ru_lbl}: нет данных")
     # Z1: ОТКРЫТАЯ заявка ТО — «в работе» (текущий ремонт, ещё не закрытый). TH = тайские лейблы kinds;
     # RU = дословные работы (Z4 из note) ИЛИ лейблы. Кириллица дословных работ идёт ТОЛЬКО в 🇷🇺-блок.
     if sp_open and (sp_open.get("kinds") or sp_open.get("works")):
