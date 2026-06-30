@@ -1,4 +1,27 @@
 {
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/notify_hook.py"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/notify_clear_hook.py"
+          }
+        ]
+      }
+    ]
+  },
   "permissions": {
     "allow": [
       "Bash(grep *)",
