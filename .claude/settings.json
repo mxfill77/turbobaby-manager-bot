@@ -20,6 +20,17 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/pretool_guard.py"
+          }
+        ]
+      }
     ]
   },
   "permissions": {
@@ -58,6 +69,9 @@
       "Bash(git pull *)",
       "Bash(git add *)",
       "Bash(git commit *)",
+      "Bash(python3 -m json.tool *)",
+      "Bash(git --no-pager branch *)",
+      "Bash(git --no-pager remote *)",
       "Bash(systemctl status *)",
       "Bash(systemctl is-active *)",
       "Bash(systemctl show *)",
@@ -114,6 +128,18 @@
       "Bash(systemctl restart*)",
       "Bash(systemctl stop*)",
       "Bash(sudo systemctl *)"
+    ],
+    "deny": [
+      "Bash(*--no-verify*)",
+      "Bash(*--dangerously-skip-permissions*)",
+      "Bash(git push*--force*)",
+      "Bash(git push*-f *)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf ~*)",
+      "Bash(chmod -R 777 /*)",
+      "Bash(dd *of=/dev/*)",
+      "Bash(mkfs*)"
     ],
     "defaultMode": "acceptEdits",
     "additionalDirectories": [

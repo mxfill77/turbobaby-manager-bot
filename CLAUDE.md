@@ -474,3 +474,32 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
 ## СИГНАЛ НА ОСТАНОВКЕ-ОЖИДАНИИ (обновлено 26.06.2026)
 
 Сигнал на остановке-ожидании = штатный хук Notification (`.claude/settings.json` → `notify_hook.py` → пуш в личку). BEL убран как ненадёжный.
+
+## РЕЖИМ АВТО-APPROVE (заведено 01.07.2026) — меньше «полотен да/нет»
+
+Настроен так, чтобы ЗЕЛЁНАЯ рутина шла без подтверждений, а КРАСНОЕ (запись в Лист1/CRM/деньги/удаление)
+всегда просило «да» + показывало человеческую карточку. Механика (3 независимых слоя, precedence deny>ask>hook>allow):
+- **allow (settings.json)** — зелёное авто: читалки, git status·diff·log·show·add·commit, `venv/bin/python3 *`
+  (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write рабочих каталогов. Prompt не появляется.
+- **ask (settings.json)** — красное всегда спрашивает: `sqlite3 *`, `clasp push|redeploy|deploy|run`, `git push`,
+  `systemctl restart|stop`, `sudo systemctl`. Hook НЕ обходит ask (ask>hook).
+- **deny (settings.json)** — абсолютный запрет (я обойти НЕ могу; владелец — вручную в Termux): `*--no-verify*`
+  (обход гейта тестов 4.3), `*--dangerously-skip-permissions*`, `git push --force/-f`, `rm -rf /`, `chmod -R 777 /`,
+  `dd of=/dev/*`, `mkfs`.
+- **PreToolUse hook `pretool_guard.py`** — закрывает слепое пятно: `venv/bin/python3 *` в allow → пишущий скрипт
+  иначе шёл бы без сигнала. Hook читает СОДЕРЖИМОЕ вызываемого python-скрипта; если есть WRITE-признак
+  (set_fleet_oil/service, add_transaction, void_last, create/activate_booking, closing_upsert, delete_event,
+  `confirmed=true`, `DOWRITE`, memory.db+UPDATE/DELETE/INSERT) → форсит **"ask" + пуш красной карточки в Telegram**.
+  Читающий python → defer (allow). **FAIL-SAFE:** скрипт нечитаем/цель неясна → "ask" (в сторону подтверждения).
+  Hook ТОЛЬКО добавляет подтверждения, НИКОГДА не выдаёт новых разрешений.
+- **Третий слой (независим): `confirmed=true` в КОДЕ Bridge** (`ReadFleet.js`) — запись в Лист1 РЕФЬЮЗ без него.
+  Даже если hook пропустит, Bridge не запишет. Этот гейт НЕ трогать.
+
+ПРАВИЛА для меня в этом режиме:
+- **Красная карточка ПЕРЕД красной командой** — я сам пишу короткое человеческое пояснение (что делаю простым языком ·
+  таблица/байк/сумма · последствия · на что смотреть), НЕ дамп кода. Hook дублирует пушем; но основной — мой текст.
+- **DOWRITE=1** — помечать им ЛЮБОЙ python-скрипт, который реально пишет в рабочие таблицы (hook ловит маркер).
+- **Чистая форма команд остаётся** (раздел «ФОРМА КОМАНД») — встроенный FORM-GUARD на `$()`/`;`/`2>&1`/редиректы/heredoc
+  hook НЕ обходит (нельзя), эти формы всё равно дадут prompt. Писать команды чисто.
+- Правка settings/hook применяется ТОЛЬКО при перезапуске сессии `claude` (читается на старте). Откат = вернуть
+  `.claude/settings.json.bak-approve-*` + убрать `pretool_guard.py` из hooks + рестарт сессии.
