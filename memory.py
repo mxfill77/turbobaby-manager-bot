@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS info_pin (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (chat_id, topic_id)
 );
+
+CREATE TABLE IF NOT EXISTS o3_task (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    bike            TEXT NOT NULL,
+    plate           TEXT,
+    kinds           TEXT,             -- csv видов ТО: oil,abs,airfilter
+    from_where      TEXT,             -- office / client / area
+    when_slot       TEXT,             -- now / today
+    status          TEXT DEFAULT 'new',   -- new / draft / sent
+    delivery_msg_id INTEGER,          -- id сообщения-наряда в группе доставок
+    board_chat      INTEGER,
+    board_msg       INTEGER,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 """
 
 
@@ -273,6 +288,69 @@ class Memory:
             return {(int(r[0]), int(r[1])): int(r[2]) for r in rows}
         finally:
             conn.close()
+
+    # === O3 наряды (ступень 1: просрочки → наряд → доставки; своя таблица, НЕ Лист1/CRM) ===
+
+    _O3_COLS = ["id", "bike", "plate", "kinds", "from_where", "when_slot", "status",
+                "delivery_msg_id", "board_chat", "board_msg", "created_at", "updated_at"]
+
+    def o3_task_create(self, bike, plate="", kinds="", from_where="", when_slot="",
+                       status="sent", delivery_msg_id=None, board_chat=None, board_msg=None):
+        """Создать запись наряда O3 (обычно по факту отправки, status='sent'). Возвращает id."""
+        now = datetime.now().isoformat()
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO o3_task (bike, plate, kinds, from_where, when_slot, status, "
+                "delivery_msg_id, board_chat, board_msg, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(bike), str(plate or ""), str(kinds or ""), str(from_where or ""),
+                 str(when_slot or ""), str(status or "new"),
+                 int(delivery_msg_id) if delivery_msg_id else None,
+                 int(board_chat) if board_chat else None,
+                 int(board_msg) if board_msg else None, now, now)
+            )
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def o3_task_update(self, task_id, **fields):
+        """Обновить поля наряда (status/delivery_msg_id/kinds/from_where/when_slot/...) + updated_at."""
+        allowed = {"bike", "plate", "kinds", "from_where", "when_slot", "status",
+                   "delivery_msg_id", "board_chat", "board_msg"}
+        cols = [k for k in fields if k in allowed]
+        if not task_id or not cols:
+            return
+        sets = ", ".join(f"{c}=?" for c in cols) + ", updated_at=?"
+        vals = [fields[c] for c in cols] + [datetime.now().isoformat(), int(task_id)]
+        conn = self._conn()
+        try:
+            conn.execute(f"UPDATE o3_task SET {sets} WHERE id=?", vals)
+        finally:
+            conn.close()
+
+    def o3_task_get(self, task_id):
+        """Наряд по id → dict или None."""
+        if not task_id:
+            return None
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                f"SELECT {', '.join(self._O3_COLS)} FROM o3_task WHERE id=?", (int(task_id),)).fetchone()
+        finally:
+            conn.close()
+        return dict(zip(self._O3_COLS, row)) if row else None
+
+    def o3_tasks_active(self, status="sent"):
+        """Наряды со статусом (по умолч. sent) → list dict. Для пометки байков «в наряде» на board."""
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                f"SELECT {', '.join(self._O3_COLS)} FROM o3_task WHERE status=? ORDER BY id DESC",
+                (str(status),)).fetchall()
+        finally:
+            conn.close()
+        return [dict(zip(self._O3_COLS, r)) for r in rows]
 
     # === Corrections ===
 

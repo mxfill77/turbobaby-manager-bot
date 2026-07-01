@@ -3349,6 +3349,350 @@ async def handle_delivery_button(update, context, bridge) -> None:
     await q.answer()
 
 
+# ============================================================
+#  O3 СТУПЕНЬ 1 — ПРОСРОЧКИ → BOARD → КОНСТРУКТОР НАРЯДА → ДОСТАВКИ
+#  Первый кирпич конвейера. Читает парк (fleet+service_list), считает просрочки 4 обязательных ТО,
+#  постит board-список в тему «🔧 Наряды», таец/штаб кнопками собирает наряд (вид→откуда→когда) и
+#  отправляет его в группу доставок. Лист1/CRM/касса/state_set НЕ трогает (наряд ≠ смена статуса байка).
+#  Хранение отправленных нарядов — своя таблица memory.db o3_task (🟢, как info_pin). Скан/хранение 🟢, постинг 🟠.
+# ============================================================
+O3_TEST_MODE = True                          # обкатка: board+наряд в HQ на РЕАЛЬНОМ парке (доставки/тайцы не дёргаются)
+O3_TEST_CHAT_ID = -1003853365891             # HQ / TurboControl (тестовая лента)
+NARYADY_TOPIC = None                         # topic_id темы «🔧 Наряды» в группе ОБСЛУЖИВАНИЯ (-1002751134848).
+                                             #   Задать ПОСЛЕ создания темы; None → board без темы (в тесте — HQ).
+_O3_TOKENS = {}                              # tok(int) -> draft {bike,plate,current_km,overdue_kinds,kinds,from_where,when}
+_O3_SEQ = [0]
+_O3_BOARD = {"chat": None, "msg": None}      # последнее board-сообщение (для editMessageText на rescan/после отправки)
+
+_O3_FROM_LABEL = {"office": ("ที่ออฟฟิศ", "в офисе"), "client": ("ที่ลูกค้า", "у клиента"),
+                  "area": ("ตามพื้นที่", "по району")}
+_O3_WHEN_LABEL = {"now": ("ตอนนี้", "сейчас"), "today": ("วันนี้", "сегодня")}
+
+
+def _o3_put(data):
+    _O3_SEQ[0] += 1
+    tok = _O3_SEQ[0]
+    _O3_TOKENS[tok] = data
+    if len(_O3_TOKENS) > 200:                 # держим последние 200 (как _HB_TOKENS)
+        for k in sorted(_O3_TOKENS)[:-200]:
+            _O3_TOKENS.pop(k, None)
+    return tok
+
+
+def _o3_kind_ru(kind):
+    return _MAND_LABEL.get(kind, (kind, kind))[1]
+
+
+def _o3_kind_th(kind):
+    return _MAND_LABEL.get(kind, (kind, kind))[0]
+
+
+def _o3_overdue_scan(bridge):
+    """Park-wide скан просрочек 4 обязательных ТО (масло/gear[скутер]/ABS/возд.фильтр). ЧТЕНИЕ+расчёт (🟢).
+    fleet() (38 байков, *_last_km + mileage=colH) + service_list (current_km). Текущий пробег = max(colH,
+    service_list current_km). Просрочка: last>0 И next(=last+interval)−текущий ≤ 0. last≤0 → подсписок «нет
+    базы» (не делалось; НЕ автонаряд). Возврат {overdue:[{bike,plate,current_km,items:[{kind,last,next,over_km}]}]
+    (худшие сверху), nobase:[{bike,plate,kinds}]}."""
+    def _i(x):
+        try:
+            return int(str(x).replace(" ", "").replace(",", ""))
+        except (ValueError, TypeError):
+            return None
+    try:
+        bikes = ((bridge.fleet().get("data") or {}).get("bikes")) or []
+    except Exception:
+        log.exception("  → O3 scan: fleet упал")
+        return {"overdue": [], "nobase": []}
+    try:
+        svc = bridge.service_list().get("items", []) or []
+    except Exception:
+        svc = []
+    overdue, nobase = [], []
+    for b in bikes:
+        name = str(b.get("name") or "").strip()
+        if not name:
+            continue
+        plate = _plate_from_name(name) or "?"
+        cands = [_i(b.get("mileage"))] + [_i(r.get("current_km")) for r in svc if _same_bike(r.get("bike"), name)]
+        cands = [c for c in cands if c and c > 0]
+        cur = max(cands) if cands else 0
+        items, nb = [], []
+        for kind in _MAND_KINDS:
+            interval = _service_interval(kind, name, bridge)
+            if interval is None:                  # gear на мото/XADV → не трекаем
+                continue
+            last = _i(b.get(f"{kind}_last_km")) or 0
+            if last <= 0:
+                nb.append(kind)                   # нет базы отсчёта
+                continue
+            nxt = last + int(interval)
+            if nxt - cur <= 0:                     # просрочено
+                items.append({"kind": kind, "last": last, "next": nxt, "over_km": cur - nxt})
+        if items:
+            items.sort(key=lambda x: x["over_km"], reverse=True)
+            overdue.append({"bike": name, "plate": plate, "current_km": cur, "items": items})
+        if nb:
+            nobase.append({"bike": name, "plate": plate, "kinds": nb})
+    overdue.sort(key=lambda x: x["items"][0]["over_km"], reverse=True)   # худшие (макс over_km) сверху
+    return {"overdue": overdue, "nobase": nobase}
+
+
+def _o3_board_text(scan, active_plates):
+    """Текст board (RU+TH _bilingual): просрочки худшие сверху + подсписок «нет базы». active_plates —
+    номера байков с уже отправленным нарядом (пометка «✅ в наряде»)."""
+    ov = scan.get("overdue") or []
+    nb = scan.get("nobase") or []
+    th = ["🔧 ใบสั่งงาน — เลยกำหนดเซอร์วิส"]
+    ru = ["🔧 Наряды — просрочки ТО"]
+    if not ov:
+        th.append("ไม่มีรายการเลยกำหนด 👍"); ru.append("Просрочек нет 👍")
+    for o in ov:
+        mk_th = " · ✅ ในใบสั่งงาน" if o["plate"] in active_plates else ""
+        mk_ru = " · ✅ в наряде" if o["plate"] in active_plates else ""
+        th.append(f"⚠️ {o['plate']} — " + " · ".join(f"{_o3_kind_th(it['kind'])} {it['over_km']}กม." for it in o["items"]) + mk_th)
+        ru.append(f"⚠️ {o['plate']} {o['bike']} — " + " · ".join(f"{_o3_kind_ru(it['kind'])} {it['over_km']}км" for it in o["items"]) + mk_ru)
+    if nb:
+        th += ["", "❔ ไม่มีข้อมูลฐาน (ยังไม่เคยทำ):", ", ".join(x["plate"] for x in nb)]
+        ru += ["", "❔ Нет базы (не делалось):", ", ".join(x["plate"] for x in nb)]
+    return _bilingual(None, th, ru)
+
+
+def _o3_build_board(bridge):
+    """Собрать (текст, клавиатура) board: скан + токены на просроченные байки (o3:pick). Общий для post и edit.
+    Байки с уже отправленным нарядом (o3_tasks_active) помечаются и БЕЗ кнопки."""
+    scan = _o3_overdue_scan(bridge)
+    active = set()
+    try:
+        active = {str(t.get("plate")) for t in (_MEMORY.o3_tasks_active() if _MEMORY else [])}
+    except Exception:
+        log.exception("  → O3 board: активные наряды не прочитаны")
+    text = _o3_board_text(scan, active)
+    rows = []
+    for o in (scan.get("overdue") or []):
+        if o["plate"] in active:
+            continue                          # уже в наряде — без кнопки
+        tok = _o3_put({"bike": o["bike"], "plate": o["plate"], "current_km": o["current_km"],
+                       "overdue_kinds": [it["kind"] for it in o["items"]],
+                       "kinds": [it["kind"] for it in o["items"]],   # по умолчанию выбраны ВСЕ просроченные
+                       "from_where": None, "when": None})
+        rows.append([InlineKeyboardButton(f"🔧 {o['plate']} {o['bike']}"[:64], callback_data=f"o3:pick:{tok}")])
+        if len(rows) >= 20:                   # cap кнопок (пагинация — ступень 2)
+            break
+    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="o3:rescan")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def o3_post_board(context, bridge):
+    """Пост board НОВЫМ сообщением. ТЕСТ (O3_TEST_MODE) → HQ на реальном парке. БОЕВОЙ → тема «Наряды»
+    группы ОБСЛУЖИВАНИЯ. Вызов: /o3board (owner) для ручного репоста."""
+    target = O3_TEST_CHAT_ID if O3_TEST_MODE else SERVICING_CHAT
+    topic = None if O3_TEST_MODE else NARYADY_TOPIC
+    text, kb = _o3_build_board(bridge)
+    msg = await _send(context, chat_id=target, message_thread_id=topic, text=text, reply_markup=kb)
+    if msg is not None:
+        _O3_BOARD["chat"] = target
+        _O3_BOARD["msg"] = msg.message_id
+    log.info(f"  → O3 board запощен (test={O3_TEST_MODE}, chat={target}, topic={topic})")
+    return msg
+
+
+async def _o3_refresh_board(context, bridge):
+    """Перерисовать существующий board (editMessageText по _O3_BOARD) — на rescan и после отправки наряда."""
+    if not _O3_BOARD.get("msg"):
+        return
+    text, kb = _o3_build_board(bridge)
+    try:
+        await context.bot.edit_message_text(chat_id=_O3_BOARD["chat"], message_id=_O3_BOARD["msg"],
+                                             text=_with_separator(text), reply_markup=kb)
+    except Exception as e:
+        log.warning(f"  → O3 board refresh упал: {e}")
+
+
+def _o3_from_ru(d): return _O3_FROM_LABEL.get(d.get("from_where"), ("", ""))[1]
+def _o3_from_th(d): return _O3_FROM_LABEL.get(d.get("from_where"), ("", ""))[0]
+def _o3_when_ru(d): return _O3_WHEN_LABEL.get(d.get("when"), ("", ""))[1]
+def _o3_when_th(d): return _O3_WHEN_LABEL.get(d.get("when"), ("", ""))[0]
+
+
+def _o3_naryad_lines(d):
+    """Строки наряда без шапки — (th_lines, ru_lines): байк · работы · откуда · когда."""
+    kinds_th = ", ".join(_o3_kind_th(k) for k in d.get("kinds", []))
+    kinds_ru = ", ".join(_o3_kind_ru(k) for k in d.get("kinds", []))
+    th = [f"{d['bike']}", f"งาน: {kinds_th}", f"รับรถ: {_o3_from_th(d)}", f"เมื่อไร: {_o3_when_th(d)}"]
+    ru = [f"{d['bike']}", f"работы: {kinds_ru}", f"забрать: {_o3_from_ru(d)}", f"когда: {_o3_when_ru(d)}"]
+    return th, ru
+
+
+def _o3_step_vids(d, tok):
+    """Шаг 1 конструктора — мультивыбор видов (тоггл ✅/▫️) → «Далее»."""
+    th = [f"🔧 ใบสั่งงาน · {d['plate']}", "เลือกงาน (กดสลับ):"]
+    ru = [f"🔧 Наряд · {d['plate']} {d['bike']}", "Выбери виды (тап — вкл/выкл):"]
+    rows = []
+    for kind in d.get("overdue_kinds", []):
+        mark = "✅ " if kind in d.get("kinds", []) else "▫️ "
+        rows.append([InlineKeyboardButton(f"{mark}{_o3_kind_ru(kind)}"[:64], callback_data=f"o3:vid:{tok}:{kind}")])
+    rows.append([InlineKeyboardButton("▶️ Далее", callback_data=f"o3:step:{tok}:from")])
+    rows.append([InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")])
+    return _bilingual(None, th, ru), InlineKeyboardMarkup(rows)
+
+
+def _o3_step_from(d, tok):
+    """Шаг 2 — откуда забрать байк."""
+    sel = ", ".join(_o3_kind_ru(k) for k in d.get("kinds", []))
+    th = [f"🔧 {d['plate']} · {', '.join(_o3_kind_th(k) for k in d.get('kinds', []))}", "รับรถจากไหน?"]
+    ru = [f"🔧 {d['plate']} · {sel}", "Откуда забрать?"]
+    rows = [[InlineKeyboardButton("🏢 В офисе", callback_data=f"o3:from:{tok}:office")],
+            [InlineKeyboardButton("🙋 У клиента", callback_data=f"o3:from:{tok}:client")],
+            [InlineKeyboardButton("📍 По району", callback_data=f"o3:from:{tok}:area")],
+            [InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")]]
+    return _bilingual(None, th, ru), InlineKeyboardMarkup(rows)
+
+
+def _o3_step_when(d, tok):
+    """Шаг 3 — когда."""
+    th = [f"🔧 {d['plate']} · {_o3_from_th(d)}", "เมื่อไร?"]
+    ru = [f"🔧 {d['plate']} · {_o3_from_ru(d)}", "Когда?"]
+    rows = [[InlineKeyboardButton("⏱ Сейчас", callback_data=f"o3:when:{tok}:now")],
+            [InlineKeyboardButton("📅 Сегодня", callback_data=f"o3:when:{tok}:today")],
+            [InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")]]
+    return _bilingual(None, th, ru), InlineKeyboardMarkup(rows)
+
+
+def _o3_step_confirm(d, tok):
+    """Шаг 4 — предпросмотр наряда + «Отправить»."""
+    th, ru = _o3_naryad_lines(d)
+    rows = [[InlineKeyboardButton("✅ Отправить в доставки", callback_data=f"o3:send:{tok}")],
+            [InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")]]
+    return _bilingual(None, ["🔧 ตรวจสอบใบสั่งงาน:"] + th, ["🔧 Проверь наряд:"] + ru), InlineKeyboardMarkup(rows)
+
+
+async def _o3_edit(q, text, kb):
+    """Заменить сообщение-конструктор следующим шагом (editMessageText + разделитель 🇹🇭/🇷🇺)."""
+    try:
+        await q.edit_message_text(text=_with_separator(text), reply_markup=kb)
+    except Exception as e:
+        log.warning(f"  → O3 edit шага упал: {e}")
+
+
+async def _o3_do_send(q, context, bridge, tok, d):
+    """Отправить наряд в доставки (в тесте → HQ). Запись o3_task(sent). Обновить board (байк «в наряде»).
+    Конструктор → подтверждение (нестираемый след). Лист1/CRM/касса/state_set НЕ трогаем."""
+    target = O3_TEST_CHAT_ID if O3_TEST_MODE else DELIVERY_CHAT_ID
+    sndr = _hb_sender(q); now = _hb_phuket("%H:%M")
+    th, ru = _o3_naryad_lines(d)
+    _tth = ["🧪 ทดสอบ"] if O3_TEST_MODE else []
+    _tru = ["🧪 ТЕСТ"] if O3_TEST_MODE else []
+    body = _bilingual(None,
+        _tth + ["🔧 ใบสั่งงานเซอร์วิส"] + th + [f"โดย {sndr} · {now} (ภูเก็ต)"],
+        _tru + ["🔧 Наряд на ТО"] + ru + [f"от {sndr} · {now} (Пхукет)"])
+    dmsg = await _send(context, chat_id=target, text=body)
+    delivery_msg_id = dmsg.message_id if dmsg else None
+    try:
+        if _MEMORY:
+            _MEMORY.o3_task_create(bike=d["bike"], plate=d.get("plate", ""),
+                                   kinds=",".join(d.get("kinds", [])), from_where=d.get("from_where", ""),
+                                   when_slot=d.get("when", ""), status="sent", delivery_msg_id=delivery_msg_id,
+                                   board_chat=_O3_BOARD.get("chat"), board_msg=_O3_BOARD.get("msg"))
+    except Exception:
+        log.exception("  → O3: запись o3_task упала")
+    log.info(f"  → O3 наряд отправлен: {d.get('plate')} kinds={d.get('kinds')} from={d.get('from_where')} "
+             f"when={d.get('when')} test={O3_TEST_MODE} chat={target}")
+    conf = _bilingual(None, _tth + ["✅ ส่งใบสั่งงานไปทีมส่งรถแล้ว"] + th,
+                      _tru + ["✅ Наряд отправлен в доставки"] + ru)
+    try:
+        await q.edit_message_text(text=_with_separator(conf), reply_markup=None)
+    except Exception:
+        pass
+    await _o3_refresh_board(context, bridge)   # байк на board помечается «в наряде»
+
+
+async def handle_o3_button(update, context, bridge):
+    """Кнопки O3 (CallbackQueryHandler '^o3:'). Ступень 1: board pick → конструктор (вид→откуда→когда) →
+    Отправить наряд в доставки. Доступно всем в теме (таец+штаб). Лист1/CRM/касса/state_set НЕ трогаем."""
+    q = update.callback_query
+    if not q:
+        return
+    parts = (q.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "rescan":
+        await q.answer("🔄")
+        await _o3_refresh_board(context, bridge)
+        return
+    try:
+        tok = int(parts[2])
+    except Exception:
+        await q.answer()
+        return
+    d = _O3_TOKENS.get(tok)
+    if not d:
+        await q.answer()
+        try:
+            await q.edit_message_text("🐀 Splinter\n⚠️ Наряд устарел (перезапуск бота). Обновите board 🙏")
+        except Exception:
+            pass
+        return
+
+    if action == "pick":                       # открыть конструктор НОВЫМ сообщением (board не трогаем)
+        await q.answer()
+        text, kb = _o3_step_vids(d, tok)
+        await _send(context, chat_id=q.message.chat.id,
+                    message_thread_id=getattr(q.message, "message_thread_id", None), text=text, reply_markup=kb)
+        return
+
+    if action == "vid":                        # мультивыбор видов (тоггл)
+        kind = parts[3] if len(parts) > 3 else ""
+        if kind in d.get("kinds", []):
+            d["kinds"].remove(kind)
+        elif kind in d.get("overdue_kinds", []):
+            d["kinds"].append(kind)
+        await q.answer()
+        text, kb = _o3_step_vids(d, tok)
+        await _o3_edit(q, text, kb)
+        return
+
+    if action == "step" and len(parts) > 3 and parts[3] == "from":
+        if not d.get("kinds"):
+            await q.answer("Выбери хотя бы один вид")
+            return
+        await q.answer()
+        text, kb = _o3_step_from(d, tok)
+        await _o3_edit(q, text, kb)
+        return
+
+    if action == "from":
+        d["from_where"] = parts[3] if len(parts) > 3 else "office"
+        await q.answer()
+        text, kb = _o3_step_when(d, tok)
+        await _o3_edit(q, text, kb)
+        return
+
+    if action == "when":
+        d["when"] = parts[3] if len(parts) > 3 else "now"
+        await q.answer()
+        text, kb = _o3_step_confirm(d, tok)
+        await _o3_edit(q, text, kb)
+        return
+
+    if action == "send":
+        if not (d.get("kinds") and d.get("from_where") and d.get("when")):
+            await q.answer("Наряд не заполнен")
+            return
+        await q.answer("✅")
+        await _o3_do_send(q, context, bridge, tok, d)
+        return
+
+    if action == "back":                       # чистая отмена — ничего не отправлено
+        await q.answer("↩️ Отменено")
+        try:
+            await q.edit_message_text(text=_with_separator(_bilingual(None,
+                ["↩️ ยกเลิกใบสั่งงาน"], ["↩️ Наряд отменён (ничего не отправлено)"])), reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    await q.answer()
+
+
 def _aggregate_album_vis(vis_list):
     """Слить разборы фото АЛЬБОМА в ОДИН вердикт (чтобы ответить один раз, без дублей):
     - пробег → берём фото с наибольшей уверенностью одометра (лучшее фото приборки);

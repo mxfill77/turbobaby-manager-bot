@@ -221,6 +221,11 @@ async def on_delivery_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await splinter.handle_delivery_button(update, context, bridge)
 
 
+async def on_o3_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки O3 ступень-1 (board просрочек → конструктор наряда → Отправить в доставки). Доступны всем в теме. → splinter."""
+    await splinter.handle_o3_button(update, context, bridge)
+
+
 async def on_info_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Постоянная кнопка «ℹ️ Инфо по байку» в темах обслуживания → карточка байка (чтение, ЗЕЛЁНОЕ, без гейта)."""
     await splinter.handle_info_button(update, context, bridge)
@@ -257,6 +262,18 @@ async def cmd_board(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     log.info("  → /board от владельца id=%s @%s → пощу доску выдач", u.id, uname or "-")
     await splinter.hb_post_board(context, bridge)
+
+
+async def cmd_o3board(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """РУЧНОЙ репост board просрочек ТО (O3 ступень-1). ТОЛЬКО владелец (is_owner_user) — как /board.
+    В O3_TEST_MODE board идёт в HQ на реальном парке (обкатка без боевых доставок)."""
+    u = update.effective_user
+    if not splinter.is_owner_user(u):
+        log.info("  → /o3board отклонён (не владелец): id=%s @%s",
+                 getattr(u, "id", None), (getattr(u, "username", "") or "-"))
+        return
+    log.info("  → /o3board от владельца id=%s → пощу board просрочек (O3 ступень-1)", getattr(u, "id", None))
+    await splinter.o3_post_board(context, bridge)
 
 
 # === HANDLERS ===
@@ -1262,6 +1279,7 @@ def main():
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("bike", cmd_bike))
     app.add_handler(CommandHandler("board", cmd_board))   # ручной репост доски выдач (Delivery, слой 1 O3)
+    app.add_handler(CommandHandler("o3board", cmd_o3board))   # ручной репост board просрочек ТО (O3 ступень-1, владелец)
     app.add_handler(CommandHandler("pin_info_all", cmd_pin_info_all))   # засев кнопки «ℹ️ Инфо» во все темы (владелец)
 
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
@@ -1269,6 +1287,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_service_button, pattern=r"^svc:"))
     app.add_handler(CallbackQueryHandler(on_devbot_button, pattern=r"^(approve|reject|check|next):"))
     app.add_handler(CallbackQueryHandler(on_delivery_button, pattern=r"^delivery:"))   # табло выдачи (слой 1 O3)
+    app.add_handler(CallbackQueryHandler(on_o3_button, pattern=r"^o3:"))   # board→конструктор наряда→доставки (O3 ступень-1)
     app.add_handler(CallbackQueryHandler(on_info_button, pattern=r"^info:"))   # кнопка «ℹ️ Инфо по байку» в обслуживании
 
     # Сервис-события форума (создание/переименование темы) → привязка тема→байк
