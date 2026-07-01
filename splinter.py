@@ -709,17 +709,35 @@ async def handle_info_button(update, context, bridge):
         await q.answer("⏳")
         return
     _INFO_TAP_TS[key] = _time.time()
-    await q.answer()
+    await q.answer()   # П4: мгновенно гасим «часик» на кнопке (до сбора карточки)
     bike = bike_from_topic(chat_id, topic_id)
     if not bike:
         await _send(context, chat_id=chat_id, message_thread_id=topic_id, bilingual=False,
                     text="🐀 Splinter\n🇹🇭 ยังไม่ได้ผูกรถกับหัวข้อนี้\n🇷🇺 Тема пока не привязана к байку")
         return
-    # ОБХОД _card_allowed: явный тап кнопки ВСЕГДА отвечает (тротл — против карточка-спама на болтовне, не на тапе).
+    # П4: мгновенная двуязычная заглушка «⏳ Вывожу…» → собрать карточку → ЗАМЕНИТЬ её editMessageText (то же
+    # сообщение, не плодим новое). ОБХОД _card_allowed: явный тап кнопки ВСЕГДА отвечает (тротл — против спама на болтовне).
+    ph = None
     try:
-        await _send_bike_card(context, bridge, chat_id, topic_id, bike)
+        ph = await _send(context, chat_id=chat_id, message_thread_id=topic_id, bilingual=False,
+                         text="🐀 Splinter\n🇹🇭 ⏳ กำลังดึงข้อมูลล่าสุดของรถ...\n🇷🇺 ⏳ Вывожу актуальную информацию по байку...")
+    except Exception:
+        log.exception("  → инфо-кнопка: заглушка не ушла")
+    try:
+        card = _with_separator(_build_bike_card(bridge, chat_id, topic_id, bike))
+        if ph is not None:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=ph.message_id,
+                                                 text=card, parse_mode="HTML")
+        else:   # заглушка не ушла → шлём карточку обычным путём (не оставляем без ответа)
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id, parse_mode="HTML", text=card)
     except Exception:
         log.exception("  → инфо-кнопка: ошибка карточки")
+        if ph is not None:   # заменить «⏳» на понятную ошибку, не оставлять висеть заглушку
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=ph.message_id,
+                    text="🐀 Splinter\n🇹🇭 ⚠️ ดึงข้อมูลไม่สำเร็จ ลองใหม่อีกครั้ง\n🇷🇺 ⚠️ Не удалось получить данные, попробуйте ещё раз")
+            except Exception:
+                log.exception("  → инфо-кнопка: не заменил заглушку на ошибку")
 
 
 async def pin_info_all(context):
@@ -1577,6 +1595,19 @@ def _mand_line(kind, last, interval, cur):
             f"{ru_lbl} — ⚠️ <b>просрочено на {abs(rem)} км</b>")
 
 
+def _km_ago(cur, km, th):
+    """Инлайн-текст скобки для истории работ: ТЕКУЩИЙ пробег (max) − пробег работы.
+    ≤0 (работа на текущем/выше — не должно после фикса пробега) → «на текущем пробеге» (без минуса);
+    нечисло → «на пробеге». Точный расчёт, не выдумывать."""
+    try:
+        d = int(str(cur).replace(" ", "").replace(",", "")) - int(str(km).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return "บนไมล์" if th else "на пробеге"
+    if d <= 0:
+        return "ไมล์ปัจจุบัน" if th else "на текущем пробеге"
+    return f"{d} กม.ที่แล้ว" if th else f"{d} км назад"
+
+
 def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_last=None):
     """КАРТОЧКА байка (HTML) — аккуратная двуязычная справка (фикс вёрстки 30.06).
     \U0001f400 имя → пустая → [\U0001f1f9\U0001f1ed блок] → пустая → _SEP (вставляет _send) → [\U0001f1f7\U0001f1fa блок].
@@ -1627,9 +1658,7 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
         _lo = str(sp_last.get("odo") or ""); _ld = str(sp_last.get("date") or "")
         hist_th.append(f"ล่าสุด: {_dl_th}" + (f" · {_lo} กม." if _lo else "") + (f" ({_ld})" if _ld else ""))
         hist_ru.append(f"Последний сервис: {_dl_ru}" + (f" · {_lo} км" if _lo else "") + (f" ({_ld})" if _ld else ""))
-    if service:
-        hist_th.append("ตามไมล์: " + ", ".join(f"{_hb(_work_th(s.get('work')))} ({s.get('km')})" for s in service))
-        hist_ru.append("На пробеге: " + ", ".join(f"{_hb(s.get('work'))} ({s.get('km')})" for s in service))
+    # service (доп. работы на пробеге, read_events) рендерятся БЛОЧНО в _block ниже — не сплошной строкой.
 
     def _block(th):
         if th:
@@ -1648,29 +1677,50 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
             L += ["", sec_wk] + wk
         if hs:
             L += ["", sec_hs] + hs
+        # П3: доп. работы на пробеге — блочно (заголовок + на работу 2 строки: «{км} км ({N км назад})» + название).
+        if service:
+            _hdr = "<b>ประวัติเซอร์วิสเพิ่มเติมตามไมล์:</b>" if th else "<b>Обслужено дополнительно на пробегах:</b>"
+            L += ["", _hdr]
+            for s in (service or []):
+                _km = s.get("km"); _wk = s.get("work")
+                _ago = _km_ago(cur_km, _km, th)
+                _nm = _hb(_work_th(_wk)) if th else _hb(_wk)
+                L += ["", (f"{_km} กม. ({_ago})" if th else f"{_km} км ({_ago})"), _nm]
         return L
 
     out = [head, ""] + _block(True) + ["", ""] + _block(False)
     return "\n".join(out)
 
 
-async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
-    """Собрать карточку байка из ЧИТАЕМЫХ источников (find_bike + service_list) и отправить. Ничего не пишет."""
+def _build_bike_card(bridge, chat_id, topic_id, bike):
+    """Собрать ТЕКСТ карточки байка из ЧИТАЕМЫХ источников (find_bike + service_list + read_events).
+    Ничего не пишет и не отправляет — только строит строку. Разделён с отправкой, чтобы инфо-кнопка могла
+    показать loading-заглушку и заменить её editMessageText (П4). Все Bridge-вызовы синхронны → def, не async."""
     fb = bridge.find_bike(bike) or {}
     canon = fb.get("name") or bike
     try:
         recs = [r for r in (bridge.service_list().get("items", []) or []) if _same_bike(r.get("bike"), bike)]
     except Exception:
         recs = []
-    # Текущий пробег = МАКСИМУМ известных одометров: Лист1 «пробег» (find_bike.mileage, col H — живой, НЕ
-    # покупочный вопреки старой подписи: услуги ниже него невозможны) + последние current_km из service_list.
-    # current_mileage ≥ любого замера → max = лучшая оценка (иначе устаревший фото-замер прятал просрочки).
+
     def _i(x):
         try:
             return int(str(x).replace(" ", "").replace(",", ""))
         except (ValueError, TypeError):
             return None
-    _cands = [_i(fb.get("mileage"))] + [_i(r.get("current_km")) for r in recs]
+    # ЗАХОД 3: сервис-на-пробеге — 6 последних инфо-работ из истории «события» (read_events). Считаем РАНЬШЕ
+    # пробега: их одометр — тоже кандидат в «текущий» (работа не могла быть на пробеге ВЫШЕ текущего).
+    service = []
+    try:
+        ev = bridge.read_events(canon, limit=6)
+        service = _parse_service_items(ev.get("items", []), limit=6)
+    except Exception:
+        log.exception("  → read_events для карточки упал")
+    # П2: Текущий пробег = МАКСИМУМ известных одометров: Лист1 «пробег» (col H) + current_km из service_list +
+    # км выполненных работ (service events). Одометр не падает → max = лучшая оценка (иначе заниженный фото-замер
+    # прятал просрочки И показывал работы «выше текущего»: баг 5849 — colH 3500, замер 20229, работы 20829 → 20829).
+    _cands = ([_i(fb.get("mileage"))] + [_i(r.get("current_km")) for r in recs]
+              + [_i(s.get("km")) for s in service])
     _cands = [c for c in _cands if c and c > 0]
     cur_km = str(max(_cands)) if _cands else ""
     # ПЛАНОВОЕ ТО — 4 ОБЯЗАТЕЛЬНЫХ вида из Лист1 (cols I/J/K/L = *_last_km), интервал из книги знаний.
@@ -1682,13 +1732,6 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
         _end = (fb.get("current_rental") or {}).get("end_date", "")
         rental = {"state": fb.get("status"), "client": (fb.get("current_rental") or {}).get("client", ""),
                   "expired": _rental_expired(fb.get("status"), _end), "end": _end}   # Z3
-    # ЗАХОД 3: сервис-на-пробеге — 6 последних инфо-работ из истории «события» (read_events, фильтр по паттерну).
-    service = []
-    try:
-        ev = bridge.read_events(canon, limit=6)
-        service = _parse_service_items(ev.get("items", []), limit=6)
-    except Exception:
-        log.exception("  → read_events для карточки упал")
     # Z1: то_заявки — ОТКРЫТАЯ (в работе) + последняя ЗАКРЫТАЯ (последний сервис). read-only, мягко (методов может не быть в моках).
     sp_open = None; sp_last = None
     try:
@@ -1714,8 +1757,13 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
                            "date": str(_c0.get("updated_at") or "")[:10]}
     except Exception:
         log.exception("  → карточка: чтение закрытых то_заявки упало")
+    return msg_bike_card(canon, cur_km, mand, rental, service, sp_open=sp_open, sp_last=sp_last)
+
+
+async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
+    """Собрать карточку (см. _build_bike_card) и отправить (bilingual → _with_separator, parse_mode=HTML)."""
     await _send(context, chat_id=chat_id, message_thread_id=topic_id, parse_mode="HTML",
-                text=msg_bike_card(canon, cur_km, mand, rental, service, sp_open=sp_open, sp_last=sp_last))
+                text=_build_bike_card(bridge, chat_id, topic_id, bike))
 
 
 def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date=""):

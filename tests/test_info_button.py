@@ -18,6 +18,8 @@ class FakeBot:
     def __init__(self): self.pinned = []
     async def pin_chat_message(self, chat_id, message_id, disable_notification=None):
         self.pinned.append(message_id)
+    async def edit_message_text(self, chat_id, message_id, text, parse_mode=None, **kw):
+        EDITS.append({"chat": chat_id, "mid": message_id, "text": text, "pm": parse_mode})
 class FakeCtx:
     def __init__(self): self.bot = FakeBot()
 class FakeChat:
@@ -37,18 +39,19 @@ class FakeMemory:
     def all_info_pins(self): return dict(self.pins)
 
 # --- перехваты ---
-SENDS = []; CARDS = []; _MID = [9000]
-async def rec_send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group="", reply_markup=None):
+SENDS = []; CARDS = []; EDITS = []; _MID = [9000]
+async def rec_send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group="", reply_markup=None, parse_mode=None, **kw):
     SENDS.append({"chat": chat_id, "topic": message_thread_id, "text": text, "kb": reply_markup})
     _MID[0] += 1
     return FakeSent(_MID[0])
-async def rec_card(context, bridge, chat_id, topic_id, bike):
+def rec_build(bridge, chat_id, topic_id, bike):   # П4: карточка теперь строится (sync), шлётся заглушка+editMessageText
     CARDS.append({"chat": chat_id, "topic": topic_id, "bike": bike})
+    return f"🐀 <b>{bike}</b>\n🇹🇭 ข้อมูล\n🇷🇺 инфо"
 S._send = rec_send
-S._send_bike_card = rec_card
+S._build_bike_card = rec_build
 
 def reset():
-    SENDS.clear(); CARDS.clear()
+    SENDS.clear(); CARDS.clear(); EDITS.clear()
     S._INFO_PINNED.clear(); S._INFO_TAP_TS.clear(); S._CARD_LAST.clear()
     S._TOPIC_NAMES.clear(); S._TOPIC_BIKE_OVERRIDE.clear()
     S._MEMORY = FakeMemory()
@@ -61,9 +64,25 @@ res = []; loop = asyncio.new_event_loop()
 reset()
 q = FakeQuery("info:card", CHAT, TOPIC)
 loop.run_until_complete(S.handle_info_button(FakeUpdate(q), FakeCtx(), bridge=None))
-print("(a) тап → карточка:")
-res.append(ok(len(CARDS) == 1 and CARDS[0]["bike"] == BIKE and CARDS[0]["topic"] == TOPIC, "_send_bike_card по байку темы"))
+print("(a) тап → заглушка → карточка (editMessageText):")
+res.append(ok(len(CARDS) == 1 and CARDS[0]["bike"] == BIKE and CARDS[0]["topic"] == TOPIC, "_build_bike_card по байку темы"))
+res.append(ok(any("⏳" in s["text"] and "Вывожу" in s["text"] and "กำลังดึงข้อมูล" in s["text"] for s in SENDS), "заглушка «⏳ Вывожу…» RU+TH отправлена"))
+res.append(ok(len(EDITS) == 1 and BIKE in EDITS[0]["text"] and EDITS[0]["pm"] == "HTML" and EDITS[0]["mid"] == _MID[0],
+              "editMessageText заменил заглушку карточкой (тот же msg_id, parse_mode HTML)"))
 res.append(ok(q.answers and q.answers[0] is None, "q.answer() вызван (спиннер снят)"))
+
+# (a'') ошибка сборки карточки → заглушку заменяем понятной ошибкой, не оставляем «⏳» висеть
+reset()
+_save_build = S._build_bike_card
+def rec_build_boom(bridge, chat_id, topic_id, bike): raise RuntimeError("bridge down")
+S._build_bike_card = rec_build_boom
+q = FakeQuery("info:card", CHAT, TOPIC)
+loop.run_until_complete(S.handle_info_button(FakeUpdate(q), FakeCtx(), bridge=None))
+S._build_bike_card = _save_build
+print("(a'') ошибка сборки → заглушка→ошибка:")
+res.append(ok(any("⏳" in s["text"] for s in SENDS), "заглушка «⏳» была отправлена"))
+res.append(ok(len(EDITS) == 1 and ("Не удалось" in EDITS[0]["text"] or "ดึงข้อมูลไม่สำเร็จ" in EDITS[0]["text"]),
+              "заглушка заменена на ошибку (editMessageText), «⏳» не висит"))
 
 # (d) резолв байка из темы — через override
 reset()
@@ -71,14 +90,15 @@ S._TOPIC_BIKE_OVERRIDE[(CHAT, TOPIC)] = "XMAX 300 5773"
 q = FakeQuery("info:card", CHAT, TOPIC)
 loop.run_until_complete(S.handle_info_button(FakeUpdate(q), FakeCtx(), bridge=None))
 print("(d) резолв из темы (override):")
-res.append(ok(len(CARDS) == 1 and CARDS[0]["bike"] == "XMAX 300 5773", "карточка по override-байку темы"))
+res.append(ok(len(CARDS) == 1 and CARDS[0]["bike"] == "XMAX 300 5773" and "XMAX 300 5773" in EDITS[0]["text"], "карточка по override-байку темы (edit)"))
 
-# (a') тема без байка → дружелюбный ответ, карточки нет
+# (a') тема без байка → дружелюбный ответ, карточки/заглушки/edit нет
 reset(); S._TOPIC_NAMES.clear()
 q = FakeQuery("info:card", CHAT, 9999)
 loop.run_until_complete(S.handle_info_button(FakeUpdate(q), FakeCtx(), bridge=None))
 print("(a') тема без байка:")
-res.append(ok(len(CARDS) == 0 and any("не привязана" in s["text"] for s in SENDS), "карточки нет, сказано «тема не привязана»"))
+res.append(ok(len(CARDS) == 0 and len(EDITS) == 0 and not any("⏳" in s["text"] for s in SENDS)
+              and any("не привязана" in s["text"] for s in SENDS), "нет байка → нет заглушки/карточки/edit, только «не привязана»"))
 
 # (e) обход тротла _card_allowed: кулдаун стоит, тап всё равно даёт карточку
 reset()
