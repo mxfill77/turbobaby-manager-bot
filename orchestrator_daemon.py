@@ -41,6 +41,9 @@ HEARTBEAT_SEC = 45       # как часто фон-поток бьёт updated,
 TASK_TIMEOUT = 600       # таймаут быстрой задачи «задача:» (10 мин) — claude -p не должен висеть вечно
 TASK_TIMEOUT_DEV = 2700  # таймаут дев-ТЗ «тз:» (45 мин, ступень 2 O4) — правка+тесты+гейт+отчёт
 DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очереди (devbot кладёт Filipp-328-dev)
+DEC_FROM_SUFFIX = "-dec" # метка декомпозиции (ступень 2 часть C; devbot кладёт Filipp-328-dec):
+                         # родитель «декомпозируй:» + его шаги + synthetic-сводка — всё под этой меткой
+MAX_STEPS = 8            # потолок шагов декомпозиции (планировщику велено 2–7; больше → failed родителя)
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
 CLAUDE_BIN = "/usr/bin/claude"
@@ -105,6 +108,31 @@ APPROVAL_PREAMBLE = (
     "подробности — в cc_log, НЕ в вывод. Задача целиком read-only → просто выполни и верни сводку.\n\n"
     "ЗАДАЧА:\n"
 )
+
+# === ДЕКОМПОЗЕР (ступень 2 часть C, KB_review PLAN 21:40) ===
+# «декомпозируй: <крупное ТЗ>» → родитель (from=*-dec, без паттернов ниже) → планировщик claude -p
+# (read-only) возвращает нумерованный список → шаги отдельными задачами «[шаг i/N родитель id] …»
+# → исполнение по одному (FIFO + guard последовательности) → synthetic-сводка «[сводка родитель id]».
+# Bridge-очередь НЕ меняется: родство — ТОЛЬКО по паттерну в task_text (решение плана C).
+PLANNER_PREAMBLE = (
+    "Ты — планировщик декомпозиции в headless-режиме в репо /root/turbobaby-manager-bot "
+    "(CLAUDE.md действует). Твоя задача — РАЗБИТЬ крупное ТЗ на шаги, НЕ выполняя его: можно "
+    "читать код/логи/доки (read-only разведка), НЕЛЬЗЯ править файлы, коммитить, деплоить, "
+    "писать в таблицы.\n"
+    "ФОРМАТ ОТВЕТА — СТРОГО и ТОЛЬКО нумерованный список шагов, каждый с новой строки "
+    "«N. <шаг>», без заголовков, без кода, без текста до/после списка. Шагов 2–7. Каждый шаг — "
+    "САМОДОСТАТОЧНОЕ дев-ТЗ (до 45 мин, ≤400 символов): исполнитель увидит ТОЛЬКО текст шага, "
+    "поэтому впиши в каждый нужный контекст (файлы, функции, что сделать, как проверить). Шаги "
+    "строго в порядке исполнения; правки кода раньше, деплой/рестарт/проверка — последними.\n\n"
+    "КРУПНОЕ ТЗ:\n"
+)
+_STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")
+_SUM_RE = re.compile(r"^\[сводка родитель (\d+)\]")
+_PLAN_LINE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(\S.*)")
+# guard последовательности: пока сиблинг висит в этих статусах — новые шаги родителя НЕ берём
+# (needs_approval/approved = ждём Филиппа/доводку; in_progress = stale после падения демона —
+# порядок шагов важнее живости, Филиппу и так уйдёт «⚠️ зависла» от devbot).
+_DEC_WAIT_STATUSES = ("in_progress", "needs_approval", "approved")
 # Фоллбэк-фразы (если claude описал блокировку гейта без маркера) — тоже эскалируем (эскалация
 # безопасна: лишь спрашивает Филиппа, красное НЕ исполняется; op=other → человек в Termux).
 _NA_FALLBACK = ("требует подтверждения", "нужно подтверждение", "нужно «да»", "нужно \"да\"",
@@ -149,13 +177,16 @@ def _heartbeat_loop(task_id, stop_event):
 
 
 def _task_timeout(task):
-    """Таймаут по метке from очереди: дев-ТЗ («тз:», from=*-dev) → 45 мин, остальное → 10 мин."""
-    return TASK_TIMEOUT_DEV if str(task.get("from") or "").endswith(DEV_FROM_SUFFIX) else TASK_TIMEOUT
+    """Таймаут по метке from очереди: дев-ТЗ («тз:», from=*-dev) и декомпозиция (from=*-dec,
+    планирование-разведка и шаги — те же дев-ТЗ) → 45 мин, остальное → 10 мин."""
+    frm = str(task.get("from") or "")
+    return TASK_TIMEOUT_DEV if frm.endswith((DEV_FROM_SUFFIX, DEC_FROM_SUFFIX)) else TASK_TIMEOUT
 
 
-def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT):
+def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
-    status ∈ done|failed|needs_approval (красная зона — самодекларация claude через маркер)."""
+    status ∈ done|failed|needs_approval (красная зона — самодекларация claude через маркер).
+    preamble: None → боевая APPROVAL_PREAMBLE; планировщик декомпозиции передаёт PLANNER_PREAMBLE."""
     log.info("ИСПОЛНЕНИЕ id=%s через claude -p (timeout=%ss)", task_id, task_timeout)
     child_env = dict(os.environ)
     child_env.setdefault("HOME", "/root")
@@ -165,7 +196,7 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT):
     # а НЕ по платному API. Splinter не затронут (он ключ берёт из своего процесса, не через claude -p).
     child_env.pop("ANTHROPIC_API_KEY", None)
     child_env.pop("OPENAI_API_KEY", None)
-    prompt = APPROVAL_PREAMBLE + task_text
+    prompt = (preamble if preamble is not None else APPROVAL_PREAMBLE) + task_text
     # Heartbeat: фон-поток бьёт updated, пока claude -p блокирующе исполняется. Останавливаем в finally.
     _hb_stop = threading.Event()
     _hb = threading.Thread(target=_heartbeat_loop, args=(task_id, _hb_stop), daemon=True)
@@ -236,6 +267,184 @@ def _exec_restart_splinter(task_id):
 EXECUTORS = {"git_push": _exec_git_push, "restart_splinter": _exec_restart_splinter}
 
 
+# === ДЕКОМПОЗЕР: функции (родитель → план → шаги → guard → сводка) ===
+def _is_dec(task):
+    """Задача семейства декомпозиции (from=*-dec: родитель / шаг / synthetic-сводка)."""
+    return str(task.get("from") or "").endswith(DEC_FROM_SUFFIX)
+
+
+def _parse_steps(text):
+    """Нумерованные строки плана «N. <шаг>» / «N) <шаг>» → список текстов шагов (по порядку).
+    Прочие строки (пустые, преамбулы, маркдаун) молча игнорируются — планировщику велено их не давать."""
+    steps = []
+    for line in (text or "").splitlines():
+        m = _PLAN_LINE_RE.match(line)
+        if m:
+            steps.append(m.group(2).strip())
+    return steps
+
+
+def _dec_siblings(pid, statuses):
+    """Шаги родителя pid в указанных статусах очереди → [(step_i, step_n, item), …]. read-only."""
+    out = []
+    for st in statuses:
+        try:
+            r = bc.get_pending(st)
+        except Exception as e:
+            log.warning("dec: get_pending(%s) упал (%s)", st, e)
+            continue
+        if not r.get("ok"):
+            continue
+        for it in r.get("items", []):
+            m = _STEP_RE.match(str(it.get("task_text") or ""))
+            if m and int(m.group(3)) == pid:
+                out.append((int(m.group(1)), int(m.group(2)), it))
+    return out
+
+
+def _dec_step_blocked(pid):
+    """True → шаг родителя pid брать НЕЛЬЗЯ: сиблинг висит в needs_approval/approved/in_progress
+    (порядок исполнения важнее скорости). Блокируется ТОЛЬКО эта цепочка — process_new возьмёт
+    следующую по FIFO чужую задачу."""
+    return bool(_dec_siblings(pid, _DEC_WAIT_STATUSES))
+
+
+def _dec_summary_text(pid):
+    """Сводный отчёт по родителю pid: все done/failed-шаги, отсортированные по номеру.
+    Строка на шаг = ✅/❌ + первая строка результата (сводка ≤400 от исполнителя)."""
+    rows = sorted(_dec_siblings(pid, ("done", "failed")), key=lambda x: x[0])
+    if not rows:
+        return f"🧩 Сводка декомпозиции (родитель {pid}): шагов не найдено (очередь пуста?)"
+    n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
+    total = rows[0][1]
+    head = f"🧩 Сводка декомпозиции (родитель {pid}): {n_done}/{total} шагов done"
+    if n_done < len(rows):
+        head += ", есть упавшие/пропущенные"
+    lines = [head]
+    for i, n, it in rows:
+        emoji = "✅" if str(it.get("status")) == "done" else "❌"
+        first = (str(it.get("result") or "").strip().splitlines() or ["(пусто)"])[0]
+        lines.append(f"{emoji} шаг {i}/{n}: {first[:400]}")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+_summarized = set()      # родители, по которым сводка уже отправлена (память процесса; после
+                         # рестарта демона от дублей защищает скан существующих сводок ниже)
+
+
+def _dec_summary_exists(pid):
+    """Сводка по родителю pid уже есть в очереди (в любом живом статусе)? Защита от дубля."""
+    mark = f"[сводка родитель {pid}]"
+    for st in ("done", "new", "in_progress"):
+        try:
+            r = bc.get_pending(st)
+        except Exception:
+            continue
+        if r.get("ok") and any(str(it.get("task_text") or "").startswith(mark)
+                               for it in r.get("items", [])):
+            return True
+    return False
+
+
+def _dec_post_summary(pid):
+    """Все шаги родителя pid финальны → отдать сводку в 328 synthetic-задачей (enqueue→claim→done).
+    Очередь — единственный канал демона в 328; devbot принесёт её как обычный done-рапорт.
+    Идемпотентно: повторный вызов (рестарт демона, хвостовой скан) дубля не даёт."""
+    if pid in _summarized:
+        return
+    if _dec_summary_exists(pid):
+        _summarized.add(pid)
+        return
+    text = _dec_summary_text(pid)
+    r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", f"[сводка родитель {pid}] сводный отчёт по шагам")
+    if not r.get("ok"):
+        log.warning("dec: сводка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
+    cm = bc.complete_task(sid, "done", text)
+    _summarized.add(pid)
+    log.info("dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
+
+
+def process_dec_tails():
+    """Хвост декомпозиции, финализированный МИМО демона (напр. «нет N» по шагу → devbot ставит
+    failed без хука цепочки): если у родителя есть failed-шаг, живых шагов не осталось, а сводки
+    нет — отправить сводку. Дёшево: 1 get_pending(failed) на цикл, детали — только по новым pid."""
+    try:
+        r = bc.get_pending("failed")
+    except Exception as e:
+        log.warning("dec tails: get_pending(failed) упал (%s)", e)
+        return
+    if not r.get("ok"):
+        return
+    pids = set()
+    for it in r.get("items", []):
+        m = _STEP_RE.match(str(it.get("task_text") or ""))
+        if m:
+            pids.add(int(m.group(3)))
+    for pid in pids - _summarized:
+        if _dec_siblings(pid, ("new",) + _DEC_WAIT_STATUSES):
+            continue        # цепочка ещё живёт — сводка придёт штатным хуком/пропуском шагов
+        _dec_post_summary(pid)
+
+
+def _dec_after_step(pid, step_i, step_n, status):
+    """Хук после финала шага: failed → пропустить оставшиеся new-сиблинги (цепочка зависимая,
+    дальше идти опасно); все финальны → сводка по родителю."""
+    if status == "failed":
+        for i, n, it in sorted(_dec_siblings(pid, ("new",)), key=lambda x: x[0]):
+            bc.complete_task(it.get("id"), "failed",
+                             f"⏭ пропущен: шаг {step_i}/{step_n} родителя {pid} упал — цепочка остановлена")
+            log.info("dec: шаг %s/%s родителя %s пропущен (цепочка остановлена)", i, n, pid)
+    if not _dec_siblings(pid, ("new",) + _DEC_WAIT_STATUSES):
+        _dec_post_summary(pid)
+
+
+def _maybe_dec_after(task_text, status):
+    """Если финализированная задача — шаг декомпозиции, дёрнуть хук цепочки (halt/сводка)."""
+    m = _STEP_RE.match(str(task_text or ""))
+    if m and status in ("done", "failed"):
+        _dec_after_step(int(m.group(3)), int(m.group(1)), int(m.group(2)), status)
+
+
+def _dec_plan_and_fanout(tid, task_text):
+    """Родитель декомпозиции: планировщик claude -p (read-only) → парс шагов → шаги в очередь
+    «[шаг i/N родитель tid] …» → родитель done с планом (devbot принесёт план в 328)."""
+    status, out = run_task(tid, task_text, task_timeout=TASK_TIMEOUT_DEV, preamble=PLANNER_PREAMBLE)
+    if status != "done":
+        # планировщик read-only: needs_approval от него = аномалия → честный failed, не кнопка
+        bc.complete_task(tid, "failed", f"декомпозиция не удалась (планировщик {status}): {out}"[:RESULT_MAX])
+        return
+    steps = _parse_steps(out)
+    if not steps:
+        bc.complete_task(tid, "failed",
+                         f"декомпозиция не удалась: планировщик не вернул нумерованный список шагов:\n{out}"[:RESULT_MAX])
+        return
+    if len(steps) > MAX_STEPS:
+        bc.complete_task(tid, "failed",
+                         f"декомпозиция не удалась: {len(steps)} шагов > потолка {MAX_STEPS} — "
+                         f"упрости ТЗ или разбей вручную:\n{out}"[:RESULT_MAX])
+        return
+    n = len(steps)
+    ids, errs = [], []
+    for i, step in enumerate(steps, 1):
+        r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", f"[шаг {i}/{n} родитель {tid}] {step}")
+        if r.get("ok"):
+            ids.append(str(r.get("id")))
+        else:
+            errs.append(f"шаг {i} не встал: {r.get('error')}")
+            log.warning("dec: родитель %s шаг %s не встал в очередь (%s)", tid, i, r.get("error"))
+    plan = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+    res = (f"🧩 Декомпозиция: {n} шагов, в очереди id {', '.join(ids) or '—'}.\n{plan}\n"
+           f"Исполняю по одному (каждый шаг отчитается сюда отдельно), после последнего пришлю сводку. "
+           f"Красный шаг спрошу кнопкой.")
+    if errs:
+        res += "\n⚠️ " + "; ".join(errs)
+    bc.complete_task(tid, "done" if ids else "failed", res[:RESULT_MAX])
+    log.info("dec: родитель %s → %s шагов (id %s)", tid, n, ",".join(ids))
+
+
 def _approved_expired(updated_iso):
     """True, если approved-задача висит дольше APPROVED_TTL (по полю updated очереди). При ошибке
     разбора времени → False (одобренное Филиппом лучше выполнить, чем потерять из-за парсинга)."""
@@ -265,6 +474,7 @@ def process_approved():
         if _approved_expired(task.get("updated")):
             log.info("APPROVED id=%s ИСТЁК (>%ss) → failed", tid, APPROVED_TTL)
             bc.complete_task(tid, "failed", "approve истёк (>30 мин), повтори задачу")
+            _maybe_dec_after(task.get("task_text"), "failed")
             continue
 
         op = parse_op(what)
@@ -273,6 +483,7 @@ def process_approved():
             log.info("APPROVED id=%s op вне перечня (%s) → failed (Termux)", tid, op)
             bc.complete_task(tid, "failed",
                              f"не могу выполнить автоматически: {what[:400]} — сделай в Termux")
+            _maybe_dec_after(task.get("task_text"), "failed")
             continue
 
         # билет 4.2: одноразовый серверный жетон авторизации + аудит (issue → consume перед командой)
@@ -292,6 +503,7 @@ def process_approved():
             log.warning("APPROVED id=%s чёрный ящик не записан (%s)", tid, e)
         bc.complete_task(tid, status, out)
         log.info("APPROVED id=%s op=%s → %s", tid, op, status)
+        _maybe_dec_after(task.get("task_text"), status)   # шаг декомпозиции → halt/сводка
 
 
 def process_new():
@@ -304,8 +516,32 @@ def process_new():
     if not items:
         return
     # FIFO: get_pending отдаёт newest-first → берём наименьший id (старейшую задачу) первым.
-    items = sorted(items, key=lambda x: int(x.get("id") or 0))
-    task = items[0]
+    # Шаг декомпозиции, чей сиблинг ждёт (needs_approval/approved/in_progress), пропускаем —
+    # НЕ блокируя чужие задачи дальше по очереди (guard последовательности цепочки).
+    task = None
+    for cand in sorted(items, key=lambda x: int(x.get("id") or 0)):
+        if _is_dec(cand):
+            m = _STEP_RE.match(str(cand.get("task_text") or ""))
+            if m:
+                pid = int(m.group(3))
+                if _dec_siblings(pid, ("failed",)):
+                    # сиблинг упал/отклонён («нет N» finalизирует мимо демона) → цепочку глушим:
+                    # этот шаг failed, хук доведёт остальных + сводку. return (не continue):
+                    # снапшот items уже неактуален, доработаем следующим циклом.
+                    bc.complete_task(cand.get("id"), "failed",
+                                     f"⏭ пропущен: другой шаг родителя {pid} упал/отклонён — цепочка остановлена")
+                    log.info("dec: шаг id=%s родителя %s пропущен (в цепочке есть failed)",
+                             cand.get("id"), pid)
+                    _maybe_dec_after(str(cand.get("task_text") or ""), "failed")
+                    return
+                if _dec_step_blocked(pid):
+                    log.info("dec: шаг id=%s родителя %s ждёт сиблинга — пропускаю в этом цикле",
+                             cand.get("id"), pid)
+                    continue
+        task = cand
+        break
+    if task is None:
+        return
     tid = task.get("id")
     text = str(task.get("task_text") or "")
     log.info("NEW id=%s from=%s text=%.120s", tid, task.get("from"), text)
@@ -315,6 +551,17 @@ def process_new():
         log.info("claim id=%s не удался (%s) — пропускаю в этом цикле", tid, cl.get("error"))
         return
 
+    if _is_dec(task):
+        sm = _SUM_RE.match(text)
+        if sm:
+            # осиротевшая synthetic-сводка (демон упал между enqueue и complete) → доводим
+            bc.complete_task(tid, "done", _dec_summary_text(int(sm.group(1))))
+            log.info("dec: осиротевшая сводка id=%s доведена", tid)
+            return
+        if not _STEP_RE.match(text):
+            _dec_plan_and_fanout(tid, text)     # родитель «декомпозируй:» → план → fan-out шагов
+            return
+
     status, result = run_task(tid, text, task_timeout=_task_timeout(task))
     if status == "needs_approval":
         # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
@@ -323,11 +570,14 @@ def process_new():
     else:
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
+        _maybe_dec_after(text, status)          # шаг декомпозиции → halt-on-fail / сводка
 
 
 def cycle():
-    """Один проход: сначала довести одобренное красное (approved), потом взять новое (new)."""
+    """Один проход: довести одобренное красное (approved) → добрать хвосты декомпозиций,
+    финализированные мимо демона (сводка) → взять новое (new)."""
     process_approved()
+    process_dec_tails()
     process_new()
 
 
