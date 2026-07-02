@@ -8,6 +8,7 @@ origin=agent → ЛЮБАЯ попытка красной записи лови�
 import os
 import re
 import time
+import asyncio
 import datetime
 import logging
 import subprocess
@@ -27,6 +28,60 @@ DEVBOT_TOPIC = 328                      # тема dev-bot (VPS). 205 = pc_agent
 CC_LOG_ID = "1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF"
 
 BRIDGE = None   # выставляется из bot.py при старте (devbot.BRIDGE = bridge)
+
+# === Фикс заморозки event loop (разбор таймаутов get_pending 02.07.2026) ===
+# Синхронные requests к Bridge прямо в async job вешали ВЕСЬ event loop PTB до 60-240с
+# (окна деградации Apps Script /exec). Фикс: опрос очереди — ОДНИМ синхронным прогоном в
+# отдельном потоке (asyncio.to_thread) + отдельный клиент с коротким timeout: опрос
+# идемпотентен, при таймауте просто ждём следующий тик 45с, а не держим 60с.
+POLL_TIMEOUT = 15                       # сек на get_pending при опросе очереди (вместо 60)
+_REPORT_STATUSES = ("done", "failed", "needs_approval", "in_progress")
+_poll_bridge = None                     # ленивый клиент опроса (timeout=POLL_TIMEOUT)
+_poll_bridge_for = None                 # BRIDGE, под который создан _poll_bridge (тесты меняют BRIDGE)
+
+
+def _get_poll_bridge():
+    """Отдельный BridgeClient для 45с-опроса очереди (timeout=POLL_TIMEOUT вместо 60с).
+    Тестовый/нестандартный BRIDGE без url/token опрашиваем как есть (моки в tests/)."""
+    global _poll_bridge, _poll_bridge_for
+    b = BRIDGE
+    if b is None:
+        return None
+    if _poll_bridge is None or _poll_bridge_for is not b:
+        url = getattr(b, "url", None)
+        token = getattr(b, "token", None)
+        _poll_bridge = (bridge_client.BridgeClient(url=url, token=token, timeout=POLL_TIMEOUT)
+                        if url and token else b)
+        _poll_bridge_for = b
+    return _poll_bridge
+
+
+def _poll_queue_sync(pb):
+    """СИНХРОННЫЙ опрос очереди одним прогоном — звать ТОЛЬКО через asyncio.to_thread.
+    Склейка статусов: get_pending_multi = 1 CSV-вызов на новом Bridge (фоллбэк по-статусно
+    на старом/мокнутом). → {status: [items c from∈QUEUE_FROMS]} | None (ошибка → ждём тик)."""
+    fn = getattr(pb, "get_pending_multi", None)
+    if fn is not None:
+        r = fn(_REPORT_STATUSES)
+    else:                                   # мок в тестах без multi — по-статусно
+        items = []
+        for st in _REPORT_STATUSES:
+            rr = pb.get_pending(st)
+            if not rr.get("ok"):
+                return None
+            for it in rr.get("items", []):
+                if isinstance(it, dict):
+                    it.setdefault("status", st)
+                items.append(it)
+        r = {"ok": True, "items": items}
+    if not r.get("ok"):
+        return None
+    by = {st: [] for st in _REPORT_STATUSES}
+    for it in r.get("items", []):
+        st = str(it.get("status") or "")
+        if st in by and str(it.get("from")) in QUEUE_FROMS:
+            by[st].append(it)
+    return by
 
 # === ОРКЕСТРАТОР (ступень1 заход2б-1 + ступень2 O4): дев-бот ↔ очередь ===
 # Префикс в 328 → кладём задачу в очередь оркестратора; фоновый job приносит результат обратно.
@@ -168,7 +223,7 @@ async def _send_thread(context, q, text):
 
 async def _cb_approve(q, qid, bridge):
     """approve:<id> → approve_task (та же логика «да N»). ОДНОРАЗОВО + идемпотентность."""
-    r = bridge.approve_task(qid, "Filipp")
+    r = await asyncio.to_thread(bridge.approve_task, qid, "Filipp")
     if r.get("ok"):
         _reported.discard(qid)            # пусть дальнейший done/failed отрапортуется штатно
         await q.answer("✅ одобрено")
@@ -186,7 +241,7 @@ async def _cb_approve(q, qid, bridge):
 
 async def _cb_reject(q, qid, bridge):
     """reject:<id> → complete_task failed (как «нет N»). ОДНОРАЗОВО."""
-    r = bridge.complete_task(qid, "failed", "отклонено Филиппом (кнопка)")
+    r = await asyncio.to_thread(bridge.complete_task, qid, "failed", "отклонено Филиппом (кнопка)")
     if r.get("ok"):
         _reported.add(qid)                # уже сообщили «отклонена» — не дублируем failed-рапортом
         await q.answer("❌ отклонено")
@@ -201,7 +256,7 @@ async def _cb_reject(q, qid, bridge):
 async def _cb_check(context, q, qid, bridge):
     """check:<id> → свежий статус задачи. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
     await q.answer("проверяю…")
-    status, item = _find_task(bridge, qid)
+    status, item = await asyncio.to_thread(_find_task, bridge, qid)
     if status is None:
         txt = f"🔄 Задача {qid}: не найдена в очереди."
     else:
@@ -216,7 +271,7 @@ async def _cb_check(context, q, qid, bridge):
 async def _cb_next(context, q, qid, bridge):
     """next:<id> → подсказка по следующему шагу. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
     await q.answer("📋")
-    status, _item = _find_task(bridge, qid)
+    status, _item = await asyncio.to_thread(_find_task, bridge, qid)
     if status is None:
         txt = f"📋 Задача {qid}: не найдена — поставь новую командой «задача: <что сделать>»."
     elif status == "done":
@@ -283,23 +338,22 @@ def _task_age_sec(updated_iso):
 async def report_results(context) -> None:
     """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
     Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
-    как отрапортованные, чтобы при рестарте не присылать всю историю заново."""
+    как отрапортованные, чтобы при рестарте не присылать всю историю заново.
+    Фикс 02.07: весь опрос очереди — ОДИН прогон в отдельном потоке (to_thread, timeout 15с) —
+    event loop не встаёт, бот отвечает на кнопки/сообщения, даже когда Bridge тупит."""
     global _report_seeded
-    bridge = BRIDGE
-    if bridge is None:
+    pb = _get_poll_bridge()
+    if pb is None:
         return
-    finished = []
     try:
-        for st in ("done", "failed"):
-            r = bridge.get_pending(st)
-            if not r.get("ok"):
-                continue
-            for it in r.get("items", []):
-                if str(it.get("from")) in QUEUE_FROMS:
-                    finished.append((st, it))
+        by = await asyncio.to_thread(_poll_queue_sync, pb)
     except Exception as e:
         log.warning("devbot.report_results: опрос очереди упал (%s)", e)
         return
+    if by is None:
+        return          # таймаут/ошибка опроса — не страшно, следующий тик через 45с
+
+    finished = [(st, it) for st in ("done", "failed") for it in by[st]]
     finished.sort(key=lambda x: int(x[1].get("id") or 0))   # старые задачи рапортуем первыми
 
     if not _report_seeded:
@@ -328,15 +382,7 @@ async def report_results(context) -> None:
 
     # needs_approval (заход 2б-2): задача упёрлась в красную зону — спрашиваем «да N»/«нет N».
     # БЕЗ seed (незакрытый вопрос после рестарта стоит переспросить); дедуп = _asked в памяти процесса.
-    try:
-        na = bridge.get_pending("needs_approval")
-    except Exception as e:
-        log.warning("devbot.report_results: опрос needs_approval упал (%s)", e)
-        return
-    if not na.get("ok"):
-        return
-    pend = sorted((it for it in na.get("items", []) if str(it.get("from")) in QUEUE_FROMS),
-                  key=lambda x: int(x.get("id") or 0))
+    pend = sorted(by["needs_approval"], key=lambda x: int(x.get("id") or 0))
     for it in pend:
         qid = it.get("id")
         if qid in _asked:
@@ -357,15 +403,7 @@ async def report_results(context) -> None:
 
     # in_progress (heartbeat/детект-зависания, части 1-2): «🔄 в работе» один раз + «⚠️ зависла» один раз.
     # Анти-спам: дедуп _inprogress_seen / _stalled — НЕ шлём на каждом 45с-проходе.
-    try:
-        ip = bridge.get_pending("in_progress")
-    except Exception as e:
-        log.warning("devbot.report_results: опрос in_progress упал (%s)", e)
-        return
-    if not ip.get("ok"):
-        return
-    running = sorted((it for it in ip.get("items", []) if str(it.get("from")) in QUEUE_FROMS),
-                     key=lambda x: int(x.get("id") or 0))
+    running = sorted(by["in_progress"], key=lambda x: int(x.get("id") or 0))
     for it in running:
         qid = it.get("id")
         if qid not in _inprogress_seen:        # анонс «в работе» — один раз на задачу
@@ -556,7 +594,8 @@ async def handle_command(msg, context, bridge) -> None:
     tid = getattr(msg, "message_thread_id", None)
 
     # 0) Ответ на запрос подтверждения «да N» / «нет N» — ПЕРВЫМ (специфичный паттерн).
-    appr = _try_approval_reply(msg.text or "", bridge)
+    # Bridge-вызовы — через to_thread (фикс 02.07): event loop не встаёт, пока /exec тупит.
+    appr = await asyncio.to_thread(_try_approval_reply, msg.text or "", bridge)
     if appr is not None:
         for chunk in _chunks(appr):
             await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
@@ -564,7 +603,7 @@ async def handle_command(msg, context, bridge) -> None:
 
     # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
     #    (служебный лист очереди), origin=human по умолчанию — гейт 4.2 не трогаем.
-    enq = _try_enqueue(msg.text or "", bridge)
+    enq = await asyncio.to_thread(_try_enqueue, msg.text or "", bridge)
     if enq is not None:
         for chunk in _chunks(enq):
             await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
@@ -579,9 +618,11 @@ async def handle_command(msg, context, bridge) -> None:
                   "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / просрочки / статус / гейт / помощь. "
                   "Дев-ТЗ: «тз: <что сделать>»."))
         return
-    try:
+    def _run_green():
         with bridge_client.agent_write(None):   # origin=agent, без билета → красная запись будет отклонена
-            reply = fn(bridge)
+            return fn(bridge)
+    try:
+        reply = await asyncio.to_thread(_run_green)   # фикс 02.07: не морозим loop на зелёной команде
     except Exception as e:
         reply = f"🤖 ошибка зелёной задачи: {type(e).__name__}: {e}"
     for chunk in _chunks(reply):
@@ -594,11 +635,12 @@ async def morning_summary(context) -> None:
     if bridge is None:
         log.warning("devbot.morning_summary: BRIDGE не выставлен")
         return
-    try:
+    def _collect():
         with bridge_client.agent_write(None):
-            parts = ["🌅 Утренняя сводка дев-бота", "", _g_health(), "",
-                     _g_audit(bridge), "", _g_brain(bridge)]
-        text = "\n".join(parts)
+            return "\n".join(["🌅 Утренняя сводка дев-бота", "", _g_health(), "",
+                              _g_audit(bridge), "", _g_brain(bridge)])
+    try:
+        text = await asyncio.to_thread(_collect)   # фикс 02.07: сбор сводки не морозит loop
     except Exception as e:
         text = f"🌅 Утренняя сводка: ошибка сбора ({type(e).__name__}: {e})"
     for chunk in _chunks(text):

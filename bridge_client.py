@@ -233,6 +233,37 @@ class BridgeClient:
         """Задачи по статусу (деф. new), newest-first → {ok, items}. Дешёвое чтение (GET)."""
         return self._call("get_pending", status=status)
 
+    def get_pending_multi(self, statuses) -> dict:
+        """Задачи по НЕСКОЛЬКИМ статусам ОДНИМ вызовом (status=CSV), склейка 02.07.2026 →
+        {ok, items} — у каждого item есть 'status'. Новый Bridge понимает CSV и подтверждает
+        полем 'statuses'; старый (до redeploy) CSV не матчит и отдаёт items=[] БЕЗ 'statuses' →
+        тихий фоллбэк на по-статусные вызовы (кэшируется, CSV-проба не гоняется каждый раз).
+        Ошибка склеенного вызова (timeout и пр.) → возвращаем как есть, фоллбэком Bridge
+        в окно деградации НЕ добиваем."""
+        statuses = [str(s).strip() for s in statuses if str(s).strip()]
+        if not statuses:
+            return {"ok": True, "items": []}
+        if len(statuses) == 1:
+            return self._call("get_pending", status=statuses[0])
+        if getattr(self, "_pending_multi_supported", None) is not False:
+            r = self._call("get_pending", status=",".join(statuses))
+            if not r.get("ok"):
+                return r
+            if r.get("statuses"):
+                self._pending_multi_supported = True
+                return r
+            self._pending_multi_supported = False   # старый Bridge — дальше сразу по-статусно
+        items = []
+        for st in statuses:
+            rr = self._call("get_pending", status=st)
+            if not rr.get("ok"):
+                return rr
+            for it in rr.get("items", []):
+                if isinstance(it, dict):
+                    it.setdefault("status", st)
+                items.append(it)
+        return {"ok": True, "items": items}
+
     def claim_task(self, task_id) -> dict:
         """Атомарно new→in_progress → {ok, task} | {ok:false, error:'already_claimed'/...}."""
         return self._post("claim_task", id=task_id)
