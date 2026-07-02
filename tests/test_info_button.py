@@ -171,6 +171,19 @@ res.append(ok(st["pinned"] == 3 and st["total"] == 3, f"засеяно 3/3 servi
 res.append(ok((-999, 333) not in S._INFO_PINNED, "тема чужого чата НЕ пиннута"))
 res.append(ok(len(ctx.bot.pinned) == 3, "ровно 3 пина (по servicing-темам)"))
 
+# (i) протухший q.answer (фикс кнопок вне O3 02.07, паттерн _o3_answer из 749cf46):
+# колбэк отлежался за долгой обработкой → q.answer кидает BadRequest «Query is too old» —
+# действие кнопки ВСЁ РАВНО выполняется (карточка строится), хендлер не валится.
+reset()
+class DeadAnswerQuery(FakeQuery):
+    async def answer(self, text=None):
+        raise Exception("Query is too old and response timeout expired or query id is invalid")
+q = DeadAnswerQuery("info:card", CHAT, TOPIC)
+loop.run_until_complete(S.handle_info_button(FakeUpdate(q), FakeCtx(), bridge=None))
+print("(i) протухший q.answer:")
+res.append(ok(len(CARDS) == 1 and len(EDITS) == 1 and BIKE in EDITS[0]["text"],
+              "протухший q.answer НЕ валит кнопку — карточка всё равно построена (edit прошёл)"))
+
 loop.close()
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

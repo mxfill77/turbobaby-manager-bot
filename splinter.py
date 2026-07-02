@@ -689,6 +689,17 @@ async def _repin_info(context, chat_id, topic_id):
         log.warning(f"  → инфо-кнопка: пере-закреп не удался: {e}")
 
 
+async def _btn_answer(q, txt=None, **kw):
+    """q.answer() с защитой — общий для кнопок ВНЕ O3 (паттерн _o3_answer, фикс 749cf46):
+    колбэк, отлежавшийся в очереди за долгой обработкой (флуд-контроль на эдитах, апдейты
+    последовательные), протухает — BadRequest «Query is too old». Ack тогда невозможен,
+    но ДЕЙСТВИЕ кнопки обязано выполниться; упавший q.answer не валит хендлер."""
+    try:
+        await q.answer(txt, **kw)
+    except Exception as e:
+        log.warning(f"  → q.answer протух/упал (действие кнопки всё равно выполняю): {e}")
+
+
 async def handle_info_button(update, context, bridge):
     """Кнопка «ℹ️ Инфо по байку» (CallbackQueryHandler '^info:' в bot.py). Чтение карточки — ЗЕЛЁНОЕ,
     тайцам БЕЗ гейта. Байк резолвится ИЗ ТЕМЫ (статичный callback, без токен-буфера → переживает рестарт)."""
@@ -701,15 +712,15 @@ async def handle_info_button(update, context, bridge):
     chat_id = msg.chat.id if msg else None
     topic_id = getattr(msg, "message_thread_id", None) if msg else None
     if action != "card":
-        await q.answer()   # будущие info:handover/return/work — пока не обслуживаем
+        await _btn_answer(q)   # будущие info:handover/return/work — пока не обслуживаем
         return
     # Debounce 5с на (chat,topic) (Q6): два быстрых тапа → одна карточка
     key = (chat_id, topic_id)
     if _time.time() - _INFO_TAP_TS.get(key, 0) < 5:
-        await q.answer("⏳")
+        await _btn_answer(q, "⏳")
         return
     _INFO_TAP_TS[key] = _time.time()
-    await q.answer()   # П4: мгновенно гасим «часик» на кнопке (до сбора карточки)
+    await _btn_answer(q)   # П4: мгновенно гасим «часик» на кнопке (до сбора карточки)
     bike = bike_from_topic(chat_id, topic_id)
     if not bike:
         await _send(context, chat_id=chat_id, message_thread_id=topic_id, bilingual=False,
@@ -2904,11 +2915,11 @@ async def handle_service_button(update, context, bridge) -> None:
         _, action, tok = (q.data or "").split(":", 2)
         token = int(tok)
     except Exception:
-        await q.answer()
+        await _btn_answer(q)
         return
     data = _SVC_TOKENS.get(token)
     if not data:
-        await q.answer()
+        await _btn_answer(q)
         try:
             await q.edit_message_text(
                 "🐀 Splinter\n"
@@ -2924,7 +2935,7 @@ async def handle_service_button(update, context, bridge) -> None:
     if action == "fix":
         # [✅ Да] на переспрос текстовой КОРРЕКЦИИ пробега (фикс _row22) — эквивалент текстового «да».
         # Санкционированная человеком правка → перезапись в обход сторожа B (только этот путь).
-        await q.answer("กำลังแก้… · Исправляю…")
+        await _btn_answer(q, "กำลังแก้… · Исправляю…")
         old_km, new_km = data.get("old_km"), data.get("new_km")
         key = (chat_id, topic_id)
         try:
@@ -2943,7 +2954,7 @@ async def handle_service_button(update, context, bridge) -> None:
     if action == "mok":
         # [✅ Да] на подтверждение распознанного пробега — эквивалент текстового «да».
         # Сторож B сохранён: если число < floor — не принимаем, шлём msg_mileage_drop.
-        await q.answer()
+        await _btn_answer(q)
         mileage = data.get("mileage", "")
         floor = data.get("floor")
         oil_hint = bool(data.get("oil_hint"))
@@ -2984,14 +2995,14 @@ async def handle_service_button(update, context, bridge) -> None:
         # [Зафиксировать <тип>] группы B (gear/abs/airfilter) → set_fleet_service. ТОЛЬКО доверенный.
         svc_kind = data.get("svc_kind", "")
         if not _is_trusted_user(q.from_user):
-            await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
+            await _btn_answer(q, f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             th_lbl, ru_lbl = _SVC_COL_LABEL.get(svc_kind, (svc_kind, svc_kind))
             await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс
                               text=(f"🐀 Splinter\n"
                                     f"🇹🇭 🔧 การบันทึก «{th_lbl}» ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้น\n"
                                     f"🇷🇺 🔧 Запись «{ru_lbl}» подтверждает {PYM_HANDLE} или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
-        await q.answer("กำลังบันทึก… · Записываю…")
+        await _btn_answer(q, "กำลังบันทึก… · Записываю…")
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -3003,11 +3014,11 @@ async def handle_service_button(update, context, bridge) -> None:
     if action == "oil":
         # [После замены] → боевая запись кол.I. ТОЛЬКО доверенный.
         if not _is_trusted_user(q.from_user):
-            await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
+            await _btn_answer(q, f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс
                               text=msg_oil_need_trusted(bike, km))
             return   # токен и кнопки живут — Пым нажмёт [После замены] позже
-        await q.answer("กำลังบันทึกน้ำมันเครื่อง… · Записываю ТО Oil…")
+        await _btn_answer(q, "กำลังบันทึกน้ำมันเครื่อง… · Записываю ТО Oil…")
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -3019,14 +3030,14 @@ async def handle_service_button(update, context, bridge) -> None:
         # Пишет СДЕЛАННЫЕ позиции (кол.I/J/K/L set_fleet_* confirmed=True под сторожем + синк «обслуживание»),
         # прочее → событие. Earth сам нажать НЕ может — бот ждёт Пыма/владельца (токен+кнопка живут).
         if not _is_trusted_user(q.from_user):
-            await q.answer(f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
+            await _btn_answer(q, f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
             await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс
                               text=("🐀 Splinter\n"
                                     f"🇹🇭 🔧 บันทึกผลเซอร์วิส ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
                                     f"{_SEP}\n"
                                     f"🇷🇺 🔧 Запись результата ТО подтверждает {PYM_HANDLE} или владелец"))
             return   # токен и кнопка живут — Пым нажмёт позже
-        await q.answer("กำลังบันทึก… · Записываю ТО…")
+        await _btn_answer(q, "กำลังบันทึก… · Записываю ТО…")
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -3050,7 +3061,7 @@ async def handle_service_button(update, context, bridge) -> None:
     elif action == "km":
         # [Просто пробег] → в кол.I НЕ пишем. Квитанцию шлём ВСЕГДА (раньше при уже-закреплённой
         # просрочке _pin_overdue_reminder выходил молча → человек видел тишину).
-        await q.answer()
+        await _btn_answer(q)
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -3076,7 +3087,7 @@ async def handle_service_button(update, context, bridge) -> None:
         # ЧАСТЬ D: [Просто пробег] = финал цикла (закреп-просрочку оставляем, вопросы убираем).
         await _clear_cycle_msgs(context, chat_id, topic_id)
     else:
-        await q.answer()
+        await _btn_answer(q)
 
 
 # ============================================================
@@ -3276,17 +3287,17 @@ async def handle_delivery_button(update, context, bridge) -> None:
         return
     parts = (q.data or "").split(":")
     if len(parts) < 3 or parts[0] != "delivery":
-        await q.answer()
+        await _btn_answer(q)
         return
     action = parts[1]
     try:
         tok = int(parts[2])
     except Exception:
-        await q.answer()
+        await _btn_answer(q)
         return
     d = _HB_TOKENS.get(tok)
     if not d:
-        await q.answer()
+        await _btn_answer(q)
         try:
             await q.edit_message_text("🐀 Splinter\n⚠️ Карточка устарела (перезапуск бота). Перепостите доску выдач 🙏")
         except Exception:
@@ -3294,12 +3305,12 @@ async def handle_delivery_button(update, context, bridge) -> None:
         return
 
     if action == "pay":
-        await q.answer("💵 ได้รับเงินแล้ว · Оплата — следующий слой (пока не активна)")   # РАЗЪЁМ-тост: ничего не пишем
+        await _btn_answer(q, "💵 ได้รับเงินแล้ว · Оплата — следующий слой (пока не активна)")   # РАЗЪЁМ-тост: ничего не пишем
         return
 
     if action == "back":
         # выход из выбора замены ДО записи — ЧИСТАЯ отмена (ничего не записано). Доска остаётся выше.
-        await q.answer("↩️ Отменено")
+        await _btn_answer(q, "↩️ Отменено")
         txt = _with_separator(_bilingual(None,
             ["↩️ ยกเลิกการเปลี่ยนรถ", "กลับไปที่รายการส่งมอบด้านบน"],
             ["↩️ Замена отменена", "Вернитесь к списку выдач выше"]))
@@ -3312,7 +3323,7 @@ async def handle_delivery_button(update, context, bridge) -> None:
     if action == "hand":
         # доска: выдать ПЛАНОВЫЙ байк СРАЗУ (без переспроса — байк/клиент видны на кнопке).
         # Доску НЕ редактируем (там другие брони) → подтверждение НОВЫМ сообщением (edit=False).
-        await q.answer("✅")
+        await _btn_answer(q, "✅")
         await _hb_do_handover(q, context, bridge, tok, d, d["bike"], edit=False)
         return
 
@@ -3320,9 +3331,9 @@ async def handle_delivery_button(update, context, bridge) -> None:
         # доска: подмена байка → список байков ДОМА кнопками, НОВЫМ сообщением (доску не трогаем)
         d["candidates"] = _hb_home_bikes(bridge)[:12]   # cap 12 (пагинация — следующий слой)
         if not d["candidates"]:
-            await q.answer("Нет байков «дома» для замены")
+            await _btn_answer(q, "Нет байков «дома» для замены")
             return
-        await q.answer()
+        await _btn_answer(q)
         rows = [[InlineKeyboardButton(f"✅ {nm}"[:50], callback_data=f"delivery:pick:{tok}:{i}")]
                 for i, nm in enumerate(d["candidates"])]   # кнопки замены = эмодзи + ДАННЫЕ (как кнопки выдачи)
         rows.append([InlineKeyboardButton("◀️", callback_data=f"delivery:back:{tok}")])   # голая ◀️ (смысл в легенде)
@@ -3340,13 +3351,13 @@ async def handle_delivery_button(update, context, bridge) -> None:
             idx = int(parts[3])
             bike = d["candidates"][idx]
         except Exception:
-            await q.answer("Не понял выбор")
+            await _btn_answer(q, "Не понял выбор")
             return
-        await q.answer("✅")
+        await _btn_answer(q, "✅")
         await _hb_do_handover(q, context, bridge, tok, d, bike, edit=True)
         return
 
-    await q.answer()
+    await _btn_answer(q)
 
 
 # ============================================================

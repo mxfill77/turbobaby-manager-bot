@@ -189,6 +189,18 @@ def test_stale_token_graceful():
     assert br.state_calls == [], "устаревший токен ничего не пишет"
     assert any("устарела" in (t or "") for t, _ in q.edits), q.edits
 
+def test_stale_answer_still_hands_over():
+    # фикс 02.07 (паттерн _o3_answer из 749cf46): колбэк протух за долгой обработкой →
+    # q.answer кидает BadRequest «Query is too old» — выдача ВСЁ РАВНО выполняется, кнопка не «мёртвая».
+    _reset(); br = FakeBridge(); ctx = FakeCtx()
+    tok = _first_tok(_post_board(br, ctx))
+    class DeadAnswerQuery(FakeQuery):
+        async def answer(s, text=None):
+            raise Exception("Query is too old and response timeout expired or query id is invalid")
+    asyncio.run(S.handle_delivery_button(FakeUpdate(DeadAnswerQuery(f"delivery:hand:{tok}")), ctx, br))
+    assert len(br.state_calls) == 1, "state_set прошёл несмотря на протухший ack"
+    assert _cbs(ctx.bot.sent[-1]["reply_markup"]) == [f"delivery:pay:{tok}"], "подтверждение с разъёмом 💵 отправлено"
+
 def test_zz_test_mode_hq_mock_prefix():
     _reset(); S.HB_TEST_MODE = True
     br = FakeBridge(); ctx = FakeCtx()

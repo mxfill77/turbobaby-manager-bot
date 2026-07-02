@@ -161,6 +161,20 @@ def test_done_button_trusted_writes():
     assert b.closed is True
     assert tok not in S._SVC_TOKENS
 
+def test_done_button_stale_answer_still_writes():
+    # фикс 02.07 (паттерн _o3_answer из 749cf46): протухший q.answer (BadRequest «Query is too old»)
+    # НЕ валит хендлер — запись по «да» доверенного всё равно проходит.
+    reset()
+    b = FakeBridge(); b.sp = {"declared": "oil,gear", "done": "oil,gear",
+                              "status": "ждёт_подтверждения", "odometer": "20316"}
+    tok = S._svc_put({"chat": CHAT, "topic": TOPIC, "bike": BIKE, "done": ["oil", "gear"], "odo": "20316", "kind": "sp_done"})
+    class DeadQ(FakeQ):
+        async def answer(self, *a, **k):
+            raise Exception("Query is too old and response timeout expired or query id is invalid")
+    run(S.handle_service_button(_mk_update(DeadQ(f"svc:done:{tok}", "Pleummmm")), context=None, bridge=b))
+    assert len(b.oil_calls) == 1 and len(b.svc_calls) == 1, (b.oil_calls, b.svc_calls)
+    assert tok not in S._SVC_TOKENS, "токен снят — запись прошла до конца"
+
 # ============ F) ФИКСЫ B1-B6 (закрытие доходит до конца) ============
 def _iso_ago(hours):
     return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
