@@ -1,7 +1,8 @@
-"""Моки O4 ступень 2 (A+B, 03.07): «тз:» дев-режим (метка from → таймаут 45 мин), преамбула v2
-(карта красного синхронна settings 02.07: git push сам, restart splinter кнопкой, настоящее красное
-op=other; дисциплина cc_log+пульс; сводка ≤400), NEEDS_APPROVAL-детект жив, новые зелёные команды
-(просрочки/статус/гейт). Сети/Telegram/claude нет — всё мокнуто."""
+"""Моки O4 ступень 2 (A+B, 03.07; Q2 разблокирован 03.07): «тз:» дев-режим (метка from → таймаут
+45 мин), преамбула v3 (git push И restart splinter — CC сам; restart оранжевым циклом
+гейт→restart→чистый старт→отчёт; настоящее красное op=other БЕЗ изменений; дисциплина cc_log+пульс;
+сводка ≤400), NEEDS_APPROVAL-детект жив (фоллбэк), новые зелёные команды (просрочки/статус/гейт).
+Сети/Telegram/claude нет — всё мокнуто."""
 import os, sys
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
@@ -19,13 +20,15 @@ res.append(ok(OD._task_timeout({"from": "Filipp-328-dev"}) == 2700, "from=*-dev 
 res.append(ok(OD._task_timeout({"from": "Filipp-328"}) == 600, "from=Filipp-328 → 600с"))
 res.append(ok(OD._task_timeout({}) == 600, "без from → 600с (безопасный дефолт)"))
 
-# (2) преамбула v2: карта красного синхронна settings 02.07 + дисциплина
-print("(2) преамбула v2:")
+# (2) преамбула v3: git push И restart сам (Q2), настоящее красное op=other + дисциплина
+print("(2) преамбула v3:")
 P = OD.APPROVAL_PREAMBLE
 res.append(ok("git push" in P and "делай САМ" in P, "git push — делает САМ (не через кнопку)"))
 res.append(ok("git_push — отправить коммиты" not in P, "устаревшая op-инструкция git_push УБРАНА"))
-res.append(ok("op=restart_splinter" in P and "САМ НЕ делай" in P,
-              "restart splinter на обкатке — только кнопкой (op-маркер)"))
+res.append(ok("systemctl restart splinter — тоже делай САМ" in P and "САМ НЕ делай" not in P,
+              "Q2: restart splinter — CC делает САМ (обкаточный запрет снят)"))
+res.append(ok("только при exit 0" in P and "чистого старта" in P and "нужен был restart" in P,
+              "Q2: оранжевый цикл restart — гейт → restart → чистый старт → отчёт"))
 res.append(ok("op=other" in P and "confirmed=true" in P and "delete_event" in P,
               "настоящее красное → op=other с карточкой"))
 res.append(ok("cc_log" in P and "pulse" in P and "ОДНОЙ операцией" in P and "gate.py" in P,

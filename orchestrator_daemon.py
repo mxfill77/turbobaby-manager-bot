@@ -76,9 +76,10 @@ NA_MARKER = "NEEDS_APPROVAL:"
 # clasp_redeploy / CRM / Лист1 / деньги / set_fleet_* / delete_event — НЕ здесь (позже, особое «да»).
 AUTO_OPS = ("git_push", "restart_splinter")
 
-# Преамбула v2 (ступень 2 O4, 03.07): красная карта СИНХРОННА .claude/settings.json от 02.07
-# (git push теперь allow → CC делает сам; restart splinter на обкатке — кнопкой через op-маркер).
-# Red-zone → claude выводит маркер с op-кодом и останавливается, НЕ обходит гейт.
+# Преамбула v3 (Q2 разблокирован 03.07: критерий обкатки ступени 2 выполнен — 3 «тз:» подряд done
+# без Termux, вкл. прод-фикс 3978a91). restart splinter теперь CC делает САМ оранжевым циклом
+# (гейт→restart→проверка чистого старта→отчёт); кнопка op=restart_splinter остаётся фоллбэком.
+# Red-zone (Лист1/CRM/деньги/clasp/sqlite3/delete) — БЕЗ изменений: маркер op=other, НЕ обходить гейт.
 APPROVAL_PREAMBLE = (
     "Ты выполняешь задачу автономно в headless-режиме (без интерактивного подтверждения) в репо "
     "/root/turbobaby-manager-bot — CLAUDE.md и вся его дисциплина действуют.\n"
@@ -90,8 +91,11 @@ APPROVAL_PREAMBLE = (
     "КАРТА ДЕЙСТВИЙ:\n"
     "- Зелёное/оранжевое (чтение, диагностика, правки кода, тесты, git commit, git push) — делай САМ; "
     "git push по циклу гейт→push→отчёт, БЕЗ маркера.\n"
-    "- systemctl restart splinter САМ НЕ делай (режим обкатки ступени 2): если рестарт нужен — выведи "
-    "строку «NEEDS_APPROVAL: op=restart_splinter | <зачем>» и заверши работу (исполнят кнопкой в 328).\n"
+    "- systemctl restart splinter — тоже делай САМ, оранжевым циклом: гейт (venv/bin/python3 gate.py, "
+    "только при exit 0) → systemctl restart splinter → проверка чистого старта (systemctl is-active "
+    "active + свежий старт-лог в splinter.log без ошибок) → в сводке отчитайся «нужен был restart — "
+    "сделал, старт чистый». При failed/грязном старте — откат на прошлый рабочий коммит + restart + "
+    "честный отчёт. Маркер op=restart_splinter НЕ выводи (он остаётся только аварийным фоллбэком).\n"
     "- НАСТОЯЩЕЕ КРАСНОЕ — запись в рабочие таблицы (CRM/Лист1/Байки/Зарплаты), деньги/транзакции, "
     "clasp deploy/redeploy/push, sqlite3 CLI на memory.db, set_fleet_oil/set_fleet_service, "
     "confirmed=true, delete_event, любое удаление — НЕ выполняй и НЕ ищи обходных путей: выведи РОВНО "

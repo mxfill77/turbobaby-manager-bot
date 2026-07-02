@@ -481,9 +481,13 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
 Настроен так, чтобы ЗЕЛЁНАЯ рутина шла без подтверждений, а КРАСНОЕ (запись в Лист1/CRM/деньги/удаление)
 всегда просило «да» + показывало человеческую карточку. Механика (3 независимых слоя, precedence deny>ask>hook>allow):
 - **allow (settings.json)** — зелёное авто: читалки, git status·diff·log·show·add·commit, **`git push`
-  (переклассификация 02.07: приватный репо, откат = git revert)**, **`systemctl restart splinter` (02.07:
-  restart происходит ТОЛЬКО по «да» владельца в ТЗ + гейт + откат — терминальный prompt был двойным
-  вопросом)**, `venv/bin/python3 *` (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write
+  (переклассификация 02.07: приватный репо, откат = git revert)**, **`systemctl restart splinter`
+  (Q2 разблокирован 03.07 — критерий обкатки ступени 2 выполнен, 3 «тз:» подряд done без Termux вкл.
+  прод-фикс 3978a91: headless-CC по ходу «тз:» делает restart САМ оранжевым циклом — гейт `gate.py`
+  (только exit 0) → restart → проверка чистого старта (is-active=active + старт-лог splinter.log без
+  ошибок) → отчёт «нужен был restart — сделал, старт чистый»; при failed — откат на прошлый рабочий
+  коммит + restart; кнопка op=restart_splinter в 328 остаётся аварийным фоллбэком)**,
+  `venv/bin/python3 *` (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write
   рабочих каталогов. Prompt не появляется.
 - **ask (settings.json)** — красное всегда спрашивает: `sqlite3 *` (CLI), `clasp push|redeploy|deploy|run`,
   `systemctl stop` (вне задачи подозрителен), `sudo systemctl`. Hook НЕ обходит ask (ask>hook).
