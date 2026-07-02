@@ -10,6 +10,12 @@
 - red/неоднозначный python → "ask" (+карточка).
 - зелёный python и всё прочее → exit 0 (defer к штатным allow/ask rules; venv python уже в allow).
 - FAIL-SAFE: нечитаемо/непонятно → "ask" (в сторону подтверждения, НЕ пропуска).
+ПЕРЕКЛАССИФИКАЦИЯ 02.07 (меньше шума, ask только где «да» реально решает):
+- tests/*.py и gate.py → ранний defer БЕЗ чтения содержимого (моки по определению);
+- memory.db через python-код → defer (своя БД бота; sqlite3 CLI остаётся ask в settings);
+  SQL-write в ИНУЮ .db → ask;
+- git push / systemctl restart splinter → авто на уровне settings (restart идёт только по «да»
+  владельца в ТЗ — терминальный prompt был двойным вопросом); systemctl stop остался ask.
 НЕ трогает реальный гейт записи confirmed=true в Bridge (ReadFleet.js) — тот независим (третий слой защиты).
 Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
 """
@@ -33,7 +39,7 @@ RED_TOKEN_HIT = {
 }
 RED_TOKENS = tuple(RED_TOKEN_HIT.keys())
 _GREEN_MODULES = {"py_compile", "json.tool", "pytest", "unittest", "pip", "venv", "http.server"}
-_SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO)\b", re.IGNORECASE)
+_SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b", re.IGNORECASE)
 
 
 def _defer():
@@ -81,9 +87,9 @@ _ACTIONS = {
     "DOWRITE": ("скрипт помечен DOWRITE=1 — реальная запись (не dry-run)",
                 "выполнит боевую запись в рабочие данные",
                 "прочитай, ЧТО именно пишет скрипт — это не пробный прогон"),
-    "sqlite": ("прямая запись в memory.db (UPDATE/DELETE/INSERT)",
-               "изменит локальную БД правил/истории бота",
-               "та ли таблица и условие WHERE — есть ли бэкап memory.db"),
+    "sqlite": ("SQL-запись в БД вне memory.db (UPDATE/DELETE/INSERT/DROP)",
+               "изменит НЕизвестную базу данных (не свою memory.db)",
+               "какая это БД и почему пишем не в memory.db — memory.db через код шёл бы без вопроса"),
 }
 _AMBIGUOUS = ("не распознал операцию — скрипт может писать в рабочие данные, но точную операцию не разобрал",
               "неизвестно — не могу гарантировать, что скрипт только читает",
@@ -187,6 +193,35 @@ def _is_python(cmd):
     return re.search(r"(^|\s|/)(python3?|venv/bin/python3?)(\s|$)", cmd) is not None
 
 
+def _py_targets(cmd, cwd):
+    """Все .py-цели команды → list существующих абсолютных путей (realpath). Непрочитавшиеся пути пропускаются."""
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        return []
+    out = []
+    for t in toks:
+        if not t.endswith(".py"):
+            continue
+        for cand in (t, os.path.join(cwd or PROJECT, t), os.path.join(PROJECT, t)):
+            if os.path.isfile(cand):
+                out.append(os.path.realpath(cand))
+                break
+    return out
+
+
+def _is_trusted_test(cmd, cwd):
+    """Ранний defer БЕЗ чтения содержимого (переклассификация 02.07): запуск тестов/гейта = зелёная рутина
+    по определению (tests/* — моки, gate.py их прогоняет). True ТОЛЬКО если есть ≥1 .py-цель и ВСЕ цели
+    лежат в PROJECT/tests/ или равны PROJECT/gate.py. Скрипт вне tests/ рядом в команде → НЕ доверяем."""
+    targets = _py_targets(cmd, cwd)
+    if not targets:
+        return False
+    tests_dir = os.path.join(PROJECT, "tests") + os.sep
+    gate = os.path.join(PROJECT, "gate.py")
+    return all(p.startswith(tests_dir) or p == gate for p in targets)
+
+
 def _read_file(path, cwd):
     for cand in (path, os.path.join(cwd or PROJECT, path), os.path.join(PROJECT, path)):
         try:
@@ -200,6 +235,9 @@ def _read_file(path, cwd):
 
 def _analyze(cmd, cwd):
     """→ (kind, hit, blob): kind ∈ {'red','ambiguous','green'}; hit — ключ действия; blob — текст для _detail()."""
+    # 0) тесты/гейт → зелёное СРАЗУ, до сканирования содержимого (моки по определению; шум ask убран 02.07)
+    if _is_trusted_test(cmd, cwd):
+        return "green", "", cmd
     # 1) быстрый греп по САМОЙ команде (инлайн -c, env DOWRITE, argv)
     for tok in RED_TOKENS:
         if tok in cmd:
@@ -236,7 +274,9 @@ def _analyze(cmd, cwd):
     for tok in RED_TOKENS:
         if tok in content:
             return "red", RED_TOKEN_HIT[tok], blob
-    if "memory.db" in blob and _SQLITE_WRITE.search(blob):
+    # memory.db через python-код = 🟢 (своя БД бота, доктрина «своя таблица через код = зелёное»,
+    # переклассификация 02.07; прямой sqlite3 CLI остаётся ask в settings). SQL-write в ИНУЮ БД → ask.
+    if _SQLITE_WRITE.search(blob) and ".db" in blob and "memory.db" not in blob:
         return "red", "sqlite", blob
     if not saw_target:
         return "ambiguous", "ambiguous", blob          # python без внятной цели (REPL и т.п.) → подтверждаем

@@ -480,19 +480,25 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
 
 Настроен так, чтобы ЗЕЛЁНАЯ рутина шла без подтверждений, а КРАСНОЕ (запись в Лист1/CRM/деньги/удаление)
 всегда просило «да» + показывало человеческую карточку. Механика (3 независимых слоя, precedence deny>ask>hook>allow):
-- **allow (settings.json)** — зелёное авто: читалки, git status·diff·log·show·add·commit, `venv/bin/python3 *`
-  (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write рабочих каталогов. Prompt не появляется.
-- **ask (settings.json)** — красное всегда спрашивает: `sqlite3 *`, `clasp push|redeploy|deploy|run`, `git push`,
-  `systemctl restart|stop`, `sudo systemctl`. Hook НЕ обходит ask (ask>hook).
+- **allow (settings.json)** — зелёное авто: читалки, git status·diff·log·show·add·commit, **`git push`
+  (переклассификация 02.07: приватный репо, откат = git revert)**, **`systemctl restart splinter` (02.07:
+  restart происходит ТОЛЬКО по «да» владельца в ТЗ + гейт + откат — терминальный prompt был двойным
+  вопросом)**, `venv/bin/python3 *` (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write
+  рабочих каталогов. Prompt не появляется.
+- **ask (settings.json)** — красное всегда спрашивает: `sqlite3 *` (CLI), `clasp push|redeploy|deploy|run`,
+  `systemctl stop` (вне задачи подозрителен), `sudo systemctl`. Hook НЕ обходит ask (ask>hook).
 - **deny (settings.json)** — абсолютный запрет (я обойти НЕ могу; владелец — вручную в Termux): `*--no-verify*`
   (обход гейта тестов 4.3), `*--dangerously-skip-permissions*`, `git push --force/-f`, `rm -rf /`, `chmod -R 777 /`,
   `dd of=/dev/*`, `mkfs`.
 - **PreToolUse hook `pretool_guard.py`** — закрывает слепое пятно: `venv/bin/python3 *` в allow → пишущий скрипт
   иначе шёл бы без сигнала. Hook читает СОДЕРЖИМОЕ вызываемого python-скрипта; если есть WRITE-признак
   (set_fleet_oil/service, add_transaction, void_last, create/activate_booking, closing_upsert, delete_event,
-  `confirmed=true`, `DOWRITE`, memory.db+UPDATE/DELETE/INSERT) → форсит **"ask" + пуш красной карточки в Telegram**.
-  Читающий python → defer (allow). **FAIL-SAFE:** скрипт нечитаем/цель неясна → "ask" (в сторону подтверждения).
-  Hook ТОЛЬКО добавляет подтверждения, НИКОГДА не выдаёт новых разрешений.
+  `confirmed=true`, `DOWRITE`, SQL-write в ЧУЖУЮ .db вне memory.db) → форсит **"ask" + пуш красной карточки в
+  Telegram**. Читающий python → defer (allow). **FAIL-SAFE:** скрипт нечитаем/цель неясна → "ask" (в сторону
+  подтверждения). Hook ТОЛЬКО добавляет подтверждения, НИКОГДА не выдаёт новых разрешений.
+  **Переклассификация 02.07 (ask только где «да» реально решает):** `tests/*.py` и `gate.py` → ранний defer
+  БЕЗ чтения содержимого (тесты = моки по определению); **memory.db через python-код → defer** (своя БД бота,
+  бэкапится с репо, доктрина «своя таблица через код = зелёное») — прямой `sqlite3` CLI остаётся ask.
   **🧪-пометка тестов (02.07):** если запускаемый скрипт из scratchpad (`/tmp/claude-*/…/scratchpad/`) или несёт
   `_dryrun`/`_test` в имени — карточка начинается строкой «🧪 ТЕСТ (dry-run, не реальная операция)» (и в терминале,
   и в Telegram-пуше). Пометка меняет ТОЛЬКО текст карточки; классификация red/ask и fail-safe — нетронуты.

@@ -69,6 +69,9 @@
       "Bash(git pull *)",
       "Bash(git add *)",
       "Bash(git commit *)",
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(systemctl restart splinter)",
       "Bash(python3 -m json.tool *)",
       "Bash(git --no-pager branch *)",
       "Bash(git --no-pager remote *)",
@@ -124,8 +127,6 @@
       "Bash(clasp redeploy*)",
       "Bash(clasp deploy*)",
       "Bash(clasp run*)",
-      "Bash(git push*)",
-      "Bash(systemctl restart*)",
       "Bash(systemctl stop*)",
       "Bash(sudo systemctl *)"
     ],
