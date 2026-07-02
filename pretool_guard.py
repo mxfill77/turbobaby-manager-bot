@@ -139,13 +139,34 @@ def _detail(hit, blob):
     return " — " + ", ".join(bits) if bits else ""
 
 
-def _card(hit, blob=""):
+def _is_test_script(cmd):
+    """Тестовый прогон: запускаемый .py лежит в scratchpad (/tmp/claude-*/…/scratchpad/) или несёт
+    _dryrun/_test в имени. Влияет ТОЛЬКО на текст карточки (🧪-пометка первой строкой) — классификацию
+    red/ambiguous/green и решение ask/defer НЕ меняет. Боевые скрипты из репо — без пометки."""
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        toks = cmd.split()
+    for t in toks:
+        if not t.endswith(".py"):
+            continue
+        if "/tmp/claude-" in t and "/scratchpad/" in t:
+            return True
+        base = os.path.basename(t)
+        if "_dryrun" in base or "_test" in base:
+            return True
+    return False
+
+
+def _card(hit, blob="", test=False):
     if hit == "ambiguous" or hit not in _ACTIONS:
         what, cons, check = _AMBIGUOUS
     else:
         what, cons, check = _ACTIONS[hit]
         what += _detail(hit, blob)
-    return ("🔴 КРАСНОЕ\n"
+    head = "🧪 ТЕСТ (dry-run, не реальная операция)\n" if test else ""
+    return (head +
+            "🔴 КРАСНОЕ\n"
             "Что: " + what + "\n"
             "Последствия: " + cons + "\n"
             "Проверь: " + check + " — жду твоё «да».")
@@ -239,7 +260,7 @@ def main():
         kind, hit, blob = "ambiguous", "ambiguous", cmd  # любая ошибка анализа → fail-safe ask
     if kind == "green":
         _defer()                                       # читающий python → штатный allow (venv python в allow)
-    card = _card(hit, blob)
+    card = _card(hit, blob, _is_test_script(cmd))
     _push(card)
     _ask(card)
 
