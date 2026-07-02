@@ -273,7 +273,19 @@ async def cmd_o3board(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  getattr(u, "id", None), (getattr(u, "username", "") or "-"))
         return
     log.info("  → /o3board от владельца id=%s → пощу board просрочек (O3 ступень-1)", getattr(u, "id", None))
-    await splinter.o3_post_board(context, bridge)
+    stats = await splinter.o3_post_board(context, bridge)
+    # сводка-ответ владельцу (фикс «тишины» 02.07): повторный синк редактирует карточки НА МЕСТЕ,
+    # без ответа выглядел как молчание бота. Синк уже прошёл — сводка не должна его «уронить».
+    try:
+        m = update.effective_message
+        if m and isinstance(stats, dict):
+            note = (f"🐀 Splinter\n📋 Board синхронизирован: просрочек {stats.get('overdue', 0)}, "
+                    f"карточек {stats.get('cards', 0)}, новых {stats.get('new', 0)}, решено {stats.get('gone', 0)}.")
+            if not stats.get("new") and not stats.get("gone"):
+                note += "\nНовых сообщений нет — существующие карточки обновлены НА МЕСТЕ (они выше в ленте)."
+            await m.reply_text(note)
+    except Exception:
+        log.exception("  → /o3board: сводка владельцу не отправлена (синк прошёл)")
 
 
 # === HANDLERS ===

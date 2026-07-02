@@ -3570,7 +3570,7 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
     _O3_BOARD["chat"], _O3_BOARD["msg"] = target, header_mid   # для o3_task(board_chat/board_msg)
 
     # 2) карточки: существующая → editMessageText, новая → send (ровный темп против флуда)
-    shown = set()
+    shown, new_cnt = set(), 0
     for o in show:
         shown.add(o["plate"])
         text, kb = _o3_card_render(o, active)
@@ -3580,11 +3580,13 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
         else:
             msg = await _send_retry(context, chat_id=target, message_thread_id=topic,
                                     text=text, reply_markup=kb)
-            if msg is not None and _MEMORY:
-                try:
-                    _MEMORY.o3_card_set(target, o["plate"], msg.message_id)
-                except Exception:
-                    log.exception("  → O3 board: карточка не персистнулась")
+            if msg is not None:
+                new_cnt += 1
+                if _MEMORY:
+                    try:
+                        _MEMORY.o3_card_set(target, o["plate"], msg.message_id)
+                    except Exception:
+                        log.exception("  → O3 board: карточка не персистнулась")
         await asyncio.sleep(_O3_CARD_PAUSE)
 
     # 3) ушедшие из просрочки → «✅ решено» (след остаётся), msg_id забыть (новая просрочка = новая карточка)
@@ -3599,14 +3601,17 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
             except Exception:
                 log.exception("  → O3 board: карточка не забылась")
         await asyncio.sleep(_O3_CARD_PAUSE)
-    log.info(f"  → O3 board sync: просрочек={len(overdue)}, карточек={len(show)}, решено={len(gone)}, "
-             f"test={O3_TEST_MODE}, chat={target}, topic={topic}")
+    log.info(f"  → O3 board sync: просрочек={len(overdue)}, карточек={len(show)}, новых={new_cnt}, "
+             f"решено={len(gone)}, test={O3_TEST_MODE}, chat={target}, topic={topic}")
+    return {"overdue": len(overdue), "cards": len(show), "new": new_cnt, "gone": len(gone)}
 
 
 async def o3_post_board(context, bridge):
     """/o3board (owner): синк board «карточка-на-байк». ТЕСТ (O3_TEST_MODE) → HQ на реальном парке.
-    БОЕВОЙ → тема «Наряды» группы ОБСЛУЖИВАНИЯ. Повторный вызов дубли НЕ плодит (синк по o3_card)."""
-    await _o3_board_sync(context, bridge, allow_post_header=True)
+    БОЕВОЙ → тема «Наряды» группы ОБСЛУЖИВАНИЯ. Повторный вызов дубли НЕ плодит (синк по o3_card).
+    → stats {overdue,cards,new,gone} — для сводки-ответа владельцу (фикс «тишины» 02.07:
+    повторный синк = всё эдиты-на-месте, без сводки выглядел как молчание бота)."""
+    return await _o3_board_sync(context, bridge, allow_post_header=True)
 
 
 async def _o3_refresh_board(context, bridge):
@@ -3684,6 +3689,17 @@ def _o3_step_confirm(d, tok):
     return _bilingual(None, ["🔧 ตรวจสอบใบสั่งงาน:"] + th, ["🔧 Проверь наряд:"] + ru), InlineKeyboardMarkup(rows)
 
 
+async def _o3_answer(q, txt=None):
+    """q.answer() с защитой (урок обкатки №3, 02.07): колбэк, отлежавшийся в очереди за долгим
+    синком board (флуд-контроль на эдитах, обработка апдейтов последовательная), протухает —
+    BadRequest «Query is too old». Ack тогда невозможен, но ДЕЙСТВИЕ кнопки обязано выполниться;
+    раньше упавший q.answer валил весь хендлер → кнопки выглядели «мёртвыми»."""
+    try:
+        await q.answer(txt)
+    except Exception as e:
+        log.warning(f"  → O3 q.answer протух/упал (действие кнопки всё равно выполняю): {e}")
+
+
 async def _o3_edit(q, text, kb):
     """Заменить сообщение-конструктор следующим шагом (editMessageText + разделитель 🇹🇭/🇷🇺)."""
     try:
@@ -3733,7 +3749,7 @@ async def handle_o3_button(update, context, bridge):
     parts = (q.data or "").split(":")
     action = parts[1] if len(parts) > 1 else ""
     if action == "rescan":
-        await q.answer("🔄")
+        await _o3_answer(q, "🔄")
         try:   # кнопка 🔄 живёт ПОД заголовком → усыновить его msg_id (переживает рестарт бота)
             if _MEMORY and q.message:
                 _MEMORY.o3_card_set(q.message.chat.id, _O3_HEADER_KEY, q.message.message_id)
@@ -3744,11 +3760,11 @@ async def handle_o3_button(update, context, bridge):
     try:
         tok = int(parts[2])
     except Exception:
-        await q.answer()
+        await _o3_answer(q)
         return
     d = _O3_TOKENS.get(tok)
     if not d:
-        await q.answer()
+        await _o3_answer(q)
         try:
             await q.edit_message_text(_with_separator(_bilingual(None,
                 ["⚠️ ใบสั่งงานหมดอายุ (บอทรีสตาร์ท) กดอัปเดต board ใหม่ 🙏"],
@@ -3758,7 +3774,7 @@ async def handle_o3_button(update, context, bridge):
         return
 
     if action == "pick":                       # открыть конструктор НОВЫМ сообщением (board не трогаем)
-        await q.answer()
+        await _o3_answer(q)
         text, kb = _o3_step_vids(d, tok)
         await _send(context, chat_id=q.message.chat.id,
                     message_thread_id=getattr(q.message, "message_thread_id", None), text=text, reply_markup=kb)
@@ -3770,44 +3786,44 @@ async def handle_o3_button(update, context, bridge):
             d["kinds"].remove(kind)
         elif kind in d.get("overdue_kinds", []):
             d["kinds"].append(kind)
-        await q.answer()
+        await _o3_answer(q)
         text, kb = _o3_step_vids(d, tok)
         await _o3_edit(q, text, kb)
         return
 
     if action == "step" and len(parts) > 3 and parts[3] == "from":
         if not d.get("kinds"):
-            await q.answer("เลือกอย่างน้อย 1 งาน / Выбери хотя бы один вид")
+            await _o3_answer(q, "เลือกอย่างน้อย 1 งาน / Выбери хотя бы один вид")
             return
-        await q.answer()
+        await _o3_answer(q)
         text, kb = _o3_step_from(d, tok)
         await _o3_edit(q, text, kb)
         return
 
     if action == "from":
         d["from_where"] = parts[3] if len(parts) > 3 else "office"
-        await q.answer()
+        await _o3_answer(q)
         text, kb = _o3_step_when(d, tok)
         await _o3_edit(q, text, kb)
         return
 
     if action == "when":
         d["when"] = parts[3] if len(parts) > 3 else "now"
-        await q.answer()
+        await _o3_answer(q)
         text, kb = _o3_step_confirm(d, tok)
         await _o3_edit(q, text, kb)
         return
 
     if action == "send":
         if not (d.get("kinds") and d.get("from_where") and d.get("when")):
-            await q.answer("ใบสั่งงานยังไม่ครบ / Наряд не заполнен")
+            await _o3_answer(q, "ใบสั่งงานยังไม่ครบ / Наряд не заполнен")
             return
-        await q.answer("✅")
+        await _o3_answer(q, "✅")
         await _o3_do_send(q, context, bridge, tok, d)
         return
 
     if action == "back":                       # чистая отмена — ничего не отправлено
-        await q.answer("↩️ ยกเลิกแล้ว / Отменено")
+        await _o3_answer(q, "↩️ ยกเลิกแล้ว / Отменено")
         try:
             await q.edit_message_text(text=_with_separator(_bilingual(None,
                 ["↩️ ยกเลิกใบสั่งงาน"], ["↩️ Наряд отменён (ничего не отправлено)"])), reply_markup=None)
@@ -3815,7 +3831,7 @@ async def handle_o3_button(update, context, bridge):
             pass
         return
 
-    await q.answer()
+    await _o3_answer(q)
 
 
 def _aggregate_album_vis(vis_list):

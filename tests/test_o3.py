@@ -301,6 +301,32 @@ loop.run_until_complete(S.handle_o3_button(FakeUpd(qs14), ctx, BR()))
 res.append(ok(qs14.edits and "ใบสั่งงานหมดอายุ" in qs14.edits[0]["text"] and "устарел" in qs14.edits[0]["text"],
               "«наряд устарел»: TH-блок добавлен (двуязычно)"))
 
+# (15) фикс «/o3board молчит» (02.07): stats синка для сводки владельцу + протухший q.answer не валит кнопку
+print("(15) фикс «/o3board молчит»:")
+mem_f = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_f
+SENDS.clear()
+st1 = loop.run_until_complete(S.o3_post_board(ctx, BR()))
+res.append(ok(st1 == {"overdue": 2, "cards": 2, "new": 2, "gone": 0},
+              f"первый пост: stats {{overdue:2, cards:2, new:2, gone:0}} — {st1}"))
+n15 = len(SENDS)
+st2 = loop.run_until_complete(S.o3_post_board(ctx, BR()))
+res.append(ok(st2 and st2["new"] == 0 and st2["cards"] == 2 and len(SENDS) == n15,
+              f"повторный синк: new=0 (всё эдиты-на-месте, сводка честно скажет «обновлены на месте») — {st2}"))
+class DeadAnswerQ(FakeQ):   # колбэк протух за долгим синком (реальный кейс 20:19:49 02.07)
+    async def answer(s, txt=None):
+        raise Exception("Query is too old and response timeout expired or query id is invalid")
+tok15 = S._o3_put({"bike": "NMAX 155CC PHUKET 4255", "plate": "4255", "current_km": 30000,
+                   "overdue_kinds": ["oil", "abs"], "kinds": ["oil", "abs"], "from_where": None, "when": None})
+SENDS.clear()
+qd = DeadAnswerQ(f"o3:pick:{tok15}")
+loop.run_until_complete(S.handle_o3_button(FakeUpd(qd), ctx, BR()))
+res.append(ok(any("Выбери виды" in s["text"] for s in SENDS),
+              "протухший q.answer НЕ валит pick — конструктор всё равно открыт"))
+qd2 = DeadAnswerQ("o3:rescan", c=HQ)
+loop.run_until_complete(S.handle_o3_button(FakeUpd(qd2), ctx, BR()))
+res.append(ok(mem_f.o3_cards(HQ).get("__header__") == 555000,
+              "протухший q.answer НЕ валит rescan — заголовок усыновлён, синк прошёл"))
+
 asyncio.sleep = _orig_sleep
 loop.close()
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
