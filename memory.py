@@ -93,6 +93,14 @@ CREATE TABLE IF NOT EXISTS o3_task (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS o3_card (
+    board_chat INTEGER NOT NULL,      -- чат board (HQ в тесте / обслуживание в бою)
+    plate      TEXT NOT NULL,         -- номер байка; спец-ключ '__header__' = заголовок-счётчик board
+    msg_id     INTEGER NOT NULL,      -- id сообщения-карточки (editMessageText на rescan, без дублей)
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (board_chat, plate)
+);
 """
 
 
@@ -351,6 +359,37 @@ class Memory:
         finally:
             conn.close()
         return [dict(zip(self._O3_COLS, r)) for r in rows]
+
+    # === O3 board «карточка-на-байк»: msg_id карточек для editMessageText на rescan (без дублей) ===
+
+    def o3_card_set(self, board_chat, plate, msg_id):
+        """Запомнить/обновить msg_id карточки байка (или заголовка, plate='__header__') на board."""
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO o3_card (board_chat, plate, msg_id, updated_at) VALUES (?, ?, ?, ?)",
+                (int(board_chat), str(plate), int(msg_id), datetime.now().isoformat()))
+        finally:
+            conn.close()
+
+    def o3_cards(self, board_chat):
+        """Все карточки board-чата → {plate: msg_id} (вкл. '__header__')."""
+        conn = self._conn()
+        try:
+            rows = conn.execute("SELECT plate, msg_id FROM o3_card WHERE board_chat=?",
+                                (int(board_chat),)).fetchall()
+        finally:
+            conn.close()
+        return {str(p): int(m) for p, m in rows}
+
+    def o3_card_del(self, board_chat, plate):
+        """Забыть карточку (байк помечен «✅ решено» — новая просрочка получит НОВУЮ карточку)."""
+        conn = self._conn()
+        try:
+            conn.execute("DELETE FROM o3_card WHERE board_chat=? AND plate=?",
+                         (int(board_chat), str(plate)))
+        finally:
+            conn.close()
 
     # === Corrections ===
 

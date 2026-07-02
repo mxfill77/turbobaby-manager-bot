@@ -3362,11 +3362,22 @@ NARYADY_TOPIC = None                         # topic_id темы «🔧 Наря
                                              #   Задать ПОСЛЕ создания темы; None → board без темы (в тесте — HQ).
 _O3_TOKENS = {}                              # tok(int) -> draft {bike,plate,current_km,overdue_kinds,kinds,from_where,when}
 _O3_SEQ = [0]
-_O3_BOARD = {"chat": None, "msg": None}      # последнее board-сообщение (для editMessageText на rescan/после отправки)
+_O3_BOARD = {"chat": None, "msg": None}      # заголовок board (для o3_task board_chat/board_msg)
 
 _O3_FROM_LABEL = {"office": ("ที่ออฟฟิศ", "в офисе"), "client": ("ที่ลูกค้า", "у клиента"),
                   "area": ("ตามพื้นที่", "по району")}
 _O3_WHEN_LABEL = {"now": ("ตอนนี้", "сейчас"), "today": ("วันนี้", "сегодня")}
+
+_O3_CARD_CAP = 30      # предохранитель: карточек ≤ 30 (худшие сверху), остальное строкой в заголовке — не спамим тему
+_O3_CARD_PAUSE = 0.5   # сек между карточками — ровный темп против флуд-контроля (урок pin_info_all)
+_O3_HEADER_KEY = "__header__"                # plate-ключ заголовка board в memory.o3_card
+_O3_KIND_NOTE = {      # правило вида: kind → (TH, RU) ОБЯЗАТЕЛЬНАЯ строка в наряде (расширяемо: новый вид → пара строк)
+    "abs": ("⚠️ เปลี่ยนน้ำมัน ABS: ต้องทำความสะอาดกระบอกสูบด้วย",
+            "⚠️ При замене ABS: чистка цилиндров ОБЯЗАТЕЛЬНА"),
+}
+_O3_KIND_MARK = {      # kind → (TH, RU) КОРОТКАЯ пометка в карточке байка рядом со строкой вида
+    "abs": ("⚠️ ต้องล้างกระบอกสูบ", "⚠️ чистка цилиндров обязательна"),
+}
 
 
 def _o3_put(data):
@@ -3390,9 +3401,11 @@ def _o3_kind_th(kind):
 def _o3_overdue_scan(bridge):
     """Park-wide скан просрочек 4 обязательных ТО (масло/gear[скутер]/ABS/возд.фильтр). ЧТЕНИЕ+расчёт (🟢).
     fleet() (38 байков, *_last_km + mileage=colH) + service_list (current_km). Текущий пробег = max(colH,
-    service_list current_km). Просрочка: last>0 И next(=last+interval)−текущий ≤ 0. last≤0 → подсписок «нет
-    базы» (не делалось; НЕ автонаряд). Возврат {overdue:[{bike,plate,current_km,items:[{kind,last,next,over_km}]}]
-    (худшие сверху), nobase:[{bike,plate,kinds}]}."""
+    service_list current_km) — colH ненадёжен. Просрочка: last>0 И next(=last+interval)−текущий ≤ 0.
+    «НЕ ДЕЛАЛОСЬ» (last≤0) — задача ПО ФАКТУ ПОРОГА (доводка 02.07): показываем ТОЛЬКО когда текущий
+    пробег ≥ интервала вида (ABS 10000 / возд.фильтр 20000 / масло-редуктор от нуля) — item nobase=True,
+    next=интервал. Не дорос → не показываем; балласт-подсписок «нет базы» убран совсем.
+    Возврат {overdue:[{bike,plate,current_km,items:[{kind,last,next,over_km,nobase?}]}]} — худшие сверху."""
     def _i(x):
         try:
             return int(str(x).replace(" ", "").replace(",", ""))
@@ -3402,12 +3415,12 @@ def _o3_overdue_scan(bridge):
         bikes = ((bridge.fleet().get("data") or {}).get("bikes")) or []
     except Exception:
         log.exception("  → O3 scan: fleet упал")
-        return {"overdue": [], "nobase": []}
+        return {"overdue": []}
     try:
         svc = bridge.service_list().get("items", []) or []
     except Exception:
         svc = []
-    overdue, nobase = [], []
+    overdue = []
     for b in bikes:
         name = str(b.get("name") or "").strip()
         if not name:
@@ -3416,14 +3429,16 @@ def _o3_overdue_scan(bridge):
         cands = [_i(b.get("mileage"))] + [_i(r.get("current_km")) for r in svc if _same_bike(r.get("bike"), name)]
         cands = [c for c in cands if c and c > 0]
         cur = max(cands) if cands else 0
-        items, nb = [], []
+        items = []
         for kind in _MAND_KINDS:
             interval = _service_interval(kind, name, bridge)
             if interval is None:                  # gear на мото/XADV → не трекаем
                 continue
             last = _i(b.get(f"{kind}_last_km")) or 0
             if last <= 0:
-                nb.append(kind)                   # нет базы отсчёта
+                if cur >= int(interval):           # не делалось И пробег дорос до порога → пора
+                    items.append({"kind": kind, "last": 0, "next": int(interval),
+                                  "over_km": cur - int(interval), "nobase": True})
                 continue
             nxt = last + int(interval)
             if nxt - cur <= 0:                     # просрочено
@@ -3431,81 +3446,166 @@ def _o3_overdue_scan(bridge):
         if items:
             items.sort(key=lambda x: x["over_km"], reverse=True)
             overdue.append({"bike": name, "plate": plate, "current_km": cur, "items": items})
-        if nb:
-            nobase.append({"bike": name, "plate": plate, "kinds": nb})
     overdue.sort(key=lambda x: x["items"][0]["over_km"], reverse=True)   # худшие (макс over_km) сверху
-    return {"overdue": overdue, "nobase": nobase}
+    return {"overdue": overdue}
 
 
-def _o3_board_text(scan, active_plates):
-    """Текст board (RU+TH _bilingual): просрочки худшие сверху + подсписок «нет базы». active_plates —
-    номера байков с уже отправленным нарядом (пометка «✅ в наряде»)."""
-    ov = scan.get("overdue") or []
-    nb = scan.get("nobase") or []
-    th = ["🔧 ใบสั่งงาน — เลยกำหนดเซอร์วิส"]
-    ru = ["🔧 Наряды — просрочки ТО"]
-    if not ov:
+def _o3_card_render(o, active_plates):
+    """(text, kb|None) карточки ОДНОГО байка (доводка 02.07, как Delivery): шапка «⚠️ номер имя», просроченные
+    виды построчно («просрочено N км» / «❗ не делалось (пробег N ≥ порога, пора)»), короткая пометка вида
+    (_O3_KIND_MARK: ABS → чистка цилиндров). Байк в наряде → строка «✅ в наряде» и БЕЗ кнопки; иначе кнопка
+    [🔧 Собрать наряд] → тот же конструктор (o3:pick), flow дальше без изменений."""
+    plate, in_work = o["plate"], o["plate"] in active_plates
+    name = " ".join(w for w in str(o["bike"]).split() if w != plate) or o["bike"]   # номер вперёд, без дубля в имени
+    th = [f"⚠️ {plate} {name}"]
+    ru = [f"⚠️ {plate} {name}"]
+    for it in o["items"]:
+        lbl_th, lbl_ru = _MAND_LABEL.get(it["kind"], (str(it["kind"]), str(it["kind"])))
+        if it.get("nobase"):
+            th.append(f"{lbl_th} — ❗ ยังไม่เคยทำ (เลขไมล์ {o['current_km']} ≥ {it['next']} ถึงเวลาแล้ว)")
+            ru.append(f"{lbl_ru} — ❗ не делалось (пробег {o['current_km']} ≥ {it['next']}, пора)")
+        else:
+            th.append(f"{lbl_th} — เลยกำหนด {it['over_km']} กม.")
+            ru.append(f"{lbl_ru} — просрочено {it['over_km']} км")
+        mk = _O3_KIND_MARK.get(it["kind"])
+        if mk:
+            th[-1] += " · " + mk[0]
+            ru[-1] += " · " + mk[1]
+    kb = None
+    if in_work:
+        th.append("✅ ในใบสั่งงาน"); ru.append("✅ в наряде")
+    else:
+        tok = _o3_put({"bike": o["bike"], "plate": o["plate"], "current_km": o["current_km"],
+                       "overdue_kinds": [it["kind"] for it in o["items"]],
+                       "kinds": [it["kind"] for it in o["items"]],   # по умолчанию выбраны ВСЕ просроченные
+                       "from_where": None, "when": None})
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Собрать наряд", callback_data=f"o3:pick:{tok}")]])
+    return _bilingual(None, th, ru), kb
+
+
+def _o3_header_render(n_total, extra_plates):
+    """(text, kb) заголовка board: счётчик просрочек + [🔄 Обновить]; байки сверх капа карточек — строкой."""
+    th = [f"🔧 ใบสั่งงาน · เลยกำหนดเซอร์วิส · {n_total} คัน"]
+    ru = [f"🔧 Наряды · просрочки парка · {n_total} байков"]
+    if not n_total:
         th.append("ไม่มีรายการเลยกำหนด 👍"); ru.append("Просрочек нет 👍")
-    for o in ov:
-        mk_th = " · ✅ ในใบสั่งงาน" if o["plate"] in active_plates else ""
-        mk_ru = " · ✅ в наряде" if o["plate"] in active_plates else ""
-        th.append(f"⚠️ {o['plate']} — " + " · ".join(f"{_o3_kind_th(it['kind'])} {it['over_km']}กม." for it in o["items"]) + mk_th)
-        ru.append(f"⚠️ {o['plate']} {o['bike']} — " + " · ".join(f"{_o3_kind_ru(it['kind'])} {it['over_km']}км" for it in o["items"]) + mk_ru)
-    if nb:
-        th += ["", "❔ ไม่มีข้อมูลฐาน (ยังไม่เคยทำ):", ", ".join(x["plate"] for x in nb)]
-        ru += ["", "❔ Нет базы (не делалось):", ", ".join(x["plate"] for x in nb)]
-    return _bilingual(None, th, ru)
+    if extra_plates:
+        th.append(f"…อีก {len(extra_plates)} คัน: " + ", ".join(extra_plates))
+        ru.append(f"…ещё {len(extra_plates)} вне карточек: " + ", ".join(extra_plates))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="o3:rescan")]])
+    return _bilingual(None, th, ru), kb
 
 
-def _o3_build_board(bridge):
-    """Собрать (текст, клавиатура) board: скан + токены на просроченные байки (o3:pick). Общий для post и edit.
-    Байки с уже отправленным нарядом (o3_tasks_active) помечаются и БЕЗ кнопки."""
-    scan = _o3_overdue_scan(bridge)
+async def _o3_msg_edit(context, chat_id, msg_id, text, kb):
+    """editMessageText карточки/заголовка с ретраем на флуд-контроль (RetryAfter). «Message is not
+    modified» = текст не поменялся с прошлого rescan — норма, не ошибка. → True/False (обновлено ли)."""
+    import asyncio
+    from telegram.error import RetryAfter
+    for i in range(3):
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
+                                                 text=_with_separator(text), reply_markup=kb)
+            return True
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", 1) + 1
+            log.warning(f"  → O3 card edit: флуд-контроль (RetryAfter), попытка {i + 1}/3, ждём {wait}s")
+            await asyncio.sleep(wait)
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return True
+            log.warning(f"  → O3 card edit упал (msg={msg_id}): {e}")
+            return False
+    return False
+
+
+async def _o3_board_sync(context, bridge, allow_post_header=True):
+    """СИНК board «карточка-на-байк» (доводка 02.07): заголовок-счётчик + каждый просроченный байк —
+    СВОЁ сообщение-карточка со СВОЕЙ кнопкой (как Delivery). Повторные вызовы (🔄 rescan / повторный
+    /o3board / после отправки наряда) дубли НЕ плодят: msg_id карточек в memory.db o3_card →
+    существующие обновляются editMessageText, новые просрочки досылаются, ушедшие из просрочки
+    помечаются «✅ решено» (след остаётся, msg_id забывается), байк в наряде — «✅ в наряде» без кнопки.
+    Троттл _O3_CARD_PAUSE между карточками + _send_retry (RetryAfter) — урок pin_info_all.
+    Предохранитель: карточек ≤ _O3_CARD_CAP (худшие сверху), остальное строкой в заголовке.
+    Скан/хранение 🟢, постинг 🟠. Лист1/CRM/касса/state_set НЕ трогаем."""
+    import asyncio
+    target = O3_TEST_CHAT_ID if O3_TEST_MODE else SERVICING_CHAT
+    topic = None if O3_TEST_MODE else NARYADY_TOPIC
+    overdue = _o3_overdue_scan(bridge).get("overdue") or []
     active = set()
     try:
         active = {str(t.get("plate")) for t in (_MEMORY.o3_tasks_active() if _MEMORY else [])}
     except Exception:
         log.exception("  → O3 board: активные наряды не прочитаны")
-    text = _o3_board_text(scan, active)
-    rows = []
-    for o in (scan.get("overdue") or []):
-        if o["plate"] in active:
-            continue                          # уже в наряде — без кнопки
-        tok = _o3_put({"bike": o["bike"], "plate": o["plate"], "current_km": o["current_km"],
-                       "overdue_kinds": [it["kind"] for it in o["items"]],
-                       "kinds": [it["kind"] for it in o["items"]],   # по умолчанию выбраны ВСЕ просроченные
-                       "from_where": None, "when": None})
-        rows.append([InlineKeyboardButton(f"🔧 {o['plate']} {o['bike']}"[:64], callback_data=f"o3:pick:{tok}")])
-        if len(rows) >= 20:                   # cap кнопок (пагинация — ступень 2)
-            break
-    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="o3:rescan")])
-    return text, InlineKeyboardMarkup(rows)
+    cards = {}
+    try:
+        cards = dict(_MEMORY.o3_cards(target)) if _MEMORY else {}
+    except Exception:
+        log.exception("  → O3 board: карточки из memory.db не прочитаны")
+    header_mid = cards.pop(_O3_HEADER_KEY, None)
+
+    # показываем топ-CAP худших + ВСЕ байки, у кого карточка уже висит (их продолжаем обновлять)
+    show = [o for i, o in enumerate(overdue) if i < _O3_CARD_CAP or o["plate"] in cards]
+    extra = [o["plate"] for i, o in enumerate(overdue) if i >= _O3_CARD_CAP and o["plate"] not in cards]
+
+    # 1) заголовок: edit существующего / новый (только при allow_post_header)
+    htext, hkb = _o3_header_render(len(overdue), extra)
+    if header_mid:
+        await _o3_msg_edit(context, target, header_mid, htext, hkb)
+    elif allow_post_header:
+        msg = await _send_retry(context, chat_id=target, message_thread_id=topic, text=htext, reply_markup=hkb)
+        if msg is not None:
+            header_mid = msg.message_id
+            if _MEMORY:
+                try:
+                    _MEMORY.o3_card_set(target, _O3_HEADER_KEY, header_mid)
+                except Exception:
+                    log.exception("  → O3 board: заголовок не персистнулся")
+    _O3_BOARD["chat"], _O3_BOARD["msg"] = target, header_mid   # для o3_task(board_chat/board_msg)
+
+    # 2) карточки: существующая → editMessageText, новая → send (ровный темп против флуда)
+    shown = set()
+    for o in show:
+        shown.add(o["plate"])
+        text, kb = _o3_card_render(o, active)
+        mid = cards.get(o["plate"])
+        if mid:
+            await _o3_msg_edit(context, target, mid, text, kb)
+        else:
+            msg = await _send_retry(context, chat_id=target, message_thread_id=topic,
+                                    text=text, reply_markup=kb)
+            if msg is not None and _MEMORY:
+                try:
+                    _MEMORY.o3_card_set(target, o["plate"], msg.message_id)
+                except Exception:
+                    log.exception("  → O3 board: карточка не персистнулась")
+        await asyncio.sleep(_O3_CARD_PAUSE)
+
+    # 3) ушедшие из просрочки → «✅ решено» (след остаётся), msg_id забыть (новая просрочка = новая карточка)
+    gone = [(p, m) for p, m in cards.items() if p not in shown]
+    for plate, mid in gone:
+        done = _bilingual(None, [f"✅ {plate} — เรียบร้อยแล้ว ไม่มีงานเลยกำหนด"],
+                          [f"✅ {plate} — решено, просрочек нет"])
+        await _o3_msg_edit(context, target, mid, done, None)
+        if _MEMORY:
+            try:
+                _MEMORY.o3_card_del(target, plate)
+            except Exception:
+                log.exception("  → O3 board: карточка не забылась")
+        await asyncio.sleep(_O3_CARD_PAUSE)
+    log.info(f"  → O3 board sync: просрочек={len(overdue)}, карточек={len(show)}, решено={len(gone)}, "
+             f"test={O3_TEST_MODE}, chat={target}, topic={topic}")
 
 
 async def o3_post_board(context, bridge):
-    """Пост board НОВЫМ сообщением. ТЕСТ (O3_TEST_MODE) → HQ на реальном парке. БОЕВОЙ → тема «Наряды»
-    группы ОБСЛУЖИВАНИЯ. Вызов: /o3board (owner) для ручного репоста."""
-    target = O3_TEST_CHAT_ID if O3_TEST_MODE else SERVICING_CHAT
-    topic = None if O3_TEST_MODE else NARYADY_TOPIC
-    text, kb = _o3_build_board(bridge)
-    msg = await _send(context, chat_id=target, message_thread_id=topic, text=text, reply_markup=kb)
-    if msg is not None:
-        _O3_BOARD["chat"] = target
-        _O3_BOARD["msg"] = msg.message_id
-    log.info(f"  → O3 board запощен (test={O3_TEST_MODE}, chat={target}, topic={topic})")
-    return msg
+    """/o3board (owner): синк board «карточка-на-байк». ТЕСТ (O3_TEST_MODE) → HQ на реальном парке.
+    БОЕВОЙ → тема «Наряды» группы ОБСЛУЖИВАНИЯ. Повторный вызов дубли НЕ плодит (синк по o3_card)."""
+    await _o3_board_sync(context, bridge, allow_post_header=True)
 
 
 async def _o3_refresh_board(context, bridge):
-    """Перерисовать существующий board (editMessageText по _O3_BOARD) — на rescan и после отправки наряда."""
-    if not _O3_BOARD.get("msg"):
-        return
-    text, kb = _o3_build_board(bridge)
-    try:
-        await context.bot.edit_message_text(chat_id=_O3_BOARD["chat"], message_id=_O3_BOARD["msg"],
-                                             text=_with_separator(text), reply_markup=kb)
-    except Exception as e:
-        log.warning(f"  → O3 board refresh упал: {e}")
+    """Обновить карточки после события (🔄 rescan / отправка наряда): тот же синк, но новый заголовок
+    НЕ постим (не спамить, если board ещё не поднимали)."""
+    await _o3_board_sync(context, bridge, allow_post_header=False)
 
 
 def _o3_from_ru(d): return _O3_FROM_LABEL.get(d.get("from_where"), ("", ""))[1]
@@ -3515,11 +3615,18 @@ def _o3_when_th(d): return _O3_WHEN_LABEL.get(d.get("when"), ("", ""))[0]
 
 
 def _o3_naryad_lines(d):
-    """Строки наряда без шапки — (th_lines, ru_lines): байк · работы · откуда · когда."""
-    kinds_th = ", ".join(_o3_kind_th(k) for k in d.get("kinds", []))
-    kinds_ru = ", ".join(_o3_kind_ru(k) for k in d.get("kinds", []))
+    """Строки наряда без шапки — (th_lines, ru_lines): байк · работы · откуда · когда. Выбран вид с
+    обязательной пометкой (_O3_KIND_NOTE: ABS → чистка цилиндров) → строка добавляется АВТОМАТИЧЕСКИ (RU+TH)."""
+    kinds = d.get("kinds", [])
+    kinds_th = ", ".join(_o3_kind_th(k) for k in kinds)
+    kinds_ru = ", ".join(_o3_kind_ru(k) for k in kinds)
     th = [f"{d['bike']}", f"งาน: {kinds_th}", f"รับรถ: {_o3_from_th(d)}", f"เมื่อไร: {_o3_when_th(d)}"]
     ru = [f"{d['bike']}", f"работы: {kinds_ru}", f"забрать: {_o3_from_ru(d)}", f"когда: {_o3_when_ru(d)}"]
+    for k in kinds:
+        note = _O3_KIND_NOTE.get(k)
+        if note:
+            th.append(note[0])
+            ru.append(note[1])
     return th, ru
 
 
@@ -3616,6 +3723,11 @@ async def handle_o3_button(update, context, bridge):
     action = parts[1] if len(parts) > 1 else ""
     if action == "rescan":
         await q.answer("🔄")
+        try:   # кнопка 🔄 живёт ПОД заголовком → усыновить его msg_id (переживает рестарт бота)
+            if _MEMORY and q.message:
+                _MEMORY.o3_card_set(q.message.chat.id, _O3_HEADER_KEY, q.message.message_id)
+        except Exception:
+            log.exception("  → O3 rescan: заголовок не усыновлён")
         await _o3_refresh_board(context, bridge)
         return
     try:

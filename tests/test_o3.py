@@ -1,15 +1,19 @@
-"""Моки O3 ступень 1: park-scan просрочек → o3_task CRUD → конструктор наряда (pick→vid→from→when→send) →
-наряд RU+TH → board refresh → back-отмена. Боевых тайцев/Telegram/Лист1 нет — всё мокнуто."""
+"""Моки O3 ступень 1 (доводка 02.07): скан с порогом «не делалось» (балласт убран) → o3_task/o3_card CRUD →
+board «карточка-на-байк» (заголовок+счётчик, карточка+кнопка, троттл/RetryAfter, rescan без дублей,
+«✅ в наряде»/«✅ решено», кап 30) → ABS-пометка (карточка+наряд) → конструктор-регресс (pick→vid→from→when→send).
+Боевых тайцев/Telegram/Лист1 нет — всё мокнуто."""
 import os, sys, asyncio, tempfile
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 import splinter as S
 import memory as M
+from telegram.error import RetryAfter
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []; loop = asyncio.new_event_loop()
+HQ = S.O3_TEST_CHAT_ID
 
-# --- mock bridge для скана: knowledge_base fail → фоллбэк-интервалы (oil ск4000/мо5000, gear ск4000/мо None, abs 10000, air 20000)
+# --- mock bridge: knowledge_base fail → фоллбэк-интервалы (oil ск4000/мо5000, gear ск4000/мо None, abs 10000, air 20000)
 class BR:
     def _call(s, a, **k): return {"ok": False}
     def fleet(s): return {"data": {"bikes": [
@@ -24,36 +28,40 @@ class BR:
         {"bike": "NMAX 155CC PHUKET 4255", "current_km": 30000},   # выше colH(3000) → max=30000 (тест max)
     ]}
 
-# (1) скан просрочек
-scan = S._o3_overdue_scan(BR()); ov = scan["overdue"]; nb = scan["nobase"]
-print("(1) _o3_overdue_scan:")
-res.append(ok(len(ov) == 2, f"2 байка с просрочками (NINJA+NMAX) — {len(ov)}"))
-res.append(ok("NINJA" in ov[0]["bike"] and ov[0]["items"][0]["kind"] == "airfilter" and ov[0]["items"][0]["over_km"] == 10000,
-              "худший сверху: NINJA airfilter over 10000"))
-res.append(ok("NMAX" in ov[1]["bike"] and ov[1]["current_km"] == 30000, "NMAX второй; текущий=max(colH,service_list)=30000"))
-nm = [o for o in ov if "NMAX" in o["bike"]][0]; kinds_nm = [it["kind"] for it in nm["items"]]
-res.append(ok(set(kinds_nm) == {"oil", "airfilter"} and "gear" not in kinds_nm, "NMAX: oil+airfilter просрочены, gear НЕ (rem>0)"))
+# (1) скан: просрочки + порог «не делалось» (по факту), балласт-подсписок отсутствует
+print("(1) _o3_overdue_scan (порог nobase):")
+scan = S._o3_overdue_scan(BR()); ov = scan["overdue"]
+res.append(ok("nobase" not in scan, "балласт-подсписок «нет базы» убран из скана"))
+res.append(ok(len(ov) == 2, f"2 байка с просрочками (NMAX+NINJA), PCX нет — {len(ov)}"))
+res.append(ok(not any("PCX" in o["bike"] for o in ov), "PCX: abs/air не делались, пробег 5000 < порогов → НЕ показан"))
+nm = [o for o in ov if "NMAX" in o["bike"]][0]
+res.append(ok(nm["current_km"] == 30000, "NMAX текущий=max(colH,service_list)=30000"))
+res.append(ok(ov[0] is nm and nm["items"][0]["kind"] == "abs" and nm["items"][0].get("nobase") is True
+              and nm["items"][0]["next"] == 10000 and nm["items"][0]["over_km"] == 20000,
+              "NMAX первый: ABS не делалось, пробег 30000 ≥ 10000 → nobase-просрочка (порог=10000)"))
+res.append(ok([it["kind"] for it in nm["items"]] == ["abs", "airfilter", "oil"], "NMAX: abs>airfilter>oil (по over_km)"))
 ninja = [o for o in ov if "NINJA" in o["bike"]][0]
+res.append(ok([it["kind"] for it in ninja["items"]] == ["airfilter", "abs"]
+              and not any(it.get("nobase") for it in ninja["items"]), "NINJA: airfilter+abs просрочены (база есть)"))
 res.append(ok("gear" not in [it["kind"] for it in ninja["items"]], "NINJA мото: gear пропущен (interval None)"))
-res.append(ok(any("PCX" in x["bike"] for x in nb) and any("NMAX" in x["bike"] for x in nb), "nobase: PCX (abs+air) и NMAX (abs)"))
-res.append(ok(not any("NINJA" in x["bike"] for x in nb), "NINJA не в nobase (база есть)"))
 
-# (2) o3_task CRUD round-trip
-print("(2) o3_task CRUD:")
+# (2) o3_task + o3_card CRUD
+print("(2) o3_task + o3_card CRUD:")
 mem = M.Memory(db_path=tempfile.mktemp(suffix=".db"))
 tid = mem.o3_task_create(bike="NMAX 4255", plate="4255", kinds="oil,airfilter", from_where="office",
                          when_slot="now", status="sent", delivery_msg_id=555)
 g = mem.o3_task_get(tid)
 res.append(ok(g and g["bike"] == "NMAX 4255" and g["kinds"] == "oil,airfilter" and g["status"] == "sent"
-              and g["delivery_msg_id"] == 555, "create+get round-trip"))
+              and g["delivery_msg_id"] == 555, "o3_task create+get round-trip"))
 mem.o3_task_update(tid, status="new")
-res.append(ok(mem.o3_task_get(tid)["status"] == "new", "update меняет status"))
-mem.o3_task_create(bike="X", plate="9", kinds="abs", status="sent")
-act = mem.o3_tasks_active()
-res.append(ok(len(act) == 1 and act[0]["plate"] == "9", "o3_tasks_active вернул только sent (tid→new исключён)"))
+res.append(ok(mem.o3_task_get(tid)["status"] == "new", "o3_task update меняет status"))
+mem.o3_card_set(HQ, "4255", 700); mem.o3_card_set(HQ, "4255", 701); mem.o3_card_set(HQ, "__header__", 699)
+res.append(ok(mem.o3_cards(HQ) == {"4255": 701, "__header__": 699}, "o3_card set перезаписывает, o3_cards читает"))
+mem.o3_card_del(HQ, "4255")
+res.append(ok("4255" not in mem.o3_cards(HQ), "o3_card_del забывает карточку"))
 
-# --- фейки Telegram для конструктора ---
-SENDS = []; EDITS = []; _MID = [7000]
+# --- фейки Telegram ---
+SENDS = []; EDITS = []; SLEEPS = []; _MID = [7000]
 class FakeSent:
     def __init__(s, m): s.message_id = m
 class FakeBot:
@@ -64,7 +72,7 @@ class FakeCtx:
 class FakeChat:
     def __init__(s, c): s.id = c
 class FakeMsg:
-    def __init__(s, c, t): s.chat = FakeChat(c); s.message_thread_id = t
+    def __init__(s, c, t): s.chat = FakeChat(c); s.message_thread_id = t; s.message_id = 555000
 class FakeQ:
     def __init__(s, data, c=-100, t=None):
         s.data = data; s.message = FakeMsg(c, t); s.answers = []; s.edits = []
@@ -73,23 +81,123 @@ class FakeQ:
     async def edit_message_text(s, text=None, reply_markup=None, **kw): s.edits.append({"text": text, "kb": reply_markup})
 class FakeUpd:
     def __init__(s, q): s.callback_query = q
+FAIL_AT = set()   # номера ПОПЫТОК отправки, падающих RetryAfter (эмуляция флуд-контроля)
+_ATT = [0]
 async def rec_send(context, *, chat_id, text, message_thread_id=None, bilingual=True, reply_markup=None, **kw):
+    _ATT[0] += 1
+    if _ATT[0] in FAIL_AT:
+        raise RetryAfter(0)
     _MID[0] += 1; SENDS.append({"chat": chat_id, "topic": message_thread_id, "text": text, "kb": reply_markup})
     return FakeSent(_MID[0])
 S._send = rec_send
-S._MEMORY = mem
+_orig_sleep = asyncio.sleep
+async def _fake_sleep(t): SLEEPS.append(t)
+asyncio.sleep = _fake_sleep   # троттл/ретрай мгновенно; вызовы записываются (восстановим в конце)
 
-# (3) конструктор: pick → vid тоггл → from → when → send
-print("(3) конструктор наряда:")
-tok = S._o3_put({"bike": "NMAX 155CC PHUKET 4255", "plate": "4255", "current_km": 30000,
-                 "overdue_kinds": ["oil", "airfilter"], "kinds": ["oil", "airfilter"], "from_where": None, "when": None})
+def btn(kb): return kb.inline_keyboard[0][0] if kb else None
+
+# (3) board «карточка-на-байк»: заголовок+счётчик+🔄, карточка+кнопка, троттл
+print("(3) board карточка-на-байк:")
+mem_b = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_b
 ctx = FakeCtx()
+loop.run_until_complete(S.o3_post_board(ctx, BR()))
+res.append(ok(len(SENDS) == 3, f"заголовок + 2 карточки = 3 сообщения — {len(SENDS)}"))
+hdr = [s for s in SENDS if "Наряды · просрочки парка" in s["text"]]
+res.append(ok(len(hdr) == 1 and "· 2 байков" in hdr[0]["text"], "заголовок с counter «просрочки парка · 2 байков»"))
+res.append(ok(hdr and btn(hdr[0]["kb"]).callback_data == "o3:rescan", "заголовок с кнопкой [🔄 Обновить] (o3:rescan)"))
+card_nm = [s for s in SENDS if "⚠️ 4255" in s["text"]]
+res.append(ok(len(card_nm) == 1, "NMAX = своё сообщение-карточка"))
+res.append(ok(card_nm and "ABS — ❗ не делалось (пробег 30000 ≥ 10000, пора)" in card_nm[0]["text"],
+              "строка «не делалось (пробег ≥ порога, пора)» в карточке"))
+res.append(ok(card_nm and "Возд. фильтр — просрочено 5000 км" in card_nm[0]["text"], "строка «просрочено N км»"))
+res.append(ok(card_nm and btn(card_nm[0]["kb"]).text == "🔧 Собрать наряд"
+              and btn(card_nm[0]["kb"]).callback_data.startswith("o3:pick:"), "кнопка [🔧 Собрать наряд] → o3:pick"))
+cards_db = mem_b.o3_cards(HQ)
+res.append(ok(set(cards_db) == {"__header__", "4255", "6334"}, "msg_id заголовка и карточек в memory.db o3_card"))
+res.append(ok(SLEEPS.count(S._O3_CARD_PAUSE) >= 2, f"троттл {S._O3_CARD_PAUSE}с между карточками"))
+
+# (4) rescan: existing → editMessageText, дублей нет
+print("(4) rescan без дублей:")
+n_sends = len(SENDS); EDITS.clear()
+loop.run_until_complete(S._o3_refresh_board(ctx, BR()))
+res.append(ok(len(SENDS) == n_sends, "повторный синк НЕ шлёт новых сообщений (нет дублей)"))
+res.append(ok(len(EDITS) == 3 and {e["message_id"] for e in EDITS} == set(cards_db.values()),
+              "заголовок + обе карточки обновлены editMessageText"))
+
+# (5) байк ушёл в наряд → карточка «✅ в наряде» без кнопки
+print("(5) пометка «в наряде»:")
+mem_b.o3_task_create(bike="NMAX 155CC PHUKET 4255", plate="4255", kinds="abs", status="sent")
+EDITS.clear()
+loop.run_until_complete(S._o3_refresh_board(ctx, BR()))
+e_nm = [e for e in EDITS if e["message_id"] == cards_db["4255"]]
+res.append(ok(e_nm and "✅ в наряде" in e_nm[0]["text"] and e_nm[0].get("reply_markup") is None,
+              "карточка 4255 → «✅ в наряде», кнопка убрана"))
+
+# (6) байк ушёл из просрочки → «✅ решено» (след остаётся), msg_id забыт
+print("(6) пометка «решено»:")
+class BR2(BR):   # NMAX обслужили (база свежая), NINJA всё ещё просрочен
+    def fleet(s): return {"data": {"bikes": [
+        {"name": "NMAX 155CC PHUKET 4255", "status": "ДОМА", "mileage": 3000,
+         "oil_last_km": 30000, "gear_last_km": 30000, "abs_last_km": 30000, "airfilter_last_km": 30000},
+        {"name": "NINJA 400CC PHUKET 6334", "status": "ДОМА", "mileage": 40000,
+         "oil_last_km": 38000, "gear_last_km": 0, "abs_last_km": 25000, "airfilter_last_km": 10000},
+    ]}}
+EDITS.clear()
+loop.run_until_complete(S._o3_refresh_board(ctx, BR2()))
+e_done = [e for e in EDITS if e["message_id"] == cards_db["4255"]]
+res.append(ok(e_done and "✅ 4255 — решено, просрочек нет" in e_done[0]["text"], "карточка 4255 → «✅ решено»"))
+left = mem_b.o3_cards(HQ)
+res.append(ok("4255" not in left and "6334" in left, "msg_id решённого забыт, NINJA остался"))
+res.append(ok(any("· 1 байков" in e.get("text", "") for e in EDITS), "заголовок-счётчик обновился (2 → 1)"))
+
+# (7) 35 просрочек: кап 30 карточек + хвост в заголовке + RetryAfter-ретрай → все доставлены
+print("(7) кап 30 + троттл/RetryAfter на потоке карточек:")
+class BR35:
+    def _call(s, a, **k): return {"ok": False}
+    def fleet(s): return {"data": {"bikes": [
+        {"name": f"NMAX 155CC PHUKET {5100 + i}", "status": "ДОМА", "mileage": 20000 + i * 10,
+         "oil_last_km": 1000, "gear_last_km": 19000, "abs_last_km": 15000, "airfilter_last_km": 5000}
+        for i in range(35)]}}
+    def service_list(s): return {"items": []}
+mem_c = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_c
+SENDS.clear(); SLEEPS.clear(); _ATT[0] = 0
+FAIL_AT.update({4, 12, 25})   # три отправки ловят флуд-контроль с первой попытки
+loop.run_until_complete(S.o3_post_board(ctx, BR35()))
+FAIL_AT.clear()
+res.append(ok(len(SENDS) == 31, f"кап: заголовок + 30 карточек (не 35) — {len(SENDS)}"))
+hdr35 = [s for s in SENDS if "Наряды · просрочки парка · 35 байков" in s["text"]]
+res.append(ok(bool(hdr35), "counter=35 в заголовке"))
+res.append(ok(hdr35 and "…ещё 5 вне карточек: " in hdr35[0]["text"] and "5100" in hdr35[0]["text"],
+              "хвост сверх капа — строкой в заголовке (5 худших НЕ потеряны)"))
+res.append(ok(len(mem_c.o3_cards(HQ)) == 31, "все 30 карточек + заголовок персистнуты (RetryAfter пережит)"))
+res.append(ok(SLEEPS.count(S._O3_CARD_PAUSE) >= 30 and any(t >= 1 for t in SLEEPS),
+              "троттл на каждой карточке + ожидание окна RetryAfter"))
+
+# (8) ABS → чистка цилиндров: пометка в карточке + обязательная строка в наряде (RU+TH)
+print("(8) ABS-правило:")
+res.append(ok("⚠️ чистка цилиндров обязательна" in card_nm[0]["text"]
+              and "ล้างกระบอกสูบ" in card_nm[0]["text"], "карточка: короткая пометка у строки ABS (RU+TH)"))
+d_abs = {"bike": "NMAX 155CC PHUKET 4255", "plate": "4255", "kinds": ["abs", "oil"],
+         "from_where": "office", "when": "now"}
+th_l, ru_l = S._o3_naryad_lines(d_abs)
+res.append(ok("⚠️ При замене ABS: чистка цилиндров ОБЯЗАТЕЛЬНА" in ru_l
+              and "⚠️ เปลี่ยนน้ำมัน ABS: ต้องทำความสะอาดกระบอกสูบด้วย" in th_l, "наряд с ABS: строка чистки RU+TH"))
+th_n, ru_n = S._o3_naryad_lines({**d_abs, "kinds": ["oil"]})
+res.append(ok(not any("ABS" in x for x in ru_n) and not any("กระบอกสูบ" in x for x in th_n),
+              "наряд без ABS: строки чистки НЕТ"))
+
+# (9) конструктор-регресс: pick → vid тоггл → from → when → send (flow не тронут)
+print("(9) конструктор наряда (регресс):")
+S._MEMORY = mem_b
+tok = S._o3_put({"bike": "NMAX 155CC PHUKET 4255", "plate": "4255", "current_km": 30000,
+                 "overdue_kinds": ["oil", "abs"], "kinds": ["oil", "abs"], "from_where": None, "when": None})
+SENDS.clear()
 q = FakeQ(f"o3:pick:{tok}")
 loop.run_until_complete(S.handle_o3_button(FakeUpd(q), ctx, BR()))
 res.append(ok(any("Выбери виды" in s["text"] for s in SENDS), "pick → конструктор (выбор видов) новым сообщением"))
 q2 = FakeQ(f"o3:vid:{tok}:oil")
 loop.run_until_complete(S.handle_o3_button(FakeUpd(q2), ctx, BR()))
-res.append(ok(S._O3_TOKENS[tok]["kinds"] == ["airfilter"], "vid тоггл снял oil (осталось airfilter)"))
+res.append(ok(S._O3_TOKENS[tok]["kinds"] == ["abs"], "vid тоггл снял oil (остался abs)"))
 q3 = FakeQ(f"o3:step:{tok}:from")
 loop.run_until_complete(S.handle_o3_button(FakeUpd(q3), ctx, BR()))
 res.append(ok(any("Откуда" in e["text"] for e in q3.edits), "step:from → шаг «откуда»"))
@@ -98,31 +206,26 @@ loop.run_until_complete(S.handle_o3_button(FakeUpd(q4), ctx, BR()))
 res.append(ok(S._O3_TOKENS[tok]["from_where"] == "office" and any("Когда" in e["text"] for e in q4.edits), "from=office → шаг «когда»"))
 q5 = FakeQ(f"o3:when:{tok}:now")
 loop.run_until_complete(S.handle_o3_button(FakeUpd(q5), ctx, BR()))
-res.append(ok(S._O3_TOKENS[tok]["when"] == "now" and any("Проверь наряд" in e["text"] for e in q5.edits), "when=now → предпросмотр наряда"))
+res.append(ok(S._O3_TOKENS[tok]["when"] == "now" and any("Проверь наряд" in e["text"] for e in q5.edits), "when=now → предпросмотр"))
 
-# (4) send → наряд в доставки RU+TH + o3_task + подтверждение
-print("(4) отправка наряда:")
+# (10) send: наряд RU+TH с ABS-строкой + o3_task + подтверждение
+print("(10) отправка наряда (с ABS):")
 SENDS.clear()
 q6 = FakeQ(f"o3:send:{tok}")
 loop.run_until_complete(S.handle_o3_button(FakeUpd(q6), ctx, BR()))
 naryad = [s for s in SENDS if "Наряд на ТО" in s["text"]]
-res.append(ok(len(naryad) == 1, "send → наряд запощен в доставки (1 сообщение)"))
-res.append(ok("работы: Возд. фильтр" in naryad[0]["text"] and "забрать: в офисе" in naryad[0]["text"]
+res.append(ok(len(naryad) == 1, "send → наряд запощен (1 сообщение)"))
+res.append(ok("работы: ABS" in naryad[0]["text"] and "забрать: в офисе" in naryad[0]["text"]
               and "когда: сейчас" in naryad[0]["text"], "текст наряда RU: работы/откуда/когда"))
-res.append(ok("งาน: ไส้กรองอากาศ" in naryad[0]["text"] and "รับรถ: ที่ออฟฟิศ" in naryad[0]["text"] and "เมื่อไร: ตอนนี้" in naryad[0]["text"], "текст наряда TH: тайскими"))
-res.append(ok(any("Наряд отправлен" in e["text"] for e in q6.edits), "конструктор → подтверждение (нестираемый след)"))
-res.append(ok(any(t["plate"] == "4255" and t["kinds"] == "airfilter" for t in mem.o3_tasks_active()),
-              "o3_task(sent) записан с выбранными видами (airfilter)"))
+res.append(ok("งาน: น้ำมัน ABS" in naryad[0]["text"] and "รับรถ: ที่ออฟฟิศ" in naryad[0]["text"], "текст наряда TH"))
+res.append(ok("⚠️ При замене ABS: чистка цилиндров ОБЯЗАТЕЛЬНА" in naryad[0]["text"]
+              and "ต้องทำความสะอาดกระบอกสูบ" in naryad[0]["text"], "наряд содержит ABS-строку чистки RU+TH"))
+res.append(ok(any("Наряд отправлен" in e["text"] for e in q6.edits), "конструктор → подтверждение (след)"))
+res.append(ok(any(t["plate"] == "4255" and t["kinds"] == "abs" for t in mem_b.o3_tasks_active()),
+              "o3_task(sent) записан с выбранным видом (abs)"))
 
-# (5) board refresh (editMessageText) — байк с активным нарядом помечается
-print("(5) board refresh:")
-S._O3_BOARD["chat"] = -100; S._O3_BOARD["msg"] = 999
-EDITS.clear()
-loop.run_until_complete(S._o3_refresh_board(ctx, BR()))
-res.append(ok(any(e.get("message_id") == 999 and "Наряды" in e.get("text", "") for e in EDITS), "refresh → editMessageText board (просрочки)"))
-
-# (6) back → чистая отмена, ничего не отправлено
-print("(6) back-отмена:")
+# (11) back → чистая отмена
+print("(11) back-отмена:")
 tok2 = S._o3_put({"bike": "X 1", "plate": "1", "overdue_kinds": ["oil"], "kinds": ["oil"], "from_where": None, "when": None})
 SENDS.clear()
 qb = FakeQ(f"o3:back:{tok2}")
@@ -130,16 +233,29 @@ loop.run_until_complete(S.handle_o3_button(FakeUpd(qb), ctx, BR()))
 res.append(ok(not any("Наряд на ТО" in s.get("text", "") for s in SENDS) and any("отменён" in e["text"] for e in qb.edits),
               "back → отменено, ничего не отправлено"))
 
-# (7) устойчивость: неизвестный токен / rescan без board — не падает
-print("(7) устойчивость префикса o3:")
+# (12) устойчивость: неизвестный токен / rescan (усыновление заголовка) — не падает
+print("(12) устойчивость префикса o3:")
 qg = FakeQ("o3:bogus:999999")
 loop.run_until_complete(S.handle_o3_button(FakeUpd(qg), ctx, BR()))
 res.append(ok(qg.answers and any("устарел" in e["text"] for e in qg.edits), "неизвестный токен → «устарел», не падает"))
-S._O3_BOARD["chat"] = None; S._O3_BOARD["msg"] = None
-qr = FakeQ("o3:rescan")
+qr = FakeQ("o3:rescan", c=HQ)
 loop.run_until_complete(S.handle_o3_button(FakeUpd(qr), ctx, BR()))
-res.append(ok(qr.answers == ["🔄"], "rescan без board → q.answer, no-op не падает"))
+res.append(ok(qr.answers == ["🔄"], "rescan → q.answer, не падает"))
+res.append(ok(mem_b.o3_cards(HQ).get("__header__") == 555000, "rescan усыновил msg_id заголовка (переживает рестарт)"))
 
+# (13) пустой парк без просрочек → карточек нет, заголовок «Просрочек нет»
+print("(13) просрочек нет:")
+class BR0(BR):
+    def fleet(s): return {"data": {"bikes": [
+        {"name": "PCX 160CC PHUKET 1111", "status": "ДОМА", "mileage": 5000,
+         "oil_last_km": 4000, "gear_last_km": 4000, "abs_last_km": 0, "airfilter_last_km": 0}]}}
+    def service_list(s): return {"items": []}
+mem_0 = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_0
+SENDS.clear()
+loop.run_until_complete(S.o3_post_board(ctx, BR0()))
+res.append(ok(len(SENDS) == 1 and "Просрочек нет 👍" in SENDS[0]["text"], "0 просрочек → только заголовок, карточек нет"))
+
+asyncio.sleep = _orig_sleep
 loop.close()
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)
