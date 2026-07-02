@@ -72,6 +72,7 @@
       "Bash(git push)",
       "Bash(git push *)",
       "Bash(systemctl restart splinter)",
+      "Bash(systemctl restart orchestrator-daemon)",
       "Bash(python3 -m json.tool *)",
       "Bash(git --no-pager branch *)",
       "Bash(git --no-pager remote *)",

@@ -28,10 +28,13 @@ CC_LOG_ID = "1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF"
 
 BRIDGE = None   # выставляется из bot.py при старте (devbot.BRIDGE = bridge)
 
-# === ОРКЕСТРАТОР (ступень1 заход2б-1): дев-бот ↔ очередь ===
+# === ОРКЕСТРАТОР (ступень1 заход2б-1 + ступень2 O4): дев-бот ↔ очередь ===
 # Префикс в 328 → кладём задачу в очередь оркестратора; фоновый job приносит результат обратно.
-QUEUE_FROM = "Filipp-328"               # метка источника задач из ТГ (фильтр для отчёта)
+QUEUE_FROM = "Filipp-328"               # метка источника быстрых задач «задача:» (таймаут 10 мин)
+QUEUE_FROM_DEV = "Filipp-328-dev"       # метка дев-ТЗ «тз:» (ступень 2 O4, таймаут 45 мин у демона)
+QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV)   # фильтр отчётов: обе метки — наши
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
+_DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
 _reported = set()                       # id задач, уже отрапортованных (done/failed; дедуп, память процесса)
 _report_seeded = False                  # seed-on-start: не спамим историей done/failed при рестарте
 _asked = set()                          # id задач needs_approval, по которым УЖЕ задан вопрос (дедуп)
@@ -74,9 +77,21 @@ def _try_approval_reply(text, bridge):
 
 def _try_enqueue(text, bridge):
     """Если текст начинается с префикса задачи — кладём в очередь оркестратора. Иначе None.
+    «тз:»/«dev:» → метка QUEUE_FROM_DEV (демон даст 45 мин); «задача:» → быстрый режим (10 мин).
     Проверяется ДО allowlist (иначе ключевые слова в тексте задачи перехватили бы зелёную команду)."""
     t = (text or "").strip()
     low = t.lower()
+    for p in _DEV_PREFIXES:
+        if low.startswith(p):
+            task_text = t[len(p):].strip()
+            if not task_text:
+                return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
+            r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text)
+            if r.get("ok"):
+                return (f"✅ ТЗ {r.get('id')} в очереди (дев-режим, до 45 мин; демон возьмёт ~60с). "
+                        f"Работает headless Claude Code: зелёное сам, красное спрошу кнопкой. "
+                        f"Результат принесу сюда.")
+            return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
     for p in _TASK_PREFIXES:
         if low.startswith(p):
             task_text = t[len(p):].strip()
@@ -280,7 +295,7 @@ async def report_results(context) -> None:
             if not r.get("ok"):
                 continue
             for it in r.get("items", []):
-                if str(it.get("from")) == QUEUE_FROM:
+                if str(it.get("from")) in QUEUE_FROMS:
                     finished.append((st, it))
     except Exception as e:
         log.warning("devbot.report_results: опрос очереди упал (%s)", e)
@@ -320,7 +335,7 @@ async def report_results(context) -> None:
         return
     if not na.get("ok"):
         return
-    pend = sorted((it for it in na.get("items", []) if str(it.get("from")) == QUEUE_FROM),
+    pend = sorted((it for it in na.get("items", []) if str(it.get("from")) in QUEUE_FROMS),
                   key=lambda x: int(x.get("id") or 0))
     for it in pend:
         qid = it.get("id")
@@ -349,7 +364,7 @@ async def report_results(context) -> None:
         return
     if not ip.get("ok"):
         return
-    running = sorted((it for it in ip.get("items", []) if str(it.get("from")) == QUEUE_FROM),
+    running = sorted((it for it in ip.get("items", []) if str(it.get("from")) in QUEUE_FROMS),
                      key=lambda x: int(x.get("id") or 0))
     for it in running:
         qid = it.get("id")
@@ -442,6 +457,44 @@ def _g_brain(bridge):
     return "\n".join(out)
 
 
+def _g_overdue(bridge):
+    """Просрочки ТО парка — переиспользуем прод-скан O3 (splinter._o3_overdue_scan, read-only).
+    Топ-10 худших строками; «не делалось» помечаем, остальное «+N км»."""
+    import splinter                     # локальный импорт — не плодить связность на уровне модуля
+    ov = splinter._o3_overdue_scan(bridge).get("overdue") or []
+    if not ov:
+        return "🔧 Просрочек ТО нет 👍"
+    out = [f"🔧 Просрочки ТО: {len(ov)} байков (худшие сверху, топ-10):"]
+    for o in ov[:10]:
+        parts = []
+        for it in o["items"]:
+            lbl = splinter._MAND_LABEL.get(it["kind"], (str(it["kind"]), str(it["kind"])))[1]
+            parts.append(f"{lbl} ❗не делалось" if it.get("nobase") else f"{lbl} +{it['over_km']}км")
+        out.append(f"  ⚠️ {splinter._o3_bike_label(o['bike'], o['plate'])} · " + ", ".join(parts))
+    if len(ov) > 10:
+        out.append(f"  …ещё {len(ov) - 10} (полный board — /o3board)")
+    return "\n".join(out)
+
+
+def _g_pulse(bridge):
+    """Пульс проекта — одна строка KB_PULSE (read_doc name=pulse), мгновенный «где я сейчас»."""
+    r = bridge._call("read_doc", name="pulse")
+    if not r.get("ok"):
+        return f"пульс недоступен: {r.get('error')}"
+    return "📟 " + (r.get("text") or "").strip()
+
+
+def _g_gate():
+    """Прогон гейта 4.3 (тесты, ~7с). Зелёный read-only прогон — сам ничего не деплоит."""
+    try:
+        r = subprocess.run([PY, os.path.join(ROOT, "gate.py")], cwd=ROOT,
+                           capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "").strip() or (r.stderr or "").strip() or "(нет вывода)"
+        return out if r.returncode == 0 else f"🔴 ГЕЙТ КРАСНЫЙ (exit={r.returncode}):\n{out}"
+    except Exception as e:
+        return f"гейт не запустился: {e}"
+
+
 def _g_help():
     return ("🤖 Дев-бот — зелёные read-only команды:\n"
             "  health — здоровье системы\n"
@@ -450,12 +503,17 @@ def _g_help():
             "  cclog — свежие cc_log\n"
             "  ошибки — сводка splinter.log\n"
             "  мозг / brain — латентность Brain\n"
+            "  просрочки — просрочки ТО парка (скан O3, топ-10)\n"
+            "  статус / пульс — строка KB_PULSE (где проект сейчас)\n"
+            "  гейт — прогон тестов 4.3 (~7с)\n"
             "  помощь\n"
-            "\n🎻 Оркестратор (демон исполняет через claude -p):\n"
-            "  задача: <что сделать> — поставить задачу в очередь; результат принесу сюда\n"
+            "\n🎻 Оркестратор (демон исполняет через headless Claude Code):\n"
+            "  тз: <что сделать> — дев-ТЗ (до 45 мин): правки кода/тесты/гейт/push сам,\n"
+            "    restart splinter и настоящее красное — спрошу кнопкой; отчёт принесу сюда\n"
+            "  задача: <что сделать> — быстрая задача (до 10 мин), та же дисциплина\n"
             "  да N / нет N — ответ на запрос подтверждения красной зоны по задаче N\n"
-            "  (красную зону демон сам НЕ проходит — спросит «да N»)\n"
-            "Красное (запись/деплой) сам НЕ делаю — нужно твоё «да».")
+            "  (красную зону демон сам НЕ проходит — спросит кнопкой)\n"
+            "Красное (запись в таблицы/деньги/деплой Bridge) сам НЕ делаю — нужно твоё «да».")
 
 
 # allowlist: набор ключевых слов → зелёная функция (берёт bridge)
@@ -466,6 +524,9 @@ _ALLOWLIST = [
     (("cclog", "cc_log", "cc лог", "cc-лог"), lambda b: _g_cclog(b)),
     (("ошибк", "errors", "splinter.log", "лог сплинтер"), lambda b: _g_errors()),
     (("мозг", "brain", "свеж"), lambda b: _g_brain(b)),
+    (("просрочк", "overdue"), lambda b: _g_overdue(b)),
+    (("статус", "пульс", "pulse", "status"), lambda b: _g_pulse(b)),
+    (("гейт", "gate"), lambda b: _g_gate()),
     (("помощ", "help", "команд"), lambda b: _g_help()),
 ]
 
@@ -515,7 +576,8 @@ async def handle_command(msg, context, bridge) -> None:
         await context.bot.send_message(
             chat_id=msg.chat_id, message_thread_id=tid,
             text=("🤖 Это не зелёная команда (или красное: запись/деплой). Сам НЕ выполняю — нужно твоё «да». "
-                  "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / помощь."))
+                  "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / просрочки / статус / гейт / помощь. "
+                  "Дев-ТЗ: «тз: <что сделать>»."))
         return
     try:
         with bridge_client.agent_write(None):   # origin=agent, без билета → красная запись будет отклонена

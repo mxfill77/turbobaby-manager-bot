@@ -38,7 +38,9 @@ from bridge_client import BridgeClient
 
 POLL_SEC = 60            # пауза между опросами очереди
 HEARTBEAT_SEC = 45       # как часто фон-поток бьёт updated, пока claude -p исполняется (детект зависания)
-TASK_TIMEOUT = 600       # таймаут одной задачи (10 мин) — claude -p не должен висеть вечно
+TASK_TIMEOUT = 600       # таймаут быстрой задачи «задача:» (10 мин) — claude -p не должен висеть вечно
+TASK_TIMEOUT_DEV = 2700  # таймаут дев-ТЗ «тз:» (45 мин, ступень 2 O4) — правка+тесты+гейт+отчёт
+DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очереди (devbot кладёт Filipp-328-dev)
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
 CLAUDE_BIN = "/usr/bin/claude"
@@ -74,22 +76,29 @@ NA_MARKER = "NEEDS_APPROVAL:"
 # clasp_redeploy / CRM / Лист1 / деньги / set_fleet_* / delete_event — НЕ здесь (позже, особое «да»).
 AUTO_OPS = ("git_push", "restart_splinter")
 
-# Преамбула к задаче: red-zone → claude выводит маркер с op-кодом и останавливается, НЕ обходит гейт.
+# Преамбула v2 (ступень 2 O4, 03.07): красная карта СИНХРОННА .claude/settings.json от 02.07
+# (git push теперь allow → CC делает сам; restart splinter на обкатке — кнопкой через op-маркер).
+# Red-zone → claude выводит маркер с op-кодом и останавливается, НЕ обходит гейт.
 APPROVAL_PREAMBLE = (
-    "Ты выполняешь задачу автономно в headless-режиме (без интерактивного подтверждения).\n"
-    "ПРАВИЛО БЕЗОПАСНОСТИ: если для выполнения нужно КРАСНОЕ действие — запись в рабочие таблицы "
-    "(CRM/Лист1/Байки/Зарплаты), деньги/транзакции, clasp deploy/redeploy/push, sqlite3 на memory.db, "
-    "git push, systemctl restart/stop, set_fleet_oil/set_fleet_service, confirmed=true, delete_event, "
-    "любое удаление — НЕ пытайся его выполнить и НЕ ищи обходных путей. Вместо этого выведи РОВНО одну "
-    "строку вида:\n"
-    "NEEDS_APPROVAL: op=<КОД> | <кратко что и зачем>\n"
-    "где <КОД> — один из:\n"
-    "  git_push — отправить коммиты на remote (git push);\n"
-    "  restart_splinter — перезапустить сервис splinter (systemctl restart splinter);\n"
-    "Если нужное красное действие НЕ одно из этих двух (запись в таблицы/деньги/clasp/sqlite3/удаление/"
-    "прочее) — используй op=other и опиши действие текстом (его выполнит человек вручную).\n"
-    "Затем заверши работу. Зелёные read-only шаги (чтение, диагностика) выполняй как обычно.\n"
-    "Если задача целиком read-only — просто выполни её и верни результат, без маркера.\n\n"
+    "Ты выполняешь задачу автономно в headless-режиме (без интерактивного подтверждения) в репо "
+    "/root/turbobaby-manager-bot — CLAUDE.md и вся его дисциплина действуют.\n"
+    "ДИСЦИПЛИНА (обязательно): перед правкой кода — бэкап (коммит/копия .bak); после правки — "
+    "py_compile + тесты; перед git push — гейт (venv/bin/python3 gate.py; pre-push зовёт его сам); "
+    "каждый значимый шаг — строка в cc_log (write_doc name=cc_log, запись ПОД врезкой) + пульс "
+    "(write_doc name=pulse) ОДНОЙ операцией; статус честно: «технически готово» отдельно от "
+    "«функционально подтверждено».\n"
+    "КАРТА ДЕЙСТВИЙ:\n"
+    "- Зелёное/оранжевое (чтение, диагностика, правки кода, тесты, git commit, git push) — делай САМ; "
+    "git push по циклу гейт→push→отчёт, БЕЗ маркера.\n"
+    "- systemctl restart splinter САМ НЕ делай (режим обкатки ступени 2): если рестарт нужен — выведи "
+    "строку «NEEDS_APPROVAL: op=restart_splinter | <зачем>» и заверши работу (исполнят кнопкой в 328).\n"
+    "- НАСТОЯЩЕЕ КРАСНОЕ — запись в рабочие таблицы (CRM/Лист1/Байки/Зарплаты), деньги/транзакции, "
+    "clasp deploy/redeploy/push, sqlite3 CLI на memory.db, set_fleet_oil/set_fleet_service, "
+    "confirmed=true, delete_event, любое удаление — НЕ выполняй и НЕ ищи обходных путей: выведи РОВНО "
+    "одну строку «NEEDS_APPROVAL: op=other | <карточка: что · куда · последствия · на что смотреть>» "
+    "и заверши работу (исполнит человек).\n"
+    "ФОРМАТ ОТВЕТА: первая строка — сводка результата (≤400 символов, уйдёт в Telegram-тему 328); "
+    "подробности — в cc_log, НЕ в вывод. Задача целиком read-only → просто выполни и верни сводку.\n\n"
     "ЗАДАЧА:\n"
 )
 # Фоллбэк-фразы (если claude описал блокировку гейта без маркера) — тоже эскалируем (эскалация
@@ -135,10 +144,15 @@ def _heartbeat_loop(task_id, stop_event):
             log.warning("id=%s heartbeat упал (глушу): %s", task_id, e)
 
 
-def run_task(task_id, task_text):
+def _task_timeout(task):
+    """Таймаут по метке from очереди: дев-ТЗ («тз:», from=*-dev) → 45 мин, остальное → 10 мин."""
+    return TASK_TIMEOUT_DEV if str(task.get("from") or "").endswith(DEV_FROM_SUFFIX) else TASK_TIMEOUT
+
+
+def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT):
     """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
     status ∈ done|failed|needs_approval (красная зона — самодекларация claude через маркер)."""
-    log.info("ИСПОЛНЕНИЕ id=%s через claude -p (timeout=%ss)", task_id, TASK_TIMEOUT)
+    log.info("ИСПОЛНЕНИЕ id=%s через claude -p (timeout=%ss)", task_id, task_timeout)
     child_env = dict(os.environ)
     child_env.setdefault("HOME", "/root")
     child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -157,12 +171,12 @@ def run_task(task_id, task_text):
             [CLAUDE_BIN, "-p", prompt],      # список аргументов, БЕЗ shell → нет инъекции через task_text
             cwd=REPO,
             capture_output=True, text=True,
-            timeout=TASK_TIMEOUT,
+            timeout=task_timeout,
             env=child_env,
         )
     except subprocess.TimeoutExpired:
-        log.warning("id=%s ТАЙМАУТ %ss — задача прервана", task_id, TASK_TIMEOUT)
-        return "failed", f"таймаут {TASK_TIMEOUT}s — claude -p прерван, задача не завершилась"
+        log.warning("id=%s ТАЙМАУТ %ss — задача прервана", task_id, task_timeout)
+        return "failed", f"таймаут {task_timeout}s — claude -p прерван, задача не завершилась"
     except Exception as e:
         log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
         return "failed", f"ошибка запуска claude -p: {e}"
@@ -297,7 +311,7 @@ def process_new():
         log.info("claim id=%s не удался (%s) — пропускаю в этом цикле", tid, cl.get("error"))
         return
 
-    status, result = run_task(tid, text)
+    status, result = run_task(tid, text, task_timeout=_task_timeout(task))
     if status == "needs_approval":
         # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
         rr = bc.set_needs_approval(tid, result)
@@ -314,8 +328,8 @@ def cycle():
 
 
 def main():
-    log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s) ===",
-             POLL_SEC, TASK_TIMEOUT, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN)
+    log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s) ===",
+             POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN)
     while _running:
         try:
             cycle()
