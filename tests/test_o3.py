@@ -1,6 +1,7 @@
 """Моки O3 ступень 1 (доводка 02.07): скан с порогом «не делалось» (балласт убран) → o3_task/o3_card CRUD →
 board «карточка-на-байк» (заголовок+счётчик, карточка+кнопка, троттл/RetryAfter, rescan без дублей,
-«✅ в наряде»/«✅ решено», кап 30) → ABS-пометка (карточка+наряд) → конструктор-регресс (pick→vid→from→when→send).
+«✅ в наряде»/«✅ решено», кап 30) → ABS-пометка (карточка+наряд) → конструктор-регресс (pick→vid→from→when→send)
+→ паритет RU↔TH построчно во всех рендерах (фикс тайского 02.07: имя байка в TH, номер один раз, кнопки TH/RU).
 Боевых тайцев/Telegram/Лист1 нет — всё мокнуто."""
 import os, sys, asyncio, tempfile
 sys.path.insert(0, "/root/turbobaby-manager-bot")
@@ -110,8 +111,8 @@ res.append(ok(len(card_nm) == 1, "NMAX = своё сообщение-карто�
 res.append(ok(card_nm and "ABS — ❗ не делалось (пробег 30000 ≥ 10000, пора)" in card_nm[0]["text"],
               "строка «не делалось (пробег ≥ порога, пора)» в карточке"))
 res.append(ok(card_nm and "Возд. фильтр — просрочено 5000 км" in card_nm[0]["text"], "строка «просрочено N км»"))
-res.append(ok(card_nm and btn(card_nm[0]["kb"]).text == "🔧 Собрать наряд"
-              and btn(card_nm[0]["kb"]).callback_data.startswith("o3:pick:"), "кнопка [🔧 Собрать наряд] → o3:pick"))
+res.append(ok(card_nm and btn(card_nm[0]["kb"]).text == "🔧 สร้างใบสั่งงาน / Собрать наряд"
+              and btn(card_nm[0]["kb"]).callback_data.startswith("o3:pick:"), "кнопка [🔧 …/ Собрать наряд] → o3:pick (TH+RU)"))
 cards_db = mem_b.o3_cards(HQ)
 res.append(ok(set(cards_db) == {"__header__", "4255", "6334"}, "msg_id заголовка и карточек в memory.db o3_card"))
 res.append(ok(SLEEPS.count(S._O3_CARD_PAUSE) >= 2, f"троттл {S._O3_CARD_PAUSE}с между карточками"))
@@ -254,6 +255,51 @@ mem_0 = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_0
 SENDS.clear()
 loop.run_until_complete(S.o3_post_board(ctx, BR0()))
 res.append(ok(len(SENDS) == 1 and "Просрочек нет 👍" in SENDS[0]["text"], "0 просрочек → только заголовок, карточек нет"))
+
+# (14) паритет RU↔TH построчно (фикс тайского 02.07): TH-блок = зеркало RU во ВСЕХ рендерах
+print("(14) паритет RU/TH построчно (все рендеры):")
+import re
+CYR = re.compile(r"[А-Яа-яЁё]")
+THAI = re.compile(r"[฀-๿]")
+def blocks(text):
+    th = [l for l in text.split("🇹🇭", 1)[1].split("🇷🇺")[0].split("\n") if l.strip() and set(l.strip()) != {"─"}]
+    ru = [l for l in text.split("🇷🇺", 1)[1].split("\n") if l.strip()]
+    return th, ru
+d14 = {"bike": "NMAX 155CC PHUKET 4255", "plate": "4255", "current_km": 30000,
+       "overdue_kinds": ["abs", "oil"], "kinds": ["abs", "oil"], "from_where": "office", "when": "now"}
+LBL = "4255 NMAX 155CC PHUKET"
+renders = {
+    "карточка board":  S._o3_card_render(nm, set())[0],
+    "заголовок board": S._o3_header_render(2, ["1234", "5678"])[0],
+    "шаг1 виды":       S._o3_step_vids(d14, 1)[0],
+    "шаг2 откуда":     S._o3_step_from(d14, 1)[0],
+    "шаг3 когда":      S._o3_step_when(d14, 1)[0],
+    "шаг4 предпросмотр": S._o3_step_confirm(d14, 1)[0],
+}
+for label, text in renders.items():
+    th_b, ru_b = blocks(text)
+    res.append(ok(len(th_b) == len(ru_b), f"{label}: строк TH == строк RU ({len(th_b)}/{len(ru_b)})"))
+    res.append(ok(not CYR.search("\n".join(th_b)), f"{label}: TH-блок без кириллицы"))
+for label in ("карточка board", "шаг1 виды", "шаг2 откуда", "шаг3 когда", "шаг4 предпросмотр"):
+    th_b, ru_b = blocks(renders[label])
+    res.append(ok(LBL in "\n".join(th_b) and LBL in "\n".join(ru_b),
+                  f"{label}: полное имя байка в ОБОИХ блоках"))
+    res.append(ok("\n".join(th_b).count("4255") == 1 and "\n".join(ru_b).count("4255") == 1,
+                  f"{label}: номер один раз в каждом блоке (дубля нет)"))
+for label, text in renders.items():   # каждая кнопка двуязычна: тайский + (кириллица или общий 🔄-стиль)
+    kb14 = {"карточка board": S._o3_card_render(nm, set())[1], "заголовок board": S._o3_header_render(2, [])[1],
+            "шаг1 виды": S._o3_step_vids(d14, 1)[1], "шаг2 откуда": S._o3_step_from(d14, 1)[1],
+            "шаг3 когда": S._o3_step_when(d14, 1)[1], "шаг4 предпросмотр": S._o3_step_confirm(d14, 1)[1]}[label]
+    btns = [b for row in kb14.inline_keyboard for b in row]
+    res.append(ok(all(THAI.search(b.text) for b in btns), f"{label}: все кнопки ({len(btns)}) с тайским"))
+th_n14, ru_n14 = S._o3_naryad_lines(d14)
+res.append(ok(len(th_n14) == len(ru_n14) and th_n14[0] == LBL and ru_n14[0] == LBL
+              and not CYR.search("\n".join(th_n14)),
+              "наряд: строк TH == RU, байк = «номер имя» один раз, TH без кириллицы"))
+qs14 = FakeQ("o3:pick:999777")   # несуществующий токен → «устарел» теперь тоже двуязычный
+loop.run_until_complete(S.handle_o3_button(FakeUpd(qs14), ctx, BR()))
+res.append(ok(qs14.edits and "ใบสั่งงานหมดอายุ" in qs14.edits[0]["text"] and "устарел" in qs14.edits[0]["text"],
+              "«наряд устарел»: TH-блок добавлен (двуязычно)"))
 
 asyncio.sleep = _orig_sleep
 loop.close()

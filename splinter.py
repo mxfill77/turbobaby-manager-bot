@@ -3398,6 +3398,13 @@ def _o3_kind_th(kind):
     return _MAND_LABEL.get(kind, (kind, kind))[0]
 
 
+def _o3_bike_label(bike, plate):
+    """«номер имя» — номер ОДИН раз, вперёд; из имени дубль номера убран (фикс паритета 02.07:
+    имя латиницей — одна строка на оба языка, RU и TH получают ОДИНАКОВУЮ полную метку байка)."""
+    name = " ".join(w for w in str(bike).split() if w != str(plate)) or str(bike)
+    return f"{plate} {name}".strip()
+
+
 def _o3_overdue_scan(bridge):
     """Park-wide скан просрочек 4 обязательных ТО (масло/gear[скутер]/ABS/возд.фильтр). ЧТЕНИЕ+расчёт (🟢).
     fleet() (38 байков, *_last_km + mileage=colH) + service_list (current_km). Текущий пробег = max(colH,
@@ -3456,9 +3463,9 @@ def _o3_card_render(o, active_plates):
     (_O3_KIND_MARK: ABS → чистка цилиндров). Байк в наряде → строка «✅ в наряде» и БЕЗ кнопки; иначе кнопка
     [🔧 Собрать наряд] → тот же конструктор (o3:pick), flow дальше без изменений."""
     plate, in_work = o["plate"], o["plate"] in active_plates
-    name = " ".join(w for w in str(o["bike"]).split() if w != plate) or o["bike"]   # номер вперёд, без дубля в имени
-    th = [f"⚠️ {plate} {name}"]
-    ru = [f"⚠️ {plate} {name}"]
+    lbl = _o3_bike_label(o["bike"], plate)   # номер вперёд, один раз — одинаково в TH и RU
+    th = [f"⚠️ {lbl}"]
+    ru = [f"⚠️ {lbl}"]
     for it in o["items"]:
         lbl_th, lbl_ru = _MAND_LABEL.get(it["kind"], (str(it["kind"]), str(it["kind"])))
         if it.get("nobase"):
@@ -3479,7 +3486,7 @@ def _o3_card_render(o, active_plates):
                        "overdue_kinds": [it["kind"] for it in o["items"]],
                        "kinds": [it["kind"] for it in o["items"]],   # по умолчанию выбраны ВСЕ просроченные
                        "from_where": None, "when": None})
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔧 Собрать наряд", callback_data=f"o3:pick:{tok}")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔧 สร้างใบสั่งงาน / Собрать наряд", callback_data=f"o3:pick:{tok}")]])
     return _bilingual(None, th, ru), kb
 
 
@@ -3490,9 +3497,9 @@ def _o3_header_render(n_total, extra_plates):
     if not n_total:
         th.append("ไม่มีรายการเลยกำหนด 👍"); ru.append("Просрочек нет 👍")
     if extra_plates:
-        th.append(f"…อีก {len(extra_plates)} คัน: " + ", ".join(extra_plates))
+        th.append(f"…อีก {len(extra_plates)} คัน นอกการ์ด: " + ", ".join(extra_plates))
         ru.append(f"…ещё {len(extra_plates)} вне карточек: " + ", ".join(extra_plates))
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="o3:rescan")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 อัปเดต / Обновить", callback_data="o3:rescan")]])
     return _bilingual(None, th, ru), kb
 
 
@@ -3620,8 +3627,9 @@ def _o3_naryad_lines(d):
     kinds = d.get("kinds", [])
     kinds_th = ", ".join(_o3_kind_th(k) for k in kinds)
     kinds_ru = ", ".join(_o3_kind_ru(k) for k in kinds)
-    th = [f"{d['bike']}", f"งาน: {kinds_th}", f"รับรถ: {_o3_from_th(d)}", f"เมื่อไร: {_o3_when_th(d)}"]
-    ru = [f"{d['bike']}", f"работы: {kinds_ru}", f"забрать: {_o3_from_ru(d)}", f"когда: {_o3_when_ru(d)}"]
+    lbl = _o3_bike_label(d["bike"], d.get("plate", ""))   # полное имя, номер один раз (фикс паритета 02.07)
+    th = [lbl, f"งาน: {kinds_th}", f"รับรถ: {_o3_from_th(d)}", f"เมื่อไร: {_o3_when_th(d)}"]
+    ru = [lbl, f"работы: {kinds_ru}", f"забрать: {_o3_from_ru(d)}", f"когда: {_o3_when_ru(d)}"]
     for k in kinds:
         note = _O3_KIND_NOTE.get(k)
         if note:
@@ -3632,44 +3640,47 @@ def _o3_naryad_lines(d):
 
 def _o3_step_vids(d, tok):
     """Шаг 1 конструктора — мультивыбор видов (тоггл ✅/▫️) → «Далее»."""
-    th = [f"🔧 ใบสั่งงาน · {d['plate']}", "เลือกงาน (กดสลับ):"]
-    ru = [f"🔧 Наряд · {d['plate']} {d['bike']}", "Выбери виды (тап — вкл/выкл):"]
+    lbl = _o3_bike_label(d["bike"], d["plate"])   # полное имя в ОБОИХ языках, номер один раз (фикс 02.07)
+    th = [f"🔧 ใบสั่งงาน · {lbl}", "เลือกงาน (กดสลับ):"]
+    ru = [f"🔧 Наряд · {lbl}", "Выбери виды (тап — вкл/выкл):"]
     rows = []
     for kind in d.get("overdue_kinds", []):
         mark = "✅ " if kind in d.get("kinds", []) else "▫️ "
-        rows.append([InlineKeyboardButton(f"{mark}{_o3_kind_ru(kind)}"[:64], callback_data=f"o3:vid:{tok}:{kind}")])
-    rows.append([InlineKeyboardButton("▶️ Далее", callback_data=f"o3:step:{tok}:from")])
-    rows.append([InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")])
+        rows.append([InlineKeyboardButton(f"{mark}{_o3_kind_th(kind)} / {_o3_kind_ru(kind)}"[:64],
+                                          callback_data=f"o3:vid:{tok}:{kind}")])
+    rows.append([InlineKeyboardButton("▶️ ต่อไป / Далее", callback_data=f"o3:step:{tok}:from")])
+    rows.append([InlineKeyboardButton("↩️ ยกเลิก / Отмена", callback_data=f"o3:back:{tok}")])
     return _bilingual(None, th, ru), InlineKeyboardMarkup(rows)
 
 
 def _o3_step_from(d, tok):
     """Шаг 2 — откуда забрать байк."""
-    sel = ", ".join(_o3_kind_ru(k) for k in d.get("kinds", []))
-    th = [f"🔧 {d['plate']} · {', '.join(_o3_kind_th(k) for k in d.get('kinds', []))}", "รับรถจากไหน?"]
-    ru = [f"🔧 {d['plate']} · {sel}", "Откуда забрать?"]
-    rows = [[InlineKeyboardButton("🏢 В офисе", callback_data=f"o3:from:{tok}:office")],
-            [InlineKeyboardButton("🙋 У клиента", callback_data=f"o3:from:{tok}:client")],
-            [InlineKeyboardButton("📍 По району", callback_data=f"o3:from:{tok}:area")],
-            [InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")]]
+    lbl = _o3_bike_label(d["bike"], d["plate"])
+    th = [f"🔧 {lbl} · {', '.join(_o3_kind_th(k) for k in d.get('kinds', []))}", "รับรถจากไหน?"]
+    ru = [f"🔧 {lbl} · {', '.join(_o3_kind_ru(k) for k in d.get('kinds', []))}", "Откуда забрать?"]
+    rows = [[InlineKeyboardButton("🏢 ที่ออฟฟิศ / В офисе", callback_data=f"o3:from:{tok}:office")],
+            [InlineKeyboardButton("🙋 ที่ลูกค้า / У клиента", callback_data=f"o3:from:{tok}:client")],
+            [InlineKeyboardButton("📍 ตามพื้นที่ / По району", callback_data=f"o3:from:{tok}:area")],
+            [InlineKeyboardButton("↩️ ยกเลิก / Отмена", callback_data=f"o3:back:{tok}")]]
     return _bilingual(None, th, ru), InlineKeyboardMarkup(rows)
 
 
 def _o3_step_when(d, tok):
     """Шаг 3 — когда."""
-    th = [f"🔧 {d['plate']} · {_o3_from_th(d)}", "เมื่อไร?"]
-    ru = [f"🔧 {d['plate']} · {_o3_from_ru(d)}", "Когда?"]
-    rows = [[InlineKeyboardButton("⏱ Сейчас", callback_data=f"o3:when:{tok}:now")],
-            [InlineKeyboardButton("📅 Сегодня", callback_data=f"o3:when:{tok}:today")],
-            [InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")]]
+    lbl = _o3_bike_label(d["bike"], d["plate"])
+    th = [f"🔧 {lbl} · {_o3_from_th(d)}", "เมื่อไร?"]
+    ru = [f"🔧 {lbl} · {_o3_from_ru(d)}", "Когда?"]
+    rows = [[InlineKeyboardButton("⏱ ตอนนี้ / Сейчас", callback_data=f"o3:when:{tok}:now")],
+            [InlineKeyboardButton("📅 วันนี้ / Сегодня", callback_data=f"o3:when:{tok}:today")],
+            [InlineKeyboardButton("↩️ ยกเลิก / Отмена", callback_data=f"o3:back:{tok}")]]
     return _bilingual(None, th, ru), InlineKeyboardMarkup(rows)
 
 
 def _o3_step_confirm(d, tok):
     """Шаг 4 — предпросмотр наряда + «Отправить»."""
     th, ru = _o3_naryad_lines(d)
-    rows = [[InlineKeyboardButton("✅ Отправить в доставки", callback_data=f"o3:send:{tok}")],
-            [InlineKeyboardButton("↩️ Отмена", callback_data=f"o3:back:{tok}")]]
+    rows = [[InlineKeyboardButton("✅ ส่งให้ทีมส่งรถ / Отправить в доставки", callback_data=f"o3:send:{tok}")],
+            [InlineKeyboardButton("↩️ ยกเลิก / Отмена", callback_data=f"o3:back:{tok}")]]
     return _bilingual(None, ["🔧 ตรวจสอบใบสั่งงาน:"] + th, ["🔧 Проверь наряд:"] + ru), InlineKeyboardMarkup(rows)
 
 
@@ -3739,7 +3750,9 @@ async def handle_o3_button(update, context, bridge):
     if not d:
         await q.answer()
         try:
-            await q.edit_message_text("🐀 Splinter\n⚠️ Наряд устарел (перезапуск бота). Обновите board 🙏")
+            await q.edit_message_text(_with_separator(_bilingual(None,
+                ["⚠️ ใบสั่งงานหมดอายุ (บอทรีสตาร์ท) กดอัปเดต board ใหม่ 🙏"],
+                ["⚠️ Наряд устарел (перезапуск бота). Обновите board 🙏"])))
         except Exception:
             pass
         return
@@ -3764,7 +3777,7 @@ async def handle_o3_button(update, context, bridge):
 
     if action == "step" and len(parts) > 3 and parts[3] == "from":
         if not d.get("kinds"):
-            await q.answer("Выбери хотя бы один вид")
+            await q.answer("เลือกอย่างน้อย 1 งาน / Выбери хотя бы один вид")
             return
         await q.answer()
         text, kb = _o3_step_from(d, tok)
@@ -3787,14 +3800,14 @@ async def handle_o3_button(update, context, bridge):
 
     if action == "send":
         if not (d.get("kinds") and d.get("from_where") and d.get("when")):
-            await q.answer("Наряд не заполнен")
+            await q.answer("ใบสั่งงานยังไม่ครบ / Наряд не заполнен")
             return
         await q.answer("✅")
         await _o3_do_send(q, context, bridge, tok, d)
         return
 
     if action == "back":                       # чистая отмена — ничего не отправлено
-        await q.answer("↩️ Отменено")
+        await q.answer("↩️ ยกเลิกแล้ว / Отменено")
         try:
             await q.edit_message_text(text=_with_separator(_bilingual(None,
                 ["↩️ ยกเลิกใบสั่งงาน"], ["↩️ Наряд отменён (ничего не отправлено)"])), reply_markup=None)
