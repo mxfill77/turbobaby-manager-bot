@@ -179,7 +179,7 @@ async def on_audit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
-    await q.answer()
+    await splinter._btn_answer(q)   # протухший ack («Query is too old») не валит действие кнопки
     try:
         _, action, tok = (q.data or "").split(":", 2)
         token = int(tok)

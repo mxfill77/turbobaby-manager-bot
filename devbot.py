@@ -236,22 +236,33 @@ async def _send_thread(context, q, text):
             log.warning("devbot._send_thread: отправка не прошла (%s)", e)
 
 
+async def _btn_answer(q, txt=None, **kw):
+    """q.answer() с защитой — паттерн _o3_answer (хвост ревизии §7): колбэк, отлежавшийся
+    в очереди за долгим Bridge-вызовом (approve/check ходят в Apps Script по несколько секунд),
+    протухает — BadRequest «Query is too old». Ack тогда невозможен, но ДЕЙСТВИЕ кнопки
+    обязано выполниться; упавший q.answer не валит хендлер."""
+    try:
+        await q.answer(txt, **kw)
+    except Exception as e:
+        log.warning("devbot: q.answer протух/упал (действие кнопки всё равно выполняю): %s", e)
+
+
 async def _cb_approve(q, qid, bridge):
     """approve:<id> → approve_task (та же логика «да N»). ОДНОРАЗОВО + идемпотентность."""
     r = await asyncio.to_thread(bridge.approve_task, qid, "Filipp")
     if r.get("ok"):
         _reported.discard(qid)            # пусть дальнейший done/failed отрапортуется штатно
-        await q.answer("✅ одобрено")
+        await _btn_answer(q, "✅ одобрено")
         await _strip_and_mark(q, "✅ одобрено")
     elif r.get("error") == "not_awaiting":
         # уже approved/done/failed → идемпотентно: сообщить + убрать кнопки (гонка/повторный тап)
-        await q.answer("уже обработано")
+        await _btn_answer(q, "уже обработано")
         await _strip_and_mark(q, f"✅ уже обработано (статус {r.get('status')})")
     elif r.get("error") == "not_found":
-        await q.answer("задачи нет в очереди")
+        await _btn_answer(q, "задачи нет в очереди")
         await _strip_and_mark(q, "🤖 задачи нет в очереди")
     else:
-        await q.answer(f"approve не прошёл: {r.get('error')}")
+        await _btn_answer(q, f"approve не прошёл: {r.get('error')}")
 
 
 async def _cb_reject(q, qid, bridge):
@@ -259,18 +270,18 @@ async def _cb_reject(q, qid, bridge):
     r = await asyncio.to_thread(bridge.complete_task, qid, "failed", "отклонено Филиппом (кнопка)")
     if r.get("ok"):
         _reported.add(qid)                # уже сообщили «отклонена» — не дублируем failed-рапортом
-        await q.answer("❌ отклонено")
+        await _btn_answer(q, "❌ отклонено")
         await _strip_and_mark(q, "❌ отклонено")
     elif r.get("error") == "not_found":
-        await q.answer("задачи нет в очереди")
+        await _btn_answer(q, "задачи нет в очереди")
         await _strip_and_mark(q, "🤖 задачи нет в очереди")
     else:
-        await q.answer(f"reject не прошёл: {r.get('error')}")
+        await _btn_answer(q, f"reject не прошёл: {r.get('error')}")
 
 
 async def _cb_check(context, q, qid, bridge):
     """check:<id> → свежий статус задачи. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
-    await q.answer("проверяю…")
+    await _btn_answer(q, "проверяю…")
     status, item = await asyncio.to_thread(_find_task, bridge, qid)
     if status is None:
         txt = f"🔄 Задача {qid}: не найдена в очереди."
@@ -285,7 +296,7 @@ async def _cb_check(context, q, qid, bridge):
 
 async def _cb_next(context, q, qid, bridge):
     """next:<id> → подсказка по следующему шагу. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
-    await q.answer("📋")
+    await _btn_answer(q, "📋")
     status, _item = await asyncio.to_thread(_find_task, bridge, qid)
     if status is None:
         txt = f"📋 Задача {qid}: не найдена — поставь новую командой «задача: <что сделать>»."
@@ -309,13 +320,13 @@ async def handle_callback(update, context, bridge) -> None:
         return
     uid = q.from_user.id if q.from_user else None
     if uid != DEVBOT_USER:
-        await q.answer("не для тебя", show_alert=False)
+        await _btn_answer(q, "не для тебя", show_alert=False)
         return
     try:
         action, sid = (q.data or "").split(":", 1)
         qid = int(sid)
     except Exception:
-        await q.answer()
+        await _btn_answer(q)
         return
     # origin=human (как «да N»): тап Филиппа = ручное действие, токен-замок 4.2 не вмешивается.
     try:
@@ -328,13 +339,10 @@ async def handle_callback(update, context, bridge) -> None:
         elif action == "next":
             await _cb_next(context, q, qid, bridge)
         else:
-            await q.answer()
+            await _btn_answer(q)
     except Exception as e:
         log.exception("devbot.handle_callback error (%s:%s)", action, qid)
-        try:
-            await q.answer(f"ошибка: {type(e).__name__}")
-        except Exception:
-            pass
+        await _btn_answer(q, f"ошибка: {type(e).__name__}")
 
 
 def _task_age_sec(updated_iso):
