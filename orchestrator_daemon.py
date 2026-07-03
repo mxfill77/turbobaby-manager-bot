@@ -138,6 +138,8 @@ _DEC_WAIT_STATUSES = ("in_progress", "needs_approval", "approved")
 _NA_FALLBACK = ("требует подтверждения", "нужно подтверждение", "нужно «да»", "нужно \"да\"",
                 "requires approval", "needs approval", "permission to use", "не разрешено гейтом")
 _OP_RE = re.compile(r"op\s*=\s*([a-z_]+)", re.IGNORECASE)
+# префикс дескриптора «op=xxx | » — срезается при конверте op=other в headless-ТЗ (остаётся карточка)
+_OP_PREFIX_RE = re.compile(r"^\s*op\s*=\s*[a-z_]+\s*\|\s*", re.IGNORECASE)
 
 
 def parse_op(what):
@@ -459,10 +461,49 @@ def _approved_expired(updated_iso):
         return False
 
 
+def _convert_other_approved(tid, task, what):
+    """op=other после «да» Филиппа (заведено 03.07): хардкод-команды нет — заявку НЕ валим
+    «сделай в Termux», а конвертируем в ОБЫЧНУЮ headless-задачу (текст заявки = ТЗ,
+    from=Filipp-328-dev → дев-таймаут 45 мин); devbot принесёт её результат в 328 отдельным
+    рапортом. Красная классификация ВНУТРИ новой задачи как была (преамбула/hook): настоящее
+    красное снова даст NEEDS_APPROVAL-кнопку — approve заявки обхода гейта НЕ создаёт.
+    Исключение: шаг декомпозиции НЕ конвертируем — конверт жил бы ВНЕ цепочки (без паттерна
+    [шаг i/N]), guard последовательности его не видит → следующий шаг стартовал бы до
+    исполнения одобренного. Для шага — прежний честный failed (halt-on-fail цепочки)."""
+    if _STEP_RE.match(str(task.get("task_text") or "")):
+        log.info("APPROVED id=%s op=other у шага декомпозиции → failed (конверт сломал бы guard)", tid)
+        bc.complete_task(tid, "failed",
+                         f"не могу выполнить автоматически: {what[:400]} — сделай в Termux")
+        _maybe_dec_after(task.get("task_text"), "failed")
+        return
+    card = _OP_PREFIX_RE.sub("", what or "").strip() or "(карточка пустая — см. исходную задачу)"
+    orig = str(task.get("task_text") or "").strip()
+    tz = (f"[конверт одобренной заявки {tid}] Филипп нажал «да» на заявку: {card}\n"
+          f"Исходная задача (контекст): {orig}\n"
+          f"Выполни одобренное в рамках исходной задачи. Дисциплина CLAUDE.md действует полностью; "
+          f"настоящее красное (рабочие таблицы/деньги/clasp/sqlite3/удаление) — по-прежнему ТОЛЬКО "
+          f"маркером NEEDS_APPROVAL: одобрение заявки обход гейта НЕ даёт.")[:RESULT_MAX]
+    r = bc.enqueue_task(f"Filipp-328{DEV_FROM_SUFFIX}", tz)
+    if not r.get("ok"):
+        log.warning("APPROVED id=%s конверт op=other не встал в очередь (%s) → failed", tid, r.get("error"))
+        bc.complete_task(tid, "failed",
+                         f"одобрено, но конверт в headless-задачу не встал в очередь "
+                         f"({r.get('error')}) — сделай в Termux: {what[:400]}")
+        _maybe_dec_after(task.get("task_text"), "failed")
+        return
+    nid = r.get("id")
+    bc.complete_task(tid, "done",
+                     f"✅ Одобрено → конвертировано в headless-задачу id {nid} (from=Filipp-328-dev, "
+                     f"таймаут 45 мин). Результат придёт отдельным рапортом по задаче {nid}.")
+    log.info("APPROVED id=%s op=other → конверт в headless-задачу %s", tid, nid)
+
+
 def process_approved():
     """Довести одобренные Филиппом красные шаги (status=approved). claude ПОВТОРНО НЕ зовётся —
-    op-код берётся из сохранённого в needs_approval дескриптора (то, что одобрил Филипп).
-    Инвариант: исполняю ТОЛЬКО если op∈AUTO_OPS И билет 4.2 consume ok И не истёк таймаут approved."""
+    op∈AUTO_OPS исполняется хардкод-командой (билет 4.2 + чёрный ящик); op=other (заведено 03.07)
+    конвертируется в обычную headless-задачу (см. _convert_other_approved) — демон красное сам
+    НЕ исполняет, конверт лишь возвращает заявку в обычный контур с той же классификацией.
+    Инвариант: хардкод — ТОЛЬКО если op∈AUTO_OPS И билет 4.2 consume ok И не истёк таймаут approved."""
     r = bc.get_pending("approved")
     if not r.get("ok"):
         return
@@ -479,11 +520,9 @@ def process_approved():
 
         op = parse_op(what)
         if op not in EXECUTORS:
-            # вне авто-перечня / free-text / op=other → не исполняем, человек в Termux
-            log.info("APPROVED id=%s op вне перечня (%s) → failed (Termux)", tid, op)
-            bc.complete_task(tid, "failed",
-                             f"не могу выполнить автоматически: {what[:400]} — сделай в Termux")
-            _maybe_dec_after(task.get("task_text"), "failed")
+            # вне авто-перечня / free-text / op=other → демон сам НЕ исполняет:
+            # конверт в обычную headless-задачу (или failed для шага декомпозиции)
+            _convert_other_approved(tid, task, what)
             continue
 
         # билет 4.2: одноразовый серверный жетон авторизации + аудит (issue → consume перед командой)
