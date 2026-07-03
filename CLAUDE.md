@@ -543,6 +543,18 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
   коммит + restart; кнопка op=restart_splinter в 328 остаётся аварийным фоллбэком)**,
   `venv/bin/python3 *` (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write
   рабочих каталогов. Prompt не появляется.
+- **Deferred-рестарт (заведено 03.07.2026): в allow — ДВА УЗКИХ паттерна и ТОЛЬКО они:**
+  `systemd-run --on-active=* systemctl restart orchestrator-daemon` и
+  `systemd-run --on-active=* systemctl restart splinter` (отложенный рестарт по правилу
+  самомодификации, wildcard только на значении таймера). **Голый/широкий `systemd-run` в allow
+  НЕ добавлять НИКОГДА:** systemd-run создаёт transient unit, исполняющий ПРОИЗВОЛЬНУЮ команду
+  уже ВНЕ bash-паттернов allowlist — `systemd-run --on-active=1s <что угодно>` = обход всей
+  классификации allow/ask/deny (мимо deny на rm -rf и ask на sqlite3). Любая другая форма
+  systemd-run остаётся под дефолтным prompt/ask, как раньше. Тест-guard классификации:
+  `tests/test_settings_deferred_restart.py` (в гейте). Headless писать в `.claude/settings.json`
+  НЕ может (гейт движка, это правильно) — правка вносится разово из Termux:
+  `cp _sdrun_new_settings.json .claude/settings.json` (подготовлено 03.07, тест до применения
+  проверяет подготовленный файл и печатает WARN).
 - **ask (settings.json)** — красное всегда спрашивает: `sqlite3 *` (CLI), `clasp push|redeploy|deploy|run`,
   `systemctl stop` (вне задачи подозрителен), `sudo systemctl`. Hook НЕ обходит ask (ask>hook).
 - **deny (settings.json)** — абсолютный запрет (я обойти НЕ могу; владелец — вручную в Termux): `*--no-verify*`
