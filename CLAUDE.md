@@ -57,6 +57,16 @@ CLAUDE.md) → complete → фоновый job devbot `report_results` (раз �
 `op=restart_splinter` — аварийный фоллбэк. Рубильник контура: `systemctl stop orchestrator-daemon`
 (гасит ТОЛЬКО демон, splinter живёт). Утренняя авто-сводка в 328 в 08:00 (health/аудит/Brain, read-only).
 
+**ПРАВИЛО САМОМОДИФИКАЦИИ (заведено 03.07.2026, урок задачи 43):** headless-задача, правящая
+`orchestrator_daemon.py`, правит код демона, который исполняет ЕЁ САМУ — `systemctl restart
+orchestrator-daemon` по ходу задачи убивает её же claude-подпроцесс (SIGTERM/exit 143), отчёт
+пропадает. Поэтому: отчёт в cc_log+пульс и итоговая сводка пишутся ДО рестарта демона, а сам
+рестарт — САМОЕ ПОСЛЕДНЕЕ действие и ТОЛЬКО ОТЛОЖЕННО:
+`systemd-run --on-active=10s systemctl restart orchestrator-daemon`
+(за 10с claude-процесс задачи успевает завершиться и отчитаться). Прямой
+`systemctl restart orchestrator-daemon` из тела headless-задачи — ЗАПРЕЩЁН.
+Урок: C-декомпозер выжил (SIGTERM пришёл ПОСЛЕ отчёта), задача 43 погибла (рестарт ДО отчёта).
+
 ## Apps Script Bridge — какой проект «правильный»
 Bridge — это Google Apps Script. Проектов несколько, легко перепутать. Признаки ВЕРНОГО:
 - проект называется **«TurboBaby Bridge»**;

@@ -83,6 +83,8 @@ AUTO_OPS = ("git_push", "restart_splinter")
 # без Termux, вкл. прод-фикс 3978a91). restart splinter теперь CC делает САМ оранжевым циклом
 # (гейт→restart→проверка чистого старта→отчёт); кнопка op=restart_splinter остаётся фоллбэком.
 # Red-zone (Лист1/CRM/деньги/clasp/sqlite3/delete) — БЕЗ изменений: маркер op=other, НЕ обходить гейт.
+# v3.1 (03.07, урок задачи 43): правило самомодификации — рестарт orchestrator-daemon из задачи
+# только ОТЛОЖЕННО (systemd-run --on-active=10s) и ПОСЛЕ отчёта, иначе рестарт убивает свой claude.
 APPROVAL_PREAMBLE = (
     "Ты выполняешь задачу автономно в headless-режиме (без интерактивного подтверждения) в репо "
     "/root/turbobaby-manager-bot — CLAUDE.md и вся его дисциплина действуют.\n"
@@ -99,6 +101,11 @@ APPROVAL_PREAMBLE = (
     "active + свежий старт-лог в splinter.log без ошибок) → в сводке отчитайся «нужен был restart — "
     "сделал, старт чистый». При failed/грязном старте — откат на прошлый рабочий коммит + restart + "
     "честный отчёт. Маркер op=restart_splinter НЕ выводи (он остаётся только аварийным фоллбэком).\n"
+    "- САМОМОДИФИКАЦИЯ (правишь orchestrator_daemon.py — код демона, который исполняет ТЕБЯ): "
+    "рестарт демона убьёт твой же claude-процесс (SIGTERM, отчёт пропадёт). Поэтому отчёт в "
+    "cc_log+пульс и сводку пиши ДО рестарта, а рестарт — САМОЕ ПОСЛЕДНЕЕ действие и ТОЛЬКО "
+    "ОТЛОЖЕННО: systemd-run --on-active=10s systemctl restart orchestrator-daemon. НИКОГДА не зови "
+    "systemctl restart orchestrator-daemon напрямую из задачи.\n"
     "- НАСТОЯЩЕЕ КРАСНОЕ — запись в рабочие таблицы (CRM/Лист1/Байки/Зарплаты), деньги/транзакции, "
     "clasp deploy/redeploy/push, sqlite3 CLI на memory.db, set_fleet_oil/set_fleet_service, "
     "confirmed=true, delete_event, любое удаление — НЕ выполняй и НЕ ищи обходных путей: выведи РОВНО "
