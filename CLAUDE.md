@@ -119,6 +119,12 @@ Claude Code правит `.gs` локально и деплоит Bridge сам 
 
 БАЗА (git → Drive зеркало, истина = `docs/*.md`): `project_state` / `knowledge_base` / `faq` / `park_list`.
 
+**ИСКЛЮЧЕНИЕ — FAQ (заведено 03.07.2026, подготовка клиентской обкатки): для FAQ КАНОН = `KB_faq`
+в Brain** (ключи манифеста `faq` И `turbobaby_faq` — оба ведут на id `1tv8Y-K3gLyT9Y0mXyYXZLf2c2rEzPMLHPzvg4lGqs98`;
+`turbobaby_faq` зарегистрирован для suggest.py userbot'а — он читает `read_doc name=turbobaby_faq`).
+FAQ-правки вносить В KB_faq через `write_doc` (снимок до правки); `docs/turbobaby_faq_v1.md` на VPS = ЗЕРКАЛО
+(ре-синк ИЗ KB_faq, не наоборот). Направление синка у FAQ ОБРАТНОЕ остальной базе.
+
 ЖУРНАЛЫ (Brain-only, новые записи СВЕРХУ):
 - `cc_log` (KB_claude_code_log) — журнал Claude Code: PLAN/DONE/NOTE/BLOCKED.
 - `review` (KB_claude_review) — ревью Claude Code ↔ Claude на сайте (см. memory: review-policy).
