@@ -73,6 +73,8 @@
       "Bash(git push *)",
       "Bash(systemctl restart splinter)",
       "Bash(systemctl restart orchestrator-daemon)",
+      "Bash(systemd-run --on-active=* systemctl restart orchestrator-daemon)",
+      "Bash(systemd-run --on-active=* systemctl restart splinter)",
       "Bash(python3 -m json.tool *)",
       "Bash(git --no-pager branch *)",
       "Bash(git --no-pager remote *)",
