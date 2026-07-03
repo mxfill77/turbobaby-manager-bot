@@ -131,6 +131,22 @@ class BridgeClient:
     def daily_pulse(self) -> dict:
         return self._call("daily_pulse")
 
+    def quote_price(self, bike: str, date_start: str, date_end: str) -> Optional[dict]:
+        """Read-only расчёт цены аренды через Bridge (QuotePrice.gs), ничего не пишет.
+        Даты: dd.mm.yyyy | dd-mm-yyyy | yyyy-mm-dd.
+        → dict {bike, model, days, day_price, total, deposit, available, conflicts,
+        season, text} при ok; None при любой ошибке (таймаут/не-ok/кривой JSON) —
+        вызывающий код не роняет."""
+        try:
+            data = self._call("quote_price", bike=bike,
+                              date_start=date_start, date_end=date_end)
+            if not isinstance(data, dict) or not data.get("ok"):
+                return None
+            return data
+        except Exception as e:
+            log.error(f"quote_price wrapper error: {e}")
+            return None
+
 
     # === ЧЁРНЫЙ ЯЩИК боевых записей (4.1): какие действия логируем в боевой_лог ===
     _REDZONE_ACTIONS = {
