@@ -25,7 +25,7 @@ class SlowBridge:
     def __init__(s, delay):
         s.delay = delay
         s.calls = 0
-    def get_pending(s, status="new"):
+    def get_pending(s, status="new", lane=None):
         s.calls += 1
         time.sleep(s.delay)
         return {"ok": True, "items": []}
@@ -136,7 +136,7 @@ def test_multi_timeout_no_fallback_hammer():
 def test_report_done_via_multi():
     class MultiBridge:
         def __init__(s, items): s.items = items
-        def get_pending_multi(s, statuses):
+        def get_pending_multi(s, statuses, lane=None):
             return {"ok": True, "items": list(s.items)}
     b = MultiBridge([{"id": 5, "from": DB.QUEUE_FROM, "status": "done", "result": "готово: всё ок"}])
     _reset(b)

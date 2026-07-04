@@ -23,7 +23,7 @@ class FakeBridge:
     """get_pending: done/failed/needs_approval пустые; in_progress = заданный список."""
     def __init__(s, inprogress):
         s.inprogress = inprogress
-    def get_pending(s, status="new"):
+    def get_pending(s, status="new", lane=None):
         if status == "in_progress":
             return {"ok": True, "items": list(s.inprogress)}
         return {"ok": True, "items": []}

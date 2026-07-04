@@ -240,16 +240,26 @@ class BridgeClient:
         return self._post("consume_write_ticket", ticket=ticket or "")
 
     # === ОЧЕРЕДЬ ОРКЕСТРАТОРА (ступень 1, заход 1 — служебный лист, НЕ боевые данные) ===
+    # lane (вторая полоса 04.07.2026): 'vps' — демон на VPS, 'pc' — агент на ПК. Во всех методах
+    # lane ОПЦИОНАЛЕН: None → параметр НЕ шлётся (старый Bridge не ломается; новый дефолтит vps).
+    # 'all' в get_pending = обе полосы (опрос devbot).
 
-    def enqueue_task(self, from_: str, task_text: str) -> dict:
-        """Положить задачу в очередь → {ok, id}. status=new."""
-        return self._post("enqueue_task", **{"from": from_, "task_text": task_text})
+    def enqueue_task(self, from_: str, task_text: str, lane: str = None) -> dict:
+        """Положить задачу в очередь → {ok, id}. status=new. lane: None=vps (дефолт Bridge) | 'pc'."""
+        kw = {"from": from_, "task_text": task_text}
+        if lane is not None:
+            kw["lane"] = lane
+        return self._post("enqueue_task", **kw)
 
-    def get_pending(self, status: str = "new") -> dict:
-        """Задачи по статусу (деф. new), newest-first → {ok, items}. Дешёвое чтение (GET)."""
-        return self._call("get_pending", status=status)
+    def get_pending(self, status: str = "new", lane: str = None) -> dict:
+        """Задачи по статусу (деф. new), newest-first → {ok, items}. Дешёвое чтение (GET).
+        lane: None → Bridge-дефолт vps; 'pc' — полоса ПК; 'all' — обе полосы."""
+        kw = {"status": status}
+        if lane is not None:
+            kw["lane"] = lane
+        return self._call("get_pending", **kw)
 
-    def get_pending_multi(self, statuses) -> dict:
+    def get_pending_multi(self, statuses, lane: str = None) -> dict:
         """Задачи по НЕСКОЛЬКИМ статусам ОДНИМ вызовом (status=CSV), склейка 02.07.2026 →
         {ok, items} — у каждого item есть 'status'. Новый Bridge понимает CSV и подтверждает
         полем 'statuses'; старый (до redeploy) CSV не матчит и отдаёт items=[] БЕЗ 'statuses' →
@@ -257,12 +267,13 @@ class BridgeClient:
         Ошибка склеенного вызова (timeout и пр.) → возвращаем как есть, фоллбэком Bridge
         в окно деградации НЕ добиваем."""
         statuses = [str(s).strip() for s in statuses if str(s).strip()]
+        lane_kw = {} if lane is None else {"lane": lane}
         if not statuses:
             return {"ok": True, "items": []}
         if len(statuses) == 1:
-            return self._call("get_pending", status=statuses[0])
+            return self._call("get_pending", status=statuses[0], **lane_kw)
         if getattr(self, "_pending_multi_supported", None) is not False:
-            r = self._call("get_pending", status=",".join(statuses))
+            r = self._call("get_pending", status=",".join(statuses), **lane_kw)
             if not r.get("ok"):
                 return r
             if r.get("statuses"):
@@ -271,7 +282,7 @@ class BridgeClient:
             self._pending_multi_supported = False   # старый Bridge — дальше сразу по-статусно
         items = []
         for st in statuses:
-            rr = self._call("get_pending", status=st)
+            rr = self._call("get_pending", status=st, **lane_kw)
             if not rr.get("ok"):
                 return rr
             for it in rr.get("items", []):
@@ -280,9 +291,13 @@ class BridgeClient:
                 items.append(it)
         return {"ok": True, "items": items}
 
-    def claim_task(self, task_id) -> dict:
-        """Атомарно new→in_progress → {ok, task} | {ok:false, error:'already_claimed'/...}."""
-        return self._post("claim_task", id=task_id)
+    def claim_task(self, task_id, lane: str = None) -> dict:
+        """Атомарно new→in_progress → {ok, task} | {ok:false, error:'already_claimed'/'wrong_lane'/...}.
+        lane (опц. guard): новый Bridge не отдаст задачу чужой полосы даже по прямому id."""
+        kw = {"id": task_id}
+        if lane is not None:
+            kw["lane"] = lane
+        return self._post("claim_task", **kw)
 
     def complete_task(self, task_id, status: str, result: str = "") -> dict:
         """Финал задачи: status='done'|'failed' + result → {ok}."""

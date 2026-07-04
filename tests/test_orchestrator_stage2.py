@@ -79,8 +79,9 @@ m2 = DB._try_enqueue("задача: прочитай лог", fb)
 res.append(ok(ENQ[-1] == ("Filipp-328", "прочитай лог"), "«задача:» → from=Filipp-328 (быстрый)"))
 res.append(ok(DB._try_enqueue("тз:", fb).startswith("🤖 Пустое ТЗ"), "пустое «тз:» отклонено"))
 res.append(ok(DB._try_enqueue("обычный текст", fb) is None, "не-префикс → None (идёт в allowlist)"))
-res.append(ok(DB.QUEUE_FROMS == ("Filipp-328", "Filipp-328-dev", "Filipp-328-dec"),
-              "фильтр отчётов включает все метки (вкл. dec, часть C)"))
+res.append(ok(set(("Filipp-328", "Filipp-328-dev", "Filipp-328-dec",
+                   "Filipp-pc", "Filipp-pc-dev")) == set(DB.QUEUE_FROMS),
+              "фильтр отчётов включает все метки (вкл. dec часть C и полосу pc 04.07)"))
 
 # (6) новые зелёные команды B
 print("(6) зелёные команды B:")

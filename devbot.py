@@ -27,6 +27,17 @@ HQ_CHAT_ID = -1003853365891
 DEVBOT_TOPIC = 328                      # тема dev-bot (VPS). 205 = pc_agent/userbot (ПК) — НЕ наша
 CC_LOG_ID = "1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF"
 
+
+def pc_dev_topic():
+    """Тема «PC-дев» (вторая полоса lane=pc, 04.07.2026) — id из env PC_DEV_TOPIC_ID.
+    0/пусто/мусор = полоса ВЫКЛЮЧЕНА (id Филипп даёт после создания темы). Читается лениво
+    на каждый вызов: bot.py импортирует devbot ДО load_dotenv(), модульная константа
+    зафиксировала бы пустое значение."""
+    try:
+        return int(os.getenv("PC_DEV_TOPIC_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
 BRIDGE = None   # выставляется из bot.py при старте (devbot.BRIDGE = bridge)
 
 # === Фикс заморозки event loop (разбор таймаутов get_pending 02.07.2026) ===
@@ -59,14 +70,16 @@ def _get_poll_bridge():
 def _poll_queue_sync(pb):
     """СИНХРОННЫЙ опрос очереди одним прогоном — звать ТОЛЬКО через asyncio.to_thread.
     Склейка статусов: get_pending_multi = 1 CSV-вызов на новом Bridge (фоллбэк по-статусно
-    на старом/мокнутом). → {status: [items c from∈QUEUE_FROMS]} | None (ошибка → ждём тик)."""
+    на старом/мокнутом). lane='all' (04.07.2026): опрашиваем ОБЕ полосы (vps+pc) — карточки
+    pc-задач devbot разносит в тему PC-дев (_item_topic). → {status: [items c from∈QUEUE_FROMS]}
+    | None (ошибка → ждём тик)."""
     fn = getattr(pb, "get_pending_multi", None)
     if fn is not None:
-        r = fn(_REPORT_STATUSES)
+        r = fn(_REPORT_STATUSES, lane="all")
     else:                                   # мок в тестах без multi — по-статусно
         items = []
         for st in _REPORT_STATUSES:
-            rr = pb.get_pending(st)
+            rr = pb.get_pending(st, lane="all")
             if not rr.get("ok"):
                 return None
             for it in rr.get("items", []):
@@ -89,7 +102,10 @@ QUEUE_FROM = "Filipp-328"               # метка источника быст
 QUEUE_FROM_DEV = "Filipp-328-dev"       # метка дев-ТЗ «тз:» (ступень 2 O4, таймаут 45 мин у демона)
 QUEUE_FROM_DEC = "Filipp-328-dec"       # метка декомпозиции «декомпозируй:» (ступень 2 часть C):
                                         # родитель + его шаги «[шаг i/N родитель id]» + сводка
-QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC)   # фильтр отчётов: все метки — наши
+QUEUE_FROM_PC = "Filipp-pc"             # быстрая задача из темы PC-дев (lane=pc, исполняет ПК-агент)
+QUEUE_FROM_PC_DEV = "Filipp-pc-dev"     # дев-ТЗ из темы PC-дев (lane=pc)
+QUEUE_FROMS_PC = (QUEUE_FROM_PC, QUEUE_FROM_PC_DEV)          # метки полосы pc (карточки → тема PC-дев)
+QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
 _DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
 _DEC_PREFIXES = ("декомпозируй:", "разбей:", "decompose:")  # крупное ТЗ → план шагов → по одному
@@ -133,14 +149,21 @@ def _try_approval_reply(text, bridge):
         return f"🤖 Не удалось отклонить задачу {qid}: {r.get('error')}"
 
 
-def _try_enqueue(text, bridge):
+def _try_enqueue(text, bridge, lane="vps"):
     """Если текст начинается с префикса задачи — кладём в очередь оркестратора. Иначе None.
     «тз:»/«dev:» → метка QUEUE_FROM_DEV (демон даст 45 мин); «задача:» → быстрый режим (10 мин).
-    Проверяется ДО allowlist (иначе ключевые слова в тексте задачи перехватили бы зелёную команду)."""
+    Проверяется ДО allowlist (иначе ключевые слова в тексте задачи перехватили бы зелёную команду).
+    lane='pc' (тема PC-дев, 04.07.2026): ТОЛЬКО «тз:»/«задача:» → enqueue с lane='pc' и метками
+    Filipp-pc-dev / Filipp-pc (исполняет ПК-агент); «декомпозируй:» на pc-полосе НЕ поддержан.
+    lane='vps' (328): вызовы enqueue_task как раньше, БЕЗ lane — Bridge дефолтит vps."""
     t = (text or "").strip()
     low = t.lower()
+    pc = (lane == "pc")
     for p in _DEC_PREFIXES:
         if low.startswith(p):
+            if pc:
+                return ("🤖 «декомпозируй:» на полосе PC не поддержан — поставь «тз: <ТЗ>» "
+                        "или «задача: <что сделать>» (уйдёт ПК-агенту).")
             task_text = t[len(p):].strip()
             if not task_text:
                 return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
@@ -156,8 +179,14 @@ def _try_enqueue(text, bridge):
             task_text = t[len(p):].strip()
             if not task_text:
                 return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
-            r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text)
+            if pc:
+                r = bridge.enqueue_task(QUEUE_FROM_PC_DEV, task_text, lane="pc")
+            else:
+                r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text)
             if r.get("ok"):
+                if pc:
+                    return (f"✅ ТЗ {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
+                            f"Статусы/красные вопросы/итог принесу в эту тему.")
                 return (f"✅ ТЗ {r.get('id')} в очереди (дев-режим, до 45 мин; демон возьмёт ~60с). "
                         f"Работает headless Claude Code: зелёное/оранжевое (вкл. restart splinter "
                         f"через гейт) сам, настоящее красное спрошу кнопкой. Результат принесу сюда.")
@@ -167,8 +196,14 @@ def _try_enqueue(text, bridge):
             task_text = t[len(p):].strip()
             if not task_text:
                 return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
-            r = bridge.enqueue_task(QUEUE_FROM, task_text)
+            if pc:
+                r = bridge.enqueue_task(QUEUE_FROM_PC, task_text, lane="pc")
+            else:
+                r = bridge.enqueue_task(QUEUE_FROM, task_text)
             if r.get("ok"):
+                if pc:
+                    return (f"✅ Задача {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
+                            f"Принесу результат в эту тему, когда будет done/failed.")
                 return (f"✅ Задача {r.get('id')} поставлена в очередь — демон возьмёт её (опрос ~60с). "
                         f"Принесу результат сюда, когда будет done/failed.")
             return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
@@ -197,10 +232,11 @@ def _kb_done(qid):
 
 
 def _find_task(bridge, qid):
-    """Найти задачу по id среди всех статусов очереди → (status, item) | (None, None). read-only (get_pending)."""
+    """Найти задачу по id среди всех статусов очереди → (status, item) | (None, None). read-only
+    (get_pending, lane='all' — кнопки 🔄/📋 работают и под карточками полосы pc)."""
     for st in ("needs_approval", "approved", "in_progress", "new", "done", "failed"):
         try:
-            r = bridge.get_pending(st)
+            r = bridge.get_pending(st, lane="all")
         except Exception:
             continue
         if not r.get("ok"):
@@ -209,6 +245,19 @@ def _find_task(bridge, qid):
             if str(it.get("id")) == str(qid):
                 return st, it
     return None, None
+
+
+def _is_pc_item(it):
+    """Задача полосы pc? По полю lane (новый Bridge) ИЛИ по метке from (работает и до redeploy)."""
+    lane = str((it or {}).get("lane") or "").strip().lower()
+    return lane == "pc" or str((it or {}).get("from") or "") in QUEUE_FROMS_PC
+
+
+def _item_topic(it):
+    """Тема для карточки задачи: полоса pc → тема PC-дев; иначе / PC-тема не настроена → 328."""
+    if _is_pc_item(it):
+        return pc_dev_topic() or DEVBOT_TOPIC
+    return DEVBOT_TOPIC
 
 
 async def _strip_and_mark(q, mark):
@@ -395,7 +444,7 @@ async def report_results(context) -> None:
         head = f"{emoji} Задача {qid} — {st}\n\n{body}"
         chunks = _chunks(head)
         for i, chunk in enumerate(chunks):
-            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": DEVBOT_TOPIC, "text": chunk}
+            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _item_topic(it), "text": chunk}
             if st == "done" and i == len(chunks) - 1:   # 🔄/📋 только под done, на последнем чанке
                 kw["reply_markup"] = _kb_done(qid)
             try:
@@ -416,7 +465,7 @@ async def report_results(context) -> None:
              f"Подтвердить? Тапни кнопку ниже — или ответь «да {qid}» / «нет {qid}».")
         chunks = _chunks(q)
         for i, chunk in enumerate(chunks):
-            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": DEVBOT_TOPIC, "text": chunk}
+            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _item_topic(it), "text": chunk}
             if i == len(chunks) - 1:   # кнопки ✅/❌/🔄/📋 на последнем чанке
                 kw["reply_markup"] = _kb_approval(qid)
             try:
@@ -435,7 +484,7 @@ async def report_results(context) -> None:
             msg = f"🔄 Задача {qid} в работе…\n\n{task_text}"
             for chunk in _chunks(msg):
                 try:
-                    await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+                    await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
                 except Exception as e:
                     log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
         if qid not in _stalled:                # детект зависания — один раз на задачу
@@ -443,11 +492,14 @@ async def report_results(context) -> None:
             if age is not None and age > STALL_SEC:
                 _stalled.add(qid)
                 mins = int(age // 60)
-                w = (f"⚠️ Задача {qid} зависла — нет heartbeat ~{mins} мин (демон оркестратора не отвечает).\n"
-                     f"Проверь: systemctl status orchestrator-daemon")
+                if _is_pc_item(it):
+                    hint = "ПК-агент полосы pc не отвечает — проверь агента на ПК."
+                else:
+                    hint = "демон оркестратора не отвечает.\nПроверь: systemctl status orchestrator-daemon"
+                w = f"⚠️ Задача {qid} зависла — нет heartbeat ~{mins} мин ({hint})"
                 for chunk in _chunks(w):
                     try:
-                        await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)
+                        await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
                     except Exception as e:
                         log.warning("devbot.report_results: warn о зависании %s не ушло (%s)", qid, e)
 
@@ -574,6 +626,7 @@ def _g_help():
             "  задача: <что сделать> — быстрая задача (до 10 мин), та же дисциплина\n"
             "  декомпозируй: <крупное ТЗ> — план шагов → шаги отдельными задачами по одному → сводка\n"
             "  да N / нет N — ответ на запрос подтверждения красной зоны по задаче N\n"
+            "  (в теме PC-дев те же «тз:»/«задача:» уходят ПК-агенту, полоса lane=pc)\n"
             "  (красную зону демон сам НЕ проходит — спросит кнопкой)\n"
             "Красное (запись в таблицы/деньги/деплой Bridge) сам НЕ делаю — нужно твоё «да».")
 
@@ -608,14 +661,20 @@ def _chunks(s, n=3500):
 
 # ===================== ТОЧКИ ВХОДА =====================
 async def handle_command(msg, context, bridge) -> None:
-    """Команда дев-боту в его теме (328). ТОЛЬКО от Филиппа; только зелёное из allowlist.
-    Вне-allowlist/красное → НЕ выполняет, просит «да». Зелёное гоняет как origin=agent (без билета):
-    любая попытка красной записи внутри → ловится токен-замком 4.2."""
-    if getattr(msg, "message_thread_id", None) != DEVBOT_TOPIC:
-        return   # не тема dev-bot (напр. 205 = pc_agent на ПК) — НЕ реагируем вообще
+    """Команда дев-боту в его темах: 328 (полоса vps) и PC-дев (полоса pc, env PC_DEV_TOPIC_ID).
+    ТОЛЬКО от Филиппа; в 328 — префиксы + зелёное из allowlist; в PC-дев — ТОЛЬКО «тз:»/«задача:»
+    (→ enqueue lane=pc) и ответы «да N»/«нет N». Вне-allowlist/красное → НЕ выполняет, просит «да».
+    Зелёное гоняет как origin=agent (без билета): красная запись внутри → токен-замок 4.2."""
+    tid = getattr(msg, "message_thread_id", None)
+    pc_topic = pc_dev_topic()
+    if tid == DEVBOT_TOPIC:
+        lane = "vps"
+    elif pc_topic and tid == pc_topic:
+        lane = "pc"
+    else:
+        return   # не наша тема (напр. 205 = pc_agent на ПК) — НЕ реагируем вообще
     if not msg.from_user or msg.from_user.id != DEVBOT_USER:
         return   # чужой — игнор
-    tid = getattr(msg, "message_thread_id", None)
 
     # 0) Ответ на запрос подтверждения «да N» / «нет N» — ПЕРВЫМ (специфичный паттерн).
     # Bridge-вызовы — через to_thread (фикс 02.07): event loop не встаёт, пока /exec тупит.
@@ -627,10 +686,19 @@ async def handle_command(msg, context, bridge) -> None:
 
     # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
     #    (служебный лист очереди), origin=human по умолчанию — гейт 4.2 не трогаем.
-    enq = await asyncio.to_thread(_try_enqueue, msg.text or "", bridge)
+    enq = await asyncio.to_thread(_try_enqueue, msg.text or "", bridge, lane)
     if enq is not None:
         for chunk in _chunks(enq):
             await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
+        return
+
+    # Полоса pc: зелёный allowlist НЕ гоняем (он про VPS) — только подсказка формата.
+    if lane == "pc":
+        await context.bot.send_message(
+            chat_id=msg.chat_id, message_thread_id=tid,
+            text=("🤖 Тема PC-дев (lane=pc): «тз: <ТЗ>» или «задача: <что сделать>» — уйдёт "
+                  "ПК-агенту; «да N» / «нет N» — ответ на красный вопрос. "
+                  "Зелёные VPS-команды (health/аудит/…) — в теме 328."))
         return
 
     # 2) Зелёная read-only команда из allowlist

@@ -51,7 +51,7 @@ class FakeBridge:
         s.approve_calls.append(qid); return s._approve
     def complete_task(s, qid, status, note):
         s.complete_calls.append(qid); return s._complete
-    def get_pending(s, status="new"):
+    def get_pending(s, status="new", lane=None):
         return {"ok": True, "items": [i for i in s._items if i.get("_st") == status]}
 
 SENDS = []

@@ -14,6 +14,7 @@
   - Общается только с Пымом; остальных читает для учёта.
 """
 
+import os
 import json
 import base64
 import html
@@ -183,10 +184,25 @@ HQ_CHAT_ID = -1003853365891
 IGNORED_THREADS = {205, 328}
 
 
+def _pc_dev_topic():
+    """Тема «PC-дев» (вторая полоса lane=pc, 04.07.2026) из env PC_DEV_TOPIC_ID; 0 = не создана.
+    Лениво (не модульной константой): bot.py импортирует splinter ДО load_dotenv()."""
+    try:
+        return int(os.getenv("PC_DEV_TOPIC_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def is_ignored_thread(chat_id, topic_id) -> bool:
     """True → Splinter полностью молчит в этой теме (чужой контур userbot/агента в HQ).
-    Проверять РАНО, до мозга/учёта/аудитора/любой реакции."""
-    return chat_id == HQ_CHAT_ID and topic_id in IGNORED_THREADS
+    Проверять РАНО, до мозга/учёта/аудитора/любой реакции. Тема PC-дев (env PC_DEV_TOPIC_ID)
+    тоже игнорится: там командует devbot (полоса lane=pc), Splinter молчит как в 328."""
+    if chat_id != HQ_CHAT_ID:
+        return False
+    if topic_id in IGNORED_THREADS:
+        return True
+    pc = _pc_dev_topic()
+    return bool(pc) and topic_id == pc
 
 
 # Через сколько записей звать Пыма проверить (для накопительного режима)
