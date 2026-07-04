@@ -3,7 +3,10 @@
 (L5) _try_enqueue: pc-полоса → метки Filipp-pc[-dev] + lane='pc', декомпозиция на pc не поддержана,
 328 — как раньше БЕЗ lane; (L6) handle_command: тема PC-дев только от Филиппа, выключена без env;
 (L7) report_results разносит карточки по полосам (pc → тема PC-дев, vps → 328);
-(L8) splinter.is_ignored_thread игнорит тему PC-дев из env. Сеть/бот замоканы."""
+(L8) splinter.is_ignored_thread игнорит тему PC-дев из env;
+(L9) боевой id темы = 829 (прописан в .env 04.07.2026): сообщение в 829 → очередь lane=pc,
+splinter тему 829 игнорит, .env реально содержит PC_DEV_TOPIC_ID=829;
+(L10) VPS-демон pc-задачи НЕ берёт: его опрос идёт БЕЗ lane → Bridge дефолтит vps. Сеть/бот замоканы."""
 import sys, asyncio
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 import os
@@ -209,6 +212,53 @@ def test_splinter_ignores_pc_topic():
         _set_pc(False)
     assert not splinter.is_ignored_thread(splinter.HQ_CHAT_ID, PC_TOPIC), \
         "env не задан → тема не игнорится (полоса выключена)"
+
+
+# L9: боевой id темы PC-дев = 829 — маршрутизация в проде (env как в .env)
+def test_pc_topic_829_live_id():
+    env_path = "/root/turbobaby-manager-bot/.env"
+    if os.path.exists(env_path):                       # конфиг-дрейф: строка должна быть в .env
+        with open(env_path, encoding="utf-8") as f:
+            assert "PC_DEV_TOPIC_ID=829" in f.read(), ".env потерял PC_DEV_TOPIC_ID=829"
+    os.environ["PC_DEV_TOPIC_ID"] = "829"
+    try:
+        b = EnqBridge()
+        SENDS.clear()
+        asyncio.run(DB.handle_command(FakeMsg("тз: проверь полосу", 829), Ctx(), b))
+        assert b.calls == [(DB.QUEUE_FROM_PC_DEV, "проверь полосу", "pc")], \
+            f"«тз:» в теме 829 → enqueue lane=pc: {b.calls}"
+        assert SENDS and SENDS[0][0] == 829, f"ответ-карточка в тему 829: {SENDS}"
+        b2 = EnqBridge()
+        SENDS.clear()
+        asyncio.run(DB.handle_command(FakeMsg("задача: пингани ПК", 829), Ctx(), b2))
+        assert b2.calls == [(DB.QUEUE_FROM_PC, "пингани ПК", "pc")], \
+            f"«задача:» в теме 829 → enqueue lane=pc: {b2.calls}"
+        b3 = EnqBridge()
+        SENDS.clear()
+        asyncio.run(DB.handle_command(FakeMsg("тз: чужой", 829, uid=111), Ctx(), b3))
+        assert b3.calls == [] and SENDS == [], "тема 829: не-Филипп — полный игнор"
+        import splinter
+        assert splinter.is_ignored_thread(splinter.HQ_CHAT_ID, 829), "splinter игнорит тему 829"
+    finally:
+        os.environ.pop("PC_DEV_TOPIC_ID", None)
+
+
+# L10: VPS-демон pc-задачи НЕ берёт — process_new опрашивает БЕЗ lane (Bridge дефолтит vps)
+def test_vps_daemon_polls_without_lane():
+    import orchestrator_daemon as OD
+    calls = []
+    class PollBridge:
+        def get_pending(s, status, **kw):
+            calls.append((status, dict(kw)))
+            return {"ok": True, "items": []}
+    old = OD.bc
+    OD.bc = PollBridge()
+    try:
+        OD.process_new()
+    finally:
+        OD.bc = old
+    assert calls == [("new", {})], \
+        f"опрос VPS-демона должен идти БЕЗ lane (Bridge дефолтит vps → pc-задачи невидимы): {calls}"
 
 
 if __name__ == "__main__":
