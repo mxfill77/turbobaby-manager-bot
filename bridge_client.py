@@ -135,8 +135,11 @@ class BridgeClient:
         """Read-only расчёт цены аренды через Bridge (QuotePrice.gs), ничего не пишет.
         Даты: dd.mm.yyyy | dd-mm-yyyy | yyyy-mm-dd.
         → dict {bike, model, days, day_price, total, deposit, available, conflicts,
-        season, text} при ok; None при любой ошибке (таймаут/не-ok/кривой JSON) —
-        вызывающий код не роняет."""
+        season, cap_price, cap_active, text} при ok; None при любой ошибке
+        (таймаут/не-ok/кривой JSON) — вызывающий код не роняет.
+        cap_price/cap_active — кап-акция low season из блока капов «Календаря
+        бронирования» (05.07.2026); подмену цены делает userbot, не эта обёртка.
+        Старый Bridge без капов этих полей не шлёт — вызывающему коду брать через .get()."""
         try:
             data = self._call("quote_price", bike=bike,
                               date_start=date_start, date_end=date_end)
