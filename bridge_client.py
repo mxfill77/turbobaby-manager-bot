@@ -154,6 +154,7 @@ class BridgeClient:
     # === ЧЁРНЫЙ ЯЩИК боевых записей (4.1): какие действия логируем в боевой_лог ===
     _REDZONE_ACTIONS = {
         "set_fleet_oil", "set_fleet_service",   # Байки H/I/J/K/L
+        "set_caps", "toggle_cap",                # блок капов «Календарь бронирования» Z3:AB15 (живая таблица)
         "add_transaction", "void_last",          # касса (проводки + отмена)
         "create_booking", "activate_booking",    # CRM «клиенты»
         "delete_event",                          # удаление
@@ -535,6 +536,22 @@ class BridgeClient:
         not_found / ambiguous / km_decreasing / write_failed."""
         return self._post("set_fleet_service", number=str(number), kind=str(kind),
                           km=km, confirmed=bool(confirmed))
+
+    def set_caps(self, caps, confirmed: bool = False) -> dict:
+        """GUARDED: записать блок капов в «Календарь бронирования» (QuotePrice.js setCaps, адрес
+        CAPS_ANCHOR Z3:AB15). caps = [{model, cap, active}, ...]. Требует confirmed=True.
+        Ответ проводится наверх БЕЗ потери: при пост-записи-верификации Bridge возвращает
+        verified/full_address (успех) либо ok:false + error='verify_failed' + full_address
+        (запись не подтвердилась чтением обратно). Ошибки: not_confirmed / missing_caps /
+        too_many_caps / bad_cap_row / verify_failed / write_failed."""
+        return self._post("set_caps", caps=caps, confirmed=bool(confirmed))
+
+    def toggle_cap(self, model, on, confirmed: bool = False) -> dict:
+        """GUARDED: включить/выключить кап одной модели (QuotePrice.js toggleCap). Требует
+        confirmed=True. Ответ (verified/full_address/verify_failed) проводится наверх без потери.
+        Ошибки: not_confirmed / missing_model / bad_on / no_cap_block / model_not_found /
+        verify_failed / write_failed."""
+        return self._post("toggle_cap", model=str(model), on=on, confirmed=bool(confirmed))
 
     # === Архивация журнала cc_log (Archive.gs на Bridge) ===
     def prune_cc_log(self) -> dict:

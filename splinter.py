@@ -2785,6 +2785,11 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
         elif err == "not_found":
             detail_ru = f"не нашёл байк с номером {plate} в Лист1"
             detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
+        elif err == "verify_failed":
+            # запись НЕ подтвердилась перечитыванием ячейки — считаем ПРОВАЛОМ, не «done»
+            _addr = res.get("full_address") or "Лист1"
+            detail_ru = f"запись в {_addr} не подтвердилась при проверке — НЕ записал, повтори"
+            detail_th = f"ยืนยันการบันทึก {_addr} ไม่ผ่าน — ไม่บันทึก ลองใหม่"
         else:
             detail_ru = f"не удалось записать ({err or 'ошибка'})"
             detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
@@ -2872,6 +2877,11 @@ async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km)
         elif err == "not_found":
             detail_ru = f"не нашёл байк с номером {plate} в Лист1"
             detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
+        elif err == "verify_failed":
+            # запись НЕ подтвердилась перечитыванием ячейки — считаем ПРОВАЛОМ, не «done»
+            _addr = res.get("full_address") or "Лист1"
+            detail_ru = f"запись в {_addr} не подтвердилась при проверке — НЕ записал, повтори"
+            detail_th = f"ยืนยันการบันทึก {_addr} ไม่ผ่าน — ไม่บันทึก ลองใหม่"
         else:
             detail_ru = f"не удалось записать ({err or 'ошибка'})"
             detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
