@@ -22,7 +22,9 @@ import subprocess
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PY = os.path.join(ROOT, "venv", "bin", "python3")
-TESTS_DIR = os.path.join(ROOT, "tests")
+# GATE_TESTS_DIR — ТОЛЬКО для регресса tests/test_no_push_leak.py (подмена набора на фейковый,
+# чтобы прогнать полный цикл гейта без рекурсии). Боевой запуск переменную не ставит.
+TESTS_DIR = os.environ.get("GATE_TESTS_DIR") or os.path.join(ROOT, "tests")
 
 
 def _arg(flag):
@@ -55,7 +57,11 @@ def _push(text):
 
 def run_tests():
     """Прогнать все tests/test_*.py. Вернуть (failed:list, total:int, dt:float)."""
-    env = dict(os.environ, PYTHONPATH=ROOT)   # чтобы import splinter работал из tests/
+    # PYTHONPATH — чтобы import splinter работал из tests/. PRETOOL_NOPUSH=1 — тесты и ВСЕ их
+    # подпроцессы (вкл. pretool_guard-фикстуры) НЕ шлют пуши в личку (утечки 01–05.07): env
+    # наследуется детьми, pretool_guard._push и notify.notify его чтут. Пуш самого гейта о красных
+    # тестах НЕ затронут (переменная ставится только подпроцессам тестов, не самому гейту).
+    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1")
     tests = sorted(glob.glob(os.path.join(TESTS_DIR, "test_*.py")))
     failed = []
     t0 = time.time()

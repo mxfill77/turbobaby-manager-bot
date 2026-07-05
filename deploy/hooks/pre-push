@@ -1,4 +1,6 @@
 #!/bin/sh
 # ТЕСТЫ-ГЕЙТ (4.3): перед КАЖДЫМ git push гоняем gate.py. Красные тесты → exit≠0 → git РВЁТ push.
 # Обход (только по «да» Филиппа): git push --no-verify (+ gate.py --override «причина» для записи).
+# Пуши из тестов: gate.py САМ ставит PRETOOL_NOPUSH=1 подпроцессам тестов (фикс утечек 01–05.07) —
+# здесь переменную НЕ ставим НАМЕРЕННО, чтобы пуш самого гейта «🔴 ТЕСТЫ КРАСНЫЕ» остался живым.
 exec /root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/gate.py --for push

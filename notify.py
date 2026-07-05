@@ -116,11 +116,40 @@ def _delete_stored(token):
     _save_ids([])
 
 
+def _test_mode():
+    """Тест-контур (фикс утечек 01–05.07: тестовые карточки летели в личку).
+    → 'count' | 'mute' | None. Проверяется ДО токена и ДО сети:
+    - NOTIFY_COUNT_FILE=<путь> — мок-счётчик регресса: попытка пуша = строка в файл, сеть НЕ дёргаем
+      (первым: регресс считает ПОПЫТКИ, даже те, что дальше замутил бы PRETOOL_NOPUSH);
+    - PRETOOL_NOPUSH=1 — мут тестовых прогонов (gate.py ставит его подпроцессам тестов; та же
+      переменная, что чтит pretool_guard._push)."""
+    if os.environ.get("NOTIFY_COUNT_FILE"):
+        return "count"
+    if os.environ.get("PRETOOL_NOPUSH") == "1":
+        return "mute"
+    return None
+
+
+def _count_attempt(text):
+    try:
+        with open(os.environ["NOTIFY_COUNT_FILE"], "a", encoding="utf-8") as f:
+            f.write(text.replace("\n", " ")[:200] + "\n")
+    except Exception:
+        pass
+
+
 def notify(text, track=False, clear_first=False) -> bool:
     """Отправить пуш Филиппу. track=True → это 🔔-уведомление: удалить прошлые 🔔, отправить, СОХРАНИТЬ id
     (чтобы следующее его убрало). clear_first=True → удалить висящие 🔔 перед отправкой, но НЕ трекать (для
     --done/--need: задача разрешена). По умолчанию (оба False) — просто отправить, висящий 🔔 НЕ трогать
     (health/эскалации/произвольный текст)."""
+    mode = _test_mode()
+    if mode == "count":
+        _count_attempt(text)
+        return True
+    if mode == "mute":
+        print("notify: muted (PRETOOL_NOPUSH=1, тест-режим — пуш не отправлен)", file=sys.stderr)
+        return True
     token = _get_token()
     if not token:
         print("notify: NO BOT_TOKEN in env", file=sys.stderr)
@@ -138,6 +167,8 @@ def notify(text, track=False, clear_first=False) -> bool:
 
 def clear_notifications() -> None:
     """Удалить все накопленные 🔔 (хук UserPromptSubmit — при новом задании владельца). Тихо, без stdout."""
+    if _test_mode():
+        return   # тест-контур: сеть не дёргаем
     token = _get_token()
     if not token:
         return

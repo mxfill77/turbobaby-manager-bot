@@ -2,6 +2,10 @@
 стор атомарен; deleteMessage на мёртвом id не валит. Сеть НЕ дёргаем — _send_message/_delete_message мокнуты."""
 import os, sys, json
 sys.path.insert(0, "/root/turbobaby-manager-bot")
+# Снимаем тест-мут (гейт ставит PRETOOL_NOPUSH=1 подпроцессам тестов): этот тест проверяет ЛОГИКУ
+# notify изнутри, сеть замокана (_send_message/_delete_message/_get_token) — мут тут не нужен.
+os.environ.pop("PRETOOL_NOPUSH", None)
+os.environ.pop("NOTIFY_COUNT_FILE", None)
 import notify as N
 
 TMP = "/tmp/claude-0/-root-turbobaby-manager-bot/de0bcc53-2bb9-43ea-8f40-d32c5dc0212b/scratchpad/cc_notif_test.json"

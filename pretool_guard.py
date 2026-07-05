@@ -147,8 +147,10 @@ def _detail(hit, blob):
 
 def _is_test_script(cmd):
     """Тестовый прогон: запускаемый .py лежит в scratchpad (/tmp/claude-*/…/scratchpad/) или несёт
-    _dryrun/_test в имени. Влияет ТОЛЬКО на текст карточки (🧪-пометка первой строкой) — классификацию
-    red/ambiguous/green и решение ask/defer НЕ меняет. Боевые скрипты из репо — без пометки."""
+    _dryrun/_test в имени. Влияние: 🧪-пометка первой строкой карточки И пуш в Telegram НЕ шлётся
+    (фикс утечек 01–05.07: тестовые красные карточки летели Филиппу в личку; терминальная карточка
+    и решение ask ОСТАЮТСЯ — классификацию red/ambiguous/green это НЕ меняет). Боевые скрипты из
+    репо — без пометки, с пушем."""
     try:
         toks = shlex.split(cmd)
     except Exception:
@@ -300,8 +302,10 @@ def main():
         kind, hit, blob = "ambiguous", "ambiguous", cmd  # любая ошибка анализа → fail-safe ask
     if kind == "green":
         _defer()                                       # читающий python → штатный allow (venv python в allow)
-    card = _card(hit, blob, _is_test_script(cmd))
-    _push(card)
+    test = _is_test_script(cmd)
+    card = _card(hit, blob, test)
+    if not test:
+        _push(card)   # 🧪-тестовые карточки в личку НЕ пушим (утечки 01–05.07); ask остаётся
     _ask(card)
 
 
