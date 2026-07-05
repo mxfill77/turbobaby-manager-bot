@@ -54,28 +54,27 @@ EXPECTED_CAPS = {
 }
 
 
+# Адрес блока капов — зеркало CAPS_ANCHOR (QuotePrice.js): шапка Z3, данные Z4:AB15 (12 строк)
+CAPS_ANCHOR = {"col": 26, "header_row": 3, "data_rows": 12}
+
+
 # ── ЗЕРКАЛО quoteNormCap_/quoteReadCaps_ (QuotePrice.js) ──
 def norm_cap(s):
     return re.sub(r"\s+", " ", str(s or "").lower()).strip()
 
 
-def read_caps_mirror(header_row_vals, data_rows, scan_from=11):
-    """header_row_vals: значения строки 3 колонок K..T; data_rows: строки ниже (та же ширина)."""
-    col = -1
-    for i, h in enumerate(header_row_vals):
-        if norm_cap(h) == "модель":
-            col = i
-            break
-    if col < 0:
+def read_caps_mirror(head, data_rows):
+    """От CAPS_ANCHOR: head — 3 ячейки Z3:AB3; data_rows — строки Z4:AB.. (3-широкие).
+    Шапка не «Модель» → None (блока по адресу нет). Данные до первой пустой «Модели»."""
+    if norm_cap(head[0] if head else "") != "модель":
         return None
     caps = {}
     for r in data_rows:
-        name = norm_cap(r[col] if col < len(r) else "")
+        name = norm_cap(r[0] if r else "")
         if not name:
             break
-        raw = str(r[col + 1] if col + 1 < len(r) else "")
-        cap_num = float(re.sub(r"[^\d.]", "", raw) or 0)
-        act = norm_cap(r[col + 2] if col + 2 < len(r) else "")
+        cap_num = float(re.sub(r"[^\d.]", "", str(r[1] if len(r) > 1 else "")) or 0)
+        act = norm_cap(r[2] if len(r) > 2 else "")
         caps[name] = {
             "cap": cap_num if cap_num else None,
             "active": act in ("да", "yes", "true", "1"),
@@ -93,19 +92,11 @@ def resolve_cap_mirror(caps, cap_key):
     return cap_price, cap_active
 
 
-def block_as_sheet(header_col=1):
-    """Блок капов как диапазон K..T: шапка в строке 3, данные ниже; header_col — смещение внутри K..T."""
-    width = 10
-    head = [""] * width
-    head[header_col] = "Модель"
-    head[header_col + 1] = "Кап ฿/мес"
-    head[header_col + 2] = "Активен"
-    rows = []
-    for m, c, a in CAP_BLOCK:
-        r = [""] * width
-        r[header_col], r[header_col + 1], r[header_col + 2] = m, c, a
-        rows.append(r)
-    rows.append([""] * width)  # конец блока
+def block_as_sheet():
+    """Блок капов как регион CAPS_ANCHOR (Z3:AB..): шапка Z3:AB3 + данные Z4.. + пустая строка-конец."""
+    head = ["Модель", "Кап ฿/мес", "Активен"]
+    rows = [[m, c, a] for m, c, a in CAP_BLOCK]
+    rows.append(["", "", ""])  # конец блока
     return head, rows
 
 
@@ -151,17 +142,26 @@ def test_read_caps_parses_block():
     assert caps["cb650r/cbr650r"]["cap"] == 18900
 
 
-def test_read_caps_header_position_independent():
-    """Шапка «Модель» ищется по K..T — блок находится в любой свободной колонке."""
-    for col in (0, 3, 7):
-        head, rows = block_as_sheet(header_col=col)
-        caps = read_caps_mirror(head, rows)
-        assert caps and caps["nmax"]["cap"] == 5000, f"не нашли блок при смещении {col}"
+def test_caps_anchor_matches_js():
+    """Дрейф-guard адреса: CAPS_ANCHOR в реальном QuotePrice.js == Z3, данные Z4:AB15 (12 строк).
+    Читатель И писатель берут адрес из ОДНОЙ константы — старого скана K..T больше нет."""
+    src = open(QP_JS, encoding="utf-8").read()
+    body = src.split("var CAPS_ANCHOR = {")[1].split("};")[0]
+    col = int(re.search(r"col:\s*(\d+)", body).group(1))
+    hr = int(re.search(r"headerRow:\s*(\d+)", body).group(1))
+    dr = int(re.search(r"dataRows:\s*(\d+)", body).group(1))
+    assert (col, hr, dr) == (26, 3, 12), f"адрес капов уехал: col={col} row={hr} rows={dr}"
+    assert col == CAPS_ANCHOR["col"] and hr == CAPS_ANCHOR["header_row"] and dr == CAPS_ANCHOR["data_rows"]
+    # старые скан-константы и сканирующий поиск колонки удалены — адрес теперь единый
+    for gone in ("QUOTE_CAP_SCAN_FROM", "QUOTE_CAP_SCAN_TO", "QUOTE_CAP_MAX_ROWS", "quoteFindCapCol_"):
+        assert gone not in src, f"остался рудимент старого скан-адреса: {gone}"
+    # оба потока (чтение и запись) ссылаются на единый CAPS_ANCHOR
+    assert src.count("CAPS_ANCHOR") >= 6, "CAPS_ANCHOR должен использоваться в чтении и записи"
 
 
 def test_no_block_returns_none():
-    caps = read_caps_mirror([""] * 10, [])
-    assert caps is None  # блока ещё нет → quote_price отдаёт null/false, не ошибку
+    caps = read_caps_mirror(["", "", ""], [])
+    assert caps is None  # шапки по адресу нет → quote_price отдаёт null/false, не ошибку
 
 
 def test_resolution_shared_and_missing():
@@ -178,8 +178,8 @@ def test_resolution_shared_and_missing():
 
 def test_inactive_and_formats():
     head, rows = block_as_sheet()
-    rows[0][3] = "нет"          # NMAX «Активен» = нет (шапка в col 1 → активен = col 3)
-    rows[1][2] = "8 900 ฿"      # XMAX OLD кап с пробелом и ฿
+    rows[0][2] = "нет"          # NMAX «Активен» = нет (AB, третья колонка региона)
+    rows[1][1] = "8 900 ฿"      # XMAX OLD кап с пробелом и ฿ (AA, вторая колонка)
     caps = read_caps_mirror(head, rows)
     price, active = resolve_cap_mirror(caps, "nmax")
     assert price == 5000 and active is False, "кап виден, но неактивен"

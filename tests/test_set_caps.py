@@ -10,16 +10,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 
-from test_quote_caps import CAP_BLOCK, EXPECTED_CAPS, norm_cap, read_caps_mirror
+from test_quote_caps import CAPS_ANCHOR, CAP_BLOCK, EXPECTED_CAPS, norm_cap, read_caps_mirror
 
 QP_JS = "/root/turbobaby-bridge-gs/QuotePrice.js"
 BRIDGE_JS = "/root/turbobaby-bridge-gs/Bridge.js"
 
-CAP_HEADER_ROW = 3      # QUOTE_CAP_HEADER_ROW
-CAP_SCAN_FROM = 11      # K
-CAP_SCAN_TO = 20        # T
-CAP_MAX_ROWS = 20       # QUOTE_CAP_MAX_ROWS
-WIDTH = 14              # ширина фейковой сетки: K..T (10) + запас справа под блок у края
+CAP_HEADER_ROW = CAPS_ANCHOR["header_row"]  # 3 (Z3)
+CAP_COL = CAPS_ANCHOR["col"]                # 26 (Z)
+CAP_MAX_ROWS = CAPS_ANCHOR["data_rows"]     # 12 (Z4:AB15)
 
 # payload для боевого вызова set_caps после деплоя — ровно финальная таблица (те же 12 строк)
 SET_CAPS_PAYLOAD = [{"model": m, "cap": int(c), "active": True} for m, c, a in CAP_BLOCK]
@@ -27,7 +25,16 @@ SET_CAPS_PAYLOAD = [{"model": m, "cap": int(c), "active": True} for m, c, a in C
 _UNSET = object()
 
 
-# ── ЗЕРКАЛО quoteParseOnOff_/quoteFindCapCol_/setCaps/toggleCap (QuotePrice.js) ──
+# ── ЗЕРКАЛО quoteColLetter_/quoteParseOnOff_/setCaps/toggleCap (QuotePrice.js) ──
+def col_letter(col):
+    """Зеркало quoteColLetter_: 26 → 'Z', 27 → 'AA', 28 → 'AB'."""
+    s = ""
+    while col > 0:
+        col, m = divmod(col - 1, 26)
+        s = chr(65 + m) + s
+    return s
+
+
 def parse_on_off(v):
     if v is True:
         return True
@@ -41,17 +48,9 @@ def parse_on_off(v):
     return None
 
 
-def blank_grid(data_rows=CAP_MAX_ROWS + 2):
-    """Сетка региона капов: head = строка 3 (K..), data = строки 4.. той же ширины."""
-    return [""] * WIDTH, [[""] * WIDTH for _ in range(data_rows)]
-
-
-def find_cap_col(head):
-    """Зеркало quoteFindCapCol_: индекс шапки «Модель» ВНУТРИ региона K..T, либо -1."""
-    for i in range(CAP_SCAN_TO - CAP_SCAN_FROM + 1):
-        if norm_cap(head[i]) == "модель":
-            return i
-    return -1
+def blank_grid(data_rows=CAP_MAX_ROWS):
+    """Регион капов CAPS_ANCHOR: head = Z3:AB3 (3-широкий), data = Z4:AB.. строки (3-широкие)."""
+    return ["", "", ""], [["", "", ""] for _ in range(data_rows)]
 
 
 def set_caps_mirror(head, data, body):
@@ -78,15 +77,13 @@ def set_caps_mirror(head, data, body):
         if act is None:
             return {"ok": False, "error": "bad_cap_row", "row": i + 1}
         rows.append([name, cap_num, "да" if act else "нет"])
-    col = find_cap_col(head)
-    if col < 0:
-        col = 0  # = QUOTE_CAP_SCAN_FROM (K)
-    head[col], head[col + 1], head[col + 2] = "Модель", "Кап ฿/мес", "Активен"
+    # запись ВСЕГДА от адреса CAPS_ANCHOR (Z3) — скана колонки больше нет
+    head[0], head[1], head[2] = "Модель", "Кап ฿/мес", "Активен"
     for j, r in enumerate(rows):
-        data[j][col], data[j][col + 1], data[j][col + 2] = r[0], r[1], r[2]
-    for j in range(len(rows), CAP_MAX_ROWS):  # дочистка хвоста старого блока
-        data[j][col] = data[j][col + 1] = data[j][col + 2] = ""
-    return {"ok": True, "header_cell": chr(64 + CAP_SCAN_FROM + col) + str(CAP_HEADER_ROW),
+        data[j][0], data[j][1], data[j][2] = r[0], r[1], r[2]
+    for j in range(len(rows), CAP_MAX_ROWS):  # дочистка хвоста старого блока до конца региона
+        data[j][0] = data[j][1] = data[j][2] = ""
+    return {"ok": True, "header_cell": col_letter(CAP_COL) + str(CAP_HEADER_ROW),
             "rows": len(rows), "models": [r[0] for r in rows]}
 
 
@@ -100,17 +97,16 @@ def toggle_cap_mirror(head, data, body):
     on = parse_on_off(p.get("on"))
     if on is None:
         return {"ok": False, "error": "bad_on"}
-    col = find_cap_col(head)
-    if col < 0:
+    if norm_cap(head[0]) != "модель":
         return {"ok": False, "error": "no_cap_block"}
     for j in range(CAP_MAX_ROWS):
-        name = norm_cap(data[j][col])
+        name = norm_cap(data[j][0])
         if not name:
             break
         if name == want:
-            data[j][col + 2] = "да" if on else "нет"
-            cap_num = float(re.sub(r"[^\d.]", "", str(data[j][col + 1])) or 0)
-            return {"ok": True, "model": str(data[j][col]),
+            data[j][2] = "да" if on else "нет"
+            cap_num = float(re.sub(r"[^\d.]", "", str(data[j][1])) or 0)
+            return {"ok": True, "model": str(data[j][0]),
                     "cap_price": cap_num if cap_num else None, "cap_active": on}
     return {"ok": False, "error": "model_not_found"}
 
@@ -134,7 +130,7 @@ def test_js_confirmed_gate_and_readonly_quote():
     src = open(QP_JS, encoding="utf-8").read()
     assert src.count("not_confirmed") >= 2, "confirmed-гейт должен стоять в ОБОИХ экшенах"
     for fn in ("function setCaps(", "function toggleCap(", "function quoteParseOnOff_(",
-               "function quoteFindCapCol_("):
+               "function quoteColLetter_("):
         assert fn in src, f"в QuotePrice.js нет {fn}"
     # quote_price остаётся read-only: до блока setCaps ни одного setValue/clearContent
     read_part = src.split("function setCaps(")[0]
@@ -153,7 +149,7 @@ def test_not_confirmed_refused():
 def test_set_caps_creates_block_roundtrip():
     head, data = blank_grid()
     r = set_caps_mirror(head, data, {"confirmed": True, "caps": SET_CAPS_PAYLOAD})
-    assert r["ok"] and r["rows"] == 12 and r["header_cell"] == "K3"
+    assert r["ok"] and r["rows"] == 12 and r["header_cell"] == "Z3"
     caps = read_caps_mirror(head, data)  # что записали — quoteReadCaps_ читает обратно
     assert len(caps) == 12
     assert caps["nmax"] == {"cap": 5000, "active": True}
@@ -164,17 +160,24 @@ def test_set_caps_creates_block_roundtrip():
         assert cap_key in caps, f"cap-ключ {cap_key} не находит строку после set_caps"
 
 
-def test_set_caps_updates_in_place_and_clears_tail():
-    # старый блок: шапка со смещением (N вместо K) и 15 строк
+def test_set_caps_overwrites_and_clears_tail():
+    # старый блок по адресу Z3: заполнен ПОЛНОСТЬЮ (12 строк OLD)
     head, data = blank_grid()
-    head[3], head[4], head[5] = "Модель", "Кап ฿/мес", "Активен"
-    for i in range(15):
-        data[i][3], data[i][4], data[i][5] = f"OLD{i}", 100 + i, "да"
-    r = set_caps_mirror(head, data, {"confirmed": True, "caps": SET_CAPS_PAYLOAD})
-    assert r["ok"] and r["header_cell"] == "N3", "блок обновляется НА МЕСТЕ найденной шапки"
+    head[0], head[1], head[2] = "Модель", "Кап ฿/мес", "Активен"
+    for i in range(CAP_MAX_ROWS):
+        data[i][0], data[i][1], data[i][2] = f"OLD{i}", 100 + i, "да"
+    # новый set меньшего размера (5 строк) — хвост Z9:AB15 должен дочиститься
+    small = SET_CAPS_PAYLOAD[:5]
+    r = set_caps_mirror(head, data, {"confirmed": True, "caps": small})
+    assert r["ok"] and r["header_cell"] == "Z3" and r["rows"] == 5
     caps = read_caps_mirror(head, data)
-    assert len(caps) == 12 and "old12" not in caps, "хвост старого блока (13..15) дочищен"
+    assert len(caps) == 5, "блок ровно 5 строк — хвост старого (6..12) дочищен"
+    assert all(not str(k).startswith("old") for k in caps), "OLD-строки не должны остаться"
     assert caps["nmax"]["cap"] == 5000
+    # затем полный set из 12 строк перезаписывает всё
+    r2 = set_caps_mirror(head, data, {"confirmed": True, "caps": SET_CAPS_PAYLOAD})
+    assert r2["ok"] and r2["rows"] == 12
+    assert len(read_caps_mirror(head, data)) == 12
 
 
 def test_set_caps_validation():
@@ -188,7 +191,7 @@ def test_set_caps_validation():
                 {"model": "NMAX", "cap": 5000, "active": "может быть"}):
         r = set_caps_mirror(head, data, {"confirmed": True, "caps": [bad]})
         assert r["error"] == "bad_cap_row", f"пропущена кривая строка: {bad}"
-    assert find_cap_col(head) == -1, "ошибки валидации не должны трогать лист"
+    assert norm_cap(head[0]) != "модель", "ошибки валидации не должны трогать лист"
 
 
 def test_toggle_cap_roundtrip():
@@ -219,6 +222,12 @@ def test_parse_on_off_variants():
         assert parse_on_off(v) is False, f"{v!r} должен быть False"
     for v in (None, "", "вкл?", 2):
         assert parse_on_off(v) is None, f"{v!r} должен быть None (не понят)"
+
+
+def test_col_letter_helper():
+    """Зеркало quoteColLetter_: адрес капов Z/AA/AB считается верно (header_cell = 'Z3')."""
+    assert col_letter(26) == "Z" and col_letter(27) == "AA" and col_letter(28) == "AB"
+    assert col_letter(CAP_COL) + str(CAP_HEADER_ROW) == "Z3"
 
 
 def test_payload_matches_final_table():
