@@ -16,4 +16,6 @@ except Exception:
     data = {}
 msg = (data.get("message") or "ждёт тебя в Termux")
 # track=True: удалить ПРЕДЫДУЩИЕ 🔔 и сохранить id нового → в личке висит максимум ОДНО уведомление.
-notify("🔔 Claude Code: " + msg, track=True)
+# force=True: это БОЕВОЕ Termux-уведомление (CC реально ждёт Филиппа) — тест-мут PRETOOL_NOPUSH его
+# НЕ глушит (регресс 05.07: широкий мут заглушил живые уведомления Termux).
+notify("🔔 Claude Code: " + msg, track=True, force=True)

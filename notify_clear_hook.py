@@ -11,6 +11,6 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 
 try:
     from notify import clear_notifications
-    clear_notifications()
+    clear_notifications(force=True)   # боевая чистка 🔔: тест-мут PRETOOL_NOPUSH не блокирует
 except Exception:
     pass   # хук не должен ронять отправку промпта ни при каких условиях

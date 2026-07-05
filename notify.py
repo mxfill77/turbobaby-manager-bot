@@ -138,16 +138,23 @@ def _count_attempt(text):
         pass
 
 
-def notify(text, track=False, clear_first=False) -> bool:
+def notify(text, track=False, clear_first=False, force=False) -> bool:
     """Отправить пуш Филиппу. track=True → это 🔔-уведомление: удалить прошлые 🔔, отправить, СОХРАНИТЬ id
     (чтобы следующее его убрало). clear_first=True → удалить висящие 🔔 перед отправкой, но НЕ трекать (для
     --done/--need: задача разрешена). По умолчанию (оба False) — просто отправить, висящий 🔔 НЕ трогать
-    (health/эскалации/произвольный текст)."""
+    (health/эскалации/произвольный текст).
+
+    force=True → ЛЕГИТИМНЫЙ БОЕВОЙ пуш (CLI notify.py, хук Notification=Termux-уведомление, health/gate/
+    splinter-алерты). Мут по PRETOOL_NOPUSH его НЕ глушит, даже если флаг протёк в окружение сессии
+    (регресс 05.07: боевые Termux-уведомления заглохли, т.к. мут был слишком широким). Мут PRETOOL_NOPUSH
+    оставлен ТОЛЬКО тестовому коду/фикстурам (force=False по умолчанию); pretool_guard._push тоже НЕ форсит
+    (его красные фикстуры-карточки остаются замьюченными). Мок-счётчик NOTIFY_COUNT_FILE (регресс) действует
+    ВСЕГДА, включая force — сеть в тестах не дёргаем ни при каких условиях."""
     mode = _test_mode()
     if mode == "count":
         _count_attempt(text)
         return True
-    if mode == "mute":
+    if mode == "mute" and not force:
         print("notify: muted (PRETOOL_NOPUSH=1, тест-режим — пуш не отправлен)", file=sys.stderr)
         return True
     token = _get_token()
@@ -165,10 +172,15 @@ def notify(text, track=False, clear_first=False) -> bool:
     return ok
 
 
-def clear_notifications() -> None:
-    """Удалить все накопленные 🔔 (хук UserPromptSubmit — при новом задании владельца). Тихо, без stdout."""
-    if _test_mode():
-        return   # тест-контур: сеть не дёргаем
+def clear_notifications(force=False) -> None:
+    """Удалить все накопленные 🔔 (хук UserPromptSubmit — при новом задании владельца). Тихо, без stdout.
+    force=True (зовётся из notify_clear_hook) → чистка проходит даже под PRETOOL_NOPUSH (боевая сессия);
+    мок-счётчик NOTIFY_COUNT_FILE всё равно блокирует сеть в тестах."""
+    mode = _test_mode()
+    if mode == "count":
+        return   # тест-контур (мок-счётчик): сеть не дёргаем
+    if mode == "mute" and not force:
+        return   # тест-мут PRETOOL_NOPUSH: сеть не дёргаем
     token = _get_token()
     if not token:
         return
@@ -184,13 +196,19 @@ def _build_text(argv) -> str:
     return " ".join(argv)
 
 
+def _cli(argv) -> bool:
+    """Обёртка CLI (тестируемая): явный запуск notify.py владельцем/CC — ВСЕГДА боевой (force=True),
+    тест-мут PRETOOL_NOPUSH его не глушит."""
+    # --done/--need разрешают задачу → убираем висящий 🔔 (но сами не трекаются, владелец их читает)
+    _clear = bool(argv and argv[0] in ("--done", "--need"))
+    return notify(_build_text(argv), clear_first=_clear, force=True)
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
         print("usage: notify.py [--done|--need] <текст>", file=sys.stderr)
         raise SystemExit(2)
-    # --done/--need разрешают задачу → убираем висящий 🔔 (но сами не трекаются, владелец их читает)
-    _clear = bool(args and args[0] in ("--done", "--need"))
-    ok = notify(_build_text(args), clear_first=_clear)
+    ok = _cli(args)
     print("ok" if ok else "FAILED")
     raise SystemExit(0 if ok else 1)

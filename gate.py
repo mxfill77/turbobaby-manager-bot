@@ -50,7 +50,7 @@ def _log(result, args_str):
 def _push(text):
     try:
         from notify import notify
-        notify(text)
+        notify(text, force=True)   # боевой алерт гейта («ТЕСТЫ КРАСНЫЕ») — тест-мут его не глушит
     except Exception:
         pass
 

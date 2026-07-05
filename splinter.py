@@ -4437,7 +4437,7 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
     try:
         import notify
         notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(declared)}) — заявка открыта {age_ru} без закрытия. "
-                      f"Глянь/закрой вручную или дожми подтверждение.")
+                      f"Глянь/закрой вручную или дожми подтверждение.", force=True)   # боевой прод-алерт
     except Exception:
         log.exception("  → B4 эскалация владельцу (notify) упала")
     try:

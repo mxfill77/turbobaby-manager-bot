@@ -294,7 +294,7 @@ def main(argv):
     if push_always or (push and (code != 0 or brain_warn)):
         try:
             from notify import notify
-            ok = notify(report)
+            ok = notify(report, force=True)   # боевой health-алерт — тест-мут не глушит
             print("[push] " + ("отправлен" if ok else "НЕ отправлен"))
         except Exception as e:
             print("[push] ошибка: " + type(e).__name__ + " " + str(e))
