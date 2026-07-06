@@ -31,6 +31,27 @@ import subprocess
 from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.abspath(__file__))
+REGISTRY_MANIFEST = os.path.join(REPO, "registry_manifest.json")   # git-версионируемый реестр доков Brain
+
+
+def load_registry_manifest(path=REGISTRY_MANIFEST):
+    """Прочитать registry_manifest.json → {"docs":[{name,purpose,status}], ...} или None (нет/битый).
+    READ-ONLY. None (файл отсутствует/не парсится) → проверка #4 деградирует в note, не в расхождение."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("docs"), list):
+            return data
+        return None
+    except Exception:
+        return None
+
+
+def _is_temp_brain_name(name):
+    """Временный/служебный ключ Brain — не шуметь: префикс _ (в т.ч. _archive) или tmp в имени."""
+    n = (name or "").lower()
+    return n.startswith("_") or "tmp" in n
+
 
 # --- Маркеры контуров (для проверки КАРТА↔GIT) -------------------------------------------------
 # Клиентский контур: коммиты userbot/PC/модерации/подсказок/черновиков — НЕ наш камень (§4).
@@ -78,6 +99,9 @@ class World:
         raise NotImplementedError
     def manifest(self):
         raise NotImplementedError
+    def registry_manifest(self):
+        """Реестр известных доков (registry_manifest.json) → dict|None. Живой = с диска; фейк = инъекция."""
+        raise NotImplementedError
     def git_resolves(self, short_hash):
         raise NotImplementedError
     def git_head(self):
@@ -106,6 +130,9 @@ class LiveWorld(World):
             r = self._c._call("list_brain")
             self._man = r.get("manifest", {}) if r.get("ok") else None
         return self._man
+
+    def registry_manifest(self):
+        return load_registry_manifest()   # с диска репо (git-версионируемый файл)
 
     def git_resolves(self, short_hash):
         if short_hash not in self._git_cache:
@@ -240,11 +267,62 @@ def check_brain_count(world, run):
                  f"в манифесте всего {n} distinct доков — усушка/порча манифеста")
 
 
+# --------------------------------------------------------------------------------------------
+#  ПРОВЕРКА 4 — РЕГИСТРАЦИЯ НОВОГО (Слой роста: реестр САМ замечает новое в мозге)
+# --------------------------------------------------------------------------------------------
+@register("РЕГИСТРАЦИЯ НОВОГО")
+def check_registration_growth(world, run):
+    """Реестр знания должен САМ замечать новое: в бизнес добавляются вещи → система узнаёт и индексирует.
+    Сверяем ЖИВОЙ манифест мозга (list_brain, ключи = зарегистрированные доки Brain) с registry_manifest.json
+    (git-версионируемый реестр известных доков):
+    • ключ в живом мозге, но НЕ в реестре → 🆕 НОВОЕ (не зарегистрирован — добавь строку коммитом);
+    • active-док в реестре, но НЕТ в живом мозге → ⚠️ ПРОПАЛО (переименован/удалён).
+    Переименование честно ловится как ПРОПАЛО+НОВОЕ — это ок (лучше пропустить сомнительное, чем шуметь).
+    Игнор: folder_id, временные (_/tmp), status=archive (архив вне манифеста — это норма, не ПРОПАЛО).
+    Источник живого состояния = list_brain (read-only, headless-безопасный; сырого списка Drive-папки
+    endpoint'а нет — та же опора, что у СЧЁТ BRAIN)."""
+    reg = world.registry_manifest()
+    if reg is None:
+        run.note("registry_manifest.json не прочитан/битый — проверка регистрации пропущена")
+        return
+    man = world.manifest()
+    if man is None:
+        run.note("живой манифест мозга (list_brain) не прочитан — проверка регистрации пропущена")
+        return
+
+    # ЖИВОЕ: ключи манифеста мозга, без folder_id и без временных/служебных
+    live = {k for k in man.keys() if k != "folder_id" and not _is_temp_brain_name(k)}
+
+    # РЕЕСТР: известные доки по статусу
+    docs = [d for d in reg.get("docs", []) if isinstance(d, dict) and d.get("name")]
+    active = {d["name"] for d in docs if d.get("status", "active") == "active"}
+    known = {d["name"] for d in docs}                       # active + archive + любые прочие статусы
+    # архив может лежать отдельным списком reg["archive"] — тоже «известное», не НОВОЕ
+    for d in reg.get("archive", []) or []:
+        if isinstance(d, dict) and d.get("name"):
+            known.add(d["name"])
+        elif isinstance(d, str):
+            known.add(d)
+
+    # 🆕 НОВОЕ — живой ключ, которого реестр не знает
+    for name in sorted(live - known):
+        run.flag(f"реестр (registry_manifest.json) не знает док «{name}»",
+                 f"🆕 НОВОЕ: «{name}» есть в живом мозге (list_brain), не зарегистрирован — "
+                 f"добавь строку в registry_manifest.json коммитом")
+
+    # ⚠️ ПРОПАЛО — active-док реестра, которого нет в живом мозге
+    for name in sorted(active - live):
+        run.flag(f"реестр ждёт активный док «{name}»",
+                 f"⚠️ ПРОПАЛО: «{name}» (active в registry_manifest.json) НЕТ в живом манифесте мозга — "
+                 f"переименован/удалён?")
+
+
 # ============================================================================================
 #  БУДУЩИЕ КАМНИ (точка расширения) — НЕ реализуем сейчас, каркас готов принять:
 #    @register("КАРТА↔ТАБЛИЦЫ")  — сверка описания листов в мозге со схемой Sheets через Bridge.
 #    @register("СВЕРКА КОНТУРОВ") — внутренний↔клиентский (userbot-репо), когда появится доступ.
-#    @register("РЕГИСТРАЦИЯ НОВОГО") — новый компонент в проде без записи в KB_MASTER.
+#    ИНТЕРАКТИВНАЯ РЕГИСТРАЦИЯ — кнопка/команда «зарегистрируй» в 328 добавляет строку в
+#      registry_manifest.json автоматически (пока регистрация = коммит в файл руками CC). Точка расширения #4.
 #  Каждый — одна @register-функция fn(world, run); список выше не переписывать.
 # ============================================================================================
 
@@ -286,17 +364,21 @@ def format_report(runs, head=None):
 #  САМОТЕСТ — синтетические заведомые расхождения (обкатка для владельца, standalone без pytest)
 # ============================================================================================
 class FakeWorld(World):
-    def __init__(self, docs=None, man=None, git=None, head="deadbee"):
+    def __init__(self, docs=None, man=None, git=None, head="deadbee", reg=None):
         self._docs = docs or {}
         self._man = man if man is not None else {}
         self._git = set(git or [])
         self._head = head
+        self._reg = reg   # None = «файла нет» (деградация); dict = инъекция реестра
 
     def read_doc(self, name):
         return self._docs.get(name)
 
     def manifest(self):
         return self._man
+
+    def registry_manifest(self):
+        return self._reg
 
     def git_resolves(self, short_hash):
         return short_hash in self._git
@@ -315,8 +397,11 @@ def _healthy_world():
     pulse = "2026-07-06 12:00 | 🟢 | всё ок | ничего не жду | детали→cc_log запись X"
     man["cc_log"] = "idcc"
     man["index"] = "idmaster"   # KB_MASTER зарегистрирован (как в живом манифесте)
+    # реестр знает РОВНО живые ключи мозга (без folder_id) → проверка #4 чистая
+    reg = {"docs": [{"name": k, "purpose": "p", "status": "active"}
+                    for k in man if k != "folder_id"]}
     return FakeWorld(docs={"index": master, "pulse": pulse}, man=man,
-                     git={"aaaaaa1"}, head="aaaaaa1")
+                     git={"aaaaaa1"}, head="aaaaaa1", reg=reg)
 
 
 def _self_test():
@@ -346,6 +431,19 @@ def _self_test():
     for i in range(10):
         clutter._man[f"junk{i}"] = f"jid{i}"    # раздуваем манифест
     cases.append(("СЧЁТ BRAIN грязный (засорение)", 1, lambda w=clutter: w, "СЧЁТ BRAIN"))
+
+    # --- РЕГИСТРАЦИЯ НОВОГО ---
+    cases.append(("РЕГИСТРАЦИЯ чистая (реестр = живой мозг)", 0, _healthy_world, "РЕГИСТРАЦИЯ НОВОГО"))
+    novel = _healthy_world()
+    novel._man["new_biz_doc"] = "idnew"          # (б) лишний живой ключ, нет в реестре
+    cases.append(("РЕГИСТРАЦИЯ: НОВОЕ (лишний живой док)", 1, lambda w=novel: w, "РЕГИСТРАЦИЯ НОВОГО"))
+    gone = _healthy_world()
+    gone._reg["docs"].append({"name": "phantom_active", "purpose": "p", "status": "active"})  # (а) фантом-active
+    cases.append(("РЕГИСТРАЦИЯ: ПРОПАЛО (фантом active в реестре)", 1, lambda w=gone: w, "РЕГИСТРАЦИЯ НОВОГО"))
+    quiet = _healthy_world()
+    quiet._man["_scratch"] = "x"; quiet._man["tmpjunk"] = "y"   # (г) временные — не считаются
+    quiet._reg["docs"].append({"name": "old_merged", "status": "archive"})  # archive — не ПРОПАЛО
+    cases.append(("РЕГИСТРАЦИЯ: _/tmp и archive не шумят", 0, lambda w=quiet: w, "РЕГИСТРАЦИЯ НОВОГО"))
 
     print("=== САМОТЕСТ РЕЕСТРА ===")
     allpass = True
