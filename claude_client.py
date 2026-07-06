@@ -646,6 +646,10 @@ class ClaudeClient:
         env = {k: v for k, v in os.environ.items()
                if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
         env.setdefault("HOME", "/root")
+        # Гасим самообновление CLI: авто-апдейт мог кратко подменять бинарь во время вызова →
+        # редкий FileNotFound (боевой транзиент 06.07) → пропущенный парс money. Для кассы недопустимо.
+        env.setdefault("DISABLE_AUTOUPDATER", "1")
+        env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         cwd = tempfile.mkdtemp(prefix="splinter_llm_")
         # user-промпт идёт через stdin (input=), НЕ позиционным argv: сообщение с ведущим
         # '-' (расход '-100', возврат '-1 passport') иначе распознаётся claude-CLI как опция.

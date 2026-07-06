@@ -170,6 +170,7 @@ def test_env_strips_key_even_when_present():
             os.environ["ANTHROPIC_API_KEY"] = prev
     assert "ANTHROPIC_API_KEY" not in rec.calls[0]["env"], "ключ вырезан из env claude -p"
     assert rec.calls[0]["env"].get("HOME") == "/root", "HOME сохранён (иначе Max-auth не найдётся)"
+    assert rec.calls[0]["env"].get("DISABLE_AUTOUPDATER") == "1", "авто-апдейт CLI выключен (транзиент FileNotFound)"
 
 
 def test_strip_code_fences_helper():
