@@ -38,7 +38,12 @@ RED_TOKEN_HIT = {
     '"confirmed": true': "confirmed", '"confirmed":true': "confirmed",
 }
 RED_TOKENS = tuple(RED_TOKEN_HIT.keys())
-_GREEN_MODULES = {"py_compile", "json.tool", "pytest", "unittest", "pip", "venv", "http.server"}
+_GREEN_MODULES = {"py_compile", "json.tool", "pytest", "unittest", "pip", "venv", "http.server",
+                  "platform", "sysconfig", "site"}
+# Инфо-флаги интерпретатора: НИЧЕГО не исполняют (печатают версию/справку) → зелёное, даже без .py-цели.
+# Убирает ложный ambiguous-ask на `venv/bin/python3 --version` (нет target → раньше падало в ask, хотя
+# venv python в allow). Сужение неоднозначности (06.07.2026) — red-список НЕ трогает.
+_INFO_FLAGS = {"--version", "-V", "-VV", "--help", "-h"}
 _SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b", re.IGNORECASE)
 
 
@@ -281,6 +286,11 @@ def _analyze(cmd, cwd):
     if _SQLITE_WRITE.search(blob) and ".db" in blob and "memory.db" not in blob:
         return "red", "sqlite", blob
     if not saw_target:
+        # Инфо-флаги (--version/-V/--help) НИЧЕГО не исполняют → зелёное (сужение ambiguous 06.07):
+        # все не-интерпретаторные, не-`VAR=val` токены ∈ _INFO_FLAGS и хотя бы один есть.
+        rest = [t for t in toks[1:] if not re.match(r"^\w+=", t)]
+        if rest and all(t in _INFO_FLAGS for t in rest):
+            return "green", "", blob
         return "ambiguous", "ambiguous", blob          # python без внятной цели (REPL и т.п.) → подтверждаем
     return "green", "", blob
 
