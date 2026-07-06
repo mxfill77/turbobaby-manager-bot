@@ -38,6 +38,17 @@ def pc_dev_topic():
     except (TypeError, ValueError):
         return 0
 
+
+def inbox_topic():
+    """Тема «Единый инбокс подтверждений» (ст3 оркестратора, KB_MASTER §7 Вариант Б, 06.07.2026)
+    из env INBOX_TOPIC_ID. 0/пусто/мусор = ИНБОКС ВЫКЛЮЧЕН → карточки needs_approval идут по старым
+    полосам 328/829 (текущее поведение, без регресса); задан → approve-карточки ОБЕИХ полос сходятся
+    в эту тему. Лениво (как pc_dev_topic — bot.py импортирует devbot ДО load_dotenv())."""
+    try:
+        return int(os.getenv("INBOX_TOPIC_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
 BRIDGE = None   # выставляется из bot.py при старте (devbot.BRIDGE = bridge)
 
 # === Фикс заморозки event loop (разбор таймаутов get_pending 02.07.2026) ===
@@ -260,6 +271,85 @@ def _item_topic(it):
     return DEVBOT_TOPIC
 
 
+def _item_lane_label(it):
+    """Ярлык полосы для строки инбокса: pc → 'pc', иначе 'vps'."""
+    return "pc" if _is_pc_item(it) else "vps"
+
+
+# === Отпечаток конверта для дедупа В СПИСКЕ /inbox (ст3, часть г) ===
+# ЗЕРКАЛО orchestrator_daemon.parse_op / _OP_PREFIX_RE (см. AUTO_OPS там). Импортировать демон в
+# процесс бота нельзя: его модуль на import ставит signal.signal — в рабочем потоке to_thread это
+# ValueError, а в main-потоке перебил бы обработчики PTB. Логика отпечатка крошечная — повторяем.
+# КОРНЕВОЙ дедуп конвертов в очереди тут НЕ решаем (отдельный заход §7) — только схлопывание строк.
+_INBOX_AUTO_OPS = ("git_push", "restart_splinter")
+_INBOX_OP_RE = re.compile(r"op\s*=\s*([a-z_]+)", re.IGNORECASE)
+_INBOX_OP_PREFIX_RE = re.compile(r"^\s*op\s*=\s*[a-z_]+\s*\|\s*", re.IGNORECASE)
+
+
+def _inbox_fingerprint(what):
+    """Отпечаток карточки needs_approval = (op-код, очищенный от 'op=… |' текст). НЕ по id —
+    одинаковые конверты (один и тот же op + один и тот же текст) схлопываются в списке в одну строку."""
+    w = str(what or "")
+    m = _INBOX_OP_RE.search(w)
+    op = m.group(1).lower() if m else "other"
+    if op not in _INBOX_AUTO_OPS:
+        op = "other"
+    card = _INBOX_OP_PREFIX_RE.sub("", w).strip()
+    return op, card
+
+
+def build_inbox(bridge):
+    """ЕДИНЫЙ ИНБОКС (ст3, часть в+г): текст-список ВСЕХ открытых needs_approval по ОБЕИМ полосам
+    (get_pending needs_approval lane='all' — чистый read-only GET, без записи). Дедуп в списке по
+    отпечатку конверта (_inbox_fingerprint, НЕ id): одинаковые карточки — одной строкой ×N со списком
+    id и возрастом старейшей. Пусто/ошибка → человеческая строка. Зона 🟢 (read-only)."""
+    try:
+        r = bridge.get_pending("needs_approval", lane="all")
+    except Exception as e:
+        return f"📥 Инбокс: ошибка чтения очереди ({type(e).__name__}: {e})."
+    if not r.get("ok"):
+        return f"📥 Инбокс: очередь недоступна ({r.get('error')})."
+    items = [it for it in (r.get("items") or []) if isinstance(it, dict)]
+    if not items:
+        return "📥 Инбокс пуст — открытых подтверждений нет 👍"
+    # группировка по отпечатку конверта
+    groups = {}   # fp -> {"op", "card", "lanes":set, "ids":[], "ages":[]}
+    for it in items:
+        what = str(it.get("result") or "")
+        op, card = _inbox_fingerprint(what)
+        g = groups.setdefault((op, card), {"op": op, "card": card, "lanes": set(), "ids": [], "ages": []})
+        g["lanes"].add(_item_lane_label(it))
+        try:
+            g["ids"].append(int(it.get("id")))
+        except (TypeError, ValueError):
+            g["ids"].append(it.get("id"))
+        age = _task_age_sec(it.get("updated"))
+        if age is not None:
+            g["ages"].append(age)
+    total = len(items)
+    out = [f"📥 Инбокс подтверждений: открыто {total} (по обеим полосам vps+pc):"]
+    # старейшая группа сверху (по максимальному возрасту в группе; без возраста → в конец)
+    ordered = sorted(groups.values(),
+                     key=lambda g: (-(max(g["ages"]) if g["ages"] else -1), min(str(i) for i in g["ids"])))
+    for g in ordered:
+        ids = g["ids"]
+        n = len(ids)
+        lanes = "/".join(sorted(g["lanes"]))
+        op = g["op"]
+        card1 = (g["card"] or "(карточка пустая — см. исходную задачу)").splitlines()[0][:200]
+        oldest = max(g["ages"]) if g["ages"] else None
+        if n == 1:
+            age_txt = f", висит {int(oldest // 60)} мин" if oldest is not None else ""
+            out.append(f"  • id {ids[0]} [{lanes}] op={op}{age_txt}")
+        else:
+            id_list = ", ".join(str(i) for i in sorted(ids, key=lambda x: str(x)))
+            age_txt = f", старейшая {int(oldest // 60)} мин" if oldest is not None else ""
+            out.append(f"  • ×{n} [{lanes}] op={op} (id: {id_list}{age_txt})")
+        out.append(f"      {card1}")
+    out.append("\nОтвет: тапни ✅/❌ под карточкой в теме, либо «да N» / «нет N».")
+    return "\n".join(out)
+
+
 async def _strip_and_mark(q, mark):
     """Одноразовые ✅/❌: убрать кнопки и дописать пометку к тексту сообщения.
     editMessageText заодно снимает reply_markup; если упало — хотя бы снять кнопки."""
@@ -454,18 +544,25 @@ async def report_results(context) -> None:
 
     # needs_approval (заход 2б-2): задача упёрлась в красную зону — спрашиваем «да N»/«нет N».
     # БЕЗ seed (незакрытый вопрос после рестарта стоит переспросить); дедуп = _asked в памяти процесса.
+    # ЕДИНЫЙ ИНБОКС (ст3, часть б): если INBOX_TOPIC_ID задан — approve-карточки ОБЕИХ полос сходятся
+    # в тему-инбокс; не задан → прежнее поведение (_item_topic: vps→328, pc→829), без регресса.
+    # Кнопки approve/reject/check/next те же — callback тем-агностичен (по id, не по теме).
+    # done/failed/heartbeat выше ОСТАЮТСЯ по полосам _item_topic (в инбокс НЕ сводятся).
+    inbox = inbox_topic()
     pend = sorted(by["needs_approval"], key=lambda x: int(x.get("id") or 0))
     for it in pend:
         qid = it.get("id")
         if qid in _asked:
             continue
         _asked.add(qid)
+        _approval_topic = inbox or _item_topic(it)
         what = it.get("result") or "(не уточнено)"
-        q = (f"⚠️ Задача {qid} требует подтверждения красной зоны:\n\n{what}\n\n"
+        lane = _item_lane_label(it)
+        q = (f"⚠️ Задача {qid} [{lane}] требует подтверждения красной зоны:\n\n{what}\n\n"
              f"Подтвердить? Тапни кнопку ниже — или ответь «да {qid}» / «нет {qid}».")
         chunks = _chunks(q)
         for i, chunk in enumerate(chunks):
-            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _item_topic(it), "text": chunk}
+            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _approval_topic, "text": chunk}
             if i == len(chunks) - 1:   # кнопки ✅/❌/🔄/📋 на последнем чанке
                 kw["reply_markup"] = _kb_approval(qid)
             try:

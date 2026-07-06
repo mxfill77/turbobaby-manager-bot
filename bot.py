@@ -288,6 +288,24 @@ async def cmd_o3board(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("  → /o3board: сводка владельцу не отправлена (синк прошёл)")
 
 
+async def cmd_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ЕДИНЫЙ ИНБОКС ПОДТВЕРЖДЕНИЙ (ст3 оркестратора, KB_MASTER §7 Вариант Б). ТОЛЬКО Филипп
+    (504608015 — devbot.DEVBOT_USER, строгий id, НЕ бизнес-аккаунт): read-only список ВСЕХ открытых
+    needs_approval по ОБЕИМ полосам (vps+pc) с дедупом одинаковых конвертов в списке. Зона 🟢
+    (чистый GET через devbot.build_inbox → get_pending lane='all', без записи в очередь/таблицы)."""
+    u = update.effective_user
+    if not u or u.id != devbot.DEVBOT_USER:
+        log.info("  → /inbox отклонён (не Филипп): id=%s", getattr(u, "id", None))
+        return
+    try:
+        text = await asyncio.to_thread(devbot.build_inbox, bridge)
+    except Exception as e:
+        text = f"📥 Инбокс: ошибка сбора ({type(e).__name__}: {e})."
+    m = update.effective_message
+    for chunk in chunk_text(text, 4000):
+        await m.reply_text(chunk)
+
+
 # === HANDLERS ===
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1293,6 +1311,7 @@ def main():
     app.add_handler(CommandHandler("board", cmd_board))   # ручной репост доски выдач (Delivery, слой 1 O3)
     app.add_handler(CommandHandler("o3board", cmd_o3board))   # ручной репост board просрочек ТО (O3 ступень-1, владелец)
     app.add_handler(CommandHandler("pin_info_all", cmd_pin_info_all))   # засев кнопки «ℹ️ Инфо» во все темы (владелец)
+    app.add_handler(CommandHandler("inbox", cmd_inbox))   # единый инбокс подтверждений O4 (ст3, только Филипп, read-only)
 
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
     app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))

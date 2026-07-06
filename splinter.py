@@ -193,16 +193,30 @@ def _pc_dev_topic():
         return 0
 
 
+def _inbox_topic():
+    """Тема «Единый инбокс подтверждений» (ст3 оркестратора, 06.07.2026) из env INBOX_TOPIC_ID;
+    0 = инбокс выключен. Лениво (как _pc_dev_topic — bot.py импортирует splinter ДО load_dotenv).
+    Splinter молчит в теме-инбоксе: там devbot собирает approve-карточки, опергруппы там нет."""
+    try:
+        return int(os.getenv("INBOX_TOPIC_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def is_ignored_thread(chat_id, topic_id) -> bool:
     """True → Splinter полностью молчит в этой теме (чужой контур userbot/агента в HQ).
-    Проверять РАНО, до мозга/учёта/аудитора/любой реакции. Тема PC-дев (env PC_DEV_TOPIC_ID)
-    тоже игнорится: там командует devbot (полоса lane=pc), Splinter молчит как в 328."""
+    Проверять РАНО, до мозга/учёта/аудитора/любой реакции. Темы PC-дев (env PC_DEV_TOPIC_ID)
+    и инбокс подтверждений (env INBOX_TOPIC_ID) тоже игнорятся: там командует devbot, Splinter
+    молчит как в 328."""
     if chat_id != HQ_CHAT_ID:
         return False
     if topic_id in IGNORED_THREADS:
         return True
     pc = _pc_dev_topic()
-    return bool(pc) and topic_id == pc
+    if pc and topic_id == pc:
+        return True
+    inbox = _inbox_topic()
+    return bool(inbox) and topic_id == inbox
 
 
 # Через сколько записей звать Пыма проверить (для накопительного режима)
