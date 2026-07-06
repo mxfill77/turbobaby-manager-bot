@@ -152,6 +152,56 @@ _OP_RE = re.compile(r"op\s*=\s*([a-z_]+)", re.IGNORECASE)
 # префикс дескриптора «op=xxx | » — срезается при конверте op=other в headless-ТЗ (остаётся карточка)
 _OP_PREFIX_RE = re.compile(r"^\s*op\s*=\s*[a-z_]+\s*\|\s*", re.IGNORECASE)
 
+# === КОРНЕВОЙ РАЗРЫВ ПЕТЕЛЬ КОНВЕРТОВ op=other (ст3, KB_MASTER §7/§12 — чинить навсегда) ===
+# Петля: op=other → «да» Филиппа → конверт (headless-задача) → та упирается в то же красное →
+# NEEDS_APPROVAL → «да» → новый конверт → … (56→57→58…). Рвём тремя слоями (план 06.07, RESULT 10:07):
+#  СЛОЙ 1 (ядро): конверт-задача (текст с маркером ниже), снова эскалировавшая NEEDS_APPROVAL, =
+#    доказательство, что headless красное НЕ пройдёт → НЕ ставим approvable needs_approval (это был бы
+#    ре-конверт), а финализируем ТЕРМИНАЛЬНЫМ failed с ручной картой → рендер без approve-кнопки → петля
+#    рвётся после РОВНО 1 перерождения.
+#  СЛОЙ 2 (экономия перерождения): известное headless-НЕВОЗМОЖНОЕ красное (по ключевым словам) НЕ
+#    конвертируем вовсе → сразу та же терминальная карта = ноль перерождений на известных петлях.
+#  СЛОЙ 3 (страховка): fingerprint-дедуп в /inbox (devbot) — не трогаем.
+_CONVERT_MARK = "[конверт одобренной заявки"
+_CONVERT_RE = re.compile(r"^\s*\[конверт одобренной заявки\b")
+# Слой 2: маркеры заведомо headless-невозможного красного (clasp/живая таблица/деньги/CLI-БД/удаление/
+# календарь). Ловим в дескрипторе (what) И в тексте исходной задачи — до первого конверта.
+_HEADLESS_IMPOSSIBLE_RE = re.compile(
+    r"clasp|redeploy|\bsqlite3\b|set_fleet_(?:oil|service)|delete_event|confirmed\s*=\s*true|"
+    r"лист\s*1|\bcrm\b|зарплат|байки|транзакц|проводк|деньг|касс|удал(?:и|ени|яе|ён)|календар",
+    re.IGNORECASE,
+)
+
+
+def _is_convert(text):
+    """True → задача является конвертом одобренной op=other (родилась из «да» Филиппа). Слой 1."""
+    return bool(_CONVERT_RE.match(str(text or "")))
+
+
+def _is_headless_impossible(*texts):
+    """True → в тексте(ах) есть маркер заведомо headless-невозможного красного действия. Слой 2."""
+    blob = " ".join(str(t or "") for t in texts)
+    return bool(_HEADLESS_IMPOSSIBLE_RE.search(blob))
+
+
+def _manual_card(what, orig_text=""):
+    """Терминальная карточка «сделай РУКАМИ» (это НЕ сбой, а нормальный ручной исход). Кладётся в
+    complete_task(failed) → рендерится БЕЗ approve-кнопки → ре-approve/ре-конверт невозможен, петля
+    рвётся. Тело: явно «требуется ручное действие», что именно сделать (из карточки) и что проверить."""
+    card = _OP_PREFIX_RE.sub("", what or "").strip() or "(карточка пустая — см. вывод задачи)"
+    lines = [
+        "✋ ТРЕБУЕТСЯ РУЧНОЕ ДЕЙСТВИЕ (это не сбой, а нормальный ручной исход)",
+        "Headless-контур доказано не может выполнить это красное действие (рабочие таблицы/деньги/"
+        "clasp/sqlite3/удаление). Кнопки «да» здесь НЕТ намеренно — повторный approve лишь плодит "
+        "петлю конвертов. Выполни РУКАМИ в Termux:",
+        card,
+        "После — проверь результат в целевой таблице/логах; при необходимости повтори исходную "
+        "задачу в 328 обычным префиксом.",
+    ]
+    if orig_text:
+        lines.append(f"Исходная задача (контекст): {str(orig_text).strip()[:300]}")
+    return "\n".join(lines)[:RESULT_MAX]
+
 
 def parse_op(what):
     """Извлечь op-код из сохранённого what (дескриптор needs_approval). 'other' если не распознан/не из перечня."""
@@ -487,8 +537,15 @@ def _convert_other_approved(tid, task, what):
                          f"не могу выполнить автоматически: {what[:400]} — сделай в Termux")
         _maybe_dec_after(task.get("task_text"), "failed")
         return
-    card = _OP_PREFIX_RE.sub("", what or "").strip() or "(карточка пустая — см. исходную задачу)"
     orig = str(task.get("task_text") or "").strip()
+    # СЛОЙ 2: заведомо headless-НЕВОЗМОЖНОЕ красное (clasp/живая таблица/деньги/sqlite3/удаление) —
+    # НЕ конвертируем (конверт лишь родил бы то же NEEDS_APPROVAL) → сразу терминальная ручная карта =
+    # ноль перерождений на известной петле. Слой 1 добьёт неизвестное красное при ре-эскалации конверта.
+    if _is_headless_impossible(what, orig):
+        log.info("APPROVED id=%s op=other headless-невозможно (keyword) → терминальная карта, без конверта", tid)
+        bc.complete_task(tid, "failed", _manual_card(what, orig))
+        return
+    card = _OP_PREFIX_RE.sub("", what or "").strip() or "(карточка пустая — см. исходную задачу)"
     tz = (f"[конверт одобренной заявки {tid}] Филипп нажал «да» на заявку: {card}\n"
           f"Исходная задача (контекст): {orig}\n"
           f"Выполни одобренное в рамках исходной задачи. Дисциплина CLAUDE.md действует полностью; "
@@ -614,9 +671,18 @@ def process_new():
 
     status, result = run_task(tid, text, task_timeout=_task_timeout(task))
     if status == "needs_approval":
-        # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
-        rr = bc.set_needs_approval(tid, result)
-        log.info("NEEDS_APPROVAL id=%s bridge_ok=%s", tid, rr.get("ok"))
+        if _is_convert(text):
+            # СЛОЙ 1 (ядро): конверт снова упёрся в красное → headless ДОКАЗАННО не может. НЕ ставим
+            # approvable needs_approval (это был бы ре-конверт = петля). Терминальный failed с ручной
+            # картой → рендер БЕЗ approve-кнопки → петля рвётся после РОВНО 1 перерождения.
+            cm = bc.complete_task(tid, "failed", _manual_card(result))
+            log.info("CONVERT-LOOP-BREAK id=%s → failed (терминальная ручная карта), bridge_ok=%s",
+                     tid, cm.get("ok"))
+            _maybe_dec_after(text, "failed")
+        else:
+            # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
+            rr = bc.set_needs_approval(tid, result)
+            log.info("NEEDS_APPROVAL id=%s bridge_ok=%s", tid, rr.get("ok"))
     else:
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))

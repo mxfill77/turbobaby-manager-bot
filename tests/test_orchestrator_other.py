@@ -81,11 +81,12 @@ def fresh():
     return fb
 
 
-# (1) полный путь: заявка op=other → approve → конверт → исполнилась headless → отчёт
-print("(1) op=other → approve → конверт → headless done:")
+# (1) полный путь: НЕИЗВЕСТНОЕ (не-keyword) op=other → approve → конверт → исполнилась headless → отчёт
+#     (headless-невозможное красное — clasp/Лист1/деньги — теперь перехватывает слой 2, см. test_convert_loop_break)
+print("(1) op=other (headless-доступное) → approve → конверт → headless done:")
 fb = fresh()
-tid = fb.enqueue_task("Filipp-328-dev", "поправь конфиг и задеплой Bridge")["id"]
-fake_run.out = "NEEDS_APPROVAL: op=other | clasp redeploy Bridge · прод-деплой · смотреть ping"
+tid = fb.enqueue_task("Filipp-328-dev", "уточни и примени рефакторинг helper в claude_client")["id"]
+fake_run.out = "NEEDS_APPROVAL: op=other | нужно решение: применить рефакторинг helper _foo · claude_client.py · смотреть git diff"
 OD.process_new()
 res.append(ok(fb.rows[tid]["status"] == "needs_approval"
               and fb.rows[tid]["result"].startswith("op=other"),
@@ -99,8 +100,8 @@ news = fb.by_status("new")
 res.append(ok(len(news) == 1 and news[0]["from"] == "Filipp-328-dev",
               "конверт в очереди, from=Filipp-328-dev (дев-таймаут 45 мин)"))
 conv = news[0]
-res.append(ok("clasp redeploy Bridge" in conv["task_text"]
-              and "поправь конфиг и задеплой Bridge" in conv["task_text"]
+res.append(ok("применить рефакторинг helper" in conv["task_text"]
+              and "уточни и примени рефакторинг helper" in conv["task_text"]
               and not conv["task_text"].startswith("op=") and "op=other |" not in conv["task_text"],
               "ТЗ конверта = карточка заявки + исходная задача, префикс op= срезан"))
 res.append(ok("NEEDS_APPROVAL" in conv["task_text"] and "обход" in conv["task_text"],
