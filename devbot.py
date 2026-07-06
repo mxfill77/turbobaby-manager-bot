@@ -694,6 +694,21 @@ def _g_pulse(bridge):
     return "📟 " + (r.get("text") or "").strip()
 
 
+def _g_registry():
+    """Реестр знания — сверка карта↔реальность (registry_check.py, read-only: git + read_doc +
+    счёт файлов Brain, БЕЗ LLM). Сжатый отчёт для телефона: «✅ СХОДИТСЯ» или список расхождений.
+    Подпроцессом (как гейт) — своя LiveWorld/BridgeClient внутри скрипта, изоляция контура цела."""
+    try:
+        r = subprocess.run([PY, os.path.join(ROOT, "registry_check.py")], cwd=ROOT,
+                           capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "").strip() or (r.stderr or "").strip() or "(нет вывода)"
+        return out if r.returncode == 0 else f"🧭 реестр упал (exit={r.returncode}):\n{out}"
+    except subprocess.TimeoutExpired:
+        return "🧭 реестр не уложился в 120с (Bridge/сеть тупит) — попробуй позже."
+    except Exception as e:
+        return f"🧭 реестр не запустился: {e}"
+
+
 def _g_gate():
     """Прогон гейта 4.3 (тесты, ~7с). Зелёный read-only прогон — сам ничего не деплоит."""
     try:
@@ -715,6 +730,7 @@ def _g_help():
             "  мозг / brain — латентность Brain\n"
             "  просрочки — просрочки ТО парка (скан O3, топ-10)\n"
             "  статус / пульс — строка KB_PULSE (где проект сейчас)\n"
+            "  сверься / реестр — сверка карта↔реальность (реестр знания, read-only)\n"
             "  гейт — прогон тестов 4.3 (~7с)\n"
             "  помощь\n"
             "\n🎻 Оркестратор (демон исполняет через headless Claude Code):\n"
@@ -738,6 +754,7 @@ _ALLOWLIST = [
     (("мозг", "brain", "свеж"), lambda b: _g_brain(b)),
     (("просрочк", "overdue"), lambda b: _g_overdue(b)),
     (("статус", "пульс", "pulse", "status"), lambda b: _g_pulse(b)),
+    (("сверься", "сверка", "сверить", "реестр", "registry"), lambda b: _g_registry()),
     (("гейт", "gate"), lambda b: _g_gate()),
     (("помощ", "help", "команд"), lambda b: _g_help()),
 ]
@@ -804,7 +821,7 @@ async def handle_command(msg, context, bridge) -> None:
         await context.bot.send_message(
             chat_id=msg.chat_id, message_thread_id=tid,
             text=("🤖 Это не зелёная команда (или красное: запись/деплой). Сам НЕ выполняю — нужно твоё «да». "
-                  "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / просрочки / статус / гейт / помощь. "
+                  "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / просрочки / статус / сверься / гейт / помощь. "
                   "Дев-ТЗ: «тз: <что сделать>»."))
         return
     def _run_green():
