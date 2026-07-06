@@ -7,11 +7,44 @@ Claude API клиент.
 
 import os
 import json
+import shutil
 import logging
+import tempfile
+import subprocess
 from typing import Optional, List, Dict
 from anthropic import Anthropic
 
 log = logging.getLogger(__name__)
+
+# === Фаза 1: подписочный (Max) путь для чистых генераторов quick()/judge() ===
+# Флаг SPLINTER_LLM_VIA_CLI=1 уводит ТЕКСТОВЫЕ вызовы (quick/judge) на `claude -p` (подписка),
+# минуя платный Anthropic API (ANTHROPIC_API_KEY, кредит=0 → 400). Деф off = старый API-путь
+# (fallback, НЕ удалён — обесточен). vision()/ask() Фаза 1 НЕ трогает (остаются на платном ключе).
+CLAUDE_CLI_BIN = os.getenv("CLAUDE_BIN", "/usr/bin/claude")
+CLI_TIMEOUT = int(os.getenv("SPLINTER_LLM_CLI_TIMEOUT", "120"))
+
+
+class SplinterLLMError(Exception):
+    """Понятная ошибка подписочного пути (claude -p недоступен: rc!=0 / timeout).
+    НЕ сырой anthropic-400 — вызыватели логируют её и деградируют штатно (''/{})."""
+
+
+def _splinter_llm_via_cli() -> bool:
+    """Читается на КАЖДЫЙ вызов (не в __init__) — флаг переключается без рестарта, мокается в тестах."""
+    return os.environ.get("SPLINTER_LLM_VIA_CLI") == "1"
+
+
+def _strip_code_fences(text: str) -> str:
+    """Снять обрамляющие ```lang ... ``` если claude -p завернул ответ в markdown-блок.
+    Трогает ТОЛЬКО когда весь ответ — один fenced-блок (money/servicing JSON и перевод —
+    оба остаются чистыми, как на API-пути). Inline-бэктики не задевает."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        nl = t.find("\n")
+        t = t[nl + 1:] if nl != -1 else t[3:]     # срезать строку-открывашку ```lang
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()
 
 
 def oil_interval_for(bike_name: str) -> int:
@@ -585,13 +618,56 @@ class ClaudeClient:
 
         return "Слишком много шагов в обработке. Попробуй переформулировать."
 
+    def _run_claude_cli(self, cmd: list, env: dict, cwd: str, timeout: int,
+                        stdin: str = None) -> str:
+        """ЕДИНСТВЕННАЯ точка запуска `claude -p` (seam — мокается в тестах).
+        → stdout(str). Бросает SplinterLLMError на timeout / rc!=0 — понятная ошибка,
+        НЕ сырой anthropic-400. Промпт передаётся через stdin (input=), НЕ позиционным
+        argv — иначе сообщение, начинающееся с '-' (кассовый расход '-100', '-1 passport'),
+        commander парсит как неизвестную опцию → rc=1 (боевой баг 06.07)."""
+        try:
+            p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True,
+                               text=True, timeout=timeout, input=stdin)
+        except subprocess.TimeoutExpired:
+            raise SplinterLLMError(f"claude -p не ответил за {timeout}s (подписка/сеть)")
+        except Exception as e:
+            raise SplinterLLMError(f"claude -p не запустился: {e}")
+        if p.returncode != 0:
+            tail = (p.stderr or p.stdout or "").strip()[:300]
+            raise SplinterLLMError(f"claude -p rc={p.returncode}: {tail}")
+        return p.stdout or ""
+
+    def _cli_generate(self, system: str, user: str, model: str) -> str:
+        """Чистый генератор по ПОДПИСКЕ (Max): `claude -p --model <model>` в нейтральном
+        tempdir (вне репо → .claude/pretool_guard НЕ тянется, это генератор, не агент),
+        env БЕЗ ANTHROPIC_API_KEY/OPENAI_API_KEY (не платный API). Возврат — текст без
+        ```-обрамления (контракт как у API-пути). max_tokens у claude -p не задаётся —
+        объём держат system-промпты (строгий JSON)."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
+        env.setdefault("HOME", "/root")
+        cwd = tempfile.mkdtemp(prefix="splinter_llm_")
+        # user-промпт идёт через stdin (input=), НЕ позиционным argv: сообщение с ведущим
+        # '-' (расход '-100', возврат '-1 passport') иначе распознаётся claude-CLI как опция.
+        cmd = [CLAUDE_CLI_BIN, "-p",
+               "--model", model,
+               "--append-system-prompt", system]
+        try:
+            out = self._run_claude_cli(cmd, env, cwd, CLI_TIMEOUT, stdin=user)
+        finally:
+            shutil.rmtree(cwd, ignore_errors=True)
+        return _strip_code_fences(out)
+
     def quick(self, system: str, user: str, max_tokens: int = 600) -> str:
         """
         Одноразовый вызов Claude БЕЗ инструментов — для классификации/парсинга.
         Используется Splinter'ом чтобы разобрать сообщение Пыма в строгий JSON.
         Возвращает чистый текст ответа модели.
-        """
+        SPLINTER_LLM_VIA_CLI=1 → генерация по подписке (claude -p/Max, sonnet); иначе платный
+        API (fallback). Формат ответа одинаков. Недоступность CLI → лог + '' (не сырой 400)."""
         try:
+            if _splinter_llm_via_cli():
+                return self._cli_generate(system, user, self.model)
             resp = self.client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,
@@ -612,13 +688,16 @@ class ClaudeClient:
         import json as _json
         import re as _re
         try:
-            resp = self.client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            text = "\n".join(b.text for b in resp.content if b.type == "text").strip()
+            if _splinter_llm_via_cli():
+                text = self._cli_generate(system, user, model)   # подписка, Haiku сохранён
+            else:
+                resp = self.client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
+                text = "\n".join(b.text for b in resp.content if b.type == "text").strip()
             m = _re.search(r"\{.*\}", text, _re.DOTALL)   # вытащить JSON-объект
             if not m:
                 return {}
