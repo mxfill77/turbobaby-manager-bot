@@ -171,6 +171,11 @@ def _reset_report(bridge):
 # L7: report_results — карточки pc-задач идут в тему PC-дев, vps — в 328; опрос с lane='all'
 def test_report_routing_by_lane():
     _set_pc(True)
+    # L7 проверяет маршрут по ПОЛОСАМ (pc→PC_TOPIC, vps→328). Единый инбокс (INBOX_TOPIC_ID, ст3)
+    # перекрывает маршрут approve-карточек на тему-инбокс — его поведение покрыто отдельно в
+    # test_inbox.py (I4/I5). Здесь инбокс детерминированно ВЫКЛючаем, чтобы не течь ambient .env
+    # (INBOX_TOPIC_ID=1160) и тестировать именно полосовую маршрутизацию.
+    _inbox_saved = os.environ.pop("INBOX_TOPIC_ID", None)
     try:
         b = MultiBridge([
             {"id": 1, "from": DB.QUEUE_FROM_PC_DEV, "lane": "pc", "status": "done", "result": "готово pc"},
@@ -196,6 +201,8 @@ def test_report_routing_by_lane():
         assert SENDS and SENDS[0][0] == PC_TOPIC, f"без поля lane маршрут по from: {SENDS}"
     finally:
         _set_pc(False)
+        if _inbox_saved is not None:
+            os.environ["INBOX_TOPIC_ID"] = _inbox_saved
         DB.BRIDGE = None
 
 

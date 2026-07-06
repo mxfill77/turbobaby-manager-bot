@@ -20,6 +20,15 @@ import base64
 import html
 import logging
 import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM + паспорт B2
+# §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
+# из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
+# claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
+# путь такие стаб-тесты не гоняют; денежные тесты берут РЕАЛЬНЫЙ claude_client).
+try:
+    from claude_client import SplinterLLMError
+except Exception:                                # стаб claude_client в тестах без SplinterLLMError
+    class SplinterLLMError(Exception):
+        pass
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 log = logging.getLogger("splinter")
@@ -1846,6 +1855,51 @@ def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_da
 #  ОБРАБОТЧИКИ ПО РЕЖИМАМ
 # ============================================================
 
+# === §12: молчаливых потерь LLM больше НЕТ — единый обработчик upstream-down ==================
+# Раньше: money-сообщение → quick() upstream упал → '' → parse {} → type=None → тихо потеряно.
+# Теперь: quick(raise_on_upstream=True) бросает SplinterLLMError → сюда. Критерий пуша (Поправка Б
+# штаба): касается ДЕНЕГ (money-чат/перевод/депозит/чек-с-суммой) → ГРОМКИЙ пуш «впиши руками»;
+# НЕ деньги (фото-байк/ask/judge слепнет) → лог + тихий счётчик, БЕЗ пуша.
+# Дедуп (Поправка А штаба): при длящемся обвале первый пуш в окне ГРОМКИЙ, дальше СХЛОПКА
+# «ещё N потерялось за окно» — владельца не спамим по одному.
+_LLM_LOSS_WINDOW = 600          # окно схлопки громких пушей, сек (~10 мин)
+_llm_loss = {"loud_ts": 0.0, "collapsed": 0, "quiet": 0}
+
+
+def _note_llm_loss(*, money, wallet="", lost_text="", detail="", kind="") -> bool:
+    """LLM upstream упал на разборе — фиксируем, чтобы операция не пропала тихо.
+    money=True → громкий пуш владельцу (с дедупом за окно); money=False → лог + тихий счётчик.
+    Возврат: был ли отправлен громкий пуш (для тестов/диагностики)."""
+    if not money:
+        _llm_loss["quiet"] += 1
+        log.error(f"  → LLM upstream down (НЕ-деньги, лог без пуша): kind={kind} {detail}")
+        return False
+    log.error(f"  → LLM upstream down на ДЕНЬГАХ: wallet={wallet} kind={kind} "
+              f"lost={lost_text[:120]!r} {detail}")
+    now = _time.time()
+    if now - _llm_loss["loud_ts"] > _LLM_LOSS_WINDOW:
+        # новый эпизод/окно → ГРОМКИЙ пуш (+ хвост схлопнутых за прошлое окно, если были)
+        extra = ""
+        if _llm_loss["collapsed"] > 0:
+            extra = f"\n(+ ещё {_llm_loss['collapsed']} операц. потерялось в прошлом окне)"
+        _llm_loss["loud_ts"] = now
+        _llm_loss["collapsed"] = 0
+        try:
+            import notify
+            notify.notify(
+                "⚠️ ОПЕРАЦИЯ ПОТЕРЯЛАСЬ (LLM upstream упал)\n"
+                f"Кошелёк: {wallet or '?'}\n"
+                f"Впиши руками: {lost_text or '(текст недоступен)'}" + extra,
+                force=True)   # боевой алерт кассы — тест-мут не глушит
+        except Exception:
+            log.exception("  → пуш о потере money упал")
+        return True
+    # в окне — СХЛОПКА: копим счётчик, владельца не спамим
+    _llm_loss["collapsed"] += 1
+    log.warning(f"  → потеря money схлопнута в окне ({_llm_loss['collapsed']} за окно) — пуш не шлём")
+    return False
+
+
 async def _handle_money(msg, context, bridge, claude):
     """Money Cashflow / Самоорганизация — считаем, сверяем с Пымом."""
     # Записи учитываем от Пыма ИЛИ от аккаунта владельца (Филипп). Остальных читаем, но не как проводки.
@@ -1863,10 +1917,27 @@ async def _handle_money(msg, context, bridge, claude):
         if await handle_currency_confirm(msg, context, bridge, claude, text):
             return
 
-    parsed = _parse_json(claude.quick(MONEY_SYSTEM, text, max_tokens=400))
-    ptype = parsed.get("type")
     chat_id = msg.chat_id
     wallet = group_label(chat_id)
+
+    # §12: разбор кассы — raise_on_upstream=True. UPSTREAM упал (кредит/Auth/timeout/CLI) →
+    # SplinterLLMError → громкий пуш «впиши руками» + ответ в чат, проводка НЕ теряется тихо.
+    # ЧЕСТНЫЙ type:none (модель ответила) — сюда НЕ попадает, идёт штатно (тихо, как раньше).
+    try:
+        raw = claude.quick(MONEY_SYSTEM, text, max_tokens=400, raise_on_upstream=True)
+    except SplinterLLMError as e:
+        _note_llm_loss(money=True, wallet=wallet, lost_text=text, detail=str(e), kind="money")
+        try:
+            await _send(context, chat_id=chat_id,
+                        text=("🐀 Splinter\n⚠️ Не смог обработать сейчас (LLM временно недоступен). "
+                              "Запись НЕ потеряна — впиши вручную или повтори, когда восстановится."),
+                        bilingual=False)
+        except Exception:
+            log.exception("  → money loss: ответ в чат упал")
+        return
+
+    parsed = _parse_json(raw)
+    ptype = parsed.get("type")
     log.info(f"  → parsed type={ptype} transfer={parsed.get('transfer_to_pettycash')}")
 
     if ptype == "transaction":
@@ -4588,6 +4659,9 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             if not img:
                 log.warning(f"  → photo download failed")
                 continue
+            # Фото-байк (ТО/приёмка) — НЕ деньги (Поправка Б штаба): upstream упал → vision() сам
+            # логирует «upstream down (graceful '')» и отдаёт '' → лог БЕЗ пуша, разбор деградирует
+            # штатно (raise_on_upstream не включаем — громкий пуш только на ДЕНЬГАХ).
             v = _parse_json(claude.vision(VISION_BIKE_SYSTEM, img, max_tokens=400))
             log.info(f"  → vision: fuel={v.get('fuel')} mileage={v.get('mileage')} "
                      f"conf={v.get('mileage_confidence')} tire={v.get('tire')} damage={v.get('damage')}")

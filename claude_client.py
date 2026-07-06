@@ -12,7 +12,7 @@ import logging
 import tempfile
 import subprocess
 from typing import Optional, List, Dict
-from anthropic import Anthropic
+from anthropic import Anthropic, AnthropicError
 
 log = logging.getLogger(__name__)
 
@@ -662,13 +662,20 @@ class ClaudeClient:
             shutil.rmtree(cwd, ignore_errors=True)
         return _strip_code_fences(out)
 
-    def quick(self, system: str, user: str, max_tokens: int = 600) -> str:
+    def quick(self, system: str, user: str, max_tokens: int = 600,
+              raise_on_upstream: bool = False) -> str:
         """
         Одноразовый вызов Claude БЕЗ инструментов — для классификации/парсинга.
         Используется Splinter'ом чтобы разобрать сообщение Пыма в строгий JSON.
         Возвращает чистый текст ответа модели.
         SPLINTER_LLM_VIA_CLI=1 → генерация по подписке (claude -p/Max, sonnet); иначе платный
-        API (fallback). Формат ответа одинаков. Недоступность CLI → лог + '' (не сырой 400)."""
+        API (fallback). Формат ответа одинаков.
+
+        raise_on_upstream=True (кассовый путь _handle_money): UPSTREAM-DOWN (BadRequest=кредит-
+        на-нуле / Auth / APIStatus / timeout платного API ИЛИ SplinterLLMError CLI-пути) → бросить
+        ТИПИЗИРОВАННЫЙ SplinterLLMError — ОТДЕЛЬНО от «модель ответила, но парс пуст / честный
+        type:none» (тот идёт штатно, это НЕ потеря). Деф off (translate/intake/servicing) —
+        happy-path контракт цел: upstream-down → лог + '' (как раньше, не сырой 400)."""
         try:
             if _splinter_llm_via_cli():
                 return self._cli_generate(system, user, self.model)
@@ -680,6 +687,16 @@ class ClaudeClient:
             )
             parts = [b.text for b in resp.content if b.type == "text"]
             return "\n".join(parts).strip()
+        except (SplinterLLMError, AnthropicError) as e:
+            # UPSTREAM упал: CLI (SplinterLLMError уже типизирован) ИЛИ платный API (AnthropicError —
+            # база для BadRequest/Auth/APIStatus/APITimeout). Кассе (raise_on_upstream) — громко
+            # типизированным исключением; остальным — деградация в '' (контракт как раньше).
+            if raise_on_upstream:
+                if isinstance(e, SplinterLLMError):
+                    raise
+                raise SplinterLLMError(f"quick upstream down: {type(e).__name__}") from e
+            log.error(f"Claude quick() upstream down (graceful ''): {type(e).__name__}: {e}")
+            return ""
         except Exception as e:
             log.error(f"Claude quick() error: {e}")
             return ""
@@ -711,10 +728,14 @@ class ClaudeClient:
             return {}
 
     def vision(self, system: str, image_bytes: bytes, prompt: str = "",
-               media_type: str = "image/jpeg", max_tokens: int = 500) -> str:
+               media_type: str = "image/jpeg", max_tokens: int = 500,
+               raise_on_upstream: bool = False) -> str:
         """
         Анализ изображения через Claude vision (чеки, фото байков: топливо/пробег).
         Возвращает текст ответа (обычно строгий JSON по заданию из system).
+
+        raise_on_upstream=True → UPSTREAM-DOWN (AnthropicError: BadRequest/Auth/APIStatus/timeout)
+        бросает ТИПИЗИРОВАННЫЙ SplinterLLMError. Деф off — '' (как раньше; hint-путь чек/фото цел).
         """
         import base64
         try:
@@ -733,6 +754,11 @@ class ClaudeClient:
             )
             parts = [b.text for b in resp.content if b.type == "text"]
             return "\n".join(parts).strip()
+        except AnthropicError as e:
+            if raise_on_upstream:
+                raise SplinterLLMError(f"vision upstream down: {type(e).__name__}") from e
+            log.error(f"Claude vision() upstream down (graceful ''): {type(e).__name__}: {e}")
+            return ""
         except Exception as e:
             log.error(f"Claude vision() error: {e}")
             return ""
