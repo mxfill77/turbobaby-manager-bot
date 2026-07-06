@@ -7,6 +7,10 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.pop("PRETOOL_NOPUSH", None)
 os.environ.pop("NOTIFY_COUNT_FILE", None)
 import notify as N
+# notify на импорте авто-поднимает PRETOOL_NOPUSH по тест-entry-point (§12 корень 2, 06.07) —
+# снимаем ЕЩЁ РАЗ ПОСЛЕ импорта: тест проверяет реальный send-путь notify, сеть замокана
+# (_send_message/_delete_message), поэтому мут тут не нужен и утечки нет.
+os.environ.pop("PRETOOL_NOPUSH", None)
 
 TMP = "/tmp/claude-0/-root-turbobaby-manager-bot/de0bcc53-2bb9-43ea-8f40-d32c5dc0212b/scratchpad/cc_notif_test.json"
 N._STORE = TMP

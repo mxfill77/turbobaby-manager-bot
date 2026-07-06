@@ -31,6 +31,25 @@ CHAT_ID = 504608015  # личный аккаунт Филиппа (написа�
 _STORE = "/root/.claude/cc_notif_ids.json"   # message_id висящих 🔔 (для автоудаления)
 
 
+def _is_test_entrypoint() -> bool:
+    """§12 корень 2 (06.07.2026): процесс запущен как ТЕСТ? Активный pytest ИЛИ entry-point
+    tests/test_*.py. gate.py (сам не test_*) и notify.py-CLI детектором НЕ считаются боевыми —
+    их force-пуши остаются живыми (auto-set через setdefault, force это не глушит)."""
+    if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    ep = os.path.basename((sys.argv[0] if sys.argv else "") or "")
+    return ep.startswith("test_") and ep.endswith(".py")
+
+
+# §12 корень 2: PRETOOL_NOPUSH раньше ставил ТОЛЬКО gate.py подпроцессам тестов (20762b6) — прямой
+# прогон `venv/bin/python3 tests/test_*.py` МИМО гейта флага не получал → тестовые карточки текли в
+# личку. Теперь любой тест-entry-point (прямой прогон ИЛИ pytest) поднимает флаг на СТАРТЕ импортом
+# notify — физически, не только под гейтом. setdefault: тест может явно снять флаг (test_notify_force
+# проверяет боевой путь, снимая PRETOOL_NOPUSH перед проверкой отправки) → его force-путь цел.
+if _is_test_entrypoint():
+    os.environ.setdefault("PRETOOL_NOPUSH", "1")
+
+
 def _get_token():
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))

@@ -50,10 +50,25 @@ CLAUDE_BIN = "/usr/bin/claude"
 RESULT_MAX = 4500        # Bridge режет result на 5000 — оставляем запас
 LOG_PATH = os.path.join(REPO, "orchestrator_daemon.log")
 
-logging.basicConfig(
-    filename=LOG_PATH, level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+# §12 корень 1 (06.07.2026): под тест-прогоном НЕ трогаем боевой orchestrator_daemon.log —
+# сам ИМПОРТ модуля (test_orchestrator_*/test_convert_loop_break делают `import orchestrator_daemon`)
+# конфигурировал FileHandler на ЖИВОЙ лог, и любой log.info фикстуры лил строки в него. Тест-прогон
+# определяем по: активный pytest / entry-point tests/test_*.py / явный флаг ORCH_DAEMON_TEST=1 →
+# логгер в NullHandler (ни файла, ни консоли). Боевой демон (systemd, argv=orchestrator_daemon.py) —
+# как раньше, пишет в LOG_PATH.
+_UNDER_TEST = (
+    "pytest" in sys.modules
+    or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    or os.path.basename((sys.argv[0] if sys.argv else "") or "").startswith("test_")
+    or os.environ.get("ORCH_DAEMON_TEST") == "1"
 )
+if _UNDER_TEST:
+    logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+else:
+    logging.basicConfig(
+        filename=LOG_PATH, level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 log = logging.getLogger("orchestrator_daemon")
 
 bc = BridgeClient(timeout=90)
@@ -74,6 +89,21 @@ signal.signal(signal.SIGINT, _stop)
 # Маркер самодекларации красной зоны (заход 2б-2). Демон НЕ угадывает формулировки отказа —
 # инструктирует claude -p вывести этот маркер вместо попытки обойти гейт.
 NA_MARKER = "NEEDS_APPROVAL:"
+
+
+def _fail_card(out, err, rc):
+    """§12 корень 3 (06.07.2026): ЧИСТАЯ карточка провала claude -p — НЕ сырой дамп всего
+    stdout+stderr (шум, усиленный громким-провалом d946f92). Отдаём осмысленную суть: первую
+    строку stdout (по контракту преамбулы = сводка ≤400) + хвост stderr (реальная ошибка),
+    капнуто коротко. Полный поток claude -p как карточку НЕ релеим — детали задача пишет в cc_log.
+    Границу «громкий провал ДЕНЕГ» (splinter._note_llm_loss, force-пуш) это НЕ трогает —
+    там отдельный механизм, он остаётся."""
+    o = (out or "").strip()
+    e = (err or "").strip()
+    summary = o.splitlines()[0].strip() if o else ""
+    etail = " / ".join([x for x in e.splitlines() if x.strip()][-2:]) if e else ""
+    body = " | ".join([b for b in (summary, etail) if b]) or f"exit={rc}"
+    return f"claude -p упал (exit={rc}): {body}"[:600]
 
 # === АВТО-ПЕРЕЧЕНЬ красных op (п.4 узкий, штаб 19.06) — РОВНО два, оба обратимы ===
 # clasp_redeploy / CRM / Лист1 / деньги / set_fleet_* / delete_event — НЕ здесь (позже, особое «да»).
@@ -293,8 +323,8 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
 
     if proc.returncode != 0:
         log.warning("id=%s claude -p exit=%s", task_id, proc.returncode)
-        msg = (out + ("\n" + err if err else "")).strip() or f"exit={proc.returncode}"
-        return "failed", f"claude exit={proc.returncode}: {msg}"[:RESULT_MAX]
+        # §12 корень 3: чистая карточка провала, НЕ сырой дамп stdout+stderr (шум).
+        return "failed", _fail_card(out, err, proc.returncode)
     log.info("id=%s claude -p exit=0 (вывод %d симв)", task_id, len(out))
     return "done", (out[:RESULT_MAX] if out else "(claude -p вернул пустой вывод)")
 
