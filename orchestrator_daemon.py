@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+import json
 import signal
 import logging
 import datetime
@@ -47,6 +48,15 @@ MAX_STEPS = 8            # потолок шагов декомпозиции (�
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
 CLAUDE_BIN = "/usr/bin/claude"
+# КОНДУКТОР МОДЕЛИ (06.07.2026): headless-исполнитель по умолчанию — Claude Fable 5, фолбэк —
+# прежняя рабочая модель (Opus 4.8 1M = CLI-дефолт до этой правки). Вынесено в env, НЕ хардкод:
+# смена модели в будущем = правка .env (ORCH_MODEL / ORCH_MODEL_FALLBACK), без правки кода.
+# Фолбэк исполняет САМ CLI флагом --fallback-model В РАМКАХ ОДНОГО вызова при
+# overload/недоступности/лимите/неверном имени primary → задача НЕ исполняется дважды
+# (проверено 06.07: невалидная primary + --fallback-model=opus → CLI сам берёт opus, exit 0,
+# modelUsage=opus). Хардкода без фолбэка нет: упёршись в лимит Fable, автоматика не встаёт.
+ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "fable").strip() or "fable"
+ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-opus-4-8[1m]").strip() or "claude-opus-4-8[1m]"
 RESULT_MAX = 4500        # Bridge режет result на 5000 — оставляем запас
 LOG_PATH = os.path.join(REPO, "orchestrator_daemon.log")
 
@@ -294,9 +304,19 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     _hb_stop = threading.Event()
     _hb = threading.Thread(target=_heartbeat_loop, args=(task_id, _hb_stop), daemon=True)
     _hb.start()
+    # Кондуктор: --model основная (Fable 5) + --fallback-model прежняя (Opus 4.8 1M). При
+    # overload/недоступности/лимите/неверном имени primary CLI сам переключается на fallback внутри
+    # ОДНОГО вызова (без двойного исполнения). --output-format json → из ответа достаём и текст
+    # (result), и КАКАЯ модель реально отработала (ключи modelUsage) для явной строки в лог.
+    # prompt — ПОСЛЕДНИМ аргументом (позиционный; тест-моки читают args[-1]).
+    cmd = [CLAUDE_BIN, "-p",
+           "--model", ORCH_MODEL,
+           "--fallback-model", ORCH_MODEL_FALLBACK,
+           "--output-format", "json",
+           prompt]                          # список аргументов, БЕЗ shell → нет инъекции через task_text
     try:
         proc = subprocess.run(
-            [CLAUDE_BIN, "-p", prompt],      # список аргументов, БЕЗ shell → нет инъекции через task_text
+            cmd,
             cwd=REPO,
             capture_output=True, text=True,
             timeout=task_timeout,
@@ -312,8 +332,27 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
         _hb_stop.set()
         _hb.join(timeout=5)
 
-    out = (proc.stdout or "").strip()
+    raw = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()
+
+    # --output-format json: {result:<текст>, modelUsage:{<модель>:{…}}, is_error, api_error_status}.
+    # Достаём текст ответа (result) и КАКАЯ модель реально отработала (ключи modelUsage). Парс-фейл
+    # (пустой/не-json вывод, тест-моки с plain text) → деградация на сырой stdout, как в текст-режиме.
+    out, models_ran = raw, []
+    try:
+        j = json.loads(raw)
+        out = (j.get("result") or "").strip()
+        models_ran = list((j.get("modelUsage") or {}).keys())
+    except Exception:
+        pass
+    if models_ran:
+        ran = ",".join(models_ran)
+        picked = "фолбэк" if ORCH_MODEL not in ran and ORCH_MODEL_FALLBACK in ran else "основная"
+        log.info("id=%s модель отработала: %s (запрошена=%s, фолбэк=%s, взята=%s)",
+                 task_id, ran, ORCH_MODEL, ORCH_MODEL_FALLBACK, picked)
+    else:
+        log.info("id=%s модель: запрошена=%s фолбэк=%s (modelUsage пуст — ошибка резолва / текст-режим)",
+                 task_id, ORCH_MODEL, ORCH_MODEL_FALLBACK)
 
     # Красная зона: claude самодекларировал, что нужно «да» Филиппа → needs_approval (НЕ failed).
     what = _detect_needs_approval(out)

@@ -66,7 +66,7 @@ class FakeProc:
 _real_run = OD.subprocess.run
 def fake_run(args, **kw):
     if args and args[0] == OD.CLAUDE_BIN:
-        prompt = args[2]
+        prompt = args[-1]      # prompt — последний позиционный (после --model/--fallback-model/--output-format)
         if prompt.startswith(OD.PLANNER_PREAMBLE):
             return FakeProc(fake_run.plan_out)
         return FakeProc(fake_run.step_out)
