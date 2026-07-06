@@ -213,6 +213,39 @@ _HEADLESS_IMPOSSIBLE_RE = re.compile(
 )
 
 
+# === САМОПОЧИНКА ШАГА (мета-дирижёр кусок 1, KB_MASTER §4, заведено 06.07.2026) ===
+# Провал шага декомпозера (исполнительский fail, НЕ красный NEEDS_APPROVAL) при STEP_SELFHEAL=1
+# в .env → вместо мгновенного halt-on-fail зовём ДУМАТЕЛЯ: claude -p через тот же кондуктор
+# ORCH_MODEL/ORCH_MODEL_FALLBACK (0bc9187), чистый генератор (--max-turns 1, без исполнения),
+# строгий JSON {"verdict","fixed_step","reason"}. verdict=retry → шаг перерождается НОВОЙ задачей
+# с детерминированным маркером «[самопочинка шага N, попытка 1]» (паттерн конвертов fa90193);
+# перерождённый шаг, упавший ПОВТОРНО, → ТЕРМИНАЛЬНЫЙ halt (ровно 1 попытка, петля невозможна).
+# FAIL-SAFE: думатель упал / таймаут / JSON не распарсился / enqueue не встал → прежний
+# halt-on-fail байт-в-байт (не хуже текущего). Красное НЕ ослабляется: думатель ничего не
+# исполняет, перерождённый шаг идёт обычным путём (NEEDS_APPROVAL → кнопка как раньше).
+# STEP_SELFHEAL=0/нет → ветка не зовётся вовсе (мгновенный откат конфигом + рестарт демона).
+STEP_SELFHEAL_TIMEOUT = 180   # думатель — чистый генератор без tools, ответ короткий
+_HEAL_RE = re.compile(r"\[самопочинка шага (\d+), попытка (\d+)\]")
+THINKER_PREAMBLE = (
+    "Ты — думательный слой самопочинки оркестратора TurboBaby (мета-дирижёр). Шаг декомпозиции "
+    "упал при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО не исполняешь, "
+    "инструментов у тебя нет, файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"retry"|"halt","fixed_step":"<новая формулировка шага>","reason":"<1 строка диагноза>"}\n'
+    "verdict=retry — ТОЛЬКО если провал починим переформулировкой шага (неверный путь/имя файла, "
+    "недостающий контекст, кривая команда) и правка очевидна; fixed_step тогда — САМОДОСТАТОЧНОЕ "
+    "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
+    "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
+    "verdict=halt и fixed_step пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
+    "многошаговых планов.\n\n"
+)
+
+
+def _selfheal_on():
+    """Флаг STEP_SELFHEAL=1 в .env (демон load_dotenv'ит на старте). 0/нет → прежнее поведение."""
+    return (os.environ.get("STEP_SELFHEAL") or "").strip() == "1"
+
+
 def _is_convert(text):
     """True → задача является конвертом одобренной op=other (родилась из «да» Филиппа). Слой 1."""
     return bool(_CONVERT_RE.match(str(text or "")))
@@ -444,7 +477,14 @@ def _dec_step_blocked(pid):
 def _dec_summary_text(pid):
     """Сводный отчёт по родителю pid: все done/failed-шаги, отсортированные по номеру.
     Строка на шаг = ✅/❌ + первая строка результата (сводка ≤400 от исполнителя)."""
-    rows = sorted(_dec_siblings(pid, ("done", "failed")), key=lambda x: x[0])
+    rows = sorted(_dec_siblings(pid, ("done", "failed")),
+                  key=lambda x: (x[0], int(x[2].get("id") or 0)))
+    # самопочинка может дать ДВЕ записи на один номер шага (исходный 🩹-done + перерождённый);
+    # в сводке оставляем ПОСЛЕДНЮЮ по id (реальный финал шага). Без дублей — поведение прежнее.
+    last = {}
+    for i, n, it in rows:
+        last[i] = (i, n, it)
+    rows = [last[k] for k in sorted(last)]
     if not rows:
         return f"🧩 Сводка декомпозиции (родитель {pid}): шагов не найдено (очередь пуста?)"
     n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
@@ -538,6 +578,153 @@ def _maybe_dec_after(task_text, status):
     m = _STEP_RE.match(str(task_text or ""))
     if m and status in ("done", "failed"):
         _dec_after_step(int(m.group(3)), int(m.group(1)), int(m.group(2)), status)
+
+
+# === САМОПОЧИНКА ШАГА: функции (диагноз думателя → 1 перерождение / терминальный halt) ===
+def _dec_parent_context(pid):
+    """Контекст родителя pid для думателя: (исходная цель дословно, план шагов). Родитель после
+    fan-out лежит в done (task_text = цель, result = план). Не нашли → заглушки (не валимся)."""
+    try:
+        r = bc.get_pending("done")
+        if r.get("ok"):
+            for it in r.get("items", []):
+                if int(it.get("id") or 0) == int(pid):
+                    return (str(it.get("task_text") or "").strip()[:1500],
+                            str(it.get("result") or "").strip()[:2000])
+    except Exception as e:
+        log.warning("selfheal: контекст родителя %s не прочитан (%s)", pid, e)
+    return (f"(родитель {pid} не найден в очереди)", "(план недоступен)")
+
+
+def _parse_thinker_json(text):
+    """Строгий парс ответа думателя → {"verdict","fixed_step","reason"} или None (fail-safe).
+    Терпим обёртку-мусор вокруг JSON (берём от первой { до последней }), но verdict обязан быть
+    retry|halt — иначе None."""
+    t = (text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = str(d.get("verdict") or "").strip().lower()
+    if v not in ("retry", "halt"):
+        return None
+    return {"verdict": v,
+            "fixed_step": str(d.get("fixed_step") or "").strip(),
+            "reason": str(d.get("reason") or "").strip()}
+
+
+def _selfheal_consult(pid, step_i, step_n, step_text, fail_text):
+    """Думатель: claude -p через кондуктор ORCH_MODEL/ORCH_MODEL_FALLBACK, чистый генератор
+    (--max-turns 1 — один ответ, без инструментального цикла). Промпт: цель родителя ДОСЛОВНО +
+    план шагов + упавший шаг + суть провала (как _fail_card). Возврат: dict вердикта или None
+    (любой сбой думателя = None = fail-safe прежний halt-on-fail)."""
+    goal, plan = _dec_parent_context(pid)
+    prompt = (THINKER_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ПЛАН ШАГОВ РОДИТЕЛЯ:\n{plan}\n\n"
+              f"УПАВШИЙ ШАГ {step_i}/{step_n} (текст дословно):\n{step_text}\n\n"
+              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+    child_env = dict(os.environ)
+    child_env.setdefault("HOME", "/root")
+    child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    child_env.pop("ANTHROPIC_API_KEY", None)   # как в run_task: идём по ~/.claude, не по платному API
+    child_env.pop("OPENAI_API_KEY", None)
+    cmd = [CLAUDE_BIN, "-p",
+           "--model", ORCH_MODEL,
+           "--fallback-model", ORCH_MODEL_FALLBACK,
+           "--output-format", "json",
+           "--max-turns", "1",
+           prompt]                             # prompt последним (тест-моки читают args[-1])
+    try:
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
+                              timeout=STEP_SELFHEAL_TIMEOUT, env=child_env)
+    except Exception as e:
+        log.warning("selfheal: думатель не отработал (%s) — fail-safe halt", e)
+        return None
+    raw = (proc.stdout or "").strip()
+    out = raw
+    try:
+        env_j = json.loads(raw)
+        if isinstance(env_j, dict) and "result" in env_j:   # CLI-конверт --output-format json
+            out = (env_j.get("result") or "").strip()
+    except Exception:
+        pass
+    if proc.returncode != 0:
+        log.warning("selfheal: думатель exit=%s — fail-safe halt", proc.returncode)
+        return None
+    verdict = _parse_thinker_json(out)
+    if verdict is None:
+        log.warning("selfheal: ответ думателя не распарсился (fail-safe halt): %.200s", out)
+    return verdict
+
+
+def _maybe_selfheal(tid, text, fail_text):
+    """Провал шага декомпозиции (исполнительский failed) → думательный слой, РОВНО 1 попытка
+    самопочинки. Возврат True = финализация сделана здесь (перерождение / терминальный halt с
+    диагнозом); False = ничего не делал → прежний halt-on-fail в вызывающем коде (fail-safe)."""
+    if not _selfheal_on():
+        return False
+    m = _STEP_RE.match(str(text or ""))
+    if not m:
+        return False                          # одиночные «тз:»/«задача:» не трогаем (расширение потом)
+    step_i, step_n, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if _HEAL_RE.search(text):
+        # перерождённый шаг упал ПОВТОРНО → терминальный halt (без retry) — петля невозможна
+        bc.complete_task(tid, "failed",
+                         (f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {step_i}/{step_n} "
+                          f"родителя {pid} упал повторно — цепочка остановлена, нужен человек.\n"
+                          f"{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("selfheal: id=%s шаг %s/%s родителя %s упал ПОВТОРНО → терминальный halt",
+                 tid, step_i, step_n, pid)
+        _maybe_dec_after(text, "failed")
+        return True
+    verdict = _selfheal_consult(pid, step_i, step_n, text, fail_text)
+    if verdict is None:
+        return False                          # fail-safe: сбой думателя = прежнее поведение
+    reason = verdict["reason"] or "(без причины)"
+    fixed = verdict["fixed_step"]
+    if verdict["verdict"] != "retry" or not fixed:
+        bc.complete_task(tid, "failed",
+                         (f"шаг {step_i}/{step_n} упал → думатель: halt, причина: {reason}\n"
+                          f"Цепочка остановлена (диагноз думателя выше).\n"
+                          f"{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("selfheal: id=%s шаг %s/%s родителя %s → думатель halt (%s)",
+                 tid, step_i, step_n, pid, reason[:120])
+        _maybe_dec_after(text, "failed")
+        return True
+    reborn = (f"[шаг {step_i}/{step_n} родитель {pid}] "
+              f"[самопочинка шага {step_i}, попытка 1] {fixed}")[:RESULT_MAX]
+    r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", reborn)
+    if not r.get("ok"):
+        log.warning("selfheal: перерождение шага id=%s не встало в очередь (%s) — fail-safe halt",
+                    tid, r.get("error"))
+        return False                          # fail-safe: очередь не приняла → прежний halt
+    nid = r.get("id")
+    card = (f"🩹 шаг {step_i}/{step_n} упал → думатель: retry, правка: {fixed[:200]}, "
+            f"причина: {reason[:200]}\n"
+            f"Перерождён задачей id {nid} (попытка 1 из 1; повторный провал = терминальный halt).\n"
+            f"Исходный провал: {str(fail_text or '')[:400]}")
+    bc.complete_task(tid, "done", card[:RESULT_MAX])
+    log.info("selfheal: id=%s шаг %s/%s родителя %s перерождён задачей %s (retry)",
+             tid, step_i, step_n, pid, nid)
+    _maybe_dec_after(text, "done")
+    return True
+
+
+def _earlier_new_sibling(items, pid, step_i):
+    """True → среди new-задач снапшота есть шаг ТОГО ЖЕ родителя с МЕНЬШИМ номером. Перерождение
+    самопочинки получает id ВЫШЕ следующих шагов — порядок цепочки держим по НОМЕРУ шага, не по id.
+    В обычной цепочке (id растут вместе с номерами) всегда False — поведение прежнее."""
+    for it in items:
+        mm = _STEP_RE.match(str(it.get("task_text") or ""))
+        if mm and int(mm.group(3)) == int(pid) and int(mm.group(1)) < int(step_i):
+            return True
+    return False
 
 
 def _dec_plan_and_fanout(tid, task_text):
@@ -714,6 +901,12 @@ def process_new():
                     log.info("dec: шаг id=%s родителя %s ждёт сиблинга — пропускаю в этом цикле",
                              cand.get("id"), pid)
                     continue
+                if _earlier_new_sibling(items, pid, int(m.group(1))):
+                    # перерождение самопочинки: шаг с МЕНЬШИМ номером ждёт в new (id у него выше) —
+                    # порядок цепочки по номеру шага, этого кандидата пропускаем в этом проходе
+                    log.info("dec: шаг id=%s родителя %s ждёт шага с меньшим номером — пропускаю",
+                             cand.get("id"), pid)
+                    continue
         task = cand
         break
     if task is None:
@@ -753,6 +946,10 @@ def process_new():
             rr = bc.set_needs_approval(tid, result)
             log.info("NEEDS_APPROVAL id=%s bridge_ok=%s", tid, rr.get("ok"))
     else:
+        # САМОПОЧИНКА (STEP_SELFHEAL=1): провал шага декомпозиции → думатель, 1 попытка.
+        # True = финализировано внутри (перерождение/терминальный halt); False = прежний путь.
+        if status == "failed" and _maybe_selfheal(tid, text, result):
+            return
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
         _maybe_dec_after(text, status)          # шаг декомпозиции → halt-on-fail / сводка
