@@ -41,6 +41,7 @@ from memory import Memory
 from prompts import SYSTEM_PROMPT, daily_pulse_prompt
 import splinter
 import devbot
+import spend_ledger
 
 # === Загружаем конфиг ===
 load_dotenv()
@@ -698,6 +699,36 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
         claude.pending_unpin = []
 
 
+async def _maybe_api_ledger_cmd(msg) -> bool:
+    """§12 ЛЕДЖЕР ТРАТ: владелец (Филипп) управляет балансом платного API текстом Splinter'у.
+    «баланс api пополнен на $N» → set_topup; «сколько осталось api / баланс api» → показать
+    remaining + потрачено. Требует API-маркер (api/апи/$/credit) — не путается с наличной кассой.
+    Возврат True = команда распознана и отвечена (дальнейший роутинг не идёт)."""
+    if not splinter.is_owner_user(getattr(msg, "from_user", None)):
+        return False
+    text = msg.text or ""
+    amt = spend_ledger.parse_topup(text)
+    if amt is not None:
+        new_bal = spend_ledger.set_topup(amt)
+        await msg.reply_text(
+            f"🐀 Splinter\n✅ Баланс API принят: ~${new_bal:.2f}. Считаю траты отсюда; "
+            f"предупрежу заранее при остатке ~${spend_ledger.THRESHOLD_USD:.0f}.")
+        return True
+    if spend_ledger.is_balance_query(text):
+        st = spend_ledger.status()
+        if st["topup"] <= 0:
+            await msg.reply_text(
+                "🐀 Splinter\nℹ️ Баланс API ещё не задан. Как пополнишь — напиши "
+                "«баланс api пополнен на $N», дальше буду считать остаток сам.")
+        else:
+            await msg.reply_text(
+                f"🐀 Splinter\n💳 Баланс API: осталось ~${st['remaining']:.2f} из "
+                f"${st['topup']:.2f} (потрачено ~${st['spent']:.2f} с пополнения). Оценка "
+                f"приблизительная — сигнал «пора пополнять», не бухгалтерия.")
+        return True
+    return False
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстовых сообщений."""
     msg = update.message
@@ -712,6 +743,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("devbot handle_command error")
         return
+
+    # §12 ЛЕДЖЕР ТРАТ API: владельческая команда пополнения/запроса остатка (в любом чате —
+    # это глобальный ресурс, не касса группы). Ловим ДО операционного роутинга; API-маркер в
+    # команде исключает клэш с наличным балансом кошелька.
+    try:
+        if await _maybe_api_ledger_cmd(msg):
+            return
+    except Exception:
+        log.exception("api ledger cmd error")
 
     chat_id = msg.chat_id
 

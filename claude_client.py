@@ -16,6 +16,18 @@ from anthropic import Anthropic, AnthropicError
 
 log = logging.getLogger(__name__)
 
+
+def _meter_spend(model, resp):
+    """§12 ЛЕДЖЕР ТРАТ: учесть usage платного вызова (только API-путь — CLI-подписка usage не
+    даёт). Безопасно: любая ошибка проглатывается, учёт НЕ роняет LLM-путь. При пересечении
+    порога остатка leджер сам шлёт ОДИН ранний пуш владельцу (spend_ledger.meter)."""
+    try:
+        import spend_ledger
+        spend_ledger.meter(model, getattr(resp, "usage", None))
+    except Exception:
+        pass
+
+
 # === Фаза 1: подписочный (Max) путь для чистых генераторов quick()/judge() ===
 # Флаг SPLINTER_LLM_VIA_CLI=1 уводит ТЕКСТОВЫЕ вызовы (quick/judge) на `claude -p` (подписка),
 # минуя платный Anthropic API (ANTHROPIC_API_KEY, кредит=0 → 400). Деф off = старый API-путь
@@ -685,6 +697,7 @@ class ClaudeClient:
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
+            _meter_spend(self.model, resp)   # §12 леджер трат (API-путь)
             parts = [b.text for b in resp.content if b.type == "text"]
             return "\n".join(parts).strip()
         except (SplinterLLMError, AnthropicError) as e:
@@ -718,6 +731,7 @@ class ClaudeClient:
                     system=system,
                     messages=[{"role": "user", "content": user}],
                 )
+                _meter_spend(model, resp)   # §12 леджер трат (judge — модель Haiku)
                 text = "\n".join(b.text for b in resp.content if b.type == "text").strip()
             m = _re.search(r"\{.*\}", text, _re.DOTALL)   # вытащить JSON-объект
             if not m:
@@ -752,6 +766,7 @@ class ClaudeClient:
                 system=system,
                 messages=[{"role": "user", "content": content}],
             )
+            _meter_spend(self.model, resp)   # §12 леджер трат (vision — API-путь)
             parts = [b.text for b in resp.content if b.type == "text"]
             return "\n".join(parts).strip()
         except AnthropicError as e:
