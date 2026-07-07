@@ -7,6 +7,7 @@ origin=agent → ЛЮБАЯ попытка красной записи лови�
 """
 import os
 import re
+import json
 import time
 import asyncio
 import datetime
@@ -163,6 +164,135 @@ def _try_approval_reply(text, bridge):
         return f"🤖 Не удалось отклонить задачу {qid}: {r.get('error')}"
 
 
+# ===================== РОУТЕР ТЕАТРА (кусок 3 «единый пульт», 07.07.2026) =====================
+# ОДИН вход (тема 328) для всех команд — система САМА определяет театр исполнения (vps | pc).
+# Слой 1 (детерминированный, БЕЗ LLM): явный префикс «пк:»/«pc:» сразу после команды → pc
+# (префикс срезается); keyword-классы pc/vps — ровно один класс совпал → он и театр. Оба или
+# ни один → слой 2: думатель-классификатор (claude -p, --model haiku --fallback-model sonnet,
+# --max-turns 1 — чистый генератор, ничего не исполняет; строгий JSON {"theater":"vps"|"pc"}).
+# FAIL-SAFE любого сбоя слоя 2 (запуск/таймаут/exit!=0/мусор) → vps (= прежнее поведение, не
+# хуже) + строка-подсказка в карточке приёма. Тема 829 = явный запасной вход БЕЗ роутера
+# (форс pc, как раньше). Театр=pc: одиночные «тз:»/«задача:» → ТА ЖЕ 328-метка from (карточки
+# идут в тему ПОСТАНОВКИ 328 по from-метке) + lane=pc (claim'ит ПК-агент); «декомпозируй:» →
+# родитель QUEUE_FROM_PC_DEC (опора на кусок 2: план строит VPS-демон, шаги lane=pc по одному,
+# отчёты цепи — в теме PC-дев по метке цепи). Изоляция полос НЕ ослаблена: роутер только
+# ВЫБИРАЕТ полосу при enqueue, claim-механику не трогает. Красное НЕ ослаблено (роутер ничего
+# не исполняет). Откат: THEATER_ROUTER=0 в .env + restart splinter — прежнее поведение
+# байт-в-байт (пк:-префикс НЕ срезается, 🎭 не показывается, слой 2 не зовётся).
+CLAUDE_BIN = "/usr/bin/claude"          # зеркало orchestrator_daemon.CLAUDE_BIN (импорт демона в
+                                        # процесс бота нельзя — signal.signal на import, см. выше)
+ROUTER_KW_PC = ("userbot", "suggest", "playbook", "модербот", "dispatch",
+                "d:\\turbobaby-userbot", "приветстви", "черновик клиенту")
+ROUTER_KW_VPS = ("splinter", "bridge", "manager-bot", "registry", "гейт", "cc_log",
+                 "devbot", "orchestrator_daemon", "vps")
+ROUTER_HINT = "театр: vps (по умолчанию); нужен ПК — префикс пк:"
+_PC_TEXT_PREFIXES = ("пк:", "pc:")      # явный префикс театра сразу после команды («тз: пк: …»)
+
+
+def _router_on():
+    """THEATER_ROUTER (деф. 1 = включён). Лениво на каждый вызов: bot.py импортирует devbot
+    ДО load_dotenv() (как pc_dev_topic)."""
+    return str(os.getenv("THEATER_ROUTER", "1")).strip().lower() not in ("0", "false", "off")
+
+
+def _router_timeout():
+    """Таймаут слоя 2 в секундах (THEATER_ROUTER_TIMEOUT, деф. 45с; haiku отвечает за секунды)."""
+    try:
+        return int(os.getenv("THEATER_ROUTER_TIMEOUT", "45") or 45)
+    except (TypeError, ValueError):
+        return 45
+
+
+def _classify_theater(task_text):
+    """Слой 2: думатель-классификатор театра — claude -p дешёвым кондуктором haiku→sonnet
+    (--max-turns 1, --output-format json; зеркало orchestrator_daemon._thinker_exec).
+    → 'vps' | 'pc' | None при ЛЮБОМ сбое (fail-safe, решает вызывающий)."""
+    model = (os.getenv("ROUTER_MODEL") or "haiku").strip() or "haiku"
+    fallback = (os.getenv("ROUTER_MODEL_FALLBACK") or "sonnet").strip() or "sonnet"
+    prompt = (
+        "Ты — роутер театра исполнения дев-задач TurboBaby. Театры:\n"
+        "- vps: серверный репозиторий manager-bot на VPS (Splinter-бот, bot.py, Apps Script "
+        "Bridge, гейт тестов, cc_log, devbot, orchestrator_daemon, деплой/рестарт на VPS).\n"
+        "- pc: репозиторий userbot на ПК Windows (D:\\turbobaby-userbot: suggest.py, playbook, "
+        "модербот, Dispatch, приветствия и черновики ответов клиентам).\n"
+        "Определи театр задачи. Ответь СТРОГО одним JSON без пояснений и без markdown:\n"
+        "{\"theater\":\"vps\"|\"pc\",\"reason\":\"одна строка\"}\n\n"
+        f"ЗАДАЧА (дословно):\n{str(task_text or '')[:2000]}")
+    child_env = dict(os.environ)
+    child_env.setdefault("HOME", "/root")
+    child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    child_env.pop("ANTHROPIC_API_KEY", None)   # как думатели демона: по ~/.claude, не платный API
+    child_env.pop("OPENAI_API_KEY", None)
+    cmd = [CLAUDE_BIN, "-p",
+           "--model", model,
+           "--fallback-model", fallback,
+           "--output-format", "json",
+           "--max-turns", "1",
+           prompt]                             # prompt последним (тест-моки читают args[-1])
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                              timeout=_router_timeout(), env=child_env)
+    except Exception as e:
+        log.warning("theater-router: классификатор не отработал (%s) — fail-safe vps", e)
+        return None
+    if proc.returncode != 0:
+        log.warning("theater-router: классификатор exit=%s — fail-safe vps", proc.returncode)
+        return None
+    out = (proc.stdout or "").strip()
+    try:
+        env_j = json.loads(out)
+        if isinstance(env_j, dict) and "result" in env_j:   # CLI-конверт --output-format json
+            out = (env_j.get("result") or "").strip()
+    except Exception:
+        pass
+    i, j = out.find("{"), out.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(out[i:j + 1])
+    except Exception:
+        return None
+    th = str(d.get("theater") or "").strip().lower() if isinstance(d, dict) else ""
+    return th if th in ("vps", "pc") else None
+
+
+def _route_theater(task_text):
+    """Роутер театра → (театр 'vps'|'pc', текст без явного пк:-префикса, note|None —
+    строка-подсказка при fail-safe слоя 2)."""
+    t = (task_text or "").strip()
+    low = t.lower()
+    for p in _PC_TEXT_PREFIXES:
+        if low.startswith(p):
+            return "pc", t[len(p):].strip(), None
+    pc_hit = any(k in low for k in ROUTER_KW_PC)
+    vps_hit = any(k in low for k in ROUTER_KW_VPS)
+    if pc_hit != vps_hit:                      # ровно один класс совпал → слой 1 решил
+        return ("pc" if pc_hit else "vps"), t, None
+    th = _classify_theater(t)                  # оба/ни один → слой 2 (думатель)
+    if th is not None:
+        return th, t, None
+    return "vps", t, ROUTER_HINT               # fail-safe: vps + подсказка владельцу
+
+
+def _route_328(task_text):
+    """Роутер для темы 328. Выключен (THEATER_ROUTER=0) → (None, текст как есть, None) —
+    прежнее поведение байт-в-байт, 🎭 в карточке не показываем."""
+    if not _router_on():
+        return None, task_text, None
+    return _route_theater(task_text)
+
+
+def _router_card(theater, note):
+    """Хвост карточки приёма с решением роутера: «🎭 vps|pc» (+ подсказка fail-safe).
+    theater=None (роутер выключен) → пустая строка (карточка как раньше)."""
+    if theater is None:
+        return ""
+    s = f"\n🎭 {theater}"
+    if note:
+        s += f"\n{note}"
+    return s
+
+
 def _try_enqueue(text, bridge, lane="vps"):
     """Если текст начинается с префикса задачи — кладём в очередь оркестратора. Иначе None.
     «тз:»/«dev:» → метка QUEUE_FROM_DEV (демон даст 45 мин); «задача:» → быстрый режим (10 мин).
@@ -171,7 +301,10 @@ def _try_enqueue(text, bridge, lane="vps"):
     Filipp-pc-dev / Filipp-pc (исполняет ПК-агент); «декомпозируй:» (ПК-театр кусок 2,
     07.07.2026) → родитель QUEUE_FROM_PC_DEC БЕЗ lane (план строит VPS-демон — единственный
     планировщик), шаги демон релизит на lane=pc по одному.
-    lane='vps' (328): вызовы enqueue_task как раньше, БЕЗ lane — Bridge дефолтит vps."""
+    lane='vps' (328, кусок 3 «единый пульт» 07.07.2026): текст задачи идёт через роутер театра
+    (_route_328). Театр vps → вызовы enqueue_task байт-в-байт как раньше (БЕЗ lane — Bridge
+    дефолтит vps); театр pc → одиночные с 328-меткой + lane='pc' (карточки в тему постановки),
+    «декомпозируй:» → родитель QUEUE_FROM_PC_DEC (кусок 2). Карточка приёма показывает 🎭."""
     t = (text or "").strip()
     low = t.lower()
     pc = (lane == "pc")
@@ -189,11 +322,25 @@ def _try_enqueue(text, bridge, lane="vps"):
                             f"(lane=pc). Каждый шаг отчитается сюда; красный спрошу кнопкой; "
                             f"в конце — сводка. ПК выключен → цепь честно упадёт по таймауту.")
                 return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
+            theater, task_text, note = _route_328(task_text)
+            if not task_text:
+                return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
+                        "и выполню по одному.")
+            if theater == "pc":
+                r = bridge.enqueue_task(QUEUE_FROM_PC_DEC, task_text)
+                if r.get("ok"):
+                    return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
+                            f"построит VPS-дирижёр (~60с), шаги уйдут ПК-агенту по одному "
+                            f"(lane=pc); отчёты шагов и сводка цепи — в теме PC-дев (метка цепи "
+                            f"pc), красный шаг спрошу кнопкой. ПК выключен → цепь честно упадёт "
+                            f"по таймауту." + _router_card("pc", note))
+                return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
             r = bridge.enqueue_task(QUEUE_FROM_DEC, task_text)
             if r.get("ok"):
                 return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (демон возьмёт ~60с). "
                         f"Сначала верну план шагов, затем шаги пойдут отдельными задачами по одному "
-                        f"(каждый отчитается сюда; красный шаг спрошу кнопкой), в конце — сводка.")
+                        f"(каждый отчитается сюда; красный шаг спрошу кнопкой), в конце — сводка."
+                        + _router_card(theater, note))
             return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
     for p in _DEV_PREFIXES:
         if low.startswith(p):
@@ -202,15 +349,26 @@ def _try_enqueue(text, bridge, lane="vps"):
                 return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
             if pc:
                 r = bridge.enqueue_task(QUEUE_FROM_PC_DEV, task_text, lane="pc")
-            else:
-                r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text)
-            if r.get("ok"):
-                if pc:
+                if r.get("ok"):
                     return (f"✅ ТЗ {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
                             f"Статусы/красные вопросы/итог принесу в эту тему.")
+                return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
+            theater, task_text, note = _route_328(task_text)
+            if not task_text:
+                return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
+            if theater == "pc":
+                r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text, lane="pc")
+                if r.get("ok"):
+                    return (f"✅ ТЗ {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт ПК-агент. "
+                            f"Статусы/красные вопросы/итог принесу сюда, в тему постановки."
+                            + _router_card("pc", note))
+                return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
+            r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text)
+            if r.get("ok"):
                 return (f"✅ ТЗ {r.get('id')} в очереди (дев-режим, до 45 мин; демон возьмёт ~60с). "
                         f"Работает headless Claude Code: зелёное/оранжевое (вкл. restart splinter "
-                        f"через гейт) сам, настоящее красное спрошу кнопкой. Результат принесу сюда.")
+                        f"через гейт) сам, настоящее красное спрошу кнопкой. Результат принесу сюда."
+                        + _router_card(theater, note))
             return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
     for p in _TASK_PREFIXES:
         if low.startswith(p):
@@ -219,14 +377,25 @@ def _try_enqueue(text, bridge, lane="vps"):
                 return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
             if pc:
                 r = bridge.enqueue_task(QUEUE_FROM_PC, task_text, lane="pc")
-            else:
-                r = bridge.enqueue_task(QUEUE_FROM, task_text)
-            if r.get("ok"):
-                if pc:
+                if r.get("ok"):
                     return (f"✅ Задача {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
                             f"Принесу результат в эту тему, когда будет done/failed.")
+                return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
+            theater, task_text, note = _route_328(task_text)
+            if not task_text:
+                return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
+            if theater == "pc":
+                r = bridge.enqueue_task(QUEUE_FROM, task_text, lane="pc")
+                if r.get("ok"):
+                    return (f"✅ Задача {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт "
+                            f"ПК-агент. Результат принесу сюда, в тему постановки."
+                            + _router_card("pc", note))
+                return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
+            r = bridge.enqueue_task(QUEUE_FROM, task_text)
+            if r.get("ok"):
                 return (f"✅ Задача {r.get('id')} поставлена в очередь — демон возьмёт её (опрос ~60с). "
-                        f"Принесу результат сюда, когда будет done/failed.")
+                        f"Принесу результат сюда, когда будет done/failed."
+                        + _router_card(theater, note))
             return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
     return None
 
@@ -275,8 +444,12 @@ def _is_pc_item(it):
 
 
 def _item_topic(it):
-    """Тема для карточки задачи: полоса pc → тема PC-дев; иначе / PC-тема не настроена → 328."""
-    if _is_pc_item(it):
+    """Тема для карточки задачи — по метке from = тема ПОСТАНОВКИ (кусок 3 «единый пульт»,
+    07.07.2026): from полосы pc (Filipp-pc*) → тема PC-дев; иначе → 328. Задача, поставленная
+    в 328 и роутнутая на театр pc (from=Filipp-328*, lane=pc), отчитывается в 328 — где её
+    ставили. По lane тему НЕ решаем (lane = полоса ИСПОЛНЕНИЯ, не тема владельца); ярлык [pc]
+    в карточке остаётся по lane (_item_lane_label)."""
+    if str((it or {}).get("from") or "") in QUEUE_FROMS_PC:
         return pc_dev_topic() or DEVBOT_TOPIC
     return DEVBOT_TOPIC
 
