@@ -66,6 +66,14 @@ INTERNAL_MARK = re.compile(
     r"bot\.py|claude_client|claude code|termux|термукс|orchestrator_daemon|инбокс|inbox|"
     r"конверт|envelope|очеред",
     re.I)
+# ЧУЖОЙ РЕПОЗИТОРИЙ: карта ЯВНО приписывает коммит другому репо (ПК-репо/userbot/Dispatch) —
+# резолвить его в git manager-bot бессмысленно, пропускаем по образцу CLIENT_MARK (§4 изоляция).
+# Важно: pc_orchestrator содержит «orchestrator» (INTERNAL_MARK) — без этого маркера строка
+# «pc_orchestrator (hash, ПК-репо)» давала ложное расхождение (урок родителя 113, шаг 2).
+# Детектор НЕ ослаблен: внутренний фантом-хеш БЕЗ таких маркеров ловится как раньше.
+FOREIGN_REPO_MARK = re.compile(
+    r"пк[\s_-]?репо|pc[\s_-]?репо|pc[_-]?orchestrator|userbot|юзербот|dispatch|диспатч",
+    re.I)
 
 HASH_RE = re.compile(r"\b[0-9a-f]{7,40}\b")   # commit-подобный токен (короткий/полный hex)
 
@@ -183,8 +191,10 @@ def register(name):
 @register("КАРТА↔GIT")
 def check_map_vs_git(world, run):
     """KB_MASTER цитирует коммиты как якоря вех. Сигнал — если хеш ЯВНО заявлен как ВНУТРЕННИЙ
-    (splinter/оркестратор/инбокс…) и НЕ клиентский, но такого коммита нет в git manager-bot.
-    Клиентские (userbot) коммиты сознательно пропускаем (§4: репо userbot на VPS нет, отдельный камень)."""
+    (splinter/оркестратор/инбокс…) и НЕ клиентский/НЕ чужого репо, но такого коммита нет в git manager-bot.
+    Клиентские (userbot) коммиты сознательно пропускаем (§4: репо userbot на VPS нет, отдельный камень);
+    так же пропускаем коммиты, ЯВНО приписанные чужому репо (FOREIGN_REPO_MARK: ПК-репо/pc_orchestrator/
+    userbot/Dispatch рядом с хешем) — их резолв в manager-bot бессмыслен."""
     txt = world.read_doc("index")
     if txt is None:
         run.note("KB_MASTER (name=index) не прочитан через Bridge — проверка пропущена")
@@ -197,7 +207,8 @@ def check_map_vs_git(world, run):
         # позитивном внутреннем маркере И отсутствии клиентского — консервативно (0 ложных на живом).
         internal_line = None
         for ln in lines:
-            if h in ln and INTERNAL_MARK.search(ln) and not CLIENT_MARK.search(ln):
+            if h in ln and INTERNAL_MARK.search(ln) and not CLIENT_MARK.search(ln) \
+                    and not FOREIGN_REPO_MARK.search(ln):
                 internal_line = ln.strip()
                 break
         if internal_line:
@@ -415,6 +426,11 @@ def _self_test():
     iso_git = _healthy_world()
     iso_git._docs["index"] += "- userbot suggest.py commit ddddddd8 (нет в manager-bot)\n"  # клиентский фантом
     cases.append(("КАРТА↔GIT изоляция (клиентский фантом НЕ ловим, §4)", 0, lambda w=iso_git: w, "КАРТА↔GIT"))
+    foreign_git = _healthy_world()
+    # чужой репо: pc_orchestrator содержит «orchestrator» (INTERNAL) — раньше давало ложный сигнал
+    foreign_git._docs["index"] += "- ПК-полоса — кондуктор pc_orchestrator (eeeeee7, ПК-репо)\n"
+    cases.append(("КАРТА↔GIT чужой репо (ПК-репо/pc_orchestrator рядом с хешем НЕ ловим)",
+                  0, lambda w=foreign_git: w, "КАРТА↔GIT"))
 
     # --- КАРТА↔ПУЛЬС ---
     cases.append(("КАРТА↔ПУЛЬС чистый", 0, _healthy_world, "КАРТА↔ПУЛЬС"))

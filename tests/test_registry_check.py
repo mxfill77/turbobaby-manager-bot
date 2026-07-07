@@ -44,6 +44,22 @@ w._git.add("ccccccc9")
 w._docs["index"] += "- splinter commit ccccccc9 в проде\n"
 ok(len(runs_by_name(w)["КАРТА↔GIT"].findings) == 0, "существующий внутр. коммит не сигналит")
 
+# (4a) КАРТА↔GIT: коммит, ЯВНО приписанный чужому репо → НЕ ловим (фикс родителя 113 шаг 2:
+#      pc_orchestrator содержит «orchestrator» = INTERNAL_MARK, раньше давал ложное расхождение)
+w = healthy()
+w._docs["index"] += "- ПК-полоса — кондуктор pc_orchestrator (eeeeee7, ПК-репо)\n"
+ok(len(runs_by_name(w)["КАРТА↔GIT"].findings) == 0, "хеш с маркером чужого репо (ПК-репо/pc_orchestrator) не сигналит")
+
+# (4b) КАРТА↔GIT: маркер «ПК-репо» сам по себе (без pc_orchestrator) → НЕ ловим
+w = healthy()
+w._docs["index"] += "- оркестратор ПК фикс eeeeee8 (ПК-репо)\n"
+ok(len(runs_by_name(w)["КАРТА↔GIT"].findings) == 0, "маркер «ПК-репо» рядом с хешем гасит проверку резолва")
+
+# (4c) КАРТА↔GIT: детектор НЕ ослаб — внутренний фантом БЕЗ маркеров чужого репо по-прежнему пойман
+w = healthy()
+w._docs["index"] += "- оркестратор headless commit ffffff1 в проде\n"
+ok(len(runs_by_name(w)["КАРТА↔GIT"].findings) == 1, "внутр. фантом без чужих маркеров ПОЙМАН (детектор не ослаб)")
+
 # (5) КАРТА↔ПУЛЬС: §99 нет в карте → ловим
 w = healthy()
 w._docs["pulse"] = "... | детали→KB_MASTER §99 про что-то"
