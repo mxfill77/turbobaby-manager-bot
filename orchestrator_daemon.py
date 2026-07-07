@@ -271,8 +271,17 @@ _HEADLESS_IMPOSSIBLE_RE = re.compile(
 # halt-on-fail байт-в-байт (не хуже текущего). Красное НЕ ослабляется: думатель ничего не
 # исполняет, перерождённый шаг идёт обычным путём (NEEDS_APPROVAL → кнопка как раньше).
 # STEP_SELFHEAL=0/нет → ветка не зовётся вовсе (мгновенный откат конфигом + рестарт демона).
+# РАСШИРЕНИЕ ст4 (07.07.2026, последний кусок): ТОТ ЖЕ механизм и ТОТ ЖЕ флаг на одиночные
+# «тз:»/«задача:» — провал → думатель (контекст: текст задачи дословно + суть провала, JSON с
+# fixed_task) → 1 перерождение «[самопочинка задачи N, попытка 1]» → повторный провал =
+# терминальный failed с диагнозом. Конверты и плановый рестарт самомода (done) — НЕ трогаются.
 STEP_SELFHEAL_TIMEOUT = 180   # думатель — чистый генератор без tools, ответ короткий
 _HEAL_RE = re.compile(r"\[самопочинка шага (\d+), попытка (\d+)\]")
+# РАСШИРЕНИЕ ст4 (07.07.2026, последний кусок мета-дирижёра): ТОТ ЖЕ механизм на одиночные
+# «тз:»/«задача:» под ТЕМ ЖЕ флагом STEP_SELFHEAL. Маркер перерождения одиночной задачи стоит
+# ПЕРВЫМ в тексте → якорь ^ (у шага маркер идёт после [шаг i/N], там search). N = id исходной
+# задачи. Анкер ещё и страхует от ложного срабатывания на ТЗ, где маркер лишь упомянут в тексте.
+_HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
 THINKER_PREAMBLE = (
     "Ты — думательный слой самопочинки оркестратора TurboBaby (мета-дирижёр). Шаг декомпозиции "
     "упал при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО не исполняешь, "
@@ -284,6 +293,21 @@ THINKER_PREAMBLE = (
     "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
     "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
     "verdict=halt и fixed_step пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
+    "многошаговых планов.\n\n"
+)
+# Преамбула думателя ОДИНОЧНОЙ задачи (расширение ст4): та же схема/строгость, но контекст без
+# родителя/плана (их у одиночной нет) и ключ fixed_task вместо fixed_step.
+TASK_THINKER_PREAMBLE = (
+    "Ты — думательный слой самопочинки оркестратора TurboBaby (мета-дирижёр). Одиночная "
+    "headless-задача упала при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО "
+    "не исполняешь, инструментов у тебя нет, файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"retry"|"halt","fixed_task":"<новая формулировка задачи>","reason":"<1 строка диагноза>"}\n'
+    "verdict=retry — ТОЛЬКО если провал починим переформулировкой задачи (неверный путь/имя файла, "
+    "недостающий контекст, кривая команда) и правка очевидна; fixed_task тогда — САМОДОСТАТОЧНОЕ "
+    "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
+    "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
+    "verdict=halt и fixed_task пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
     "многошаговых планов.\n\n"
 )
 
@@ -667,8 +691,9 @@ def _dec_parent_context(pid):
     return (f"(родитель {pid} не найден в очереди)", "(план недоступен)")
 
 
-def _parse_thinker_json(text):
-    """Строгий парс ответа думателя → {"verdict","fixed_step","reason"} или None (fail-safe).
+def _parse_thinker_json(text, fix_key="fixed_step"):
+    """Строгий парс ответа думателя → {"verdict",<fix_key>,"reason"} или None (fail-safe).
+    fix_key: "fixed_step" (шаг декомпозера) / "fixed_task" (одиночная задача, расширение ст4).
     Терпим обёртку-мусор вокруг JSON (берём от первой { до последней }), но verdict обязан быть
     retry|halt — иначе None."""
     t = (text or "").strip()
@@ -685,7 +710,7 @@ def _parse_thinker_json(text):
     if v not in ("retry", "halt"):
         return None
     return {"verdict": v,
-            "fixed_step": str(d.get("fixed_step") or "").strip(),
+            fix_key: str(d.get(fix_key) or "").strip(),
             "reason": str(d.get("reason") or "").strip()}
 
 
@@ -744,15 +769,83 @@ def _selfheal_consult(pid, step_i, step_n, step_text, fail_text):
     return verdict
 
 
-def _maybe_selfheal(tid, text, fail_text):
-    """Провал шага декомпозиции (исполнительский failed) → думательный слой, РОВНО 1 попытка
-    самопочинки. Возврат True = финализация сделана здесь (перерождение / терминальный halt с
-    диагнозом); False = ничего не делал → прежний halt-on-fail в вызывающем коде (fail-safe)."""
+def _task_selfheal_consult(task_text, fail_text):
+    """Думатель самопочинки ОДИНОЧНОЙ задачи (расширение ст4): контекст — текст задачи ДОСЛОВНО +
+    суть провала (родителя/плана у одиночной нет). Возврат: dict {"verdict","fixed_task","reason"}
+    или None (любой сбой думателя = None = fail-safe прежний голый failed)."""
+    prompt = (TASK_THINKER_PREAMBLE +
+              f"УПАВШАЯ ЗАДАЧА (текст дословно):\n{str(task_text or '')[:2000]}\n\n"
+              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+    out = _thinker_exec(prompt, STEP_SELFHEAL_TIMEOUT, "task-selfheal")
+    if out is None:
+        return None
+    verdict = _parse_thinker_json(out, fix_key="fixed_task")
+    if verdict is None:
+        log.warning("task-selfheal: ответ думателя не распарсился (fail-safe failed): %.200s", out)
+    return verdict
+
+
+def _maybe_task_selfheal(tid, text, fail_text, frm):
+    """Провал ОДИНОЧНОЙ задачи («тз:»/«задача:», НЕ шаг декомпозера) → тот же думательный слой,
+    РОВНО 1 попытка (расширение ст4, 07.07.2026, тот же флаг STEP_SELFHEAL). Возврат True =
+    финализация сделана здесь (перерождение / терминальный failed с диагнозом); False = прежний
+    голый failed в вызывающем коде (fail-safe). Красное НЕ ослаблено: сюда доходит только
+    исполнительский failed — needs_approval отсечён раньше в process_new, а плановый рестарт
+    самомод-задачи (фикс 48d9c64) уже стал done внутри run_task и думателя не видит.
+    Конверты одобренных заявок ([конверт…]) НЕ трогаем: их маркер обязан стоять ПЕРВЫМ —
+    по нему работает разрыв петли ре-конвертов (_is_convert), перерождение сдвинуло бы его.
+    PLAN_ADAPT на одиночные НЕ распространяется — плана у одиночной задачи нет."""
+    if _is_convert(text):
+        return False
+    if str(frm or "").endswith(DEC_FROM_SUFFIX):
+        return False                          # артефакт декомпозиции без [шаг i/N] — не одиночная задача
+    hm = _HEAL_TASK_RE.match(str(text or ""))
+    if hm:
+        # перерождённая задача упала ПОВТОРНО → терминальный failed (без retry) — петля невозможна
+        oid = hm.group(1)
+        bc.complete_task(tid, "failed",
+                         (f"🛑 самопочинка не помогла (попытка 1 исчерпана): перерождение задачи "
+                          f"{oid} упало повторно — нужен человек.\n{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("task-selfheal: id=%s (перерождение задачи %s) упал ПОВТОРНО → терминальный failed",
+                 tid, oid)
+        return True
+    verdict = _task_selfheal_consult(text, fail_text)
+    if verdict is None:
+        return False                          # fail-safe: сбой думателя = прежний голый failed
+    reason = verdict["reason"] or "(без причины)"
+    fixed = verdict["fixed_task"]
+    if verdict["verdict"] != "retry" or not fixed:
+        bc.complete_task(tid, "failed",
+                         (f"задача упала → думатель: halt, причина: {reason}\n"
+                          f"Перерождение не поможет (диагноз думателя выше), нужен человек.\n"
+                          f"{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("task-selfheal: id=%s → думатель halt (%s)", tid, reason[:120])
+        return True
+    reborn = f"[самопочинка задачи {tid}, попытка 1] {fixed}"[:RESULT_MAX]
+    r = bc.enqueue_task(frm or f"Filipp-328{DEV_FROM_SUFFIX}", reborn)
+    if not r.get("ok"):
+        log.warning("task-selfheal: перерождение задачи id=%s не встало в очередь (%s) — fail-safe failed",
+                    tid, r.get("error"))
+        return False                          # fail-safe: очередь не приняла → прежний голый failed
+    nid = r.get("id")
+    card = (f"🩹 задача упала → думатель: retry, правка: {fixed[:200]}, причина: {reason[:200]}\n"
+            f"Перерождена задачей id {nid} (попытка 1 из 1; повторный провал = терминальный failed).\n"
+            f"Исходный провал: {str(fail_text or '')[:400]}")
+    bc.complete_task(tid, "done", card[:RESULT_MAX])
+    log.info("task-selfheal: id=%s перерождён задачей %s (retry)", tid, nid)
+    return True
+
+
+def _maybe_selfheal(tid, text, fail_text, frm=""):
+    """Провал задачи (исполнительский failed) → думательный слой, РОВНО 1 попытка самопочинки:
+    шаг декомпозера — с контекстом родителя (кусок 1); одиночная «тз:»/«задача:» — по тексту
+    задачи (расширение ст4). Возврат True = финализация сделана здесь (перерождение / терминальный
+    halt с диагнозом); False = ничего не делал → прежний путь в вызывающем коде (fail-safe)."""
     if not _selfheal_on():
         return False
     m = _STEP_RE.match(str(text or ""))
     if not m:
-        return False                          # одиночные «тз:»/«задача:» не трогаем (расширение потом)
+        return _maybe_task_selfheal(tid, text, fail_text, frm)
     step_i, step_n, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
     if _HEAL_RE.search(text):
         # перерождённый шаг упал ПОВТОРНО → терминальный halt (без retry) — петля невозможна
@@ -1241,9 +1334,10 @@ def process_new():
             rr = bc.set_needs_approval(tid, result)
             log.info("NEEDS_APPROVAL id=%s bridge_ok=%s", tid, rr.get("ok"))
     else:
-        # САМОПОЧИНКА (STEP_SELFHEAL=1): провал шага декомпозиции → думатель, 1 попытка.
-        # True = финализировано внутри (перерождение/терминальный halt); False = прежний путь.
-        if status == "failed" and _maybe_selfheal(tid, text, result):
+        # САМОПОЧИНКА (STEP_SELFHEAL=1): провал шага декомпозиции ИЛИ одиночной «тз:»/«задача:»
+        # (расширение ст4) → думатель, 1 попытка. True = финализировано внутри (перерождение/
+        # терминальный failed с диагнозом); False = прежний путь.
+        if status == "failed" and _maybe_selfheal(tid, text, result, frm=str(task.get("from") or "")):
             return
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))

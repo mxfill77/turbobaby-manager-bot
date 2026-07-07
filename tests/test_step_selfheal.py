@@ -69,7 +69,7 @@ _real_run = OD.subprocess.run
 def fake_run(args, **kw):
     if args and args[0] == OD.CLAUDE_BIN:
         prompt = args[-1]
-        if prompt.startswith(OD.THINKER_PREAMBLE):
+        if prompt.startswith(OD.THINKER_PREAMBLE) or prompt.startswith(OD.TASK_THINKER_PREAMBLE):
             fake_run.thinker_calls += 1
             fake_run.thinker_prompts.append(prompt)
             fake_run.thinker_cmds.append(list(args))
@@ -277,14 +277,19 @@ OD.process_new()
 res.append(ok(len(fb.heals()) == 1 and fb.rows[s1]["status"] == "done",
               "вердикт внутри CLI-json-конверта распакован → retry сработал"))
 
-# (8) одиночные «тз:»/«задача:» НЕ трогаем (только шаги декомпозера)
-print("(8) одиночные задачи мимо самопочинки:")
+# (8) одиночные «тз:»/«задача:» — ТОЖЕ под самопочинкой (расширение ст4, 07.07.2026);
+# детальные сценарии одиночной ветки — tests/test_task_selfheal.py, тут смоук-маршрутизация
+print("(8) одиночная задача маршрутизируется в думателя задачи:")
 fb = fresh()
 tid = fb.enqueue_task("Filipp-328-dev", "почини рендер")["id"]
 fake_run.step_queue = [("", 1)]
+fake_run.thinker_out = ('{"verdict":"retry","fixed_task":"почини рендер: верный путь '
+                        '/root/turbobaby-manager-bot/bot.py","reason":"кривой путь"}')
 OD.process_new()
-res.append(ok(fake_run.thinker_calls == 0 and fb.rows[tid]["status"] == "failed",
-              "провал «тз:» → прежний failed, думатель не позван"))
+_reborn8 = [r for r in fb.rows.values() if r["task_text"].startswith("[самопочинка задачи")]
+res.append(ok(fake_run.thinker_calls == 1 and fb.rows[tid]["status"] == "done"
+              and len(_reborn8) == 1 and _reborn8[0]["status"] == "new",
+              "провал «тз:» → думатель задачи → перерождение (расширение ст4)"))
 
 # (9) красный шаг НЕ ослаблен: NEEDS_APPROVAL идёт кнопкой, самопочинка не вмешивается
 print("(9) красное не ослаблено:")
