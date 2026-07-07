@@ -115,6 +115,51 @@ def _fail_card(out, err, rc):
     body = " | ".join([b for b in (summary, etail) if b]) or f"exit={rc}"
     return f"claude -p упал (exit={rc}): {body}"[:600]
 
+# === ФИКС КЛАССА «самомодификация → ложный failed» (урок задачи 105, 07.07.2026) ===
+# Самомод-задача правит orchestrator_daemon.py и по доктрине ставит отложенный
+# `systemd-run --on-active=Ns systemctl restart orchestrator-daemon` ПОСЛЕДНИМ действием. Рестарт
+# гасит ВЕСЬ cgroup сервиса, включая claude -p самой задачи (SIGTERM → exit=143) — работа к этому
+# моменту СДЕЛАНА (RESULT в cc_log, commit в git), но демон метил задачу failed «claude -p упал».
+# Отличаем «убит запланированным рестартом» от настоящего падения по ЧЕТЫРЁМ обязательным
+# признакам (нужны ВСЕ; любое сомнение → False → прежний честный failed, fail-safe):
+#   1) exit-код SIGTERM (143 у CLI / -15 от subprocess) — SIGKILL/oom (137/-9) сюда НЕ попадают;
+#   2) демон САМ получил SIGTERM тем же моментом (_running=False): systemd гасит cgroup целиком;
+#      точечный kill claude-процесса или oom демона не трогают (_running останется True);
+#   3) в тексте задачи признак самомодификации (orchestrator_daemon / «самомодификация»);
+#   4) в systemd ВИДНА transient-единица systemd-run с рестартом демона: run-*.timer ещё не
+#      сработал ИЛИ run-*.service прямо сейчас гонит restart (он блокируется, пока демон не
+#      погашен — мы ещё живы и успеваем её увидеть). Ручной systemctl stop/restart из Termux
+#      такой единицы НЕ создаёт → останется честный failed.
+_SIGTERM_RCS = (143, -15)
+_SELFMOD_RE = re.compile(r"orchestrator[-_ ]?daemon|самомодифика", re.IGNORECASE)
+
+
+def _deferred_restart_visible():
+    """True → systemd показывает transient-единицу systemd-run (run-*.timer / run-*.service),
+    чья Description содержит команду рестарта демона. Любой сбой пробы = False (fail-safe)."""
+    try:
+        p = subprocess.run(
+            ["systemctl", "list-units", "--all", "--plain", "--no-legend",
+             "run-*.service", "run-*.timer"],
+            capture_output=True, text=True, timeout=10)
+        return "restart orchestrator-daemon" in (p.stdout or "")
+    except Exception as e:
+        log.warning("planned-restart: проба systemctl не отработала (%s) — считаю НЕплановым", e)
+        return False
+
+
+def _killed_by_planned_restart(rc, task_text):
+    """True → claude -p задачи убит ЗАПЛАНИРОВАННЫМ отложенным рестартом демона (самомодификация),
+    НЕ настоящее падение. Все 4 признака обязательны — см. комментарий блока выше."""
+    if rc not in _SIGTERM_RCS:
+        return False
+    if _running:
+        return False
+    if not _SELFMOD_RE.search(str(task_text or "")):
+        return False
+    return _deferred_restart_visible()
+
+
 # === АВТО-ПЕРЕЧЕНЬ красных op (п.4 узкий, штаб 19.06) — РОВНО два, оба обратимы ===
 # clasp_redeploy / CRM / Лист1 / деньги / set_fleet_* / delete_event — НЕ здесь (позже, особое «да»).
 AUTO_OPS = ("git_push", "restart_splinter")
@@ -145,7 +190,9 @@ APPROVAL_PREAMBLE = (
     "рестарт демона убьёт твой же claude-процесс (SIGTERM, отчёт пропадёт). Поэтому отчёт в "
     "cc_log+пульс и сводку пиши ДО рестарта, а рестарт — САМОЕ ПОСЛЕДНЕЕ действие и ТОЛЬКО "
     "ОТЛОЖЕННО: systemd-run --on-active=10s systemctl restart orchestrator-daemon. НИКОГДА не зови "
-    "systemctl restart orchestrator-daemon напрямую из задачи.\n"
+    "systemctl restart orchestrator-daemon напрямую из задачи. Если рестарт всё же погасит твой "
+    "процесс раньше выхода (exit=143) — демон распознает плановый рестарт (фикс 07.07) и пометит "
+    "задачу done с пометкой, НЕ failed; настоящие падения остаются failed.\n"
     "- ТЕСТЫ/ФИКСТУРЫ БЕЗ ПУШЕЙ В ЛИЧКУ: гейт (gate.py) сам ставит PRETOOL_NOPUSH=1 подпроцессам "
     "тестов. Если запускаешь тест/фикстуру/dry-run ВНЕ гейта (ручной прогон tests/*.py, скрипт со "
     "scratchpad/_test/_dryrun, проверка pretool_guard) — ставь env-префикс сам: "
@@ -394,6 +441,15 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
         return "needs_approval", what[:RESULT_MAX]
 
     if proc.returncode != 0:
+        # фикс класса (урок 105): убит ПЛАНОВЫМ рестартом демона (самомодификация) → это НЕ сбой
+        if _killed_by_planned_restart(proc.returncode, task_text):
+            log.info("id=%s claude -p погашен ПЛАНОВЫМ рестартом демона (exit=%s) → done с пометкой",
+                     task_id, proc.returncode)
+            return "done", (
+                "🔁 Завершено плановым рестартом демона (самомодификация): claude-процесс задачи "
+                "штатно погашен отложенным systemd-run restart — по доктрине рестарт ставится "
+                "ПОСЛЕДНИМ действием, работа к этому моменту сделана. Итоги — в cc_log (RESULT "
+                "задачи) и git log. Это НЕ сбой.")
         log.warning("id=%s claude -p exit=%s", task_id, proc.returncode)
         # §12 корень 3: чистая карточка провала, НЕ сырой дамп stdout+stderr (шум).
         return "failed", _fail_card(out, err, proc.returncode)
