@@ -45,6 +45,16 @@ DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очер
 DEC_FROM_SUFFIX = "-dec" # метка декомпозиции (ступень 2 часть C; devbot кладёт Filipp-328-dec):
                          # родитель «декомпозируй:» + его шаги + synthetic-сводка — всё под этой меткой
 MAX_STEPS = 8            # потолок шагов декомпозиции (планировщику велено 2–7; больше → failed родителя)
+# === ПК-ТЕАТР (кусок 2 «один дирижёр, два театра», 07.07.2026) ===
+# «декомпозируй:» из темы PC-дев (829): родитель кладётся devbot'ом с меткой PC_DEC_FROM на полосе
+# vps (планировщик/думатели ТОЛЬКО здесь, на ПК мозг не дублируется), а ШАГИ демон выдаёт на полосу
+# lane=pc — их claim'ит и исполняет pc_orchestrator. Детали — секция «ПК-ТЕАТР: функции» ниже.
+PC_LANE = "pc"
+PC_DEC_FROM = "Filipp-pc-dec"   # метка семейства pc-декомпозиции (родитель vps + шаги lane=pc + карточки/сводка)
+PC_STEP_TIMEOUT = int(os.environ.get("PC_STEP_TIMEOUT") or 3600)  # сек: ПК молчит (шаг не взят /
+                         # heartbeat умер / approved завис) → честный failed цепи, думатель НЕ зовётся
+PC_SILENT_MARK = "⏱ ПК-театр не отвечает"   # маркер таймаут-диагноза (по нему же гасится самопочинка)
+_REJECT_PREFIX = "отклонено Филиппом"        # результат devbot-отказа («нет N»/кнопка ❌) — halt без думателя
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
 CLAUDE_BIN = "/usr/bin/claude"
@@ -223,6 +233,14 @@ PLANNER_PREAMBLE = (
     "поэтому впиши в каждый нужный контекст (файлы, функции, что сделать, как проверить). Шаги "
     "строго в порядке исполнения; правки кода раньше, деплой/рестарт/проверка — последними.\n\n"
     "КРУПНОЕ ТЗ:\n"
+)
+# Дописка планировщику для родителя ПК-театра (ДОБАВЛЯЕТСЯ ПОСЛЕ PLANNER_PREAMBLE — startswith
+# в тест-моках/роутинге не ломается): шаги исполнит агент на ДРУГОЙ машине, не этот VPS.
+PLANNER_PC_NOTE = (
+    "ОСОБЕННОСТЬ ТЕАТРА ИСПОЛНЕНИЯ: шаги будет исполнять headless-агент на ДРУГОЙ машине "
+    "(ПК, pc_orchestrator) — НЕ этот VPS. Пиши каждый шаг самодостаточно для ТОЙ машины: не "
+    "ссылайся на пути/сервисы/файлы этого VPS, если само ТЗ явно не про них; весь контекст, "
+    "нужный шагу, впиши в его текст.\n\n"
 )
 _STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")
 _SUM_RE = re.compile(r"^\[сводка родитель (\d+)\]")
@@ -1097,6 +1115,410 @@ def _maybe_plan_adapt(pid, step_i, step_n):
              pid, k, step_i, len(steps), ids)
 
 
+# === ПК-ТЕАТР: функции (кусок 2 «один дирижёр, два театра», 07.07.2026) ===
+# Мозг (планировщик, думатели самопочинки/адаптации) живёт ТОЛЬКО здесь, на VPS; ПК-агент
+# (pc_orchestrator) — второй театр ИСПОЛНЕНИЯ шагов (claim lane=pc + headless CC, без мозга).
+# КЛЮЧЕВОЕ ОТЛИЧИЕ от vps-цепи: guard последовательности vps-цепи живёт в НАШЕМ process_new —
+# у ПК-агента такого guard'а нет (он claim'ит FIFO всё подряд). Веерный fan-out дал бы гонку:
+# после провала шага i ПК взял бы шаг i+1 раньше, чем мы его пропустим (halt-on-fail дырявый),
+# а перерождение самопочинки (id выше) исполнилось бы ПОСЛЕ следующих шагов. Поэтому шаги
+# релизятся ПО ОДНОМУ: в очереди lane=pc живёт максимум один шаг цепи, следующий встаёт только
+# после done предыдущего (+ адаптация). Состояние цепи restart-proof — целиком из очереди:
+# план = нумерованный список в result родителя, коррекции = карточки «[коррекция плана родитель N]»
+# с нумерованным остатком плана в result, прогресс = сами pc-шаги. Память процесса — только
+# дедуп-кэши (_summarized, _pc_adapted); после рестарта демона цепь продолжается с того же места.
+# ИЗОЛЯЦИЯ ПОЛОС НЕ ОСЛАБЛЕНА: читаем ТОЛЬКО шаги СВОИХ родителей (from=PC_DEC_FROM + [шаг i/N]);
+# одиночные pc-задачи (Filipp-pc / Filipp-pc-dev) не трогаем; claim чужой полосы НЕ делаем
+# (complete_task на своих шагах = финализация собственной цепи, как в vps-потоке).
+# ТАЙМАУТ: ПК может быть выключен → шаг висит (new не взят / in_progress без heartbeat /
+# approved не доведён) дольше PC_STEP_TIMEOUT → честный failed с диагнозом «ПК-театр не
+# отвечает» + halt цепи; думатель такое НЕ чинит (переформулировка не включит ПК).
+_PC_CARD_RE = re.compile(r"^\[карточка родитель (\d+)\]")
+_PC_ADAPT_BASE_RE = re.compile(r"после шага (\d+)")
+_PC_STATUSES = ("new", "in_progress", "needs_approval", "approved", "done", "failed")
+_pc_adapted = set()           # (pid, step_i), по которым думатель адаптации уже спрошен (память
+                              # процесса — рестарт даст максимум один лишний keep-вопрос)
+
+
+def _age_sec(updated_iso):
+    """Возраст updated задачи в секундах. None при ошибке разбора → таймаут НЕ объявляем
+    (лучше подождать цикл, чем убить живой шаг из-за парсинга; зеркало devbot._task_age_sec)."""
+    try:
+        s = str(updated_iso).replace("Z", "+00:00")
+        t = datetime.datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
+
+
+def _pc_enqueue(text):
+    """Шаг цепи в очередь полосы pc (from=PC_DEC_FROM, lane=pc). Мок без lane-kwarg (легаси-тесты
+    сюда не заходят, страховка) → обычный enqueue."""
+    try:
+        return bc.enqueue_task(PC_DEC_FROM, text, lane=PC_LANE)
+    except TypeError:
+        return bc.enqueue_task(PC_DEC_FROM, text)
+
+
+def _pc_fetch_items():
+    """Все задачи полосы pc по статусам _PC_STATUSES → список items (у каждого есть status)
+    | None (ошибка чтения → пропустить цикл целиком: частичная картина опаснее ожидания).
+    Один CSV-вызов get_pending_multi, фоллбэк — по-статусно; мок без lane-kwarg → без lane
+    (фильтр по from=PC_DEC_FROM ниже отсеивает чужое)."""
+    fn = getattr(bc, "get_pending_multi", None)
+    if fn is not None:
+        try:
+            r = fn(_PC_STATUSES, lane=PC_LANE)
+        except TypeError:
+            r = fn(_PC_STATUSES)
+        if not r.get("ok"):
+            return None
+        return [it for it in r.get("items", []) if isinstance(it, dict)]
+    items = []
+    for st in _PC_STATUSES:
+        try:
+            rr = bc.get_pending(st, lane=PC_LANE)
+        except TypeError:
+            rr = bc.get_pending(st)
+        if not rr.get("ok"):
+            return None
+        for it in rr.get("items", []):
+            if isinstance(it, dict):
+                it.setdefault("status", st)
+                items.append(it)
+    return items
+
+
+def _pc_group_chains(items):
+    """items полосы pc → {pid: [(step_i, step_n, item), …]} ТОЛЬКО своих цепей
+    (from=PC_DEC_FROM + паттерн шага). Одиночные pc-задачи (Filipp-pc[-dev]) не попадают."""
+    chains = {}
+    for it in items:
+        if str(it.get("from") or "") != PC_DEC_FROM:
+            continue
+        m = _STEP_RE.match(str(it.get("task_text") or ""))
+        if m:
+            chains.setdefault(int(m.group(3)), []).append(
+                (int(m.group(1)), int(m.group(2)), it))
+    return chains
+
+
+def _pc_chain_steps(pid):
+    """Шаги цепи родителя pid с полосы pc (для осиротевшей сводки). Ошибка чтения → []."""
+    items = _pc_fetch_items()
+    return (_pc_group_chains(items).get(int(pid)) or []) if items is not None else []
+
+
+def _pc_post_card(pid, text):
+    """Событийная карточка цепи ПК-театра (🩹 retry / 🛑 terminal / halt-диагноз) в тему PC-дев
+    synthetic-задачей (enqueue vps → claim → done): очередь — единственный канал демона наружу,
+    devbot принесёт done-рапортом (from=PC_DEC_FROM → тема 829)."""
+    r = bc.enqueue_task(PC_DEC_FROM, f"[карточка родитель {pid}] событие цепи ПК-театра")
+    if not r.get("ok"):
+        log.warning("pc-dec: карточка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
+    bc.complete_task(sid, "done", str(text)[:RESULT_MAX])
+
+
+def _pc_summary_text(pid, steps):
+    """Сводка цепи ПК-театра из переданных шагов (зеркало _dec_summary_text, но по снапшоту
+    pc-шагов — vps-читалка _dec_siblings их не видит). Дубли номера (провал+перерождение) —
+    последняя запись по id."""
+    rows = sorted([s for s in steps if str(s[2].get("status")) in ("done", "failed")],
+                  key=lambda x: (x[0], int(x[2].get("id") or 0)))
+    last = {}
+    for i, n, it in rows:
+        last[i] = (i, n, it)
+    rows = [last[k] for k in sorted(last)]
+    if not rows:
+        return f"🧩 Сводка декомпозиции (родитель {pid}, театр PC): шагов не найдено (очередь пуста?)"
+    n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
+    total = rows[-1][1]   # маркер последнего релизнутого шага несёт актуальный итог плана
+    head = f"🧩 Сводка декомпозиции (родитель {pid}, театр PC): {n_done}/{total} шагов done"
+    fin = _adapt_finish.get(pid)
+    if fin:
+        head += f", 🏁 завершено досрочно: {fin}"
+    elif n_done < len(rows):
+        head += ", есть упавшие/пропущенные"
+    lines = [head]
+    for i, n, it in rows:
+        emoji = "✅" if str(it.get("status")) == "done" else "❌"
+        first = (str(it.get("result") or "").strip().splitlines() or ["(пусто)"])[0]
+        lines.append(f"{emoji} шаг {i}/{n}: {first[:400]}")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+def _pc_post_summary(pid, steps):
+    """Финал цепи ПК-театра → сводка в тему PC-дев (synthetic done, как _dec_post_summary).
+    Идемпотентно: _summarized + скан существующих сводок (_dec_summary_exists — сводка лежит
+    на полосе vps, читалка её видит)."""
+    if pid in _summarized:
+        return
+    if _dec_summary_exists(pid):
+        _summarized.add(pid)
+        return
+    text = _pc_summary_text(pid, steps)
+    r = bc.enqueue_task(PC_DEC_FROM, f"[сводка родитель {pid}] сводный отчёт по шагам")
+    if not r.get("ok"):
+        log.warning("pc-dec: сводка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)
+    cm = bc.complete_task(sid, "done", text)
+    _summarized.add(pid)
+    log.info("pc-dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
+
+
+def _parse_numbered(text):
+    """Нумерованные строки «N. <текст>» → {N: <текст>} (для восстановления плана из result
+    родителя / карточки коррекции). Прочие строки игнорируются."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = _PLAN_LINE_RE.match(line)
+        if m:
+            out[int(m.group(1))] = m.group(2).strip()
+    return out
+
+
+def _pc_current_plan(pid):
+    """ТЕКУЩИЙ план цепи ПК-театра, restart-proof из очереди (полоса vps, где лежат родитель и
+    карточки): план родителя (нумерованный список в result) + коррекции «[коррекция плана
+    родитель pid] после шага B…» (нумерованный остаток в result) поверх, в порядке id.
+    → (plan: {номер: (текст, K-происхождение; 0=исходный)}, K всего коррекций, база последней
+    коррекции | None). Ошибка чтения / родитель не найден → ({}, 0, None) — вызывающий даст
+    честный halt-диагноз, не гадаем."""
+    try:
+        r = bc.get_pending("done")
+    except Exception as e:
+        log.warning("pc-dec: план родителя %s не прочитан (%s)", pid, e)
+        return {}, 0, None
+    if not r.get("ok"):
+        return {}, 0, None
+    parent_result, cards = "", []
+    for it in r.get("items", []):
+        if int(it.get("id") or 0) == int(pid):
+            parent_result = str(it.get("result") or "")
+        m = _ADAPT_CARD_RE.match(str(it.get("task_text") or ""))
+        if m and int(m.group(1)) == int(pid):
+            cards.append(it)
+    plan = {num: (txt, 0) for num, txt in _parse_numbered(parent_result).items()}
+    last_base = None
+    cards.sort(key=lambda x: int(x.get("id") or 0))
+    for k, card in enumerate(cards, 1):
+        bm = _PC_ADAPT_BASE_RE.search(str(card.get("task_text") or ""))
+        nums = _parse_numbered(str(card.get("result") or ""))
+        if not bm or not nums:
+            continue          # осиротевшая/пустая коррекция — план не меняла (fail-safe keep)
+        base = int(bm.group(1))
+        plan = {num: v for num, v in plan.items() if num <= base}
+        plan.update({num: (txt, k) for num, txt in nums.items()})
+        last_base = base
+    return plan, len(cards), last_base
+
+
+def _pc_release(pid, j, total, text, k=0):
+    """Релиз шага j/total цепи pid на полосу pc (следующий шаг встаёт ТОЛЬКО после done
+    предыдущего). k>0 → шаг из коррекции плана (маркер для restart-proof счётчика/глаз).
+    Возврат: ok-флаг."""
+    mark = f"[коррекция плана {k}] " if k else ""
+    r = _pc_enqueue(f"[шаг {j}/{total} родитель {pid}] {mark}{text}"[:RESULT_MAX])
+    if not r.get("ok"):
+        log.warning("pc-dec: релиз шага %s/%s родителя %s не встал (%s) — повтор следующим циклом",
+                    j, total, pid, r.get("error"))
+        return False
+    log.info("pc-dec: шаг %s/%s родителя %s релизнут (id %s, lane=pc)", j, total, pid, r.get("id"))
+    return True
+
+
+def _pc_adapt_consult(pid, step_i, steps, remaining):
+    """Думатель адаптации для цепи ПК-театра — ТА ЖЕ схема, что _adapt_consult (ADAPT_PREAMBLE,
+    кондуктор, --max-turns 1, строгий JSON), но сделанное берём из pc-шагов снапшота, а
+    оставшееся — из восстановленного плана (в очереди lane=pc его нет — шаги релизятся по одному).
+    None = fail-safe keep."""
+    goal, plan_txt = _dec_parent_context(pid)
+    done_last = {}
+    for i, _n, it in sorted([s for s in steps if str(s[2].get("status")) == "done"],
+                            key=lambda x: (x[0], int(x[2].get("id") or 0))):
+        done_last[i] = str(it.get("result") or "").strip()
+    done_lines = [f"шаг {i}: {(done_last[i].splitlines() or ['(пусто)'])[0][:300]}"
+                  for i in sorted(done_last)] or ["(результатов пока нет)"]
+    rem_lines = [f"шаг {j}: {t[:400]}" for j, t in remaining]
+    prompt = (ADAPT_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ИСХОДНЫЙ ПЛАН ШАГОВ:\n{plan_txt}\n\n"
+              f"РЕЗУЛЬТАТЫ СДЕЛАННЫХ ШАГОВ (сжато; только что завершён шаг {step_i}):\n"
+              + "\n".join(done_lines) + "\n\n"
+              "ОСТАВШИЕСЯ ШАГИ ПЛАНА:\n" + "\n".join(rem_lines) + "\n")
+    out = _thinker_exec(prompt, PLAN_ADAPT_TIMEOUT, "pc-plan-adapt")
+    if out is None:
+        return None
+    v = _parse_adapt_json(out)
+    if v is None:
+        log.warning("pc-plan-adapt: ответ думателя не распарсился/пуст (fail-safe keep): %.200s", out)
+    return v
+
+
+def _pc_after_fail(pid, i, n, it, steps):
+    """Провал pc-шага (финализирован ПК-агентом/devbot'ом/таймаутом — уже failed в очереди).
+    Отказ Филиппа / молчание ПК → halt без думателя; перерождение упало повторно → терминальный
+    halt; иначе при STEP_SELFHEAL=1 → ТОТ ЖЕ думатель самопочинки, РОВНО 1 перерождение lane=pc.
+    Halt в sequential-модели = просто НЕ релизить дальше + сводка (пропускать нечего)."""
+    text = str(it.get("task_text") or "")
+    fail_text = str(it.get("result") or "")
+    if fail_text.lstrip().startswith(_REJECT_PREFIX) or PC_SILENT_MARK in fail_text:
+        _pc_post_summary(pid, steps)          # человек сказал «нет» / ПК молчал — чинить нечего
+        return
+    if _HEAL_RE.search(text):
+        _pc_post_card(pid, f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {i}/{n} "
+                           f"родителя {pid} упал повторно — цепочка остановлена, нужен человек.\n"
+                           f"{fail_text[:400]}")
+        _pc_post_summary(pid, steps)
+        return
+    if not _selfheal_on():
+        _pc_post_summary(pid, steps)          # прежний halt-on-fail (провал уже отрапортован ❌)
+        return
+    verdict = _selfheal_consult(pid, i, n, text, fail_text)
+    if verdict is None or verdict["verdict"] != "retry" or not verdict["fixed_step"]:
+        reason = (verdict or {}).get("reason") or "(сбой думателя — fail-safe halt)"
+        _pc_post_card(pid, f"шаг {i}/{n} упал → думатель: halt, причина: {reason}\n"
+                           f"Цепочка остановлена (диагноз думателя выше).")
+        _pc_post_summary(pid, steps)
+        return
+    fixed, reason = verdict["fixed_step"], verdict["reason"] or "(без причины)"
+    r = _pc_enqueue((f"[шаг {i}/{n} родитель {pid}] "
+                     f"[самопочинка шага {i}, попытка 1] {fixed}")[:RESULT_MAX])
+    if not r.get("ok"):
+        log.warning("pc-dec: перерождение шага %s родителя %s не встало (%s) — fail-safe halt",
+                    i, pid, r.get("error"))
+        _pc_post_summary(pid, steps)          # как vps: очередь не приняла → halt
+        return
+    _pc_post_card(pid, f"🩹 шаг {i}/{n} упал → думатель: retry, правка: {fixed[:200]}, "
+                       f"причина: {reason[:200]}\n"
+                       f"Перерождён задачей id {r.get('id')} (lane=pc; попытка 1 из 1; повторный "
+                       f"провал = терминальный halt).\nИсходный провал: {fail_text[:400]}")
+    log.info("pc-dec: шаг %s/%s родителя %s перерождён задачей %s (retry)", i, n, pid, r.get("id"))
+
+
+def _pc_after_done(pid, i, n, it, steps):
+    """Done pc-шага: последний по плану → сводка; иначе ТА ЖЕ адаптация плана (PLAN_ADAPT):
+    keep → релиз следующего шага; adjust → карточка коррекции (restart-proof план в result)
+    + релиз первого скорректированного (≤PLAN_ADAPT_MAX коррекций, дальше halt «план дрейфует»);
+    finish → сводка «завершено досрочно». Любой сбой думателя = keep."""
+    plan, k_cnt, last_base = _pc_current_plan(pid)
+    total = max(plan) if plan else n
+    if i >= total:
+        _pc_post_summary(pid, steps)
+        return
+    if plan.get(i + 1) is None:
+        _pc_post_card(pid, f"⚠️ план родителя {pid} не восстановился из очереди (шаг {i + 1} "
+                           f"не найден в result родителя/коррекций) — цепочка остановлена, "
+                           f"поставь «декомпозируй:» заново.")
+        _pc_post_summary(pid, steps)
+        return
+    consult = (_plan_adapt_on() and last_base != i and (pid, i) not in _pc_adapted)
+    if consult:
+        _pc_adapted.add((pid, i))
+        remaining = [(j, plan[j][0]) for j in sorted(plan) if j > i]
+        verdict = _pc_adapt_consult(pid, i, steps, remaining)
+        if verdict is not None and verdict["verdict"] == "finish":
+            reason = (verdict["reason"] or "(без причины)")[:300]
+            _adapt_finish[pid] = reason
+            _pc_post_card(pid, f"🏁 после шага {i} думатель решил: цель родителя {pid} достигнута "
+                               f"досрочно ({reason}) — оставшиеся шаги {i + 1}–{total} не релизятся.")
+            _pc_post_summary(pid, steps)
+            log.info("pc-plan-adapt: родитель %s finish после шага %s (%s)", pid, i, reason[:120])
+            return
+        if verdict is not None and verdict["verdict"] == "adjust":
+            new_steps = verdict["adjusted_steps"]
+            reason = (verdict["reason"] or "(без причины)")[:300]
+            k = k_cnt + 1
+            if k > PLAN_ADAPT_MAX:
+                _pc_post_card(pid, f"🛑 план дрейфует: думатель запросил коррекцию №{k} (лимит "
+                                   f"{PLAN_ADAPT_MAX} на цепь) — цепочка остановлена, нужен "
+                                   f"владелец. Диагноз думателя: {reason}")
+                _pc_post_summary(pid, steps)
+                log.info("pc-plan-adapt: родитель %s — adjust №%s (> лимита %s) → halt (дрейф)",
+                         pid, k, PLAN_ADAPT_MAX)
+                return
+            if i + len(new_steps) > MAX_STEPS:
+                log.warning("pc-plan-adapt: родитель %s adjust дал %s шагов (итог > потолка %s) "
+                            "— fail-safe keep", pid, len(new_steps), MAX_STEPS)
+            else:
+                new_total = i + len(new_steps)
+                numbered = "\n".join(f"{j}. {s}" for j, s in enumerate(new_steps, start=i + 1))
+                card = (f"🧭 после шага {i} думатель скорректировал план (коррекция "
+                        f"{k}/{PLAN_ADAPT_MAX}): {reason}\n"
+                        f"НОВЫЙ ОСТАВШИЙСЯ ПЛАН (шаги {i + 1}–{new_total}, релизятся по одному):\n"
+                        f"{numbered}\n"
+                        f"Итог плана {new_total} шагов; сделанные шаги 1–{i} не тронуты. "
+                        f"Третья коррекция = halt «план дрейфует».")
+                cr = bc.enqueue_task(PC_DEC_FROM,
+                                     f"[коррекция плана родитель {pid}] после шага {i} (K={k})")
+                if cr.get("ok"):
+                    bc.claim_task(cr.get("id"))
+                    bc.complete_task(cr.get("id"), "done", card[:RESULT_MAX])
+                    _pc_release(pid, i + 1, new_total, new_steps[0], k=k)
+                    log.info("pc-plan-adapt: родитель %s adjust K=%s после шага %s → релиз "
+                             "скорректированного шага %s/%s", pid, k, i, i + 1, new_total)
+                    return
+                log.warning("pc-plan-adapt: карточка коррекции родителя %s не встала (%s) — "
+                            "fail-safe keep", pid, cr.get("error"))
+    # keep / fail-safe / адаптация выключена / уже адаптировано → следующий шаг прежнего плана
+    txt, k_origin = plan[i + 1]
+    _pc_release(pid, i + 1, total, txt, k=k_origin)
+
+
+def _pc_chain_tick(pid, steps):
+    """Один тик надзора цепи ПК-театра: смотрим ПОСЛЕДНИЙ шаг (максимальный номер, при дублях —
+    старший id: перерождение самопочинки). Ожидание (new/in_progress/approved) → проверка
+    таймаута ПК; needs_approval → ждём Филиппа (карточка уже в инбоксе от devbot); done/failed →
+    хуки цепи (адаптация/самопочинка/сводка)."""
+    i, n, it = max(steps, key=lambda s: (s[0], int(s[2].get("id") or 0)))
+    st = str(it.get("status") or "")
+    if st == "needs_approval":
+        return
+    if st in ("new", "in_progress", "approved"):
+        age = _age_sec(it.get("updated"))
+        if age is not None and age > PC_STEP_TIMEOUT:
+            diag = (f"{PC_SILENT_MARK}: шаг {i}/{n} родителя {pid} висит в статусе {st} "
+                    f"{int(age // 60)} мин (лимит {PC_STEP_TIMEOUT // 60} мин) — ПК выключен или "
+                    f"агент не работает. Цепочка остановлена (самопочинка такое не чинит). "
+                    f"Проверь ПК-агента и повтори «декомпозируй:» в теме PC-дев.")
+            bc.complete_task(it.get("id"), "failed", diag)
+            log.info("pc-dec: шаг %s/%s родителя %s таймаут ПК (%s, %sс) → failed + halt",
+                     i, n, pid, st, int(age))
+            it["status"], it["result"] = "failed", diag   # снапшот в актуальное — для сводки
+            _pc_post_summary(pid, steps)
+        return
+    # терминальный статус: закрытая ранее цепь (рестарт демона) → в кэш и не трогать
+    if _dec_summary_exists(pid):
+        _summarized.add(pid)
+        return
+    if st == "failed":
+        _pc_after_fail(pid, i, n, it, steps)
+    elif st == "done":
+        _pc_after_done(pid, i, n, it, steps)
+
+
+def process_pc_chains():
+    """Надзор ПК-театра (каждый цикл демона): read-only снимок полосы pc → тик по каждой СВОЕЙ
+    цепи (from=PC_DEC_FROM). Чужое на полосе pc (одиночные Filipp-pc[-dev]) не трогаем, claim
+    не делаем. Сбой тика одной цепи не валит остальные (доберём следующим циклом)."""
+    items = _pc_fetch_items()
+    if items is None:
+        return
+    chains = _pc_group_chains(items)
+    for pid in sorted(set(chains) - _summarized):
+        try:
+            _pc_chain_tick(pid, chains[pid])
+        except Exception as e:
+            log.warning("pc-dec: тик цепи родителя %s упал (%s) — следующим циклом", pid, e)
+
+
 def _earlier_new_sibling(items, pid, step_i):
     """True → среди new-задач снапшота есть шаг ТОГО ЖЕ родителя с МЕНЬШИМ номером. Перерождение
     самопочинки получает id ВЫШЕ следующих шагов — порядок цепочки держим по НОМЕРУ шага, не по id.
@@ -1108,10 +1530,16 @@ def _earlier_new_sibling(items, pid, step_i):
     return False
 
 
-def _dec_plan_and_fanout(tid, task_text):
+def _dec_plan_and_fanout(tid, task_text, frm=""):
     """Родитель декомпозиции: планировщик claude -p (read-only) → парс шагов → шаги в очередь
-    «[шаг i/N родитель tid] …» → родитель done с планом (devbot принесёт план в 328)."""
-    status, out = run_task(tid, task_text, task_timeout=TASK_TIMEOUT_DEV, preamble=PLANNER_PREAMBLE)
+    «[шаг i/N родитель tid] …» → родитель done с планом (devbot принесёт план в 328).
+    ПК-ТЕАТР (frm=PC_DEC_FROM): план строится ТАК ЖЕ здесь (единственный планировщик), но шаги
+    уходят на полосу lane=pc ПО ОДНОМУ (sequential release, см. секцию «ПК-ТЕАТР») — в очередь
+    сразу встаёт ТОЛЬКО шаг 1, остальные релизит process_pc_chains после done предыдущего.
+    Полоса vps (любой другой frm) — байт-в-байт прежнее поведение (веерный fan-out)."""
+    pc = (frm == PC_DEC_FROM)
+    preamble = PLANNER_PREAMBLE + (PLANNER_PC_NOTE if pc else "")
+    status, out = run_task(tid, task_text, task_timeout=TASK_TIMEOUT_DEV, preamble=preamble)
     if status != "done":
         # планировщик read-only: needs_approval от него = аномалия → честный failed, не кнопка
         bc.complete_task(tid, "failed", f"декомпозиция не удалась (планировщик {status}): {out}"[:RESULT_MAX])
@@ -1127,6 +1555,26 @@ def _dec_plan_and_fanout(tid, task_text):
                          f"упрости ТЗ или разбей вручную:\n{out}"[:RESULT_MAX])
         return
     n = len(steps)
+    if pc:
+        # ПК-театр: релизим ТОЛЬКО шаг 1 (lane=pc) ДО complete родителя (crash-окно без шагов —
+        # родитель останется in_progress, devbot поднимет «зависла»); план целиком — в result
+        # родителя нумерованным списком (restart-proof источник для release/адаптации).
+        r = _pc_enqueue(f"[шаг 1/{n} родитель {tid}] {steps[0]}")
+        if not r.get("ok"):
+            bc.complete_task(tid, "failed",
+                             f"декомпозиция (театр PC) не удалась: шаг 1 не встал в очередь "
+                             f"lane=pc ({r.get('error')})"[:RESULT_MAX])
+            return
+        plan = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+        res = (f"🧩 Декомпозиция (театр PC): {n} шагов — исполняет ПК-агент ПО ОДНОМУ (lane=pc), "
+               f"план и надзор на VPS.\n{plan}\n"
+               f"Шаг 1 в очереди lane=pc (id {r.get('id')}). Каждый шаг отчитается сюда отдельно; "
+               f"красный шаг спрошу кнопкой; после последнего пришлю сводку. ПК молчит "
+               f">{PC_STEP_TIMEOUT // 60} мин → честный failed цепи (без самопочинки).")
+        bc.complete_task(tid, "done", res[:RESULT_MAX])
+        log.info("pc-dec: родитель %s → план %s шагов, шаг 1 релизнут (id %s, lane=pc)",
+                 tid, n, r.get("id"))
+        return
     ids, errs = [], []
     for i, step in enumerate(steps, 1):
         r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", f"[шаг {i}/{n} родитель {tid}] {step}")
@@ -1304,8 +1752,13 @@ def process_new():
     if _is_dec(task):
         sm = _SUM_RE.match(text)
         if sm:
-            # осиротевшая synthetic-сводка (демон упал между enqueue и complete) → доводим
-            bc.complete_task(tid, "done", _dec_summary_text(int(sm.group(1))))
+            # осиротевшая synthetic-сводка (демон упал между enqueue и complete) → доводим;
+            # у ПК-семейства сводку собираем из pc-шагов (vps-читалка их не видит)
+            if str(task.get("from") or "") == PC_DEC_FROM:
+                pid = int(sm.group(1))
+                bc.complete_task(tid, "done", _pc_summary_text(pid, _pc_chain_steps(pid)))
+            else:
+                bc.complete_task(tid, "done", _dec_summary_text(int(sm.group(1))))
             log.info("dec: осиротевшая сводка id=%s доведена", tid)
             return
         if _ADAPT_CARD_RE.match(text):
@@ -1315,8 +1768,16 @@ def process_new():
                                           "демона; шаги коррекции уже в цепочке родителя)")
             log.info("dec: осиротевшая карточка адаптации id=%s доведена", tid)
             return
+        if _PC_CARD_RE.match(text):
+            # осиротевшая событийная карточка ПК-театра (🩹/🛑/⚠️ — тело живёт в result при
+            # complete; сирота = тело потеряно при рестарте, сама цепь идёт своим ходом)
+            bc.complete_task(tid, "done", "🃏 карточка события цепи ПК-театра (осиротела при "
+                                          "рестарте демона; цепь родителя идёт своим ходом)")
+            log.info("pc-dec: осиротевшая карточка id=%s доведена", tid)
+            return
         if not _STEP_RE.match(text):
-            _dec_plan_and_fanout(tid, text)     # родитель «декомпозируй:» → план → fan-out шагов
+            # родитель «декомпозируй:» → план → fan-out шагов (ПК-театр: релиз шага 1 lane=pc)
+            _dec_plan_and_fanout(tid, text, frm=str(task.get("from") or ""))
             return
 
     status, result = run_task(tid, text, task_timeout=_task_timeout(task))
@@ -1346,9 +1807,11 @@ def process_new():
 
 def cycle():
     """Один проход: довести одобренное красное (approved) → добрать хвосты декомпозиций,
-    финализированные мимо демона (сводка) → взять новое (new)."""
+    финализированные мимо демона (сводка) → надзор цепей ПК-театра (полоса pc, read-only +
+    релиз/хуки своих цепей) → взять новое (new)."""
     process_approved()
     process_dec_tails()
+    process_pc_chains()
     process_new()
 
 

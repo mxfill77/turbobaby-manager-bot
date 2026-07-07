@@ -1,6 +1,7 @@
 """Вторая полоса дев-контура O4: lane=pc (тема PC-дев, 04.07.2026). Маршрутизация lane:
 (L1-L4) bridge_client шлёт lane ТОЛЬКО если передан (старый Bridge не ломается);
-(L5) _try_enqueue: pc-полоса → метки Filipp-pc[-dev] + lane='pc', декомпозиция на pc не поддержана,
+(L5) _try_enqueue: pc-полоса → метки Filipp-pc[-dev] + lane='pc'; «декомпозируй:» (ПК-театр
+кусок 2, 07.07.2026) → родитель Filipp-pc-dec БЕЗ lane (план строит VPS-демон, шаги — lane=pc);
 328 — как раньше БЕЗ lane; (L6) handle_command: тема PC-дев только от Филиппа, выключена без env;
 (L7) report_results разносит карточки по полосам (pc → тема PC-дев, vps → 328);
 (L8) splinter.is_ignored_thread игнорит тему PC-дев из env;
@@ -100,9 +101,10 @@ def test_try_enqueue_lanes():
     assert "PC" in r and "42" in r
     DB._try_enqueue("задача: проверь Z", b, lane="pc")
     assert b.calls[-1] == (DB.QUEUE_FROM_PC, "проверь Z", "pc"), f"pc-задача: {b.calls}"
-    n = len(b.calls)
     r = DB._try_enqueue("декомпозируй: большое ТЗ", b, lane="pc")
-    assert len(b.calls) == n and "не поддержан" in r, "декомпозиция на pc-полосе НЕ ставится в очередь"
+    assert b.calls[-1] == (DB.QUEUE_FROM_PC_DEC, "большое ТЗ", None), \
+        f"pc-декомпозиция (ПК-театр кусок 2): родитель Filipp-pc-dec БЕЗ lane (план строит VPS-демон): {b.calls}"
+    assert "театр PC" in r and "42" in r, f"ответ про ПК-театр: {r}"
     DB._try_enqueue("тз: как раньше", b)                     # 328 (vps) — регресс
     assert b.calls[-1] == (DB.QUEUE_FROM_DEV, "как раньше", None), \
         f"полоса vps: старая метка и БЕЗ lane: {b.calls}"
