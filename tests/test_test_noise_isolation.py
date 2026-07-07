@@ -17,6 +17,7 @@ os.environ.pop("PRETOOL_NOPUSH", None)
 os.environ.pop("NOTIFY_COUNT_FILE", None)
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
+os.environ.setdefault("PLAN_ADAPT", "0")  # изоляция от боевого .env (кусок 2)
 os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 sys.path.insert(0, ROOT)
 

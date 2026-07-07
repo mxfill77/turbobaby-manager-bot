@@ -11,6 +11,7 @@ import sys, asyncio
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 import os
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
+os.environ.setdefault("PLAN_ADAPT", "0")  # изоляция от боевого .env (адаптация плана, кусок 2)
 import devbot as DB
 import bridge_client
 

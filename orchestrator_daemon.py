@@ -535,6 +535,11 @@ def _dec_summary_text(pid):
     Строка на шаг = ✅/❌ + первая строка результата (сводка ≤400 от исполнителя)."""
     rows = sorted(_dec_siblings(pid, ("done", "failed")),
                   key=lambda x: (x[0], int(x[2].get("id") or 0)))
+    # адаптация плана (кусок 2): заменённые/досрочно закрытые шаги (done+♻️/⏭-карта) — не
+    # результаты работы, из сводки исключаются (их закрытие уже отрапортовано отдельно)
+    rows = [(i, n, it) for i, n, it in rows
+            if not str(it.get("result") or "").lstrip().startswith(
+                (ADAPT_REPLACED_MARK, ADAPT_FINISH_MARK))]
     # самопочинка может дать ДВЕ записи на один номер шага (исходный 🩹-done + перерождённый);
     # в сводке оставляем ПОСЛЕДНЮЮ по id (реальный финал шага). Без дублей — поведение прежнее.
     last = {}
@@ -544,9 +549,13 @@ def _dec_summary_text(pid):
     if not rows:
         return f"🧩 Сводка декомпозиции (родитель {pid}): шагов не найдено (очередь пуста?)"
     n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
-    total = rows[0][1]
+    total = rows[-1][1]     # хвостовой шаг несёт АКТУАЛЬНЫЙ итог плана (adjust мог сменить N);
+                            # в обычной цепи все N равны — поведение прежнее
     head = f"🧩 Сводка декомпозиции (родитель {pid}): {n_done}/{total} шагов done"
-    if n_done < len(rows):
+    fin = _adapt_finish.get(pid)
+    if fin:
+        head += f", 🏁 завершено досрочно: {fin}"
+    elif n_done < len(rows):
         head += ", есть упавшие/пропущенные"
     lines = [head]
     for i, n, it in rows:
@@ -618,8 +627,14 @@ def process_dec_tails():
 
 
 def _dec_after_step(pid, step_i, step_n, status):
-    """Хук после финала шага: failed → пропустить оставшиеся new-сиблинги (цепочка зависимая,
-    дальше идти опасно); все финальны → сводка по родителю."""
+    """Хук после финала шага: done → адаптация плана (PLAN_ADAPT, кусок 2 мета-дирижёра);
+    failed → пропустить оставшиеся new-сиблинги (цепочка зависимая, дальше идти опасно);
+    все финальны → сводка по родителю."""
+    if status == "done":
+        try:
+            _maybe_plan_adapt(pid, step_i, step_n)
+        except Exception as e:      # адаптация — слой-надстройка: её сбой НЕ валит хук цепи
+            log.warning("plan-adapt: сбой адаптации родителя %s (%s) — fail-safe keep", pid, e)
     if status == "failed":
         for i, n, it in sorted(_dec_siblings(pid, ("new",)), key=lambda x: x[0]):
             bc.complete_task(it.get("id"), "failed",
@@ -674,17 +689,11 @@ def _parse_thinker_json(text):
             "reason": str(d.get("reason") or "").strip()}
 
 
-def _selfheal_consult(pid, step_i, step_n, step_text, fail_text):
-    """Думатель: claude -p через кондуктор ORCH_MODEL/ORCH_MODEL_FALLBACK, чистый генератор
-    (--max-turns 1 — один ответ, без инструментального цикла). Промпт: цель родителя ДОСЛОВНО +
-    план шагов + упавший шаг + суть провала (как _fail_card). Возврат: dict вердикта или None
-    (любой сбой думателя = None = fail-safe прежний halt-on-fail)."""
-    goal, plan = _dec_parent_context(pid)
-    prompt = (THINKER_PREAMBLE +
-              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
-              f"ПЛАН ШАГОВ РОДИТЕЛЯ:\n{plan}\n\n"
-              f"УПАВШИЙ ШАГ {step_i}/{step_n} (текст дословно):\n{step_text}\n\n"
-              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+def _thinker_exec(prompt, timeout, tag):
+    """Общий запуск думателя (самопочинка кусок 1 / адаптация плана кусок 2): claude -p через
+    кондуктор ORCH_MODEL/ORCH_MODEL_FALLBACK, чистый генератор (--max-turns 1 — один ответ, без
+    инструментального цикла). Возврат: текст ответа (распакован из CLI-конверта
+    --output-format json) или None при ЛЮБОМ сбое (запуск/таймаут/exit!=0) — fail-safe."""
     child_env = dict(os.environ)
     child_env.setdefault("HOME", "/root")
     child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -698,9 +707,9 @@ def _selfheal_consult(pid, step_i, step_n, step_text, fail_text):
            prompt]                             # prompt последним (тест-моки читают args[-1])
     try:
         proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
-                              timeout=STEP_SELFHEAL_TIMEOUT, env=child_env)
+                              timeout=timeout, env=child_env)
     except Exception as e:
-        log.warning("selfheal: думатель не отработал (%s) — fail-safe halt", e)
+        log.warning("%s: думатель не отработал (%s) — fail-safe", tag, e)
         return None
     raw = (proc.stdout or "").strip()
     out = raw
@@ -711,7 +720,23 @@ def _selfheal_consult(pid, step_i, step_n, step_text, fail_text):
     except Exception:
         pass
     if proc.returncode != 0:
-        log.warning("selfheal: думатель exit=%s — fail-safe halt", proc.returncode)
+        log.warning("%s: думатель exit=%s — fail-safe", tag, proc.returncode)
+        return None
+    return out
+
+
+def _selfheal_consult(pid, step_i, step_n, step_text, fail_text):
+    """Думатель самопочинки: промпт = цель родителя ДОСЛОВНО + план шагов + упавший шаг + суть
+    провала (как _fail_card). Возврат: dict вердикта или None (любой сбой думателя = None =
+    fail-safe прежний halt-on-fail)."""
+    goal, plan = _dec_parent_context(pid)
+    prompt = (THINKER_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ПЛАН ШАГОВ РОДИТЕЛЯ:\n{plan}\n\n"
+              f"УПАВШИЙ ШАГ {step_i}/{step_n} (текст дословно):\n{step_text}\n\n"
+              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+    out = _thinker_exec(prompt, STEP_SELFHEAL_TIMEOUT, "selfheal")
+    if out is None:
         return None
     verdict = _parse_thinker_json(out)
     if verdict is None:
@@ -770,6 +795,213 @@ def _maybe_selfheal(tid, text, fail_text):
              tid, step_i, step_n, pid, nid)
     _maybe_dec_after(text, "done")
     return True
+
+
+# === АДАПТАЦИЯ ПЛАНА (мета-дирижёр кусок 2, KB_MASTER §4, заведено 07.07.2026) ===
+# После КАЖДОГО done-шага декомпозера (при PLAN_ADAPT=1 в .env, отдельный флаг) думатель — та же
+# схема, что самопочинка: claude -p через кондуктор ORCH_MODEL/FALLBACK, чистый генератор
+# (--max-turns 1) — сверяет результаты с целью родителя и решает дальнейший план. Строгий JSON
+# {"verdict":"keep"|"adjust"|"finish","adjusted_steps":[…],"reason":"1 строка"}:
+#   keep   → оставшиеся шаги исполняются как были (ноль изменений в очереди);
+#   adjust → оставшиеся new-шаги заменяются adjusted_steps (СДЕЛАННЫЕ не трогаются); новые шаги
+#            несут маркер «[коррекция плана K]», в 328 идёт карточка «после шага i думатель
+#            скорректировал план: <reason>». МАКСИМУМ 2 коррекции на цепь (счётчик K —
+#            restart-proof, выводится из маркеров в очереди): третий adjust → терминальный halt
+#            «план дрейфует, нужен владелец» с диагнозом;
+#   finish → цель достигнута досрочно: оставшиеся шаги закрываются пропуском, сводка родителя —
+#            с пометкой «завершено досрочно: <reason>».
+# «skipped» РЕАЛИЗОВАН КАК done+маркер-карта (⏭ досрочно / ♻️ заменён): Bridge completeTask_
+# принимает ТОЛЬКО done|failed (bad_status), а редеплой Bridge = красная зона; failed нельзя —
+# failed-сиблинг глушит цепь (guard в process_new). Сводка эти карты ИСКЛЮЧАЕТ (не результаты).
+# ЭКОНОМИЯ ЛИМИТОВ: оставшихся шагов 0 (последний шаг) → думатель НЕ зовётся (сводка и так
+# финалит); план из 2 шагов ⇒ зовётся только после шага 1 (то же правило).
+# FAIL-SAFE везде: думатель упал / таймаут / мусор-JSON / verdict вне словаря / adjust с пустым
+# adjusted_steps / переполнение потолка MAX_STEPS / enqueue коррекции не встал → keep (план как
+# есть, не хуже текущего). Красное НЕ ослаблено: скорректированный шаг идёт обычным путём
+# (NEEDS_APPROVAL → кнопка). Совместимость с самопочинкой (STEP_SELFHEAL): провал шага →
+# самопочинка; done шага → адаптация; после 🩹-done исходного упавшего шага адаптация НЕ зовётся
+# (перерождение того же номера ещё в очереди — guard по номеру шага).
+# PLAN_ADAPT=0/нет → ветка не зовётся вовсе (байт-в-байт прежнее поведение, независимый откат).
+PLAN_ADAPT_TIMEOUT = 180      # думатель — чистый генератор без tools, ответ короткий
+PLAN_ADAPT_MAX = 2            # потолок коррекций на цепь; третий adjust = дрейф плана → halt
+_ADAPT_MARK_RE = re.compile(r"\[коррекция плана (\d+)\]")
+_ADAPT_CARD_RE = re.compile(r"^\[коррекция плана родитель (\d+)\]")
+ADAPT_REPLACED_MARK = "♻️ заменён коррекцией плана"
+ADAPT_FINISH_MARK = "⏭ закрыт досрочно"
+_adapt_finish = {}            # pid → reason досрочного финиша (память процесса; сводка идёт
+                              # в ТОМ ЖЕ вызове _dec_after_step, рестарт между ними не страшен)
+ADAPT_PREAMBLE = (
+    "Ты — думательный слой адаптации плана оркестратора TurboBaby (мета-дирижёр). Очередной шаг "
+    "декомпозиции успешно завершён. Твоя задача — сверить результаты сделанного с целью родителя "
+    "и решить, верен ли ЕЩЁ оставшийся план; ты НИЧЕГО не исполняешь, инструментов у тебя нет, "
+    "файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"keep"|"adjust"|"finish","adjusted_steps":["<шаг>",...],"reason":"<1 строка>"}\n'
+    "verdict=keep — оставшийся план верен, исполнять как есть (adjusted_steps пустой). Это "
+    "ДЕФОЛТ: при малейшем сомнении — keep.\n"
+    "verdict=adjust — ТОЛЬКО если результаты сделанных шагов сделали оставшиеся лишними/"
+    "неверными и правка очевидна; adjusted_steps = НОВЫЙ полный список ОСТАВШИХСЯ шагов "
+    "(сделанные не трогай), каждый — САМОДОСТАТОЧНОЕ дев-ТЗ ≤400 символов (исполнитель увидит "
+    "ТОЛЬКО его текст, впиши нужный контекст).\n"
+    "verdict=finish — цель родителя УЖЕ достигнута, оставшиеся шаги не нужны вовсе "
+    "(adjusted_steps пустой).\n\n"
+)
+
+
+def _plan_adapt_on():
+    """Флаг PLAN_ADAPT=1 в .env (отдельно от STEP_SELFHEAL). 0/нет → прежнее поведение."""
+    return (os.environ.get("PLAN_ADAPT") or "").strip() == "1"
+
+
+def _parse_adapt_json(text):
+    """Строгий парс ответа думателя адаптации → {"verdict","adjusted_steps","reason"} или None
+    (None = fail-safe keep у вызывающего). Терпим обёртку-мусор вокруг JSON; verdict обязан быть
+    keep|adjust|finish; adjust без непустых adjusted_steps → None (пустой adjusted = keep)."""
+    t = (text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = str(d.get("verdict") or "").strip().lower()
+    if v not in ("keep", "adjust", "finish"):
+        return None
+    raw_steps = d.get("adjusted_steps")
+    steps = ([str(s).strip() for s in raw_steps if str(s).strip()]
+             if isinstance(raw_steps, list) else [])
+    if v == "adjust" and not steps:
+        return None
+    return {"verdict": v, "adjusted_steps": steps, "reason": str(d.get("reason") or "").strip()}
+
+
+def _adapt_count(pid):
+    """Сколько коррекций уже было у цепи родителя pid = max K из маркеров «[коррекция плана K]»
+    среди шагов очереди. Restart-proof: счётчик выводится из очереди, не из памяти процесса."""
+    k = 0
+    for _i, _n, it in _dec_siblings(pid, ("new", "done", "failed")):
+        m = _ADAPT_MARK_RE.search(str(it.get("task_text") or ""))
+        if m:
+            k = max(k, int(m.group(1)))
+    return k
+
+
+def _adapt_post_card(pid, card):
+    """Карточка адаптации в 328 synthetic-задачей (enqueue→claim→done) — как сводка декомпозера:
+    очередь = единственный канал демона в 328, devbot принесёт done-рапортом."""
+    r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}",
+                        f"[коррекция плана родитель {pid}] карточка адаптации плана")
+    if not r.get("ok"):
+        log.warning("plan-adapt: карточка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
+    bc.complete_task(sid, "done", card[:RESULT_MAX])
+
+
+def _adapt_consult(pid, step_i, remaining):
+    """Думатель адаптации: цель родителя ДОСЛОВНО + исходный план + результаты сделанных шагов
+    (сжато: первая строка = сводка ≤400 исполнителя) + оставшиеся шаги → вердикт keep/adjust/
+    finish. Возврат: dict вердикта или None (любой сбой = None = fail-safe keep)."""
+    goal, plan = _dec_parent_context(pid)
+    done_last = {}                        # номер шага → финальный результат (последний по id:
+    for i, _n, it in sorted(_dec_siblings(pid, ("done",)),   # 🩹-дубли самопочинки затираются)
+                            key=lambda x: (x[0], int(x[2].get("id") or 0))):
+        res = str(it.get("result") or "").strip()
+        if res.startswith((ADAPT_REPLACED_MARK, ADAPT_FINISH_MARK)):
+            continue                      # закрытые адаптацией — не результаты работы
+        done_last[i] = res
+    done_lines = [f"шаг {i}: {(done_last[i].splitlines() or ['(пусто)'])[0][:300]}"
+                  for i in sorted(done_last)] or ["(результатов пока нет)"]
+    rem_lines = [f"шаг {i}: {_STEP_RE.sub('', str(it.get('task_text') or ''), 1).strip()[:400]}"
+                 for i, _n, it in remaining]
+    prompt = (ADAPT_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ИСХОДНЫЙ ПЛАН ШАГОВ:\n{plan}\n\n"
+              f"РЕЗУЛЬТАТЫ СДЕЛАННЫХ ШАГОВ (сжато; только что завершён шаг {step_i}):\n"
+              + "\n".join(done_lines) + "\n\n"
+              "ОСТАВШИЕСЯ ШАГИ ПЛАНА:\n" + "\n".join(rem_lines) + "\n")
+    out = _thinker_exec(prompt, PLAN_ADAPT_TIMEOUT, "plan-adapt")
+    if out is None:
+        return None
+    v = _parse_adapt_json(out)
+    if v is None:
+        log.warning("plan-adapt: ответ думателя не распарсился/пуст (fail-safe keep): %.200s", out)
+    return v
+
+
+def _maybe_plan_adapt(pid, step_i, step_n):
+    """Адаптация плана после done-шага декомпозера (PLAN_ADAPT=1): keep → ничего; adjust →
+    заменить оставшиеся new-шаги (≤2 коррекций на цепь, третья = halt «план дрейфует»); finish →
+    закрыть оставшиеся досрочно. ЛЮБОЙ сбой = keep (план как есть). Вызывается из _dec_after_step
+    ДО проверки сводки — статусы, выставленные здесь, сводка увидит тем же вызовом."""
+    if not _plan_adapt_on():
+        return
+    remaining = sorted(_dec_siblings(pid, ("new",)), key=lambda x: x[0])
+    if not remaining:
+        return                            # последний шаг: думателя не звать (экономия лимитов)
+    if any(i <= step_i for i, _n, _it in remaining):
+        return                            # перерождение самопочинки этого номера ждёт в new —
+                                          # шаг реально НЕ закрыт (🩹-done лишь карточка)
+    verdict = _adapt_consult(pid, step_i, remaining)
+    if verdict is None or verdict["verdict"] == "keep":
+        return                            # keep / fail-safe: ноль изменений в очереди
+    reason = (verdict["reason"] or "(без причины)")[:300]
+    if verdict["verdict"] == "finish":
+        _adapt_finish[pid] = reason
+        for i, n, it in remaining:
+            bc.complete_task(it.get("id"), "done",
+                             f"{ADAPT_FINISH_MARK}: шаг {i}/{n} не нужен — цель родителя {pid} "
+                             f"достигнута после шага {step_i} (решение думателя): {reason}")
+        log.info("plan-adapt: родитель %s finish после шага %s → %s шагов закрыто досрочно (%s)",
+                 pid, step_i, len(remaining), reason[:120])
+        return
+    # adjust
+    steps = verdict["adjusted_steps"]
+    if step_i + len(steps) > MAX_STEPS:
+        log.warning("plan-adapt: родитель %s adjust дал %s шагов (итог > потолка %s) — fail-safe keep",
+                    pid, len(steps), MAX_STEPS)
+        return
+    k = _adapt_count(pid) + 1
+    if k > PLAN_ADAPT_MAX:
+        for i, n, it in remaining:
+            bc.complete_task(it.get("id"), "failed",
+                             f"🛑 план дрейфует: думатель запросил коррекцию №{k} (лимит "
+                             f"{PLAN_ADAPT_MAX} на цепь) — цепочка остановлена, нужен владелец. "
+                             f"Диагноз думателя: {reason}")
+        log.info("plan-adapt: родитель %s — adjust №%s (> лимита %s) → терминальный halt (дрейф)",
+                 pid, k, PLAN_ADAPT_MAX)
+        return
+    # порядок fail-safe: СНАЧАЛА полностью ставим новый план, ТОЛЬКО потом закрываем старый;
+    # не встал целиком → откатываем вставшие новые и живём по прежнему плану (keep)
+    new_total = step_i + len(steps)
+    ids = []
+    for j, s in enumerate(steps, start=step_i + 1):
+        r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}",
+                            (f"[шаг {j}/{new_total} родитель {pid}] [коррекция плана {k}] {s}")[:RESULT_MAX])
+        if r.get("ok"):
+            ids.append(r.get("id"))
+        else:
+            log.warning("plan-adapt: родитель %s шаг коррекции %s не встал (%s) — fail-safe keep",
+                        pid, j, r.get("error"))
+            for nid in ids:
+                bc.complete_task(nid, "done",
+                                 f"{ADAPT_REPLACED_MARK} — отменён: коррекция {k} не встала "
+                                 f"целиком, действует прежний план")
+            return
+    for i, n, it in remaining:
+        bc.complete_task(it.get("id"), "done",
+                         f"{ADAPT_REPLACED_MARK} {k}: шаг {i}/{n} заменён (решение думателя "
+                         f"после шага {step_i}): {reason}")
+    _adapt_post_card(pid, (
+        f"🧭 после шага {step_i} думатель скорректировал план (коррекция {k}/{PLAN_ADAPT_MAX}): {reason}\n"
+        f"Новых шагов {len(steps)} (id {', '.join(str(x) for x in ids)}), итог плана {new_total} "
+        f"шагов; сделанные шаги 1–{step_i} не тронуты. Третья коррекция = halt «план дрейфует»."))
+    log.info("plan-adapt: родитель %s adjust K=%s после шага %s → %s новых шагов (id %s)",
+             pid, k, step_i, len(steps), ids)
 
 
 def _earlier_new_sibling(items, pid, step_i):
@@ -982,6 +1214,13 @@ def process_new():
             # осиротевшая synthetic-сводка (демон упал между enqueue и complete) → доводим
             bc.complete_task(tid, "done", _dec_summary_text(int(sm.group(1))))
             log.info("dec: осиротевшая сводка id=%s доведена", tid)
+            return
+        if _ADAPT_CARD_RE.match(text):
+            # осиротевшая карточка адаптации (демон упал между enqueue и complete) → доводим,
+            # НЕ отдавая её планировщику как «родителя» (сами шаги коррекции уже в цепочке)
+            bc.complete_task(tid, "done", "🧭 карточка коррекции плана (осиротела при рестарте "
+                                          "демона; шаги коррекции уже в цепочке родителя)")
+            log.info("dec: осиротевшая карточка адаптации id=%s доведена", tid)
             return
         if not _STEP_RE.match(text):
             _dec_plan_and_fanout(tid, text)     # родитель «декомпозируй:» → план → fan-out шагов

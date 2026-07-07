@@ -8,6 +8,7 @@ claude -p (SIGTERM/143) → старый код метил failed при пол�
 import os, sys, datetime
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
+os.environ.setdefault("PLAN_ADAPT", "0")  # изоляция от боевого .env (адаптация плана, кусок 2)
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
