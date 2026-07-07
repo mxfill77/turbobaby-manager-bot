@@ -1,4 +1,5 @@
-"""Обёртка BridgeClient.quote_price() — мок-тесты (Bridge не дёргаем, requests.get подменён).
+"""Обёртка BridgeClient.quote_price() — мок-тесты (Bridge не дёргаем, Session.get подменён:
+durable-слой 07.07.2026 ходит через requests.Session, не через module-level requests.get).
 Проверяет: ok → dict с ключами day_price/total/deposit/available/conflicts/season/text;
 не-ok (bike_not_resolved) → None; таймаут → None; кривой JSON → None; неожиданный
 Exception внутри _call → None (вызывающий код не падает). Плюс: правильные GET-параметры."""
@@ -8,6 +9,8 @@ from unittest import mock
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
+os.environ.setdefault("BRIDGE_RETRY_BASE", "0")     # ретраи durable-слоя без пауз в тестах
+os.environ.setdefault("BRIDGE_RETRY_JITTER", "0")
 
 import requests
 from bridge_client import BridgeClient
@@ -24,6 +27,10 @@ OK_PAYLOAD = {
 
 
 class FakeResp:
+    status_code = 200
+    headers = {}
+    text = ""
+
     def __init__(self, payload=None, raw=None):
         self._payload = payload
         self._raw = raw
@@ -43,7 +50,7 @@ def client():
 
 
 def test_ok_returns_dict_with_expected_keys():
-    with mock.patch("bridge_client.requests.get", return_value=FakeResp(OK_PAYLOAD)) as g:
+    with mock.patch("bridge_client.requests.Session.get", return_value=FakeResp(OK_PAYLOAD)) as g:
         res = client().quote_price("4957", "08.07.2026", "15.07.2026")
     assert isinstance(res, dict)
     for key in ("day_price", "total", "deposit", "available", "conflicts", "season", "text"):
@@ -61,14 +68,14 @@ def test_ok_returns_dict_with_expected_keys():
 def test_not_ok_returns_none():
     payload = {"ok": False, "error": "bike_not_resolved",
                "message": 'Байк "PCX" не найден однозначно в "список мото"'}
-    with mock.patch("bridge_client.requests.get", return_value=FakeResp(payload)):
+    with mock.patch("bridge_client.requests.Session.get", return_value=FakeResp(payload)):
         res = client().quote_price("PCX", "08.07.2026", "15.07.2026")
     assert res is None
     print("OK: bike_not_resolved → None")
 
 
 def test_timeout_returns_none():
-    with mock.patch("bridge_client.requests.get",
+    with mock.patch("bridge_client.requests.Session.get",
                     side_effect=requests.exceptions.Timeout("boom")):
         res = client().quote_price("4957", "08.07.2026", "15.07.2026")
     assert res is None
@@ -76,7 +83,7 @@ def test_timeout_returns_none():
 
 
 def test_bad_json_returns_none():
-    with mock.patch("bridge_client.requests.get",
+    with mock.patch("bridge_client.requests.Session.get",
                     return_value=FakeResp(raw="<html>not json</html>")):
         res = client().quote_price("4957", "08.07.2026", "15.07.2026")
     assert res is None

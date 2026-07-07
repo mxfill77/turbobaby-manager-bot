@@ -5,13 +5,19 @@ TurboBaby Bridge HTTP клиент.
 
 import os
 import json
+import time
+import random
 import logging
 import contextlib
 import contextvars
 import requests
 from typing import Optional
+from urllib.parse import urljoin
 
 log = logging.getLogger(__name__)
+
+# HTTP-коды редиректа script.google.com/exec → script.googleusercontent.com (echo-слой)
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
 
 # === ТОКЕН-ЗАМОК боевой записи (4.2) ===
 # origin записи: 'human' (по умолчанию — люди/кнопки, замок СПИТ) | 'agent' (автономный процесс).
@@ -37,6 +43,17 @@ def agent_write(ticket: str):
 class BridgeClient:
     """Клиент к Apps Script Bridge Web App."""
 
+    # POST-действия, безопасные для ПОЛНОГО повтора (re-POST): read-only/идемпотентные.
+    # Write-действия (enqueue/claim/complete/set_fleet_*/транзакции/...) сюда НЕ добавлять —
+    # слепой re-POST даёт дубль записи (enqueue покрыт _enqueue_reliable verify-паттерном).
+    _IDEMPOTENT_POST_ACTIONS = {
+        "read_write_log", "get_balance", "tx_summary",
+        "closing_get", "closing_list", "service_list",
+        "service_pending_get", "service_pending_list",
+        "important_list", "important_due", "audit_list",
+        "state_get", "state_list", "task_heartbeat",
+    }
+
     def __init__(self, url: str = None, token: str = None, timeout: int = 60):
         self.url = url or os.getenv("BRIDGE_URL")
         self.token = token or os.getenv("BRIDGE_TOKEN")
@@ -45,26 +62,165 @@ class BridgeClient:
         if not self.url or not self.token:
             raise ValueError("BRIDGE_URL и BRIDGE_TOKEN обязательны (см. .env)")
 
-    def _call(self, action: str, **params) -> dict:
-        """Выполняет GET запрос к Bridge."""
-        query = {"token": self.token, "action": action, **params}
+        # DURABLE-слой (фикс intermittent 404 Google, 07.07.2026): ретраи + анти-клин.
+        def _env_num(name, default, cast):
+            try:
+                return cast(os.getenv(name, "") or default)
+            except (TypeError, ValueError):
+                return default
+        self.retry_attempts = _env_num("BRIDGE_RETRY_ATTEMPTS", 3, int)   # попыток всего (1 = без ретраев)
+        self.retry_base = _env_num("BRIDGE_RETRY_BASE", 0.6, float)       # base экспоненциальной паузы, сек
+        self.retry_jitter = _env_num("BRIDGE_RETRY_JITTER", 0.4, float)   # верх jitter, сек
+        self.wedge_limit = _env_num("BRIDGE_WEDGE_LIMIT", 3, int)         # N подряд транспорт-сбоев → новая сессия
+        self._session = requests.Session()
+        self._consec_transport_fails = 0
+
+    # === DURABLE HTTP-слой (единая точка всех клиентов Bridge) ===
+
+    def _new_session(self):
+        """Анти-клин: пересоздать HTTP-сессию (заклинившие keep-alive соединения — в мусор)."""
+        old = getattr(self, "_session", None)
         try:
-            log.debug(f"Bridge call: action={action} params={params}")
-            r = requests.get(self.url, params=query, timeout=self.timeout, allow_redirects=True)
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("ok"):
-                log.warning(f"Bridge returned error: {data.get('error')} — {data.get('message')}")
-            return data
+            if old is not None:
+                old.close()
+        except Exception:
+            pass
+        self._session = requests.Session()
+
+    def _note_transport(self, failed: bool):
+        """Счётчик подряд идущих транспорт-сбоев (timeout/request_failed). Порог → новая сессия."""
+        if not failed:
+            self._consec_transport_fails = 0
+            return
+        self._consec_transport_fails += 1
+        if self._consec_transport_fails >= self.wedge_limit:
+            log.warning(f"Bridge: {self._consec_transport_fails} подряд транспорт-сбоев — "
+                        f"пересоздаю HTTP-сессию (анти-клин)")
+            self._new_session()
+            self._consec_transport_fails = 0
+
+    def _backoff(self, attempt: int):
+        """Экспоненциальная пауза + jitter перед повтором (attempt с 0)."""
+        time.sleep(self.retry_base * (2 ** attempt) + random.uniform(0, self.retry_jitter))
+
+    def _fetch_redirect_target(self, url: str):
+        """GET на Location redirect-echo слоя googleusercontent с backoff-ретраями на
+        404/5xx/timeout. Ретраить БЕЗОПАСНО даже после write-POST: сам POST уже исполнен
+        Apps Script'ом, этот GET лишь забирает готовый ответ (ночной инцидент 07.07:
+        claim долетел, а ответ терялся на 404 echo-слоя)."""
+        last_err = None
+        for attempt in range(max(1, self.retry_attempts)):
+            if attempt:
+                log.warning(f"Bridge: echo-слой сбоит ({last_err}) — ретрай {attempt + 1}/{self.retry_attempts}")
+                self._backoff(attempt - 1)
+            try:
+                r = self._session.get(url, timeout=self.timeout, allow_redirects=False)
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                continue
+            if r.status_code == 404 or r.status_code >= 500:
+                last_err = requests.exceptions.HTTPError(
+                    f"HTTP {r.status_code} на redirect-echo", response=r)
+                continue
+            return r
+        if isinstance(last_err, requests.exceptions.RequestException):
+            raise last_err
+        raise requests.exceptions.RequestException(str(last_err))
+
+    def _exchange(self, method: str, params: dict = None, body: dict = None):
+        """Один HTTP-обмен с Bridge: явный follow-redirect-as-GET. POST/GET на /exec идёт с
+        allow_redirects=False; 3xx → GET на Location руками (не полагаемся на авто-follow
+        requests, который на редиректе терял тело/токен). Возвращает финальный Response."""
+        if method == "GET":
+            r = self._session.get(self.url, params=params, timeout=self.timeout,
+                                  allow_redirects=False)
+        else:
+            r = self._session.post(self.url, json=body, timeout=self.timeout,
+                                   allow_redirects=False)
+        cur_url, hops = self.url, 0
+        while r.status_code in _REDIRECT_CODES and hops < 6:
+            loc = r.headers.get("Location") or r.headers.get("location")
+            if not loc:
+                break
+            cur_url = urljoin(cur_url, loc)
+            r = self._fetch_redirect_target(cur_url)
+            hops += 1
+        return r
+
+    def _one_exchange(self, method: str, action: str, params: dict = None, body: dict = None) -> dict:
+        """Обмен + разбор ответа в прежний контракт {ok, error, message}. Служебный флаг
+        _unauthorized (токен не дошёл/отвергнут) снимается в _durable_request, наружу не уходит."""
+        try:
+            r = self._exchange(method, params=params, body=body)
         except requests.exceptions.Timeout:
             log.error(f"Bridge timeout (>{self.timeout}s) for action={action}")
             return {"ok": False, "error": "timeout", "message": f"Timeout >{self.timeout}s"}
         except requests.exceptions.RequestException as e:
-            log.error(f"Bridge request error: {e}")
+            log.error(f"Bridge request error ({action}): {e}")
             return {"ok": False, "error": "request_failed", "message": str(e)}
-        except json.JSONDecodeError as e:
-            log.error(f"Bridge JSON parse error: {e}")
+        if r.status_code == 401:
+            return {"ok": False, "error": "unauthorized", "message": "HTTP 401",
+                    "_unauthorized": True}
+        if r.status_code >= 400 or r.status_code in _REDIRECT_CODES:
+            log.error(f"Bridge request error ({action}): HTTP {r.status_code}")
+            return {"ok": False, "error": "request_failed",
+                    "message": f"HTTP {r.status_code}"}
+        try:
+            data = r.json()
+        except ValueError as e:
+            text = str(getattr(r, "text", "") or "")
+            if "invalid or missing token" in text.lower():
+                return {"ok": False, "error": "unauthorized",
+                        "message": "Invalid or missing token", "_unauthorized": True}
+            log.error(f"Bridge JSON parse error ({action}): {e}")
             return {"ok": False, "error": "json_parse_error", "message": str(e)}
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "json_parse_error", "message": "не-dict ответ"}
+        if not data.get("ok"):
+            log.warning(f"Bridge returned error: {data.get('error')} — {data.get('message')}")
+            err = str(data.get("error", "")).lower()
+            msg = str(data.get("message", "")).lower()
+            if err == "unauthorized" or "invalid or missing token" in msg:
+                data["_unauthorized"] = True
+        return data
+
+    def _durable_request(self, method: str, action: str, params: dict = None,
+                         body: dict = None, retry_full: bool = False) -> dict:
+        """Durable-запрос к Bridge. retry_full=True (read-only GET / идемпотентные POST) —
+        до retry_attempts полных повторов на timeout/request_failed. retry_full=False
+        (write-POST) — РОВНО одна отправка (дубль записи страшнее потери ответа); durability
+        write-пути даёт echo-ретрай внутри _exchange. Особый случай — unauthorized: Bridge
+        проверяет токен ДО исполнения действия, значит запрос НЕ исполнен и одна пересылка
+        с токеном безопасна для ЛЮБОГО действия (ночью POST-retry терял токен на редиректе)."""
+        max_attempts = max(1, self.retry_attempts) if retry_full else 1
+        auth_resend_left = 1
+        attempt = 0
+        while True:
+            attempt += 1
+            data = self._one_exchange(method, action, params=params, body=body)
+            unauthorized = bool(data.pop("_unauthorized", False))
+            err = data.get("error")
+            self._note_transport(failed=err in ("timeout", "request_failed"))
+            if data.get("ok"):
+                return data
+            if unauthorized and auth_resend_left > 0:
+                auth_resend_left -= 1
+                log.warning(f"Bridge {action}: unauthorized (токен потерян на редиректе?) — "
+                            f"пересылаю запрос с токеном заново")
+                self._backoff(0)
+                continue
+            if err in ("timeout", "request_failed") and attempt < max_attempts:
+                log.warning(f"Bridge {action}: {err} — backoff-ретрай "
+                            f"{attempt + 1}/{max_attempts}")
+                self._backoff(attempt - 1)
+                continue
+            return data
+
+    def _call(self, action: str, **params) -> dict:
+        """Выполняет GET запрос к Bridge (read-only → полный ретрай безопасен)."""
+        query = {"token": self.token, "action": action, **params}
+        log.debug(f"Bridge call: action={action} params={params}")
+        return self._durable_request("GET", action, params=query, retry_full=True)
 
     # === Удобные методы для отдельных endpoint'ов ===
 
@@ -179,22 +335,11 @@ class BridgeClient:
             tk = WRITE_TICKET.get()
             if tk:
                 body["ticket"] = tk
-        try:
-            log.debug(f"Bridge POST: action={action}")
-            r = requests.post(self.url, json=body, timeout=self.timeout, allow_redirects=True)
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("ok"):
-                log.warning(f"Bridge POST error: {data.get('error')} — {data.get('message')}")
-        except requests.exceptions.Timeout:
-            log.error(f"Bridge POST timeout for action={action}")
-            data = {"ok": False, "error": "timeout"}
-        except requests.exceptions.RequestException as e:
-            log.error(f"Bridge POST request error: {e}")
-            data = {"ok": False, "error": "request_failed", "message": str(e)}
-        except json.JSONDecodeError as e:
-            log.error(f"Bridge POST JSON error: {e}")
-            data = {"ok": False, "error": "json_parse_error", "message": str(e)}
+        log.debug(f"Bridge POST: action={action}")
+        # Полный re-POST — ТОЛЬКО идемпотентным (read-like) действиям; write шлётся один раз
+        # (durability write-пути — echo-ретрай + verify-паттерны вызывающего кода).
+        data = self._durable_request("POST", action, body=body,
+                                     retry_full=action in self._IDEMPOTENT_POST_ACTIONS)
         self._blackbox_log(action, fields, data)   # 4.1: лог постфактум, НЕ блокирует
         return data
 

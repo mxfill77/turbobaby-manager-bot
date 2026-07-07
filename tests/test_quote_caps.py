@@ -196,9 +196,10 @@ def test_wrapper_passes_cap_fields():
                "season": {"label": "low", "global_discount": 0.25},
                "cap_price": 5000, "cap_active": True, "text": "..."}
     resp = mock.Mock()
+    resp.status_code = 200
     resp.raise_for_status = lambda: None
     resp.json = lambda: payload
-    with mock.patch("bridge_client.requests.get", return_value=resp):
+    with mock.patch("bridge_client.requests.Session.get", return_value=resp):
         res = BridgeClient(url="http://x", token="x", timeout=1).quote_price(
             "4957", "08.07.2026", "07.08.2026")
     assert res["cap_price"] == 5000 and res["cap_active"] is True
@@ -210,9 +211,10 @@ def test_wrapper_old_bridge_without_caps():
     payload = {"ok": True, "day_price": 317, "total": 2217, "deposit": 3000,
                "available": True, "conflicts": 0, "season": {"label": "low"}, "text": "..."}
     resp = mock.Mock()
+    resp.status_code = 200
     resp.raise_for_status = lambda: None
     resp.json = lambda: payload
-    with mock.patch("bridge_client.requests.get", return_value=resp):
+    with mock.patch("bridge_client.requests.Session.get", return_value=resp):
         res = BridgeClient(url="http://x", token="x", timeout=1).quote_price(
             "4957", "08.07.2026", "15.07.2026")
     assert isinstance(res, dict) and res.get("cap_price") is None
