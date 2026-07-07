@@ -37,10 +37,28 @@ load_dotenv(os.path.join(REPO, ".env"))
 sys.path.insert(0, REPO)
 from bridge_client import BridgeClient
 
+def _env_int(name, default):
+    """Целое из .env с дефолтом; мусор/пусто → дефолт (fail-safe: кривой .env не роняет демона)."""
+    try:
+        v = int(str(os.environ.get(name) or "").strip() or default)
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 POLL_SEC = 60            # пауза между опросами очереди
 HEARTBEAT_SEC = 45       # как часто фон-поток бьёт updated, пока claude -p исполняется (детект зависания)
-TASK_TIMEOUT = 600       # таймаут быстрой задачи «задача:» (10 мин) — claude -p не должен висеть вечно
-TASK_TIMEOUT_DEV = 2700  # таймаут дев-ТЗ «тз:» (45 мин, ступень 2 O4) — правка+тесты+гейт+отчёт
+# Таймауты claude-подпроцесса задач — из .env (инцидент 07.07 задача 138, по образцу PC_STEP_TIMEOUT);
+# по истечении subprocess.run сам убивает claude → честный failed «⏱ таймаут», думатель такое НЕ чинит
+# (гейт по ⏱-маркеру в _maybe_selfheal). Heartbeat задачи тикает НЕЗАВИСИМЫМ фон-потоком (_heartbeat_loop)
+# и исполнением не блокируется. Дефолты = прежние боевые значения (не ослабляем «задача:» до часа).
+TASK_TIMEOUT = _env_int("TASK_TIMEOUT", 600)        # быстрая «задача:» (10 мин)
+TASK_TIMEOUT_DEV = _env_int("TASK_TIMEOUT_DEV", 2700)  # дев-ТЗ «тз:» (45 мин) — правка+тесты+гейт+отчёт
+TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагнозов: думатель самопочинки их НЕ чинит
+# Сирота in_progress (инцидент 07.07, задача 138): claim долетел сервер-сайд при потерянном ответе
+# (404/timeout Bridge) → демон задачу «пропустил», а подобрать некому — висела бы вечно. Реапер:
+# in_progress полосы vps с updated старше ORPHAN_TTL → честный failed (см. process_orphans).
+ORPHAN_TTL = _env_int("ORPHAN_TTL", 600)
 DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очереди (devbot кладёт Filipp-328-dev)
 DEC_FROM_SUFFIX = "-dec" # метка декомпозиции (ступень 2 часть C; devbot кладёт Filipp-328-dec):
                          # родитель «декомпозируй:» + его шаги + synthetic-сводка — всё под этой меткой
@@ -507,8 +525,10 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
             env=child_env,
         )
     except subprocess.TimeoutExpired:
-        log.warning("id=%s ТАЙМАУТ %ss — задача прервана", task_id, task_timeout)
-        return "failed", f"таймаут {task_timeout}s — claude -p прерван, задача не завершилась"
+        log.warning("id=%s ТАЙМАУТ %ss — claude -p убит, честный failed", task_id, task_timeout)
+        return "failed", (f"{TIMEOUT_MARK} таймаут задачи {task_timeout}s — claude -p убит, задача "
+                          f"не завершилась (лимит TASK_TIMEOUT из .env); думатель таймауты не чинит — "
+                          f"упрости/раздели задачу и поставь заново")
     except Exception as e:
         log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
         return "failed", f"ошибка запуска claude -p: {e}"
@@ -931,6 +951,10 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
     задачи (расширение ст4). Возврат True = финализация сделана здесь (перерождение / терминальный
     halt с диагнозом); False = ничего не делал → прежний путь в вызывающем коде (fail-safe)."""
     if not _selfheal_on():
+        return False
+    if str(fail_text or "").lstrip().startswith(TIMEOUT_MARK):
+        # ⏱-диагнозы (таймаут задачи / сирота in_progress / молчание ПК) думатель НЕ чинит:
+        # переформулировка не ускорит зависший claude и не оживит Bridge — честный failed
         return False
     m = _STEP_RE.match(str(text or ""))
     if not m:
@@ -1800,6 +1824,42 @@ def _requeue_foreign_restart(tid, frm, text, note):
     log.info("FOREIGN-RESTART id=%s → возвращена в new задачей %s", tid, nid)
 
 
+def process_orphans():
+    """Фикс класса «claim долетел — исполнение не стартовало» (инцидент 07.07.2026, задача 138):
+    Bridge в сбое (404 на redirect-echo / timeout) может ИСПОЛНИТЬ claim_task сервер-сайд, потеряв
+    ответ → клиент видит request_failed и «пропускает», а задача уже in_progress — исполнять её
+    некому, heartbeat мёртв, висит вечно (138 провисела 70+ мин до ручного рестарта и осталась бы
+    висеть). Демон однопоточный: в момент cycle() НАША задача in_progress быть не может (run_task
+    блокирующий) — любая vps-in_progress здесь = сирота; ORPHAN_TTL — страховка (свежий claim из
+    гонки/чужого процесса не трогаем, ждём порог). Полосу pc НЕ трогаем — там надзор
+    process_pc_chains (PC_STEP_TIMEOUT). Сирота → честный failed с ⏱-маркером (думатель НЕ
+    зовётся — гейт ⏱ в _maybe_selfheal, да и путь реапера думателя не знает) + хук цепи
+    декомпозера (halt-on-fail/сводка), чтобы цепь тоже не висела. Сбой чтения/парсинга → ничего
+    не делаем (fail-safe: лучше подождать цикл, чем убить живое)."""
+    r = bc.get_pending("in_progress")
+    if not r.get("ok"):
+        return
+    for it in r.get("items", []):
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("lane") or "").strip().lower() == PC_LANE:
+            continue                     # ПК-театр — чужой исполнитель, надзор PC_STEP_TIMEOUT
+        age = _age_sec(it.get("updated"))
+        if age is None or age < ORPHAN_TTL:
+            continue
+        tid = it.get("id")
+        text = str(it.get("task_text") or "")
+        card = (f"{TIMEOUT_MARK} задача-сирота: взята в исполнение (in_progress), но исполнитель "
+                f"молчит {int(age)}с (heartbeat мёртв, порог {ORPHAN_TTL}с). Вероятно claim долетел "
+                f"до Bridge без ответа в окно его сбоя (урок задачи 138, 07.07) или демон был "
+                f"прерван до/во время исполнения. Работа не выполнялась либо оборвана — повтори "
+                f"задачу; думатель сирот не чинит.")
+        cm = bc.complete_task(tid, "failed", card[:RESULT_MAX])
+        log.warning("ORPHAN id=%s: in_progress без heartbeat %sс → честный failed (bridge_ok=%s)",
+                    tid, int(age), cm.get("ok"))
+        _maybe_dec_after(text, "failed")
+
+
 def process_new():
     """Взять старейшую new-задачу, исполнить через claude -p, записать результат/needs_approval."""
     r = bc.get_pending("new")
@@ -1920,9 +1980,10 @@ def process_new():
 
 
 def cycle():
-    """Один проход: довести одобренное красное (approved) → добрать хвосты декомпозиций,
-    финализированные мимо демона (сводка) → надзор цепей ПК-театра (полоса pc, read-only +
-    релиз/хуки своих цепей) → взять новое (new)."""
+    """Один проход: подобрать сирот in_progress (урок 138) → довести одобренное красное
+    (approved) → добрать хвосты декомпозиций, финализированные мимо демона (сводка) → надзор
+    цепей ПК-театра (полоса pc, read-only + релиз/хуки своих цепей) → взять новое (new)."""
+    process_orphans()
     process_approved()
     process_dec_tails()
     process_pc_chains()

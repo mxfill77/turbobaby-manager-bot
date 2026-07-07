@@ -276,10 +276,17 @@ def _route_theater(task_text):
 
 def _route_328(task_text):
     """Роутер для темы 328. Выключен (THEATER_ROUTER=0) → (None, текст как есть, None) —
-    прежнее поведение байт-в-байт, 🎭 в карточке не показываем."""
+    прежнее поведение байт-в-байт, 🎭 в карточке не показываем.
+    ТОТАЛЬНЫЙ fail-safe (инцидент 07.07.2026): ЛЮБОЕ исключение роутера (не только пойманные
+    внутри _classify_theater сбои классификатора — unauthorized CLI, exit!=0, таймаут, мусор) →
+    театр vps + подсказка в карточке. Постановка задачи из-за роутера НЕ падает НИКОГДА."""
     if not _router_on():
         return None, task_text, None
-    return _route_theater(task_text)
+    try:
+        return _route_theater(task_text)
+    except Exception as e:
+        log.warning("theater-router: роутер упал (%s) — ТОТАЛЬНЫЙ fail-safe vps", e)
+        return "vps", task_text, ROUTER_HINT
 
 
 def _router_card(theater, note):
@@ -291,6 +298,47 @@ def _router_card(theater, note):
     if note:
         s += f"\n{note}"
     return s
+
+
+def _find_enqueued(bridge, frm, text):
+    """Verify после сбойного enqueue: есть ли НАША задача (тот же from + текст ДОСЛОВНО) в new
+    (обе полосы)? → id | None. Любой сбой чтения → None (не хуже прежнего)."""
+    try:
+        rr = bridge.get_pending("new", lane="all")
+        if not rr.get("ok"):
+            return None
+        for it in rr.get("items", []):
+            if isinstance(it, dict) and str(it.get("from") or "") == frm \
+                    and str(it.get("task_text") or "") == text:
+                return it.get("id")
+    except Exception:
+        return None
+    return None
+
+
+def _enqueue_reliable(bridge, frm, text, lane=None):
+    """Постановка, которая НЕ падает наружу зря (инцидент 07.07.2026, задача 138): Bridge в сбое
+    (404 на redirect-echo) может ИСПОЛНИТЬ enqueue, потеряв ответ («unauthorized»/request_failed
+    клиенту) — Филипп видел «не удалось», хотя задача встала. Слепой ретрай дал бы ДУБЛЬ, поэтому:
+    (1) enqueue; ok → как раньше; (2) сбой → verify: задача с тем же from+текстом уже в new →
+    ответ потерялся, считаем поставленной (её id); (3) не нашли → РОВНО один повтор enqueue;
+    (4) снова сбой → честная ошибка (карточка «не удалось», как раньше). Не хуже прежнего ни в
+    одной ветке; красное не ослаблено (это только постановка в очередь)."""
+    kw = {} if lane is None else {"lane": lane}      # без lane зовём БЕЗ kwarg (форма как раньше)
+    r = bridge.enqueue_task(frm, text, **kw)
+    if r.get("ok"):
+        return r
+    err1 = r.get("error")
+    qid = _find_enqueued(bridge, frm, text)
+    if qid is not None:
+        log.warning("enqueue: ответ потерялся (%s), но задача %s найдена в new — поставлена", err1, qid)
+        return {"ok": True, "id": qid}
+    r2 = bridge.enqueue_task(frm, text, **kw)
+    if r2.get("ok"):
+        log.warning("enqueue: первая попытка упала (%s) — повтор успешен (id=%s)", err1, r2.get("id"))
+    else:
+        log.warning("enqueue: обе попытки упали (%s / %s) — честная ошибка Филиппу", err1, r2.get("error"))
+    return r2
 
 
 def _try_enqueue(text, bridge, lane="vps"):
@@ -315,7 +363,7 @@ def _try_enqueue(text, bridge, lane="vps"):
                 return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
                         "и выполню по одному.")
             if pc:
-                r = bridge.enqueue_task(QUEUE_FROM_PC_DEC, task_text)
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
                 if r.get("ok"):
                     return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
                             f"построит VPS-дирижёр (~60с), шаги уйдут ПК-агенту по одному "
@@ -327,7 +375,7 @@ def _try_enqueue(text, bridge, lane="vps"):
                 return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
                         "и выполню по одному.")
             if theater == "pc":
-                r = bridge.enqueue_task(QUEUE_FROM_PC_DEC, task_text)
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
                 if r.get("ok"):
                     return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
                             f"построит VPS-дирижёр (~60с), шаги уйдут ПК-агенту по одному "
@@ -335,7 +383,7 @@ def _try_enqueue(text, bridge, lane="vps"):
                             f"pc), красный шаг спрошу кнопкой. ПК выключен → цепь честно упадёт "
                             f"по таймауту." + _router_card("pc", note))
                 return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
-            r = bridge.enqueue_task(QUEUE_FROM_DEC, task_text)
+            r = _enqueue_reliable(bridge, QUEUE_FROM_DEC, task_text)
             if r.get("ok"):
                 return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (демон возьмёт ~60с). "
                         f"Сначала верну план шагов, затем шаги пойдут отдельными задачами по одному "
@@ -348,7 +396,7 @@ def _try_enqueue(text, bridge, lane="vps"):
             if not task_text:
                 return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
             if pc:
-                r = bridge.enqueue_task(QUEUE_FROM_PC_DEV, task_text, lane="pc")
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEV, task_text, lane="pc")
                 if r.get("ok"):
                     return (f"✅ ТЗ {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
                             f"Статусы/красные вопросы/итог принесу в эту тему.")
@@ -357,13 +405,13 @@ def _try_enqueue(text, bridge, lane="vps"):
             if not task_text:
                 return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
             if theater == "pc":
-                r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text, lane="pc")
+                r = _enqueue_reliable(bridge, QUEUE_FROM_DEV, task_text, lane="pc")
                 if r.get("ok"):
                     return (f"✅ ТЗ {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт ПК-агент. "
                             f"Статусы/красные вопросы/итог принесу сюда, в тему постановки."
                             + _router_card("pc", note))
                 return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
-            r = bridge.enqueue_task(QUEUE_FROM_DEV, task_text)
+            r = _enqueue_reliable(bridge, QUEUE_FROM_DEV, task_text)
             if r.get("ok"):
                 return (f"✅ ТЗ {r.get('id')} в очереди (дев-режим, до 45 мин; демон возьмёт ~60с). "
                         f"Работает headless Claude Code: зелёное/оранжевое (вкл. restart splinter "
@@ -376,7 +424,7 @@ def _try_enqueue(text, bridge, lane="vps"):
             if not task_text:
                 return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
             if pc:
-                r = bridge.enqueue_task(QUEUE_FROM_PC, task_text, lane="pc")
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC, task_text, lane="pc")
                 if r.get("ok"):
                     return (f"✅ Задача {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
                             f"Принесу результат в эту тему, когда будет done/failed.")
@@ -385,13 +433,13 @@ def _try_enqueue(text, bridge, lane="vps"):
             if not task_text:
                 return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
             if theater == "pc":
-                r = bridge.enqueue_task(QUEUE_FROM, task_text, lane="pc")
+                r = _enqueue_reliable(bridge, QUEUE_FROM, task_text, lane="pc")
                 if r.get("ok"):
                     return (f"✅ Задача {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт "
                             f"ПК-агент. Результат принесу сюда, в тему постановки."
                             + _router_card("pc", note))
                 return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
-            r = bridge.enqueue_task(QUEUE_FROM, task_text)
+            r = _enqueue_reliable(bridge, QUEUE_FROM, task_text)
             if r.get("ok"):
                 return (f"✅ Задача {r.get('id')} поставлена в очередь — демон возьмёт её (опрос ~60с). "
                         f"Принесу результат сюда, когда будет done/failed."
