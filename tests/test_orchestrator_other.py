@@ -116,9 +116,12 @@ res.append(ok(fb.rows[conv["id"]]["status"] == "done"
               "конверт исполнился headless → done-отчёт (devbot принесёт в 328)"))
 
 # (2) билет 4.2 на конверт НЕ жжётся (демон красное сам не исполняет)
+# read-only проба `systemctl show run-*` (пауза приёма, фикс дыры 48d9c64/122) — НЕ хардкод,
+# из запрета исключена; хардкод-исполнители (git push / systemctl restart|is-active) — под запретом.
 print("(2) конверт без билета/хардкода:")
-res.append(ok(not any(a and a[0] in ("git", "systemctl") for a in fake_run.calls),
-              "хардкод-команды (git/systemctl) при конверте не звались"))
+res.append(ok(not any(a and (a[0] == "git" or (a[0] == "systemctl" and list(a[1:2]) != ["show"]))
+                      for a in fake_run.calls),
+              "хардкод-команды (git/systemctl кроме read-only show) при конверте не звались"))
 
 # (3) шаг декомпозиции: конверт запрещён (guard цепочки) → прежний failed + halt
 print("(3) шаг декомпозиции op=other → прежний failed:")

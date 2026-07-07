@@ -130,8 +130,8 @@ def _fail_card(out, err, rc):
 # `systemd-run --on-active=Ns systemctl restart orchestrator-daemon` ПОСЛЕДНИМ действием. Рестарт
 # гасит ВЕСЬ cgroup сервиса, включая claude -p самой задачи (SIGTERM → exit=143) — работа к этому
 # моменту СДЕЛАНА (RESULT в cc_log, commit в git), но демон метил задачу failed «claude -p упал».
-# Отличаем «убит запланированным рестартом» от настоящего падения по ЧЕТЫРЁМ обязательным
-# признакам (нужны ВСЕ; любое сомнение → False → прежний честный failed, fail-safe):
+# Отличаем «убит запланированным рестартом» от настоящего падения по обязательным признакам
+# (любое сомнение → прежний честный failed, fail-safe):
 #   1) exit-код SIGTERM (143 у CLI / -15 от subprocess) — SIGKILL/oom (137/-9) сюда НЕ попадают;
 #   2) демон САМ получил SIGTERM тем же моментом (_running=False): systemd гасит cgroup целиком;
 #      точечный kill claude-процесса или oom демона не трогают (_running останется True);
@@ -140,34 +140,93 @@ def _fail_card(out, err, rc):
 #      сработал ИЛИ run-*.service прямо сейчас гонит restart (он блокируется, пока демон не
 #      погашен — мы ещё живы и успеваем её увидеть). Ручной systemctl stop/restart из Termux
 #      такой единицы НЕ создаёт → останется честный failed.
+#
+# ФИКС ДЫРЫ класса 48d9c64 (урок задачи 122, 07.07.2026): признаки выше НЕ отличали СВОЙ рестарт
+# от ЧУЖОГО — задача, взятая в окно ЧУЖОГО отложенного рестарта (единица уже тикала, когда её
+# claude стартовал), гибла на СТАРТЕ и ложно закрывалась done+🔁 («фантомный done», работа
+# терялась). Два слоя:
+#   СЛОЙ 1 (профилактика, process_new): пока systemd-run-единица рестарта демона ЖИВА
+#     (ActiveState active/activating — таймер тикает или restart уже идёт) — новые задачи НЕ
+#     берём («пауза приёма»); они спокойно ждут в new, свежий демон возьмёт их после рестарта.
+#     Мёртвые/failed-остовы единиц паузу НЕ дают (иначе залипший остов заморозил бы приём).
+#   СЛОЙ 2 (детект, run_task): 5-й признак — ВРЕМЯ. Единица создана ДО старта claude задачи
+#     (min monotonic-меток единицы < time.monotonic() старта — одна шкала CLOCK_MONOTONIC)
+#     = ЧУЖОЙ рестарт → задача возвращается в new (клон дословно; НЕ failed — думателя зря не
+#     дёргаем) и переисполняется после рестарта. Создана ПОСЛЕ старта (или времени не видно —
+#     сомнение) = прежний путь 48d9c64: признак 3 (самомод-ТЗ) → done+🔁, иначе честный failed.
 _SIGTERM_RCS = (143, -15)
 _SELFMOD_RE = re.compile(r"orchestrator[-_ ]?daemon|самомодифика", re.IGNORECASE)
+_RESTART_NEEDLE = "restart orchestrator-daemon"
 
 
-def _deferred_restart_visible():
-    """True → systemd показывает transient-единицу systemd-run (run-*.timer / run-*.service),
-    чья Description содержит команду рестарта демона. Любой сбой пробы = False (fail-safe)."""
+def _restart_probe():
+    """ОДИН systemctl-вызов → свойства transient-единиц systemd-run (run-*.timer/service),
+    чей блок содержит команду рестарта демона. Возврат (visible, pending, earliest_mono_sec):
+      visible  — единица видна (признак 4, как в 48d9c64);
+      pending  — единица ЖИВА (ActiveState active/activating): окно, в котором новые задачи
+                 брать нельзя (слой 1); мёртвый/failed остов паузы НЕ даёт;
+      earliest — самая ранняя monotonic-метка (сек с boot; шкала = time.monotonic()) среди
+                 таких единиц ≈ момент создания systemd-run; None = времени не видно (сомнение).
+    Любой сбой пробы = (False, False, None) — fail-safe: детект молчит, приём не встаёт."""
     try:
         p = subprocess.run(
-            ["systemctl", "list-units", "--all", "--plain", "--no-legend",
-             "run-*.service", "run-*.timer"],
+            ["systemctl", "show", "run-*.service", "run-*.timer",
+             "--property=Id,Description,ActiveState,"
+             "ActiveEnterTimestampMonotonic,InactiveExitTimestampMonotonic"],
             capture_output=True, text=True, timeout=10)
-        return "restart orchestrator-daemon" in (p.stdout or "")
+        out = p.stdout or ""
     except Exception as e:
         log.warning("planned-restart: проба systemctl не отработала (%s) — считаю НЕплановым", e)
-        return False
+        return False, False, None
+    visible, pending, earliest = False, False, None
+    for block in out.split("\n\n"):
+        if _RESTART_NEEDLE not in block:
+            continue
+        visible = True
+        state = ""
+        for line in block.splitlines():
+            k, _sep, v = line.partition("=")
+            k, v = k.strip(), v.strip()
+            if k == "ActiveState":
+                state = v
+            elif k in ("ActiveEnterTimestampMonotonic", "InactiveExitTimestampMonotonic"):
+                try:
+                    usec = int(v)
+                except ValueError:
+                    continue
+                if usec > 0 and (earliest is None or usec / 1e6 < earliest):
+                    earliest = usec / 1e6
+        if state in ("active", "activating"):
+            pending = True
+    return visible, pending, earliest
 
 
-def _killed_by_planned_restart(rc, task_text):
-    """True → claude -p задачи убит ЗАПЛАНИРОВАННЫМ отложенным рестартом демона (самомодификация),
-    НЕ настоящее падение. Все 4 признака обязательны — см. комментарий блока выше."""
+def _restart_pending():
+    """True → отложенный плановый рестарт демона ЖИВ в systemd (слой 1: пауза приёма new)."""
+    return _restart_probe()[1]
+
+
+def _planned_restart_verdict(rc, task_text, t0_mono):
+    """Классификация гибели claude -p задачи (см. блок-комментарий выше):
+      None      — НЕ плановый рестарт → прежний честный failed;
+      "own"     — СВОЙ рестарт (самомод-задача поставила единицу ПОСЛЕ своего старта,
+                  работа сделана) → done+🔁 (фикс 48d9c64, байт-в-байт);
+      "foreign" — ЧУЖОЙ рестарт (единица создана ДО старта claude этой задачи — гибель на
+                  старте, работа НЕ делалась) → возврат задачи в new (фикс дыры, урок 122).
+    Fail-safe: времени не видно / сомнение → ветка own только при самомод-признаке в ТЗ
+    (прежние 4 признака), иначе None — не хуже 48d9c64."""
     if rc not in _SIGTERM_RCS:
-        return False
+        return None
     if _running:
-        return False
-    if not _SELFMOD_RE.search(str(task_text or "")):
-        return False
-    return _deferred_restart_visible()
+        return None
+    visible, _pending, earliest = _restart_probe()
+    if not visible:
+        return None
+    if earliest is not None and t0_mono is not None and earliest < t0_mono:
+        return "foreign"
+    if _SELFMOD_RE.search(str(task_text or "")):
+        return "own"
+    return None
 
 
 # === АВТО-ПЕРЕЧЕНЬ красных op (п.4 узкий, штаб 19.06) — РОВНО два, оба обратимы ===
@@ -410,7 +469,8 @@ def _task_timeout(task):
 
 def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
-    status ∈ done|failed|needs_approval (красная зона — самодекларация claude через маркер).
+    status ∈ done|failed|needs_approval|requeue (needs_approval — красная зона, самодекларация
+    claude через маркер; requeue — гибель от ЧУЖОГО планового рестарта, вернуть задачу в new).
     preamble: None → боевая APPROVAL_PREAMBLE; планировщик декомпозиции передаёт PLANNER_PREAMBLE."""
     log.info("ИСПОЛНЕНИЕ id=%s через claude -p (timeout=%ss)", task_id, task_timeout)
     child_env = dict(os.environ)
@@ -436,6 +496,8 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
            "--fallback-model", ORCH_MODEL_FALLBACK,
            "--output-format", "json",
            prompt]                          # список аргументов, БЕЗ shell → нет инъекции через task_text
+    # старт claude задачи по CLOCK_MONOTONIC — опора 5-го признака (свой/чужой плановый рестарт)
+    t0_mono = time.monotonic()
     try:
         proc = subprocess.run(
             cmd,
@@ -483,8 +545,17 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
         return "needs_approval", what[:RESULT_MAX]
 
     if proc.returncode != 0:
-        # фикс класса (урок 105): убит ПЛАНОВЫМ рестартом демона (самомодификация) → это НЕ сбой
-        if _killed_by_planned_restart(proc.returncode, task_text):
+        # фикс класса (урок 105): убит ПЛАНОВЫМ рестартом демона (самомодификация) → это НЕ сбой;
+        # фикс дыры 48d9c64 (урок 122): ЧУЖОЙ рестарт (единица старше старта claude) → гибель на
+        # старте, работа не делалась → возврат задачи в new (requeue), НЕ done+🔁 и НЕ failed.
+        planned = _planned_restart_verdict(proc.returncode, task_text, t0_mono)
+        if planned == "foreign":
+            log.info("id=%s claude -p погашен ЧУЖИМ плановым рестартом демона (exit=%s) → возврат в new",
+                     task_id, proc.returncode)
+            return "requeue", (
+                "🔄 Задача взята в окно ЧУЖОГО планового рестарта демона и погашена на старте — "
+                "работа НЕ выполнялась. Возвращаю в очередь: исполнится заново после рестарта.")
+        if planned == "own":
             log.info("id=%s claude -p погашен ПЛАНОВЫМ рестартом демона (exit=%s) → done с пометкой",
                      task_id, proc.returncode)
             return "done", (
@@ -1540,6 +1611,10 @@ def _dec_plan_and_fanout(tid, task_text, frm=""):
     pc = (frm == PC_DEC_FROM)
     preamble = PLANNER_PREAMBLE + (PLANNER_PC_NOTE if pc else "")
     status, out = run_task(tid, task_text, task_timeout=TASK_TIMEOUT_DEV, preamble=preamble)
+    if status == "requeue":
+        # чужой плановый рестарт погасил планировщик на старте → родитель возвращается в new
+        _requeue_foreign_restart(tid, frm, task_text, out)
+        return
     if status != "done":
         # планировщик read-only: needs_approval от него = аномалия → честный failed, не кнопка
         bc.complete_task(tid, "failed", f"декомпозиция не удалась (планировщик {status}): {out}"[:RESULT_MAX])
@@ -1698,6 +1773,33 @@ def process_approved():
         _maybe_dec_after(task.get("task_text"), status)   # шаг декомпозиции → halt/сводка
 
 
+def _requeue_foreign_restart(tid, frm, text, note):
+    """СЛОЙ 2 фикса дыры 48d9c64 (урок 122): задача погашена ЧУЖИМ плановым рестартом на старте —
+    работа НЕ делалась. Bridge completeTask_ принимает только done|failed → «возврат в new» =
+    клон задачи ДОСЛОВНО (тот же текст — шаг декомпозера сохраняет маркер [шаг i/N], одиночная —
+    полосу from и таймаут) + исходная закрывается done с маркер-картой 🔄. НЕ failed: думатель
+    самопочинки зря не дёргается, цепочка декомпозера не глушится (сводка возьмёт финал клона —
+    последняя запись номера шага по id). Хуки цепи НЕ зовём: клон в new держит цепь живой
+    (guard'ы process_new/_maybe_plan_adapt его видят). Клон не встал → честный failed
+    (не потерять задачу молча)."""
+    frm = str(frm or "") or f"Filipp-328{DEV_FROM_SUFFIX}"
+    r = bc.enqueue_task(frm, text)
+    if not r.get("ok"):
+        log.warning("FOREIGN-RESTART id=%s клон не встал в очередь (%s) → честный failed",
+                    tid, r.get("error"))
+        bc.complete_task(tid, "failed",
+                         (f"погашена чужим плановым рестартом демона на старте (работа не "
+                          f"делалась), возврат в очередь не встал ({r.get('error')}) — повтори "
+                          f"задачу")[:RESULT_MAX])
+        _maybe_dec_after(text, "failed")
+        return
+    nid = r.get("id")
+    bc.complete_task(tid, "done",
+                     (f"{note}\nВозвращена в очередь задачей id {nid} (текст дословно, полоса "
+                      f"from та же) — исполнится после рестарта демона.")[:RESULT_MAX])
+    log.info("FOREIGN-RESTART id=%s → возвращена в new задачей %s", tid, nid)
+
+
 def process_new():
     """Взять старейшую new-задачу, исполнить через claude -p, записать результат/needs_approval."""
     r = bc.get_pending("new")
@@ -1706,6 +1808,14 @@ def process_new():
         return
     items = r.get("items", [])
     if not items:
+        return
+    # СЛОЙ 1 фикса дыры 48d9c64 (урок 122) — ПРОФИЛАКТИКА: в systemd жив отложенный плановый
+    # рестарт демона (таймер тикает / restart уже идёт) → новые задачи НЕ берём — взятая сейчас
+    # погибнет на старте вместе с нами. Задачи спокойно ждут в new; после рестарта свежий демон
+    # возьмёт их как обычно. Сбой пробы → паузы нет (fail-safe, поведение как было).
+    if _restart_pending():
+        log.info("пауза приёма: жду планового рестарта демона (systemd-run-единица жива) — "
+                 "%d задач(и) ждут в new", len(items))
         return
     # FIFO: get_pending отдаёт newest-first → берём наименьший id (старейшую задачу) первым.
     # Шаг декомпозиции, чей сиблинг ждёт (needs_approval/approved/in_progress), пропускаем —
@@ -1781,6 +1891,10 @@ def process_new():
             return
 
     status, result = run_task(tid, text, task_timeout=_task_timeout(task))
+    if status == "requeue":
+        # чужой плановый рестарт погасил задачу на старте → вернуть в new (слой 2 фикса 122)
+        _requeue_foreign_restart(tid, task.get("from"), text, result)
+        return
     if status == "needs_approval":
         if _is_convert(text):
             # СЛОЙ 1 (ядро): конверт снова упёрся в красное → headless ДОКАЗАННО не может. НЕ ставим
