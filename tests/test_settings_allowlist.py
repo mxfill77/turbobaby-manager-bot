@@ -18,6 +18,14 @@ Headless не может писать в .claude/ (гейт движка) → с
   cp _claspsplit_new_settings.json .claude/settings.json
   cp _claspsplit_new_settings.local.json .claude/settings.local.json
 Пока не применён — тест проверяет подготовленные файлы и печатает WARN (как test_settings_deferred_restart).
+
+UX-фикс №2 (08.07.2026, вердикт диагностики 13:09): env-префикс перед интерпретатором ломает
+allow-матч движка — `PRETOOL_NOPUSH=1 venv/bin/python3 x` НЕ матчится `Bash(venv/bin/python3 *)`.
+Лечение: в local — литеральные env-ДУБЛИ интерпретаторных правил. Форма подтверждена живым probe
+(_envfix_probe.py, как в de36412): ctrl2 BLOCKED (баг есть) / litecho+pytest_dup RAN (дубль матчится).
+Внимание конфаунду probe: hook pretool_guard сам ask'ает `… venv/bin/python3 --version` с префиксом
+(hook бьёт allow) — probe-команды брать guard-deferred (echo / tests/*.py). Ask-список by design
+не тронут: env-дубли покрывают ТОЛЬКО интерпретаторы, clasp/sqlite3/stop/sudo остаются ask/prompt.
 """
 import json
 import os
@@ -71,6 +79,36 @@ OWNER_ALLOW = [
     "clasp create-version",
 ]
 
+# Пары «правило + env-дубль» (UX-фикс №2): base — в объединённом интерактив-allow,
+# дубль — в local-allow; форма дубля = литеральный префикс, probe-подтверждена.
+ENV_DUPS = [
+    ("Bash(venv/bin/python3 *)", "Bash(PRETOOL_NOPUSH=1 venv/bin/python3 *)"),
+    ("Bash(venv/bin/python *)", "Bash(PRETOOL_NOPUSH=1 venv/bin/python *)"),
+    ("Bash(/root/turbobaby-manager-bot/venv/bin/python3 *)",
+     "Bash(PRETOOL_NOPUSH=1 /root/turbobaby-manager-bot/venv/bin/python3 *)"),
+    ("Bash(node *)", "Bash(PRETOOL_NOPUSH=1 node *)"),
+    ("Bash(/root/turbobaby-manager-bot/venv/bin/python3 *)",
+     "Bash(DOWRITE=1 /root/turbobaby-manager-bot/venv/bin/python3 *)"),
+    ("Bash(venv/bin/python3 *)", "Bash(DOWRITE=1 venv/bin/python3 *)"),
+]
+
+# Env-префиксные команды владельца — после дублей ДОЛЖНЫ быть allow (интерактив).
+ENV_GREEN = [
+    "PRETOOL_NOPUSH=1 venv/bin/python3 tests/test_cclog.py",
+    "PRETOOL_NOPUSH=1 venv/bin/python3 gate.py",
+    "PRETOOL_NOPUSH=1 /root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/_recon.py",
+    "PRETOOL_NOPUSH=1 node --check /root/turbobaby-bridge-gs/Bridge.js",
+]
+
+# Env-префикс НЕ должен открывать красное/ask-зону НИ в одной роли (дубли только на интерпретаторы).
+ENV_NO_ALLOW = [
+    "PRETOOL_NOPUSH=1 clasp push",
+    "PRETOOL_NOPUSH=1 clasp deploy",
+    "DOWRITE=1 sqlite3 memory.db .tables",
+    "FOO=1 systemctl stop splinter",
+    "PRETOOL_NOPUSH=1 sudo systemctl restart nginx",
+]
+
 # Опасное для ВСЕХ ролей: ask даже у владельца.
 OWNER_STILL_ASK = [
     "clasp deploy",            # создаёт НОВЫЙ деплой → смена URL → Splinter отвалится
@@ -116,14 +154,16 @@ def ok(c, label):
 live_proj = json.load(open(SETTINGS))["permissions"]
 live_local = json.load(open(LOCAL))["permissions"]
 applied_proj = "Bash(clasp push*)" not in live_proj.get("ask", [])
-applied_local = "Bash(clasp push*)" in live_local.get("allow", [])
+applied_local = ("Bash(clasp push*)" in live_local.get("allow", [])
+                 and all(dup in live_local.get("allow", []) for _, dup in ENV_DUPS))
 proj = live_proj if applied_proj else json.load(open(PREPARED_PROJ))["permissions"]
 local = live_local if applied_local else json.load(open(PREPARED_LOCAL))["permissions"]
 if applied_proj and applied_local:
     print("settings: сплит ПРИМЕНЁН — проверяю живые project+local файлы")
 else:
-    print("WARN: роль-сплит применён не полностью (project: %s, local: %s; headless в .claude/ "
-          "не пишет) — недостающее проверяю по подготовленным _claspsplit_new_settings*.json; "
+    print("WARN: роль-сплит/env-дубли применены не полностью (project: %s, local: %s — local "
+          "должен нести и clasp-allow, и env-дубли UX-фикса №2; headless в .claude/ не пишет) — "
+          "недостающее проверяю по подготовленным _claspsplit_new_settings*.json; "
           "применение из Termux:\n"
           "  cp _claspsplit_new_settings.json .claude/settings.json\n"
           "  cp _claspsplit_new_settings.local.json .claude/settings.local.json\n"
@@ -161,6 +201,21 @@ for cmd in RED_DENY:
     res.append(ok(classify(cmd, ia) == "deny", "интерактив: " + cmd + " → deny"))
 for cmd in GREEN:
     res.append(ok(classify(cmd, ia) == "allow", "интерактив: " + cmd + " → allow"))
+
+print("ENV-ДУБЛИ (UX-фикс №2): пара «правило + env-дубль», зелёный env-префикс allow, красное не открыто:")
+for base, dup in ENV_DUPS:
+    res.append(ok(base in ia["allow"], "env-пара: базовое правило на месте: " + base))
+    res.append(ok(dup in local.get("allow", []), "env-пара: дубль в local: " + dup))
+for cmd in ENV_GREEN:
+    res.append(ok(classify(cmd, ia) == "allow", "интерактив env: " + cmd + " → allow"))
+for cmd in ENV_NO_ALLOW:
+    res.append(ok(not matches(cmd, ia["allow"]),
+                  "интерактив env: " + cmd + " → allow-матчей НЕТ (prompt/ask)"))
+    res.append(ok(not matches(cmd, merge(proj, headless_layer, local)["allow"]),
+                  "headless env (даже с local): " + cmd + " → allow-матчей НЕТ"))
+res.append(ok(all(inner(dup) is not None and "clasp" not in dup and "sqlite3" not in dup
+                  and "systemctl" not in dup and "sudo" not in dup for _, dup in ENV_DUPS),
+              "env-дубли покрывают только интерпретаторы (нет clasp/sqlite3/systemctl/sudo)"))
 
 print("Headless-конфиг: только ask-забор, БЕЗ allow/deny-правок; демон передаёт его через --settings:")
 res.append(ok(not headless_layer.get("allow") and not headless_layer.get("deny"),

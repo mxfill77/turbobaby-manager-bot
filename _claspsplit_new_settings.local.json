@@ -45,7 +45,12 @@
       "Bash(clasp deployments*)",
       "Bash(clasp version*)",
       "Bash(clasp versions*)",
-      "Bash(clasp create-version*)"
+      "Bash(clasp create-version*)",
+      "Bash(PRETOOL_NOPUSH=1 venv/bin/python3 *)",
+      "Bash(PRETOOL_NOPUSH=1 venv/bin/python *)",
+      "Bash(PRETOOL_NOPUSH=1 /root/turbobaby-manager-bot/venv/bin/python3 *)",
+      "Bash(PRETOOL_NOPUSH=1 node *)",
+      "Bash(DOWRITE=1 venv/bin/python3 *)"
     ],
     "ask": []
   }
