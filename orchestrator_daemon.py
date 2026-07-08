@@ -1860,6 +1860,39 @@ def process_orphans():
         _maybe_dec_after(text, "failed")
 
 
+def _claim_task_verified(tid):
+    """ФИКС КОРНЯ повторных сирот (138 вчера, 146 сегодня — 08.07.2026): claim-verify по образцу
+    _enqueue_reliable. Инцидент 146 (лог 03:44 UTC): 1-й POST claim ИСПОЛНИЛСЯ сервер-сайд, но
+    глючный echo-слой Google вернул unauthorized → auth-resend клиента получил already_claimed
+    ОТ СВОЕГО ЖЕ долетевшего claim'а → демон счёл claim чужим и пропустил цикл → задача сирота
+    in_progress до реапера (~10 мин простоя). Claim НЕ идемпотентен (в _IDEMPOTENT_POST_ACTIONS
+    не вносить — слепой re-POST брал бы уже чужое), поэтому именно verify: после клиентского
+    сбоя claim — немедленный read-only GET in_progress СВОЕЙ полосы (vps). Worker-колонки в
+    очереди нет; доказательство владения = одно-воркерность полосы: claim vps-задач делает
+    ТОЛЬКО этот демон (pc claim'ит pc_orchestrator, synthetic-задачи имеют свои id), а кандидат
+    секунды назад был new в ЭТОМ ЖЕ цикле — значит in_progress сейчас может быть только НАШ
+    долетевший claim → считаем claim успешным, исполняем штатно, сироты нет.
+    Задачи нет в in_progress (claim реально не долетел) / статус иной / verify сам сбоит →
+    как раньше: пропуск цикла (fail-safe, не хуже прежнего; настоящее застревание добьёт реапер
+    process_orphans по ORPHAN_TTL). Семантические отказы not_found/wrong_lane/no_id verify не
+    дёргают — там claim заведомо не наш. Тесты tests/test_claim_verify.py (в гейте)."""
+    cl = bc.claim_task(tid)
+    if cl.get("ok"):
+        return cl
+    err = str(cl.get("error") or "")
+    if err in ("not_found", "wrong_lane", "no_id"):
+        return cl
+    try:
+        vr = bc.get_pending("in_progress")
+        if vr.get("ok") and any(str(it.get("id")) == str(tid) for it in (vr.get("items") or [])):
+            log.warning("CLAIM-VERIFY id=%s: клиентский сбой claim (%s), но задача in_progress "
+                        "на моей полосе — claim долетел, исполняю штатно (сироты нет)", tid, err)
+            return {"ok": True, "verified": True}
+    except Exception as e:
+        log.warning("CLAIM-VERIFY id=%s: verify не удался (%s) — прежний пропуск цикла", tid, e)
+    return cl
+
+
 def process_new():
     """Взять старейшую new-задачу, исполнить через claude -p, записать результат/needs_approval."""
     r = bc.get_pending("new")
@@ -1914,7 +1947,7 @@ def process_new():
     text = str(task.get("task_text") or "")
     log.info("NEW id=%s from=%s text=%.120s", tid, task.get("from"), text)
 
-    cl = bc.claim_task(tid)
+    cl = _claim_task_verified(tid)
     if not cl.get("ok"):
         log.info("claim id=%s не удался (%s) — пропускаю в этом цикле", tid, cl.get("error"))
         return
