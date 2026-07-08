@@ -350,6 +350,14 @@ _INTAKE_DRAFTS = {}
 # Связывает фото↔карточку в обе стороны (фото могло прийти ДО или ПОСЛЕ карточки, окно 5 мин).
 _INTAKE_PASSPORT = {}
 
+# O3-3a ВЫДАЧА: ожидающая подтверждения активация брони (Бронь→В аренде) — {chat_id: {...}}.
+# Карточка уходит в INTAKE_CHAT (авторизаторы = INTAKE_APPROVERS; Пым/тайцы НЕ авторизуют — §9),
+# «да» исполняется красным шагом под билетом 4.2. Один активный запрос на чат, TTL как approve.
+_HANDOVER_ACTIVATIONS = {}
+_HO_ACT_TTL = 1800          # сек; просроченный запрос «да» больше не исполняет
+_HO_ACT_WARN_TS = {}        # bike → ts последнего ⚠️ «бронь не нашёл» (анти-спам повторных handover-фраз)
+_HO_ACT_WARN_COOLDOWN = 600
+
 # Стандартный денежный депозит по модели (из прайса) — для ПОКАЗА в резюме (этап A не пишет).
 # Порядок важен: специфичные/дорогие выше, иначе короткий ключ перехватит.
 _DEPOSIT_BY_MODEL = [
@@ -4019,6 +4027,63 @@ def _closing_resolve_booking(bridge, bike):
     return (last.get("booking_id") or None, last.get("name") or "", last.get("date_end") or "")
 
 
+def _handover_resolve_activation(bridge, bike):
+    """O3-3a: кандидат на активацию при выдаче. Последняя строка CRM по байку со статусом
+    Бронь/В аренде → dict {row, name, date_start, date_end, status} или None (брони нет).
+    status=="в аренде" → активировать нечего (уже активна) — решает вызыватель."""
+    try:
+        cl = bridge._call("clients", filter="all").get("data", {})
+        rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
+    except Exception:
+        return None
+    want = plateFromName_(bike)
+    cand = [c for c in rows if plateFromName_(str(c.get("bike", ""))) == want
+            and str(c.get("status", "")).strip().lower() in ("бронь", "в аренде")]
+    if not cand:
+        return None
+    last = cand[-1]
+    return {"row": last.get("row"), "name": last.get("name") or "",
+            "date_start": str(last.get("date_start") or ""),
+            "date_end": str(last.get("date_end") or ""),
+            "status": str(last.get("status", "")).strip().lower()}
+
+
+async def _handover_activation_card(context, bridge, bike):
+    """O3-3a: на handover-контексте предложить активацию брони (Бронь→В аренде) карточкой
+    в INTAKE_CHAT (там авторизаторы INTAKE_APPROVERS). Сама активация — ТОЛЬКО после «да»,
+    красным шагом 4.2 в _handle_intake. Брони нет → ⚠️ «активируй руками» (handover не падает)."""
+    cand = _handover_resolve_activation(bridge, bike)
+    now = _time.time()
+    if cand is None:
+        # анти-спам: повторные handover-фразы по тому же байку не дублируют ⚠️ чаще кулдауна
+        if now - _HO_ACT_WARN_TS.get(bike, 0) < _HO_ACT_WARN_COOLDOWN:
+            return
+        _HO_ACT_WARN_TS[bike] = now
+        log.info(f"  → ВЫДАЧА {bike}: брони в CRM не нашёл — ⚠️ во Входящие, активация руками")
+        await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                    text=f"🐀 Splinter\n⚠️ ВЫДАЧА {bike}: брони в CRM не нашёл (байк/имя/дата) — "
+                         f"активируй руками (Бронь→В аренде).")
+        return
+    if cand.get("status") == "в аренде":
+        log.info(f"  → ВЫДАЧА {bike}: строка {cand.get('row')} уже «В аренде» — активация не нужна")
+        return
+    prev = _HANDOVER_ACTIVATIONS.get(INTAKE_CHAT)
+    if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
+            and now - prev.get("ts", 0) <= _HO_ACT_TTL):
+        return   # та же бронь уже ждёт «да» — карточку не дублируем
+    _HANDOVER_ACTIVATIONS[INTAKE_CHAT] = {
+        "bike": bike, "name": cand["name"], "date_start": cand["date_start"],
+        "row": cand.get("row"), "ts": now, "status": "awaiting",
+    }
+    dates = (cand["date_start"] + " — " + cand["date_end"]).strip(" —")
+    log.info(f"  → ВЫДАЧА {bike}: карточка активации во Входящие (строка {cand.get('row')}, "
+             f"клиент {cand['name'] or '—'})")
+    await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                text=(f"🐀 Splinter\n🏍 ВЫДАЧА: {bike} → {cand['name'] or '—'}, "
+                      f"бронь строка {cand.get('row')} ({dates or 'даты —'}).\n"
+                      f"Активирую (Бронь→В аренде)? да / нет"))
+
+
 def _closing_crm_debt(bridge, bike):
     """Долг (CRM I/J) активной брони байка для чек-листа. None если не нашли."""
     try:
@@ -4817,6 +4882,12 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                      + ("" if _bid else " | бронь не найдена (детали добьются позже)"))
         except Exception as e:
             log.warning(f"  → state выдача не удалась: {e}")
+        # O3-3a ДОПОЛНЕНИЕ (state-путь выше не трогаем): предложить активацию брони в CRM
+        # карточкой аппруверам. Свой try — сбой активационной ветки handover НЕ ломает.
+        try:
+            await _handover_activation_card(context, bridge, bike)
+        except Exception as e:
+            log.warning(f"  → карточка активации выдачи не удалась: {e}")
     elif _ho_ctx and not bike:
         log.info("  → state выдача пропущена: handover-ctx, но bike пуст (не пишем мусор)")
 
@@ -5350,6 +5421,45 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             await _send(context, chat_id=chat_id,
                         text="🐀 Splinter\n✏️ Принял, жду исправленную карточку.", bilingual=False, message_thread_id=tid)
         return
+
+    # 4) O3-3a: подтверждение активации выдачи (Бронь→В аренде) — ТОЛЬКО авторизаторы
+    #    (INTAKE_APPROVERS; Пым/тайцы не авторизуют), ТОЛЬКО пока запрос свежий (TTL).
+    #    Ветка ПОСЛЕ intake-draft (та выше возвращается сама — приоритет брони не сломан).
+    act = _HANDOVER_ACTIVATIONS.get(chat_id)
+    if (act and act.get("status") == "awaiting" and _intake_can_approve(msg)
+            and now - act.get("ts", 0) <= _HO_ACT_TTL):
+        low = text.lower()
+        tid = getattr(msg, "message_thread_id", None)
+        if any(w in low for w in ("да", "ок", "активируй", "подтвержд")):
+            _who = msg.from_user.username if msg.from_user else "?"
+            # --- КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write) ---
+            try:
+                ticket = (bridge.issue_write_ticket() or {}).get("ticket")
+                with bridge_client.agent_write(ticket):
+                    res = bridge.activate_booking(bike=act["bike"], name=act["name"],
+                                                  date_start=(act.get("date_start") or None))
+            except Exception as e:
+                res = {"ok": False, "error": "exception", "message": str(e)}
+            if res.get("ok"):
+                act["status"] = "activated"
+                _row = res.get("row") or act.get("row")
+                log.info(f"  → ВЫДАЧА: бронь активирована (строка {_row}, @{_who}) {act['bike']}")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text=f"🐀 Splinter\n✅ В аренде, строка {_row}.")
+            else:
+                act["status"] = "error"
+                _err = res.get("error") or "?"
+                _emsg = res.get("message") or ""
+                log.warning(f"  → ВЫДАЧА: активация НЕ прошла ({_err}: {_emsg}) {act['bike']}")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text=f"🐀 Splinter\n❌ Активация не прошла: {_err}. {_emsg}\n"
+                                 f"Статус в CRM не менял — переведи руками.")
+            return
+        if any(w in low for w in ("нет", "отмена", "не актив", "отклон")):
+            act["status"] = "rejected"
+            await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                        text="🐀 Splinter\n❌ Активацию отменил — статус в CRM не менял.")
+            return
 
 
 async def _handle_delivery(msg, context, bridge, claude):
