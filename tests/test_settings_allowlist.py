@@ -1,94 +1,87 @@
-"""Регресс расширения allow-листа .claude/settings.json (заведено 06.07.2026).
+"""Страж permissions: allow-лист + РОЛЬ-РАЗВОД интерактив/headless (обновлено 08.07.2026).
 
-Цель правки: частые БЕЗОПАСНЫЕ команды (read-only утилиты, git-читалки, python --version,
-tmux capture) перестают падать в дефолт-prompt → уходят в allow. КРАСНОЕ (sqlite3 CLI, clasp
-push/redeploy/deploy/run, systemctl stop, sudo systemctl) остаётся ask; deny остаётся deny.
+История: 06.07 расширен allow (read-only утилиты); 08.07 permissions разведены ПО РОЛЯМ:
+  - ИНТЕРАКТИВ владельца (Termux): clasp push/redeploy/deployments/version(s)/create-version
+    в allow через .claude/settings.local.json (гит его игнорит глобально) — ноль промптов
+    при исполнении одобренных конвертов. clasp deploy (создаёт НОВЫЙ деплой, ломает URL) и
+    clasp run — остаются ask ВЕЗДЕ.
+  - HEADLESS (orchestrator_daemon → claude -p): демон передаёт `--settings headless_settings.json`
+    (git-истина, корень репо) — ask на ВСЮ clasp-запись. Precedence deny>ask>allow действует
+    поверх всех источников → headless-ask бьёт allow из local владельца: забор цел, даже если
+    local загружен. В -p режиме ask = авто-отказ → NEEDS_APPROVAL, как раньше.
 
-ГЛАВНАЯ проверка регресса: НИ ОДИН новый allow-паттерн не задел красное — для каждой красной
-команды classify() всё ещё возвращает ask/deny, и ни одно allow-правило её не матчит.
+ГЛАВНАЯ проверка: строгость ИМЕННО headless-пути = git-истина (project settings) + headless-конфиг;
+live-файл владельца .claude/settings.local.json headless-проверка НЕ читает (его содержимое не
+влияет на вердикт — забор доказывается симуляцией «local разрешил clasp» поверх headless-слоя).
 
-Headless не может писать в .claude/settings.json (гейт движка) → правка внесётся разовым
-`cp _allow_new_settings.json .claude/settings.json` из Termux. Пока не внесена — тест проверяет
-подготовленный _allow_new_settings.json и печатает WARN (как test_settings_deferred_restart).
+Headless не может писать в .claude/ (гейт движка) → сплит применяется разово из Termux:
+  cp _claspsplit_new_settings.json .claude/settings.json
+  cp _claspsplit_new_settings.local.json .claude/settings.local.json
+Пока не применён — тест проверяет подготовленные файлы и печатает WARN (как test_settings_deferred_restart).
 """
 import json
 import os
+import subprocess
 import sys
 from fnmatch import fnmatchcase
 
 ROOT = "/root/turbobaby-manager-bot"
 SETTINGS = os.path.join(ROOT, ".claude", "settings.json")
-PREPARED = os.path.join(ROOT, "_allow_new_settings.json")
+LOCAL = os.path.join(ROOT, ".claude", "settings.local.json")
+HEADLESS = os.path.join(ROOT, "headless_settings.json")
+PREPARED_PROJ = os.path.join(ROOT, "_claspsplit_new_settings.json")
+PREPARED_LOCAL = os.path.join(ROOT, "_claspsplit_new_settings.local.json")
+DAEMON_SRC = os.path.join(ROOT, "orchestrator_daemon.py")
 
-# Представительный маркер применённости (одна из НОВЫХ зелёных строк).
-MARKER = "Bash(jq *)"
-
-# Новые (или уже бывшие) ЗЕЛЁНЫЕ — должны классифицироваться allow.
+# Зелёные — классифицируются allow (набор 06.07, не должен сломаться сплитом).
 GREEN = [
-    "echo hello",
-    "printf '%s' x",
-    "jq '.a' /tmp/x.json",
-    "rg TODO splinter.py",
-    "tr a b",
-    "comm -12 a b",
-    "column -t x",
-    "file splinter.py",
-    "basename /a/b",
-    "dirname /a/b",
-    "realpath .",
-    "readlink -f splinter.py",
-    "which python3",
-    "command -v git",
-    "printenv PATH",
-    "env",
-    "md5sum splinter.py",
-    "sha256sum splinter.py",
-    "du -sh .",
-    "df -h",
-    "ps aux",
-    "free -m",
-    "uptime",
-    "whoami",
-    "journalctl -u splinter -n 50",
-    "git ls-files",
-    "git grep TODO",
-    "git blame splinter.py",
-    "git shortlog -sn",
-    "git describe --tags",
-    "git reflog",
-    "git tag",
-    "git tag -l 'v*'",
-    "python3 --version",
-    "python3 -V",
-    "python3 -m py_compile splinter.py",
+    "echo hello", "printf '%s' x", "jq '.a' /tmp/x.json", "rg TODO splinter.py",
+    "tr a b", "comm -12 a b", "column -t x", "file splinter.py", "basename /a/b",
+    "dirname /a/b", "realpath .", "readlink -f splinter.py", "which python3",
+    "command -v git", "printenv PATH", "env", "md5sum splinter.py", "sha256sum splinter.py",
+    "du -sh .", "df -h", "ps aux", "free -m", "uptime", "whoami",
+    "journalctl -u splinter -n 50", "git ls-files", "git grep TODO", "git blame splinter.py",
+    "git shortlog -sn", "git describe --tags", "git reflog", "git tag", "git tag -l 'v*'",
+    "python3 --version", "python3 -V", "python3 -m py_compile splinter.py",
     "tmux capture-pane -p",
-    # прежние зелёные — не должны сломаться
-    "grep -n X splinter.py",
-    "systemctl restart splinter",
-    "git push",
-    "venv/bin/python3 gate.py",
+    "grep -n X splinter.py", "systemctl restart splinter", "git push", "venv/bin/python3 gate.py",
 ]
 
-# КРАСНОЕ — должно остаться ask (и НИ ОДИН allow-паттерн его не матчит).
-RED_ASK = [
-    "sqlite3 memory.db .tables",
-    "sqlite3 memory.db 'UPDATE x SET a=1'",
+# clasp-ЗАПИСЬ: в headless — строго ask (авто-отказ в -p), НИ ОДИН allow headless-источников не матчит.
+CLASP_WRITE = [
     "clasp push",
+    "clasp push --force",
     "clasp redeploy AKfycb...",
     "clasp deploy",
+    "clasp deploy AKfycb...",
     "clasp run setupBrain",
+    "clasp version 66",
+    "clasp create-version",
+    "clasp deployments",
+]
+
+# Владельцу в ИНТЕРАКТИВЕ — allow (одобренные конверты без промптов).
+OWNER_ALLOW = [
+    "clasp push",
+    "clasp push --force",
+    "clasp redeploy AKfycb...",
+    "clasp deployments",
+    "clasp version 66",
+    "clasp versions",
+    "clasp create-version",
+]
+
+# Опасное для ВСЕХ ролей: ask даже у владельца.
+OWNER_STILL_ASK = [
+    "clasp deploy",            # создаёт НОВЫЙ деплой → смена URL → Splinter отвалится
+    "clasp deploy AKfycb...",
+    "clasp run setupBrain",
+    "sqlite3 memory.db .tables",
     "systemctl stop splinter",
-    "systemctl stop orchestrator-daemon",
     "sudo systemctl restart nginx",
 ]
 
-# DENY — остаётся deny.
-RED_DENY = [
-    "git push --no-verify",
-    "git push --force",
-    "git push -f origin main",
-    "rm -rf /",
-]
+RED_DENY = ["git push --no-verify", "git push --force", "git push -f origin main", "rm -rf /"]
 
 
 def inner(rule):
@@ -97,6 +90,15 @@ def inner(rule):
 
 def matches(cmd, rules):
     return [r for r in rules if inner(r) is not None and fnmatchcase(cmd, inner(r))]
+
+
+def merge(*perms_list):
+    """Слить permissions нескольких источников (модель движка: зоны объединяются)."""
+    out = {"deny": [], "ask": [], "allow": []}
+    for p in perms_list:
+        for z in out:
+            out[z] = out[z] + list(p.get(z, []))
+    return out
 
 
 def classify(cmd, perms):
@@ -111,39 +113,91 @@ def ok(c, label):
     return c
 
 
-live = json.load(open(SETTINGS))["permissions"]
-applied = MARKER in live["allow"]
-if applied:
-    perms = live
-    print("settings.json: расширенный allow ВНЕСЁН — проверяю живой файл")
+live_proj = json.load(open(SETTINGS))["permissions"]
+live_local = json.load(open(LOCAL))["permissions"]
+applied_proj = "Bash(clasp push*)" not in live_proj.get("ask", [])
+applied_local = "Bash(clasp push*)" in live_local.get("allow", [])
+proj = live_proj if applied_proj else json.load(open(PREPARED_PROJ))["permissions"]
+local = live_local if applied_local else json.load(open(PREPARED_LOCAL))["permissions"]
+if applied_proj and applied_local:
+    print("settings: сплит ПРИМЕНЁН — проверяю живые project+local файлы")
 else:
-    perms = json.load(open(PREPARED))["permissions"]
-    print("WARN: расширенный allow ЕЩЁ НЕ в .claude/settings.json (гейт headless) — "
-          "проверяю подготовленный _allow_new_settings.json; применение = "
-          "cp _allow_new_settings.json .claude/settings.json из Termux + рестарт сессии claude")
+    print("WARN: роль-сплит применён не полностью (project: %s, local: %s; headless в .claude/ "
+          "не пишет) — недостающее проверяю по подготовленным _claspsplit_new_settings*.json; "
+          "применение из Termux:\n"
+          "  cp _claspsplit_new_settings.json .claude/settings.json\n"
+          "  cp _claspsplit_new_settings.local.json .claude/settings.local.json\n"
+          "  (+ рестарт сессии claude)"
+          % ("да" if applied_proj else "нет", "да" if applied_local else "нет"))
 
+headless_layer = json.load(open(HEADLESS))["permissions"]
 res = []
 
-print("Зелёные команды → allow (без prompt):")
+print("HEADLESS-путь (git-истина project + headless_settings.json, БЕЗ local):")
+hl = merge(proj, headless_layer)
+for cmd in CLASP_WRITE:
+    z = classify(cmd, hl)
+    hit_allow = matches(cmd, hl["allow"])
+    res.append(ok(z == "ask" and not hit_allow, "headless: " + cmd + " → ask, allow-матчей нет"))
 for cmd in GREEN:
-    res.append(ok(classify(cmd, perms) == "allow", cmd + " → allow"))
-
-print("Красные → ask И ни одно allow-правило не матчит (регресс: расширение не задело красное):")
-for cmd in RED_ASK:
-    z = classify(cmd, perms)
-    hit_allow = matches(cmd, perms.get("allow", []))
-    res.append(ok(z == "ask" and not hit_allow,
-                  cmd + " → ask, allow-матчей нет" + ("" if not hit_allow else " !!!" + str(hit_allow))))
-
-print("Deny остаётся deny:")
+    res.append(ok(classify(cmd, hl) == "allow", "headless: " + cmd + " → allow"))
 for cmd in RED_DENY:
-    res.append(ok(classify(cmd, perms) == "deny", cmd + " → deny"))
+    res.append(ok(classify(cmd, hl) == "deny", "headless: " + cmd + " → deny"))
 
-print("Тройная защита красного не ослаблена (ask-лист = §7 красное, целиком на месте):")
-ASK_MUST = ["Bash(sqlite3 *)", "Bash(clasp push*)", "Bash(clasp redeploy*)", "Bash(clasp deploy*)",
-            "Bash(clasp run*)", "Bash(systemctl stop*)", "Bash(sudo systemctl *)"]
-for a in ASK_MUST:
-    res.append(ok(a in perms["ask"], "ask содержит " + a))
+print("ЗАБОР: даже если local владельца разрешил clasp — headless-ask бьёт его allow:")
+owner_sim = {"allow": ["Bash(clasp push*)", "Bash(clasp redeploy*)", "Bash(clasp deployments*)",
+                       "Bash(clasp version*)", "Bash(clasp create-version*)"]}
+hl_leaky = merge(proj, headless_layer, owner_sim, local)
+for cmd in CLASP_WRITE:
+    res.append(ok(classify(cmd, hl_leaky) == "ask", "забор: " + cmd + " → ask при загруженном local"))
+
+print("ИНТЕРАКТИВ владельца (project + local): конверты без промптов, опасное — ask:")
+ia = merge(proj, local)
+for cmd in OWNER_ALLOW:
+    res.append(ok(classify(cmd, ia) == "allow", "интерактив: " + cmd + " → allow"))
+for cmd in OWNER_STILL_ASK:
+    res.append(ok(classify(cmd, ia) == "ask", "интерактив: " + cmd + " → ask"))
+for cmd in RED_DENY:
+    res.append(ok(classify(cmd, ia) == "deny", "интерактив: " + cmd + " → deny"))
+for cmd in GREEN:
+    res.append(ok(classify(cmd, ia) == "allow", "интерактив: " + cmd + " → allow"))
+
+print("Headless-конфиг: только ask-забор, БЕЗ allow/deny-правок; демон передаёт его через --settings:")
+res.append(ok(not headless_layer.get("allow") and not headless_layer.get("deny"),
+              "headless_settings.json не добавляет allow/deny (только ask-забор)"))
+for must in ["Bash(clasp push*)", "Bash(clasp redeploy*)", "Bash(clasp deploy*)", "Bash(clasp run*)"]:
+    res.append(ok(must in headless_layer.get("ask", []), "headless ask содержит " + must))
+src = open(DAEMON_SRC, encoding="utf-8").read()
+res.append(ok('HEADLESS_SETTINGS = os.path.join(REPO, "headless_settings.json")' in src,
+              "демон: HEADLESS_SETTINGS указывает на headless_settings.json"))
+res.append(ok(src.count('"--settings", HEADLESS_SETTINGS') >= 2,
+              "демон: --settings HEADLESS_SETTINGS в обоих claude-вызовах (исполнитель+думатель)"))
+
+print("git-забор: local игнорится (не попадёт в git-истину), headless-конфиг — НЕ игнорится:")
+ign_local = subprocess.run(["git", "check-ignore", "-q", ".claude/settings.local.json"],
+                           cwd=ROOT).returncode == 0
+ign_hl = subprocess.run(["git", "check-ignore", "-q", "headless_settings.json"],
+                        cwd=ROOT).returncode == 0
+res.append(ok(ign_local, ".claude/settings.local.json игнорится git"))
+res.append(ok(not ign_hl, "headless_settings.json НЕ игнорится (git-истина)"))
+
+print("Прежний ask-костяк project (кроме clasp push/redeploy) на месте:")
+for a in ["Bash(sqlite3 *)", "Bash(clasp run*)", "Bash(systemctl stop*)", "Bash(sudo systemctl *)"]:
+    res.append(ok(a in proj.get("ask", []), "project ask содержит " + a))
+
+if not applied_proj:
+    print("Подготовленный project = живой settings минус clasp push*/redeploy*, deploy* сужен (остальное байт-в-байт):")
+    res.append(ok(proj["allow"] == live_proj["allow"] and proj["deny"] == live_proj["deny"],
+                  "prepared project: allow/deny идентичны живому"))
+    gone = {"Bash(clasp push*)", "Bash(clasp redeploy*)", "Bash(clasp deploy*)"}
+    narrowed = {"Bash(clasp deploy)", "Bash(clasp deploy *)"}
+    exp_ask = [r for r in live_proj["ask"] if r not in gone]
+    got_ask = [r for r in proj["ask"] if r not in narrowed]
+    res.append(ok(got_ask == exp_ask and narrowed <= set(proj["ask"]),
+                  "prepared project: ask-diff = ровно clasp-сплит"))
+if not applied_local:
+    res.append(ok(all(r in local.get("allow", []) for r in live_local.get("allow", [])),
+                  "prepared local: прежние локальные allow-записи сохранены"))
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

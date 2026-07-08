@@ -771,3 +771,35 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
   не пушатся вовсе (см. выше). Регресс: `tests/test_no_push_leak.py` — «полный гейт → ноль исходящих пушей» (в гейте).
 - Правка settings/hook применяется ТОЛЬКО при перезапуске сессии `claude` (читается на старте). Откат = вернуть
   `.claude/settings.json.bak-approve-*` + убрать `pretool_guard.py` из hooks + рестарт сессии.
+
+## РОЛЬ-РАЗВОД PERMISSIONS: интерактив владельца = allow, headless = строгий (заведено 08.07.2026)
+
+Одна и та же команда классифицируется ПО РОЛИ сессии, а не одинаково для всех:
+- **ИНТЕРАКТИВ владельца (Termux, живая сессия `claude`):** clasp push / redeploy / deployments /
+  version(s) / create-version — в **allow** через `.claude/settings.local.json` (git его игнорит
+  ГЛОБАЛЬНО — `/root/.config/git/ignore`, в репо не попадает). Владелец исполняет одобренные
+  конверты БЕЗ промптов: его «да» уже дано на ревью конверта, повторное дакание на каждый clasp —
+  слепое (доктрина подтверждений 02.07). `clasp deploy` (создаёт НОВЫЙ деплой → смена URL → Splinter
+  отвалится) и `clasp run` — остаются ask ВЕЗДЕ, у владельца тоже.
+- **HEADLESS (orchestrator_daemon → `claude -p`):** демон передаёт КАЖДОМУ вызову (исполнитель,
+  планировщик, думатель) флаг `--settings /root/turbobaby-manager-bot/headless_settings.json` —
+  строгий слой с ask на ВСЮ clasp-запись. Precedence движка deny>ask>allow действует ПОВЕРХ всех
+  источников → этот ask бьёт allow из local владельца, даже когда headless его загрузил: забор цел.
+  В -p режиме ask = авто-отказ → задача выводит NEEDS_APPROVAL, карточка в 328 — как раньше.
+- **Почему headless-конфиг в КОРНЕ репо** (`headless_settings.json`, git-истина, НЕ в `.claude/`):
+  движок не даёт headless-задаче писать в `.claude/` вообще (проверено 08.07 — Write отклонён и на
+  новое имя). Fail-closed: файла нет → CLI падает → честный failed, а не тихая потеря забора.
+  В headless-конфиг НИКОГДА не добавлять allow/deny — только ask-забор (страж это проверяет).
+- **Тест-страж:** `tests/test_settings_allowlist.py` (в гейте) — headless-путь строг (git-истина +
+  headless-конфиг, live-local НЕ читается), забор доказан симуляцией «local разрешил clasp»,
+  интерактив владельца clasp'ает без промптов, `clasp deploy`/`run`/sqlite3/stop — ask.
+- **Применение сплита** (headless в `.claude/` не пишет) — разово из Termux + рестарт сессии:
+  `cp _claspsplit_new_settings.json .claude/settings.json` и
+  `cp _claspsplit_new_settings.local.json .claude/settings.local.json`. Откат = вернуть
+  `.bak-roleperm-20260708`-копии. До применения страж проверяет подготовленные файлы с WARN.
+
+**НОТИФИКАЦИЯ ВИСЯЩЕГО ПРОМПТА (та же дата):** хук Notification (`notify_hook.py`) на
+permission-ожидании достаёт из транскрипта сессии ПОСЛЕДНИЙ tool_use и шлёт в личку
+«⏳ Termux ждёт подтверждения: <команда>» (Bash — команда, Edit/Write — файл; транскрипт нечитаем →
+fallback на текст события). Если на хосте есть `termux-notification` (Termux:API) — дублирует
+локально; на VPS бинаря нет, ветка молчит. Регресс: `tests/test_notify_hook_prompt.py` (в гейте).

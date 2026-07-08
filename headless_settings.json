@@ -1,0 +1,15 @@
+{
+  "_comment": "СТРОГИЙ headless-слой (роль-развод permissions, 08.07.2026). Демон orchestrator_daemon передаёт этот файл через `claude -p --settings` КАЖДОЙ headless-задаче (исполнитель/планировщик/думатель). Precedence движка deny>ask>allow действует ПОВЕРХ всех источников: ask здесь бьёт allow из .claude/settings.local.json владельца → clasp-запись в headless остаётся заблокированной (в -p режиме ask = авто-отказ, claude выводит NEEDS_APPROVAL как раньше). Лежит в КОРНЕ репо (git-истина): движок Claude Code не даёт headless-задаче писать в .claude/ вообще. НЕ добавлять сюда allow-правил: файл существует ТОЛЬКО чтобы держать забор. Тест-страж: tests/test_settings_allowlist.py.",
+  "permissions": {
+    "ask": [
+      "Bash(clasp push*)",
+      "Bash(clasp redeploy*)",
+      "Bash(clasp deploy*)",
+      "Bash(clasp run*)",
+      "Bash(clasp version*)",
+      "Bash(clasp versions*)",
+      "Bash(clasp create-version*)",
+      "Bash(clasp deployments*)"
+    ]
+  }
+}

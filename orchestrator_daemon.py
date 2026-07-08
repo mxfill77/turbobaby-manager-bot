@@ -76,6 +76,14 @@ _REJECT_PREFIX = "отклонено Филиппом"        # результа
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
 CLAUDE_BIN = "/usr/bin/claude"
+# РОЛЬ-РАЗВОД PERMISSIONS (08.07.2026): headless-задачи получают СТРОГИЙ доп-слой настроек через
+# `--settings` — ask на clasp push/redeploy/deploy/run/version/create-version/deployments.
+# Precedence движка deny>ask>allow действует ПОВЕРХ всех источников → этот ask бьёт allow из
+# .claude/settings.local.json владельца (интерактивные Termux-сессии clasp'ают без промптов,
+# headless — нет). В -p режиме ask = авто-отказ → claude выводит NEEDS_APPROVAL, как раньше.
+# Файл в корне репо (git-истина): в .claude/ headless писать не может (гейт движка).
+# Fail-closed: файла нет → CLI падает с ошибкой → честный failed, а не тихая потеря забора.
+HEADLESS_SETTINGS = os.path.join(REPO, "headless_settings.json")
 # КОНДУКТОР МОДЕЛИ (06.07.2026): headless-исполнитель по умолчанию — Claude Fable 5, фолбэк —
 # прежняя рабочая модель (Opus 4.8 1M = CLI-дефолт до этой правки). Вынесено в env, НЕ хардкод:
 # смена модели в будущем = правка .env (ORCH_MODEL / ORCH_MODEL_FALLBACK), без правки кода.
@@ -513,6 +521,7 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
            "--model", ORCH_MODEL,
            "--fallback-model", ORCH_MODEL_FALLBACK,
            "--output-format", "json",
+           "--settings", HEADLESS_SETTINGS,  # строгий headless-слой (роль-развод: clasp → ask)
            prompt]                          # список аргументов, БЕЗ shell → нет инъекции через task_text
     # старт claude задачи по CLOCK_MONOTONIC — опора 5-го признака (свой/чужой плановый рестарт)
     t0_mono = time.monotonic()
@@ -838,6 +847,7 @@ def _thinker_exec(prompt, timeout, tag):
            "--fallback-model", ORCH_MODEL_FALLBACK,
            "--output-format", "json",
            "--max-turns", "1",
+           "--settings", HEADLESS_SETTINGS,    # тот же строгий headless-слой (единообразие забора)
            prompt]                             # prompt последним (тест-моки читают args[-1])
     try:
         proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
