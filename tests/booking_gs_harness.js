@@ -222,12 +222,22 @@ function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: de
         sh.grid[1][9] === '=J' && sh.grid[1][22] === '=W');
 }
 {
-  // K/N опциональны: без km_end/paid_total ячейки НЕ трогаются
+  // K опционален: без paid_total ячейка K НЕ трогается (km_end с фикса row705 обязателен)
   const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
-  sh.grid[1][10] = 3000; sh.grid[1][13] = 11111;
-  const r = closeBooking({ bike: '4957', name: 'Пётр' });
+  sh.grid[1][10] = 3000; sh.grid[1][16] = 11111;
+  const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 12000 });
   check('close.k-optional', r.ok === true && sh.grid[1][0] === 'Завершена' &&
-        sh.grid[1][10] === 3000 && sh.grid[1][13] === 11111, JSON.stringify(r));
+        sh.grid[1][10] === 3000 && sh.grid[1][13] === 12000, JSON.stringify(r));
+}
+{
+  // фикс row705 fail-closed: km_end НЕ передан / пустой → km_required, лист не тронут
+  const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
+  sh.grid[1][16] = 12000;
+  const r1 = closeBooking({ bike: '4957', name: 'Пётр' });
+  const r2 = closeBooking({ bike: '4957', name: 'Пётр', km_end: '' });
+  check('close.km-required', !r1.ok && r1.error === 'km_required' &&
+        !r2.ok && r2.error === 'km_required' &&
+        sh.grid[1][0] === 'В аренде' && sh.grid[1][13] === '', JSON.stringify({ r1, r2 }));
 }
 {
   // Бронь (не активирована) → not_active, лист не тронут
@@ -249,10 +259,11 @@ function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: de
     row('В аренде', NMAX, 'Пётр', '10.06.2026', '10.07.2026'),
     row('В аренде', NMAX, 'Пётр', '20.07.2026', '25.07.2026'),
   ]);
+  sh.grid[2][16] = 30000; // Q второй аренды (km_end с фикса row705 обязателен)
   const r1 = closeBooking({ bike: '4957', name: 'Пётр' });
   check('close.ambiguous', !r1.ok && r1.error === 'ambiguous' && r1.rows.length === 2 &&
         sh.grid[1][0] === 'В аренде' && sh.grid[2][0] === 'В аренде', JSON.stringify(r1));
-  const r2 = closeBooking({ bike: '4957', name: 'Пётр', date_start: '2026-07-20' }); // ISO против дд.мм листа
+  const r2 = closeBooking({ bike: '4957', name: 'Пётр', date_start: '2026-07-20', km_end: 30100 }); // ISO против дд.мм листа
   check('close.by-date', r2.ok === true && r2.row === 3 && sh.grid[2][0] === 'Завершена' &&
         sh.grid[1][0] === 'В аренде', JSON.stringify(r2));
 }
@@ -267,11 +278,21 @@ function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: de
   check('close.odometer-equal-ok', r2.ok === true && sh.grid[1][13] === 12000, JSON.stringify(r2));
 }
 {
-  // Q нечисловой (формула упала) → чек одометра пропускается, запись идёт
+  // фикс row705 fail-closed: Q нечисловой (формула упала) → odo_unverifiable, лист НЕ тронут
+  // (раньше чек молчаливо пропускался и запись шла — та самая дыра)
   const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
   sh.grid[1][16] = '#N/A';
   const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 500 });
-  check('close.odo-nonnumeric-skipped', r.ok === true && sh.grid[1][13] === 500, JSON.stringify(r));
+  check('close.odo-nonnumeric-unverifiable', !r.ok && r.error === 'odo_unverifiable' &&
+        sh.grid[1][0] === 'В аренде' && sh.grid[1][13] === '', JSON.stringify(r));
+}
+{
+  // фикс row705 fail-closed: Q ПУСТ → odo_unverifiable «сверь и закрой руками», лист НЕ тронут
+  const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
+  const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 35200 });
+  check('close.odo-empty-unverifiable', !r.ok && r.error === 'odo_unverifiable' && r.row === 2 &&
+        /руками/.test(r.message) && sh.grid[1][0] === 'В аренде' && sh.grid[1][13] === '',
+        JSON.stringify(r));
 }
 {
   // km_end мусор → bad_km_end, лист не тронут

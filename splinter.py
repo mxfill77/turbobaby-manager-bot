@@ -5594,6 +5594,25 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                 await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
                             text="🐀 Splinter\n⏳ Закрытие аренды (closeBooking) ещё не задеплоено на Bridge — "
                                  "дождись Termux-деплоя, карточка останется, потом снова «да».")
+            elif res.get("error") == "km_required":
+                # fail-closed (инцидент row705): Bridge без пробега на сдаче аренду НЕ закрывает.
+                # Карточку НЕ гасим — «да <цифра пробега>» тем же запросом добьёт закрытие.
+                log.warning(f"  → ПРИЁМ: закрытие без пробега отклонено (km_required) {ret['bike']}")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text="🐀 Splinter\n❌ Закрыть не могу: нет пробега на сдаче — без него аренду "
+                                 "не закрываем. Ответь «да <цифра пробега>» — или заверши руками "
+                                 "(В аренде→Завершена). Статус в CRM не менял.")
+            elif res.get("error") == "odo_unverifiable":
+                # fail-closed (инцидент row705): одометр строки (Q) пуст/нечисловой — чек
+                # «одометр не уменьшается» провести нельзя, автозакрытие запрещено.
+                ret["status"] = "error"
+                log.warning(f"  → ПРИЁМ: одометр строки не сверить (odo_unverifiable) {ret['bike']}: "
+                            f"{res.get('message') or ''}")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text=f"🐀 Splinter\n❌ Закрыть не могу: одометр строки в CRM пуст/не читается — "
+                                 f"сверить пробег автоматически нельзя. Сверь и заверши руками "
+                                 f"(В аренде→Завершена, строка {res.get('row') or ret.get('row') or '?'}). "
+                                 f"Статус в CRM не менял.")
             else:
                 ret["status"] = "error"
                 _err = res.get("error") or "?"

@@ -3,6 +3,8 @@
 close_booking под билетом 4.2 (с km_end/paid_total) → ✅; «нет» → ничего не записано;
 строки «В аренде» нет → ⚠️ без падения; уже «Завершена» → молчание (идемпотентность);
 unknown_action (Bridge без деплоя фазы I) → ⏳, карточка жива; не-авторизатор → игнор.
+Фикс row705 fail-closed: km_required → карточка жива + «да <цифра>»/«заверши руками»;
+odo_unverifiable → «сверь и заверши руками», статус error, записи нет.
 Существующий closing-путь (лист закрытия) НЕ ломается. Сеть/LLM/_send замоканы."""
 import os, sys, json, asyncio, datetime
 sys.path.insert(0, "/root/turbobaby-manager-bot")
@@ -161,6 +163,41 @@ def test_bridge_error_honest():
     do_return(b)
     run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
     assert any("❌ Закрытие не прошло" in t and "odometer_back" in t for t in intake_sends()), f"{SENDS}"
+    assert S._RETURN_CLOSES[INTAKE]["status"] == "error"
+
+# ---- km_required (фикс row705 fail-closed): Bridge без пробега не закрывает → карточка ЖИВА,
+# ----   «заверши руками»/«да <цифра>» в тексте; повторное «да 35300» закрывает ----
+def test_km_required_keeps_card():
+    reset(); b = FakeBridge(clients=[RENT_ROW])
+    good_close = b.close_booking
+    def strict_close(bike, name, date_start=None, km_end=None, paid_total=None):
+        if km_end in (None, ""):
+            return {"ok": False, "error": "km_required",
+                    "message": "km_end обязателен — без пробега на сдаче аренду не закрываем"}
+        return good_close(bike, name, date_start=date_start, km_end=km_end, paid_total=paid_total)
+    b.close_booking = strict_close
+    do_return(b, parse=dict(RET_PARSE, mileage=""))   # пробега в контексте нет
+    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    errs = [t for t in intake_sends() if "Закрыть не могу" in t and "пробега" in t]
+    assert errs and "руками" in errs[0] and "цифра пробега" in errs[0], f"{SENDS}"
+    assert b.closed == [], "без km_end записи в CRM быть не должно (fail-closed)"
+    assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting", "карточка должна остаться живой"
+    run(S._handle_intake(Msg("да 35300", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    assert b.closed and b.closed[0]["km_end"] == "35300", f"«да 35300» должно закрыть: {b.closed}"
+    assert S._RETURN_CLOSES[INTAKE]["status"] == "closed"
+
+# ---- odo_unverifiable (фикс row705 fail-closed): Q строки пуст → «сверь и заверши руками», error ----
+def test_odo_unverifiable_manual():
+    reset(); b = FakeBridge(clients=[RENT_ROW])
+    def unverifiable_close(bike, name, date_start=None, km_end=None, paid_total=None):
+        return {"ok": False, "error": "odo_unverifiable", "row": 21, "odo_raw": "",
+                "message": "одометр строки 21 пуст — сверь и закрой руками"}
+    b.close_booking = unverifiable_close
+    do_return(b)
+    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    errs = [t for t in intake_sends() if "Закрыть не могу" in t and "одометр" in t.lower()]
+    assert errs and "руками" in errs[0] and "строка 21" in errs[0], f"{SENDS}"
+    assert b.closed == [], "одометр не сверить → записи в CRM быть не должно"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "error"
 
 # ---- пробега в контексте нет → карточка просит цифру; «да 35300» → km_end из ответа ----

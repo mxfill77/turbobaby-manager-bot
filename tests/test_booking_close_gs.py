@@ -2,8 +2,10 @@
 Тот же node-vm харнесс tests/booking_gs_harness.js (реальный Booking.js + мок-SpreadsheetApp),
 что и O3-2a. Покрытие: штатное закрытие (A=Завершена, N=km_end, K=paid_total), not_active
 (Бронь — сначала выдача), not_found, ambiguous (две "В аренде" без date_start) + уточнение
-по date_start, odometer_back (km_end < Q; == Q ок; нечисловой Q — чек пропущен), bad_km_end,
-K/N опциональны (не переданы → не тронуты), F и формульные G/I/J/W целы.
+по date_start, odometer_back (km_end < Q; == Q ок), bad_km_end, K опционален (без paid_total
+не тронут), F и формульные G/I/J/W целы. Фикс дыры fail-closed (инцидент row705): km_end
+ОБЯЗАТЕЛЕН (нет → km_required), Q пуст/нечисловой → odo_unverifiable «сверь и закрой руками»
+(молчаливого пропуска гейта одометра больше нет; force-флага нет намеренно).
 Плюс: роутинг close_booking в Bridge.js под REDZONE_LOCK 4.2; bridge_client.close_booking
 шлёт опциональные поля только при наличии."""
 import json
@@ -47,7 +49,9 @@ def test_close_harness_covers_required_scenarios():
         "close.ok", "close.km-written", "close.paid-written", "close.f-intact",
         "close.formulas-intact", "close.k-optional", "close.not-active", "close.not-found",
         "close.ambiguous", "close.by-date", "close.odometer-back", "close.odometer-equal-ok",
-        "close.odo-nonnumeric-skipped", "close.bad-km-end",
+        "close.bad-km-end",
+        # фикс row705 fail-closed: km_end обязателен; Q пуст/нечисловой → err, не пропуск
+        "close.km-required", "close.odo-empty-unverifiable", "close.odo-nonnumeric-unverifiable",
     }
     missing = required - names
     assert not missing, f"в харнессе нет кейсов: {missing}"
@@ -59,6 +63,7 @@ def test_close_booking_js_structure():
     for marker in (
         "function closeBooking", "not_active", "not_found", "ambiguous",
         "odometer_back", "bad_km_end", "BOOKING.COL.ODO",
+        "km_required", "odo_unverifiable",  # фикс row705 fail-closed
     ):
         assert marker in src, f"нет маркера {marker}"
     # запись строго точечная: A/N/K; формульные не копируются, F не пишется
@@ -67,6 +72,8 @@ def test_close_booking_js_structure():
     assert "BOOKING.COL.KM" in close_body and "BOOKING.COL.INITIAL_PAY" in close_body
     assert "DATE_END" not in close_body, "closeBooking не должен трогать F (дату возврата)"
     assert "copyTo" not in close_body, "closeBooking не должен копировать формулы"
+    # фикс row705: обхода гейта одометра быть не должно — никакого force-флага в body
+    assert not re.search(r"[pb]\w*\.force|\bforce\s*[:=]", close_body), "force-флаг запрещён (fail-closed)"
 
 
 def test_bridge_js_routing():
