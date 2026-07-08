@@ -358,6 +358,14 @@ _HO_ACT_TTL = 1800          # сек; просроченный запрос «д
 _HO_ACT_WARN_TS = {}        # bike → ts последнего ⚠️ «бронь не нашёл» (анти-спам повторных handover-фраз)
 _HO_ACT_WARN_COOLDOWN = 600
 
+# O3-3b фаза II ПРИЁМ: ожидающее подтверждения закрытие аренды (В аренде→Завершена) — {chat_id: {...}}.
+# Зеркало _HANDOVER_ACTIVATIONS: карточка в INTAKE_CHAT (авторизаторы INTAKE_APPROVERS),
+# «да» → close_booking красным шагом под билетом 4.2. Один активный запрос на чат, TTL как approve.
+_RETURN_CLOSES = {}
+_RET_CLOSE_TTL = 1800       # сек; просроченный запрос «да» больше не исполняет
+_RET_CLOSE_WARN_TS = {}     # bike → ts последнего ⚠️ «В аренде не нашёл» (анти-спам повторных return-фраз)
+_RET_CLOSE_WARN_COOLDOWN = 600
+
 # Стандартный денежный депозит по модели (из прайса) — для ПОКАЗА в резюме (этап A не пишет).
 # Порядок важен: специфичные/дорогие выше, иначе короткий ключ перехватит.
 _DEPOSIT_BY_MODEL = [
@@ -4084,6 +4092,79 @@ async def _handover_activation_card(context, bridge, bike):
                       f"Активирую (Бронь→В аренде)? да / нет"))
 
 
+def _return_resolve_close(bridge, bike):
+    """O3-3b фаза II: кандидат на закрытие при возврате. Последняя строка CRM по байку со
+    статусом В аренде/Завершена → dict {row, name, date_start, status} или None (строки нет).
+    status=="завершена" → уже закрыта (идемпотентность, молчим) — решает вызыватель."""
+    try:
+        cl = bridge._call("clients", filter="all").get("data", {})
+        rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
+    except Exception:
+        return None
+    want = plateFromName_(bike)
+    cand = [c for c in rows if plateFromName_(str(c.get("bike", ""))) == want
+            and str(c.get("status", "")).strip().lower() in ("в аренде", "завершена")]
+    if not cand:
+        return None
+    last = cand[-1]   # getClients в порядке строк (свежие ниже) → последняя
+    return {"row": last.get("row"), "name": last.get("name") or "",
+            "date_start": str(last.get("date_start") or ""),
+            "status": str(last.get("status", "")).strip().lower()}
+
+
+async def _return_close_card(context, bridge, bike, km="", total_due=None):
+    """O3-3b фаза II: на return-контексте предложить закрытие аренды (В аренде→Завершена)
+    карточкой в INTAKE_CHAT (авторизаторы INTAKE_APPROVERS). Само закрытие — ТОЛЬКО после «да»,
+    красным шагом 4.2 в _handle_intake. Строки «В аренде» нет → ⚠️ «заверши руками» (возврат
+    не падает); последняя уже «Завершена» → молчание (повторная return-фраза, идемпотентно).
+    km — пробег на сдаче из return-контекста (может быть пуст → карточка просит цифру);
+    total_due — итог листа закрытия (в K уйдёт ТОЛЬКО числовой > 0)."""
+    cand = _return_resolve_close(bridge, bike)
+    now = _time.time()
+    if cand is None:
+        # анти-спам: повторные return-фразы по тому же байку не дублируют ⚠️ чаще кулдауна
+        if now - _RET_CLOSE_WARN_TS.get(bike, 0) < _RET_CLOSE_WARN_COOLDOWN:
+            return
+        _RET_CLOSE_WARN_TS[bike] = now
+        log.info(f"  → ПРИЁМ {bike}: строки «В аренде» в CRM не нашёл — ⚠️ во Входящие, закрытие руками")
+        await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                    text=f"🐀 Splinter\n⚠️ ПРИЁМ {bike}: строки «В аренде» в CRM не нашёл — "
+                         f"заверши руками (В аренде→Завершена).")
+        return
+    if cand.get("status") == "завершена":
+        log.info(f"  → ПРИЁМ {bike}: строка {cand.get('row')} уже «Завершена» — закрывать нечего (идемпотентно)")
+        return
+    prev = _RETURN_CLOSES.get(INTAKE_CHAT)
+    if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
+            and now - prev.get("ts", 0) <= _RET_CLOSE_TTL):
+        return   # та же аренда уже ждёт «да» — карточку не дублируем
+    _paid = None   # в K пойдёт только числовой итог > 0 (0/пусто/мусор → K не трогаем)
+    try:
+        _t = float(total_due)
+        if _t > 0:
+            _paid = _t
+    except (TypeError, ValueError):
+        pass
+    km = str(km or "").strip()
+    _RETURN_CLOSES[INTAKE_CHAT] = {
+        "bike": bike, "name": cand["name"], "date_start": cand["date_start"],
+        "row": cand.get("row"), "km": km, "paid_total": _paid,
+        "ts": now, "status": "awaiting",
+    }
+    km_line = (f"Пробег на сдаче: {km}." if km
+               else "Пробег на сдаче: не увидел — ответь «да <цифра пробега>».")
+    due_line = (f" Итог закрытия: {_fmt(_paid)} ฿." if _paid is not None else "")
+    log.info(f"  → ПРИЁМ {bike}: карточка закрытия во Входящие (строка {cand.get('row')}, "
+             f"клиент {cand['name'] or '—'}, km={km or '-'}, итог={_paid if _paid is not None else '-'})")
+    await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                text=(f"🐀 Splinter\n📥 ПРИЁМ: {bike} вернулся от {cand['name'] or '—'}, "
+                      f"строка {cand.get('row')}. {km_line}{due_line}\n"
+                      f"Завершаю (Завершена"
+                      + (f" + пробег {km}" if km else "")
+                      + (f" + оплачено {_fmt(_paid)}" if _paid is not None else "")
+                      + ")? да / нет"))
+
+
 def _closing_crm_debt(bridge, bike):
     """Долг (CRM I/J) активной брони байка для чек-листа. None если не нашли."""
     try:
@@ -4847,6 +4928,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # (топливо/пробег/booking) + пинг Пыму по депозиту/ущербу. closing_upsert = Bot Data (своя таблица).
     # НЕ зависим от _ev_r (при info-работах событие пишет _write_info_works, _ev_r=None).
     if _ret_ctx and bike:
+        _cu = None
         try:
             _bid, _bname, _bend = _closing_resolve_booking(bridge, bike)
             _dret = _msg_date or _bend or ""
@@ -4865,6 +4947,14 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                             text=bilingual_from_ru(claude, _ru_intake))
         except Exception as e:
             log.warning(f"  → closing авто-создание не удалось: {e}")
+        # O3-3b фаза II ДОПОЛНЕНИЕ (closing-путь выше не трогаем): карточка ПРИЁМА аппруверам —
+        # предложение закрыть аренду в CRM (В аренде→Завершена) после «да». Свой try —
+        # сбой карточки возврат/лист закрытия НЕ ломает. km = пробег return-контекста.
+        try:
+            await _return_close_card(context, bridge, bike, km=str(mileage or ""),
+                                     total_due=(_cu or {}).get("total_due"))
+        except Exception as e:
+            log.warning(f"  → карточка приёма (закрытие) не удалась: {e}")
 
     # === ВЫДАЧА (этап 2 трекинга): на handover-контексте фиксируем state «в аренде» в bot-owned
     # вкладке состояния. Зеркало ветки возврата выше (_ret_ctx). Источник деталей = CRM
@@ -5459,6 +5549,59 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             act["status"] = "rejected"
             await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
                         text="🐀 Splinter\n❌ Активацию отменил — статус в CRM не менял.")
+            return
+
+    # 5) O3-3b фаза II: подтверждение ПРИЁМА (В аренде→Завершена) — ТОЛЬКО авторизаторы, TTL.
+    #    Ветка ПОСЛЕДНЯЯ: приоритет «да» = карточка брони (3) → активация выдачи (4) → закрытие (5);
+    #    ветки выше возвращаются сами на своём матче — «да» между тремя карточками не путается.
+    ret = _RETURN_CLOSES.get(chat_id)
+    if (ret and ret.get("status") == "awaiting" and _intake_can_approve(msg)
+            and now - ret.get("ts", 0) <= _RET_CLOSE_TTL):
+        low = text.lower()
+        tid = getattr(msg, "message_thread_id", None)
+        # отказ проверяем ПЕРВЫМ: «не завершай»/«не закрывай» содержат yes-слово «заверш»/«закрывай» —
+        # порядок yes-первым закрыл бы аренду на явном отказе
+        if any(w in low for w in ("нет", "отмена", "не заверш", "не закрыв", "отклон")):
+            ret["status"] = "rejected"
+            await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                        text="🐀 Splinter\n❌ Закрытие отменил — статус в CRM не менял.")
+            return
+        if any(w in low for w in ("да", "ок", "заверш", "закрывай", "подтвержд")):
+            _who = msg.from_user.username if msg.from_user else "?"
+            # цифра в ответе авторизатора = правка/добор пробега на сдаче («да 35200» — перекрывает контекст)
+            _m = _re_lang.search(r"\d{2,7}", text.replace(" ", ""))
+            _km = (_m.group(0) if _m else "") or ret.get("km") or None
+            # --- КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write) ---
+            try:
+                ticket = (bridge.issue_write_ticket() or {}).get("ticket")
+                with bridge_client.agent_write(ticket):
+                    res = bridge.close_booking(bike=ret["bike"], name=ret["name"],
+                                               date_start=(ret.get("date_start") or None),
+                                               km_end=_km, paid_total=ret.get("paid_total"))
+            except Exception as e:
+                res = {"ok": False, "error": "exception", "message": str(e)}
+            if res.get("ok"):
+                ret["status"] = "closed"
+                _row = res.get("row") or ret.get("row")
+                log.info(f"  → ПРИЁМ: аренда завершена (строка {_row}, @{_who}) {ret['bike']} "
+                         f"km_end={_km or '-'} paid={ret.get('paid_total') if ret.get('paid_total') is not None else '-'}")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text=f"🐀 Splinter\n✅ Завершена, строка {_row}.")
+            elif res.get("error") == "unknown_action":
+                # Bridge ещё без деплоя фазы I (конверт close_booking ждёт Termux) — карточку НЕ гасим:
+                # статус остаётся awaiting, после деплоя то же «да» закроет аренду штатно.
+                log.warning(f"  → ПРИЁМ: Bridge без close_booking (unknown_action) {ret['bike']} — жду деплоя")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text="🐀 Splinter\n⏳ Закрытие аренды (closeBooking) ещё не задеплоено на Bridge — "
+                                 "дождись Termux-деплоя, карточка останется, потом снова «да».")
+            else:
+                ret["status"] = "error"
+                _err = res.get("error") or "?"
+                _emsg = res.get("message") or ""
+                log.warning(f"  → ПРИЁМ: закрытие НЕ прошло ({_err}: {_emsg}) {ret['bike']}")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text=f"🐀 Splinter\n❌ Закрытие не прошло: {_err}. {_emsg}\n"
+                                 f"Статус в CRM не менял — заверши руками.")
             return
 
 
