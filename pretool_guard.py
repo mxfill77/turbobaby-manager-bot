@@ -19,7 +19,7 @@
 НЕ трогает реальный гейт записи confirmed=true в Bridge (ReadFleet.js) — тот независим (третий слой защиты).
 Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
 """
-import sys, os, json, re, shlex
+import sys, os, json, re, shlex, time, fcntl, hashlib
 
 PROJECT = "/root/turbobaby-manager-bot"
 
@@ -44,7 +44,15 @@ _GREEN_MODULES = {"py_compile", "json.tool", "pytest", "unittest", "pip", "venv"
 # Убирает ложный ambiguous-ask на `venv/bin/python3 --version` (нет target → раньше падало в ask, хотя
 # venv python в allow). Сужение неоднозначности (06.07.2026) — red-список НЕ трогает.
 _INFO_FLAGS = {"--version", "-V", "-VV", "--help", "-h"}
+_ENV_ASSIGN = re.compile(r"^\w+=")   # env-префикс VAR=val перед интерпретатором (PRETOOL_NOPUSH=1 …)
 _SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b", re.IGNORECASE)
+
+# Дедуп ambiguous-карточек в рамках одной задачи/сессии (UX-фикс 08.07.2026, спам-инцидент задачи 163:
+# 4 ОДИНАКОВЫХ конверта «не распознал операцию» за 4 минуты). Повтор той же команды → счётчик ×N
+# правит ТУ ЖЕ Telegram-карточку (editMessageText), нового сообщения НЕ шлёт. Стор — файл на сессию
+# в /tmp (чистится ребутом); запись старше TTL = новая карточка (сессии переиспользуют id редко).
+_DEDUP_DIR = os.environ.get("PRETOOL_DEDUP_DIR") or "/tmp/cc_pretool_dedup"
+_DEDUP_TTL = 4 * 3600
 
 
 def _defer():
@@ -98,7 +106,7 @@ _ACTIONS = {
 }
 _AMBIGUOUS = ("не распознал операцию — скрипт может писать в рабочие данные, но точную операцию не разобрал",
               "неизвестно — не могу гарантировать, что скрипт только читает",
-              "глянь команду выше вручную; подтверждай, только если знаешь, что она делает")
+              "команда в карточке — подтверждай, только если понимаешь, что она делает")
 
 
 def _find(patterns, blob):
@@ -171,33 +179,125 @@ def _is_test_script(cmd):
     return False
 
 
-def _card(hit, blob="", test=False):
-    if hit == "ambiguous" or hit not in _ACTIONS:
+def _card(hit, blob="", test=False, cmd="", count=1):
+    ambiguous = hit == "ambiguous" or hit not in _ACTIONS
+    if ambiguous:
         what, cons, check = _AMBIGUOUS
     else:
         what, cons, check = _ACTIONS[hit]
         what += _detail(hit, blob)
     head = "🧪 ТЕСТ (dry-run, не реальная операция)\n" if test else ""
+    # UX-фикс 08.07 (инцидент 163): ambiguous-карточка НЕСЁТ саму команду — владелец решает прямо из
+    # уведомления («глянь выше вручную» в headless некуда). Повтор той же команды в задаче → счётчик ×N.
+    cmd_line = ""
+    if ambiguous:
+        c = " ".join((cmd or "").split())
+        if c:
+            cmd_line = "Команда: " + (c[:200] + "…" if len(c) > 200 else c) + "\n"
+    rep = ("Повтор: ×%d — та же команда в этой задаче (карточка обновлена, новых не шлю)\n" % count) \
+        if count > 1 else ""
     return (head +
-            "🔴 КРАСНОЕ\n"
-            "Что: " + what + "\n"
+            "🔴 КРАСНОЕ\n" + rep +
+            "Что: " + what + "\n" + cmd_line +
             "Последствия: " + cons + "\n"
             "Проверь: " + check + " — жду твоё «да».")
 
 
+def _dedup_path(session):
+    sid = re.sub(r"[^\w\-]", "_", str(session or "nosession"))[:64]
+    return os.path.join(_DEDUP_DIR, sid + ".json")
+
+
+def _dedup_bump(session, cmd):
+    """Счётчик одинаковой ambiguous-команды в рамках сессии (= headless-задачи). → (count, mid|None):
+    count — какой это раз (1 = первая карточка), mid — message_id уже висящей Telegram-карточки.
+    FAIL-SAFE: любой сбой стора → (1, None) = прежнее поведение (новая карточка), не хуже."""
+    try:
+        os.makedirs(_DEDUP_DIR, exist_ok=True)
+        path = _dedup_path(session)
+        key = hashlib.sha1(cmd.encode("utf-8", "ignore")).hexdigest()[:16]
+        with open(path + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+            ent = data.get(key) if isinstance(data, dict) else None
+            now = time.time()
+            if not isinstance(ent, dict) or now - float(ent.get("ts", 0)) > _DEDUP_TTL:
+                ent = {"count": 0, "mid": None}
+            ent["count"] = int(ent.get("count", 0)) + 1
+            ent["ts"] = now
+            data[key] = ent
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+        return ent["count"], ent.get("mid")
+    except Exception:
+        return 1, None
+
+
+def _dedup_save_mid(session, cmd, mid):
+    """Запомнить message_id первой карточки (под тем же lock) — повтор будет править ЕЁ. Best-effort."""
+    try:
+        path = _dedup_path(session)
+        key = hashlib.sha1(cmd.encode("utf-8", "ignore")).hexdigest()[:16]
+        with open(path + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data.get(key), dict):
+                data[key]["mid"] = mid
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def _push(card):
+    """Отправить карточку. → message_id|None (id нужен дедупу: повтор правит ЭТУ карточку)."""
     if os.environ.get("PRETOOL_NOPUSH") == "1":
-        return   # тест-режим валидации хука: не спамить Telegram красными карточками
+        return None   # тест-режим валидации хука: не спамить Telegram красными карточками
     try:
         sys.path.insert(0, PROJECT)
-        from notify import notify
-        notify(card)
+        from notify import send_card
+        return send_card(card)
     except Exception:
-        pass   # пуш — вторичный канал; не роняем решение из-за сети/ошибки
+        return None   # пуш — вторичный канал; не роняем решение из-за сети/ошибки
+
+
+def _edit(mid, card):
+    """Повтор той же команды → правка УЖЕ висящей карточки (счётчик ×N). Сбой → молча (спама нет)."""
+    if os.environ.get("PRETOOL_NOPUSH") == "1" or not mid:
+        return
+    try:
+        sys.path.insert(0, PROJECT)
+        from notify import edit_card
+        edit_card(mid, card)
+    except Exception:
+        pass
 
 
 def _is_python(cmd):
     return re.search(r"(^|\s|/)(python3?|venv/bin/python3?)(\s|$)", cmd) is not None
+
+
+def _args_after_interp(toks):
+    """Аргументы ПОСЛЕ интерпретатора: срезает ведущие VAR=val (env-префикс) и сам python-токен.
+    Фикс инцидента 163 (08.07.2026): `PRETOOL_NOPUSH=1 venv/bin/python3 --version` считал интерпретатор
+    обычным аргументом → инфо-флаг не распознавался → ложный ambiguous → конверт-спам. Probe-паттерны
+    без python (node --check / node tests/*harness* / cat / grep / diff) сюда НЕ доходят вовсе —
+    main() дефёрит не-python до анализа (они «может писать» не считаются by construction)."""
+    i = 0
+    while i < len(toks) and _ENV_ASSIGN.match(toks[i]):
+        i += 1
+    if i < len(toks) and re.search(r"(^|/)python3?$", toks[i]):
+        return toks[i + 1:]
+    return toks[1:]   # интерпретатор не опознан токеном → прежнее поведение (fail-safe)
 
 
 def _py_targets(cmd, cwd):
@@ -288,7 +388,8 @@ def _analyze(cmd, cwd):
     if not saw_target:
         # Инфо-флаги (--version/-V/--help) НИЧЕГО не исполняют → зелёное (сужение ambiguous 06.07):
         # все не-интерпретаторные, не-`VAR=val` токены ∈ _INFO_FLAGS и хотя бы один есть.
-        rest = [t for t in toks[1:] if not re.match(r"^\w+=", t)]
+        # Интерпретатор ищется С УЧЁТОМ env-префикса (фикс 163, 08.07) — см. _args_after_interp.
+        rest = [t for t in _args_after_interp(toks) if not _ENV_ASSIGN.match(t)]
         if rest and all(t in _INFO_FLAGS for t in rest):
             return "green", "", blob
         return "ambiguous", "ambiguous", blob          # python без внятной цели (REPL и т.п.) → подтверждаем
@@ -313,9 +414,17 @@ def main():
     if kind == "green":
         _defer()                                       # читающий python → штатный allow (venv python в allow)
     test = _is_test_script(cmd)
-    card = _card(hit, blob, test)
-    if not test:
-        _push(card)   # 🧪-тестовые карточки в личку НЕ пушим (утечки 01–05.07); ask остаётся
+    count, mid = 1, None
+    if hit == "ambiguous":                             # дедуп ТОЛЬКО ambiguous (инцидент 163); red —
+        count, mid = _dedup_bump(data.get("session_id"), cmd)   # конкретная операция, каждая пушится
+    card = _card(hit, blob, test, cmd=cmd, count=count)
+    if not test:                  # 🧪-тестовые карточки в личку НЕ пушим (утечки 01–05.07); ask остаётся
+        if count <= 1:
+            new_mid = _push(card)
+            if new_mid:
+                _dedup_save_mid(data.get("session_id"), cmd, new_mid)
+        else:
+            _edit(mid, card)      # повтор → счётчик ×N в ТОЙ ЖЕ карточке, нового сообщения НЕТ
     _ask(card)
 
 

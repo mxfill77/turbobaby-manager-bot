@@ -115,6 +115,20 @@ def _send_message(token, text):
         return False, None
 
 
+def _edit_message(token, mid, text):
+    """editMessageText того же сообщения (дедуп карточек pretool_guard 08.07: повтор → ×N в ТОЙ ЖЕ
+    карточке). Best-effort: сообщения нет/текст идентичен/сеть → False, НЕ кидает."""
+    try:
+        url = "https://api.telegram.org/bot" + token + "/editMessageText"
+        data = json.dumps({"chat_id": CHAT_ID, "message_id": int(mid), "text": text}).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            resp = json.load(r)
+        return bool(resp.get("ok"))
+    except Exception:
+        return False
+
+
 def _delete_message(token, mid):
     """Удалить сообщение бота (≤48ч). Best-effort: id уже нет / старше 48ч → молча False, НЕ кидает."""
     try:
@@ -189,6 +203,45 @@ def notify(text, track=False, clear_first=False, force=False) -> bool:
             ids.append(int(mid))
             _save_ids(ids)
     return ok
+
+
+def send_card(text):
+    """Отправить карточку с ВОЗВРАТОМ message_id (дедуп pretool_guard, 08.07.2026: повтор той же
+    нераспознанной команды правит ЭТУ карточку через edit_card, а не шлёт новую — спам-инцидент 163).
+    Тест-контур как в notify(): NOTIFY_COUNT_FILE → попытка в счётчик, сети нет (псевдо-id -1);
+    PRETOOL_NOPUSH → мут (None). force не нужен: единственный вызыватель — pretool_guard, его
+    карточки в тест-прогонах ДОЛЖНЫ мутиться (как раньше)."""
+    mode = _test_mode()
+    if mode == "count":
+        _count_attempt(text)
+        return -1
+    if mode == "mute":
+        print("notify: muted (PRETOOL_NOPUSH=1, тест-режим — пуш не отправлен)", file=sys.stderr)
+        return None
+    token = _get_token()
+    if not token:
+        print("notify: NO BOT_TOKEN in env", file=sys.stderr)
+        return None
+    ok, mid = _send_message(token, text)
+    return mid if ok and mid else None
+
+
+def edit_card(mid, text) -> bool:
+    """Правка ранее отправленной send_card-карточки (счётчик ×N). Тест-контур: count → строка с
+    префиксом `EDIT ` в мок-счётчик (регресс различает «новое сообщение» и «правка той же карточки»);
+    mute → тихо True. Сеть/нет сообщения → False, не кидает."""
+    mode = _test_mode()
+    if mode == "count":
+        _count_attempt("EDIT " + text)
+        return True
+    if mode == "mute":
+        return True
+    if not mid:
+        return False
+    token = _get_token()
+    if not token:
+        return False
+    return _edit_message(token, mid, text)
 
 
 def clear_notifications(force=False) -> None:
