@@ -477,7 +477,8 @@ class BridgeClient:
 
     def add_transaction(self, **fields) -> dict:
         """Записать приход/расход. Поля: msg_date, group, sender, amount,
-        currency, category, bike, deposit, description, raw, msg_id."""
+        currency, category, bike, deposit, description, raw, msg_id,
+        booking_id (опционально, col N — привязка к брони; старый Bridge молча игнорирует)."""
         return self._post("add_transaction", **fields)
 
     def add_event(self, **fields) -> dict:

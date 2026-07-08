@@ -2151,12 +2151,47 @@ async def handle_currency_confirm(msg, context, bridge, claude, text) -> bool:
     return True
 
 
+# === O3-3c часть Б: привязка deposit-прихода Money к брони по байку ===
+# Money-парсер клиента НЕ знает (deposit=passport/cash + bike из текста) — мост к брони строим
+# по байку: приоритет — intake-окно после «✅ Бронь записана», иначе read-only резолв по CRM.
+_DEPOSIT_LINK_WINDOW = 1800   # 30 мин intake-окна
+_RECENT_BOOKINGS = {}         # plate -> {"booking_id", "row", "ts"} — брони, созданные intake
+
+
+def _deposit_resolve_booking(bridge, bike):
+    """Бронь для deposit-прихода по байку (READ-ONLY). Приоритет: intake-окно 30 мин после
+    «✅ Бронь записана» по тому же байку (CRM не читаем). Иначе CRM: строки Бронь/В аренде по
+    номеру байка — РОВНО одна и с booking_id (col Y) → линк; ноль/несколько/без uuid/сбой →
+    None (запись как сейчас + подсказка «уточни бронь» у вызывателя).
+    → {"booking_id", "row"} | None."""
+    plate = plateFromName_(bike or "")
+    if not plate:
+        return None
+    rec = _RECENT_BOOKINGS.get(plate)
+    if rec and rec.get("booking_id") and _time.time() - rec.get("ts", 0) <= _DEPOSIT_LINK_WINDOW:
+        return {"booking_id": str(rec["booking_id"]), "row": rec.get("row")}
+    try:
+        cl = bridge._call("clients", filter="all").get("data", {})
+        rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
+    except Exception:
+        return None
+    cand = [c for c in rows if plateFromName_(str(c.get("bike", ""))) == plate
+            and str(c.get("status", "")).strip().lower() in ("бронь", "в аренде")]
+    if len(cand) != 1 or not str(cand[0].get("booking_id") or "").strip():
+        return None
+    return {"booking_id": str(cand[0]["booking_id"]).strip(), "row": cand[0].get("row")}
+
+
 async def _record_transaction(context, bridge, claude, msg, parsed, wallet, receipt=None):
     """Запись проводок + сверка чека + перенос в кассу + подтверждение. Валюта уже разрешена
     (THB по умолчанию / явная / подтверждённая). receipt — предзагруженный разбор фото (без 2-го vision)."""
     chat_id = msg.chat_id
     text = msg.text or msg.caption or ""
     moves = parsed.get("moves") or []
+    # deposit-ПРИХОД (deposit=passport/cash на плюсовом движении) → пробуем привязать к брони.
+    # Возвраты депозита (минус) не трогаем — на возврате бронь уже «Завершена», подсказка спамила бы.
+    dep_move = next((m for m in moves if m.get("deposit") and (m.get("amount") or 0) > 0), None)
+    dep_link = _deposit_resolve_booking(bridge, dep_move.get("bike")) if dep_move else None
     for i, mv in enumerate(moves):
         bridge.add_transaction(
             msg_date=str(msg.date.date()) if msg.date else "",
@@ -2170,6 +2205,7 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
             description=text[:200],
             raw=text,
             msg_id=f"{chat_id}:{msg.message_id}:m{i}",
+            booking_id=(dep_link["booking_id"] if (dep_link and mv is dep_move) else ""),
         )
 
     money_move = next((m for m in moves if m.get("currency") != "PASSPORT"), None)
@@ -2221,14 +2257,23 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
                     text=msg_topup_pettycash(plus, pc_bal, wallet=PETTYCASH_LABEL, source=wallet))
 
     # === Подтверждение записи ===
+    # O3-3c часть Б: итог привязки депозита строкой в подтверждении (линк или «уточни бронь»)
+    link_note = ""
+    if dep_move and dep_link:
+        link_note = f"\n🔗 привязано к брони строка {dep_link.get('row') or '—'}"
+        log.info(f"  → депозит {dep_move.get('bike')}: привязан к брони "
+                 f"строка {dep_link.get('row')} ({dep_link['booking_id'][:12]}…)")
+    elif dep_move:
+        link_note = "\n⚠️ депозит: бронь по байку не определил — уточни бронь"
+        log.info(f"  → депозит {dep_move.get('bike') or '—'}: бронь не определена (0/несколько)")
     _entry_counts[chat_id] = _entry_counts.get(chat_id, 0) + 1
     if chat_id in MONEY_CONFIRM_EACH:
         await _send_retry(context, chat_id=chat_id,
-                          text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet))
+                          text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet) + link_note)
         _entry_counts[chat_id] = 0
     else:
         await _send_retry(context, chat_id=chat_id,
-                          text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet))
+                          text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet) + link_note)
         if _entry_counts[chat_id] >= RECONCILE_EVERY:
             await _send_retry(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
             _entry_counts[chat_id] = 0
@@ -5515,6 +5560,12 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             if res.get("ok"):
                 d["status"] = "booked"
                 _row = res.get("row")
+                # O3-3c часть Б: intake-окно 30 мин — deposit-приход в Money по этому байку
+                # привяжется к свежесозданной брони без чтения CRM (приоритет над резолвом).
+                _bid = res.get("booking_id")
+                _pl = plateFromName_(res.get("bike") or d.get("model") or "")
+                if _bid and _pl:
+                    _RECENT_BOOKINGS[_pl] = {"booking_id": str(_bid), "row": _row, "ts": now}
                 log.info(f"  🆕 INTAKE: бронь записана (строка {_row}, @{_who}) {d.get('model')}")
                 await _send(context, chat_id=chat_id,
                             text=f"🐀 Splinter\n✅ Бронь записана, строка {_row}, статус «Бронь».",
