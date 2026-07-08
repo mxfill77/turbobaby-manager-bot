@@ -533,9 +533,13 @@ class BridgeClient:
         Долг по брони НЕ начисляется, пока не вызван activate_booking."""
         return self._post("create_booking", **fields)
 
-    def activate_booking(self, bike: str, name: str) -> dict:
+    def activate_booking(self, bike: str, name: str, date_start: Optional[str] = None) -> dict:
         """Активировать бронь: 'Бронь' → 'В аренде'. Вызывать после фото выдачи (этап 6).
-        С этого момента формулы долга/оплаты начинают считать."""
+        С этого момента формулы долга/оплаты начинают считать.
+        date_start (опц., O3-2a) — уточнение при двух бронях одного клиента на один байк
+        (матч по дню; без даты — прежнее поведение: первая подходящая)."""
+        if date_start:
+            return self._post("activate_booking", bike=bike, name=name, date_start=date_start)
         return self._post("activate_booking", bike=bike, name=name)
 
     # === Паспорт (этап B2): OCR через EdenAI + хранение в Bot Data «паспорта». КРАСНАЯ зона. ===

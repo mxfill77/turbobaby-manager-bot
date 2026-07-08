@@ -1,0 +1,209 @@
+'use strict';
+/**
+ * Харнесс O3-2a: исполняет РЕАЛЬНЫЙ /root/turbobaby-bridge-gs/Booking.js в node
+ * с мок-SpreadsheetApp/Utilities (Apps Script локально не исполнить — но Booking.js
+ * зовёт сервисы только внутри функций, поэтому vm-загрузка + мок листа работает).
+ * Печатает JSON {cases:[{name, pass, detail}]}; exit 1, если есть провалы.
+ * Запускается из tests/test_booking_gs.py (в гейте).
+ */
+const fs = require('fs');
+const vm = require('vm');
+
+const BOOKING_JS = '/root/turbobaby-bridge-gs/Booking.js';
+const NMAX = 'NMAX 155CC GREEN-B PHUKET 4957';
+const CB = 'CB 300CC R 9011';
+
+// ── мок листа поверх 2D-массива (1-indexed строки/колонки как в Apps Script) ──
+function makeSheet(rows) {
+  const WIDTH = 30;
+  const grid = rows.map(r => { const a = r.slice(); while (a.length < WIDTH) a.push(''); return a; });
+  function ensureRow(n) { while (grid.length < n) grid.push(new Array(WIDTH).fill('')); }
+  function cellRange(row, col) {
+    return {
+      setValue(v) { ensureRow(row); grid[row - 1][col - 1] = v; },
+      copyTo(dst) { dst.setValue('=FORMULA'); }, // fill-down формулы — маркер
+    };
+  }
+  return {
+    grid,
+    getLastRow() {
+      for (let i = grid.length - 1; i >= 0; i--)
+        if (grid[i].some(v => v !== '' && v !== null && v !== undefined)) return i + 1;
+      return 0;
+    },
+    getRange(a, b, c, d) {
+      if (typeof a === 'string') return { getValues: () => grid.map(r => [r[0]]) }; // 'A:A'
+      if (c === undefined) return cellRange(a, b);
+      return {
+        getValues() {
+          const out = [];
+          for (let r = a; r < a + c; r++) { ensureRow(r); out.push(grid[r - 1].slice(b - 1, b - 1 + d)); }
+          return out;
+        },
+      };
+    },
+  };
+}
+
+function makeEnv(clientRows) {
+  const clients = makeSheet(clientRows);
+  const bikes = makeSheet([[NMAX], [CB], ['HONDA CLICK 125CC 1111']]);
+  const sheets = { 'клиенты': clients, 'список мото': bikes };
+  global.SpreadsheetApp = { openById: () => ({ getSheetByName: n => sheets[n] || null }) };
+  global.Utilities = { getUuid: () => 'uuid-test' };
+  global.Logger = { log: () => {} };
+  return clients;
+}
+
+vm.runInThisContext(fs.readFileSync(BOOKING_JS, 'utf8'), { filename: BOOKING_JS });
+
+// строка листа: [A статус, B, C байк, D имя, E начало, F конец]
+const HEADER = ['СТАТУС', 'AUTO CNCL', 'Название мото', 'Имя', 'Дата начала', 'Дата завершения'];
+function row(st, bike, name, ds, de) { return [st, 'OFF', bike, name, ds, de]; }
+
+const cases = [];
+function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: detail === undefined ? '' : String(detail) }); }
+
+// ── 1. bookingParseDate_: форматы листа/входа ──
+{
+  const p1 = bookingParseDate_('02.06.2026');
+  check('parse.dd.mm.yyyy', p1 && p1.d.getDate() === 2 && p1.d.getMonth() === 5 && p1.d.getFullYear() === 2026 && !p1.hasTime, JSON.stringify(p1));
+  const p2 = bookingParseDate_('09.06.2026 , 13:00');
+  check('parse.sheet-comma-time', p2 && p2.hasTime && p2.d.getHours() === 13 && p2.d.getMinutes() === 0, JSON.stringify(p2));
+  const p3 = bookingParseDate_('09.06.2026, 13:05');
+  check('parse.comma-time', p3 && p3.hasTime && p3.d.getHours() === 13 && p3.d.getMinutes() === 5);
+  const p4 = bookingParseDate_('03.07.2026 14:00'); // как в живых строках CRM (row698)
+  check('parse.space-time', p4 && p4.hasTime && p4.d.getHours() === 14);
+  const p5 = bookingParseDate_('02-06-2026'); // формат testBooking
+  check('parse.dashes', p5 && p5.d.getDate() === 2 && p5.d.getMonth() === 5);
+  const p6 = bookingParseDate_('2026-06-02');
+  check('parse.iso', p6 && p6.d.getDate() === 2 && p6.d.getMonth() === 5 && !p6.hasTime);
+  const p7 = bookingParseDate_('2026-06-02T13:30');
+  check('parse.iso-time', p7 && p7.hasTime && p7.d.getHours() === 13 && p7.d.getMinutes() === 30);
+  const p8 = bookingParseDate_(new Date(2026, 5, 2, 13, 0)); // Date-ячейка листа
+  check('parse.date-object', p8 && p8.hasTime && p8.t === new Date(2026, 5, 2, 13, 0).getTime());
+  check('parse.rollover-rejected', bookingParseDate_('32.13.2026') === null);
+  check('parse.garbage-null', bookingParseDate_('скоро') === null && bookingParseDate_('') === null && bookingParseDate_(null) === null);
+  check('parse.bad-time-rejected', bookingParseDate_('02.06.2026 , 25:00') === null);
+  check('fmt.date', bookingFmtDate_(bookingParseDate_('2026-06-02')) === '02.06.2026');
+  check('fmt.date-time', bookingFmtDate_(bookingParseDate_('2026-06-09T13:05')) === '09.06.2026 , 13:05');
+  check('fmt.roundtrip-sheet', bookingFmtDate_(bookingParseDate_('09.06.2026 , 13:00')) === '09.06.2026 , 13:00');
+}
+
+// ── 2. bookingOverlap_: касание границ НЕ конфликт, открытая аренда блокирует ──
+{
+  const D = (s) => bookingParseDate_(s).t;
+  check('overlap.inside', bookingOverlap_(D('12.07.2026'), D('14.07.2026'), D('10.07.2026'), D('15.07.2026')) === true);
+  check('overlap.touch-start', bookingOverlap_(D('15.07.2026'), D('20.07.2026'), D('10.07.2026'), D('15.07.2026')) === false);
+  check('overlap.touch-end', bookingOverlap_(D('05.07.2026'), D('10.07.2026'), D('10.07.2026'), D('15.07.2026')) === false);
+  check('overlap.disjoint', bookingOverlap_(D('01.07.2026'), D('05.07.2026'), D('10.07.2026'), D('15.07.2026')) === false);
+  check('overlap.open-ended-after', bookingOverlap_(D('10.08.2026'), D('12.08.2026'), D('01.07.2026'), null) === true);
+  check('overlap.open-ended-before', bookingOverlap_(D('10.06.2026'), D('01.07.2026'), D('01.07.2026'), null) === false);
+}
+
+// ── 3. createBooking: конфликт пересечения ──
+{
+  makeEnv([HEADER, row('Бронь', NMAX, 'Иван', '10.07.2026', '15.07.2026 , 13:00')]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: '12.07.2026', date_end: '14.07.2026' });
+  check('create.conflict-overlap', !r.ok && r.error === 'booking_conflict' && r.row === 2 &&
+        r.conflict_name === 'Иван' && r.conflict_start === '10.07.2026' && r.conflict_end === '15.07.2026 , 13:00',
+        JSON.stringify(r));
+  check('create.conflict-message-detail', /4957/.test(r.message) && /Иван/.test(r.message) && /10\.07\.2026/.test(r.message), r.message);
+}
+{
+  // ячейки как Date-объекты (реальный getValues листа отдаёт Date)
+  makeEnv([HEADER, row('В аренде', NMAX, 'Гость', new Date(2026, 6, 10), new Date(2026, 6, 15, 13, 0))]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: '2026-07-12', date_end: '2026-07-14' });
+  check('create.conflict-date-cells', !r.ok && r.error === 'booking_conflict', JSON.stringify(r));
+}
+{
+  // касание границ: возврат 15.07 (без времени) → выдача с 15.07 допустима
+  const sh = makeEnv([HEADER, row('Бронь', NMAX, 'Иван', '10.07.2026', '15.07.2026')]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: '15.07.2026', date_end: '20.07.2026' });
+  check('create.touch-ok', r.ok === true && sh.grid[2][0] === 'Бронь', JSON.stringify(r));
+  check('create.touch-written-dates', sh.grid[2][4] === '15.07.2026' && sh.grid[2][5] === '20.07.2026');
+}
+{
+  // другой байк — те же даты свободны
+  makeEnv([HEADER, row('Бронь', NMAX, 'Иван', '10.07.2026', '15.07.2026')]);
+  const r = createBooking({ bike: '9011', name: 'Пётр', date_start: '12.07.2026', date_end: '14.07.2026' });
+  check('create.other-bike-ok', r.ok === true, JSON.stringify(r));
+}
+{
+  // статус "Завершена" НЕ блокирует
+  makeEnv([HEADER, row('Завершена', NMAX, 'Иван', '10.07.2026', '15.07.2026')]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: '12.07.2026', date_end: '14.07.2026' });
+  check('create.completed-not-blocking', r.ok === true, JSON.stringify(r));
+}
+{
+  // открытая аренда (F пуст) блокирует всё после старта
+  makeEnv([HEADER, row('В аренде', NMAX, 'Иван', '01.07.2026', '')]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: '10.08.2026', date_end: '12.08.2026' });
+  check('create.open-ended-conflict', !r.ok && r.error === 'booking_conflict' && r.conflict_end === '', JSON.stringify(r));
+}
+
+// ── 4. bad_dates ──
+{
+  makeEnv([HEADER]);
+  const r1 = createBooking({ bike: '4957', name: 'Пётр', date_start: '14.07.2026', date_end: '12.07.2026' });
+  check('create.bad-dates-reversed', !r1.ok && r1.error === 'bad_dates', JSON.stringify(r1));
+  const r2 = createBooking({ bike: '4957', name: 'Пётр', date_start: '14.07.2026', date_end: '14.07.2026' });
+  check('create.bad-dates-equal', !r2.ok && r2.error === 'bad_dates', JSON.stringify(r2));
+  const r3 = createBooking({ bike: '4957', name: 'Пётр', date_start: '14.07.2026', date_end: '14.07.2026 , 13:00' });
+  check('create.same-day-with-time-ok', r3.ok === true, JSON.stringify(r3));
+}
+
+// ── 5. нормализация: ISO на входе → формат листа в ячейках ──
+{
+  const sh = makeEnv([HEADER]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: '2026-07-21', date_end: '2026-07-25T13:00' });
+  check('create.normalize-iso', r.ok === true && sh.grid[1][4] === '21.07.2026' && sh.grid[1][5] === '25.07.2026 , 13:00',
+        JSON.stringify({ r, E: sh.grid[1][4], F: sh.grid[1][5] }));
+}
+{
+  // совместимость: нераспознанные даты пишутся как пришли, брони не рушатся
+  const sh = makeEnv([HEADER, row('Бронь', NMAX, 'Иван', 'когда-то', '')]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: 'скоро', date_end: 'потом' });
+  check('create.unparseable-passthrough', r.ok === true && sh.grid[2][4] === 'скоро' && sh.grid[2][5] === 'потом',
+        JSON.stringify(r));
+}
+
+// ── 6. дубль-чек прежний + через нормализацию ──
+{
+  makeEnv([HEADER, row('Бронь', NMAX, 'Пётр', '12.07.2026', '14.07.2026')]);
+  const r = createBooking({ bike: '4957', name: 'Пётр', date_start: '12.07.2026', date_end: '14.07.2026' });
+  check('create.duplicate-exact', !r.ok && r.error === 'duplicate' && r.row === 2, JSON.stringify(r));
+  const r2 = createBooking({ bike: '4957', name: 'Пётр', date_start: '2026-07-12', date_end: '2026-07-14' });
+  check('create.duplicate-iso-normalized', !r2.ok && r2.error === 'duplicate', JSON.stringify(r2));
+}
+
+// ── 7. activateBooking: уточнение по date_start ──
+{
+  const sh = makeEnv([
+    HEADER,
+    row('Бронь', NMAX, 'Пётр', '10.07.2026', '12.07.2026'),
+    row('Бронь', NMAX, 'Пётр', '20.07.2026', '25.07.2026'),
+  ]);
+  const r = activateBooking({ bike: '4957', name: 'Пётр', date_start: '2026-07-20' }); // ISO против дд.мм в листе
+  check('activate.by-date', r.ok === true && r.row === 3 && sh.grid[2][0] === 'В аренде' && sh.grid[1][0] === 'Бронь',
+        JSON.stringify(r));
+}
+{
+  const sh = makeEnv([
+    HEADER,
+    row('Бронь', NMAX, 'Пётр', '10.07.2026', '12.07.2026'),
+    row('Бронь', NMAX, 'Пётр', '20.07.2026', '25.07.2026'),
+  ]);
+  const r = activateBooking({ bike: '4957', name: 'Пётр' }); // без даты — прежнее поведение: первая
+  check('activate.no-date-legacy', r.ok === true && r.row === 2 && sh.grid[1][0] === 'В аренде', JSON.stringify(r));
+}
+{
+  makeEnv([HEADER, row('Бронь', NMAX, 'Пётр', '10.07.2026', '12.07.2026')]);
+  const r = activateBooking({ bike: '4957', name: 'Пётр', date_start: '11.07.2026' });
+  check('activate.date-mismatch-not-found', !r.ok && r.error === 'booking_not_found', JSON.stringify(r));
+}
+
+// ── итог ──
+const failed = cases.filter(c => !c.pass);
+console.log(JSON.stringify({ total: cases.length, failed: failed.length, cases }, null, 1));
+process.exit(failed.length ? 1 : 0);
