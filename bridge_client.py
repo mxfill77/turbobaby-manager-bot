@@ -312,7 +312,7 @@ class BridgeClient:
         "set_fleet_oil", "set_fleet_service",   # Байки H/I/J/K/L
         "set_caps", "toggle_cap",                # блок капов «Календарь бронирования» Z3:AB15 (живая таблица)
         "add_transaction", "void_last",          # касса (проводки + отмена)
-        "create_booking", "activate_booking",    # CRM «клиенты»
+        "create_booking", "activate_booking", "close_booking",  # CRM «клиенты»
         "delete_event",                          # удаление
         "ocr_passport", "save_passport", "upload_passport_photo",  # B2: EdenAI + Drive + Bot Data
         "make_contract",                         # B3: договор (Drive-запись + чтение CRM)
@@ -541,6 +541,22 @@ class BridgeClient:
         if date_start:
             return self._post("activate_booking", bike=bike, name=name, date_start=date_start)
         return self._post("activate_booking", bike=bike, name=name)
+
+    def close_booking(self, bike: str, name: str, date_start: Optional[str] = None,
+                      km_end=None, paid_total=None) -> dict:
+        """Закрыть аренду: 'В аренде' → 'Завершена' (O3-3b, возврат байка).
+        date_start (опц.) — уточнение строки по дню при двух арендах bike+name;
+        km_end (опц.) — пробег на сдаче (→ N; Bridge отклонит odometer_back, если
+        меньше текущего Q); paid_total (опц.) — итог оплаты (→ K; без него K не трогается).
+        Опциональные поля шлются только при наличии (обратная совместимость)."""
+        fields = {"bike": bike, "name": name}
+        if date_start:
+            fields["date_start"] = date_start
+        if km_end is not None:
+            fields["km_end"] = km_end
+        if paid_total is not None:
+            fields["paid_total"] = paid_total
+        return self._post("close_booking", **fields)
 
     # === Паспорт (этап B2): OCR через EdenAI + хранение в Bot Data «паспорта». КРАСНАЯ зона. ===
     def upload_passport_photo(self, image_b64: str, filename: str = "passport", mime: str = "image/jpeg") -> dict:
