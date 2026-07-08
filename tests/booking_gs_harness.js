@@ -210,7 +210,7 @@ function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: de
   // штатное закрытие: A→Завершена, N=km_end, K=paid_total; F и формулы G/I/J/W целы
   const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
   sh.grid[1][6] = '=G'; sh.grid[1][8] = '=I'; sh.grid[1][9] = '=J'; sh.grid[1][22] = '=W';
-  sh.grid[1][16] = 12000; // Q текущий пробег
+  sh.grid[1][16] = '12000 Km, 05.07.2026'; // Q текущий пробег — ЖИВОЙ формат листа (разведка CRM 23:04)
   sh.grid[1][10] = 3000;  // K было оплачено
   const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 12500, paid_total: 9000 });
   check('close.ok', r.ok === true && r.closed === true && r.row === 2 && sh.grid[1][0] === 'Завершена',
@@ -299,6 +299,46 @@ function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: de
   const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
   const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 'много' });
   check('close.bad-km-end', !r.ok && r.error === 'bad_km_end' && sh.grid[1][0] === 'В аренде',
+        JSON.stringify(r));
+}
+
+// ── 9. bookingParseOdo_ (фикс №2 маятника row705→1268): Q живёт строкой «<число> Km, <дата>» ──
+{
+  check('parseOdo.live-format', bookingParseOdo_('35200 Km, 05.07.2026') === 35200);
+  check('parseOdo.lower-km', bookingParseOdo_('12345 km') === 12345);
+  check('parseOdo.no-space-km', bookingParseOdo_('12345Km') === 12345);
+  check('parseOdo.plain-string', bookingParseOdo_('12345') === 12345);
+  check('parseOdo.number-cell', bookingParseOdo_(12345) === 12345);
+  check('parseOdo.empty-null', bookingParseOdo_('') === null && bookingParseOdo_(null) === null &&
+        bookingParseOdo_(undefined) === null);
+  check('parseOdo.garbage-null', bookingParseOdo_('#N/A') === null && bookingParseOdo_('мусор') === null);
+  check('parseOdo.bare-date-null', bookingParseOdo_('05.07.2026') === null); // голая дата ≠ пробег
+  check('parseOdo.split-number-null', bookingParseOdo_('12 345 Km') === null); // недопарс «12» запрещён
+  check('parseOdo.nan-null', bookingParseOdo_(NaN) === null && bookingParseOdo_(Infinity) === null);
+}
+{
+  // живой формат Q → парс → back-гейт ЛОВИТ занижение (до фикса Q-строка давала odo_unverifiable)
+  const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
+  sh.grid[1][16] = '35200 Km, 05.07.2026';
+  const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 35100 });
+  check('close.odo-live-format-back', !r.ok && r.error === 'odometer_back' && r.odo === 35200 &&
+        sh.grid[1][0] === 'В аренде' && sh.grid[1][13] === '', JSON.stringify(r));
+}
+{
+  // живой формат Q, km_end ≥ распарсенного → закрытие ok (маятник 1268 закрыт)
+  const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
+  sh.grid[1][16] = '35200 Km, 05.07.2026';
+  const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 35450 });
+  check('close.odo-live-format-ok', r.ok === true && sh.grid[1][0] === 'Завершена' &&
+        sh.grid[1][13] === 35450, JSON.stringify(r));
+}
+{
+  // Q = голая дата без числа → odo_unverifiable (fail-closed цел), лист НЕ тронут
+  const sh = makeEnv([HEADER, row('В аренде', NMAX, 'Пётр', '10.07.2026', '20.07.2026')]);
+  sh.grid[1][16] = '05.07.2026';
+  const r = closeBooking({ bike: '4957', name: 'Пётр', km_end: 35200 });
+  check('close.odo-date-only-unverifiable', !r.ok && r.error === 'odo_unverifiable' &&
+        /руками/.test(r.message) && sh.grid[1][0] === 'В аренде' && sh.grid[1][13] === '',
         JSON.stringify(r));
 }
 

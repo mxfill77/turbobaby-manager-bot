@@ -6,6 +6,8 @@
 не тронут), F и формульные G/I/J/W целы. Фикс дыры fail-closed (инцидент row705): km_end
 ОБЯЗАТЕЛЕН (нет → km_required), Q пуст/нечисловой → odo_unverifiable «сверь и закрой руками»
 (молчаливого пропуска гейта одометра больше нет; force-флага нет намеренно).
+Фикс №2 (маятник row705→1268): Q в живом листе — СТРОКА «<число> Km, <дата>» → bookingParseOdo_
+извлекает число (моки Q — живым форматом листа); не извлекли → odo_unverifiable как раньше.
 Плюс: роутинг close_booking в Bridge.js под REDZONE_LOCK 4.2; bridge_client.close_booking
 шлёт опциональные поля только при наличии."""
 import json
@@ -52,6 +54,11 @@ def test_close_harness_covers_required_scenarios():
         "close.bad-km-end",
         # фикс row705 fail-closed: km_end обязателен; Q пуст/нечисловой → err, не пропуск
         "close.km-required", "close.odo-empty-unverifiable", "close.odo-nonnumeric-unverifiable",
+        # фикс №2 (маятник row705→1268): Q живёт строкой «<число> Km, <дата>» — парсер + гейты
+        "parseOdo.live-format", "parseOdo.empty-null", "parseOdo.garbage-null",
+        "parseOdo.bare-date-null", "parseOdo.split-number-null",
+        "close.odo-live-format-back", "close.odo-live-format-ok",
+        "close.odo-date-only-unverifiable",
     }
     missing = required - names
     assert not missing, f"в харнессе нет кейсов: {missing}"
@@ -64,6 +71,7 @@ def test_close_booking_js_structure():
         "function closeBooking", "not_active", "not_found", "ambiguous",
         "odometer_back", "bad_km_end", "BOOKING.COL.ODO",
         "km_required", "odo_unverifiable",  # фикс row705 fail-closed
+        "function bookingParseOdo_",  # фикс №2: Q «<число> Km, <дата>» → число
     ):
         assert marker in src, f"нет маркера {marker}"
     # запись строго точечная: A/N/K; формульные не копируются, F не пишется
