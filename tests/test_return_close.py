@@ -262,6 +262,50 @@ def test_activation_priority_over_close():
     assert b.activated and b.closed == [], "«да» при живой карточке активации идёт активации, не закрытию"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting", "карточка приёма остаётся ждать своего «да»"
 
+# ==== O3-3c часть В: строка депозита в карточке ПРИЁМА (RAW col S, НЕ parseNumber) ====
+# Живой формат S (разведка Contract.js:315-351): число из getValues | строка-число |
+# 'passport' (регистр любой) | '' — моки строго этими формами (урок-класс «моки = живой формат»).
+
+def _dep_card(b):
+    do_return(b)
+    cards = [t for t in intake_sends() if "ПРИЁМ" in t and "Завершаю" in t]
+    assert len(cards) == 1, f"ждал одну карточку приёма: {SENDS}"
+    return cards[0]
+
+def test_deposit_passport_raw():
+    reset(); b = FakeBridge(clients=[dict(RENT_ROW, deposit_raw="passport", deposit=0)])
+    card = _dep_card(b)
+    assert "💰 Верни депозит: passport" in card, f"passport из RAW S: {card}"
+    assert "не указан" not in card
+
+def test_deposit_money_number():
+    # живой формат: getValues отдаёт S числом
+    reset(); b = FakeBridge(clients=[dict(RENT_ROW, deposit_raw=20000, deposit=20000)])
+    assert "💰 Верни депозит: 20 000 ฿" in _dep_card(b)
+
+def test_deposit_money_string():
+    # живой формат: S бывает строкой-числом (ручной ввод)
+    reset(); b = FakeBridge(clients=[dict(RENT_ROW, deposit_raw="5000", deposit=5000)])
+    assert "💰 Верни депозит: 5 000 ฿" in _dep_card(b)
+
+def test_deposit_empty_warns():
+    reset(); b = FakeBridge(clients=[dict(RENT_ROW, deposit_raw="", deposit=0)])
+    card = _dep_card(b)
+    assert "💰 Депозит: не указан ⚠️" in card, f"S пуст → предупреждение: {card}"
+    assert "Верни депозит" not in card
+
+def test_deposit_old_bridge_fallback_money():
+    # Bridge без deposit_raw (до redeploy): parsed>0 → сумма показывается
+    reset(); b = FakeBridge(clients=[dict(RENT_ROW, deposit=15000)])
+    assert "💰 Верни депозит: 15 000 ฿" in _dep_card(b)
+
+def test_deposit_old_bridge_passport_honest():
+    # старый Bridge: parseNumber('passport')=0 → passport неотличим от пустого →
+    # честное «не указан ⚠️», НЕ ложный «0 ฿» (после redeploy покажет passport)
+    reset(); b = FakeBridge(clients=[dict(RENT_ROW, deposit=0)])
+    card = _dep_card(b)
+    assert "💰 Депозит: не указан ⚠️" in card and "Верни депозит" not in card, card
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

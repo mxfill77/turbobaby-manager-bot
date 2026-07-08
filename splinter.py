@@ -4109,7 +4109,32 @@ def _return_resolve_close(bridge, bike):
     last = cand[-1]   # getClients в порядке строк (свежие ниже) → последняя
     return {"row": last.get("row"), "name": last.get("name") or "",
             "date_start": str(last.get("date_start") or ""),
-            "status": str(last.get("status", "")).strip().lower()}
+            "status": str(last.get("status", "")).strip().lower(),
+            "deposit_raw": last.get("deposit_raw"),
+            "deposit": last.get("deposit")}
+
+
+def _return_deposit_disp(raw, parsed):
+    """O3-3c часть В: депозит для карточки ПРИЁМА из CRM col S. RAW живёт: число (getValues) |
+    строка-число | 'passport' | '' (разведка = Contract.js:315-351; депозит = деньги ИЛИ паспорт).
+    Bridge-поле deposit = parseNumber(S) ест 'passport' в 0 — для показа НЕ годится; оно
+    fallback ТОЛЬКО на старом Bridge без deposit_raw (там passport неотличим от пустого S →
+    честное «не указан ⚠️» до redeploy). → строка для карточки или None (S пуст)."""
+    if raw is None:                       # старый Bridge: ключа deposit_raw в строке нет
+        try:
+            p = float(parsed)
+            if p > 0:
+                return f"{_fmt(p)} ฿"
+        except (TypeError, ValueError):
+            pass
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:                                  # число/строка-число (вкл. '20000.0' из float-raw)
+        return f"{_fmt(float(s.replace(',', '.')))} ฿"
+    except ValueError:
+        return s                          # 'passport' и прочее нечисловое — показываем сырьём
 
 
 async def _return_close_card(context, bridge, bike, km="", total_due=None):
@@ -4154,11 +4179,14 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None):
     km_line = (f"Пробег на сдаче: {km}." if km
                else "Пробег на сдаче: не увидел — ответь «да <цифра пробега>».")
     due_line = (f" Итог закрытия: {_fmt(_paid)} ฿." if _paid is not None else "")
+    _dep = _return_deposit_disp(cand.get("deposit_raw"), cand.get("deposit"))
+    dep_line = (f"\n💰 Верни депозит: {_dep}" if _dep else "\n💰 Депозит: не указан ⚠️")
     log.info(f"  → ПРИЁМ {bike}: карточка закрытия во Входящие (строка {cand.get('row')}, "
-             f"клиент {cand['name'] or '—'}, km={km or '-'}, итог={_paid if _paid is not None else '-'})")
+             f"клиент {cand['name'] or '—'}, km={km or '-'}, итог={_paid if _paid is not None else '-'}, "
+             f"депозит={_dep or 'не указан'})")
     await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
                 text=(f"🐀 Splinter\n📥 ПРИЁМ: {bike} вернулся от {cand['name'] or '—'}, "
-                      f"строка {cand.get('row')}. {km_line}{due_line}\n"
+                      f"строка {cand.get('row')}. {km_line}{due_line}{dep_line}\n"
                       f"Завершаю (Завершена"
                       + (f" + пробег {km}" if km else "")
                       + (f" + оплачено {_fmt(_paid)}" if _paid is not None else "")
