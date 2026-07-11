@@ -178,9 +178,8 @@
     ],
     "ask": [
       "Bash(sqlite3 *)",
-      "Bash(clasp push*)",
-      "Bash(clasp redeploy*)",
-      "Bash(clasp deploy*)",
+      "Bash(clasp deploy)",
+      "Bash(clasp deploy *)",
       "Bash(clasp run*)",
       "Bash(systemctl stop*)",
       "Bash(sudo systemctl *)"
