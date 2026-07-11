@@ -4554,6 +4554,39 @@ async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, decla
     log.info(f"  → ТО фаза2 → подтверждение Пыму: {bike} done={done} odo={odo} (tok={tok})")
 
 
+async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, km=None):
+    """row12 (аудит 08.07): мозг вызвал set_service в servicing-теме — E2b-гейт запись блокирует,
+    но работа НЕ должна теряться молча («Принято» без следа → Инфо молчал про редуктор). Оформляем
+    ШТАТНУЮ то_заявку: есть одометр → сразу кнопка Пыму (_sp_advance_to_confirm; запись в Лист1
+    только по его «да» — гейт цел); одометра нет → заявка 'ждёт_факт' + просьба одометра
+    (B1 довезёт подтверждённым фото-одометром). Инфо-карточка видит заявку в «В работе» (sp_open).
+    Bot Data (то_заявки) = зелёная зона."""
+    kind = str(kind or "").strip().lower()
+    if kind not in _SP_KIND_LABEL:
+        kind = "other"
+    sp = _sp_open(bridge, chat_id, topic_id, bike) or {}
+    declared = _sp_merge_done(_sp_split(sp.get("declared")), [kind])
+    done = _sp_merge_done(_sp_split(sp.get("done")), [kind])
+    odo = str(km or "").strip().replace(" ", "").replace(",", "")
+    if not _re_pl.fullmatch(r"\d{3,6}", odo):
+        odo = ""
+    # Заявка уже ждёт Пыма с этой работой (и тем же одометром) → кнопку не дублируем.
+    if (str(sp.get("status")) == "ждёт_подтверждения" and kind in _sp_split(sp.get("done"))
+            and (not odo or str(sp.get("odometer") or "") == odo)):
+        log.info(f"  → E2b-заявка: {bike} {kind} уже ждёт подтверждения — не дублирую")
+        return
+    if odo:
+        await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo)
+        return
+    bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                  declared=_sp_join(declared), done=_sp_join(done), status="ждёт_факт")
+    if _sp_ask_ok(chat_id, topic_id):
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=msg_ask_odometer(bike, kinds=done))
+    mark_awaiting(chat_id, topic_id)
+    log.info(f"  → E2b-заявка без одометра: {bike} {kind} → ждёт_факт")
+
+
 async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declared, works_raw=None):
     """Фаза 1: фиксируем НАМЕРЕНИЕ (заявка). В Лист1/обслуживание НИЧЕГО не пишем.
     Z4: дословные работы (works_raw) кладём в note (для правдивой карточки «в работе»)."""
@@ -5132,6 +5165,24 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         # (a) НЕ ЗАДВАИВАТЬ: ОДНО сообщение. msg_work_receipt уже называет работы И просит пробег
         # («Принял работы {works} — пришли пробег») → пробег покрыт для ВСЕХ работ (правило «пробег всегда»).
         # Дублирующий msg_ask_odometer (блок2, к тому же с хардкод-«масло») убран.
+        # row12 (аудит 08.07): работы группы B (gear/abs/airfilter) без пробега В ЭТОМ сообщении
+        # РАНЬШЕ терялись молча (кнопка фиксации ниже требует пробег в том же сообщении, инцидент
+        # X MAX GREEN 4248 06:11). Теперь фиксируем их в то_заявке 'ждёт_факт': подтверждённый
+        # одометр довезёт до кнопки Пыма (B1), Инфо-карточка показывает «в работе». На возврате
+        # (_ret_ctx) заявку не открываем — works уже легли в «события» (не наряд).
+        if bike and not _ret_ctx:
+            _bkinds = [k for k in _declared_kinds(text, works, vis) if k in ("gear", "abs", "airfilter")]
+            if _bkinds:
+                try:
+                    _sp0 = _sp_open(bridge, chat_id, topic_id, bike) or {}
+                    bridge.service_pending_upsert(
+                        chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                        declared=_sp_join(_sp_merge_done(_sp_split(_sp0.get("declared")), _bkinds)),
+                        done=_sp_join(_sp_merge_done(_sp_split(_sp0.get("done")), _bkinds)),
+                        status="ждёт_факт")
+                    log.info(f"  → работы группы B без пробега → то_заявка ждёт_факт: {_bkinds} ({bike})")
+                except Exception:
+                    log.exception("  → заявка на работы группы B (без пробега) упала")
         await _send(context, chat_id=chat_id,
                     text=msg_work_receipt(bike, works), message_thread_id=topic_id)
         return

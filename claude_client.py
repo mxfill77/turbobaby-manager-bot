@@ -447,12 +447,25 @@ class ClaudeClient:
                 # запись регламента ТОЛЬКО через кнопку подтверждения Пыма (двухфазный флоу). Закрывает
                 # путь «Да»→мозг→set_service(oil) мимо гейта (каскад 4255).
                 if getattr(self, "_force_bike", ""):
-                    log.info("  set_service: ЗАБЛОКИРОВАН в servicing-теме (E2b) — запись ТО только кнопкой Пыма")
+                    # row12 (аудит 08.07): раньше блок терял работу МОЛЧА — бот отвечал «Принято»,
+                    # а ни заявки, ни кнопки не оставалось → Инфо не показывал редуктор. Теперь блок
+                    # ставит работу в очередь: bot.py после ответа оформит то_заявку + кнопку Пыма
+                    # (splinter.sp_confirm_from_brain). Сам гейт НЕ ослаблен: запись только по «да» Пыма.
+                    _kind = str(tool_input.get("service_type") or "oil").strip().lower()
+                    _km = tool_input.get("current_km") or getattr(self, "_force_mileage", None)
+                    _q = getattr(self, "pending_service_confirm", None)
+                    if _q is None:
+                        _q = self.pending_service_confirm = []
+                    if not any(p.get("kind") == _kind for p in _q):
+                        _q.append({"kind": _kind, "km": _km})
+                    log.info(f"  set_service: ЗАБЛОКИРОВАН в servicing-теме (E2b) — запись ТО только "
+                             f"кнопкой Пыма; работа в очередь на заявку: kind={_kind} km={_km}")
                     return json.dumps({
                         "ok": False, "blocked": "service_gate",
                         "ОБЯЗАТЕЛЬНО": ("Запись ТО/пробега в servicing-теме оформляется ТОЛЬКО кнопкой подтверждения "
                                         "@Pleummmm (двухфазный сервисный флоу), НЕ диалогом. НЕ вызывай set_service здесь. "
-                                        "Ответь механику: результат ТО зафиксирует @Pleummmm кнопкой подтверждения."),
+                                        "Заявка на эту работу уже поставлена и уйдёт @Pleummmm кнопкой подтверждения. "
+                                        "Ответь механику: принял, запись подтвердит @Pleummmm кнопкой."),
                     }, ensure_ascii=False)
                 _bike = tool_input.get("bike", "")
                 # ЗАЩИТА: в теме обслуживания байк ВСЕГДА из темы, не из выбора модели
@@ -577,6 +590,7 @@ class ClaudeClient:
         self.pending_pins = []   # запросы на закреп, которые исполнит bot.py после ответа
         self.pending_important = []  # важное к закрепу+записи (bot.py исполнит)
         self.pending_unpin = []      # row важного к откреплению
+        self.pending_service_confirm = []  # row12: работы, упёршиеся в E2b-гейт → то_заявка+кнопка Пыма (bot.py)
         self._force_bike = force_bike or ""
         self._force_mileage = force_mileage
         self._force_mileage_conf = force_mileage_conf or ""

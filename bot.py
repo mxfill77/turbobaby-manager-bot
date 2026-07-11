@@ -698,6 +698,19 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
             log.warning(f"  → ошибка при откреплении важного: {e}")
         claude.pending_unpin = []
 
+    # row12 (аудит 08.07): мозг упёрся в E2b-гейт set_service (servicing-тема) → работа НЕ теряется:
+    # оформляем штатную то_заявку + кнопку Пыма (запись в Лист1 только по его «да» — гейт цел),
+    # Инфо-карточка честно показывает работу в «В работе».
+    sp_blocked = getattr(claude, "pending_service_confirm", None) or []
+    if sp_blocked and force_bike:
+        for it in sp_blocked:
+            try:
+                await splinter.sp_confirm_from_brain(context, bridge, chat_id, _topic, force_bike,
+                                                     it.get("kind"), it.get("km"))
+            except Exception as e:
+                log.warning(f"  → заявка из E2b-блока не оформилась: {e}")
+        claude.pending_service_confirm = []
+
 
 async def _maybe_api_ledger_cmd(msg) -> bool:
     """§12 ЛЕДЖЕР ТРАТ: владелец (Филипп) управляет балансом платного API текстом Splinter'у.
