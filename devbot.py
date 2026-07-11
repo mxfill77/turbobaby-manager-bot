@@ -119,7 +119,14 @@ QUEUE_FROM_PC_DEV = "Filipp-pc-dev"     # дев-ТЗ из темы PC-дев (l
 QUEUE_FROM_PC_DEC = "Filipp-pc-dec"     # декомпозиция ПК-театра (кусок 2, 07.07.2026): родитель
                                         # БЕЗ lane (план строит VPS-демон — единственный мозг),
                                         # шаги демон релизит на lane=pc по одному; карточки → 829
-QUEUE_FROMS_PC = (QUEUE_FROM_PC, QUEUE_FROM_PC_DEV, QUEUE_FROM_PC_DEC)  # метки полосы pc (карточки → тема PC-дев)
+QUEUE_FROM_PCLOC_DEC = "Filipp-pcloc-dec"  # ЛОКАЛЬНЫЙ дирижёр-декомпозер ПК (родитель 185, шаг 5/7,
+                                        # 11.07.2026): план/релиз/надзор целиком на ПК
+                                        # (pc_orchestrator, PC_LOCAL_DEC=1), VPS-демон цепь НЕ видит;
+                                        # devbot несёт её карточки штатно — needs_approval красного
+                                        # шага → инбокс (INBOX_TOPIC_ID, прод 1160) с кнопками ✅/❌,
+                                        # done/failed/сводки/карточки → тема PC-дев
+QUEUE_FROMS_PC = (QUEUE_FROM_PC, QUEUE_FROM_PC_DEV, QUEUE_FROM_PC_DEC,
+                  QUEUE_FROM_PCLOC_DEC)  # метки полосы pc (карточки → тема PC-дев)
 QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
 _DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
