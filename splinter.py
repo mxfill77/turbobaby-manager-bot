@@ -1456,25 +1456,33 @@ def msg_ask_odometer(bike, kinds=None):
 def msg_work_receipt(bike, works):
     """Квитанция на ЭТАПЕ ТЕКСТА: работы ПРИНЯТЫ (ещё в буфере, НЕ записаны) — просим пробег.
     Факт записи подтверждается ОТДЕЛЬНО (msg_works_logged) ПОСЛЕ прихода пробега, чтобы не
-    выглядело «записал», когда записи ещё нет. Список работ по-русски → только в 🇷🇺-строке."""
+    выглядело «записал», когда записи ещё нет. Список работ в ОБОИХ блоках: 🇹🇭 тайские
+    названия (_works_th_str, аудит row9 08.07: TH был 49 симв < 40% RU), 🇷🇺 русские."""
     b = f" {bike}" if bike else ""
     works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
+    th_str = _works_th_str(works)
+    th_part = f": {th_str}" if th_str else ""
+    ru_part = f": {works_str}" if works_str else ""
     return (
         f"🐀 Splinter\n"
-        f"🇹🇭 รับงานแล้วครับ{b} — รบกวนส่งเลขไมล์ด้วยครับ 🙏\n"
-        f"🇷🇺 Принял работы{b}: {works_str} — пришли пробег 🙏"
+        f"🇹🇭 รับงานแล้วครับ{b}{th_part} — รบกวนส่งเลขไมล์ด้วยครับ 🙏\n"
+        f"🇷🇺 Принял работы{b}{ru_part} — пришли пробег 🙏"
     )
 
 
 def msg_works_logged(bike, km, works):
     """Пост-квитанция ПО ФАКТУ записи инфо-работ в историю (после flush/записи с км).
-    Список работ по-русски → ТОЛЬКО в 🇷🇺-строке (🇹🇭 без кириллицы; km — цифры, bike — латиница)."""
+    Список работ в ОБОИХ блоках (тот же класс, что row9): 🇹🇭 тайские названия
+    (_works_th_str, без кириллицы; km — цифры, bike — латиница), 🇷🇺 русские."""
     b = f" {bike}" if bike else ""
     works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
+    th_str = _works_th_str(works)
+    th_part = f": {th_str}" if th_str else ""
+    ru_part = f": {works_str}" if works_str else ""
     return (
         f"🐀 Splinter\n"
-        f"🇹🇭 ✅ บันทึกงานลงประวัติที่เลขไมล์ {km} กม. แล้วครับ{b} 🛠️\n"
-        f"🇷🇺 ✅ Записал работы на пробеге {km} км{b}: {works_str} 🛠️"
+        f"🇹🇭 ✅ บันทึกงานลงประวัติที่เลขไมล์ {km} กม. แล้วครับ{b}{th_part} 🛠️\n"
+        f"🇷🇺 ✅ Записал работы на пробеге {km} км{b}{ru_part} 🛠️"
     )
 
 
@@ -1512,6 +1520,12 @@ def _work_th(w):
         if k in s:
             return _WORK_TH[k]
     return "งานอื่น ๆ"
+
+
+def _works_th_str(works):
+    """Список работ по-тайски одной строкой для 🇹🇭-блока квитанций: _work_th на каждую,
+    дедуп ПЕРЕВОДОВ с сохранением порядка (две неизвестные работы → один 'งานอื่น ๆ')."""
+    return ", ".join(dict.fromkeys(_work_th(w) for w in (works or []) if str(w).strip()))
 
 
 def msg_service_summary(bike, acc, skip_oil=False):
