@@ -124,6 +124,9 @@ QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC) + QUEUE_FROMS_PC  # �
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
 _DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
 _DEC_PREFIXES = ("декомпозируй:", "разбей:", "decompose:")  # крупное ТЗ → план шагов → по одному
+_STRUCT_PREFIXES = _DEC_PREFIXES + _DEV_PREFIXES + _TASK_PREFIXES  # ВСЕ командные префиксы очереди:
+                                        # матчатся ПЕРВЫМИ по началу сообщения, абсолютный приоритет
+                                        # над зелёным allowlist (инцидент 23:49 11.07.2026)
 _reported = set()                       # id задач, уже отрапортованных (done/failed; дедуп, память процесса)
 _report_seeded = False                  # seed-on-start: не спамим историей done/failed при рестарте
 _asked = set()                          # id задач needs_approval, по которым УЖЕ задан вопрос (дедуп)
@@ -341,6 +344,28 @@ def _enqueue_reliable(bridge, frm, text, lane=None):
     return r2
 
 
+def _canon_theater_prefix(t):
+    """Канонизация порядка префиксов: «пк: тз: X» → «тз: пк: X» (команда первой, театр внутри).
+    Инцидент 23:49 11.07.2026: лидирующий «пк:» ПЕРЕД командным префиксом не матчился ни одним
+    структурированным префиксом → «пк: декомпозируй: <крупное ТЗ>» падал мимо очереди в зелёный
+    allowlist и угонялся словом из тела ТЗ (простыня журнала вместо постановки родителя).
+    Перестановка чисто СИНТАКСИЧЕСКАЯ: дальше работает прежний слой 1 роутера (явный пк:-префикс
+    ПОСЛЕ команды); THEATER_ROUTER=0 и полоса pc ведут себя с «тз: пк: X» ровно как раньше.
+    Театр-префикс БЕЗ командного дальше — не трогаем (это не команда очереди)."""
+    low = t.lower()
+    for p in _PC_TEXT_PREFIXES:
+        if not low.startswith(p):
+            continue
+        rest = t[len(p):].strip()
+        rl = rest.lower()
+        for cp in _STRUCT_PREFIXES:
+            if rl.startswith(cp):
+                body = rest[len(cp):].strip()
+                return f"{rest[:len(cp)]} {p} {body}".strip()
+        break
+    return t
+
+
 def _try_enqueue(text, bridge, lane="vps"):
     """Если текст начинается с префикса задачи — кладём в очередь оркестратора. Иначе None.
     «тз:»/«dev:» → метка QUEUE_FROM_DEV (демон даст 45 мин); «задача:» → быстрый режим (10 мин).
@@ -353,7 +378,7 @@ def _try_enqueue(text, bridge, lane="vps"):
     (_route_328). Театр vps → вызовы enqueue_task байт-в-байт как раньше (БЕЗ lane — Bridge
     дефолтит vps); театр pc → одиночные с 328-меткой + lane='pc' (карточки в тему постановки),
     «декомпозируй:» → родитель QUEUE_FROM_PC_DEC (кусок 2). Карточка приёма показывает 🎭."""
-    t = (text or "").strip()
+    t = _canon_theater_prefix((text or "").strip())
     low = t.lower()
     pc = (lane == "pc")
     for p in _DEC_PREFIXES:
@@ -992,8 +1017,22 @@ _ALLOWLIST = [
 ]
 
 
+_GREEN_CMD_MAX_CHARS = 32   # зелёная команда = короткое сообщение-команда («покажи статус», «cc лог»)
+_GREEN_CMD_MAX_WORDS = 4    # длинный текст со словом команды В ТЕЛЕ — это ТЗ/вопрос, НЕ команда
+
+
 def _match(text):
+    """Зелёная однословная команда срабатывает ТОЛЬКО когда сообщение и ЕСТЬ команда (короткое
+    после трима), а НЕ когда её слово встретилось в теле длинного ТЗ. Инцидент 23:49 11.07.2026:
+    «пк: декомпозируй: <крупное ТЗ>» угнан словом зелёной команды из тела → простыня журнала
+    вместо постановки родителя. Структурированные префиксы (задача:/тз:/декомпозируй:/пк:) —
+    абсолютный приоритет: сообщение с ними в зелёное не попадает вообще, даже короткое
+    (защита в глубину: обычно их раньше съедает _try_enqueue)."""
     t = (text or "").strip().lower()
+    if not t or len(t) > _GREEN_CMD_MAX_CHARS or len(t.split()) > _GREEN_CMD_MAX_WORDS:
+        return None
+    if t.startswith(_STRUCT_PREFIXES + _PC_TEXT_PREFIXES):
+        return None
     for keys, fn in _ALLOWLIST:
         if any(k in t for k in keys):
             return fn
