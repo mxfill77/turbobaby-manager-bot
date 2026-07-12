@@ -1252,6 +1252,108 @@ def _maybe_plan_adapt(pid, step_i, step_n):
              pid, k, step_i, len(steps), ids)
 
 
+# === КУРАТОР ЦЕЛИ (мета-дирижёр, шаг 1/7 родитель 231, 12.07.2026) ===
+# При CURATOR=1 в .env (отдельный флаг, парсер как STEP_SELFHEAL, дефолт 0 = ветки нет вовсе)
+# думатель-«куратор» сверяет ИСХОДНУЮ ЦЕЛЬ задачи с итогом исполнителя: closed → цель закрыта;
+# followup → остались ЗЕЛЁНЫЕ хвосты, tasks = самодостаточные дев-ТЗ ≤400 на дожим; human →
+# дожим требует владельца. ЭТОТ шаг вносит ТОЛЬКО флаг + консультацию + парсер (подключение к
+# финалам задач — следующие шаги родителя 231, здесь никакой боевой путь НЕ меняется).
+# Та же схема, что самопочинка/адаптация: _thinker_exec (кондуктор ORCH_MODEL/FALLBACK,
+# --max-turns 1, чистый генератор без инструментов), строгий JSON. FAIL-SAFE: мусор / сбой /
+# таймаут думателя → None — вызывающий код обязан вести себя как при CURATOR=0 (не хуже).
+CURATOR_TIMEOUT = 180         # куратор — чистый генератор без tools, ответ короткий
+CURATOR_TASK_MAX = 400        # потолок одного followup-ТЗ (лимит сводки в 328)
+# Секции хвостов в result исполнителя: «ХВОСТ:/ХВОСТЫ:», «технически готово…; функционально…»
+_CURATOR_TAIL_RE = re.compile(r"(?i)(хвост|технически готово|функциональн)")
+CURATOR_PREAMBLE = (
+    "Ты — куратор целей оркестратора TurboBaby (мета-дирижёр). Headless-задача завершилась — "
+    "сверь ИСХОДНУЮ ЦЕЛЬ с итогом исполнителя и реши, закрыта ли цель. Ты НИЧЕГО не исполняешь, "
+    "инструментов у тебя нет, файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"closed"|"followup"|"human","tasks":["<зелёное ТЗ ≤400>"],'
+    '"human":"<что нужно от владельца>","reason":"<1 строка>"}\n'
+    "closed — цель достигнута, хвостов нет (или они чисто косметические; tasks/human пустые). "
+    "followup — остались ЗЕЛЁНЫЕ хвосты (код/тесты/доки/диагностика БЕЗ красной зоны: без записи "
+    "в рабочие таблицы, денег, clasp, sqlite3, удалений); tasks тогда — 1–3 САМОДОСТАТОЧНЫХ "
+    "дев-ТЗ ≤400 символов каждое (исполнитель увидит ТОЛЬКО текст ТЗ, впиши нужный контекст). "
+    "human — дожим требует владельца (красная зона, бизнес-решение, доступы, ручной тест); human "
+    "тогда — 1 строка, что именно нужно. При сомнении между followup и human выбирай human — "
+    "куратор не плодит самодеятельность.\n\n"
+)
+
+
+def _curator_on():
+    """Флаг CURATOR=1 в .env (демон load_dotenv'ит на старте; парсер как STEP_SELFHEAL).
+    0/нет/мусор → куратор выключен, поведение прежнее."""
+    return (os.environ.get("CURATOR") or "").strip() == "1"
+
+
+def _curator_tails(result):
+    """Секции «ХВОСТ/ХВОСТЫ/технически готово…; функционально…» из result исполнителя:
+    строка-триггер + её блок вниз до пустой строки. Секций нет → явная заглушка (куратор видит,
+    что исполнитель хвостов не заявил). Общий потолок 1500 символов."""
+    lines = str(result or "").splitlines()
+    blocks, i = [], 0
+    while i < len(lines):
+        if _CURATOR_TAIL_RE.search(lines[i]):
+            j = i
+            while j < len(lines) and lines[j].strip():
+                j += 1
+            blocks.append("\n".join(lines[i:j]))
+            i = j
+        else:
+            i += 1
+    return "\n\n".join(blocks)[:1500] if blocks else "(секций про хвосты в итоге нет)"
+
+
+def _parse_curator_json(text):
+    """Строгий парс ответа куратора → {"verdict","tasks","human","reason"} или None (fail-safe).
+    Терпим обёртку-мусор вокруг JSON (от первой { до последней }); verdict обязан быть
+    closed|followup|human; followup без непустых tasks → None (пустой followup бессмыслен);
+    каждое ТЗ режется до CURATOR_TASK_MAX (лимит сводки 328)."""
+    t = (text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = str(d.get("verdict") or "").strip().lower()
+    if v not in ("closed", "followup", "human"):
+        return None
+    raw = d.get("tasks")
+    tasks = ([str(s).strip()[:CURATOR_TASK_MAX] for s in raw if str(s).strip()]
+             if isinstance(raw, list) else [])
+    if v == "followup" and not tasks:
+        return None
+    return {"verdict": v, "tasks": tasks,
+            "human": str(d.get("human") or "").strip(),
+            "reason": str(d.get("reason") or "").strip()}
+
+
+def _curator_consult(goal, result):
+    """Куратор цели (CURATOR=1): вход — цель ДОСЛОВНО + итог/сводка (первая строка result — по
+    протоколу это сводка ≤400 для 328) + секции хвостов из result → вердикт closed/followup/human.
+    Возврат: dict вердикта или None при ЛЮБОМ сбое (запуск/таймаут/мусор) — fail-safe, вызывающий
+    код ведёт себя как при CURATOR=0."""
+    res = str(result or "").strip()
+    summary = (res.splitlines() or ["(итог пуст)"])[0][:400] or "(итог пуст)"
+    prompt = (CURATOR_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ (дословно):\n{str(goal or '').strip()[:1500]}\n\n"
+              f"ИТОГ/СВОДКА ИСПОЛНИТЕЛЯ:\n{summary}\n\n"
+              f"СЕКЦИИ ХВОСТОВ ИЗ ИТОГА:\n{_curator_tails(res)}\n")
+    out = _thinker_exec(prompt, CURATOR_TIMEOUT, "curator")
+    if out is None:
+        return None
+    v = _parse_curator_json(out)
+    if v is None:
+        log.warning("curator: ответ куратора не распарсился (fail-safe None): %.200s", out)
+    return v
+
+
 # === ПК-ТЕАТР: функции (кусок 2 «один дирижёр, два театра», 07.07.2026) ===
 # Мозг (планировщик, думатели самопочинки/адаптации) живёт ТОЛЬКО здесь, на VPS; ПК-агент
 # (pc_orchestrator) — второй театр ИСПОЛНЕНИЯ шагов (claim lane=pc + headless CC, без мозга).
