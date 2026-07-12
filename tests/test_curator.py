@@ -13,12 +13,17 @@ followup без tasks → None, обрезка ТЗ до 400); (2) выжимк�
 цель дословно + сводку + хвосты, кондуктор --max-turns 1 / таймаут 180; (4) фолбэки consult:
 исключение / exit!=0 / мусор в ответе → None; (5) триггер одиночки (вкл/выкл, все вердикты,
 сбой думателя); (6) МИМО-исключения; (7) дедуп (память + маркер очереди); (8) триггер цепи
-(_dec_post_summary, идемпотентность, ⏱/отклонено); (9) осиротевшая карточка куратора."""
+(_dec_post_summary, идемпотентность, ⏱/отклонено); (9) осиротевшая карточка куратора;
+(10) CURATOR=0 байт-в-байт (шаг 6/7): боевой _curator_consult на месте, спай на самом думателе
+_thinker_exec + счётчик enqueue — ноль вызовов думателя, ноль лишних enqueue, финалы дословно."""
 import os, sys
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
-os.environ.setdefault("STEP_SELFHEAL", "0")  # изоляция от боевого .env
-os.environ.setdefault("PLAN_ADAPT", "0")
+# Изоляция ПРИНУДИТЕЛЬНАЯ (не setdefault): headless-задача наследует env демона, где
+# STEP_SELFHEAL=1/PLAN_ADAPT=1 из боевого .env — setdefault их не перебил бы, и failed-финалы
+# в проверках дёргали бы думатель самопочинки (урок шага 6/7 родителя 231).
+os.environ["STEP_SELFHEAL"] = "0"
+os.environ["PLAN_ADAPT"] = "0"
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
@@ -362,6 +367,46 @@ res.append(ok(ran == [] and not any("[шаг" in str(r["task_text"]) for r in fb
 res.append(ok(bool(OD._CURATOR_CARD_RE.match("[куратор родитель 12] вердикт куратора"))
               and not OD._CURATOR_CARD_RE.match("[куратор нечто 12] х"),
               "маркер-regex: задача|родитель, прочее не матчится"))
+
+# (10) CURATOR=0 байт-в-байт (шаг 6/7): спай consults снят — БОЕВОЙ _curator_consult на месте,
+# слежка на уровне ниже: сам думатель (_thinker_exec) + КАЖДЫЙ enqueue моста. Доказательство:
+# при CURATOR=0 путь мёртв ДО думателя, новых задач в очереди ноль, финалы — дословно как без куратора.
+print("(10) CURATOR=0 байт-в-байт:")
+import copy
+os.environ["CURATOR"] = "0"
+OD._curator_consult = _real_consult
+thinker_calls = []
+_real_thinker = OD._thinker_exec
+OD._thinker_exec = lambda *a, **k: (thinker_calls.append(a), None)[1]
+_orig_enqueue = FakeBridge.enqueue_task
+enq = []
+def _counting_enqueue(s, frm, text, lane=None):
+    enq.append(str(text))
+    return _orig_enqueue(s, frm, text, lane)
+FakeBridge.enqueue_task = _counting_enqueue
+
+fb, t = setup(("done", "сделано, гейт зелёный"))
+expected = copy.deepcopy(fb.rows)
+expected[t]["status"], expected[t]["result"] = "done", "сделано, гейт зелёный"
+OD.process_new()
+res.append(ok(fb.rows == expected and enq == [] and thinker_calls == [],
+              "одиночка done: финал байт-в-байт, ноль enqueue, думатель не звался"))
+enq.clear(); thinker_calls.clear()
+fb, t = setup(("failed", "гейт красный: 2 теста"))
+expected = copy.deepcopy(fb.rows)
+expected[t]["status"], expected[t]["result"] = "failed", "гейт красный: 2 теста"
+OD.process_new()
+res.append(ok(fb.rows == expected and enq == [] and thinker_calls == [],
+              "одиночка failed: финал байт-в-байт, ноль enqueue, думатель не звался"))
+enq.clear(); thinker_calls.clear()
+fb, p = chain()
+OD._dec_post_summary(p)
+res.append(ok(len(enq) == 1 and enq[0].startswith("[сводка родитель")
+              and thinker_calls == [] and fb.cards() == [],
+              "цепь: единственный enqueue — сводка (как без куратора), думатель мёртв"))
+
+OD._thinker_exec = _real_thinker
+FakeBridge.enqueue_task = _orig_enqueue
 
 OD.bc = _real_bc
 OD.run_task = _real_run_task

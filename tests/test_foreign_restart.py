@@ -12,6 +12,7 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["PLAN_ADAPT"] = "0"       # изоляция от боевого .env
 os.environ["STEP_SELFHEAL"] = "0"    # думатель в этих тестах не участвует вовсе
+os.environ["CURATOR"] = "0"  # изоляция от боевого .env (куратор целей, родитель 231; принудительно — env демона)
 os.environ.setdefault("PRETOOL_NOPUSH", "1")   # ноль пушей и при ручном прогоне вне гейта
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
