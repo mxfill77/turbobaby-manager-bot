@@ -125,9 +125,14 @@ QUEUE_FROM_PCLOC_DEC = "Filipp-pcloc-dec"  # ЛОКАЛЬНЫЙ дирижёр-�
                                         # devbot несёт её карточки штатно — needs_approval красного
                                         # шага → инбокс (INBOX_TOPIC_ID, прод 1160) с кнопками ✅/❌,
                                         # done/failed/сводки/карточки → тема PC-дев
+QUEUE_FROM_CURATOR = "Filipp-curator"   # followup-задачи куратора целей (шаг 3/7 родитель 231):
+                                        # ставит orchestrator_daemon (CURATOR_FROM), полоса vps →
+                                        # карточки в 328. Урок 682a881: метки нет в QUEUE_FROMS →
+                                        # done/failed/needs_approval куратор-задач НЕ доезжают
 QUEUE_FROMS_PC = (QUEUE_FROM_PC, QUEUE_FROM_PC_DEV, QUEUE_FROM_PC_DEC,
                   QUEUE_FROM_PCLOC_DEC)  # метки полосы pc (карточки → тема PC-дев)
-QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
+QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC,
+               QUEUE_FROM_CURATOR) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
 _DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
 _DEC_PREFIXES = ("декомпозируй:", "разбей:", "decompose:")  # крупное ТЗ → план шагов → по одному
@@ -994,12 +999,114 @@ def _g_overdue(bridge):
     return "\n".join(out)
 
 
+# === Дайджест кураторских целей (шаг 5/7 родитель 231) ===
+# Маркеры куратора продублированы из orchestrator_daemon (демон в процесс бота не импортируем —
+# его модуль на import ставит signal.signal; образец REPEAT_MARK): followup-задача несёт
+# [куратор цели G, шаг m] (ищем search'ем — маркер жив и под префиксом перерождения самопочинки),
+# сводная карточка владельцу начинается с [куратор владельцу цель G]. Дайджест read-only (один
+# опрос очереди, записи нет) и живёт ТОЛЬКО в зелёной команде «статус» по запросу — в утреннюю
+# авто-сводку НЕ входит (по расписанию не спамим).
+_CURATOR_GOAL_RE = re.compile(r"\[куратор цели (\d+), шаг (\d+)\]")
+_CURATOR_HUMAN_RE = re.compile(r"^\[куратор владельцу цель (\d+)\]")
+_CURATOR_DIGEST_STATUSES = ("new", "in_progress", "approved", "needs_approval", "done", "failed")
+_CURATOR_ACTIVE_STATUSES = ("new", "in_progress", "approved")
+
+
+def _curator_goals(pb):
+    """Срез кураторских целей из очереди (полоса vps — куратор живёт только там) →
+    {G: {active, wait, done, failed, steps, owner}} | None (очередь не опросилась).
+    wait = followup-задача цели упёрлась в красное (needs_approval — ждёт «да» владельца);
+    owner = открытая сводная карточка «нужно от владельца» по цели."""
+    try:
+        fn = getattr(pb, "get_pending_multi", None)
+        if fn is not None:
+            r = fn(_CURATOR_DIGEST_STATUSES)
+        else:                               # мок в тестах без multi — по-статусно
+            items = []
+            for st in _CURATOR_DIGEST_STATUSES:
+                rr = pb.get_pending(st)
+                if not rr.get("ok"):
+                    return None
+                for it in rr.get("items", []):
+                    if isinstance(it, dict):
+                        it.setdefault("status", st)
+                    items.append(it)
+            r = {"ok": True, "items": items}
+    except Exception:
+        return None
+    if not r.get("ok"):
+        return None
+    goals = {}
+
+    def _g(gid):
+        return goals.setdefault(int(gid), {"active": 0, "wait": 0, "done": 0,
+                                           "failed": 0, "steps": 0, "owner": False})
+    for it in r.get("items", []):
+        txt = str(it.get("task_text") or "")
+        st = str(it.get("status") or "")
+        m = _CURATOR_HUMAN_RE.match(txt)
+        if m:
+            if st == "needs_approval":      # закрытая (done) карточка владельцу цель не держит
+                _g(m.group(1))["owner"] = True
+            continue
+        m = _CURATOR_GOAL_RE.search(txt)
+        if not m:
+            continue
+        g = _g(m.group(1))
+        g["steps"] = max(g["steps"], int(m.group(2)))
+        if st in _CURATOR_ACTIVE_STATUSES:
+            g["active"] += 1
+        elif st == "needs_approval":
+            g["wait"] += 1
+        elif st == "failed":
+            g["failed"] += 1
+        else:
+            g["done"] += 1
+    return goals
+
+
+def _curator_digest(pb):
+    """Дайджест кураторских целей для «статус»: закрыто / в работе / ждёт владельца.
+    Кураторских маркеров в очереди нет → None (строка в статус не добавляется);
+    очередь не опросилась → короткая честная пометка (пульс не валим)."""
+    goals = _curator_goals(pb)
+    if goals is None:
+        return "🧭 кураторские цели: очередь не опросилась — дайджест недоступен"
+    if not goals:
+        return None
+    counts = {"закрыто": 0, "в работе": 0, "ждёт владельца": 0}
+    rows = []
+    for gid in sorted(goals):
+        g = goals[gid]
+        total = g["active"] + g["wait"] + g["done"] + g["failed"]
+        if g["owner"] or g["wait"]:
+            state, why = "ждёт владельца", ("карточка в инбоксе" if g["owner"]
+                                            else f"красный вопрос по {g['wait']} задаче(ам)")
+            line = f"  цель {gid}: 🧑 ждёт владельца — {why}"
+        elif g["active"]:
+            state = "в работе"
+            line = f"  цель {gid}: 🔄 в работе — продолжений {total}, активных {g['active']}"
+        else:
+            state = "закрыто"
+            line = (f"  цель {gid}: ✅ закрыто — продолжений {total}" +
+                    (f", провалено {g['failed']}" if g["failed"] else ""))
+        counts[state] += 1
+        rows.append(line)
+    head = ("🧭 кураторские цели (" + str(len(goals)) + "): " +
+            " · ".join(f"{k} {v}" for k, v in counts.items() if v))
+    return "\n".join([head] + rows)
+
+
 def _g_pulse(bridge):
-    """Пульс проекта — одна строка KB_PULSE (read_doc name=pulse), мгновенный «где я сейчас»."""
+    """Пульс проекта — одна строка KB_PULSE (read_doc name=pulse), мгновенный «где я сейчас».
+    Плюс дайджест кураторских целей из очереди (шаг 5/7 родитель 231) — только когда цели есть."""
     r = bridge._call("read_doc", name="pulse")
     if not r.get("ok"):
-        return f"пульс недоступен: {r.get('error')}"
-    return "📟 " + (r.get("text") or "").strip()
+        base = f"пульс недоступен: {r.get('error')}"
+    else:
+        base = "📟 " + (r.get("text") or "").strip()
+    dig = _curator_digest(bridge)
+    return base if dig is None else base + "\n\n" + dig
 
 
 def _g_registry():

@@ -83,9 +83,10 @@ res.append(ok(DB._try_enqueue("тз:", fb).startswith("🤖 Пустое ТЗ"),
 res.append(ok(DB._try_enqueue("обычный текст", fb) is None, "не-префикс → None (идёт в allowlist)"))
 res.append(ok(set(("Filipp-328", "Filipp-328-dev", "Filipp-328-dec",
                    "Filipp-pc", "Filipp-pc-dev", "Filipp-pc-dec",
-                   "Filipp-pcloc-dec")) == set(DB.QUEUE_FROMS),
+                   "Filipp-pcloc-dec", "Filipp-curator")) == set(DB.QUEUE_FROMS),
               "фильтр отчётов включает все метки (вкл. dec часть C, полосу pc 04.07, "
-              "pc-декомпозицию ПК-театра 07.07 и локальный дирижёр ПК 11.07)"))
+              "pc-декомпозицию ПК-театра 07.07, локальный дирижёр ПК 11.07 "
+              "и куратора целей 12.07)"))
 
 # (6) новые зелёные команды B
 print("(6) зелёные команды B:")
