@@ -286,6 +286,44 @@ def _is_python(cmd):
     return re.search(r"(^|\s|/)(python3?|venv/bin/python3?)(\s|$)", cmd) is not None
 
 
+def _strip_git_msg(cmd):
+    """Нюанс bd5d516 (фикс 12.07.2026): слово-интерпретатор ВНУТРИ текста git commit -m
+    («фикс python скрипта») попадало в скан _is_python → git-команда шла в _analyze → ветка -m
+    видела «не-зелёный модуль» → ложная ambiguous-карточка. Для СКАНА интерпретатора из git-команды
+    вырезаются payload'ы -m/-am/--message (формы: -m <txt>, -am <txt>, --message <txt>,
+    --message=<txt>, приклеенное -m<txt>); классификация самого git НЕ меняется — git без
+    интерпретатора вне -m остаётся не-python → defer к штатным allow/ask rules, как и был.
+    Не git (учитывая env-префикс) / сбой разбора → команда КАК ЕСТЬ (fail-safe: скан полный,
+    интерпретатор в компаунде `git … && python3 evil.py` по-прежнему ловится)."""
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        return cmd
+    i0 = 0
+    while i0 < len(toks) and _ENV_ASSIGN.match(toks[i0]):
+        i0 += 1
+    if i0 >= len(toks) or toks[i0] != "git":
+        return cmd
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-m", "-am", "--message"):
+            out.append(t)
+            i += 2
+            continue
+        if t.startswith("--message="):
+            out.append("--message")
+            i += 1
+            continue
+        if re.match(r"^-a?m.", t):        # приклеенный payload: -mтекст / -amтекст
+            out.append("-m")
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return " ".join(out)
+
+
 def _args_after_interp(toks):
     """Аргументы ПОСЛЕ интерпретатора: срезает ведущие VAR=val (env-префикс) и сам python-токен.
     Фикс инцидента 163 (08.07.2026): `PRETOOL_NOPUSH=1 venv/bin/python3 --version` считал интерпретатор
@@ -405,8 +443,8 @@ def main():
         _defer()
     cmd = ((data.get("tool_input") or {}).get("command") or "")
     cwd = data.get("cwd") or PROJECT
-    if not cmd or not _is_python(cmd):
-        _defer()                                       # не-python → allow/ask rules сами
+    if not cmd or not _is_python(_strip_git_msg(cmd)):
+        _defer()                                       # не-python (текст git -m не скан) → allow/ask rules сами
     try:
         kind, hit, blob = _analyze(cmd, cwd)
     except Exception:

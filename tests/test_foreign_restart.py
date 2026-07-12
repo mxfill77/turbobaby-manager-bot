@@ -184,9 +184,10 @@ clones = [r for r in fb.by_status("new")]
 orig = fb.rows[tid]
 res.append(ok(orig["status"] == "done" and "ЧУЖОГО" in orig["result"] and "Возвращена в очередь" in orig["result"],
               "исходная закрыта done с маркер-картой 🔄 (не failed, не фантомный 🔁)"))
-res.append(ok(len(clones) == 1 and clones[0]["task_text"] == PLAIN_TEXT
+exp_clone = f"{PLAIN_TEXT}\n{OD.REPEAT_MARK} {tid}]"   # микрофикс 156 (12.07): + маркер повтора в конце
+res.append(ok(len(clones) == 1 and clones[0]["task_text"] == exp_clone
               and clones[0]["from"] == "Filipp-328-dev",
-              "клон в new: текст ДОСЛОВНО, полоса from та же"))
+              "клон в new: текст ДОСЛОВНО + маркер повтора в конце, полоса from та же"))
 # «после рестарта»: демон свежий, единицы нет → клон исполняется штатно
 OD._running = False
 fake_run.probe_out, fake_run.probe_queue = "", []
@@ -221,9 +222,11 @@ fake_run.probe_queue = ["", SHOW_PAST]
 fake_run.claude_queue = [("", 143)]
 OD.process_new()
 clones = fb.by_status("new")
+exp_step = f"{step_text}\n{OD.REPEAT_MARK} {tid}]"     # микрофикс 156 (12.07): + маркер повтора в конце
 res.append(ok(fb.rows[tid]["status"] == "done" and len(clones) == 1
-              and clones[0]["task_text"] == step_text and clones[0]["from"] == "Filipp-328-dec",
-              "шаг вернулся в new дословно (маркер цепи цел), исходный done+🔄 — думатель не звался"))
+              and clones[0]["task_text"] == exp_step and clones[0]["from"] == "Filipp-328-dec"
+              and OD._STEP_RE.match(clones[0]["task_text"]) is not None,
+              "шаг вернулся в new с маркером цепи ПЕРВЫМ (+повтор в конце), исходный done+🔄 — думатель не звался"))
 
 # (8) fail-safe возврата: клон не встал в очередь → честный failed (задача не теряется молча)
 print("(8) клон не встал → честный failed:")

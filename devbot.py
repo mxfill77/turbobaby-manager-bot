@@ -142,6 +142,19 @@ _inprogress_seen = set()                # id задач in_progress, по кот
 _stalled = set()                        # id задач, по которым УЖЕ слали «⚠️ зависла» (дедуп)
 STALL_SEC = 720                         # in_progress с updated старше → демон завис/умер (TASK_TIMEOUT 600 + запас 120)
 
+# Маркер клона (микрофикс §7 12.07.2026, инцидент 156): демон при возврате задачи из-под чужого
+# рестарта (orchestrator_daemon._requeue_foreign_restart) дописывает «[повтор задачи N]» в КОНЕЦ
+# текста клона. Карточки такой задачи несут «(повтор)» в заголовке — владелец отличает клон от
+# новой задачи (в 156 «задвоение карточки» выглядело как дубль). Константа продублирована из
+# orchestrator_daemon.REPEAT_MARK (devbot живёт в процессе bot.py, демон не импортируем).
+REPEAT_MARK = "[повтор задачи"
+
+
+def _is_repeat_item(it):
+    """True → задача рождена ПОВТОРНОЙ постановкой той же задачи (клон возврата, маркер в task_text)."""
+    return REPEAT_MARK in str(it.get("task_text") or "")
+
+
 # «да N» / «нет N» (+ англ., + опц. # и пунктуация) — ответ Филиппа на запрос подтверждения (заход 2б-2)
 _APPROVAL_RE = re.compile(r"^(да|нет|yes|no)\b[\s,.:]*#?\s*(\d+)\s*$", re.IGNORECASE)
 _YES = ("да", "yes")
@@ -824,7 +837,8 @@ async def report_results(context) -> None:
         _reported.add(qid)
         emoji = "✅" if st == "done" else "❌"
         body = it.get("result") or "(пустой результат)"
-        head = f"{emoji} Задача {qid} — {st}\n\n{body}"
+        rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
+        head = f"{emoji} Задача {qid}{rep} — {st}\n\n{body}"
         chunks = _chunks(head)
         for i, chunk in enumerate(chunks):
             kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _item_topic(it), "text": chunk}
@@ -871,7 +885,8 @@ async def report_results(context) -> None:
         if qid not in _inprogress_seen:        # анонс «в работе» — один раз на задачу
             _inprogress_seen.add(qid)
             task_text = str(it.get("task_text") or "")[:120]
-            msg = f"🔄 Задача {qid} в работе…\n\n{task_text}"
+            rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
+            msg = f"🔄 Задача {qid}{rep} в работе…\n\n{task_text}"
             for chunk in _chunks(msg):
                 try:
                     await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
