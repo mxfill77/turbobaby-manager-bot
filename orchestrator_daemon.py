@@ -776,6 +776,8 @@ def _dec_post_summary(pid):
     cm = bc.complete_task(sid, "done", text)
     _summarized.add(pid)
     log.info("dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
+    _maybe_curator_chain(pid, text)     # куратор цели (CURATOR=1, шаг 2/7 родитель 231):
+                                        # ПОСЛЕ сводки; идемпотентность выше = один вызов на цепь
 
 
 def process_dec_tails():
@@ -1256,8 +1258,10 @@ def _maybe_plan_adapt(pid, step_i, step_n):
 # При CURATOR=1 в .env (отдельный флаг, парсер как STEP_SELFHEAL, дефолт 0 = ветки нет вовсе)
 # думатель-«куратор» сверяет ИСХОДНУЮ ЦЕЛЬ задачи с итогом исполнителя: closed → цель закрыта;
 # followup → остались ЗЕЛЁНЫЕ хвосты, tasks = самодостаточные дев-ТЗ ≤400 на дожим; human →
-# дожим требует владельца. ЭТОТ шаг вносит ТОЛЬКО флаг + консультацию + парсер (подключение к
-# финалам задач — следующие шаги родителя 231, здесь никакой боевой путь НЕ меняется).
+# дожим требует владельца. Шаг 1 внёс флаг + консультацию + парсер; шаг 2/7 подключил ТОЧКИ
+# ВЫЗОВА (_maybe_curator_*: сводка родителя vps-цепи + финал done/failed одиночки vps-полосы,
+# closed → тишина, followup/human → карточка-сигнал в 328); постановка followup-задач в
+# очередь — следующие шаги родителя 231.
 # Та же схема, что самопочинка/адаптация: _thinker_exec (кондуктор ORCH_MODEL/FALLBACK,
 # --max-turns 1, чистый генератор без инструментов), строгий JSON. FAIL-SAFE: мусор / сбой /
 # таймаут думателя → None — вызывающий код обязан вести себя как при CURATOR=0 (не хуже).
@@ -1352,6 +1356,111 @@ def _curator_consult(goal, result):
     if v is None:
         log.warning("curator: ответ куратора не распарсился (fail-safe None): %.200s", out)
     return v
+
+
+# --- Точки вызова куратора (шаг 2/7 родитель 231): терминалы vps-полосы ---
+# Куратор зовётся РОВНО один раз на терминал (дедуп: память процесса _curated + restart-proof
+# скан маркеров [куратор …] в очереди). verdict=closed / сбой думателя → тишина (поведение как
+# при CURATOR=0); followup/human → карточка-сигнал [куратор …] в 328 synthetic-задачей (тот же
+# канал, что сводки/коррекции) — она же и маркер дедупа. МИМО куратора: ⏱-диагнозы
+# (таймаут/сирота/ПК — инфраструктура, не цель), «отклонено Филиппом» (владелец уже решил),
+# конверты одобренных заявок, pc-полоса (_pc_post_summary хук не зовёт; одиночки pc в process_new
+# не попадают), плановый рестарт-🔁 (работа отчитана в cc_log, итога для сверки нет).
+_CURATOR_CARD_RE = re.compile(r"^\[куратор (задача|родитель) (\d+)\]")
+_CURATOR_SKIP_MARKS = (TIMEOUT_MARK, "🔁", _REJECT_PREFIX)
+_curated = set()              # (kind, id) — терминалы, по которым консультация уже потрачена
+
+
+def _curator_card_exists(kind, key):
+    """Карточка куратора по этому терминалу уже в очереди (любой живой статус)? Restart-proof
+    слой дедупа: после рестарта демона память _curated пуста, маркер в очереди — нет."""
+    mark = f"[куратор {kind} {key}]"
+    for st in ("done", "new", "in_progress"):
+        try:
+            r = bc.get_pending(st)
+        except Exception:
+            continue
+        if r.get("ok") and any(str(it.get("task_text") or "").startswith(mark)
+                               for it in r.get("items", [])):
+            return True
+    return False
+
+
+def _curator_card_text(kind, key, v):
+    """Тело карточки-сигнала куратора для 328 (result synthetic-задачи)."""
+    reason = v.get("reason") or "(без причины)"
+    if v["verdict"] == "human":
+        return (f"🧭 куратор: цель ({kind} {key}) требует владельца.\n"
+                f"что нужно: {v.get('human') or '(куратор не уточнил)'}\n"
+                f"причина: {reason}")[:RESULT_MAX]
+    lines = [f"🧭 куратор: цель ({kind} {key}) НЕ закрыта — остались зелёные хвосты.",
+             f"причина: {reason}",
+             f"хвосты на дожим ({len(v['tasks'])}):"]
+    lines += [f"{i}. {t}" for i, t in enumerate(v["tasks"], 1)]
+    lines.append("(куратор задач НЕ ставит — постановка followup в следующих шагах родителя 231; "
+                 "дожать можно «тз:» из списка)")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+def _maybe_curator(kind, key, goal, result):
+    """Консультация куратора на терминале (kind=задача|родитель, key=id очереди). CURATOR=0 →
+    ноль вызовов; дедуп — ровно одна консультация на терминал; closed/сбой → тишина;
+    followup/human → карточка [куратор …] в 328. Куратор — слой-надстройка: ЛЮБОЕ исключение
+    ловится, боевой финал задачи он не валит и не меняет."""
+    try:
+        if not _curator_on():
+            return
+        k = (kind, int(key))
+        if k in _curated:
+            return
+        if _curator_card_exists(kind, key):
+            _curated.add(k)
+            return
+        _curated.add(k)           # попытка потрачена независимо от исхода — одна на терминал
+        v = _curator_consult(goal, result)
+        if v is None or v["verdict"] == "closed":
+            log.info("curator: %s %s → %s (тишина)", kind, key,
+                     v["verdict"] if v else "сбой думателя")
+            return
+        r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}",
+                            f"[куратор {kind} {key}] вердикт куратора")
+        if not r.get("ok"):
+            log.warning("curator: карточка по %s %s не встала в очередь (%s)",
+                        kind, key, r.get("error"))
+            return
+        sid = r.get("id")
+        bc.claim_task(sid)        # даже если claim не прошёл — complete финализирует
+        cm = bc.complete_task(sid, "done", _curator_card_text(kind, key, v))
+        log.info("curator: %s %s → %s, карточка задачей %s (bridge_ok=%s)",
+                 kind, key, v["verdict"], sid, cm.get("ok"))
+    except Exception as e:
+        log.warning("curator: сбой консультации по %s %s (%s) — fail-safe тишина", kind, key, e)
+
+
+def _maybe_curator_single(frm, tid, text, result):
+    """Куратор на финале done/failed ОДИНОЧКИ «тз:»/«задача:» vps-полосы (from=Filipp-328[-dev]
+    строго — артефакты декомпозиции/операций/pc сюда не проходят). Зовётся из process_new ПОСЛЕ
+    complete_task — финал уже записан, куратор его не трогает."""
+    if str(frm or "") not in ("Filipp-328", "Filipp-328" + DEV_FROM_SUFFIX):
+        return                    # dec-семейство (куратор цепи зовётся на сводке), pc, op и прочее
+    if _is_convert(text):
+        return                    # конверт одобренной заявки — вне кураторского контура
+    if str(result or "").lstrip().startswith(_CURATOR_SKIP_MARKS):
+        return                    # ⏱-диагноз / плановый рестарт-🔁 / отклонено Филиппом
+    _maybe_curator("задача", tid, text, result)
+
+
+def _maybe_curator_chain(pid, summary):
+    """Куратор после сводки родителя vps-цепи декомпозера (зовётся из _dec_post_summary — сводка
+    уже в очереди). Цель = task_text родителя (дословно из done), итог = текст сводки. МИМО:
+    цепь с ⏱-диагнозом или «отклонено Филиппом» в шагах (первые строки шагов видны в сводке)."""
+    if not _curator_on():
+        return
+    s = str(summary or "")
+    if TIMEOUT_MARK in s or _REJECT_PREFIX in s:
+        return
+    goal, _plan = _dec_parent_context(pid)
+    _maybe_curator("родитель", pid, goal, summary)
 
 
 # === ПК-ТЕАТР: функции (кусок 2 «один дирижёр, два театра», 07.07.2026) ===
@@ -2141,6 +2250,13 @@ def process_new():
                                           "рестарте демона; цепь родителя идёт своим ходом)")
             log.info("pc-dec: осиротевшая карточка id=%s доведена", tid)
             return
+        if _CURATOR_CARD_RE.match(text):
+            # осиротевшая карточка куратора (демон упал между enqueue и complete: вердикт потерян,
+            # повторно куратора НЕ зовём — карточка остаётся restart-proof маркером дедупа)
+            bc.complete_task(tid, "done", "🧭 карточка куратора (осиротела при рестарте демона; "
+                                          "вердикт потерян, консультация не повторяется)")
+            log.info("curator: осиротевшая карточка id=%s доведена", tid)
+            return
         if not _STEP_RE.match(text):
             # родитель «декомпозируй:» → план → fan-out шагов (ПК-театр: релиз шага 1 lane=pc)
             _dec_plan_and_fanout(tid, text, frm=str(task.get("from") or ""))
@@ -2173,6 +2289,7 @@ def process_new():
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
         _maybe_dec_after(text, status)          # шаг декомпозиции → halt-on-fail / сводка
+        _maybe_curator_single(task.get("from"), tid, text, result)   # куратор цели (CURATOR=1)
 
 
 def cycle():

@@ -1,13 +1,19 @@
-"""КУРАТОР ЦЕЛИ (мета-дирижёр, шаг 1/7 родитель 231, 12.07.2026).
-Флаг CURATOR из .env (дефолт 0, парсер как STEP_SELFHEAL) + _curator_consult(цель, итог) через
-_thinker_exec (--max-turns 1, таймаут 180с): вход = цель ДОСЛОВНО + итог/сводка + секции
+"""КУРАТОР ЦЕЛИ (мета-дирижёр, шаги 1–2/7 родитель 231, 12.07.2026).
+Шаг 1: флаг CURATOR из .env (дефолт 0, парсер как STEP_SELFHEAL) + _curator_consult(цель, итог)
+через _thinker_exec (--max-turns 1, таймаут 180с): вход = цель ДОСЛОВНО + итог/сводка + секции
 «ХВОСТ/ХВОСТЫ/технически готово; функционально…» из result; строгий JSON
 {"verdict":"closed"|"followup"|"human","tasks":[…],"human":"…","reason":"…"};
 мусор/сбой/таймаут → None (fail-safe). Сети/claude нет — subprocess.run подменён.
+Шаг 2: ТОЧКИ ВЫЗОВА — финал done/failed одиночки «тз:»/«задача:» vps-полосы (process_new) и
+сводка родителя vps-цепи (_dec_post_summary); closed/сбой → тишина, followup/human → карточка
+[куратор …] в 328; дедуп = память процесса + restart-proof скан маркеров очереди; МИМО:
+⏱ / «отклонено Филиппом» / конверты / pc-полоса / плановый рестарт-🔁; CURATOR=0 → ноль вызовов.
 Проверки: (0) парсер флага; (1) парсер JSON (все вердикты, мусор-обёртка, невалидное → None,
 followup без tasks → None, обрезка ТЗ до 400); (2) выжимка хвостов; (3) consult: промпт несёт
 цель дословно + сводку + хвосты, кондуктор --max-turns 1 / таймаут 180; (4) фолбэки consult:
-исключение / exit!=0 / мусор в ответе → None."""
+исключение / exit!=0 / мусор в ответе → None; (5) триггер одиночки (вкл/выкл, все вердикты,
+сбой думателя); (6) МИМО-исключения; (7) дедуп (память + маркер очереди); (8) триггер цепи
+(_dec_post_summary, идемпотентность, ⏱/отклонено); (9) осиротевшая карточка куратора."""
 import os, sys
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
@@ -158,6 +164,201 @@ res.append(ok(v is not None and v["verdict"] == "closed"
               and "(секций про хвосты в итоге нет)" in fake_run.prompts[-1],
               "None-входы не роняют consult (заглушки итога/хвостов в промпте)"))
 
+# ==== ШАГ 2/7: точки вызова куратора (триггеры / МИМО / дедуп / цепь / сирота) ====
+class FakeBridge:
+    """Мост-очередь в памяти: get/claim/complete/enqueue. Сети нет."""
+    def __init__(s):
+        s.rows, s.nid = {}, 200
+    def add(s, status, text, frm="Filipp-328", result=""):
+        s.nid += 1
+        s.rows[s.nid] = {"id": s.nid, "from": frm, "task_text": text, "status": status,
+                         "result": result, "updated": "2026-07-12T00:00:00+00:00"}
+        return s.nid
+    def get_pending(s, status="new", lane=None):
+        sts = [x.strip() for x in str(status).split(",")]
+        return {"ok": True, "items": [dict(r) for r in sorted(s.rows.values(), key=lambda x: -x["id"])
+                                      if r["status"] in sts]}
+    def claim_task(s, tid, lane=None):
+        r = s.rows.get(int(tid))
+        if not r: return {"ok": False, "error": "not_found"}
+        if r["status"] != "new": return {"ok": False, "error": "already_claimed", "status": r["status"]}
+        r["status"] = "in_progress"
+        return {"ok": True, "task": dict(r)}
+    def complete_task(s, tid, status, result=""):
+        r = s.rows.get(int(tid))
+        if not r: return {"ok": False, "error": "not_found"}
+        r["status"], r["result"] = status, result
+        return {"ok": True}
+    def enqueue_task(s, frm, text, lane=None):
+        return {"ok": True, "id": s.add("new", text, frm=frm)}
+    def task_heartbeat(s, tid): return {"ok": True}
+    def cards(s, mark="[куратор"):
+        return [dict(r) for r in s.rows.values() if str(r["task_text"]).startswith(mark)]
+
+
+_real_bc, _real_run_task, _real_rp = OD.bc, OD.run_task, OD._restart_pending
+_real_consult = OD._curator_consult
+OD._restart_pending = lambda: False
+
+consults = []
+def spy_consult(goal, result):
+    consults.append((goal, result))
+    return spy_consult.verdict
+OD._curator_consult = spy_consult
+
+
+def setup(run_ret, frm="Filipp-328-dev", text="тз: почини рендер карточки байка",
+          verdict={"verdict": "closed", "tasks": [], "human": "", "reason": "цель закрыта"}):
+    fb = FakeBridge()
+    OD.bc = fb
+    OD.run_task = lambda tid, t, task_timeout=600, preamble=None: run_ret
+    OD._curated.clear(); OD._summarized.clear(); consults.clear()
+    spy_consult.verdict = verdict
+    return fb, fb.add("new", text, frm=frm)
+
+
+# (5) триггер одиночки vps-полосы
+print("(5) триггер: финал одиночки vps-полосы:")
+os.environ["CURATOR"] = "0"
+fb, t = setup(("done", "сделано, гейт зелёный"))
+OD.process_new()
+res.append(ok(consults == [] and fb.cards() == [] and fb.rows[t]["status"] == "done",
+              "CURATOR=0 → ноль консультаций, ноль карточек, финал задачи прежний"))
+os.environ["CURATOR"] = "1"
+fb, t = setup(("done", "сделано, гейт зелёный"))
+OD.process_new()
+res.append(ok(len(consults) == 1 and consults[0] == ("тз: почини рендер карточки байка",
+                                                     "сделано, гейт зелёный"),
+              "CURATOR=1, done → РОВНО одна консультация: цель = текст задачи ДОСЛОВНО + итог"))
+res.append(ok(fb.cards() == [] and fb.rows[t] == dict(fb.rows[t], status="done",
+                                                      result="сделано, гейт зелёный"),
+              "verdict=closed → тишина (карточки нет, финал задачи не тронут)"))
+fb, t = setup(("done", "сделано, но есть хвост"),
+              verdict={"verdict": "followup", "tasks": ["тз: дожать тест на пустой env"],
+                       "human": "", "reason": "хвост в тестах"})
+OD.process_new()
+cards = fb.cards()
+res.append(ok(len(cards) == 1 and cards[0]["task_text"].startswith(f"[куратор задача {t}]")
+              and cards[0]["status"] == "done" and cards[0]["from"] == "Filipp-328-dec",
+              "followup → карточка [куратор задача N] synthetic-задачей (done, from -dec)"))
+res.append(ok("🧭" in cards[0]["result"] and "тз: дожать тест на пустой env" in cards[0]["result"]
+              and "хвост в тестах" in cards[0]["result"]
+              and "постановка followup" in cards[0]["result"],
+              "тело карточки: 🧭 + хвосты списком + причина + пометка «задачи не ставятся»"))
+res.append(ok(fb.rows[t]["status"] == "done" and fb.rows[t]["result"] == "сделано, но есть хвост",
+              "финал самой задачи карточкой не тронут"))
+fb, t = setup(("failed", "гейт красный, не смог"),
+              verdict={"verdict": "human", "tasks": [], "human": "нужно «да» на clasp",
+                       "reason": "красная зона"})
+OD.process_new()
+cards = fb.cards()
+res.append(ok(len(consults) == 1 and len(cards) == 1
+              and "требует владельца" in cards[0]["result"]
+              and "нужно «да» на clasp" in cards[0]["result"],
+              "failed-одиночка тоже терминал; human → карточка «требует владельца»"))
+fb, t = setup(("done", "сделано"), verdict=None)
+OD.process_new()
+res.append(ok(len(consults) == 1 and fb.cards() == [] and fb.rows[t]["status"] == "done",
+              "сбой думателя (None) → тишина, финал цел, цикл не падает (fail-safe)"))
+fb, t = setup(("done", "сделано"), frm="Filipp-328", text="задача: проверь логи")
+OD.process_new()
+res.append(ok(len(consults) == 1, "from=Filipp-328 («задача:») — тоже одиночка, куратор зовётся"))
+
+# (6) МИМО-исключения
+print("(6) МИМО куратора:")
+fb, t = setup(("done", "исполнено"), text="[конверт одобренной заявки 55] сделай clasp redeploy")
+OD.process_new()
+res.append(ok(consults == [] and fb.cards() == [], "конверт одобренной заявки → мимо"))
+fb, t = setup(("failed", OD.TIMEOUT_MARK + " таймаут задачи 600s — claude -p убит"))
+OD.process_new()
+res.append(ok(consults == [] and fb.cards() == [], "⏱-диагноз (таймаут/сирота) → мимо"))
+fb, t = setup(("done", "🔁 Завершено плановым рестартом демона (самомодификация)"))
+OD.process_new()
+res.append(ok(consults == [] and fb.cards() == [], "плановый рестарт-🔁 → мимо"))
+fb, t = setup(("failed", "отклонено Филиппом (кнопка ❌)"))
+OD.process_new()
+res.append(ok(consults == [] and fb.cards() == [], "«отклонено Филиппом» → мимо"))
+fb, t = setup(("done", "сделано"), frm="Filipp-pc-dev")
+OD.process_new()
+res.append(ok(consults == [] and fb.cards() == [], "pc-полоса (Filipp-pc-dev) → мимо"))
+fb, t = setup(("done", "шаг сделан"), frm="Filipp-328-dec", text="[шаг 1/1 родитель 300] сделай X")
+OD.process_new()
+res.append(ok(fb.cards("[куратор задача") == [], "шаг декомпозера НЕ одиночка — [куратор задача] нет"))
+res.append(ok(len(consults) == 1 and "родитель 300" in consults[0][0],
+              "…но финал шага финалит цепь → одна консультация ЦЕПИ (сводка родителя)"))
+
+# (7) дедуп: одна консультация на терминал
+print("(7) дедуп:")
+fb, _ = setup(("done", "x"))
+OD._maybe_curator("задача", 5, "цель", "итог")
+OD._maybe_curator("задача", 5, "цель", "итог")
+res.append(ok(len(consults) == 1, "повторный вызов того же терминала → консультация одна (память)"))
+fb, _ = setup(("done", "x"))
+fb.add("done", "[куратор задача 5] вердикт куратора", frm="Filipp-328-dec", result="🧭 старая")
+OD._curated.clear()
+OD._maybe_curator("задача", 5, "цель", "итог")
+res.append(ok(consults == [], "маркер [куратор задача 5] уже в очереди → скан глушит (restart-proof)"))
+OD._maybe_curator("родитель", 5, "цель", "итог")
+res.append(ok(len(consults) == 1, "тот же id, но другой вид терминала (родитель) — не путается"))
+
+# (8) триггер цепи: _dec_post_summary
+print("(8) триггер: сводка родителя цепи:")
+def chain(step2_status="done", step2_result="шаг 2 сделан", verdict=None):
+    fb, _ = setup(("done", "x"),
+                  verdict=verdict or {"verdict": "followup", "tasks": ["тз: дожать хвост цепи"],
+                                      "human": "", "reason": "хвост"})
+    p = fb.add("done", "декомпозируй: собери фичу Y", frm="Filipp-328-dec",
+               result="1. шаг один\n2. шаг два")
+    fb.add("done", f"[шаг 1/2 родитель {p}] шаг один", frm="Filipp-328-dec", result="шаг 1 сделан")
+    fb.add(step2_status, f"[шаг 2/2 родитель {p}] шаг два", frm="Filipp-328-dec", result=step2_result)
+    return fb, p
+fb, p = chain()
+OD._dec_post_summary(p)
+sums = fb.cards("[сводка родитель")
+cards = fb.cards()
+res.append(ok(len(sums) == 1 and sums[0]["status"] == "done", "сводка родителя встала как раньше"))
+res.append(ok(len(consults) == 1 and consults[0][0] == "декомпозируй: собери фичу Y"
+              and "Сводка декомпозиции" in consults[0][1],
+              "консультация ПОСЛЕ сводки: цель = task_text родителя дословно, итог = сводка"))
+res.append(ok(len(cards) == 1 and cards[0]["task_text"].startswith(f"[куратор родитель {p}]"),
+              "followup → карточка [куратор родитель N]"))
+OD._dec_post_summary(p)
+res.append(ok(len(consults) == 1 and len(fb.cards()) == 1,
+              "повторный вызов (рестарт/хвостовой скан) → без дублей консультации/карточки"))
+os.environ["CURATOR"] = "0"
+fb, p = chain()
+OD._dec_post_summary(p)
+res.append(ok(len(fb.cards("[сводка родитель")) == 1 and consults == [] and fb.cards() == [],
+              "CURATOR=0 → сводка как раньше, куратора нет"))
+os.environ["CURATOR"] = "1"
+fb, p = chain(step2_status="failed", step2_result=OD.TIMEOUT_MARK + " ПК-театр не отвечает")
+OD._dec_post_summary(p)
+res.append(ok(consults == [] and fb.cards() == [], "⏱-диагноз в шаге цепи (виден в сводке) → мимо"))
+fb, p = chain(step2_status="failed", step2_result="отклонено Филиппом («нет 42»)")
+OD._dec_post_summary(p)
+res.append(ok(consults == [] and fb.cards() == [], "«отклонено Филиппом» в цепи → мимо"))
+
+# (9) осиротевшая карточка куратора (демон упал между enqueue и complete)
+print("(9) осиротевшая карточка:")
+fb, _ = setup(("done", "x"))
+ran = []
+OD.run_task = lambda tid, t, task_timeout=600, preamble=None: (ran.append(int(tid)) or ("done", "x"))
+oid = fb.add("new", "[куратор задача 77] вердикт куратора", frm="Filipp-328-dec")
+del fb.rows[list(fb.rows)[0]]     # убрать сеттаповскую new-задачу — сирота должна взяться первой
+OD.process_new()
+res.append(ok(fb.rows[oid]["status"] == "done" and "🧭" in fb.rows[oid]["result"],
+              "сирота доводится done-карточкой, НЕ уходит планировщику"))
+res.append(ok(ran == [] and not any("[шаг" in str(r["task_text"]) for r in fb.rows.values()),
+              "claude не зовётся, fan-out шагов не происходит"))
+res.append(ok(bool(OD._CURATOR_CARD_RE.match("[куратор родитель 12] вердикт куратора"))
+              and not OD._CURATOR_CARD_RE.match("[куратор нечто 12] х"),
+              "маркер-regex: задача|родитель, прочее не матчится"))
+
+OD.bc = _real_bc
+OD.run_task = _real_run_task
+OD._restart_pending = _real_rp
+OD._curator_consult = _real_consult
+OD._curated.clear(); OD._summarized.clear()
 os.environ.pop("CURATOR", None)
 OD.subprocess.run = _real_run
 
