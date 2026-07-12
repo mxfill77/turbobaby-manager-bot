@@ -2535,8 +2535,10 @@ def cycle():
 
 
 def main():
-    log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s) ===",
-             POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN)
+    log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
+             "selfheal=%s, plan_adapt=%s, curator=%s) ===",
+             POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
+             int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()))
     while _running:
         try:
             cycle()
