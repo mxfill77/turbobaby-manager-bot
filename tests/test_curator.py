@@ -191,6 +191,11 @@ class FakeBridge:
         return {"ok": True}
     def enqueue_task(s, frm, text, lane=None):
         return {"ok": True, "id": s.add("new", text, frm=frm)}
+    def set_needs_approval(s, tid, what):
+        r = s.rows.get(int(tid))
+        if not r: return {"ok": False, "error": "not_found"}
+        r["status"], r["result"] = "needs_approval", what
+        return {"ok": True}
     def task_heartbeat(s, tid): return {"ok": True}
     def cards(s, mark="[куратор"):
         return [dict(r) for r in s.rows.values() if str(r["task_text"]).startswith(mark)]
@@ -251,11 +256,15 @@ fb, t = setup(("failed", "гейт красный, не смог"),
               verdict={"verdict": "human", "tasks": [], "human": "нужно «да» на clasp",
                        "reason": "красная зона"})
 OD.process_new()
-cards = fb.cards()
+cards = fb.cards("[куратор задача")
 res.append(ok(len(consults) == 1 and len(cards) == 1
               and "требует владельца" in cards[0]["result"]
               and "нужно «да» на clasp" in cards[0]["result"],
               "failed-одиночка тоже терминал; human → карточка «требует владельца»"))
+hum = fb.cards("[куратор владельцу цель")
+res.append(ok(len(hum) == 1 and hum[0]["status"] == "needs_approval"
+              and "нужно «да» на clasp" in hum[0]["result"],
+              "…и пункт ушёл в сводную карточку владельцу (needs_approval, шаг 4/7)"))
 fb, t = setup(("done", "сделано"), verdict=None)
 OD.process_new()
 res.append(ok(len(consults) == 1 and fb.cards() == [] and fb.rows[t]["status"] == "done",

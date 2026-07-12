@@ -1291,7 +1291,9 @@ CURATOR_PREAMBLE = (
     "в рабочие таблицы, денег, clasp, sqlite3, удалений); tasks тогда — 1–3 САМОДОСТАТОЧНЫХ "
     "дев-ТЗ ≤400 символов каждое (исполнитель увидит ТОЛЬКО текст ТЗ, впиши нужный контекст). "
     "human — дожим требует владельца (красная зона, бизнес-решение, доступы, ручной тест); human "
-    "тогда — 1 строка, что именно нужно. При сомнении между followup и human выбирай human — "
+    "тогда — 1 строка, что именно нужно. ЖЕЛЕЗНО: красные и смок-шаги (запись в рабочие таблицы "
+    "Лист1/CRM/Зарплаты, деньги, clasp, sqlite3, удаления, деплой, смок-прогон на живых данных) — "
+    "ТОЛЬКО в human, НИКОГДА в tasks. При сомнении между followup и human выбирай human — "
     "куратор не плодит самодеятельность.\n\n"
 )
 
@@ -1383,6 +1385,15 @@ _CURATOR_CARD_RE = re.compile(r"^\[куратор (задача|родитель
 # на терминале — поиском по тексту (.search — маркер жив и под префиксом перерождения).
 _CURATOR_GOAL_RE = re.compile(r"\[куратор цели (\d+), шаг (\d+)\]")
 _CURATOR_DEPTH2_MARK = "[глубина 2]"  # тег сразу ЗА маркером у продолжений второй глубины
+# Ветка human (шаг 4/7 родитель 231): пункты «нужно от владельца» НЕ ставятся задачами, а копятся
+# в ОДНУ сводную карточку на цель G — synthetic-задачу [куратор владельцу цель G] в статусе
+# needs_approval (devbot несёт needs_approval в инбокс INBOX_TOPIC_ID, прод 1160). Новые пункты
+# той же цели дописываются ПРАВКОЙ result существующей открытой карточки (set_needs_approval
+# по любому статусу перезаписывает result); тот же текст пункта повторно → счётчик ×N на той же
+# строке, НЕ дубль (дедуп-образец bd5d516). Маркер НЕ матчится ни _CURATOR_CARD_RE (задача|
+# родитель), ни _CURATOR_GOAL_RE (куратор цели) — бюджеты followup и дедуп терминалов не путает.
+_CURATOR_HUMAN_RE = re.compile(r"^\[куратор владельцу цель (\d+)\]")
+_CURATOR_HUMAN_ITEM_RE = re.compile(r"^(\d+)\. (.+?)(?: \(×(\d+)\))?$")
 _CURATOR_SKIP_MARKS = (TIMEOUT_MARK, "🔁", _REJECT_PREFIX)
 _curated = set()              # (kind, id) — терминалы, по которым консультация уже потрачена
 
@@ -1493,14 +1504,87 @@ def _curator_spawn(kind, key, goal, tasks):
     return {"root": root, "placed": placed, "refused": refused}
 
 
-def _curator_card_text(kind, key, v, spawn=None):
+def _curator_human_items(body):
+    """Пункты из тела сводной карточки владельцу → [(текст, счётчик)]. Строки-ненумерованные
+    (заголовок, подсказка, пустые) молча пропускаются — рендер их пересоберёт."""
+    items = []
+    for ln in str(body or "").splitlines():
+        m = _CURATOR_HUMAN_ITEM_RE.match(ln.strip())
+        if m:
+            items.append((m.group(2).strip(), int(m.group(3) or 1)))
+    return items
+
+
+def _curator_human_render(root, items):
+    """Тело сводной карточки «нужно от владельца» по цели root. Пункт с счётчиком >1 несёт ×N."""
+    lines = [f"🧑 нужно от владельца (цель {root}) — куратор задач по этим пунктам НЕ ставит:"]
+    for i, (t, n) in enumerate(items, 1):
+        lines.append(f"{i}. {t}" + (f" (×{n})" if n > 1 else ""))
+    lines.append("")
+    lines.append("✅ — принял/сделал (карточка закроется), ❌ — отклонить. Новые пункты этой цели "
+                 "куратор дописывает в ЭТУ карточку (актуальный список — /inbox).")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+def _curator_human_upsert(root, item):
+    """Ветка human (шаг 4/7 родитель 231): пункт → ЕДИНАЯ сводная карточка владельцу по цели root.
+    Открытая (needs_approval) карточка [куратор владельцу цель root] уже есть → дописать пункт
+    правкой её result (тот же текст → ×N, не дубль); нет → создать synthetic-задачу (образец
+    _dec_post_summary: enqueue → claim → финализация, здесь финал = set_needs_approval, чтобы
+    devbot унёс карточку в инбокс INBOX_TOPIC_ID). Пункт кладётся и в task_text новой карточки —
+    упади демон между enqueue и set_needs_approval, сирота доводится в process_new БЕЗ потери
+    пункта. Возврат (id, "created"|"edited"|"dedup") или None при ЛЮБОМ сбое — вызывающий код
+    откатывается на прежнюю карточку-полотно в 328 (fail-safe, не хуже шага 2/7)."""
+    try:
+        item = str(item or "").strip()[:CURATOR_TASK_MAX] or "(куратор не уточнил)"
+        mark = f"[куратор владельцу цель {root}]"
+        r = bc.get_pending("needs_approval")
+        if not r.get("ok"):
+            return None
+        for it in r.get("items", []):
+            if not str(it.get("task_text") or "").startswith(mark):
+                continue
+            tid, mode = it.get("id"), "edited"
+            items = _curator_human_items(it.get("result"))
+            for i, (t, n) in enumerate(items):
+                if t == item:
+                    items[i], mode = (t, n + 1), "dedup"
+                    break
+            else:
+                items.append((item, 1))
+            rr = bc.set_needs_approval(tid, _curator_human_render(root, items))
+            return (tid, mode) if rr.get("ok") else None
+        r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", f"{mark} {item}")
+        if not r.get("ok"):
+            return None
+        sid = r.get("id")
+        bc.claim_task(sid)    # даже если claim не прошёл — set_needs_approval финализирует
+        rr = bc.set_needs_approval(sid, _curator_human_render(root, [(item, 1)]))
+        return (sid, "created") if rr.get("ok") else None
+    except Exception as e:
+        log.warning("curator-human: upsert карточки владельцу (цель %s) упал (%s) — fail-safe",
+                    root, e)
+        return None
+
+
+def _curator_card_text(kind, key, v, spawn=None, hum=None):
     """Тело карточки-сигнала куратора для 328 (result synthetic-задачи). followup — отчёт о
-    поставленных продолжениях и/или почему не поставлены (бюджет/сбой)."""
+    поставленных продолжениях и/или почему не поставлены (бюджет/сбой); human — отчёт, куда
+    ушёл пункт (сводная карточка владельцу, шаг 4/7) либо сам пункт при сбое upsert."""
     reason = v.get("reason") or "(без причины)"
     if v["verdict"] == "human":
-        return (f"🧭 куратор: цель ({kind} {key}) требует владельца.\n"
-                f"что нужно: {v.get('human') or '(куратор не уточнил)'}\n"
-                f"причина: {reason}")[:RESULT_MAX]
+        lines = [f"🧭 куратор: цель ({kind} {key}) требует владельца — задачи НЕ ставятся.",
+                 f"что нужно: {v.get('human') or '(куратор не уточнил)'}",
+                 f"причина: {reason}"]
+        if hum:
+            word = {"created": "создана сводная карточка владельцу",
+                    "edited": "пункт добавлен в сводную карточку владельцу",
+                    "dedup": "пункт уже был в сводной карточке владельцу (счётчик ×N)"}[hum[1]]
+            lines.append(f"🧑 {word} (задача {hum[0]}, инбокс).")
+        else:
+            lines.append("🧑 сводная карточка владельцу НЕ встала (сбой очереди) — "
+                         "пункт только в этой карточке.")
+        return "\n".join(lines)[:RESULT_MAX]
     sp = spawn or {"root": key, "placed": [],
                    "refused": [(t, "постановка не выполнялась") for t in v["tasks"]]}
     lines = [f"🧭 куратор: цель ({kind} {key}) НЕ закрыта — остались зелёные хвосты.",
@@ -1547,10 +1631,16 @@ def _maybe_curator(kind, key, goal, result):
         sid = r.get("id")
         bc.claim_task(sid)        # даже если claim не прошёл — complete финализирует
         spawn = _curator_spawn(kind, key, goal, v["tasks"]) if v["verdict"] == "followup" else None
-        cm = bc.complete_task(sid, "done", _curator_card_text(kind, key, v, spawn))
-        log.info("curator: %s %s → %s, карточка задачей %s (bridge_ok=%s, продолжений=%s)",
+        hum = None
+        if v["verdict"] == "human":
+            # ветка human (шаг 4/7): задач НЕ ставим — пункт в сводную карточку владельцу
+            # по КОРНЮ цели (продолжения того же корня копятся в ту же карточку)
+            hum = _curator_human_upsert(_curator_root_depth(kind, key, goal)[0],
+                                        v.get("human") or v.get("reason"))
+        cm = bc.complete_task(sid, "done", _curator_card_text(kind, key, v, spawn, hum))
+        log.info("curator: %s %s → %s, карточка задачей %s (bridge_ok=%s, продолжений=%s, hum=%s)",
                  kind, key, v["verdict"], sid, cm.get("ok"),
-                 len(spawn["placed"]) if spawn else 0)
+                 len(spawn["placed"]) if spawn else 0, hum and hum[1])
     except Exception as e:
         log.warning("curator: сбой консультации по %s %s (%s) — fail-safe тишина", kind, key, e)
 
@@ -2144,6 +2234,18 @@ def process_approved():
         tid = task.get("id")
         what = str(task.get("result") or "")        # сохранённый дескриптор (op=… | текст) — одобренный
 
+        # Сводная карточка владельцу (куратор, шаг 4/7): ✅ = «принял/сделал» — просто закрываем
+        # done, НИКАКОГО конверта/исполнения (пункты по определению red/владельческие; конверт
+        # op=other погнал бы их в headless — петля NEEDS_APPROVAL). До проверки таймаута:
+        # «approve истёк» для карточки-списка бессмыслен. Новые human-пункты той же цели после
+        # закрытия пойдут НОВОЙ карточкой (_curator_human_upsert ищет только открытые).
+        if _CURATOR_HUMAN_RE.match(str(task.get("task_text") or "")):
+            bc.complete_task(tid, "done",
+                             "🧑 сводная карточка владельцу закрыта (✅): пункты приняты/сделаны "
+                             "владельцем. Новые human-пункты той же цели встанут новой карточкой.")
+            log.info("curator-human: сводная карточка %s закрыта владельцем (✅)", tid)
+            continue
+
         # таймаут approved: одобрено давно, не довели → авто-failed
         if _approved_expired(task.get("updated")):
             log.info("APPROVED id=%s ИСТЁК (>%ss) → failed", tid, APPROVED_TTL)
@@ -2369,6 +2471,15 @@ def process_new():
             bc.complete_task(tid, "done", "🃏 карточка события цепи ПК-театра (осиротела при "
                                           "рестарте демона; цепь родителя идёт своим ходом)")
             log.info("pc-dec: осиротевшая карточка id=%s доведена", tid)
+            return
+        hm = _CURATOR_HUMAN_RE.match(text)
+        if hm:
+            # осиротевшая сводная карточка владельцу (демон упал между enqueue и set_needs_approval):
+            # пункт живёт в task_text → доводим В needs_approval с отрендеренным телом, пункт не
+            # теряется, devbot унесёт карточку в инбокс как обычно
+            item = text[hm.end():].strip() or "(пункт потерян при рестарте демона)"
+            bc.set_needs_approval(tid, _curator_human_render(int(hm.group(1)), [(item, 1)]))
+            log.info("curator-human: осиротевшая сводная карточка id=%s доведена в needs_approval", tid)
             return
         if _CURATOR_CARD_RE.match(text):
             # осиротевшая карточка куратора (демон упал между enqueue и complete: вердикт потерян,
