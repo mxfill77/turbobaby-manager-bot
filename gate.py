@@ -8,7 +8,15 @@
 Использование:
     venv/bin/python3 gate.py                 # прогон гейта (перед clasp redeploy / git push / restart)
     venv/bin/python3 gate.py --for push      # пометить операцию в логе (push/clasp/restart)
+    venv/bin/python3 gate.py --final         # ФИНАЛЬНЫЙ прогон: красный алерт в Telegram гарантирован
     venv/bin/python3 gate.py --override "причина"   # ОБХОД — ТОЛЬКО по явному «да» Филиппа
+
+Алерты владельцу (хвост §7, 12.07.2026): «🔴 ТЕСТЫ КРАСНЫЕ» пушится ТОЛЬКО на финальном прогоне.
+Внутри headless-задачи (orchestrator_daemon ставит окружению claude -p GATE_ALERT_FINAL_ONLY=1)
+промежуточные красные прогоны — штатный red-fix-green цикл: решение гейта/exit 1/боевой_лог не
+меняются, но Telegram молчит. Финальность детерминированна: pre-push hook зовёт gate.py --final
+(бьёт подавление даже внутри headless — деплой-прогон алертит всегда). FAIL-SAFE: флага контекста
+нет / контекст неясен / сбой определения → алертим как раньше.
 
 ЭНФОРСМЕНТ: git push — нативный pre-push hook (deploy/hooks/pre-push) зовёт gate.py автоматически.
 clasp redeploy / systemctl restart — по правилу CLAUDE.md (дисциплинарно). Будущий дев-бот/оркестратор
@@ -55,6 +63,20 @@ def _push(text):
         pass
 
 
+def _alert_allowed(final):
+    """Красный Telegram-алерт разрешён на ЭТОМ прогоне? (хвост §7, 12.07.2026)
+    Финальный прогон (--final, его ставит pre-push hook) → всегда да, даже внутри headless.
+    Промежуточный прогон ВНУТРИ headless-задачи (демон даёт claude -p окружение
+    GATE_ALERT_FINAL_ONLY=1; красный там — штатный red-fix-green цикл) → тихо, без пуша.
+    FAIL-SAFE: переменной нет / значение не «1» / любой сбой чтения → True (алертим как раньше)."""
+    try:
+        if final:
+            return True
+        return (os.environ.get("GATE_ALERT_FINAL_ONLY") or "").strip() != "1"
+    except Exception:
+        return True
+
+
 def run_tests():
     """Прогнать все tests/test_*.py. Вернуть (failed:list, total:int, dt:float)."""
     # PYTHONPATH — чтобы import splinter работал из tests/. PRETOOL_NOPUSH=1 — тесты и ВСЕ их
@@ -80,6 +102,7 @@ def run_tests():
 def main():
     op = _arg("--for") or "prod"
     override = _arg("--override")
+    final = "--final" in sys.argv[1:]   # финальный прогон (pre-push / явный запуск) — алерт обязателен
 
     if override is not None:
         # ОБХОД — только по явному «да» Филиппа. Claude Code сам этот флаг не ставит.
@@ -93,13 +116,19 @@ def main():
         print(f"✅ ГЕЙТ: {total} тестов зелёные ({dt:.1f}с) — прод-операция «{op}» разрешена.")
         return 0
 
-    # КРАСНЫЙ → блок + пуш + лог
+    # КРАСНЫЙ → блок + лог; пуш владельцу — только на финальном прогоне (см. _alert_allowed)
     flist = ", ".join(failed)
+    alert = _alert_allowed(final)
     print(f"❌ ГЕЙТ: КРАСНЫЕ ТЕСТЫ ({len(failed)}/{total}): {flist}")
     print(f"   ДЕПЛОЙ «{op}» ЗАБЛОКИРОВАН. Обход только по «да» Филиппа: gate.py --override «причина».")
-    _log("blocked_by_tests", f"op={op}; упали: {flist}")
-    _push(f"🔴 ТЕСТЫ КРАСНЫЕ ({len(failed)}/{total}): {flist}. Деплой «{op}» ЗАБЛОКИРОВАН (тесты-гейт 4.3). "
-          f"Обход только твоим «да».")
+    _log("blocked_by_tests", f"op={op}; упали: {flist}"
+         + ("" if alert else "; промежуточный headless-прогон — Telegram-алерт подавлен"))
+    if alert:
+        _push(f"🔴 ТЕСТЫ КРАСНЫЕ ({len(failed)}/{total}): {flist}. Деплой «{op}» ЗАБЛОКИРОВАН (тесты-гейт 4.3). "
+              f"Обход только твоим «да».")
+    else:
+        print("   [gate] промежуточный прогон внутри headless-задачи (GATE_ALERT_FINAL_ONLY=1) — "
+              "Telegram-алерт подавлен; финальный прогон (pre-push / --final) алертит как обычно.")
     return 1
 
 

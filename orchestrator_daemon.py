@@ -516,6 +516,11 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     # а НЕ по платному API. Splinter не затронут (он ключ берёт из своего процесса, не через claude -p).
     child_env.pop("ANTHROPIC_API_KEY", None)
     child_env.pop("OPENAI_API_KEY", None)
+    # Гейт-алерты только на финальном прогоне (хвост §7, 12.07.2026): внутри headless-задачи
+    # промежуточные красные прогоны gate.py — штатный red-fix-green цикл, НЕ шум владельцу.
+    # Флаг велит gate.py молчать в Telegram на НЕ-финальных прогонах; финальный pre-push зовёт
+    # gate.py --final и алертит как раньше. Без этого env (Termux/cron/девбот) — всё как было.
+    child_env["GATE_ALERT_FINAL_ONLY"] = "1"
     prompt = (preamble if preamble is not None else APPROVAL_PREAMBLE) + task_text
     # Heartbeat: фон-поток бьёт updated, пока claude -p блокирующе исполняется. Останавливаем в finally.
     _hb_stop = threading.Event()
