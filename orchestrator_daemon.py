@@ -496,9 +496,12 @@ def _heartbeat_loop(task_id, stop_event):
 
 
 def _task_timeout(task):
-    """Таймаут по метке from очереди: дев-ТЗ («тз:», from=*-dev) и декомпозиция (from=*-dec,
-    планирование-разведка и шаги — те же дев-ТЗ) → 45 мин, остальное → 10 мин."""
+    """Таймаут по метке from очереди: дев-ТЗ («тз:», from=*-dev), декомпозиция (from=*-dec,
+    планирование-разведка и шаги — те же дев-ТЗ) и followup-задачи куратора (from=Filipp-curator —
+    по промпту куратора это дев-ТЗ: код/тесты/доки) → 45 мин, остальное → 10 мин."""
     frm = str(task.get("from") or "")
+    if frm == CURATOR_FROM:
+        return TASK_TIMEOUT_DEV
     return TASK_TIMEOUT_DEV if frm.endswith((DEV_FROM_SUFFIX, DEC_FROM_SUFFIX)) else TASK_TIMEOUT
 
 
@@ -1267,6 +1270,13 @@ def _maybe_plan_adapt(pid, step_i, step_n):
 # таймаут думателя → None — вызывающий код обязан вести себя как при CURATOR=0 (не хуже).
 CURATOR_TIMEOUT = 180         # куратор — чистый генератор без tools, ответ короткий
 CURATOR_TASK_MAX = 400        # потолок одного followup-ТЗ (лимит сводки в 328)
+# Постановка followup-задач (шаг 3/7 родитель 231): from-метка и бюджеты. Бюджеты считаются
+# restart-proof ИЗ МАРКЕРОВ очереди ([куратор цели G, шаг m] в начале task_text) — память
+# процесса не нужна, рестарт демона счётчики не обнуляет.
+CURATOR_FROM = "Filipp-curator"  # метка followup-задач куратора в очереди (та же полоса vps)
+CURATOR_MAX_PER_ROOT = 3      # ≤3 продолжений (куратор-задач) на корень G суммарно, обе глубины
+CURATOR_MAX_DEPTH = 2         # корень → продолжения (глубина 1) → дожим дожима (глубина 2) → стоп
+CURATOR_MAX_PER_DAY = 10      # ≤10 куратор-задач/сутки (UTC) по ВСЕМ корням — общий предохранитель
 # Секции хвостов в result исполнителя: «ХВОСТ:/ХВОСТЫ:», «технически готово…; функционально…»
 _CURATOR_TAIL_RE = re.compile(r"(?i)(хвост|технически готово|функциональн)")
 CURATOR_PREAMBLE = (
@@ -1367,6 +1377,12 @@ def _curator_consult(goal, result):
 # конверты одобренных заявок, pc-полоса (_pc_post_summary хук не зовёт; одиночки pc в process_new
 # не попадают), плановый рестарт-🔁 (работа отчитана в cc_log, итога для сверки нет).
 _CURATOR_CARD_RE = re.compile(r"^\[куратор (задача|родитель) (\d+)\]")
+# Маркер followup-задачи куратора (шаг 3/7): G = id КОРНЕВОЙ задачи (или родителя цепи), m —
+# сквозной номер продолжения по корню. Для бюджетов regex матчится ОТ НАЧАЛА task_text
+# (.match — перерождения самопочинки с их префиксом не задваивают счёт), для трассировки корня
+# на терминале — поиском по тексту (.search — маркер жив и под префиксом перерождения).
+_CURATOR_GOAL_RE = re.compile(r"\[куратор цели (\d+), шаг (\d+)\]")
+_CURATOR_DEPTH2_MARK = "[глубина 2]"  # тег сразу ЗА маркером у продолжений второй глубины
 _CURATOR_SKIP_MARKS = (TIMEOUT_MARK, "🔁", _REJECT_PREFIX)
 _curated = set()              # (kind, id) — терминалы, по которым консультация уже потрачена
 
@@ -1386,27 +1402,124 @@ def _curator_card_exists(kind, key):
     return False
 
 
-def _curator_card_text(kind, key, v):
-    """Тело карточки-сигнала куратора для 328 (result synthetic-задачи)."""
+def _curator_root_depth(kind, key, goal):
+    """Корень G и ГЛУБИНА новых продолжений по тексту терминала (restart-proof: только маркеры).
+    Терминал без маркера куратора → корень = сам терминал, новые задачи = глубина 1;
+    терминал-продолжение ([куратор цели G, шаг m]) → тот же корень G, новые = глубина 2;
+    терминал с тегом [глубина 2] → новые были бы глубиной 3 (запрещено, вернём 3).
+    Терминал-родитель цепи — всегда корень (шаги цепи кураторских маркеров не несут)."""
+    if kind != "задача":
+        return int(key), 1
+    t = str(goal or "")
+    m = _CURATOR_GOAL_RE.search(t)
+    if not m:
+        return int(key), 1
+    if t[m.end():m.end() + len(_CURATOR_DEPTH2_MARK)] == _CURATOR_DEPTH2_MARK:
+        return int(m.group(1)), 3
+    return int(m.group(1)), 2
+
+
+def _curator_used(root):
+    """Срез бюджетов из маркеров очереди ОДНИМ CSV-опросом (restart-proof):
+    (продолжений по корню root, куратор-задач за сегодня UTC по всем корням, max шаг корня).
+    None при сбое опроса — вызывающий код задачи НЕ ставит (fail-safe: без доказанного бюджета
+    не плодим, карточка объяснит владельцу). created нечитаем → считаем сегодняшней (в сторону
+    лимита, не в сторону спама)."""
+    try:
+        r = bc.get_pending("new,in_progress,done,failed,needs_approval,approved")
+        if not r.get("ok"):
+            return None
+    except Exception:
+        return None
+    per_root, today, max_step = 0, 0, 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for it in r.get("items", []):
+        m = _CURATOR_GOAL_RE.match(str(it.get("task_text") or ""))
+        if not m:
+            continue
+        if int(m.group(1)) == int(root):
+            per_root += 1
+            max_step = max(max_step, int(m.group(2)))
+        try:
+            s = str(it.get("created")).replace("Z", "+00:00")
+            t = datetime.datetime.fromisoformat(s)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=datetime.timezone.utc)
+            if t.astimezone(datetime.timezone.utc).date() == now.date():
+                today += 1
+        except Exception:
+            today += 1
+    return per_root, today, max_step
+
+
+def _curator_spawn(kind, key, goal, tasks):
+    """Ветка followup (шаг 3/7 родитель 231): каждое ТЗ куратора → задача from=Filipp-curator
+    ТОЙ ЖЕ полосы (куратор живёт только на vps-терминалах → полоса vps, дефолт enqueue) с
+    маркером [куратор цели G, шаг m]; вторая глубина несёт тег [глубина 2]. Бюджеты — из
+    маркеров очереди (см. _curator_used): превышение / сбой опроса / enqueue-fail → ТЗ уходит
+    в refused (владелец увидит его в карточке и может дожать «тз:» руками), постановка не
+    падает и не зацикливается. Возврат {"placed":[(id, ТЗ)...], "refused":[(ТЗ, почему)...],
+    "root": G}."""
+    root, depth = _curator_root_depth(kind, key, goal)
+    if depth > CURATOR_MAX_DEPTH:
+        return {"root": root, "placed": [],
+                "refused": [(t, f"глубина цепочки продолжений > {CURATOR_MAX_DEPTH}") for t in tasks]}
+    used = _curator_used(root)
+    if used is None:
+        return {"root": root, "placed": [],
+                "refused": [(t, "очередь не опросить — бюджет не доказать") for t in tasks]}
+    per_root, today, max_step = used
+    depth_tag = _CURATOR_DEPTH2_MARK if depth == 2 else ""
+    placed, refused = [], []
+    for t in tasks:
+        if per_root >= CURATOR_MAX_PER_ROOT:
+            refused.append((t, f"исчерпан лимит корня ({CURATOR_MAX_PER_ROOT} продолжений на цель)"))
+            continue
+        if today >= CURATOR_MAX_PER_DAY:
+            refused.append((t, f"исчерпан суточный лимит ({CURATOR_MAX_PER_DAY} куратор-задач/сутки)"))
+            continue
+        max_step += 1
+        try:
+            r = bc.enqueue_task(CURATOR_FROM, f"[куратор цели {root}, шаг {max_step}]{depth_tag} {t}")
+        except Exception as e:
+            r = {"ok": False, "error": str(e)}
+        if r.get("ok"):
+            placed.append((r.get("id"), t))
+            per_root += 1
+            today += 1
+        else:
+            max_step -= 1
+            refused.append((t, f"enqueue не прошёл ({r.get('error')})"))
+    return {"root": root, "placed": placed, "refused": refused}
+
+
+def _curator_card_text(kind, key, v, spawn=None):
+    """Тело карточки-сигнала куратора для 328 (result synthetic-задачи). followup — отчёт о
+    поставленных продолжениях и/или почему не поставлены (бюджет/сбой)."""
     reason = v.get("reason") or "(без причины)"
     if v["verdict"] == "human":
         return (f"🧭 куратор: цель ({kind} {key}) требует владельца.\n"
                 f"что нужно: {v.get('human') or '(куратор не уточнил)'}\n"
                 f"причина: {reason}")[:RESULT_MAX]
+    sp = spawn or {"root": key, "placed": [],
+                   "refused": [(t, "постановка не выполнялась") for t in v["tasks"]]}
     lines = [f"🧭 куратор: цель ({kind} {key}) НЕ закрыта — остались зелёные хвосты.",
-             f"причина: {reason}",
-             f"хвосты на дожим ({len(v['tasks'])}):"]
-    lines += [f"{i}. {t}" for i, t in enumerate(v["tasks"], 1)]
-    lines.append("(куратор задач НЕ ставит — постановка followup в следующих шагах родителя 231; "
-                 "дожать можно «тз:» из списка)")
+             f"причина: {reason}"]
+    if sp["placed"]:
+        lines.append(f"поставлены продолжения (from={CURATOR_FROM}, корень {sp['root']}):")
+        lines += [f"{i}. задача id {pid}: {t}" for i, (pid, t) in enumerate(sp["placed"], 1)]
+    if sp["refused"]:
+        lines.append("НЕ поставлено (дожать можно «тз:» из списка):")
+        lines += [f"- {t} — {why}" for t, why in sp["refused"]]
     return "\n".join(lines)[:RESULT_MAX]
 
 
 def _maybe_curator(kind, key, goal, result):
     """Консультация куратора на терминале (kind=задача|родитель, key=id очереди). CURATOR=0 →
     ноль вызовов; дедуп — ровно одна консультация на терминал; closed/сбой → тишина;
-    followup/human → карточка [куратор …] в 328. Куратор — слой-надстройка: ЛЮБОЕ исключение
-    ловится, боевой финал задачи он не валит и не меняет."""
+    followup → постановка продолжений (_curator_spawn, бюджеты из маркеров) + карточка-отчёт;
+    human → карточка «требует владельца». Куратор — слой-надстройка: ЛЮБОЕ исключение ловится,
+    боевой финал задачи он не валит и не меняет."""
     try:
         if not _curator_on():
             return
@@ -1422,6 +1535,9 @@ def _maybe_curator(kind, key, goal, result):
             log.info("curator: %s %s → %s (тишина)", kind, key,
                      v["verdict"] if v else "сбой думателя")
             return
+        # Карточка-маркер дедупа встаёт ПЕРВОЙ, продолжения ставятся МЕЖДУ её enqueue и
+        # complete: упади демон посреди — сирота доводится (process_new), консультация не
+        # повторяется, продолжения не задваиваются.
         r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}",
                             f"[куратор {kind} {key}] вердикт куратора")
         if not r.get("ok"):
@@ -1430,18 +1546,22 @@ def _maybe_curator(kind, key, goal, result):
             return
         sid = r.get("id")
         bc.claim_task(sid)        # даже если claim не прошёл — complete финализирует
-        cm = bc.complete_task(sid, "done", _curator_card_text(kind, key, v))
-        log.info("curator: %s %s → %s, карточка задачей %s (bridge_ok=%s)",
-                 kind, key, v["verdict"], sid, cm.get("ok"))
+        spawn = _curator_spawn(kind, key, goal, v["tasks"]) if v["verdict"] == "followup" else None
+        cm = bc.complete_task(sid, "done", _curator_card_text(kind, key, v, spawn))
+        log.info("curator: %s %s → %s, карточка задачей %s (bridge_ok=%s, продолжений=%s)",
+                 kind, key, v["verdict"], sid, cm.get("ok"),
+                 len(spawn["placed"]) if spawn else 0)
     except Exception as e:
         log.warning("curator: сбой консультации по %s %s (%s) — fail-safe тишина", kind, key, e)
 
 
 def _maybe_curator_single(frm, tid, text, result):
     """Куратор на финале done/failed ОДИНОЧКИ «тз:»/«задача:» vps-полосы (from=Filipp-328[-dev]
-    строго — артефакты декомпозиции/операций/pc сюда не проходят). Зовётся из process_new ПОСЛЕ
-    complete_task — финал уже записан, куратор его не трогает."""
-    if str(frm or "") not in ("Filipp-328", "Filipp-328" + DEV_FROM_SUFFIX):
+    строго — артефакты декомпозиции/операций/pc сюда не проходят) и followup-задачи куратора
+    (from=Filipp-curator — её терминал даёт вторую глубину дожима; третью глушит бюджет глубины
+    в _curator_spawn). Зовётся из process_new ПОСЛЕ complete_task — финал уже записан, куратор
+    его не трогает."""
+    if str(frm or "") not in ("Filipp-328", "Filipp-328" + DEV_FROM_SUFFIX, CURATOR_FROM):
         return                    # dec-семейство (куратор цепи зовётся на сводке), pc, op и прочее
     if _is_convert(text):
         return                    # конверт одобренной заявки — вне кураторского контура

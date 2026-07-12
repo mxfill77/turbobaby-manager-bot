@@ -237,14 +237,14 @@ fb, t = setup(("done", "сделано, но есть хвост"),
               verdict={"verdict": "followup", "tasks": ["тз: дожать тест на пустой env"],
                        "human": "", "reason": "хвост в тестах"})
 OD.process_new()
-cards = fb.cards()
+cards = fb.cards("[куратор задача")
 res.append(ok(len(cards) == 1 and cards[0]["task_text"].startswith(f"[куратор задача {t}]")
               and cards[0]["status"] == "done" and cards[0]["from"] == "Filipp-328-dec",
               "followup → карточка [куратор задача N] synthetic-задачей (done, from -dec)"))
 res.append(ok("🧭" in cards[0]["result"] and "тз: дожать тест на пустой env" in cards[0]["result"]
               and "хвост в тестах" in cards[0]["result"]
-              and "постановка followup" in cards[0]["result"],
-              "тело карточки: 🧭 + хвосты списком + причина + пометка «задачи не ставятся»"))
+              and "поставлены продолжения" in cards[0]["result"],
+              "тело карточки: 🧭 + хвосты списком + причина + отчёт о постановке (шаг 3/7)"))
 res.append(ok(fb.rows[t]["status"] == "done" and fb.rows[t]["result"] == "сделано, но есть хвост",
               "финал самой задачи карточкой не тронут"))
 fb, t = setup(("failed", "гейт красный, не смог"),
@@ -315,7 +315,7 @@ def chain(step2_status="done", step2_result="шаг 2 сделан", verdict=Non
 fb, p = chain()
 OD._dec_post_summary(p)
 sums = fb.cards("[сводка родитель")
-cards = fb.cards()
+cards = fb.cards("[куратор родитель")
 res.append(ok(len(sums) == 1 and sums[0]["status"] == "done", "сводка родителя встала как раньше"))
 res.append(ok(len(consults) == 1 and consults[0][0] == "декомпозируй: собери фичу Y"
               and "Сводка декомпозиции" in consults[0][1],
@@ -323,7 +323,7 @@ res.append(ok(len(consults) == 1 and consults[0][0] == "декомпозируй
 res.append(ok(len(cards) == 1 and cards[0]["task_text"].startswith(f"[куратор родитель {p}]"),
               "followup → карточка [куратор родитель N]"))
 OD._dec_post_summary(p)
-res.append(ok(len(consults) == 1 and len(fb.cards()) == 1,
+res.append(ok(len(consults) == 1 and len(fb.cards("[куратор родитель")) == 1,
               "повторный вызов (рестарт/хвостовой скан) → без дублей консультации/карточки"))
 os.environ["CURATOR"] = "0"
 fb, p = chain()
