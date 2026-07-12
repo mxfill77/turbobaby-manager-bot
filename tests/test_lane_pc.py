@@ -14,6 +14,7 @@ import os
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ.setdefault("PLAN_ADAPT", "0")  # изоляция от боевого .env (адаптация плана, кусок 2)
 os.environ["THEATER_ROUTER"] = "0"  # изоляция от роутера театра (кусок 3): легаси-поведение 328
+os.environ["PC_DEC_LOCAL"] = "0"  # изоляция от боевого .env: тут проверяем СТАРЫЙ путь pc-dec
 import devbot as DB
 import bridge_client
 

@@ -10,6 +10,7 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["THEATER_ROUTER"] = "1"          # роутер ВКЛ детерминированно (не зависим от .env)
+os.environ["PC_DEC_LOCAL"] = "0"            # изоляция: тут проверяем СТАРЫЙ путь pc-dec (VPS-дирижёр)
 import devbot as DB
 
 

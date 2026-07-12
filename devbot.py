@@ -213,6 +213,16 @@ def _router_timeout():
         return 45
 
 
+def _pc_dec_local():
+    """PC_DEC_LOCAL (деф. 0 = ВЫКЛ, старое поведение). 1 → родитель «пк: декомпозируй» ставится
+    как from=Filipp-pcloc-dec + lane=pc: его целиком (план → релиз шагов → надзор) ведёт
+    ЛОКАЛЬНЫЙ дирижёр ПК (pc_orchestrator, PC_LOCAL_DEC=1; живьём доказан родителем 195),
+    VPS-демон такую цепь НЕ трогает (его надзор группирует строго Filipp-pc-dec). Карточки
+    цепи devbot уже носит (682a881). Откат = PC_DEC_LOCAL=0 в .env + restart splinter,
+    без деплоя. Лениво на каждый вызов (bot.py импортирует devbot ДО load_dotenv)."""
+    return str(os.getenv("PC_DEC_LOCAL", "0")).strip().lower() in ("1", "true", "on")
+
+
 def _classify_theater(task_text):
     """Слой 2: думатель-классификатор театра — claude -p дешёвым кондуктором haiku→sonnet
     (--max-turns 1, --output-format json; зеркало orchestrator_daemon._thinker_exec).
@@ -384,7 +394,10 @@ def _try_enqueue(text, bridge, lane="vps"):
     lane='vps' (328, кусок 3 «единый пульт» 07.07.2026): текст задачи идёт через роутер театра
     (_route_328). Театр vps → вызовы enqueue_task байт-в-байт как раньше (БЕЗ lane — Bridge
     дефолтит vps); театр pc → одиночные с 328-меткой + lane='pc' (карточки в тему постановки),
-    «декомпозируй:» → родитель QUEUE_FROM_PC_DEC (кусок 2). Карточка приёма показывает 🎭."""
+    «декомпозируй:» → родитель QUEUE_FROM_PC_DEC (кусок 2). Карточка приёма показывает 🎭.
+    PC_DEC_LOCAL=1 (.env, финал развязки 12.07.2026): ОБЕ ветки pc-декомпозиции (829 и 328-pc)
+    ставят родителя QUEUE_FROM_PCLOC_DEC + lane='pc' — цепь целиком ведёт локальный дирижёр ПК
+    (см. _pc_dec_local); 0 (дефолт) → байт-в-байт старый путь QUEUE_FROM_PC_DEC без lane."""
     t = _canon_theater_prefix((text or "").strip())
     low = t.lower()
     pc = (lane == "pc")
@@ -395,6 +408,14 @@ def _try_enqueue(text, bridge, lane="vps"):
                 return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
                         "и выполню по одному.")
             if pc:
+                if _pc_dec_local():
+                    r = _enqueue_reliable(bridge, QUEUE_FROM_PCLOC_DEC, task_text, lane="pc")
+                    if r.get("ok"):
+                        return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (ЛОКАЛЬНЫЙ "
+                                f"дирижёр ПК): план/шаги/надзор целиком на ПК (lane=pc). "
+                                f"Каждый шаг отчитается сюда; красный спрошу кнопкой в инбоксе; "
+                                f"в конце — сводка. ПК выключен → цепь честно упадёт по таймауту.")
+                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
                 r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
                 if r.get("ok"):
                     return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
@@ -407,6 +428,15 @@ def _try_enqueue(text, bridge, lane="vps"):
                 return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
                         "и выполню по одному.")
             if theater == "pc":
+                if _pc_dec_local():
+                    r = _enqueue_reliable(bridge, QUEUE_FROM_PCLOC_DEC, task_text, lane="pc")
+                    if r.get("ok"):
+                        return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (ЛОКАЛЬНЫЙ "
+                                f"дирижёр ПК): план/шаги/надзор целиком на ПК (lane=pc); отчёты "
+                                f"шагов и сводка цепи — в теме PC-дев, красный шаг спрошу "
+                                f"кнопкой в инбоксе. ПК выключен → цепь честно упадёт по "
+                                f"таймауту." + _router_card("pc", note))
+                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
                 r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
                 if r.get("ok"):
                     return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
