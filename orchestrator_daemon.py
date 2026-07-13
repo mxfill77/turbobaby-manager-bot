@@ -301,6 +301,9 @@ APPROVAL_PREAMBLE = (
     "/root/turbobaby-manager-bot — CLAUDE.md и вся его дисциплина действуют.\n"
     "ДИСЦИПЛИНА (обязательно): перед правкой кода — бэкап (коммит/копия .bak); после правки — "
     "py_compile + тесты; перед git push — гейт (venv/bin/python3 gate.py; pre-push зовёт его сам); "
+    "для промежуточных шагов цепи гейт автоматически работает в селективном режиме (только тесты "
+    "затронутых модулей + smoke) — команда gate.py та же, режим прозрачный; вывод несёт пометку "
+    "«гейт полный» / «гейт селективный (N тестов)» — упомяни в первой строке отчёта шага; "
     "каждый значимый шаг — строка в cc_log (write_doc name=cc_log, запись ПОД врезкой) + пульс "
     "(write_doc name=pulse) ОДНОЙ операцией; статус честно: «технически готово» отдельно от "
     "«функционально подтверждено».\n"
@@ -555,6 +558,14 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     # Флаг велит gate.py молчать в Telegram на НЕ-финальных прогонах; финальный pre-push зовёт
     # gate.py --final и алертит как раньше. Без этого env (Termux/cron/девбот) — всё как было.
     child_env["GATE_ALERT_FINAL_ONLY"] = "1"
+    # Ускорение цепей ч.2 (13.07.2026): промежуточный шаг декомпозиции (i < N) →
+    # gate.py запускает только тесты затронутых модулей (селективный гейт).
+    # Последний шаг (i == N), одиночки, планировщик — полный сьют (preamble is None = executor).
+    # --final (pre-push hook) всегда бьёт флаг — деплой-прогон всегда полный.
+    if preamble is None:
+        _sm = _STEP_RE.match(str(task_text or ""))
+        if _sm and int(_sm.group(1)) < int(_sm.group(2)):
+            child_env["GATE_STEP_SELECTIVE"] = "1"
     prompt = (preamble if preamble is not None else APPROVAL_PREAMBLE) + task_text
     # Heartbeat: фон-поток бьёт updated, пока claude -p блокирующе исполняется. Останавливаем в finally.
     _hb_stop = threading.Event()

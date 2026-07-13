@@ -99,6 +99,102 @@ def run_tests():
     return failed, len(tests), time.time() - t0
 
 
+# === УСКОРЕНИЕ ЦЕПЕЙ ч.2 (13.07.2026): СЕЛЕКТИВНЫЙ ГЕЙТ ПРОМЕЖУТОЧНЫХ ШАГОВ ===
+# Промежуточный шаг декомпозера (i < N) → только smoke (py_compile) + тесты затронутых
+# модулей вместо полного сьюта — быстрее и дешевле. Последний шаг (i == N), одиночки,
+# пуши (pre-push hook --final) — полный сьют, финальное качество не ослабляется.
+# Активация: orchestrator_daemon.run_task ставит GATE_STEP_SELECTIVE=1 в child_env
+# промежуточного шага; gate.py читает его и переключается в selective-режим.
+# --final (pre-push hook) всегда бьёт флаг: деплой-прогон всегда полный.
+# Fail-safe: не удалось определить затронутое → полный сьют (label «полный (fail-safe…)»).
+
+def _step_selective():
+    """True → текущий вызов — промежуточный шаг цепи (GATE_STEP_SELECTIVE=1 в env).
+    Только строгое «1»; мусор/0/пусто → False (в сторону полного, не тишины)."""
+    return (os.environ.get("GATE_STEP_SELECTIVE") or "").strip() == "1"
+
+
+def _changed_py_files():
+    """Изменённые .py-файлы: uncommitted (staged + unstaged) + последний коммит.
+    Возврат: sorted list базовых имён. Ошибка / пустой git → [] (fail-safe полного сьюта)."""
+    try:
+        found = set()
+        for args in (
+            ["git", "diff", "--name-only", "HEAD"],              # unstaged изменения
+            ["git", "diff", "--name-only", "--cached", "HEAD"],  # staged изменения
+            ["git", "diff", "--name-only", "HEAD~1", "HEAD"],    # последний коммит
+        ):
+            p = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, timeout=15)
+            if p.returncode == 0:
+                for f in p.stdout.strip().splitlines():
+                    f = f.strip()
+                    if f.endswith(".py"):
+                        found.add(os.path.basename(f))
+        return sorted(found)
+    except Exception:
+        return []
+
+
+def _affected_test_files(changed_files):
+    """Тесты, покрывающие изменённые модули: имя модуля (без .py) ищем в содержимом каждого теста.
+    Возврат: sorted list путей. Пустой → [] (вызывающий переключится на полный сьют).
+    Нечитаемый тест включаем (fail-safe в сторону полноты)."""
+    if not changed_files:
+        return []
+    all_tests = sorted(glob.glob(os.path.join(TESTS_DIR, "test_*.py")))
+    modules = {f[:-3] for f in changed_files if f.endswith(".py")}
+    affected = set()
+    for test in all_tests:
+        try:
+            with open(test, encoding="utf-8", errors="ignore") as fh:
+                content = fh.read()
+            for mod in modules:
+                if mod in content:
+                    affected.add(test)
+                    break
+        except Exception:
+            affected.add(test)   # нечитаемый файл включаем — не пропускать молча
+    return sorted(affected)
+
+
+def run_selective_tests(changed_files):
+    """Smoke (py_compile) + тесты затронутых модулей.
+    Возврат: (failed_names:list, n_tests:int, dt:float, label:str).
+    Если затронутых тестов не нашли → fail-safe: полный сьют (label несёт «fail-safe»)."""
+    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1")
+    t0 = time.time()
+    failed = []
+
+    # Smoke: py_compile каждого изменённого .py
+    for fname in changed_files:
+        path = os.path.join(ROOT, fname)
+        if not os.path.isfile(path):
+            continue
+        r = subprocess.run([PY, "-m", "py_compile", path], cwd=ROOT, env=env,
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            failed.append(f"py_compile:{fname}")
+
+    # Тесты затронутых модулей
+    test_files = _affected_test_files(changed_files)
+    if not test_files:
+        # Fail-safe: модули не опознаны → полный сьют
+        ff, total, _ = run_tests()
+        return (failed + ff), total, time.time() - t0, f"полный (fail-safe: {total} тестов)"
+
+    for t in test_files:
+        name = os.path.basename(t)
+        try:
+            r = subprocess.run([PY, t], cwd=ROOT, env=env,
+                               capture_output=True, text=True, timeout=90)
+            if r.returncode != 0:
+                failed.append(name)
+        except subprocess.TimeoutExpired:
+            failed.append(name + "(timeout)")
+
+    return failed, len(test_files), time.time() - t0, f"селективный ({len(test_files)} тестов)"
+
+
 def main():
     op = _arg("--for") or "prod"
     override = _arg("--override")
@@ -111,17 +207,25 @@ def main():
         print(f"⚠️ ГЕЙТ ОБОЙДЁН (по «да» Филиппа). op={op}. {msg}. Записано в боевой_лог: test_override.")
         return 0
 
-    failed, total, dt = run_tests()
+    # Selective mode: промежуточный шаг цепи (GATE_STEP_SELECTIVE=1) + не финальный прогон →
+    # smoke + тесты затронутых модулей. --final (pre-push) всегда полный сьют.
+    if _step_selective() and not final:
+        changed = _changed_py_files()
+        failed, total, dt, label = run_selective_tests(changed)
+    else:
+        failed, total, dt = run_tests()
+        label = "полный"
+
     if not failed:
-        print(f"✅ ГЕЙТ: {total} тестов зелёные ({dt:.1f}с) — прод-операция «{op}» разрешена.")
+        print(f"✅ ГЕЙТ ({label}): {total} тестов зелёные ({dt:.1f}с) — прод-операция «{op}» разрешена.")
         return 0
 
     # КРАСНЫЙ → блок + лог; пуш владельцу — только на финальном прогоне (см. _alert_allowed)
     flist = ", ".join(failed)
     alert = _alert_allowed(final)
     print(f"❌ ГЕЙТ: КРАСНЫЕ ТЕСТЫ ({len(failed)}/{total}): {flist}")
-    print(f"   ДЕПЛОЙ «{op}» ЗАБЛОКИРОВАН. Обход только по «да» Филиппа: gate.py --override «причина».")
-    _log("blocked_by_tests", f"op={op}; упали: {flist}"
+    print(f"   ДЕПЛОЙ «{op}» ЗАБЛОКИРОВАН ({label}). Обход только по «да» Филиппа: gate.py --override «причина».")
+    _log("blocked_by_tests", f"op={op}; гейт {label}; упали: {flist}"
          + ("" if alert else "; промежуточный headless-прогон — Telegram-алерт подавлен"))
     if alert:
         _push(f"🔴 ТЕСТЫ КРАСНЫЕ ({len(failed)}/{total}): {flist}. Деплой «{op}» ЗАБЛОКИРОВАН (тесты-гейт 4.3). "
