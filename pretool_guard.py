@@ -240,7 +240,8 @@ def _dedup_bump(session, cmd):
 
 
 def _dedup_save_mid(session, cmd, mid):
-    """Запомнить message_id первой карточки (под тем же lock) — повтор будет править ЕЁ. Best-effort."""
+    """Запомнить (message_id, chat_id) первой карточки (под тем же lock; tuple → JSON-список) —
+    повтор будет править ЕЁ в том же чате (инбокс/личка). Best-effort."""
     try:
         path = _dedup_path(session)
         key = hashlib.sha1(cmd.encode("utf-8", "ignore")).hexdigest()[:16]
@@ -259,7 +260,8 @@ def _dedup_save_mid(session, cmd, mid):
 
 
 def _push(card):
-    """Отправить карточку. → message_id|None (id нужен дедупу: повтор правит ЭТУ карточку)."""
+    """Отправить карточку. → (message_id, chat_id)|None (нужно дедупу: повтор правит ЭТУ карточку
+    В ТОМ ЖЕ чате). Маршрут 13.07.2026 — внутри notify.send_card: тема-инбокс HQ 1160, личка-фолбэк."""
     if os.environ.get("PRETOOL_NOPUSH") == "1":
         return None   # тест-режим валидации хука: не спамить Telegram красными карточками
     try:
@@ -271,13 +273,21 @@ def _push(card):
 
 
 def _edit(mid, card):
-    """Повтор той же команды → правка УЖЕ висящей карточки (счётчик ×N). Сбой → молча (спама нет)."""
+    """Повтор той же команды → правка УЖЕ висящей карточки (счётчик ×N). mid из стора: [message_id,
+    chat_id] (карточки 13.07+ несут чат: инбокс 1160 или личка-фолбэк) либо голый id (легаси-записи
+    до маршрута инбокса → личка). Сбой → молча (спама нет)."""
     if os.environ.get("PRETOOL_NOPUSH") == "1" or not mid:
+        return
+    chat = None
+    if isinstance(mid, (list, tuple)):
+        chat = mid[1] if len(mid) > 1 else None
+        mid = mid[0] if mid else None
+    if not mid:
         return
     try:
         sys.path.insert(0, PROJECT)
         from notify import edit_card
-        edit_card(mid, card)
+        edit_card(mid, card, chat_id=chat)
     except Exception:
         pass
 

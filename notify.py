@@ -28,7 +28,23 @@ import urllib.request
 import urllib.error
 
 CHAT_ID = 504608015  # личный аккаунт Филиппа (написал боту Start → бот может инициировать личку)
+HQ_CHAT_ID = -1003853365891   # HQ-форум TurboControl (тема-инбокс «ждут владельца» = INBOX_TOPIC_ID)
 _STORE = "/root/.claude/cc_notif_ids.json"   # message_id висящих 🔔 (для автоудаления)
+
+
+def _inbox_dest():
+    """(chat_id, thread_id) темы-инбокса HQ (единое место «ждут владельца», guard-карточки
+    pretool_guard → сюда, 13.07.2026) или None: INBOX_TOPIC_ID не задан/0/мусор = инбокс
+    выключен → карточки в личку (старое поведение). .env грузим сами: pretool_guard зовёт
+    send_card из отдельного hook-процесса, где .env ещё не загружен; load_dotenv существующие
+    env-переменные НЕ перекрывает (тесты ставят INBOX_TOPIC_ID=0 → выключено)."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+        t = int(os.getenv("INBOX_TOPIC_ID", "0") or 0)
+    except Exception:
+        return None
+    return (HQ_CHAT_ID, t) if t else None
 
 
 def _is_test_entrypoint() -> bool:
@@ -96,10 +112,14 @@ def _save_ids(ids):
         pass
 
 
-def _send_message(token, text):
-    """Низкоуровневая отправка. → (ok, message_id|None). Токен только в URL, не печатается."""
+def _send_message(token, text, chat_id=None, thread_id=None):
+    """Низкоуровневая отправка. → (ok, message_id|None). Токен только в URL, не печатается.
+    chat_id по умолчанию — личка Филиппа; thread_id → message_thread_id (тема форума)."""
     url = "https://api.telegram.org/bot" + token + "/sendMessage"
-    data = json.dumps({"chat_id": CHAT_ID, "text": text}).encode()
+    payload = {"chat_id": chat_id if chat_id else CHAT_ID, "text": text}
+    if thread_id:
+        payload["message_thread_id"] = int(thread_id)
+    data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
@@ -115,12 +135,14 @@ def _send_message(token, text):
         return False, None
 
 
-def _edit_message(token, mid, text):
+def _edit_message(token, mid, text, chat_id=None):
     """editMessageText того же сообщения (дедуп карточек pretool_guard 08.07: повтор → ×N в ТОЙ ЖЕ
-    карточке). Best-effort: сообщения нет/текст идентичен/сеть → False, НЕ кидает."""
+    карточке). chat_id — где висит карточка (инбокс 1160 / личка-фолбэк, 13.07.2026); нет →
+    личка (легаси). Best-effort: сообщения нет/текст идентичен/сеть → False, НЕ кидает."""
     try:
         url = "https://api.telegram.org/bot" + token + "/editMessageText"
-        data = json.dumps({"chat_id": CHAT_ID, "message_id": int(mid), "text": text}).encode()
+        data = json.dumps({"chat_id": chat_id if chat_id else CHAT_ID,
+                           "message_id": int(mid), "text": text}).encode()
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as r:
             resp = json.load(r)
@@ -206,15 +228,18 @@ def notify(text, track=False, clear_first=False, force=False) -> bool:
 
 
 def send_card(text):
-    """Отправить карточку с ВОЗВРАТОМ message_id (дедуп pretool_guard, 08.07.2026: повтор той же
-    нераспознанной команды правит ЭТУ карточку через edit_card, а не шлёт новую — спам-инцидент 163).
+    """Отправить guard-карточку pretool_guard. → (message_id, chat_id) | None.
+    МАРШРУТ (13.07.2026): тема-инбокс HQ (INBOX_TOPIC_ID, прод 1160) — единое место «ждут
+    владельца»; ЛИЧКА = ФОЛБЭК (инбокс выключен ИЛИ форум недоступен — отправка не прошла).
+    chat_id в возврате нужен дедупу (08.07: повтор той же нераспознанной команды правит ЭТУ
+    карточку через edit_card В ТОМ ЖЕ чате, а не шлёт новую — спам-инцидент 163).
     Тест-контур как в notify(): NOTIFY_COUNT_FILE → попытка в счётчик, сети нет (псевдо-id -1);
     PRETOOL_NOPUSH → мут (None). force не нужен: единственный вызыватель — pretool_guard, его
     карточки в тест-прогонах ДОЛЖНЫ мутиться (как раньше)."""
     mode = _test_mode()
     if mode == "count":
         _count_attempt(text)
-        return -1
+        return -1, 0
     if mode == "mute":
         print("notify: muted (PRETOOL_NOPUSH=1, тест-режим — пуш не отправлен)", file=sys.stderr)
         return None
@@ -222,14 +247,20 @@ def send_card(text):
     if not token:
         print("notify: NO BOT_TOKEN in env", file=sys.stderr)
         return None
-    ok, mid = _send_message(token, text)
-    return mid if ok and mid else None
+    dest = _inbox_dest()
+    if dest:
+        ok, mid = _send_message(token, text, chat_id=dest[0], thread_id=dest[1])
+        if ok and mid:
+            return mid, dest[0]
+    ok, mid = _send_message(token, text)   # фолбэк: личка (инбокс выключен / форум недоступен)
+    return (mid, CHAT_ID) if ok and mid else None
 
 
-def edit_card(mid, text) -> bool:
-    """Правка ранее отправленной send_card-карточки (счётчик ×N). Тест-контур: count → строка с
-    префиксом `EDIT ` в мок-счётчик (регресс различает «новое сообщение» и «правка той же карточки»);
-    mute → тихо True. Сеть/нет сообщения → False, не кидает."""
+def edit_card(mid, text, chat_id=None) -> bool:
+    """Правка ранее отправленной send_card-карточки (счётчик ×N). chat_id — чат карточки из
+    возврата send_card (инбокс/личка, 13.07.2026); None → личка (легаси-записи стора без чата).
+    Тест-контур: count → строка с префиксом `EDIT ` в мок-счётчик (регресс различает «новое
+    сообщение» и «правка той же карточки»); mute → тихо True. Сеть/нет сообщения → False, не кидает."""
     mode = _test_mode()
     if mode == "count":
         _count_attempt("EDIT " + text)
@@ -241,7 +272,7 @@ def edit_card(mid, text) -> bool:
     token = _get_token()
     if not token:
         return False
-    return _edit_message(token, mid, text)
+    return _edit_message(token, mid, text, chat_id=chat_id)
 
 
 def clear_notifications(force=False) -> None:

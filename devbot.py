@@ -1205,27 +1205,43 @@ def _chunks(s, n=3500):
 
 # ===================== ТОЧКИ ВХОДА =====================
 async def handle_command(msg, context, bridge) -> None:
-    """Команда дев-боту в его темах: 328 (полоса vps) и PC-дев (полоса pc, env PC_DEV_TOPIC_ID).
+    """Команда дев-боту в его темах: 328 (полоса vps), PC-дев (полоса pc, env PC_DEV_TOPIC_ID)
+    и тема-инбокс (env INBOX_TOPIC_ID, 13.07.2026 — только ответы на карточки «ждут владельца»).
     ТОЛЬКО от Филиппа; в 328 — префиксы + зелёное из allowlist; в PC-дев — ТОЛЬКО «тз:»/«задача:»
-    (→ enqueue lane=pc) и ответы «да N»/«нет N». Вне-allowlist/красное → НЕ выполняет, просит «да».
+    (→ enqueue lane=pc) и ответы «да N»/«нет N»; в инбоксе — ТОЛЬКО «да N»/«нет N» (+кнопки).
+    Вне-allowlist/красное → НЕ выполняет, просит «да».
     Зелёное гоняет как origin=agent (без билета): красная запись внутри → токен-замок 4.2."""
     tid = getattr(msg, "message_thread_id", None)
     pc_topic = pc_dev_topic()
+    ibx = inbox_topic()
     if tid == DEVBOT_TOPIC:
         lane = "vps"
     elif pc_topic and tid == pc_topic:
         lane = "pc"
+    elif ibx and tid == ibx:
+        lane = "inbox"   # тема-инбокс «ждут владельца» (13.07.2026): ТОЛЬКО ответы «да N»/«нет N»
     else:
         return   # не наша тема (напр. 205 = pc_agent на ПК) — НЕ реагируем вообще
     if not msg.from_user or msg.from_user.id != DEVBOT_USER:
         return   # чужой — игнор
 
     # 0) Ответ на запрос подтверждения «да N» / «нет N» — ПЕРВЫМ (специфичный паттерн).
-    # Bridge-вызовы — через to_thread (фикс 02.07): event loop не встаёт, пока /exec тупит.
+    # Работает из 328, PC-дев И темы-инбокса (13.07.2026: карточки «ждут владельца» сходятся в
+    # инбокс — ответ там же). Bridge — через to_thread (фикс 02.07): loop не встаёт, пока /exec тупит.
     appr = await asyncio.to_thread(_try_approval_reply, msg.text or "", bridge)
     if appr is not None:
         for chunk in _chunks(appr):
             await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
+        return
+
+    # Тема-инбокс: команд/ТЗ/зелёного allowlist там НЕТ — только ответы на карточки.
+    # Guard-карточки pretool_guard (Termux «жду да») тоже приходят сюда, но их «да» даётся
+    # в терминале — «да N» применим только к задачам очереди с номером.
+    if lane == "inbox":
+        await context.bot.send_message(
+            chat_id=msg.chat_id, message_thread_id=tid,
+            text=("🤖 Это тема-инбокс подтверждений: «да N» / «нет N» или кнопки под карточкой. "
+                  "Команды и ТЗ — в теме 328 (полоса vps) или PC-дев."))
         return
 
     # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
