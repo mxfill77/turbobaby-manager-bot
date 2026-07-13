@@ -1156,21 +1156,28 @@ def _curator_digest_render(goals):
 
 # === Сводка системы для «статус» (задача 285, 13.07.2026): одна правда «всё ли завершено» ===
 # Read-only, из ТОГО ЖЕ снимка очереди, что дайджест куратора (один опрос на «статус»):
-# ⚙️ в работе — активные цепи декомпозера (родитель dec-метки без «[сводка родитель N]»),
-# new/in_progress/approved одиночки обеих полос, кураторские цели в работе; 🧑 ждёт тебя —
-# все needs_approval (красные вопросы + сводные карточки владельцу); 👁 надзор — последний
-# тик ревизора. Всё пусто → «🟢 ТИХО: в работе 0, ждёт тебя 0» = сигнал «всё завершено».
+# ⚙️ в работе — активные цепи декомпозера (ТОЛЬКО по живым признакам, зеркало ПК-фикса
+# 1403fa2), new/in_progress/approved одиночки обеих полос, кураторские цели в работе;
+# 🧑 ждёт тебя — все needs_approval (красные вопросы + сводные карточки владельцу);
+# 👁 надзор — последний тик ревизора из cowork_log. Всё пусто → «🟢 ТИХО: в работе 0,
+# ждёт тебя 0» = сигнал «всё завершено».
 _DEC_FROMS = (QUEUE_FROM_DEC, QUEUE_FROM_PC_DEC, QUEUE_FROM_PCLOC_DEC)
 _STEP_MARK_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")   # зеркало демона _STEP_RE
-_SUM_MARK_RE = re.compile(r"^\[сводка родитель (\d+)\]")             # зеркало демона _SUM_RE
 _OWNER_CARD_RE = re.compile(r"^\[(?:куратор|ревизор) владельцу")     # сводные карточки владельцу
 _ST_ICON = {"new": "⏳", "in_progress": "🔄", "approved": "▶️"}
 _SECTION_TOP = 5                            # телефонный формат: топ-строк на секцию, дальше «…ещё K»
+_OPEN_STEP_STATUSES = ("new", "in_progress", "needs_approval", "approved")  # незакрытый шаг = живая цепь
+_LIVE_PARENT_STATUSES = ("new", "in_progress")   # живой родитель (план строится / шаги идут)
 
-# Контракт меток ревизора (компонент строится; парсер готов заранее, деградация честная):
-# очередь — synthetic-задача с текстом от «[ревизор …]»; cc_log — NOTE/DONE-строка со словами
-# «ревизор» и «окон». Из свежайшей метки тянем время (ГГГГ-ММ-ДД ЧЧ:ММ), «окон N», «находок M».
+# Контракт тика ревизора (зеркало ПК-фикса 1403fa2, «честный тик»): тик = NOTE-строка
+# cowork_log (журнал ПК-контура, Bridge read_doc) с «ревизор:» сразу после автора NOTE —
+# живой формат «NOTE Orchestrator: ревизор: 2 окон с активностью…» (разведка cowork_log
+# 13.07.2026). Маркеры очереди «[ревизор дата=…]» — дедуп/бюджет маршрутизации находок,
+# НЕ тики (живой призрак 23:10 13.07: они давали «ревизор (время неизвестно)»). Время
+# показываем ТОЛЬКО если оно есть в NOTE; NOTE нет → «ревизор: тиков ещё не было».
+_REV_NOTE_RE = re.compile(r"^NOTE(?:\s+[^:]{0,40})?:\s*ревизор:\s*(.+)", re.I)
 _REV_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}")
+_REV_HHMM_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
 _REV_WIN_RE = re.compile(r"окон\D{0,3}(\d+)")
 _REV_WIN_RE2 = re.compile(r"(\d+)\s*окон")
 _REV_FIND_RE = re.compile(r"наход\w*\D{0,3}(\d+)")
@@ -1190,79 +1197,77 @@ def _short(txt, n=60):
 
 
 def _active_chains(items):
-    """Активные цепи декомпозера из снимка очереди: родитель dec-метки (текст БЕЗ ведущего
-    [маркера], НЕ failed), у которого НЕТ «[сводка родитель N]». Прогресс = максимальный
-    выпущенный «[шаг i/d родитель N]» (нет шагов → план ещё строится). Покрывает и pcloc-dec
-    (цепь целиком на ПК — VPS-демон её не видит, а очередь видит) → [{pid, line}]."""
-    parents, steps, sums = {}, {}, set()
+    """Активные цепи декомпозера ТОЛЬКО по живым признакам (зеркало ПК-фикса 1403fa2;
+    живой призрак 23:10 13.07: терминальные родители pcloc-dec 194/200/206–208 висели
+    «план строится» вечно — цепь целиком на ПК, шагов в Bridge-очереди нет, а done-родитель
+    остаётся в снимке): родитель dec-метки (текст БЕЗ ведущего [маркера] — synthetic
+    сводки/карточки/коррекции родителями не считаются) в new/in_progress ИЛИ незакрытый
+    «[шаг i/d родитель N]» (new/in_progress/needs_approval/approved). Терминальный родитель
+    (done/failed) без незакрытых шагов — призрак, НЕ показываем. Ярлык: открытый шаг
+    «шаг i/d», иначе «план строится» → [{pid, line}]."""
+    parents, open_steps = {}, {}
     for it in items:
         txt = str(it.get("task_text") or "")
-        m = _SUM_MARK_RE.match(txt)
-        if m:
-            sums.add(int(m.group(1)))
-            continue
         m = _STEP_MARK_RE.match(txt)
         if m:
-            i, d, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if i >= steps.get(pid, (0, 0))[0]:
-                steps[pid] = (i, d)
+            if str(it.get("status") or "") in _OPEN_STEP_STATUSES:
+                i, d, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if i >= open_steps.get(pid, (0, 0, None))[0]:
+                    open_steps[pid] = (i, d, it)
             continue
-        if (str(it.get("from") or "") in _DEC_FROMS and not txt.startswith("[")
-                and str(it.get("status") or "") != "failed"):
+        if str(it.get("from") or "") in _DEC_FROMS and not txt.startswith("["):
             pid = _int0(it.get("id"))
             if pid:
                 parents[pid] = it
+    live = {pid for pid, it in parents.items()
+            if str(it.get("status") or "") in _LIVE_PARENT_STATUSES}
     out = []
-    for pid in sorted(parents):
-        if pid in sums:
-            continue
-        it = parents[pid]
-        i, d = steps.get(pid, (0, 0))
-        prog = f"шаг {i}/{d}" if d else "план строится"
+    for pid in sorted(live | set(open_steps)):
+        i, d, step = open_steps.get(pid, (0, 0, None))
+        prog = f"шаг {i}/{d}" if step else "план строится"
+        it = parents.get(pid) or step or {}
         lane = str(it.get("lane") or "") or "vps"
+        text = (parents[pid].get("task_text") if pid in parents
+                else _STEP_MARK_RE.sub("", str(step.get("task_text") or "")).strip())
         out.append({"pid": pid,
-                    "line": f"  ⛓ цепь {pid} [{lane}]: {prog} — {_short(it.get('task_text'), 50)}"})
+                    "line": f"  ⛓ цепь {pid} [{lane}]: {prog} — {_short(text, 50)}"})
     return out
 
 
-def _parse_revisor(blob):
-    """Строка «👁 надзор: …» из сырой метки ревизора (время / окна / находки — что нашлось)."""
-    tm = _REV_TIME_RE.search(blob)
-    mw = _REV_WIN_RE.search(blob) or _REV_WIN_RE2.search(blob)
-    mf = _REV_FIND_RE.search(blob)
+def _parse_revisor(tick):
+    """Строка «👁 надзор: …» из текста тик-NOTE: честное время (ТОЛЬКО если есть в NOTE —
+    никакого «время неизвестно»), окна/находки (что распарсилось), иначе короткий текст тика."""
+    tm = _REV_TIME_RE.search(tick) or _REV_HHMM_RE.search(tick)
+    mw = _REV_WIN_RE.search(tick) or _REV_WIN_RE2.search(tick)
+    mf = _REV_FIND_RE.search(tick)
     parts = []
     if mw:
         parts.append(f"окон {mw.group(1)}")
     if mf:
         f = _int0(mf.group(1))
         parts.append(f"находок {f}" + (" ❗" if f else ""))
-    return ("👁 надзор: ревизор " + (tm.group(0) if tm else "(время неизвестно)") +
-            (" — " + ", ".join(parts) if parts else ""))
+    return ("👁 надзор: ревизор" + (f" {tm.group(0)}" if tm else "") + " — " +
+            (", ".join(parts) if parts else _short(tick)))
 
 
-def _revisor_line(items, cclog_fn=None):
-    """Последний тик ревизора: сперва метки очереди «[ревизор …]» (свежайшая по id),
-    затем NOTE-строка в cc_log (новые сверху — первая совпавшая). Нет нигде / любой сбой →
-    честное «тиков ревизора нет» (сводку не валим)."""
+def _revisor_line(cowork_fn=None):
+    """Последний тик ревизора — свежая NOTE «ревизор: …» в cowork_log (новые сверху, первая
+    совпавшая). NOTE нет → честное «тиков ещё не было»; журнал не прочитался → честное
+    «недоступен» (отсутствие данных ≠ тишина; сводку в любом случае не валим)."""
     try:
-        cands = [it for it in (items or [])
-                 if str(it.get("task_text") or "").startswith("[ревизор")]
-        if cands:
-            it = max(cands, key=lambda x: _int0(x.get("id")))
-            return _parse_revisor(str(it.get("task_text") or "") + " " +
-                                  str(it.get("result") or ""))
-        text = cclog_fn() if cclog_fn else None
-        if text:
-            for line in text.splitlines():
-                low = line.lower()
-                if "ревизор" in low and "окон" in low:
-                    return _parse_revisor(line)
+        text = cowork_fn() if cowork_fn else None
     except Exception:
-        pass
-    return "👁 надзор: тиков ревизора нет"
+        text = None
+    if text is None:
+        return "👁 надзор: cowork_log недоступен — тик ревизора неизвестен"
+    for line in text.splitlines():
+        m = _REV_NOTE_RE.match(line)
+        if m:
+            return _parse_revisor(m.group(1))
+    return "👁 надзор: ревизор: тиков ещё не было"
 
 
-def _system_summary(items, goals, cclog_fn=None):
+def _system_summary(items, goals, cowork_fn=None):
     """Сводка «всё ли завершено» из снимка очереди + среза кураторских целей.
     Дедуп с соседними блоками: шаги/родители активных цепей не дублируются одиночками,
     кураторские задачи ([куратор …]) — одной строкой-счётчиком (детали в дайджесте ниже)."""
@@ -1312,7 +1317,7 @@ def _system_summary(items, goals, cclog_fn=None):
                 out.append(f"  ❓ {iid} [{lane}]: {_short(txt)}")
         if m > _SECTION_TOP:
             out.append(f"  …ещё {m - _SECTION_TOP}")
-    out.append(_revisor_line(items, cclog_fn))
+    out.append(_revisor_line(cowork_fn))
     return "\n".join(out)
 
 
@@ -1331,13 +1336,13 @@ def _g_pulse(bridge):
         return base + "\n\n⚠️ очередь не опросилась — сводка системы недоступна"
     goals = _curator_goals(bridge, items) or {}
 
-    def _cclog_text():
+    def _cowork_text():
         try:
-            rr = bridge._call("read_doc", name="cc_log")
+            rr = bridge._call("read_doc", name="cowork_log")
             return (rr.get("text") or "") if rr.get("ok") else None
         except Exception:
             return None
-    blocks = [base, _system_summary(items, goals, _cclog_text)]
+    blocks = [base, _system_summary(items, goals, _cowork_text)]
     dig = _curator_digest_render(goals)
     if dig:
         blocks.append(dig)
