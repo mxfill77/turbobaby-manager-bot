@@ -98,7 +98,8 @@ class QRaise:
     def get_pending(self, st, lane=None): raise RuntimeError("сеть упала")
 res.append(ok("не опросилась" in DB._curator_digest(QRaise()), "исключение опроса → пометка, не падение"))
 
-# (6) «статус» (_g_pulse): пульс + дайджест; без целей — пульс как раньше
+# (6) «статус» (_g_pulse): пульс + дайджест; пустая очередь — «🟢 ТИХО» (контракт задачи 285:
+# сводка системы «всё ли завершено» вошла в статус 13.07.2026, пустота = явный сигнал)
 print("(6) команда «статус»:")
 class BR(QB):
     def _call(s, a, **k):
@@ -110,15 +111,19 @@ res.append(ok(out.startswith("📟 2026-07-12"), "строка пульса пе
 res.append(ok("🧭 кураторские цели (4):" in out and "цель 231" in out, "дайджест дописан под пульсом"))
 class BRClean(QEmpty):
     _call = BR._call
-res.append(ok(DB._g_pulse(BRClean()) == "📟 2026-07-12 | 🟢 | тестовый пульс",
-              "целей нет → чистый пульс, ни строки лишней"))
+out_clean = DB._g_pulse(BRClean())
+res.append(ok(out_clean.startswith("📟 2026-07-12 | 🟢 | тестовый пульс"),
+              "целей нет → пульс первой строкой, дайджеста нет"))
+res.append(ok("🟢 ТИХО: в работе 0, ждёт тебя 0" in out_clean and "🧭" not in out_clean,
+              "пустая очередь → «🟢 ТИХО» (сигнал «всё завершено»), без дайджеста"))
 res.append(ok(DB._match("статус") is not None, "«статус» в зелёном allowlist"))
 
 # (7) по расписанию не спамим: утренняя сводка дайджест/пульс НЕ зовёт
 print("(7) утренняя сводка без дайджеста:")
 src = inspect.getsource(DB.morning_summary)
-res.append(ok("_curator_digest" not in src and "_g_pulse" not in src,
-              "morning_summary не включает пульс/дайджест (только по запросу «статус»)"))
+res.append(ok("_curator_digest" not in src and "_g_pulse" not in src
+              and "_system_summary" not in src,
+              "morning_summary не включает пульс/дайджест/сводку системы (только по «статус»)"))
 
 print()
 if all(res):

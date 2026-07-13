@@ -1010,21 +1010,21 @@ _CURATOR_GOAL_RE = re.compile(r"\[куратор цели (\d+), шаг (\d+)\]"
 _CURATOR_HUMAN_RE = re.compile(r"^\[куратор владельцу цель (\d+)\]")
 _CURATOR_DIGEST_STATUSES = ("new", "in_progress", "approved", "needs_approval", "done", "failed")
 _CURATOR_ACTIVE_STATUSES = ("new", "in_progress", "approved")
+_UNSET = object()                           # сентинел «items не передали» (звать опрос самому)
 
 
-def _curator_goals(pb):
-    """Срез кураторских целей из очереди (полоса vps — куратор живёт только там) →
-    {G: {active, wait, done, failed, steps, owner}} | None (очередь не опросилась).
-    wait = followup-задача цели упёрлась в красное (needs_approval — ждёт «да» владельца);
-    owner = открытая сводная карточка «нужно от владельца» по цели."""
+def _queue_snapshot(pb):
+    """ОДИН read-only опрос очереди по всем статусам ОБЕИХ полос (lane='all') → [items] | None
+    (сбой/исключение — вызывающий даёт честную пометку, пульс не валим). Общий снимок для
+    сводки системы И дайджеста куратора — очередь на «статус» опрашивается ровно один раз."""
     try:
         fn = getattr(pb, "get_pending_multi", None)
         if fn is not None:
-            r = fn(_CURATOR_DIGEST_STATUSES)
+            r = fn(_CURATOR_DIGEST_STATUSES, lane="all")
         else:                               # мок в тестах без multi — по-статусно
             items = []
             for st in _CURATOR_DIGEST_STATUSES:
-                rr = pb.get_pending(st)
+                rr = pb.get_pending(st, lane="all")
                 if not rr.get("ok"):
                     return None
                 for it in rr.get("items", []):
@@ -1036,12 +1036,28 @@ def _curator_goals(pb):
         return None
     if not r.get("ok"):
         return None
+    return [it for it in r.get("items", []) if isinstance(it, dict)]
+
+
+def _curator_goals(pb, items=_UNSET):
+    """Срез кураторских целей из очереди (полоса vps — куратор живёт только там) →
+    {G: {active, wait, done, failed, steps, owner}} | None (очередь не опросилась).
+    wait = followup-задача цели упёрлась в красное (needs_approval — ждёт «да» владельца);
+    owner = открытая сводная карточка «нужно от владельца» по цели.
+    items — готовый снимок _queue_snapshot (не передали → опросим сами; снимок теперь
+    несёт ОБЕ полосы, pc-элементы отсеиваются здесь — семантика «только vps» цела)."""
+    if items is _UNSET:
+        items = _queue_snapshot(pb)
+    if items is None:
+        return None
     goals = {}
 
     def _g(gid):
         return goals.setdefault(int(gid), {"active": 0, "wait": 0, "done": 0,
                                            "failed": 0, "steps": 0, "owner": False})
-    for it in r.get("items", []):
+    for it in items:
+        if str(it.get("lane") or "") == "pc":   # куратор живёт только на vps
+            continue
         txt = str(it.get("task_text") or "")
         st = str(it.get("status") or "")
         m = _CURATOR_HUMAN_RE.match(txt)
@@ -1065,13 +1081,18 @@ def _curator_goals(pb):
     return goals
 
 
-def _curator_digest(pb):
+def _curator_digest(pb, items=_UNSET):
     """Дайджест кураторских целей для «статус»: закрыто / в работе / ждёт владельца.
     Кураторских маркеров в очереди нет → None (строка в статус не добавляется);
     очередь не опросилась → короткая честная пометка (пульс не валим)."""
-    goals = _curator_goals(pb)
+    goals = _curator_goals(pb, items)
     if goals is None:
         return "🧭 кураторские цели: очередь не опросилась — дайджест недоступен"
+    return _curator_digest_render(goals)
+
+
+def _curator_digest_render(goals):
+    """Рендер дайджеста из готового среза целей ({} → None, строка не добавляется)."""
     if not goals:
         return None
     counts = {"закрыто": 0, "в работе": 0, "ждёт владельца": 0}
@@ -1097,16 +1118,194 @@ def _curator_digest(pb):
     return "\n".join([head] + rows)
 
 
+# === Сводка системы для «статус» (задача 285, 13.07.2026): одна правда «всё ли завершено» ===
+# Read-only, из ТОГО ЖЕ снимка очереди, что дайджест куратора (один опрос на «статус»):
+# ⚙️ в работе — активные цепи декомпозера (родитель dec-метки без «[сводка родитель N]»),
+# new/in_progress/approved одиночки обеих полос, кураторские цели в работе; 🧑 ждёт тебя —
+# все needs_approval (красные вопросы + сводные карточки владельцу); 👁 надзор — последний
+# тик ревизора. Всё пусто → «🟢 ТИХО: в работе 0, ждёт тебя 0» = сигнал «всё завершено».
+_DEC_FROMS = (QUEUE_FROM_DEC, QUEUE_FROM_PC_DEC, QUEUE_FROM_PCLOC_DEC)
+_STEP_MARK_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")   # зеркало демона _STEP_RE
+_SUM_MARK_RE = re.compile(r"^\[сводка родитель (\d+)\]")             # зеркало демона _SUM_RE
+_OWNER_CARD_RE = re.compile(r"^\[(?:куратор|ревизор) владельцу")     # сводные карточки владельцу
+_ST_ICON = {"new": "⏳", "in_progress": "🔄", "approved": "▶️"}
+_SECTION_TOP = 5                            # телефонный формат: топ-строк на секцию, дальше «…ещё K»
+
+# Контракт меток ревизора (компонент строится; парсер готов заранее, деградация честная):
+# очередь — synthetic-задача с текстом от «[ревизор …]»; cc_log — NOTE/DONE-строка со словами
+# «ревизор» и «окон». Из свежайшей метки тянем время (ГГГГ-ММ-ДД ЧЧ:ММ), «окон N», «находок M».
+_REV_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}")
+_REV_WIN_RE = re.compile(r"окон\D{0,3}(\d+)")
+_REV_WIN_RE2 = re.compile(r"(\d+)\s*окон")
+_REV_FIND_RE = re.compile(r"наход\w*\D{0,3}(\d+)")
+
+
+def _int0(v):
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _short(txt, n=60):
+    """Одна телефонная строка из текста задачи: без переносов, обрезка с многоточием."""
+    s = " ".join(str(txt or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _active_chains(items):
+    """Активные цепи декомпозера из снимка очереди: родитель dec-метки (текст БЕЗ ведущего
+    [маркера], НЕ failed), у которого НЕТ «[сводка родитель N]». Прогресс = максимальный
+    выпущенный «[шаг i/d родитель N]» (нет шагов → план ещё строится). Покрывает и pcloc-dec
+    (цепь целиком на ПК — VPS-демон её не видит, а очередь видит) → [{pid, line}]."""
+    parents, steps, sums = {}, {}, set()
+    for it in items:
+        txt = str(it.get("task_text") or "")
+        m = _SUM_MARK_RE.match(txt)
+        if m:
+            sums.add(int(m.group(1)))
+            continue
+        m = _STEP_MARK_RE.match(txt)
+        if m:
+            i, d, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if i >= steps.get(pid, (0, 0))[0]:
+                steps[pid] = (i, d)
+            continue
+        if (str(it.get("from") or "") in _DEC_FROMS and not txt.startswith("[")
+                and str(it.get("status") or "") != "failed"):
+            pid = _int0(it.get("id"))
+            if pid:
+                parents[pid] = it
+    out = []
+    for pid in sorted(parents):
+        if pid in sums:
+            continue
+        it = parents[pid]
+        i, d = steps.get(pid, (0, 0))
+        prog = f"шаг {i}/{d}" if d else "план строится"
+        lane = str(it.get("lane") or "") or "vps"
+        out.append({"pid": pid,
+                    "line": f"  ⛓ цепь {pid} [{lane}]: {prog} — {_short(it.get('task_text'), 50)}"})
+    return out
+
+
+def _parse_revisor(blob):
+    """Строка «👁 надзор: …» из сырой метки ревизора (время / окна / находки — что нашлось)."""
+    tm = _REV_TIME_RE.search(blob)
+    mw = _REV_WIN_RE.search(blob) or _REV_WIN_RE2.search(blob)
+    mf = _REV_FIND_RE.search(blob)
+    parts = []
+    if mw:
+        parts.append(f"окон {mw.group(1)}")
+    if mf:
+        f = _int0(mf.group(1))
+        parts.append(f"находок {f}" + (" ❗" if f else ""))
+    return ("👁 надзор: ревизор " + (tm.group(0) if tm else "(время неизвестно)") +
+            (" — " + ", ".join(parts) if parts else ""))
+
+
+def _revisor_line(items, cclog_fn=None):
+    """Последний тик ревизора: сперва метки очереди «[ревизор …]» (свежайшая по id),
+    затем NOTE-строка в cc_log (новые сверху — первая совпавшая). Нет нигде / любой сбой →
+    честное «тиков ревизора нет» (сводку не валим)."""
+    try:
+        cands = [it for it in (items or [])
+                 if str(it.get("task_text") or "").startswith("[ревизор")]
+        if cands:
+            it = max(cands, key=lambda x: _int0(x.get("id")))
+            return _parse_revisor(str(it.get("task_text") or "") + " " +
+                                  str(it.get("result") or ""))
+        text = cclog_fn() if cclog_fn else None
+        if text:
+            for line in text.splitlines():
+                low = line.lower()
+                if "ревизор" in low and "окон" in low:
+                    return _parse_revisor(line)
+    except Exception:
+        pass
+    return "👁 надзор: тиков ревизора нет"
+
+
+def _system_summary(items, goals, cclog_fn=None):
+    """Сводка «всё ли завершено» из снимка очереди + среза кураторских целей.
+    Дедуп с соседними блоками: шаги/родители активных цепей не дублируются одиночками,
+    кураторские задачи ([куратор …]) — одной строкой-счётчиком (детали в дайджесте ниже)."""
+    chains = _active_chains(items)
+    chain_ids = {c["pid"] for c in chains}
+    singles, waits = [], []
+    for it in items:
+        if str(it.get("from") or "") not in QUEUE_FROMS:
+            continue
+        st = str(it.get("status") or "")
+        txt = str(it.get("task_text") or "")
+        iid = _int0(it.get("id"))
+        if st == "needs_approval":
+            waits.append((iid, it, txt))
+        elif st in _CURATOR_ACTIVE_STATUSES:
+            if txt.startswith(("[куратор", "[сводка", "[ревизор")):
+                continue                     # куратор — счётчиком ниже; сводка/тик — технические
+            if _STEP_MARK_RE.match(txt) or iid in chain_ids:
+                continue                     # шаг/родитель активной цепи — покрыт строкой цепи
+            singles.append((iid, it, st, txt))
+    cur_work = sum(1 for g in goals.values()
+                   if not (g["owner"] or g["wait"]) and g["active"])
+    n = len(chains) + len(singles) + cur_work
+    m = len(waits)
+    if n == 0 and m == 0:
+        out = ["🟢 ТИХО: в работе 0, ждёт тебя 0"]
+    else:
+        out = [f"⚙️ в работе {n}:"]
+        for c in chains[:_SECTION_TOP]:
+            out.append(c["line"])
+        shown = sorted(singles, key=lambda t: -t[0])[:_SECTION_TOP]
+        for iid, it, st, txt in shown:
+            lane = str(it.get("lane") or "") or "vps"
+            out.append(f"  {_ST_ICON.get(st, '🔄')} {iid} [{lane}]: {_short(txt)}")
+        hidden = (len(chains) - min(len(chains), _SECTION_TOP)
+                  + len(singles) - len(shown))
+        if hidden:
+            out.append(f"  …ещё {hidden}")
+        if cur_work:
+            out.append(f"  🧭 цели куратора в работе: {cur_work} (дайджест ниже)")
+        out.append(f"🧑 ждёт тебя {m}:" if m else "🧑 ждёт тебя 0")
+        for iid, it, txt in sorted(waits, key=lambda t: -t[0])[:_SECTION_TOP]:
+            if _OWNER_CARD_RE.match(txt):
+                out.append(f"  🧑 карточка {iid}: {_short(txt)}")
+            else:
+                lane = str(it.get("lane") or "") or "vps"
+                out.append(f"  ❓ {iid} [{lane}]: {_short(txt)}")
+        if m > _SECTION_TOP:
+            out.append(f"  …ещё {m - _SECTION_TOP}")
+    out.append(_revisor_line(items, cclog_fn))
+    return "\n".join(out)
+
+
 def _g_pulse(bridge):
-    """Пульс проекта — одна строка KB_PULSE (read_doc name=pulse), мгновенный «где я сейчас».
-    Плюс дайджест кураторских целей из очереди (шаг 5/7 родитель 231) — только когда цели есть."""
+    """Пульс проекта (строка KB_PULSE) + сводка системы (задача 285: в работе / ждёт тебя /
+    надзор — одна правда «всё ли завершено») + дайджест кураторских целей (шаг 5/7 родитель
+    231, когда цели есть). Очередь опрашивается РОВНО один раз (снимок общий); сбой опроса →
+    пульс + честная пометка, ничего не валим."""
     r = bridge._call("read_doc", name="pulse")
     if not r.get("ok"):
         base = f"пульс недоступен: {r.get('error')}"
     else:
         base = "📟 " + (r.get("text") or "").strip()
-    dig = _curator_digest(bridge)
-    return base if dig is None else base + "\n\n" + dig
+    items = _queue_snapshot(bridge)
+    if items is None:
+        return base + "\n\n⚠️ очередь не опросилась — сводка системы недоступна"
+    goals = _curator_goals(bridge, items) or {}
+
+    def _cclog_text():
+        try:
+            rr = bridge._call("read_doc", name="cc_log")
+            return (rr.get("text") or "") if rr.get("ok") else None
+        except Exception:
+            return None
+    blocks = [base, _system_summary(items, goals, _cclog_text)]
+    dig = _curator_digest_render(goals)
+    if dig:
+        blocks.append(dig)
+    return "\n\n".join(blocks)
 
 
 def _g_registry():
@@ -1144,7 +1343,8 @@ def _g_help():
             "  ошибки — сводка splinter.log\n"
             "  мозг / brain — латентность Brain\n"
             "  просрочки — просрочки ТО парка (скан O3, топ-10)\n"
-            "  статус / пульс — строка KB_PULSE (где проект сейчас)\n"
+            "  статус / пульс — сводка системы: в работе / ждёт тебя / надзор + KB_PULSE\n"
+            "    (всё пусто → «🟢 ТИХО» = всё завершено)\n"
             "  сверься / реестр — сверка карта↔реальность (реестр знания, read-only)\n"
             "  гейт — прогон тестов 4.3 (~7с)\n"
             "  помощь\n"
