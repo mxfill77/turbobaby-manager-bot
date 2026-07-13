@@ -145,7 +145,12 @@ _asked = set()                          # id задач needs_approval, по к�
 # heartbeat/детект-зависания (части 1-2): анонс «в работе» и предупреждение «зависла» — по разу на задачу
 _inprogress_seen = set()                # id задач in_progress, по которым УЖЕ слали «🔄 в работе» (дедуп)
 _stalled = set()                        # id задач, по которым УЖЕ слали «⚠️ зависла» (дедуп)
-STALL_SEC = 720                         # in_progress с updated старше → демон завис/умер (TASK_TIMEOUT 600 + запас 120)
+STALL_GRACE_SEC = 120                   # люфт НАД штатным потолком задачи (даём демону/реаперу самому
+                                        # довести терминал done/failed раньше тревоги владельцу).
+                                        # Порог «зависла» — per-задача: _stall_threshold_sec(it).
+                                        # Урок задачи 287 (22:55 13.07.2026): плоский порог 12 мин
+                                        # тревожил за минуту до честного done долгого «тз:» (норма
+                                        # до 45 мин) — класс «долго работает ≠ умерла» (ПК-вотчдог 5167365).
 
 # Маркер клона (микрофикс §7 12.07.2026, инцидент 156): демон при возврате задачи из-под чужого
 # рестарта (orchestrator_daemon._requeue_foreign_restart) дописывает «[повтор задачи N]» в КОНЕЦ
@@ -808,6 +813,35 @@ def _task_age_sec(updated_iso):
         return None
 
 
+def _env_sec(name, default):
+    """Секунды из env с дефолтом; мусор/пусто → дефолт (порог тревоги не должен падать на парсинге)."""
+    try:
+        return int(str(os.getenv(name, "") or "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _stall_threshold_sec(it):
+    """Порог «зависла» для КОНКРЕТНОЙ задачи = её штатный потолок исполнения + люфт STALL_GRACE_SEC.
+    «Долго работает» ≠ «умерла» (урок 287, класс ПК-вотчдога 5167365): пока in_progress моложе
+    своего потолка — тишина; тревога только ПОСЛЕ потолка и без терминала (цикл идёт лишь по
+    in_progress — терминальная задача сюда не попадает, done/failed рапортуются штатно, «отбой»
+    не шлём). Потолки зеркалят исполнителей — env-имена/дефолты те же, что в .env демона:
+    полоса pc → PC_STEP_TIMEOUT (надзор ПК-театра, 3600); vps from=*-dev/*-dec/Filipp-curator →
+    TASK_TIMEOUT_DEV (orchestrator_daemon._task_timeout, 2700); прочее vps → TASK_TIMEOUT (600).
+    Возраст меряем по updated (heartbeat демона его освежает) — строже потолка от старта задачи,
+    ложняка до потолка не даёт."""
+    if _is_pc_item(it):
+        cap = _env_sec("PC_STEP_TIMEOUT", 3600)
+    else:
+        frm = str((it or {}).get("from") or "")
+        if frm == QUEUE_FROM_CURATOR or frm.endswith(("-dev", "-dec")):
+            cap = _env_sec("TASK_TIMEOUT_DEV", 2700)
+        else:
+            cap = _env_sec("TASK_TIMEOUT", 600)
+    return cap + STALL_GRACE_SEC
+
+
 async def report_results(context) -> None:
     """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
     Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
@@ -897,16 +931,18 @@ async def report_results(context) -> None:
                     await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
                 except Exception as e:
                     log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
-        if qid not in _stalled:                # детект зависания — один раз на задачу
+        if qid not in _stalled:                # детект зависания — один раз на задачу (анти-спам)
             age = _task_age_sec(it.get("updated"))
-            if age is not None and age > STALL_SEC:
+            thr = _stall_threshold_sec(it)     # per-задача: потолок исполнения + люфт (урок 287)
+            if age is not None and age > thr:
                 _stalled.add(qid)
                 mins = int(age // 60)
                 if _is_pc_item(it):
                     hint = "ПК-агент полосы pc не отвечает — проверь агента на ПК."
                 else:
                     hint = "демон оркестратора не отвечает.\nПроверь: systemctl status orchestrator-daemon"
-                w = f"⚠️ Задача {qid} зависла — нет heartbeat ~{mins} мин ({hint})"
+                w = (f"⚠️ Задача {qid} зависла — нет heartbeat ~{mins} мин "
+                     f"при потолке {thr // 60} мин ({hint})")
                 for chunk in _chunks(w):
                     try:
                         await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
