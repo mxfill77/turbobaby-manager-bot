@@ -7,6 +7,9 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ.setdefault("PLAN_ADAPT", "0")  # изоляция от боевого .env (адаптация плана, кусок 2)
 os.environ["CURATOR"] = "0"  # изоляция от боевого .env (куратор целей, родитель 231; принудительно — env демона)
+# изоляция от боевого .env (ускорение цепей ч.1): пустая строка = дефолт EXECUTOR_MODEL=ORCH_MODEL,
+# load_dotenv(override=False) существующее значение не перебьёт — тест доказывает дефолт байт-в-байт
+os.environ["EXECUTOR_MODEL"] = ""
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []

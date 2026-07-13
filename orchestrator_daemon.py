@@ -93,6 +93,37 @@ HEADLESS_SETTINGS = os.path.join(REPO, "headless_settings.json")
 # modelUsage=opus). Хардкода без фолбэка нет: упёршись в лимит Fable, автоматика не встаёт.
 ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "fable").strip() or "fable"
 ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-opus-4-8[1m]").strip() or "claude-opus-4-8[1m]"
+# УСКОРЕНИЕ ЦЕПЕЙ ч.1 (13.07.2026): модель ИСПОЛНИТЕЛЯ headless-задач — отдельный флаг
+# EXECUTOR_MODEL (.env). Шаги цепей в основном механические по готовой спеке — быстрый
+# исполнитель ускоряет цепь; ДУМАНЬЕ (планировщик декомпозиции, самопочинка, адаптация
+# плана, куратор) остаётся на кондукторе ORCH_MODEL и этим флагом НЕ трогается.
+# Дефолт (переменной нет / пустая) = ORCH_MODEL байт-в-байт — поведение как до правки;
+# откат = убрать EXECUTOR_MODEL из .env + рестарт демона, без деплоя.
+# КЛАСС 404 (урок ПК b18ad08, KB 12.07): claude -p принимает только ПОЛНЫЕ model id,
+# короткий алиас в конфиге → 404 от API. Известные алиасы нормализуем на импорте;
+# незнакомое значение не трогаем (на невалидной primary CLI сам уйдёт на --fallback-model).
+_MODEL_ALIASES = {
+    "fable": "claude-fable-5",
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+
+def _normalize_model(name):
+    """Короткий алиас → полный model id (класс 404 b18ad08). Полные id и незнакомые
+    значения — как есть; суффиксы вида [1m] сохраняются («opus-4-8[1m]» → «claude-opus-4-8[1m]»)."""
+    n = (name or "").strip()
+    low = n.lower()
+    if low in _MODEL_ALIASES:
+        return _MODEL_ALIASES[low]
+    if re.match(r"^(fable|opus|sonnet|haiku)-\d", low):  # семейство-версия без префикса claude-
+        return "claude-" + n
+    return n
+
+
+_EXECUTOR_MODEL_RAW = (os.environ.get("EXECUTOR_MODEL") or "").strip()
+EXECUTOR_MODEL = _normalize_model(_EXECUTOR_MODEL_RAW) if _EXECUTOR_MODEL_RAW else ORCH_MODEL
 RESULT_MAX = 4500        # Bridge режет result на 5000 — оставляем запас
 LOG_PATH = os.path.join(REPO, "orchestrator_daemon.log")
 
@@ -529,13 +560,17 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     _hb_stop = threading.Event()
     _hb = threading.Thread(target=_heartbeat_loop, args=(task_id, _hb_stop), daemon=True)
     _hb.start()
-    # Кондуктор: --model основная (Fable 5) + --fallback-model прежняя (Opus 4.8 1M). При
+    # Кондуктор: --model основная + --fallback-model прежняя (Opus 4.8 1M). При
     # overload/недоступности/лимите/неверном имени primary CLI сам переключается на fallback внутри
     # ОДНОГО вызова (без двойного исполнения). --output-format json → из ответа достаём и текст
     # (result), и КАКАЯ модель реально отработала (ключи modelUsage) для явной строки в лог.
     # prompt — ПОСЛЕДНИМ аргументом (позиционный; тест-моки читают args[-1]).
+    # УСКОРЕНИЕ ЦЕПЕЙ ч.1: планировщик декомпозиции = ДУМАНЬЕ → ORCH_MODEL (предикат тот же,
+    # что у NA-гейта ниже); исполнитель задач/шагов → EXECUTOR_MODEL (дефолт = ORCH_MODEL).
+    is_planner = preamble is not None and preamble.startswith(PLANNER_PREAMBLE)
+    model = ORCH_MODEL if is_planner else EXECUTOR_MODEL
     cmd = [CLAUDE_BIN, "-p",
-           "--model", ORCH_MODEL,
+           "--model", model,
            "--fallback-model", ORCH_MODEL_FALLBACK,
            "--output-format", "json",
            "--settings", HEADLESS_SETTINGS,  # строгий headless-слой (роль-развод: clasp → ask)
@@ -577,12 +612,12 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
         pass
     if models_ran:
         ran = ",".join(models_ran)
-        picked = "фолбэк" if ORCH_MODEL not in ran and ORCH_MODEL_FALLBACK in ran else "основная"
+        picked = "фолбэк" if model not in ran and ORCH_MODEL_FALLBACK in ran else "основная"
         log.info("id=%s модель отработала: %s (запрошена=%s, фолбэк=%s, взята=%s)",
-                 task_id, ran, ORCH_MODEL, ORCH_MODEL_FALLBACK, picked)
+                 task_id, ran, model, ORCH_MODEL_FALLBACK, picked)
     else:
         log.info("id=%s модель: запрошена=%s фолбэк=%s (modelUsage пуст — ошибка резолва / текст-режим)",
-                 task_id, ORCH_MODEL, ORCH_MODEL_FALLBACK)
+                 task_id, model, ORCH_MODEL_FALLBACK)
 
     # Красная зона: claude самодекларировал, что нужно «да» Филиппа → needs_approval (НЕ failed).
     # ИСКЛЮЧЕНИЕ — планировщик декомпозиции (урок 166): он read-only и ничего не исполняет,
@@ -2536,9 +2571,9 @@ def cycle():
 
 def main():
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
-             "selfheal=%s, plan_adapt=%s, curator=%s) ===",
+             "selfheal=%s, plan_adapt=%s, curator=%s, model=%s, executor_model=%s) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
-             int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()))
+             int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), ORCH_MODEL, EXECUTOR_MODEL)
     while _running:
         try:
             cycle()
