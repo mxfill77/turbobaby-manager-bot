@@ -1,0 +1,19 @@
+[Unit]
+Description=TurboBaby WA-0 WhatsApp Cloud API webhook receiver (thin transit)
+# Isolation §4: NO content logic here — client text on PC only.
+# Receives WA events, normalises, enqueues to wa_queue.db.
+After=network.target splinter.service
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/turbobaby-manager-bot
+ExecStart=/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/wa_webhook.py
+Restart=always
+RestartSec=15
+User=root
+StandardOutput=append:/root/turbobaby-manager-bot/wa_webhook.log
+StandardError=append:/root/turbobaby-manager-bot/wa_webhook.log
+
+[Install]
+WantedBy=multi-user.target

@@ -192,6 +192,42 @@ def check_commit():
     return (bool(out), out or "git недоступен")
 
 
+def check_wa_webhook():
+    """Optional WA-0 health check: service state + pending queue size.
+
+    Skipped (returns None, info-string) when WA_VERIFY_TOKEN is not set in .env —
+    so health report stays clean until WA is actually configured.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(ROOT, ".env"))
+    except Exception:
+        pass
+    if not os.environ.get("WA_VERIFY_TOKEN"):
+        return None, "не настроен (WA_VERIFY_TOKEN не задан)"
+
+    state = _run(["systemctl", "is-active", "wa-webhook"])
+    ok = (state == "active")
+
+    q_info = ""
+    try:
+        import sqlite3 as _sq
+        db_path = os.environ.get("WA_QUEUE_DB") or os.path.join(ROOT, "wa_queue.db")
+        if os.path.exists(db_path):
+            with _sq.connect(db_path, timeout=2) as conn:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM wa_inbox WHERE status='new'"
+                ).fetchone()[0]
+            q_info = ", очередь new=" + str(n)
+        else:
+            q_info = ", db отсутствует"
+    except Exception as e:
+        q_info = ", db err=" + type(e).__name__
+
+    detail = state + (q_info if ok else "")
+    return ok, detail
+
+
 def check_brain_latency():
     """Замер latency чтения Brain-доков (ранний детектор износа). Вернуть (warn:bool, detail:str).
     warn=True если док читается > СВОЕГО порога ИЛИ не прочитался — сигнал деградации.
@@ -313,6 +349,7 @@ def build_report():
     brain_warn, brain_d = check_brain_latency()
     credit_warn, credit_d = check_api_credit()
     _, commit_d = check_commit()
+    wa_ok, wa_d = check_wa_webhook()
 
     rows = [
         (svc_ok, "Splinter сервис", svc_d),
@@ -330,6 +367,11 @@ def build_report():
     out.append((WARN if brain_warn else OK) + " Brain read     " + brain_d)
     # Кредит платного ключа — ранний детектор обвала money/vision (кредит-на-нуле / отзыв ключа)
     out.append((WARN if credit_warn else OK) + " Кредит API     " + credit_d)
+    # WA-0 webhook — только если настроен (WA_VERIFY_TOKEN задан)
+    if wa_ok is not None:
+        out.append((OK if wa_ok else BAD) + " WA webhook     " + wa_d)
+    elif wa_d and "не настроен" not in wa_d:
+        out.append(INFO + "WA webhook     " + wa_d)
     out.append(INFO + "Прод           " + commit_d)
     out.append("─" * 46)
 
