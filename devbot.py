@@ -13,6 +13,7 @@ import asyncio
 import datetime
 import logging
 import subprocess
+import unicodedata
 from collections import Counter
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -343,16 +344,38 @@ def _router_card(theater, note):
     return s
 
 
+def _bridge_err_detail(r):
+    """Человекочитаемое описание ошибки Bridge для Telegram-карточки.
+    Показывает реальную причину вместо голого кода «internal_error»."""
+    err = str(r.get("error") or "unknown")
+    msg = str(r.get("message") or "")
+    # Google Sheets LockService timeout — появляется на разных языках (нем./англ./etc.)
+    _LOCK_MARKERS = ("lock", "exklusiv", "zeitübers", "timed out waiting",
+                     "waitlock", "exclusive", "exklus")
+    if err == "internal_error" and any(m in msg.lower() for m in _LOCK_MARKERS):
+        return "Bridge занят (Google lock), повтори через ~1 мин"
+    if err == "timeout":
+        return "Bridge не ответил (timeout), повтори через ~1 мин"
+    if err == "internal_error":
+        detail = msg[:100].strip() if msg else ""
+        return f"internal_error: {detail}" if detail else "internal_error (Bridge)"
+    if msg:
+        return f"{err}: {msg[:100]}"
+    return err
+
+
 def _find_enqueued(bridge, frm, text):
     """Verify после сбойного enqueue: есть ли НАША задача (тот же from + текст ДОСЛОВНО) в new
-    (обе полосы)? → id | None. Любой сбой чтения → None (не хуже прежнего)."""
+    (обе полосы)? → id | None. Любой сбой чтения → None (не хуже прежнего).
+    NFC-нормализация обеих сторон — устойчивость к Unicode-вариантам (тайский, emoji)."""
     try:
         rr = bridge.get_pending("new", lane="all")
         if not rr.get("ok"):
             return None
+        needle = unicodedata.normalize("NFC", text)
         for it in rr.get("items", []):
             if isinstance(it, dict) and str(it.get("from") or "") == frm \
-                    and str(it.get("task_text") or "") == text:
+                    and unicodedata.normalize("NFC", str(it.get("task_text") or "")) == needle:
                 return it.get("id")
     except Exception:
         return None
@@ -421,7 +444,7 @@ def _try_enqueue(text, bridge, lane="vps"):
     PC_DEC_LOCAL=1 (.env, финал развязки 12.07.2026): ОБЕ ветки pc-декомпозиции (829 и 328-pc)
     ставят родителя QUEUE_FROM_PCLOC_DEC + lane='pc' — цепь целиком ведёт локальный дирижёр ПК
     (см. _pc_dec_local); 0 (дефолт) → байт-в-байт старый путь QUEUE_FROM_PC_DEC без lane."""
-    t = _canon_theater_prefix((text or "").strip())
+    t = _canon_theater_prefix(unicodedata.normalize("NFC", (text or "").strip()))
     low = t.lower()
     pc = (lane == "pc")
     for p in _DEC_PREFIXES:
@@ -438,14 +461,14 @@ def _try_enqueue(text, bridge, lane="vps"):
                                 f"дирижёр ПК): план/шаги/надзор целиком на ПК (lane=pc). "
                                 f"Каждый шаг отчитается сюда; красный спрошу кнопкой в инбоксе; "
                                 f"в конце — сводка. ПК выключен → цепь честно упадёт по таймауту.")
-                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
+                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
                 r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
                 if r.get("ok"):
                     return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
                             f"построит VPS-дирижёр (~60с), шаги уйдут ПК-агенту по одному "
                             f"(lane=pc). Каждый шаг отчитается сюда; красный спрошу кнопкой; "
                             f"в конце — сводка. ПК выключен → цепь честно упадёт по таймауту.")
-                return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
+                return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
             theater, task_text, note = _route_328(task_text)
             if not task_text:
                 return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
@@ -459,7 +482,7 @@ def _try_enqueue(text, bridge, lane="vps"):
                                 f"шагов и сводка цепи — в теме PC-дев, красный шаг спрошу "
                                 f"кнопкой в инбоксе. ПК выключен → цепь честно упадёт по "
                                 f"таймауту." + _router_card("pc", note))
-                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
+                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
                 r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
                 if r.get("ok"):
                     return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
@@ -467,14 +490,14 @@ def _try_enqueue(text, bridge, lane="vps"):
                             f"(lane=pc); отчёты шагов и сводка цепи — в теме PC-дев (метка цепи "
                             f"pc), красный шаг спрошу кнопкой. ПК выключен → цепь честно упадёт "
                             f"по таймауту." + _router_card("pc", note))
-                return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
+                return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
             r = _enqueue_reliable(bridge, QUEUE_FROM_DEC, task_text)
             if r.get("ok"):
                 return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (демон возьмёт ~60с). "
                         f"Сначала верну план шагов, затем шаги пойдут отдельными задачами по одному "
                         f"(каждый отчитается сюда; красный шаг спрошу кнопкой), в конце — сводка."
                         + _router_card(theater, note))
-            return f"🤖 Не удалось поставить ТЗ на декомпозицию: {r.get('error')}"
+            return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
     for p in _DEV_PREFIXES:
         if low.startswith(p):
             task_text = t[len(p):].strip()
@@ -485,7 +508,7 @@ def _try_enqueue(text, bridge, lane="vps"):
                 if r.get("ok"):
                     return (f"✅ ТЗ {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
                             f"Статусы/красные вопросы/итог принесу в эту тему.")
-                return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
+                return f"🤖 Не удалось поставить ТЗ в очередь: {_bridge_err_detail(r)}"
             theater, task_text, note = _route_328(task_text)
             if not task_text:
                 return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
@@ -495,14 +518,14 @@ def _try_enqueue(text, bridge, lane="vps"):
                     return (f"✅ ТЗ {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт ПК-агент. "
                             f"Статусы/красные вопросы/итог принесу сюда, в тему постановки."
                             + _router_card("pc", note))
-                return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
+                return f"🤖 Не удалось поставить ТЗ в очередь: {_bridge_err_detail(r)}"
             r = _enqueue_reliable(bridge, QUEUE_FROM_DEV, task_text)
             if r.get("ok"):
                 return (f"✅ ТЗ {r.get('id')} в очереди (дев-режим, до 45 мин; демон возьмёт ~60с). "
                         f"Работает headless Claude Code: зелёное/оранжевое (вкл. restart splinter "
                         f"через гейт) сам, настоящее красное спрошу кнопкой. Результат принесу сюда."
                         + _router_card(theater, note))
-            return f"🤖 Не удалось поставить ТЗ в очередь: {r.get('error')}"
+            return f"🤖 Не удалось поставить ТЗ в очередь: {_bridge_err_detail(r)}"
     for p in _TASK_PREFIXES:
         if low.startswith(p):
             task_text = t[len(p):].strip()
@@ -513,7 +536,7 @@ def _try_enqueue(text, bridge, lane="vps"):
                 if r.get("ok"):
                     return (f"✅ Задача {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
                             f"Принесу результат в эту тему, когда будет done/failed.")
-                return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
+                return f"🤖 Не удалось поставить задачу в очередь: {_bridge_err_detail(r)}"
             theater, task_text, note = _route_328(task_text)
             if not task_text:
                 return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
@@ -523,13 +546,13 @@ def _try_enqueue(text, bridge, lane="vps"):
                     return (f"✅ Задача {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт "
                             f"ПК-агент. Результат принесу сюда, в тему постановки."
                             + _router_card("pc", note))
-                return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
+                return f"🤖 Не удалось поставить задачу в очередь: {_bridge_err_detail(r)}"
             r = _enqueue_reliable(bridge, QUEUE_FROM, task_text)
             if r.get("ok"):
                 return (f"✅ Задача {r.get('id')} поставлена в очередь — демон возьмёт её (опрос ~60с). "
                         f"Принесу результат сюда, когда будет done/failed."
                         + _router_card(theater, note))
-            return f"🤖 Не удалось поставить задачу в очередь: {r.get('error')}"
+            return f"🤖 Не удалось поставить задачу в очередь: {_bridge_err_detail(r)}"
     return None
 
 
