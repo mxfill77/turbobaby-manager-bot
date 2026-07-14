@@ -783,6 +783,17 @@ class BridgeClient:
         """Обновить статус записи аудита."""
         return self._post("audit_update", row=row, status=status)
 
+    # === Зоны доставки ===
+
+    def delivery_zones_get(self) -> dict:
+        """Read-only: зоны доставки + конфиг из листа «Доставка» книги Календарь бронирования."""
+        return self._call("delivery_zones_get")
+
+    def delivery_zones_init(self) -> dict:
+        """Одноразовый init листа «Доставка» (идемпотентен — лист уже есть → отказ без перезаписи).
+        Красная зона: пишет в книгу Календарь бронирования — только для владельца."""
+        return self._post("delivery_zones_init")
+
 
 # === Тест запуск ===
 if __name__ == "__main__":
