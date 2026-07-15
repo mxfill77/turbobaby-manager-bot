@@ -20,6 +20,7 @@ import base64
 import html
 import logging
 import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM + паспорт B2
+import wallet_cache    # §касса: персистентный fallback-кэш баланса (переживает рестарт splinter)
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -2064,7 +2065,8 @@ async def _handle_money(msg, context, bridge, claude):
     elif ptype == "balance_set":
         # Установить/зафиксировать баланс кошелька (стартовый или правка) — приоритет владельцу
         target = parsed.get("balance", {}) or {}
-        cur_bal = bridge.get_balance(group=wallet).get("balance", {})
+        cur_bal = wallet_cache.get_balance_with_fallback(
+            wallet, bridge.get_balance(group=wallet).get("balance", {}))
         parts = []
         for cur in ("THB", "EUR", "PASSPORT"):
             tgt = target.get(cur)
@@ -2082,7 +2084,13 @@ async def _handle_money(msg, context, bridge, claude):
                     description=f"фиксация баланса до {tgt} {cur}",
                     raw=text, msg_id=f"{chat_id}:{msg.message_id}:set:{cur}",
                 )
-            parts.append(f"{_fmt(tgt)} {cur}")
+        # якорь сохраняем в кэш сразу (target — намерение владельца; Bridge мог записать с задержкой)
+        anchor_cache = {k: float(v) for k, v in target.items() if v is not None}
+        if anchor_cache:
+            wallet_cache.save_wallet_balance(wallet, anchor_cache)
+            parts = [f"{_fmt(v)} {k}" for k, v in target.items() if v is not None]
+        else:
+            parts = []
         await _send(context, chat_id=chat_id, text=msg_balance_set(wallet, parts))
         _entry_counts[chat_id] = 0
 
@@ -2292,7 +2300,8 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
                               f"🧾 {PYM_HANDLE}, на чеке {_fmt(ramount)} {u}, а записано {_fmt(wamount)} {u} — "
                               f"не сходится, глянь пожалуйста 🙏"))
 
-    wallet_bal = bridge.get_balance(group=wallet).get("balance", {})
+    wallet_bal = wallet_cache.get_balance_with_fallback(
+        wallet, bridge.get_balance(group=wallet).get("balance", {}))
 
     # === Перенос в мелкую кассу === (только денежное движение, паспорт не переносим)
     is_transfer = parsed.get("transfer_to_pettycash") and money_move and chat_id != PETTYCASH_CHAT_ID
