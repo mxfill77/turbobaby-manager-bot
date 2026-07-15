@@ -59,7 +59,8 @@ GREEN = [
 CLASP_WRITE = [
     "clasp push",
     "clasp push --force",
-    "clasp redeploy AKfycb...",
+    "clasp redeploy AKfycbxNC9gCM7-a635gDMk_jtPKsBNeCcBA23uuyrWXcMWHNREANzFSnpE1kXISAYZ_hXNOqw",
+    "clasp redeploy AKfycbxNC9gCM7-a635gDMk_jtPKsBNeCcBA23uuyrWXcMWHNREANzFSnpE1kXISAYZ_hXNOqw -V 66",
     "clasp deploy",
     "clasp deploy AKfycb...",
     "clasp run setupBrain",
@@ -69,10 +70,14 @@ CLASP_WRITE = [
 ]
 
 # Владельцу в ИНТЕРАКТИВЕ — allow (одобренные конверты без промптов).
+# §7 шаг 2: clasp redeploy сужен до прод-deploymentId (bridge_deploy.py PROD_ID).
+# redeploy -V <ver> тоже allow — для отката из bridge_deploy.py.
+PROD_DEPLOYMENT_ID = "AKfycbxNC9gCM7-a635gDMk_jtPKsBNeCcBA23uuyrWXcMWHNREANzFSnpE1kXISAYZ_hXNOqw"
 OWNER_ALLOW = [
     "clasp push",
     "clasp push --force",
-    "clasp redeploy AKfycb...",
+    f"clasp redeploy {PROD_DEPLOYMENT_ID}",
+    f"clasp redeploy {PROD_DEPLOYMENT_ID} -V 66",
     "clasp deployments",
     "clasp version 66",
     "clasp versions",
@@ -156,6 +161,11 @@ live_local = json.load(open(LOCAL))["permissions"]
 applied_proj = "Bash(clasp push*)" not in live_proj.get("ask", [])
 applied_local = ("Bash(clasp push*)" in live_local.get("allow", [])
                  and all(dup in live_local.get("allow", []) for _, dup in ENV_DUPS))
+# §7 шаг 2 (15.07.2026): сужение redeploy до прод-ID.
+# Headless в .claude/ не пишет — применяется из Termux после подготовки:
+#   cp _claspsplit_new_settings.local.json .claude/settings.local.json
+_NARROW_REDEPLOY_RULE = f"Bash(clasp redeploy {PROD_DEPLOYMENT_ID}*)"
+applied_narrow = _NARROW_REDEPLOY_RULE in live_local.get("allow", [])
 proj = live_proj if applied_proj else json.load(open(PREPARED_PROJ))["permissions"]
 local = live_local if applied_local else json.load(open(PREPARED_LOCAL))["permissions"]
 if applied_proj and applied_local:
@@ -169,6 +179,14 @@ else:
           "  cp _claspsplit_new_settings.local.json .claude/settings.local.json\n"
           "  (+ рестарт сессии claude)"
           % ("да" if applied_proj else "нет", "да" if applied_local else "нет"))
+if not applied_narrow:
+    print("WARN: §7 шаг 2 — сужение redeploy до прод-ID не применено в живом "
+          ".claude/settings.local.json (headless в .claude/ не пишет); "
+          "применить из Termux:\n"
+          "  cp _claspsplit_new_settings.local.json .claude/settings.local.json\n"
+          "  (+ рестарт сессии claude)")
+else:
+    print("§7 шаг 2: сужение redeploy до прод-ID ПРИМЕНЕНО")
 
 headless_layer = json.load(open(HEADLESS))["permissions"]
 res = []
@@ -239,6 +257,19 @@ res.append(ok(not ign_hl, "headless_settings.json НЕ игнорится (git-�
 print("Прежний ask-костяк project (кроме clasp push/redeploy) на месте:")
 for a in ["Bash(sqlite3 *)", "Bash(clasp run*)", "Bash(systemctl stop*)", "Bash(sudo systemctl *)"]:
     res.append(ok(a in proj.get("ask", []), "project ask содержит " + a))
+
+print(f"§7 шаг 2 — сужение redeploy до прод-ID (applied_narrow={'да' if applied_narrow else 'нет'}):")
+if applied_narrow:
+    res.append(ok(bool(matches(f"clasp redeploy {PROD_DEPLOYMENT_ID}", ia["allow"])),
+                  "интерактив: clasp redeploy <прод-ID> → allow"))
+    res.append(ok(bool(matches(f"clasp redeploy {PROD_DEPLOYMENT_ID} -V 66", ia["allow"])),
+                  "интерактив: clasp redeploy <прод-ID> -V 66 → allow (rollback)"))
+    res.append(ok(not matches("clasp redeploy OtherDeploymentId", ia["allow"]),
+                  "интерактив: clasp redeploy <чужой-ID> → НЕ allow (только прод-ID)"))
+    res.append(ok(not matches("clasp redeploy", ia["allow"]),
+                  "интерактив: clasp redeploy (без ID) → НЕ allow"))
+else:
+    print("  (сужение не применено — проверки прод-ID пропущены; применить cp из Termux)")
 
 if not applied_proj:
     print("Подготовленный project = живой settings минус clasp push*/redeploy*, deploy* сужен (остальное байт-в-байт):")

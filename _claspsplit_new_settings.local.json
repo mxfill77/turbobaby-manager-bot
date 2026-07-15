@@ -41,7 +41,7 @@
       "Bash(echo \"exit-grep=$?  \\(1=чисто, нет ошибок\\)\")",
       "Bash(break)",
       "Bash(clasp push*)",
-      "Bash(clasp redeploy*)",
+      "Bash(clasp redeploy AKfycbxNC9gCM7-a635gDMk_jtPKsBNeCcBA23uuyrWXcMWHNREANzFSnpE1kXISAYZ_hXNOqw*)",
       "Bash(clasp deployments*)",
       "Bash(clasp version*)",
       "Bash(clasp versions*)",
