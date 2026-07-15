@@ -4316,9 +4316,24 @@ _CLOSING_FIELDS = {"топливо": "fuel_level", "доплата_дни": "sur
                    "депозит": "deposit_action", "заметка": "note", "статус": "status"}
 
 
+def _date_start_key(c):
+    """Ключ сортировки по date_start: свежее = больше. datetime.min если не распарсить.
+    Живые форматы CRM: '2026-07-01 10:00' (ISO+time), '01.07.2026 10:00' (RU+time),
+    '2026-07-01' (ISO), '01.07.2026' (RU)."""
+    import datetime as _dt
+    s = str(c.get("date_start") or "").strip()
+    for prefix, fmt in ((16, "%Y-%m-%d %H:%M"), (16, "%d.%m.%Y %H:%M"),
+                        (10, "%Y-%m-%d"), (10, "%d.%m.%Y")):
+        try:
+            return _dt.datetime.strptime(s[:prefix], fmt)
+        except (ValueError, AttributeError):
+            pass
+    return _dt.datetime.min
+
+
 def _closing_resolve_booking(bridge, bike):
-    """Последняя не-«Завершена» бронь (Бронь/В аренде) по байку → (booking_id, name, date_end).
-    Активация (этап 6) не построена → берём последнюю Бронь/В аренде. Нет → (None, '', '')."""
+    """Активная бронь/аренда (Бронь/В аренде) по байку → (booking_id, name, date_end).
+    При нескольких кандидатах — свежайшая date_start. Нет → (None, '', '')."""
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -4329,7 +4344,7 @@ def _closing_resolve_booking(bridge, bike):
             and str(c.get("status", "")).strip().lower() in ("бронь", "в аренде")]
     if not cand:
         return (None, "", "")
-    last = cand[-1]   # getClients в порядке строк (свежие ниже) → последняя
+    last = max(cand, key=_date_start_key)
     return (last.get("booking_id") or None, last.get("name") or "", last.get("date_end") or "")
 
 
@@ -4391,9 +4406,9 @@ async def _handover_activation_card(context, bridge, bike):
 
 
 def _return_resolve_close(bridge, bike):
-    """O3-3b фаза II: кандидат на закрытие при возврате. Последняя строка CRM по байку со
-    статусом В аренде/Завершена → dict {row, name, date_start, status} или None (строки нет).
-    status=="завершена" → уже закрыта (идемпотентность, молчим) — решает вызыватель."""
+    """O3-3b фаза II: кандидат на закрытие при возврате. Строго «В аренде» по байку;
+    при нескольких — свежайшая date_start; закрытые/архивные исключены.
+    Нет → None (вызыватель пошлёт ⚠️ «активной аренды не нашёл, закрой руками»)."""
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -4401,10 +4416,10 @@ def _return_resolve_close(bridge, bike):
         return None
     want = plateFromName_(bike)
     cand = [c for c in rows if plateFromName_(str(c.get("bike", ""))) == want
-            and str(c.get("status", "")).strip().lower() in ("в аренде", "завершена")]
+            and str(c.get("status", "")).strip().lower() == "в аренде"]
     if not cand:
         return None
-    last = cand[-1]   # getClients в порядке строк (свежие ниже) → последняя
+    last = max(cand, key=_date_start_key)
     return {"row": last.get("row"), "name": last.get("name") or "",
             "date_start": str(last.get("date_start") or ""),
             "status": str(last.get("status", "")).strip().lower(),
@@ -4451,11 +4466,8 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None):
         _RET_CLOSE_WARN_TS[bike] = now
         log.info(f"  → ПРИЁМ {bike}: строки «В аренде» в CRM не нашёл — ⚠️ во Входящие, закрытие руками")
         await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
-                    text=f"🐀 Splinter\n⚠️ ПРИЁМ {bike}: строки «В аренде» в CRM не нашёл — "
+                    text=f"🐀 Splinter\n⚠️ ПРИЁМ {bike}: активной аренды в CRM не нашёл — "
                          f"заверши руками (В аренде→Завершена).")
-        return
-    if cand.get("status") == "завершена":
-        log.info(f"  → ПРИЁМ {bike}: строка {cand.get('row')} уже «Завершена» — закрывать нечего (идемпотентно)")
         return
     prev = _RETURN_CLOSES.get(INTAKE_CHAT)
     if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")

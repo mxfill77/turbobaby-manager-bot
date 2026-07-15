@@ -1,10 +1,11 @@
 """O3-3b фаза II ПРИЁМ: карточка закрытия аренды (В аренде→Завершена) на return-контексте.
 Моки: возврат в «Обслуживании» → карточка ПРИЁМА в INTAKE_CHAT → «да» авторизатора →
 close_booking под билетом 4.2 (с km_end/paid_total) → ✅; «нет» → ничего не записано;
-строки «В аренде» нет → ⚠️ без падения; уже «Завершена» → молчание (идемпотентность);
+строки «В аренде» нет → ⚠️ без падения; только «Завершена» → ⚠️ (нет активной аренды);
 unknown_action (Bridge без деплоя фазы I) → ⏳, карточка жива; не-авторизатор → игнор.
 Фикс row705 fail-closed: km_required → карточка жива + «да <цифра>»/«заверши руками»;
 odo_unverifiable → «сверь и заверши руками», статус error, записи нет.
+Голден 5960 (инцидент 10.07): Завершена row1204 + В аренде row703 → карточка для row703.
 Существующий closing-путь (лист закрытия) НЕ ломается. Сеть/LLM/_send замоканы."""
 import os, sys, json, asyncio, datetime
 sys.path.insert(0, "/root/turbobaby-manager-bot")
@@ -147,11 +148,15 @@ def test_unknown_action_keeps_card():
     assert len(b.closed) == 1, f"после деплоя то же «да» должно закрыть: {b.closed}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "closed"
 
-# ---- (е) последняя строка уже «Завершена» → молчание (идемпотентность повторного return) ----
-def test_already_closed_silent():
+# ---- (е) только «Завершена» в CRM → нет «В аренде» → ⚠️ «активной аренды не нашёл» ----
+def test_only_closed_row_warns():
+    """Единственная строка байка — «Завершена». Резолвер фильтрует только «В аренде» →
+    cand пуст → None → ⚠️ «активной аренды не нашёл» (не молчание, как было до фикса)."""
     reset(); b = FakeBridge(clients=[dict(RENT_ROW, status="Завершена")])
     do_return(b)
-    assert not any("ПРИЁМ" in t for t in intake_sends()), f"уже завершена — ни карточки, ни ⚠️: {SENDS}"
+    warns = [t for t in intake_sends() if "⚠️" in t and "не нашёл" in t]
+    assert len(warns) == 1, f"ждал ⚠️ когда только Завершена строка: {SENDS}"
+    assert "руками" in warns[0]
     assert INTAKE not in S._RETURN_CLOSES
 
 # ---- err от Bridge (not_active и т.п.) → честная ошибка, статус error ----
@@ -305,6 +310,45 @@ def test_deposit_old_bridge_passport_honest():
     reset(); b = FakeBridge(clients=[dict(RENT_ROW, deposit=0)])
     card = _dep_card(b)
     assert "💰 Депозит: не указан ⚠️" in card and "Верни депозит" not in card, card
+
+
+# ==== Голден 5960: фикс резолвера ПРИЁМА (инцидент 10.07.2026) ====
+# Проблема: Завершена row1204 (2025) была НИЖЕ В аренде row703 в листе →
+# старый cand[-1] брал row1204 → «завершена» → карточка 📥 не создавалась.
+# Фикс: резолвер фильтрует СТРОГО «В аренде» + выбирает свежайшую date_start.
+
+def test_golden_5960_live_over_closed():
+    """Голден кейс 5960 (инцидент 10.07): Завершена row1204 (2025) стоит ПОСЛЕ В аренде row703
+    в списке (row1204 > row703 → старый cand[-1] брал её). Фикс: берём row703."""
+    reset()
+    # живые форматы CRM: status с заглавной, date_start ISO+время
+    closed = dict(RENT_ROW, row=1204, status="Завершена",
+                  date_start="2025-03-01 10:00", name="Старый клиент")
+    live   = dict(RENT_ROW, row=703,  status="В аренде",
+                  date_start="2026-07-01 10:00", name="Иван Тест")
+    # clients=[live, closed]: closed стоит последним в списке → cand[-1] = closed (старый баг)
+    b = FakeBridge(clients=[live, closed])
+    do_return(b)
+    cards = [t for t in intake_sends() if "ПРИЁМ" in t and "Завершаю" in t]
+    assert len(cards) == 1, f"ждал карточку 📥 для живой строки row703: {SENDS}"
+    assert "строка 703" in cards[0], f"должна быть живая строка 703, а не закрытая 1204: {cards[0]}"
+    assert "Иван Тест" in cards[0]
+
+
+def test_multi_active_freshest_date_start():
+    """Два «В аренде» на одном байке → резолвер берёт свежайший по date_start."""
+    reset()
+    older = dict(RENT_ROW, row=500, status="В аренде",
+                 date_start="2026-06-01 10:00", name="Старый")
+    newer = dict(RENT_ROW, row=600, status="В аренде",
+                 date_start="2026-07-01 10:00", name="Новый")
+    # clients=[newer, older]: older последний → cand[-1] = older (старый баг)
+    b = FakeBridge(clients=[newer, older])
+    do_return(b)
+    cards = [t for t in intake_sends() if "ПРИЁМ" in t and "Завершаю" in t]
+    assert len(cards) == 1, f"ждал одну карточку: {SENDS}"
+    assert "Новый" in cards[0], f"свежайший по date_start должен быть выбран: {cards[0]}"
+
 
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
