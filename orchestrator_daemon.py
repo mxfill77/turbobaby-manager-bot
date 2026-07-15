@@ -561,11 +561,15 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     child_env["GATE_ALERT_FINAL_ONLY"] = "1"
     # Ускорение цепей ч.2 (13.07.2026): промежуточный шаг декомпозиции (i < N) →
     # gate.py запускает только тесты затронутых модулей (селективный гейт).
-    # Последний шаг (i == N), одиночки, планировщик — полный сьют (preamble is None = executor).
-    # --final (pre-push hook) всегда бьёт флаг — деплой-прогон всегда полный.
+    # Расширение (15.07.2026, GATE_SINGLE_SELECTIVE=1): одиночные «тз:»/«задача:» — тоже.
+    # Последний шаг (i == N), планировщик — всегда полный. --final (pre-push) всегда полный.
+    # Fail-safe gate.py: не смог определить затронутые → полный сьют автоматически.
     if preamble is None:
         _sm = _STEP_RE.match(str(task_text or ""))
         if _sm and int(_sm.group(1)) < int(_sm.group(2)):
+            child_env["GATE_STEP_SELECTIVE"] = "1"
+        elif not _sm and (os.environ.get("GATE_SINGLE_SELECTIVE") or "").strip() == "1":
+            # Одиночные «тз:»/«задача:» + GATE_SINGLE_SELECTIVE=1 → тоже селективный гейт.
             child_env["GATE_STEP_SELECTIVE"] = "1"
     prompt = (preamble if preamble is not None else APPROVAL_PREAMBLE) + task_text
     # Heartbeat: фон-поток бьёт updated, пока claude -p блокирующе исполняется. Останавливаем в finally.
