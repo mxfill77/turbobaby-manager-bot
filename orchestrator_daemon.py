@@ -26,6 +26,7 @@ import json
 import signal
 import logging
 import datetime
+import fcntl
 import subprocess
 import threading
 
@@ -1323,8 +1324,149 @@ CURATOR_FROM = "Filipp-curator"  # метка followup-задач куратор
 CURATOR_MAX_PER_ROOT = 3      # ≤3 продолжений (куратор-задач) на корень G суммарно, обе глубины
 CURATOR_MAX_DEPTH = 2         # корень → продолжения (глубина 1) → дожим дожима (глубина 2) → стоп
 CURATOR_MAX_PER_DAY = 10      # ≤10 куратор-задач/сутки (UTC) по ВСЕМ корням — общий предохранитель
+# === РЕЕСТР ПРОВЕРЕННЫХ ФАКТОВ (15.07.2026, петля повторных диагностик) ===
+# Куратор независим на каждый терминал: без памяти ставил DNS-разведку ×3 за 10 мин
+# (07:38/07:42/07:47; 10:57/11:01/11:05; 15:07/15:10 — инциденты 15.07). Реестр (JSON+flock)
+# хранит «факт подтверждён задачей N»: ключ = нормализованный предмет, значение = вердикт+время+id.
+# Пишется при постановке (pending) и при done-финале (вердикт = первая строка result).
+# Перед postановкой: свежая запись (< FACT_TTL) → refused вместо enqueue.
+# Противоречие (старый ≠ новый, оба не pending) → карточка-сигнал в 328. FAIL-SAFE везде.
+VERIFIED_FACTS_FILE = os.path.join(REPO, "verified_facts.json")
+VERIFIED_FACTS_LOCK = os.path.join(REPO, "verified_facts.lock")
+FACT_TTL = _env_int("FACT_TTL", 21600)   # 6ч по умолчанию (.env); 0 = всё устаревшее (тест)
+# Под тест-прогоном (ORCH_DAEMON_TEST/pytest/test_*.py) реестр заглушается: _vf_write — no-op,
+# _vf_check — None. Иначе test_curator_budget/test_curator загрязняли бы production-файл
+# между тест-кейсами. test_verified_facts.py явно снимает флаг + перенаправляет пути в tmpdir.
+_VF_DISABLED = _UNDER_TEST
 # Секции хвостов в result исполнителя: «ХВОСТ:/ХВОСТЫ:», «технически готово…; функционально…»
 _CURATOR_TAIL_RE = re.compile(r"(?i)(хвост|технически готово|функциональн)")
+_VF_MARKER_RE = re.compile(r"^\[куратор цели \d+, шаг \d+\](\[глубина 2\])?\s*")
+
+
+def _vf_normalize(task_text):
+    """Ключ реестра проверенных фактов: стрипает куратор-маркер → lowercase →
+    спецсимволы в пробелы → collapse → первые 120 символов.
+    None если пусто (fail-safe: None = кэш не используется)."""
+    try:
+        t = _VF_MARKER_RE.sub("", str(task_text or "")).lower()
+        t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t[:120] or None
+    except Exception:
+        return None
+
+
+def _vf_load():
+    """Читает реестр с диска БЕЗ lock (вызывать только под flock). {} при ошибке."""
+    try:
+        with open(VERIFIED_FACTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+    except Exception as e:
+        log.warning("vf_load: ошибка (%s) → {}", e)
+        return {}
+
+
+def _vf_save(data):
+    """Пишет реестр на диск БЕЗ lock (вызывать только под flock)."""
+    with open(VERIFIED_FACTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _vf_ts_hhmm(ts_str):
+    """UTC ISO → «HH:MM UTC». «?» при ошибке."""
+    try:
+        t = datetime.datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return t.astimezone(datetime.timezone.utc).strftime("%H:%M")
+    except Exception:
+        return "?"
+
+
+def _vf_entry_fresh(entry):
+    """True если entry не устарел (< FACT_TTL секунд). False при ошибке разбора."""
+    try:
+        ts = datetime.datetime.fromisoformat(str(entry["ts"]).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds() < FACT_TTL
+    except Exception:
+        return False
+
+
+def _vf_check(key):
+    """Ищет ключ в реестре. dict entry если запись СВЕЖАЯ (< FACT_TTL), None если нет/ошибка/устарела.
+    Fail-safe: любая ошибка → None (spawn ведёт себя как без кэша). _VF_DISABLED → None (под тестом)."""
+    if _VF_DISABLED or not key:
+        return None
+    try:
+        with open(VERIFIED_FACTS_LOCK, "a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_SH)
+            try:
+                data = _vf_load()
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+        entry = data.get(key)
+        if not entry:
+            return None
+        return entry if _vf_entry_fresh(entry) else None
+    except Exception as e:
+        log.warning("vf_check(%.60s): ошибка (%s) — fail-safe None", key, e)
+        return None
+
+
+def _vf_contradiction_card(key, old_entry, new_verdict, new_task_id):
+    """Карточка «вердикты расходятся» в 328 (read-only synthetic, без конверта). Fail-safe тишина."""
+    try:
+        old_hm = _vf_ts_hhmm(old_entry.get("ts", ""))
+        old_v = str(old_entry.get("verdict", "") or "")[:150]
+        new_v = str(new_verdict or "")[:150]
+        body = (f"⚠️ вердикты расходятся по факту «{key[:80]}»:\n"
+                f"  старый: задача {old_entry.get('task_id')} в {old_hm} UTC — «{old_v}»\n"
+                f"  новый: задача {new_task_id} — «{new_v}»\n"
+                "(реестр обновлён новым вердиктом; если расхождение важно — проверьте вручную)")
+        r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}",
+                            f"[вердикты расходятся] {key[:60]}")
+        if r.get("ok"):
+            sid = r["id"]
+            bc.claim_task(sid)
+            bc.complete_task(sid, "done", body[:RESULT_MAX])
+            log.info("vf_contradiction: карточка id=%s, ключ=%.60s", sid, key)
+    except Exception as e:
+        log.warning("vf_contradiction: ошибка карточки (%s) — fail-safe тишина", e)
+
+
+def _vf_write(key, verdict, task_id):
+    """Записывает key → {verdict, ts, task_id} в реестр с exclusive flock.
+    После сброса lock: если старый и новый вердикты НЕ pending и различаются → карточка противоречия.
+    Fail-safe: любая ошибка логируется, не роняет вызывающий код. _VF_DISABLED → no-op (под тестом)."""
+    if _VF_DISABLED or not key:
+        return
+    contradiction = None
+    try:
+        with open(VERIFIED_FACTS_LOCK, "a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                data = _vf_load()
+                old = data.get(key)
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                old_v = str(old.get("verdict") or "").strip() if old else ""
+                new_v = str(verdict or "").strip()
+                if (old and old_v not in ("pending", "") and new_v not in ("pending", "")
+                        and old_v.lower() != new_v.lower()):
+                    contradiction = (old, verdict)   # эмитируем ПОСЛЕ сброса lock
+                data[key] = {"verdict": str(verdict or "")[:200],
+                             "ts": now_iso, "task_id": task_id}
+                _vf_save(data)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except Exception as e:
+        log.warning("vf_write(%.60s): ошибка (%s) — fail-safe", key, e)
+        return
+    if contradiction:
+        _vf_contradiction_card(key, contradiction[0], contradiction[1], task_id)
 CURATOR_PREAMBLE = (
     "Ты — куратор целей оркестратора TurboBaby (мета-дирижёр). Headless-задача завершилась — "
     "сверь ИСХОДНУЮ ЦЕЛЬ с итогом исполнителя и реши, закрыта ли цель. Ты НИЧЕГО не исполняешь, "
@@ -1535,6 +1677,18 @@ def _curator_spawn(kind, key, goal, tasks):
         if today >= CURATOR_MAX_PER_DAY:
             refused.append((t, f"исчерпан суточный лимит ({CURATOR_MAX_PER_DAY} куратор-задач/сутки)"))
             continue
+        # Сверка с реестром проверенных фактов: свежий факт → не ставим дубль диагностики
+        vf_key = _vf_normalize(t)
+        cached = _vf_check(vf_key) if vf_key else None
+        if cached is not None:
+            cv = str(cached.get("verdict") or "").strip()
+            hm = _vf_ts_hhmm(cached.get("ts", ""))
+            cid = cached.get("task_id")
+            if cv == "pending":
+                refused.append((t, f"кэш: задача {cid} уже поставлена в {hm} UTC (ожидает результат)"))
+            else:
+                refused.append((t, f"кэш: уже подтверждено задачей {cid} в {hm} UTC — «{cv[:80]}»"))
+            continue
         max_step += 1
         try:
             r = bc.enqueue_task(CURATOR_FROM, f"[куратор цели {root}, шаг {max_step}]{depth_tag} {t}")
@@ -1542,6 +1696,7 @@ def _curator_spawn(kind, key, goal, tasks):
             r = {"ok": False, "error": str(e)}
         if r.get("ok"):
             placed.append((r.get("id"), t))
+            _vf_write(vf_key, "pending", r.get("id"))   # отметить: поставлено, ожидает результат
             per_root += 1
             today += 1
         else:
@@ -2566,6 +2721,11 @@ def process_new():
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
         _maybe_dec_after(text, status)          # шаг декомпозиции → halt-on-fail / сводка
+        # Реестр фактов: done-финал followup-задачи куратора → зафиксировать вердикт (перезапишет pending)
+        if status == "done" and _curator_on() and str(task.get("from") or "") == CURATOR_FROM:
+            vf_key = _vf_normalize(text)
+            if vf_key:
+                _vf_write(vf_key, (result.splitlines()[0] if result else "")[:200], tid)
         _maybe_curator_single(task.get("from"), tid, text, result)   # куратор цели (CURATOR=1)
 
 
@@ -2582,9 +2742,9 @@ def cycle():
 
 def main():
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
-             "selfheal=%s, plan_adapt=%s, curator=%s, model=%s, executor_model=%s) ===",
+             "selfheal=%s, plan_adapt=%s, curator=%s, fact_ttl=%ss, model=%s, executor_model=%s) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
-             int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), ORCH_MODEL, EXECUTOR_MODEL)
+             int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL)
     while _running:
         try:
             cycle()
