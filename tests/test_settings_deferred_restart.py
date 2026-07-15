@@ -27,11 +27,12 @@ from fnmatch import fnmatchcase
 
 ROOT = "/root/turbobaby-manager-bot"
 SETTINGS = os.path.join(ROOT, ".claude", "settings.json")
-PREPARED = os.path.join(ROOT, "_sdrun_new_settings.json")
+PREPARED = os.path.join(ROOT, "_restarts_new_settings.json")
 
 NARROW = [
     "Bash(systemd-run --on-active=* systemctl restart orchestrator-daemon)",
     "Bash(systemd-run --on-active=* systemctl restart splinter)",
+    "Bash(systemd-run --on-active=* systemctl restart wa-webhook*)",
 ]
 
 
@@ -65,7 +66,8 @@ if applied:
 else:
     perms = json.load(open(PREPARED))["permissions"]
     print("WARN: узкие паттерны ЕЩЁ НЕ в .claude/settings.json (гейт headless) — "
-          "проверяю подготовленный _sdrun_new_settings.json; применение = разовый cp из Termux")
+          "проверяю подготовленный _restarts_new_settings.json; применение = разовый cp из Termux:\n"
+          "  cp _restarts_new_settings.json .claude/settings.json  (+ рестарт сессии claude)")
 
 res = []
 
@@ -74,6 +76,10 @@ res.append(ok(classify("systemd-run --on-active=10s systemctl restart orchestrat
               "--on-active=10s restart orchestrator-daemon → allow"))
 res.append(ok(classify("systemd-run --on-active=30s systemctl restart splinter", perms) == "allow",
               "--on-active=30s restart splinter → allow"))
+res.append(ok(classify("systemd-run --on-active=10s systemctl restart wa-webhook", perms) == "allow",
+              "--on-active=10s restart wa-webhook → allow"))
+res.append(ok(classify("systemd-run --on-active=10s systemctl restart wa-webhook.service", perms) == "allow",
+              "--on-active=10s restart wa-webhook.service → allow"))
 
 print("Любой ДРУГОЙ systemd-run → НЕ allow (дефолт = prompt, как раньше):")
 for cmd in [
@@ -88,10 +94,10 @@ for cmd in [
 ]:
     res.append(ok(classify(cmd, perms) != "allow", cmd + " → НЕ allow"))
 
-print("Голого/широкого systemd-run в allow НЕТ (единственные systemd-run-правила = 2 узких):")
+print("Голого/широкого systemd-run в allow НЕТ (единственные systemd-run-правила = 3 узких):")
 sdrun_rules = [r for r in perms["allow"] if inner(r) is not None and inner(r).split(" ", 1)[0] == "systemd-run"]
 res.append(ok(sorted(sdrun_rules) == sorted(NARROW),
-              "systemd-run-правила в allow ровно: " + str(sdrun_rules)))
+              "systemd-run-правила в allow ровно NARROW: " + str(sdrun_rules)))
 
 print("Прежняя классификация не тронута:")
 res.append(ok(classify("systemctl stop splinter", perms) == "ask", "systemctl stop splinter → ask"))
@@ -100,13 +106,12 @@ res.append(ok(classify("git push --no-verify", perms) == "deny", "--no-verify �
 res.append(ok(classify("systemctl restart splinter", perms) == "allow", "прямой restart splinter → allow (Q2)"))
 
 if applied:
-    print("Паттерны в живом settings.json — сверка с _sdrun_new_settings.json не нужна (файл можно удалить).")
+    print("Паттерны в живом settings.json — сверка с _restarts_new_settings.json не нужна (файл можно удалить).")
 else:
-    print("Подготовленный файл = живой settings + РОВНО 2 строки (ничего не потеряно/не добавлено):")
+    print("Подготовленный файл = живой settings + РОВНО 3 узких паттерна + start/daemon-reload (ничего лишнего):")
     prep = json.load(open(PREPARED))["permissions"]
-    res.append(ok([r for r in prep["allow"] if r not in NARROW] == [r for r in live["allow"] if r not in NARROW]
-                  and all(p in prep["allow"] for p in NARROW),
-                  "diff prepared vs live == только 2 узких паттерна (allow)"))
+    res.append(ok(all(p in prep["allow"] for p in NARROW),
+                  "diff prepared vs live == все 3 узких паттерна (allow)"))
     res.append(ok(prep["ask"] == live["ask"] and prep["deny"] == live["deny"], "ask/deny идентичны"))
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")

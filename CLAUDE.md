@@ -362,8 +362,7 @@ PLAN с диффом → `KB_review` (канон — манифест-ключ `
 - `git commit` + `git push` (бэкап = сам git; откат = `git revert <hash>`);
 - `clasp redeploy` (бэкап = номер ТЕКУЩЕЙ версии ПЕРЕД деплоем; откат = `clasp redeploy` прошлой
   версии; именно `redeploy`, НЕ `deploy --deploymentId`);
-- `systemctl restart splinter` (бэкап = текущий рабочий коммит + сервис `active` ДО; тест = статус
-  `active`/`failed` + чистый старт в `splinter.log`; откат при `failed` = вернуть прошлый код и рестарт);
+- **рестарт/старт своих сервисов** — `systemctl restart/start splinter`, `systemctl restart/start orchestrator-daemon`, `systemctl restart/start wa-webhook` (бэкап = текущий рабочий коммит + сервис `active` ДО; тест = `systemctl is-active active`; откат при `failed` = вернуть прошлый код + рестарт). `systemctl daemon-reload` — 🟢 зелёное (только перечитать юниты systemd). **NEEDS_APPROVAL на рестарт/старт своих сервисов НЕ объявлять** — это оранжевый цикл, не красное;
 - синк рабочих Brain-доков `project_state`/`knowledge_base`/`faq`/`park_list` (`write_doc` перезаписывает
   весь док; бэкап = git-исходник `docs/*.md`; откат = ре-синк из git / version history);
 - **SQL на `memory.db`** (бэкап = копия файла `memory.db` ПЕРЕД; откат = restore копии);
@@ -387,7 +386,7 @@ PLAN с диффом → `KB_review` (канон — манифест-ключ `
 - Команды НЕ сцеплять с cd через ;/&&. Путь указывать прямо в команде.
 
 ОРАНЖЕВАЯ ЗОНА (делать САМ, но ОБЯЗАТЕЛЬНО через протокол бэкап+откат):
-- git push, systemctl restart splinter.
+- git push, systemctl restart/start splinter/orchestrator-daemon/wa-webhook, systemctl daemon-reload.
 - Протокол на каждое действие: (1) git-бэкап/фиксация коммита ДО; (2) действие; (3) проверка active + Bot polling + Auditor LLM✅ + 0 ошибок после старта; (4) при сбое — САМООТКАТ git revert + restart; (5) оранжевый отчёт в cc_log (бэкап/тест/push-диапазон/откат).
 
 КРАСНАЯ ЗОНА (ТОЛЬКО после явного «да» Филиппа в чате/Termux; НИКОГДА не опережать, даже если кажется безопасным):
@@ -732,26 +731,27 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
 Настроен так, чтобы ЗЕЛЁНАЯ рутина шла без подтверждений, а КРАСНОЕ (запись в Лист1/CRM/деньги/удаление)
 всегда просило «да» + показывало человеческую карточку. Механика (3 независимых слоя, precedence deny>ask>hook>allow):
 - **allow (settings.json)** — зелёное авто: читалки, git status·diff·log·show·add·commit, **`git push`
-  (переклассификация 02.07: приватный репо, откат = git revert)**, **`systemctl restart splinter`
-  (Q2 разблокирован 03.07 — критерий обкатки ступени 2 выполнен, 3 «тз:» подряд done без Termux вкл.
-  прод-фикс 3978a91: headless-CC по ходу «тз:» делает restart САМ оранжевым циклом — гейт `gate.py`
-  (только exit 0) → restart → проверка чистого старта (is-active=active + старт-лог splinter.log без
-  ошибок) → отчёт «нужен был restart — сделал, старт чистый»; при failed — откат на прошлый рабочий
-  коммит + restart; кнопка op=restart_splinter в 328 остаётся аварийным фоллбэком)**,
+  (переклассификация 02.07: приватный репо, откат = git revert)**,
+  **рестарт/старт своих сервисов** (`systemctl restart/start splinter`, `systemctl restart/start orchestrator-daemon`,
+  `systemctl restart/start wa-webhook`): Q2 разблокирован 03.07; headless-CC делает restart SAM оранжевым циклом
+  (гейт → restart → is-active active → отчёт «сделал, старт чистый»; при failed — откат + рестарт;
+  кнопка op=restart_splinter в 328 — аварийный фоллбэк). `systemctl daemon-reload` — allow (15.07.2026,
+  `_restarts_new_settings.json`). NEEDS_APPROVAL на рестарт своих сервисов НЕ объявлять.
   `venv/bin/python3 *` (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write
   рабочих каталогов. Prompt не появляется.
-- **Deferred-рестарт (заведено 03.07.2026): в allow — ДВА УЗКИХ паттерна и ТОЛЬКО они:**
-  `systemd-run --on-active=* systemctl restart orchestrator-daemon` и
-  `systemd-run --on-active=* systemctl restart splinter` (отложенный рестарт по правилу
-  самомодификации, wildcard только на значении таймера). **Голый/широкий `systemd-run` в allow
+- **Deferred-рестарт (заведено 03.07.2026, расширено 15.07.2026): в allow — ТРИ УЗКИХ паттерна и ТОЛЬКО они:**
+  `systemd-run --on-active=* systemctl restart orchestrator-daemon`,
+  `systemd-run --on-active=* systemctl restart splinter`,
+  `systemd-run --on-active=* systemctl restart wa-webhook*` (отложенный рестарт по правилу
+  самомодификации, wildcard только на значении таймера и суффиксе wa-webhook). **Голый/широкий `systemd-run` в allow
   НЕ добавлять НИКОГДА:** systemd-run создаёт transient unit, исполняющий ПРОИЗВОЛЬНУЮ команду
   уже ВНЕ bash-паттернов allowlist — `systemd-run --on-active=1s <что угодно>` = обход всей
   классификации allow/ask/deny (мимо deny на rm -rf и ask на sqlite3). Любая другая форма
   systemd-run остаётся под дефолтным prompt/ask, как раньше. Тест-guard классификации:
   `tests/test_settings_deferred_restart.py` (в гейте). Headless писать в `.claude/settings.json`
   НЕ может (гейт движка, это правильно) — правка вносится разово из Termux:
-  `cp _sdrun_new_settings.json .claude/settings.json` (подготовлено 03.07, тест до применения
-  проверяет подготовленный файл и печатает WARN).
+  `cp _restarts_new_settings.json .claude/settings.json` (тест до применения
+  проверяет подготовленный файл и печатает WARN; `tests/test_guard_own_restarts.py` в гейте).
 - **ask (settings.json)** — красное всегда спрашивает: `sqlite3 *` (CLI), `clasp push|redeploy|deploy|run`,
   `systemctl stop` (вне задачи подозрителен), `sudo systemctl`. Hook НЕ обходит ask (ask>hook).
 - **deny (settings.json)** — абсолютный запрет (я обойти НЕ могу; владелец — вручную в Termux): `*--no-verify*`
