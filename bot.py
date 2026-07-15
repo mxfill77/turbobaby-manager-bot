@@ -706,7 +706,8 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
         for it in sp_blocked:
             try:
                 await splinter.sp_confirm_from_brain(context, bridge, chat_id, _topic, force_bike,
-                                                     it.get("kind"), it.get("km"))
+                                                     it.get("kind"), it.get("km"),
+                                                     it.get("backdated", False))
             except Exception as e:
                 log.warning(f"  → заявка из E2b-блока не оформилась: {e}")
         claude.pending_service_confirm = []
@@ -801,6 +802,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if splinter.pending_mileage_for(chat_id, _tid_sv):
                 if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
                     return
+            # 2.5) масло-нарратив задним числом («было на N», «поменял на N») →
+            #      Пым-подтверждение для кол.I; одометр НЕ трогается (класс A разбора 2478).
+            if msg.text and await splinter.handle_oil_backdated_service(msg, context, bridge, msg.text):
+                return
             # 3) НОВАЯ текстовая коррекция пробега после недавней записи → переспрос (не пишем сразу)
             if await splinter.handle_mileage_correction(msg, context, bridge, msg.text):
                 return

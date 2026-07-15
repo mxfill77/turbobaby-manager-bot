@@ -231,13 +231,14 @@ BRIDGE_TOOLS = [
     },
     {
         "name": "set_service",
-        "description": "Отметить регламент ТО байка / обновить текущий пробег в ТО-трекере. Пробег последней замены масла и интервал система берёт САМА из Листа1 Байки (колонка I) — НЕ указывай их сам, не выдумывай. Ты указываешь только байк и (если знаешь из фото/текста) текущий пробег. ВАЖНО: если current_km взят С ФОТО — сначала покажи цифру человеку и спроси подтверждение, и вызывай set_service с confirmed=true ТОЛЬКО после 'да' или после того как человек назвал верное число. Используй когда обсуждается ТО конкретного байка.",
+        "description": "Отметить регламент ТО байка / обновить текущий пробег в ТО-трекере. Пробег последней замены масла и интервал система берёт САМА из Листа1 Байки (колонка I) — НЕ указывай их сам, не выдумывай. Ты указываешь только байк и (если знаешь из фото/текста) текущий пробег. ВАЖНО: если current_km взят С ФОТО — сначала покажи цифру человеку и спроси подтверждение, и вызывай set_service с confirmed=true ТОЛЬКО после 'да' или после того как человек назвал верное число. СПЕЦИАЛЬНО для нарратива «масло было/заменено на N км» (задним числом): передавай km замены в oil_last_km, НЕ в current_km — это разные числа (N = км при замене, current_km = сейчас на одометре). Используй когда обсуждается ТО конкретного байка.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "bike": {"type": "string", "description": "Название/номер байка (как в названии темы или Листе1)"},
                 "service_type": {"type": "string", "description": "'oil' (масло) или 'tire' (резина). По умолчанию oil."},
                 "current_km": {"type": "number", "description": "Текущий пробег ТОЛЬКО если точно известен из фото одометра или текста. Не выдумывай."},
+                "oil_last_km": {"type": "number", "description": "Пробег НА КОТОРОМ было заменено масло ЗАДНИМ ЧИСЛОМ (не текущий одометр). Используй ТОЛЬКО когда человек говорит «масло было/заменено на N км» и N — это км замены, не текущий пробег. Не смешивай с current_km."},
                 "confirmed": {"type": "boolean", "description": "true — пробег подтверждён человеком (сказал 'да' или назвал число). Для пробега С ФОТО без подтверждения НЕ ставь true."}
             },
             "required": ["bike"]
@@ -452,12 +453,18 @@ class ClaudeClient:
                     # ставит работу в очередь: bot.py после ответа оформит то_заявку + кнопку Пыма
                     # (splinter.sp_confirm_from_brain). Сам гейт НЕ ослаблен: запись только по «да» Пыма.
                     _kind = str(tool_input.get("service_type") or "oil").strip().lower()
-                    _km = tool_input.get("current_km") or getattr(self, "_force_mileage", None)
+                    # oil_last_km = задний-числом км замены (класс A разбора 2478); приоритет над current_km
+                    _oil_last = tool_input.get("oil_last_km")
+                    _backdated = bool(_oil_last and _kind == "oil")
+                    _km = _oil_last if _backdated else (tool_input.get("current_km") or getattr(self, "_force_mileage", None))
                     _q = getattr(self, "pending_service_confirm", None)
                     if _q is None:
                         _q = self.pending_service_confirm = []
                     if not any(p.get("kind") == _kind for p in _q):
-                        _q.append({"kind": _kind, "km": _km})
+                        _item = {"kind": _kind, "km": _km}
+                        if _backdated:
+                            _item["backdated"] = True
+                        _q.append(_item)
                     log.info(f"  set_service: ЗАБЛОКИРОВАН в servicing-теме (E2b) — запись ТО только "
                              f"кнопкой Пыма; работа в очередь на заявку: kind={_kind} km={_km}")
                     return json.dumps({

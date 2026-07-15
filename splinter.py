@@ -2363,6 +2363,10 @@ _LAST_REC_TTL = 3600      # коррекцию принимаем только �
 _PENDING_CORRECTION = {}  # (chat_id, topic_id) -> (old_km:int, new_km:int, bike:str, ts)
 # негатор правки: «не верно / неверно / неправильно / ошибся / wrong»
 _CORRECTION_RE = r"(не\s*верн|неверн|неправильн|ошиб|не\s*прав|wrong|ผิด)"
+# Масло-нарративы задним числом — исключаются из _CORRECTION_RE, даже если содержат негатор.
+# Покрывают: «масло/замена масла было(а) на N», «поменял/заменил/менял (масло) на N», TH: «เปลี่ยนแล้ว»
+_OIL_PAST_WORDS = ("была на", "было на", "был на", "поменял", "заменил", "менял",
+                   "เปลี่ยนแล้ว", "เปลี่ยนน้ำมันแล้ว", "ถ่ายน้ำมันแล้ว")
 
 
 def pending_correction_for(chat_id, topic_id):
@@ -2370,9 +2374,33 @@ def pending_correction_for(chat_id, topic_id):
     return _PENDING_CORRECTION.get((chat_id, topic_id))
 
 
+def detect_oil_backdated_km(text):
+    """Текст — нарратив замены масла задним числом («было на N», «поменял на N»)?
+    Нужен oil-контекст + прошедшее время/факт + число 4-6 цифр. → km:int или None.
+    Используется для исключения из detect_mileage_correction и в handle_oil_backdated_service."""
+    t = str(text or "").strip().lower()
+    if not any(kw in t for kw in _OIL_KEYWORDS):
+        return None
+    if not any(w in t for w in _OIL_PAST_WORDS):
+        return None
+    m = _re_pl.search(r"\d[\d  ,]{2,}\d", t)
+    if not m:
+        m = _re_pl.search(r"\b\d{4,6}\b", t)
+    if not m:
+        return None
+    try:
+        n = int(m.group(0).replace(" ", "").replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+    return n if 1000 <= n <= 999999 else None
+
+
 def detect_mileage_correction(text):
     """Текст — это коррекция пробега? Нужен негатор + число 4-6 цифр. Вернуть new_km:int или None."""
     t = str(text or "").strip()
+    # Исключить масло-нарративы задним числом — у них свой маршрут (handle_oil_backdated_service).
+    if detect_oil_backdated_km(t) is not None:
+        return None
     if not _re_pl.search(_CORRECTION_RE, t.lower()):
         return None
     m = _re_pl.search(r"\d[\d  ,]{2,}\d", t)   # 4+ цифр (с пробелами/запятыми)
@@ -2609,6 +2637,64 @@ async def _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, ne
     log.info(f"  → коррекция пробега ПРИМЕНЕНА (обход сторожа B): {old_km}→{new_km} (тема {topic_id})")
 
 
+async def handle_oil_backdated_service(msg, context, bridge, text) -> bool:
+    """Перехват нарратива «масло/замена задним числом на N» от доверенного (Пым/владелец).
+    Одометр НЕ трогается — только oil_last (кол.I) через кнопку подтверждения Пыма.
+    Fail-safe: если не распознал (bike не известен, число не то) → False → прежний manager_reply."""
+    if not _is_trusted(msg):
+        return False
+    chat_id = msg.chat_id
+    topic_id = getattr(msg, "message_thread_id", None)
+    bike = bike_from_topic(chat_id, topic_id) or ""
+    if not bike:
+        return False
+    km = detect_oil_backdated_km(text)
+    if km is None:
+        return False
+
+    # Validation: N > prev oil_last, N ≤ current odometer (если известен)
+    fleet = {}
+    try:
+        fleet = bridge.find_bike(bike) or {}
+    except Exception:
+        pass
+    oil_last = fleet.get("oil_last_km")
+
+    # Текущий одометр — из буфера фото темы (наиболее актуален в servicing)
+    lm = last_mileage_in_topic(chat_id, topic_id)
+    cur_km = None
+    if lm:
+        try:
+            cur_km = int(str(lm[0]).replace(" ", "").replace(",", ""))
+        except Exception:
+            pass
+
+    if oil_last and km <= oil_last:
+        reason = f"N={km} не больше текущего oil_last={oil_last}"
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=msg_oil_backdated_invalid(bike, km, reason))
+        log.info(f"  → backdated oil INVALID (N≤oil_last): km={km} oil_last={oil_last}")
+        return True
+    if cur_km is not None and km > cur_km:
+        reason = f"N={km} > текущий одометр={cur_km}"
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=msg_oil_backdated_invalid(bike, km, reason))
+        log.info(f"  → backdated oil INVALID (N>odo): km={km} cur={cur_km}")
+        return True
+
+    # Всё ок — показываем карточку Пыму для подтверждения записи в кол.I
+    tok = _svc_put({"kind": "oil_backdated", "chat": chat_id, "topic": topic_id,
+                    "bike": bike, "km": str(km)})
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+        "✅ ยืนยัน / Подтвердить", callback_data=f"svc:oilbk:{tok}")]])
+    sent = await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                       text=msg_oil_backdated_confirm(bike, km), reply_markup=kb)
+    _remember_cycle_msg(chat_id, topic_id, sent)
+    mark_awaiting(chat_id, topic_id)
+    log.info(f"  → backdated oil: переспрос Пыму {km} км (тема {topic_id})")
+    return True
+
+
 # === Фиксация замены масла: ЯВНЫЙ ВОПРОС кнопками (без угадывания маркер/TTL/окно) ===
 # После подтверждения пробега, если замена осмысленна (ТО due/overdue или была подсказка-маркер),
 # бот спрашивает кнопками: [После замены] / [Просто пробег]. [После замены] от ДОВЕРЕННОГО →
@@ -2710,6 +2796,30 @@ def msg_oil_need_trusted(bike, km):
         f"{PYM_HANDLE} ยืนยันการเปลี่ยนน้ำมัน{b_th} = {km} กม. ไหมครับ? ตอบ «ใช่» หรือ «ไม่»\n"
         f"🇷🇺 🔧 Запись ТО в журнал подтверждает {PYM_HANDLE} или владелец. "
         f"{PYM_HANDLE}, подтвердите замену масла{b_ru} = {km} км? да/нет"
+    )
+
+
+def msg_oil_backdated_confirm(bike, km):
+    """Переспрос Пыму: замена масла задним числом на N км — подтвердить запись в кол.I?"""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 เปลี่ยนน้ำมัน{b_th} ที่ {km} กม. (ย้อนหลัง) — ยืนยันบันทึก ТО (col.I) ไหมครับ? {PYM_HANDLE} 🙏\n"
+        f"{_SEP}\n"
+        f"🇷🇺 📟 Замена масла{b_ru} задним числом на {km} км — подтвердить запись в ТО (кол.I)? {PYM_HANDLE}"
+    )
+
+
+def msg_oil_backdated_invalid(bike, km, reason_ru):
+    """Сообщение об ошибке валидации при записи задним числом."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 ไมล์เปลี่ยนน้ำมัน{b_th} {km} กม. ตรวจสอบไม่ผ่าน: {reason_ru} ระบุตัวเลขที่ถูกต้องครับ 🙏\n"
+        f"{_SEP}\n"
+        f"🇷🇺 📟 Пробег замены масла{b_ru} {km} км — не прошёл проверку: {reason_ru}. Уточни правильное число 🙏"
     )
 
 
@@ -3007,6 +3117,63 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
             detail_ru = f"не удалось записать ({err or 'ошибка'})"
             detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
+                          text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+
+
+async def _write_oil_backdated(context, bridge, chat_id, topic_id, bike, oil_km):
+    """Боевая запись задним числом: set_fleet_oil(oil_km=N, confirmed=True) → кол.I.
+    Одометр НЕ трогается: service_upsert только last_service_km, current_km НЕ передаём.
+    Вызывается ТОЛЬКО после svc:oilbk от доверенного (Пым/владелец)."""
+    plate = _plate_from_name(bike)
+    if not plate:
+        fb = bridge.find_bike(bike) or {}
+        plate = _plate_from_name(fb.get("name", ""))
+    if not plate:
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=("🐀 Splinter\n"
+                                "🇹🇭 ขอโทษครับ ไม่พบเลขทะเบียนรถ — บอกชื่อรุ่น+เลขให้หน่อยครับ 🙏\n"
+                                "🇷🇺 Не смог определить номер байка — уточни модель+номер 🙏"))
+        return
+    try:
+        km_int = int(str(oil_km).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return
+
+    res = bridge.set_fleet_oil(number=plate, oil_km=km_int, confirmed=True)
+    log.info(f"  → backdated ТО Oil set_fleet_oil({plate},{km_int},confirmed=True) → {res}")
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    if res.get("ok"):
+        _canon = res.get("bike_name", bike)
+        _iv = _service_interval("oil", _canon, bridge) or _oil_interval(_canon)
+        _next = km_int + _iv if _iv else None
+        # service_upsert: только last_service_km — current_km НЕ передаём (не трогаем одометр)
+        bridge.service_upsert(bike=bike, service_type="oil",
+                              last_service_km=km_int, interval_km=_iv)
+        next_str = f" · следующее ТО на {_next} км" if _next else ""
+        next_th = f" · ТО ครั้งถัดไปที่ {_next} กม." if _next else ""
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=(f"🐀 Splinter\n"
+                                f"🇹🇭 ✅ บันทึก ТО น้ำมัน{b_th} ย้อนหลัง = {km_int} กม. แล้วครับ{next_th}\n"
+                                f"{_SEP}\n"
+                                f"🇷🇺 ✅ ТО Oil{b_ru} задним числом записано: {km_int} км{next_str}"))
+        log.info(f"  → backdated ТО Oil ЗАПИСАНО: {bike} oil_km={km_int} next={_next}")
+    else:
+        err = res.get("error", "")
+        if err == "oil_decreasing":
+            detail_ru = f"новое {km_int} меньше прошлого ТО {res.get('old_oil')} — не записал"
+            detail_th = f"ค่าใหม่ {km_int} น้อยกว่าครั้งก่อน {res.get('old_oil')} — ไม่บันทึก"
+        elif err == "not_found":
+            detail_ru = f"байк с номером {plate} не найден в Лист1"
+            detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
+        elif err == "verify_failed":
+            _addr = res.get("full_address") or "Лист1"
+            detail_ru = f"запись в {_addr} не подтвердилась — повтори"
+            detail_th = f"ยืนยันการบันทึก {_addr} ไม่ผ่าน — ลองใหม่"
+        else:
+            detail_ru = f"не удалось записать ({err or 'ошибка'})"
+            detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
                           text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
 
@@ -3325,6 +3492,25 @@ async def handle_service_button(update, context, bridge) -> None:
             await _emit_summary(context, chat_id, topic_id, bike)
         # ЧАСТЬ D: [Просто пробег] = финал цикла (закреп-просрочку оставляем, вопросы убираем).
         await _clear_cycle_msgs(context, chat_id, topic_id)
+    elif action == "oilbk":
+        # [✅ Подтвердить] замены масла задним числом (из handle_oil_backdated_service). ТОЛЬКО доверенный.
+        if not _is_trusted_user(q.from_user):
+            await _btn_answer(q, f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец", show_alert=False)
+            b_th = f" ({bike})" if bike else ""
+            b_ru = f" по {bike}" if bike else ""
+            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                              text=(f"🐀 Splinter\n"
+                                    f"🇹🇭 🔧 บันทึก ТО ย้อนหลัง{b_th} ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
+                                    f"{_SEP}\n"
+                                    f"🇷🇺 🔧 Запись ТО задним числом{b_ru} подтверждает {PYM_HANDLE} или владелец"))
+            return   # токен и кнопка живут — Пым нажмёт позже
+        await _btn_answer(q, "กำลังบันทึก ТО ย้อนหลัง… · Записываю ТО задним числом…")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        await _write_oil_backdated(context, bridge, chat_id, topic_id, bike, km)
     else:
         await _btn_answer(q)
 
@@ -4607,13 +4793,30 @@ async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, decla
     log.info(f"  → ТО фаза2 → подтверждение Пыму: {bike} done={done} odo={odo} (tok={tok})")
 
 
-async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, km=None):
+async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, km=None,
+                                backdated=False):
     """row12 (аудит 08.07): мозг вызвал set_service в servicing-теме — E2b-гейт запись блокирует,
     но работа НЕ должна теряться молча («Принято» без следа → Инфо молчал про редуктор). Оформляем
     ШТАТНУЮ то_заявку: есть одометр → сразу кнопка Пыму (_sp_advance_to_confirm; запись в Лист1
     только по его «да» — гейт цел); одометра нет → заявка 'ждёт_факт' + просьба одометра
     (B1 довезёт подтверждённым фото-одометром). Инфо-карточка видит заявку в «В работе» (sp_open).
+    backdated=True (oil_last_km из set_service): запись задним числом → специальная карточка
+    (одометр НЕ трогается), кнопка _write_oil_backdated.
     Bot Data (то_заявки) = зелёная зона."""
+    # Спецпуть для задним-числом масла из мозга (oil_last_km в set_service)
+    if backdated and kind == "oil" and km:
+        odo_str = str(km).strip().replace(" ", "").replace(",", "")
+        if _re_pl.fullmatch(r"\d{3,6}", odo_str):
+            tok = _svc_put({"kind": "oil_backdated", "chat": chat_id, "topic": topic_id,
+                            "bike": bike, "km": odo_str})
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "✅ ยืนยัน / Подтвердить", callback_data=f"svc:oilbk:{tok}")]])
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=msg_oil_backdated_confirm(bike, int(odo_str)), reply_markup=kb)
+            mark_awaiting(chat_id, topic_id)
+            log.info(f"  → E2b backdated oil: {bike} oil_km={odo_str} → кнопка Пыму")
+            return
+
     kind = str(kind or "").strip().lower()
     if kind not in _SP_KIND_LABEL:
         kind = "other"
