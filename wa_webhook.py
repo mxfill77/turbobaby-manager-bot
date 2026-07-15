@@ -11,11 +11,18 @@ Endpoints:
   POST /wa-webhook  — Incoming events, verified by X-Hub-Signature-256 HMAC
 
 Environment (.env):
-  WA_VERIFY_TOKEN   — token agreed with Meta developer portal (required)
-  WA_APP_SECRET     — app secret for HMAC-SHA256 signature verification (required)
-  WA_PHONE_NUMBER_ID — our WA phone-number-id (used for echo detection)
-  WA_WEBHOOK_PORT   — HTTP listen port (default: 8765)
-  WA_QUEUE_DB       — path to SQLite queue file (default: wa_queue.db next to this file)
+  WA_VERIFY_TOKEN     — token agreed with Meta developer portal (required)
+  WA_APP_SECRET       — app secret for HMAC-SHA256 signature verification (required)
+  WA_PHONE_NUMBER_ID  — our WA phone-number-id (used for echo detection)
+  WA_WEBHOOK_PORT     — HTTP listen port (default: 8765)
+  WA_QUEUE_DB         — path to SQLite queue file (default: wa_queue.db next to this file)
+  WA_360_SANDBOX_KEY  — 360dialog sandbox API key (D360-API-KEY header)
+  WA_D360_PATH_SECRET — random hex secret embedded in the 360dialog webhook path
+
+Endpoints:
+  GET  /wa-webhook                            — Meta hub.verify-token handshake
+  POST /wa-webhook                            — Meta Cloud API v2 (HMAC-verified)
+  POST /wa-webhook/d360/<WA_D360_PATH_SECRET> — 360dialog v1 (auth by path secret, no HMAC)
 
 Queue schema (wa_inbox table in wa_queue.db):
   id, ts_queued, channel, from_number, name, msg_type, text, media_id,
@@ -58,11 +65,13 @@ def _env():
     except Exception:
         pass
     return {
-        "verify_token": os.environ.get("WA_VERIFY_TOKEN", ""),
-        "app_secret":   os.environ.get("WA_APP_SECRET", ""),
-        "phone_id":     os.environ.get("WA_PHONE_NUMBER_ID", ""),
-        "port":         int(os.environ.get("WA_WEBHOOK_PORT", "8765")),
-        "queue_db":     os.environ.get("WA_QUEUE_DB", os.path.join(ROOT, "wa_queue.db")),
+        "verify_token":     os.environ.get("WA_VERIFY_TOKEN", ""),
+        "app_secret":       os.environ.get("WA_APP_SECRET", ""),
+        "phone_id":         os.environ.get("WA_PHONE_NUMBER_ID", ""),
+        "port":             int(os.environ.get("WA_WEBHOOK_PORT", "8765")),
+        "queue_db":         os.environ.get("WA_QUEUE_DB", os.path.join(ROOT, "wa_queue.db")),
+        "d360_key":         os.environ.get("WA_360_SANDBOX_KEY", ""),
+        "d360_path_secret": os.environ.get("WA_D360_PATH_SECRET", ""),
     }
 
 
@@ -262,6 +271,91 @@ def normalize_wa_payload(payload: dict, our_phone_number: str = "") -> list:
     return events
 
 
+# ─── 360dialog v1 normalisation ──────────────────────────────────────────────────────
+
+def normalize_d360_v1_payload(payload: dict) -> list:
+    """Extract and normalise a 360dialog v1 webhook payload (waba-sandbox.360dialog.io).
+
+    360dialog v1 uses the on-premise WA Business API format: a flat top-level dict with
+    'messages', 'contacts', and 'statuses' keys — no entry/changes/value nesting.
+
+    Returns a list of normalised event dicts with the same schema as normalize_wa_payload().
+    """
+    events = []
+    now = int(time.time())
+
+    # Build contact name lookup: wa_id → display name
+    contacts = {
+        c["wa_id"]: c.get("profile", {}).get("name", "")
+        for c in payload.get("contacts", [])
+        if isinstance(c, dict) and c.get("wa_id")
+    }
+
+    # ── incoming messages ──────────────────────────────────────────
+    for msg in payload.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+
+        sender   = msg.get("from", "")
+        msg_type = msg.get("type", "")
+        ts       = int(msg.get("timestamp") or 0)
+        wamid    = msg.get("id")
+
+        text     = None
+        media_id = None
+        if msg_type == "text":
+            text = (msg.get("text") or {}).get("body")
+        elif msg_type in _MEDIA_TYPES:
+            media_id = (msg.get(msg_type) or {}).get("id")
+        elif msg_type == "location":
+            loc  = msg.get("location") or {}
+            text = f"{loc.get('latitude')},{loc.get('longitude')}"
+        elif msg_type == "interactive":
+            intr = msg.get("interactive") or {}
+            kind = intr.get("type", "")
+            if kind == "button_reply":
+                text = (intr.get("button_reply") or {}).get("title")
+            elif kind == "list_reply":
+                text = (intr.get("list_reply") or {}).get("title")
+
+        history = ts > 0 and (now - ts) > _HISTORY_THRESHOLD_SECS
+
+        events.append({
+            "channel":  "wa",
+            "from":     sender,
+            "name":     contacts.get(sender, ""),
+            "type":     msg_type,
+            "text":     text,
+            "media_id": media_id,
+            "ts":       ts,
+            "echo":     False,   # sandbox: messages are always from real users
+            "history":  history,
+            "wamid":    wamid,
+            "raw":      msg,
+        })
+
+    # ── status updates (delivery/read receipts for outbound messages) ──
+    for status in payload.get("statuses", []):
+        if not isinstance(status, dict):
+            continue
+        ts = int(status.get("timestamp") or 0)
+        events.append({
+            "channel":  "wa",
+            "from":     status.get("recipient_id", ""),
+            "name":     "",
+            "type":     "status",
+            "text":     status.get("status"),
+            "media_id": None,
+            "ts":       ts,
+            "echo":     True,
+            "history":  ts > 0 and (now - ts) > _HISTORY_THRESHOLD_SECS,
+            "wamid":    status.get("id"),
+            "raw":      status,
+        })
+
+    return events
+
+
 # ─── HMAC signature verification ─────────────────────────────────────────────────────
 
 def verify_signature(body: bytes, signature_header: str, app_secret: str) -> bool:
@@ -293,10 +387,11 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
       db            WAQueueDB
     """
 
-    verify_token: str = ""
-    app_secret: str = ""
-    our_phone: str = ""
-    db: WAQueueDB = None
+    verify_token:     str = ""
+    app_secret:       str = ""
+    our_phone:        str = ""
+    db:               WAQueueDB = None
+    d360_path_secret: str = ""
 
     # Socket r/w timeout per request — a slow/stalled client closes the connection
     # rather than holding the thread indefinitely (incident 15.07: TCP open, HTTP hung).
@@ -332,12 +427,18 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             log.warning("WA verify-token handshake FAILED mode=%r token=%r", mode, token)
             self._send(403, "Forbidden")
 
-    # POST /wa-webhook — incoming events
+    # POST dispatcher — routes by path
     def do_POST(self):
-        if urlparse(self.path).path != "/wa-webhook":
+        path = urlparse(self.path).path
+        if path == "/wa-webhook":
+            self._do_meta_post()
+        elif path.startswith("/wa-webhook/d360/"):
+            self._do_d360_post(path)
+        else:
             self._send(404, "Not found")
-            return
 
+    # POST /wa-webhook — Meta Cloud API v2, HMAC-verified
+    def _do_meta_post(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
         sig = self.headers.get("X-Hub-Signature-256", "")
@@ -374,6 +475,42 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         except Exception as e:
             log.error("WA POST: processing error: %s", e, exc_info=True)
 
+    # POST /wa-webhook/d360/<secret> — 360dialog v1, auth by path secret (no HMAC)
+    def _do_d360_post(self, path: str):
+        # Extract secret from path: /wa-webhook/d360/<secret>
+        # Wrong secret → 404 (not 401 — don't reveal endpoint existence)
+        parts = path.split("/")
+        secret_in_path = parts[3] if len(parts) > 3 else ""
+        if not self.d360_path_secret or secret_in_path != self.d360_path_secret:
+            self._send(404, "Not found")
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            log.warning("D360 POST: JSON parse error: %s", e)
+            self._send(400, "Bad request")
+            return
+
+        self._send(200, "ok")
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+
+        try:
+            events = normalize_d360_v1_payload(payload)
+            if events:
+                n = self.db.enqueue(events) if self.db else 0
+                log.info("D360 POST: %d events, %d enqueued", len(events), n)
+            else:
+                log.debug("D360 POST: payload contained 0 events")
+        except Exception as e:
+            log.error("D360 POST: processing error: %s", e, exc_info=True)
+
 
 # ─── server bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -388,10 +525,11 @@ def make_server(env: dict) -> ThreadingHTTPServer:
     class _Handler(WAWebhookHandler):
         pass
 
-    _Handler.verify_token = env["verify_token"]
-    _Handler.app_secret   = env["app_secret"]
-    _Handler.our_phone    = env["phone_id"]
-    _Handler.db           = db
+    _Handler.verify_token     = env["verify_token"]
+    _Handler.app_secret       = env["app_secret"]
+    _Handler.our_phone        = env["phone_id"]
+    _Handler.db               = db
+    _Handler.d360_path_secret = env.get("d360_path_secret", "")
 
     server = ThreadingHTTPServer(("0.0.0.0", env["port"]), _Handler)
     server.daemon_threads = True

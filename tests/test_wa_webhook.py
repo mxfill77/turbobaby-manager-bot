@@ -203,12 +203,14 @@ def _make_handler(method, path, body=b"", headers=None,
                   verify_token="test_verify_token",
                   app_secret="test_secret",
                   our_phone="",
-                  db=None):
+                  db=None,
+                  d360_path_secret=""):
     h = _FakeHandler(method, path, body, headers)
-    _FakeHandler.verify_token = verify_token
-    _FakeHandler.app_secret   = app_secret
-    _FakeHandler.our_phone    = our_phone
-    _FakeHandler.db           = db
+    _FakeHandler.verify_token     = verify_token
+    _FakeHandler.app_secret       = app_secret
+    _FakeHandler.our_phone        = our_phone
+    _FakeHandler.db               = db
+    _FakeHandler.d360_path_secret = d360_path_secret
     return h
 
 
@@ -735,6 +737,182 @@ def test_watchdog_increments_on_consecutive_failures():
             pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. 360dialog v1 — webhook path + payload normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_D360_SECRET = "teststest1234abcd"  # fixed test secret
+
+
+def _make_d360_text_payload(
+    sender: str = "66812345678",
+    body_text: str = "Hello 360",
+    ts: int = None,
+    wamid: str = "d360.msg001",
+) -> dict:
+    """360dialog v1 flat format — no entry/changes wrapper."""
+    ts = ts or int(time.time())
+    return {
+        "contacts": [{"wa_id": sender, "profile": {"name": "D360User"}}],
+        "messages": [{
+            "from":      sender,
+            "id":        wamid,
+            "timestamp": str(ts),
+            "type":      "text",
+            "text":      {"body": body_text},
+        }],
+    }
+
+
+def _make_d360_image_payload(sender="66812345678", media_id="MEDIA456") -> dict:
+    ts = int(time.time())
+    return {
+        "contacts": [{"wa_id": sender, "profile": {"name": "D360Img"}}],
+        "messages": [{
+            "from": sender, "id": "d360.img001", "timestamp": str(ts),
+            "type": "image", "image": {"id": media_id, "mime_type": "image/jpeg"},
+        }],
+    }
+
+
+def _make_d360_status_payload(recipient="66812345678", status_val="delivered") -> dict:
+    ts = int(time.time())
+    return {
+        "statuses": [{
+            "id":           "d360.st001",
+            "status":       status_val,
+            "timestamp":    str(ts),
+            "recipient_id": recipient,
+        }],
+    }
+
+
+def test_d360_correct_secret_200():
+    """Correct secret in path → 200, event enqueued."""
+    db = _tmp_db()
+    payload = _make_d360_text_payload()
+    body = json.dumps(payload).encode()
+    path = f"/wa-webhook/d360/{_D360_SECRET}"
+    h = _make_handler("POST", path, body,
+                      headers={"Content-Length": str(len(body))},
+                      app_secret="",
+                      db=db,
+                      d360_path_secret=_D360_SECRET)
+    _dispatch(h)
+    ok(h._resp_code == 200, "d360 correct secret → 200")
+    ok(db.count_pending() == 1, "d360 event enqueued")
+
+
+def test_d360_wrong_secret_404():
+    """Wrong secret in path → 404 (not 401 — don't reveal endpoint)."""
+    db = _tmp_db()
+    payload = _make_d360_text_payload()
+    body = json.dumps(payload).encode()
+    path = "/wa-webhook/d360/wrong_secret_xyz"
+    h = _make_handler("POST", path, body,
+                      headers={"Content-Length": str(len(body))},
+                      app_secret="",
+                      db=db,
+                      d360_path_secret=_D360_SECRET)
+    _dispatch(h)
+    ok(h._resp_code == 404, "d360 wrong secret → 404")
+    ok(db.count_pending() == 0, "nothing enqueued on wrong secret")
+
+
+def test_d360_no_secret_configured_404():
+    """If server has no d360_path_secret set, any d360 path → 404."""
+    db = _tmp_db()
+    payload = _make_d360_text_payload()
+    body = json.dumps(payload).encode()
+    path = f"/wa-webhook/d360/{_D360_SECRET}"
+    h = _make_handler("POST", path, body,
+                      headers={"Content-Length": str(len(body))},
+                      app_secret="",
+                      db=db,
+                      d360_path_secret="")   # not configured
+    _dispatch(h)
+    ok(h._resp_code == 404, "d360 path → 404 when server has no secret configured")
+
+
+def test_meta_path_still_needs_hmac():
+    """Meta path /wa-webhook still requires HMAC even when d360 is active."""
+    db = _tmp_db()
+    # Post a payload to the Meta path WITHOUT a signature
+    payload = _make_text_payload()
+    body = json.dumps(payload).encode()
+    h = _make_handler("POST", "/wa-webhook", body,
+                      headers={"Content-Length": str(len(body))},
+                      app_secret="test_secret",
+                      db=db,
+                      d360_path_secret=_D360_SECRET)
+    _dispatch(h)
+    ok(h._resp_code == 403, "meta path still rejects POST without HMAC when d360 is configured")
+    ok(db.count_pending() == 0, "nothing enqueued on missing HMAC for meta path")
+
+
+def test_d360_dedup_same_wamid():
+    """360dialog events deduplicate by wamid just like Meta events."""
+    db = _tmp_db()
+    payload = _make_d360_text_payload(wamid="d360.dup999")
+    body = json.dumps(payload).encode()
+    path = f"/wa-webhook/d360/{_D360_SECRET}"
+    h1 = _make_handler("POST", path, body,
+                       headers={"Content-Length": str(len(body))},
+                       app_secret="", db=db, d360_path_secret=_D360_SECRET)
+    h2 = _make_handler("POST", path, body,
+                       headers={"Content-Length": str(len(body))},
+                       app_secret="", db=db, d360_path_secret=_D360_SECRET)
+    _dispatch(h1)
+    _dispatch(h2)
+    ok(db.count_pending() == 1, "d360 duplicate wamid → only 1 row in db")
+
+
+# ── normalize_d360_v1_payload unit tests ──────────────────────────────────────
+
+def test_normalize_d360_v1_text():
+    payload = _make_d360_text_payload(sender="66812345678",
+                                      body_text="สวัสดี 360", wamid="d360.n001")
+    events = wh.normalize_d360_v1_payload(payload)
+    ok(len(events) == 1,               "d360 text payload → 1 event")
+    ev = events[0]
+    ok(ev["channel"] == "wa",          "d360: channel=wa")
+    ok(ev["from"] == "66812345678",    "d360: from=sender")
+    ok(ev["name"] == "D360User",       "d360: name from contacts")
+    ok(ev["type"] == "text",           "d360: type=text")
+    ok(ev["text"] == "สวัสดี 360",     "d360: text body (Unicode)")
+    ok(ev["wamid"] == "d360.n001",     "d360: wamid set")
+    ok(ev["echo"] is False,            "d360: echo=False (sandbox = real user)")
+    ok(ev["media_id"] is None,         "d360: media_id=None for text")
+
+
+def test_normalize_d360_v1_image():
+    payload = _make_d360_image_payload(media_id="MEDIA456")
+    events = wh.normalize_d360_v1_payload(payload)
+    ok(len(events) == 1,               "d360 image payload → 1 event")
+    ev = events[0]
+    ok(ev["type"] == "image",          "d360: type=image")
+    ok(ev["media_id"] == "MEDIA456",   "d360: media_id extracted")
+    ok(ev["text"] is None,             "d360: text=None for image")
+
+
+def test_normalize_d360_v1_status():
+    payload = _make_d360_status_payload(status_val="read")
+    events = wh.normalize_d360_v1_payload(payload)
+    ok(len(events) == 1,                    "d360 status payload → 1 event")
+    ev = events[0]
+    ok(ev["type"] == "status",              "d360: type=status")
+    ok(ev["text"] == "read",                "d360: text=status value")
+    ok(ev["echo"] is True,                  "d360: echo=True for status")
+    ok(ev["wamid"] == "d360.st001",         "d360: wamid from status id")
+    ok(ev["from"] == "66812345678",         "d360: from=recipient_id")
+
+
+def test_normalize_d360_v1_empty():
+    """Empty payload → 0 events, no crash."""
+    events = wh.normalize_d360_v1_payload({})
+    ok(len(events) == 0, "d360 empty payload → 0 events")
+
+
 # ─── runner ───────────────────────────────────────────────────────────────────
 
 def _run_all():
@@ -771,6 +949,16 @@ def _run_all():
         test_wa_probe_hung,
         test_watchdog_count_and_reset,
         test_watchdog_increments_on_consecutive_failures,
+        # 9. 360dialog v1
+        test_d360_correct_secret_200,
+        test_d360_wrong_secret_404,
+        test_d360_no_secret_configured_404,
+        test_meta_path_still_needs_hmac,
+        test_d360_dedup_same_wamid,
+        test_normalize_d360_v1_text,
+        test_normalize_d360_v1_image,
+        test_normalize_d360_v1_status,
+        test_normalize_d360_v1_empty,
     ]
     for t in tests:
         try:
