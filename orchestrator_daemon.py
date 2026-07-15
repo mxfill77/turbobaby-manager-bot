@@ -1563,6 +1563,21 @@ def _curator_on():
     return (os.environ.get("CURATOR") or "").strip() == "1"
 
 
+def _curator_scope_on():
+    """Флаг CURATOR_SCOPE=1 в .env: done-одиночки без коммита в result → мимо куратора
+    (read-only разведки/диагностики не плодят followup). 0/нет → текущее поведение
+    (консультация на каждом done/failed одиночки). Откат: CURATOR_SCOPE=0 + рестарт демона."""
+    return (os.environ.get("CURATOR_SCOPE") or "").strip() == "1"
+
+
+_COMMIT_IN_RESULT_RE = re.compile(r"(?i)(коммит\b|commit\b|git\s+push)")
+
+
+def _result_has_commit(result):
+    """True если result содержит признак коммита / push — задача делала изменения кода."""
+    return bool(_COMMIT_IN_RESULT_RE.search(str(result or "")))
+
+
 def _curator_tails(result):
     """Секции «ХВОСТ/ХВОСТЫ/технически готово…; функционально…» из result исполнителя:
     строка-триггер + её блок вниз до пустой строки. Секций нет → явная заглушка (куратор видит,
@@ -1944,7 +1959,7 @@ def _maybe_curator(kind, key, goal, result):
         log.warning("curator: сбой консультации по %s %s (%s) — fail-safe тишина", kind, key, e)
 
 
-def _maybe_curator_single(frm, tid, text, result):
+def _maybe_curator_single(frm, tid, text, result, status="done"):
     """Куратор на финале done/failed ОДИНОЧКИ «тз:»/«задача:» vps-полосы (from=Filipp-328[-dev]
     строго — артефакты декомпозиции/операций/pc сюда не проходят) и followup-задачи куратора
     (from=Filipp-curator — её терминал даёт вторую глубину дожима; третью глушит бюджет глубины
@@ -1956,6 +1971,9 @@ def _maybe_curator_single(frm, tid, text, result):
         return                    # конверт одобренной заявки — вне кураторского контура
     if str(result or "").lstrip().startswith(_CURATOR_SKIP_MARKS):
         return                    # ⏱-диагноз / плановый рестарт-🔁 / отклонено Филиппом
+    # CURATOR_SCOPE=1: done-одиночки без коммита в result → мимо куратора (read-only разведки)
+    if _curator_scope_on() and status == "done" and not _result_has_commit(result):
+        return
     _maybe_curator("задача", tid, text, result)
 
 
@@ -2824,7 +2842,7 @@ def process_new():
             vf_key = _vf_normalize(text)
             if vf_key:
                 _vf_write(vf_key, (result.splitlines()[0] if result else "")[:200], tid)
-        _maybe_curator_single(task.get("from"), tid, text, result)   # куратор цели (CURATOR=1)
+        _maybe_curator_single(task.get("from"), tid, text, result, status=status)   # куратор цели (CURATOR=1)
 
 
 def cycle():
@@ -2840,9 +2858,10 @@ def cycle():
 
 def main():
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
-             "selfheal=%s, plan_adapt=%s, curator=%s, fact_ttl=%ss, model=%s, executor_model=%s) ===",
+             "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, fact_ttl=%ss, model=%s, executor_model=%s) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
-             int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL)
+             int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), int(_curator_scope_on()),
+             FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL)
     while _running:
         try:
             cycle()

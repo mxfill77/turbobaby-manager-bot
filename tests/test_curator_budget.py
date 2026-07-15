@@ -17,8 +17,9 @@ import datetime
 import os, sys
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
-os.environ.setdefault("STEP_SELFHEAL", "0")  # изоляция от боевого .env
-os.environ.setdefault("PLAN_ADAPT", "0")
+os.environ["STEP_SELFHEAL"] = "0"   # принудительная изоляция (load_dotenv грузит боевые значения)
+os.environ["PLAN_ADAPT"] = "0"
+os.environ["CURATOR_SCOPE"] = "0"  # новый флаг (15.07.2026): консультация на всех done/failed
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []

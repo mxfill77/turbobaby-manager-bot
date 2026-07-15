@@ -28,6 +28,7 @@ os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["STEP_SELFHEAL"] = "0"
 os.environ["PLAN_ADAPT"] = "0"
+os.environ["CURATOR_SCOPE"] = "0"  # новый флаг (15.07.2026): консультация на всех done/failed
 os.environ["CURATOR"] = "1"
 
 def ok(c, l):

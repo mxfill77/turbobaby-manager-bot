@@ -24,6 +24,7 @@ os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_T
 # в проверках дёргали бы думатель самопочинки (урок шага 6/7 родителя 231).
 os.environ["STEP_SELFHEAL"] = "0"
 os.environ["PLAN_ADAPT"] = "0"
+os.environ["CURATOR_SCOPE"] = "0"  # новый флаг (15.07.2026): консультация на всех done/failed
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
