@@ -1,0 +1,13 @@
+[Unit]
+Description=Запуск TurboBaby data invariants check каждые 4 часа
+
+[Timer]
+# первая проверка через 15 мин после загрузки, далее каждые 4 часа
+OnBootSec=15min
+OnUnitActiveSec=4h
+# если сервер спал/был выключен в момент срабатывания — догнать пропущенную проверку
+Persistent=true
+Unit=invariants.service
+
+[Install]
+WantedBy=timers.target

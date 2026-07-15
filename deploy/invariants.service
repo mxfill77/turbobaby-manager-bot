@@ -1,0 +1,11 @@
+[Unit]
+Description=TurboBaby data invariants check (проверка инвариантов живых данных, read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/turbobaby-manager-bot
+ExecStart=/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/invariants_check.py --push
+User=root
+# read-only: только чтение fleet/clients/queue через Bridge; --push → тема 328 только при нарушениях.

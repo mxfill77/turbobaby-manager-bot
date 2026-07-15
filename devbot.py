@@ -1540,6 +1540,20 @@ def _g_registry():
         return f"🧭 реестр не запустился: {e}"
 
 
+def _g_invariants():
+    """Инварианты данных v1 — непрерывные проверки живых данных (read-only).
+    Подпроцессом (изоляция контура цела); silent при ✅, флаги при нарушениях."""
+    try:
+        r = subprocess.run([PY, os.path.join(ROOT, "invariants_check.py")], cwd=ROOT,
+                           capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "").strip() or (r.stderr or "").strip() or "(нет вывода)"
+        return out if r.returncode == 0 else f"⚠️ инварианты упали (exit={r.returncode}):\n{out}"
+    except subprocess.TimeoutExpired:
+        return "⚠️ инварианты не уложились в 120с (Bridge/сеть тупит) — попробуй позже."
+    except Exception as e:
+        return f"⚠️ инварианты не запустились: {e}"
+
+
 def _g_gate():
     """Прогон гейта 4.3 (тесты, ~7с). Зелёный read-only прогон — сам ничего не деплоит."""
     try:
@@ -1563,6 +1577,7 @@ def _g_help():
             "  статус / пульс — сводка системы: в работе / ждёт тебя / надзор + KB_PULSE\n"
             "    (всё пусто → «🟢 ТИХО» = всё завершено)\n"
             "  сверься / реестр — сверка карта↔реальность (реестр знания, read-only)\n"
+            "  инварианты — проверка данных аренды (масло/сроки/депозит/CLICK125, read-only)\n"
             "  гейт — прогон тестов 4.3 (~7с)\n"
             "  помощь\n"
             "\n🎻 Оркестратор (демон исполняет через headless Claude Code):\n"
@@ -1588,6 +1603,7 @@ _ALLOWLIST = [
     (("просрочк", "overdue"), lambda b: _g_overdue(b)),
     (("статус", "пульс", "pulse", "status"), lambda b: _g_pulse(b)),
     (("сверься", "сверка", "сверить", "реестр", "registry"), lambda b: _g_registry()),
+    (("инвариант", "invariant"), lambda b: _g_invariants()),
     (("гейт", "gate"), lambda b: _g_gate()),
     (("помощ", "help", "команд"), lambda b: _g_help()),
 ]
@@ -1685,7 +1701,7 @@ async def handle_command(msg, context, bridge) -> None:
         await context.bot.send_message(
             chat_id=msg.chat_id, message_thread_id=tid,
             text=("🤖 Это не зелёная команда (или красное: запись/деплой). Сам НЕ выполняю — нужно твоё «да». "
-                  "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / просрочки / статус / сверься / гейт / помощь. "
+                  "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / просрочки / статус / сверься / инварианты / гейт / помощь."
                   "Дев-ТЗ: «тз: <что сделать>»."))
         return
     def _run_green():
