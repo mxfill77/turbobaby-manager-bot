@@ -59,7 +59,7 @@ BRIDGE = None   # выставляется из bot.py при старте (devb
 # отдельном потоке (asyncio.to_thread) + отдельный клиент с коротким timeout: опрос
 # идемпотентен, при таймауте просто ждём следующий тик 45с, а не держим 60с.
 POLL_TIMEOUT = 15                       # сек на get_pending при опросе очереди (вместо 60)
-_REPORT_STATUSES = ("done", "failed", "needs_approval", "in_progress")
+_REPORT_STATUSES = ("done", "failed", "needs_approval", "in_progress", "new", "approved")
 _poll_bridge = None                     # ленивый клиент опроса (timeout=POLL_TIMEOUT)
 _poll_bridge_for = None                 # BRIDGE, под который создан _poll_bridge (тесты меняют BRIDGE)
 
@@ -146,7 +146,10 @@ _asked = set()                          # id задач needs_approval, по к�
 # heartbeat/детект-зависания (части 1-2): анонс «в работе» и предупреждение «зависла» — по разу на задачу
 _inprogress_seen = set()                # id задач in_progress, по которым УЖЕ слали «🔄 в работе» (дедуп)
 _stalled = set()                        # id задач, по которым УЖЕ слали «⚠️ зависла» (дедуп)
-STALL_GRACE_SEC = 120                   # люфт НАД штатным потолком задачи (даём демону/реаперу самому
+STALL_GRACE_SEC = 120                   # люфт НАД штатным потолком задачи
+# {qid: (chat_id, topic_id, msg_id, base_text, task_text, task_from, st, sent_at)}
+_curator_pending = {}                   # карточки, показывающие «куратор оценивает» — ждут edit
+_CURATOR_WAIT_MAX = 240                 # сек до fallback-перерасчёта (CURATOR_TIMEOUT 180 + буфер) (даём демону/реаперу самому
                                         # довести терминал done/failed раньше тревоги владельцу).
                                         # Порог «зависла» — per-задача: _stall_threshold_sec(it).
                                         # Урок задачи 287 (22:55 13.07.2026): плоский порог 12 мин
@@ -865,6 +868,47 @@ def _stall_threshold_sec(it):
     return cap + STALL_GRACE_SEC
 
 
+async def _check_curator_pending(context, by) -> None:
+    """Редактирует done/failed-карточки с «куратор оценивает» после вердикта куратора
+    или по таймауту (_CURATOR_WAIT_MAX). Вызывается из report_results с текущим by-снимком."""
+    if not _curator_pending:
+        return
+    now = time.monotonic()
+    to_remove = []
+    for qid, info in list(_curator_pending.items()):
+        chat_id, topic_id, msg_id, base_text, task_text, task_from, st, sent_at = info
+        verdict = _curator_verdict_exists(qid, task_text, task_from, by)
+        timed_out = (now - sent_at) > _CURATOR_WAIT_MAX
+        if not verdict and not timed_out:
+            continue  # ещё ждём следующего тика
+        to_remove.append(qid)
+        if verdict:
+            # Куратор ответил — определяем goal_key для поиска followup-задач
+            frm = str(task_from or "")
+            kind, key = "задача", int(str(qid or 0))
+            if frm in (QUEUE_FROM_DEC, QUEUE_FROM_PC_DEC, QUEUE_FROM_PCLOC_DEC):
+                m = _SUMMARY_PARENT_RE.match(str(task_text or ""))
+                if m:
+                    kind, key = "родитель", int(m.group(1))
+            fid = _curator_followup_id(key, by)
+            new_banner = (f"⏳ Куратор поставил продолжение (задача {fid})" if fid is not None
+                          else _build_banner(qid, task_text, task_from, by))
+        else:
+            # Таймаут: closed/сбой — пересчёт плашки по текущему снимку
+            new_banner = _build_banner(qid, task_text, task_from, by)
+        new_text = base_text + "\n" + new_banner
+        markup = _kb_done(qid) if st == "done" else None
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=new_text, reply_markup=markup,
+            )
+        except Exception as e:
+            log.warning("devbot.banner: edit_message_text задача %s упал (%s)", qid, e)
+    for qid in to_remove:
+        _curator_pending.pop(qid, None)
+
+
 async def report_results(context) -> None:
     """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
     Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
@@ -892,6 +936,9 @@ async def report_results(context) -> None:
         _report_seeded = True
         return
 
+    # Редактировать карточки, ожидающие вердикт куратора (если появился)
+    await _check_curator_pending(context, by)
+
     for st, it in finished:
         qid = it.get("id")
         if qid in _reported:
@@ -900,16 +947,31 @@ async def report_results(context) -> None:
         emoji = "✅" if st == "done" else "❌"
         body = it.get("result") or "(пустой результат)"
         rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
-        head = f"{emoji} Задача {qid}{rep} — {st}\n\n{body}"
+        task_text = str(it.get("task_text") or "")
+        task_from = str(it.get("from") or "")
+        banner = _build_banner(qid, task_text, task_from, by)
+        head = f"{emoji} Задача {qid}{rep} — {st}\n\n{body}\n{banner}"
         chunks = _chunks(head)
+        last_msg_obj = None
         for i, chunk in enumerate(chunks):
             kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _item_topic(it), "text": chunk}
             if st == "done" and i == len(chunks) - 1:   # 🔄/📋 только под done, на последнем чанке
                 kw["reply_markup"] = _kb_done(qid)
             try:
-                await context.bot.send_message(**kw)
+                m = await context.bot.send_message(**kw)
+                if i == len(chunks) - 1:
+                    last_msg_obj = m
             except Exception as e:
                 log.warning("devbot.report_results: отправка результата задачи %s упала (%s)", qid, e)
+        # Трекинг ожидания куратора: если показали «оценивает» — редактируем потом
+        _CURATOR_THINKING = "🧭 Куратор оценивает итог — вердикт через ~10с"
+        if banner == _CURATOR_THINKING and last_msg_obj is not None:
+            last_chunk = chunks[-1]
+            base_text = last_chunk.rsplit("\n", 1)[0] if "\n" in last_chunk else last_chunk
+            _curator_pending[qid] = (
+                HQ_CHAT_ID, _item_topic(it), last_msg_obj.message_id,
+                base_text, task_text, task_from, st, time.monotonic(),
+            )
 
     # needs_approval (заход 2б-2): задача упёрлась в красную зону — спрашиваем «да N»/«нет N».
     # БЕЗ seed (незакрытый вопрос после рестарта стоит переспросить); дедуп = _asked в памяти процесса.
@@ -1067,6 +1129,8 @@ def _g_overdue(bridge):
 # авто-сводку НЕ входит (по расписанию не спамим).
 _CURATOR_GOAL_RE = re.compile(r"\[куратор цели (\d+), шаг (\d+)\]")
 _CURATOR_HUMAN_RE = re.compile(r"^\[куратор владельцу цель (\d+)\]")
+_CURATOR_BANNER_RE = re.compile(r"^\[куратор (задача|родитель) (\d+)\]")  # карточка-маркер вердикта
+_SUMMARY_PARENT_RE = re.compile(r"^\[сводка родитель (\d+)\]")            # text цепной сводки
 _CURATOR_DIGEST_STATUSES = ("new", "in_progress", "approved", "needs_approval", "done", "failed")
 _CURATOR_ACTIVE_STATUSES = ("new", "in_progress", "approved")
 _UNSET = object()                           # сентинел «items не передали» (звать опрос самому)
@@ -1175,6 +1239,95 @@ def _curator_digest_render(goals):
     head = ("🧭 кураторские цели (" + str(len(goals)) + "): " +
             " · ".join(f"{k} {v}" for k, v in counts.items() if v))
     return "\n".join([head] + rows)
+
+
+# === Плашка продолжения в done/failed-карточках (задача N) ===
+# Дописывается последней строкой каждой done/failed-карточки devbot.
+# Данные — из ТОГО ЖЕ by-снимка, что report_results (без лишних Bridge-вызовов).
+# Куратор: только для from Filipp-328, -dev, -curator, -dec (vps-цепь);
+#   pc-dec и pcloc-dec НЕ входят (_pc_post_summary куратора не вызывает).
+_CURATOR_ELIGIBLE_FROMS = frozenset([
+    "Filipp-328", "Filipp-328-dev", "Filipp-curator", "Filipp-328-dec",
+])
+
+
+def _curator_on():
+    """Флаг CURATOR=1 в .env. Зеркало orchestrator_daemon._curator_on()."""
+    return str(os.getenv("CURATOR", "0")).strip() == "1"
+
+
+def _curator_verdict_exists(qid, task_text, task_from, by):
+    """Куратор уже вынес вердикт по задаче qid?
+    Одиночка → ищем [куратор задача qid]; цепная сводка (dec) → [куратор родитель PID].
+    Ищем в by["done"] (куратор-карточки — немедленный done synthetic-задачи)."""
+    frm = str(task_from or "")
+    kind, key = "задача", int(str(qid or 0))
+    if frm in (QUEUE_FROM_DEC, QUEUE_FROM_PC_DEC, QUEUE_FROM_PCLOC_DEC):
+        m = _SUMMARY_PARENT_RE.match(str(task_text or ""))
+        if m:
+            kind, key = "родитель", int(m.group(1))
+    for it in by.get("done", []):
+        m = _CURATOR_BANNER_RE.match(str(it.get("task_text") or ""))
+        if m and m.group(1) == kind and int(m.group(2)) == key:
+            return True
+    return False
+
+
+def _curator_followup_id(goal_key, by):
+    """Id первой followup-задачи куратора для цели goal_key (int), или None.
+    Followup-задачи: from=Filipp-curator, text содержит [куратор цели G, шаг m]."""
+    for st in ("new", "in_progress", "approved"):
+        for it in by.get(st, []):
+            if str(it.get("from") or "") != QUEUE_FROM_CURATOR:
+                continue
+            m = _CURATOR_GOAL_RE.search(str(it.get("task_text") or ""))
+            if m and int(m.group(1)) == goal_key:
+                return it.get("id")
+    return None
+
+
+def _build_banner(qid, task_text, task_from, by):
+    """Плашка продолжения для done/failed-карточки задачи qid.
+    Fail-safe: by=None → «недоступно» (НИКОГДА не говорим «завершено» без данных очереди).
+    Порядок приоритетов: недоступно > куратор думает > конверты > активные задачи > завершено."""
+    if by is None:
+        return "⏳ состояние очереди недоступно — набери \"статус\""
+
+    frm = str(task_from or "")
+
+    # Куратор ещё думает?
+    if _curator_on() and frm in _CURATOR_ELIGIBLE_FROMS:
+        if not _curator_verdict_exists(qid, task_text, frm, by):
+            return "🧭 Куратор оценивает итог — вердикт через ~10с"
+
+    # Считаем активные задачи обеих полос из QUEUE_FROMS
+    active_vps, active_pc = [], []
+    for st in ("new", "in_progress", "approved"):
+        for it in by.get(st, []):
+            if str(it.get("from") or "") not in QUEUE_FROMS:
+                continue
+            (active_pc if _is_pc_item(it) else active_vps).append(it)
+
+    n_approval = sum(1 for it in by.get("needs_approval", [])
+                     if str(it.get("from") or "") in QUEUE_FROMS)
+    if n_approval > 0:
+        return f"✋ Ждёт тебя: {n_approval} конвертов"
+
+    total = len(active_vps) + len(active_pc)
+    if total > 0:
+        parts = (([f"vps {len(active_vps)}"] if active_vps else []) +
+                 ([f"pc {len(active_pc)}"] if active_pc else []))
+        ids = (" (" + ", ".join(str(i.get("id")) for i in active_vps + active_pc) + ")"
+               if total <= 3 else "")
+        return f"⏳ Работа продолжается: {total} (🎭 {' · '.join(parts)}){ids}"
+
+    # Проверить кураторские цели через готовый снимок (без Bridge-вызовов)
+    flat = [it for lst in by.values() for it in lst]
+    goals = _curator_goals(None, flat) or {}
+    if any(g["active"] or g["wait"] or g["owner"] for g in goals.values()):
+        return "⏳ Работа продолжается: 0 задач (🧭 куратор активен)"
+
+    return "✅ ВСЁ ЗАВЕРШЕНО — очередь пуста, кураторских целей нет. Это была последняя задача"
 
 
 # === Сводка системы для «статус» (задача 285, 13.07.2026): одна правда «всё ли завершено» ===
