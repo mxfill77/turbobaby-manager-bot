@@ -1334,6 +1334,7 @@ CURATOR_MAX_PER_DAY = 10      # ≤10 куратор-задач/сутки (UTC)
 VERIFIED_FACTS_FILE = os.path.join(REPO, "verified_facts.json")
 VERIFIED_FACTS_LOCK = os.path.join(REPO, "verified_facts.lock")
 FACT_TTL = _env_int("FACT_TTL", 21600)   # 6ч по умолчанию (.env); 0 = всё устаревшее (тест)
+DEDUP_WINDOW = _env_int("DEDUP_WINDOW", 1800)  # 30 мин — окно дедупа followup-проверок куратора
 # Под тест-прогоном (ORCH_DAEMON_TEST/pytest/test_*.py) реестр заглушается: _vf_write — no-op,
 # _vf_check — None. Иначе test_curator_budget/test_curator загрязняли бы production-файл
 # между тест-кейсами. test_verified_facts.py явно снимает флаг + перенаправляет пути в tmpdir.
@@ -1467,6 +1468,76 @@ def _vf_write(key, verdict, task_id):
         return
     if contradiction:
         _vf_contradiction_card(key, contradiction[0], contradiction[1], task_id)
+
+
+# === ДЕДУП FOLLOWUP-ПРОВЕРОК (15.07.2026, наблюдение: цели 82/83 — wa-webhook ×2, цель 73 — DNS ×2)
+# Куратор видит только текущий терминал и не знает, что аналогичная read-only проверка уже
+# выполнена другой задачей за последние 30 мин. Два слоя: (1) промпт-инъекция — куратор получает
+# список недавних done-задач и решает семантически; (2) программный фильтр — нормализованный ключ
+# предложенной задачи совпадает с ключом done-задачи → refused+note. Deploy-контекст (терминал сам
+# был изменением) → дедуп пропускается (проверки после деплоя обязаны быть свежими). FAIL-SAFE везде.
+
+
+def _recent_done_tasks_map(window_sec=None):
+    """Done-задачи из bridge в окне window_sec сек → {normalized_key: task_id}.
+    Fail-safe: {} при ошибке / _VF_DISABLED (под тестом, как и весь VF-блок)."""
+    if _VF_DISABLED:
+        return {}
+    ws = window_sec if window_sec is not None else DEDUP_WINDOW
+    try:
+        r = bc.get_pending("done")
+        if not r.get("ok"):
+            return {}
+        out = {}
+        for it in r.get("items", []):
+            age = _age_sec(it.get("updated"))  # _age_sec определена ниже по файлу — OK, Python резолвит при вызове
+            if age is None or age >= ws:
+                continue
+            k = _vf_normalize(it.get("task_text", ""))
+            if k:
+                out[k] = it.get("id")
+        return out
+    except Exception as e:
+        log.warning("recent_done_map: ошибка (%s) — fail-safe {}", e)
+        return {}
+
+
+_DEPLOY_CTX_RE = re.compile(
+    r"(?i)(деплой|deploy|clasp\s+redeploy|git\s+push|рестарт\s+splinter|рестарт\s+демон"
+    r"|restart\s+splinter|перезапустил|задеплоил|новая\s+версия|коммит|commit\b)")
+
+
+def _is_deploy_context(goal, result):
+    """True если терминал — деплой/код-изменение/рестарт. В таком контексте
+    followup-проверки обязаны быть свежими, дедуп не применяется."""
+    return bool(_DEPLOY_CTX_RE.search(str(goal or "") + " " + str(result or "")))
+
+
+def _followup_dedup(tasks, goal="", result=""):
+    """Фильтрует предложенные followup-задачи против недавних done-задач (DEDUP_WINDOW).
+    Deploy-контекст → пропуск дедупа (проверки после изменений должны быть свежими).
+    Возврат (remaining, refused): refused = [(task_text, reason), ...].
+    Fail-safe: (tasks, []) при любой ошибке или _VF_DISABLED."""
+    if _VF_DISABLED or _is_deploy_context(goal, result):
+        return tasks, []
+    try:
+        done_map = _recent_done_tasks_map(DEDUP_WINDOW)
+        if not done_map:
+            return tasks, []
+        remaining, refused = [], []
+        for t in tasks:
+            k = _vf_normalize(t)
+            if k and k in done_map:
+                did = done_map[k]
+                refused.append((t, f"проверка уже выполнена задачей {did}"))
+            else:
+                remaining.append(t)
+        return remaining, refused
+    except Exception as e:
+        log.warning("followup_dedup: ошибка (%s) — fail-safe (все задачи без фильтра)", e)
+        return tasks, []
+
+
 CURATOR_PREAMBLE = (
     "Ты — куратор целей оркестратора TurboBaby (мета-дирижёр). Headless-задача завершилась — "
     "сверь ИСХОДНУЮ ЦЕЛЬ с итогом исполнителя и реши, закрыта ли цель. Ты НИЧЕГО не исполняешь, "
@@ -1545,10 +1616,21 @@ def _curator_consult(goal, result):
     код ведёт себя как при CURATOR=0."""
     res = str(result or "").strip()
     summary = (res.splitlines() or ["(итог пуст)"])[0][:400] or "(итог пуст)"
+    # Промпт-инъекция: недавние done-задачи (DEDUP_WINDOW) — куратор решает семантически,
+    # не ставить ли дублирующую проверку. Пуст при _VF_DISABLED (тесты) или нет свежих задач.
+    recent_map = _recent_done_tasks_map(DEDUP_WINDOW)
+    if recent_map:
+        lines = [f"  - задача {tid}: {key[:80]}" for key, tid in list(recent_map.items())[:12]]
+        recent_ctx = ("\n\nНЕДАВНО ВЫПОЛНЕННЫЕ ЗАДАЧИ (окно 30 мин):\n" + "\n".join(lines) +
+                      "\nЕсли предлагаемый followup по смыслу дублирует задачу выше — "
+                      "не включай его в tasks (верни closed или исключи из tasks).\n")
+    else:
+        recent_ctx = ""
     prompt = (CURATOR_PREAMBLE +
               f"ИСХОДНАЯ ЦЕЛЬ (дословно):\n{str(goal or '').strip()[:1500]}\n\n"
               f"ИТОГ/СВОДКА ИСПОЛНИТЕЛЯ:\n{summary}\n\n"
-              f"СЕКЦИИ ХВОСТОВ ИЗ ИТОГА:\n{_curator_tails(res)}\n")
+              f"СЕКЦИИ ХВОСТОВ ИЗ ИТОГА:\n{_curator_tails(res)}\n"
+              + recent_ctx)
     out = _thinker_exec(prompt, CURATOR_TIMEOUT, "curator")
     if out is None:
         return None
@@ -1820,6 +1902,20 @@ def _maybe_curator(kind, key, goal, result):
             log.info("curator: %s %s → %s (тишина)", kind, key,
                      v["verdict"] if v else "сбой думателя")
             return
+        # Дедуп followup-проверок (программный фильтр поверх промпт-инъекции):
+        # предложенные задачи, дублирующие недавние done (DEDUP_WINDOW) → refused+note.
+        # Deploy-контекст → пропуск дедупа (_followup_dedup проверяет сам).
+        pre_refused = []
+        if v["verdict"] == "followup":
+            remaining, pre_refused = _followup_dedup(v["tasks"], goal, result)
+            if not remaining:
+                log.info("curator: %s %s followup→closed (все %d задач дедуплицированы окном %ss)",
+                         kind, key, len(pre_refused), DEDUP_WINDOW)
+                return
+            if pre_refused:
+                v = dict(v, tasks=remaining)
+                log.info("curator: %s %s %d/%d followup-задач дедуплицированы (окно %ss)",
+                         kind, key, len(pre_refused), len(pre_refused) + len(remaining), DEDUP_WINDOW)
         # Карточка-маркер дедупа встаёт ПЕРВОЙ, продолжения ставятся МЕЖДУ её enqueue и
         # complete: упади демон посреди — сирота доводится (process_new), консультация не
         # повторяется, продолжения не задваиваются.
@@ -1832,6 +1928,8 @@ def _maybe_curator(kind, key, goal, result):
         sid = r.get("id")
         bc.claim_task(sid)        # даже если claim не прошёл — complete финализирует
         spawn = _curator_spawn(kind, key, goal, v["tasks"]) if v["verdict"] == "followup" else None
+        if spawn and pre_refused:
+            spawn = dict(spawn, refused=spawn["refused"] + pre_refused)
         hum = None
         if v["verdict"] == "human":
             # ветка human (шаг 4/7): задач НЕ ставим — пункт в сводную карточку владельцу
