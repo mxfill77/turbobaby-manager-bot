@@ -25,6 +25,8 @@ import re
 import subprocess
 import datetime
 import time
+import urllib.request
+import urllib.error
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(ROOT, "splinter.log")
@@ -192,11 +194,76 @@ def check_commit():
     return (bool(out), out or "git недоступен")
 
 
-def check_wa_webhook():
-    """Optional WA-0 health check: service state + pending queue size.
+# ─── WA-0 watchdog helpers ────────────────────────────────────────────────────
+# State file tracking consecutive probe failures for the watchdog.
+# Reset on successful probe; on N consecutive failures → auto-restart.
+_WA_PROBE_FAIL_FILE = os.path.join(ROOT, ".wa_watchdog_fails")
+_WA_WATCHDOG_THRESHOLD = 2   # consecutive probe failures that trigger auto-restart
 
-    Skipped (returns None, info-string) when WA_VERIFY_TOKEN is not set in .env —
-    so health report stays clean until WA is actually configured.
+
+def _wa_probe(port: int, verify_token: str, timeout: float = 6.0):
+    """Real HTTP GET handshake: GET /wa-webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=probe42.
+    Returns (ok:bool, detail:str).  Port-probe alone is unreliable (incident 15.07: TCP open, HTTP hung)."""
+    challenge = "probe42"
+    url = ("http://127.0.0.1:" + str(port)
+           + "/wa-webhook?hub.mode=subscribe&hub.verify_token=" + verify_token
+           + "&hub.challenge=" + challenge)
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(256).decode("utf-8", errors="replace")
+            if resp.status == 200 and challenge in body:
+                return True, "handshake " + str(resp.status) + "/" + challenge
+            return False, "bad resp " + str(resp.status) + " " + repr(body[:40])
+    except urllib.error.HTTPError as e:
+        return False, "HTTP " + str(e.code)
+    except Exception as e:
+        return False, type(e).__name__
+
+
+def _wa_watchdog_count():
+    """Return consecutive probe-failure count from state file (0 if missing/unreadable)."""
+    try:
+        with open(_WA_PROBE_FAIL_FILE, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def _wa_watchdog_set(n: int):
+    try:
+        with open(_WA_PROBE_FAIL_FILE, "w", encoding="utf-8") as f:
+            f.write(str(n))
+    except Exception:
+        pass
+
+
+def _wa_watchdog_reset():
+    try:
+        os.remove(_WA_PROBE_FAIL_FILE)
+    except Exception:
+        pass
+
+
+def _wa_restart_unit():
+    """systemctl restart wa-webhook. Returns True on success (returncode==0)."""
+    try:
+        r = subprocess.run(["systemctl", "restart", "wa-webhook"],
+                           capture_output=True, text=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def check_wa_webhook():
+    """WA-0 health check: service state + real HTTP handshake probe + watchdog.
+
+    Skipped (returns None, info-string) when WA_VERIFY_TOKEN is not set in .env.
+
+    Port-level liveness check is insufficient — the incident of 15.07 proved that
+    TCP accepted connections while the HTTP layer was completely hung.  This probe
+    does a real GET handshake and, on _WA_WATCHDOG_THRESHOLD consecutive failures,
+    auto-restarts the unit (logged in the health report).
     """
     try:
         from dotenv import load_dotenv
@@ -207,7 +274,7 @@ def check_wa_webhook():
         return None, "не настроен (WA_VERIFY_TOKEN не задан)"
 
     state = _run(["systemctl", "is-active", "wa-webhook"])
-    ok = (state == "active")
+    svc_ok = (state == "active")
 
     q_info = ""
     try:
@@ -224,8 +291,35 @@ def check_wa_webhook():
     except Exception as e:
         q_info = ", db err=" + type(e).__name__
 
-    detail = state + (q_info if ok else "")
-    return ok, detail
+    if not svc_ok:
+        _wa_watchdog_reset()
+        return False, state + q_info
+
+    # Real HTTP handshake probe (port-probe lied: TCP open ≠ HTTP responds, incident 15.07)
+    port = int(os.environ.get("WA_WEBHOOK_PORT", "8765"))
+    verify_token = os.environ.get("WA_VERIFY_TOKEN", "")
+    probe_ok, probe_detail = _wa_probe(port, verify_token)
+
+    # Watchdog: track consecutive failures; restart on threshold
+    watchdog_note = ""
+    if probe_ok:
+        _wa_watchdog_reset()
+    else:
+        fails = _wa_watchdog_count() + 1
+        _wa_watchdog_set(fails)
+        if fails >= _WA_WATCHDOG_THRESHOLD:
+            restarted = _wa_restart_unit()
+            if restarted:
+                _wa_watchdog_reset()
+                watchdog_note = " — ⚠️ wa-webhook перезапущен вотчдогом"
+            else:
+                watchdog_note = " — ⚠️ вотчдог: рестарт не удался"
+
+    if probe_ok:
+        detail = state + ", " + probe_detail + q_info
+    else:
+        detail = state + ", PROBE FAIL: " + probe_detail + watchdog_note + q_info
+    return probe_ok, detail
 
 
 def check_brain_latency():

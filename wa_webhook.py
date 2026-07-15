@@ -34,7 +34,7 @@ import sqlite3
 import logging
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -298,6 +298,10 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
     our_phone: str = ""
     db: WAQueueDB = None
 
+    # Socket r/w timeout per request — a slow/stalled client closes the connection
+    # rather than holding the thread indefinitely (incident 15.07: TCP open, HTTP hung).
+    timeout = 10
+
     def log_message(self, fmt, *args):
         log.debug("WA HTTP: " + fmt, *args)
 
@@ -350,8 +354,15 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             self._send(400, "Bad request")
             return
 
-        # WA requires 200 within 5s — acknowledge immediately, process after
+        # Respond 200 immediately and flush — Meta retries if we exceed ~5s.
+        # Processing (normalise + enqueue) happens AFTER the flush in this thread;
+        # ThreadingHTTPServer gives each request its own thread, so a slow enqueue
+        # never blocks other incoming connections (incident 15.07).
         self._send(200, "ok")
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
 
         try:
             events = normalize_wa_payload(payload, our_phone_number=self.our_phone)
@@ -366,8 +377,12 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
 
 # ─── server bootstrap ─────────────────────────────────────────────────────────────────
 
-def make_server(env: dict) -> HTTPServer:
-    """Configure and return an HTTPServer with WAWebhookHandler."""
+def make_server(env: dict) -> ThreadingHTTPServer:
+    """Configure and return a ThreadingHTTPServer with WAWebhookHandler.
+
+    ThreadingHTTPServer spawns a daemon thread per request so a slow/hung
+    client or a slow db.enqueue() never blocks other incoming connections.
+    """
     db = WAQueueDB(env["queue_db"])
 
     class _Handler(WAWebhookHandler):
@@ -378,7 +393,8 @@ def make_server(env: dict) -> HTTPServer:
     _Handler.our_phone    = env["phone_id"]
     _Handler.db           = db
 
-    server = HTTPServer(("0.0.0.0", env["port"]), _Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", env["port"]), _Handler)
+    server.daemon_threads = True
     return server
 
 

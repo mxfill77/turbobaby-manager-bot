@@ -142,7 +142,7 @@ class _FakeWFile:
     def write(self, data):
         self._buf += data
 
-    def flush(self):
+    def flush(self):  # called by do_POST after _send(200) to push bytes before processing
         pass
 
 
@@ -495,6 +495,246 @@ def test_verify_signature_empty_secret_dev_mode():
     ok(wh.verify_signature(b"anything", "sha256=bad", ""), "empty secret → True even w/ bad sig")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Concurrency — ThreadingHTTPServer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_make_server_is_threaded():
+    """make_server() returns ThreadingHTTPServer with daemon_threads=True."""
+    from http.server import ThreadingHTTPServer
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    env = {"verify_token": "tok", "app_secret": "", "phone_id": "",
+           "port": 0, "queue_db": db_path}
+    server = wh.make_server(env)
+    try:
+        ok(isinstance(server, ThreadingHTTPServer), "make_server → ThreadingHTTPServer")
+        ok(getattr(server, "daemon_threads", False) is True, "daemon_threads=True")
+    finally:
+        server.server_close()
+        try:
+            os.remove(db_path)
+        except Exception:
+            pass
+
+
+def test_200_before_db_write():
+    """200 is sent and flushed before db.enqueue(); an enqueue error doesn't change the 200."""
+    class _FailDB:
+        def enqueue(self, events):
+            raise RuntimeError("simulated db failure")
+        def count_pending(self):
+            return 0
+
+    payload = _make_text_payload()
+    body = json.dumps(payload).encode()
+    sig = _sign(body)
+    h = _make_handler("POST", "/wa-webhook", body,
+                      headers={"Content-Length": str(len(body)),
+                               "X-Hub-Signature-256": sig},
+                      db=_FailDB())
+    _dispatch(h)
+    ok(h._resp_code == 200, "200 sent even when db.enqueue raises after response")
+    ok(b"ok" in h._wfile._buf, "response body 'ok' in buffer before db error")
+
+
+def test_parallel_requests_no_blocking():
+    """ThreadingHTTPServer: fast GET completes while a slow POST enqueue runs in its thread."""
+    import urllib.request as _ur
+    from http.server import ThreadingHTTPServer
+
+    fast_done = threading.Event()
+    slow_started = threading.Event()
+
+    class _SlowDB:
+        def enqueue(self, events):
+            slow_started.set()
+            fast_done.wait(timeout=4)  # block until GET completes
+            return 1
+        def count_pending(self):
+            return 0
+
+    class _H(wh.WAWebhookHandler):
+        pass
+    _H.verify_token = "tok"
+    _H.app_secret = ""
+    _H.our_phone = ""
+    _H.db = _SlowDB()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    server.daemon_threads = True
+    port = server.server_address[1]
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+
+    payload = _make_text_payload()
+    body = json.dumps(payload).encode()
+
+    post_status = {}
+    def _post():
+        try:
+            req = _ur.Request(
+                "http://127.0.0.1:" + str(port) + "/wa-webhook",
+                data=body,
+                method="POST",
+                headers={"Content-Length": str(len(body))}
+            )
+            with _ur.urlopen(req, timeout=8) as resp:
+                post_status["code"] = resp.status
+        except Exception as e:
+            post_status["err"] = str(e)
+
+    post_t = threading.Thread(target=_post, daemon=True)
+    post_t.start()
+
+    slow_started.wait(timeout=3)  # wait for slow enqueue to start
+
+    # Now send a fast GET while slow POST enqueue is blocking
+    get_status = {}
+    t0 = time.time()
+    try:
+        url = ("http://127.0.0.1:" + str(port)
+               + "/wa-webhook?hub.mode=subscribe&hub.verify_token=tok&hub.challenge=FAST42")
+        with _ur.urlopen(url, timeout=5) as resp:
+            gbody = resp.read().decode()
+            get_status["code"] = resp.status
+            get_status["body"] = gbody
+    except Exception as e:
+        get_status["err"] = str(e)
+    get_elapsed = time.time() - t0
+
+    fast_done.set()      # release slow enqueue
+    post_t.join(timeout=5)
+    server.shutdown()
+
+    ok(get_status.get("code") == 200,
+       "fast GET returns 200 while slow enqueue blocks in its thread (code=" + str(get_status.get("code")) + ")")
+    ok("FAST42" in get_status.get("body", ""),
+       "fast GET challenge echoed: " + repr(get_status.get("body", "")[:20]))
+    ok(get_elapsed < 2.0,
+       "fast GET completed in " + ("%.2f" % get_elapsed) + "s (parallel, not waiting for enqueue)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Health probe + watchdog
+# ─────────────────────────────────────────────────────────────────────────────
+
+import urllib.parse as _up
+
+def test_wa_probe_ok():
+    """_wa_probe returns True when a real server responds with the challenge."""
+    import urllib.parse as _up2
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+    import health as _health
+
+    class _MockH(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args): pass
+        def do_GET(self):
+            q = _up2.parse_qs(_up2.urlparse(self.path).query)
+            ch = (q.get("hub.challenge") or [""])[0]
+            mode = (q.get("hub.mode") or [""])[0]
+            tok = (q.get("hub.verify_token") or [""])[0]
+            if mode == "subscribe" and tok == "tok":
+                enc = ch.encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(enc)))
+                self.end_headers()
+                self.wfile.write(enc)
+            else:
+                self.send_response(403)
+                self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _MockH)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+
+    result, detail = _health._wa_probe(port, "tok", timeout=3)
+    srv.shutdown()
+
+    ok(result is True, "probe OK when server responds to handshake: " + detail)
+
+
+def test_wa_probe_hung():
+    """_wa_probe returns False when server accepts TCP but never sends HTTP response."""
+    import socket as _sk
+
+    srv = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+    srv.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def _absorb():
+        try:
+            conn, _ = srv.accept()
+            time.sleep(2)   # accept but don't reply
+            conn.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=_absorb, daemon=True).start()
+
+    import health as _health
+    result, detail = _health._wa_probe(port, "tok", timeout=0.5)
+    srv.close()
+
+    ok(result is False, "probe fails when server accepts TCP but doesn't respond: " + detail)
+
+
+def test_watchdog_count_and_reset():
+    """_wa_watchdog_count/_set/_reset manage the state file correctly."""
+    import health as _health
+
+    orig_file = _health._WA_PROBE_FAIL_FILE
+    fd, tmp = tempfile.mkstemp(suffix=".wdog")
+    os.close(fd)
+    os.remove(tmp)
+    _health._WA_PROBE_FAIL_FILE = tmp
+    try:
+        ok(_health._wa_watchdog_count() == 0, "fresh state: count=0 (file absent)")
+        _health._wa_watchdog_set(1)
+        ok(_health._wa_watchdog_count() == 1, "count=1 after _wa_watchdog_set(1)")
+        _health._wa_watchdog_reset()
+        ok(_health._wa_watchdog_count() == 0, "count=0 after _wa_watchdog_reset()")
+    finally:
+        _health._WA_PROBE_FAIL_FILE = orig_file
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
+def test_watchdog_increments_on_consecutive_failures():
+    """Watchdog state file increments on each probe failure, resets on success."""
+    import health as _health
+
+    orig_file = _health._WA_PROBE_FAIL_FILE
+    fd, tmp = tempfile.mkstemp(suffix=".wdog2")
+    os.close(fd)
+    os.remove(tmp)
+    _health._WA_PROBE_FAIL_FILE = tmp
+    try:
+        _health._wa_watchdog_reset()
+        fails1 = _health._wa_watchdog_count() + 1
+        _health._wa_watchdog_set(fails1)
+        ok(fails1 == 1, "first failure: count=1")
+
+        fails2 = _health._wa_watchdog_count() + 1
+        _health._wa_watchdog_set(fails2)
+        ok(fails2 == 2, "second failure: count=2 (= threshold)")
+
+        _health._wa_watchdog_reset()
+        ok(_health._wa_watchdog_count() == 0, "after reset (simulate restart): count=0")
+    finally:
+        _health._WA_PROBE_FAIL_FILE = orig_file
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
 # ─── runner ───────────────────────────────────────────────────────────────────
 
 def _run_all():
@@ -522,6 +762,15 @@ def _run_all():
         test_verify_signature_wrong_secret,
         test_verify_signature_tampered_body,
         test_verify_signature_empty_secret_dev_mode,
+        # 7. Concurrency
+        test_make_server_is_threaded,
+        test_200_before_db_write,
+        test_parallel_requests_no_blocking,
+        # 8. Health probe + watchdog
+        test_wa_probe_ok,
+        test_wa_probe_hung,
+        test_watchdog_count_and_reset,
+        test_watchdog_increments_on_consecutive_failures,
     ]
     for t in tests:
         try:
