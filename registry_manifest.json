@@ -22,7 +22,7 @@
     {"name": "rules", "purpose": "KB_RULES — свод правил работы (маршрутизация, гигиена штаба, Dispatch ASK-строки)", "status": "active"},
     {"name": "infra", "purpose": "KB_INFRA — свод карты инфраструктуры таблиц (форма→клиенты→Байки, формулы CRM/Байки, прайсы, формы Apps Script)", "status": "active"},
     {"name": "state_model", "purpose": "KB_STATE_MODEL — свод модели состояний байка, цикл бронь→аренда→возврат", "status": "active"},
-    {"name": "roadmap_master", "purpose": "KB_ROADMAP_MASTER — расширенный backlog P1-P11, детальный план-лист локальных задач", "status": "active"},
+    {"name": "roadmap_master", "purpose": "KB_ROADMAP_MASTER — расширенный backlog P1-P11, детальный план-лист локальных задач", "status": "archive"},
     {"name": "executors_map", "purpose": "KB_executors_map — кто что может (полная версия раздела 2)", "status": "active"},
     {"name": "orchestrator_plan", "purpose": "KB_ORCHESTRATOR_PLAN — лестница оркестратора-дирижёра", "status": "active"},
     {"name": "orchestrator_safety", "purpose": "KB_ORCHESTRATOR_SAFETY — границы и безопасность оркестратора", "status": "active"},
