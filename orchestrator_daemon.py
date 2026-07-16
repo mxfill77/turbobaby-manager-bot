@@ -60,6 +60,17 @@ TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагн
 # (404/timeout Bridge) → демон задачу «пропустил», а подобрать некому — висела бы вечно. Реапер:
 # in_progress полосы vps с updated старше ORPHAN_TTL → честный failed (см. process_orphans).
 ORPHAN_TTL = _env_int("ORPHAN_TTL", 600)
+# ГЕЙТ ПАМЯТИ (16.07.2026, OOM-инцидент 05:27 UTC): перед стартом claude -p (шаг/одиночка)
+# проверяем MemAvailable; дефицит → задача ждёт в new, не started и не failed.
+# MEM_MIN_MB=0 → гейт выключен полностью (off в баннере).
+# Fail-safe: /proc/meminfo нечитаем → гейт пропускается, прежнее поведение.
+try:
+    _raw_mem = str(os.environ.get("MEM_MIN_MB") or "").strip()
+    MEM_MIN_MB = max(0, int(_raw_mem)) if _raw_mem else 700
+except (ValueError, TypeError):
+    MEM_MIN_MB = 700
+MEM_RETRY_SEC = _env_int("MEM_RETRY_SEC", 120)   # cooldown после детекта дефицита, сек
+_mem_wait_until = 0.0                              # monotonic: до этого момента не берём задачи
 DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очереди (devbot кладёт Filipp-328-dev)
 DEC_FROM_SUFFIX = "-dec" # метка декомпозиции (ступень 2 часть C; devbot кладёт Filipp-328-dec):
                          # родитель «декомпозируй:» + его шаги + synthetic-сводка — всё под этой меткой
@@ -262,6 +273,41 @@ def _restart_probe():
 def _restart_pending():
     """True → отложенный плановый рестарт демона ЖИВ в systemd (слой 1: пауза приёма new)."""
     return _restart_probe()[1]
+
+
+def _mem_available_mb():
+    """MemAvailable из /proc/meminfo в МБ. None при любой ошибке чтения (fail-safe)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return None
+
+
+def _mem_gate_check():
+    """Гейт памяти перед стартом claude -p.
+    True  = дефицит (не берём задачу, она остаётся в new).
+    False = памяти достаточно / /proc/meminfo нечитаем (fail-safe) / MEM_MIN_MB=0 (выключен)."""
+    global _mem_wait_until
+    if MEM_MIN_MB <= 0:
+        return False
+    now = time.monotonic()
+    if now < _mem_wait_until:
+        log.info("⏳ ждёт памяти: cooldown %ds — задачи ждут в new (порог=%dМБ)",
+                 int(_mem_wait_until - now), MEM_MIN_MB)
+        return True
+    mb = _mem_available_mb()
+    if mb is None:
+        return False  # fail-safe: /proc/meminfo нечитаем → гейт пропускается
+    if mb >= MEM_MIN_MB:
+        return False
+    _mem_wait_until = now + MEM_RETRY_SEC
+    log.warning("⏳ ждёт памяти: свободно %dМБ < %dМБ — задача ждёт в new, ретрай через %ds",
+                mb, MEM_MIN_MB, MEM_RETRY_SEC)
+    return True
 
 
 def _planned_restart_verdict(rc, task_text, t0_mono):
@@ -2743,6 +2789,9 @@ def process_new():
         log.info("пауза приёма: жду планового рестарта демона (systemd-run-единица жива) — "
                  "%d задач(и) ждут в new", len(items))
         return
+    # ГЕЙТ ПАМЯТИ: свободно < MEM_MIN_MB → задача ждёт в new (не failed, не потеряна)
+    if _mem_gate_check():
+        return
     # FIFO: get_pending отдаёт newest-first → берём наименьший id (старейшую задачу) первым.
     # Шаг декомпозиции, чей сиблинг ждёт (needs_approval/approved/in_progress), пропускаем —
     # НЕ блокируя чужие задачи дальше по очереди (guard последовательности цепочки).
@@ -2879,13 +2928,15 @@ def cycle():
 
 
 def main():
+    _banner_avail = _mem_available_mb() or 0
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
              "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, gate_single_sel=%s, "
-             "fact_ttl=%ss, model=%s, executor_model=%s) ===",
+             "fact_ttl=%ss, model=%s, executor_model=%s, mem_gate=%s(min=%dMB avail=%dMB)) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
              int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), int(_curator_scope_on()),
              int(_gate_single_selective_on()),
-             FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL)
+             FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL,
+             "on" if MEM_MIN_MB > 0 else "off", MEM_MIN_MB, _banner_avail)
     while _running:
         try:
             cycle()
