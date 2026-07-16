@@ -58,6 +58,8 @@ DAILY_MINUTE = int(os.getenv("DAILY_PULSE_MINUTE", "0"))
 AUDIT_CHAT_ID = int(os.getenv("AUDIT_CHAT_ID", "0"))     # форум HQ (TurboControl)
 AUDIT_THREAD_ID = int(os.getenv("AUDIT_THREAD_ID", "0")) # тема «Аудит» внутри форума (0 = весь чат)
 AUDIT_GROUPS = [g.strip() for g in os.getenv("AUDIT_GROUPS", "").split(",") if g.strip()]
+# Инбокс для эскалации contradiction/high (INBOX_TOPIC_ID из .env); 0 = выключен → fallback к AUDIT_THREAD_ID
+AUDIT_INBOX_TOPIC_ID = int(os.getenv("INBOX_TOPIC_ID", "0") or 0)
 
 # === Логирование ===
 logging.basicConfig(
@@ -106,6 +108,8 @@ else:
 _audit_cards = {}
 _audit_seq = [0]
 _audit_pending_edit = {}   # {audit_chat_id: token} — ждём текст нового правила от Филиппа
+# Дедуп contradiction/high в инбокс: fingerprint = (chat_id, topic_id, detail[:80])
+_audit_high_dedup: set = set()
 # Сильные ссылки на фоновые задачи аудита — иначе GC может убить задачу на await
 # (asyncio держит на task только слабую ссылку). add_done_callback(discard) чистит набор.
 _bg_tasks = set()
@@ -122,9 +126,22 @@ ALBUM_WINDOW = 1.8       # окно склейки альбома, сек
 
 
 async def post_audit_card(context, card: dict):
-    """Отправить карточку странности в группу «Аудит» с кнопками 👍/✏️/👎."""
+    """Отправить карточку странности в группу «Аудит» с кнопками 👍/✏️/👎.
+    Класс F: verdict=contradiction + severity=high → эскалация в тему-инбокс 1160
+    (AUDIT_INBOX_TOPIC_ID) с дедупом по fingerprint(chat_id, topic_id, detail[:80]).
+    Fail-safe: инбокс выключен/недоступен → прежняя тема «Аудит» 161."""
     if not AUDIT_CHAT_ID or not card:
         return
+
+    # Дедуп для contradiction/high: не слать повтор одного и того же в инбокс
+    inbox_escalate = bool(card.get("inbox_escalate")) and bool(AUDIT_INBOX_TOPIC_ID)
+    if inbox_escalate:
+        fp = (card.get("chat_id"), card.get("topic_id"), str(card.get("detail", ""))[:80])
+        if fp in _audit_high_dedup:
+            log.info(f"  🔎 АУДИТ: дедуп contradiction/high — карточка уже отправлена {fp}")
+            return
+        _audit_high_dedup.add(fp)
+
     _audit_seq[0] += 1
     token = _audit_seq[0]
     _audit_cards[token] = card
@@ -141,6 +158,18 @@ async def post_audit_card(context, card: dict):
         InlineKeyboardButton("👎 отклонить", callback_data=f"aud:no:{token}"),
     ]])
     kw = {"chat_id": AUDIT_CHAT_ID, "text": text, "reply_markup": kb}
+    if inbox_escalate:
+        # Класс F: contradiction/high → инбокс владельца (тема 1160)
+        kw["message_thread_id"] = AUDIT_INBOX_TOPIC_ID
+        try:
+            await context.bot.send_message(**kw)
+            log.info(f"  🔎 АУДИТ: ✅ contradiction/HIGH → инбокс {AUDIT_INBOX_TOPIC_ID} "
+                     f"(chat {AUDIT_CHAT_ID}), token={token}")
+            return
+        except Exception as e:
+            # Fail-safe: инбокс недоступен → прежняя тема «Аудит»
+            log.warning(f"post_audit_card inbox error (fallback to audit thread): {e}")
+            kw.pop("message_thread_id", None)
     if AUDIT_THREAD_ID:                      # шлём в тему «Аудит», не в General форума
         kw["message_thread_id"] = AUDIT_THREAD_ID
     try:

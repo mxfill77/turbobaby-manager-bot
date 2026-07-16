@@ -325,6 +325,8 @@ class Auditor:
                     "chat_id": chat_id,            # где найдена странность (аудируемая группа)
                     "topic_id": topic_id,
                     "audit_thread_id": self.audit_thread_id,  # куда слать карточку (тема Аудит)
+                    # escalate contradiction/high → инбокс владельца (INBOX_TOPIC_ID)
+                    "inbox_escalate": (result["verdict"] == "contradiction" and result["severity"] == "high"),
                 }
         except Exception as e:
             log.warning(f"auditor.review_logic error: {e}")
