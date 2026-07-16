@@ -60,6 +60,7 @@ def reset():
     SENDS.clear(); S._SVC_TOKENS.clear(); S._AWAITING_REPLY.clear()
     S._RECENT_PHOTOS.clear(); S._PENDING_WORKS.clear(); S._ODOMETER_ASK_TS.clear()
     S._SP_ASK_TS.clear(); S._SP_LAST_SENT.clear()   # E4/B5 in-memory троттлы — чистим между тестами
+    S._SVC_WRITE_DEDUP.clear()   # E (класс E): дедуп-стор — чистим между тестами
     S._TOPIC_BIKE_OVERRIDE[(CHAT, TOPIC)] = BIKE
     S._TOPIC_NAMES[(CHAT, TOPIC)] = BIKE
 

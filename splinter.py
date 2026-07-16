@@ -4671,6 +4671,9 @@ _SP_RECENT_CLOSE_MIN = 15       # E2a: окно «недавно закрыта 
 _SP_BARE_CONFIRM = {"да", "ок", "окей", "угу", "ага", "yes", "ok", "okay", "готово", "принято", "+", "👍"}
 _SP_ASK_TS = {}                 # E4: in-memory троттл переспросов фазы-2 (key=(chat,topic) → ts последнего ask)
 _SP_ASK_THROTTLE_SEC = 90       # E4: не переспрашивать чаще, чем раз в N сек на тему
+# E (класс E): дедуп записи в Лист1 — повтор тройки (plate, service_type, km) в окне → без второй строки
+_SVC_WRITE_DEDUP = {}           # (plate_or_bike, kind, km_int) -> ts последней успешной записи
+_SVC_DEDUP_WIN_SEC = int(os.getenv("SERVICE_DEDUP_WIN_MIN", "60")) * 60
 
 # B2: маркеры «работа завершена» (ДОВОДЯТ заявку к гейту Пыма, САМИ в Лист1 НЕ пишут).
 # Длинные/distinctive — подстрокой; короткие/неоднозначные (да/ок/все) — ТОЛЬКО как целое слово (без ложных срабатываний).
@@ -5116,6 +5119,19 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     for k in done:
         try:
             if k in _SP_COL_KINDS:
+                # Класс E дедуп: повтор той же тройки (plate, kind, km) в окне → пропустить запись в Лист1
+                _dedup_key = (plate or bike, k, odo_int)
+                try:
+                    _prev_ts = _SVC_WRITE_DEDUP.get(_dedup_key)
+                    if _prev_ts is not None and _time.time() - _prev_ts < _SVC_DEDUP_WIN_SEC:
+                        log.info(
+                            f"  → дедуп ТО: {bike} {k} {odo_int} км — повтор в окне"
+                            f" {_SVC_DEDUP_WIN_SEC // 60} мин, запись пропущена"
+                        )
+                        written.append(k)
+                        continue
+                except Exception:
+                    log.exception("  → дедуп ТО: стор сбоил — fail-safe, пишем как обычно")
                 iv = _service_interval(k, bike, bridge) or 4000
                 if k == "oil":
                     r = bridge.set_fleet_oil(number=plate, oil_km=odo_int, confirmed=True)
@@ -5124,6 +5140,10 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                 if r.get("ok"):
                     bridge.service_upsert(bike=bike, service_type=k, current_km=odo_int,
                                           last_service_km=odo_int, interval_km=iv)
+                    try:
+                        _SVC_WRITE_DEDUP[_dedup_key] = _time.time()
+                    except Exception:
+                        pass
                     written.append(k)
                 else:
                     failed.append((k, r.get("error")))
