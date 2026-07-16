@@ -30,19 +30,60 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from bridge_client import BridgeClient
 
 TYPES = ("DONE", "PLAN", "NOTE", "BLOCKED", "WAITING", "SKIPPED")
+_RELAY_KINDS = frozenset(TYPES)
 
-# Канонический паттерн одной записи (используется тестами)
+# Канонический паттерн одной записи (используется тестами).
+# Допускает оба источника: «(Termux)» (прямая запись) и «(headless via Termux)» (ретрансляция).
 ENTRY_RE = re.compile(
-    r"^(?:DONE|PLAN|NOTE|BLOCKED|WAITING|SKIPPED) \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \(Termux\): .+$"
+    r"^(?:DONE|PLAN|NOTE|BLOCKED|WAITING|SKIPPED) \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC "
+    r"\((?:Termux|headless via Termux)\): .+$"
 )
 
 
+def _relay_payload(text: str):
+    """Класс 1+3: определить, является ли text ретрансляцией готовой cc_log-записи.
+    Признак: text начинается с KIND-ключевого слова (DONE|PLAN|...).
+    Возвращает payload (строка после первого «: » в теле) — или None, если не ретрансляция.
+    Пустой payload → fallback на всё тело после KIND-слова.
+    Обратная совместимость: нормальный текст (не начинается с KIND) — None, без изменений."""
+    first_space = text.find(" ")
+    if first_space <= 0:
+        return None
+    if text[:first_space].upper() not in _RELAY_KINDS:
+        return None
+    after_kind = text[first_space + 1:]
+    sep = after_kind.find(": ")
+    payload = after_kind[sep + 2:] if sep != -1 else after_kind
+    clean = payload.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+    if not clean:
+        clean = after_kind.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+    return clean or None
+
+
+def _ensure_pulse_hhmm(pulse: str, now=None) -> str:
+    """Класс 2: гарантировать Ч:ММ в пульс-строке.
+    Если строка начинается с YYYY-MM-DD без H:MM — инжектировать H:MM после даты.
+    Если H:MM уже есть или строка не начинается с даты — вернуть без изменений."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    if re.match(r"^\d{4}-\d{2}-\d{2}(?!\s+\d{2}:\d{2})", pulse):
+        hhmm = now.strftime("%H:%M")
+        return re.sub(r"^(\d{4}-\d{2}-\d{2})", r"\1 " + hhmm, pulse, count=1)
+    return pulse
+
+
 def _make_entry(kind: str, text: str, now=None) -> str:
-    """Сформировать каноническую однострочную запись: KIND YYYY-MM-DD HH:MM UTC (Termux): text.
-    H:MM обязательны. Переносы строк в тексте коллапсируются в пробел — запись всегда одна строка."""
+    """Сформировать каноническую однострочную запись.
+    • Нормальный текст → «KIND YYYY-MM-DD HH:MM UTC (Termux): text»
+    • Ретрансляция (text начинается с KIND-слова) → «KIND ts UTC (headless via Termux): payload»
+      Одна метка источника вместо вложенного «(Termux): DONE … (headless): …».
+    H:MM обязательны. Переносы строк коллапсируются в пробел."""
     if now is None:
         now = datetime.now(timezone.utc)
     ts = now.strftime("%Y-%m-%d %H:%M")
+    relayed = _relay_payload(text)
+    if relayed is not None:
+        return f"{kind} {ts} UTC (headless via Termux): {relayed}"
     clean = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
     return f"{kind} {ts} UTC (Termux): {clean}"
 
@@ -97,6 +138,7 @@ def main(argv) -> int:
     print(f"cclog: OK cc_log ← {line}  (old={len(old)} → new={len(new)})")
 
     if pulse is not None:
+        pulse = _ensure_pulse_hhmm(pulse)
         wp = c.write_doc(text=pulse, name="pulse")
         print(f"cclog: pulse ← {'OK' if wp.get('ok') else 'FAIL ' + str(wp)}")
     return 0

@@ -106,5 +106,126 @@ ok("старый текст без времени" in out_g,
 ok(out_g.index("новая запись") < out_g.index("старый текст"),
    "обратная совм.: новое выше старого")
 
+
+# (h) Класс 1+3: ретрансляция — вложенный headless-entry разворачивается в (headless via Termux)
+
+# _relay_payload: нормальный текст не является ретрансляцией
+ok(cclog._relay_payload("обычный текст без KIND-слова") is None,
+   "_relay_payload: нормальный текст → None (не ретрансляция)")
+ok(cclog._relay_payload("") is None,
+   "_relay_payload: пустая строка → None")
+ok(cclog._relay_payload("2026-07-16 UTC: что-то") is None,
+   "_relay_payload: строка с датой но без KIND → None")
+
+# _relay_payload: текст, начинающийся с KIND-слова — это ретрансляция
+ok(cclog._relay_payload("DONE 2026-07-16 (headless): payload текст") == "payload текст",
+   "_relay_payload: headless-запись → извлекает payload после «: »")
+ok(cclog._relay_payload("PLAN 16.07 UTC (шаг 3/6): класс H сторож Б") == "класс H сторож Б",
+   "_relay_payload: шаговая запись → payload после «: »")
+ok(cclog._relay_payload("DONE шаг 1/6 (родитель 171): log.info fix-btn") == "log.info fix-btn",
+   "_relay_payload: без даты, с шагом → payload после «: »")
+ok(cclog._relay_payload("DONE 2026-07-16 UTC: просто текст") == "просто текст",
+   "_relay_payload: KIND DATE UTC: text → payload")
+ok(cclog._relay_payload("NOTE без_двоеточия") == "без_двоеточия",
+   "_relay_payload: нет «: » → всё тело после KIND")
+ok(cclog._relay_payload("DONE 2026-07-16 (headless): PLAN 16.07: вложенный план") == "PLAN 16.07: вложенный план",
+   "_relay_payload: двойное вложение → payload с первого «: »")
+
+# _make_entry: ретрансляция → (headless via Termux)
+from datetime import datetime, timezone as _tz
+_fixed_now = datetime(2026, 7, 16, 9, 0, tzinfo=_tz.utc)
+
+entry_relay = cclog._make_entry("DONE", "DONE 2026-07-16 07:44 UTC (headless): реальный payload", now=_fixed_now)
+ok("(headless via Termux):" in entry_relay, "_make_entry relay: источник «(headless via Termux)»")
+ok("(Termux):" not in entry_relay, "_make_entry relay: НЕ вложенный «(Termux):»")
+ok("реальный payload" in entry_relay, "_make_entry relay: реальный payload сохранён")
+ok("DONE 2026-07-16 07:44 UTC (headless):" not in entry_relay, "_make_entry relay: внутренний заголовок НЕ дублируется")
+
+entry_relay2 = cclog._make_entry("DONE", "PLAN 16.07 UTC (шаг 3/6 родитель 171): класс H", now=_fixed_now)
+ok("(headless via Termux):" in entry_relay2, "_make_entry relay шаговая запись: источник")
+ok("класс H" in entry_relay2, "_make_entry relay шаговая: payload сохранён")
+
+# _make_entry: нормальный текст → (Termux) без изменений (регресс)
+entry_normal = cclog._make_entry("DONE", "обычный текст 123", now=_fixed_now)
+ok("(Termux):" in entry_normal, "_make_entry нормальный: сохраняет «(Termux):»")
+ok("(headless via Termux):" not in entry_normal, "_make_entry нормальный: НЕ помечает как relay")
+
+# ENTRY_RE принимает оба формата: (Termux) и (headless via Termux)
+ok(bool(cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (Termux): текст")),
+   "ENTRY_RE матчит (Termux):")
+ok(bool(cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (headless via Termux): текст")),
+   "ENTRY_RE матчит (headless via Termux):")
+ok(not cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (headless via Termux):"),
+   "ENTRY_RE НЕ матчит (headless via Termux): без payload")
+
+# Сквозной прогон main() с ретрансляцией
+cclog.BridgeClient = _FakeBridge   # восстановить мок (после _FailRead в секции (e))
+captured.clear()
+rc = cclog.main(["DONE 2026-07-16 UTC (headless): сводка задачи 42"])
+cc_entry = next((l for l in captured.get("cc_log", "").split("\n") if "(headless via Termux):" in l), "")
+ok(rc == 0 and bool(re.match(
+    r"DONE \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \(headless via Termux\): сводка задачи 42$", cc_entry)),
+   "main() relay → каноничный (headless via Termux): текст в cc_log, одна строка")
+
+# Ретрансляция НЕ меняет (headless via Termux) entries дважды (идемпотентность)
+captured.clear()
+cclog.main(["DONE 2026-07-16 09:00 UTC (headless via Termux): уже правильный формат"])
+cc_relay2 = next((l for l in captured.get("cc_log", "").split("\n") if "уже правильный формат" in l), "")
+ok("(headless via Termux): уже правильный формат" in cc_relay2,
+   "relay идемпотентен: (headless via Termux) entry не оборачивается повторно")
+
+# (i) Класс 2: пульс — обязательный H:MM
+
+ok(cclog._ensure_pulse_hhmm("2026-07-16 | 🟢 | статус", now=_fixed_now) == "2026-07-16 09:00 | 🟢 | статус",
+   "_ensure_pulse_hhmm: дата без H:MM → инжектирует H:MM")
+ok(cclog._ensure_pulse_hhmm("2026-07-16 08:46 UTC | 🟢 | статус") == "2026-07-16 08:46 UTC | 🟢 | статус",
+   "_ensure_pulse_hhmm: дата с H:MM → без изменений")
+ok(cclog._ensure_pulse_hhmm("🟢 готово") == "🟢 готово",
+   "_ensure_pulse_hhmm: без даты → без изменений")
+ok(re.search(r"\d{2}:\d{2}", cclog._ensure_pulse_hhmm("2026-07-16 | 🟢 | текст", now=_fixed_now)),
+   "_ensure_pulse_hhmm: результат содержит H:MM")
+
+# _ensure_pulse_hhmm не трогает уже корректный пульс
+pulse_ok = "2026-07-16 09:00 | 🔴 | ждёт да"
+ok(cclog._ensure_pulse_hhmm(pulse_ok, now=_fixed_now) == pulse_ok,
+   "_ensure_pulse_hhmm: корректный пульс не меняется (идемпотентен)")
+
+# main() --pulse с датой без H:MM → H:MM добавляется
+captured.clear()
+cclog.main(["тест пульса", "--pulse", "2026-07-16 | 🟢 | что-то сделал"])
+stored_pulse = captured.get("pulse", "")
+ok(bool(re.search(r"2026-07-16 \d{2}:\d{2}", stored_pulse)),
+   "main() --pulse: H:MM инжектируется в пульс при записи")
+
+# main() --pulse с полным форматом → не изменяется
+captured.clear()
+cclog.main(["тест пульса 2", "--pulse", "2026-07-16 08:46 | 🟢 | уже правильный"])
+ok("2026-07-16 08:46 | 🟢 | уже правильный" == captured.get("pulse", ""),
+   "main() --pulse: H:MM уже есть → пульс не меняется")
+
+# (j) Обратная совместимость чтения: старые записи не ломаются
+
+# Старые записи без H:MM в old-контенте (до de95caf/format3) сохраняются
+old_legacy = "DONE 2026-07-01 UTC (Termux):\nстарый текст без HH:MM\n"
+out_j = cclog._insert_under_vrezka(
+    "hdr\n" + "═" * 60 + "\n\n" + old_legacy,
+    "DONE 2026-07-16 09:00 UTC (Termux): новая запись"
+)
+ok("старый текст без HH:MM" in out_j,
+   "обратная совм. (j): старые записи без H:MM сохраняются в old-контенте")
+ok(out_j.index("новая запись") < out_j.index("старый текст"),
+   "обратная совм. (j): новое выше старого")
+
+# Вложенные записи (Termux)/(headless) из прошлого не трогаются при _insert_under_vrezka
+old_nested = "DONE 2026-07-15 15:10 UTC (Termux): DONE 2026-07-15 UTC (headless): текст\n"
+out_j2 = cclog._insert_under_vrezka(
+    "hdr\n" + "═" * 60 + "\n\n" + old_nested,
+    "DONE 2026-07-16 09:00 UTC (Termux): свежая запись"
+)
+ok("DONE 2026-07-15 15:10 UTC (Termux): DONE 2026-07-15 UTC (headless): текст" in out_j2,
+   "обратная совм. (j): старые вложенные записи не изменяются в old-контенте")
+ok(out_j2.index("свежая запись") < out_j2.index("текст"),
+   "обратная совм. (j): новое выше старого вложенного")
+
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)
