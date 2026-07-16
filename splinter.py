@@ -954,10 +954,15 @@ def last_mileage_in_topic(chat_id, topic_id=None, exclude_km=None):
     if not buf:
         return None
     now = _time.time()
+    try:
+        _mileage_ttl_sec = float(os.environ.get("MILEAGE_TTL_DAYS", "7")) * 86400
+    except (ValueError, TypeError):
+        _mileage_ttl_sec = 7 * 86400
     newest_any = None   # (km, conf) — самый свежий любой
     newest_high = None  # (km, conf) — самый свежий high
     for it in reversed(buf):   # с конца — самый свежий
-        if now - it["ts"] > _RECENT_TTL:
+        _ts = it.get("ts")
+        if _ts is not None and (now - _ts > _mileage_ttl_sec):
             continue
         v = it["vis"]
         km = v.get("mileage")

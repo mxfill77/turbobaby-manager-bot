@@ -10,7 +10,7 @@ SQLite база эпизодической памяти.
 import os
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 log = logging.getLogger(__name__)
@@ -147,15 +147,31 @@ class Memory:
     def recent_messages(self, chat_id: int, limit: int = 20, topic_id=None) -> List[Dict]:
         """Последние N сообщений в чате для контекста Claude.
         Если topic_id задан — только сообщения этой темы (форум обслуживания:
-        каждая тема = свой байк, истории тем НЕ смешиваются)."""
+        каждая тема = свой байк, истории тем НЕ смешиваются).
+        Для topic_id применяется SERVICING_HISTORY_TTL_H: сообщения старше N часов
+        не входят в контекст (поверх history_limit). Fail-safe: ошибка парса env → без фильтра."""
         conn = self._conn()
         try:
             if topic_id is not None:
-                cursor = conn.execute(
-                    "SELECT role, content FROM conversations WHERE chat_id = ? AND topic_id = ? "
-                    "ORDER BY id DESC LIMIT ?",
-                    (chat_id, str(topic_id), limit)
-                )
+                cutoff_str = None
+                try:
+                    ttl_h = float(os.environ.get("SERVICING_HISTORY_TTL_H", "48"))
+                    if ttl_h > 0:
+                        cutoff_str = (datetime.now() - timedelta(hours=ttl_h)).isoformat()
+                except (ValueError, TypeError):
+                    pass
+                if cutoff_str:
+                    cursor = conn.execute(
+                        "SELECT role, content FROM conversations WHERE chat_id = ? AND topic_id = ? "
+                        "AND timestamp >= ? ORDER BY id DESC LIMIT ?",
+                        (chat_id, str(topic_id), cutoff_str, limit)
+                    )
+                else:
+                    cursor = conn.execute(
+                        "SELECT role, content FROM conversations WHERE chat_id = ? AND topic_id = ? "
+                        "ORDER BY id DESC LIMIT ?",
+                        (chat_id, str(topic_id), limit)
+                    )
             else:
                 cursor = conn.execute(
                     "SELECT role, content FROM conversations WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
