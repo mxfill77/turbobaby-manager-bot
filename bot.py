@@ -852,6 +852,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # чтобы на "проверь фото резины/пробега" мозг видел всю недавнюю пачку, а не одно фото
             _bike_topic = ""
             if mode == "servicing":
+                log.info(f"  → text servicing @{_spk}: {msg.text[:60]}")
                 _tid = getattr(msg, "message_thread_id", None)
                 # имя байка из названия темы (по договорённости Филиппа)
                 splinter._remember_topic_name(chat_id, _tid, msg)

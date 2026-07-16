@@ -311,9 +311,9 @@ APPROVAL_PREAMBLE = (
     "КАРТА ДЕЙСТВИЙ:\n"
     "- Зелёное/оранжевое (чтение, диагностика, правки кода, тесты, git commit, git push) — делай САМ; "
     "git push по циклу гейт→push→отчёт, БЕЗ маркера.\n"
-    "- systemctl restart/start splinter, systemctl restart/start wa-webhook — тоже делай САМ, "
-    "оранжевым циклом: гейт (venv/bin/python3 gate.py, только exit 0) → systemctl restart <сервис> "
-    "→ systemctl is-active <сервис> active → в сводке «restart сделал, старт чистый». "
+    "- рестарт/старт своих сервисов (splinter/orchestrator-daemon/wa-webhook) — делай САМ, "
+    "оранжевым циклом: гейт (venv/bin/python3 gate.py, только exit 0) → systemctl restart/start <сервис> "
+    "→ systemctl is-active <сервис> active → в сводке «сделал, старт чистый». "
     "При failed — откат на прошлый рабочий коммит + restart + честный отчёт. "
     "Маркер op=restart_splinter НЕ выводи (он только аварийный фоллбэк). "
     "systemctl daemon-reload — зелёное (просто перечитать юниты, без рестарта). "
@@ -569,6 +569,10 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     # Расширение (15.07.2026, GATE_SINGLE_SELECTIVE=1): одиночные «тз:»/«задача:» — тоже.
     # Последний шаг (i == N), планировщик — всегда полный. --final (pre-push) всегда полный.
     # Fail-safe gate.py: не смог определить затронутые → полный сьют автоматически.
+    # Сброс унаследованного значения: parent-процесс (gate.py при селективном прогоне) может
+    # передавать GATE_STEP_SELECTIVE=1 через env → child-задача наследует его в child_env.
+    # Сбрасываем до нашего решения — флаг управляем ТОЛЬКО отсюда, не наследованием.
+    child_env.pop("GATE_STEP_SELECTIVE", None)
     if preamble is None:
         _sm = _STEP_RE.match(str(task_text or ""))
         if _sm and int(_sm.group(1)) < int(_sm.group(2)):

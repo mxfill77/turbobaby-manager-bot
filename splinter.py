@@ -3351,6 +3351,8 @@ async def handle_service_button(update, context, bridge) -> None:
         _SVC_TOKENS.pop(token, None)
         _PENDING_CORRECTION.pop(key, None)
         clear_awaiting(*key)
+        uname = getattr(q.from_user, "username", None) or str(getattr(q.from_user, "id", "?"))
+        log.info(f"  🔧 fix-btn: @{uname} bike={bike} {old_km}→{new_km}")
         try:
             await _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, new_km)
         except Exception:

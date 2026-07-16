@@ -35,6 +35,9 @@ def run_gate(argv, env_flag=None, red=True):
     """Прогнать gate.main() с мокнутым результатом тестов. Вернуть (exit_code, stdout)."""
     pushes.clear(); logs.clear()
     gate.run_tests = (lambda: (["test_fake_red.py"], 3, 0.1)) if red else (lambda: ([], 3, 0.1))
+    # Мокаем run_selective_tests — при GATE_STEP_SELECTIVE=1 (headless-контекст) gate.main()
+    # идёт в selective-ветку; без мока вызывается реальный прогон тестов → таймаут.
+    gate.run_selective_tests = (lambda *_: (["test_fake_red.py"], 3, 0.1, "селективный (мок)")) if red else (lambda *_: ([], 3, 0.1, "селективный (мок)"))
     old_argv, old_env = sys.argv, os.environ.get("GATE_ALERT_FINAL_ONLY")
     sys.argv = ["gate.py"] + argv
     if env_flag is None:

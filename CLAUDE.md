@@ -746,8 +746,11 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
   **рестарт/старт своих сервисов** (`systemctl restart/start splinter`, `systemctl restart/start orchestrator-daemon`,
   `systemctl restart/start wa-webhook`): Q2 разблокирован 03.07; headless-CC делает restart SAM оранжевым циклом
   (гейт → restart → is-active active → отчёт «сделал, старт чистый»; при failed — откат + рестарт;
-  кнопка op=restart_splinter в 328 — аварийный фоллбэк). `systemctl daemon-reload` — allow (15.07.2026,
-  `_restarts_new_settings.json`). NEEDS_APPROVAL на рестарт своих сервисов НЕ объявлять.
+  кнопка op=restart_splinter в 328 — аварийный фоллбэк). `systemctl start splinter/orchestrator-daemon`,
+  `systemctl daemon-reload` — также allow (добавлены в `_restarts_new_settings.json` вместе с
+  `systemd-run --on-active=* restart wa-webhook*`; применяются из Termux одной командой:
+  `cp _restarts_new_settings.json .claude/settings.json` + рестарт сессии).
+  NEEDS_APPROVAL на рестарт/старт своих сервисов НЕ объявлять.
   `venv/bin/python3 *` (py_compile/gate/tests/recon/reports), node --check, cp, Edit/Write
   рабочих каталогов. Prompt не появляется.
 - **Deferred-рестарт (заведено 03.07.2026, расширено 15.07.2026): в allow — ТРИ УЗКИХ паттерна и ТОЛЬКО они:**

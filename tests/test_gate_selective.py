@@ -234,10 +234,17 @@ ok(CAP["env"].get("GATE_STEP_SELECTIVE") != "1",
 OD.run_task(5, "[шаг 2/2 родитель 10] последний из двух", task_timeout=60)
 ok(CAP["env"].get("GATE_STEP_SELECTIVE") != "1", "шаг 2/2 → нет флага")
 
-# (22) одиночная задача (нет [шаг i/N]) → нет флага
+# (22) одиночная задача без GATE_SINGLE_SELECTIVE → нет флага
+# (изоляция: боевой .env может иметь GATE_SINGLE_SELECTIVE=1; тест проверяет поведение БЕЗ флага)
+_saved22 = os.environ.get("GATE_SINGLE_SELECTIVE")
+os.environ["GATE_SINGLE_SELECTIVE"] = "0"
 OD.run_task(6, "обычная одиночная задача без маркера", task_timeout=60)
+if _saved22 is None:
+    os.environ.pop("GATE_SINGLE_SELECTIVE", None)
+else:
+    os.environ["GATE_SINGLE_SELECTIVE"] = _saved22
 ok(CAP["env"].get("GATE_STEP_SELECTIVE") != "1",
-   "одиночная задача → нет GATE_STEP_SELECTIVE")
+   "одиночная задача (GATE_SINGLE_SELECTIVE=0) → нет GATE_STEP_SELECTIVE")
 
 # (23) планировщик (preamble != None) → нет флага, даже если текст похож на шаг
 def cap_run_plan(args, **kw):

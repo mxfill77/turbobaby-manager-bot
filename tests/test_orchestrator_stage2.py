@@ -28,8 +28,9 @@ print("(2) преамбула v3:")
 P = OD.APPROVAL_PREAMBLE
 res.append(ok("git push" in P and "делай САМ" in P, "git push — делает САМ (не через кнопку)"))
 res.append(ok("git_push — отправить коммиты" not in P, "устаревшая op-инструкция git_push УБРАНА"))
-res.append(ok("тоже делай САМ" in P and "wa-webhook" in P and "NEEDS_APPROVAL НЕ объявлять" in P,
-              "Q2/15.07: restart splinter/wa-webhook — CC делает САМ, NEEDS_APPROVAL не объявлять"))
+res.append(ok("делай САМ" in P and "wa-webhook" in P and "orchestrator-daemon" in P
+              and "NEEDS_APPROVAL НЕ объявлять" in P,
+              "Q2/16.07: рестарт/старт всех трёх сервисов — CC делает САМ, NEEDS_APPROVAL не объявлять"))
 res.append(ok("только exit 0" in P and "старт чистый" in P,
               "Q2: оранжевый цикл restart — гейт → restart → чистый старт → отчёт"))
 res.append(ok("op=other" in P and "confirmed=true" in P and "delete_event" in P,
