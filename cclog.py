@@ -7,10 +7,14 @@
 см. CLAUDE.md, раздел «НАБЛЮДАЕМОСТЬ TERMUX».
 
 Использование (из репо; или через алиас `cclog`, см. CLAUDE.md):
-  venv/bin/python3 cclog.py "<текст итога>"                 → DONE <UTC> UTC (Termux): <текст>
+  venv/bin/python3 cclog.py "<текст итога>"                 → DONE YYYY-MM-DD HH:MM UTC (Termux): <текст>
   venv/bin/python3 cclog.py PLAN "<что начал>"             → PLAN ...
   venv/bin/python3 cclog.py BLOCKED "<что мешает>"         → BLOCKED ...
   Тип (первый арг, регистр не важен): DONE|PLAN|NOTE|BLOCKED|WAITING|SKIPPED. По умолчанию DONE.
+
+Формат записи (канонический, одно событие = одна строка):
+  KIND YYYY-MM-DD HH:MM UTC (Termux): текст
+  H:MM обязательны в каждой записи. Переносы строк в тексте коллапсируются в пробел.
 
 Дисциплина cc_log (CLAUDE.md): новые записи СВЕРХУ, ПОД врезкой-шапкой (после её ═-only-линии);
 защита от затирки — пишем ТОЛЬКО если read_doc вернул ok. Зона 🟢 (журнал Brain, не рабочие таблицы).
@@ -18,6 +22,7 @@
 """
 import sys
 import os
+import re
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -26,10 +31,26 @@ from bridge_client import BridgeClient
 
 TYPES = ("DONE", "PLAN", "NOTE", "BLOCKED", "WAITING", "SKIPPED")
 
+# Канонический паттерн одной записи (используется тестами)
+ENTRY_RE = re.compile(
+    r"^(?:DONE|PLAN|NOTE|BLOCKED|WAITING|SKIPPED) \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \(Termux\): .+$"
+)
+
+
+def _make_entry(kind: str, text: str, now=None) -> str:
+    """Сформировать каноническую однострочную запись: KIND YYYY-MM-DD HH:MM UTC (Termux): text.
+    H:MM обязательны. Переносы строк в тексте коллапсируются в пробел — запись всегда одна строка."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%d %H:%M")
+    clean = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ").strip()
+    return f"{kind} {ts} UTC (Termux): {clean}"
+
 
 def _insert_under_vrezka(old: str, line: str) -> str:
     """Вставить запись СВЕРХУ, но ПОД врезкой-шапкой (после первой ═-only-линии в первых 15 строках).
-    Врезки нет → просто сверху. Матч по ═-only-строке (вся строка из ═), НЕ по фикс-длине (правило 25.06)."""
+    Врезки нет → просто сверху. Матч по ═-only-строке (вся строка из ═), НЕ по фикс-длине (правило 25.06).
+    Обратная совместимость: старые записи в old (в т.ч. без H:M) не парсятся и не изменяются."""
     lines = old.split("\n")
     idx = None
     for i, ln in enumerate(lines[:15]):
@@ -67,8 +88,7 @@ def main(argv) -> int:
         print("cclog: READ FAIL — НЕ пишу (защита от затирки):", r, file=sys.stderr)
         return 1
     old = r.get("text", "")
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    line = f"{kind} {ts} UTC (Termux): {text}"
+    line = _make_entry(kind, text)
     new = _insert_under_vrezka(old, line)
     w = c.write_doc(text=new, name="cc_log")
     if not w.get("ok"):
