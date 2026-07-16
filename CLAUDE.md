@@ -733,6 +733,12 @@ venv/bin/python3 notify.py --need "жду твоё решение: <что им�
 - **Удобный алиас (разовая настройка Termux, `~/.bashrc`):**
   `alias cclog='/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/cclog.py'`
   → потом просто `cclog "итог"` / `cclog BLOCKED "что мешает"`.
+- **Алиас для сырых Termux-заходов — `logdone` (в `~/.bashrc`, добавлен 16.07.2026):**
+  `alias logdone='/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/cclog.py --raw'`
+  → пишет `DONE … (Termux-raw): …` в cc_log — видно, что это ручной заход без Claude Code.
+- **ПРАВИЛО: сырой Termux-заход (без Claude Code, без headless) завершается `logdone "кратко что сделано"`** —
+  иначе штаб (Claude-на-сайте) не видит сделанного и три проверки подряд докладывают «не сделано»
+  (кейс 16.07.2026: своп+таймер были поставлены, но следа в мозге не осталось). Зона 🟢.
 - **ОБЯЗАТЕЛЬНЫЙ ФИНАЛ каждой Termux-задачи:** закончил работу → `cclog "<что сделал, числа, хвосты>"`
   (при статусе-сдвиге `--pulse`). Без этого шага задача для штаба «не существует» (правило «ЛОГ СРАЗУ»,
   раздел ЛОГИРОВАНИЕ). Зона 🟢 (журнал Brain, не рабочие таблицы). Регресс: `tests/test_cclog.py`.

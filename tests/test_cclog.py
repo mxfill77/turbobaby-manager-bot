@@ -227,5 +227,62 @@ ok("DONE 2026-07-15 15:10 UTC (Termux): DONE 2026-07-15 UTC (headless): текс
 ok(out_j2.index("свежая запись") < out_j2.index("текст"),
    "обратная совм. (j): новое выше старого вложенного")
 
+# (k) Класс «сырой Termux-заход»: --raw флаг → (Termux-raw)
+cclog.BridgeClient = _FakeBridge
+captured.clear()
+rc = cclog.main(["--raw", "поставил своп и таймер"])
+cc_raw = next((l for l in captured.get("cc_log", "").split("\n") if "(Termux-raw):" in l), "")
+ok(rc == 0 and bool(re.match(
+    r"DONE \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \(Termux-raw\): поставил своп и таймер$", cc_raw)),
+   "--raw: формат KIND YYYY-MM-DD HH:MM UTC (Termux-raw): текст")
+
+# без --raw остаётся (Termux) (регресс)
+captured.clear()
+rc = cclog.main(["без флага"])
+cc_norm = next((l for l in captured.get("cc_log", "").split("\n") if "(Termux):" in l), "")
+ok(rc == 0 and "(Termux):" in cc_norm and "(Termux-raw):" not in cc_norm,
+   "без --raw: метка (Termux), не (Termux-raw) — регресс не сломан")
+
+# --raw + явный тип
+captured.clear()
+rc = cclog.main(["PLAN", "--raw", "начинаю настройку"])
+cc_rp = next((l for l in captured.get("cc_log", "").split("\n") if "(Termux-raw):" in l), "")
+ok(rc == 0 and "PLAN " in cc_rp and "(Termux-raw):" in cc_rp,
+   "--raw с типом PLAN: правильный тип и метка")
+
+# --raw не ломает --pulse
+captured.clear()
+rc = cclog.main(["--raw", "шаг X", "--pulse", "2026-07-16 | 🟢 | raw-заход завершён"])
+ok(rc == 0 and "raw-заход завершён" in captured.get("pulse", ""),
+   "--raw + --pulse: пульс записывается с правильным значением")
+
+# ENTRY_RE принимает (Termux-raw) и (headless via Termux-raw)
+ok(bool(cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (Termux-raw): текст")),
+   "ENTRY_RE матчит (Termux-raw):")
+ok(bool(cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (headless via Termux-raw): текст")),
+   "ENTRY_RE матчит (headless via Termux-raw):")
+ok(not cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (Termux-raw):"),
+   "ENTRY_RE НЕ матчит (Termux-raw): без payload")
+# старые метки по-прежнему матчатся (регресс)
+ok(bool(cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (Termux): текст")),
+   "ENTRY_RE (k-регресс): (Termux) по-прежнему матчится")
+ok(bool(cclog.ENTRY_RE.match("DONE 2026-07-16 09:00 UTC (headless via Termux): текст")),
+   "ENTRY_RE (k-регресс): (headless via Termux) по-прежнему матчится")
+
+# _make_entry с явным label=Termux-raw
+entry_raw = cclog._make_entry("DONE", "текст", label="Termux-raw", now=_fixed_now)
+ok("(Termux-raw):" in entry_raw and "(Termux):" not in entry_raw,
+   "_make_entry label=Termux-raw: метка в записи")
+ok(bool(cclog.ENTRY_RE.match(entry_raw)),
+   "_make_entry label=Termux-raw: запись матчит ENTRY_RE")
+
+# relay через --raw → (headless via Termux-raw)
+entry_relay_raw = cclog._make_entry("DONE", "DONE 2026-07-16 07:44 UTC (headless): payload", label="Termux-raw", now=_fixed_now)
+ok("(headless via Termux-raw):" in entry_relay_raw,
+   "_make_entry relay + raw: источник (headless via Termux-raw)")
+ok("payload" in entry_relay_raw,
+   "_make_entry relay + raw: payload сохранён")
+
+
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)
