@@ -1271,6 +1271,8 @@ async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):
     # В мозг — ТОЛЬКО если подпись содержательно тегает бота (явный запрос «@bot проверь резину»).
     # Голый тег / без подписи / открытый awaiting → авто-сверка (не мозг).
     if splinter.GROUPS.get(msg.chat_id) == "servicing":
+        _spk_ph = (msg.from_user.username or "").lower() if msg.from_user else ""
+        log.info(f"  → photo servicing @{_spk_ph}: cap={cap[:60]!r}")
         # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» и в фото-пути обслуживания
         await splinter.ensure_info_pin(context, msg.chat_id, _tid)
         _addressed = _servicing_caption_to_brain(msg, context, cap)
