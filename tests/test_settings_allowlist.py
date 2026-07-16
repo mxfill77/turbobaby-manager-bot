@@ -235,9 +235,9 @@ res.append(ok(all(inner(dup) is not None and "clasp" not in dup and "sqlite3" no
                   and "systemctl" not in dup and "sudo" not in dup for _, dup in ENV_DUPS),
               "env-дубли покрывают только интерпретаторы (нет clasp/sqlite3/systemctl/sudo)"))
 
-print("Headless-конфиг: только ask-забор, БЕЗ allow/deny-правок; демон передаёт его через --settings:")
-res.append(ok(not headless_layer.get("allow") and not headless_layer.get("deny"),
-              "headless_settings.json не добавляет allow/deny (только ask-забор)"))
+print("Headless-конфиг: БЕЗ allow-правок (deny разрешён для failopen-забора); демон передаёт через --settings:")
+res.append(ok(not headless_layer.get("allow"),
+              "headless_settings.json не добавляет allow (только ask/deny-забор)"))
 for must in ["Bash(clasp push*)", "Bash(clasp redeploy*)", "Bash(clasp deploy*)", "Bash(clasp run*)"]:
     res.append(ok(must in headless_layer.get("ask", []), "headless ask содержит " + must))
 src = open(DAEMON_SRC, encoding="utf-8").read()
