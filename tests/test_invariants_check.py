@@ -20,12 +20,18 @@ from invariants_check import (
     FakeWorld, CheckRun, run_all, format_report,
     check_fleet_oil_gear, check_crm_overdue, check_crm_no_booking_id,
     check_crm_deposit, check_fleet_click_125, check_queue_long_ip,
+    check_oil_vs_current_odo, check_bot_data_vs_sheet,
+    OIL_PHOTO_DELTA, OIL_FRESH_SECS, BOT_DATA_OIL_DELTA,
     CHECKS,
 )
 from datetime import timezone
 
 # ─── Вспомогательные константы ─────────────────────────────────────────────────────────────
 _NOW = datetime.datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+# Метка «старая запись» (30ч до NOW = 2026-07-14T06:00) — релевантна для OIL_VS_CURRENT_ODO
+_OLD_TS = "2026-07-14T06:00:00+00:00"
+# Метка «свежая запись» (1ч до NOW = 2026-07-15T11:00 < OIL_FRESH_SECS=7200с)
+_FRESH_TS = "2026-07-15T11:00:00+00:00"
 
 # Живой формат fleet bike (ReadFleet.js parseNumber → 0 если пусто)
 _BIKE_RENTED_OK = {
@@ -63,10 +69,29 @@ _TASK_FRESH = {
     "status": "in_progress",
     "updated": (_NOW - datetime.timedelta(seconds=100)).isoformat(),
 }
+# Bot Data service records — здоровое состояние:
+# current_km=36000 (≠ oil_last_km 35200 → нет флага OIL_VS_CURRENT_ODO)
+# last_service_km=35200 (= col I → diff=0 ≤ BOT_DATA_OIL_DELTA → нет флага BOT_DATA_VS_SHEET)
+_SVC_OIL_OK = {
+    "updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "oil",
+    "current_km": 36000,       # текущий пробег; diff с col I (35200) = 800 > OIL_PHOTO_DELTA(100)
+    "last_service_km": 35200,  # = col I → расхождение 0 ≤ BOT_DATA_OIL_DELTA(200)
+    "interval_km": 3000, "next_km": 38200, "status": "ok",
+}
+_SVC_GEAR_OK = {
+    "updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "gear",
+    "current_km": 36000,
+    "last_service_km": 34000,  # = col J (gear_last_km)
+    "interval_km": 10000, "next_km": 44000, "status": "ok",
+}
 
 
-def _make_world(bikes=None, clients=None, queue=None, tt=600, ttd=2700):
-    """Собрать FakeWorld с дефолтами чистого мира."""
+def _make_world(bikes=None, clients=None, queue=None, tt=600, ttd=2700, services=None):
+    """Собрать FakeWorld с дефолтами чистого мира.
+    services=None (дефолт) → Bridge down для ТО-трекера (note, без флагов).
+    services=[] → Bot Data пуст (нет записей для сравнения).
+    services=[...] → Bot Data с записями.
+    """
     if bikes is None:
         bikes = [dict(_BIKE_RENTED_OK), dict(_BIKE_HOME), dict(_BIKE_CLICK_HOME)]
     if clients is None:
@@ -74,7 +99,7 @@ def _make_world(bikes=None, clients=None, queue=None, tt=600, ttd=2700):
     if queue is None:
         queue = [dict(_TASK_FRESH)]
     return FakeWorld(bikes=bikes, clients=clients, queue_ip=queue,
-                     task_timeout=tt, task_timeout_dev=ttd, now=_NOW)
+                     task_timeout=tt, task_timeout_dev=ttd, now=_NOW, services=services)
 
 
 def _run(check_fn, world):
@@ -431,6 +456,204 @@ def test_queue_bridge_down():
     r = _run(check_queue_long_ip, w)
     assert len(r.findings) == 0
     assert r.notes
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ИНВАРИАНТ 7: OIL_VS_CURRENT_ODO
+# ════════════════════════════════════════════════════════════════════════════════
+def test_oil_vs_current_odo_clean():
+    """Нормальная ситуация: oil_last_km ≠ current_km (байк проехал после замены) → 0 нарушений."""
+    bikes = [dict(_BIKE_RENTED_OK)]   # oil_last_km=35200
+    svcs = [dict(_SVC_OIL_OK)]        # current_km=36000, diff=800 > OIL_PHOTO_DELTA(100) → нет флага
+    r = _run(check_oil_vs_current_odo, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_oil_vs_current_odo_golden_2478():
+    """ГОЛДЕН инцидент 2478: col I = current_km = 24997, запись старая (>2ч) → флаг.
+    Сценарий: vision прочитала одометр (24997) и записала его в col I как «пробег замены»,
+    хотя реальная замена была на 22000. Bot Data current_km=24997 (то же фото), запись старая."""
+    bikes = [{"name": "PCX160 4234", "status": "В аренде",
+              "oil_last_km": 24997, "gear_last_km": 34000, "mileage": 20000}]
+    # Bot Data: current_km=24997 (= col I → diff=0 ≤ 100), старая запись (30ч > 7200с)
+    svcs = [{"updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "oil",
+             "current_km": 24997, "last_service_km": 22000,
+             "interval_km": 3000, "next_km": 25000, "status": "overdue"}]
+    r = _run(check_oil_vs_current_odo, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) >= 1, r.findings
+    assert "24997" in r.findings[0][0], r.findings
+    assert "2478" in r.findings[0][1], r.findings
+
+
+def test_oil_vs_current_odo_fresh_no_flag():
+    """ТО записано < 2ч назад: oil_last_km = current_km — НОРМАЛЬНО (только что заменили),
+    не флагуем по маркеру свежести OIL_FRESH_SECS."""
+    bikes = [{"name": "PCX160 4234", "status": "В аренде",
+              "oil_last_km": 24997, "gear_last_km": 34000, "mileage": 20000}]
+    # Свежая запись: NOW=2026-07-15 12:00, fresh=11:00 → age=3600с < OIL_FRESH_SECS(7200с)
+    svcs = [{"updated_at": _FRESH_TS, "bike": "PCX160 4234", "service_type": "oil",
+             "current_km": 24997, "last_service_km": 22000,
+             "interval_km": 3000, "next_km": 25000, "status": "ok"}]
+    r = _run(check_oil_vs_current_odo, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_oil_vs_current_odo_small_diff_within_delta():
+    """oil_last_km и current_km отличаются на 50 < OIL_PHOTO_DELTA(100) → подозрительно, флаг."""
+    bikes = [{"name": "PCX160 4234", "status": "В аренде",
+              "oil_last_km": 24997, "gear_last_km": 34000, "mileage": 20000}]
+    svcs = [{"updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "oil",
+             "current_km": 24950,  # |24997 - 24950| = 47 ≤ 100 → флаг
+             "last_service_km": 22000, "interval_km": 3000, "next_km": 25000, "status": "ok"}]
+    r = _run(check_oil_vs_current_odo, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) >= 1, r.findings
+
+
+def test_oil_vs_current_odo_over_delta_no_flag():
+    """|oil_last_km - current_km| > OIL_PHOTO_DELTA(100) → нет флага (нормальный разрыв)."""
+    bikes = [{"name": "PCX160 4234", "status": "В аренде",
+              "oil_last_km": 24500, "gear_last_km": 34000, "mileage": 20000}]
+    svcs = [{"updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "oil",
+             "current_km": 24997,  # |24500 - 24997| = 497 > 100 → нет флага
+             "last_service_km": 22000, "interval_km": 3000, "next_km": 25000, "status": "ok"}]
+    r = _run(check_oil_vs_current_odo, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_oil_vs_current_odo_no_oil_record():
+    """Нет Bot Data oil-записи для байка → пропуск (note «нет oil-записей»), 0 нарушений."""
+    bikes = [dict(_BIKE_RENTED_OK)]
+    r = _run(check_oil_vs_current_odo, _make_world(bikes=bikes, services=[]))
+    assert len(r.findings) == 0, r.findings
+    assert r.notes  # note «не содержит oil-записей»
+
+
+def test_oil_vs_current_odo_no_plate_skipped():
+    """Байк без 4-значного номера в имени → пропуск, нет флага."""
+    bikes = [{"name": "XSR 155 GREEN", "status": "В аренде",
+              "oil_last_km": 15000, "gear_last_km": 14000, "mileage": 10000}]
+    svcs = [{"updated_at": _OLD_TS, "bike": "XSR 155 GREEN", "service_type": "oil",
+             "current_km": 15000, "last_service_km": 12000,
+             "interval_km": 3000, "next_km": 15000, "status": "due"}]
+    r = _run(check_oil_vs_current_odo, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_oil_vs_current_odo_fleet_none():
+    """fleet() вернул None → note, 0 нарушений."""
+    w = FakeWorld(bikes=None, clients=[], queue_ip=[], services=[], now=_NOW)
+    r = _run(check_oil_vs_current_odo, w)
+    assert len(r.findings) == 0
+    assert r.notes
+
+
+def test_oil_vs_current_odo_service_none():
+    """service_list() вернул None → note, 0 нарушений."""
+    w = FakeWorld(bikes=[dict(_BIKE_RENTED_OK)], clients=[], queue_ip=[], services=None, now=_NOW)
+    r = _run(check_oil_vs_current_odo, w)
+    assert len(r.findings) == 0
+    assert r.notes
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ИНВАРИАНТ 8: BOT_DATA_VS_SHEET
+# ════════════════════════════════════════════════════════════════════════════════
+def test_bot_data_vs_sheet_clean():
+    """last_service_km (Bot Data) совпадает с col I → 0 нарушений."""
+    bikes = [dict(_BIKE_RENTED_OK)]   # oil_last_km=35200, gear_last_km=34000
+    svcs = [dict(_SVC_OIL_OK), dict(_SVC_GEAR_OK)]
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_bot_data_vs_sheet_oil_diverge():
+    """Bot Data last_service_km ↔ col I расходятся > BOT_DATA_OIL_DELTA(200 km) → флаг.
+    Сценарий 2478-вариант: vision записала в col I 24997, но Bot Data помнит старое значение 22000."""
+    bikes = [{"name": "PCX160 4234", "status": "В аренде",
+              "oil_last_km": 24997, "gear_last_km": 34000, "mileage": 20000}]
+    svcs = [{"updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "oil",
+             "current_km": 24997, "last_service_km": 22000,  # diff = 2997 > 200
+             "interval_km": 3000, "next_km": 25000, "status": "overdue"}]
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) >= 1, r.findings
+    text = r.findings[0][0] + r.findings[0][1]
+    assert "2997" in text, r.findings  # diff упомянут в репорте
+
+
+def test_bot_data_vs_sheet_gear_diverge():
+    """Bot Data last_service_km gear ↔ col J расходятся > 200 км → флаг."""
+    bikes = [{"name": "PCX160 4234", "status": "В аренде",
+              "oil_last_km": 35200, "gear_last_km": 34000, "mileage": 20000}]
+    svcs = [{"updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "gear",
+             "current_km": 36000, "last_service_km": 31000,  # diff = 3000 > 200
+             "interval_km": 10000, "next_km": 41000, "status": "ok"}]
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=svcs))
+    assert len(r.findings) >= 1, r.findings
+    assert "gear" in r.findings[0][0].lower() or "J" in r.findings[0][0], r.findings
+
+
+def test_bot_data_vs_sheet_small_diff_no_flag():
+    """Расхождение ≤ BOT_DATA_OIL_DELTA(200 км) → не флаг."""
+    bikes = [dict(_BIKE_RENTED_OK)]   # oil_last_km=35200
+    svc = dict(_SVC_OIL_OK)
+    svc["last_service_km"] = 35100    # diff = 100 ≤ 200 → нет флага
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=[svc]))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_bot_data_vs_sheet_exact_at_delta_boundary():
+    """Расхождение ровно = BOT_DATA_OIL_DELTA(200 км) → НЕ флаг (порог строгий >)."""
+    bikes = [dict(_BIKE_RENTED_OK)]   # oil_last_km=35200
+    svc = dict(_SVC_OIL_OK)
+    svc["last_service_km"] = 35000    # diff = 200 = граница → нет флага (строго >)
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=[svc]))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_bot_data_vs_sheet_just_over_delta():
+    """Расхождение = BOT_DATA_OIL_DELTA + 1 = 201 → флаг (> порога)."""
+    bikes = [dict(_BIKE_RENTED_OK)]   # oil_last_km=35200
+    svc = dict(_SVC_OIL_OK)
+    svc["last_service_km"] = 34999    # diff = 201 > 200 → флаг
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=[svc]))
+    assert len(r.findings) >= 1, r.findings
+
+
+def test_bot_data_vs_sheet_no_last_service_km():
+    """Bot Data last_service_km = 0/пусто → пропуск (нет предыдущего значения), 0 нарушений."""
+    bikes = [dict(_BIKE_RENTED_OK)]
+    svc = dict(_SVC_OIL_OK)
+    svc["last_service_km"] = 0  # нет предыдущего → пропуск
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=[svc]))
+    assert len(r.findings) == 0, r.findings
+
+
+def test_bot_data_vs_sheet_fleet_none():
+    """fleet() вернул None → note, 0 нарушений."""
+    w = FakeWorld(bikes=None, clients=[], queue_ip=[],
+                  services=[dict(_SVC_OIL_OK)], now=_NOW)
+    r = _run(check_bot_data_vs_sheet, w)
+    assert len(r.findings) == 0
+    assert r.notes
+
+
+def test_bot_data_vs_sheet_service_none():
+    """service_list() вернул None → note, 0 нарушений."""
+    w = FakeWorld(bikes=[dict(_BIKE_RENTED_OK)], clients=[], queue_ip=[],
+                  services=None, now=_NOW)
+    r = _run(check_bot_data_vs_sheet, w)
+    assert len(r.findings) == 0
+    assert r.notes
+
+
+def test_bot_data_vs_sheet_unknown_service_type_skipped():
+    """service_type = 'abs' или 'airfilter' → пропуск (нет col в fleet endpoint), 0 нарушений."""
+    bikes = [dict(_BIKE_RENTED_OK)]
+    svc = {"updated_at": _OLD_TS, "bike": "PCX160 4234", "service_type": "abs",
+           "current_km": 36000, "last_service_km": 0,
+           "interval_km": 20000, "next_km": 56000, "status": "ok"}
+    r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=[svc]))
+    assert len(r.findings) == 0, r.findings
 
 
 # ════════════════════════════════════════════════════════════════════════════════

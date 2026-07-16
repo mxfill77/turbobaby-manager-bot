@@ -50,6 +50,15 @@ _CLICK125_RE = re.compile(r"honda\s+click\s+125", re.IGNORECASE)
 _DEV_SUFFIXES = ("-dev", "-dec", "-curator")
 # Наличие цифры в строке депозита.
 _DIGIT_RE = re.compile(r"\d")
+# 4-значный номер байка в имени («PCX160 4234» → '4234').
+_PLATE_RE = re.compile(r"\b(\d{4})\b")
+
+# OIL_VS_CURRENT_ODO: |oil_last_km − current_km (Bot Data)| ≤ N → подозрение «фото-одометр».
+OIL_PHOTO_DELTA = 100    # km
+# Маркер свежести: Bot Data updated_at < N секунд → ТО только что занесено, не флагуем.
+OIL_FRESH_SECS = 7200    # s (2 часа)
+# BOT_DATA_VS_SHEET: расхождение oil/gear Лист1 I/J vs Bot Data last_service_km > N → флаг.
+BOT_DATA_OIL_DELTA = 200  # km
 
 
 # ============================================================================================
@@ -77,6 +86,10 @@ class World:
         """int: TASK_TIMEOUT_DEV из .env (дефолт 2700с) — для dev/dec задач."""
         raise NotImplementedError
 
+    def service_records(self):
+        """list[dict] (Bot Data ТО-трекер «обслуживание») или None."""
+        raise NotImplementedError
+
     def now_utc(self):
         """datetime: текущее UTC-время (инъекция в тестах)."""
         raise NotImplementedError
@@ -92,6 +105,7 @@ class LiveWorld(World):
         self._fleet = False   # False = «ещё не запрошено»; None = «запрошено, не получено»
         self._clients = False
         self._queue = False
+        self._services = False
 
     def fleet_bikes(self):
         if self._fleet is False:
@@ -110,6 +124,12 @@ class LiveWorld(World):
             r = self._c.get_pending(status="in_progress", lane="vps")
             self._queue = (r.get("items") or []) if r.get("ok") else None
         return self._queue
+
+    def service_records(self):
+        if self._services is False:
+            r = self._c.service_list()
+            self._services = (r.get("items") or []) if r.get("ok") else None
+        return self._services
 
     def task_timeout(self):
         try:
@@ -130,10 +150,11 @@ class LiveWorld(World):
 class FakeWorld(World):
     """Фейковый мир для тестов и самотеста. Инъекция данных через конструктор."""
     def __init__(self, bikes=None, clients=None, queue_ip=None,
-                 task_timeout=600, task_timeout_dev=2700, now=None):
+                 task_timeout=600, task_timeout_dev=2700, now=None, services=None):
         self._bikes = bikes      # None = «Bridge не ответил»
         self._clients = clients
         self._queue = queue_ip
+        self._services = services
         self._tt = task_timeout
         self._ttd = task_timeout_dev
         self._now = now or datetime.datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -141,6 +162,7 @@ class FakeWorld(World):
     def fleet_bikes(self): return self._bikes
     def clients_all_active(self): return self._clients
     def queue_in_progress(self): return self._queue
+    def service_records(self): return self._services
     def task_timeout(self): return self._tt
     def task_timeout_dev(self): return self._ttd
     def now_utc(self): return self._now
@@ -399,9 +421,137 @@ def check_queue_long_ip(world, run):
             )
 
 
+# --------------------------------------------------------------------------------------------
+#  Вспомогательные функции для инвариантов 7 и 8
+# --------------------------------------------------------------------------------------------
+def _extract_plate(name):
+    """4-значный номер байка из имени («PCX160 4234» → '4234') или None."""
+    m = _PLATE_RE.search(str(name))
+    return m.group(1) if m else None
+
+
+def _parse_iso_dt(val):
+    """ISO datetime (updated_at Bot Data) → datetime UTC или None."""
+    if not val:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 7: OIL_VS_CURRENT_ODO
+#  Лист1 col I (oil_last_km) ≈ current_km из Bot Data ТО-трекера → подозрение
+#  «км взят из фото одометра, а не из реальной замены масла» (класс инцидента 2478).
+#  Порог OIL_PHOTO_DELTA = 100 км: |oil_last_km − current_km| ≤ N → подозрительно.
+#  Маркер свежести OIL_FRESH_SECS = 2 ч: Bot Data обновлён < 2ч назад → ТО только что
+#  занесено (oil = текущий пробег в момент замены, норма) — не флагуем.
+#  ЖИВОЙ ФОРМАТ Bot Data: updated_at = ISO строка (Date из Apps Script → JSON); current_km = число.
+# --------------------------------------------------------------------------------------------
+@register("OIL_VS_CURRENT_ODO")
+def check_oil_vs_current_odo(world, run):
+    bikes = world.fleet_bikes()
+    services = world.service_records()
+    if bikes is None:
+        run.note("fleet() не вернул данные — OIL_VS_CURRENT_ODO пропущена")
+        return
+    if services is None:
+        run.note("service_list() не вернул данные — OIL_VS_CURRENT_ODO пропущена")
+        return
+    now = world.now_utc()
+    # Индекс Bot Data: номер байка → oil-запись
+    oil_svc = {}
+    for svc in services:
+        if str(svc.get("service_type") or "").strip() != "oil":
+            continue
+        plate = _extract_plate(svc.get("bike") or "")
+        if plate:
+            oil_svc[plate] = svc
+    if not oil_svc:
+        run.note("Bot Data «обслуживание» не содержит oil-записей — OIL_VS_CURRENT_ODO пропущена")
+        return
+    for b in bikes:
+        name = b.get("name", "?")
+        oil_last_km = b.get("oil_last_km") or 0
+        if not oil_last_km:
+            continue  # пустой col I — покрывается FLEET_OIL_GEAR
+        plate = _extract_plate(name)
+        if not plate:
+            continue
+        svc = oil_svc.get(plate)
+        if not svc:
+            continue
+        cur_km = svc.get("current_km") or 0
+        if not cur_km:
+            continue
+        if abs(oil_last_km - cur_km) > OIL_PHOTO_DELTA:
+            continue  # нормальный разрыв: байк проехал с момента последней замены
+        # Маркер свежести: Bot Data только что обновлён → ТО занесено сейчас
+        upd_dt = _parse_iso_dt(svc.get("updated_at"))
+        if upd_dt is not None:
+            if (now - upd_dt).total_seconds() <= OIL_FRESH_SECS:
+                continue  # свежая запись — не флагуем
+        run.flag(
+            f"Лист1 Байки/«{name}» col I: oil_last_km={oil_last_km}, "
+            f"Bot Data current_km={cur_km} (|diff|≤{OIL_PHOTO_DELTA}км)",
+            f"подозрение класс 2478: col I совпадает с текущим одометром — "
+            f"возможно км взят из фото одометра, а не из реальной замены масла",
+        )
+
+
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 8: BOT_DATA_VS_SHEET
+#  Bot Data «обслуживание» last_service_km ↔ Лист1 I (oil) / J (gear) расходятся
+#  более чем на BOT_DATA_OIL_DELTA = 200 км → флаг «источники ТО не синхронизированы».
+#  ЖИВОЙ ФОРМАТ: last_service_km = число из Bot Data (num_); 0/'' = не задано.
+# --------------------------------------------------------------------------------------------
+@register("BOT_DATA_VS_SHEET")
+def check_bot_data_vs_sheet(world, run):
+    bikes = world.fleet_bikes()
+    services = world.service_records()
+    if bikes is None:
+        run.note("fleet() не вернул данные — BOT_DATA_VS_SHEET пропущена")
+        return
+    if services is None:
+        run.note("service_list() не вернул данные — BOT_DATA_VS_SHEET пропущена")
+        return
+    fleet = {}
+    for b in bikes:
+        plate = _extract_plate(b.get("name") or "")
+        if plate:
+            fleet[plate] = b
+    for svc in services:
+        stype = str(svc.get("service_type") or "").strip()
+        if stype not in ("oil", "gear"):
+            continue
+        bike_name = svc.get("bike") or "?"
+        plate = _extract_plate(bike_name)
+        if not plate:
+            continue
+        b = fleet.get(plate)
+        if not b:
+            continue
+        last_svc_km = svc.get("last_service_km") or 0
+        if not last_svc_km:
+            continue  # Bot Data не хранит предыдущее значение — пропуск
+        col, sheet_km = ("I", b.get("oil_last_km") or 0) if stype == "oil" \
+            else ("J", b.get("gear_last_km") or 0)
+        if not sheet_km:
+            continue  # пустой col → покрывается FLEET_OIL_GEAR
+        diff = abs(sheet_km - last_svc_km)
+        if diff > BOT_DATA_OIL_DELTA:
+            run.flag(
+                f"Лист1 Байки/«{b.get('name', bike_name)}» col {col}: "
+                f"{stype}_last_km={sheet_km} ↔ Bot Data last_service_km={last_svc_km} "
+                f"(расхождение {diff}км)",
+                f"источники ТО расходятся на {diff}км (порог {BOT_DATA_OIL_DELTA}км) — "
+                f"Лист1 {col} и Bot Data «обслуживание» не синхронизированы",
+            )
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
-#    @register("OIL_VS_ODO")  — полное oil/gear vs current_odo (ждёт col Q в API clients)
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
 #    @register("FLEET_DEBT")  — долг col X в CRM пересчитывается формулой, не вводится вручную
 #  Каждый — одна @register-функция fn(world, run); CHECKS не переписывать.
@@ -475,7 +625,7 @@ def _now():
 
 
 def _healthy_world():
-    """Чистый мир: ни одного нарушения ни в одном инварианте."""
+    """Чистый мир: ни одного нарушения ни в одном инварианте (8 инвариантов)."""
     bikes = [
         # Байк в аренде с корректными данными
         {"name": "PCX160 4234", "status": "В аренде",
@@ -504,8 +654,22 @@ def _healthy_world():
         {"id": 1, "from": "Filipp-328", "task_text": "тест",
          "status": "in_progress", "updated": fresh_upd},
     ]
+    # Bot Data service records: нет расхождений (NOW=2026-07-15 12:00)
+    # PCX160 4234: масло на 35200 (= col I), current_km=36000 (≠ col I → нет флага OIL_VS_CURRENT_ODO)
+    # Bot Data last_service_km=35200 (= col I → diff=0 ≤ 200, нет флага BOT_DATA_VS_SHEET)
+    # Запись не свежая: 2026-07-14T06:00 = 30ч назад > OIL_FRESH_SECS(7200с) → релевантна
+    _old_ts = "2026-07-14T06:00:00+00:00"
+    services = [
+        {"updated_at": _old_ts, "bike": "PCX160 4234", "service_type": "oil",
+         "current_km": 36000, "last_service_km": 35200,
+         "interval_km": 3000, "next_km": 38200, "status": "ok"},
+        {"updated_at": _old_ts, "bike": "PCX160 4234", "service_type": "gear",
+         "current_km": 36000, "last_service_km": 34000,
+         "interval_km": 10000, "next_km": 44000, "status": "ok"},
+    ]
     return FakeWorld(bikes=bikes, clients=clients, queue_ip=queue,
-                     task_timeout=600, task_timeout_dev=2700, now=_now())
+                     task_timeout=600, task_timeout_dev=2700, now=_now(),
+                     services=services)
 
 
 def _runs_by_name(world):
@@ -609,6 +773,7 @@ def _self_test():
     # ── 6. QUEUE_LONG_IP ──────────────────────────────────────────────────────────────────
     cases.append(("QUEUE_LONG_IP чистый (свежая задача)", 0, _healthy_world, "QUEUE_LONG_IP"))
 
+
     now = _now()
     old_upd = (now - datetime.timedelta(seconds=3000)).isoformat()   # 50 мин > 2×600с
     w17 = _healthy_world()
@@ -627,6 +792,59 @@ def _self_test():
     w19._queue = [{"id": 77, "from": "Filipp-328-dev", "task_text": "т",
                    "status": "in_progress", "updated": young_dev}]
     cases.append(("QUEUE_LONG_IP dev молодая — не флаг", 0, lambda _w=w19: _w, "QUEUE_LONG_IP"))
+
+    # ── 7. OIL_VS_CURRENT_ODO ────────────────────────────────────────────────────────────
+    cases.append(("OIL_VS_CURRENT_ODO чистый (current_km ≠ oil_last_km)", 0,
+                  _healthy_world, "OIL_VS_CURRENT_ODO"))
+
+    # ГОЛДЕН КЛАСС 2478: oil_last_km (col I) = current_km = 24997 (не свежая запись → флаг)
+    w20 = _healthy_world()
+    w20._bikes[0]["oil_last_km"] = 24997
+    w20._services[0]["current_km"] = 24997       # совпадает с col I
+    w20._services[0]["updated_at"] = "2026-07-14T06:00:00+00:00"  # старая запись
+    cases.append(("OIL_VS_CURRENT_ODO голден 2478: oil=odo, старая запись — флаг", 1,
+                  lambda _w=w20: _w, "OIL_VS_CURRENT_ODO"))
+
+    # Свежая запись (< 2ч): ТО только что занесено — не флаг
+    w21 = _healthy_world()
+    w21._bikes[0]["oil_last_km"] = 24997
+    w21._services[0]["current_km"] = 24997
+    # NOW=2026-07-15 12:00, свежая = 1ч назад = 11:00
+    w21._services[0]["updated_at"] = "2026-07-15T11:00:00+00:00"
+    cases.append(("OIL_VS_CURRENT_ODO свежая запись (<2ч) — не флаг", 0,
+                  lambda _w=w21: _w, "OIL_VS_CURRENT_ODO"))
+
+    # Bridge None → note
+    cases.append(("OIL_VS_CURRENT_ODO Bridge None → note", 0,
+                  lambda: FakeWorld(bikes=[], clients=[], queue_ip=[], services=None),
+                  "OIL_VS_CURRENT_ODO"))
+
+    # ── 8. BOT_DATA_VS_SHEET ────────────────────────────────────────────────────────────
+    cases.append(("BOT_DATA_VS_SHEET чистый (last_svc_km = col I)", 0,
+                  _healthy_world, "BOT_DATA_VS_SHEET"))
+
+    # oil расхождение > 200 км → флаг
+    w22 = _healthy_world()
+    w22._services[0]["last_service_km"] = 34000   # diff с col I(35200) = 1200 > 200
+    cases.append(("BOT_DATA_VS_SHEET oil расхождение >200км — флаг", 1,
+                  lambda _w=w22: _w, "BOT_DATA_VS_SHEET"))
+
+    # gear расхождение > 200 км → флаг
+    w23 = _healthy_world()
+    w23._services[1]["last_service_km"] = 31000   # diff с col J(34000) = 3000 > 200
+    cases.append(("BOT_DATA_VS_SHEET gear расхождение >200км — флаг", 1,
+                  lambda _w=w23: _w, "BOT_DATA_VS_SHEET"))
+
+    # Маленькое расхождение ≤ 200 км → не флаг
+    w24 = _healthy_world()
+    w24._services[0]["last_service_km"] = 35100   # diff с col I(35200) = 100 ≤ 200
+    cases.append(("BOT_DATA_VS_SHEET расхождение ≤200км — не флаг", 0,
+                  lambda _w=w24: _w, "BOT_DATA_VS_SHEET"))
+
+    # Bridge None → note
+    cases.append(("BOT_DATA_VS_SHEET Bridge None → note", 0,
+                  lambda: FakeWorld(bikes=[], clients=[], queue_ip=[], services=None),
+                  "BOT_DATA_VS_SHEET"))
 
     # ── Общие свойства (вычисляем ДО регистрации _SELF_TEST_TEMP — иначе ALL-счёт растёт) ──
     # Чистый мир = ноль нарушений суммарно
@@ -658,7 +876,7 @@ def _self_test():
 
     # Проверяем предвычисленные ALL-результаты
     for title, got, expect in [
-        ("чистый мир — 0 нарушений ВСЕГО (6 инвариантов)", _total_clean, 0),
+        ("чистый мир — 0 нарушений ВСЕГО (8 инвариантов)", _total_clean, 0),
         ("деградация (всё None) → 0 нарушений суммарно", _total_degraded, 0),
     ]:
         ok = (got == expect)
@@ -702,36 +920,6 @@ def main(argv):
             ok = _push_to_328(report)
             print(f"[push] {'отправлен в 328' if ok else 'НЕ отправлен (см. stderr)'}")
         # При ✅ — тихо (silent = designed)
-
-    # ── Предложения по классу инцидента 2478 ─────────────────────────────────────────────
-    # Инцидент 2478 (разбор 15.07.2026): vision-фото прочитало ТЕКУЩИЙ одометр («было на N км»)
-    # и записало его в col I Лист1 как «последняя замена масла» — хотя замены не было.
-    # Три инварианта, которые поймали бы этот класс:
-    if "--suggestions" in argv or ("--push" not in argv and "--json" not in argv):
-        print()
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print("💡 ПРЕДЛОЖЕНИЯ: инварианты для класса инцидента 2478 (на выбор владельца)")
-        print()
-        print("Инцидент: vision-фото прочитало ТЕКУЩИЙ одометр («масло было на N км») и")
-        print("записало N в col I Лист1 как «замену масла» — хотя замена не производилась.")
-        print()
-        print("1. OIL_VS_CURRENT_ODO (требует col Q из CRM в fleet-ответе):")
-        print("   oil_last_km (col I) > current_odo (col Q) → флаг «масло в будущем».")
-        print("   Прямо ловит запись «текущий одометр» вместо «пробег на замене».")
-        print("   Реализация: передать Q из ReadClients через Bridge в fleet-ответ или")
-        print("   добавить endpoint «fleet_with_odo» (join Лист1 + col Q из CRM по имени байка).")
-        print()
-        print("2. OIL_SERVICE_INTERVAL (current_odo - oil_last_km > OIL_MAX_KM, дефолт 3000):")
-        print("   Интервал с последней замены масла превышает норму → флаг «ТО просрочено».")
-        print("   Ловит обратный класс: oil_last_km слишком старый относительно пробега.")
-        print("   Требует col Q; настраивается OIL_MAX_KM в .env (дефолт 3000 км).")
-        print()
-        print("3. BOT_DATA_VS_SHEET (сверка Bot Data «обслуживание» с col I Лист1):")
-        print("   oil_last_km в Bot Data (последняя запись «ТО Oil» для байка) ≠ col I Лист1")
-        print("   с разницей > 200 км → флаг «расхождение источников».")
-        print("   Ловит случаи когда vision записало в Лист1, но Bot Data видела другое.")
-        print("   Не требует col Q; работает с уже доступными данными.")
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     return 0
 
