@@ -1581,6 +1581,13 @@ def _curator_scope_on():
     return (os.environ.get("CURATOR_SCOPE") or "").strip() == "1"
 
 
+def _gate_single_selective_on():
+    """Флаг GATE_SINGLE_SELECTIVE=1 в .env: одиночные «тз:»/«задача:» → селективный гейт
+    (smoke + затронутые модули вместо полного сьюта). Fail-safe: gate.py не смог определить
+    затронутые → полный сьют. 0/нет → полный гейт на одиночных (прежнее поведение)."""
+    return (os.environ.get("GATE_SINGLE_SELECTIVE") or "").strip() == "1"
+
+
 _COMMIT_IN_RESULT_RE = re.compile(r"(?i)(коммит\b|commit\b|git\s+push)")
 
 
@@ -2869,9 +2876,11 @@ def cycle():
 
 def main():
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
-             "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, fact_ttl=%ss, model=%s, executor_model=%s) ===",
+             "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, gate_single_sel=%s, "
+             "fact_ttl=%ss, model=%s, executor_model=%s) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
              int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), int(_curator_scope_on()),
+             int(_gate_single_selective_on()),
              FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL)
     while _running:
         try:
