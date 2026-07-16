@@ -52,6 +52,7 @@ class FakeBridge:
         r = s.rows.get(int(tid))
         if r:
             r["status"] = status
+            r["result"] = result
         return {"ok": True}
 
     def set_needs_approval(s, tid, what):
@@ -86,7 +87,9 @@ def fresh(mem_mb=900):
     fb = FakeBridge()
     OD.bc = fb
     OD._mem_wait_until = 0.0       # сброс cooldown
+    OD._mem_deny_count = 0         # сброс счётчика отказов
     OD.MEM_MIN_MB = 700            # стандартный порог
+    OD.MEM_DENY_ALERT = 3          # стандартный порог алерта
     OD._mem_available_mb = lambda: mem_mb
     return fb
 
@@ -189,8 +192,50 @@ def t7():
     OD._mem_wait_until = 0.0
 
 
+# T8: 3 последовательных «настоящих» отказа → synthetic-карточка в 328 (enqueue→claim→done)
+def t8():
+    fb = fresh(mem_mb=300)        # ниже порога
+    # первые два отказа — карточки ещё нет
+    for _ in range(2):
+        OD._mem_wait_until = 0.0  # сброс cooldown, чтобы каждый проход был «настоящим» чеком
+        OD._mem_gate_check()
+    done_before = [r for r in fb.rows.values() if r["status"] == "done"]
+    res.append(ok(len(done_before) == 0, "T8a: 2 отказа — карточки ещё нет"))
+    # третий отказ → карточка
+    OD._mem_wait_until = 0.0
+    OD._mem_gate_check()
+    done_after = [r for r in fb.rows.values() if r["status"] == "done"]
+    res.append(ok(len(done_after) == 1, "T8b: 3-й отказ → synthetic done в 328"))
+    card_result = done_after[0].get("result", "") if done_after else ""
+    res.append(ok("памят" in card_result.lower() or "oom" in card_result.lower(),
+                  "T8c: текст карточки упоминает память/OOM"))
+    # счётчик сброшен после алерта → следующий отказ начинает отсчёт заново
+    res.append(ok(OD._mem_deny_count == 0, "T8d: счётчик сброшен после алерта"))
+
+
+# T9: успех сбрасывает счётчик — цикл не нарастает через recovery
+def t9():
+    fb = fresh(mem_mb=300)
+    # два отказа
+    for _ in range(2):
+        OD._mem_wait_until = 0.0
+        OD._mem_gate_check()
+    # память восстановилась
+    OD._mem_wait_until = 0.0
+    OD._mem_available_mb = lambda: 1200
+    OD._mem_gate_check()
+    res.append(ok(OD._mem_deny_count == 0, "T9a: успех после 2 отказов → счётчик=0"))
+    # следующий отказ — снова с нуля, карточек нет
+    OD._mem_wait_until = 0.0
+    OD._mem_available_mb = lambda: 300
+    OD._mem_gate_check()
+    done = [r for r in fb.rows.values() if r["status"] == "done"]
+    res.append(ok(len(done) == 0 and OD._mem_deny_count == 1,
+                  "T9b: отказ после recovery — счётчик=1, карточек нет"))
+
+
 # run all
-t1(); t2(); t3(); t4(); t5(); t6(); t7()
+t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9()
 
 fails = sum(0 if r else 1 for r in res)
 print(f"\n{'OK' if not fails else 'FAIL'} — {fails}/{len(res)} тестов провалились")

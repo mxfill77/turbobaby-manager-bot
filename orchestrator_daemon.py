@@ -71,6 +71,8 @@ except (ValueError, TypeError):
     MEM_MIN_MB = 700
 MEM_RETRY_SEC = _env_int("MEM_RETRY_SEC", 120)   # cooldown после детекта дефицита, сек
 _mem_wait_until = 0.0                              # monotonic: до этого момента не берём задачи
+_mem_deny_count = 0        # число последовательных «настоящих» отказов (cooldown-пропуски не в счёт)
+MEM_DENY_ALERT = 3         # порог для карточки в 328 (сбрасывается после алерта)
 DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очереди (devbot кладёт Filipp-328-dev)
 DEC_FROM_SUFFIX = "-dec" # метка декомпозиции (ступень 2 часть C; devbot кладёт Filipp-328-dec):
                          # родитель «декомпозируй:» + его шаги + synthetic-сводка — всё под этой меткой
@@ -290,8 +292,9 @@ def _mem_available_mb():
 def _mem_gate_check():
     """Гейт памяти перед стартом claude -p.
     True  = дефицит (не берём задачу, она остаётся в new).
-    False = памяти достаточно / /proc/meminfo нечитаем (fail-safe) / MEM_MIN_MB=0 (выключен)."""
-    global _mem_wait_until
+    False = памяти достаточно / /proc/meminfo нечитаем (fail-safe) / MEM_MIN_MB=0 (выключен).
+    После MEM_DENY_ALERT последовательных «настоящих» отказов отправляет synthetic-карточку в 328."""
+    global _mem_wait_until, _mem_deny_count
     if MEM_MIN_MB <= 0:
         return False
     now = time.monotonic()
@@ -303,11 +306,34 @@ def _mem_gate_check():
     if mb is None:
         return False  # fail-safe: /proc/meminfo нечитаем → гейт пропускается
     if mb >= MEM_MIN_MB:
+        _mem_deny_count = 0   # память восстановилась — сброс счётчика
         return False
     _mem_wait_until = now + MEM_RETRY_SEC
-    log.warning("⏳ ждёт памяти: свободно %dМБ < %dМБ — задача ждёт в new, ретрай через %ds",
-                mb, MEM_MIN_MB, MEM_RETRY_SEC)
+    _mem_deny_count += 1
+    log.warning("⏳ ждёт памяти: свободно %dМБ < %dМБ — задача ждёт в new, ретрай через %ds (подряд=%d)",
+                mb, MEM_MIN_MB, MEM_RETRY_SEC, _mem_deny_count)
+    if _mem_deny_count >= MEM_DENY_ALERT:
+        _mem_deny_count = 0   # сброс: следующие MEM_DENY_ALERT отказов дадут ещё один алерт
+        _mem_alert_328(mb)
     return True
+
+
+def _mem_alert_328(mb):
+    """Synthetic-карточка в 328 при MEM_DENY_ALERT последовательных OOM-отказах. Fail-safe тишина."""
+    try:
+        wait_min = round(MEM_DENY_ALERT * MEM_RETRY_SEC / 60)
+        msg = (f"⚠️ OOM-ГЕЙТ: памяти {mb}МБ < {MEM_MIN_MB}МБ · "
+               f"{MEM_DENY_ALERT} отказа(ов) подряд (~{wait_min} мин) · "
+               f"задачи ждут в new · при восстановлении подберутся автоматически")
+        r = bc.enqueue_task("Filipp-328", "[⚠️ oom-гейт] памяти мало — задачи ждут")
+        if not r.get("ok"):
+            return
+        sid = r.get("id")
+        bc.claim_task(sid)
+        bc.complete_task(sid, "done", msg)
+        log.warning("mem-gate: карточка в 328 (id=%s): %s", sid, msg)
+    except Exception as e:
+        log.warning("mem-gate: карточка в 328 упала (%s) — тишина", e)
 
 
 def _planned_restart_verdict(rc, task_text, t0_mono):
