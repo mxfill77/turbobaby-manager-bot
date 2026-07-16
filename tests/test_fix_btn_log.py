@@ -12,9 +12,10 @@ BIKE = "XMAX 300CC NEW BLUE-3 PHUKET 4724"
 
 
 class FakeQ:
-    def __init__(self, data, uname="Pleummmm"):
+    def __init__(self, data, uname="Pleummmm", uid=504608015):
         self.data = data
-        self.from_user = type("U", (), {"username": uname})()
+        # uid=504608015 = владелец (OWNER_IDS) — класс H: только владелец подтверждает снижение
+        self.from_user = type("U", (), {"username": uname, "id": uid})()
     async def answer(self, *a, **k): pass
     async def edit_message_reply_markup(self, **k): pass
     async def edit_message_text(self, *a, **k): pass

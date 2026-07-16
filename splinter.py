@@ -2361,6 +2361,58 @@ _CONFIRM_NO = {"нет", "не", "no", "ไม่", "ไม่ใช่"}
 _LAST_RECORDED_KM = {}    # (chat_id, topic_id) -> (km:int, ts) — что реально записали через service_upsert
 _LAST_REC_TTL = 3600      # коррекцию принимаем только если запись была недавно (1 ч)
 _PENDING_CORRECTION = {}  # (chat_id, topic_id) -> (old_km:int, new_km:int, bike:str, ts)
+
+# === Сторож Б (класс H): единый гейт снижения одометра ===
+# Авторизует снижение km ТОЛЬКО явное «да»/кнопка от ВЛАДЕЛЬЦА. Лог тапа/текста — ДО применения.
+# Fail-safe: исключение в guard → allow (прежнее поведение). Гейт «да» Пыма не ослаблен.
+_ODOGUARD_CONFIRMED = {}  # (chat_id, topic_id) -> {new_km:int, ts:float, source:str}
+_ODOGUARD_TTL = 300       # авторизация действительна 5 мин
+
+
+def _odoguard_authorize(chat_id, topic_id, new_km, source="?"):
+    """Зарегистрировать явное «да» владельца на снижение одометра.
+    Вызывать СРАЗУ ПОСЛЕ явного подтверждения, ДО вызова _apply_correction."""
+    try:
+        km_int = int(str(new_km).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return
+    _ODOGUARD_CONFIRMED[(chat_id, topic_id)] = {
+        "new_km": km_int, "ts": _time.time(), "source": source,
+    }
+    log.info(f"  🔑 сторож Б: авторизован {km_int} тема={topic_id} source={source}")
+
+
+def _odoguard_check(chat_id, topic_id, new_km, caller="?"):
+    """Единый сторож Б (класс H): гейт перед записью снижения одометра.
+    Возвращает True (разрешено, токен потреблён) или False (заблокировано).
+    Fail-safe: любое исключение → True (прежнее поведение)."""
+    try:
+        try:
+            new_int = int(str(new_km).replace(" ", "").replace(",", ""))
+        except (ValueError, TypeError):
+            return True
+        tok = _ODOGUARD_CONFIRMED.get((chat_id, topic_id))
+        if tok is None:
+            log.warning(f"  🔒 сторож Б БЛОК [{caller}]: нет авторизации km={new_int} тема={topic_id}")
+            return False
+        if tok["new_km"] != new_int:
+            log.warning(
+                f"  🔒 сторож Б БЛОК [{caller}]: km≠авт {tok['new_km']}≠{new_int} тема={topic_id}"
+            )
+            return False
+        if _time.time() - tok["ts"] > _ODOGUARD_TTL:
+            log.warning(f"  🔒 сторож Б БЛОК [{caller}]: авторизация устарела тема={topic_id}")
+            _ODOGUARD_CONFIRMED.pop((chat_id, topic_id), None)
+            return False
+        src = tok["source"]
+        _ODOGUARD_CONFIRMED.pop((chat_id, topic_id), None)
+        log.info(f"  ✅ сторож Б [{caller}]: ok km={new_int} source={src}")
+        return True
+    except Exception:
+        log.exception(f"  сторож Б: исключение fail-safe → allow [{caller}]")
+        return True
+
+
 # негатор правки: «не верно / неверно / неправильно / ошибся / wrong»
 _CORRECTION_RE = r"(не\s*верн|неверн|неправильн|ошиб|не\s*прав|wrong|ผิด)"
 # Масло-нарративы задним числом — исключаются из _CORRECTION_RE, даже если содержат негатор.
@@ -2597,9 +2649,21 @@ async def handle_correction_confirm(msg, context, bridge, text) -> bool:
         return False
     t = (text or "").strip().lower()
     if t in _CONFIRM_YES:
+        # Класс H (сторож Б): только ВЛАДЕЛЕЦ подтверждает снижение одометра.
+        # Пым или посторонний «да» — НЕ применяем (pending остаётся, ждём владельца).
+        if not _is_owner(msg):
+            uname = getattr(getattr(msg, "from_user", None), "username", None) or "?"
+            log.warning(
+                f"  🔒 сторож Б: confirm не от владельца (@{uname}) тема={topic_id} — pending сохранён"
+            )
+            return False
         old_km, new_km, bike = pend[0], pend[1], pend[2]
         _PENDING_CORRECTION.pop(key, None)
         clear_awaiting(*key)
+        uname = getattr(getattr(msg, "from_user", None), "username", None) or str(
+            getattr(getattr(msg, "from_user", None), "id", "?")
+        )
+        _odoguard_authorize(chat_id, topic_id, new_km, source=f"text:{uname}")
         await _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, new_km)
         return True
     if t in _CONFIRM_NO:
@@ -2616,9 +2680,14 @@ async def handle_correction_confirm(msg, context, bridge, text) -> bool:
 
 
 async def _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, new_km):
-    """САНКЦИОНИРОВАННАЯ правка (после «да»/кнопки): перезапись service_upsert(new) В ОБХОД сторожа B.
-    Сторож B (floor) здесь НЕ применяется — это явное подтверждённое человеком исправление вниз.
-    Сторож B для ФОТО не затрагивается. Кол.H/I (set_fleet_*) не пишем — только обслуживание."""
+    """Санкционированная правка одометра через единый сторож Б (класс H).
+    Требует предварительной авторизации _odoguard_authorize от владельца.
+    Без авторизации — блокируется. Кол.H/I (set_fleet_*) не пишем — только обслуживание."""
+    if not _odoguard_check(chat_id, topic_id, new_km, caller="_apply_correction"):
+        log.warning(
+            f"  🔒 _apply_correction ЗАБЛОКИРОВАНА сторожем Б: {old_km}→{new_km} тема={topic_id}"
+        )
+        return
     info = _run_service_tracker(bridge, chat_id, topic_id, bike, new_km)   # service_upsert(new)
     # Новый last-known = исправленное значение: будущие ФОТО сравнивает сторож B уже от него
     # (_run_service_tracker обновил _LAST_RECORDED_KM; дублируем в буфер фото как свежий high).
@@ -2634,7 +2703,7 @@ async def _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, ne
                             f"🇹🇭 ✅ แก้เลขไมล์แล้ว{b_th}: {old_km} → {new_km} กม.{extra_th}\n"
                             f"{_SEP}\n"
                             f"🇷🇺 ✅ Пробег исправлен{b_ru}: {old_km} → {new_km} км.{extra_ru}"))
-    log.info(f"  → коррекция пробега ПРИМЕНЕНА (обход сторожа B): {old_km}→{new_km} (тема {topic_id})")
+    log.info(f"  → коррекция пробега ПРИМЕНЕНА (сторож Б ✅): {old_km}→{new_km} (тема {topic_id})")
 
 
 async def handle_oil_backdated_service(msg, context, bridge, text) -> bool:
@@ -3340,9 +3409,15 @@ async def handle_service_button(update, context, bridge) -> None:
 
     if action == "fix":
         # [✅ Да] на переспрос текстовой КОРРЕКЦИИ пробега (фикс _row22) — эквивалент текстового «да».
-        # Санкционированная человеком правка → перезапись в обход сторожа B (только этот путь).
-        await _btn_answer(q, "กำลังแก้… · Исправляю…")
+        # Класс H (сторож Б): только ВЛАДЕЛЕЦ авторизует снижение. Проверяем ДО очистки состояния.
         old_km, new_km = data.get("old_km"), data.get("new_km")
+        uname = getattr(q.from_user, "username", None) or str(getattr(q.from_user, "id", "?"))
+        if not is_owner_user(q.from_user):
+            await _btn_answer(q, "Снижение пробега — только владелец / Owner confirms km decrease",
+                              show_alert=True)
+            log.warning(f"  🔒 сторож Б: fix-btn не от владельца (@{uname}) тема={topic_id} — кнопка живёт")
+            return
+        await _btn_answer(q, "กำลังแก้… · Исправляю…")
         key = (chat_id, topic_id)
         try:
             await q.edit_message_reply_markup(reply_markup=None)
@@ -3351,8 +3426,8 @@ async def handle_service_button(update, context, bridge) -> None:
         _SVC_TOKENS.pop(token, None)
         _PENDING_CORRECTION.pop(key, None)
         clear_awaiting(*key)
-        uname = getattr(q.from_user, "username", None) or str(getattr(q.from_user, "id", "?"))
         log.info(f"  🔧 fix-btn: @{uname} bike={bike} {old_km}→{new_km}")
+        _odoguard_authorize(chat_id, topic_id, new_km, source=f"btn:{uname}")
         try:
             await _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, new_km)
         except Exception:
@@ -4846,6 +4921,18 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
         log.info(f"  → E2b-заявка: {bike} {kind} уже ждёт подтверждения — не дублирую")
         return
     if odo:
+        # Сторож Б (класс H) — мягкий: мозг не имеет токена владельца; если odo меньше последнего
+        # известного — логируем предупреждение (fail-safe: НЕ блокируем, гейт «да» Пыма сохранён).
+        _rec = _LAST_RECORDED_KM.get((chat_id, topic_id))
+        if _rec:
+            try:
+                if int(odo) < _rec[0]:
+                    log.warning(
+                        f"  ⚠️ сторож Б [sp_confirm_from_brain]: odo={odo} < last={_rec[0]}"
+                        f" тема={topic_id} bike={bike} — fail-safe пропускаем (гейт Пыма сохранён)"
+                    )
+            except (ValueError, TypeError):
+                pass
         await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo)
         return
     bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
