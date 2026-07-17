@@ -29,13 +29,31 @@ import orchestrator_daemon as OD
 _good_out = json.dumps({"result": "готово", "is_error": False,
                          "modelUsage": {"claude-fable-5": {}}})
 
+class _FakePopen:
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
 CAP = {}
 _real_od_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0
 
 
 def cap_run(args, **kw):
     CAP.update({"args": list(args), "env": dict(kw.get("env") or {})})
     return type("P", (), {"stdout": _good_out, "stderr": "", "returncode": 0})()
+
+
+def cap_popen(args, **kw):
+    CAP.update({"args": list(args), "env": dict(kw.get("env") or {})})
+    return _FakePopen(out=_good_out)
 
 
 def with_flag(value, fn):
@@ -52,6 +70,7 @@ def with_flag(value, fn):
 
 
 OD.subprocess.run = cap_run
+OD._POPEN = cap_popen
 
 
 # ── (1–4) Дефолт (GATE_SINGLE_SELECTIVE=0/не задан) = текущее поведение ──────
@@ -131,15 +150,15 @@ _plan_out = json.dumps({"result": "1. шаг один\n2. шаг два", "is_er
                          "modelUsage": {"claude-fable-5": {}}})
 
 
-def cap_run_plan(args, **kw):
+def cap_popen_plan(args, **kw):
     CAP.update({"args": list(args), "env": dict(kw.get("env") or {})})
-    return type("P", (), {"stdout": _plan_out, "stderr": "", "returncode": 0})()
+    return _FakePopen(out=_plan_out)
 
 
-OD.subprocess.run = cap_run_plan
+OD._POPEN = cap_popen_plan
 ok(_run("[шаг 2/5 родитель 10] планировщик", preamble=OD.PLANNER_PREAMBLE, tid=10) != "1",
    "планировщик + флаг=1 → нет GATE_STEP_SELECTIVE (планировщик всегда полный)")
-OD.subprocess.run = cap_run
+OD._POPEN = cap_popen
 
 
 # ── (11) GATE_ALERT_FINAL_ONLY=1 цел при флаге=1 (регресс) ───────────────────
@@ -192,6 +211,8 @@ ok(code == 0 and "селективный" in out and "3" in out,
    "GATE_STEP_SELECTIVE=1 → gate.py идёт в selective branch (end-to-end)")
 
 OD.subprocess.run = _real_od_run
+OD._POPEN = _real_POPEN
+OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 
 print(f"\nИТОГ: {'ВСЕ PASS' if all(res) else 'ЕСТЬ FAIL (%d/%d)' % (sum(res), len(res))}")
 sys.exit(0 if all(res) else 1)

@@ -74,12 +74,19 @@ class FakeBridge:
         return {"ok": True}
 
 
-def _fake_run_done(args, **kw):
-    """Имитирует успешный claude -p exit=0 с минимальным JSON-выводом."""
-    return type("P", (), {
-        "stdout": '{"type":"result","result":"сводка done","subtype":"success"}',
-        "stderr": "", "returncode": 0
-    })()
+class FakePopen:
+    """Имитирует subprocess.Popen для мокирования OD._POPEN в run_task."""
+    def __init__(s, out="", rc=0):
+        s._out, s.returncode = out, rc
+    def communicate(s, timeout=None):
+        return s._out, ""
+    def kill(s): pass
+    def terminate(s): pass
+
+
+def _fake_popen_done(args, **kw):
+    """Имитирует успешный claude -p (Popen) с минимальным JSON-выводом."""
+    return FakePopen('{"type":"result","result":"сводка done","subtype":"success"}')
 
 
 def fresh(mem_mb=900):
@@ -101,16 +108,18 @@ def fresh(mem_mb=900):
     return fb
 
 
+_real_POPEN = OD._POPEN
+
 # T1: память выше порога → задача берётся
 def t1():
     fb = fresh(mem_mb=900)          # 900 >= 700
     fb.enqueue_task("Filipp-328", "задача: тест 1")
-    _old = OD.subprocess.run
-    OD.subprocess.run = _fake_run_done
+    _old = OD._POPEN
+    OD._POPEN = _fake_popen_done
     try:
         OD.process_new()
     finally:
-        OD.subprocess.run = _old
+        OD._POPEN = _old
     res.append(ok(len(fb.claimed) == 1, "T1: память ОК → задача взята"))
 
 
@@ -142,12 +151,12 @@ def t4():
     fb = fresh()
     fb.enqueue_task("Filipp-328", "задача: тест 4")
     OD._mem_available_mb = lambda: None   # /proc/meminfo «нечитаем»
-    _old = OD.subprocess.run
-    OD.subprocess.run = _fake_run_done
+    _old = OD._POPEN
+    OD._POPEN = _fake_popen_done
     try:
         OD.process_new()
     finally:
-        OD.subprocess.run = _old
+        OD._POPEN = _old
     res.append(ok(len(fb.claimed) == 1,
                   "T4: fail-safe (None) → гейт пропущен, задача взята"))
 
@@ -157,12 +166,12 @@ def t5():
     fb = fresh(mem_mb=50)
     fb.enqueue_task("Filipp-328", "задача: тест 5")
     OD.MEM_MIN_MB = 0               # gate off
-    _old = OD.subprocess.run
-    OD.subprocess.run = _fake_run_done
+    _old = OD._POPEN
+    OD._POPEN = _fake_popen_done
     try:
         OD.process_new()
     finally:
-        OD.subprocess.run = _old
+        OD._POPEN = _old
     res.append(ok(len(fb.claimed) == 1,
                   "T5: MEM_MIN_MB=0 → гейт выключен, задача берётся"))
 
@@ -176,12 +185,12 @@ def t6():
     # симулируем истечение cooldown
     OD._mem_wait_until = time.monotonic() - 1.0
     OD._mem_available_mb = lambda: 900    # теперь ОК
-    _old = OD.subprocess.run
-    OD.subprocess.run = _fake_run_done
+    _old = OD._POPEN
+    OD._POPEN = _fake_popen_done
     try:
         OD.process_new()
     finally:
-        OD.subprocess.run = _old
+        OD._POPEN = _old
     res.append(ok(len(fb.claimed) == 1,
                   "T6: cooldown истёк + память ОК → задача взята"))
 
@@ -259,12 +268,12 @@ def t11():
     fb.enqueue_task("Filipp-328", "задача: тест 11")
     OD.CLAUDE_RSS_TOTAL_MB = 1200
     OD._live_claude_rss_mb = lambda: 800     # RSS < порога
-    _old = OD.subprocess.run
-    OD.subprocess.run = _fake_run_done
+    _old = OD._POPEN
+    OD._POPEN = _fake_popen_done
     try:
         OD.process_new()
     finally:
-        OD.subprocess.run = _old
+        OD._POPEN = _old
     res.append(ok(len(fb.claimed) == 1, "T11: claude RSS 800МБ < 1200МБ → задача берётся"))
 
 
@@ -274,17 +283,19 @@ def t12():
     fb.enqueue_task("Filipp-328", "задача: тест 12")
     OD.CLAUDE_RSS_TOTAL_MB = 0               # выключен
     OD._live_claude_rss_mb = lambda: 99999   # огромный RSS, но гейт выключен
-    _old = OD.subprocess.run
-    OD.subprocess.run = _fake_run_done
+    _old = OD._POPEN
+    OD._POPEN = _fake_popen_done
     try:
         OD.process_new()
     finally:
-        OD.subprocess.run = _old
+        OD._POPEN = _old
     res.append(ok(len(fb.claimed) == 1, "T12: CLAUDE_RSS_TOTAL_MB=0 → RSS-гейт выключен"))
 
 
 # run all
 t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10(); t11(); t12()
+
+OD._POPEN = _real_POPEN
 
 fails = sum(0 if r else 1 for r in res)
 print(f"\n{'OK' if not fails else 'FAIL'} — {fails}/{len(res)} тестов провалились")

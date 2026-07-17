@@ -130,6 +130,7 @@ def fake_popen(args, **kw):
     return FakePopen(CLAUDE_OUT)
 OD.subprocess.run = fake_run
 OD._POPEN = fake_popen           # БЕЗ этого первый прогон спавнил ЖИВОЙ claude (урок класса!)
+OD.MAX_CLAUDE_PROCS = 0; OD.MEM_MIN_MB = 0; OD.CLAUDE_RSS_TOTAL_MB = 0
 
 print("(4) РУБЕЖ 2: фикстура в живой очереди → мгновенный failed, claude -p не звался:")
 os.environ.pop("ORCH_TEST_MODE", None)   # боевой режим (гейт наследует ORCH_TEST_MODE=1 — снимаем)

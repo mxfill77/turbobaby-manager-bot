@@ -61,14 +61,36 @@ class FakeBridge:
         return [r for r in s.rows.values() if r["task_text"].startswith("[самопочинка задачи")]
 
 
+class FakePopen:
+    """Мок _POPEN для claude -p в run_task (исполнитель задачи, НЕ думатель)."""
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
 class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
 
 _real_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0  # отключить proc-gate в тестах (нет живых claude)
+
+def fake_popen(args, **kw):
+    """Мок claude -p через _POPEN: исполнитель задачи (run_task). task_queue на fake_run."""
+    if fake_run.task_queue:
+        out, rc = fake_run.task_queue.pop(0)
+        return FakePopen(out, rc)
+    return FakePopen("сделано", 0)
+
 def fake_run(args, **kw):
+    """Мок systemctl + думатель через subprocess.run (думатель идёт через subprocess.run, НЕ _POPEN)."""
     if args and args[0] == "systemctl":
-        # проба _deferred_restart_visible (плановый рестарт): видимость управляется флагом
         return FakeProc(fake_run.systemd_units)
     if args and args[0] == OD.CLAUDE_BIN:
         prompt = args[-1]
@@ -79,12 +101,9 @@ def fake_run(args, **kw):
             if fake_run.thinker_exc:
                 raise fake_run.thinker_exc
             return FakeProc(fake_run.thinker_out)
-        if fake_run.task_queue:
-            out, rc = fake_run.task_queue.pop(0)
-            return FakeProc(out, rc)
-        return FakeProc("сделано")
     return FakeProc("ok")
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 
 
 def fresh(selfheal="1"):
@@ -283,6 +302,8 @@ res.append(ok(fake_run.thinker_calls == 1
 
 os.environ.pop("STEP_SELFHEAL", None)
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN
+OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

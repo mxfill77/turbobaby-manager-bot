@@ -80,7 +80,20 @@ class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
 
+class FakePopen:
+    """Имитирует subprocess.Popen для мокирования OD._POPEN в run_task."""
+    def __init__(s, out="", rc=0):
+        s._out, s.returncode = out, rc
+    def communicate(s, timeout=None):
+        return s._out, ""
+    def kill(s): pass
+    def terminate(s): pass
+
+
 _real_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
+
+
 def fake_run(args, **kw):
     if args and args[0] == OD.CLAUDE_BIN:
         prompt = args[-1]
@@ -96,14 +109,22 @@ def fake_run(args, **kw):
         if prompt.startswith(OD.THINKER_PREAMBLE):
             fake_run.heal_calls += 1
             return FakeProc(fake_run.heal_out)
-        if prompt.startswith(OD.PLANNER_PREAMBLE):
-            return FakeProc(fake_run.plan_out)
-        if fake_run.step_queue:
-            out, rc = fake_run.step_queue.pop(0)
-            return FakeProc(out, rc)
-        return FakeProc("сводка: шаг сделан")
     return FakeProc("ok")
+
+
+def fake_popen(args, **kw):
+    """Имитирует Popen для исполнителя и планировщика (пути через _POPEN в run_task)."""
+    prompt = args[-1]
+    if prompt.startswith(OD.PLANNER_PREAMBLE):
+        return FakePopen(fake_run.plan_out)
+    if fake_run.step_queue:
+        out, rc = fake_run.step_queue.pop(0)
+        return FakePopen(out, rc)
+    return FakePopen("сводка: шаг сделан")
+
+
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 
 
 def fresh(adapt="1", selfheal="1", plan="1. шаг один\n2. шаг два\n3. шаг три"):
@@ -111,6 +132,7 @@ def fresh(adapt="1", selfheal="1", plan="1. шаг один\n2. шаг два\n3
     OD.bc = fb
     OD._summarized.clear()
     OD._adapt_finish.clear()
+    OD.MAX_CLAUDE_PROCS = 0
     os.environ["PLAN_ADAPT"] = adapt
     os.environ["STEP_SELFHEAL"] = selfheal
     fake_run.plan_out = plan
@@ -338,6 +360,7 @@ res.append(ok(len(corr) == 1 and fb.rows[corr[0]["id"]]["status"] == "needs_appr
 
 os.environ["PLAN_ADAPT"] = "0"
 os.environ.pop("STEP_SELFHEAL", None)
+OD._POPEN = _real_POPEN
 OD.subprocess.run = _real_run
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")

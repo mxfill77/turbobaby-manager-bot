@@ -70,6 +70,7 @@ _real_bc = OD.bc
 _real_run_task = OD.run_task
 _real_rp = OD._restart_pending
 OD._restart_pending = lambda: False
+OD.MAX_CLAUDE_PROCS = 0; OD.MEM_MIN_MB = 0; OD.CLAUDE_RSS_TOTAL_MB = 0
 
 # Заменяем bc сразу — orchestrator_daemon load_dotenv'ит реальный .env при import,
 # поэтому OD.bc изначально указывает на боевой Bridge. Без замены _curator_card_exists

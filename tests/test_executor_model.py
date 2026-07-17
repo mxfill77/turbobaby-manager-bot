@@ -20,10 +20,24 @@ import orchestrator_daemon as OD
 print("(1) дефолт байт-в-байт:")
 res.append(ok(OD.EXECUTOR_MODEL == OD.ORCH_MODEL, "EXECUTOR_MODEL по умолчанию == ORCH_MODEL"))
 
+class FakePopen:
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
 class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
+class _MinFakeBC:
+    def task_heartbeat(s, tid): return {"ok": True}
+
 _real_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
 CAP = {}
 def fake_run(args, **kw):
     CAP["args"] = list(args); CAP["kw"] = kw
@@ -31,7 +45,12 @@ def fake_run(args, **kw):
 fake_run.out = json.dumps({"result": "готово", "is_error": False,
                            "modelUsage": {"claude-fable-5": {"inputTokens": 1}}})
 fake_run.rc = 0
+def fake_popen(args, **kw):
+    CAP["args"] = list(args); CAP["kw"] = kw
+    return FakePopen(fake_run.out, fake_run.rc)
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
+OD.bc = _MinFakeBC()
 
 def argv_model(a):
     return a[a.index("--model") + 1] if "--model" in a else None
@@ -57,6 +76,8 @@ res.append(ok(OD._normalize_model("my-custom-model") == "my-custom-model",
 print("(4) флаг подхватывается (реимпорт с EXECUTOR_MODEL=sonnet-4-6):")
 os.environ["EXECUTOR_MODEL"] = "sonnet-4-6"
 importlib.reload(OD)  # patch subprocess.run живёт на общем модуле subprocess — переживает reload
+OD._POPEN = fake_popen   # _POPEN сбрасывается reload'ом — восстанавливаем
+OD.bc = _MinFakeBC()     # bc сбрасывается reload'ом — восстанавливаем
 res.append(ok(OD.EXECUTOR_MODEL == "claude-sonnet-4-6",
               "флаг из env подхвачен + алиас нормализован в полный id"))
 res.append(ok(OD.ORCH_MODEL == "fable", "ORCH_MODEL (думатель/планировщик) флагом НЕ тронут"))
@@ -92,5 +113,6 @@ res.append(ok(st7 == "needs_approval" and r7.startswith("op=other"),
               "маркер в выводе sonnet-исполнителя → needs_approval как раньше"))
 
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

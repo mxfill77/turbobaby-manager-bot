@@ -7,9 +7,6 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ.setdefault("PLAN_ADAPT", "0")  # изоляция от боевого .env (адаптация плана, кусок 2)
 os.environ["CURATOR"] = "0"  # изоляция от боевого .env (куратор целей, родитель 231; принудительно — env демона)
-# изоляция от боевого .env (ускорение цепей ч.1): пустая строка = дефолт EXECUTOR_MODEL=ORCH_MODEL,
-# load_dotenv(override=False) существующее значение не перебьёт — тест доказывает дефолт байт-в-байт
-os.environ["EXECUTOR_MODEL"] = ""
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
@@ -22,35 +19,16 @@ res.append(ok(OD.ORCH_MODEL == "fable", "ORCH_MODEL по умолчанию = fa
 res.append(ok(OD.ORCH_MODEL_FALLBACK == "claude-opus-4-8[1m]", "ORCH_MODEL_FALLBACK = Opus 4.8 1M (прежняя)"))
 res.append(ok(OD.ORCH_MODEL != OD.ORCH_MODEL_FALLBACK, "основная и фолбэк — разные модели"))
 
-class FakePopen:
-    def __init__(s, out="", rc=0):
-        s.returncode = None; s._out = out; s._rc = rc
-    def communicate(s, timeout=None):
-        if s.returncode is None: s.returncode = s._rc
-        return s._out, ""
-    def terminate(s): s.returncode = -15
-    def kill(s): s.returncode = -9
-    def poll(s): return s.returncode
-
 class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
-class _MinFakeBC:
-    def task_heartbeat(s, tid): return {"ok": True}
-
 _real_run = OD.subprocess.run
-_real_POPEN = OD._POPEN
 CAP = {}
 def fake_run(args, **kw):
     CAP["args"] = list(args); CAP["kw"] = kw
     return FakeProc(fake_run.out, fake_run.rc)
 fake_run.out = ""; fake_run.rc = 0
-def fake_popen(args, **kw):
-    CAP["args"] = list(args); CAP["kw"] = kw
-    return FakePopen(fake_run.out, fake_run.rc)
 OD.subprocess.run = fake_run
-OD._POPEN = fake_popen
-OD.bc = _MinFakeBC()
 
 # (2) кондуктор в argv: --model основная + --fallback-model прежняя + json, prompt последним
 print("(2) argv кондуктора:")
@@ -104,6 +82,5 @@ res.append(ok(st7 == "needs_approval" and r7.startswith("op=other"),
               "маркер внутри json.result → needs_approval (гейт красной зоны жив)"))
 
 OD.subprocess.run = _real_run
-OD._POPEN = _real_POPEN
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

@@ -49,24 +49,42 @@ res.append(ok(OD.parse_op("op=restart_splinter | x") == "restart_splinter"
 res.append(ok(OD._detect_needs_approval("обычный отчёт, всё сделано") is None, "чистый done — без маркера"))
 res.append(ok(OD.AUTO_OPS == ("git_push", "restart_splinter"), "AUTO_OPS не расширены (безопасность D)"))
 
-# (4) run_task: таймаут прокидывается в subprocess, маркер → needs_approval
-print("(4) run_task (мок subprocess):")
+# (4) run_task: таймаут прокидывается в communicate(), маркер → needs_approval
+print("(4) run_task (мок _POPEN):")
 CALLS = []
 class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
+class _FakePopen4:
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        CALLS.append({"timeout": timeout})
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+class _MinFakeBC4:
+    def task_heartbeat(s, tid): return {"ok": True}
 _real_run = OD.subprocess.run
+_real_POPEN4 = OD._POPEN
 def fake_run(args, **kw):
     CALLS.append(kw)
     return FakeProc(fake_run.out)
+def fake_popen4(args, **kw):
+    return _FakePopen4(fake_run.out)
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen4
+OD.bc = _MinFakeBC4()
 fake_run.out = "сводка: всё сделано"
 st, r = OD.run_task(1, "проверь X", task_timeout=2700)
-res.append(ok(st == "done" and CALLS[-1]["timeout"] == 2700, "dev-таймаут 2700 дошёл до subprocess"))
+res.append(ok(st == "done" and CALLS[-1]["timeout"] == 2700, "dev-таймаут 2700 дошёл до communicate"))
 fake_run.out = "NEEDS_APPROVAL: op=restart_splinter | нужен рестарт после правки"
 st2, r2 = OD.run_task(2, "поправь Y")
 res.append(ok(st2 == "needs_approval" and "restart_splinter" in r2 and CALLS[-1]["timeout"] == 600,
               "маркер → needs_approval; дефолт-таймаут 600"))
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN4
 
 # (5) devbot: «тз:» → dev-метка, «задача:» → быстрая
 print("(5) enqueue «тз:» vs «задача:»:")

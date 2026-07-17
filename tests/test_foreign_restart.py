@@ -91,14 +91,32 @@ SELFMOD_TEXT = ("тз: фикс класса — правка orchestrator_daemo
                 "systemd-run restart демона")
 PLAIN_TEXT = "тз: поправь опечатку в prompts.py и прогони тесты"
 
+class FakePopen:
+    """Мок _POPEN для claude -p: communicate() возвращает (out, "") с заданным rc."""
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
 _real_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0  # отключить proc-gate в тестах (нет живых claude)
+
+def fake_popen(args, **kw):
+    """Мок claude -p через _POPEN; читает очередь fake_run для единого fresh()-управления."""
+    fake_run.claude_calls += 1
+    if fake_run.claude_queue:
+        out, rc = fake_run.claude_queue.pop(0)
+        return FakePopen(out, rc)
+    return FakePopen("сводка: сделано", 0)
+
 def fake_run(args, **kw):
-    if args and args[0] == OD.CLAUDE_BIN:
-        fake_run.claude_calls += 1
-        if fake_run.claude_queue:
-            out, rc = fake_run.claude_queue.pop(0)
-            return FakeProc(out, rc)
-        return FakeProc("сводка: сделано")
+    """Мок systemctl и прочих subprocess — НЕ claude (он через _POPEN)."""
     if args and args[0] == "systemctl":
         fake_run.probe_calls += 1
         if fake_run.probe_exc:
@@ -108,6 +126,7 @@ def fake_run(args, **kw):
         return FakeProc(fake_run.probe_out)
     return FakeProc("ok")
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 
 _prev_running = OD._running
 
@@ -242,6 +261,8 @@ res.append(ok(fb.rows[tid]["status"] == "failed" and "повтори задач�
 
 OD._running = _prev_running
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN
+OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

@@ -66,15 +66,30 @@ class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
 
+class FakePopen:
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
+
 _real_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0  # отключить proc-gate в тестах (real /proc видит claude)
 def fake_run(args, **kw):
-    if args and args[0] == OD.CLAUDE_BIN:
-        prompt = args[-1]      # prompt — последний позиционный (после --model/--fallback-model/--output-format)
-        if prompt.startswith(OD.PLANNER_PREAMBLE):
-            return FakeProc(fake_run.plan_out)
-        return FakeProc(fake_run.step_out)
-    return FakeProc("ok")                      # git push / systemctl из EXECUTORS
+    return FakeProc("ok")   # git / systemctl (claude идёт через _POPEN)
+def fake_popen(args, **kw):
+    prompt = args[-1] if args else ""
+    if prompt.startswith(OD.PLANNER_PREAMBLE):
+        return FakePopen(fake_run.plan_out)
+    return FakePopen(fake_run.step_out)
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 fake_run.plan_out = "1. шаг один\n2. шаг два"
 fake_run.step_out = "сводка: шаг сделан"
 
@@ -238,6 +253,8 @@ res.append(ok(fb.rows[tid]["status"] == "done" and fb.rows[tid]["result"].starts
               "«тз:» (from=dev) исполнена как раньше (без планировщика)"))
 
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN
+OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

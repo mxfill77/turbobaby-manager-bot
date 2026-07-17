@@ -65,6 +65,9 @@ class FakeBridge:
 
 _real_bc, _real_run_task, _real_restart_pending = OD.bc, OD.run_task, OD._restart_pending
 OD._restart_pending = lambda: False
+OD.MAX_CLAUDE_PROCS = 0    # proc-gate выключен в тестах
+OD.MEM_MIN_MB = 0           # mem-gate выключен в тестах
+OD.CLAUDE_RSS_TOTAL_MB = 0  # RSS-gate выключен в тестах
 ran = []
 OD.run_task = lambda tid, text, task_timeout=600, preamble=None: (ran.append(int(tid)) or ("done", "выполнено"))
 

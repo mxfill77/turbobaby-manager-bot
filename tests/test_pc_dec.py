@@ -79,12 +79,22 @@ class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
 
+class FakePopen:
+    """Имитирует subprocess.Popen для мокирования OD._POPEN в run_task."""
+    def __init__(s, out="", rc=0):
+        s._out, s.returncode = out, rc
+    def communicate(s, timeout=None):
+        return s._out, ""
+    def kill(s): pass
+    def terminate(s): pass
+
+
+_real_POPEN = OD._POPEN
+
+
 def fake_run(args, **kw):
     if args and args[0] == OD.CLAUDE_BIN:
         prompt = args[-1]
-        if prompt.startswith(OD.PLANNER_PREAMBLE):
-            fake_run.planner_prompts.append(prompt)
-            return FakeProc(fake_run.plan_out)
         if prompt.startswith(OD.ADAPT_PREAMBLE):
             fake_run.adapt_calls += 1
             if fake_run.adapt_queue:
@@ -93,12 +103,23 @@ def fake_run(args, **kw):
         if prompt.startswith(OD.THINKER_PREAMBLE) or prompt.startswith(OD.TASK_THINKER_PREAMBLE):
             fake_run.thinker_calls += 1
             return FakeProc(fake_run.thinker_out)
-        if fake_run.step_queue:                     # vps-шаги (театр Е) исполняет claude-мок
-            out, rc = fake_run.step_queue.pop(0)
-            return FakeProc(out, rc)
-        return FakeProc("сводка: шаг сделан")
     return FakeProc("ok")
+
+
+def fake_popen(args, **kw):
+    """Имитирует Popen для планировщика и vps-исполнителя (пути через _POPEN в run_task)."""
+    prompt = args[-1]
+    if prompt.startswith(OD.PLANNER_PREAMBLE):
+        fake_run.planner_prompts.append(prompt)
+        return FakePopen(fake_run.plan_out)
+    if fake_run.step_queue:                         # vps-шаги (театр Е) исполняет claude-мок
+        out, rc = fake_run.step_queue.pop(0)
+        return FakePopen(out, rc)
+    return FakePopen("сводка: шаг сделан")
+
+
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 
 
 def fresh(plan="1. шаг один\n2. шаг два", selfheal="1", adapt="1"):
@@ -107,6 +128,7 @@ def fresh(plan="1. шаг один\n2. шаг два", selfheal="1", adapt="1"):
     OD._summarized.clear()
     OD._pc_adapted.clear()
     OD._adapt_finish.clear()
+    OD.MAX_CLAUDE_PROCS = 0
     os.environ["STEP_SELFHEAL"] = selfheal
     os.environ["PLAN_ADAPT"] = adapt
     fake_run.plan_out = plan
@@ -387,6 +409,8 @@ res.append(ok(len(sums) == 1 and "театр PC" not in sums[0]["result"]
               and "2/2" in sums[0]["result"], "vps-цепь дошла до обычной сводки 2/2"))
 res.append(ok(fb.rows[lone_pc]["status"] == "new" and fake_run.thinker_calls == 0,
               "одиночная pc-задача так и нетронута; лишних думателей не было"))
+
+OD._POPEN = _real_POPEN
 
 print()
 if all(res):

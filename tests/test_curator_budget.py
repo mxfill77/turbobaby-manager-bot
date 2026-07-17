@@ -77,6 +77,7 @@ class FakeBridge:
 _real_bc, _real_run_task, _real_rp = OD.bc, OD.run_task, OD._restart_pending
 _real_consult = OD._curator_consult
 OD._restart_pending = lambda: False
+OD.MAX_CLAUDE_PROCS = 0; OD.MEM_MIN_MB = 0; OD.CLAUDE_RSS_TOTAL_MB = 0
 os.environ["CURATOR"] = "1"
 
 consults = []

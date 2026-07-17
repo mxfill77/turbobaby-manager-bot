@@ -54,6 +54,25 @@ _SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)
 _DEDUP_DIR = os.environ.get("PRETOOL_DEDUP_DIR") or "/tmp/cc_pretool_dedup"
 _DEDUP_TTL = 4 * 3600
 
+# Guard-маркер для headless-задач (шаг 2/6 родитель 185): когда CC_TASK_ID задан в env,
+# красный блок пишет маркер-файл → демон видит → гасит claude-подпроцесс → needs_approval.
+GUARD_BLOCK_DIR = "/tmp/cc_guard_block"
+
+
+def _guard_write_marker(task_id, hit, card):
+    """Записать маркер красного блока для демона-наблюдателя."""
+    if not task_id:
+        return
+    try:
+        os.makedirs(GUARD_BLOCK_DIR, exist_ok=True)
+        path = os.path.join(GUARD_BLOCK_DIR, f"{task_id}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"task_id": task_id, "hit": hit, "card": card}, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
 
 def _defer():
     sys.exit(0)   # ничего не печатаем → штатный permission-flow (allow/ask rules)
@@ -466,6 +485,7 @@ def main():
     if hit == "ambiguous":                             # дедуп ТОЛЬКО ambiguous (инцидент 163); red —
         count, mid = _dedup_bump(data.get("session_id"), cmd)   # конкретная операция, каждая пушится
     card = _card(hit, blob, test, cmd=cmd, count=count)
+    _guard_write_marker(os.environ.get("CC_TASK_ID", "").strip(), hit, card)
     if not test:                  # 🧪-тестовые карточки в личку НЕ пушим (утечки 01–05.07); ask остаётся
         if count <= 1:
             new_mid = _push(card)

@@ -71,15 +71,31 @@ class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
 
+class FakePopen:
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
+
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0  # отключить proc-gate в тестах
 _real_run = OD.subprocess.run
 def fake_run(args, **kw):
     fake_run.calls.append(args)
-    if args and args[0] == OD.CLAUDE_BIN:
-        return FakeProc(fake_run.out)
     return FakeProc("ok")
 fake_run.calls = []
 fake_run.out = "сводка: сделано"
+def fake_popen(args, **kw):
+    fake_run.calls.append(args)
+    return FakePopen(fake_run.out)
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 
 
 def fresh():
@@ -202,5 +218,7 @@ res.append(ok(fb.na_calls == 0, "ни одного approvable needs_approval н�
 
 
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN
+OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

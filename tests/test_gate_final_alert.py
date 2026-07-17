@@ -102,15 +102,35 @@ ok(allowed is True, "исключение при чтении env → алерт
 # (7) демон даёт claude -p окружение GATE_ALERT_FINAL_ONLY=1 (детерминизм контекста)
 print("(7) run_task демона несёт флаг подавления в child_env:")
 import orchestrator_daemon as OD
-class FakeProc:
-    def __init__(s): s.stdout, s.stderr, s.returncode = json.dumps({"result": "готово", "is_error": False, "modelUsage": {}}), "", 0
+class FakePopen:
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
 CAP = {}
 _real_run = OD.subprocess.run
-OD.subprocess.run = lambda args, **kw: (CAP.update(kw), FakeProc())[1]
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0
+_fake_good_out = json.dumps({"result": "готово", "is_error": False, "modelUsage": {}})
+
+def fake_popen(args, **kw):
+    CAP.update({"args": list(args), "env": dict(kw.get("env") or {})})
+    return FakePopen(out=_fake_good_out)
+
+OD.subprocess.run = lambda args, **kw: type("P", (), {"stdout": "", "stderr": "", "returncode": 0})()
+OD._POPEN = fake_popen
 try:
     st, _r = OD.run_task(1, "проверь X", task_timeout=60)
 finally:
     OD.subprocess.run = _real_run
+    OD._POPEN = _real_POPEN
+    OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 ok(st == "done", "мок-задача прошла (run_task жив)")
 ok((CAP.get("env") or {}).get("GATE_ALERT_FINAL_ONLY") == "1", "child_env claude -p несёт GATE_ALERT_FINAL_ONLY=1")
 

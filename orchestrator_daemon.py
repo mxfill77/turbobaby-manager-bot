@@ -196,6 +196,54 @@ signal.signal(signal.SIGINT, _stop)
 # инструктирует claude -p вывести этот маркер вместо попытки обойти гейт.
 NA_MARKER = "NEEDS_APPROVAL:"
 
+# Guard-маркер (шаг 2/6 родитель 185): pretool_guard пишет /tmp/cc_guard_block/{tid}.json
+# при красном блоке внутри headless-задачи → монитор-поток видит файл → гасит claude-подпроцесс
+# → run_task возвращает needs_approval с честной карточкой. Никакого «продолжаю другими путями».
+GUARD_BLOCK_DIR = "/tmp/cc_guard_block"
+_POPEN = subprocess.Popen   # module-level для замены в тестах (тест мокает OD._POPEN)
+
+
+def _guard_marker_path(tid):
+    return os.path.join(GUARD_BLOCK_DIR, f"{tid}.json")
+
+
+def _guard_marker_clear(tid):
+    try:
+        os.remove(_guard_marker_path(tid))
+    except OSError:
+        pass
+
+
+def _guard_marker_read(tid):
+    try:
+        with open(_guard_marker_path(tid), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _guard_what(tid, data):
+    """Строка needs_approval из данных маркера: op=other + hit + card."""
+    hit = str((data or {}).get("hit") or "guard_block")
+    card = str((data or {}).get("card") or "")
+    body = card if card else f"guard заблокировал операцию «{hit}» в headless-задаче"
+    return f"op=other | [{hit}] {body}\n[guard-block задача {tid}]"
+
+
+def _guard_monitor_loop(tid, proc, stop_event, kill_event, card_holder):
+    """Фон-поток: каждые 2с проверяем маркер. Нашли → terminate claude → kill_event."""
+    path = _guard_marker_path(tid)
+    while not stop_event.wait(2.0):
+        if os.path.exists(path):
+            data = _guard_marker_read(tid)
+            card_holder.append(data or {})
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            kill_event.set()
+            return
+
 
 def _fail_card(out, err, rc):
     """§12 корень 3 (06.07.2026): ЧИСТАЯ карточка провала claude -p — НЕ сырой дамп всего
@@ -760,6 +808,11 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     # а НЕ по платному API. Splinter не затронут (он ключ берёт из своего процесса, не через claude -p).
     child_env.pop("ANTHROPIC_API_KEY", None)
     child_env.pop("OPENAI_API_KEY", None)
+    # Фикс утечки тест-флагов (17.07.2026): ORCH_TEST_MODE=1/PRETOOL_NOPUSH=1 могут попасть в
+    # os.environ демона если он был запущен из тест-окружения (gate.py не изолирует parent env).
+    # В боевом child_env тест-флаги НИКОГДА не нужны: ban-сеть и mute-пуши ломают нормальные задачи.
+    child_env.pop("ORCH_TEST_MODE", None)
+    child_env.pop("PRETOOL_NOPUSH", None)
     # Гейт-алерты только на финальном прогоне (хвост §7, 12.07.2026): внутри headless-задачи
     # промежуточные красные прогоны gate.py — штатный red-fix-green цикл, НЕ шум владельцу.
     # Флаг велит gate.py молчать в Telegram на НЕ-финальных прогонах; финальный pre-push зовёт
@@ -801,30 +854,65 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
            "--output-format", "json",
            "--settings", HEADLESS_SETTINGS,  # строгий headless-слой (роль-развод: clasp → ask)
            prompt]                          # список аргументов, БЕЗ shell → нет инъекции через task_text
+    # Guard-маркер: очистить старый маркер, задать CC_TASK_ID для pretool_guard
+    task_id_str = str(task_id)
+    child_env["CC_TASK_ID"] = task_id_str
+    _guard_marker_clear(task_id_str)
+    _guard_kill = threading.Event()
+    _guard_data = []
+
     # старт claude задачи по CLOCK_MONOTONIC — опора 5-го признака (свой/чужой плановый рестарт)
     t0_mono = time.monotonic()
     try:
-        proc = subprocess.run(
-            cmd,
-            cwd=REPO,
-            capture_output=True, text=True,
-            timeout=task_timeout,
-            env=child_env,
-        )
+        proc = _POPEN(cmd, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      text=True, env=child_env)
+    except Exception as e:
+        log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
+        _hb_stop.set()
+        _hb.join(timeout=5)
+        return "failed", f"ошибка запуска claude -p: {e}"
+
+    # Guard-монитор: фон-поток проверяет маркер каждые 2с, при обнаружении — terminate
+    _gm = threading.Thread(target=_guard_monitor_loop,
+                            args=(task_id_str, proc, _hb_stop, _guard_kill, _guard_data),
+                            daemon=True)
+    _gm.start()
+
+    _timed_out = False
+    try:
+        _stdout, _stderr = proc.communicate(timeout=task_timeout)
     except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            _stdout, _stderr = proc.communicate()
+        except Exception:
+            _stdout, _stderr = "", ""
+        _timed_out = True
+    finally:
+        _hb_stop.set()
+        _hb.join(timeout=5)
+        _gm.join(timeout=3)
+
+    if _timed_out:
         log.warning("id=%s ТАЙМАУТ %ss — claude -p убит, честный failed", task_id, task_timeout)
         return "failed", (f"{TIMEOUT_MARK} таймаут задачи {task_timeout}s — claude -p убит, задача "
                           f"не завершилась (лимит TASK_TIMEOUT из .env); думатель таймауты не чинит — "
                           f"упрости/раздели задачу и поставь заново")
-    except Exception as e:
-        log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
-        return "failed", f"ошибка запуска claude -p: {e}"
-    finally:
-        _hb_stop.set()
-        _hb.join(timeout=5)
 
-    raw = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
+    # Пост-проверка маркера (монитор мог не успеть до выхода claude)
+    if not _guard_kill.is_set():
+        _d = _guard_marker_read(task_id_str)
+        if _d is not None:
+            _guard_data.append(_d)
+            _guard_kill.set()
+
+    if _guard_kill.is_set():
+        what = _guard_what(task_id_str, _guard_data[0] if _guard_data else None)
+        log.info("id=%s guard-block → needs_approval: %.100s", task_id, what)
+        return "needs_approval", what[:RESULT_MAX]
+
+    raw = (_stdout or "").strip()
+    err = (_stderr or "").strip()
 
     # --output-format json: {result:<текст>, modelUsage:{<модель>:{…}}, is_error, api_error_status}.
     # Достаём текст ответа (result) и КАКАЯ модель реально отработала (ключи modelUsage). Парс-фейл
@@ -1141,6 +1229,8 @@ def _thinker_exec(prompt, timeout, tag):
     child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     child_env.pop("ANTHROPIC_API_KEY", None)   # как в run_task: идём по ~/.claude, не по платному API
     child_env.pop("OPENAI_API_KEY", None)
+    child_env.pop("ORCH_TEST_MODE", None)      # фикс 17.07: тест-флаги не утекают в дочерние
+    child_env.pop("PRETOOL_NOPUSH", None)
     cmd = [CLAUDE_BIN, "-p",
            "--model", ORCH_MODEL,
            "--fallback-model", ORCH_MODEL_FALLBACK,

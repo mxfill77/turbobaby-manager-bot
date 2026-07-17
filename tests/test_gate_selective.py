@@ -199,17 +199,30 @@ _good_out = json.dumps({"result": "готово", "is_error": False,
 _plan_out = json.dumps({"result": "1. шаг один\n2. шаг два", "is_error": False,
                          "modelUsage": {"claude-fable-5": {}}})
 
+class _FakePopenSel:
+    def __init__(s, out=""):
+        s.returncode = None; s._out = out
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = 0
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
+class _MinFakeBCSel:
+    def task_heartbeat(s, tid): return {"ok": True}
+
 CAP = {}
 _real_od_run = OD.subprocess.run
+_real_POPEN_sel = OD._POPEN
+OD.bc = _MinFakeBCSel()
 
 
-def cap_run(args, **kw):
+def cap_popen(args, **kw):
     CAP.update({"args": list(args), "env": dict(kw.get("env") or {})})
-    return type("P", (), {
-        "stdout": _good_out, "stderr": "", "returncode": 0
-    })()
+    return _FakePopenSel(_good_out)
 
-OD.subprocess.run = cap_run
+OD._POPEN = cap_popen
 
 # (17) промежуточный шаг 2/5 → GATE_STEP_SELECTIVE=1
 OD.run_task(1, "[шаг 2/5 родитель 10] сделай X", task_timeout=60)
@@ -247,18 +260,18 @@ ok(CAP["env"].get("GATE_STEP_SELECTIVE") != "1",
    "одиночная задача (GATE_SINGLE_SELECTIVE=0) → нет GATE_STEP_SELECTIVE")
 
 # (23) планировщик (preamble != None) → нет флага, даже если текст похож на шаг
-def cap_run_plan(args, **kw):
+def cap_popen_plan(args, **kw):
     CAP.update({"args": list(args), "env": dict(kw.get("env") or {})})
-    return type("P", (), {"stdout": _plan_out, "stderr": "", "returncode": 0})()
+    return _FakePopenSel(_plan_out)
 
-OD.subprocess.run = cap_run_plan
+OD._POPEN = cap_popen_plan
 OD.run_task(7, "[шаг 2/5 родитель 10] планировщик-тест", task_timeout=60,
             preamble=OD.PLANNER_PREAMBLE)
 ok(CAP["env"].get("GATE_STEP_SELECTIVE") != "1",
    "планировщик (preamble != None) → нет GATE_STEP_SELECTIVE")
 
 # (24) GATE_ALERT_FINAL_ONLY=1 по-прежнему выставляется (регресс)
-OD.subprocess.run = cap_run
+OD._POPEN = cap_popen
 OD.run_task(8, "[шаг 3/7 родитель 10] шаг для регресса", task_timeout=60)
 ok(CAP["env"].get("GATE_ALERT_FINAL_ONLY") == "1",
    "GATE_ALERT_FINAL_ONLY=1 цел (регресс: оба флага вместе в child_env)")
@@ -266,6 +279,7 @@ ok(CAP["env"].get("GATE_STEP_SELECTIVE") == "1",
    "GATE_STEP_SELECTIVE=1 и GATE_ALERT_FINAL_ONLY=1 стоят вместе (промежуточный шаг 3/7)")
 
 OD.subprocess.run = _real_od_run
+OD._POPEN = _real_POPEN_sel
 
 print(f"\nИТОГ: {'ВСЕ PASS' if all(res) else 'ЕСТЬ FAIL (%d/%d)' % (sum(res), len(res))}")
 sys.exit(0 if all(res) else 1)

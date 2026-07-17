@@ -62,12 +62,38 @@ class FakeBridge:
         return [r for r in s.rows.values() if "[самопочинка шага" in r["task_text"]]
 
 
+class FakePopen:
+    """Мок _POPEN для claude -p в run_task (планировщик + шаг; НЕ думатель)."""
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
 class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
 
 _real_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0  # отключить proc-gate в тестах (нет живых claude)
+
+def fake_popen(args, **kw):
+    """Мок claude -p через _POPEN: планировщик (plan) + шаги (step_queue)."""
+    prompt = args[-1] if args else ""
+    if prompt.startswith(OD.PLANNER_PREAMBLE):
+        return FakePopen(fake_run.plan_out, 0)
+    if fake_run.step_queue:
+        out, rc = fake_run.step_queue.pop(0)
+        return FakePopen(out, rc)
+    return FakePopen("сводка: шаг сделан", 0)
+
 def fake_run(args, **kw):
+    """Мок думателя через subprocess.run (думатель идёт через _thinker_exec → subprocess.run)."""
     if args and args[0] == OD.CLAUDE_BIN:
         prompt = args[-1]
         if prompt.startswith(OD.THINKER_PREAMBLE) or prompt.startswith(OD.TASK_THINKER_PREAMBLE):
@@ -77,14 +103,9 @@ def fake_run(args, **kw):
             if fake_run.thinker_exc:
                 raise fake_run.thinker_exc
             return FakeProc(fake_run.thinker_out)
-        if prompt.startswith(OD.PLANNER_PREAMBLE):
-            return FakeProc(fake_run.plan_out)
-        if fake_run.step_queue:
-            out, rc = fake_run.step_queue.pop(0)
-            return FakeProc(out, rc)
-        return FakeProc("сводка: шаг сделан")
     return FakeProc("ok")
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 
 
 def fresh(selfheal="1", plan="1. шаг один\n2. шаг два"):
@@ -305,6 +326,8 @@ res.append(ok(fb.rows[s1]["status"] == "needs_approval" and fake_run.thinker_cal
 
 os.environ.pop("STEP_SELFHEAL", None)
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN
+OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

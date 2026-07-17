@@ -52,6 +52,17 @@ class FakeBridge:
     def task_heartbeat(s, tid): return {"ok": True}
 
 
+class FakePopen:
+    """Мок _POPEN для claude -p: communicate() возвращает (out, ""), rc задаётся заранее."""
+    def __init__(s, out="", rc=0):
+        s.returncode = None; s._out = out; s._rc = rc
+    def communicate(s, timeout=None):
+        if s.returncode is None: s.returncode = s._rc
+        return s._out, ""
+    def terminate(s): s.returncode = -15
+    def kill(s): s.returncode = -9
+    def poll(s): return s.returncode
+
 class FakeProc:
     def __init__(s, out, rc=0): s.stdout, s.stderr, s.returncode = out, "", rc
 
@@ -66,9 +77,18 @@ SELFMOD_TEXT = ("тз: фикс класса — правка orchestrator_daemo
 PLAIN_TEXT = "тз: поправь опечатку в prompts.py и прогони тесты"
 
 _real_run = OD.subprocess.run
+_real_POPEN = OD._POPEN
+_real_MAX_CLAUDE_PROCS = OD.MAX_CLAUDE_PROCS
+OD.MAX_CLAUDE_PROCS = 0  # отключить proc-gate в тестах (нет живых claude)
+
+def fake_popen(args, **kw):
+    """Мок claude -p через _POPEN."""
+    return FakePopen(fake_popen.claude_out, fake_popen.claude_rc)
+fake_popen.claude_out = ""
+fake_popen.claude_rc = 143
+
 def fake_run(args, **kw):
-    if args and args[0] == OD.CLAUDE_BIN:
-        return FakeProc(fake_run.claude_out, fake_run.claude_rc)
+    """Мок systemctl и прочих subprocess — НЕ claude (он через _POPEN)."""
     if args and args[0] == "systemctl":
         fake_run.probe_calls += 1
         if fake_run.probe_exc:
@@ -76,6 +96,7 @@ def fake_run(args, **kw):
         return FakeProc(fake_run.probe_out)
     return FakeProc("ok")
 OD.subprocess.run = fake_run
+OD._POPEN = fake_popen
 
 _prev_running = OD._running
 
@@ -84,7 +105,7 @@ def fresh(claude_out="", claude_rc=143, probe_out=UNIT_RESTART, running=False):
     fb = FakeBridge()
     OD.bc = fb
     OD._running = running
-    fake_run.claude_out, fake_run.claude_rc = claude_out, claude_rc
+    fake_popen.claude_out, fake_popen.claude_rc = claude_out, claude_rc
     fake_run.probe_out, fake_run.probe_exc = probe_out, None
     fake_run.probe_calls = 0
     return fb
@@ -153,6 +174,8 @@ res.append(ok(r["status"] == "done" and "плановым рестартом" in
 
 OD._running = _prev_running
 OD.subprocess.run = _real_run
+OD._POPEN = _real_POPEN
+OD.MAX_CLAUDE_PROCS = _real_MAX_CLAUDE_PROCS
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)
