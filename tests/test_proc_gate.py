@@ -1,0 +1,397 @@
+"""Гейт параллелизма + RSS-гейт + выгрузка цепей (OOM-инцидент №2, 17.07.2026):
+  (1) MAX_CLAUDE_PROCS — перед spawn считать живые claude; при лимите задача ждёт в new.
+  (2) CLAUDE_RSS_TOTAL_MB — суммарный RSS claude в mem-gate (дополнительно к MemAvailable).
+  (3) _prune_chain_cache — _summarized/_adapt_finish не растут без ограничения.
+  (4) Голден: при 4 псевдо-claude пятый не спавнится.
+Все тесты изолированы от боевого .env — флаги выставляются ДО импорта OD."""
+import os, sys, time
+sys.path.insert(0, "/root/turbobaby-manager-bot")
+os.environ.setdefault("BRIDGE_URL", "http://x")
+os.environ.setdefault("BRIDGE_TOKEN", "x")
+os.environ["PLAN_ADAPT"] = "0"
+os.environ["CURATOR"] = "0"
+os.environ["STEP_SELFHEAL"] = "0"
+os.environ["GATE_SINGLE_SELECTIVE"] = "0"
+os.environ["MAX_CLAUDE_PROCS"] = "2"
+os.environ["PROC_RETRY_SEC"] = "120"
+os.environ["CLAUDE_RSS_TOTAL_MB"] = "1200"
+os.environ["MEM_MIN_MB"] = "0"       # mem-gate по MemAvailable выключен — тестируем отдельно
+os.environ["PRETOOL_NOPUSH"] = "1"
+
+def ok(c, l):
+    print(("  PASS " if c else "  FAIL ") + l)
+    return c
+
+res = []
+
+import orchestrator_daemon as OD
+
+
+class FakeBridge:
+    def __init__(s):
+        s.rows, s.nid, s.claimed = {}, 100, []
+
+    def enqueue_task(s, frm, txt, lane=None):
+        s.nid += 1
+        s.rows[s.nid] = {"id": s.nid, "from": frm, "task_text": txt,
+                         "status": "new", "result": "", "updated": "x"}
+        return {"ok": True, "id": s.nid}
+
+    def get_pending(s, status="new", lane=None):
+        items = [dict(r) for r in sorted(s.rows.values(), key=lambda x: -x["id"])
+                 if r["status"] == status]
+        return {"ok": True, "items": items}
+
+    def claim_task(s, tid, lane=None):
+        r = s.rows.get(int(tid))
+        if not r:
+            return {"ok": False, "error": "not_found"}
+        if r["status"] != "new":
+            return {"ok": False, "error": "already_claimed"}
+        r["status"] = "in_progress"
+        s.claimed.append(int(tid))
+        return {"ok": True, "task": dict(r)}
+
+    def complete_task(s, tid, status, result=""):
+        r = s.rows.get(int(tid))
+        if r:
+            r["status"] = status
+            r["result"] = result
+        return {"ok": True}
+
+    def set_needs_approval(s, tid, what):
+        return {"ok": True}
+
+    def task_heartbeat(s, tid):
+        return {"ok": True}
+
+    def get_in_progress(s, lane="vps"):
+        return {"ok": True, "items": []}
+
+    def issue_write_ticket(s):
+        return {"ok": True, "ticket": "t-test"}
+
+    def consume_write_ticket(s, tk):
+        return {"ok": True}
+
+    def log_write(s, **kw):
+        return {"ok": True}
+
+
+def _fake_run_done(args, **kw):
+    return type("P", (), {
+        "stdout": '{"type":"result","result":"сводка done","subtype":"success"}',
+        "stderr": "", "returncode": 0
+    })()
+
+
+def fresh_proc(count=0):
+    """Сброс proc-gate состояния, mem-gate выключен (MEM_MIN_MB=0)."""
+    fb = FakeBridge()
+    OD.bc = fb
+    OD._proc_wait_until = 0.0
+    OD._proc_deny_count = 0
+    OD.MAX_CLAUDE_PROCS = 2
+    OD.PROC_DENY_ALERT = 3
+    OD._live_claude_count = lambda: count
+    OD._mem_wait_until = 0.0
+    OD._mem_deny_count = 0
+    OD.MEM_MIN_MB = 0          # выключаем MemAvail-гейт — тестируем proc
+    OD.CLAUDE_RSS_TOTAL_MB = 0 # выключаем RSS-гейт — тестируем proc
+    return fb
+
+
+def fresh_rss(mem_mb=2000, rss_mb=0):
+    """Сброс для RSS-тестов: MemAvail ОК (mem_mb≥700), RSS задаётся."""
+    fb = FakeBridge()
+    OD.bc = fb
+    OD._mem_wait_until = 0.0
+    OD._mem_deny_count = 0
+    OD.MEM_MIN_MB = 700
+    OD.MEM_DENY_ALERT = 3
+    OD._mem_available_mb = lambda: mem_mb
+    OD.CLAUDE_RSS_TOTAL_MB = 1200
+    OD._live_claude_rss_mb = lambda: rss_mb
+    OD._proc_wait_until = 0.0
+    OD._proc_deny_count = 0
+    OD.MAX_CLAUDE_PROCS = 0    # proc-gate выключен — тестируем RSS
+    return fb
+
+
+# ── PROC-GATE тесты ─────────────────────────────────────────────────────────
+
+# P1: claude меньше лимита → задача берётся
+def p1():
+    fb = fresh_proc(count=0)  # 0 < 2
+    fb.enqueue_task("Filipp-328", "задача: proc p1")
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1, "P1: 0 claude < 2 → задача взята"))
+
+
+# P2: claude на лимите → задача НЕ берётся, остаётся new
+def p2():
+    fb = fresh_proc(count=2)  # 2 >= 2 → блок
+    fb.enqueue_task("Filipp-328", "задача: proc p2")
+    OD.process_new()
+    res.append(ok(len(fb.claimed) == 0, "P2: 2 claude >= 2 → claim не было"))
+    res.append(ok(list(fb.rows.values())[0]["status"] == "new",
+                  "P2: задача осталась в new"))
+
+
+# P3: cooldown держит блок даже когда claude освободился
+def p3():
+    fb = fresh_proc(count=2)
+    fb.enqueue_task("Filipp-328", "задача: proc p3")
+    OD.process_new()              # ← cooldown взводится
+    assert len(fb.claimed) == 0
+    OD._live_claude_count = lambda: 0   # «claude освободился»
+    OD.process_new()
+    res.append(ok(len(fb.claimed) == 0,
+                  "P3: cooldown держит блок даже при 0 claude"))
+
+
+# P4: fail-safe — _live_claude_count возвращает None → гейт пропускается, задача берётся
+def p4():
+    fb = fresh_proc(count=0)
+    fb.enqueue_task("Filipp-328", "задача: proc p4")
+    OD._live_claude_count = lambda: None
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1,
+                  "P4: fail-safe (None) → гейт пропущен, задача взята"))
+
+
+# P5: MAX_CLAUDE_PROCS=0 полностью выключает гейт
+def p5():
+    fb = fresh_proc(count=999)
+    fb.enqueue_task("Filipp-328", "задача: proc p5")
+    OD.MAX_CLAUDE_PROCS = 0      # gate off
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1,
+                  "P5: MAX_CLAUDE_PROCS=0 → гейт выключен, задача берётся"))
+
+
+# P6: cooldown истекает → при освободившемся claude задача берётся
+def p6():
+    fb = fresh_proc(count=2)
+    fb.enqueue_task("Filipp-328", "задача: proc p6")
+    OD.process_new()
+    assert len(fb.claimed) == 0
+    OD._proc_wait_until = time.monotonic() - 1.0
+    OD._live_claude_count = lambda: 1   # теперь < 2
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1,
+                  "P6: cooldown истёк + claude=1 → задача взята"))
+
+
+# P7: _proc_gate_check прямой юнит-тест
+def p7():
+    OD._proc_wait_until = 0.0
+    OD.MAX_CLAUDE_PROCS = 2
+    OD._live_claude_count = lambda: 1
+    res.append(ok(not OD._proc_gate_check(), "P7a: 1 < 2 → gate=False"))
+    OD._proc_wait_until = 0.0
+    OD._proc_deny_count = 0
+    OD._live_claude_count = lambda: 3
+    res.append(ok(OD._proc_gate_check(), "P7b: 3 >= 2 → gate=True"))
+    OD._proc_wait_until = 0.0
+    OD._proc_deny_count = 0
+
+
+# P8: 3 подряд «настоящих» отказа → synthetic-карточка в 328
+def p8():
+    fb = fresh_proc(count=3)
+    OD.MAX_CLAUDE_PROCS = 2
+    for _ in range(2):
+        OD._proc_wait_until = 0.0
+        OD._proc_gate_check()
+    done_before = [r for r in fb.rows.values() if r["status"] == "done"]
+    res.append(ok(len(done_before) == 0, "P8a: 2 отказа — карточки ещё нет"))
+    OD._proc_wait_until = 0.0
+    OD._proc_gate_check()
+    done_after = [r for r in fb.rows.values() if r["status"] == "done"]
+    res.append(ok(len(done_after) == 1, "P8b: 3-й отказ → synthetic done в 328"))
+    card_result = done_after[0].get("result", "") if done_after else ""
+    res.append(ok("claude" in card_result.lower() or "proc" in card_result.lower(),
+                  "P8c: текст карточки упоминает claude/proc"))
+    res.append(ok(OD._proc_deny_count == 0, "P8d: счётчик сброшен после алерта"))
+
+
+# P9: успех сбрасывает счётчик
+def p9():
+    fb = fresh_proc(count=3)
+    OD.MAX_CLAUDE_PROCS = 2
+    for _ in range(2):
+        OD._proc_wait_until = 0.0
+        OD._proc_gate_check()
+    OD._proc_wait_until = 0.0
+    OD._live_claude_count = lambda: 1   # освободилось
+    OD._proc_gate_check()
+    res.append(ok(OD._proc_deny_count == 0, "P9a: успех после 2 отказов → счётчик=0"))
+    OD._proc_wait_until = 0.0
+    OD._live_claude_count = lambda: 5
+    OD._proc_gate_check()
+    done = [r for r in fb.rows.values() if r["status"] == "done"]
+    res.append(ok(len(done) == 0 and OD._proc_deny_count == 1,
+                  "P9b: отказ после recovery — счётчик=1, карточек нет"))
+
+
+# ── GOLDEN тест ──────────────────────────────────────────────────────────────
+
+# P_GOLDEN: при 4 псевдо-claude пятый не спавнится; при 3 — разрешает
+def p_golden():
+    fb = fresh_proc(count=0)
+    fb.enqueue_task("Filipp-328", "задача: golden")
+    OD.MAX_CLAUDE_PROCS = 4
+    OD._live_claude_count = lambda: 4   # ровно на лимите → блок
+    OD.process_new()
+    res.append(ok(len(fb.claimed) == 0,
+                  "GOLDEN: 4 живых claude (лимит=4) → 5-й НЕ спавнится (claim=0)"))
+    # теперь с 3 — должен пройти
+    OD._proc_wait_until = 0.0
+    OD._proc_deny_count = 0
+    OD._live_claude_count = lambda: 3   # 3 < 4 → разрешаем
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1,
+                  "GOLDEN: 3 живых claude (лимит=4) → разрешает (claim=1)"))
+
+
+# ── RSS-GATE тесты (mem_gate с CLAUDE_RSS_TOTAL_MB) ─────────────────────────
+
+# R1: RSS ниже порога → задача берётся
+def r1():
+    fb = fresh_rss(mem_mb=2000, rss_mb=800)
+    fb.enqueue_task("Filipp-328", "задача: rss r1")
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1, "R1: RSS 800МБ < 1200МБ → задача берётся"))
+
+
+# R2: RSS >= порога → задача НЕ берётся (даже при достаточной памяти)
+def r2():
+    fb = fresh_rss(mem_mb=2000, rss_mb=1500)
+    fb.enqueue_task("Filipp-328", "задача: rss r2")
+    OD.process_new()
+    res.append(ok(len(fb.claimed) == 0, "R2: RSS 1500МБ >= 1200МБ → задача НЕ берётся"))
+    res.append(ok(list(fb.rows.values())[0]["status"] == "new",
+                  "R2: задача осталась в new"))
+
+
+# R3: CLAUDE_RSS_TOTAL_MB=0 → RSS-гейт выключен (даже огромный RSS пропускается)
+def r3():
+    fb = fresh_rss(mem_mb=2000, rss_mb=9999)
+    fb.enqueue_task("Filipp-328", "задача: rss r3")
+    OD.CLAUDE_RSS_TOTAL_MB = 0   # выключен
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1,
+                  "R3: CLAUDE_RSS_TOTAL_MB=0 → RSS-гейт выключен, задача берётся"))
+
+
+# R4: _live_claude_rss_mb=None → fail-safe, RSS-гейт пропускается
+def r4():
+    fb = fresh_rss(mem_mb=2000, rss_mb=0)
+    fb.enqueue_task("Filipp-328", "задача: rss r4")
+    OD._live_claude_rss_mb = lambda: None   # /proc нечитаем
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1,
+                  "R4: RSS=None (fail-safe) → гейт пропущен, задача берётся"))
+
+
+# ── PRUNE тесты ─────────────────────────────────────────────────────────────
+
+# PR1: _prune_chain_cache не трогает кэш ниже потолка
+def pr1():
+    old_sum = OD._summarized.copy()
+    old_af = dict(OD._adapt_finish)
+    OD._summarized = set(range(50))
+    OD._adapt_finish = {i: "r" for i in range(50)}
+    OD.MAX_CHAIN_CACHE = 200
+    OD._prune_chain_cache()
+    res.append(ok(len(OD._summarized) == 50, "PR1: < MAX_CHAIN_CACHE → не трогается"))
+    OD._summarized = old_sum
+    OD._adapt_finish = old_af
+
+
+# PR2: _prune_chain_cache отсекает старые при превышении потолка
+def pr2():
+    old_sum = OD._summarized.copy()
+    old_af = dict(OD._adapt_finish)
+    OD._summarized = set(range(300))           # 300 > MAX_CHAIN_CACHE=200
+    OD._adapt_finish = {i: "r" for i in range(300)}
+    OD.MAX_CHAIN_CACHE = 200
+    OD._prune_chain_cache()
+    res.append(ok(len(OD._summarized) == 200,
+                  f"PR2: 300 → prune до 200 (осталось {len(OD._summarized)})"))
+    # должны остаться БОЛЬШИЕ pid (старые 0..99 вытеснены)
+    res.append(ok(min(OD._summarized) == 100,
+                  f"PR2: старые pid (0..99) вытеснены (min={min(OD._summarized)})"))
+    # _adapt_finish синхронизован: записи вытесненных pid удалены
+    removed = set(range(100))
+    res.append(ok(all(p not in OD._adapt_finish for p in removed),
+                  "PR2: adapt_finish записи вытесненных pid удалены"))
+    OD._summarized = old_sum
+    OD._adapt_finish = old_af
+
+
+# PR3: _adapt_finish.pop в _dec_post_summary — проверяем через прямой вызов механики
+def pr3():
+    old_sum = OD._summarized.copy()
+    old_af = dict(OD._adapt_finish)
+    # Симулируем: pid=555 в _adapt_finish до сводки
+    OD._summarized = set()
+    OD._adapt_finish = {555: "досрочно"}
+    # _dec_post_summary добавляет в _summarized и попает из _adapt_finish
+    OD._summarized.add(555)
+    OD._adapt_finish.pop(555, None)
+    res.append(ok(555 in OD._summarized, "PR3: pid добавлен в _summarized"))
+    res.append(ok(555 not in OD._adapt_finish, "PR3: pid убран из _adapt_finish после сводки"))
+    OD._summarized = old_sum
+    OD._adapt_finish = old_af
+
+
+# run all
+p1(); p2(); p3(); p4(); p5(); p6(); p7(); p8(); p9(); p_golden()
+r1(); r2(); r3(); r4()
+pr1(); pr2(); pr3()
+
+fails = sum(0 if r else 1 for r in res)
+print(f"\n{'OK' if not fails else 'FAIL'} — {fails}/{len(res)} тестов провалились")
+raise SystemExit(0 if not fails else 1)

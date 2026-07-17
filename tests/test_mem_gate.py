@@ -91,6 +91,13 @@ def fresh(mem_mb=900):
     OD.MEM_MIN_MB = 700            # стандартный порог
     OD.MEM_DENY_ALERT = 3          # стандартный порог алерта
     OD._mem_available_mb = lambda: mem_mb
+    # RSS-гейт: мокируем 0МБ чтобы RSS-гейт не мешал MemAvail-тестам
+    OD.CLAUDE_RSS_TOTAL_MB = 1200
+    OD._live_claude_rss_mb = lambda: 0
+    # proc-gate: выключаем чтобы не мешал
+    OD._proc_wait_until = 0.0
+    OD._proc_deny_count = 0
+    OD.MAX_CLAUDE_PROCS = 0
     return fb
 
 
@@ -234,8 +241,50 @@ def t9():
                   "T9b: отказ после recovery — счётчик=1, карточек нет"))
 
 
+# T10: RSS >= порога → задача НЕ берётся (даже при достаточной памяти)
+def t10():
+    fb = fresh(mem_mb=2000)      # MemAvail ОК
+    fb.enqueue_task("Filipp-328", "задача: тест 10")
+    OD.CLAUDE_RSS_TOTAL_MB = 1200
+    OD._live_claude_rss_mb = lambda: 1500    # RSS > порога
+    OD.process_new()
+    res.append(ok(len(fb.claimed) == 0, "T10: claude RSS 1500МБ >= 1200МБ → задача НЕ берётся"))
+    res.append(ok(list(fb.rows.values())[0]["status"] == "new",
+                  "T10: задача осталась в new"))
+
+
+# T11: RSS ниже порога → задача берётся
+def t11():
+    fb = fresh(mem_mb=900)
+    fb.enqueue_task("Filipp-328", "задача: тест 11")
+    OD.CLAUDE_RSS_TOTAL_MB = 1200
+    OD._live_claude_rss_mb = lambda: 800     # RSS < порога
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1, "T11: claude RSS 800МБ < 1200МБ → задача берётся"))
+
+
+# T12: CLAUDE_RSS_TOTAL_MB=0 → RSS-гейт выключен
+def t12():
+    fb = fresh(mem_mb=2000)
+    fb.enqueue_task("Filipp-328", "задача: тест 12")
+    OD.CLAUDE_RSS_TOTAL_MB = 0               # выключен
+    OD._live_claude_rss_mb = lambda: 99999   # огромный RSS, но гейт выключен
+    _old = OD.subprocess.run
+    OD.subprocess.run = _fake_run_done
+    try:
+        OD.process_new()
+    finally:
+        OD.subprocess.run = _old
+    res.append(ok(len(fb.claimed) == 1, "T12: CLAUDE_RSS_TOTAL_MB=0 → RSS-гейт выключен"))
+
+
 # run all
-t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9()
+t1(); t2(); t3(); t4(); t5(); t6(); t7(); t8(); t9(); t10(); t11(); t12()
 
 fails = sum(0 if r else 1 for r in res)
 print(f"\n{'OK' if not fails else 'FAIL'} — {fails}/{len(res)} тестов провалились")

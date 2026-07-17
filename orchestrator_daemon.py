@@ -73,6 +73,21 @@ MEM_RETRY_SEC = _env_int("MEM_RETRY_SEC", 120)   # cooldown после дете�
 _mem_wait_until = 0.0                              # monotonic: до этого момента не берём задачи
 _mem_deny_count = 0        # число последовательных «настоящих» отказов (cooldown-пропуски не в счёт)
 MEM_DENY_ALERT = 3         # порог для карточки в 328 (сбрасывается после алерта)
+# ГЕЙТ RSS CLAUDE (17.07.2026, OOM №2): суммарный RSS живых claude-процессов в mem-gate.
+# Если суммарный RSS >= CLAUDE_RSS_TOTAL_MB → тот же cooldown/карточка, что у MemAvail-гейта.
+# CLAUDE_RSS_TOTAL_MB=0 → RSS-гейт выключен. Fail-safe: /proc нечитаем → пропускается.
+CLAUDE_RSS_TOTAL_MB = _env_int("CLAUDE_RSS_TOTAL_MB", 1200)
+# ГЕЙТ ПАРАЛЛЕЛИЗМА (17.07.2026, OOM №2): считать живые claude-процессы перед spawn.
+# Если живых claude >= MAX_CLAUDE_PROCS → задача ждёт в new (не failed, не потеряна).
+# MAX_CLAUDE_PROCS=0 → гейт выключен. Fail-safe: /proc нечитаем → гейт пропускается.
+MAX_CLAUDE_PROCS = _env_int("MAX_CLAUDE_PROCS", 2)
+PROC_RETRY_SEC = _env_int("PROC_RETRY_SEC", 120)   # cooldown после детекта превышения
+_proc_wait_until = 0.0
+_proc_deny_count = 0
+PROC_DENY_ALERT = 3       # порог алерта в 328 (механика идентична MEM_DENY_ALERT)
+# ВЫГРУЗКА ЗАВЕРШЁННЫХ ЦЕПЕЙ (17.07.2026): _summarized/_adapt_finish растут без очистки.
+# MAX_CHAIN_CACHE — потолок: старые (наименьшие pid) вытесняются при превышении.
+MAX_CHAIN_CACHE = _env_int("MAX_CHAIN_CACHE", 200)
 DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очереди (devbot кладёт Filipp-328-dev)
 DEC_FROM_SUFFIX = "-dec" # метка декомпозиции (ступень 2 часть C; devbot кладёт Filipp-328-dec):
                          # родитель «декомпозируй:» + его шаги + synthetic-сводка — всё под этой меткой
@@ -289,10 +304,57 @@ def _mem_available_mb():
     return None
 
 
+def _live_claude_count():
+    """Число живых claude-процессов по /proc/*/cmdline (первый элемент = исполняемый).
+    None при ошибке сканирования (fail-safe: гейт пропускается)."""
+    try:
+        n = 0
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/cmdline", "rb") as f:
+                    cmd = f.read(512)
+                first = cmd.split(b"\x00")[0]
+                if b"claude" in first:
+                    n += 1
+            except OSError:
+                pass
+        return n
+    except Exception:
+        return None
+
+
+def _live_claude_rss_mb():
+    """Суммарный RSS всех живых claude-процессов в МБ. None при ошибке (fail-safe)."""
+    try:
+        total_kb = 0
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            pid = entry.name
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read(512)
+                if b"claude" not in cmd.split(b"\x00")[0]:
+                    continue
+                with open(f"/proc/{pid}/status") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            total_kb += int(line.split()[1])
+                            break
+            except OSError:
+                pass
+        return total_kb // 1024
+    except Exception:
+        return None
+
+
 def _mem_gate_check():
     """Гейт памяти перед стартом claude -p.
     True  = дефицит (не берём задачу, она остаётся в new).
-    False = памяти достаточно / /proc/meminfo нечитаем (fail-safe) / MEM_MIN_MB=0 (выключен).
+    False = памяти достаточно / /proc нечитаем (fail-safe) / MEM_MIN_MB=0 (выключен).
+    Два критерия: (1) MemAvailable < MEM_MIN_MB; (2) суммарный RSS claude >= CLAUDE_RSS_TOTAL_MB.
     После MEM_DENY_ALERT последовательных «настоящих» отказов отправляет synthetic-карточку в 328."""
     global _mem_wait_until, _mem_deny_count
     if MEM_MIN_MB <= 0:
@@ -305,13 +367,21 @@ def _mem_gate_check():
     mb = _mem_available_mb()
     if mb is None:
         return False  # fail-safe: /proc/meminfo нечитаем → гейт пропускается
-    if mb >= MEM_MIN_MB:
-        _mem_deny_count = 0   # память восстановилась — сброс счётчика
+    # (2) RSS живых claude
+    crss = _live_claude_rss_mb() if CLAUDE_RSS_TOTAL_MB > 0 else None
+    low_mem = mb < MEM_MIN_MB
+    high_rss = (crss is not None and crss >= CLAUDE_RSS_TOTAL_MB)
+    if not low_mem and not high_rss:
+        _mem_deny_count = 0   # память в норме — сброс счётчика
         return False
     _mem_wait_until = now + MEM_RETRY_SEC
     _mem_deny_count += 1
-    log.warning("⏳ ждёт памяти: свободно %dМБ < %dМБ — задача ждёт в new, ретрай через %ds (подряд=%d)",
-                mb, MEM_MIN_MB, MEM_RETRY_SEC, _mem_deny_count)
+    if low_mem:
+        log.warning("⏳ mem-gate: MemAvail %dМБ < %dМБ — задача ждёт new, ретрай %ds (подряд=%d)",
+                    mb, MEM_MIN_MB, MEM_RETRY_SEC, _mem_deny_count)
+    if high_rss:
+        log.warning("⏳ mem-gate: claude RSS %dМБ >= %dМБ — задача ждёт new, ретрай %ds (подряд=%d)",
+                    crss, CLAUDE_RSS_TOTAL_MB, MEM_RETRY_SEC, _mem_deny_count)
     if _mem_deny_count >= MEM_DENY_ALERT:
         _mem_deny_count = 0   # сброс: следующие MEM_DENY_ALERT отказов дадут ещё один алерт
         _mem_alert_328(mb)
@@ -334,6 +404,65 @@ def _mem_alert_328(mb):
         log.warning("mem-gate: карточка в 328 (id=%s): %s", sid, msg)
     except Exception as e:
         log.warning("mem-gate: карточка в 328 упала (%s) — тишина", e)
+
+
+def _proc_gate_check():
+    """Гейт параллелизма: живых claude >= MAX_CLAUDE_PROCS → задача ждёт в new.
+    True = превышение. False = ОК / MAX_CLAUDE_PROCS=0 (выключен) / /proc нечитаем (fail-safe).
+    Механика cooldown/алерт идентична _mem_gate_check."""
+    global _proc_wait_until, _proc_deny_count
+    if MAX_CLAUDE_PROCS <= 0:
+        return False
+    now = time.monotonic()
+    if now < _proc_wait_until:
+        log.info("⏳ proc-gate: cooldown %ds — ждём слота claude (лимит=%d)",
+                 int(_proc_wait_until - now), MAX_CLAUDE_PROCS)
+        return True
+    n = _live_claude_count()
+    if n is None:
+        return False  # fail-safe: /proc нечитаем → гейт пропускается
+    if n < MAX_CLAUDE_PROCS:
+        _proc_deny_count = 0
+        return False
+    _proc_wait_until = now + PROC_RETRY_SEC
+    _proc_deny_count += 1
+    log.warning("⏳ proc-gate: живых claude %d >= %d — задача ждёт new, ретрай %ds (подряд=%d)",
+                n, MAX_CLAUDE_PROCS, PROC_RETRY_SEC, _proc_deny_count)
+    if _proc_deny_count >= PROC_DENY_ALERT:
+        _proc_deny_count = 0
+        _proc_alert_328(n)
+    return True
+
+
+def _proc_alert_328(n):
+    """Synthetic-карточка в 328 при PROC_DENY_ALERT последовательных proc-gate отказах. Fail-safe тишина."""
+    try:
+        wait_min = round(PROC_DENY_ALERT * PROC_RETRY_SEC / 60)
+        msg = (f"⚠️ PROC-ГЕЙТ: живых claude {n} >= {MAX_CLAUDE_PROCS} · "
+               f"{PROC_DENY_ALERT} отказа(ов) подряд (~{wait_min} мин) · "
+               f"задачи ждут в new · при освобождении слота подберутся автоматически")
+        r = bc.enqueue_task("Filipp-328", "[⚠️ proc-гейт] claude занят — задачи ждут")
+        if not r.get("ok"):
+            return
+        sid = r.get("id")
+        bc.claim_task(sid)
+        bc.complete_task(sid, "done", msg)
+        log.warning("proc-gate: карточка в 328 (id=%s): %s", sid, msg)
+    except Exception as e:
+        log.warning("proc-gate: карточка в 328 упала (%s) — тишина", e)
+
+
+def _prune_chain_cache():
+    """Выгрузка завершённых цепей: _summarized/_adapt_finish растут без ограничения.
+    Если _summarized > MAX_CHAIN_CACHE — отсекаем старые (наименьшие pid) до MAX_CHAIN_CACHE,
+    синхронно чистим осиротевшие записи _adapt_finish."""
+    if len(_summarized) <= MAX_CHAIN_CACHE:
+        return
+    excess = sorted(_summarized)[:len(_summarized) - MAX_CHAIN_CACHE]
+    for pid in excess:
+        _summarized.discard(pid)
+        _adapt_finish.pop(pid, None)
+    log.info("chain-cache: pruned %d old pids (_summarized=%d)", len(excess), len(_summarized))
 
 
 def _planned_restart_verdict(rc, task_text, t0_mono):
@@ -910,6 +1039,7 @@ def _dec_post_summary(pid):
     bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
     cm = bc.complete_task(sid, "done", text)
     _summarized.add(pid)
+    _adapt_finish.pop(pid, None)          # выгрузка: adapt_reason больше не нужен после сводки
     log.info("dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
     _maybe_curator_chain(pid, text)     # куратор цели (CURATOR=1, шаг 2/7 родитель 231):
                                         # ПОСЛЕ сводки; идемпотентность выше = один вызов на цепь
@@ -2239,6 +2369,7 @@ def _pc_post_summary(pid, steps):
     bc.claim_task(sid)
     cm = bc.complete_task(sid, "done", text)
     _summarized.add(pid)
+    _adapt_finish.pop(pid, None)          # выгрузка: adapt_reason больше не нужен после сводки
     log.info("pc-dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
 
 
@@ -2815,8 +2946,11 @@ def process_new():
         log.info("пауза приёма: жду планового рестарта демона (systemd-run-единица жива) — "
                  "%d задач(и) ждут в new", len(items))
         return
-    # ГЕЙТ ПАМЯТИ: свободно < MEM_MIN_MB → задача ждёт в new (не failed, не потеряна)
+    # ГЕЙТ ПАМЯТИ: свободно < MEM_MIN_MB или claude RSS >= CLAUDE_RSS_TOTAL_MB → ждём в new
     if _mem_gate_check():
+        return
+    # ГЕЙТ ПАРАЛЛЕЛИЗМА: живых claude >= MAX_CLAUDE_PROCS → ждём в new
+    if _proc_gate_check():
         return
     # FIFO: get_pending отдаёт newest-first → берём наименьший id (старейшую задачу) первым.
     # Шаг декомпозиции, чей сиблинг ждёт (needs_approval/approved/in_progress), пропускаем —
@@ -2956,7 +3090,9 @@ def process_new():
 def cycle():
     """Один проход: подобрать сирот in_progress (урок 138) → довести одобренное красное
     (approved) → добрать хвосты декомпозиций, финализированные мимо демона (сводка) → надзор
-    цепей ПК-театра (полоса pc, read-only + релиз/хуки своих цепей) → взять новое (new)."""
+    цепей ПК-театра (полоса pc, read-only + релиз/хуки своих цепей) → взять новое (new).
+    Выгрузка завершённых цепей (_prune_chain_cache): cheap check, только при превышении потолка."""
+    _prune_chain_cache()
     process_orphans()
     process_approved()
     process_dec_tails()
@@ -2966,14 +3102,20 @@ def cycle():
 
 def main():
     _banner_avail = _mem_available_mb() or 0
+    _banner_crss = _live_claude_rss_mb() or 0
+    _banner_cprocs = _live_claude_count() or 0
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
              "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, gate_single_sel=%s, "
-             "fact_ttl=%ss, model=%s, executor_model=%s, mem_gate=%s(min=%dMB avail=%dMB)) ===",
+             "fact_ttl=%ss, model=%s, executor_model=%s, mem_gate=%s(min=%dMB avail=%dMB), "
+             "rss_gate=%s(max=%dMB cur=%dMB), proc_gate=%s(max=%d cur=%d), chain_cache=%d) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
              int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), int(_curator_scope_on()),
              int(_gate_single_selective_on()),
              FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL,
-             "on" if MEM_MIN_MB > 0 else "off", MEM_MIN_MB, _banner_avail)
+             "on" if MEM_MIN_MB > 0 else "off", MEM_MIN_MB, _banner_avail,
+             "on" if CLAUDE_RSS_TOTAL_MB > 0 else "off", CLAUDE_RSS_TOTAL_MB, _banner_crss,
+             "on" if MAX_CLAUDE_PROCS > 0 else "off", MAX_CLAUDE_PROCS, _banner_cprocs,
+             MAX_CHAIN_CACHE)
     while _running:
         try:
             cycle()
