@@ -10,6 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, "/root/turbobaby-manager-bot")
+os.environ["BRIDGE_ALLOW_FIXTURES"] = "1"  # транспорт-тест: «тест» на фейковый URL — осознанный обход fixture-guard (класс 193)
 os.environ.setdefault("BRIDGE_URL", "http://x/exec")
 os.environ.setdefault("BRIDGE_TOKEN", "T")
 

@@ -200,7 +200,19 @@
       "Bash(rm -rf ~*)",
       "Bash(chmod -R 777 /*)",
       "Bash(dd *of=/dev/*)",
-      "Bash(mkfs*)"
+      "Bash(mkfs*)",
+      "Write(//root/.claude/settings.json)",
+      "Write(//root/.claude/settings.local.json)",
+      "Edit(//root/.claude/settings.json)",
+      "Edit(//root/.claude/settings.local.json)",
+      "Write(//etc/**)",
+      "Edit(//etc/**)",
+      "Write(//usr/**)",
+      "Edit(//usr/**)",
+      "Write(//var/**)",
+      "Edit(//var/**)",
+      "Write(//boot/**)",
+      "Edit(//boot/**)"
     ],
     "defaultMode": "acceptEdits",
     "additionalDirectories": [

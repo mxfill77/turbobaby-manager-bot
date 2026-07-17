@@ -36,7 +36,7 @@ BRIDGE_GS = "/root/turbobaby-bridge-gs"
 from dotenv import load_dotenv
 load_dotenv(os.path.join(REPO, ".env"))
 sys.path.insert(0, REPO)
-from bridge_client import BridgeClient
+from bridge_client import BridgeClient, FIXTURE_TASK_RE
 
 def _env_int(name, default):
     """Целое из .env с дефолтом; мусор/пусто → дефолт (fail-safe: кривой .env не роняет демона)."""
@@ -2823,6 +2823,17 @@ def process_new():
     # НЕ блокируя чужие задачи дальше по очереди (guard последовательности цепочки).
     task = None
     for cand in sorted(items, key=lambda x: int(x.get("id") or 0)):
+        # FIXTURE-GUARD (класс 193): заглушка из тестов дошла до живой очереди (гард клиента
+        # обойдён/чужой клиент) → НЕ исполняем: мгновенный failed без claude -p. ORCH_TEST_MODE=1
+        # (ставит gate.py тестам) фильтр выключает — голдены гоняют фикстуры через мок свободно.
+        _ftxt = str(cand.get("task_text") or "")
+        if FIXTURE_TASK_RE.search(_ftxt) and os.environ.get("ORCH_TEST_MODE") != "1":
+            bc.complete_task(cand.get("id"), "failed",
+                             "⛔ фикстура-заглушка в живой очереди — НЕ исполняю (класс 193: тесты "
+                             "пишут мимо мока). Чинить источник: тестам — мок-очередь либо TEST-.")
+            log.warning("fixture-guard: id=%s заглушка (%.40s…) → failed без исполнения",
+                        cand.get("id"), _ftxt)
+            return
         if _is_dec(cand):
             m = _STEP_RE.match(str(cand.get("task_text") or ""))
             if m:

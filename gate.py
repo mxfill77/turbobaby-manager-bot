@@ -83,7 +83,7 @@ def run_tests():
     # подпроцессы (вкл. pretool_guard-фикстуры) НЕ шлют пуши в личку (утечки 01–05.07): env
     # наследуется детьми, pretool_guard._push и notify.notify его чтут. Пуш самого гейта о красных
     # тестах НЕ затронут (переменная ставится только подпроцессам тестов, не самому гейту).
-    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1")
+    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1")
     tests = sorted(glob.glob(os.path.join(TESTS_DIR, "test_*.py")))
     failed = []
     t0 = time.time()
@@ -161,7 +161,7 @@ def run_selective_tests(changed_files):
     """Smoke (py_compile) + тесты затронутых модулей.
     Возврат: (failed_names:list, n_tests:int, dt:float, label:str).
     Если затронутых тестов не нашли → fail-safe: полный сьют (label несёт «fail-safe»)."""
-    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1")
+    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1")
     t0 = time.time()
     failed = []
 

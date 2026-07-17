@@ -4,6 +4,7 @@ TurboBaby Bridge HTTP клиент.
 """
 
 import os
+import re
 import json
 import time
 import random
@@ -15,6 +16,20 @@ from typing import Optional
 from urllib.parse import urljoin
 
 log = logging.getLogger(__name__)
+
+# FIXTURE-GUARD (класс 193, 17.07.2026): тест-фикстуры утекали в ЖИВУЮ очередь — демон исполнял
+# заглушки по-настоящему (16.07 21:36–21:50: «конверт 999 "сделать нечто"» ×5, «проверь X» ×4,
+# «сделай X» шага родителя 10, «task»). Правило класса: тестам — ТОЛЬКО мок-очередь либо явный
+# префикс TEST-. Паттерны НАМЕРЕННО узкие (канонические тексты фикстур дословно), чтобы живой
+# конверт «[конверт одобренной заявки 999] …» с реальной заявкой через годы НЕ попал под гард:
+# фикстурный конверт опознаётся по хвосту «сделать нечто», шаг «родителя 10» — по «сделай X».
+# Два рубежа: enqueue_task (клиент, до сети) и process_new демона (фильтр перед claude -p).
+FIXTURE_TASK_RE = re.compile(
+    r"^\s*TEST-"                                                     # доктрина: явный тест-префикс
+    r"|\[конверт одобренной заявки 999\][^\n]{0,80}сделать нечто"    # канонический фикстур-конверт
+    r"|\[шаг \d+/\d+ родитель 10\]\s*сделай X"                       # фикстурная цепь «родитель 10»
+    r"|^\s*(?:проверь X|сделай X|task|тест|нечто)\s*\.?\s*$",         # голые заглушки целиком
+    re.I)
 
 # HTTP-коды редиректа script.google.com/exec → script.googleusercontent.com (echo-слой)
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
@@ -394,7 +409,15 @@ class BridgeClient:
     # 'all' в get_pending = обе полосы (опрос devbot).
 
     def enqueue_task(self, from_: str, task_text: str, lane: str = None) -> dict:
-        """Положить задачу в очередь → {ok, id}. status=new. lane: None=vps (дефолт Bridge) | 'pc'."""
+        """Положить задачу в очередь → {ok, id}. status=new. lane: None=vps (дефолт Bridge) | 'pc'.
+        FIXTURE-GUARD (класс 193): канонические тест-заглушки в живую очередь НЕ пишутся —
+        мгновенный {ok:False, fixture_guard:True} БЕЗ сети. Обход для легитимных тест-контуров
+        (транспорт-тесты на фейковом URL): BRIDGE_ALLOW_FIXTURES=1 ставит сам тест."""
+        if FIXTURE_TASK_RE.search(str(task_text or "")) and os.environ.get("BRIDGE_ALLOW_FIXTURES") != "1":
+            log.warning("fixture-guard: enqueue заблокирован (тест-фикстура): %.60r", task_text)
+            return {"ok": False, "fixture_guard": True,
+                    "error": "fixture_guard: тест-фикстура не пишется в живую очередь "
+                             "(класс 193; тестам — мок-очередь либо TEST-/BRIDGE_ALLOW_FIXTURES=1)"}
         kw = {"from": from_, "task_text": task_text}
         if lane is not None:
             kw["lane"] = lane
