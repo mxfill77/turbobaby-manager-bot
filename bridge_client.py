@@ -31,6 +31,37 @@ FIXTURE_TASK_RE = re.compile(
     r"|^\s*(?:проверь X|сделай X|task|тест|нечто)\s*\.?\s*$",         # голые заглушки целиком
     re.I)
 
+# СЕТЕВОЙ ЗАПРЕТ В ТЕСТ-РЕЖИМЕ (класс 193, 17.07.2026, рубеж 3): gate.py ставит ORCH_TEST_MODE=1
+# всем тестам. При импорте bridge_client с этим флагом патчим requests.Session.send — любая попытка
+# дотянуться до нелокального URL поднимает RuntimeError ДО открытия сокета.
+# Тесты, корректно мокирующие _post или заменяющие _session своим FakeSession, под гард не попадают
+# (до .send() дойти не могут). Localhost разрешён: test_wa_webhook запускает локальный сервер.
+# Обход: BRIDGE_ALLOW_NETWORK=1 (транспорт-тесты test_bridge_durable, если когда-то понадобится).
+_LOCALHOST_PREFIXES = ("http://127.", "https://127.", "http://[::1]",
+                       "https://[::1]", "http://localhost", "https://localhost")
+
+
+def _install_test_network_ban() -> None:
+    """Патчит requests.Session.send, запрещая нелокальные TCP-соединения в тест-режиме."""
+    _orig = requests.Session.send
+
+    def _banned(self_sess, request, **kw):
+        if os.getenv("BRIDGE_ALLOW_NETWORK") == "1":
+            return _orig(self_sess, request, **kw)
+        url = str(getattr(request, "url", "") or "")
+        if not any(url.startswith(p) for p in _LOCALHOST_PREFIXES):
+            raise RuntimeError(
+                f"🚫 ТЕСТ ДЁРНУЛ СЕТЬ [{url[:80]}] "
+                "(ORCH_TEST_MODE=1) — замокай _post/_session или поставь BRIDGE_ALLOW_NETWORK=1"
+            )
+        return _orig(self_sess, request, **kw)
+
+    requests.Session.send = _banned
+
+
+if os.getenv("ORCH_TEST_MODE") == "1":
+    _install_test_network_ban()
+
 # HTTP-коды редиректа script.google.com/exec → script.googleusercontent.com (echo-слой)
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
 
