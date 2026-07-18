@@ -161,5 +161,99 @@ SPAWNS.clear()
 OD.process_new()
 res.append(ok("⛔" not in str(fb.rows[tid]["result"]), "живой текст фильтром не тронут"))
 
+# ---- РУБЕЖ 1 доп: Unicode-нормализация (тask Кирилл.т, 17.07.2026 02:16) ----
+print("(7) РУБЕЖ 1: «тask» с Кирилл.т блокируется (NFC+casefold+confusable):")
+# «тask» = U+0442 (Кирилл.т) + ASCII ask — re.I не ловит, нужна нормализация
+CYRILLIC_TASK = "тask"          # т (U+0442) + ask
+r = c.enqueue_task("Filipp-328", CYRILLIC_TASK)
+res.append(ok(r.get("ok") is False and r.get("fixture_guard") is True,
+              "тask (Кирилл.т) блокируется рубежом 1"))
+calls.clear()
+
+print("(8) РУБЕЖ 1: нормализованные варианты «task» тоже блокируются:")
+for variant in ["тASK", "ТASK", "таск"]:  # тASK, ТASK, таск (чисто кирилл.)
+    r = c.enqueue_task("Filipp-328", variant)
+    # «таск» (чисто кирилл.) — НЕ заглушка (не в паттерне); тASK — заглушка после нормализации
+    is_pure_cyr_other = variant == "таск"
+    expect_block = not is_pure_cyr_other
+    res.append(ok((r.get("ok") is False) == expect_block,
+                  f"{variant!r}: {'блокируется' if expect_block else 'пропускается'} корректно"))
+    calls.clear()
+
+print("(9) РУБЕЖ 1: живые тексты с кирилл. буквами НЕ блокируются:")
+for live in ["проверь клиента", "тест-прогон ОДО", "прочитай лог"]:
+    r = c.enqueue_task("Filipp-328", live)
+    res.append(ok(r.get("ok") is True, f"живой кирилл. текст {live!r} прошёл"))
+    calls.clear()
+
+# ---- РУБЕЖ approved: process_approved не исполняет фикстуры (класс 193 новый рубеж) ----
+print("(10) РУБЕЖ approved: фикстура в статусе approved → failed, claude не вызывался:")
+os.environ.pop("ORCH_TEST_MODE", None)
+fb = FakeBridge(); OD.bc = fb
+# Добавляем фикстуру напрямую в approved (минуя enqueue_task guard)
+fb.rows[201] = {"id": 201, "from": "Filipp-328", "task_text": "проверь X",
+                "status": "approved", "result": "op=other | проверь X", "updated": now_iso()}
+SPAWNS.clear()
+OD.process_approved()
+res.append(ok(fb.rows[201]["status"] == "failed", "approved фикстура → failed"))
+res.append(ok("⛔" in fb.rows[201]["result"], "approved фикстура: тело = ⛔-метка"))
+res.append(ok(not SPAWNS, "approved фикстура: claude НЕ вызывался"))
+
+print("(11) РУБЕЖ approved: «тask» (Кирилл.т) в approved тоже блокируется:")
+fb = FakeBridge(); OD.bc = fb
+fb.rows[202] = {"id": 202, "from": "Filipp-328", "task_text": "тask",
+                "status": "approved", "result": "op=other | тask", "updated": now_iso()}
+SPAWNS.clear()
+OD.process_approved()
+res.append(ok(fb.rows[202]["status"] == "failed", "approved тask (Кирилл.т) → failed"))
+res.append(ok(not SPAWNS, "approved тask: claude НЕ вызывался"))
+
+print("(12) РУБЕЖ approved: живая задача в approved (op=other) гвардом не тронута:")
+fb = FakeBridge(); OD.bc = fb
+# op=other → _convert_other_approved → bc.enqueue_task (FakeBridge, без fixture-guard)
+# → complete(tid, done) — не ⛔, не blocked
+fb.rows[203] = {"id": 203, "from": "Filipp-328",
+                "task_text": "прочитай и проверь wa_queue.db на VPS",
+                "status": "approved", "result": "op=other | прочитай лог", "updated": now_iso()}
+SPAWNS.clear()
+OD.process_approved()
+res.append(ok("⛔" not in str(fb.rows[203].get("result", "")),
+              "approved живая задача гвардом не заблокирована"))
+
+# ---- РУБЕЖ 4: _fixture_reap_open (needs_approval/approved реапер) ----
+print("(13) РУБЕЖ 4 реапер: фикстура в needs_approval → failed:")
+os.environ.pop("ORCH_TEST_MODE", None)
+fb = FakeBridge(); OD.bc = fb
+fb.rows[301] = {"id": 301, "from": "Filipp-328", "task_text": "task",
+                "status": "needs_approval", "result": "op=other | task", "updated": now_iso()}
+OD._fixture_reap_open()
+res.append(ok(fb.rows[301]["status"] == "failed", "реапер: needs_approval фикстура → failed"))
+res.append(ok("⛔" in fb.rows[301]["result"], "реапер: тело = ⛔-метка"))
+
+print("(14) РУБЕЖ 4 реапер: «тask» (Кирилл.т) в needs_approval → failed:")
+fb = FakeBridge(); OD.bc = fb
+fb.rows[302] = {"id": 302, "from": "Filipp-328", "task_text": "тask",
+                "status": "needs_approval", "result": "op=other | тask", "updated": now_iso()}
+OD._fixture_reap_open()
+res.append(ok(fb.rows[302]["status"] == "failed", "реапер: needs_approval тask (Кирилл.т) → failed"))
+
+print("(15) РУБЕЖ 4 реапер: ORCH_TEST_MODE=1 — реапер молчит:")
+os.environ["ORCH_TEST_MODE"] = "1"
+fb = FakeBridge(); OD.bc = fb
+fb.rows[303] = {"id": 303, "from": "Filipp-328", "task_text": "task",
+                "status": "needs_approval", "result": "", "updated": now_iso()}
+OD._fixture_reap_open()
+res.append(ok(fb.rows[303]["status"] == "needs_approval", "ORCH_TEST_MODE=1: реапер не трогает"))
+os.environ.pop("ORCH_TEST_MODE", None)
+
+print("(16) РУБЕЖ 4 реапер: живая задача в needs_approval НЕ трогается:")
+fb = FakeBridge(); OD.bc = fb
+fb.rows[304] = {"id": 304, "from": "Filipp-328",
+                "task_text": "NEEDS_APPROVAL: op=restart_splinter | перезапустить бот",
+                "status": "needs_approval", "result": "op=restart_splinter", "updated": now_iso()}
+OD._fixture_reap_open()
+res.append(ok(fb.rows[304]["status"] == "needs_approval",
+              "реапер: живая needs_approval задача не тронута"))
+
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)

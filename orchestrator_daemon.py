@@ -36,7 +36,16 @@ BRIDGE_GS = "/root/turbobaby-bridge-gs"
 from dotenv import load_dotenv
 load_dotenv(os.path.join(REPO, ".env"))
 sys.path.insert(0, REPO)
-from bridge_client import BridgeClient, FIXTURE_TASK_RE
+from bridge_client import BridgeClient, FIXTURE_TASK_RE, _fixture_norm
+
+
+def _is_fixture(text: str) -> bool:
+    """True → текст — каноническая тест-фикстура класса 193.
+    Проверяет ОБА: оригинал (чистые кирилл. паттерны «проверь X»/«тест» …) И нормализованный
+    (mixed-script: «тask» Кирилл.т+ASCII → «task»). ORCH_TEST_MODE НЕ проверяет — место вызова."""
+    s = str(text or "")
+    return bool(FIXTURE_TASK_RE.search(s) or FIXTURE_TASK_RE.search(_fixture_norm(s)))
+
 
 def _env_int(name, default):
     """Целое из .env с дефолтом; мусор/пусто → дефолт (fail-safe: кривой .env не роняет демона)."""
@@ -2865,6 +2874,15 @@ def process_approved():
         return
     for task in sorted(r.get("items", []), key=lambda x: int(x.get("id") or 0)):
         tid = task.get("id")
+        # FIXTURE-GUARD (класс 193, рубеж approved): заглушка одобрена — НЕ исполнять,
+        # не конвертировать в конверт. ORCH_TEST_MODE=1 выключает, как в process_new.
+        _ftxt_ap = str(task.get("task_text") or "")
+        if _is_fixture(_ftxt_ap) and os.environ.get("ORCH_TEST_MODE") != "1":
+            bc.complete_task(tid, "failed",
+                             "⛔ фикстура-заглушка в живой очереди (approved) — НЕ исполняю "
+                             "(класс 193). Чинить источник: тестам — мок-очередь либо TEST-.")
+            log.warning("fixture-guard/approved: id=%s заглушка (%.40s…) → failed", tid, _ftxt_ap)
+            continue
         what = str(task.get("result") or "")        # сохранённый дескриптор (op=… | текст) — одобренный
 
         # Сводная карточка владельцу (куратор, шаг 4/7): ✅ = «принял/сделал» — просто закрываем
@@ -2949,6 +2967,27 @@ def _requeue_foreign_restart(tid, frm, text, note):
                      (f"{note}\nВозвращена в очередь задачей id {nid} (текст дословно, полоса "
                       f"from та же) — исполнится после рестарта демона.")[:RESULT_MAX])
     log.info("FOREIGN-RESTART id=%s → возвращена в new задачей %s", tid, nid)
+
+
+def _fixture_reap_open():
+    """Реапер фикстур (класс 193, рубеж 4): закрыть тест-заглушки, застрявшие в
+    needs_approval или approved (туда guard process_new не достаёт). Каждый cycle().
+    ORCH_TEST_MODE=1 → тесты гоняют фикстуры через мок, не трогаем."""
+    if os.environ.get("ORCH_TEST_MODE") == "1":
+        return
+    r = bc.get_pending("needs_approval,approved")
+    if not r.get("ok"):
+        return
+    for item in r.get("items", []):
+        tid = item.get("id")
+        txt = str(item.get("task_text") or "")
+        if not _is_fixture(txt):
+            continue
+        st = item.get("status", "?")
+        bc.complete_task(tid, "failed",
+                         f"⛔ фикстура-заглушка в живой очереди (статус={st}, "
+                         "класс 193 реапер). Чинить источник: тестам — мок-очередь либо TEST-.")
+        log.warning("fixture-reap: id=%s статус=%s заглушка (%.40s…) → failed", tid, st, txt)
 
 
 def process_orphans():
@@ -3052,7 +3091,7 @@ def process_new():
         # обойдён/чужой клиент) → НЕ исполняем: мгновенный failed без claude -p. ORCH_TEST_MODE=1
         # (ставит gate.py тестам) фильтр выключает — голдены гоняют фикстуры через мок свободно.
         _ftxt = str(cand.get("task_text") or "")
-        if FIXTURE_TASK_RE.search(_ftxt) and os.environ.get("ORCH_TEST_MODE") != "1":
+        if _is_fixture(_ftxt) and os.environ.get("ORCH_TEST_MODE") != "1":
             bc.complete_task(cand.get("id"), "failed",
                              "⛔ фикстура-заглушка в живой очереди — НЕ исполняю (класс 193: тесты "
                              "пишут мимо мока). Чинить источник: тестам — мок-очередь либо TEST-.")
@@ -3184,6 +3223,7 @@ def cycle():
     цепей ПК-театра (полоса pc, read-only + релиз/хуки своих цепей) → взять новое (new).
     Выгрузка завершённых цепей (_prune_chain_cache): cheap check, только при превышении потолка."""
     _prune_chain_cache()
+    _fixture_reap_open()        # закрыть фикстуры в needs_approval/approved (класс 193 рубеж 4)
     process_orphans()
     process_approved()
     process_dec_tails()

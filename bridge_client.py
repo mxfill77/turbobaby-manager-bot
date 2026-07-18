@@ -11,6 +11,7 @@ import random
 import logging
 import contextlib
 import contextvars
+import unicodedata
 import requests
 from typing import Optional
 from urllib.parse import urljoin
@@ -30,6 +31,21 @@ FIXTURE_TASK_RE = re.compile(
     r"|\[шаг \d+/\d+ родитель 10\]\s*сделай X"                       # фикстурная цепь «родитель 10»
     r"|^\s*(?:проверь X|сделай X|task|тест|нечто)\s*\.?\s*$",         # голые заглушки целиком
     re.I)
+
+# ЮНИКОД-НОРМАЛИЗАЦИЯ (класс 193, продолжение 17.07.2026): тест «тask» (Кирилл.т + ASCII ask)
+# прошёл 02:16 — re.I не знает о конфузиках (Кирилл.т ≠ Latin.t разные кодпоинты). Решение:
+# NFC + casefold + узкая карта Кирилл.→Latin-омоглифов. Проверяем ОБА: оригинал (чтобы не сломать
+# чисто-кирилл. паттерны «проверь X»/«тест» после map'а) и нормализованный (чтобы поймать тask).
+_FIXTURE_CYR2LAT = str.maketrans("аАеЕоОрРсСтТхХ", "aAeEoOpPcCtTxX")
+
+
+def _fixture_norm(text: str) -> str:
+    """NFC + casefold + Кирилл.→Latin lookalike map — для детекции mixed-script заглушек.
+    «тask» (Кирилл.т + ASCII ask) → «task» → совпадает паттерном task.
+    Чистые кирилл. паттерны ломаются при map'е → проверяются отдельно по оригиналу."""
+    t = unicodedata.normalize("NFC", text).casefold()
+    return t.translate(_FIXTURE_CYR2LAT)
+
 
 # СЕТЕВОЙ ЗАПРЕТ В ТЕСТ-РЕЖИМЕ (класс 193, 17.07.2026, рубеж 3): gate.py ставит ORCH_TEST_MODE=1
 # всем тестам. При импорте bridge_client с этим флагом патчим requests.Session.send — любая попытка
@@ -444,7 +460,9 @@ class BridgeClient:
         FIXTURE-GUARD (класс 193): канонические тест-заглушки в живую очередь НЕ пишутся —
         мгновенный {ok:False, fixture_guard:True} БЕЗ сети. Обход для легитимных тест-контуров
         (транспорт-тесты на фейковом URL): BRIDGE_ALLOW_FIXTURES=1 ставит сам тест."""
-        if FIXTURE_TASK_RE.search(str(task_text or "")) and os.environ.get("BRIDGE_ALLOW_FIXTURES") != "1":
+        _ftxt = str(task_text or "")
+        if (FIXTURE_TASK_RE.search(_ftxt) or FIXTURE_TASK_RE.search(_fixture_norm(_ftxt))) \
+                and os.environ.get("BRIDGE_ALLOW_FIXTURES") != "1":
             log.warning("fixture-guard: enqueue заблокирован (тест-фикстура): %.60r", task_text)
             return {"ok": False, "fixture_guard": True,
                     "error": "fixture_guard: тест-фикстура не пишется в живую очередь "
