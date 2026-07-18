@@ -33,9 +33,9 @@ res.append(ok("делай САМ" in P and "wa-webhook" in P and "orchestrator-d
               "Q2/16.07: рестарт/старт всех трёх сервисов — CC делает САМ, NEEDS_APPROVAL не объявлять"))
 res.append(ok("только exit 0" in P and "старт чистый" in P,
               "Q2: оранжевый цикл restart — гейт → restart → чистый старт → отчёт"))
-res.append(ok("op=other" in P and "confirmed=true" in P and "delete_event" in P,
+res.append(ok("op=other" in P and "подтверждённая запись" in P and "удаление событий" in P,
               "настоящее красное → op=other с карточкой"))
-res.append(ok("cc_log" in P and "pulse" in P and "ОДНОЙ операцией" in P and "gate.py" in P,
+res.append(ok("cc_log" in P and "pulse" in P and "cclog.py" in P and "gate.py" in P,
               "дисциплина: cc_log+пульс одной операцией, гейт перед push"))
 res.append(ok("400" in P and "бэкап" in P.lower(), "формат сводки ≤400 + бэкап перед правкой"))
 
