@@ -11,7 +11,7 @@
 (7) guard_marker_clear + guard_marker_read.
 (8) CC_TASK_ID выставляется в child_env перед запуском.
 Сети/claude нет — subprocess.Popen (_POPEN) подменён FakePopen."""
-import os, sys, json, time, tempfile, shutil, threading
+import os, sys, json, tempfile, shutil, threading
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
@@ -34,11 +34,15 @@ class FakePopen:
         self._exc = exc; self._on_communicate = on_communicate
         self.returncode = None
         self._killed = threading.Event()
+        self.sleeping = threading.Event()    # set when communicate() enters its wait
     def communicate(self, timeout=None):
         if self._on_communicate:
             self._on_communicate()
         if self._sleep:
+            self.sleeping.set()              # signal: now entering interruptible sleep
             self._killed.wait(self._sleep)   # прерывается terminate()/kill()
+        else:
+            self.sleeping.set()
         if self._exc:
             e = self._exc; self._exc = None; raise e
         if self.returncode is None:          # не перезаписываем rc от terminate()
@@ -119,16 +123,29 @@ print("(3) run_task: guard-монитор (асинхронный):")
 tmp_guard3 = tempfile.mkdtemp(prefix="guard_esc3_")
 OD.GUARD_BLOCK_DIR = tmp_guard3
 
-def _delayed_plant(*a, **kw):
-    """Записать маркер через 0.1с (пока communicate() ещё ждёт)."""
-    def _write():
-        time.sleep(0.1)
-        path = os.path.join(tmp_guard3, "77.json")
-        with open(path, "w") as f:
-            json.dump({"task_id": "77", "hit": "closing_upsert", "card": "закрыть booking"}, f)
-    threading.Thread(target=_write, daemon=True).start()
+# Детерминизация: вместо time.sleep(0.1) ждём Event, который communicate() выставляет
+# перед входом в _killed.wait() — гарантирует запись маркера ПОКА proc ещё «работает»,
+# без зависимости от CPU-нагрузки или реального планировщика ОС.
+_popen_ref_3 = [None]
 
-OD._POPEN = lambda *a, **kw: FakePopen("нет маркера", rc=0, sleep_s=0.5, on_communicate=_delayed_plant)
+def _plant_when_sleeping():
+    """Записать маркер ровно когда communicate() вошёл в ожидание — без fixed sleep."""
+    proc = _popen_ref_3[0]
+    if proc is not None:
+        proc.sleeping.wait(timeout=5.0)   # Event, выставляемый FakePopen.communicate()
+    path = os.path.join(tmp_guard3, "77.json")
+    with open(path, "w") as f:
+        json.dump({"task_id": "77", "hit": "closing_upsert", "card": "закрыть booking"}, f)
+
+def _on_start_3():
+    threading.Thread(target=_plant_when_sleeping, daemon=True).start()
+
+def _make_popen_3(*a, **kw):
+    p = FakePopen("нет маркера", rc=0, sleep_s=0.5, on_communicate=_on_start_3)
+    _popen_ref_3[0] = p
+    return p
+
+OD._POPEN = _make_popen_3
 fb = FakeBridge(); OD.bc = fb
 
 # Уменьшим монитор-интервал до 0.05с для быстрого теста (подменяем функцию)
