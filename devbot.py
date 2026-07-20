@@ -596,6 +596,41 @@ def _find_task(bridge, qid):
     return None, None
 
 
+def _next_approval(bridge, exclude_id):
+    """Найти первый другой открытый needs_approval (кроме exclude_id). Sync → asyncio.to_thread."""
+    try:
+        r = bridge.get_pending("needs_approval", lane="all")
+    except Exception:
+        return None
+    if not r.get("ok"):
+        return None
+    for it in (r.get("items") or []):
+        if str(it.get("id")) != str(exclude_id):
+            return it
+    return None
+
+
+async def _send_stale_followup(context, q, next_it):
+    """Отправить свежую карточку следующего открытого needs_approval после стейл-ответа."""
+    if next_it is None:
+        return
+    try:
+        next_id = int(next_it.get("id"))
+    except (TypeError, ValueError):
+        return
+    what = str(next_it.get("result") or "").strip()
+    tid = getattr(q.message, "message_thread_id", None) or DEVBOT_TOPIC
+    try:
+        await context.bot.send_message(
+            chat_id=HQ_CHAT_ID,
+            message_thread_id=tid,
+            text=what[:4000] if what else f"Задача {next_id} — ждёт подтверждения",
+            reply_markup=_kb_approval(next_id),
+        )
+    except Exception as e:
+        log.warning("devbot._send_stale_followup: send_message упал (%s)", e)
+
+
 def _is_pc_item(it):
     """Задача полосы pc? По полю lane (новый Bridge) ИЛИ по метке from (работает и до redeploy)."""
     lane = str((it or {}).get("lane") or "").strip().lower()
@@ -728,8 +763,20 @@ async def _btn_answer(q, txt=None, **kw):
         log.warning("devbot: q.answer протух/упал (действие кнопки всё равно выполняю): %s", e)
 
 
-async def _cb_approve(q, qid, bridge):
+async def _cb_approve(context, q, qid, bridge):
     """approve:<id> → approve_task (та же логика «да N»). ОДНОРАЗОВО + идемпотентность."""
+    # Стейл-гейт: проверить статус ДО действия (конверт мог быть обработан параллельно)
+    cur_status, _ = await asyncio.to_thread(_find_task, bridge, qid)
+    if cur_status != "needs_approval":
+        st_txt = f" (статус: {cur_status})" if cur_status else " (задача не найдена)"
+        next_it = await asyncio.to_thread(_next_approval, bridge, qid)
+        mark = f"⏱ карточка устарела{st_txt}"
+        if next_it is not None:
+            mark += f" — актуальный конверт №{next_it.get('id')} ниже"
+        await _btn_answer(q, "карточка устарела")
+        await _strip_and_mark(q, mark)
+        await _send_stale_followup(context, q, next_it)
+        return
     r = await asyncio.to_thread(bridge.approve_task, qid, "Filipp")
     if r.get("ok"):
         _reported.discard(qid)            # пусть дальнейший done/failed отрапортуется штатно
@@ -746,8 +793,20 @@ async def _cb_approve(q, qid, bridge):
         await _btn_answer(q, f"approve не прошёл: {r.get('error')}")
 
 
-async def _cb_reject(q, qid, bridge):
+async def _cb_reject(context, q, qid, bridge):
     """reject:<id> → complete_task failed (как «нет N»). ОДНОРАЗОВО."""
+    # Стейл-гейт: проверить статус ДО действия
+    cur_status, _ = await asyncio.to_thread(_find_task, bridge, qid)
+    if cur_status != "needs_approval":
+        st_txt = f" (статус: {cur_status})" if cur_status else " (задача не найдена)"
+        next_it = await asyncio.to_thread(_next_approval, bridge, qid)
+        mark = f"⏱ карточка устарела{st_txt}"
+        if next_it is not None:
+            mark += f" — актуальный конверт №{next_it.get('id')} ниже"
+        await _btn_answer(q, "карточка устарела")
+        await _strip_and_mark(q, mark)
+        await _send_stale_followup(context, q, next_it)
+        return
     r = await asyncio.to_thread(bridge.complete_task, qid, "failed", "отклонено Филиппом (кнопка)")
     if r.get("ok"):
         _reported.add(qid)                # уже сообщили «отклонена» — не дублируем failed-рапортом
@@ -812,9 +871,9 @@ async def handle_callback(update, context, bridge) -> None:
     # origin=human (как «да N»): тап Филиппа = ручное действие, токен-замок 4.2 не вмешивается.
     try:
         if action == "approve":
-            await _cb_approve(q, qid, bridge)
+            await _cb_approve(context, q, qid, bridge)
         elif action == "reject":
-            await _cb_reject(q, qid, bridge)
+            await _cb_reject(context, q, qid, bridge)
         elif action == "check":
             await _cb_check(context, q, qid, bridge)
         elif action == "next":

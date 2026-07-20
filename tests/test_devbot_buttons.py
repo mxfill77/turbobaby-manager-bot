@@ -68,7 +68,7 @@ loop = asyncio.new_event_loop()
 run = loop.run_until_complete
 
 # B1: approve с мёртвым ack — approve_task вызван, кнопки сняты пометкой «одобрено»
-br = FakeBridge(approve={"ok": True})
+br = FakeBridge(approve={"ok": True}, items=[{"_st": "needs_approval", "id": 7}])
 q = DeadAnswerQuery("approve:7")
 run(DB.handle_callback(Upd(q), Ctx(), br))
 print("(B1) approve при протухшем ack:")
@@ -83,8 +83,8 @@ run(DB.handle_callback(Upd(q), Ctx(), br))
 print("(B2) check при протухшем ack:")
 res.append(ok(len(SENDS) == 1 and "статус done" in SENDS[0], "статус задачи ушёл в тему несмотря на мёртвый ack"))
 
-# B3: reject not_found с мёртвым ack — идемпотентная пометка проходит
-br = FakeBridge(complete={"ok": False, "error": "not_found"})
+# B3: reject not_found с мёртвым ack (race: задача была в needs_approval, исчезла до complete)
+br = FakeBridge(complete={"ok": False, "error": "not_found"}, items=[{"_st": "needs_approval", "id": 5}])
 q = DeadAnswerQuery("reject:5")
 run(DB.handle_callback(Upd(q), Ctx(), br))
 print("(B3) reject not_found при протухшем ack:")
@@ -99,7 +99,7 @@ print("(B4) чужой юзер при протухшем ack:")
 res.append(ok(br.approve_calls == [] and q.edits == [], "approve НЕ выполнен, хендлер не упал"))
 
 # B5: регресс — живой ack работает как раньше (тост уходит)
-br = FakeBridge(approve={"ok": True})
+br = FakeBridge(approve={"ok": True}, items=[{"_st": "needs_approval", "id": 7}])
 q = FakeQuery("approve:7")
 run(DB.handle_callback(Upd(q), Ctx(), br))
 print("(B5) живой ack (регресс):")
