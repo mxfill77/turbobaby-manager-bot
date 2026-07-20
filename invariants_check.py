@@ -37,6 +37,11 @@ from datetime import timezone
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
+# Injectable root for SCRATCHPAD_WRITERS; None → REPO (переопределяется в тестах).
+_SCRATCHPAD_ROOT = None
+# Паттерн прямой записи в мозг: .write_doc( или ._call("write_doc"
+_BRAIN_WRITE_RE = re.compile(r'\.write_doc\s*\(|_call\s*\(\s*[\'"]write_doc[\'"]')
+
 # HARD_MAX_KM — нереальный пробег замены масла (> 300к km для тайского проката невозможно):
 # ловит случайные набросы типа «35200» прочитанное как «352000» или иные ошибки ввода.
 HARD_MAX_KM = 300_000
@@ -550,6 +555,40 @@ def check_bot_data_vs_sheet(world, run):
             )
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 9: SCRATCHPAD_WRITERS
+#  _*.py в корне репо: прямые вызовы write_doc (минуя write_cclog/cclog.py) → флаг с адресом.
+#  Правило (CLAUDE.md R16): единственный путь записи в журнал мозга — write_cclog() / cclog.py;
+#  прямая запись из scratchpad-скриптов вне tools/ запрещена.
+#  Реализация: in-process скан (os.listdir + file.read), без subprocess — по образцу token_audit.
+#  Тестируем через _SCRATCHPAD_ROOT (injectable); None → REPO.
+# --------------------------------------------------------------------------------------------
+@register("SCRATCHPAD_WRITERS")
+def check_scratchpad_writers(world, run):
+    root = _SCRATCHPAD_ROOT if _SCRATCHPAD_ROOT is not None else REPO
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError as e:
+        run.note(f"каталог репо недоступен: {e}")
+        return
+    for fn in entries:
+        if not (fn.startswith("_") and fn.endswith(".py")):
+            continue
+        path = os.path.join(root, fn)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                for lineno, line in enumerate(f, 1):
+                    if _BRAIN_WRITE_RE.search(line):
+                        run.flag(
+                            f"scratchpad/{fn}:{lineno}",
+                            "прямой вызов write_doc — канонический путь: write_cclog() или cclog.py",
+                        )
+        except OSError:
+            pass
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
@@ -846,11 +885,21 @@ def _self_test():
                   lambda: FakeWorld(bikes=[], clients=[], queue_ip=[], services=None),
                   "BOT_DATA_VS_SHEET"))
 
-    # ── Общие свойства (вычисляем ДО регистрации _SELF_TEST_TEMP — иначе ALL-счёт растёт) ──
-    # Чистый мир = ноль нарушений суммарно
-    _total_clean = sum(len(r.findings) for r in run_all(_healthy_world()))
-    _total_degraded = sum(len(r.findings) for r in run_all(
-        FakeWorld(bikes=None, clients=None, queue_ip=None)))
+    # ── Общие свойства: предвычисляем ДО регистрации _SELF_TEST_TEMP ─────────────────────────
+    # SCRATCHPAD_WRITERS — static-инвариант (использует _SCRATCHPAD_ROOT, не world).
+    # Для ALL-тестов указываем пустой temp (→ 0 находок SCRATCHPAD_WRITERS).
+    import tempfile, shutil
+    global _SCRATCHPAD_ROOT
+    _old_scratch_root = _SCRATCHPAD_ROOT
+    _all_clean_dir = tempfile.mkdtemp()
+    try:
+        _SCRATCHPAD_ROOT = _all_clean_dir  # пустой → 0 SCRATCHPAD_WRITERS
+        _total_clean = sum(len(r.findings) for r in run_all(_healthy_world()))
+        _total_degraded = sum(len(r.findings) for r in run_all(
+            FakeWorld(bikes=None, clients=None, queue_ip=None)))
+    finally:
+        shutil.rmtree(_all_clean_dir, ignore_errors=True)
+        _SCRATCHPAD_ROOT = _old_scratch_root
 
     # Растяжимость — регистрируем ПОСЛЕ предвычислений ALL
     n_before = len(CHECKS)
@@ -864,24 +913,61 @@ def _self_test():
 
     print("=== САМОТЕСТ ИНВАРИАНТОВ ===")
     allpass = True
-    for title, expect, factory, cname in cases:
-        w = factory() if callable(factory) else factory
-        all_runs = run_all(w)
-        by_name = {r.name: r for r in all_runs}
-        got = len(by_name.get(cname, CheckRun(cname)).findings)
-        ok = (got == expect)
-        allpass &= ok
-        print(f"  {'PASS' if ok else 'FAIL'}  [{cname}] {title}: "
-              f"ждали {expect}, поймали {got}")
+
+    # Основной цикл (SCRATCHPAD_WRITERS видит пустой _all_clean_dir → 0 находок)
+    _loop_clean_dir = tempfile.mkdtemp()
+    _SCRATCHPAD_ROOT = _loop_clean_dir
+    try:
+        for title, expect, factory, cname in cases:
+            w = factory() if callable(factory) else factory
+            all_runs = run_all(w)
+            by_name = {r.name: r for r in all_runs}
+            got = len(by_name.get(cname, CheckRun(cname)).findings)
+            ok = (got == expect)
+            allpass &= ok
+            print(f"  {'PASS' if ok else 'FAIL'}  [{cname}] {title}: "
+                  f"ждали {expect}, поймали {got}")
+    finally:
+        shutil.rmtree(_loop_clean_dir, ignore_errors=True)
+        _SCRATCHPAD_ROOT = _old_scratch_root
+
+    # ── 9. SCRATCHPAD_WRITERS (запускаем отдельно с temp-каталогами) ─────────────────────────
+    _sw_clean_dir = tempfile.mkdtemp()
+    _sw_dirty_dir = tempfile.mkdtemp()
+    try:
+        # Грязный dir: _*.py с прямым .write_doc( → флаг; _*.py без → нет флага
+        with open(os.path.join(_sw_dirty_dir, "_bad_writer.py"), "w") as _f:
+            _f.write("bc.write_doc(text='x', name='cc_log')\n")
+        with open(os.path.join(_sw_dirty_dir, "_ok_no_write.py"), "w") as _f:
+            _f.write("# cclog.py handles this\n")
+
+        for _sw_title, _sw_expect, _sw_root in [
+            ("SCRATCHPAD чистый (нет _*.py)", 0, _sw_clean_dir),
+            ("SCRATCHPAD прямой write_doc → флаг", 1, _sw_dirty_dir),
+        ]:
+            _SCRATCHPAD_ROOT = _sw_root
+            _sw_runs = run_all(_healthy_world())
+            _sw_by_name = {r.name: r for r in _sw_runs}
+            _sw_got = len(_sw_by_name.get("SCRATCHPAD_WRITERS",
+                                           CheckRun("SCRATCHPAD_WRITERS")).findings)
+            _sw_ok = (_sw_got == _sw_expect)
+            allpass &= _sw_ok
+            print(f"  {'PASS' if _sw_ok else 'FAIL'}  [SCRATCHPAD_WRITERS] {_sw_title}: "
+                  f"ждали {_sw_expect}, поймали {_sw_got}")
+    finally:
+        shutil.rmtree(_sw_clean_dir, ignore_errors=True)
+        shutil.rmtree(_sw_dirty_dir, ignore_errors=True)
+        _SCRATCHPAD_ROOT = _old_scratch_root
 
     # Проверяем предвычисленные ALL-результаты
-    for title, got, expect in [
-        ("чистый мир — 0 нарушений ВСЕГО (8 инвариантов)", _total_clean, 0),
+    for _all_title, _all_got, _all_expect in [
+        ("чистый мир — 0 нарушений ВСЕГО (9 инвариантов)", _total_clean, 0),
         ("деградация (всё None) → 0 нарушений суммарно", _total_degraded, 0),
     ]:
-        ok = (got == expect)
+        ok = (_all_got == _all_expect)
         allpass &= ok
-        print(f"  {'PASS' if ok else 'FAIL'}  [ALL] {title}: ждали {expect}, поймали {got}")
+        print(f"  {'PASS' if ok else 'FAIL'}  [ALL] {_all_title}: "
+              f"ждали {_all_expect}, поймали {_all_got}")
 
     # Очищаем временный инвариант
     CHECKS[:] = [c for c in CHECKS if c[0] != "_SELF_TEST_TEMP"]

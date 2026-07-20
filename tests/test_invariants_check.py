@@ -25,6 +25,13 @@ from invariants_check import (
     CHECKS,
 )
 from datetime import timezone
+import tempfile as _tempfile
+
+# SCRATCHPAD_WRITERS — статический ФС-инвариант: сканирует РЕПО-корень на прямые .write_doc(
+# в _*.py и ортогонален миру _make_world(). Для world-тестов этого файла нейтрализуем его,
+# указав _SCRATCHPAD_ROOT на ПУСТОЙ каталог (тот же приём, что в invariants_check._self_test),
+# иначе живые scratchpad-скрипты в корне ломают свойства «чистый мир → 0 нарушений».
+ic._SCRATCHPAD_ROOT = _tempfile.mkdtemp(prefix="inv_test_scratch_clean_")
 
 # ─── Вспомогательные константы ─────────────────────────────────────────────────────────────
 _NOW = datetime.datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
