@@ -38,6 +38,12 @@ RED_TOKEN_HIT = {
     '"confirmed": true': "confirmed", '"confirmed":true': "confirmed",
 }
 RED_TOKENS = tuple(RED_TOKEN_HIT.keys())
+# Python-специфичные опасные операции (файловая система / деструктив) — дополняет RED_TOKENS.
+# Используется tools/token_audit.py для in-process сканирования файлов проекта.
+# В pretool_guard эти строки НЕ служат триггерами перехвата (для этого есть RED_TOKENS выше).
+_RED_PY_TOKENS = (
+    "os.remove", "os.unlink", "shutil.rmtree", "rmtree(", "os.rmdir",
+)
 _GREEN_MODULES = {"py_compile", "json.tool", "pytest", "unittest", "pip", "venv", "http.server",
                   "platform", "sysconfig", "site"}
 # Инфо-флаги интерпретатора: НИЧЕГО не исполняют (печатают версию/справку) → зелёное, даже без .py-цели.
