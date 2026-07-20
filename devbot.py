@@ -113,6 +113,18 @@ def _poll_queue_sync(pb):
 # Префикс в 328 → кладём задачу в очередь оркестратора; фоновый job приносит результат обратно.
 QUEUE_FROM = "Filipp-328"               # метка источника быстрых задач «задача:» (таймаут 10 мин)
 QUEUE_FROM_DEV = "Filipp-328-dev"       # метка дев-ТЗ «тз:» (ступень 2 O4, таймаут 45 мин у демона)
+# 229 (FACT-верификация): блок FACT: в результате dev-задачи = живое доказательство эффекта.
+_FACT_RE = re.compile(r"\bFACT\s*:", re.IGNORECASE)
+
+
+def _unverified_card_prefix(st, it):
+    """229 недеструктивно: dev-задача (from *-dev) со st=='done' и БЕЗ блока FACT: в result →
+    префикс карточки 328 «⚠️ unverified (нет блока FACT:)\n»; иначе ''. Хранимый result в
+    Bridge НЕ трогаем — демон пишет финал байт-в-байт, видимость даёт только текст карточки."""
+    if st == "done" and str(it.get("from") or "").endswith("-dev") \
+            and not _FACT_RE.search(str(it.get("result") or "")):
+        return "⚠️ unverified (нет блока FACT:)\n"
+    return ""
 QUEUE_FROM_DEC = "Filipp-328-dec"       # метка декомпозиции «декомпозируй:» (ступень 2 часть C):
                                         # родитель + его шаги «[шаг i/N родитель id]» + сводка
 QUEUE_FROM_PC = "Filipp-pc"             # быстрая задача из темы PC-дев (lane=pc, исполняет ПК-агент)
@@ -1039,8 +1051,11 @@ async def report_results(context) -> None:
         rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
         task_text = str(it.get("task_text") or "")
         task_from = str(it.get("from") or "")
+        # 229 (FACT-верификация, недеструктивно, 20.07.2026): пометка ТОЛЬКО текста карточки 328,
+        # сохранённый result в Bridge не трогаем (инвариант «финал байт-в-байт»). См. helper ниже.
+        unv = _unverified_card_prefix(st, it)
         banner = _build_banner(qid, task_text, task_from, by)
-        head = f"{emoji} Задача {qid}{rep} — {st}\n\n{body}\n{banner}"
+        head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{body}\n{banner}"
         chunks = _chunks(head)
         last_msg_obj = None
         for i, chunk in enumerate(chunks):

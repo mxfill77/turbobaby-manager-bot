@@ -593,6 +593,11 @@ APPROVAL_PREAMBLE = (
     "подтверждённая запись в Лист1/CRM, удаление событий, любое удаление — НЕ выполняй и НЕ ищи обходных путей: выведи РОВНО "
     "одну строку «NEEDS_APPROVAL: op=other | <карточка: что · куда · последствия · на что смотреть>» "
     "и заверши работу (исполнит человек).\n"
+    "ВЕРИФИКАЦИЯ ЖИВЫМ ФАКТОМ (класс R11–R15, 19.07.2026): в выводе ОБЯЗАТЕЛЬНО включи блок «FACT:» "
+    "с живым доказательством эффекта — для кода: «FACT: commit <хеш> в git log origin/main»; "
+    "для рестарта сервиса: «FACT: PID=<новый PID>, is-active=active, баннер=<первая строка лога после старта>»; "
+    "для записи в мозг (write_doc): «FACT: read back: <первые 200 символов перечитанного текста>»; "
+    "read-only задача без изменений: «FACT: read-only». Задача без FACT: → карточка в 328 получит ⚠️ unverified.\n"
     "ФОРМАТ ОТВЕТА: первая строка — сводка результата (≤400 символов, уйдёт в Telegram-тему 328); "
     "подробности — в cc_log, НЕ в вывод. Задача целиком read-only → просто выполни и верни сводку.\n\n"
     "ЗАДАЧА:\n"
@@ -624,7 +629,10 @@ PLANNER_PREAMBLE = (
     "«NEEDS_APPROVAL: op=other | <карточка: что · куда · последствия>».\n"
     "ОРАНЖЕВОЕ ≠ красное: рестарт/старт своих сервисов (splinter/orchestrator-daemon/wa-webhook), "
     "git push, systemctl daemon-reload — исполнитель делает САМОСТОЯТЕЛЬНО (оранжевый цикл); "
-    "в план выносить ОБЫЧНЫМ шагом, НЕ как NEEDS_APPROVAL-шаг.\n\n"
+    "в план выносить ОБЫЧНЫМ шагом, НЕ как NEEDS_APPROVAL-шаг.\n"
+    "ВЕРИФИКАЦИЯ В ШАГАХ (класс R11–R15): для каждого шага, меняющего состояние системы "
+    "(код/рестарт/запись в мозг), добавь в текст шага напоминание «в выводе включи FACT: с живым "
+    "подтверждением (commit <хеш>/PID+is-active/read back)» — исполнитель обязан верифицировать эффект.\n\n"
     "КРУПНОЕ ТЗ:\n"
 )
 # Дописка планировщику для родителя ПК-театра (ДОБАВЛЯЕТСЯ ПОСЛЕ PLANNER_PREAMBLE — startswith
@@ -704,7 +712,9 @@ THINKER_PREAMBLE = (
     "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
     "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
     "verdict=halt и fixed_step пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
-    "многошаговых планов.\n\n"
+    "многошаговых планов.\n"
+    "(Контекст системы R11–R15: исполнительские задачи обязаны включать блок FACT: в финальный вывод. "
+    "В твоём JSON-ответе FACT: не нужен — ты думаешь, не исполняешь.)\n\n"
 )
 # Преамбула думателя ОДИНОЧНОЙ задачи (расширение ст4): та же схема/строгость, но контекст без
 # родителя/плана (их у одиночной нет) и ключ fixed_task вместо fixed_step.
@@ -719,7 +729,9 @@ TASK_THINKER_PREAMBLE = (
     "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
     "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
     "verdict=halt и fixed_task пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
-    "многошаговых планов.\n\n"
+    "многошаговых планов.\n"
+    "(Контекст системы R11–R15: исполнительские задачи обязаны включать блок FACT: в финальный вывод. "
+    "В твоём JSON-ответе FACT: не нужен — ты думаешь, не исполняешь.)\n\n"
 )
 
 
@@ -1870,7 +1882,10 @@ CURATOR_PREAMBLE = (
     "тогда — 1 строка, что именно нужно. ЖЕЛЕЗНО: красные и смок-шаги (запись в рабочие таблицы "
     "Лист1/CRM/Зарплаты, деньги, clasp, sqlite3, удаления, деплой, смок-прогон на живых данных) — "
     "ТОЛЬКО в human, НИКОГДА в tasks. При сомнении между followup и human выбирай human — "
-    "куратор не плодит самодеятельность.\n\n"
+    "куратор не плодит самодеятельность.\n"
+    "ВЕРИФИКАЦИЯ (класс R11–R15): наличие блока «FACT:» в итоге исполнителя — признак верификации "
+    "живым фактом. Его ОТСУТСТВИЕ у dev-задачи — сигнал неопределённости: при сомнении выбирай "
+    "followup/human, а не closed (эффект не доказан — цель нельзя считать закрытой уверенно).\n\n"
 )
 
 
@@ -1895,11 +1910,17 @@ def _gate_single_selective_on():
 
 
 _COMMIT_IN_RESULT_RE = re.compile(r"(?i)(коммит\b|commit\b|git\s+push)")
+_RESULT_FACT_RE = re.compile(r"\bFACT\s*:", re.IGNORECASE)
 
 
 def _result_has_commit(result):
     """True если result содержит признак коммита / push — задача делала изменения кода."""
     return bool(_COMMIT_IN_RESULT_RE.search(str(result or "")))
+
+
+def _result_has_fact(result):
+    """True если result содержит блок FACT: — живое доказательство эффекта (класс R11–R15)."""
+    return bool(_RESULT_FACT_RE.search(str(result or "")))
 
 
 def _curator_tails(result):
@@ -2283,20 +2304,21 @@ def _maybe_curator(kind, key, goal, result):
         log.warning("curator: сбой консультации по %s %s (%s) — fail-safe тишина", kind, key, e)
 
 
-def _maybe_curator_single(frm, tid, text, result, status="done"):
+def _maybe_curator_single(frm, tid, text, result, status="done", force_consult=False):
     """Куратор на финале done/failed ОДИНОЧКИ «тз:»/«задача:» vps-полосы (from=Filipp-328[-dev]
     строго — артефакты декомпозиции/операций/pc сюда не проходят) и followup-задачи куратора
     (from=Filipp-curator — её терминал даёт вторую глубину дожима; третью глушит бюджет глубины
     в _curator_spawn). Зовётся из process_new ПОСЛЕ complete_task — финал уже записан, куратор
-    его не трогает."""
+    его не трогает. force_consult=True — bypass CURATOR_SCOPE-фильтра (для ⚠️ unverified задач)."""
     if str(frm or "") not in ("Filipp-328", "Filipp-328" + DEV_FROM_SUFFIX, CURATOR_FROM):
         return                    # dec-семейство (куратор цепи зовётся на сводке), pc, op и прочее
     if _is_convert(text):
         return                    # конверт одобренной заявки — вне кураторского контура
     if str(result or "").lstrip().startswith(_CURATOR_SKIP_MARKS):
         return                    # ⏱-диагноз / плановый рестарт-🔁 / отклонено Филиппом
-    # CURATOR_SCOPE=1: done-одиночки без коммита в result → мимо куратора (read-only разведки)
-    if _curator_scope_on() and status == "done" and not _result_has_commit(result):
+    # CURATOR_SCOPE=1: done-одиночки без коммита в result → мимо куратора (read-only разведки).
+    # force_consult=True (⚠️ unverified dev-задача) обходит этот фильтр — куратор всегда нужен.
+    if not force_consult and _curator_scope_on() and status == "done" and not _result_has_commit(result):
         return
     _maybe_curator("задача", tid, text, result)
 
@@ -3206,6 +3228,10 @@ def process_new():
         # терминальный failed с диагнозом); False = прежний путь.
         if status == "failed" and _maybe_selfheal(tid, text, result, frm=str(task.get("from") or "")):
             return
+        # FACT-верификация (R11–R15, смягчено 20.07.2026): dev-done без блока FACT: НЕ мутирует
+        # сохранённый result (инвариант «финал байт-в-байт») и НЕ форсирует куратора (CURATOR_SCOPE
+        # цел). Видимость ⚠️ unverified даёт devbot в ТЕКСТЕ карточки 328 недеструктивно (по
+        # _result_has_fact). _result_has_fact()/force_consult оставлены для devbot и юнит-теста §9.
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
         _maybe_dec_after(text, status)          # шаг декомпозиции → halt-on-fail / сводка
