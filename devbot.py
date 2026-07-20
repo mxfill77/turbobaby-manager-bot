@@ -909,6 +909,37 @@ async def _check_curator_pending(context, by) -> None:
         _curator_pending.pop(qid, None)
 
 
+# ── ФИКС B: доставка TG-карточки с ретраями (тихая потеря 20.07.2026) ────────────────
+_TG_SEND_RETRIES = 3          # попыток отправки карточки при Telegram-исключении
+_TG_SEND_BACKOFF = 0.5        # база backoff (сек); задержка = _TG_SEND_BACKOFF * 2**(попытка-1)
+
+
+async def _send_card_with_retry(context, qid, chunks, topic, markup_last, label):
+    """Отправить ВСЕ чанки карточки с ретраями (backoff, до _TG_SEND_RETRIES попыток).
+    Возвращает True ТОЛЬКО когда доставлены ВСЕ чанки. Уже доставленные чанки
+    при ретрае НЕ пересылаются (курсор sent_idx) → нет дублей. Пометку «отправлено»
+    ставит ВЫЗЫВАЮЩИЙ строго после True; False → карточка уйдёт на следующий тик."""
+    n = len(chunks)
+    sent_idx = 0
+    for attempt in range(1, _TG_SEND_RETRIES + 1):
+        try:
+            while sent_idx < n:
+                kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": topic, "text": chunks[sent_idx]}
+                if markup_last is not None and sent_idx == n - 1:
+                    kw["reply_markup"] = markup_last
+                await context.bot.send_message(**kw)
+                sent_idx += 1          # инкремент ТОЛЬКО после успешной отправки чанка
+            return True
+        except Exception as e:
+            log.warning("devbot.report_results: %s qid=%s попытка %d/%d упала на чанке %d/%d (%s)",
+                        label, qid, attempt, _TG_SEND_RETRIES, sent_idx + 1, n, e)
+            if attempt < _TG_SEND_RETRIES:
+                await asyncio.sleep(_TG_SEND_BACKOFF * (2 ** (attempt - 1)))
+    log.warning("devbot.report_results: %s qid=%s НЕ доставлена за %d попыток — "
+                "НЕ помечаю отправленной, повтор на следующем тике", label, qid, _TG_SEND_RETRIES)
+    return False
+
+
 async def report_results(context) -> None:
     """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
     Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
@@ -985,21 +1016,19 @@ async def report_results(context) -> None:
         qid = it.get("id")
         if qid in _asked:
             continue
-        _asked.add(qid)
         _approval_topic = inbox or _item_topic(it)
         what = it.get("result") or "(не уточнено)"
         lane = _item_lane_label(it)
         q = (f"⚠️ Задача {qid} [{lane}] требует подтверждения красной зоны:\n\n{what}\n\n"
              f"Подтвердить? Тапни кнопку ниже — или ответь «да {qid}» / «нет {qid}».")
         chunks = _chunks(q)
-        for i, chunk in enumerate(chunks):
-            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _approval_topic, "text": chunk}
-            if i == len(chunks) - 1:   # кнопки ✅/❌/🔄/📋 на последнем чанке
-                kw["reply_markup"] = _kb_approval(qid)
-            try:
-                await context.bot.send_message(**kw)
-            except Exception as e:
-                log.warning("devbot.report_results: вопрос по задаче %s не ушёл (%s)", qid, e)
+        # ФИКС B (тихая потеря TG-карточек, 20.07.2026): пометку «отправлено» (_asked) ставим
+        # СТРОГО ПОСЛЕ успешной доставки. Раньше _asked.add(qid) стоял ДО send_message → при
+        # Telegram-исключении карточка молча терялась (qid уже «задан» → след. тик её пропускал).
+        ok = await _send_card_with_retry(context, qid, chunks, _approval_topic,
+                                         _kb_approval(qid), "вопрос-конверт")
+        if ok:
+            _asked.add(qid)   # успех → помечаем; провал → qid НЕ в _asked, уйдёт на следующий тик
 
     # in_progress (heartbeat/детект-зависания, части 1-2): «🔄 в работе» один раз + «⚠️ зависла» один раз.
     # Анти-спам: дедуп _inprogress_seen / _stalled — НЕ шлём на каждом 45с-проходе.
