@@ -1,9 +1,14 @@
 """Тест: guard не даёт красное на restart/start собственных сервисов (15.07.2026).
 
 Два аспекта:
-1. pretool_guard.py ДЕФЕРИТ non-python команды (systemctl → _is_python() = False → exit 0,
-   пустой stdout). Guard работает только на python-командах, systemctl обходит его
-   и идёт прямо к allow/ask rules — красная карточка НЕ выдаётся.
+1. ПЕРЕСМОТРЕНО 23.07.2026 (чёрный список процессов): guard больше НЕ деферит systemctl вслепую —
+   он смотрит на ГЛАГОЛ и ЮНИТ:
+     - `systemctl kill|stop` по боевому процессу контура (splinter, orchestrator-daemon, userbot,
+       moderation_bot, pc_agent) → ЖЁСТКИЙ БЛОК: deny, карточки НЕТ, approve НЕВОЗМОЖЕН;
+     - `systemctl restart|start|…` по тем же сервисам → красное с карточкой (решает владелец);
+     - чужие юниты (nginx, wa-webhook) и рутина (daemon-reload) → как раньше, defer к allow/ask rules.
+   Прежний инвариант «guard деферит ЛЮБОЙ systemctl» отменён владельцем сознательно: собственный
+   рестарт боевого сервиса теперь идёт через «да», а остановка — не идёт вообще.
 
 2. settings.json (или _restarts_new_settings.json, пока не применено из Termux) классифицирует
    собственные рестарты как allow:
@@ -105,18 +110,33 @@ else:
 
 res = []
 
-print("\n1. Guard ДЕФИРУЕТ системные команды (не python → red-карточка НЕ выдаётся):")
-# Проверяем что pretool_guard._is_python() возвращает False для systemctl
-# Делаем это через subprocess с PRETOOL_NOPUSH=1 и JSON-вводом
+print("\n1. Guard по системным командам (пересмотр 23.07.2026 — чёрный список процессов):")
+# Через subprocess с PRETOOL_NOPUSH=1 (ноль карточек в Telegram) и JSON-вводом.
+# PRETOOL_GUARD_LOG уводим в /tmp, чтобы тест не писал в боевой журнал блоков.
 env = dict(os.environ)
 env["PRETOOL_NOPUSH"] = "1"
-for cmd in ["systemctl restart splinter", "systemctl daemon-reload",
-            "systemctl start orchestrator-daemon"]:
+env["PRETOOL_GUARD_LOG"] = "/tmp/cc_pretool_guard_test_own_restarts.log"
+
+
+def guard(cmd):
     inp = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": ROOT})
     p = subprocess.run([PY, GUARD], input=inp, capture_output=True, text=True, env=env)
-    # Defer = exit 0, пустой stdout (не JSON-решение ask)
-    is_defer = p.returncode == 0 and p.stdout.strip() == ""
-    res.append(ok(is_defer, f"guard деферит '{cmd}' (exit={p.returncode}, stdout='{p.stdout.strip()[:50]}')"))
+    return p.returncode, p.stdout.strip()
+
+
+for cmd in ["systemctl daemon-reload", "systemctl restart wa-webhook", "systemctl restart nginx"]:
+    rc, out = guard(cmd)
+    res.append(ok(rc == 0 and out == "", f"guard деферит '{cmd}' (exit={rc}, stdout='{out[:50]}')"))
+
+for cmd in ["systemctl restart splinter", "systemctl start orchestrator-daemon"]:
+    rc, out = guard(cmd)
+    res.append(ok(rc == 0 and '"ask"' in out and "🔴" in out,
+                  f"свой рестарт '{cmd}' → красное с карточкой (ask)"))
+
+for cmd in ["systemctl stop splinter", "systemctl kill orchestrator-daemon"]:
+    rc, out = guard(cmd)
+    res.append(ok(rc == 0 and '"deny"' in out and "🔴 КРАСНОЕ" not in out,
+                  f"остановка боевого '{cmd}' → жёсткий блок (deny, карточки нет)"))
 
 print("\n2. Существующие own-рестарты в live settings.json (не сломаны):")
 for rule in EXISTING_ALLOW_OWN:

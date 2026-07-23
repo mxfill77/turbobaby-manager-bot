@@ -16,6 +16,25 @@
   SQL-write в ИНУЮ .db → ask;
 - git push / systemctl restart splinter → авто на уровне settings (restart идёт только по «да»
   владельца в ТЗ — терминальный prompt был двойным вопросом); systemctl stop остался ask.
+ТРИ КЛАССА ПОВЕРХ python-скана (23.07.2026) — python-скан при этом НЕ ослаблен:
+(а) ЧЁРНЫЙ СПИСОК ПРОЦЕССОВ: kill/pkill/`systemctl kill|stop` по боевым процессам контура
+    (splinter, orchestrator-daemon, userbot, moderation_bot, pc_agent) и `kill` по PID 1 →
+    HARD-BLOCK: permissionDecision="deny", карточка владельцу НЕ шлётся, approve НЕВОЗМОЖЕН,
+    строка `proc_hard_block` в GUARD_LOG. systemctl restart/start/… по тем же сервисам —
+    НЕ hard-block: обычное КРАСНОЕ с карточкой (решает владелец).
+(б) ДАННЫЕ ≠ КОМАНДА: красное слово внутри ПОИСКОВОГО ШАБЛОНА grep/rg/sed/awk (аргумент
+    -n/-e/-E либо первый позиционный) — это ДАННЫЕ, они НЕ краснят команду. Шаблон вырезается
+    ТОЛЬКО из скан-представления и ТОЛЬКО в СВОЁМ сегменте цепи; ОПЕРАНДЫ (файлы!) остаются под
+    сканом, а токен с признаками ИСПОЛНЕНИЯ ($(…)/`…`/system("…")) не вырезается и раскрывается
+    отдельным сегментом. Итог: `grep -n ".env" f.py` — зелёное, `grep -n foo .env` — блок.
+(в) HARD-BLOCK .env: обращение к файлу секретов в ЛЮБОЙ позиции цепи (после &&/;/|, внутри
+    `bash -c`, $(…), `…`) → deny БЕЗ карточки, лог `env_hard_block`, approve НЕВОЗМОЖЕН.
+    Сканируется ТОЛЬКО ТЕКСТ КОМАНДЫ: содержимое .py-целей НЕ проверяется (иначе любой боевой
+    скрипт с load_env() встал бы намертво).
+Единая точка классификации — classify(cmd, cwd) → (kind, hit, blob), kind ∈ block/red/ambiguous/
+green; can_approve(kind, hit) и decision(kind, hit, reason) — чистые (их зовут тесты, ничего не
+исполняя). Направление fail-safe прежнее: любой сбой разбора → скан по СЫРОЙ команде (краснее).
+
 НЕ трогает реальный гейт записи confirmed=true в Bridge (ReadFleet.js) — тот независим (третий слой защиты).
 Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
 """
@@ -58,6 +77,56 @@ _DEDUP_TTL = 4 * 3600
 # красный блок пишет маркер-файл → демон видит → гасит claude-подпроцесс → needs_approval.
 GUARD_BLOCK_DIR = "/tmp/cc_guard_block"
 
+# ── HARD-BLOCK: журнал жёстких блоков (JSONL). Путь берётся В МОМЕНТ ЗАПИСИ (тесты подменяют
+# PRETOOL_GUARD_LOG). Пишется ТОЛЬКО факт блока: событие + сама команда; значений секретов в
+# команде нет (файл секретов не читается — он как раз заблокирован).
+GUARD_LOG = "/tmp/cc_pretool_guard.log"
+HARD_BLOCK_HITS = ("proc_hard_block", "env_hard_block")
+
+# Боевые процессы контура: остановка = обрыв живых задач/очередей → агенту НЕЛЬЗЯ вообще.
+# Сверка по НОРМАЛИЗОВАННОМУ токену (нижний регистр, «-» и «.» → «_»), т.е. splinter.service,
+# orchestrator-daemon, /root/…/moderation_bot.py — одно и то же имя.
+_PROTECTED_PROCS = ("splinter", "orchestrator_daemon", "userbot", "moderation_bot", "pc_agent")
+_KILL_CMDS = {"kill", "pkill"}
+_HARD_VERBS = {"kill", "stop"}                    # systemctl kill|stop → жёстко
+_SVC_VERBS = {"kill", "stop", "restart", "start", "reload", "try-restart",
+              "force-reload", "enable", "disable", "mask", "unmask"}
+# Поисковые утилиты: их ШАБЛОН — данные (класс «данные ≠ команда»).
+_SEARCH_CMDS = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "mawk"}
+_PATTERN_FLAGS = {"-e", "-E", "-n", "--regexp", "--expression"}
+# Обёртки: команда-цель идёт ПОСЛЕ них (иначе `sudo systemctl stop splinter` проскочил бы).
+_WRAPPERS = {"sudo", "doas", "env", "nohup", "nice", "ionice", "time", "timeout",
+             "stdbuf", "xargs", "systemd-run"}
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+_ENV_FILE = re.compile(r"(?:^|[^\w.\-])\.env[\w.\-]*")          # .env, .env.local, /root/app/.env
+# Признаки ИСПОЛНЕНИЯ внутри «шаблона»: такой токен шаблоном не считаем (дыра
+# `awk 'BEGIN{system("…")}'` / `grep -e "$(…)"` закрыта) — он и остаётся под сканом, и раскрывается.
+_EXEC_IN_PATTERN = re.compile(r"\$\(|`|\bsystem\s*\(|\bpopen\s*\(|\|\s*['\"]?\s*(?:sh|bash|zsh|xargs)\b")
+_SUBST = re.compile(r"\$\(([^()]{1,400})\)|`([^`]{1,400})`"
+                    r"|(?:system|popen)\s*\(\s*['\"]([^'\"]{1,400})['\"]")
+
+_BLOCK_TEXT = {
+    "proc_hard_block": "⛔ ЖЁСТКИЙ БЛОК (proc_hard_block): остановка боевого процесса контура%s. "
+                       "Карточка владельцу НЕ шлётся, approve НЕВОЗМОЖЕН — агент боевые процессы "
+                       "не гасит НИКОГДА (обрыв живых задач и очередей). Нужна остановка — "
+                       "владелец делает её руками на VPS.",
+    "env_hard_block": "⛔ ЖЁСТКИЙ БЛОК (env_hard_block): обращение к файлу секретов%s. "
+                      "Карточка владельцу НЕ шлётся, approve НЕВОЗМОЖЕН — секреты агенту не "
+                      "показываются ни в каком виде. Нужно значение ключа — владелец передаёт его сам.",
+}
+
+
+def _guard_log(event, cmd, why=""):
+    """Строка JSONL о жёстком блоке. Best-effort: сбой журнала НЕ отменяет блок (решение важнее)."""
+    try:
+        line = json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event,
+                           "cmd": " ".join((cmd or "").split())[:400], "why": why},
+                          ensure_ascii=False)
+        with open(os.environ.get("PRETOOL_GUARD_LOG") or GUARD_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
 
 def _guard_write_marker(task_id, hit, card):
     """Записать маркер красного блока для демона-наблюдателя."""
@@ -78,12 +147,31 @@ def _defer():
     sys.exit(0)   # ничего не печатаем → штатный permission-flow (allow/ask rules)
 
 
-def _ask(reason):
-    print(json.dumps({"hookSpecificOutput": {
+def can_approve(kind, hit=""):
+    """False = ЖЁСТКИЙ БЛОК: ни карточки владельцу, ни «да» — обойти нельзя (deny хука).
+    Единственный источник правды: по нему же main() решает, слать ли карточку/конверт."""
+    return not (kind == "block" or hit in HARD_BLOCK_HITS)
+
+
+def decision(kind, hit, reason):
+    """Чистая функция «классификация → решение хука» (её зовут тесты, ничего не исполняя):
+    block → deny (approve НЕВОЗМОЖЕН), red/ambiguous → ask, green → None (defer)."""
+    if kind == "green":
+        return None
+    return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "ask",
-        "permissionDecisionReason": reason}}, ensure_ascii=False))
+        "permissionDecision": "ask" if can_approve(kind, hit) else "deny",
+        "permissionDecisionReason": reason}}
+
+
+def _emit(d):
+    if d:
+        print(json.dumps(d, ensure_ascii=False))
     sys.exit(0)
+
+
+def _ask(reason):
+    _emit(decision("red", "", reason))
 
 
 # per-действие: (Что — таблица/операция, Последствия, Проверь). Объект (байк/клиент/сумма/док/таблица)
@@ -119,6 +207,10 @@ _ACTIONS = {
     "DOWRITE": ("скрипт помечен DOWRITE=1 — реальная запись (не dry-run)",
                 "выполнит боевую запись в рабочие данные",
                 "прочитай, ЧТО именно пишет скрипт — это не пробный прогон"),
+    "proc_ctl": ("остановка/перезапуск процесса или systemd-сервиса",
+                 "процесс прервётся: живые задачи, очереди и открытые сессии не досчитаются",
+                 "тот ли процесс/юнит и переживёт ли контур его паузу — рестарт боевого сервиса "
+                 "идёт только по твоему «да»"),
     "sqlite": ("SQL-запись в БД вне memory.db (UPDATE/DELETE/INSERT/DROP)",
                "изменит НЕизвестную базу данных (не свою memory.db)",
                "какая это БД и почему пишем не в memory.db — memory.db через код шёл бы без вопроса"),
@@ -174,6 +266,10 @@ def _detail(hit, blob):
         doc = _find([r"write_doc\s*\(\s*(?:name|id)\s*=\s*['\"]?([\w\-]+)"], blob)
         if doc:
             bits.append("док " + doc)
+    elif hit == "proc_ctl":
+        tgt = _find([r"proc_target=([^\n]{1,60})"], blob)   # маркер кладёт classify()
+        if tgt:
+            bits.append("цель " + tgt)
     return " — " + ", ".join(bits) if bits else ""
 
 
@@ -407,14 +503,263 @@ def _read_file(path, cwd):
     return None
 
 
-def _analyze(cmd, cwd):
+# ══ РАЗБОР ЦЕПОЧКИ: сегменты, слово-команда, поисковый шаблон = ДАННЫЕ ══════════════════════
+def _base(t):
+    """Имя команды без пути и кавычек, нижним регистром (/usr/bin/systemctl → systemctl)."""
+    return os.path.basename((t or "").strip("'\"")).lower()
+
+
+def _tokens(seg):
+    try:
+        return shlex.split(seg)
+    except Exception:
+        return seg.split()          # кривое квотирование → грубые токены (скан всё равно полный)
+
+
+def _split_segments(cmd):
+    """Цепочку → сегменты по шелл-разделителям (&&, ||, ;, |, &, перевод строки) ВНЕ КАВЫЧЕК.
+    Кавычки уважаются намеренно: в `grep -n "a|b" f` труба — часть ШАБЛОНА, а не разделитель;
+    зато `grep -e x&&pkill …` разъедется на два сегмента, и второй под сканом останется."""
+    segs, buf, q, i, n = [], [], None, 0, len(cmd or "")
+    while i < n:
+        ch = cmd[i]
+        if q:
+            buf.append(ch)
+            if ch == "\\" and q == '"' and i + 1 < n:
+                buf.append(cmd[i + 1]); i += 2; continue
+            if ch == q:
+                q = None
+            i += 1; continue
+        if ch in "'\"":
+            q = ch; buf.append(ch); i += 1; continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch); buf.append(cmd[i + 1]); i += 2; continue
+        if cmd[i:i + 2] in ("&&", "||"):
+            segs.append("".join(buf)); buf = []; i += 2; continue
+        if ch in ";|&\n":
+            segs.append("".join(buf)); buf = []; i += 1; continue
+        buf.append(ch); i += 1
+    segs.append("".join(buf))
+    return [s for s in segs if s.strip()]
+
+
+def _cmd_index(toks):
+    """Индекс слова-КОМАНДЫ сегмента: пропускает env-префикс (VAR=val) и обёртки
+    (sudo/env/nohup/timeout N/xargs/systemd-run…). None — команды в сегменте нет.
+    Разбор СТРУКТУРНЫЙ, а не по подстроке: `cat splinter.log` командой-убийцей не станет."""
+    i, hops = 0, 0
+    while i < len(toks) and _ENV_ASSIGN.match(toks[i]):
+        i += 1
+    while i < len(toks) and hops < 4:
+        name = _base(toks[i])
+        if name not in _WRAPPERS:
+            return i
+        i += 1
+        while i < len(toks) and toks[i].startswith("-"):
+            i += 1
+        if name in ("timeout", "nice", "ionice") and i < len(toks) and re.match(r"^[\d.]+[smhd]?$", toks[i]):
+            i += 1
+        while i < len(toks) and _ENV_ASSIGN.match(toks[i]):
+            i += 1
+        hops += 1
+    return i if i < len(toks) else None
+
+
+def _strip_search_pattern(toks, idx):
+    """→ (токены БЕЗ поискового шаблона, список вырезанных). Шаблон = аргумент -n/-e/-E либо
+    ПЕРВЫЙ позиционный у grep/rg/sed/awk. Операнды-ФАЙЛЫ и прочие токены не трогаем — иначе
+    `grep -n foo .env` перестал бы блокироваться. Токен с признаком исполнения не вырезается."""
+    if idx is None or _base(toks[idx]) not in _SEARCH_CMDS:
+        return toks, []
+    drop, pat_seen, i = set(), False, idx + 1
+    while i < len(toks):
+        t = toks[i]
+        if t in _PATTERN_FLAGS and i + 1 < len(toks):
+            drop.add(i + 1); pat_seen = True; i += 2; continue
+        if t.startswith("-") and t != "-":
+            i += 1; continue
+        if not pat_seen:
+            drop.add(i); pat_seen = True
+        i += 1
+    keep, dropped = [], []
+    for k, t in enumerate(toks):
+        if k in drop and not _EXEC_IN_PATTERN.search(t):
+            dropped.append(t)
+        else:
+            keep.append(t)
+    return keep, dropped
+
+
+def _mask(seg, dropped):
+    """Убрать шаблоны из ТЕКСТА сегмента (в кавычках или без), сохранив всё прочее ДОСЛОВНО —
+    red-скан не должен слабеть от переклейки токенов. Не нашли форму → текст как есть (краснее)."""
+    out = seg
+    for d in dropped:
+        for form in ('"' + d + '"', "'" + d + "'", d):
+            if d and form in out:
+                out = out.replace(form, " ", 1)
+                break
+    return out
+
+
+def _subst_inners(seg):
+    """Тела подстановок $(…) / `…` / system("…") / popen("…") — это ИСПОЛНЯЕМОЕ, а не данные."""
+    out = []
+    for m in _SUBST.finditer(seg or ""):
+        for g in m.groups():
+            if g and g.strip():
+                out.append(g)
+    return out[:8]
+
+
+def _units(cmd, depth=0):
+    """Цепочка → список пар (токены сегмента, текст сегмента) с ВЫРЕЗАННЫМИ поисковыми шаблонами.
+    Тела подстановок и `sh -c "…"` добавляются ОТДЕЛЬНЫМИ парами (иначе прятались бы от скана)."""
+    out = []
+    if depth > 2 or not (cmd or "").strip():
+        return out
+    for seg in _split_segments(cmd):
+        for inner in _subst_inners(seg):
+            out.extend(_units(inner, depth + 1))
+        clean = _strip_git_msg(seg)          # текст git -m — ДАННЫЕ (нюанс bd5d516)
+        toks = _tokens(clean)
+        i = _cmd_index(toks)
+        if i is not None and _base(toks[i]) in _SHELLS:
+            for j in range(i + 1, len(toks) - 1):
+                if toks[j] == "-c":
+                    out.extend(_units(toks[j + 1], depth + 1))
+                    break
+        keep, dropped = _strip_search_pattern(toks, i)
+        out.append((keep, _mask(clean, dropped)))
+        if len(out) > 60:
+            break
+    return out
+
+
+def _scan(cmd):
+    """→ (units, скан-текст). Сбой разбора → СЫРАЯ команда (fail-safe: скан полнее, краснит охотнее)."""
+    try:
+        units = _units(cmd)
+        text = " ".join(t for _, t in units)
+        return units, (text if text.strip() else _strip_git_msg(cmd))
+    except Exception:
+        return [(_tokens(cmd), cmd)], _strip_git_msg(cmd)
+
+
+# ══ (а) ЧЁРНЫЙ СПИСОК ПРОЦЕССОВ ════════════════════════════════════════════════════════════
+def _norm(t):
+    return re.sub(r"[^a-z0-9_]", "", (t or "").lower().replace("-", "_").replace(".", "_"))
+
+
+def _protected_in(args):
+    """Первый аргумент, называющий боевой процесс контура ('' — таких нет)."""
+    for a in args:
+        v = a
+        if v.startswith("-"):
+            if "=" not in v:              # --signal=SIGKILL: цель может прятаться в значении флага
+                continue
+            v = v.split("=", 1)[1]
+        n = _norm(v)
+        for p in _PROTECTED_PROCS:
+            if p in n:
+                return a
+    return ""
+
+
+def _pid1_in(args):
+    """PID 1 (init/systemd) среди целей `kill`. Аргументы сигналов (-s TERM, -n 9) пропускаются."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-s", "--signal", "-n", "-q", "--queue"):
+            i += 2; continue
+        if a.startswith("-"):
+            i += 1; continue
+        if a.strip() == "1":
+            return True
+        i += 1
+    return False
+
+
+def _systemctl_parts(args):
+    """→ (глагол, [юниты]). Флаги и их аргументы (-H/-M) отбрасываются."""
+    verb, names, i = "", [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-H", "--host", "-M", "--machine"):
+            i += 2; continue
+        if a.startswith("-"):
+            i += 1; continue
+        if not verb:
+            verb = a.lower()
+        else:
+            names.append(a)
+        i += 1
+    return verb, names
+
+
+def _proc_class(units):
+    """→ ('block', цель) | ('red', цель) | None. Блок ищем во ВСЕЙ цепи (красное первого сегмента
+    не должно заслонять жёсткое во втором: `systemctl restart nginx && pkill -9 splinter`)."""
+    red = None
+    for toks, _text in units:
+        i = _cmd_index(toks)
+        if i is None:
+            continue
+        name, args = _base(toks[i]), toks[i + 1:]
+        if name in _KILL_CMDS:
+            tgt = _protected_in(args)
+            if tgt:
+                return "block", name + " " + tgt
+            if name == "kill" and _pid1_in(args):
+                return "block", "kill PID 1 (init/systemd)"
+            red = red or ("red", " ".join([name] + args[:3]))
+        elif name == "systemctl":
+            verb, names = _systemctl_parts(args)
+            tgt = _protected_in(names)
+            if verb in _HARD_VERBS and tgt:
+                return "block", "systemctl " + verb + " " + tgt
+            if verb in _HARD_VERBS or (verb in _SVC_VERBS and tgt):
+                red = red or ("red", ("systemctl " + verb + " " + (tgt or " ".join(names[:2]))).strip())
+    return red
+
+
+def classify(cmd, cwd=None):
+    """ЕДИНАЯ точка классификации (её зовут main() и тесты — исполнять ничего не требуется).
+    → (kind, hit, blob): kind ∈ {'block','red','ambiguous','green'}; hit — ключ действия и,
+    для жёстких блоков, имя события в журнале; blob — текст для _detail()/причины.
+    Порядок: жёсткое (процессы → секреты) ПЕРЕД всем остальным — иначе `cat .env && python gate.py`
+    ушёл бы в зелёное на раннем defer доверенных тестов/гейта."""
+    cmd = cmd or ""
+    units, scan = _scan(cmd)
+    proc = _proc_class(units)
+    if proc and proc[0] == "block":
+        return "block", "proc_hard_block", cmd + "\nproc_target=" + proc[1]
+    m = _ENV_FILE.search(scan)
+    if m:
+        return "block", "env_hard_block", cmd + "\nenv_target=" + m.group(0).strip()
+    if proc:
+        return "red", "proc_ctl", cmd + "\nproc_target=" + proc[1]
+    if not _is_python(scan):
+        return "green", "", cmd          # не-python и не процесс/секрет → штатные allow/ask rules
+    return _analyze(cmd, cwd or PROJECT, scan)
+
+
+def _block_reason(hit, blob=""):
+    tgt = _find([r"proc_target=([^\n]{1,60})", r"env_target=([^\n]{1,60})"], blob)
+    return _BLOCK_TEXT[hit] % ((" — " + tgt) if tgt else "")
+
+
+def _analyze(cmd, cwd, scan=None):
     """→ (kind, hit, blob): kind ∈ {'red','ambiguous','green'}; hit — ключ действия; blob — текст для _detail()."""
+    scan = cmd if scan is None else scan
     # 0) тесты/гейт → зелёное СРАЗУ, до сканирования содержимого (моки по определению; шум ask убран 02.07)
     if _is_trusted_test(cmd, cwd):
         return "green", "", cmd
-    # 1) быстрый греп по САМОЙ команде (инлайн -c, env DOWRITE, argv)
+    # 1) быстрый греп по САМОЙ команде (инлайн -c, env DOWRITE, argv) — по СКАН-представлению:
+    #    красное слово в поисковом шаблоне это данные, а не операция (класс «данные ≠ команда»)
     for tok in RED_TOKENS:
-        if tok in cmd:
+        if tok in scan:
             return "red", RED_TOKEN_HIT[tok], cmd
     # 2) разобрать команду на токены
     try:
@@ -472,14 +817,18 @@ def main():
         _defer()
     cmd = ((data.get("tool_input") or {}).get("command") or "")
     cwd = data.get("cwd") or PROJECT
-    if not cmd or not _is_python(_strip_git_msg(cmd)):
-        _defer()                                       # не-python (текст git -m не скан) → allow/ask rules сами
+    if not cmd:
+        _defer()
     try:
-        kind, hit, blob = _analyze(cmd, cwd)
+        kind, hit, blob = classify(cmd, cwd)
     except Exception:
         kind, hit, blob = "ambiguous", "ambiguous", cmd  # любая ошибка анализа → fail-safe ask
     if kind == "green":
-        _defer()                                       # читающий python → штатный allow (venv python в allow)
+        _defer()                                       # читающий python / не-python → штатные rules
+    if not can_approve(kind, hit):
+        why = _block_reason(hit, blob)                 # ЖЁСТКИЙ БЛОК: deny + журнал. Ниже по коду —
+        _guard_log(hit, cmd, why)                      # карточка, пуш и маркер-конверт: сюда НЕ доходим,
+        _emit(decision(kind, hit, why))                # т.е. approve по этой команде невозможен физически
     test = _is_test_script(cmd)
     count, mid = 1, None
     if hit == "ambiguous":                             # дедуп ТОЛЬКО ambiguous (инцидент 163); red —
