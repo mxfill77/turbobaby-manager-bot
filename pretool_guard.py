@@ -467,6 +467,42 @@ def _strip_git_msg(cmd):
     return " ".join(out)
 
 
+def _strip_all_git_msgs(cmd):
+    """Для скана step-1 в _analyze: вырезать -m/-am/--message payload'ы из ЛЮБОЙ git-команды
+    в строке, включая компаунды (python gate.py && git commit -m «set_fleet_oil»). Решает
+    false-red класса 23.07.2026 — _strip_git_msg работает ТОЛЬКО когда git первый токен.
+    Не-git токены и payload'ы ВНЕ -m не трогаются. Сбой шлексинга → команда как есть
+    (fail-safe: красные маркеры ВНЕ git -m по-прежнему ловятся)."""
+    if "git" not in cmd:
+        return cmd
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        return cmd
+    out, i, in_git = [], 0, False
+    while i < len(toks):
+        t = toks[i]
+        if t == "git":
+            in_git = True
+        elif t in ("&&", "||", ";", "|"):
+            in_git = False
+        elif in_git and t in ("-m", "-am", "--message"):
+            out.append(t)
+            i += 2   # пропустить payload
+            continue
+        elif in_git and t.startswith("--message="):
+            out.append("--message")
+            i += 1
+            continue
+        elif in_git and re.match(r"^-a?m.", t):
+            out.append("-m")
+            i += 1
+            continue
+        out.append(t)
+        i += 1
+    return " ".join(out)
+
+
 def _args_after_interp(toks):
     """Аргументы ПОСЛЕ интерпретатора: срезает ведущие VAR=val (env-префикс) и сам python-токен.
     Фикс инцидента 163 (08.07.2026): `PRETOOL_NOPUSH=1 venv/bin/python3 --version` считал интерпретатор

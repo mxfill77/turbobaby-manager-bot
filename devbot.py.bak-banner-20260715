@@ -1,0 +1,1564 @@
+"""Дев-бот (полу-оркестратор), пункт 5 лестницы — первый заход.
+
+ТОЛЬКО зелёные read-only задачи по ЖЁСТКОМУ allowlist (БЕЗ LLM, детерминированно). Живёт в HQ
+topic 328 (Splinter там молчит). 205 = pc_agent/userbot на ПК — НЕ наша тема. Команды ТОЛЬКО от Филиппа (504608015).
+origin=agent → ЛЮБАЯ попытка красной записи ловится токен-замком 4.2 (rejected+пуш), деплой —
+тесты-гейтом 4.3. Красное/вне-allowlist → НЕ выполняет, просит «да». Не новый процесс — на bot.py.
+"""
+import os
+import re
+import json
+import time
+import asyncio
+import datetime
+import logging
+import subprocess
+import unicodedata
+from collections import Counter
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+import bridge_client
+
+log = logging.getLogger(__name__)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PY = os.path.join(ROOT, "venv", "bin", "python3")
+
+DEVBOT_USER = 504608015                 # Филипп — единственный, кто командует дев-ботом
+HQ_CHAT_ID = -1003853365891
+DEVBOT_TOPIC = 328                      # тема dev-bot (VPS). 205 = pc_agent/userbot (ПК) — НЕ наша
+CC_LOG_ID = "1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF"
+
+
+def pc_dev_topic():
+    """Тема «PC-дев» (вторая полоса lane=pc, 04.07.2026) — id из env PC_DEV_TOPIC_ID.
+    0/пусто/мусор = полоса ВЫКЛЮЧЕНА (id Филипп даёт после создания темы). Читается лениво
+    на каждый вызов: bot.py импортирует devbot ДО load_dotenv(), модульная константа
+    зафиксировала бы пустое значение."""
+    try:
+        return int(os.getenv("PC_DEV_TOPIC_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def inbox_topic():
+    """Тема «Единый инбокс подтверждений» (ст3 оркестратора, KB_MASTER §7 Вариант Б, 06.07.2026)
+    из env INBOX_TOPIC_ID. 0/пусто/мусор = ИНБОКС ВЫКЛЮЧЕН → карточки needs_approval идут по старым
+    полосам 328/829 (текущее поведение, без регресса); задан → approve-карточки ОБЕИХ полос сходятся
+    в эту тему. Лениво (как pc_dev_topic — bot.py импортирует devbot ДО load_dotenv())."""
+    try:
+        return int(os.getenv("INBOX_TOPIC_ID", "0") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+BRIDGE = None   # выставляется из bot.py при старте (devbot.BRIDGE = bridge)
+
+# === Фикс заморозки event loop (разбор таймаутов get_pending 02.07.2026) ===
+# Синхронные requests к Bridge прямо в async job вешали ВЕСЬ event loop PTB до 60-240с
+# (окна деградации Apps Script /exec). Фикс: опрос очереди — ОДНИМ синхронным прогоном в
+# отдельном потоке (asyncio.to_thread) + отдельный клиент с коротким timeout: опрос
+# идемпотентен, при таймауте просто ждём следующий тик 45с, а не держим 60с.
+POLL_TIMEOUT = 15                       # сек на get_pending при опросе очереди (вместо 60)
+_REPORT_STATUSES = ("done", "failed", "needs_approval", "in_progress")
+_poll_bridge = None                     # ленивый клиент опроса (timeout=POLL_TIMEOUT)
+_poll_bridge_for = None                 # BRIDGE, под который создан _poll_bridge (тесты меняют BRIDGE)
+
+
+def _get_poll_bridge():
+    """Отдельный BridgeClient для 45с-опроса очереди (timeout=POLL_TIMEOUT вместо 60с).
+    Тестовый/нестандартный BRIDGE без url/token опрашиваем как есть (моки в tests/)."""
+    global _poll_bridge, _poll_bridge_for
+    b = BRIDGE
+    if b is None:
+        return None
+    if _poll_bridge is None or _poll_bridge_for is not b:
+        url = getattr(b, "url", None)
+        token = getattr(b, "token", None)
+        _poll_bridge = (bridge_client.BridgeClient(url=url, token=token, timeout=POLL_TIMEOUT)
+                        if url and token else b)
+        _poll_bridge_for = b
+    return _poll_bridge
+
+
+def _poll_queue_sync(pb):
+    """СИНХРОННЫЙ опрос очереди одним прогоном — звать ТОЛЬКО через asyncio.to_thread.
+    Склейка статусов: get_pending_multi = 1 CSV-вызов на новом Bridge (фоллбэк по-статусно
+    на старом/мокнутом). lane='all' (04.07.2026): опрашиваем ОБЕ полосы (vps+pc) — карточки
+    pc-задач devbot разносит в тему PC-дев (_item_topic). → {status: [items c from∈QUEUE_FROMS]}
+    | None (ошибка → ждём тик)."""
+    fn = getattr(pb, "get_pending_multi", None)
+    if fn is not None:
+        r = fn(_REPORT_STATUSES, lane="all")
+    else:                                   # мок в тестах без multi — по-статусно
+        items = []
+        for st in _REPORT_STATUSES:
+            rr = pb.get_pending(st, lane="all")
+            if not rr.get("ok"):
+                return None
+            for it in rr.get("items", []):
+                if isinstance(it, dict):
+                    it.setdefault("status", st)
+                items.append(it)
+        r = {"ok": True, "items": items}
+    if not r.get("ok"):
+        return None
+    by = {st: [] for st in _REPORT_STATUSES}
+    for it in r.get("items", []):
+        st = str(it.get("status") or "")
+        if st in by and str(it.get("from")) in QUEUE_FROMS:
+            by[st].append(it)
+    return by
+
+# === ОРКЕСТРАТОР (ступень1 заход2б-1 + ступень2 O4): дев-бот ↔ очередь ===
+# Префикс в 328 → кладём задачу в очередь оркестратора; фоновый job приносит результат обратно.
+QUEUE_FROM = "Filipp-328"               # метка источника быстрых задач «задача:» (таймаут 10 мин)
+QUEUE_FROM_DEV = "Filipp-328-dev"       # метка дев-ТЗ «тз:» (ступень 2 O4, таймаут 45 мин у демона)
+QUEUE_FROM_DEC = "Filipp-328-dec"       # метка декомпозиции «декомпозируй:» (ступень 2 часть C):
+                                        # родитель + его шаги «[шаг i/N родитель id]» + сводка
+QUEUE_FROM_PC = "Filipp-pc"             # быстрая задача из темы PC-дев (lane=pc, исполняет ПК-агент)
+QUEUE_FROM_PC_DEV = "Filipp-pc-dev"     # дев-ТЗ из темы PC-дев (lane=pc)
+QUEUE_FROM_PC_DEC = "Filipp-pc-dec"     # декомпозиция ПК-театра (кусок 2, 07.07.2026): родитель
+                                        # БЕЗ lane (план строит VPS-демон — единственный мозг),
+                                        # шаги демон релизит на lane=pc по одному; карточки → 829
+QUEUE_FROM_PCLOC_DEC = "Filipp-pcloc-dec"  # ЛОКАЛЬНЫЙ дирижёр-декомпозер ПК (родитель 185, шаг 5/7,
+                                        # 11.07.2026): план/релиз/надзор целиком на ПК
+                                        # (pc_orchestrator, PC_LOCAL_DEC=1), VPS-демон цепь НЕ видит;
+                                        # devbot несёт её карточки штатно — needs_approval красного
+                                        # шага → инбокс (INBOX_TOPIC_ID, прод 1160) с кнопками ✅/❌,
+                                        # done/failed/сводки/карточки → тема PC-дев
+QUEUE_FROM_CURATOR = "Filipp-curator"   # followup-задачи куратора целей (шаг 3/7 родитель 231):
+                                        # ставит orchestrator_daemon (CURATOR_FROM), полоса vps →
+                                        # карточки в 328. Урок 682a881: метки нет в QUEUE_FROMS →
+                                        # done/failed/needs_approval куратор-задач НЕ доезжают
+QUEUE_FROMS_PC = (QUEUE_FROM_PC, QUEUE_FROM_PC_DEV, QUEUE_FROM_PC_DEC,
+                  QUEUE_FROM_PCLOC_DEC)  # метки полосы pc (карточки → тема PC-дев)
+QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC,
+               QUEUE_FROM_CURATOR) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
+_TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
+_DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
+_DEC_PREFIXES = ("декомпозируй:", "разбей:", "decompose:")  # крупное ТЗ → план шагов → по одному
+_STRUCT_PREFIXES = _DEC_PREFIXES + _DEV_PREFIXES + _TASK_PREFIXES  # ВСЕ командные префиксы очереди:
+                                        # матчатся ПЕРВЫМИ по началу сообщения, абсолютный приоритет
+                                        # над зелёным allowlist (инцидент 23:49 11.07.2026)
+_reported = set()                       # id задач, уже отрапортованных (done/failed; дедуп, память процесса)
+_report_seeded = False                  # seed-on-start: не спамим историей done/failed при рестарте
+_asked = set()                          # id задач needs_approval, по которым УЖЕ задан вопрос (дедуп)
+# heartbeat/детект-зависания (части 1-2): анонс «в работе» и предупреждение «зависла» — по разу на задачу
+_inprogress_seen = set()                # id задач in_progress, по которым УЖЕ слали «🔄 в работе» (дедуп)
+_stalled = set()                        # id задач, по которым УЖЕ слали «⚠️ зависла» (дедуп)
+STALL_GRACE_SEC = 120                   # люфт НАД штатным потолком задачи (даём демону/реаперу самому
+                                        # довести терминал done/failed раньше тревоги владельцу).
+                                        # Порог «зависла» — per-задача: _stall_threshold_sec(it).
+                                        # Урок задачи 287 (22:55 13.07.2026): плоский порог 12 мин
+                                        # тревожил за минуту до честного done долгого «тз:» (норма
+                                        # до 45 мин) — класс «долго работает ≠ умерла» (ПК-вотчдог 5167365).
+
+# Маркер клона (микрофикс §7 12.07.2026, инцидент 156): демон при возврате задачи из-под чужого
+# рестарта (orchestrator_daemon._requeue_foreign_restart) дописывает «[повтор задачи N]» в КОНЕЦ
+# текста клона. Карточки такой задачи несут «(повтор)» в заголовке — владелец отличает клон от
+# новой задачи (в 156 «задвоение карточки» выглядело как дубль). Константа продублирована из
+# orchestrator_daemon.REPEAT_MARK (devbot живёт в процессе bot.py, демон не импортируем).
+REPEAT_MARK = "[повтор задачи"
+
+
+def _is_repeat_item(it):
+    """True → задача рождена ПОВТОРНОЙ постановкой той же задачи (клон возврата, маркер в task_text)."""
+    return REPEAT_MARK in str(it.get("task_text") or "")
+
+
+# «да N» / «нет N» (+ англ., + опц. # и пунктуация) — ответ Филиппа на запрос подтверждения (заход 2б-2)
+_APPROVAL_RE = re.compile(r"^(да|нет|yes|no)\b[\s,.:]*#?\s*(\d+)\s*$", re.IGNORECASE)
+_YES = ("да", "yes")
+
+
+def _try_approval_reply(text, bridge):
+    """«да N» → approve_task(N); «нет N» → complete_task(N, failed). Иначе None.
+    Проверяется ПЕРВОЙ в handle_command (специфичный паттерн ответа на запрос подтверждения)."""
+    m = _APPROVAL_RE.match((text or "").strip())
+    if not m:
+        return None
+    word = m.group(1).lower()
+    qid = int(m.group(2))
+    if word in _YES:
+        r = bridge.approve_task(qid, "Filipp")
+        if r.get("ok"):
+            _reported.discard(qid)   # пусть дальнейший done/failed по ней отрапортуется штатно
+            return (f"✅ Задача {qid} одобрена — демон выполнит approved-операцию по op-коду "
+                    f"(git_push / restart_splinter) и принесёт результат сюда. Вне авто-перечня → failed «сделай в Termux».")
+        if r.get("error") == "not_awaiting":
+            return f"🤖 Задача {qid} не ждёт подтверждения (статус {r.get('status')}). Ничего не сделал."
+        if r.get("error") == "not_found":
+            return f"🤖 Задачи {qid} нет в очереди."
+        return f"🤖 approve не прошёл: {r.get('error')}"
+    else:
+        r = bridge.complete_task(qid, "failed", "отклонено Филиппом")
+        if r.get("ok"):
+            _reported.add(qid)       # уже сообщили «отклонена» — не дублируем failed-рапортом
+            return f"🚫 Задача {qid} отклонена — статус failed."
+        return f"🤖 Не удалось отклонить задачу {qid}: {r.get('error')}"
+
+
+# ===================== РОУТЕР ТЕАТРА (кусок 3 «единый пульт», 07.07.2026) =====================
+# ОДИН вход (тема 328) для всех команд — система САМА определяет театр исполнения (vps | pc).
+# Слой 1 (детерминированный, БЕЗ LLM): явный префикс «пк:»/«pc:» сразу после команды → pc
+# (префикс срезается); keyword-классы pc/vps — ровно один класс совпал → он и театр. Оба или
+# ни один → слой 2: думатель-классификатор (claude -p, --model haiku --fallback-model sonnet,
+# --max-turns 1 — чистый генератор, ничего не исполняет; строгий JSON {"theater":"vps"|"pc"}).
+# FAIL-SAFE любого сбоя слоя 2 (запуск/таймаут/exit!=0/мусор) → vps (= прежнее поведение, не
+# хуже) + строка-подсказка в карточке приёма. Тема 829 = явный запасной вход БЕЗ роутера
+# (форс pc, как раньше). Театр=pc: одиночные «тз:»/«задача:» → ТА ЖЕ 328-метка from (карточки
+# идут в тему ПОСТАНОВКИ 328 по from-метке) + lane=pc (claim'ит ПК-агент); «декомпозируй:» →
+# родитель QUEUE_FROM_PC_DEC (опора на кусок 2: план строит VPS-демон, шаги lane=pc по одному,
+# отчёты цепи — в теме PC-дев по метке цепи). Изоляция полос НЕ ослаблена: роутер только
+# ВЫБИРАЕТ полосу при enqueue, claim-механику не трогает. Красное НЕ ослаблено (роутер ничего
+# не исполняет). Откат: THEATER_ROUTER=0 в .env + restart splinter — прежнее поведение
+# байт-в-байт (пк:-префикс НЕ срезается, 🎭 не показывается, слой 2 не зовётся).
+CLAUDE_BIN = "/usr/bin/claude"          # зеркало orchestrator_daemon.CLAUDE_BIN (импорт демона в
+                                        # процесс бота нельзя — signal.signal на import, см. выше)
+ROUTER_KW_PC = ("userbot", "suggest", "playbook", "модербот", "dispatch",
+                "d:\\turbobaby-userbot", "приветстви", "черновик клиенту")
+ROUTER_KW_VPS = ("splinter", "bridge", "manager-bot", "registry", "гейт", "cc_log",
+                 "devbot", "orchestrator_daemon", "vps")
+ROUTER_HINT = "театр: vps (по умолчанию); нужен ПК — префикс пк:"
+_PC_TEXT_PREFIXES = ("пк:", "pc:")      # явный префикс театра сразу после команды («тз: пк: …»)
+
+
+def _router_on():
+    """THEATER_ROUTER (деф. 1 = включён). Лениво на каждый вызов: bot.py импортирует devbot
+    ДО load_dotenv() (как pc_dev_topic)."""
+    return str(os.getenv("THEATER_ROUTER", "1")).strip().lower() not in ("0", "false", "off")
+
+
+def _router_timeout():
+    """Таймаут слоя 2 в секундах (THEATER_ROUTER_TIMEOUT, деф. 45с; haiku отвечает за секунды)."""
+    try:
+        return int(os.getenv("THEATER_ROUTER_TIMEOUT", "45") or 45)
+    except (TypeError, ValueError):
+        return 45
+
+
+def _pc_dec_local():
+    """PC_DEC_LOCAL (деф. 0 = ВЫКЛ, старое поведение). 1 → родитель «пк: декомпозируй» ставится
+    как from=Filipp-pcloc-dec + lane=pc: его целиком (план → релиз шагов → надзор) ведёт
+    ЛОКАЛЬНЫЙ дирижёр ПК (pc_orchestrator, PC_LOCAL_DEC=1; живьём доказан родителем 195),
+    VPS-демон такую цепь НЕ трогает (его надзор группирует строго Filipp-pc-dec). Карточки
+    цепи devbot уже носит (682a881). Откат = PC_DEC_LOCAL=0 в .env + restart splinter,
+    без деплоя. Лениво на каждый вызов (bot.py импортирует devbot ДО load_dotenv)."""
+    return str(os.getenv("PC_DEC_LOCAL", "0")).strip().lower() in ("1", "true", "on")
+
+
+def _classify_theater(task_text):
+    """Слой 2: думатель-классификатор театра — claude -p дешёвым кондуктором haiku→sonnet
+    (--max-turns 1, --output-format json; зеркало orchestrator_daemon._thinker_exec).
+    → 'vps' | 'pc' | None при ЛЮБОМ сбое (fail-safe, решает вызывающий)."""
+    model = (os.getenv("ROUTER_MODEL") or "haiku").strip() or "haiku"
+    fallback = (os.getenv("ROUTER_MODEL_FALLBACK") or "sonnet").strip() or "sonnet"
+    prompt = (
+        "Ты — роутер театра исполнения дев-задач TurboBaby. Театры:\n"
+        "- vps: серверный репозиторий manager-bot на VPS (Splinter-бот, bot.py, Apps Script "
+        "Bridge, гейт тестов, cc_log, devbot, orchestrator_daemon, деплой/рестарт на VPS).\n"
+        "- pc: репозиторий userbot на ПК Windows (D:\\turbobaby-userbot: suggest.py, playbook, "
+        "модербот, Dispatch, приветствия и черновики ответов клиентам).\n"
+        "Определи театр задачи. Ответь СТРОГО одним JSON без пояснений и без markdown:\n"
+        "{\"theater\":\"vps\"|\"pc\",\"reason\":\"одна строка\"}\n\n"
+        f"ЗАДАЧА (дословно):\n{str(task_text or '')[:2000]}")
+    child_env = dict(os.environ)
+    child_env.setdefault("HOME", "/root")
+    child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    child_env.pop("ANTHROPIC_API_KEY", None)   # как думатели демона: по ~/.claude, не платный API
+    child_env.pop("OPENAI_API_KEY", None)
+    cmd = [CLAUDE_BIN, "-p",
+           "--model", model,
+           "--fallback-model", fallback,
+           "--output-format", "json",
+           "--max-turns", "1",
+           prompt]                             # prompt последним (тест-моки читают args[-1])
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
+                              timeout=_router_timeout(), env=child_env)
+    except Exception as e:
+        log.warning("theater-router: классификатор не отработал (%s) — fail-safe vps", e)
+        return None
+    if proc.returncode != 0:
+        log.warning("theater-router: классификатор exit=%s — fail-safe vps", proc.returncode)
+        return None
+    out = (proc.stdout or "").strip()
+    try:
+        env_j = json.loads(out)
+        if isinstance(env_j, dict) and "result" in env_j:   # CLI-конверт --output-format json
+            out = (env_j.get("result") or "").strip()
+    except Exception:
+        pass
+    i, j = out.find("{"), out.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(out[i:j + 1])
+    except Exception:
+        return None
+    th = str(d.get("theater") or "").strip().lower() if isinstance(d, dict) else ""
+    return th if th in ("vps", "pc") else None
+
+
+def _route_theater(task_text):
+    """Роутер театра → (театр 'vps'|'pc', текст без явного пк:-префикса, note|None —
+    строка-подсказка при fail-safe слоя 2)."""
+    t = (task_text or "").strip()
+    low = t.lower()
+    for p in _PC_TEXT_PREFIXES:
+        if low.startswith(p):
+            return "pc", t[len(p):].strip(), None
+    pc_hit = any(k in low for k in ROUTER_KW_PC)
+    vps_hit = any(k in low for k in ROUTER_KW_VPS)
+    if pc_hit != vps_hit:                      # ровно один класс совпал → слой 1 решил
+        return ("pc" if pc_hit else "vps"), t, None
+    th = _classify_theater(t)                  # оба/ни один → слой 2 (думатель)
+    if th is not None:
+        return th, t, None
+    return "vps", t, ROUTER_HINT               # fail-safe: vps + подсказка владельцу
+
+
+def _route_328(task_text):
+    """Роутер для темы 328. Выключен (THEATER_ROUTER=0) → (None, текст как есть, None) —
+    прежнее поведение байт-в-байт, 🎭 в карточке не показываем.
+    ТОТАЛЬНЫЙ fail-safe (инцидент 07.07.2026): ЛЮБОЕ исключение роутера (не только пойманные
+    внутри _classify_theater сбои классификатора — unauthorized CLI, exit!=0, таймаут, мусор) →
+    театр vps + подсказка в карточке. Постановка задачи из-за роутера НЕ падает НИКОГДА."""
+    if not _router_on():
+        return None, task_text, None
+    try:
+        return _route_theater(task_text)
+    except Exception as e:
+        log.warning("theater-router: роутер упал (%s) — ТОТАЛЬНЫЙ fail-safe vps", e)
+        return "vps", task_text, ROUTER_HINT
+
+
+def _router_card(theater, note):
+    """Хвост карточки приёма с решением роутера: «🎭 vps|pc» (+ подсказка fail-safe).
+    theater=None (роутер выключен) → пустая строка (карточка как раньше)."""
+    if theater is None:
+        return ""
+    s = f"\n🎭 {theater}"
+    if note:
+        s += f"\n{note}"
+    return s
+
+
+def _bridge_err_detail(r):
+    """Человекочитаемое описание ошибки Bridge для Telegram-карточки.
+    Показывает реальную причину вместо голого кода «internal_error»."""
+    err = str(r.get("error") or "unknown")
+    msg = str(r.get("message") or "")
+    # Google Sheets LockService timeout — появляется на разных языках (нем./англ./etc.)
+    _LOCK_MARKERS = ("lock", "exklusiv", "zeitübers", "timed out waiting",
+                     "waitlock", "exclusive", "exklus")
+    if err == "internal_error" and any(m in msg.lower() for m in _LOCK_MARKERS):
+        return "Bridge занят (Google lock), повтори через ~1 мин"
+    if err == "timeout":
+        return "Bridge не ответил (timeout), повтори через ~1 мин"
+    if err == "internal_error":
+        detail = msg[:100].strip() if msg else ""
+        return f"internal_error: {detail}" if detail else "internal_error (Bridge)"
+    if msg:
+        return f"{err}: {msg[:100]}"
+    return err
+
+
+def _find_enqueued(bridge, frm, text):
+    """Verify после сбойного enqueue: есть ли НАША задача (тот же from + текст ДОСЛОВНО) в new
+    (обе полосы)? → id | None. Любой сбой чтения → None (не хуже прежнего).
+    NFC-нормализация обеих сторон — устойчивость к Unicode-вариантам (тайский, emoji)."""
+    try:
+        rr = bridge.get_pending("new", lane="all")
+        if not rr.get("ok"):
+            return None
+        needle = unicodedata.normalize("NFC", text)
+        for it in rr.get("items", []):
+            if isinstance(it, dict) and str(it.get("from") or "") == frm \
+                    and unicodedata.normalize("NFC", str(it.get("task_text") or "")) == needle:
+                return it.get("id")
+    except Exception:
+        return None
+    return None
+
+
+def _enqueue_reliable(bridge, frm, text, lane=None):
+    """Постановка, которая НЕ падает наружу зря (инцидент 07.07.2026, задача 138): Bridge в сбое
+    (404 на redirect-echo) может ИСПОЛНИТЬ enqueue, потеряв ответ («unauthorized»/request_failed
+    клиенту) — Филипп видел «не удалось», хотя задача встала. Слепой ретрай дал бы ДУБЛЬ, поэтому:
+    (1) enqueue; ok → как раньше; (2) сбой → verify: задача с тем же from+текстом уже в new →
+    ответ потерялся, считаем поставленной (её id); (3) не нашли → РОВНО один повтор enqueue;
+    (4) снова сбой → честная ошибка (карточка «не удалось», как раньше). Не хуже прежнего ни в
+    одной ветке; красное не ослаблено (это только постановка в очередь)."""
+    kw = {} if lane is None else {"lane": lane}      # без lane зовём БЕЗ kwarg (форма как раньше)
+    r = bridge.enqueue_task(frm, text, **kw)
+    if r.get("ok"):
+        return r
+    err1 = r.get("error")
+    qid = _find_enqueued(bridge, frm, text)
+    if qid is not None:
+        log.warning("enqueue: ответ потерялся (%s), но задача %s найдена в new — поставлена", err1, qid)
+        return {"ok": True, "id": qid}
+    r2 = bridge.enqueue_task(frm, text, **kw)
+    if r2.get("ok"):
+        log.warning("enqueue: первая попытка упала (%s) — повтор успешен (id=%s)", err1, r2.get("id"))
+    else:
+        log.warning("enqueue: обе попытки упали (%s / %s) — честная ошибка Филиппу", err1, r2.get("error"))
+    return r2
+
+
+def _canon_theater_prefix(t):
+    """Канонизация порядка префиксов: «пк: тз: X» → «тз: пк: X» (команда первой, театр внутри).
+    Инцидент 23:49 11.07.2026: лидирующий «пк:» ПЕРЕД командным префиксом не матчился ни одним
+    структурированным префиксом → «пк: декомпозируй: <крупное ТЗ>» падал мимо очереди в зелёный
+    allowlist и угонялся словом из тела ТЗ (простыня журнала вместо постановки родителя).
+    Перестановка чисто СИНТАКСИЧЕСКАЯ: дальше работает прежний слой 1 роутера (явный пк:-префикс
+    ПОСЛЕ команды); THEATER_ROUTER=0 и полоса pc ведут себя с «тз: пк: X» ровно как раньше.
+    Театр-префикс БЕЗ командного дальше — не трогаем (это не команда очереди)."""
+    low = t.lower()
+    for p in _PC_TEXT_PREFIXES:
+        if not low.startswith(p):
+            continue
+        rest = t[len(p):].strip()
+        rl = rest.lower()
+        for cp in _STRUCT_PREFIXES:
+            if rl.startswith(cp):
+                body = rest[len(cp):].strip()
+                return f"{rest[:len(cp)]} {p} {body}".strip()
+        break
+    return t
+
+
+def _try_enqueue(text, bridge, lane="vps"):
+    """Если текст начинается с префикса задачи — кладём в очередь оркестратора. Иначе None.
+    «тз:»/«dev:» → метка QUEUE_FROM_DEV (демон даст 45 мин); «задача:» → быстрый режим (10 мин).
+    Проверяется ДО allowlist (иначе ключевые слова в тексте задачи перехватили бы зелёную команду).
+    lane='pc' (тема PC-дев, 04.07.2026): «тз:»/«задача:» → enqueue с lane='pc' и метками
+    Filipp-pc-dev / Filipp-pc (исполняет ПК-агент); «декомпозируй:» (ПК-театр кусок 2,
+    07.07.2026) → родитель QUEUE_FROM_PC_DEC БЕЗ lane (план строит VPS-демон — единственный
+    планировщик), шаги демон релизит на lane=pc по одному.
+    lane='vps' (328, кусок 3 «единый пульт» 07.07.2026): текст задачи идёт через роутер театра
+    (_route_328). Театр vps → вызовы enqueue_task байт-в-байт как раньше (БЕЗ lane — Bridge
+    дефолтит vps); театр pc → одиночные с 328-меткой + lane='pc' (карточки в тему постановки),
+    «декомпозируй:» → родитель QUEUE_FROM_PC_DEC (кусок 2). Карточка приёма показывает 🎭.
+    PC_DEC_LOCAL=1 (.env, финал развязки 12.07.2026): ОБЕ ветки pc-декомпозиции (829 и 328-pc)
+    ставят родителя QUEUE_FROM_PCLOC_DEC + lane='pc' — цепь целиком ведёт локальный дирижёр ПК
+    (см. _pc_dec_local); 0 (дефолт) → байт-в-байт старый путь QUEUE_FROM_PC_DEC без lane."""
+    t = _canon_theater_prefix(unicodedata.normalize("NFC", (text or "").strip()))
+    low = t.lower()
+    pc = (lane == "pc")
+    for p in _DEC_PREFIXES:
+        if low.startswith(p):
+            task_text = t[len(p):].strip()
+            if not task_text:
+                return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
+                        "и выполню по одному.")
+            if pc:
+                if _pc_dec_local():
+                    r = _enqueue_reliable(bridge, QUEUE_FROM_PCLOC_DEC, task_text, lane="pc")
+                    if r.get("ok"):
+                        return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (ЛОКАЛЬНЫЙ "
+                                f"дирижёр ПК): план/шаги/надзор целиком на ПК (lane=pc). "
+                                f"Каждый шаг отчитается сюда; красный спрошу кнопкой в инбоксе; "
+                                f"в конце — сводка. ПК выключен → цепь честно упадёт по таймауту.")
+                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
+                if r.get("ok"):
+                    return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
+                            f"построит VPS-дирижёр (~60с), шаги уйдут ПК-агенту по одному "
+                            f"(lane=pc). Каждый шаг отчитается сюда; красный спрошу кнопкой; "
+                            f"в конце — сводка. ПК выключен → цепь честно упадёт по таймауту.")
+                return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
+            theater, task_text, note = _route_328(task_text)
+            if not task_text:
+                return ("🤖 Пустое ТЗ. Формат: «декомпозируй: <крупное ТЗ>» — разобью на шаги "
+                        "и выполню по одному.")
+            if theater == "pc":
+                if _pc_dec_local():
+                    r = _enqueue_reliable(bridge, QUEUE_FROM_PCLOC_DEC, task_text, lane="pc")
+                    if r.get("ok"):
+                        return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (ЛОКАЛЬНЫЙ "
+                                f"дирижёр ПК): план/шаги/надзор целиком на ПК (lane=pc); отчёты "
+                                f"шагов и сводка цепи — в теме PC-дев, красный шаг спрошу "
+                                f"кнопкой в инбоксе. ПК выключен → цепь честно упадёт по "
+                                f"таймауту." + _router_card("pc", note))
+                    return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEC, task_text)
+                if r.get("ok"):
+                    return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (театр PC): план "
+                            f"построит VPS-дирижёр (~60с), шаги уйдут ПК-агенту по одному "
+                            f"(lane=pc); отчёты шагов и сводка цепи — в теме PC-дев (метка цепи "
+                            f"pc), красный шаг спрошу кнопкой. ПК выключен → цепь честно упадёт "
+                            f"по таймауту." + _router_card("pc", note))
+                return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
+            r = _enqueue_reliable(bridge, QUEUE_FROM_DEC, task_text)
+            if r.get("ok"):
+                return (f"🧩 ТЗ {r.get('id')} в очереди на декомпозицию (демон возьмёт ~60с). "
+                        f"Сначала верну план шагов, затем шаги пойдут отдельными задачами по одному "
+                        f"(каждый отчитается сюда; красный шаг спрошу кнопкой), в конце — сводка."
+                        + _router_card(theater, note))
+            return f"🤖 Не удалось поставить ТЗ на декомпозицию: {_bridge_err_detail(r)}"
+    for p in _DEV_PREFIXES:
+        if low.startswith(p):
+            task_text = t[len(p):].strip()
+            if not task_text:
+                return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
+            if pc:
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC_DEV, task_text, lane="pc")
+                if r.get("ok"):
+                    return (f"✅ ТЗ {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
+                            f"Статусы/красные вопросы/итог принесу в эту тему.")
+                return f"🤖 Не удалось поставить ТЗ в очередь: {_bridge_err_detail(r)}"
+            theater, task_text, note = _route_328(task_text)
+            if not task_text:
+                return "🤖 Пустое ТЗ. Формат: «тз: <что сделать>» (дев-режим, до 45 мин)."
+            if theater == "pc":
+                r = _enqueue_reliable(bridge, QUEUE_FROM_DEV, task_text, lane="pc")
+                if r.get("ok"):
+                    return (f"✅ ТЗ {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт ПК-агент. "
+                            f"Статусы/красные вопросы/итог принесу сюда, в тему постановки."
+                            + _router_card("pc", note))
+                return f"🤖 Не удалось поставить ТЗ в очередь: {_bridge_err_detail(r)}"
+            r = _enqueue_reliable(bridge, QUEUE_FROM_DEV, task_text)
+            if r.get("ok"):
+                return (f"✅ ТЗ {r.get('id')} в очереди (дев-режим, до 45 мин; демон возьмёт ~60с). "
+                        f"Работает headless Claude Code: зелёное/оранжевое (вкл. restart splinter "
+                        f"через гейт) сам, настоящее красное спрошу кнопкой. Результат принесу сюда."
+                        + _router_card(theater, note))
+            return f"🤖 Не удалось поставить ТЗ в очередь: {_bridge_err_detail(r)}"
+    for p in _TASK_PREFIXES:
+        if low.startswith(p):
+            task_text = t[len(p):].strip()
+            if not task_text:
+                return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
+            if pc:
+                r = _enqueue_reliable(bridge, QUEUE_FROM_PC, task_text, lane="pc")
+                if r.get("ok"):
+                    return (f"✅ Задача {r.get('id')} в очереди полосы PC (lane=pc) — возьмёт ПК-агент. "
+                            f"Принесу результат в эту тему, когда будет done/failed.")
+                return f"🤖 Не удалось поставить задачу в очередь: {_bridge_err_detail(r)}"
+            theater, task_text, note = _route_328(task_text)
+            if not task_text:
+                return "🤖 Пустая задача. Формат: «задача: <что сделать>»."
+            if theater == "pc":
+                r = _enqueue_reliable(bridge, QUEUE_FROM, task_text, lane="pc")
+                if r.get("ok"):
+                    return (f"✅ Задача {r.get('id')} в очереди (театр PC, lane=pc) — возьмёт "
+                            f"ПК-агент. Результат принесу сюда, в тему постановки."
+                            + _router_card("pc", note))
+                return f"🤖 Не удалось поставить задачу в очередь: {_bridge_err_detail(r)}"
+            r = _enqueue_reliable(bridge, QUEUE_FROM, task_text)
+            if r.get("ok"):
+                return (f"✅ Задача {r.get('id')} поставлена в очередь — демон возьмёт её (опрос ~60с). "
+                        f"Принесу результат сюда, когда будет done/failed."
+                        + _router_card(theater, note))
+            return f"🤖 Не удалось поставить задачу в очередь: {_bridge_err_detail(r)}"
+    return None
+
+
+# ===================== INLINE-КНОПКИ (вместо «да N») =====================
+# Спека: KB_DEVBOT_BUTTONS_SPEC. Под needs_approval — ✅/❌ (одноразовые) + 🔄/📋 (многоразовые);
+# под done — только 🔄/📋. callback_data: approve|reject|check|next : <id>. Зелёная зона (UI Splinter).
+def _kb_approval(qid):
+    """Кнопки под needs_approval: одноразовые ✅ Да, деплой / ❌ Нет + многоразовые 🔄 Проверь / 📋 Дальше."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Да, деплой", callback_data=f"approve:{qid}"),
+         InlineKeyboardButton("❌ Нет", callback_data=f"reject:{qid}")],
+        [InlineKeyboardButton("🔄 Проверь", callback_data=f"check:{qid}"),
+         InlineKeyboardButton("📋 Дальше", callback_data=f"next:{qid}")],
+    ])
+
+
+def _kb_done(qid):
+    """Кнопки под done: многоразовые 🔄 Проверь / 📋 Дальше (✅/❌ тут не нужны — задача уже завершена)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Проверь", callback_data=f"check:{qid}"),
+         InlineKeyboardButton("📋 Дальше", callback_data=f"next:{qid}")],
+    ])
+
+
+def _find_task(bridge, qid):
+    """Найти задачу по id среди всех статусов очереди → (status, item) | (None, None). read-only
+    (get_pending, lane='all' — кнопки 🔄/📋 работают и под карточками полосы pc)."""
+    for st in ("needs_approval", "approved", "in_progress", "new", "done", "failed"):
+        try:
+            r = bridge.get_pending(st, lane="all")
+        except Exception:
+            continue
+        if not r.get("ok"):
+            continue
+        for it in r.get("items", []):
+            if str(it.get("id")) == str(qid):
+                return st, it
+    return None, None
+
+
+def _is_pc_item(it):
+    """Задача полосы pc? По полю lane (новый Bridge) ИЛИ по метке from (работает и до redeploy)."""
+    lane = str((it or {}).get("lane") or "").strip().lower()
+    return lane == "pc" or str((it or {}).get("from") or "") in QUEUE_FROMS_PC
+
+
+def _item_topic(it):
+    """Тема для карточки задачи — по метке from = тема ПОСТАНОВКИ (кусок 3 «единый пульт»,
+    07.07.2026): from полосы pc (Filipp-pc*) → тема PC-дев; иначе → 328. Задача, поставленная
+    в 328 и роутнутая на театр pc (from=Filipp-328*, lane=pc), отчитывается в 328 — где её
+    ставили. По lane тему НЕ решаем (lane = полоса ИСПОЛНЕНИЯ, не тема владельца); ярлык [pc]
+    в карточке остаётся по lane (_item_lane_label)."""
+    if str((it or {}).get("from") or "") in QUEUE_FROMS_PC:
+        return pc_dev_topic() or DEVBOT_TOPIC
+    return DEVBOT_TOPIC
+
+
+def _item_lane_label(it):
+    """Ярлык полосы для строки инбокса: pc → 'pc', иначе 'vps'."""
+    return "pc" if _is_pc_item(it) else "vps"
+
+
+# === Отпечаток конверта для дедупа В СПИСКЕ /inbox (ст3, часть г) ===
+# ЗЕРКАЛО orchestrator_daemon.parse_op / _OP_PREFIX_RE (см. AUTO_OPS там). Импортировать демон в
+# процесс бота нельзя: его модуль на import ставит signal.signal — в рабочем потоке to_thread это
+# ValueError, а в main-потоке перебил бы обработчики PTB. Логика отпечатка крошечная — повторяем.
+# КОРНЕВОЙ дедуп конвертов в очереди тут НЕ решаем (отдельный заход §7) — только схлопывание строк.
+_INBOX_AUTO_OPS = ("git_push", "restart_splinter")
+_INBOX_OP_RE = re.compile(r"op\s*=\s*([a-z_]+)", re.IGNORECASE)
+_INBOX_OP_PREFIX_RE = re.compile(r"^\s*op\s*=\s*[a-z_]+\s*\|\s*", re.IGNORECASE)
+
+
+def _inbox_fingerprint(what):
+    """Отпечаток карточки needs_approval = (op-код, очищенный от 'op=… |' текст). НЕ по id —
+    одинаковые конверты (один и тот же op + один и тот же текст) схлопываются в списке в одну строку."""
+    w = str(what or "")
+    m = _INBOX_OP_RE.search(w)
+    op = m.group(1).lower() if m else "other"
+    if op not in _INBOX_AUTO_OPS:
+        op = "other"
+    card = _INBOX_OP_PREFIX_RE.sub("", w).strip()
+    return op, card
+
+
+def build_inbox(bridge):
+    """ЕДИНЫЙ ИНБОКС (ст3, часть в+г): текст-список ВСЕХ открытых needs_approval по ОБЕИМ полосам
+    (get_pending needs_approval lane='all' — чистый read-only GET, без записи). Дедуп в списке по
+    отпечатку конверта (_inbox_fingerprint, НЕ id): одинаковые карточки — одной строкой ×N со списком
+    id и возрастом старейшей. Пусто/ошибка → человеческая строка. Зона 🟢 (read-only)."""
+    try:
+        r = bridge.get_pending("needs_approval", lane="all")
+    except Exception as e:
+        return f"📥 Инбокс: ошибка чтения очереди ({type(e).__name__}: {e})."
+    if not r.get("ok"):
+        return f"📥 Инбокс: очередь недоступна ({r.get('error')})."
+    items = [it for it in (r.get("items") or []) if isinstance(it, dict)]
+    if not items:
+        return "📥 Инбокс пуст — открытых подтверждений нет 👍"
+    # группировка по отпечатку конверта
+    groups = {}   # fp -> {"op", "card", "lanes":set, "ids":[], "ages":[]}
+    for it in items:
+        what = str(it.get("result") or "")
+        op, card = _inbox_fingerprint(what)
+        g = groups.setdefault((op, card), {"op": op, "card": card, "lanes": set(), "ids": [], "ages": []})
+        g["lanes"].add(_item_lane_label(it))
+        try:
+            g["ids"].append(int(it.get("id")))
+        except (TypeError, ValueError):
+            g["ids"].append(it.get("id"))
+        age = _task_age_sec(it.get("updated"))
+        if age is not None:
+            g["ages"].append(age)
+    total = len(items)
+    out = [f"📥 Инбокс подтверждений: открыто {total} (по обеим полосам vps+pc):"]
+    # старейшая группа сверху (по максимальному возрасту в группе; без возраста → в конец)
+    ordered = sorted(groups.values(),
+                     key=lambda g: (-(max(g["ages"]) if g["ages"] else -1), min(str(i) for i in g["ids"])))
+    for g in ordered:
+        ids = g["ids"]
+        n = len(ids)
+        lanes = "/".join(sorted(g["lanes"]))
+        op = g["op"]
+        card1 = (g["card"] or "(карточка пустая — см. исходную задачу)").splitlines()[0][:200]
+        oldest = max(g["ages"]) if g["ages"] else None
+        if n == 1:
+            age_txt = f", висит {int(oldest // 60)} мин" if oldest is not None else ""
+            out.append(f"  • id {ids[0]} [{lanes}] op={op}{age_txt}")
+        else:
+            id_list = ", ".join(str(i) for i in sorted(ids, key=lambda x: str(x)))
+            age_txt = f", старейшая {int(oldest // 60)} мин" if oldest is not None else ""
+            out.append(f"  • ×{n} [{lanes}] op={op} (id: {id_list}{age_txt})")
+        out.append(f"      {card1}")
+    out.append("\nОтвет: тапни ✅/❌ под карточкой в теме, либо «да N» / «нет N».")
+    return "\n".join(out)
+
+
+async def _strip_and_mark(q, mark):
+    """Одноразовые ✅/❌: убрать кнопки и дописать пометку к тексту сообщения.
+    editMessageText заодно снимает reply_markup; если упало — хотя бы снять кнопки."""
+    base = (q.message.text or "") if q.message else ""
+    new_text = f"{base}\n\n{mark}" if base else mark
+    try:
+        await q.edit_message_text(text=new_text)
+    except Exception as e:
+        log.warning("devbot._strip_and_mark: edit_message_text упал (%s)", e)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def _send_thread(context, q, text):
+    """Отдельным сообщением в ту же тему (для многоразовых 🔄/📋 — исходные кнопки остаются)."""
+    tid = getattr(q.message, "message_thread_id", None) or DEVBOT_TOPIC
+    for chunk in _chunks(text):
+        try:
+            await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=tid, text=chunk)
+        except Exception as e:
+            log.warning("devbot._send_thread: отправка не прошла (%s)", e)
+
+
+async def _btn_answer(q, txt=None, **kw):
+    """q.answer() с защитой — паттерн _o3_answer (хвост ревизии §7): колбэк, отлежавшийся
+    в очереди за долгим Bridge-вызовом (approve/check ходят в Apps Script по несколько секунд),
+    протухает — BadRequest «Query is too old». Ack тогда невозможен, но ДЕЙСТВИЕ кнопки
+    обязано выполниться; упавший q.answer не валит хендлер."""
+    try:
+        await q.answer(txt, **kw)
+    except Exception as e:
+        log.warning("devbot: q.answer протух/упал (действие кнопки всё равно выполняю): %s", e)
+
+
+async def _cb_approve(q, qid, bridge):
+    """approve:<id> → approve_task (та же логика «да N»). ОДНОРАЗОВО + идемпотентность."""
+    r = await asyncio.to_thread(bridge.approve_task, qid, "Filipp")
+    if r.get("ok"):
+        _reported.discard(qid)            # пусть дальнейший done/failed отрапортуется штатно
+        await _btn_answer(q, "✅ одобрено")
+        await _strip_and_mark(q, "✅ одобрено")
+    elif r.get("error") == "not_awaiting":
+        # уже approved/done/failed → идемпотентно: сообщить + убрать кнопки (гонка/повторный тап)
+        await _btn_answer(q, "уже обработано")
+        await _strip_and_mark(q, f"✅ уже обработано (статус {r.get('status')})")
+    elif r.get("error") == "not_found":
+        await _btn_answer(q, "задачи нет в очереди")
+        await _strip_and_mark(q, "🤖 задачи нет в очереди")
+    else:
+        await _btn_answer(q, f"approve не прошёл: {r.get('error')}")
+
+
+async def _cb_reject(q, qid, bridge):
+    """reject:<id> → complete_task failed (как «нет N»). ОДНОРАЗОВО."""
+    r = await asyncio.to_thread(bridge.complete_task, qid, "failed", "отклонено Филиппом (кнопка)")
+    if r.get("ok"):
+        _reported.add(qid)                # уже сообщили «отклонена» — не дублируем failed-рапортом
+        await _btn_answer(q, "❌ отклонено")
+        await _strip_and_mark(q, "❌ отклонено")
+    elif r.get("error") == "not_found":
+        await _btn_answer(q, "задачи нет в очереди")
+        await _strip_and_mark(q, "🤖 задачи нет в очереди")
+    else:
+        await _btn_answer(q, f"reject не прошёл: {r.get('error')}")
+
+
+async def _cb_check(context, q, qid, bridge):
+    """check:<id> → свежий статус задачи. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
+    await _btn_answer(q, "проверяю…")
+    status, item = await asyncio.to_thread(_find_task, bridge, qid)
+    if status is None:
+        txt = f"🔄 Задача {qid}: не найдена в очереди."
+    else:
+        res = (item.get("result") or "").strip()
+        upd = item.get("updated") or ""
+        txt = f"🔄 Задача {qid}: статус {status}" + (f"\nupdated: {upd}" if upd else "")
+        if res:
+            txt += f"\n\n{res[:1500]}"
+    await _send_thread(context, q, txt)
+
+
+async def _cb_next(context, q, qid, bridge):
+    """next:<id> → подсказка по следующему шагу. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
+    await _btn_answer(q, "📋")
+    status, _item = await asyncio.to_thread(_find_task, bridge, qid)
+    if status is None:
+        txt = f"📋 Задача {qid}: не найдена — поставь новую командой «задача: <что сделать>»."
+    elif status == "done":
+        txt = (f"📋 Задача {qid} — done. Следующий шаг: новой командой «задача: <что дальше>» "
+               f"или 🔄 Проверь для свежего статуса.")
+    elif status == "needs_approval":
+        txt = f"📋 Задача {qid} ждёт твоего решения (красная зона). Тапни ✅ Да, деплой / ❌ Нет."
+    elif status in ("approved", "in_progress", "new"):
+        txt = f"📋 Задача {qid}: статус {status} — в работе. Жди завершения или 🔄 Проверь."
+    else:
+        txt = f"📋 Задача {qid}: статус {status}."
+    await _send_thread(context, q, txt)
+
+
+async def handle_callback(update, context, bridge) -> None:
+    """Inline-кнопки дев-бота (вместо «да N»). ТОЛЬКО Филипп (504608015); чужой → answer «не для тебя».
+    answerCallbackQuery на каждый тап. approve/reject — одноразовые; check/next — многоразовые."""
+    q = update.callback_query
+    if not q:
+        return
+    uid = q.from_user.id if q.from_user else None
+    if uid != DEVBOT_USER:
+        await _btn_answer(q, "не для тебя", show_alert=False)
+        return
+    try:
+        action, sid = (q.data or "").split(":", 1)
+        qid = int(sid)
+    except Exception:
+        await _btn_answer(q)
+        return
+    # origin=human (как «да N»): тап Филиппа = ручное действие, токен-замок 4.2 не вмешивается.
+    try:
+        if action == "approve":
+            await _cb_approve(q, qid, bridge)
+        elif action == "reject":
+            await _cb_reject(q, qid, bridge)
+        elif action == "check":
+            await _cb_check(context, q, qid, bridge)
+        elif action == "next":
+            await _cb_next(context, q, qid, bridge)
+        else:
+            await _btn_answer(q)
+    except Exception as e:
+        log.exception("devbot.handle_callback error (%s:%s)", action, qid)
+        await _btn_answer(q, f"ошибка: {type(e).__name__}")
+
+
+def _task_age_sec(updated_iso):
+    """Возраст последнего updated задачи в секундах (по ISO из очереди). None при ошибке разбора
+    → зависание НЕ объявляем (лучше не пугать ложняком, чем поднять тревогу из-за парсинга)."""
+    try:
+        s = str(updated_iso).replace("Z", "+00:00")
+        t = datetime.datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
+
+
+def _env_sec(name, default):
+    """Секунды из env с дефолтом; мусор/пусто → дефолт (порог тревоги не должен падать на парсинге)."""
+    try:
+        return int(str(os.getenv(name, "") or "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _stall_threshold_sec(it):
+    """Порог «зависла» для КОНКРЕТНОЙ задачи = её штатный потолок исполнения + люфт STALL_GRACE_SEC.
+    «Долго работает» ≠ «умерла» (урок 287, класс ПК-вотчдога 5167365): пока in_progress моложе
+    своего потолка — тишина; тревога только ПОСЛЕ потолка и без терминала (цикл идёт лишь по
+    in_progress — терминальная задача сюда не попадает, done/failed рапортуются штатно, «отбой»
+    не шлём). Потолки зеркалят исполнителей — env-имена/дефолты те же, что в .env демона:
+    полоса pc → PC_STEP_TIMEOUT (надзор ПК-театра, 3600); vps from=*-dev/*-dec/Filipp-curator →
+    TASK_TIMEOUT_DEV (orchestrator_daemon._task_timeout, 2700); прочее vps → TASK_TIMEOUT (600).
+    Возраст меряем по updated (heartbeat демона его освежает) — строже потолка от старта задачи,
+    ложняка до потолка не даёт."""
+    if _is_pc_item(it):
+        cap = _env_sec("PC_STEP_TIMEOUT", 3600)
+    else:
+        frm = str((it or {}).get("from") or "")
+        if frm == QUEUE_FROM_CURATOR or frm.endswith(("-dev", "-dec")):
+            cap = _env_sec("TASK_TIMEOUT_DEV", 2700)
+        else:
+            cap = _env_sec("TASK_TIMEOUT", 600)
+    return cap + STALL_GRACE_SEC
+
+
+async def report_results(context) -> None:
+    """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
+    Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
+    как отрапортованные, чтобы при рестарте не присылать всю историю заново.
+    Фикс 02.07: весь опрос очереди — ОДИН прогон в отдельном потоке (to_thread, timeout 15с) —
+    event loop не встаёт, бот отвечает на кнопки/сообщения, даже когда Bridge тупит."""
+    global _report_seeded
+    pb = _get_poll_bridge()
+    if pb is None:
+        return
+    try:
+        by = await asyncio.to_thread(_poll_queue_sync, pb)
+    except Exception as e:
+        log.warning("devbot.report_results: опрос очереди упал (%s)", e)
+        return
+    if by is None:
+        return          # таймаут/ошибка опроса — не страшно, следующий тик через 45с
+
+    finished = [(st, it) for st in ("done", "failed") for it in by[st]]
+    finished.sort(key=lambda x: int(x[1].get("id") or 0))   # старые задачи рапортуем первыми
+
+    if not _report_seeded:
+        for _st, it in finished:
+            _reported.add(it.get("id"))
+        _report_seeded = True
+        return
+
+    for st, it in finished:
+        qid = it.get("id")
+        if qid in _reported:
+            continue
+        _reported.add(qid)
+        emoji = "✅" if st == "done" else "❌"
+        body = it.get("result") or "(пустой результат)"
+        rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
+        head = f"{emoji} Задача {qid}{rep} — {st}\n\n{body}"
+        chunks = _chunks(head)
+        for i, chunk in enumerate(chunks):
+            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _item_topic(it), "text": chunk}
+            if st == "done" and i == len(chunks) - 1:   # 🔄/📋 только под done, на последнем чанке
+                kw["reply_markup"] = _kb_done(qid)
+            try:
+                await context.bot.send_message(**kw)
+            except Exception as e:
+                log.warning("devbot.report_results: отправка результата задачи %s упала (%s)", qid, e)
+
+    # needs_approval (заход 2б-2): задача упёрлась в красную зону — спрашиваем «да N»/«нет N».
+    # БЕЗ seed (незакрытый вопрос после рестарта стоит переспросить); дедуп = _asked в памяти процесса.
+    # ЕДИНЫЙ ИНБОКС (ст3, часть б): если INBOX_TOPIC_ID задан — approve-карточки ОБЕИХ полос сходятся
+    # в тему-инбокс; не задан → прежнее поведение (_item_topic: vps→328, pc→829), без регресса.
+    # Кнопки approve/reject/check/next те же — callback тем-агностичен (по id, не по теме).
+    # done/failed/heartbeat выше ОСТАЮТСЯ по полосам _item_topic (в инбокс НЕ сводятся).
+    inbox = inbox_topic()
+    pend = sorted(by["needs_approval"], key=lambda x: int(x.get("id") or 0))
+    for it in pend:
+        qid = it.get("id")
+        if qid in _asked:
+            continue
+        _asked.add(qid)
+        _approval_topic = inbox or _item_topic(it)
+        what = it.get("result") or "(не уточнено)"
+        lane = _item_lane_label(it)
+        q = (f"⚠️ Задача {qid} [{lane}] требует подтверждения красной зоны:\n\n{what}\n\n"
+             f"Подтвердить? Тапни кнопку ниже — или ответь «да {qid}» / «нет {qid}».")
+        chunks = _chunks(q)
+        for i, chunk in enumerate(chunks):
+            kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _approval_topic, "text": chunk}
+            if i == len(chunks) - 1:   # кнопки ✅/❌/🔄/📋 на последнем чанке
+                kw["reply_markup"] = _kb_approval(qid)
+            try:
+                await context.bot.send_message(**kw)
+            except Exception as e:
+                log.warning("devbot.report_results: вопрос по задаче %s не ушёл (%s)", qid, e)
+
+    # in_progress (heartbeat/детект-зависания, части 1-2): «🔄 в работе» один раз + «⚠️ зависла» один раз.
+    # Анти-спам: дедуп _inprogress_seen / _stalled — НЕ шлём на каждом 45с-проходе.
+    running = sorted(by["in_progress"], key=lambda x: int(x.get("id") or 0))
+    for it in running:
+        qid = it.get("id")
+        if qid not in _inprogress_seen:        # анонс «в работе» — один раз на задачу
+            _inprogress_seen.add(qid)
+            task_text = str(it.get("task_text") or "")[:120]
+            rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
+            msg = f"🔄 Задача {qid}{rep} в работе…\n\n{task_text}"
+            for chunk in _chunks(msg):
+                try:
+                    await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
+                except Exception as e:
+                    log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
+        if qid not in _stalled:                # детект зависания — один раз на задачу (анти-спам)
+            age = _task_age_sec(it.get("updated"))
+            thr = _stall_threshold_sec(it)     # per-задача: потолок исполнения + люфт (урок 287)
+            if age is not None and age > thr:
+                _stalled.add(qid)
+                mins = int(age // 60)
+                if _is_pc_item(it):
+                    hint = "ПК-агент полосы pc не отвечает — проверь агента на ПК."
+                else:
+                    hint = "демон оркестратора не отвечает.\nПроверь: systemctl status orchestrator-daemon"
+                w = (f"⚠️ Задача {qid} зависла — нет heartbeat ~{mins} мин "
+                     f"при потолке {thr // 60} мин ({hint})")
+                for chunk in _chunks(w):
+                    try:
+                        await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
+                    except Exception as e:
+                        log.warning("devbot.report_results: warn о зависании %s не ушло (%s)", qid, e)
+
+
+# ===================== ЗЕЛЁНЫЕ ЗАДАЧИ (read-only) =====================
+def _g_health():
+    try:
+        r = subprocess.run([PY, os.path.join(ROOT, "health.py")], cwd=ROOT,
+                           capture_output=True, text=True, timeout=120)
+        return r.stdout.strip() or "health: нет вывода"
+    except Exception as e:
+        return f"health не запустился: {e}"
+
+
+def _g_audit(bridge):
+    r = bridge.audit_list()
+    if not r.get("ok"):
+        return f"аудит недоступен: {r.get('error')}"
+    items = r.get("items") or []
+    opn = [it for it in items if str(it.get("status", "")).lower() in ("new", "open", "", "pending")]
+    by = Counter(str(it.get("verdict", "?")) for it in opn)
+    out = [f"🔎 Аудит: всего {len(items)}, открытых {len(opn)}"]
+    for v, c in by.most_common():
+        out.append(f"  {v}: {c}")
+    return "\n".join(out)
+
+
+def _g_writelog(bridge, n=15):
+    r = bridge.read_write_log(limit=n)
+    if not r.get("ok"):
+        return f"боевой_лог недоступен: {r.get('error')}"
+    items = r.get("items") or []
+    out = [f"⬛ Боевой лог (посл. {len(items)} из {r.get('total')}):"]
+    for it in items:
+        crit = f" [{it.get('critical')}]" if it.get("critical") else ""
+        out.append(f"  {it.get('logged_at')} | {it.get('initiator')} | {it.get('action')} | {it.get('result')}{crit}")
+    return "\n".join(out)
+
+
+def _g_cclog(bridge, n=12):
+    r = bridge._call("read_doc", id=CC_LOG_ID)
+    if not r.get("ok"):
+        return f"cc_log недоступен: {r.get('error')}"
+    lines = (r.get("text") or "").splitlines()
+    return "📋 cc_log (свежие):\n" + "\n".join(lines[:n])
+
+
+def _g_errors():
+    try:
+        with open(os.path.join(ROOT, "splinter.log"), encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return f"splinter.log недоступен: {e}"
+    err = sum(1 for l in lines if "[ERROR]" in l)
+    warn = sum(1 for l in lines if "[WARNING]" in l)
+    tail = [l.rstrip()[:120] for l in lines if "[ERROR]" in l][-5:]
+    return (f"🪵 splinter.log: ERROR {err}, WARNING {warn} (строк {len(lines)})\n" +
+            "\n".join("  " + t for t in tail))
+
+
+def _g_brain(bridge):
+    out = ["🧠 Brain (латентность чтения):"]
+    for name in ("cc_log", "review", "project_state", "knowledge_base"):
+        t0 = time.time()
+        r = bridge._call("read_doc", name=name)
+        dt = time.time() - t0
+        out.append(f"  {name}: {dt:.1f}с {'ok' if r.get('ok') else '✗'} ({len(r.get('text') or '')})")
+    return "\n".join(out)
+
+
+def _g_overdue(bridge):
+    """Просрочки ТО парка — переиспользуем прод-скан O3 (splinter._o3_overdue_scan, read-only).
+    Топ-10 худших строками; «не делалось» помечаем, остальное «+N км»."""
+    import splinter                     # локальный импорт — не плодить связность на уровне модуля
+    ov = splinter._o3_overdue_scan(bridge).get("overdue") or []
+    if not ov:
+        return "🔧 Просрочек ТО нет 👍"
+    out = [f"🔧 Просрочки ТО: {len(ov)} байков (худшие сверху, топ-10):"]
+    for o in ov[:10]:
+        parts = []
+        for it in o["items"]:
+            lbl = splinter._MAND_LABEL.get(it["kind"], (str(it["kind"]), str(it["kind"])))[1]
+            parts.append(f"{lbl} ❗не делалось" if it.get("nobase") else f"{lbl} +{it['over_km']}км")
+        out.append(f"  ⚠️ {splinter._o3_bike_label(o['bike'], o['plate'])} · " + ", ".join(parts))
+    if len(ov) > 10:
+        out.append(f"  …ещё {len(ov) - 10} (полный board — /o3board)")
+    return "\n".join(out)
+
+
+# === Дайджест кураторских целей (шаг 5/7 родитель 231) ===
+# Маркеры куратора продублированы из orchestrator_daemon (демон в процесс бота не импортируем —
+# его модуль на import ставит signal.signal; образец REPEAT_MARK): followup-задача несёт
+# [куратор цели G, шаг m] (ищем search'ем — маркер жив и под префиксом перерождения самопочинки),
+# сводная карточка владельцу начинается с [куратор владельцу цель G]. Дайджест read-only (один
+# опрос очереди, записи нет) и живёт ТОЛЬКО в зелёной команде «статус» по запросу — в утреннюю
+# авто-сводку НЕ входит (по расписанию не спамим).
+_CURATOR_GOAL_RE = re.compile(r"\[куратор цели (\d+), шаг (\d+)\]")
+_CURATOR_HUMAN_RE = re.compile(r"^\[куратор владельцу цель (\d+)\]")
+_CURATOR_DIGEST_STATUSES = ("new", "in_progress", "approved", "needs_approval", "done", "failed")
+_CURATOR_ACTIVE_STATUSES = ("new", "in_progress", "approved")
+_UNSET = object()                           # сентинел «items не передали» (звать опрос самому)
+
+
+def _queue_snapshot(pb):
+    """ОДИН read-only опрос очереди по всем статусам ОБЕИХ полос (lane='all') → [items] | None
+    (сбой/исключение — вызывающий даёт честную пометку, пульс не валим). Общий снимок для
+    сводки системы И дайджеста куратора — очередь на «статус» опрашивается ровно один раз."""
+    try:
+        fn = getattr(pb, "get_pending_multi", None)
+        if fn is not None:
+            r = fn(_CURATOR_DIGEST_STATUSES, lane="all")
+        else:                               # мок в тестах без multi — по-статусно
+            items = []
+            for st in _CURATOR_DIGEST_STATUSES:
+                rr = pb.get_pending(st, lane="all")
+                if not rr.get("ok"):
+                    return None
+                for it in rr.get("items", []):
+                    if isinstance(it, dict):
+                        it.setdefault("status", st)
+                    items.append(it)
+            r = {"ok": True, "items": items}
+    except Exception:
+        return None
+    if not r.get("ok"):
+        return None
+    return [it for it in r.get("items", []) if isinstance(it, dict)]
+
+
+def _curator_goals(pb, items=_UNSET):
+    """Срез кураторских целей из очереди (полоса vps — куратор живёт только там) →
+    {G: {active, wait, done, failed, steps, owner}} | None (очередь не опросилась).
+    wait = followup-задача цели упёрлась в красное (needs_approval — ждёт «да» владельца);
+    owner = открытая сводная карточка «нужно от владельца» по цели.
+    items — готовый снимок _queue_snapshot (не передали → опросим сами; снимок теперь
+    несёт ОБЕ полосы, pc-элементы отсеиваются здесь — семантика «только vps» цела)."""
+    if items is _UNSET:
+        items = _queue_snapshot(pb)
+    if items is None:
+        return None
+    goals = {}
+
+    def _g(gid):
+        return goals.setdefault(int(gid), {"active": 0, "wait": 0, "done": 0,
+                                           "failed": 0, "steps": 0, "owner": False})
+    for it in items:
+        if str(it.get("lane") or "") == "pc":   # куратор живёт только на vps
+            continue
+        txt = str(it.get("task_text") or "")
+        st = str(it.get("status") or "")
+        m = _CURATOR_HUMAN_RE.match(txt)
+        if m:
+            if st == "needs_approval":      # закрытая (done) карточка владельцу цель не держит
+                _g(m.group(1))["owner"] = True
+            continue
+        m = _CURATOR_GOAL_RE.search(txt)
+        if not m:
+            continue
+        g = _g(m.group(1))
+        g["steps"] = max(g["steps"], int(m.group(2)))
+        if st in _CURATOR_ACTIVE_STATUSES:
+            g["active"] += 1
+        elif st == "needs_approval":
+            g["wait"] += 1
+        elif st == "failed":
+            g["failed"] += 1
+        else:
+            g["done"] += 1
+    return goals
+
+
+def _curator_digest(pb, items=_UNSET):
+    """Дайджест кураторских целей для «статус»: закрыто / в работе / ждёт владельца.
+    Кураторских маркеров в очереди нет → None (строка в статус не добавляется);
+    очередь не опросилась → короткая честная пометка (пульс не валим)."""
+    goals = _curator_goals(pb, items)
+    if goals is None:
+        return "🧭 кураторские цели: очередь не опросилась — дайджест недоступен"
+    return _curator_digest_render(goals)
+
+
+def _curator_digest_render(goals):
+    """Рендер дайджеста из готового среза целей ({} → None, строка не добавляется)."""
+    if not goals:
+        return None
+    counts = {"закрыто": 0, "в работе": 0, "ждёт владельца": 0}
+    rows = []
+    for gid in sorted(goals):
+        g = goals[gid]
+        total = g["active"] + g["wait"] + g["done"] + g["failed"]
+        if g["owner"] or g["wait"]:
+            state, why = "ждёт владельца", ("карточка в инбоксе" if g["owner"]
+                                            else f"красный вопрос по {g['wait']} задаче(ам)")
+            line = f"  цель {gid}: 🧑 ждёт владельца — {why}"
+        elif g["active"]:
+            state = "в работе"
+            line = f"  цель {gid}: 🔄 в работе — продолжений {total}, активных {g['active']}"
+        else:
+            state = "закрыто"
+            line = (f"  цель {gid}: ✅ закрыто — продолжений {total}" +
+                    (f", провалено {g['failed']}" if g["failed"] else ""))
+        counts[state] += 1
+        rows.append(line)
+    head = ("🧭 кураторские цели (" + str(len(goals)) + "): " +
+            " · ".join(f"{k} {v}" for k, v in counts.items() if v))
+    return "\n".join([head] + rows)
+
+
+# === Сводка системы для «статус» (задача 285, 13.07.2026): одна правда «всё ли завершено» ===
+# Read-only, из ТОГО ЖЕ снимка очереди, что дайджест куратора (один опрос на «статус»):
+# ⚙️ в работе — активные цепи декомпозера (ТОЛЬКО по живым признакам, зеркало ПК-фикса
+# 1403fa2), new/in_progress/approved одиночки обеих полос, кураторские цели в работе;
+# 🧑 ждёт тебя — все needs_approval (красные вопросы + сводные карточки владельцу);
+# 👁 надзор — последний тик ревизора из cowork_log. Всё пусто → «🟢 ТИХО: в работе 0,
+# ждёт тебя 0» = сигнал «всё завершено».
+_DEC_FROMS = (QUEUE_FROM_DEC, QUEUE_FROM_PC_DEC, QUEUE_FROM_PCLOC_DEC)
+_STEP_MARK_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")   # зеркало демона _STEP_RE
+_OWNER_CARD_RE = re.compile(r"^\[(?:куратор|ревизор) владельцу")     # сводные карточки владельцу
+_ST_ICON = {"new": "⏳", "in_progress": "🔄", "approved": "▶️"}
+_SECTION_TOP = 5                            # телефонный формат: топ-строк на секцию, дальше «…ещё K»
+_OPEN_STEP_STATUSES = ("new", "in_progress", "needs_approval", "approved")  # незакрытый шаг = живая цепь
+_LIVE_PARENT_STATUSES = ("new", "in_progress")   # живой родитель (план строится / шаги идут)
+
+# Контракт тика ревизора (зеркало ПК-фикса 1403fa2, «честный тик»): тик = NOTE-строка
+# cowork_log (журнал ПК-контура, Bridge read_doc) с «ревизор:» сразу после автора NOTE —
+# живой формат «NOTE Orchestrator: ревизор: 2 окон с активностью…» (разведка cowork_log
+# 13.07.2026). Маркеры очереди «[ревизор дата=…]» — дедуп/бюджет маршрутизации находок,
+# НЕ тики (живой призрак 23:10 13.07: они давали «ревизор (время неизвестно)»). Время
+# показываем ТОЛЬКО если оно есть в NOTE; NOTE нет → «ревизор: тиков ещё не было».
+_REV_NOTE_RE = re.compile(r"^NOTE(?:\s+[^:]{0,40})?:\s*ревизор:\s*(.+)", re.I)
+_REV_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}")
+_REV_HHMM_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+_REV_WIN_RE = re.compile(r"окон\D{0,3}(\d+)")
+_REV_WIN_RE2 = re.compile(r"(\d+)\s*окон")
+_REV_FIND_RE = re.compile(r"наход\w*\D{0,3}(\d+)")
+
+
+def _int0(v):
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _short(txt, n=60):
+    """Одна телефонная строка из текста задачи: без переносов, обрезка с многоточием."""
+    s = " ".join(str(txt or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _active_chains(items):
+    """Активные цепи декомпозера ТОЛЬКО по живым признакам (зеркало ПК-фикса 1403fa2;
+    живой призрак 23:10 13.07: терминальные родители pcloc-dec 194/200/206–208 висели
+    «план строится» вечно — цепь целиком на ПК, шагов в Bridge-очереди нет, а done-родитель
+    остаётся в снимке): родитель dec-метки (текст БЕЗ ведущего [маркера] — synthetic
+    сводки/карточки/коррекции родителями не считаются) в new/in_progress ИЛИ незакрытый
+    «[шаг i/d родитель N]» (new/in_progress/needs_approval/approved). Терминальный родитель
+    (done/failed) без незакрытых шагов — призрак, НЕ показываем. Ярлык: открытый шаг
+    «шаг i/d», иначе «план строится» → [{pid, line}]."""
+    parents, open_steps = {}, {}
+    for it in items:
+        txt = str(it.get("task_text") or "")
+        m = _STEP_MARK_RE.match(txt)
+        if m:
+            if str(it.get("status") or "") in _OPEN_STEP_STATUSES:
+                i, d, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if i >= open_steps.get(pid, (0, 0, None))[0]:
+                    open_steps[pid] = (i, d, it)
+            continue
+        if str(it.get("from") or "") in _DEC_FROMS and not txt.startswith("["):
+            pid = _int0(it.get("id"))
+            if pid:
+                parents[pid] = it
+    live = {pid for pid, it in parents.items()
+            if str(it.get("status") or "") in _LIVE_PARENT_STATUSES}
+    out = []
+    for pid in sorted(live | set(open_steps)):
+        i, d, step = open_steps.get(pid, (0, 0, None))
+        prog = f"шаг {i}/{d}" if step else "план строится"
+        it = parents.get(pid) or step or {}
+        lane = str(it.get("lane") or "") or "vps"
+        text = (parents[pid].get("task_text") if pid in parents
+                else _STEP_MARK_RE.sub("", str(step.get("task_text") or "")).strip())
+        out.append({"pid": pid,
+                    "line": f"  ⛓ цепь {pid} [{lane}]: {prog} — {_short(text, 50)}"})
+    return out
+
+
+def _parse_revisor(tick):
+    """Строка «👁 надзор: …» из текста тик-NOTE: честное время (ТОЛЬКО если есть в NOTE —
+    никакого «время неизвестно»), окна/находки (что распарсилось), иначе короткий текст тика."""
+    tm = _REV_TIME_RE.search(tick) or _REV_HHMM_RE.search(tick)
+    mw = _REV_WIN_RE.search(tick) or _REV_WIN_RE2.search(tick)
+    mf = _REV_FIND_RE.search(tick)
+    parts = []
+    if mw:
+        parts.append(f"окон {mw.group(1)}")
+    if mf:
+        f = _int0(mf.group(1))
+        parts.append(f"находок {f}" + (" ❗" if f else ""))
+    return ("👁 надзор: ревизор" + (f" {tm.group(0)}" if tm else "") + " — " +
+            (", ".join(parts) if parts else _short(tick)))
+
+
+def _revisor_line(cowork_fn=None):
+    """Последний тик ревизора — свежая NOTE «ревизор: …» в cowork_log (новые сверху, первая
+    совпавшая). NOTE нет → честное «тиков ещё не было»; журнал не прочитался → честное
+    «недоступен» (отсутствие данных ≠ тишина; сводку в любом случае не валим)."""
+    try:
+        text = cowork_fn() if cowork_fn else None
+    except Exception:
+        text = None
+    if text is None:
+        return "👁 надзор: cowork_log недоступен — тик ревизора неизвестен"
+    for line in text.splitlines():
+        m = _REV_NOTE_RE.match(line)
+        if m:
+            return _parse_revisor(m.group(1))
+    return "👁 надзор: ревизор: тиков ещё не было"
+
+
+def _system_summary(items, goals, cowork_fn=None):
+    """Сводка «всё ли завершено» из снимка очереди + среза кураторских целей.
+    Дедуп с соседними блоками: шаги/родители активных цепей не дублируются одиночками,
+    кураторские задачи ([куратор …]) — одной строкой-счётчиком (детали в дайджесте ниже)."""
+    chains = _active_chains(items)
+    chain_ids = {c["pid"] for c in chains}
+    singles, waits = [], []
+    for it in items:
+        if str(it.get("from") or "") not in QUEUE_FROMS:
+            continue
+        st = str(it.get("status") or "")
+        txt = str(it.get("task_text") or "")
+        iid = _int0(it.get("id"))
+        if st == "needs_approval":
+            waits.append((iid, it, txt))
+        elif st in _CURATOR_ACTIVE_STATUSES:
+            if txt.startswith(("[куратор", "[сводка", "[ревизор")):
+                continue                     # куратор — счётчиком ниже; сводка/тик — технические
+            if _STEP_MARK_RE.match(txt) or iid in chain_ids:
+                continue                     # шаг/родитель активной цепи — покрыт строкой цепи
+            singles.append((iid, it, st, txt))
+    cur_work = sum(1 for g in goals.values()
+                   if not (g["owner"] or g["wait"]) and g["active"])
+    n = len(chains) + len(singles) + cur_work
+    m = len(waits)
+    if n == 0 and m == 0:
+        out = ["🟢 ТИХО: в работе 0, ждёт тебя 0"]
+    else:
+        out = [f"⚙️ в работе {n}:"]
+        for c in chains[:_SECTION_TOP]:
+            out.append(c["line"])
+        shown = sorted(singles, key=lambda t: -t[0])[:_SECTION_TOP]
+        for iid, it, st, txt in shown:
+            lane = str(it.get("lane") or "") or "vps"
+            out.append(f"  {_ST_ICON.get(st, '🔄')} {iid} [{lane}]: {_short(txt)}")
+        hidden = (len(chains) - min(len(chains), _SECTION_TOP)
+                  + len(singles) - len(shown))
+        if hidden:
+            out.append(f"  …ещё {hidden}")
+        if cur_work:
+            out.append(f"  🧭 цели куратора в работе: {cur_work} (дайджест ниже)")
+        out.append(f"🧑 ждёт тебя {m}:" if m else "🧑 ждёт тебя 0")
+        for iid, it, txt in sorted(waits, key=lambda t: -t[0])[:_SECTION_TOP]:
+            if _OWNER_CARD_RE.match(txt):
+                out.append(f"  🧑 карточка {iid}: {_short(txt)}")
+            else:
+                lane = str(it.get("lane") or "") or "vps"
+                out.append(f"  ❓ {iid} [{lane}]: {_short(txt)}")
+        if m > _SECTION_TOP:
+            out.append(f"  …ещё {m - _SECTION_TOP}")
+    out.append(_revisor_line(cowork_fn))
+    return "\n".join(out)
+
+
+def _g_pulse(bridge):
+    """Пульс проекта (строка KB_PULSE) + сводка системы (задача 285: в работе / ждёт тебя /
+    надзор — одна правда «всё ли завершено») + дайджест кураторских целей (шаг 5/7 родитель
+    231, когда цели есть). Очередь опрашивается РОВНО один раз (снимок общий); сбой опроса →
+    пульс + честная пометка, ничего не валим."""
+    r = bridge._call("read_doc", name="pulse")
+    if not r.get("ok"):
+        base = f"пульс недоступен: {r.get('error')}"
+    else:
+        base = "📟 " + (r.get("text") or "").strip()
+    items = _queue_snapshot(bridge)
+    if items is None:
+        return base + "\n\n⚠️ очередь не опросилась — сводка системы недоступна"
+    goals = _curator_goals(bridge, items) or {}
+
+    def _cowork_text():
+        try:
+            rr = bridge._call("read_doc", name="cowork_log")
+            return (rr.get("text") or "") if rr.get("ok") else None
+        except Exception:
+            return None
+    blocks = [base, _system_summary(items, goals, _cowork_text)]
+    dig = _curator_digest_render(goals)
+    if dig:
+        blocks.append(dig)
+    return "\n\n".join(blocks)
+
+
+def _g_registry():
+    """Реестр знания — сверка карта↔реальность (registry_check.py, read-only: git + read_doc +
+    счёт файлов Brain, БЕЗ LLM). Сжатый отчёт для телефона: «✅ СХОДИТСЯ» или список расхождений.
+    Подпроцессом (как гейт) — своя LiveWorld/BridgeClient внутри скрипта, изоляция контура цела."""
+    try:
+        r = subprocess.run([PY, os.path.join(ROOT, "registry_check.py")], cwd=ROOT,
+                           capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "").strip() or (r.stderr or "").strip() or "(нет вывода)"
+        return out if r.returncode == 0 else f"🧭 реестр упал (exit={r.returncode}):\n{out}"
+    except subprocess.TimeoutExpired:
+        return "🧭 реестр не уложился в 120с (Bridge/сеть тупит) — попробуй позже."
+    except Exception as e:
+        return f"🧭 реестр не запустился: {e}"
+
+
+def _g_gate():
+    """Прогон гейта 4.3 (тесты, ~7с). Зелёный read-only прогон — сам ничего не деплоит."""
+    try:
+        r = subprocess.run([PY, os.path.join(ROOT, "gate.py")], cwd=ROOT,
+                           capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "").strip() or (r.stderr or "").strip() or "(нет вывода)"
+        return out if r.returncode == 0 else f"🔴 ГЕЙТ КРАСНЫЙ (exit={r.returncode}):\n{out}"
+    except Exception as e:
+        return f"гейт не запустился: {e}"
+
+
+def _g_help():
+    return ("🤖 Дев-бот — зелёные read-only команды:\n"
+            "  health — здоровье системы\n"
+            "  аудит — сводка открытых замечаний\n"
+            "  боевой / writelog — последние боевые записи\n"
+            "  cclog — свежие cc_log\n"
+            "  ошибки — сводка splinter.log\n"
+            "  мозг / brain — латентность Brain\n"
+            "  просрочки — просрочки ТО парка (скан O3, топ-10)\n"
+            "  статус / пульс — сводка системы: в работе / ждёт тебя / надзор + KB_PULSE\n"
+            "    (всё пусто → «🟢 ТИХО» = всё завершено)\n"
+            "  сверься / реестр — сверка карта↔реальность (реестр знания, read-only)\n"
+            "  гейт — прогон тестов 4.3 (~7с)\n"
+            "  помощь\n"
+            "\n🎻 Оркестратор (демон исполняет через headless Claude Code):\n"
+            "  тз: <что сделать> — дев-ТЗ (до 45 мин): правки кода/тесты/гейт/push/restart splinter\n"
+            "    сам (restart — через гейт + проверку старта); настоящее красное — спрошу кнопкой\n"
+            "  задача: <что сделать> — быстрая задача (до 10 мин), та же дисциплина\n"
+            "  декомпозируй: <крупное ТЗ> — план шагов → шаги отдельными задачами по одному → сводка\n"
+            "  да N / нет N — ответ на запрос подтверждения красной зоны по задаче N\n"
+            "  (в теме PC-дев те же «тз:»/«задача:»/«декомпозируй:» уходят ПК-театру: план на "
+            "VPS, шаги — ПК-агент, полоса lane=pc)\n"
+            "  (красную зону демон сам НЕ проходит — спросит кнопкой)\n"
+            "Красное (запись в таблицы/деньги/деплой Bridge) сам НЕ делаю — нужно твоё «да».")
+
+
+# allowlist: набор ключевых слов → зелёная функция (берёт bridge)
+_ALLOWLIST = [
+    (("health", "хелс", "здоров"), lambda b: _g_health()),
+    (("аудит", "audit"), lambda b: _g_audit(b)),
+    (("боев", "writelog", "write log"), lambda b: _g_writelog(b)),
+    (("cclog", "cc_log", "cc лог", "cc-лог"), lambda b: _g_cclog(b)),
+    (("ошибк", "errors", "splinter.log", "лог сплинтер"), lambda b: _g_errors()),
+    (("мозг", "brain", "свеж"), lambda b: _g_brain(b)),
+    (("просрочк", "overdue"), lambda b: _g_overdue(b)),
+    (("статус", "пульс", "pulse", "status"), lambda b: _g_pulse(b)),
+    (("сверься", "сверка", "сверить", "реестр", "registry"), lambda b: _g_registry()),
+    (("гейт", "gate"), lambda b: _g_gate()),
+    (("помощ", "help", "команд"), lambda b: _g_help()),
+]
+
+
+_GREEN_CMD_MAX_CHARS = 32   # зелёная команда = короткое сообщение-команда («покажи статус», «cc лог»)
+_GREEN_CMD_MAX_WORDS = 4    # длинный текст со словом команды В ТЕЛЕ — это ТЗ/вопрос, НЕ команда
+
+
+def _match(text):
+    """Зелёная однословная команда срабатывает ТОЛЬКО когда сообщение и ЕСТЬ команда (короткое
+    после трима), а НЕ когда её слово встретилось в теле длинного ТЗ. Инцидент 23:49 11.07.2026:
+    «пк: декомпозируй: <крупное ТЗ>» угнан словом зелёной команды из тела → простыня журнала
+    вместо постановки родителя. Структурированные префиксы (задача:/тз:/декомпозируй:/пк:) —
+    абсолютный приоритет: сообщение с ними в зелёное не попадает вообще, даже короткое
+    (защита в глубину: обычно их раньше съедает _try_enqueue)."""
+    t = (text or "").strip().lower()
+    if not t or len(t) > _GREEN_CMD_MAX_CHARS or len(t.split()) > _GREEN_CMD_MAX_WORDS:
+        return None
+    if t.startswith(_STRUCT_PREFIXES + _PC_TEXT_PREFIXES):
+        return None
+    for keys, fn in _ALLOWLIST:
+        if any(k in t for k in keys):
+            return fn
+    return None
+
+
+def _chunks(s, n=3500):
+    s = s or ""
+    return [s[i:i + n] for i in range(0, len(s), n)] or [""]
+
+
+# ===================== ТОЧКИ ВХОДА =====================
+async def handle_command(msg, context, bridge) -> None:
+    """Команда дев-боту в его темах: 328 (полоса vps), PC-дев (полоса pc, env PC_DEV_TOPIC_ID)
+    и тема-инбокс (env INBOX_TOPIC_ID, 13.07.2026 — только ответы на карточки «ждут владельца»).
+    ТОЛЬКО от Филиппа; в 328 — префиксы + зелёное из allowlist; в PC-дев — ТОЛЬКО «тз:»/«задача:»
+    (→ enqueue lane=pc) и ответы «да N»/«нет N»; в инбоксе — ТОЛЬКО «да N»/«нет N» (+кнопки).
+    Вне-allowlist/красное → НЕ выполняет, просит «да».
+    Зелёное гоняет как origin=agent (без билета): красная запись внутри → токен-замок 4.2."""
+    tid = getattr(msg, "message_thread_id", None)
+    pc_topic = pc_dev_topic()
+    ibx = inbox_topic()
+    if tid == DEVBOT_TOPIC:
+        lane = "vps"
+    elif pc_topic and tid == pc_topic:
+        lane = "pc"
+    elif ibx and tid == ibx:
+        lane = "inbox"   # тема-инбокс «ждут владельца» (13.07.2026): ТОЛЬКО ответы «да N»/«нет N»
+    else:
+        return   # не наша тема (напр. 205 = pc_agent на ПК) — НЕ реагируем вообще
+    if not msg.from_user or msg.from_user.id != DEVBOT_USER:
+        return   # чужой — игнор
+
+    # 0) Ответ на запрос подтверждения «да N» / «нет N» — ПЕРВЫМ (специфичный паттерн).
+    # Работает из 328, PC-дев И темы-инбокса (13.07.2026: карточки «ждут владельца» сходятся в
+    # инбокс — ответ там же). Bridge — через to_thread (фикс 02.07): loop не встаёт, пока /exec тупит.
+    appr = await asyncio.to_thread(_try_approval_reply, msg.text or "", bridge)
+    if appr is not None:
+        for chunk in _chunks(appr):
+            await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
+        return
+
+    # Тема-инбокс: команд/ТЗ/зелёного allowlist там НЕТ — только ответы на карточки.
+    # Guard-карточки pretool_guard (Termux «жду да») тоже приходят сюда, но их «да» даётся
+    # в терминале — «да N» применим только к задачам очереди с номером.
+    if lane == "inbox":
+        await context.bot.send_message(
+            chat_id=msg.chat_id, message_thread_id=tid,
+            text=("🤖 Это тема-инбокс подтверждений: «да N» / «нет N» или кнопки под карточкой. "
+                  "Команды и ТЗ — в теме 328 (полоса vps) или PC-дев."))
+        return
+
+    # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
+    #    (служебный лист очереди), origin=human по умолчанию — гейт 4.2 не трогаем.
+    enq = await asyncio.to_thread(_try_enqueue, msg.text or "", bridge, lane)
+    if enq is not None:
+        for chunk in _chunks(enq):
+            await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
+        return
+
+    # Полоса pc: зелёный allowlist НЕ гоняем (он про VPS) — только подсказка формата.
+    if lane == "pc":
+        await context.bot.send_message(
+            chat_id=msg.chat_id, message_thread_id=tid,
+            text=("🤖 Тема PC-дев (lane=pc): «тз: <ТЗ>» или «задача: <что сделать>» — уйдёт "
+                  "ПК-агенту; «декомпозируй: <крупное ТЗ>» — план на VPS, шаги ПК-агенту по "
+                  "одному; «да N» / «нет N» — ответ на красный вопрос. "
+                  "Зелёные VPS-команды (health/аудит/…) — в теме 328."))
+        return
+
+    # 2) Зелёная read-only команда из allowlist
+    fn = _match(msg.text or "")
+    if fn is None:
+        await context.bot.send_message(
+            chat_id=msg.chat_id, message_thread_id=tid,
+            text=("🤖 Это не зелёная команда (или красное: запись/деплой). Сам НЕ выполняю — нужно твоё «да». "
+                  "Зелёное: health / аудит / боевой / cclog / ошибки / мозг / просрочки / статус / сверься / гейт / помощь. "
+                  "Дев-ТЗ: «тз: <что сделать>»."))
+        return
+    def _run_green():
+        with bridge_client.agent_write(None):   # origin=agent, без билета → красная запись будет отклонена
+            return fn(bridge)
+    try:
+        reply = await asyncio.to_thread(_run_green)   # фикс 02.07: не морозим loop на зелёной команде
+    except Exception as e:
+        reply = f"🤖 ошибка зелёной задачи: {type(e).__name__}: {e}"
+    for chunk in _chunks(reply):
+        await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
+
+
+async def morning_summary(context) -> None:
+    """Утренняя авто-сводка в topic 328 (health + открытый аудит + латентность Brain). read-only, agent."""
+    bridge = BRIDGE
+    if bridge is None:
+        log.warning("devbot.morning_summary: BRIDGE не выставлен")
+        return
+    def _collect():
+        with bridge_client.agent_write(None):
+            return "\n".join(["🌅 Утренняя сводка дев-бота", "", _g_health(), "",
+                              _g_audit(bridge), "", _g_brain(bridge)])
+    try:
+        text = await asyncio.to_thread(_collect)   # фикс 02.07: сбор сводки не морозит loop
+    except Exception as e:
+        text = f"🌅 Утренняя сводка: ошибка сбора ({type(e).__name__}: {e})"
+    for chunk in _chunks(text):
+        await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=DEVBOT_TOPIC, text=chunk)

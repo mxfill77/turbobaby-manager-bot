@@ -1,0 +1,1835 @@
+#!/usr/bin/env python3
+"""
+ОРКЕСТРАТОР ступень 1, заход 2а — ДЕМОН исполнения очереди (ИЗОЛИРОВАННО, без дев-бота).
+
+Цикл (каждые POLL_SEC):
+  get_pending(new)  — плоский HTTP к Bridge, БЕЗ claude -p (токены LLM на опрос НЕ тратим)
+    → есть new → claim_task(id) (атомарно new→in_progress)
+      → claim успешен → исполнить через `claude -p "<task_text>"` (headless, cwd=репо, видит CLAUDE.md)
+        → complete_task(id, done|failed, <вывод/ошибка/таймаут>)
+
+ЗАЩИТА (доктрина KB_ORCHESTRATOR_SAFETY):
+  - НЕ используем --dangerously-skip-permissions. claude -p читает .claude/settings.json:
+    green-команды (allow) исполняет, красные (ask: clasp/sqlite3/systemctl stop/git push) в headless
+    НЕ может подтвердить → отказ. Демон сам красную зону НЕ проходит.
+  - Таймаут задачи (TASK_TIMEOUT) → задача не висит вечно: превышен → complete failed("таймаут").
+  - Рубильник: `systemctl stop orchestrator-daemon` — гасит ТОЛЬКО этот демон, splinter живёт.
+  - Демон спит между опросами; idle = только HTTP get_pending (бесплатно по токенам).
+
+НЕ интегрирован в дев-бот (это заход 2б). Задачи кладутся в очередь извне (в 2а — вручную).
+"""
+import os
+import re
+import sys
+import time
+import json
+import signal
+import logging
+import datetime
+import subprocess
+import threading
+
+REPO = "/root/turbobaby-manager-bot"
+BRIDGE_GS = "/root/turbobaby-bridge-gs"
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(REPO, ".env"))
+sys.path.insert(0, REPO)
+from bridge_client import BridgeClient
+
+POLL_SEC = 60            # пауза между опросами очереди
+HEARTBEAT_SEC = 45       # как часто фон-поток бьёт updated, пока claude -p исполняется (детект зависания)
+TASK_TIMEOUT = 600       # таймаут быстрой задачи «задача:» (10 мин) — claude -p не должен висеть вечно
+TASK_TIMEOUT_DEV = 2700  # таймаут дев-ТЗ «тз:» (45 мин, ступень 2 O4) — правка+тесты+гейт+отчёт
+DEV_FROM_SUFFIX = "-dev" # метка dev-режима в поле from очереди (devbot кладёт Filipp-328-dev)
+DEC_FROM_SUFFIX = "-dec" # метка декомпозиции (ступень 2 часть C; devbot кладёт Filipp-328-dec):
+                         # родитель «декомпозируй:» + его шаги + synthetic-сводка — всё под этой меткой
+MAX_STEPS = 8            # потолок шагов декомпозиции (планировщику велено 2–7; больше → failed родителя)
+# === ПК-ТЕАТР (кусок 2 «один дирижёр, два театра», 07.07.2026) ===
+# «декомпозируй:» из темы PC-дев (829): родитель кладётся devbot'ом с меткой PC_DEC_FROM на полосе
+# vps (планировщик/думатели ТОЛЬКО здесь, на ПК мозг не дублируется), а ШАГИ демон выдаёт на полосу
+# lane=pc — их claim'ит и исполняет pc_orchestrator. Детали — секция «ПК-ТЕАТР: функции» ниже.
+PC_LANE = "pc"
+PC_DEC_FROM = "Filipp-pc-dec"   # метка семейства pc-декомпозиции (родитель vps + шаги lane=pc + карточки/сводка)
+PC_STEP_TIMEOUT = int(os.environ.get("PC_STEP_TIMEOUT") or 3600)  # сек: ПК молчит (шаг не взят /
+                         # heartbeat умер / approved завис) → честный failed цепи, думатель НЕ зовётся
+PC_SILENT_MARK = "⏱ ПК-театр не отвечает"   # маркер таймаут-диагноза (по нему же гасится самопочинка)
+_REJECT_PREFIX = "отклонено Филиппом"        # результат devbot-отказа («нет N»/кнопка ❌) — halt без думателя
+OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
+APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
+CLAUDE_BIN = "/usr/bin/claude"
+# КОНДУКТОР МОДЕЛИ (06.07.2026): headless-исполнитель по умолчанию — Claude Fable 5, фолбэк —
+# прежняя рабочая модель (Opus 4.8 1M = CLI-дефолт до этой правки). Вынесено в env, НЕ хардкод:
+# смена модели в будущем = правка .env (ORCH_MODEL / ORCH_MODEL_FALLBACK), без правки кода.
+# Фолбэк исполняет САМ CLI флагом --fallback-model В РАМКАХ ОДНОГО вызова при
+# overload/недоступности/лимите/неверном имени primary → задача НЕ исполняется дважды
+# (проверено 06.07: невалидная primary + --fallback-model=opus → CLI сам берёт opus, exit 0,
+# modelUsage=opus). Хардкода без фолбэка нет: упёршись в лимит Fable, автоматика не встаёт.
+ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "fable").strip() or "fable"
+ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-opus-4-8[1m]").strip() or "claude-opus-4-8[1m]"
+RESULT_MAX = 4500        # Bridge режет result на 5000 — оставляем запас
+LOG_PATH = os.path.join(REPO, "orchestrator_daemon.log")
+
+# §12 корень 1 (06.07.2026): под тест-прогоном НЕ трогаем боевой orchestrator_daemon.log —
+# сам ИМПОРТ модуля (test_orchestrator_*/test_convert_loop_break делают `import orchestrator_daemon`)
+# конфигурировал FileHandler на ЖИВОЙ лог, и любой log.info фикстуры лил строки в него. Тест-прогон
+# определяем по: активный pytest / entry-point tests/test_*.py / явный флаг ORCH_DAEMON_TEST=1 →
+# логгер в NullHandler (ни файла, ни консоли). Боевой демон (systemd, argv=orchestrator_daemon.py) —
+# как раньше, пишет в LOG_PATH.
+_UNDER_TEST = (
+    "pytest" in sys.modules
+    or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    or os.path.basename((sys.argv[0] if sys.argv else "") or "").startswith("test_")
+    or os.environ.get("ORCH_DAEMON_TEST") == "1"
+)
+if _UNDER_TEST:
+    logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+else:
+    logging.basicConfig(
+        filename=LOG_PATH, level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+log = logging.getLogger("orchestrator_daemon")
+
+bc = BridgeClient(timeout=90)
+_running = True
+
+
+def _stop(signum, _frame):
+    """SIGTERM/SIGINT (в т.ч. от systemctl stop) — мягкая остановка после текущей итерации."""
+    global _running
+    _running = False
+    log.info("получен сигнал %s — останавливаюсь после текущей итерации", signum)
+
+
+signal.signal(signal.SIGTERM, _stop)
+signal.signal(signal.SIGINT, _stop)
+
+
+# Маркер самодекларации красной зоны (заход 2б-2). Демон НЕ угадывает формулировки отказа —
+# инструктирует claude -p вывести этот маркер вместо попытки обойти гейт.
+NA_MARKER = "NEEDS_APPROVAL:"
+
+
+def _fail_card(out, err, rc):
+    """§12 корень 3 (06.07.2026): ЧИСТАЯ карточка провала claude -p — НЕ сырой дамп всего
+    stdout+stderr (шум, усиленный громким-провалом d946f92). Отдаём осмысленную суть: первую
+    строку stdout (по контракту преамбулы = сводка ≤400) + хвост stderr (реальная ошибка),
+    капнуто коротко. Полный поток claude -p как карточку НЕ релеим — детали задача пишет в cc_log.
+    Границу «громкий провал ДЕНЕГ» (splinter._note_llm_loss, force-пуш) это НЕ трогает —
+    там отдельный механизм, он остаётся."""
+    o = (out or "").strip()
+    e = (err or "").strip()
+    summary = o.splitlines()[0].strip() if o else ""
+    etail = " / ".join([x for x in e.splitlines() if x.strip()][-2:]) if e else ""
+    body = " | ".join([b for b in (summary, etail) if b]) or f"exit={rc}"
+    return f"claude -p упал (exit={rc}): {body}"[:600]
+
+# === ФИКС КЛАССА «самомодификация → ложный failed» (урок задачи 105, 07.07.2026) ===
+# Самомод-задача правит orchestrator_daemon.py и по доктрине ставит отложенный
+# `systemd-run --on-active=Ns systemctl restart orchestrator-daemon` ПОСЛЕДНИМ действием. Рестарт
+# гасит ВЕСЬ cgroup сервиса, включая claude -p самой задачи (SIGTERM → exit=143) — работа к этому
+# моменту СДЕЛАНА (RESULT в cc_log, commit в git), но демон метил задачу failed «claude -p упал».
+# Отличаем «убит запланированным рестартом» от настоящего падения по ЧЕТЫРЁМ обязательным
+# признакам (нужны ВСЕ; любое сомнение → False → прежний честный failed, fail-safe):
+#   1) exit-код SIGTERM (143 у CLI / -15 от subprocess) — SIGKILL/oom (137/-9) сюда НЕ попадают;
+#   2) демон САМ получил SIGTERM тем же моментом (_running=False): systemd гасит cgroup целиком;
+#      точечный kill claude-процесса или oom демона не трогают (_running останется True);
+#   3) в тексте задачи признак самомодификации (orchestrator_daemon / «самомодификация»);
+#   4) в systemd ВИДНА transient-единица systemd-run с рестартом демона: run-*.timer ещё не
+#      сработал ИЛИ run-*.service прямо сейчас гонит restart (он блокируется, пока демон не
+#      погашен — мы ещё живы и успеваем её увидеть). Ручной systemctl stop/restart из Termux
+#      такой единицы НЕ создаёт → останется честный failed.
+_SIGTERM_RCS = (143, -15)
+_SELFMOD_RE = re.compile(r"orchestrator[-_ ]?daemon|самомодифика", re.IGNORECASE)
+
+
+def _deferred_restart_visible():
+    """True → systemd показывает transient-единицу systemd-run (run-*.timer / run-*.service),
+    чья Description содержит команду рестарта демона. Любой сбой пробы = False (fail-safe)."""
+    try:
+        p = subprocess.run(
+            ["systemctl", "list-units", "--all", "--plain", "--no-legend",
+             "run-*.service", "run-*.timer"],
+            capture_output=True, text=True, timeout=10)
+        return "restart orchestrator-daemon" in (p.stdout or "")
+    except Exception as e:
+        log.warning("planned-restart: проба systemctl не отработала (%s) — считаю НЕплановым", e)
+        return False
+
+
+def _killed_by_planned_restart(rc, task_text):
+    """True → claude -p задачи убит ЗАПЛАНИРОВАННЫМ отложенным рестартом демона (самомодификация),
+    НЕ настоящее падение. Все 4 признака обязательны — см. комментарий блока выше."""
+    if rc not in _SIGTERM_RCS:
+        return False
+    if _running:
+        return False
+    if not _SELFMOD_RE.search(str(task_text or "")):
+        return False
+    return _deferred_restart_visible()
+
+
+# === АВТО-ПЕРЕЧЕНЬ красных op (п.4 узкий, штаб 19.06) — РОВНО два, оба обратимы ===
+# clasp_redeploy / CRM / Лист1 / деньги / set_fleet_* / delete_event — НЕ здесь (позже, особое «да»).
+AUTO_OPS = ("git_push", "restart_splinter")
+
+# Преамбула v3 (Q2 разблокирован 03.07: критерий обкатки ступени 2 выполнен — 3 «тз:» подряд done
+# без Termux, вкл. прод-фикс 3978a91). restart splinter теперь CC делает САМ оранжевым циклом
+# (гейт→restart→проверка чистого старта→отчёт); кнопка op=restart_splinter остаётся фоллбэком.
+# Red-zone (Лист1/CRM/деньги/clasp/sqlite3/delete) — БЕЗ изменений: маркер op=other, НЕ обходить гейт.
+# v3.1 (03.07, урок задачи 43): правило самомодификации — рестарт orchestrator-daemon из задачи
+# только ОТЛОЖЕННО (systemd-run --on-active=10s) и ПОСЛЕ отчёта, иначе рестарт убивает свой claude.
+APPROVAL_PREAMBLE = (
+    "Ты выполняешь задачу автономно в headless-режиме (без интерактивного подтверждения) в репо "
+    "/root/turbobaby-manager-bot — CLAUDE.md и вся его дисциплина действуют.\n"
+    "ДИСЦИПЛИНА (обязательно): перед правкой кода — бэкап (коммит/копия .bak); после правки — "
+    "py_compile + тесты; перед git push — гейт (venv/bin/python3 gate.py; pre-push зовёт его сам); "
+    "каждый значимый шаг — строка в cc_log (write_doc name=cc_log, запись ПОД врезкой) + пульс "
+    "(write_doc name=pulse) ОДНОЙ операцией; статус честно: «технически готово» отдельно от "
+    "«функционально подтверждено».\n"
+    "КАРТА ДЕЙСТВИЙ:\n"
+    "- Зелёное/оранжевое (чтение, диагностика, правки кода, тесты, git commit, git push) — делай САМ; "
+    "git push по циклу гейт→push→отчёт, БЕЗ маркера.\n"
+    "- systemctl restart splinter — тоже делай САМ, оранжевым циклом: гейт (venv/bin/python3 gate.py, "
+    "только при exit 0) → systemctl restart splinter → проверка чистого старта (systemctl is-active "
+    "active + свежий старт-лог в splinter.log без ошибок) → в сводке отчитайся «нужен был restart — "
+    "сделал, старт чистый». При failed/грязном старте — откат на прошлый рабочий коммит + restart + "
+    "честный отчёт. Маркер op=restart_splinter НЕ выводи (он остаётся только аварийным фоллбэком).\n"
+    "- САМОМОДИФИКАЦИЯ (правишь orchestrator_daemon.py — код демона, который исполняет ТЕБЯ): "
+    "рестарт демона убьёт твой же claude-процесс (SIGTERM, отчёт пропадёт). Поэтому отчёт в "
+    "cc_log+пульс и сводку пиши ДО рестарта, а рестарт — САМОЕ ПОСЛЕДНЕЕ действие и ТОЛЬКО "
+    "ОТЛОЖЕННО: systemd-run --on-active=10s systemctl restart orchestrator-daemon. НИКОГДА не зови "
+    "systemctl restart orchestrator-daemon напрямую из задачи. Если рестарт всё же погасит твой "
+    "процесс раньше выхода (exit=143) — демон распознает плановый рестарт (фикс 07.07) и пометит "
+    "задачу done с пометкой, НЕ failed; настоящие падения остаются failed.\n"
+    "- ТЕСТЫ/ФИКСТУРЫ БЕЗ ПУШЕЙ В ЛИЧКУ: гейт (gate.py) сам ставит PRETOOL_NOPUSH=1 подпроцессам "
+    "тестов. Если запускаешь тест/фикстуру/dry-run ВНЕ гейта (ручной прогон tests/*.py, скрипт со "
+    "scratchpad/_test/_dryrun, проверка pretool_guard) — ставь env-префикс сам: "
+    "PRETOOL_NOPUSH=1 venv/bin/python3 <скрипт>. Ноль тестовых карточек/пушей Филиппу в личку.\n"
+    "- НАСТОЯЩЕЕ КРАСНОЕ — запись в рабочие таблицы (CRM/Лист1/Байки/Зарплаты), деньги/транзакции, "
+    "clasp deploy/redeploy/push, sqlite3 CLI на memory.db, set_fleet_oil/set_fleet_service, "
+    "confirmed=true, delete_event, любое удаление — НЕ выполняй и НЕ ищи обходных путей: выведи РОВНО "
+    "одну строку «NEEDS_APPROVAL: op=other | <карточка: что · куда · последствия · на что смотреть>» "
+    "и заверши работу (исполнит человек).\n"
+    "ФОРМАТ ОТВЕТА: первая строка — сводка результата (≤400 символов, уйдёт в Telegram-тему 328); "
+    "подробности — в cc_log, НЕ в вывод. Задача целиком read-only → просто выполни и верни сводку.\n\n"
+    "ЗАДАЧА:\n"
+)
+
+# === ДЕКОМПОЗЕР (ступень 2 часть C, KB_review PLAN 21:40) ===
+# «декомпозируй: <крупное ТЗ>» → родитель (from=*-dec, без паттернов ниже) → планировщик claude -p
+# (read-only) возвращает нумерованный список → шаги отдельными задачами «[шаг i/N родитель id] …»
+# → исполнение по одному (FIFO + guard последовательности) → synthetic-сводка «[сводка родитель id]».
+# Bridge-очередь НЕ меняется: родство — ТОЛЬКО по паттерну в task_text (решение плана C).
+PLANNER_PREAMBLE = (
+    "Ты — планировщик декомпозиции в headless-режиме в репо /root/turbobaby-manager-bot "
+    "(CLAUDE.md действует). Твоя задача — РАЗБИТЬ крупное ТЗ на шаги, НЕ выполняя его: можно "
+    "читать код/логи/доки (read-only разведка), НЕЛЬЗЯ править файлы, коммитить, деплоить, "
+    "писать в таблицы.\n"
+    "ФОРМАТ ОТВЕТА — СТРОГО и ТОЛЬКО нумерованный список шагов, каждый с новой строки "
+    "«N. <шаг>», без заголовков, без кода, без текста до/после списка. Шагов 2–7. Каждый шаг — "
+    "САМОДОСТАТОЧНОЕ дев-ТЗ (до 45 мин, ≤400 символов): исполнитель увидит ТОЛЬКО текст шага, "
+    "поэтому впиши в каждый нужный контекст (файлы, функции, что сделать, как проверить). Шаги "
+    "строго в порядке исполнения; правки кода раньше, деплой/рестарт/проверка — последними.\n\n"
+    "КРУПНОЕ ТЗ:\n"
+)
+# Дописка планировщику для родителя ПК-театра (ДОБАВЛЯЕТСЯ ПОСЛЕ PLANNER_PREAMBLE — startswith
+# в тест-моках/роутинге не ломается): шаги исполнит агент на ДРУГОЙ машине, не этот VPS.
+PLANNER_PC_NOTE = (
+    "ОСОБЕННОСТЬ ТЕАТРА ИСПОЛНЕНИЯ: шаги будет исполнять headless-агент на ДРУГОЙ машине "
+    "(ПК, pc_orchestrator) — НЕ этот VPS. Пиши каждый шаг самодостаточно для ТОЙ машины: не "
+    "ссылайся на пути/сервисы/файлы этого VPS, если само ТЗ явно не про них; весь контекст, "
+    "нужный шагу, впиши в его текст.\n\n"
+)
+_STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")
+_SUM_RE = re.compile(r"^\[сводка родитель (\d+)\]")
+_PLAN_LINE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(\S.*)")
+# guard последовательности: пока сиблинг висит в этих статусах — новые шаги родителя НЕ берём
+# (needs_approval/approved = ждём Филиппа/доводку; in_progress = stale после падения демона —
+# порядок шагов важнее живости, Филиппу и так уйдёт «⚠️ зависла» от devbot).
+_DEC_WAIT_STATUSES = ("in_progress", "needs_approval", "approved")
+# Фоллбэк-фразы (если claude описал блокировку гейта без маркера) — тоже эскалируем (эскалация
+# безопасна: лишь спрашивает Филиппа, красное НЕ исполняется; op=other → человек в Termux).
+_NA_FALLBACK = ("требует подтверждения", "нужно подтверждение", "нужно «да»", "нужно \"да\"",
+                "requires approval", "needs approval", "permission to use", "не разрешено гейтом")
+_OP_RE = re.compile(r"op\s*=\s*([a-z_]+)", re.IGNORECASE)
+# префикс дескриптора «op=xxx | » — срезается при конверте op=other в headless-ТЗ (остаётся карточка)
+_OP_PREFIX_RE = re.compile(r"^\s*op\s*=\s*[a-z_]+\s*\|\s*", re.IGNORECASE)
+
+# === КОРНЕВОЙ РАЗРЫВ ПЕТЕЛЬ КОНВЕРТОВ op=other (ст3, KB_MASTER §7/§12 — чинить навсегда) ===
+# Петля: op=other → «да» Филиппа → конверт (headless-задача) → та упирается в то же красное →
+# NEEDS_APPROVAL → «да» → новый конверт → … (56→57→58…). Рвём тремя слоями (план 06.07, RESULT 10:07):
+#  СЛОЙ 1 (ядро): конверт-задача (текст с маркером ниже), снова эскалировавшая NEEDS_APPROVAL, =
+#    доказательство, что headless красное НЕ пройдёт → НЕ ставим approvable needs_approval (это был бы
+#    ре-конверт), а финализируем ТЕРМИНАЛЬНЫМ failed с ручной картой → рендер без approve-кнопки → петля
+#    рвётся после РОВНО 1 перерождения.
+#  СЛОЙ 2 (экономия перерождения): известное headless-НЕВОЗМОЖНОЕ красное (по ключевым словам) НЕ
+#    конвертируем вовсе → сразу та же терминальная карта = ноль перерождений на известных петлях.
+#  СЛОЙ 3 (страховка): fingerprint-дедуп в /inbox (devbot) — не трогаем.
+_CONVERT_MARK = "[конверт одобренной заявки"
+_CONVERT_RE = re.compile(r"^\s*\[конверт одобренной заявки\b")
+# Слой 2: маркеры заведомо headless-невозможного красного (clasp/живая таблица/деньги/CLI-БД/удаление/
+# календарь). Ловим в дескрипторе (what) И в тексте исходной задачи — до первого конверта.
+_HEADLESS_IMPOSSIBLE_RE = re.compile(
+    r"clasp|redeploy|\bsqlite3\b|set_fleet_(?:oil|service)|delete_event|confirmed\s*=\s*true|"
+    r"лист\s*1|\bcrm\b|зарплат|байки|транзакц|проводк|деньг|касс|удал(?:и|ени|яе|ён)|календар",
+    re.IGNORECASE,
+)
+
+
+# === САМОПОЧИНКА ШАГА (мета-дирижёр кусок 1, KB_MASTER §4, заведено 06.07.2026) ===
+# Провал шага декомпозера (исполнительский fail, НЕ красный NEEDS_APPROVAL) при STEP_SELFHEAL=1
+# в .env → вместо мгновенного halt-on-fail зовём ДУМАТЕЛЯ: claude -p через тот же кондуктор
+# ORCH_MODEL/ORCH_MODEL_FALLBACK (0bc9187), чистый генератор (--max-turns 1, без исполнения),
+# строгий JSON {"verdict","fixed_step","reason"}. verdict=retry → шаг перерождается НОВОЙ задачей
+# с детерминированным маркером «[самопочинка шага N, попытка 1]» (паттерн конвертов fa90193);
+# перерождённый шаг, упавший ПОВТОРНО, → ТЕРМИНАЛЬНЫЙ halt (ровно 1 попытка, петля невозможна).
+# FAIL-SAFE: думатель упал / таймаут / JSON не распарсился / enqueue не встал → прежний
+# halt-on-fail байт-в-байт (не хуже текущего). Красное НЕ ослабляется: думатель ничего не
+# исполняет, перерождённый шаг идёт обычным путём (NEEDS_APPROVAL → кнопка как раньше).
+# STEP_SELFHEAL=0/нет → ветка не зовётся вовсе (мгновенный откат конфигом + рестарт демона).
+# РАСШИРЕНИЕ ст4 (07.07.2026, последний кусок): ТОТ ЖЕ механизм и ТОТ ЖЕ флаг на одиночные
+# «тз:»/«задача:» — провал → думатель (контекст: текст задачи дословно + суть провала, JSON с
+# fixed_task) → 1 перерождение «[самопочинка задачи N, попытка 1]» → повторный провал =
+# терминальный failed с диагнозом. Конверты и плановый рестарт самомода (done) — НЕ трогаются.
+STEP_SELFHEAL_TIMEOUT = 180   # думатель — чистый генератор без tools, ответ короткий
+_HEAL_RE = re.compile(r"\[самопочинка шага (\d+), попытка (\d+)\]")
+# РАСШИРЕНИЕ ст4 (07.07.2026, последний кусок мета-дирижёра): ТОТ ЖЕ механизм на одиночные
+# «тз:»/«задача:» под ТЕМ ЖЕ флагом STEP_SELFHEAL. Маркер перерождения одиночной задачи стоит
+# ПЕРВЫМ в тексте → якорь ^ (у шага маркер идёт после [шаг i/N], там search). N = id исходной
+# задачи. Анкер ещё и страхует от ложного срабатывания на ТЗ, где маркер лишь упомянут в тексте.
+_HEAL_TASK_RE = re.compile(r"^\s*\[самопочинка задачи (\d+), попытка (\d+)\]")
+THINKER_PREAMBLE = (
+    "Ты — думательный слой самопочинки оркестратора TurboBaby (мета-дирижёр). Шаг декомпозиции "
+    "упал при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО не исполняешь, "
+    "инструментов у тебя нет, файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"retry"|"halt","fixed_step":"<новая формулировка шага>","reason":"<1 строка диагноза>"}\n'
+    "verdict=retry — ТОЛЬКО если провал починим переформулировкой шага (неверный путь/имя файла, "
+    "недостающий контекст, кривая команда) и правка очевидна; fixed_step тогда — САМОДОСТАТОЧНОЕ "
+    "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
+    "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
+    "verdict=halt и fixed_step пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
+    "многошаговых планов.\n\n"
+)
+# Преамбула думателя ОДИНОЧНОЙ задачи (расширение ст4): та же схема/строгость, но контекст без
+# родителя/плана (их у одиночной нет) и ключ fixed_task вместо fixed_step.
+TASK_THINKER_PREAMBLE = (
+    "Ты — думательный слой самопочинки оркестратора TurboBaby (мета-дирижёр). Одиночная "
+    "headless-задача упала при исполнении. Твоя задача — ТОЛЬКО диагноз и вердикт; ты НИЧЕГО "
+    "не исполняешь, инструментов у тебя нет, файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"retry"|"halt","fixed_task":"<новая формулировка задачи>","reason":"<1 строка диагноза>"}\n'
+    "verdict=retry — ТОЛЬКО если провал починим переформулировкой задачи (неверный путь/имя файла, "
+    "недостающий контекст, кривая команда) и правка очевидна; fixed_task тогда — САМОДОСТАТОЧНОЕ "
+    "дев-ТЗ ≤400 символов (исполнитель увидит ТОЛЬКО его, впиши нужный контекст). Во всех прочих "
+    "случаях (причина неясна, нужен человек, красная зона, объём не влезает в таймаут) — "
+    "verdict=halt и fixed_task пустой. Система даёт РОВНО ОДНУ попытку починки — не предлагай "
+    "многошаговых планов.\n\n"
+)
+
+
+def _selfheal_on():
+    """Флаг STEP_SELFHEAL=1 в .env (демон load_dotenv'ит на старте). 0/нет → прежнее поведение."""
+    return (os.environ.get("STEP_SELFHEAL") or "").strip() == "1"
+
+
+def _is_convert(text):
+    """True → задача является конвертом одобренной op=other (родилась из «да» Филиппа). Слой 1."""
+    return bool(_CONVERT_RE.match(str(text or "")))
+
+
+def _is_headless_impossible(*texts):
+    """True → в тексте(ах) есть маркер заведомо headless-невозможного красного действия. Слой 2."""
+    blob = " ".join(str(t or "") for t in texts)
+    return bool(_HEADLESS_IMPOSSIBLE_RE.search(blob))
+
+
+def _manual_card(what, orig_text=""):
+    """Терминальная карточка «сделай РУКАМИ» (это НЕ сбой, а нормальный ручной исход). Кладётся в
+    complete_task(failed) → рендерится БЕЗ approve-кнопки → ре-approve/ре-конверт невозможен, петля
+    рвётся. Тело: явно «требуется ручное действие», что именно сделать (из карточки) и что проверить."""
+    card = _OP_PREFIX_RE.sub("", what or "").strip() or "(карточка пустая — см. вывод задачи)"
+    lines = [
+        "✋ ТРЕБУЕТСЯ РУЧНОЕ ДЕЙСТВИЕ (это не сбой, а нормальный ручной исход)",
+        "Headless-контур доказано не может выполнить это красное действие (рабочие таблицы/деньги/"
+        "clasp/sqlite3/удаление). Кнопки «да» здесь НЕТ намеренно — повторный approve лишь плодит "
+        "петлю конвертов. Выполни РУКАМИ в Termux:",
+        card,
+        "После — проверь результат в целевой таблице/логах; при необходимости повтори исходную "
+        "задачу в 328 обычным префиксом.",
+    ]
+    if orig_text:
+        lines.append(f"Исходная задача (контекст): {str(orig_text).strip()[:300]}")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+def parse_op(what):
+    """Извлечь op-код из сохранённого what (дескриптор needs_approval). 'other' если не распознан/не из перечня."""
+    m = _OP_RE.search(what or "")
+    if not m:
+        return "other"
+    op = m.group(1).lower()
+    return op if op in AUTO_OPS else "other"
+
+
+def _detect_needs_approval(text):
+    """Вернуть дескриптор красного действия (строка с op=…), если claude самодекларировал маркер или
+    явно описал блок гейта. Иначе None. Эскалация предпочтительнее тихого failed (так требует задача).
+    Дескриптор сохраняется в очередь как what — по нему демон при approved исполняет хардкод-команду op."""
+    t = text or ""
+    for line in t.splitlines():
+        i = line.find(NA_MARKER)
+        if i >= 0:
+            what = line[i + len(NA_MARKER):].strip()
+            return what or "op=other | (claude не уточнил красное действие — см. вывод задачи)"
+    low = t.lower()
+    if any(p in low for p in _NA_FALLBACK):
+        return "op=other | (гейт заблокировал красное; claude не дал маркер — вывод:)\n" + t[:1400]
+    return None
+
+
+def _heartbeat_loop(task_id, stop_event):
+    """Фон-поток: пока задача исполняется, каждые HEARTBEAT_SEC бьёт updated в Bridge
+    (доказывает, что демон жив → report_results на стороне Splinter не поднимет «завис»).
+    Ошибки heartbeat ГЛУШИМ — heartbeat не должен валить исполнение задачи."""
+    while not stop_event.wait(HEARTBEAT_SEC):
+        try:
+            bc.task_heartbeat(task_id)
+        except Exception as e:
+            log.warning("id=%s heartbeat упал (глушу): %s", task_id, e)
+
+
+def _task_timeout(task):
+    """Таймаут по метке from очереди: дев-ТЗ («тз:», from=*-dev) и декомпозиция (from=*-dec,
+    планирование-разведка и шаги — те же дев-ТЗ) → 45 мин, остальное → 10 мин."""
+    frm = str(task.get("from") or "")
+    return TASK_TIMEOUT_DEV if frm.endswith((DEV_FROM_SUFFIX, DEC_FROM_SUFFIX)) else TASK_TIMEOUT
+
+
+def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
+    """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
+    status ∈ done|failed|needs_approval (красная зона — самодекларация claude через маркер).
+    preamble: None → боевая APPROVAL_PREAMBLE; планировщик декомпозиции передаёт PLANNER_PREAMBLE."""
+    log.info("ИСПОЛНЕНИЕ id=%s через claude -p (timeout=%ss)", task_id, task_timeout)
+    child_env = dict(os.environ)
+    child_env.setdefault("HOME", "/root")
+    child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    # Фикс утечки баланса: демон load_dotenv'ит .env (ради BRIDGE) → ANTHROPIC_API_KEY коллатерально
+    # попадает в os.environ. Снимаем его (и OPENAI) из child_env, чтобы claude -p шёл по ~/.claude (Max),
+    # а НЕ по платному API. Splinter не затронут (он ключ берёт из своего процесса, не через claude -p).
+    child_env.pop("ANTHROPIC_API_KEY", None)
+    child_env.pop("OPENAI_API_KEY", None)
+    prompt = (preamble if preamble is not None else APPROVAL_PREAMBLE) + task_text
+    # Heartbeat: фон-поток бьёт updated, пока claude -p блокирующе исполняется. Останавливаем в finally.
+    _hb_stop = threading.Event()
+    _hb = threading.Thread(target=_heartbeat_loop, args=(task_id, _hb_stop), daemon=True)
+    _hb.start()
+    # Кондуктор: --model основная (Fable 5) + --fallback-model прежняя (Opus 4.8 1M). При
+    # overload/недоступности/лимите/неверном имени primary CLI сам переключается на fallback внутри
+    # ОДНОГО вызова (без двойного исполнения). --output-format json → из ответа достаём и текст
+    # (result), и КАКАЯ модель реально отработала (ключи modelUsage) для явной строки в лог.
+    # prompt — ПОСЛЕДНИМ аргументом (позиционный; тест-моки читают args[-1]).
+    cmd = [CLAUDE_BIN, "-p",
+           "--model", ORCH_MODEL,
+           "--fallback-model", ORCH_MODEL_FALLBACK,
+           "--output-format", "json",
+           prompt]                          # список аргументов, БЕЗ shell → нет инъекции через task_text
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=REPO,
+            capture_output=True, text=True,
+            timeout=task_timeout,
+            env=child_env,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("id=%s ТАЙМАУТ %ss — задача прервана", task_id, task_timeout)
+        return "failed", f"таймаут {task_timeout}s — claude -p прерван, задача не завершилась"
+    except Exception as e:
+        log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
+        return "failed", f"ошибка запуска claude -p: {e}"
+    finally:
+        _hb_stop.set()
+        _hb.join(timeout=5)
+
+    raw = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+
+    # --output-format json: {result:<текст>, modelUsage:{<модель>:{…}}, is_error, api_error_status}.
+    # Достаём текст ответа (result) и КАКАЯ модель реально отработала (ключи modelUsage). Парс-фейл
+    # (пустой/не-json вывод, тест-моки с plain text) → деградация на сырой stdout, как в текст-режиме.
+    out, models_ran = raw, []
+    try:
+        j = json.loads(raw)
+        out = (j.get("result") or "").strip()
+        models_ran = list((j.get("modelUsage") or {}).keys())
+    except Exception:
+        pass
+    if models_ran:
+        ran = ",".join(models_ran)
+        picked = "фолбэк" if ORCH_MODEL not in ran and ORCH_MODEL_FALLBACK in ran else "основная"
+        log.info("id=%s модель отработала: %s (запрошена=%s, фолбэк=%s, взята=%s)",
+                 task_id, ran, ORCH_MODEL, ORCH_MODEL_FALLBACK, picked)
+    else:
+        log.info("id=%s модель: запрошена=%s фолбэк=%s (modelUsage пуст — ошибка резолва / текст-режим)",
+                 task_id, ORCH_MODEL, ORCH_MODEL_FALLBACK)
+
+    # Красная зона: claude самодекларировал, что нужно «да» Филиппа → needs_approval (НЕ failed).
+    what = _detect_needs_approval(out)
+    if what is not None:
+        log.info("id=%s NEEDS_APPROVAL: %.140s", task_id, what)
+        return "needs_approval", what[:RESULT_MAX]
+
+    if proc.returncode != 0:
+        # фикс класса (урок 105): убит ПЛАНОВЫМ рестартом демона (самомодификация) → это НЕ сбой
+        if _killed_by_planned_restart(proc.returncode, task_text):
+            log.info("id=%s claude -p погашен ПЛАНОВЫМ рестартом демона (exit=%s) → done с пометкой",
+                     task_id, proc.returncode)
+            return "done", (
+                "🔁 Завершено плановым рестартом демона (самомодификация): claude-процесс задачи "
+                "штатно погашен отложенным systemd-run restart — по доктрине рестарт ставится "
+                "ПОСЛЕДНИМ действием, работа к этому моменту сделана. Итоги — в cc_log (RESULT "
+                "задачи) и git log. Это НЕ сбой.")
+        log.warning("id=%s claude -p exit=%s", task_id, proc.returncode)
+        # §12 корень 3: чистая карточка провала, НЕ сырой дамп stdout+stderr (шум).
+        return "failed", _fail_card(out, err, proc.returncode)
+    log.info("id=%s claude -p exit=0 (вывод %d симв)", task_id, len(out))
+    return "done", (out[:RESULT_MAX] if out else "(claude -p вернул пустой вывод)")
+
+
+# === ИСПОЛНИТЕЛИ красных op (хардкод-команды; claude НЕ участвует, op-код детерминирует команду) ===
+def _exec_git_push(task_id):
+    """op=git_push: git push текущей ветки. БЕЗ --no-verify → pre-push hook 4.3 (gate.py) остаётся."""
+    try:
+        p = subprocess.run(["git", "push"], cwd=REPO, capture_output=True, text=True, timeout=OP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "failed", f"git push: таймаут {OP_TIMEOUT}s"
+    out = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+    if p.returncode != 0:
+        return "failed", f"git push exit={p.returncode}: {out}"[:RESULT_MAX]
+    return "done", f"git push выполнен:\n{out}"[:RESULT_MAX]
+
+
+def _exec_restart_splinter(task_id):
+    """op=restart_splinter: systemctl restart splinter + проверка is-active после."""
+    try:
+        p = subprocess.run(["systemctl", "restart", "splinter"], capture_output=True, text=True, timeout=OP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "failed", f"restart splinter: таймаут {OP_TIMEOUT}s"
+    if p.returncode != 0:
+        return "failed", f"restart splinter exit={p.returncode}: {(p.stderr or '').strip()}"[:RESULT_MAX]
+    chk = subprocess.run(["systemctl", "is-active", "splinter"], capture_output=True, text=True)
+    state = (chk.stdout or "").strip()
+    if state != "active":
+        return "failed", f"restart splinter: после рестарта is-active={state} (НЕ active!)"
+    return "done", "splinter перезапущен, is-active=active"
+
+
+EXECUTORS = {"git_push": _exec_git_push, "restart_splinter": _exec_restart_splinter}
+
+
+# === ДЕКОМПОЗЕР: функции (родитель → план → шаги → guard → сводка) ===
+def _is_dec(task):
+    """Задача семейства декомпозиции (from=*-dec: родитель / шаг / synthetic-сводка)."""
+    return str(task.get("from") or "").endswith(DEC_FROM_SUFFIX)
+
+
+def _parse_steps(text):
+    """Нумерованные строки плана «N. <шаг>» / «N) <шаг>» → список текстов шагов (по порядку).
+    Прочие строки (пустые, преамбулы, маркдаун) молча игнорируются — планировщику велено их не давать."""
+    steps = []
+    for line in (text or "").splitlines():
+        m = _PLAN_LINE_RE.match(line)
+        if m:
+            steps.append(m.group(2).strip())
+    return steps
+
+
+def _dec_siblings(pid, statuses):
+    """Шаги родителя pid в указанных статусах очереди → [(step_i, step_n, item), …]. read-only."""
+    out = []
+    for st in statuses:
+        try:
+            r = bc.get_pending(st)
+        except Exception as e:
+            log.warning("dec: get_pending(%s) упал (%s)", st, e)
+            continue
+        if not r.get("ok"):
+            continue
+        for it in r.get("items", []):
+            m = _STEP_RE.match(str(it.get("task_text") or ""))
+            if m and int(m.group(3)) == pid:
+                out.append((int(m.group(1)), int(m.group(2)), it))
+    return out
+
+
+def _dec_step_blocked(pid):
+    """True → шаг родителя pid брать НЕЛЬЗЯ: сиблинг висит в needs_approval/approved/in_progress
+    (порядок исполнения важнее скорости). Блокируется ТОЛЬКО эта цепочка — process_new возьмёт
+    следующую по FIFO чужую задачу."""
+    return bool(_dec_siblings(pid, _DEC_WAIT_STATUSES))
+
+
+def _dec_summary_text(pid):
+    """Сводный отчёт по родителю pid: все done/failed-шаги, отсортированные по номеру.
+    Строка на шаг = ✅/❌ + первая строка результата (сводка ≤400 от исполнителя)."""
+    rows = sorted(_dec_siblings(pid, ("done", "failed")),
+                  key=lambda x: (x[0], int(x[2].get("id") or 0)))
+    # адаптация плана (кусок 2): заменённые/досрочно закрытые шаги (done+♻️/⏭-карта) — не
+    # результаты работы, из сводки исключаются (их закрытие уже отрапортовано отдельно)
+    rows = [(i, n, it) for i, n, it in rows
+            if not str(it.get("result") or "").lstrip().startswith(
+                (ADAPT_REPLACED_MARK, ADAPT_FINISH_MARK))]
+    # самопочинка может дать ДВЕ записи на один номер шага (исходный 🩹-done + перерождённый);
+    # в сводке оставляем ПОСЛЕДНЮЮ по id (реальный финал шага). Без дублей — поведение прежнее.
+    last = {}
+    for i, n, it in rows:
+        last[i] = (i, n, it)
+    rows = [last[k] for k in sorted(last)]
+    if not rows:
+        return f"🧩 Сводка декомпозиции (родитель {pid}): шагов не найдено (очередь пуста?)"
+    n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
+    total = rows[-1][1]     # хвостовой шаг несёт АКТУАЛЬНЫЙ итог плана (adjust мог сменить N);
+                            # в обычной цепи все N равны — поведение прежнее
+    head = f"🧩 Сводка декомпозиции (родитель {pid}): {n_done}/{total} шагов done"
+    fin = _adapt_finish.get(pid)
+    if fin:
+        head += f", 🏁 завершено досрочно: {fin}"
+    elif n_done < len(rows):
+        head += ", есть упавшие/пропущенные"
+    lines = [head]
+    for i, n, it in rows:
+        emoji = "✅" if str(it.get("status")) == "done" else "❌"
+        first = (str(it.get("result") or "").strip().splitlines() or ["(пусто)"])[0]
+        lines.append(f"{emoji} шаг {i}/{n}: {first[:400]}")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+_summarized = set()      # родители, по которым сводка уже отправлена (память процесса; после
+                         # рестарта демона от дублей защищает скан существующих сводок ниже)
+
+
+def _dec_summary_exists(pid):
+    """Сводка по родителю pid уже есть в очереди (в любом живом статусе)? Защита от дубля."""
+    mark = f"[сводка родитель {pid}]"
+    for st in ("done", "new", "in_progress"):
+        try:
+            r = bc.get_pending(st)
+        except Exception:
+            continue
+        if r.get("ok") and any(str(it.get("task_text") or "").startswith(mark)
+                               for it in r.get("items", [])):
+            return True
+    return False
+
+
+def _dec_post_summary(pid):
+    """Все шаги родителя pid финальны → отдать сводку в 328 synthetic-задачей (enqueue→claim→done).
+    Очередь — единственный канал демона в 328; devbot принесёт её как обычный done-рапорт.
+    Идемпотентно: повторный вызов (рестарт демона, хвостовой скан) дубля не даёт."""
+    if pid in _summarized:
+        return
+    if _dec_summary_exists(pid):
+        _summarized.add(pid)
+        return
+    text = _dec_summary_text(pid)
+    r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", f"[сводка родитель {pid}] сводный отчёт по шагам")
+    if not r.get("ok"):
+        log.warning("dec: сводка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
+    cm = bc.complete_task(sid, "done", text)
+    _summarized.add(pid)
+    log.info("dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
+
+
+def process_dec_tails():
+    """Хвост декомпозиции, финализированный МИМО демона (напр. «нет N» по шагу → devbot ставит
+    failed без хука цепочки): если у родителя есть failed-шаг, живых шагов не осталось, а сводки
+    нет — отправить сводку. Дёшево: 1 get_pending(failed) на цикл, детали — только по новым pid."""
+    try:
+        r = bc.get_pending("failed")
+    except Exception as e:
+        log.warning("dec tails: get_pending(failed) упал (%s)", e)
+        return
+    if not r.get("ok"):
+        return
+    pids = set()
+    for it in r.get("items", []):
+        m = _STEP_RE.match(str(it.get("task_text") or ""))
+        if m:
+            pids.add(int(m.group(3)))
+    for pid in pids - _summarized:
+        if _dec_siblings(pid, ("new",) + _DEC_WAIT_STATUSES):
+            continue        # цепочка ещё живёт — сводка придёт штатным хуком/пропуском шагов
+        _dec_post_summary(pid)
+
+
+def _dec_after_step(pid, step_i, step_n, status):
+    """Хук после финала шага: done → адаптация плана (PLAN_ADAPT, кусок 2 мета-дирижёра);
+    failed → пропустить оставшиеся new-сиблинги (цепочка зависимая, дальше идти опасно);
+    все финальны → сводка по родителю."""
+    if status == "done":
+        try:
+            _maybe_plan_adapt(pid, step_i, step_n)
+        except Exception as e:      # адаптация — слой-надстройка: её сбой НЕ валит хук цепи
+            log.warning("plan-adapt: сбой адаптации родителя %s (%s) — fail-safe keep", pid, e)
+    if status == "failed":
+        for i, n, it in sorted(_dec_siblings(pid, ("new",)), key=lambda x: x[0]):
+            bc.complete_task(it.get("id"), "failed",
+                             f"⏭ пропущен: шаг {step_i}/{step_n} родителя {pid} упал — цепочка остановлена")
+            log.info("dec: шаг %s/%s родителя %s пропущен (цепочка остановлена)", i, n, pid)
+    if not _dec_siblings(pid, ("new",) + _DEC_WAIT_STATUSES):
+        _dec_post_summary(pid)
+
+
+def _maybe_dec_after(task_text, status):
+    """Если финализированная задача — шаг декомпозиции, дёрнуть хук цепочки (halt/сводка)."""
+    m = _STEP_RE.match(str(task_text or ""))
+    if m and status in ("done", "failed"):
+        _dec_after_step(int(m.group(3)), int(m.group(1)), int(m.group(2)), status)
+
+
+# === САМОПОЧИНКА ШАГА: функции (диагноз думателя → 1 перерождение / терминальный halt) ===
+def _dec_parent_context(pid):
+    """Контекст родителя pid для думателя: (исходная цель дословно, план шагов). Родитель после
+    fan-out лежит в done (task_text = цель, result = план). Не нашли → заглушки (не валимся)."""
+    try:
+        r = bc.get_pending("done")
+        if r.get("ok"):
+            for it in r.get("items", []):
+                if int(it.get("id") or 0) == int(pid):
+                    return (str(it.get("task_text") or "").strip()[:1500],
+                            str(it.get("result") or "").strip()[:2000])
+    except Exception as e:
+        log.warning("selfheal: контекст родителя %s не прочитан (%s)", pid, e)
+    return (f"(родитель {pid} не найден в очереди)", "(план недоступен)")
+
+
+def _parse_thinker_json(text, fix_key="fixed_step"):
+    """Строгий парс ответа думателя → {"verdict",<fix_key>,"reason"} или None (fail-safe).
+    fix_key: "fixed_step" (шаг декомпозера) / "fixed_task" (одиночная задача, расширение ст4).
+    Терпим обёртку-мусор вокруг JSON (берём от первой { до последней }), но verdict обязан быть
+    retry|halt — иначе None."""
+    t = (text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = str(d.get("verdict") or "").strip().lower()
+    if v not in ("retry", "halt"):
+        return None
+    return {"verdict": v,
+            fix_key: str(d.get(fix_key) or "").strip(),
+            "reason": str(d.get("reason") or "").strip()}
+
+
+def _thinker_exec(prompt, timeout, tag):
+    """Общий запуск думателя (самопочинка кусок 1 / адаптация плана кусок 2): claude -p через
+    кондуктор ORCH_MODEL/ORCH_MODEL_FALLBACK, чистый генератор (--max-turns 1 — один ответ, без
+    инструментального цикла). Возврат: текст ответа (распакован из CLI-конверта
+    --output-format json) или None при ЛЮБОМ сбое (запуск/таймаут/exit!=0) — fail-safe."""
+    child_env = dict(os.environ)
+    child_env.setdefault("HOME", "/root")
+    child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+    child_env.pop("ANTHROPIC_API_KEY", None)   # как в run_task: идём по ~/.claude, не по платному API
+    child_env.pop("OPENAI_API_KEY", None)
+    cmd = [CLAUDE_BIN, "-p",
+           "--model", ORCH_MODEL,
+           "--fallback-model", ORCH_MODEL_FALLBACK,
+           "--output-format", "json",
+           "--max-turns", "1",
+           prompt]                             # prompt последним (тест-моки читают args[-1])
+    try:
+        proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
+                              timeout=timeout, env=child_env)
+    except Exception as e:
+        log.warning("%s: думатель не отработал (%s) — fail-safe", tag, e)
+        return None
+    raw = (proc.stdout or "").strip()
+    out = raw
+    try:
+        env_j = json.loads(raw)
+        if isinstance(env_j, dict) and "result" in env_j:   # CLI-конверт --output-format json
+            out = (env_j.get("result") or "").strip()
+    except Exception:
+        pass
+    if proc.returncode != 0:
+        log.warning("%s: думатель exit=%s — fail-safe", tag, proc.returncode)
+        return None
+    return out
+
+
+def _selfheal_consult(pid, step_i, step_n, step_text, fail_text):
+    """Думатель самопочинки: промпт = цель родителя ДОСЛОВНО + план шагов + упавший шаг + суть
+    провала (как _fail_card). Возврат: dict вердикта или None (любой сбой думателя = None =
+    fail-safe прежний halt-on-fail)."""
+    goal, plan = _dec_parent_context(pid)
+    prompt = (THINKER_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ПЛАН ШАГОВ РОДИТЕЛЯ:\n{plan}\n\n"
+              f"УПАВШИЙ ШАГ {step_i}/{step_n} (текст дословно):\n{step_text}\n\n"
+              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+    out = _thinker_exec(prompt, STEP_SELFHEAL_TIMEOUT, "selfheal")
+    if out is None:
+        return None
+    verdict = _parse_thinker_json(out)
+    if verdict is None:
+        log.warning("selfheal: ответ думателя не распарсился (fail-safe halt): %.200s", out)
+    return verdict
+
+
+def _task_selfheal_consult(task_text, fail_text):
+    """Думатель самопочинки ОДИНОЧНОЙ задачи (расширение ст4): контекст — текст задачи ДОСЛОВНО +
+    суть провала (родителя/плана у одиночной нет). Возврат: dict {"verdict","fixed_task","reason"}
+    или None (любой сбой думателя = None = fail-safe прежний голый failed)."""
+    prompt = (TASK_THINKER_PREAMBLE +
+              f"УПАВШАЯ ЗАДАЧА (текст дословно):\n{str(task_text or '')[:2000]}\n\n"
+              f"СУТЬ ПРОВАЛА:\n{str(fail_text or '')[:1200]}\n")
+    out = _thinker_exec(prompt, STEP_SELFHEAL_TIMEOUT, "task-selfheal")
+    if out is None:
+        return None
+    verdict = _parse_thinker_json(out, fix_key="fixed_task")
+    if verdict is None:
+        log.warning("task-selfheal: ответ думателя не распарсился (fail-safe failed): %.200s", out)
+    return verdict
+
+
+def _maybe_task_selfheal(tid, text, fail_text, frm):
+    """Провал ОДИНОЧНОЙ задачи («тз:»/«задача:», НЕ шаг декомпозера) → тот же думательный слой,
+    РОВНО 1 попытка (расширение ст4, 07.07.2026, тот же флаг STEP_SELFHEAL). Возврат True =
+    финализация сделана здесь (перерождение / терминальный failed с диагнозом); False = прежний
+    голый failed в вызывающем коде (fail-safe). Красное НЕ ослаблено: сюда доходит только
+    исполнительский failed — needs_approval отсечён раньше в process_new, а плановый рестарт
+    самомод-задачи (фикс 48d9c64) уже стал done внутри run_task и думателя не видит.
+    Конверты одобренных заявок ([конверт…]) НЕ трогаем: их маркер обязан стоять ПЕРВЫМ —
+    по нему работает разрыв петли ре-конвертов (_is_convert), перерождение сдвинуло бы его.
+    PLAN_ADAPT на одиночные НЕ распространяется — плана у одиночной задачи нет."""
+    if _is_convert(text):
+        return False
+    if str(frm or "").endswith(DEC_FROM_SUFFIX):
+        return False                          # артефакт декомпозиции без [шаг i/N] — не одиночная задача
+    hm = _HEAL_TASK_RE.match(str(text or ""))
+    if hm:
+        # перерождённая задача упала ПОВТОРНО → терминальный failed (без retry) — петля невозможна
+        oid = hm.group(1)
+        bc.complete_task(tid, "failed",
+                         (f"🛑 самопочинка не помогла (попытка 1 исчерпана): перерождение задачи "
+                          f"{oid} упало повторно — нужен человек.\n{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("task-selfheal: id=%s (перерождение задачи %s) упал ПОВТОРНО → терминальный failed",
+                 tid, oid)
+        return True
+    verdict = _task_selfheal_consult(text, fail_text)
+    if verdict is None:
+        return False                          # fail-safe: сбой думателя = прежний голый failed
+    reason = verdict["reason"] or "(без причины)"
+    fixed = verdict["fixed_task"]
+    if verdict["verdict"] != "retry" or not fixed:
+        bc.complete_task(tid, "failed",
+                         (f"задача упала → думатель: halt, причина: {reason}\n"
+                          f"Перерождение не поможет (диагноз думателя выше), нужен человек.\n"
+                          f"{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("task-selfheal: id=%s → думатель halt (%s)", tid, reason[:120])
+        return True
+    reborn = f"[самопочинка задачи {tid}, попытка 1] {fixed}"[:RESULT_MAX]
+    r = bc.enqueue_task(frm or f"Filipp-328{DEV_FROM_SUFFIX}", reborn)
+    if not r.get("ok"):
+        log.warning("task-selfheal: перерождение задачи id=%s не встало в очередь (%s) — fail-safe failed",
+                    tid, r.get("error"))
+        return False                          # fail-safe: очередь не приняла → прежний голый failed
+    nid = r.get("id")
+    card = (f"🩹 задача упала → думатель: retry, правка: {fixed[:200]}, причина: {reason[:200]}\n"
+            f"Перерождена задачей id {nid} (попытка 1 из 1; повторный провал = терминальный failed).\n"
+            f"Исходный провал: {str(fail_text or '')[:400]}")
+    bc.complete_task(tid, "done", card[:RESULT_MAX])
+    log.info("task-selfheal: id=%s перерождён задачей %s (retry)", tid, nid)
+    return True
+
+
+def _maybe_selfheal(tid, text, fail_text, frm=""):
+    """Провал задачи (исполнительский failed) → думательный слой, РОВНО 1 попытка самопочинки:
+    шаг декомпозера — с контекстом родителя (кусок 1); одиночная «тз:»/«задача:» — по тексту
+    задачи (расширение ст4). Возврат True = финализация сделана здесь (перерождение / терминальный
+    halt с диагнозом); False = ничего не делал → прежний путь в вызывающем коде (fail-safe)."""
+    if not _selfheal_on():
+        return False
+    m = _STEP_RE.match(str(text or ""))
+    if not m:
+        return _maybe_task_selfheal(tid, text, fail_text, frm)
+    step_i, step_n, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if _HEAL_RE.search(text):
+        # перерождённый шаг упал ПОВТОРНО → терминальный halt (без retry) — петля невозможна
+        bc.complete_task(tid, "failed",
+                         (f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {step_i}/{step_n} "
+                          f"родителя {pid} упал повторно — цепочка остановлена, нужен человек.\n"
+                          f"{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("selfheal: id=%s шаг %s/%s родителя %s упал ПОВТОРНО → терминальный halt",
+                 tid, step_i, step_n, pid)
+        _maybe_dec_after(text, "failed")
+        return True
+    verdict = _selfheal_consult(pid, step_i, step_n, text, fail_text)
+    if verdict is None:
+        return False                          # fail-safe: сбой думателя = прежнее поведение
+    reason = verdict["reason"] or "(без причины)"
+    fixed = verdict["fixed_step"]
+    if verdict["verdict"] != "retry" or not fixed:
+        bc.complete_task(tid, "failed",
+                         (f"шаг {step_i}/{step_n} упал → думатель: halt, причина: {reason}\n"
+                          f"Цепочка остановлена (диагноз думателя выше).\n"
+                          f"{str(fail_text or '')}")[:RESULT_MAX])
+        log.info("selfheal: id=%s шаг %s/%s родителя %s → думатель halt (%s)",
+                 tid, step_i, step_n, pid, reason[:120])
+        _maybe_dec_after(text, "failed")
+        return True
+    reborn = (f"[шаг {step_i}/{step_n} родитель {pid}] "
+              f"[самопочинка шага {step_i}, попытка 1] {fixed}")[:RESULT_MAX]
+    r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", reborn)
+    if not r.get("ok"):
+        log.warning("selfheal: перерождение шага id=%s не встало в очередь (%s) — fail-safe halt",
+                    tid, r.get("error"))
+        return False                          # fail-safe: очередь не приняла → прежний halt
+    nid = r.get("id")
+    card = (f"🩹 шаг {step_i}/{step_n} упал → думатель: retry, правка: {fixed[:200]}, "
+            f"причина: {reason[:200]}\n"
+            f"Перерождён задачей id {nid} (попытка 1 из 1; повторный провал = терминальный halt).\n"
+            f"Исходный провал: {str(fail_text or '')[:400]}")
+    bc.complete_task(tid, "done", card[:RESULT_MAX])
+    log.info("selfheal: id=%s шаг %s/%s родителя %s перерождён задачей %s (retry)",
+             tid, step_i, step_n, pid, nid)
+    _maybe_dec_after(text, "done")
+    return True
+
+
+# === АДАПТАЦИЯ ПЛАНА (мета-дирижёр кусок 2, KB_MASTER §4, заведено 07.07.2026) ===
+# После КАЖДОГО done-шага декомпозера (при PLAN_ADAPT=1 в .env, отдельный флаг) думатель — та же
+# схема, что самопочинка: claude -p через кондуктор ORCH_MODEL/FALLBACK, чистый генератор
+# (--max-turns 1) — сверяет результаты с целью родителя и решает дальнейший план. Строгий JSON
+# {"verdict":"keep"|"adjust"|"finish","adjusted_steps":[…],"reason":"1 строка"}:
+#   keep   → оставшиеся шаги исполняются как были (ноль изменений в очереди);
+#   adjust → оставшиеся new-шаги заменяются adjusted_steps (СДЕЛАННЫЕ не трогаются); новые шаги
+#            несут маркер «[коррекция плана K]», в 328 идёт карточка «после шага i думатель
+#            скорректировал план: <reason>». МАКСИМУМ 2 коррекции на цепь (счётчик K —
+#            restart-proof, выводится из маркеров в очереди): третий adjust → терминальный halt
+#            «план дрейфует, нужен владелец» с диагнозом;
+#   finish → цель достигнута досрочно: оставшиеся шаги закрываются пропуском, сводка родителя —
+#            с пометкой «завершено досрочно: <reason>».
+# «skipped» РЕАЛИЗОВАН КАК done+маркер-карта (⏭ досрочно / ♻️ заменён): Bridge completeTask_
+# принимает ТОЛЬКО done|failed (bad_status), а редеплой Bridge = красная зона; failed нельзя —
+# failed-сиблинг глушит цепь (guard в process_new). Сводка эти карты ИСКЛЮЧАЕТ (не результаты).
+# ЭКОНОМИЯ ЛИМИТОВ: оставшихся шагов 0 (последний шаг) → думатель НЕ зовётся (сводка и так
+# финалит); план из 2 шагов ⇒ зовётся только после шага 1 (то же правило).
+# FAIL-SAFE везде: думатель упал / таймаут / мусор-JSON / verdict вне словаря / adjust с пустым
+# adjusted_steps / переполнение потолка MAX_STEPS / enqueue коррекции не встал → keep (план как
+# есть, не хуже текущего). Красное НЕ ослаблено: скорректированный шаг идёт обычным путём
+# (NEEDS_APPROVAL → кнопка). Совместимость с самопочинкой (STEP_SELFHEAL): провал шага →
+# самопочинка; done шага → адаптация; после 🩹-done исходного упавшего шага адаптация НЕ зовётся
+# (перерождение того же номера ещё в очереди — guard по номеру шага).
+# PLAN_ADAPT=0/нет → ветка не зовётся вовсе (байт-в-байт прежнее поведение, независимый откат).
+PLAN_ADAPT_TIMEOUT = 180      # думатель — чистый генератор без tools, ответ короткий
+PLAN_ADAPT_MAX = 2            # потолок коррекций на цепь; третий adjust = дрейф плана → halt
+_ADAPT_MARK_RE = re.compile(r"\[коррекция плана (\d+)\]")
+_ADAPT_CARD_RE = re.compile(r"^\[коррекция плана родитель (\d+)\]")
+ADAPT_REPLACED_MARK = "♻️ заменён коррекцией плана"
+ADAPT_FINISH_MARK = "⏭ закрыт досрочно"
+_adapt_finish = {}            # pid → reason досрочного финиша (память процесса; сводка идёт
+                              # в ТОМ ЖЕ вызове _dec_after_step, рестарт между ними не страшен)
+ADAPT_PREAMBLE = (
+    "Ты — думательный слой адаптации плана оркестратора TurboBaby (мета-дирижёр). Очередной шаг "
+    "декомпозиции успешно завершён. Твоя задача — сверить результаты сделанного с целью родителя "
+    "и решить, верен ли ЕЩЁ оставшийся план; ты НИЧЕГО не исполняешь, инструментов у тебя нет, "
+    "файлы не читаешь — решай строго по данным ниже.\n"
+    "Ответь СТРОГО ОДНИМ JSON-объектом, без текста до/после, без markdown-обёртки:\n"
+    '{"verdict":"keep"|"adjust"|"finish","adjusted_steps":["<шаг>",...],"reason":"<1 строка>"}\n'
+    "verdict=keep — оставшийся план верен, исполнять как есть (adjusted_steps пустой). Это "
+    "ДЕФОЛТ: при малейшем сомнении — keep.\n"
+    "verdict=adjust — ТОЛЬКО если результаты сделанных шагов сделали оставшиеся лишними/"
+    "неверными и правка очевидна; adjusted_steps = НОВЫЙ полный список ОСТАВШИХСЯ шагов "
+    "(сделанные не трогай), каждый — САМОДОСТАТОЧНОЕ дев-ТЗ ≤400 символов (исполнитель увидит "
+    "ТОЛЬКО его текст, впиши нужный контекст).\n"
+    "verdict=finish — цель родителя УЖЕ достигнута, оставшиеся шаги не нужны вовсе "
+    "(adjusted_steps пустой).\n\n"
+)
+
+
+def _plan_adapt_on():
+    """Флаг PLAN_ADAPT=1 в .env (отдельно от STEP_SELFHEAL). 0/нет → прежнее поведение."""
+    return (os.environ.get("PLAN_ADAPT") or "").strip() == "1"
+
+
+def _parse_adapt_json(text):
+    """Строгий парс ответа думателя адаптации → {"verdict","adjusted_steps","reason"} или None
+    (None = fail-safe keep у вызывающего). Терпим обёртку-мусор вокруг JSON; verdict обязан быть
+    keep|adjust|finish; adjust без непустых adjusted_steps → None (пустой adjusted = keep)."""
+    t = (text or "").strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i < 0 or j <= i:
+        return None
+    try:
+        d = json.loads(t[i:j + 1])
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = str(d.get("verdict") or "").strip().lower()
+    if v not in ("keep", "adjust", "finish"):
+        return None
+    raw_steps = d.get("adjusted_steps")
+    steps = ([str(s).strip() for s in raw_steps if str(s).strip()]
+             if isinstance(raw_steps, list) else [])
+    if v == "adjust" and not steps:
+        return None
+    return {"verdict": v, "adjusted_steps": steps, "reason": str(d.get("reason") or "").strip()}
+
+
+def _adapt_count(pid):
+    """Сколько коррекций уже было у цепи родителя pid = max K из маркеров «[коррекция плана K]»
+    среди шагов очереди. Restart-proof: счётчик выводится из очереди, не из памяти процесса."""
+    k = 0
+    for _i, _n, it in _dec_siblings(pid, ("new", "done", "failed")):
+        m = _ADAPT_MARK_RE.search(str(it.get("task_text") or ""))
+        if m:
+            k = max(k, int(m.group(1)))
+    return k
+
+
+def _adapt_post_card(pid, card):
+    """Карточка адаптации в 328 synthetic-задачей (enqueue→claim→done) — как сводка декомпозера:
+    очередь = единственный канал демона в 328, devbot принесёт done-рапортом."""
+    r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}",
+                        f"[коррекция плана родитель {pid}] карточка адаптации плана")
+    if not r.get("ok"):
+        log.warning("plan-adapt: карточка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
+    bc.complete_task(sid, "done", card[:RESULT_MAX])
+
+
+def _adapt_consult(pid, step_i, remaining):
+    """Думатель адаптации: цель родителя ДОСЛОВНО + исходный план + результаты сделанных шагов
+    (сжато: первая строка = сводка ≤400 исполнителя) + оставшиеся шаги → вердикт keep/adjust/
+    finish. Возврат: dict вердикта или None (любой сбой = None = fail-safe keep)."""
+    goal, plan = _dec_parent_context(pid)
+    done_last = {}                        # номер шага → финальный результат (последний по id:
+    for i, _n, it in sorted(_dec_siblings(pid, ("done",)),   # 🩹-дубли самопочинки затираются)
+                            key=lambda x: (x[0], int(x[2].get("id") or 0))):
+        res = str(it.get("result") or "").strip()
+        if res.startswith((ADAPT_REPLACED_MARK, ADAPT_FINISH_MARK)):
+            continue                      # закрытые адаптацией — не результаты работы
+        done_last[i] = res
+    done_lines = [f"шаг {i}: {(done_last[i].splitlines() or ['(пусто)'])[0][:300]}"
+                  for i in sorted(done_last)] or ["(результатов пока нет)"]
+    rem_lines = [f"шаг {i}: {_STEP_RE.sub('', str(it.get('task_text') or ''), 1).strip()[:400]}"
+                 for i, _n, it in remaining]
+    prompt = (ADAPT_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ИСХОДНЫЙ ПЛАН ШАГОВ:\n{plan}\n\n"
+              f"РЕЗУЛЬТАТЫ СДЕЛАННЫХ ШАГОВ (сжато; только что завершён шаг {step_i}):\n"
+              + "\n".join(done_lines) + "\n\n"
+              "ОСТАВШИЕСЯ ШАГИ ПЛАНА:\n" + "\n".join(rem_lines) + "\n")
+    out = _thinker_exec(prompt, PLAN_ADAPT_TIMEOUT, "plan-adapt")
+    if out is None:
+        return None
+    v = _parse_adapt_json(out)
+    if v is None:
+        log.warning("plan-adapt: ответ думателя не распарсился/пуст (fail-safe keep): %.200s", out)
+    return v
+
+
+def _maybe_plan_adapt(pid, step_i, step_n):
+    """Адаптация плана после done-шага декомпозера (PLAN_ADAPT=1): keep → ничего; adjust →
+    заменить оставшиеся new-шаги (≤2 коррекций на цепь, третья = halt «план дрейфует»); finish →
+    закрыть оставшиеся досрочно. ЛЮБОЙ сбой = keep (план как есть). Вызывается из _dec_after_step
+    ДО проверки сводки — статусы, выставленные здесь, сводка увидит тем же вызовом."""
+    if not _plan_adapt_on():
+        return
+    remaining = sorted(_dec_siblings(pid, ("new",)), key=lambda x: x[0])
+    if not remaining:
+        return                            # последний шаг: думателя не звать (экономия лимитов)
+    if any(i <= step_i for i, _n, _it in remaining):
+        return                            # перерождение самопочинки этого номера ждёт в new —
+                                          # шаг реально НЕ закрыт (🩹-done лишь карточка)
+    verdict = _adapt_consult(pid, step_i, remaining)
+    if verdict is None or verdict["verdict"] == "keep":
+        return                            # keep / fail-safe: ноль изменений в очереди
+    reason = (verdict["reason"] or "(без причины)")[:300]
+    if verdict["verdict"] == "finish":
+        _adapt_finish[pid] = reason
+        for i, n, it in remaining:
+            bc.complete_task(it.get("id"), "done",
+                             f"{ADAPT_FINISH_MARK}: шаг {i}/{n} не нужен — цель родителя {pid} "
+                             f"достигнута после шага {step_i} (решение думателя): {reason}")
+        log.info("plan-adapt: родитель %s finish после шага %s → %s шагов закрыто досрочно (%s)",
+                 pid, step_i, len(remaining), reason[:120])
+        return
+    # adjust
+    steps = verdict["adjusted_steps"]
+    if step_i + len(steps) > MAX_STEPS:
+        log.warning("plan-adapt: родитель %s adjust дал %s шагов (итог > потолка %s) — fail-safe keep",
+                    pid, len(steps), MAX_STEPS)
+        return
+    k = _adapt_count(pid) + 1
+    if k > PLAN_ADAPT_MAX:
+        for i, n, it in remaining:
+            bc.complete_task(it.get("id"), "failed",
+                             f"🛑 план дрейфует: думатель запросил коррекцию №{k} (лимит "
+                             f"{PLAN_ADAPT_MAX} на цепь) — цепочка остановлена, нужен владелец. "
+                             f"Диагноз думателя: {reason}")
+        log.info("plan-adapt: родитель %s — adjust №%s (> лимита %s) → терминальный halt (дрейф)",
+                 pid, k, PLAN_ADAPT_MAX)
+        return
+    # порядок fail-safe: СНАЧАЛА полностью ставим новый план, ТОЛЬКО потом закрываем старый;
+    # не встал целиком → откатываем вставшие новые и живём по прежнему плану (keep)
+    new_total = step_i + len(steps)
+    ids = []
+    for j, s in enumerate(steps, start=step_i + 1):
+        r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}",
+                            (f"[шаг {j}/{new_total} родитель {pid}] [коррекция плана {k}] {s}")[:RESULT_MAX])
+        if r.get("ok"):
+            ids.append(r.get("id"))
+        else:
+            log.warning("plan-adapt: родитель %s шаг коррекции %s не встал (%s) — fail-safe keep",
+                        pid, j, r.get("error"))
+            for nid in ids:
+                bc.complete_task(nid, "done",
+                                 f"{ADAPT_REPLACED_MARK} — отменён: коррекция {k} не встала "
+                                 f"целиком, действует прежний план")
+            return
+    for i, n, it in remaining:
+        bc.complete_task(it.get("id"), "done",
+                         f"{ADAPT_REPLACED_MARK} {k}: шаг {i}/{n} заменён (решение думателя "
+                         f"после шага {step_i}): {reason}")
+    _adapt_post_card(pid, (
+        f"🧭 после шага {step_i} думатель скорректировал план (коррекция {k}/{PLAN_ADAPT_MAX}): {reason}\n"
+        f"Новых шагов {len(steps)} (id {', '.join(str(x) for x in ids)}), итог плана {new_total} "
+        f"шагов; сделанные шаги 1–{step_i} не тронуты. Третья коррекция = halt «план дрейфует»."))
+    log.info("plan-adapt: родитель %s adjust K=%s после шага %s → %s новых шагов (id %s)",
+             pid, k, step_i, len(steps), ids)
+
+
+# === ПК-ТЕАТР: функции (кусок 2 «один дирижёр, два театра», 07.07.2026) ===
+# Мозг (планировщик, думатели самопочинки/адаптации) живёт ТОЛЬКО здесь, на VPS; ПК-агент
+# (pc_orchestrator) — второй театр ИСПОЛНЕНИЯ шагов (claim lane=pc + headless CC, без мозга).
+# КЛЮЧЕВОЕ ОТЛИЧИЕ от vps-цепи: guard последовательности vps-цепи живёт в НАШЕМ process_new —
+# у ПК-агента такого guard'а нет (он claim'ит FIFO всё подряд). Веерный fan-out дал бы гонку:
+# после провала шага i ПК взял бы шаг i+1 раньше, чем мы его пропустим (halt-on-fail дырявый),
+# а перерождение самопочинки (id выше) исполнилось бы ПОСЛЕ следующих шагов. Поэтому шаги
+# релизятся ПО ОДНОМУ: в очереди lane=pc живёт максимум один шаг цепи, следующий встаёт только
+# после done предыдущего (+ адаптация). Состояние цепи restart-proof — целиком из очереди:
+# план = нумерованный список в result родителя, коррекции = карточки «[коррекция плана родитель N]»
+# с нумерованным остатком плана в result, прогресс = сами pc-шаги. Память процесса — только
+# дедуп-кэши (_summarized, _pc_adapted); после рестарта демона цепь продолжается с того же места.
+# ИЗОЛЯЦИЯ ПОЛОС НЕ ОСЛАБЛЕНА: читаем ТОЛЬКО шаги СВОИХ родителей (from=PC_DEC_FROM + [шаг i/N]);
+# одиночные pc-задачи (Filipp-pc / Filipp-pc-dev) не трогаем; claim чужой полосы НЕ делаем
+# (complete_task на своих шагах = финализация собственной цепи, как в vps-потоке).
+# ТАЙМАУТ: ПК может быть выключен → шаг висит (new не взят / in_progress без heartbeat /
+# approved не доведён) дольше PC_STEP_TIMEOUT → честный failed с диагнозом «ПК-театр не
+# отвечает» + halt цепи; думатель такое НЕ чинит (переформулировка не включит ПК).
+_PC_CARD_RE = re.compile(r"^\[карточка родитель (\d+)\]")
+_PC_ADAPT_BASE_RE = re.compile(r"после шага (\d+)")
+_PC_STATUSES = ("new", "in_progress", "needs_approval", "approved", "done", "failed")
+_pc_adapted = set()           # (pid, step_i), по которым думатель адаптации уже спрошен (память
+                              # процесса — рестарт даст максимум один лишний keep-вопрос)
+
+
+def _age_sec(updated_iso):
+    """Возраст updated задачи в секундах. None при ошибке разбора → таймаут НЕ объявляем
+    (лучше подождать цикл, чем убить живой шаг из-за парсинга; зеркало devbot._task_age_sec)."""
+    try:
+        s = str(updated_iso).replace("Z", "+00:00")
+        t = datetime.datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    except Exception:
+        return None
+
+
+def _pc_enqueue(text):
+    """Шаг цепи в очередь полосы pc (from=PC_DEC_FROM, lane=pc). Мок без lane-kwarg (легаси-тесты
+    сюда не заходят, страховка) → обычный enqueue."""
+    try:
+        return bc.enqueue_task(PC_DEC_FROM, text, lane=PC_LANE)
+    except TypeError:
+        return bc.enqueue_task(PC_DEC_FROM, text)
+
+
+def _pc_fetch_items():
+    """Все задачи полосы pc по статусам _PC_STATUSES → список items (у каждого есть status)
+    | None (ошибка чтения → пропустить цикл целиком: частичная картина опаснее ожидания).
+    Один CSV-вызов get_pending_multi, фоллбэк — по-статусно; мок без lane-kwarg → без lane
+    (фильтр по from=PC_DEC_FROM ниже отсеивает чужое)."""
+    fn = getattr(bc, "get_pending_multi", None)
+    if fn is not None:
+        try:
+            r = fn(_PC_STATUSES, lane=PC_LANE)
+        except TypeError:
+            r = fn(_PC_STATUSES)
+        if not r.get("ok"):
+            return None
+        return [it for it in r.get("items", []) if isinstance(it, dict)]
+    items = []
+    for st in _PC_STATUSES:
+        try:
+            rr = bc.get_pending(st, lane=PC_LANE)
+        except TypeError:
+            rr = bc.get_pending(st)
+        if not rr.get("ok"):
+            return None
+        for it in rr.get("items", []):
+            if isinstance(it, dict):
+                it.setdefault("status", st)
+                items.append(it)
+    return items
+
+
+def _pc_group_chains(items):
+    """items полосы pc → {pid: [(step_i, step_n, item), …]} ТОЛЬКО своих цепей
+    (from=PC_DEC_FROM + паттерн шага). Одиночные pc-задачи (Filipp-pc[-dev]) не попадают."""
+    chains = {}
+    for it in items:
+        if str(it.get("from") or "") != PC_DEC_FROM:
+            continue
+        m = _STEP_RE.match(str(it.get("task_text") or ""))
+        if m:
+            chains.setdefault(int(m.group(3)), []).append(
+                (int(m.group(1)), int(m.group(2)), it))
+    return chains
+
+
+def _pc_chain_steps(pid):
+    """Шаги цепи родителя pid с полосы pc (для осиротевшей сводки). Ошибка чтения → []."""
+    items = _pc_fetch_items()
+    return (_pc_group_chains(items).get(int(pid)) or []) if items is not None else []
+
+
+def _pc_post_card(pid, text):
+    """Событийная карточка цепи ПК-театра (🩹 retry / 🛑 terminal / halt-диагноз) в тему PC-дев
+    synthetic-задачей (enqueue vps → claim → done): очередь — единственный канал демона наружу,
+    devbot принесёт done-рапортом (from=PC_DEC_FROM → тема 829)."""
+    r = bc.enqueue_task(PC_DEC_FROM, f"[карточка родитель {pid}] событие цепи ПК-театра")
+    if not r.get("ok"):
+        log.warning("pc-dec: карточка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)                    # даже если claim не прошёл — complete финализирует
+    bc.complete_task(sid, "done", str(text)[:RESULT_MAX])
+
+
+def _pc_summary_text(pid, steps):
+    """Сводка цепи ПК-театра из переданных шагов (зеркало _dec_summary_text, но по снапшоту
+    pc-шагов — vps-читалка _dec_siblings их не видит). Дубли номера (провал+перерождение) —
+    последняя запись по id."""
+    rows = sorted([s for s in steps if str(s[2].get("status")) in ("done", "failed")],
+                  key=lambda x: (x[0], int(x[2].get("id") or 0)))
+    last = {}
+    for i, n, it in rows:
+        last[i] = (i, n, it)
+    rows = [last[k] for k in sorted(last)]
+    if not rows:
+        return f"🧩 Сводка декомпозиции (родитель {pid}, театр PC): шагов не найдено (очередь пуста?)"
+    n_done = sum(1 for _i, _n, it in rows if str(it.get("status")) == "done")
+    total = rows[-1][1]   # маркер последнего релизнутого шага несёт актуальный итог плана
+    head = f"🧩 Сводка декомпозиции (родитель {pid}, театр PC): {n_done}/{total} шагов done"
+    fin = _adapt_finish.get(pid)
+    if fin:
+        head += f", 🏁 завершено досрочно: {fin}"
+    elif n_done < len(rows):
+        head += ", есть упавшие/пропущенные"
+    lines = [head]
+    for i, n, it in rows:
+        emoji = "✅" if str(it.get("status")) == "done" else "❌"
+        first = (str(it.get("result") or "").strip().splitlines() or ["(пусто)"])[0]
+        lines.append(f"{emoji} шаг {i}/{n}: {first[:400]}")
+    return "\n".join(lines)[:RESULT_MAX]
+
+
+def _pc_post_summary(pid, steps):
+    """Финал цепи ПК-театра → сводка в тему PC-дев (synthetic done, как _dec_post_summary).
+    Идемпотентно: _summarized + скан существующих сводок (_dec_summary_exists — сводка лежит
+    на полосе vps, читалка её видит)."""
+    if pid in _summarized:
+        return
+    if _dec_summary_exists(pid):
+        _summarized.add(pid)
+        return
+    text = _pc_summary_text(pid, steps)
+    r = bc.enqueue_task(PC_DEC_FROM, f"[сводка родитель {pid}] сводный отчёт по шагам")
+    if not r.get("ok"):
+        log.warning("pc-dec: сводка родителя %s не встала в очередь (%s)", pid, r.get("error"))
+        return
+    sid = r.get("id")
+    bc.claim_task(sid)
+    cm = bc.complete_task(sid, "done", text)
+    _summarized.add(pid)
+    log.info("pc-dec: сводка родителя %s → задача %s (bridge_ok=%s)", pid, sid, cm.get("ok"))
+
+
+def _parse_numbered(text):
+    """Нумерованные строки «N. <текст>» → {N: <текст>} (для восстановления плана из result
+    родителя / карточки коррекции). Прочие строки игнорируются."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = _PLAN_LINE_RE.match(line)
+        if m:
+            out[int(m.group(1))] = m.group(2).strip()
+    return out
+
+
+def _pc_current_plan(pid):
+    """ТЕКУЩИЙ план цепи ПК-театра, restart-proof из очереди (полоса vps, где лежат родитель и
+    карточки): план родителя (нумерованный список в result) + коррекции «[коррекция плана
+    родитель pid] после шага B…» (нумерованный остаток в result) поверх, в порядке id.
+    → (plan: {номер: (текст, K-происхождение; 0=исходный)}, K всего коррекций, база последней
+    коррекции | None). Ошибка чтения / родитель не найден → ({}, 0, None) — вызывающий даст
+    честный halt-диагноз, не гадаем."""
+    try:
+        r = bc.get_pending("done")
+    except Exception as e:
+        log.warning("pc-dec: план родителя %s не прочитан (%s)", pid, e)
+        return {}, 0, None
+    if not r.get("ok"):
+        return {}, 0, None
+    parent_result, cards = "", []
+    for it in r.get("items", []):
+        if int(it.get("id") or 0) == int(pid):
+            parent_result = str(it.get("result") or "")
+        m = _ADAPT_CARD_RE.match(str(it.get("task_text") or ""))
+        if m and int(m.group(1)) == int(pid):
+            cards.append(it)
+    plan = {num: (txt, 0) for num, txt in _parse_numbered(parent_result).items()}
+    last_base = None
+    cards.sort(key=lambda x: int(x.get("id") or 0))
+    for k, card in enumerate(cards, 1):
+        bm = _PC_ADAPT_BASE_RE.search(str(card.get("task_text") or ""))
+        nums = _parse_numbered(str(card.get("result") or ""))
+        if not bm or not nums:
+            continue          # осиротевшая/пустая коррекция — план не меняла (fail-safe keep)
+        base = int(bm.group(1))
+        plan = {num: v for num, v in plan.items() if num <= base}
+        plan.update({num: (txt, k) for num, txt in nums.items()})
+        last_base = base
+    return plan, len(cards), last_base
+
+
+def _pc_release(pid, j, total, text, k=0):
+    """Релиз шага j/total цепи pid на полосу pc (следующий шаг встаёт ТОЛЬКО после done
+    предыдущего). k>0 → шаг из коррекции плана (маркер для restart-proof счётчика/глаз).
+    Возврат: ok-флаг."""
+    mark = f"[коррекция плана {k}] " if k else ""
+    r = _pc_enqueue(f"[шаг {j}/{total} родитель {pid}] {mark}{text}"[:RESULT_MAX])
+    if not r.get("ok"):
+        log.warning("pc-dec: релиз шага %s/%s родителя %s не встал (%s) — повтор следующим циклом",
+                    j, total, pid, r.get("error"))
+        return False
+    log.info("pc-dec: шаг %s/%s родителя %s релизнут (id %s, lane=pc)", j, total, pid, r.get("id"))
+    return True
+
+
+def _pc_adapt_consult(pid, step_i, steps, remaining):
+    """Думатель адаптации для цепи ПК-театра — ТА ЖЕ схема, что _adapt_consult (ADAPT_PREAMBLE,
+    кондуктор, --max-turns 1, строгий JSON), но сделанное берём из pc-шагов снапшота, а
+    оставшееся — из восстановленного плана (в очереди lane=pc его нет — шаги релизятся по одному).
+    None = fail-safe keep."""
+    goal, plan_txt = _dec_parent_context(pid)
+    done_last = {}
+    for i, _n, it in sorted([s for s in steps if str(s[2].get("status")) == "done"],
+                            key=lambda x: (x[0], int(x[2].get("id") or 0))):
+        done_last[i] = str(it.get("result") or "").strip()
+    done_lines = [f"шаг {i}: {(done_last[i].splitlines() or ['(пусто)'])[0][:300]}"
+                  for i in sorted(done_last)] or ["(результатов пока нет)"]
+    rem_lines = [f"шаг {j}: {t[:400]}" for j, t in remaining]
+    prompt = (ADAPT_PREAMBLE +
+              f"ИСХОДНАЯ ЦЕЛЬ РОДИТЕЛЯ (дословно):\n{goal}\n\n"
+              f"ИСХОДНЫЙ ПЛАН ШАГОВ:\n{plan_txt}\n\n"
+              f"РЕЗУЛЬТАТЫ СДЕЛАННЫХ ШАГОВ (сжато; только что завершён шаг {step_i}):\n"
+              + "\n".join(done_lines) + "\n\n"
+              "ОСТАВШИЕСЯ ШАГИ ПЛАНА:\n" + "\n".join(rem_lines) + "\n")
+    out = _thinker_exec(prompt, PLAN_ADAPT_TIMEOUT, "pc-plan-adapt")
+    if out is None:
+        return None
+    v = _parse_adapt_json(out)
+    if v is None:
+        log.warning("pc-plan-adapt: ответ думателя не распарсился/пуст (fail-safe keep): %.200s", out)
+    return v
+
+
+def _pc_after_fail(pid, i, n, it, steps):
+    """Провал pc-шага (финализирован ПК-агентом/devbot'ом/таймаутом — уже failed в очереди).
+    Отказ Филиппа / молчание ПК → halt без думателя; перерождение упало повторно → терминальный
+    halt; иначе при STEP_SELFHEAL=1 → ТОТ ЖЕ думатель самопочинки, РОВНО 1 перерождение lane=pc.
+    Halt в sequential-модели = просто НЕ релизить дальше + сводка (пропускать нечего)."""
+    text = str(it.get("task_text") or "")
+    fail_text = str(it.get("result") or "")
+    if fail_text.lstrip().startswith(_REJECT_PREFIX) or PC_SILENT_MARK in fail_text:
+        _pc_post_summary(pid, steps)          # человек сказал «нет» / ПК молчал — чинить нечего
+        return
+    if _HEAL_RE.search(text):
+        _pc_post_card(pid, f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {i}/{n} "
+                           f"родителя {pid} упал повторно — цепочка остановлена, нужен человек.\n"
+                           f"{fail_text[:400]}")
+        _pc_post_summary(pid, steps)
+        return
+    if not _selfheal_on():
+        _pc_post_summary(pid, steps)          # прежний halt-on-fail (провал уже отрапортован ❌)
+        return
+    verdict = _selfheal_consult(pid, i, n, text, fail_text)
+    if verdict is None or verdict["verdict"] != "retry" or not verdict["fixed_step"]:
+        reason = (verdict or {}).get("reason") or "(сбой думателя — fail-safe halt)"
+        _pc_post_card(pid, f"шаг {i}/{n} упал → думатель: halt, причина: {reason}\n"
+                           f"Цепочка остановлена (диагноз думателя выше).")
+        _pc_post_summary(pid, steps)
+        return
+    fixed, reason = verdict["fixed_step"], verdict["reason"] or "(без причины)"
+    r = _pc_enqueue((f"[шаг {i}/{n} родитель {pid}] "
+                     f"[самопочинка шага {i}, попытка 1] {fixed}")[:RESULT_MAX])
+    if not r.get("ok"):
+        log.warning("pc-dec: перерождение шага %s родителя %s не встало (%s) — fail-safe halt",
+                    i, pid, r.get("error"))
+        _pc_post_summary(pid, steps)          # как vps: очередь не приняла → halt
+        return
+    _pc_post_card(pid, f"🩹 шаг {i}/{n} упал → думатель: retry, правка: {fixed[:200]}, "
+                       f"причина: {reason[:200]}\n"
+                       f"Перерождён задачей id {r.get('id')} (lane=pc; попытка 1 из 1; повторный "
+                       f"провал = терминальный halt).\nИсходный провал: {fail_text[:400]}")
+    log.info("pc-dec: шаг %s/%s родителя %s перерождён задачей %s (retry)", i, n, pid, r.get("id"))
+
+
+def _pc_after_done(pid, i, n, it, steps):
+    """Done pc-шага: последний по плану → сводка; иначе ТА ЖЕ адаптация плана (PLAN_ADAPT):
+    keep → релиз следующего шага; adjust → карточка коррекции (restart-proof план в result)
+    + релиз первого скорректированного (≤PLAN_ADAPT_MAX коррекций, дальше halt «план дрейфует»);
+    finish → сводка «завершено досрочно». Любой сбой думателя = keep."""
+    plan, k_cnt, last_base = _pc_current_plan(pid)
+    total = max(plan) if plan else n
+    if i >= total:
+        _pc_post_summary(pid, steps)
+        return
+    if plan.get(i + 1) is None:
+        _pc_post_card(pid, f"⚠️ план родителя {pid} не восстановился из очереди (шаг {i + 1} "
+                           f"не найден в result родителя/коррекций) — цепочка остановлена, "
+                           f"поставь «декомпозируй:» заново.")
+        _pc_post_summary(pid, steps)
+        return
+    consult = (_plan_adapt_on() and last_base != i and (pid, i) not in _pc_adapted)
+    if consult:
+        _pc_adapted.add((pid, i))
+        remaining = [(j, plan[j][0]) for j in sorted(plan) if j > i]
+        verdict = _pc_adapt_consult(pid, i, steps, remaining)
+        if verdict is not None and verdict["verdict"] == "finish":
+            reason = (verdict["reason"] or "(без причины)")[:300]
+            _adapt_finish[pid] = reason
+            _pc_post_card(pid, f"🏁 после шага {i} думатель решил: цель родителя {pid} достигнута "
+                               f"досрочно ({reason}) — оставшиеся шаги {i + 1}–{total} не релизятся.")
+            _pc_post_summary(pid, steps)
+            log.info("pc-plan-adapt: родитель %s finish после шага %s (%s)", pid, i, reason[:120])
+            return
+        if verdict is not None and verdict["verdict"] == "adjust":
+            new_steps = verdict["adjusted_steps"]
+            reason = (verdict["reason"] or "(без причины)")[:300]
+            k = k_cnt + 1
+            if k > PLAN_ADAPT_MAX:
+                _pc_post_card(pid, f"🛑 план дрейфует: думатель запросил коррекцию №{k} (лимит "
+                                   f"{PLAN_ADAPT_MAX} на цепь) — цепочка остановлена, нужен "
+                                   f"владелец. Диагноз думателя: {reason}")
+                _pc_post_summary(pid, steps)
+                log.info("pc-plan-adapt: родитель %s — adjust №%s (> лимита %s) → halt (дрейф)",
+                         pid, k, PLAN_ADAPT_MAX)
+                return
+            if i + len(new_steps) > MAX_STEPS:
+                log.warning("pc-plan-adapt: родитель %s adjust дал %s шагов (итог > потолка %s) "
+                            "— fail-safe keep", pid, len(new_steps), MAX_STEPS)
+            else:
+                new_total = i + len(new_steps)
+                numbered = "\n".join(f"{j}. {s}" for j, s in enumerate(new_steps, start=i + 1))
+                card = (f"🧭 после шага {i} думатель скорректировал план (коррекция "
+                        f"{k}/{PLAN_ADAPT_MAX}): {reason}\n"
+                        f"НОВЫЙ ОСТАВШИЙСЯ ПЛАН (шаги {i + 1}–{new_total}, релизятся по одному):\n"
+                        f"{numbered}\n"
+                        f"Итог плана {new_total} шагов; сделанные шаги 1–{i} не тронуты. "
+                        f"Третья коррекция = halt «план дрейфует».")
+                cr = bc.enqueue_task(PC_DEC_FROM,
+                                     f"[коррекция плана родитель {pid}] после шага {i} (K={k})")
+                if cr.get("ok"):
+                    bc.claim_task(cr.get("id"))
+                    bc.complete_task(cr.get("id"), "done", card[:RESULT_MAX])
+                    _pc_release(pid, i + 1, new_total, new_steps[0], k=k)
+                    log.info("pc-plan-adapt: родитель %s adjust K=%s после шага %s → релиз "
+                             "скорректированного шага %s/%s", pid, k, i, i + 1, new_total)
+                    return
+                log.warning("pc-plan-adapt: карточка коррекции родителя %s не встала (%s) — "
+                            "fail-safe keep", pid, cr.get("error"))
+    # keep / fail-safe / адаптация выключена / уже адаптировано → следующий шаг прежнего плана
+    txt, k_origin = plan[i + 1]
+    _pc_release(pid, i + 1, total, txt, k=k_origin)
+
+
+def _pc_chain_tick(pid, steps):
+    """Один тик надзора цепи ПК-театра: смотрим ПОСЛЕДНИЙ шаг (максимальный номер, при дублях —
+    старший id: перерождение самопочинки). Ожидание (new/in_progress/approved) → проверка
+    таймаута ПК; needs_approval → ждём Филиппа (карточка уже в инбоксе от devbot); done/failed →
+    хуки цепи (адаптация/самопочинка/сводка)."""
+    i, n, it = max(steps, key=lambda s: (s[0], int(s[2].get("id") or 0)))
+    st = str(it.get("status") or "")
+    if st == "needs_approval":
+        return
+    if st in ("new", "in_progress", "approved"):
+        age = _age_sec(it.get("updated"))
+        if age is not None and age > PC_STEP_TIMEOUT:
+            diag = (f"{PC_SILENT_MARK}: шаг {i}/{n} родителя {pid} висит в статусе {st} "
+                    f"{int(age // 60)} мин (лимит {PC_STEP_TIMEOUT // 60} мин) — ПК выключен или "
+                    f"агент не работает. Цепочка остановлена (самопочинка такое не чинит). "
+                    f"Проверь ПК-агента и повтори «декомпозируй:» в теме PC-дев.")
+            bc.complete_task(it.get("id"), "failed", diag)
+            log.info("pc-dec: шаг %s/%s родителя %s таймаут ПК (%s, %sс) → failed + halt",
+                     i, n, pid, st, int(age))
+            it["status"], it["result"] = "failed", diag   # снапшот в актуальное — для сводки
+            _pc_post_summary(pid, steps)
+        return
+    # терминальный статус: закрытая ранее цепь (рестарт демона) → в кэш и не трогать
+    if _dec_summary_exists(pid):
+        _summarized.add(pid)
+        return
+    if st == "failed":
+        _pc_after_fail(pid, i, n, it, steps)
+    elif st == "done":
+        _pc_after_done(pid, i, n, it, steps)
+
+
+def process_pc_chains():
+    """Надзор ПК-театра (каждый цикл демона): read-only снимок полосы pc → тик по каждой СВОЕЙ
+    цепи (from=PC_DEC_FROM). Чужое на полосе pc (одиночные Filipp-pc[-dev]) не трогаем, claim
+    не делаем. Сбой тика одной цепи не валит остальные (доберём следующим циклом)."""
+    items = _pc_fetch_items()
+    if items is None:
+        return
+    chains = _pc_group_chains(items)
+    for pid in sorted(set(chains) - _summarized):
+        try:
+            _pc_chain_tick(pid, chains[pid])
+        except Exception as e:
+            log.warning("pc-dec: тик цепи родителя %s упал (%s) — следующим циклом", pid, e)
+
+
+def _earlier_new_sibling(items, pid, step_i):
+    """True → среди new-задач снапшота есть шаг ТОГО ЖЕ родителя с МЕНЬШИМ номером. Перерождение
+    самопочинки получает id ВЫШЕ следующих шагов — порядок цепочки держим по НОМЕРУ шага, не по id.
+    В обычной цепочке (id растут вместе с номерами) всегда False — поведение прежнее."""
+    for it in items:
+        mm = _STEP_RE.match(str(it.get("task_text") or ""))
+        if mm and int(mm.group(3)) == int(pid) and int(mm.group(1)) < int(step_i):
+            return True
+    return False
+
+
+def _dec_plan_and_fanout(tid, task_text, frm=""):
+    """Родитель декомпозиции: планировщик claude -p (read-only) → парс шагов → шаги в очередь
+    «[шаг i/N родитель tid] …» → родитель done с планом (devbot принесёт план в 328).
+    ПК-ТЕАТР (frm=PC_DEC_FROM): план строится ТАК ЖЕ здесь (единственный планировщик), но шаги
+    уходят на полосу lane=pc ПО ОДНОМУ (sequential release, см. секцию «ПК-ТЕАТР») — в очередь
+    сразу встаёт ТОЛЬКО шаг 1, остальные релизит process_pc_chains после done предыдущего.
+    Полоса vps (любой другой frm) — байт-в-байт прежнее поведение (веерный fan-out)."""
+    pc = (frm == PC_DEC_FROM)
+    preamble = PLANNER_PREAMBLE + (PLANNER_PC_NOTE if pc else "")
+    status, out = run_task(tid, task_text, task_timeout=TASK_TIMEOUT_DEV, preamble=preamble)
+    if status != "done":
+        # планировщик read-only: needs_approval от него = аномалия → честный failed, не кнопка
+        bc.complete_task(tid, "failed", f"декомпозиция не удалась (планировщик {status}): {out}"[:RESULT_MAX])
+        return
+    steps = _parse_steps(out)
+    if not steps:
+        bc.complete_task(tid, "failed",
+                         f"декомпозиция не удалась: планировщик не вернул нумерованный список шагов:\n{out}"[:RESULT_MAX])
+        return
+    if len(steps) > MAX_STEPS:
+        bc.complete_task(tid, "failed",
+                         f"декомпозиция не удалась: {len(steps)} шагов > потолка {MAX_STEPS} — "
+                         f"упрости ТЗ или разбей вручную:\n{out}"[:RESULT_MAX])
+        return
+    n = len(steps)
+    if pc:
+        # ПК-театр: релизим ТОЛЬКО шаг 1 (lane=pc) ДО complete родителя (crash-окно без шагов —
+        # родитель останется in_progress, devbot поднимет «зависла»); план целиком — в result
+        # родителя нумерованным списком (restart-proof источник для release/адаптации).
+        r = _pc_enqueue(f"[шаг 1/{n} родитель {tid}] {steps[0]}")
+        if not r.get("ok"):
+            bc.complete_task(tid, "failed",
+                             f"декомпозиция (театр PC) не удалась: шаг 1 не встал в очередь "
+                             f"lane=pc ({r.get('error')})"[:RESULT_MAX])
+            return
+        plan = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+        res = (f"🧩 Декомпозиция (театр PC): {n} шагов — исполняет ПК-агент ПО ОДНОМУ (lane=pc), "
+               f"план и надзор на VPS.\n{plan}\n"
+               f"Шаг 1 в очереди lane=pc (id {r.get('id')}). Каждый шаг отчитается сюда отдельно; "
+               f"красный шаг спрошу кнопкой; после последнего пришлю сводку. ПК молчит "
+               f">{PC_STEP_TIMEOUT // 60} мин → честный failed цепи (без самопочинки).")
+        bc.complete_task(tid, "done", res[:RESULT_MAX])
+        log.info("pc-dec: родитель %s → план %s шагов, шаг 1 релизнут (id %s, lane=pc)",
+                 tid, n, r.get("id"))
+        return
+    ids, errs = [], []
+    for i, step in enumerate(steps, 1):
+        r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", f"[шаг {i}/{n} родитель {tid}] {step}")
+        if r.get("ok"):
+            ids.append(str(r.get("id")))
+        else:
+            errs.append(f"шаг {i} не встал: {r.get('error')}")
+            log.warning("dec: родитель %s шаг %s не встал в очередь (%s)", tid, i, r.get("error"))
+    plan = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+    res = (f"🧩 Декомпозиция: {n} шагов, в очереди id {', '.join(ids) or '—'}.\n{plan}\n"
+           f"Исполняю по одному (каждый шаг отчитается сюда отдельно), после последнего пришлю сводку. "
+           f"Красный шаг спрошу кнопкой.")
+    if errs:
+        res += "\n⚠️ " + "; ".join(errs)
+    bc.complete_task(tid, "done" if ids else "failed", res[:RESULT_MAX])
+    log.info("dec: родитель %s → %s шагов (id %s)", tid, n, ",".join(ids))
+
+
+def _approved_expired(updated_iso):
+    """True, если approved-задача висит дольше APPROVED_TTL (по полю updated очереди). При ошибке
+    разбора времени → False (одобренное Филиппом лучше выполнить, чем потерять из-за парсинга)."""
+    try:
+        s = str(updated_iso).replace("Z", "+00:00")
+        t = datetime.datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        age = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+        return age > APPROVED_TTL
+    except Exception:
+        return False
+
+
+def _convert_other_approved(tid, task, what):
+    """op=other после «да» Филиппа (заведено 03.07): хардкод-команды нет — заявку НЕ валим
+    «сделай в Termux», а конвертируем в ОБЫЧНУЮ headless-задачу (текст заявки = ТЗ,
+    from=Filipp-328-dev → дев-таймаут 45 мин); devbot принесёт её результат в 328 отдельным
+    рапортом. Красная классификация ВНУТРИ новой задачи как была (преамбула/hook): настоящее
+    красное снова даст NEEDS_APPROVAL-кнопку — approve заявки обхода гейта НЕ создаёт.
+    Исключение: шаг декомпозиции НЕ конвертируем — конверт жил бы ВНЕ цепочки (без паттерна
+    [шаг i/N]), guard последовательности его не видит → следующий шаг стартовал бы до
+    исполнения одобренного. Для шага — прежний честный failed (halt-on-fail цепочки)."""
+    if _STEP_RE.match(str(task.get("task_text") or "")):
+        log.info("APPROVED id=%s op=other у шага декомпозиции → failed (конверт сломал бы guard)", tid)
+        bc.complete_task(tid, "failed",
+                         f"не могу выполнить автоматически: {what[:400]} — сделай в Termux")
+        _maybe_dec_after(task.get("task_text"), "failed")
+        return
+    orig = str(task.get("task_text") or "").strip()
+    # СЛОЙ 2: заведомо headless-НЕВОЗМОЖНОЕ красное (clasp/живая таблица/деньги/sqlite3/удаление) —
+    # НЕ конвертируем (конверт лишь родил бы то же NEEDS_APPROVAL) → сразу терминальная ручная карта =
+    # ноль перерождений на известной петле. Слой 1 добьёт неизвестное красное при ре-эскалации конверта.
+    if _is_headless_impossible(what, orig):
+        log.info("APPROVED id=%s op=other headless-невозможно (keyword) → терминальная карта, без конверта", tid)
+        bc.complete_task(tid, "failed", _manual_card(what, orig))
+        return
+    card = _OP_PREFIX_RE.sub("", what or "").strip() or "(карточка пустая — см. исходную задачу)"
+    tz = (f"[конверт одобренной заявки {tid}] Филипп нажал «да» на заявку: {card}\n"
+          f"Исходная задача (контекст): {orig}\n"
+          f"Выполни одобренное в рамках исходной задачи. Дисциплина CLAUDE.md действует полностью; "
+          f"настоящее красное (рабочие таблицы/деньги/clasp/sqlite3/удаление) — по-прежнему ТОЛЬКО "
+          f"маркером NEEDS_APPROVAL: одобрение заявки обход гейта НЕ даёт.")[:RESULT_MAX]
+    r = bc.enqueue_task(f"Filipp-328{DEV_FROM_SUFFIX}", tz)
+    if not r.get("ok"):
+        log.warning("APPROVED id=%s конверт op=other не встал в очередь (%s) → failed", tid, r.get("error"))
+        bc.complete_task(tid, "failed",
+                         f"одобрено, но конверт в headless-задачу не встал в очередь "
+                         f"({r.get('error')}) — сделай в Termux: {what[:400]}")
+        _maybe_dec_after(task.get("task_text"), "failed")
+        return
+    nid = r.get("id")
+    bc.complete_task(tid, "done",
+                     f"✅ Одобрено → конвертировано в headless-задачу id {nid} (from=Filipp-328-dev, "
+                     f"таймаут 45 мин). Результат придёт отдельным рапортом по задаче {nid}.")
+    log.info("APPROVED id=%s op=other → конверт в headless-задачу %s", tid, nid)
+
+
+def process_approved():
+    """Довести одобренные Филиппом красные шаги (status=approved). claude ПОВТОРНО НЕ зовётся —
+    op∈AUTO_OPS исполняется хардкод-командой (билет 4.2 + чёрный ящик); op=other (заведено 03.07)
+    конвертируется в обычную headless-задачу (см. _convert_other_approved) — демон красное сам
+    НЕ исполняет, конверт лишь возвращает заявку в обычный контур с той же классификацией.
+    Инвариант: хардкод — ТОЛЬКО если op∈AUTO_OPS И билет 4.2 consume ok И не истёк таймаут approved."""
+    r = bc.get_pending("approved")
+    if not r.get("ok"):
+        return
+    for task in sorted(r.get("items", []), key=lambda x: int(x.get("id") or 0)):
+        tid = task.get("id")
+        what = str(task.get("result") or "")        # сохранённый дескриптор (op=… | текст) — одобренный
+
+        # таймаут approved: одобрено давно, не довели → авто-failed
+        if _approved_expired(task.get("updated")):
+            log.info("APPROVED id=%s ИСТЁК (>%ss) → failed", tid, APPROVED_TTL)
+            bc.complete_task(tid, "failed", "approve истёк (>30 мин), повтори задачу")
+            _maybe_dec_after(task.get("task_text"), "failed")
+            continue
+
+        op = parse_op(what)
+        if op not in EXECUTORS:
+            # вне авто-перечня / free-text / op=other → демон сам НЕ исполняет:
+            # конверт в обычную headless-задачу (или failed для шага декомпозиции)
+            _convert_other_approved(tid, task, what)
+            continue
+
+        # билет 4.2: одноразовый серверный жетон авторизации + аудит (issue → consume перед командой)
+        tk = (bc.issue_write_ticket() or {}).get("ticket")
+        if not tk or not bc.consume_write_ticket(tk).get("ok"):
+            log.warning("APPROVED id=%s билет 4.2 не подтверждён → failed", tid)
+            bc.complete_task(tid, "failed", "билет токен-замка 4.2 не подтверждён — операция не выполнена")
+            continue
+
+        log.info("APPROVED id=%s ИСПОЛНЯЮ op=%s (билет погашен)", tid, op)
+        status, out = EXECUTORS[op](tid)
+        # чёрный ящик 4.1: факт approved-красной операции
+        try:
+            bc.log_write(initiator="orchestrator-daemon", act=op, args=f"task {tid}",
+                         result=("ok" if status == "done" else "fail"), critical="approved-redzone")
+        except Exception as e:
+            log.warning("APPROVED id=%s чёрный ящик не записан (%s)", tid, e)
+        bc.complete_task(tid, status, out)
+        log.info("APPROVED id=%s op=%s → %s", tid, op, status)
+        _maybe_dec_after(task.get("task_text"), status)   # шаг декомпозиции → halt/сводка
+
+
+def process_new():
+    """Взять старейшую new-задачу, исполнить через claude -p, записать результат/needs_approval."""
+    r = bc.get_pending("new")
+    if not r.get("ok"):
+        log.warning("get_pending ошибка: %s", r.get("error"))
+        return
+    items = r.get("items", [])
+    if not items:
+        return
+    # FIFO: get_pending отдаёт newest-first → берём наименьший id (старейшую задачу) первым.
+    # Шаг декомпозиции, чей сиблинг ждёт (needs_approval/approved/in_progress), пропускаем —
+    # НЕ блокируя чужие задачи дальше по очереди (guard последовательности цепочки).
+    task = None
+    for cand in sorted(items, key=lambda x: int(x.get("id") or 0)):
+        if _is_dec(cand):
+            m = _STEP_RE.match(str(cand.get("task_text") or ""))
+            if m:
+                pid = int(m.group(3))
+                if _dec_siblings(pid, ("failed",)):
+                    # сиблинг упал/отклонён («нет N» finalизирует мимо демона) → цепочку глушим:
+                    # этот шаг failed, хук доведёт остальных + сводку. return (не continue):
+                    # снапшот items уже неактуален, доработаем следующим циклом.
+                    bc.complete_task(cand.get("id"), "failed",
+                                     f"⏭ пропущен: другой шаг родителя {pid} упал/отклонён — цепочка остановлена")
+                    log.info("dec: шаг id=%s родителя %s пропущен (в цепочке есть failed)",
+                             cand.get("id"), pid)
+                    _maybe_dec_after(str(cand.get("task_text") or ""), "failed")
+                    return
+                if _dec_step_blocked(pid):
+                    log.info("dec: шаг id=%s родителя %s ждёт сиблинга — пропускаю в этом цикле",
+                             cand.get("id"), pid)
+                    continue
+                if _earlier_new_sibling(items, pid, int(m.group(1))):
+                    # перерождение самопочинки: шаг с МЕНЬШИМ номером ждёт в new (id у него выше) —
+                    # порядок цепочки по номеру шага, этого кандидата пропускаем в этом проходе
+                    log.info("dec: шаг id=%s родителя %s ждёт шага с меньшим номером — пропускаю",
+                             cand.get("id"), pid)
+                    continue
+        task = cand
+        break
+    if task is None:
+        return
+    tid = task.get("id")
+    text = str(task.get("task_text") or "")
+    log.info("NEW id=%s from=%s text=%.120s", tid, task.get("from"), text)
+
+    cl = bc.claim_task(tid)
+    if not cl.get("ok"):
+        log.info("claim id=%s не удался (%s) — пропускаю в этом цикле", tid, cl.get("error"))
+        return
+
+    if _is_dec(task):
+        sm = _SUM_RE.match(text)
+        if sm:
+            # осиротевшая synthetic-сводка (демон упал между enqueue и complete) → доводим;
+            # у ПК-семейства сводку собираем из pc-шагов (vps-читалка их не видит)
+            if str(task.get("from") or "") == PC_DEC_FROM:
+                pid = int(sm.group(1))
+                bc.complete_task(tid, "done", _pc_summary_text(pid, _pc_chain_steps(pid)))
+            else:
+                bc.complete_task(tid, "done", _dec_summary_text(int(sm.group(1))))
+            log.info("dec: осиротевшая сводка id=%s доведена", tid)
+            return
+        if _ADAPT_CARD_RE.match(text):
+            # осиротевшая карточка адаптации (демон упал между enqueue и complete) → доводим,
+            # НЕ отдавая её планировщику как «родителя» (сами шаги коррекции уже в цепочке)
+            bc.complete_task(tid, "done", "🧭 карточка коррекции плана (осиротела при рестарте "
+                                          "демона; шаги коррекции уже в цепочке родителя)")
+            log.info("dec: осиротевшая карточка адаптации id=%s доведена", tid)
+            return
+        if _PC_CARD_RE.match(text):
+            # осиротевшая событийная карточка ПК-театра (🩹/🛑/⚠️ — тело живёт в result при
+            # complete; сирота = тело потеряно при рестарте, сама цепь идёт своим ходом)
+            bc.complete_task(tid, "done", "🃏 карточка события цепи ПК-театра (осиротела при "
+                                          "рестарте демона; цепь родителя идёт своим ходом)")
+            log.info("pc-dec: осиротевшая карточка id=%s доведена", tid)
+            return
+        if not _STEP_RE.match(text):
+            # родитель «декомпозируй:» → план → fan-out шагов (ПК-театр: релиз шага 1 lane=pc)
+            _dec_plan_and_fanout(tid, text, frm=str(task.get("from") or ""))
+            return
+
+    status, result = run_task(tid, text, task_timeout=_task_timeout(task))
+    if status == "needs_approval":
+        if _is_convert(text):
+            # СЛОЙ 1 (ядро): конверт снова упёрся в красное → headless ДОКАЗАННО не может. НЕ ставим
+            # approvable needs_approval (это был бы ре-конверт = петля). Терминальный failed с ручной
+            # картой → рендер БЕЗ approve-кнопки → петля рвётся после РОВНО 1 перерождения.
+            cm = bc.complete_task(tid, "failed", _manual_card(result))
+            log.info("CONVERT-LOOP-BREAK id=%s → failed (терминальная ручная карта), bridge_ok=%s",
+                     tid, cm.get("ok"))
+            _maybe_dec_after(text, "failed")
+        else:
+            # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
+            rr = bc.set_needs_approval(tid, result)
+            log.info("NEEDS_APPROVAL id=%s bridge_ok=%s", tid, rr.get("ok"))
+    else:
+        # САМОПОЧИНКА (STEP_SELFHEAL=1): провал шага декомпозиции ИЛИ одиночной «тз:»/«задача:»
+        # (расширение ст4) → думатель, 1 попытка. True = финализировано внутри (перерождение/
+        # терминальный failed с диагнозом); False = прежний путь.
+        if status == "failed" and _maybe_selfheal(tid, text, result, frm=str(task.get("from") or "")):
+            return
+        cm = bc.complete_task(tid, status, result)
+        log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
+        _maybe_dec_after(text, status)          # шаг декомпозиции → halt-on-fail / сводка
+
+
+def cycle():
+    """Один проход: довести одобренное красное (approved) → добрать хвосты декомпозиций,
+    финализированные мимо демона (сводка) → надзор цепей ПК-театра (полоса pc, read-only +
+    релиз/хуки своих цепей) → взять новое (new)."""
+    process_approved()
+    process_dec_tails()
+    process_pc_chains()
+    process_new()
+
+
+def main():
+    log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s) ===",
+             POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN)
+    while _running:
+        try:
+            cycle()
+        except Exception as e:
+            log.exception("ошибка цикла: %s", e)
+        # дробный сон, чтобы остановка по сигналу была быстрой (не ждать весь POLL_SEC)
+        for _ in range(POLL_SEC):
+            if not _running:
+                break
+            time.sleep(1)
+    log.info("=== ДЕМОН ОСТАНОВЛЕН (рубильник/сигнал) ===")
+
+
+if __name__ == "__main__":
+    main()

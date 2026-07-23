@@ -1,0 +1,2812 @@
+[
+ {
+  "date": "2026-06-23T07:49:14+00:00",
+  "author": "5466425480",
+  "text": "Я бы забрал оттуда хотя бы ключи",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-23T06:23:50+00:00",
+  "author": "659135499",
+  "text": "Я и сотрудник не брали с клиента никакой дополнительной оплаты. Мы только взяли 200 бат за топливо, так как клиент вернул мотоцикл с неполным баком.",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-22T08:07:16+00:00",
+  "author": "6879003264",
+  "text": "Скоро приедет клиент с сбр, нужно вернуть паспорт",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-21T07:55:01+00:00",
+  "author": "6879003264",
+  "text": "Забрать байк в 16:00\n\nhttps://maps.app.goo.gl/q9tpUB4VAszWvGvs5?g_st=it\nВернуть залог 700$\nКонтакт @igor_gladkov_alex",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-21T05:40:13+00:00",
+  "author": "659135499",
+  "text": "Сотрудники уже отправились в путь. Они недавно вернулись в офис и сразу выехали к вам.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-21T05:05:12+00:00",
+  "author": "6879003264",
+  "text": "https://maps.app.goo.gl/PhFQBDBmRvYg9WXm9?g_st=it\nОтсюда нужно забрать байк\nВернуть депозит 500$",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-21T04:49:41+00:00",
+  "author": "8562625260",
+  "text": "Это тот клиент, который вчера забрал XMAX? Похоже, его заинтересовал ADV.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-20T06:54:30+00:00",
+  "author": "659135499",
+  "text": "Следует ли также вернуть клиенту депозит (залог)?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-18T06:55:46+00:00",
+  "author": "5466425480",
+  "text": "Документы не переформляли? В таких случаях не забывайте сообщать об этом что бы было учтено всё и возврат ниндзи тоже должен был быть через фотографии в группе",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-18T06:48:05+00:00",
+  "author": "8562625260",
+  "text": "Клиент забрал байк ещё вчера. Он выбрал XMAX.",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-16T08:36:48+00:00",
+  "author": "6879003264",
+  "text": "Хадв забрали ?",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-13T05:04:51+00:00",
+  "author": "5466425480",
+  "text": "Проснулся сейчас выдаст",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-06-06T10:30:55+00:00",
+  "author": "8562625260",
+  "text": "Мне нужно вернуть депозит 7000 бат, верно?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-05T07:26:20+00:00",
+  "author": "8562625260",
+  "text": "Какими способами я могу вернуться в офис?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-04T11:41:18+00:00",
+  "author": "8562625260",
+  "text": "Клиент спрашивает, нужно ли ему что-то доплачивать. Похоже, что он вернул байк на один день позже.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-04T11:36:54+00:00",
+  "author": "8562625260",
+  "text": "Подскажите, пожалуйста, есть ли какие-либо вещи, которые нужно вернуть клиенту?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T09:34:41+00:00",
+  "author": "8562625260",
+  "text": "Я тоже так думаю. Насколько мне известно, последний раз этот байк забирал бывший сотрудник около двух месяцев назад. Но сейчас я вернулся в офис и не нашёл ключ. Думаю, нам стоит попробовать проверить и протестировать ключи.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T09:33:12+00:00",
+  "author": "6879003264",
+  "text": "Я правильно понимаю, байк вернули.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T08:39:45+00:00",
+  "author": "5466425480",
+  "text": "Он сказал таким образом что забрал байк и прислал старые фото",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T08:31:36+00:00",
+  "author": "8562625260",
+  "text": "По XMAX, который клиент вернул, бак был не полностью заправлен. Клиент сообщил мне, что переведёт вам деньги за топливо.",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T08:01:16+00:00",
+  "author": "5466425480",
+  "text": "Они привезли красный иксмакс его вернут",
+  "et": "intake",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T07:52:58+00:00",
+  "author": "8562625260",
+  "text": "Если мы можем выдать клиенту NMAX, который только что вернули, пожалуйста, подготовьте для нас договор.",
+  "et": null,
+  "rw": true,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T07:52:13+00:00",
+  "author": "8562625260",
+  "text": "Можем ли мы выдать клиенту NMAX, который только что вернули?",
+  "et": null,
+  "rw": true,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T07:17:15+00:00",
+  "author": "6879003264",
+  "text": "Нужно подготовить xsr 155 и nmax который сдали сегодня, клиенты будут примерно через 25 минут",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T06:38:07+00:00",
+  "author": "6879003264",
+  "text": "Нужно вернуть клиенту 3000 бат",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-06-01T05:46:13+00:00",
+  "author": "8562625260",
+  "text": "Какой номер у байка и есть ли что-нибудь, что нужно вернуть клиенту?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-30T12:15:46+00:00",
+  "author": "8562625260",
+  "text": "Как мне теперь вернуться?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-30T09:05:00+00:00",
+  "author": "8562625260",
+  "text": "Сейчас поблизости нет Gekkon. Могу ли я после передачи мотоцикла клиенту вернуться в офис на InDrive?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-30T07:28:02+00:00",
+  "author": "5466425480",
+  "text": "Xmax 4724 в порядке? если да то подготовьте его к выдаче в течении часа за ним приедут",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-05-27T07:05:23+00:00",
+  "author": "6879003264",
+  "text": "Подготовьте нмакс 7530 на выдачу клиенту в офисе, договор скоро будет",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-05-24T06:46:14+00:00",
+  "author": "6879003264",
+  "text": "Нужно вернуть паспорт",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-24T06:42:56+00:00",
+  "author": "6879003264",
+  "text": "https://maps.app.goo.gl/86w9JXFuXnecM2Mn7?g_st=ic\n\nНужно забрать в 17:00 и отвезти к дому Филлипа \nВернуть Депозит паспорт Chernov Aleksandr",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-22T11:24:01+00:00",
+  "author": "8562625260",
+  "text": "Хорошо, я всё сделаю. Я ещё не вернулся.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-21T04:44:45+00:00",
+  "author": "5466425480",
+  "text": "Сейчас уточню вернут ли мне 2500 бат",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-17T09:23:41+00:00",
+  "author": "8562625260",
+  "text": "Можно ли сегодня заменить и выдать ему серый мотоцикл, а завтра мы привезём другой мотоцикл обратно с более надёжно установленным задним кофром?",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-05-15T09:44:15+00:00",
+  "author": "6879003264",
+  "text": "Вернуть клиенту",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-15T09:43:10+00:00",
+  "author": "8562625260",
+  "text": "Сейчас мне нужно ехать в офис или сразу вернуть мотоцикл клиенту?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-15T04:21:16+00:00",
+  "author": "6879003264",
+  "text": "К 13 надо забрать Адв 350 \nКлючи в байке, возврат депозита переводом \nhttps://maps.app.goo.gl/DE3sp73p2W4vQxpE9?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-14T10:14:19+00:00",
+  "author": "5466425480",
+  "text": "https://maps.app.goo.gl/PReNd7VFPfAuQnsC6?g_st=ac\n\nОтсюда надо. Забрать клик отаезти на проверку колодок перед зад. Дать л.бой нмакс на подмену и вернуть обратно",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-06T07:59:09+00:00",
+  "author": "6787320707",
+  "text": "Сейчас я жду снаружи, жду вашего брата, чтобы он сначала забрал мотоцикл.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-06T07:49:19+00:00",
+  "author": "5466425480",
+  "text": "https://share.google/vWzBM6KVYsYjgZiFY\n\nЗдесь находятся xmax и adv350\n\nКлючи внутри их надо вернуть в офис",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-05-02T11:07:16+00:00",
+  "author": "6879003264",
+  "text": "В 18:30 клиент привезет сбр в офис, нужно вернуть депозит",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-30T07:57:26+00:00",
+  "author": "6879003264",
+  "text": "В 17:30 нужно забрать ninja, нужно вернуть паспорт, не забудьте, у клиента самолет \n\nhttps://maps.app.goo.gl/NaZ7a1XvppKFoCR97?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-30T06:06:03+00:00",
+  "author": "8562625260",
+  "text": "Клиент хочет, чтобы позже ему вернули 150 бат. Я получил от него 25 004 бата.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-30T05:37:49+00:00",
+  "author": "6879003264",
+  "text": "И выдать мотоцикл",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-29T16:06:25+00:00",
+  "author": "6879003264",
+  "text": "Его клиент заберет примерно в 11:30 из офиса",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-29T10:11:20+00:00",
+  "author": "6787320707",
+  "text": "Сейчас мне очень тяжело, у меня даже нет транспорта, чтобы вернуться в офис.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-29T10:06:08+00:00",
+  "author": "6879003264",
+  "text": "А они смогут тогда сделать возврат запчасти?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-29T09:42:40+00:00",
+  "author": "6879003264",
+  "text": "По закону я имею право сделать возврат",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-29T08:57:31+00:00",
+  "author": "6879003264",
+  "text": "Если так то надо поставить на треть передачу выдать сцепление толкнуть мотоцикл. Разогнать его и бросить сцепление он заведется",
+  "et": "repair",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-29T07:59:20+00:00",
+  "author": "6787320707",
+  "text": "Да, верно — нужно сделать возврат.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-29T07:46:58+00:00",
+  "author": "5466425480",
+  "text": "Мы заказали что то не то должно быть как на картинке. Поэтому просьба сейчас взять кавасаки вулкан и ехать в кавасаки пхукет таун. Что бы они сделали возврат если это нам не нужно и заказали то что нужно",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-28T08:37:49+00:00",
+  "author": "5466425480",
+  "text": "Депозит мне вернули верно",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-28T08:37:11+00:00",
+  "author": "8562625260",
+  "text": "Он сообщил мне, что уже вернул вам предыдущий депозит 3900 бат.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-28T06:31:30+00:00",
+  "author": "6879003264",
+  "text": "Ключ не отдали",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-27T07:16:19+00:00",
+  "author": "8562625260",
+  "text": "Потому что нам, возможно, сначала нужно будет доставить мотоцикл, а потом вернуться и всё починить.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-25T09:30:18+00:00",
+  "author": "6879003264",
+  "text": "В 18:45 нужно забрать нмакс 4957, вернуть депозит 3000 бат \n\nhttps://maps.google.com?q=88,%20The%20Title%20Legendary%20Bang-Tao%20Choeng%20Thale,%20Thalang%20District,%20Phuket%2083110,%20%D0%A2%D0%B0%D0%B8%D0%BB%D0%B0%D0%BD%D0%B4&ftid=0x3050390076a0f271:0xd39ea4bafc9d3d1f&entry=gps&shh=CAE&lucs=,94297699,94284478,94231188,94280568,47071704,100809208,94218641,94282134,94286869&g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T12:25:08+00:00",
+  "author": "8562625260",
+  "text": "Уже кто-то вышел и забрал вещи.",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T12:24:55+00:00",
+  "author": "6787320707",
+  "text": "Я уже забрал паспорт и всё оформил.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T11:09:13+00:00",
+  "author": "6787320707",
+  "text": "Сейчас заправлю CBR650 и вернусь, чтобы всё завершить.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T10:39:00+00:00",
+  "author": "5466425480",
+  "text": "Хорошо,  главное что бы было так что перед возвратом денег клиенту с мотоциклом было всё в порядке",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T09:39:33+00:00",
+  "author": "8562625260",
+  "text": "Сколько нужно залить бензина для CBR650? Если не заправлю, я не смогу вернуться в офис.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T09:11:34+00:00",
+  "author": "5466425480",
+  "text": "Возврат депозита 20 000 бат",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T08:39:27+00:00",
+  "author": "8562625260",
+  "text": "И, пожалуйста, уточни, как нужно вернуть депозит: переводом или чтобы я снял наличные и отдал ему.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T08:11:40+00:00",
+  "author": "6879003264",
+  "text": "В 16:00 нужно забрать сбр650, вернуть депозит 20000 бат \n\nhttps://maps.app.goo.gl/KPebCeaMCJYVojeXA?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T07:20:19+00:00",
+  "author": "8562625260",
+  "text": "Я могу сразу вернуться в офис?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T06:16:32+00:00",
+  "author": "8562625260",
+  "text": "Доброе утро, мне нужно вернуть это в магазин вашего друга?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T06:13:44+00:00",
+  "author": "8562625260",
+  "text": "Кто может сообщить мне, какая сумма депозита была за этот товар? Я передам информацию сотрудникам, чтобы они проверили, забрали ли его уже или нет.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T06:11:49+00:00",
+  "author": "8562625260",
+  "text": "Сотрудник сообщил мне, что этой вещи здесь нет — скорее всего, её уже забрал Som.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-23T05:27:57+00:00",
+  "author": "8562625260",
+  "text": "Сейчас в Kawasaki Phuket у сотрудников обеденный перерыв, мне сказали вернуться в 13:00. Сейчас я сначала поеду доставить вам вещи.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-22T05:48:43+00:00",
+  "author": "8562625260",
+  "text": "Я думаю, нам нужно вернуться в Big Wing и оставить там байк.",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-21T09:41:15+00:00",
+  "author": "6879003264",
+  "text": "Сейчас надо вернуть паспорт клиенту и забрать 5000 бат и отдать паспорт и так же проверить топливо xadv750",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-20T11:00:14+00:00",
+  "author": "8562625260",
+  "text": "Если бы у меня его не было, я бы не смог(ла) вернуться домой.🥹",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-20T10:39:13+00:00",
+  "author": "8562625260",
+  "text": "Как мне лучше найти транспорт, чтобы вернуться?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-19T11:18:29+00:00",
+  "author": "8562625260",
+  "text": "Можем ли мы перенести возврат мотоцикла на утро?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-19T11:18:10+00:00",
+  "author": "8562625260",
+  "text": "Тогда так: сегодня я отвезу мотоцикл в Prasut, а завтра утром верну его клиенту.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-19T10:48:48+00:00",
+  "author": "6879003264",
+  "text": "Сюда вернуть клиенту забрать красный и можно ехать домой",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-19T05:38:53+00:00",
+  "author": "5466425480",
+  "text": "5 минут вернусь с ответом",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-18T18:28:06+00:00",
+  "author": "6879003264",
+  "text": "С 12 до 13 один из клиентов приедет с возвратом байка, кто-то должен быть в офисе",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-18T06:40:56+00:00",
+  "author": "8562625260",
+  "text": "“Клиент хочет сейчас заплатить 25 000 бат, а оставшиеся 540 бат он оплатит при возврате байка.”",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-18T04:39:06+00:00",
+  "author": "8562625260",
+  "text": "Сейчас байк ещё не готов. Как только закончат, я сразу вернусь и всё улажу.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-16T11:19:21+00:00",
+  "author": "8562625260",
+  "text": "Пожалуйста, сообщите клиенту, чтобы он спустился ко мне, так как у красного ADV нет ключа на месте, и я не могу вернуться в офис",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-16T09:50:55+00:00",
+  "author": "6879003264",
+  "text": "надо взять адв 350 красный и приехать к клиентам сюда\n\n\nВзять у них адв350 на обслуживание масло и колодки. Масло можно взять в офисе. А обслужить в сервисе номер 2. После чего вернуть адв 350 красный  в офис.",
+  "et": "intake",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-16T06:41:09+00:00",
+  "author": "8562625260",
+  "text": "«Можно ли продлить ещё на полчаса? Сейчас я ещё не вернулся подготовить мотоцикл и ещё не в офисе.»",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-15T11:13:48+00:00",
+  "author": "8562625260",
+  "text": "Но я пробовал(а) совсем недолго, потому что клиент спешил вернуться в отель.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-15T11:10:23+00:00",
+  "author": "8562625260",
+  "text": "Но по Xmax он попросил меня вернуться и продолжить работу у него в отеле, который находится недалеко.",
+  "et": "repair",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-14T19:38:01+00:00",
+  "author": "6879003264",
+  "text": "Далее надо взять адв 350 красный и приехать к клиентам сюда\nhttps://maps.app.goo.gl/9oADm1DuabLUTQdg9?g_st=ac\n\nВзять у них адв350 на обслуживание масло и колодки. Масло можно взять в офисе. А обслужить в сервисе номер 2. После чего вернуть адв 350 красный  в офис.",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-14T10:52:56+00:00",
+  "author": "8562625260",
+  "text": "Стоит ли мне уже вернуться в офис? А ADV 350 забрать завтра?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-14T10:21:50+00:00",
+  "author": "5466425480",
+  "text": "Сегодня надо вернуть байк клиенту",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-13T11:06:40+00:00",
+  "author": "8562625260",
+  "text": "Сейчас я могу заправить мотоцикл?\nКогда я забрал его, было одно деление топлива, а сейчас уже мигает. Я боюсь, что не доеду до места назначения.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-13T11:05:27+00:00",
+  "author": "6879003264",
+  "text": "Лучше вернуть байк клиенту",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-13T07:13:39+00:00",
+  "author": "8562625260",
+  "text": "После того как я заберу мотоцикл, я вернусь и подберу подходящий шлем.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-13T06:40:49+00:00",
+  "author": "6879003264",
+  "text": "И потом вернуть серый xadv750 обратно",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-12T08:01:05+00:00",
+  "author": "8562625260",
+  "text": "Договор и шлемы я вернусь подготовить ещё раз, потому что по дороге к месту доставки нужно заехать в офис.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-12T07:56:11+00:00",
+  "author": "8562625260",
+  "text": "Но, кажется, я помню, что сегодня клиент должен вернуть ADV 350 в офис. Пожалуйста, проверь ещё раз для меня.",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-11T11:26:43+00:00",
+  "author": "8562625260",
+  "text": "Как мне вернуться?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-11T07:19:28+00:00",
+  "author": "6879003264",
+  "text": "Выдай пожалуйста",
+  "et": "other",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-11T07:17:51+00:00",
+  "author": "6879003264",
+  "text": "Выдай пожалуйста",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-11T06:56:53+00:00",
+  "author": "5466425480",
+  "text": "Выдай ребятам без документов на пару суток без документов и депозита",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-11T04:38:49+00:00",
+  "author": "6879003264",
+  "text": "Быстро заменить и вернуть обратно",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-08T06:26:19+00:00",
+  "author": "8562625260",
+  "text": "Да, клиент хочет, чтобы я вернулся к нему снова в 15:00.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-08T06:21:28+00:00",
+  "author": "8562625260",
+  "text": "Я взял с него 300 бат за бензин и уже отдал ему сдачу.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-07T10:53:57+00:00",
+  "author": "8562625260",
+  "text": "Можешь спросить у них, если я после доставки вернусь в офис, я принесу это им ещё раз?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-07T09:56:51+00:00",
+  "author": "8562625260",
+  "text": "Ключ я уже забрал(а).",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-07T09:04:21+00:00",
+  "author": "8562625260",
+  "text": "Я вернул(а) клиенту депозит в размере 7000 бат.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-07T00:23:36+00:00",
+  "author": "6879003264",
+  "text": "В 12:00, без опозданий, нужно забрать нмакс 7530, 3000 бат на возврат\n\nhttps://maps.app.goo.gl/MQa7kdL1gTwVtYLs8?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-06T06:30:39+00:00",
+  "author": "6879003264",
+  "text": "Cbr 650r забрать отсюда до 15 часов. Вернуть депозит 20 000 бат",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-06T04:30:58+00:00",
+  "author": "7271351780",
+  "text": "И вам нужно спросить об этом у вашего арендатора, кто взял это, он должен вернуться и взять на себя ответственность перед нами, потому что это личные вещи.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-06T04:30:35+00:00",
+  "author": "7271351780",
+  "text": "А почему не положить на место? Кто взял, тот и должен вернуть на место.?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-05T09:16:08+00:00",
+  "author": "7271351780",
+  "text": "Если вы еще не ответили, я вернусь в офис и буду ждать. После того как вы сможете ответить, пожалуйста, оставьте контактные данные для связи с клиентом.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-04T11:12:47+00:00",
+  "author": "7271351780",
+  "text": "А ранее уплаченная клиентом сумма не подлежит возврату, верно?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-04T11:07:17+00:00",
+  "author": "7271351780",
+  "text": "Он хочет оставить паспорт в залог, а я должен получить деньги. Сколько я должен попросить дополнительно? Нужно ли будет вернуть ему первоначальный залог позже?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-03T10:27:01+00:00",
+  "author": "7271351780",
+  "text": "Кто-то взял это и не вернул на место.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-03T09:27:41+00:00",
+  "author": "8562625260",
+  "text": "Депозит этого клиента был в долларах, и мы уже вернули его клиенту.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-02T03:07:46+00:00",
+  "author": "8562625260",
+  "text": "Клиент сообщил мне, что хочет вернуть байк раньше и забрать паспорт.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-04-01T12:08:02+00:00",
+  "author": "6879003264",
+  "text": "Выдали?",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-01T10:12:59+00:00",
+  "author": "6879003264",
+  "text": "Во сколько сможете подготовить нмакс после этой задачи для выдачи в офисе ?",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-04-01T09:13:22+00:00",
+  "author": "7271351780",
+  "text": "Сейчас этот автомобиль находится у клиента. Когда вы хотите, чтобы я забрал этот автомобиль и отвез его на замену моторного масла?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-31T07:41:29+00:00",
+  "author": "6879003264",
+  "text": "Подготовьте нмакс на выдачу, пришлите сюда номер байка, клиент едет в офис",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-31T07:19:24+00:00",
+  "author": "6879003264",
+  "text": "В течение часа приедет клиент забрать депозит ниндзя 400, нужно вернуть 10.000 бат и принять паспорт как залог",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-30T07:11:53+00:00",
+  "author": "8562625260",
+  "text": "Клиент вернул два мотоцикла NMAX, оба в хорошем состоянии, без проблем.",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-30T06:26:09+00:00",
+  "author": "7271351780",
+  "text": "Этот клиент просто вернул автомобиль и не имеет отношения к этой работе, верно?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-26T03:18:24+00:00",
+  "author": "6879003264",
+  "text": "https://maps.app.goo.gl/KjfHhGnaRbh4ZQZh6\n\nПроверьте давление в шинах в красном адв 350 подготовьте и отправьте его в эту локацию и заберите иксмакс со сломаным зеркалом который вчера выдали клиенту.  Большая просьба не выдавайте ни когда клиенту мотоциклы и скутеры с отламанными деталями. Или с любыми неисправностями. Спасибо.",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-25T11:09:46+00:00",
+  "author": "5466425480",
+  "text": "Очень сложный клиент попался, предлагал вернуть ему деньги и отменить бронирование, но нет,  хочет просто исправить как есть",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-25T11:00:49+00:00",
+  "author": "8562625260",
+  "text": "Хорошо, вы хотите, чтобы я вернулся в офис, верно?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-25T10:58:37+00:00",
+  "author": "8562625260",
+  "text": "Вы хотите, чтобы я вернулся в офис и помыл мотоцикл вместе с этим шлемом, или мне найти место для мытья рядом и купить новый шлем? Пожалуйста, ответьте мне.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-25T10:47:53+00:00",
+  "author": "8562625260",
+  "text": "Мне нужно вернуться, чтобы помыть мотоцикл 5849 и найти новый полный шлем.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-25T10:44:47+00:00",
+  "author": "8562625260",
+  "text": "Клиент не хочет мотоцикл 738 и шлем, который вы мне принесли. Клиент хочет полный шлем. Он просит, чтобы я взял черный мотоцикл, очистил его и вернул ему сегодня.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-25T10:01:22+00:00",
+  "author": "7271351780",
+  "text": "И пожалуйста, укажите, какую сумму залога необходимо вернуть.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-25T09:05:20+00:00",
+  "author": "659135499",
+  "text": "У нас в основном шлемы такого типа. Вам подходит такой вариант, чтобы выдать клиенту?",
+  "et": "other",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-25T08:50:24+00:00",
+  "author": "8562625260",
+  "text": "Сейчас я вернулся в офис и собираюсь подготовить ADV, чтобы отвезти его клиенту.",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-24T11:28:29+00:00",
+  "author": "8562625260",
+  "text": "“Сейчас я вернулся за оборудованием и еду к клиенту.”",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-24T10:14:29+00:00",
+  "author": "6879003264",
+  "text": "Оставляйте байк 5849 на парковке, и езжайте забирать х-адв, не забудьте вернуть паспорт клиенту",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-24T05:41:48+00:00",
+  "author": "6879003264",
+  "text": "В 18:30  надо забрать xadv 750 серый и вернуть паспорт клменту ил la green",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-24T05:06:42+00:00",
+  "author": "8562625260",
+  "text": "Мне подождать и выдать MT-03?",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-24T04:45:17+00:00",
+  "author": "6879003264",
+  "text": "Сейчас требуется выдать клиенту мотоцикл CBR650R вместо мотоцикла MT-03 на пару часов, пока готовим MT-03. Вместе с этим нужно принять паспорт в качестве депозита, а оплату он переведёт на рублёвый счёт. Выберут два шлема для себя, и надо распечатать документы, чтобы они подписали. Там будет указан MT-03. Как только MT-03 будет готов, дадим локацию. Нужно будет подъехать и сделать подмену обратно.",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-24T03:41:38+00:00",
+  "author": "8562625260",
+  "text": "Да, в тот день мы вернули его на прежнее место, но сейчас он пропал.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-24T03:41:31+00:00",
+  "author": "7271351780",
+  "text": "И куда оно пропало? У меня есть свидетель — другой коллега, который может подтвердить, что в тот день мы использовали этот инструмент и вернули его на место. Но сейчас его нет.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-24T03:25:23+00:00",
+  "author": "6879003264",
+  "text": "Ключ вернули",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-23T23:29:11+00:00",
+  "author": "6879003264",
+  "text": "Нужно подготовить с утра после выдачи мт-03, адв 6895 - установить box, 2 шлема черные XL, время доставки укажем в течение дня \nКонтакт  +31 6 29767381\n\nhttps://maps.app.goo.gl/gGrUbjVrGYzUkLiz6?g_st=ic",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-23T23:25:01+00:00",
+  "author": "6879003264",
+  "text": "С 10:00 нужно подготовить мт-03 к выдаче, 2 шлема\nКлиент приедет в офис в 10:30",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-19T07:49:45+00:00",
+  "author": "6879003264",
+  "text": "Хорошо, 5800 на возврат депозит",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-18T23:05:52+00:00",
+  "author": "6879003264",
+  "text": "В 13:00 нужно забрать нмакс 7530, вернуть депозит 100$ !\n\nhttps://maps.app.goo.gl/tcwMZEK5L6ZfVVDU9?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-17T11:08:49+00:00",
+  "author": "6879003264",
+  "text": "Мт-03 забрали из сервиса ?",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-17T10:31:34+00:00",
+  "author": "6879003264",
+  "text": "Филипп сам выдаст паспорт",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-17T09:58:55+00:00",
+  "author": "6879003264",
+  "text": "Нужно вернуть паспорт",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-16T10:48:13+00:00",
+  "author": "6879003264",
+  "text": "4685 выдать клиенту который сейчас приехал в офис, я жду от них данные для контракта",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-16T10:45:29+00:00",
+  "author": "6879003264",
+  "text": "Подготовьте 4685 нмакс на выдачу",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-16T06:11:48+00:00",
+  "author": "6879003264",
+  "text": "До 14:30 нужно забрать нмакс 4253\nДепозит к возврату 3000 бат\nhttps://maps.app.goo.gl/Y4JcPnYE1WRFPM1aA?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-15T12:32:44+00:00",
+  "author": "7271351780",
+  "text": "Мы привезли только один мотоцикл Nmax 4685, и нас двое. Мы не можем вернуться домой на одном мотоцикле, поэтому нам нужно вернуться в офис за другой машиной, так как наши дома находятся в разных направлениях.",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-15T12:14:47+00:00",
+  "author": "7271351780",
+  "text": "Я пока не могу вернуться домой, потому что сейчас нас двое, я не пришёл один. Мне нужно сначала вернуться в офис, потому что наши машины там.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-14T05:44:15+00:00",
+  "author": "6879003264",
+  "text": "С 14 до 15 приедет клиент вернуть иксмакс 9315",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-13T05:42:08+00:00",
+  "author": "8562625260",
+  "text": "Нужно ли вернуть депозит?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-13T05:08:07+00:00",
+  "author": "7271351780",
+  "text": "Мне следует вернуть машину в офис или отвезти её к тебе домой?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-10T11:20:01+00:00",
+  "author": "7271351780",
+  "text": "Сейчас клиент ждет вашего ответа. Он сообщил мне, что вы не ответили на его сообщение, поэтому он еще не вернул мне автомобиль. Пожалуйста, ответьте ему.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-10T10:58:11+00:00",
+  "author": "7271351780",
+  "text": "Есть ли залог, который нужно вернуть клиенту?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-10T10:14:10+00:00",
+  "author": "7271351780",
+  "text": "Сегодня утром вы сказали нам, что клиент хочет арендовать машину еще на один день. В итоге вы хотите, чтобы мы забрали машину сегодня, верно?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-10T07:36:58+00:00",
+  "author": "6879003264",
+  "text": "Ещё не забрали в офис?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-09T10:33:15+00:00",
+  "author": "6879003264",
+  "text": "На возврат",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-08T03:58:19+00:00",
+  "author": "8562625260",
+  "text": "Депозит, который нужно вернуть — 200 долларов?\nПотому что у меня есть только 100 долларов и 100 евро.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-08T03:55:37+00:00",
+  "author": "6879003264",
+  "text": "Нужно забрать оттуда байк, вернуть депозит 200$",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-07T09:45:07+00:00",
+  "author": "8562625260",
+  "text": "«Недавно клиент уже спускался ко мне, но потом вернулся в номер, чтобы подождать, пока закончится дождь. Он сказал, чтобы я подождал здесь, пока дождь не прекратится, и тогда он снова спустится ко мне. Я уже жду довольно долго.»",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-06T10:51:34+00:00",
+  "author": "6879003264",
+  "text": "Вы успеете забрать из аэропорта байк и вернуться домой ?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-06T09:30:47+00:00",
+  "author": "6879003264",
+  "text": "В 17:50 нужно забрать нмакс 4253, депозит 100$ вернуть клиенту \n\nhttps://maps.app.goo.gl/ve2D4XP2A6bshcYP6?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-06T08:51:19+00:00",
+  "author": "6879003264",
+  "text": "Верно, они улетают, завтра вернутся и мы им привезем адв 372",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-06T08:49:31+00:00",
+  "author": "7271351780",
+  "text": "Чтобы избежать повторения ошибок, ваш клиент готов вернуть этот автомобиль, верно?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-05T04:58:42+00:00",
+  "author": "7271351780",
+  "text": "Сейчас мы вернулись в офис и собираемся отправить автомобиль ADV. Возможно, придется учесть время ожидания в очереди на заправку, так как сейчас на заправках почти везде очереди, но мы постараемся сделать это как можно быстрее.",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-04T23:40:57+00:00",
+  "author": "6879003264",
+  "text": "Филипп вернул его в офис на Камале уже",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-04T05:36:22+00:00",
+  "author": "6879003264",
+  "text": "В 15 нужно забрать нмакс 6908\n Возврат залога 100$\nhttps://maps.app.goo.gl/3T5XEoJutZ4zZpe78?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-03T07:36:28+00:00",
+  "author": "6879003264",
+  "text": "Надо устранить прокол залнего колеса xadv 750 и вернуть к моему дому",
+  "et": "repair",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-03-03T06:30:26+00:00",
+  "author": "6879003264",
+  "text": "Сейчас нужно одному приехать к дому Филиппа на CBR 650 для подготовки x-adv к выдаче",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-02T23:24:50+00:00",
+  "author": "6879003264",
+  "text": "Утром нужно забрать ниндзя 400 из сервиса, клиент привезет сбр650 в 11:00 в офис, к этому времени нужно выдать ниндзю клиенту",
+  "et": "other",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-03-02T03:36:15+00:00",
+  "author": "6879003264",
+  "text": "В 11:30 в офис приедет клиент привезет ниндзю 400 для замены задних колодок(переднии тоже проверить и цепь), ему надо дать на подмену cbr650r,  и далее ехать в prasut ,заменить колодки. А так же проверить пробег,  возможно масло тоже надо менять. После этого сделать обратный обмен и вернуть cbr в офис.",
+  "et": "intake",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-28T04:05:50+00:00",
+  "author": "5466425480",
+  "text": "Кто то один может просто приехать забрать ключи и вернуть депозит?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-28T04:02:51+00:00",
+  "author": "6879003264",
+  "text": "Возврат 14000 бат",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-28T03:21:37+00:00",
+  "author": "7271351780",
+  "text": "Необходимо указать модель автомобиля, размер залога и возможность его возврата клиенту; следует предоставить полную информацию. @turbophuket",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-27T09:19:41+00:00",
+  "author": "6879003264",
+  "text": "В 17:00 нужно забрать нмакс 4255, вернуть депозит 3000 бат, принять к доплате 568 бат\nКонтакт +7 902 924-97-98\n\nhttps://maps.app.goo.gl/Ro3tu2QA4hQcGTvq5?g_st=iw",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-27T06:37:36+00:00",
+  "author": "6879003264",
+  "text": "В 16:00 нужно забрать нмакс 8952, вернуть депозит 3000 бат \nКонтакт @sau00\n\nhttps://maps.app.goo.gl/Dfc2osmHJMxpkpHQ6?g_st=ipc",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-27T03:56:18+00:00",
+  "author": "6879003264",
+  "text": "Можно пока вернуться в офис распечатать договор и как выйдет на связь доставить",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-27T03:48:39+00:00",
+  "author": "7271351780",
+  "text": "Что мне делать? Должен ли я вернуться и подождать в офисе?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-24T09:22:20+00:00",
+  "author": "7271351780",
+  "text": "Или вы хотите, чтобы я вернул вам машину сегодня? Я ее уже помыл.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-24T09:15:45+00:00",
+  "author": "6879003264",
+  "text": "Можно его вернуть завтра",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-24T09:15:17+00:00",
+  "author": "6879003264",
+  "text": "Вы уехали на xmax, его надо завтра вернуть тогда",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-24T07:12:28+00:00",
+  "author": "7271351780",
+  "text": "Мы можем просто припарковать машину у вас дома и вернуться в офис, верно?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-24T03:55:20+00:00",
+  "author": "6879003264",
+  "text": "Скоро выдам данные на доставку в бангто",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-23T10:18:15+00:00",
+  "author": "659135499",
+  "text": "Нам нужно вернуть депозит?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-21T07:13:43+00:00",
+  "author": "659135499",
+  "text": "CB 650\n\nНам нужно вернуть ему 1500 бат?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-20T08:32:43+00:00",
+  "author": "7271351780",
+  "text": "Или мы можем использовать другой автомобиль из офиса для доставки клиенту, чтобы сегодня завершить всю работу, а машину 4729 заменить клиенту завтра? Потому что если вы хотите, чтобы мы забрали машину 4729, она не находится в офисе, нам нужно сначала поехать и забрать эту машину, а затем отвезти ее в сервисный центр.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-20T06:21:59+00:00",
+  "author": "6879003264",
+  "text": "В 16:00 нужно забрать нмакс 4685, вернуть депозит 3000 бат \nКонтакт  +44 7973 152930\n\nhttps://maps.app.goo.gl/M2TyLexpTSguZdGR6?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-20T05:11:25+00:00",
+  "author": "6879003264",
+  "text": "Клиент заберет только cbr650 r в 14 часов",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-19T22:56:09+00:00",
+  "author": "6879003264",
+  "text": "Так же нужно подготовить сбр650 к выдаче на это же время",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-19T22:15:09+00:00",
+  "author": "6879003264",
+  "text": "Нужно с утра забрать сб650 из сервиса и подготовить на выдачу к 11:00 \n\nhttps://maps.app.goo.gl/VBWDupk1QjMAfbXm7?g_st=ic",
+  "et": "other",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-19T08:20:23+00:00",
+  "author": "6879003264",
+  "text": "Пока привозите с договором из группы на 4725, адв выдается на подмену на один день, завтра мы его забираем с доставкой хмакса, контракт будет так же завтра",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-18T05:27:39+00:00",
+  "author": "6879003264",
+  "text": "В 15:00 Доставить нмакс 8952, забрать cb650r\n\nКлиенту вернуть 12710 бат, оплату не требуется\nКонтакт @sau00\n\nhttps://maps.app.goo.gl/Dfc2osmHJMxpkpHQ6?g_st=ipc",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-17T18:53:56+00:00",
+  "author": "6879003264",
+  "text": "В 11:00 забираем нмакс 5960, нужно вернуть 3.494 бат наличными \nКонтакт @xeniks\n\nhttps://maps.app.goo.gl/yCRgTCAtJjLkhu3r7?g_st=ic",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-12T22:03:20+00:00",
+  "author": "6879003264",
+  "text": "В 13:00 нужно забрать нмакс 7532, вернуть депозит 100$! \nПринять к оплате 263 бат \nКонтакт @T0NY_Y\n\nhttps://maps.app.goo.gl/Mn2EKjQMKmhbdk5R6?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-10T10:44:00+00:00",
+  "author": "6879003264",
+  "text": "Сейчас вернут",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-10T10:40:08+00:00",
+  "author": "6879003264",
+  "text": "Подготовьте адв красный 9890, клиент заберет из офиса в 18:30",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-10T03:04:54+00:00",
+  "author": "7271351780",
+  "text": "Нам нужно выдать ему какие шлемы или выдать все шлемы?",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-09T08:33:04+00:00",
+  "author": "7271351780",
+  "text": "Я сейчас поеду в магазин вашего друга, чтобы вернуть ему шлем.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-08T06:14:00+00:00",
+  "author": "7954530615",
+  "text": "А сейчас я могу покинуть этот отель и вернуться в офис?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-06T11:43:12+00:00",
+  "author": "7271351780",
+  "text": "Могу ли я вернуть машину завтра утром до 10:00? Потому что сегодня вечером после 19:00 у меня тоже есть дела.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-06T04:03:03+00:00",
+  "author": "7271351780",
+  "text": "Я помню, что мы уже говорили об этом: если ваш арендатор использует служебный автомобиль, он должен вернуть ключи в коробку для ключей.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T11:03:05+00:00",
+  "author": "7954530615",
+  "text": "Когда я вернусь в офис, я сообщу вам снова.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T11:01:18+00:00",
+  "author": "7954530615",
+  "text": "50 минут, чтобы вернуться в офис.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T09:56:38+00:00",
+  "author": "7954530615",
+  "text": "Я возьму 5000 бат, чтобы вернуть залог клиенту.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T09:45:04+00:00",
+  "author": "7271351780",
+  "text": "Или, может быть, лучше, чтобы BOAT забрал мотоцикл NMAX из офиса? Тогда вам не придется платить за использование мотоцикла Gekkon. Он заберет NMAX из офиса, затем поедет за ключами от мотоцикла Forza в Патонг, после чего заберет меня в Раваи, и мы вместе вернемся за мотоциклом Forza. Мы можем сделать это за один раз.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T09:23:47+00:00",
+  "author": "7271351780",
+  "text": "Тогда BOAT должен приехать за мной и потом вернуться за машиной клиента в Патонге, верно, или как?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T08:18:39+00:00",
+  "author": "5466425480",
+  "text": "Просьба вернуться к аристо 2",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T08:18:12+00:00",
+  "author": "5466425480",
+  "text": "Клиент дважды дал не верную информацию",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T07:29:17+00:00",
+  "author": "6879003264",
+  "text": "Возьмите с собой сразу 5000 бат для возврата депозита по форзе, забор осуществляем после доставки",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T06:10:42+00:00",
+  "author": "6879003264",
+  "text": "В 17:00 нужно забрать Forza у клиента, депозит вернуть наличными 5000 бат\nКонтакт  +7 917 080‑28‑30\n\nhttps://maps.app.goo.gl/LxyrrTQuvabCVJdJA?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-05T03:04:45+00:00",
+  "author": "5466425480",
+  "text": "Вернуть паспорт и 1315 бат",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-04T13:00:15+00:00",
+  "author": "7954530615",
+  "text": "Как мне вернуться?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-04T07:35:57+00:00",
+  "author": "7271351780",
+  "text": "Итак, если это так, мы отвезем оба ADV350 в сервисный центр вашего друга, затем воспользуемся Gekkon, чтобы вернуться в сервисный центр, где припаркован CB650, и привезем мотоциклы обратно в офис. Правильно?",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-04T07:21:25+00:00",
+  "author": "7271351780",
+  "text": "После обеда мы отвезем оба ADV350 в сервисный центр вашего друга. Затем мы воспользуемся Gekkon, чтобы вернуться в сервисный центр, где припаркован CBR650, и привезем его обратно в офис.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-04T06:58:40+00:00",
+  "author": "7271351780",
+  "text": "По дороге обратно в офис эта машина уже стояла там, поэтому мы остановились, чтобы забрать её для вас. Почему вы так сильно переживаете, будто это наша вина, что мы её забрали?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-04T04:15:59+00:00",
+  "author": "7271351780",
+  "text": "Нет, я только вчера приехал в пункт возврата арендованного автомобиля в отеле и сейчас отвожу машину обратно в офис для подготовки.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-04T02:56:22+00:00",
+  "author": "7271351780",
+  "text": "Доброе утро.\nМой NMAX8952 всё ещё стоит в отеле, потому что вчера велосипед (Gecko) был неисправен. Поэтому я только забрал ключи и не вернул велосипед в офис.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-03T12:54:35+00:00",
+  "author": "7954530615",
+  "text": "Если вы с этим согласны, то когда я доберусь до мотомастерской, и если там будет долгая очередь на ремонт, я оставлю мотоцикл там и вызову такси Grab, чтобы вернуться в офис.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-03T10:35:04+00:00",
+  "author": "7271351780",
+  "text": "Где залог? В следующий раз, если вам потребуется вернуть залог клиенту, пожалуйста, укажите это в заказе, так как залог находится не у меня.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-03T10:33:34+00:00",
+  "author": "6879003264",
+  "text": "100 евро на возврат",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-03T05:28:34+00:00",
+  "author": "6879003264",
+  "text": "Надо что бы кто нибудь или вдвоем вернулись в офис,  скажите пожалуйста, как идут наши процессы по ремонтам?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-03T04:17:50+00:00",
+  "author": "6879003264",
+  "text": "Хорошо тогда лучше вернуться в офис,  главное не забыть объявить все задачи.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-02T09:14:24+00:00",
+  "author": "6879003264",
+  "text": "Наличные на возврат есть у вас ?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-02T08:19:46+00:00",
+  "author": "6879003264",
+  "text": "Нужно доехать до банкомата и снять депозит для возврата клиенту",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-02T08:03:28+00:00",
+  "author": "6879003264",
+  "text": "Клиент попросил наличными, выдадим через банкомат",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-02T07:59:42+00:00",
+  "author": "6879003264",
+  "text": "Не уверен уточним, если что выдача через банкомат",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-02-02T07:53:06+00:00",
+  "author": "6879003264",
+  "text": "В 16:00 нужно забрать NMAX 4957, вернуть депозит 3000 бат\nКонтакт  +44 7946 070798\n\n  https://maps.app.goo.gl/edkEDMvrqCPJdiE9A?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-02T05:39:38+00:00",
+  "author": "7271351780",
+  "text": "А что насчет залога? Должны ли мы вернуть его клиенту, или что нам с ним делать?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-02-01T06:29:35+00:00",
+  "author": "6879003264",
+  "text": "В 16:00 надо забрать cb650r\nВозврат депозита переводом \n\n@troysdor\n\n https://maps.app.goo.gl/xqnHLFWk2EXfckG56?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-31T05:39:11+00:00",
+  "author": "6879003264",
+  "text": "Забрать нмакс в 16 часов\nВернуть депозит 3000 бат\n\nhttps://maps.app.goo.gl/WvWdqbUw21pmXjBA6?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-31T05:11:43+00:00",
+  "author": "6879003264",
+  "text": "Нужно забрать cb650r в 14:00\nВозврат депозита переводом \n\nhttps://maps.app.goo.gl/xqnHLFWk2EXfckG56?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-29T05:54:58+00:00",
+  "author": "5466425480",
+  "text": "Ни когда не оставляйте его работать, всегда завершайте аренду.  Если надо вернуть стартуйте аренду снова только перед началом движения",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-27T10:30:38+00:00",
+  "author": "6879003264",
+  "text": "4253 забрали?",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-22T13:37:29+00:00",
+  "author": "5466425480",
+  "text": "Это не клиент,  это партнер и мы возвращаем ему его адв 350. Депозит он должен вернуть в этом случае нам.  Скорее всего переводом",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-22T12:28:46+00:00",
+  "author": "6879003264",
+  "text": "Завтра этот адв350 надо вернуть в 10 утра обратно в чалонг . Рабочий день начнется в 10 утра в чалонге. Имейте это ввиду пожалуйста.  Подробности позже",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-22T12:15:08+00:00",
+  "author": "6879003264",
+  "text": "Я могу выдать без карты или если не сложно выдайти ему а я переведу деньги на счёт кого то из Вас",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-01-21T19:14:55+00:00",
+  "author": "6879003264",
+  "text": "В 13:00 нужно забрать adv 798 и XMAX 8969, вернуть депозиты 200$ и 200€ ! \n\nhttps://maps.app.goo.gl/nKLevVkzGSBdTWud6?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-21T10:09:42+00:00",
+  "author": "6879003264",
+  "text": "Через 45 минут приедет клиент вернуть нмакс",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-20T09:59:26+00:00",
+  "author": "6879003264",
+  "text": "Хотя бы к 19 часам и заберите ключи тогда, главное вернуть депозиты и получить ключи от байков, забрать можно будет завтра",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-20T09:36:14+00:00",
+  "author": "7271351780",
+  "text": "Сотрудник службы безопасности сказал мне, что ваш клиент забрал ключи от этой машины. Пожалуйста, напишите ему, чтобы он принес ключи мне.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-19T21:12:07+00:00",
+  "author": "6879003264",
+  "text": "В 12:00 нужно забрать MT-03, вернуть депозит 500$ \n\nhttps://maps.app.goo.gl/YsbgjzCDuD2tU57dA?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-17T06:33:38+00:00",
+  "author": "5466425480",
+  "text": "Клиент принял информацию и всё равно забрал xmax4725",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-17T06:16:02+00:00",
+  "author": "6879003264",
+  "text": "Я понял,  пожалуйста в следующий раз ни когда не передавайте альтернативный транспорт клиенту, пока вам кто то из менеджеров или я не дам подтверждение. Вчера вы отдали не спросив у меня можно ли отдать. Вы поверили клиенту что я разрешил.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-17T05:01:02+00:00",
+  "author": "7271351780",
+  "text": "Какую машину мне нужно вернуть в офис? @Rent_Bike_Phuket",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-16T09:07:43+00:00",
+  "author": "228132240",
+  "text": "Забрали, все в порядке?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-16T05:34:45+00:00",
+  "author": "6879003264",
+  "text": "Перевод я могу вернуть переводом",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-16T05:32:36+00:00",
+  "author": "6879003264",
+  "text": "Забрал ключи",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-16T03:53:50+00:00",
+  "author": "7954530615",
+  "text": "Когда ты забирал это, почему ты принес это в офис? Когда я хотел вернуть это, почему ты не принес это обратно в офис?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-15T09:32:23+00:00",
+  "author": "228132240",
+  "text": "Оно у меня. Но я вернусь через пару часов. (",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-14T23:19:53+00:00",
+  "author": "6879003264",
+  "text": "В 12:00 нужно забрать Adv 798, вернуть депозит 3000 thb \n\nhttps://maps.app.goo.gl/ZajtALowczX5hSTPA?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-14T10:16:50+00:00",
+  "author": "6879003264",
+  "text": "Эту сумму нужно вернуть, верно",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-14T05:30:59+00:00",
+  "author": "6879003264",
+  "text": "Вам не нужно принимать оплату, так как депозит xadv750 покрывает ее и остаётся остаток. Поэтому если у xadv750 нет повреждений, и полный бак, то Вам надо выдать клиенту адв350, и вернуть 10500 бат и подписать документы",
+  "et": "handover",
+  "rw": true,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-12T02:56:30+00:00",
+  "author": "6879003264",
+  "text": "В 11:30 клиент привезет mt-03, нужно будет выдать NMAX 8952",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-01-07T11:12:16+00:00",
+  "author": "228132240",
+  "text": "Клиент вернет байк завтра.",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-06T08:38:13+00:00",
+  "author": "6879003264",
+  "text": "нам нужно в 17:30 забрать адв350 отсюда. \n\nhttps://maps.app.goo.gl/NzWnRJVHWs5kz4d87?g_st=iwb\n\nИ доставить сюда https://maps.app.goo.gl/pcc5rY8o6AcHoffJA\n\n\nВсю допонительную информацию скоро выдам",
+  "et": "other",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2026-01-05T13:32:35+00:00",
+  "author": "7271351780",
+  "text": "Мы можем забрать эту машину домой или нам нужно вернуть её в офис?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-05T11:53:06+00:00",
+  "author": "7271351780",
+  "text": "Мы вернулись в офис, где же паспорт клиента?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T11:05:55+00:00",
+  "author": "228132240",
+  "text": "Можно взять N Max, Click150i надо вернуть на Камала, за ним сегодня должен приехать клиент.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T10:55:27+00:00",
+  "author": "228132240",
+  "text": "Клиент сказал что будет в 18:00 на месте. Как приедет пришлите фото N Max.\n\nУ клиента надо взять оплату 2.100 бат и вернуть 200$.",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T10:32:28+00:00",
+  "author": "228132240",
+  "text": "Если ты поедешь сейчас домой, ты это можешь забрать оплату и вернуть депозит по пути.",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T09:40:10+00:00",
+  "author": "228132240",
+  "text": "Сейчас надо помыть байки которые забрали…",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T09:40:10+00:00",
+  "author": "228132240",
+  "text": "Сейчас надо помыть байки которые забрали…",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T09:40:10+00:00",
+  "author": "228132240",
+  "text": "Сейчас надо помыть байки которые забрали…",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T09:40:10+00:00",
+  "author": "228132240",
+  "text": "Сейчас надо помыть байки которые забрали…",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T07:07:44+00:00",
+  "author": "6879003264",
+  "text": "Клиент считает что мотоцикл очень грязный просит помыть и вернуть к 15 или к 15:30",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2026-01-04T02:01:16+00:00",
+  "author": "6879003264",
+  "text": "С 10 до 12 клиент привезет в офис XMAX 4729, нужно выдать XMAX 4246",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-31T06:53:42+00:00",
+  "author": "6879003264",
+  "text": "Подготовьте его на выдачу",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-30T23:26:23+00:00",
+  "author": "6879003264",
+  "text": "В 11:30 нужно забрать NMAX 6908, вернуть депозит 3000 thb \n\nhttps://maps.app.goo.gl/zNLXdoeSB8hiEvdc9?g_st=ic",
+  "et": "return",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2025-12-30T10:31:26+00:00",
+  "author": "7954530615",
+  "text": "Могу ли я сразу идти домой, когда вернусь в офис?",
+  "et": null,
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2025-12-30T10:04:03+00:00",
+  "author": "6879003264",
+  "text": "https://maps.app.goo.gl/D1YDg8PovmjvxH6ZA\n\nСейчас надо приехать сюда дать на подмену xmax 4248, взять xmax 4724 и привезти сюда.\n\nhttps://maps.app.goo.gl/hMaV4AskG5imWUYh6\n\nЗабрать xmax 5709 и привезти обратно сюда\n\nhttps://maps.app.goo.gl/D1YDg8PovmjvxH6ZA\n\nИ потом зеленый xmax 4248 вернуть в офис",
+  "et": "handover",
+  "rw": true,
+  "hw": false,
+  "old_closing": false,
+  "new_closing": true
+ },
+ {
+  "date": "2025-12-30T07:32:12+00:00",
+  "author": "6879003264",
+  "text": "Не выдавать!",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-30T07:30:12+00:00",
+  "author": "6879003264",
+  "text": "Не выдавайте скутер",
+  "et": null,
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-30T07:28:09+00:00",
+  "author": "6879003264",
+  "text": "Ребят пока не выдавайте",
+  "et": "other",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-30T07:12:45+00:00",
+  "author": "6879003264",
+  "text": "Клиент пришел в офис, выдайте хмакс 4729, документы сейчас сделаем",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-29T10:26:29+00:00",
+  "author": "6879003264",
+  "text": "В 18:15 клиент приедет за XMAX 4248, подготовьте байк к выдаче и ожидайте в офисе",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-29T09:22:49+00:00",
+  "author": "6879003264",
+  "text": "В 21:00 нужно привезти XMAX 5709\nСверить данные паспорта и договора ! Без него не выдавать. Байк оплачен, переработку оплатим\n\nhttps://maps.app.goo.gl/66r7SWo2qSH6Baz86?g_st=ic",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-29T07:41:28+00:00",
+  "author": "6879003264",
+  "text": "Нужно подготовить NMAX 7530 к выдаче, клиент приедет в офис в 16:00",
+  "et": "handover",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ },
+ {
+  "date": "2025-12-27T04:42:15+00:00",
+  "author": "228132240",
+  "text": "Villa 91\n\nЗдесь стоит Grand Filano на котором можно вернутся на Камала…\n\nhttps://maps.app.goo.gl/2SrPqnebkLzN1PUc6?g_st=ipc",
+  "et": "other",
+  "rw": true,
+  "hw": false,
+  "old_closing": true,
+  "new_closing": true
+ },
+ {
+  "date": "2025-12-26T23:10:42+00:00",
+  "author": "6879003264",
+  "text": "В 11:00 нужно забрать байк с парковки XMAX 4725 и подготовить к выдаче в офисе, установить кофр, сообщите о готовности \nКлючи в байке, депозит переводом вернем\n\nhttps://maps.app.goo.gl/bsdis5g5UrbLw5g17?g_st=ic",
+  "et": "intake",
+  "rw": false,
+  "hw": true,
+  "old_closing": false,
+  "new_closing": false
+ }
+]

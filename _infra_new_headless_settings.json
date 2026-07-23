@@ -1,0 +1,15 @@
+{
+  "_comment": "headless-слой: ASK-ЗАБОР + ссылка на инфра-whitelist (роль-развод 08.07.2026, инфра-расширение 15.07.2026). Демон orchestrator_daemon передаёт этот файл через `claude -p --settings`. Precedence deny>ask>allow: ask здесь бьёт interactive-allow → clasp-запись в headless = NEEDS_APPROVAL. INFRA-WHITELIST (systemctl наших юнитов, openssl rand) живёт в settings.json — он грузится ДО этого файла и покрывает и headless, и интерактив (ask здесь их НЕ блокирует — для наших юнитов ask-правил нет). Чужие юниты → default (нет allow-матча) → auto-reject в headless-p. Файл в КОРНЕ репо (git-истина): headless в .claude/ не пишет. Добавлять ТОЛЬКО ask-забор (не allow/deny). Тест-страж: tests/test_settings_allowlist.py.",
+  "permissions": {
+    "ask": [
+      "Bash(clasp push*)",
+      "Bash(clasp redeploy*)",
+      "Bash(clasp deploy*)",
+      "Bash(clasp run*)",
+      "Bash(clasp version*)",
+      "Bash(clasp versions*)",
+      "Bash(clasp create-version*)",
+      "Bash(clasp deployments*)"
+    ]
+  }
+}

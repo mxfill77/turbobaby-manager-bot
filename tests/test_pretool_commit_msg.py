@@ -85,6 +85,35 @@ res.append(ok(PG._strip_git_msg(broken) == broken, "кривое квотиро�
 kept = PG._strip_git_msg(f'git commit -m "msg" && {PY} x.py')
 res.append(ok("python3" in kept, "интерпретатор вне -m в скан-представлении СОХРАНЁН"))
 
+print("(5) RED_TOKEN в тексте git commit -m компаунд-команды → НЕ red (класс 23.07.2026):")
+# false-red #281: `python gate.py && git commit -m "fixed set_fleet_oil"` → step-1 ловил
+# «set_fleet_oil» в сыром cmd, хотя python сам его не читает — только commit-сообщение.
+# Фикс: _strip_all_git_msgs убирает -m payload'ы из компаундов перед step-1 сканом.
+for compound in [
+    f'{PY} gate.py && git commit -m "fixed set_fleet_oil"',
+    f'{PY} gate.py && git commit -m "add confirmed=true validation"',
+    f'{PY} gate.py && git commit -m "fix DOWRITE pattern"',
+    f'{PY} gate.py && git commit -am "remove add_transaction stub"',
+    f'{PY} gate.py && git commit --message "refactor delete_event guard"',
+]:
+    r = run(compound)
+    label = compound.split("&&")[1].strip()[:70]
+    res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout,
+                  f"компаунд python+git -m RED_TOKEN → defer (не red): {label}"))
+
+print("(5b) _strip_all_git_msgs: юнит-тесты:")
+res.append(ok("set_fleet_oil" not in PG._strip_all_git_msgs(
+    f'{PY} gate.py && git commit -m "fixed set_fleet_oil"'),
+    "_strip_all_git_msgs: payload вырезан из компаунда"))
+res.append(ok(PG._strip_all_git_msgs("echo hello") == "echo hello",
+    "_strip_all_git_msgs: без git — команда как есть"))
+res.append(ok("venv" in PG._strip_all_git_msgs(f'{PY} gate.py && git commit -m "x"'),
+    "_strip_all_git_msgs: python-часть сохранена"))
+# fail-safe: кривое квотирование → как есть
+bad = f'{PY} x.py && git commit -m "незакрытая'
+res.append(ok(PG._strip_all_git_msgs(bad) == bad,
+    "_strip_all_git_msgs: кривое квотирование → fail-safe"))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)
