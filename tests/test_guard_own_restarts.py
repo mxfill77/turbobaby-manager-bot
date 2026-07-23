@@ -1,16 +1,17 @@
 """Тест: guard не даёт красное на restart/start собственных сервисов (15.07.2026).
 
 Два аспекта:
-1. ПЕРЕСМОТРЕНО 23.07.2026 (чёрный список процессов): guard больше НЕ деферит systemctl вслепую —
-   он смотрит на ГЛАГОЛ и ЮНИТ:
+1. ПЕРЕСМОТРЕНО 23.07.2026, в2 (чёрный список процессов + headless-тупик 339/340): guard смотрит
+   на ГЛАГОЛ и ЮНИТ systemctl:
      - `systemctl kill|stop` по боевому процессу контура (splinter, orchestrator-daemon, userbot,
-       moderation_bot, pc_agent) → ЖЁСТКИЙ БЛОК: deny, карточки НЕТ, approve НЕВОЗМОЖЕН;
-     - `systemctl restart|start|…` по тем же сервисам → красное с карточкой (решает владелец);
-     - чужие юниты (nginx, wa-webhook) и рутина (daemon-reload) → как раньше, defer к allow/ask rules.
-   Прежний инвариант «guard деферит ЛЮБОЙ systemctl» отменён владельцем сознательно: собственный
-   рестарт боевого сервиса теперь идёт через «да», а остановка — не идёт вообще.
+       moderation_bot, pc_agent) → ЖЁСТКИЙ БЛОК: deny, карточки НЕТ, approve НЕВОЗМОЖЕН —
+       и напрямую, и отложенно через systemd-run;
+     - `systemctl restart|start` СВОИХ сервисов → ЗЕЛЁНОЕ (defer к allow-правилам settings):
+       штатный поток (подъём после гейта / self-update / упавшего сервиса); ask здесь ломал
+       headless — красное не исполнялось даже после «да» владельца (задачи 339/340 failed);
+     - чужие юниты (nginx, wa-webhook) и рутина (daemon-reload) → defer как раньше.
 
-2. settings.json (или _restarts_new_settings.json, пока не применено из Termux) классифицирует
+2. settings.json (или _restarts_new_settings.json, пока владелец не применил) классифицирует
    собственные рестарты как allow:
      - systemctl restart/start splinter         → allow
      - systemctl restart/start orchestrator-daemon → allow
@@ -104,7 +105,8 @@ if new_applied:
 else:
     missing = [p for p in NEW_ALLOW if p not in live["allow"]]
     print(f"WARN: {len(missing)} новых паттернов ещё НЕ в live settings.json — "
-          "применить из Termux:\n  cp _restarts_new_settings.json .claude/settings.json\n"
+          "требуется решение владельца (применяет он, интерактивная сессия):\n"
+          "  cp _restarts_new_settings.json .claude/settings.json\n"
           "  (+ рестарт сессии claude)\n"
           f"Отсутствуют: {missing}\nПроверяю подготовленный файл.")
 
@@ -124,16 +126,14 @@ def guard(cmd):
     return p.returncode, p.stdout.strip()
 
 
-for cmd in ["systemctl daemon-reload", "systemctl restart wa-webhook", "systemctl restart nginx"]:
+for cmd in ["systemctl daemon-reload", "systemctl restart wa-webhook", "systemctl restart nginx",
+            "systemctl restart splinter", "systemctl start orchestrator-daemon",
+            "systemd-run --on-active=10s systemctl restart splinter"]:
     rc, out = guard(cmd)
     res.append(ok(rc == 0 and out == "", f"guard деферит '{cmd}' (exit={rc}, stdout='{out[:50]}')"))
 
-for cmd in ["systemctl restart splinter", "systemctl start orchestrator-daemon"]:
-    rc, out = guard(cmd)
-    res.append(ok(rc == 0 and '"ask"' in out and "🔴" in out,
-                  f"свой рестарт '{cmd}' → красное с карточкой (ask)"))
-
-for cmd in ["systemctl stop splinter", "systemctl kill orchestrator-daemon"]:
+for cmd in ["systemctl stop splinter", "systemctl kill orchestrator-daemon",
+            "systemd-run --on-active=60 systemctl stop splinter"]:
     rc, out = guard(cmd)
     res.append(ok(rc == 0 and '"deny"' in out and "🔴 КРАСНОЕ" not in out,
                   f"остановка боевого '{cmd}' → жёсткий блок (deny, карточки нет)"))

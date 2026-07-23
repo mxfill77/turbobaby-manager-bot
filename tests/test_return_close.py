@@ -143,7 +143,7 @@ def test_unknown_action_keeps_card():
     run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
     assert any("⏳" in t and "не задеплоено" in t for t in intake_sends()), f"{SENDS}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting", "карточка должна остаться живой до деплоя"
-    b.close_booking = good_close   # «Termux задеплоил Bridge»
+    b.close_booking = good_close   # «владелец задеплоил Bridge»
     run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
     assert len(b.closed) == 1, f"после деплоя то же «да» должно закрыть: {b.closed}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "closed"

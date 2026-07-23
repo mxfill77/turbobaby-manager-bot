@@ -199,7 +199,8 @@ def _try_approval_reply(text, bridge):
         if r.get("ok"):
             _reported.discard(qid)   # пусть дальнейший done/failed по ней отрапортуется штатно
             return (f"✅ Задача {qid} одобрена — демон выполнит approved-операцию по op-коду "
-                    f"(git_push / restart_splinter) и принесёт результат сюда. Вне авто-перечня → failed «сделай в Termux».")
+                    f"(git_push / restart_splinter) и принесёт результат сюда. Вне авто-перечня → failed "
+                    f"«требуется решение владельца — переставь задачу в 328 после его ответа».")
         if r.get("error") == "not_awaiting":
             return f"🤖 Задача {qid} не ждёт подтверждения (статус {r.get('status')}). Ничего не сделал."
         if r.get("error") == "not_found":
@@ -1788,7 +1789,7 @@ async def handle_command(msg, context, bridge) -> None:
         return
 
     # Тема-инбокс: команд/ТЗ/зелёного allowlist там НЕТ — только ответы на карточки.
-    # Guard-карточки pretool_guard (Termux «жду да») тоже приходят сюда, но их «да» даётся
+    # Guard-карточки pretool_guard (интерактивное «жду да») тоже приходят сюда, но их «да» даётся
     # в терминале — «да N» применим только к задачам очереди с номером.
     if lane == "inbox":
         await context.bot.send_message(

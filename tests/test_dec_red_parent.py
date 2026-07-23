@@ -115,7 +115,7 @@ res.append(ok(len(news) == 3 and news[2]["task_text"] == f"[шаг 3/3 роди�
 # (2) планировщик самодекларировал NEEDS_APPROVAL, но план всё же дал → план побеждает
 print("(2) NA-маркер в выводе планировщика РЯДОМ с планом → план побеждает:")
 fb = fresh()
-fake_run.plan_out = ("NEEDS_APPROVAL: op=clasp_redeploy (деплой из Termux)\n"
+fake_run.plan_out = ("NEEDS_APPROVAL: op=clasp_redeploy (деплой Bridge владельцем)\n"
                      "1. править код\n2. деплой Bridge")
 pid = fb.enqueue_task("Filipp-328-dec", "правки + деплой")["id"]
 OD.process_new()

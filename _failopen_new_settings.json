@@ -1,5 +1,5 @@
 {
-  "_comment_failopen": "PREPARED для cp _failopen_new_settings.json .claude/settings.json (применяет владелец из Termux + рестарт сессии). Добавлены deny Write/Edit вне whitelist-путей (/root/turbobaby-manager-bot, /root/turbobaby-bridge-gs, /tmp). Для .claude/ — точечная защита (settings.json/local) вместо //root/.claude/**, чтобы не блокировать memory. Headless-слой (headless_settings.json) строже: deny //root/.claude/**, т.к. headless memory не пишет. Bash cp-паттерны (deploy/*.service) не тронуты. Тест: tests/test_settings_failopen.py.",
+  "_comment_failopen": "PREPARED для cp _failopen_new_settings.json .claude/settings.json (применяет владелец в интерактивной сессии + рестарт сессии). Добавлены deny Write/Edit вне whitelist-путей (/root/turbobaby-manager-bot, /root/turbobaby-bridge-gs, /tmp). Для .claude/ — точечная защита (settings.json/local) вместо //root/.claude/**, чтобы не блокировать memory. Headless-слой (headless_settings.json) строже: deny //root/.claude/**, т.к. headless memory не пишет. Bash cp-паттерны (deploy/*.service) не тронуты. Тест: tests/test_settings_failopen.py.",
   "hooks": {
     "Notification": [
       {

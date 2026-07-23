@@ -10,7 +10,7 @@ WARN если _failopen_new_settings.json не применён в .claude/setti
 headless_settings.json: deny применён напрямую (движок блокирует Write к своему --settings файлу
 из текущей сессии — в тесте проверяем через прямой парсинг файла).
 
-Применение интерактива из Termux:
+Применение интерактива владельцем:
   cp _failopen_new_settings.json .claude/settings.json
   (+ рестарт сессии claude)
 """
@@ -175,7 +175,7 @@ if applied:
     print("settings.json: failopen deny ПРИМЕНЁН")
 else:
     print("WARN: failopen deny НЕ применён в .claude/settings.json (headless в .claude/ не пишет);\n"
-          "  применить из Termux:\n"
+          "  применить (владелец, интерактивная сессия):\n"
           "    cp _failopen_new_settings.json .claude/settings.json\n"
           "  (+ рестарт сессии claude)")
 

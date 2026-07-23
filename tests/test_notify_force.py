@@ -1,6 +1,6 @@
-"""Регресс 05.07: боевые уведомления Termux/CLI НЕ глушатся тест-мутом PRETOOL_NOPUSH, тестовые — глушатся.
+"""Регресс 05.07: боевые уведомления ожидания/CLI НЕ глушатся тест-мутом PRETOOL_NOPUSH, тестовые — глушатся.
 Контекст: NOPUSH-фикс 20762b6 сделал мут в notify() слишком широким — под PRETOOL_NOPUSH заглох ЛЮБОЙ пуш,
-включая живое Termux-уведомление (хук Notification) и явный `notify.py --done`. Фикс: force=True у боевых
+включая живое уведомление ожидания (хук Notification) и явный `notify.py --done`. Фикс: force=True у боевых
 отправителей (CLI/notify_hook/health/gate/splinter) проходит мут; force=False (тесты/фикстуры) — мьютится.
 Сеть НЕ дёргаем: _send_message замокан."""
 import os, sys
@@ -24,8 +24,8 @@ def ok(c, l):
 os.environ["PRETOOL_NOPUSH"] = "1"
 print("(A) PRETOOL_NOPUSH=1 — force vs не-force:")
 SENT.clear()
-r_force = N.notify("🔔 боевое Termux-уведомление", force=True)
-ok(r_force is True and SENT == ["🔔 боевое Termux-уведомление"], "боевой пуш (force=True) ПРОШЁЛ")
+r_force = N.notify("🔔 боевое уведомление ожидания", force=True)
+ok(r_force is True and SENT == ["🔔 боевое уведомление ожидания"], "боевой пуш (force=True) ПРОШЁЛ")
 SENT.clear()
 r_mute = N.notify("🔴 тестовая карточка фикстуры")   # force=False по умолчанию
 ok(r_mute is True and SENT == [], "тестовый пуш (force=False) ЗАМЬЮЧЕН (сеть не дёрнута)")

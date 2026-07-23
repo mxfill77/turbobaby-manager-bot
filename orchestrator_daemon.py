@@ -117,7 +117,7 @@ CLAUDE_BIN = "/usr/bin/claude"
 # РОЛЬ-РАЗВОД PERMISSIONS (08.07.2026): headless-задачи получают СТРОГИЙ доп-слой настроек через
 # `--settings` — ask на clasp push/redeploy/deploy/run/version/create-version/deployments.
 # Precedence движка deny>ask>allow действует ПОВЕРХ всех источников → этот ask бьёт allow из
-# .claude/settings.local.json владельца (интерактивные Termux-сессии clasp'ают без промптов,
+# .claude/settings.local.json владельца (интерактивные сессии владельца clasp'ают без промптов,
 # headless — нет). В -p режиме ask = авто-отказ → claude выводит NEEDS_APPROVAL, как раньше.
 # Файл в корне репо (git-истина): в .claude/ headless писать не может (гейт движка).
 # Fail-closed: файла нет → CLI падает с ошибкой → честный failed, а не тихая потеря забора.
@@ -281,7 +281,7 @@ def _fail_card(out, err, rc):
 #   3) в тексте задачи признак самомодификации (orchestrator_daemon / «самомодификация»);
 #   4) в systemd ВИДНА transient-единица systemd-run с рестартом демона: run-*.timer ещё не
 #      сработал ИЛИ run-*.service прямо сейчас гонит restart (он блокируется, пока демон не
-#      погашен — мы ещё живы и успеваем её увидеть). Ручной systemctl stop/restart из Termux
+#      погашен — мы ещё живы и успеваем её увидеть). Ручной systemctl stop/restart владельцем
 #      такой единицы НЕ создаёт → останется честный failed.
 #
 # ФИКС ДЫРЫ класса 48d9c64 (урок задачи 122, 07.07.2026): признаки выше НЕ отличали СВОЙ рестарт
@@ -550,7 +550,7 @@ def _planned_restart_verdict(rc, task_text, t0_mono):
 AUTO_OPS = ("git_push", "restart_splinter")
 
 # Преамбула v3 (Q2 разблокирован 03.07: критерий обкатки ступени 2 выполнен — 3 «тз:» подряд done
-# без Termux, вкл. прод-фикс 3978a91). restart splinter теперь CC делает САМ оранжевым циклом
+# без ручных сессий, вкл. прод-фикс 3978a91). restart splinter теперь CC делает САМ оранжевым циклом
 # (гейт→restart→проверка чистого старта→отчёт); кнопка op=restart_splinter остаётся фоллбэком.
 # Red-zone (Лист1/CRM/деньги/clasp/sqlite3/delete) — БЕЗ изменений: маркер op=other, НЕ обходить гейт.
 # v3.1 (03.07, урок задачи 43): правило самомодификации — рестарт orchestrator-daemon из задачи
@@ -651,7 +651,7 @@ _PLAN_LINE_RE = re.compile(r"^\s*(\d{1,2})[.)]\s+(\S.*)")
 # порядок шагов важнее живости, Филиппу и так уйдёт «⚠️ зависла» от devbot).
 _DEC_WAIT_STATUSES = ("in_progress", "needs_approval", "approved")
 # Фоллбэк-фразы (если claude описал блокировку гейта без маркера) — тоже эскалируем (эскалация
-# безопасна: лишь спрашивает Филиппа, красное НЕ исполняется; op=other → человек в Termux).
+# безопасна: лишь спрашивает Филиппа, красное НЕ исполняется; op=other → решение владельца).
 _NA_FALLBACK = ("требует подтверждения", "нужно подтверждение", "нужно «да»", "нужно \"да\"",
                 "requires approval", "needs approval", "permission to use", "не разрешено гейтом")
 _OP_RE = re.compile(r"op\s*=\s*([a-z_]+)", re.IGNORECASE)
@@ -760,7 +760,8 @@ def _manual_card(what, orig_text=""):
         "✋ ТРЕБУЕТСЯ РУЧНОЕ ДЕЙСТВИЕ (это не сбой, а нормальный ручной исход)",
         "Headless-контур доказано не может выполнить это красное действие (рабочие таблицы/деньги/"
         "clasp/sqlite3/удаление). Кнопки «да» здесь НЕТ намеренно — повторный approve лишь плодит "
-        "петлю конвертов. Выполни РУКАМИ в Termux:",
+        "петлю конвертов. Требуется решение владельца — переставь задачу в 328 после его ответа. "
+        "Действие из карточки:",
         card,
         "После — проверь результат в целевой таблице/логах; при необходимости повтори исходную "
         "задачу в 328 обычным префиксом.",
@@ -838,7 +839,7 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     # Гейт-алерты только на финальном прогоне (хвост §7, 12.07.2026): внутри headless-задачи
     # промежуточные красные прогоны gate.py — штатный red-fix-green цикл, НЕ шум владельцу.
     # Флаг велит gate.py молчать в Telegram на НЕ-финальных прогонах; финальный pre-push зовёт
-    # gate.py --final и алертит как раньше. Без этого env (Termux/cron/девбот) — всё как было.
+    # gate.py --final и алертит как раньше. Без этого env (интерактив/cron/девбот) — всё как было.
     child_env["GATE_ALERT_FINAL_ONLY"] = "1"
     # Ускорение цепей ч.2 (13.07.2026): промежуточный шаг декомпозиции (i < N) →
     # gate.py запускает только тесты затронутых модулей (селективный гейт).
@@ -2843,7 +2844,7 @@ def _approved_expired(updated_iso):
 
 def _convert_other_approved(tid, task, what):
     """op=other после «да» Филиппа (заведено 03.07): хардкод-команды нет — заявку НЕ валим
-    «сделай в Termux», а конвертируем в ОБЫЧНУЮ headless-задачу (текст заявки = ТЗ,
+    failed-отпиской «требуется решение владельца», а конвертируем в ОБЫЧНУЮ headless-задачу (текст заявки = ТЗ,
     from=Filipp-328-dev → дев-таймаут 45 мин); devbot принесёт её результат в 328 отдельным
     рапортом. Красная классификация ВНУТРИ новой задачи как была (преамбула/hook): настоящее
     красное снова даст NEEDS_APPROVAL-кнопку — approve заявки обхода гейта НЕ создаёт.
@@ -2853,7 +2854,8 @@ def _convert_other_approved(tid, task, what):
     if _STEP_RE.match(str(task.get("task_text") or "")):
         log.info("APPROVED id=%s op=other у шага декомпозиции → failed (конверт сломал бы guard)", tid)
         bc.complete_task(tid, "failed",
-                         f"не могу выполнить автоматически: {what[:400]} — сделай в Termux")
+                         f"не могу выполнить автоматически: {what[:400]} — требуется решение "
+                         f"владельца: переставь задачу в 328 после его ответа")
         _maybe_dec_after(task.get("task_text"), "failed")
         return
     orig = str(task.get("task_text") or "").strip()
@@ -2875,7 +2877,8 @@ def _convert_other_approved(tid, task, what):
         log.warning("APPROVED id=%s конверт op=other не встал в очередь (%s) → failed", tid, r.get("error"))
         bc.complete_task(tid, "failed",
                          f"одобрено, но конверт в headless-задачу не встал в очередь "
-                         f"({r.get('error')}) — сделай в Termux: {what[:400]}")
+                         f"({r.get('error')}) — требуется решение владельца: переставь задачу "
+                         f"в 328 после его ответа. Заявка: {what[:400]}")
         _maybe_dec_after(task.get("task_text"), "failed")
         return
     nid = r.get("id")

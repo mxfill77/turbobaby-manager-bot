@@ -17,7 +17,7 @@
 
 Тест гоняет матчер (glob, семантика как у движка: * = любые символы) по РЕАЛЬНОМУ
 .claude/settings.json. Если узкие паттерны ещё не внесены (headless не может писать в
-.claude/ — нужна разовая правка из Termux: cp _sdrun_new_settings.json .claude/settings.json),
+.claude/ — нужна разовая правка владельцем: cp _sdrun_new_settings.json .claude/settings.json),
 тест проверяет подготовленный _sdrun_new_settings.json и печатает WARN.
 """
 import json
@@ -66,7 +66,7 @@ if applied:
 else:
     perms = json.load(open(PREPARED))["permissions"]
     print("WARN: узкие паттерны ЕЩЁ НЕ в .claude/settings.json (гейт headless) — "
-          "проверяю подготовленный _restarts_new_settings.json; применение = разовый cp из Termux:\n"
+          "проверяю подготовленный _restarts_new_settings.json; применение = разовый cp владельцем:\n"
           "  cp _restarts_new_settings.json .claude/settings.json  (+ рестарт сессии claude)")
 
 res = []

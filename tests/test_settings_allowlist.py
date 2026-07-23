@@ -1,7 +1,7 @@
 """Страж permissions: allow-лист + РОЛЬ-РАЗВОД интерактив/headless (обновлено 08.07.2026).
 
 История: 06.07 расширен allow (read-only утилиты); 08.07 permissions разведены ПО РОЛЯМ:
-  - ИНТЕРАКТИВ владельца (Termux): clasp push/redeploy/deployments/version(s)/create-version
+  - ИНТЕРАКТИВ владельца (интерактивная сессия): clasp push/redeploy/deployments/version(s)/create-version
     в allow через .claude/settings.local.json (гит его игнорит глобально) — ноль промптов
     при исполнении одобренных конвертов. clasp deploy (создаёт НОВЫЙ деплой, ломает URL) и
     clasp run — остаются ask ВЕЗДЕ.
@@ -14,7 +14,7 @@
 live-файл владельца .claude/settings.local.json headless-проверка НЕ читает (его содержимое не
 влияет на вердикт — забор доказывается симуляцией «local разрешил clasp» поверх headless-слоя).
 
-Headless не может писать в .claude/ (гейт движка) → сплит применяется разово из Termux:
+Headless не может писать в .claude/ (гейт движка) → сплит применяется разово владельцем:
   cp _claspsplit_new_settings.json .claude/settings.json
   cp _claspsplit_new_settings.local.json .claude/settings.local.json
 Пока не применён — тест проверяет подготовленные файлы и печатает WARN (как test_settings_deferred_restart).
@@ -162,7 +162,7 @@ applied_proj = "Bash(clasp push*)" not in live_proj.get("ask", [])
 applied_local = ("Bash(clasp push*)" in live_local.get("allow", [])
                  and all(dup in live_local.get("allow", []) for _, dup in ENV_DUPS))
 # §7 шаг 2 (15.07.2026): сужение redeploy до прод-ID.
-# Headless в .claude/ не пишет — применяется из Termux после подготовки:
+# Headless в .claude/ не пишет — применяется владельцем после подготовки:
 #   cp _claspsplit_new_settings.local.json .claude/settings.local.json
 _NARROW_REDEPLOY_RULE = f"Bash(clasp redeploy {PROD_DEPLOYMENT_ID}*)"
 applied_narrow = _NARROW_REDEPLOY_RULE in live_local.get("allow", [])
@@ -174,7 +174,7 @@ else:
     print("WARN: роль-сплит/env-дубли применены не полностью (project: %s, local: %s — local "
           "должен нести и clasp-allow, и env-дубли UX-фикса №2; headless в .claude/ не пишет) — "
           "недостающее проверяю по подготовленным _claspsplit_new_settings*.json; "
-          "применение из Termux:\n"
+          "применение (владелец, интерактивная сессия):\n"
           "  cp _claspsplit_new_settings.json .claude/settings.json\n"
           "  cp _claspsplit_new_settings.local.json .claude/settings.local.json\n"
           "  (+ рестарт сессии claude)"
@@ -182,7 +182,7 @@ else:
 if not applied_narrow:
     print("WARN: §7 шаг 2 — сужение redeploy до прод-ID не применено в живом "
           ".claude/settings.local.json (headless в .claude/ не пишет); "
-          "применить из Termux:\n"
+          "применить (владелец, интерактивная сессия):\n"
           "  cp _claspsplit_new_settings.local.json .claude/settings.local.json\n"
           "  (+ рестарт сессии claude)")
 else:
@@ -269,7 +269,7 @@ if applied_narrow:
     res.append(ok(not matches("clasp redeploy", ia["allow"]),
                   "интерактив: clasp redeploy (без ID) → НЕ allow"))
 else:
-    print("  (сужение не применено — проверки прод-ID пропущены; применить cp из Termux)")
+    print("  (сужение не применено — проверки прод-ID пропущены; применить cp владельцем)")
 
 if not applied_proj:
     print("Подготовленный project = живой settings минус clasp push*/redeploy*, deploy* сужен (остальное байт-в-байт):")

@@ -20,8 +20,12 @@
 (а) ЧЁРНЫЙ СПИСОК ПРОЦЕССОВ: kill/pkill/`systemctl kill|stop` по боевым процессам контура
     (splinter, orchestrator-daemon, userbot, moderation_bot, pc_agent) и `kill` по PID 1 →
     HARD-BLOCK: permissionDecision="deny", карточка владельцу НЕ шлётся, approve НЕВОЗМОЖЕН,
-    строка `proc_hard_block` в GUARD_LOG. systemctl restart/start/… по тем же сервисам —
-    НЕ hard-block: обычное КРАСНОЕ с карточкой (решает владелец).
+    строка `proc_hard_block` в GUARD_LOG. Отложенный `systemd-run … systemctl stop|kill` —
+    тот же HARD-BLOCK (обёртки раскрываются). systemctl restart|start СВОИХ сервисов —
+    ЗЕЛЁНОЕ (defer к allow-правилам settings): это штатный поток (подъём после гейта /
+    self-update / упавшего сервиса), его гейтит оркестратор ДО команды; ask здесь ломал
+    headless — красное не исполнялось даже после «да» владельца (тупик задач 339/340).
+    Остальные глаголы по своим (mask/disable/reload…) — обычное красное с карточкой.
 (б) ДАННЫЕ ≠ КОМАНДА: красное слово внутри ПОИСКОВОГО ШАБЛОНА grep/rg/sed/awk (аргумент
     -n/-e/-E либо первый позиционный) — это ДАННЫЕ, они НЕ краснят команду. Шаблон вырезается
     ТОЛЬКО из скан-представления и ТОЛЬКО в СВОЁМ сегменте цепи; ОПЕРАНДЫ (файлы!) остаются под
@@ -89,6 +93,7 @@ HARD_BLOCK_HITS = ("proc_hard_block", "env_hard_block")
 _PROTECTED_PROCS = ("splinter", "orchestrator_daemon", "userbot", "moderation_bot", "pc_agent")
 _KILL_CMDS = {"kill", "pkill"}
 _HARD_VERBS = {"kill", "stop"}                    # systemctl kill|stop → жёстко
+_GREEN_VERBS = {"restart", "start"}               # свои сервисы: штатный поток → defer (в2, 339/340)
 _SVC_VERBS = {"kill", "stop", "restart", "start", "reload", "try-restart",
               "force-reload", "enable", "disable", "mask", "unmask"}
 # Поисковые утилиты: их ШАБЛОН — данные (класс «данные ≠ команда»).
@@ -109,7 +114,7 @@ _BLOCK_TEXT = {
     "proc_hard_block": "⛔ ЖЁСТКИЙ БЛОК (proc_hard_block): остановка боевого процесса контура%s. "
                        "Карточка владельцу НЕ шлётся, approve НЕВОЗМОЖЕН — агент боевые процессы "
                        "не гасит НИКОГДА (обрыв живых задач и очередей). Нужна остановка — "
-                       "владелец делает её руками на VPS.",
+                       "требуется решение владельца: переставь задачу в 328 после его ответа.",
     "env_hard_block": "⛔ ЖЁСТКИЙ БЛОК (env_hard_block): обращение к файлу секретов%s. "
                       "Карточка владельцу НЕ шлётся, approve НЕВОЗМОЖЕН — секреты агенту не "
                       "показываются ни в каком виде. Нужно значение ключа — владелец передаёт его сам.",
@@ -209,8 +214,8 @@ _ACTIONS = {
                 "прочитай, ЧТО именно пишет скрипт — это не пробный прогон"),
     "proc_ctl": ("остановка/перезапуск процесса или systemd-сервиса",
                  "процесс прервётся: живые задачи, очереди и открытые сессии не досчитаются",
-                 "тот ли процесс/юнит и переживёт ли контур его паузу — рестарт боевого сервиса "
-                 "идёт только по твоему «да»"),
+                 "тот ли процесс/юнит и переживёт ли контур его паузу — restart|start своих "
+                 "сервисов идёт зелёным (штатный поток), сюда попадает только НЕштатное"),
     "sqlite": ("SQL-запись в БД вне memory.db (UPDATE/DELETE/INSERT/DROP)",
                "изменит НЕизвестную базу данных (не свою memory.db)",
                "какая это БД и почему пишем не в memory.db — memory.db через код шёл бы без вопроса"),
@@ -719,7 +724,8 @@ def _proc_class(units):
             tgt = _protected_in(names)
             if verb in _HARD_VERBS and tgt:
                 return "block", "systemctl " + verb + " " + tgt
-            if verb in _HARD_VERBS or (verb in _SVC_VERBS and tgt):
+            # restart|start своих → ЗЕЛЁНОЕ (в2): штатный поток, гейт живёт выше (оркестратор+settings)
+            if verb in _HARD_VERBS or (verb in _SVC_VERBS and tgt and verb not in _GREEN_VERBS):
                 red = red or ("red", ("systemctl " + verb + " " + (tgt or " ".join(names[:2]))).strip())
     return red
 

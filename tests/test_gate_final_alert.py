@@ -56,7 +56,7 @@ def run_gate(argv, env_flag=None, red=True):
             os.environ["GATE_ALERT_FINAL_ONLY"] = old_env
     return code, buf.getvalue()
 
-# (1) FAIL-SAFE дефолт: контекста нет (Termux/cron/девбот) → красный алертит КАК РАНЬШЕ
+# (1) FAIL-SAFE дефолт: контекста нет (интерактив/cron/девбот) → красный алертит КАК РАНЬШЕ
 print("(1) красный без контекста → алерт как раньше:")
 code, out = run_gate([])
 ok(code == 1 and len(pushes) == 1 and "ТЕСТЫ КРАСНЫЕ" in pushes[0], "exit 1 + пуш ушёл (поведение не изменилось)")

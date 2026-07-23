@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Голден трёх правок pretool_guard (23.07.2026):
+"""Голден трёх правок pretool_guard (23.07.2026; в2 — headless-тупик 339/340):
   (а) чёрный список процессов  — kill/pkill/systemctl kill|stop по боевым процессам и PID 1 → HARD-BLOCK
-      (deny, карточки НЕТ, approve НЕВОЗМОЖЕН, событие proc_hard_block в журнале);
+      (deny, карточки НЕТ, approve НЕВОЗМОЖЕН, событие proc_hard_block в журнале); в2: systemctl
+      restart|start СВОИХ сервисов — ЗЕЛЁНОЕ (штатный поток, defer к allow settings), ask здесь
+      ломал headless (красное не исполнялось даже после «да» владельца);
   (б) данные ≠ команда         — красное слово в ПОИСКОВОМ ШАБЛОНЕ grep/rg/sed/awk не краснит команду,
       но ОПЕРАНДЫ и соседние звенья цепи остаются под сканом (дыру не открыли);
   (в) hard-block файла секретов — обращение к нему в ЛЮБОЙ позиции цепи → deny, событие env_hard_block.
@@ -112,10 +114,16 @@ print("(4) ТЗ-кейс: файл секретов в цепи — жёстки
 res.append(ok(is_block("cat " + ENVF + " && python gate.py", "env_hard_block"),
               "cat <секреты> && python gate.py → блок (ранний defer гейта НЕ спасает команду)"))
 
-print("(5) ТЗ-кейс: restart боевого сервиса — красное С КАРТОЧКОЙ (НЕ жёсткое):")
-good, card = red_card(SC + " restart " + SPL)
-res.append(ok(good, SC + " restart " + SPL + " → красное, approve возможен"))
-res.append(ok(SPL in card, "цель в карточке: " + card.splitlines()[1][:70]))
+print("(5) ТЗ-кейсы в2: restart|start своих — ЗЕЛЁНОЕ; отложенный/сигнальный stop — deny:")
+res.append(ok(is_green(SC + " restart " + SPL), SC + " restart " + SPL + " → ЗЕЛЁНОЕ (штатный поток)"))
+res.append(ok(is_green(SC + " start " + ORCH), SC + " start " + ORCH + " → ЗЕЛЁНОЕ"))
+res.append(ok(is_green("systemd-run --on-active=10s " + SC + " restart " + SPL),
+              "отложенный restart своего → ЗЕЛЁНОЕ (allow-правило settings)"))
+res.append(ok(is_block(SC + " stop " + SPL, "proc_hard_block"), SC + " stop " + SPL + " → deny"))
+res.append(ok(is_block(PK + " -9 " + SPL, "proc_hard_block"), PK + " -9 " + SPL + " → deny"))
+res.append(ok(is_block(K + " -SIGKILL 1", "proc_hard_block"), K + " -SIGKILL 1 → deny (PID 1)"))
+res.append(ok(is_block("systemd-run --on-active=60 " + SC + " stop " + SPL, "proc_hard_block"),
+              "systemd-run --on-active=60 " + SC + " stop " + SPL + " → deny (отложенный stop)"))
 
 print("(6) чёрный список целиком + PID 1:")
 for tgt in (SPL, ORCH, UB, MB, PCA):

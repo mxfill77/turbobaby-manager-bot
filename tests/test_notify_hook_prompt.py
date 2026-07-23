@@ -1,5 +1,5 @@
 """Регресс UX-фикса висящего промпта (08.07.2026): хук Notification на permission-ожидании
-шлёт «⏳ Termux ждёт подтверждения: <команда>» — команда достаётся из транскрипта сессии.
+шлёт «⏳ Claude Code ждёт подтверждения: <команда>» — команда достаётся из транскрипта сессии.
 
 Проверяем subprocess-запуском notify_hook (как его зовёт движок: JSON в stdin) с мок-транскриптом.
 Сеть НЕ дёргается: NOTIFY_COUNT_FILE (мок-счётчик notify, срабатывает ДО токена/сети, перекрывает
@@ -52,7 +52,7 @@ rc, sent = run_hook(
         tool_use_line("Bash", {"command": "clasp redeploy AKfycbxNC9 --versionNumber 67"}),
     ])
 res.append(ok(rc == 0, "хук отработал (exit 0)"))
-res.append(ok("⏳ Termux ждёт подтверждения:" in sent, "пуш начинается с ⏳-префикса"))
+res.append(ok("⏳ Claude Code ждёт подтверждения:" in sent, "пуш начинается с ⏳-префикса"))
 res.append(ok("clasp redeploy AKfycbxNC9" in sent, "в пуше видна САМА команда"))
 
 print("Permission-ожидание, последний tool_use = Edit → имя файла:")
@@ -69,7 +69,7 @@ print("Permission-ожидание БЕЗ читаемого транскрип�
 rc, sent = run_hook({"hook_event_name": "Notification",
                      "message": "Claude needs your permission to use Bash",
                      "transcript_path": "/nonexistent/т.jsonl"})
-res.append(ok("⏳ Termux ждёт подтверждения: Claude needs your permission" in sent,
+res.append(ok("⏳ Claude Code ждёт подтверждения: Claude needs your permission" in sent,
               "fallback на текст события"))
 
 print("НЕ-permission событие (простой ~60с) → прежний формат 🔔:")
@@ -83,7 +83,7 @@ with tempfile.TemporaryDirectory() as td:
     p = subprocess.run([PY, HOOK], input="не json", text=True, capture_output=True,
                        timeout=60, env=env)
     sent = open(count, encoding="utf-8").read() if os.path.exists(count) else ""
-res.append(ok(p.returncode == 0 and "🔔 Claude Code: ждёт тебя в Termux" in sent,
+res.append(ok(p.returncode == 0 and "🔔 Claude Code: ждёт твоего ответа" in sent,
               "битый stdin → дефолтный 🔔"))
 
 print("Обрезка длинной команды (пуш ≤ вменяемой длины):")

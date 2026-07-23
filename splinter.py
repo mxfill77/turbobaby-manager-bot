@@ -6120,12 +6120,13 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                 await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
                             text=f"🐀 Splinter\n✅ Завершена, строка {_row}.")
             elif res.get("error") == "unknown_action":
-                # Bridge ещё без деплоя фазы I (конверт close_booking ждёт Termux) — карточку НЕ гасим:
-                # статус остаётся awaiting, после деплоя то же «да» закроет аренду штатно.
+                # Bridge ещё без деплоя фазы I (конверт close_booking ждёт деплоя владельцем) — карточку
+                # НЕ гасим: статус остаётся awaiting, после деплоя то же «да» закроет аренду штатно.
                 log.warning(f"  → ПРИЁМ: Bridge без close_booking (unknown_action) {ret['bike']} — жду деплоя")
                 await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
                             text="🐀 Splinter\n⏳ Закрытие аренды (closeBooking) ещё не задеплоено на Bridge — "
-                                 "дождись Termux-деплоя, карточка останется, потом снова «да».")
+                                 "требуется решение владельца (деплой Bridge); карточка останется, "
+                                 "после деплоя снова «да».")
             elif res.get("error") == "km_required":
                 # fail-closed (инцидент row705): Bridge без пробега на сдаче аренду НЕ закрывает.
                 # Карточку НЕ гасим — «да <цифра пробега>» тем же запросом добьёт закрытие.

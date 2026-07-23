@@ -1,5 +1,5 @@
 """Моки конверта op=other (O4, 03.07.2026): заявка NEEDS_APPROVAL op=other → «да» Филиппа →
-демон НЕ валит «сделай в Termux», а конвертирует заявку в обычную headless-задачу
+демон НЕ валит failed-отпиской «требуется решение владельца», а конвертирует заявку в обычную headless-задачу
 (текст заявки = ТЗ, from=Filipp-328-dev, дев-таймаут) → та исполняется claude -p → done-рапорт.
 Исключения: шаг декомпозиции (конверт сломал бы guard цепочки → прежний failed) и сбой enqueue
 (честный failed-фоллбэк). Сети/Telegram/claude нет — всё мокнуто."""
@@ -113,7 +113,7 @@ fb.approve(tid)
 OD.process_approved()
 orig = fb.rows[tid]
 res.append(ok(orig["status"] == "done" and "конвертировано в headless-задачу" in orig["result"],
-              "approve → заявка done «конвертировано», НЕ failed «сделай в Termux»"))
+              "approve → заявка done «конвертировано», НЕ failed-отписка владельцу"))
 news = fb.by_status("new")
 res.append(ok(len(news) == 1 and news[0]["from"] == "Filipp-328-dev",
               "конверт в очереди, from=Filipp-328-dev (дев-таймаут 45 мин)"))
@@ -149,8 +149,9 @@ s2 = fb.enqueue_task("Filipp-328-dec", f"[шаг 2/2 родитель {p}] об�
 fb.rows[s1]["status"] = "needs_approval"; fb.rows[s1]["result"] = "op=other | записать в Лист1"
 fb.approve(s1)
 OD.process_approved()
-res.append(ok(fb.rows[s1]["status"] == "failed" and "Termux" in fb.rows[s1]["result"],
-              "шаг декомпозиции op=other → failed (конверта нет)"))
+res.append(ok(fb.rows[s1]["status"] == "failed" and "решение владельца" in fb.rows[s1]["result"]
+              and "328" in fb.rows[s1]["result"],
+              "шаг декомпозиции op=other → failed (конверта нет, формулировка «решение владельца»)"))
 res.append(ok(fb.rows[s2]["status"] == "failed" and "пропущен" in fb.rows[s2]["result"],
               "halt-on-fail: сиблинг пропущен, цепочка остановлена"))
 res.append(ok(all(r["from"] != "Filipp-328-dev" for r in fb.rows.values()),
@@ -165,8 +166,8 @@ fb.approve(tid)
 fb.enqueue_fail = True
 OD.process_approved()
 res.append(ok(fb.rows[tid]["status"] == "failed" and "не встал в очередь" in fb.rows[tid]["result"]
-              and "Termux" in fb.rows[tid]["result"],
-              "enqueue не прошёл → failed с фоллбэком «сделай в Termux»"))
+              and "решение владельца" in fb.rows[tid]["result"],
+              "enqueue не прошёл → failed с фоллбэком «требуется решение владельца»"))
 
 # (5) AUTO_OPS-путь не задет: op=git_push после approve по-прежнему хардкод
 print("(5) op∈AUTO_OPS без изменений:")

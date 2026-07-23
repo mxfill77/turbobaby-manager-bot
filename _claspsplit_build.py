@@ -9,7 +9,7 @@
   _claspsplit_new_settings.local.json  — будущий .claude/settings.local.json (владелец,
       игнорится git глобально: /root/.config/git/ignore): прежние локальные allow-записи +
       clasp push/redeploy/deployments/version(s)/create-version в allow.
-Применение — разовые cp из Termux (headless в .claude/ писать не может — гейт движка):
+Применение — разовые cp владельцем в интерактивной сессии (headless в .claude/ писать не может — гейт движка):
   cp _claspsplit_new_settings.json .claude/settings.json
   cp _claspsplit_new_settings.local.json .claude/settings.local.json
 Забор headless при этом держит headless_settings.json (демон передаёт его через --settings;
