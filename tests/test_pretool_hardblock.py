@@ -6,7 +6,11 @@
       ломал headless (красное не исполнялось даже после «да» владельца);
   (б) данные ≠ команда         — красное слово в ПОИСКОВОМ ШАБЛОНЕ grep/rg/sed/awk не краснит команду,
       но ОПЕРАНДЫ и соседние звенья цепи остаются под сканом (дыру не открыли);
-  (в) hard-block файла секретов — обращение к нему в ЛЮБОЙ позиции цепи → deny, событие env_hard_block.
+  (в) hard-block файла секретов — обращение к нему в ЛЮБОЙ позиции цепи → deny, событие env_hard_block;
+  (г) в3 (23.07.2026)          — ambiguous САМ ПО СЕБЕ не красный: незнакомая команда, heredoc/stdin,
+      неизвестный -m, нечитаемый .py, кривое квотирование → defer (решение None, конверта НЕТ);
+      красное гарда — ТОЛЬКО доктринальный список (таблицы/CRM/деньги, секреты, sqlite вне memory.db,
+      kill/stop боевых, PID 1) — и оно ловится И СКВОЗЬ heredoc (секция 13).
 
 ТЕСТ НИЧЕГО НЕ ИСПОЛНЯЕТ: только импорт модуля и ЧИСТЫЕ функции classify()/can_approve()/decision()/
 _card()/_guard_log(). Ни одна проверяемая строка не уходит в shell — ни один процесс не трогается.
@@ -193,11 +197,11 @@ print("(11) регресс: python-скан НЕ ослаблен:")
 kind, hit, _b = cls('python3 -c "' + TRX + '(amount=500)"')
 res.append(ok(kind == "red" and hit == TRX, "инлайн денежная операция → красное (" + hit + ")"))
 kind, hit, _b = cls("python3 -")
-res.append(ok(kind == "ambiguous" and hit == "ambiguous", "stdin '-' → ambiguous (fail-safe цел)"))
+res.append(ok(kind == "ambiguous" and hit == "ambiguous", "stdin '-' → класс ambiguous (в3: решение defer, см. 13)"))
 kind, hit, _b = cls("python3 -m some_unknown_module")
-res.append(ok(kind == "ambiguous", "неизвестный -m → ambiguous"))
+res.append(ok(kind == "ambiguous", "неизвестный -m → класс ambiguous"))
 res.append(ok(PG.can_approve("red", TRX) and PG.can_approve("ambiguous", "ambiguous"),
-              "красное/ambiguous по-прежнему approve-able (жёсткое — только два события)"))
+              "красное по-прежнему approve-able (жёсткое — только два события)"))
 
 print("(12) журнал жёстких блоков (событие пишется, значений секретов в строке нет):")
 tmp = tempfile.mkdtemp(prefix="pt_hb_")
@@ -214,6 +218,47 @@ res.append(ok([r.get("event") for r in rows] == ["proc_hard_block", "env_hard_bl
 res.append(ok(all(r.get("cmd") for r in rows), "команда в строке журнала есть"))
 res.append(ok(PG.HARD_BLOCK_HITS == ("proc_hard_block", "env_hard_block"),
               "имена событий журнала = ключи жёсткого блока"))
+
+
+def is_defer_ambiguous(cmd):
+    """в3: класс ambiguous, решение хука None (defer) — ни ask, ни deny, конверта НЕТ."""
+    kind, hit, _b = cls(cmd)
+    return kind == "ambiguous" and hit == "ambiguous" and PG.decision(kind, hit, "") is None
+
+
+print("(13) в3: ambiguous сам по себе НЕ красный — defer; красное только по доктрине:")
+HD_Q = ("python3 - <<PYEOF\n"
+        "import json\n"
+        "q = json.load(open('tmp/tasks_queue.json'))\n"
+        "print(len(q))\n"
+        "PYEOF")
+res.append(ok(is_defer_ambiguous(HD_Q), "python3 - <<PYEOF (чтение очереди) → defer (зелёное)"))
+res.append(ok(is_defer_ambiguous("python3 -"), "stdin '-' без heredoc → defer"))
+res.append(ok(is_defer_ambiguous("python3 -m some_unknown_module"), "неизвестный -m → defer"))
+res.append(ok(is_defer_ambiguous("python3 'незакрытая кавычка"), "кривое квотирование → defer"))
+res.append(ok(is_green("frobnicate --such-flag-much-unknown"), "незнакомая не-python команда → defer"))
+
+print("(13б) …но доктринальное красное СКВОЗЬ heredoc/stdin ловится по-прежнему:")
+kind, hit, _b = cls("python3 - <<PYEOF\nfrom bridge_client import api\n" + TRX + "(amount=500)\nPYEOF")
+res.append(ok(kind == "red" and hit == TRX, "heredoc с денежной операцией → красное (" + hit + ")"))
+kind, hit, _b = cls("python3 - <<PYEOF\nimport sqlite3\ncon = sqlite3.connect('/root/x/tasks.db')\n"
+                    "con.execute('UPDATE tasks SET s=1')\nPYEOF")
+res.append(ok(kind == "red" and hit == "sqlite", "heredoc с UPDATE чужой .db → красное (sqlite)"))
+res.append(ok(is_defer_ambiguous("python3 - <<PYEOF\nimport sqlite3\ncon = sqlite3.connect('memory.db')\n"
+                                 "con.execute('UPDATE tasks SET s=1')\nPYEOF"),
+              "тот же UPDATE в СВОЮ memory.db → defer (доктрина 02.07 цела)"))
+res.append(ok(is_block("python3 - <<PYEOF\nimport os\nos.system('cat " + ENVF + "')\nPYEOF",
+                       "env_hard_block"), "heredoc с чтением секретов → блок"))
+res.append(ok(is_block("python3 - <<PYEOF\nimport os\nos.system('" + PK + " -9 " + SPL + "')\nPYEOF",
+                       "proc_hard_block"), "heredoc с гашением боевого процесса → блок"))
+FLEET_OIL = "set_fleet_" + "oil"
+tmp2 = tempfile.mkdtemp(prefix="pt_v3_").replace(os.sep, "/")   # forward slashes: shlex ест бэкслэши ПК-клона
+with open(tmp2 + "/fx_red_live.py", "w", encoding="utf-8") as _f:
+    _f.write("# фикстура\nprint('" + FLEET_OIL + "')\n")
+kind, hit, _b = cls("python3 " + tmp2 + "/fx_red_live.py && python3 " + tmp2 + "/fx_absent.py")
+shutil.rmtree(tmp2, ignore_errors=True)
+res.append(ok(kind == "red" and hit == FLEET_OIL,
+              "red.py && нечитаемый.py → красное (ambiguous-звено red-скан НЕ заслоняет)"))
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)

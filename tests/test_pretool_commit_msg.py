@@ -5,7 +5,8 @@
 git шёл в _analyze → ветка -m видела «не-зелёный модуль» → ложный конверт «не распознал операцию».
 Фикс: для СКАНА интерпретатора payload'ы -m/-am/--message git-команды вырезаются (_strip_git_msg);
 классификация самого git не меняется (git → не-python → defer к штатным allow/ask rules).
-Настоящие python-команды — как раньше (red/ambiguous/green нетронуты). Пуши замучены PRETOOL_NOPUSH.
+Настоящие python-команды: red/green как раньше; ambiguous с в3 (23.07.2026) — defer БЕЗ конверта
+(сам по себе не красный, решают слои settings). Пуши замучены PRETOOL_NOPUSH.
 """
 import os, sys, json, shutil, tempfile, subprocess
 
@@ -56,18 +57,19 @@ r = run(PY + " " + red)
 res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout, "python с red-токеном → red-конверт"))
 missing = os.path.join(TMP, "fx_absent.py")
 r = run(PY + " " + missing)
-res.append(ok('"ask"' in r.stdout and "не распознал операцию" in r.stdout,
-              "нечитаемый .py → ambiguous-конверт (fail-safe цел)"))
+res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout,
+              "нечитаемый .py → defer (в3: ambiguous сам по себе не красный)"))
 r = run("PRETOOL_NOPUSH=1 " + PY + " --version")
 res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout, "инфо-флаг → зелёное (регресс 163)"))
 r = run(PY + " " + os.path.join(ROOT, "tests", "test_fmt.py"))
 res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout, "tests/* → зелёное (регресс 02.07)"))
 
-print("(3) интерпретатор ВНЕ -m в git-команде по-прежнему ловится (страж не ослаблен):")
+print("(3) интерпретатор ВНЕ -m в git-команде по-прежнему сканится (страж не ослаблен):")
 r = run(f'git commit -m "правка" && {PY} {red}')
 res.append(ok('"ask"' in r.stdout, "компаунд git…&&python red-скрипт → конверт остался"))
 r = run(f'git commit -m "правка" && {PY} {missing}')
-res.append(ok('"ask"' in r.stdout, "компаунд git…&&python нечитаемый → конверт остался"))
+res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout,
+              "компаунд git…&&python нечитаемый → defer (в3, red в компаунде ловится — выше)"))
 
 print("(4) _strip_git_msg: границы и fail-safe:")
 sys.path.insert(0, ROOT)

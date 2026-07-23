@@ -7,9 +7,11 @@
 в Telegram владельцу. Читающий python (recon/gate/tests/reports через write_doc в журналы) — не трогает (defer).
 
 ПОЗИЦИЯ БЕЗОПАСНОСТИ: hook ТОЛЬКО ДОБАВЛЯЕТ подтверждения (никогда не выдаёт новых разрешений).
-- red/неоднозначный python → "ask" (+карточка).
-- зелёный python и всё прочее → exit 0 (defer к штатным allow/ask rules; venv python уже в allow).
-- FAIL-SAFE: нечитаемо/непонятно → "ask" (в сторону подтверждения, НЕ пропуска).
+- red python → "ask" (+карточка); жёсткие классы (процессы/секреты) → "deny".
+- зелёный python, ambiguous (в3, ниже) и всё прочее → exit 0 (defer к штатным allow/ask/deny
+  rules; venv python уже в allow, доктринальное красное держит ask/deny-слой settings).
+- FAIL-SAFE РАЗБОРА: сбой разбора цепи → скан по СЫРОЙ команде, т.е. КРАСНЕЕ (см. _scan);
+  доктринальные проверки (red-токены, sqlite, процессы, секреты) идут ДО любого ambiguous-выхода.
 ПЕРЕКЛАССИФИКАЦИЯ 02.07 (меньше шума, ask только где «да» реально решает):
 - tests/*.py и gate.py → ранний defer БЕЗ чтения содержимого (моки по определению);
 - memory.db через python-код → defer (своя БД бота; sqlite3 CLI остаётся ask в settings);
@@ -35,9 +37,17 @@
     `bash -c`, $(…), `…`) → deny БЕЗ карточки, лог `env_hard_block`, approve НЕВОЗМОЖЕН.
     Сканируется ТОЛЬКО ТЕКСТ КОМАНДЫ: содержимое .py-целей НЕ проверяется (иначе любой боевой
     скрипт с load_env() встал бы намертво).
+в3 (23.07.2026, доктрина «шквал подтверждений»): AMBIGUOUS САМ ПО СЕБЕ НЕ КРАСНЫЙ. Незнакомая
+команда, python без внятной цели (stdin/heredoc `python3 - <<EOF`, неизвестный -m, нечитаемый
+.py, кривое квотирование) → defer к слоям settings (allow/ask/deny). Красное гарда — ТОЛЬКО
+доктринальный список: живые таблицы/CRM/деньги (RED_TOKENS), файл секретов, SQL-write вне
+memory.db (с в3 ловится и в heredoc/stdin — проверка поднята ДО ambiguous-выходов), kill/stop
+боевых процессов, PID 1. clasp/массовые удаления/git-force держит ask/deny-слой settings —
+гард их не дублирует. Конверт «не распознал операцию» упразднён вместе с ambiguous-ask
+(хелперы дедупа карточек оставлены: их контракт держит test_guard_inbox).
 Единая точка классификации — classify(cmd, cwd) → (kind, hit, blob), kind ∈ block/red/ambiguous/
 green; can_approve(kind, hit) и decision(kind, hit, reason) — чистые (их зовут тесты, ничего не
-исполняя). Направление fail-safe прежнее: любой сбой разбора → скан по СЫРОЙ команде (краснее).
+исполняя). Направление fail-safe разбора прежнее: сбой разбора → скан по СЫРОЙ команде (краснее).
 
 НЕ трогает реальный гейт записи confirmed=true в Bridge (ReadFleet.js) — тот независим (третий слой защиты).
 Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
@@ -70,10 +80,10 @@ _INFO_FLAGS = {"--version", "-V", "-VV", "--help", "-h"}
 _ENV_ASSIGN = re.compile(r"^\w+=")   # env-префикс VAR=val перед интерпретатором (PRETOOL_NOPUSH=1 …)
 _SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b", re.IGNORECASE)
 
-# Дедуп ambiguous-карточек в рамках одной задачи/сессии (UX-фикс 08.07.2026, спам-инцидент задачи 163:
-# 4 ОДИНАКОВЫХ конверта «не распознал операцию» за 4 минуты). Повтор той же команды → счётчик ×N
-# правит ТУ ЖЕ Telegram-карточку (editMessageText), нового сообщения НЕ шлёт. Стор — файл на сессию
-# в /tmp (чистится ребутом); запись старше TTL = новая карточка (сессии переиспользуют id редко).
+# Дедуп ambiguous-карточек (UX-фикс 08.07.2026, спам-инцидент задачи 163). в3 (23.07.2026):
+# ambiguous → defer, путь ambiguous-карточек из main() удалён — дедуп в бою НЕ зовётся. Хелперы
+# (_dedup_bump/_dedup_save_mid/_edit) оставлены как движок повторных карточек: их контракт держит
+# test_guard_inbox (5), формат стора /tmp на сессию с TTL прежний.
 _DEDUP_DIR = os.environ.get("PRETOOL_DEDUP_DIR") or "/tmp/cc_pretool_dedup"
 _DEDUP_TTL = 4 * 3600
 
@@ -160,8 +170,9 @@ def can_approve(kind, hit=""):
 
 def decision(kind, hit, reason):
     """Чистая функция «классификация → решение хука» (её зовут тесты, ничего не исполняя):
-    block → deny (approve НЕВОЗМОЖЕН), red/ambiguous → ask, green → None (defer)."""
-    if kind == "green":
+    block → deny (approve НЕВОЗМОЖЕН), red → ask, ambiguous/green → None (defer). в3 23.07.2026:
+    ambiguous сам по себе не красный — решают слои settings (доктринальное красное там ask/deny)."""
+    if kind in ("green", "ambiguous"):
         return None
     return {"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -220,6 +231,8 @@ _ACTIONS = {
                "изменит НЕизвестную базу данных (не свою memory.db)",
                "какая это БД и почему пишем не в memory.db — memory.db через код шёл бы без вопроса"),
 }
+# в3 23.07.2026: штатно НЕдостижимо (ambiguous → defer, main() до карточки не доходит);
+# оставлено фолбэком _card на случай red-hit вне _ACTIONS (карточка не падает, а страшнеет).
 _AMBIGUOUS = ("не распознал операцию — скрипт может писать в рабочие данные, но точную операцию не разобрал",
               "неизвестно — не могу гарантировать, что скрипт только читает",
               "команда в карточке — подтверждай, только если понимаешь, что она делает")
@@ -767,33 +780,43 @@ def _analyze(cmd, cwd, scan=None):
     for tok in RED_TOKENS:
         if tok in scan:
             return "red", RED_TOKEN_HIT[tok], cmd
+    # 1б) SQL-write в тексте команды (heredoc/stdin/инлайн) — в3: раньше такие формы прятались за
+    #     ambiguous-ask, теперь ambiguous defer'ится → доктринальный sqlite проверяется ДО любого
+    #     ambiguous-выхода. memory.db — своя БД (зелёная доктрина 02.07), скан-представление
+    #     чтит «данные ≠ команда» (UPDATE в шаблоне grep не краснит).
+    if _SQLITE_WRITE.search(scan) and ".db" in scan and "memory.db" not in scan:
+        return "red", "sqlite", cmd
     # 2) разобрать команду на токены
     try:
         toks = shlex.split(cmd)
     except Exception:
-        return "ambiguous", "ambiguous", cmd   # кривое квотирование → подтверждаем на всякий
+        return "ambiguous", "ambiguous", cmd   # кривое квотирование → ambiguous (в3: defer)
     content = ""
     i = 0
     saw_target = False
-    while i < len(toks):
-        t = toks[i]
+    amb = False        # в3: ambiguous КОПИТСЯ, а не выходит сразу — красное в ЧИТАЕМОЙ части команды
+    while i < len(toks):                     # важнее (иначе `python3 red.py && python3 нет_такого.py`
+        t = toks[i]                          # ушёл бы в defer, не отсканировав red.py)
         if t == "-c":                                  # инлайн-код в следующем токене
             content += (toks[i + 1] if i + 1 < len(toks) else "")
             saw_target = True
             i += 2; continue
-        if t == "-":                                   # stdin → прочитать нечего
-            return "ambiguous", "ambiguous", cmd
+        if t == "-":                                   # stdin: тело heredoc уже отсканировано по scan (шаг 1)
+            amb = True
+            i += 1; continue
         if t == "-m":                                  # модуль (py_compile/pytest/json.tool — ОБРАБАТЫВАЮТ файлы-
             mod = toks[i + 1] if i + 1 < len(toks) else ""   # аргументы, НЕ исполняют их write-логику → не читаем
             if mod in _GREEN_MODULES:                  # арг-файлы: иначе `-m py_compile splinter.py` ложно ловит
                 return "green", "", cmd                # токены из ИСХОДНИКА splinter.py (он их определяет)
-            return "ambiguous", "ambiguous", cmd
+            amb = True
+            i += 2; continue
         if t.endswith(".py"):
             body = _read_file(t, cwd)
             if body is None:
-                return "ambiguous", "ambiguous", cmd   # путь есть, файл не прочли → подтверждаем
-            content += body
-            saw_target = True
+                amb = True                             # путь есть, файл не прочли → ambiguous (в3: defer)
+            else:
+                content += body
+                saw_target = True
         i += 1
     blob = cmd + "\n" + content
     for tok in RED_TOKENS:
@@ -803,6 +826,8 @@ def _analyze(cmd, cwd, scan=None):
     # переклассификация 02.07; прямой sqlite3 CLI остаётся ask в settings). SQL-write в ИНУЮ БД → ask.
     if _SQLITE_WRITE.search(blob) and ".db" in blob and "memory.db" not in blob:
         return "red", "sqlite", blob
+    if amb:
+        return "ambiguous", "ambiguous", blob          # доктринального красного нет → в3: defer
     if not saw_target:
         # Инфо-флаги (--version/-V/--help) НИЧЕГО не исполняют → зелёное (сужение ambiguous 06.07):
         # все не-интерпретаторные, не-`VAR=val` токены ∈ _INFO_FLAGS и хотя бы один есть.
@@ -810,7 +835,7 @@ def _analyze(cmd, cwd, scan=None):
         rest = [t for t in _args_after_interp(toks) if not _ENV_ASSIGN.match(t)]
         if rest and all(t in _INFO_FLAGS for t in rest):
             return "green", "", blob
-        return "ambiguous", "ambiguous", blob          # python без внятной цели (REPL и т.п.) → подтверждаем
+        return "ambiguous", "ambiguous", blob          # python без внятной цели (REPL/heredoc) → в3: defer
     return "green", "", blob
 
 
@@ -828,26 +853,18 @@ def main():
     try:
         kind, hit, blob = classify(cmd, cwd)
     except Exception:
-        kind, hit, blob = "ambiguous", "ambiguous", cmd  # любая ошибка анализа → fail-safe ask
-    if kind == "green":
-        _defer()                                       # читающий python / не-python → штатные rules
+        kind, hit, blob = "ambiguous", "ambiguous", cmd  # сбой анализа → в3: defer (красное держат settings)
+    if kind in ("green", "ambiguous"):
+        _defer()                  # читающий python / не-python / ambiguous (в3) → штатные allow/ask/deny
     if not can_approve(kind, hit):
         why = _block_reason(hit, blob)                 # ЖЁСТКИЙ БЛОК: deny + журнал. Ниже по коду —
         _guard_log(hit, cmd, why)                      # карточка, пуш и маркер-конверт: сюда НЕ доходим,
         _emit(decision(kind, hit, why))                # т.е. approve по этой команде невозможен физически
-    test = _is_test_script(cmd)
-    count, mid = 1, None
-    if hit == "ambiguous":                             # дедуп ТОЛЬКО ambiguous (инцидент 163); red —
-        count, mid = _dedup_bump(data.get("session_id"), cmd)   # конкретная операция, каждая пушится
-    card = _card(hit, blob, test, cmd=cmd, count=count)
+    test = _is_test_script(cmd)                        # дальше ТОЛЬКО red: конкретная операция, каждая пушится
+    card = _card(hit, blob, test, cmd=cmd)
     _guard_write_marker(os.environ.get("CC_TASK_ID", "").strip(), hit, card)
     if not test:                  # 🧪-тестовые карточки в личку НЕ пушим (утечки 01–05.07); ask остаётся
-        if count <= 1:
-            new_mid = _push(card)
-            if new_mid:
-                _dedup_save_mid(data.get("session_id"), cmd, new_mid)
-        else:
-            _edit(mid, card)      # повтор → счётчик ×N в ТОЙ ЖЕ карточке, нового сообщения НЕТ
+        _push(card)
     _ask(card)
 
 

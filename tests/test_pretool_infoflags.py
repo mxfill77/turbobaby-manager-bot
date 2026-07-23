@@ -4,7 +4,9 @@
 (platform/sysconfig/site) → ЗЕЛЁНОЕ (defer), а не ложный ambiguous-ask. Раньше
 `venv/bin/python3 --version` не имел .py-цели → падал в ask, хотя venv python в allow.
 
-КРАСНОЕ и настоящий ambiguous (stdin `-`, неизвестный `-m`, нечитаемый .py) — ОСТАЮТСЯ ask.
+КРАСНОЕ — ОСТАЁТСЯ ask. в3 (23.07.2026): настоящий ambiguous (stdin `-`, неизвестный `-m`,
+нечитаемый .py, флаг вне белого списка) → defer БЕЗ конверта — ambiguous сам по себе не красный,
+решают слои settings; красное гарда — только доктринальный список.
 Пуши глушим PRETOOL_NOPUSH=1 (ноль карточек в личку).
 """
 import os
@@ -69,12 +71,12 @@ with open(red, "w", encoding="utf-8") as f:
 res.append(ok(is_ask(PY + " " + red), "скрипт с set_fleet_oil → ask"))
 res.append(ok(is_ask(PY + " -c \"add_transaction(amount=500)\""), "inline add_transaction → ask"))
 
-print("Настоящий ambiguous → по-прежнему ask (fail-safe цел):")
-res.append(ok(is_ask(PY + " -"), "stdin '-' → ask"))
-res.append(ok(is_ask(PY + " -m some_unknown_module"), "неизвестный -m → ask"))
-res.append(ok(is_ask(PY + " --version --frobnicate"), "флаг вне белого списка → ask"))
+print("Настоящий ambiguous → в3: defer БЕЗ конверта (сам по себе не красный):")
+res.append(ok(is_green(PY + " -"), "stdin '-' → defer"))
+res.append(ok(is_green(PY + " -m some_unknown_module"), "неизвестный -m → defer"))
+res.append(ok(is_green(PY + " --version --frobnicate"), "флаг вне белого списка → defer"))
 missing = os.path.join(tmp, "nope_missing.py")
-res.append(ok(is_ask(PY + " " + missing), "нечитаемый .py-путь → ask"))
+res.append(ok(is_green(PY + " " + missing), "нечитаемый .py-путь → defer"))
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else f"ЕСТЬ FAIL ({sum(res)}/{len(res)})")
 sys.exit(0 if all(res) else 1)
