@@ -33,6 +33,10 @@
     ТОЛЬКО из скан-представления и ТОЛЬКО в СВОЁМ сегменте цепи; ОПЕРАНДЫ (файлы!) остаются под
     сканом, а токен с признаками ИСПОЛНЕНИЯ ($(…)/`…`/system("…")) не вырезается и раскрывается
     отдельным сегментом. Итог: `grep -n ".env" f.py` — зелёное, `grep -n foo .env` — блок.
+    Тот же класс с 24.07.2026 — ARGV .py-СКРИПТА (_strip_script_cli_args): всё ПОСЛЕ имени
+    скрипта вырезается из скан-представления (журнальный `cclog.py "DONE …"` краснел по ТЕКСТУ
+    строки), но ТЕЛО .py читается как прежде, а операнды-улики (файл секретов, .db/SQL-write,
+    $(…)/`…`) из argv НЕ вырезаются — жёсткие блоки не слабеют.
 (в) HARD-BLOCK .env: обращение к файлу секретов в ЛЮБОЙ позиции цепи (после &&/;/|, внутри
     `bash -c`, $(…), `…`) → deny БЕЗ карточки, лог `env_hard_block`, approve НЕВОЗМОЖЕН.
     Сканируется ТОЛЬКО ТЕКСТ КОМАНДЫ: содержимое .py-целей НЕ проверяется (иначе любой боевой
@@ -467,6 +471,35 @@ def _strip_git_msg(cmd):
     return " ".join(out)
 
 
+def _strip_script_cli_args(cmd):
+    """Аргументы ПОСЛЕ имени .py-скрипта — ДАННЫЕ скрипта, а не операция команды. Тот же класс,
+    что текст git -m (_strip_git_msg): журнальные/логовые скрипты несут боевые слова В ТЕКСТЕ
+    строки — `venv/bin/python3 cclog.py "DONE …: закрыл …"` краснел на шаге 1 _analyze по argv,
+    хотя пишет он в журнал, а не в Лист1/CRM. Вырезается ТОЛЬКО из СКАН-представления; ТЕЛО .py
+    по-прежнему читается и сканируется (_analyze шаг 2 токенизирует СЫРУЮ команду) — операция,
+    которую скрипт РЕАЛЬНО делает, ловится там, как и раньше.
+    Интерпретатор и его СОБСТВЕННЫЕ флаги (всё ДО имени скрипта: -u, -X, -m …) — ОСТАЮТСЯ.
+    ОПЕРАНДЫ-УЛИКИ НЕ вырезаются (та же линия, что у _strip_search_pattern с файлами): токен с
+    файлом секретов, с .db/SQL-write или с признаком исполнения ($(…)/`…`/system(…)) остаётся под
+    сканом — иначе `python3 dump.py /root/app/.env` перестал бы жёстко блокироваться, а
+    `python3 run.py "UPDATE x SET y" other.db` — краснеть.
+    Нет .py-токена / сбой разбора → команда КАК ЕСТЬ (fail-safe: скан полный, краснит охотнее)."""
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        return cmd
+    for i, t in enumerate(toks):
+        if not t.endswith(".py"):
+            continue
+        tail = toks[i + 1:]
+        if not tail:
+            return cmd                 # аргументов нет — не трогаем (лишняя переклейка кавычек)
+        keep = [a for a in tail if _ENV_FILE.search(a) or ".db" in a
+                or _SQLITE_WRITE.search(a) or _EXEC_IN_PATTERN.search(a)]
+        return " ".join(toks[:i + 1] + keep)
+    return cmd
+
+
 def _args_after_interp(toks):
     """Аргументы ПОСЛЕ интерпретатора: срезает ведущие VAR=val (env-префикс) и сам python-токен.
     Фикс инцидента 163 (08.07.2026): `PRETOOL_NOPUSH=1 venv/bin/python3 --version` считал интерпретатор
@@ -640,6 +673,7 @@ def _units(cmd, depth=0):
         for inner in _subst_inners(seg):
             out.extend(_units(inner, depth + 1))
         clean = _strip_git_msg(seg)          # текст git -m — ДАННЫЕ (нюанс bd5d516)
+        clean = _strip_script_cli_args(clean)   # argv .py-скрипта — ДАННЫЕ (тот же класс)
         toks = _tokens(clean)
         i = _cmd_index(toks)
         if i is not None and _base(toks[i]) in _SHELLS:
