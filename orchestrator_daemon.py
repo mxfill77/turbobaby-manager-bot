@@ -75,9 +75,9 @@ ORPHAN_TTL = _env_int("ORPHAN_TTL", 600)
 # Fail-safe: /proc/meminfo нечитаем → гейт пропускается, прежнее поведение.
 try:
     _raw_mem = str(os.environ.get("MEM_MIN_MB") or "").strip()
-    MEM_MIN_MB = max(0, int(_raw_mem)) if _raw_mem else 700
+    MEM_MIN_MB = max(0, int(_raw_mem)) if _raw_mem else 2560
 except (ValueError, TypeError):
-    MEM_MIN_MB = 700
+    MEM_MIN_MB = 2560
 MEM_RETRY_SEC = _env_int("MEM_RETRY_SEC", 120)   # cooldown после детекта дефицита, сек
 _mem_wait_until = 0.0                              # monotonic: до этого момента не берём задачи
 _mem_deny_count = 0        # число последовательных «настоящих» отказов (cooldown-пропуски не в счёт)
@@ -85,11 +85,11 @@ MEM_DENY_ALERT = 3         # порог для карточки в 328 (сбра
 # ГЕЙТ RSS CLAUDE (17.07.2026, OOM №2): суммарный RSS живых claude-процессов в mem-gate.
 # Если суммарный RSS >= CLAUDE_RSS_TOTAL_MB → тот же cooldown/карточка, что у MemAvail-гейта.
 # CLAUDE_RSS_TOTAL_MB=0 → RSS-гейт выключен. Fail-safe: /proc нечитаем → пропускается.
-CLAUDE_RSS_TOTAL_MB = _env_int("CLAUDE_RSS_TOTAL_MB", 1200)
+CLAUDE_RSS_TOTAL_MB = _env_int("CLAUDE_RSS_TOTAL_MB", 4096)
 # ГЕЙТ ПАРАЛЛЕЛИЗМА (17.07.2026, OOM №2): считать живые claude-процессы перед spawn.
 # Если живых claude >= MAX_CLAUDE_PROCS → задача ждёт в new (не failed, не потеряна).
 # MAX_CLAUDE_PROCS=0 → гейт выключен. Fail-safe: /proc нечитаем → гейт пропускается.
-MAX_CLAUDE_PROCS = _env_int("MAX_CLAUDE_PROCS", 2)
+MAX_CLAUDE_PROCS = _env_int("MAX_CLAUDE_PROCS", 4)
 PROC_RETRY_SEC = _env_int("PROC_RETRY_SEC", 120)   # cooldown после детекта превышения
 _proc_wait_until = 0.0
 _proc_deny_count = 0
