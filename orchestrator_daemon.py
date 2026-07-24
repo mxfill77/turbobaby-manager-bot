@@ -162,6 +162,12 @@ def _normalize_model(name):
 
 _EXECUTOR_MODEL_RAW = (os.environ.get("EXECUTOR_MODEL") or "").strip()
 EXECUTOR_MODEL = _normalize_model(_EXECUTOR_MODEL_RAW) if _EXECUTOR_MODEL_RAW else ORCH_MODEL
+
+import task_metrics  # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens
+# УРОВЕНЬ УСИЛИЙ ИСПОЛНИТЕЛЯ (24.07.2026): claude -p принимает --effort (low/medium/high/xhigh/max);
+# на VPS раньше НЕ передавался -> CLI брал дефолт. Выносим в env EXECUTOR_EFFORT (дефолт xhigh —
+# доктрина «каждая задача ultrathink»); незнакомое значение -> xhigh (task_metrics.norm_effort).
+EXECUTOR_EFFORT = task_metrics.norm_effort(os.environ.get("EXECUTOR_EFFORT"))
 RESULT_MAX = 4500        # Bridge режет result на 5000 — оставляем запас
 LOG_PATH = os.path.join(REPO, "orchestrator_daemon.log")
 
@@ -817,7 +823,7 @@ def _task_timeout(task):
     return TASK_TIMEOUT_DEV if frm.endswith((DEV_FROM_SUFFIX, DEC_FROM_SUFFIX)) else TASK_TIMEOUT
 
 
-def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
+def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None, _mctx=None):
     """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
     status ∈ done|failed|needs_approval|requeue (needs_approval — красная зона, самодекларация
     claude через маркер; requeue — гибель от ЧУЖОГО планового рестарта, вернуть задачу в new).
@@ -874,6 +880,7 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     cmd = [CLAUDE_BIN, "-p",
            "--model", model,
            "--fallback-model", ORCH_MODEL_FALLBACK,
+           "--effort", EXECUTOR_EFFORT,
            "--output-format", "json",
            "--settings", HEADLESS_SETTINGS,  # строгий headless-слой (роль-развод: clasp → ask)
            prompt]                          # список аргументов, БЕЗ shell → нет инъекции через task_text
@@ -940,13 +947,18 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     # --output-format json: {result:<текст>, modelUsage:{<модель>:{…}}, is_error, api_error_status}.
     # Достаём текст ответа (result) и КАКАЯ модель реально отработала (ключи modelUsage). Парс-фейл
     # (пустой/не-json вывод, тест-моки с plain text) → деградация на сырой stdout, как в текст-режиме.
-    out, models_ran = raw, []
+    out, models_ran, _parsed = raw, [], None
     try:
         j = json.loads(raw)
+        _parsed = j
         out = (j.get("result") or "").strip()
         models_ran = list((j.get("modelUsage") or {}).keys())
     except Exception:
         pass
+    if _mctx is not None:
+        _mctx["model"] = ",".join(models_ran) if models_ran else model
+        _ti, _to = task_metrics.extract_tokens(_parsed)
+        _mctx["tokens_in"], _mctx["tokens_out"] = _ti, _to
     if models_ran:
         ran = ",".join(models_ran)
         picked = "фолбэк" if model not in ran and ORCH_MODEL_FALLBACK in ran else "основная"
@@ -992,6 +1004,28 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
         return "failed", _fail_card(out, err, proc.returncode)
     log.info("id=%s claude -p exit=0 (вывод %d симв)", task_id, len(out))
     return "done", (out[:RESULT_MAX] if out else "(claude -p вернул пустой вывод)")
+
+
+def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
+    # Обёртка-наблюдаемость над _run_task_impl: та же сигнатура/возврат, но по завершении пишет
+    # ОДНУ структурную строку METRICS в orchestrator_daemon.log (модель/усилие/тайминги/исход/
+    # токены/самопочинки/канал). Замер в try/except — его сбой НИКОГДА не меняет исход задачи.
+    _mctx = {"model": None, "tokens_in": None, "tokens_out": None}
+    _t0 = time.monotonic()
+    _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    status, result = _run_task_impl(task_id, task_text, task_timeout, preamble, _mctx)
+    try:
+        _is_planner = preamble is not None and preamble.startswith(PLANNER_PREAMBLE)
+        _model = _mctx.get("model") or (ORCH_MODEL if _is_planner else EXECUTOR_MODEL)
+        log.info(task_metrics.metrics_line(
+            task=task_id, lane="vps", model=_model, effort=EXECUTOR_EFFORT, start_iso=_start,
+            end_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            dur_s=time.monotonic() - _t0, outcome=status, attempts=1,
+            selfheals=task_metrics.selfheal_count(task_text),
+            tokens_in=_mctx.get("tokens_in"), tokens_out=_mctx.get("tokens_out")))
+    except Exception as _e:
+        log.warning("METRICS не записан (vps id=%s): %s", task_id, _e)
+    return status, result
 
 
 # === ИСПОЛНИТЕЛИ красных op (хардкод-команды; claude НЕ участвует, op-код детерминирует команду) ===
