@@ -133,11 +133,13 @@ class TestGitMsgGreen(unittest.TestCase):
             f"git commit -m '<OP>' должен быть green (не python), получил {kind!r}")
 
     def test_compound_gate_then_git_commit(self):
-        # gate.py зелёный + git commit с <OP> в сообщении → оба сегмента зелёные
+        # Сегмент git commit зелёный (_strip_git_msg), но тело gate.py гард
+        # дочитывает и метит неоднозначным → вся связка "ambiguous", не "green".
+        # NB: только из корня репо; из другого cwd тела нет и выйдет "green".
         cmd = "venv/bin/python3 gate.py && git commit -m 'фикс: " + _CB + "'"
         kind, _, _ = PG.classify(cmd, ROOT)
-        self.assertEqual(kind, "green",
-            f"gate && git commit -m '<OP>' → green, получил {kind!r}")
+        self.assertEqual(kind, "ambiguous",
+            f"gate && git commit -m '<OP>' → ambiguous, получил {kind!r}")
 
 
 class TestSecretsFileBlocked(unittest.TestCase):
