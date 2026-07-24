@@ -57,6 +57,7 @@ green; can_approve(kind, hit) и decision(kind, hit, reason) — чистые (�
 Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
 """
 import sys, os, json, re, shlex, time, fcntl, hashlib
+import subprocess
 
 PROJECT = "/root/turbobaby-manager-bot"
 
@@ -543,6 +544,25 @@ def _is_trusted_test(cmd, cwd):
     return all(p.startswith(tests_dir) or p == gate for p in targets)
 
 
+def _repo_tracked(path, cwd):
+    """True if path is a file TRACKED by git in THIS repo (PROJECT). Trust-by-origin (24.07.2026):
+    repo sources not body-scanned (own reviewed/tested code); _-prefixed drafts, scratchpad and
+    out-of-repo files are body-scanned as before. Fail-safe: git missing / outside repo / _-prefixed
+    -> False (body IS scanned, redder)."""
+    try:
+        if os.path.basename(path).startswith("_"):
+            return False
+        for cand in (path, os.path.join(cwd or PROJECT, path), os.path.join(PROJECT, path)):
+            if os.path.isfile(cand):
+                r = subprocess.run(["git", "-C", PROJECT, "ls-files", "--error-unmatch",
+                                    os.path.realpath(cand)],
+                                   capture_output=True, timeout=5)
+                return r.returncode == 0
+        return False
+    except Exception:
+        return False
+
+
 def _read_file(path, cwd):
     for cand in (path, os.path.join(cwd or PROJECT, path), os.path.join(PROJECT, path)):
         try:
@@ -693,9 +713,9 @@ def _scan(cmd):
     try:
         units = _units(cmd)
         text = " ".join(t for _, t in units)
-        return units, (text if text.strip() else _strip_git_msg(cmd))
+        return units, (text if text.strip() else _strip_script_cli_args(_strip_git_msg(cmd)))
     except Exception:
-        return [(_tokens(cmd), cmd)], _strip_git_msg(cmd)
+        return [(_tokens(cmd), cmd)], _strip_script_cli_args(_strip_git_msg(cmd))
 
 
 # ══ (а) ЧЁРНЫЙ СПИСОК ПРОЦЕССОВ ════════════════════════════════════════════════════════════
@@ -845,12 +865,15 @@ def _analyze(cmd, cwd, scan=None):
             amb = True
             i += 2; continue
         if t.endswith(".py"):
-            body = _read_file(t, cwd)
-            if body is None:
-                amb = True                             # путь есть, файл не прочли → ambiguous (в3: defer)
+            if _repo_tracked(t, cwd):
+                saw_target = True                      # trust-by-origin: git-tracked repo source not body-scanned
             else:
-                content += body
-                saw_target = True
+                body = _read_file(t, cwd)              # _-prefixed / out-of-repo / untracked -> body as before
+                if body is None:
+                    amb = True
+                else:
+                    content += body
+                    saw_target = True
         i += 1
     blob = cmd + "\n" + content
     for tok in RED_TOKENS:
