@@ -18,8 +18,10 @@ import orchestrator_daemon as OD
 
 # (1) модель вынесена в env, дефолты = Fable 5 → фолбэк Opus 4.8 1M (прежняя = CLI-дефолт до правки)
 print("(1) конфиг модели из env:")
-res.append(ok(OD.ORCH_MODEL == "fable", "ORCH_MODEL по умолчанию = fable"))
-res.append(ok(OD.ORCH_MODEL_FALLBACK == "claude-opus-4-8[1m]", "ORCH_MODEL_FALLBACK = Opus 4.8 1M (прежняя)"))
+# NB: два литерала ниже ЗЕРКАЛЯТ боевой .env (ORCH_MODEL / ORCH_MODEL_FALLBACK);
+# при смене модели правятся вместе с конфигом — иначе гейт краснеет и отгрузка встаёт.
+res.append(ok(OD.ORCH_MODEL == "claude-opus-5", "ORCH_MODEL из .env = claude-opus-5"))
+res.append(ok(OD.ORCH_MODEL_FALLBACK == "fable", "ORCH_MODEL_FALLBACK = fable (прежняя основная)"))
 res.append(ok(OD.ORCH_MODEL != OD.ORCH_MODEL_FALLBACK, "основная и фолбэк — разные модели"))
 
 class FakePopen:
@@ -60,7 +62,7 @@ st, r = OD.run_task(1, "проверь X", task_timeout=600)
 a = CAP["args"]
 res.append(ok(a[0] == OD.CLAUDE_BIN and a[1] == "-p", "вызов claude -p"))
 res.append(ok("--model" in a and a[a.index("--model") + 1] == OD.ORCH_MODEL,
-              "--model = ORCH_MODEL (fable)"))
+              "--model = ORCH_MODEL (claude-opus-5)"))
 res.append(ok("--fallback-model" in a and a[a.index("--fallback-model") + 1] == OD.ORCH_MODEL_FALLBACK,
               "--fallback-model = ORCH_MODEL_FALLBACK (кондуктор, не хардкод)"))
 res.append(ok("--output-format" in a and a[a.index("--output-format") + 1] == "json",

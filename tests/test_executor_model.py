@@ -80,7 +80,8 @@ OD._POPEN = fake_popen   # _POPEN сбрасывается reload'ом — во�
 OD.bc = _MinFakeBC()     # bc сбрасывается reload'ом — восстанавливаем
 res.append(ok(OD.EXECUTOR_MODEL == "claude-sonnet-4-6",
               "флаг из env подхвачен + алиас нормализован в полный id"))
-res.append(ok(OD.ORCH_MODEL == "fable", "ORCH_MODEL (думатель/планировщик) флагом НЕ тронут"))
+# NB: литерал ниже ЗЕРКАЛИТ боевой .env (ORCH_MODEL); при смене модели правится вместе с конфигом.
+res.append(ok(OD.ORCH_MODEL == "claude-opus-5", "ORCH_MODEL (думатель/планировщик) флагом НЕ тронут"))
 st4, r4 = OD.run_task(4, "поправь Y", task_timeout=600)
 a4 = CAP["args"]
 res.append(ok(argv_model(a4) == "claude-sonnet-4-6", "argv исполнителя: --model = claude-sonnet-4-6"))
