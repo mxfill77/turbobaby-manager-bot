@@ -48,6 +48,6 @@ wallet_cache.json
 _pcport185
 # scratch / throwaway
 _*.py
-*.bak
+*.bak*
 *.diff
 *.lock
