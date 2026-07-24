@@ -2367,6 +2367,12 @@ _LAST_RECORDED_KM = {}    # (chat_id, topic_id) -> (km:int, ts) — что ре�
 _LAST_REC_TTL = 3600      # коррекцию принимаем только если запись была недавно (1 ч)
 _PENDING_CORRECTION = {}  # (chat_id, topic_id) -> (old_km:int, new_km:int, bike:str, ts)
 
+# === Мягкий гейт убывания одометра (задача 383) ===
+_SOFT_ODO_THRESHOLD = 500      # Δkm ≤ этого — механик подтверждает сам; > — нужен Пым/владелец
+_ODO_DROP_CONSEC = {}          # bike → (count:int, ts:float) — повторное убывание → эскалация
+_ODO_DROP_CONSEC_TTL = 3600    # окно «подряд» = 1 час
+_SOFT_ODO_PENDING = {}         # (chat_id, topic_id) → {new_km, prev_km, bike, escalate, ts}
+
 # === Сторож Б (класс H): единый гейт снижения одометра ===
 # Авторизует снижение km ТОЛЬКО явное «да»/кнопка от ВЛАДЕЛЬЦА. Лог тапа/текста — ДО применения.
 # Fail-safe: исключение в guard → allow (прежнее поведение). Гейт «да» Пыма не ослаблен.
@@ -2416,6 +2422,57 @@ def _odoguard_check(chat_id, topic_id, new_km, caller="?"):
     except Exception:
         log.exception(f"  сторож Б: исключение fail-safe → allow [{caller}]")
         return True
+
+
+def _odo_is_consec(bike):
+    """Было ли убывание одометра по этому байку в последний час (повтор → эскалация)?"""
+    if not bike:
+        return False
+    rec = _ODO_DROP_CONSEC.get(str(bike))
+    if not rec:
+        return False
+    return (_time.time() - rec[1]) < _ODO_DROP_CONSEC_TTL
+
+
+def _odo_drop_record(bike):
+    """Запомнить убывание по байку для детекта повторного."""
+    if not bike:
+        return
+    rec = _ODO_DROP_CONSEC.get(str(bike))
+    _ODO_DROP_CONSEC[str(bike)] = ((rec[0] + 1) if rec else 1, _time.time())
+
+
+def _sender_from_user(u):
+    """username или id строкой — для аудит-следа."""
+    if not u:
+        return "?"
+    if getattr(u, "username", None):
+        return "@" + u.username
+    uid = getattr(u, "id", None)
+    return str(uid) if uid else "?"
+
+
+def _odo_audit_write(bridge, chat_id, topic_id, bike, new_km, prev_km, sender, outcome, has_photo=False):
+    """Аудит-след убывания одометра «было / стало / кто / фото». Fail-safe: не роняет вызывающего."""
+    try:
+        if not bridge:
+            log.info(f"  ОДО аудит (no bridge): {prev_km}→{new_km} {outcome} кто={sender}")
+            return
+        _grp = f"сервис / topic {topic_id}" if topic_id else "сервис"
+        notes = (
+            f"аудит ОДО: было={prev_km} стало={new_km} "
+            f"| кто={sender} | {outcome} | фото={'да' if has_photo else 'нет'}"
+        )
+        r = bridge.add_event(
+            msg_date="", group=_grp, bike=str(bike or ""),
+            event_type="odo_audit", fuel="", mileage=str(new_km),
+            photos=1 if has_photo else 0, notes=notes[:300],
+            msg_id=f"odo_audit:{chat_id}:{topic_id}:{new_km}",
+            sender=sender,
+        )
+        log.info(f"  ОДО аудит ok={r.get('ok')} {prev_km}→{new_km} {outcome}")
+    except Exception:
+        log.exception("  ОДО аудит: ошибка записи (fail-safe)")
 
 
 # негатор правки: «не верно / неверно / неправильно / ошибся / wrong»
@@ -2505,6 +2562,54 @@ def msg_mileage_drop(bike, new_km, last_km):
     )
 
 
+def msg_soft_odo_self(bike, new_km, prev_km):
+    """Мягкий гейт убывания ≤500 км — механик подтверждает сам."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    try:
+        delta = abs(int(str(prev_km)) - int(str(new_km)))
+    except (ValueError, TypeError):
+        delta = "?"
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 อ่านไมล์ได้ {new_km} กม.{b_th} แต่ครั้งก่อน {prev_km} กม. (ลด {delta} กม.)\n"
+        f"ตั้งใจไหมครับ? (เช่น เปลี่ยนมาตรวัด) กด «ใช่» หรือส่งเลขที่ถูกต้อง 🙏\n"
+        f"{_SEP}\n"
+        f"🇷🇺 📟 Вижу {new_km} км{b_ru}, но последний был {prev_km} км (−{delta} км).\n"
+        f"Это намеренно (например, новый спидометр)? Нажми «Да» или пришли верное число 🙏"
+    )
+
+
+def msg_soft_odo_escalate(bike, new_km, prev_km, reason=""):
+    """Мягкий гейт убывания — нужен Пым/владелец (Δ>500 или повтор)."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    try:
+        delta = abs(int(str(prev_km)) - int(str(new_km)))
+    except (ValueError, TypeError):
+        delta = "?"
+    reason_ru = f" ({reason})" if reason else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 ไมล์ {new_km} กม.{b_th} ลดจาก {prev_km} กม. (−{delta} กม.){reason_ru}\n"
+        f"ต้องยืนยันโดย {PYM_HANDLE} หรือเจ้าของครับ 🙏\n"
+        f"{_SEP}\n"
+        f"🇷🇺 📟 Пробег {new_km} км{b_ru} меньше прошлого {prev_km} км (−{delta} км){reason_ru}.\n"
+        f"Требуется подтверждение {PYM_HANDLE} или владельца 🙏"
+    )
+
+
+def msg_soft_odo_need_owner(bike):
+    """Ответ когда не-Пым/не-владелец пытается подтвердить эскалированное убывание."""
+    b_ru = f" по {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 ⚠️ การลดเลขไมล์นี้ต้องยืนยันโดย {PYM_HANDLE} หรือเจ้าของครับ\n"
+        f"{_SEP}\n"
+        f"🇷🇺 ⚠️ Это убывание{b_ru} требует подтверждения {PYM_HANDLE} или владельца"
+    )
+
+
 async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hint=False):
     """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting.
     Фикс B (сторож пробега): если распознанное число МЕНЬШЕ последнего известного по теме —
@@ -2526,9 +2631,29 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
     mark_awaiting(chat_id, topic_id)
 
     if floor is not None:
-        await _send(context, chat_id=chat_id,
-                    text=msg_mileage_drop(bike, new_km, floor),
-                    message_thread_id=topic_id)
+        # Мягкий гейт (задача 383): вместо жёсткого отказа — переспрос.
+        delta = floor - new_km
+        consec = _odo_is_consec(bike)
+        escalate = (delta > _SOFT_ODO_THRESHOLD) or consec
+        reason = "повтор" if consec else ""
+        _SOFT_ODO_PENDING[(chat_id, topic_id)] = {
+            "new_km": new_km, "prev_km": floor, "bike": bike or "",
+            "escalate": escalate, "ts": _time.time(),
+        }
+        if escalate:
+            await _send(context, chat_id=chat_id,
+                        text=msg_soft_odo_escalate(bike, new_km, floor, reason),
+                        message_thread_id=topic_id)
+        else:
+            tok = _svc_put({"kind": "soft_odo", "chat": chat_id, "topic": topic_id,
+                            "bike": bike or "", "new_km": new_km, "prev_km": floor,
+                            "oil_hint": bool(oil_hint)})
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ ใช่ ตั้งใจ / Да, намеренно", callback_data=f"svc:sodo:{tok}"),
+            ]])
+            await _send(context, chat_id=chat_id,
+                        text=msg_soft_odo_self(bike, new_km, floor),
+                        message_thread_id=topic_id, reply_markup=kb)
         return
 
     # Кнопка [✅ ใช่/Да] — быстрое подтверждение распознанного числа. Текст-ответ «да»/правильное
@@ -2569,8 +2694,14 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     elif m:
         num = m.group(0)            # правка: человек прислал правильное число
     elif t in _CONFIRM_NO:
+        soft = _SOFT_ODO_PENDING.pop(key, None)
         _PENDING_MILEAGE.pop(key, None)
         clear_awaiting(*key)
+        if soft and bridge:
+            _odo_audit_write(bridge, key[0], key[1], soft.get("bike", ""),
+                             soft.get("new_km", 0), soft.get("prev_km", 0),
+                             sender=_sender_from_user(getattr(msg, "from_user", None)),
+                             outcome="отказ (нет)")
         await _send(context, chat_id=msg.chat_id,
                     text=("🐀 Splinter\n"
                           "🇹🇭 โอเค ส่งรูปเลขไมล์ชัดๆ อีกครั้งนะครับ 🙏\n"
@@ -2579,17 +2710,52 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
         return True
     else:
         return False                # не подтверждение — отдаём обычному пути
-    # Сторож (фикс B): не подтверждаем «да» и не принимаем число НИЖЕ последнего известного —
-    # пробег не убывает. Держим pending (floor сохраняется), ждём корректную цифру/фото.
+    # Мягкий гейт убывания (задача 383): «да» или число ниже floor → проверяем soft gate.
     if floor is not None:
         try:
-            if int(str(num).replace(" ", "").replace(",", "")) < floor:
+            num_int = int(str(num).replace(" ", "").replace(",", ""))
+        except (ValueError, TypeError):
+            num_int = None
+        if num_int is not None and num_int < floor:
+            soft = _SOFT_ODO_PENDING.get(key)
+            sender = _sender_from_user(getattr(msg, "from_user", None))
+            if soft:
+                escalate = soft.get("escalate", True)
+                u = getattr(msg, "from_user", None)
+                authed = (not escalate) or is_owner_user(u) or (
+                    u and getattr(u, "username", None) and u.username.lower() in PYM_USERNAMES)
+                if not authed:
+                    # Блок: не Пым/владелец при эскалации — аудит, pending живёт
+                    _odo_audit_write(bridge, key[0], key[1], soft.get("bike", bike),
+                                     num_int, floor, sender=sender,
+                                     outcome="заблокировано (нужен Пым/владелец)")
+                    await _send(context, chat_id=msg.chat_id,
+                                text=msg_soft_odo_need_owner(bike),
+                                message_thread_id=key[1])
+                    return True
+                # Авторизовано: подтверждаем убывание
+                _SOFT_ODO_PENDING.pop(key, None)
+                _PENDING_MILEAGE.pop(key, None)
+                clear_awaiting(*key)
+                _odo_drop_record(soft.get("bike") or bike)
+                u = getattr(msg, "from_user", None)
+                who = ("Пым/владелец" if (is_owner_user(u) or (
+                    u and getattr(u, "username", None) and u.username.lower() in PYM_USERNAMES))
+                    else "механик")
+                _odo_audit_write(bridge, key[0], key[1], soft.get("bike", bike),
+                                 num_int, floor, sender=sender,
+                                 outcome=f"подтверждено ({who})")
+                try:
+                    await _after_mileage(context, bridge, msg.chat_id, key[1], bike, num, oil_hint)
+                except Exception:
+                    log.exception("  → soft odo gate: ошибка ТО-трекера")
+                return True
+            else:
+                # Soft gate не установлен (не должно случаться в новом флоу) — оставляем hard block
                 await _send(context, chat_id=msg.chat_id,
                             text=msg_mileage_drop(bike, num, floor),
                             message_thread_id=key[1])
                 return True
-        except (ValueError, TypeError):
-            pass
     _PENDING_MILEAGE.pop(key, None)
     clear_awaiting(*key)
     # B1 (вариант б): по байку ОТКРЫТА заявка ТО в статусе 'ждёт_факт' (механик уже отписался о работе,
@@ -3593,6 +3759,37 @@ async def handle_service_button(update, context, bridge) -> None:
             pass
         _SVC_TOKENS.pop(token, None)
         await _write_oil_backdated(context, bridge, chat_id, topic_id, bike, km)
+    elif action == "sodo":
+        # Мягкий гейт ODO ≤500 км: кнопка «Да, намеренно» от механика.
+        new_km = data.get("new_km")
+        prev_km = data.get("prev_km")
+        oil_hint = bool(data.get("oil_hint"))
+        key = (chat_id, topic_id)
+        soft = _SOFT_ODO_PENDING.get(key)
+        sender = _sender_from_user(q.from_user)
+        if soft and soft.get("escalate"):
+            # Стало эскалацией — кнопка механика не работает
+            await _btn_answer(q, f"ต้องยืนยันโดย {PYM_HANDLE}/เจ้าของ · Требует {PYM_HANDLE}/владельца",
+                              show_alert=True)
+            return
+        await _btn_answer(q, "กำลังยืนยัน… · Подтверждаю…")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        _SOFT_ODO_PENDING.pop(key, None)
+        _PENDING_MILEAGE.pop(key, None)
+        clear_awaiting(chat_id, topic_id)
+        _odo_drop_record(bike)
+        _odo_audit_write(bridge, chat_id, topic_id, bike, new_km, prev_km,
+                         sender=sender, outcome="подтверждено (кнопка механика)")
+        log.info(f"  → sodo-кнопка: {sender} bike={bike} {prev_km}→{new_km}")
+        try:
+            await _after_mileage(context, bridge, chat_id, topic_id, bike,
+                                 str(new_km) if new_km is not None else "", oil_hint)
+        except Exception:
+            log.exception("  → svc:sodo: ошибка _after_mileage")
     else:
         await _btn_answer(q)
 
@@ -5420,10 +5617,13 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             log.info(f"  → инфо-работы отложены до пробега: {info_works} (тема {topic_id})")
     else:
         # Нет инфо-работ — обычное событие сообщения (фото/возврат/топливо/только колоночные) пишем как раньше.
+        # OCR-дыра (задача 383): сырой vision-пробег до подтверждения человеком НЕ пишем в события.
+        # Только text-пробег (human-provided) идёт в поле mileage; raw OCR → "" (запишем после confirm).
+        _ev_mileage = parsed.get("mileage") or ""
         _ev_r = bridge.add_event(
             msg_date=_msg_date,
             group=group_name + (f" / тема {topic_id}" if topic_id else ""),
-            bike=bike, event_type=event_type, fuel=str(fuel), mileage=str(mileage),
+            bike=bike, event_type=event_type, fuel=str(fuel), mileage=str(_ev_mileage),
             photos=1 if has_photo else 0, notes=notes, msg_id=_ev_msg_id, sender=_sender,
         )
     # ДИАГ: бот раньше ВЫБРАСЫВАЛ return add_event — теперь видно saved/duplicate/error + разбор работ.
