@@ -33,6 +33,10 @@
     ТОЛЬКО из скан-представления и ТОЛЬКО в СВОЁМ сегменте цепи; ОПЕРАНДЫ (файлы!) остаются под
     сканом, а токен с признаками ИСПОЛНЕНИЯ ($(…)/`…`/system("…")) не вырезается и раскрывается
     отдельным сегментом. Итог: `grep -n ".env" f.py` — зелёное, `grep -n foo .env` — блок.
+    Тот же класс с 24.07.2026 — ARGV .py-СКРИПТА (_strip_script_cli_args): всё ПОСЛЕ имени
+    скрипта вырезается из скан-представления (журнальный `cclog.py "DONE …"` краснел по ТЕКСТУ
+    строки), но ТЕЛО .py читается как прежде, а операнды-улики (файл секретов, .db/SQL-write,
+    $(…)/`…`) из argv НЕ вырезаются — жёсткие блоки не слабеют.
 (в) HARD-BLOCK .env: обращение к файлу секретов в ЛЮБОЙ позиции цепи (после &&/;/|, внутри
     `bash -c`, $(…), `…`) → deny БЕЗ карточки, лог `env_hard_block`, approve НЕВОЗМОЖЕН.
     Сканируется ТОЛЬКО ТЕКСТ КОМАНДЫ: содержимое .py-целей НЕ проверяется (иначе любой боевой
@@ -53,6 +57,7 @@ green; can_approve(kind, hit) и decision(kind, hit, reason) — чистые (�
 Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
 """
 import sys, os, json, re, shlex, time, fcntl, hashlib
+import subprocess
 
 PROJECT = "/root/turbobaby-manager-bot"
 
@@ -467,40 +472,33 @@ def _strip_git_msg(cmd):
     return " ".join(out)
 
 
-def _strip_all_git_msgs(cmd):
-    """Для скана step-1 в _analyze: вырезать -m/-am/--message payload'ы из ЛЮБОЙ git-команды
-    в строке, включая компаунды (python gate.py && git commit -m «set_fleet_oil»). Решает
-    false-red класса 23.07.2026 — _strip_git_msg работает ТОЛЬКО когда git первый токен.
-    Не-git токены и payload'ы ВНЕ -m не трогаются. Сбой шлексинга → команда как есть
-    (fail-safe: красные маркеры ВНЕ git -m по-прежнему ловятся)."""
-    if "git" not in cmd:
-        return cmd
+def _strip_script_cli_args(cmd):
+    """Аргументы ПОСЛЕ имени .py-скрипта — ДАННЫЕ скрипта, а не операция команды. Тот же класс,
+    что текст git -m (_strip_git_msg): журнальные/логовые скрипты несут боевые слова В ТЕКСТЕ
+    строки — `venv/bin/python3 cclog.py "DONE …: закрыл …"` краснел на шаге 1 _analyze по argv,
+    хотя пишет он в журнал, а не в Лист1/CRM. Вырезается ТОЛЬКО из СКАН-представления; ТЕЛО .py
+    по-прежнему читается и сканируется (_analyze шаг 2 токенизирует СЫРУЮ команду) — операция,
+    которую скрипт РЕАЛЬНО делает, ловится там, как и раньше.
+    Интерпретатор и его СОБСТВЕННЫЕ флаги (всё ДО имени скрипта: -u, -X, -m …) — ОСТАЮТСЯ.
+    ОПЕРАНДЫ-УЛИКИ НЕ вырезаются (та же линия, что у _strip_search_pattern с файлами): токен с
+    файлом секретов, с .db/SQL-write или с признаком исполнения ($(…)/`…`/system(…)) остаётся под
+    сканом — иначе `python3 dump.py /root/app/.env` перестал бы жёстко блокироваться, а
+    `python3 run.py "UPDATE x SET y" other.db` — краснеть.
+    Нет .py-токена / сбой разбора → команда КАК ЕСТЬ (fail-safe: скан полный, краснит охотнее)."""
     try:
         toks = shlex.split(cmd)
     except Exception:
         return cmd
-    out, i, in_git = [], 0, False
-    while i < len(toks):
-        t = toks[i]
-        if t == "git":
-            in_git = True
-        elif t in ("&&", "||", ";", "|"):
-            in_git = False
-        elif in_git and t in ("-m", "-am", "--message"):
-            out.append(t)
-            i += 2   # пропустить payload
+    for i, t in enumerate(toks):
+        if not t.endswith(".py"):
             continue
-        elif in_git and t.startswith("--message="):
-            out.append("--message")
-            i += 1
-            continue
-        elif in_git and re.match(r"^-a?m.", t):
-            out.append("-m")
-            i += 1
-            continue
-        out.append(t)
-        i += 1
-    return " ".join(out)
+        tail = toks[i + 1:]
+        if not tail:
+            return cmd                 # аргументов нет — не трогаем (лишняя переклейка кавычек)
+        keep = [a for a in tail if _ENV_FILE.search(a) or ".db" in a
+                or _SQLITE_WRITE.search(a) or _EXEC_IN_PATTERN.search(a)]
+        return " ".join(toks[:i + 1] + keep)
+    return cmd
 
 
 def _args_after_interp(toks):
@@ -544,6 +542,25 @@ def _is_trusted_test(cmd, cwd):
     tests_dir = os.path.join(PROJECT, "tests") + os.sep
     gate = os.path.join(PROJECT, "gate.py")
     return all(p.startswith(tests_dir) or p == gate for p in targets)
+
+
+def _repo_tracked(path, cwd):
+    """True if path is a file TRACKED by git in THIS repo (PROJECT). Trust-by-origin (24.07.2026):
+    repo sources not body-scanned (own reviewed/tested code); _-prefixed drafts, scratchpad and
+    out-of-repo files are body-scanned as before. Fail-safe: git missing / outside repo / _-prefixed
+    -> False (body IS scanned, redder)."""
+    try:
+        if os.path.basename(path).startswith("_"):
+            return False
+        for cand in (path, os.path.join(cwd or PROJECT, path), os.path.join(PROJECT, path)):
+            if os.path.isfile(cand):
+                r = subprocess.run(["git", "-C", PROJECT, "ls-files", "--error-unmatch",
+                                    os.path.realpath(cand)],
+                                   capture_output=True, timeout=5)
+                return r.returncode == 0
+        return False
+    except Exception:
+        return False
 
 
 def _read_file(path, cwd):
@@ -676,6 +693,7 @@ def _units(cmd, depth=0):
         for inner in _subst_inners(seg):
             out.extend(_units(inner, depth + 1))
         clean = _strip_git_msg(seg)          # текст git -m — ДАННЫЕ (нюанс bd5d516)
+        clean = _strip_script_cli_args(clean)   # argv .py-скрипта — ДАННЫЕ (тот же класс)
         toks = _tokens(clean)
         i = _cmd_index(toks)
         if i is not None and _base(toks[i]) in _SHELLS:
@@ -695,9 +713,9 @@ def _scan(cmd):
     try:
         units = _units(cmd)
         text = " ".join(t for _, t in units)
-        return units, (text if text.strip() else _strip_git_msg(cmd))
+        return units, (text if text.strip() else _strip_script_cli_args(_strip_git_msg(cmd)))
     except Exception:
-        return [(_tokens(cmd), cmd)], _strip_git_msg(cmd)
+        return [(_tokens(cmd), cmd)], _strip_script_cli_args(_strip_git_msg(cmd))
 
 
 # ══ (а) ЧЁРНЫЙ СПИСОК ПРОЦЕССОВ ════════════════════════════════════════════════════════════
@@ -847,12 +865,15 @@ def _analyze(cmd, cwd, scan=None):
             amb = True
             i += 2; continue
         if t.endswith(".py"):
-            body = _read_file(t, cwd)
-            if body is None:
-                amb = True                             # путь есть, файл не прочли → ambiguous (в3: defer)
+            if _repo_tracked(t, cwd):
+                saw_target = True                      # trust-by-origin: git-tracked repo source not body-scanned
             else:
-                content += body
-                saw_target = True
+                body = _read_file(t, cwd)              # _-prefixed / out-of-repo / untracked -> body as before
+                if body is None:
+                    amb = True
+                else:
+                    content += body
+                    saw_target = True
         i += 1
     blob = cmd + "\n" + content
     for tok in RED_TOKENS:
