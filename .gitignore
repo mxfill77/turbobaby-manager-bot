@@ -39,3 +39,15 @@ chats/
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- vps-git-cleanup 2026-07-24: runtime state + scratch ---
+# runtime state (git rm --cached; disk copy is source of truth)
+spend_ledger.json
+verified_facts.json
+wallet_cache.json
+_pcport185
+# scratch / throwaway
+_*.py
+*.bak
+*.diff
+*.lock
