@@ -27,7 +27,7 @@ class Ctx:
 
 class FakeClaude:
     def __init__(self, parsed): self._p = parsed
-    def quick(self, system, text, max_tokens=300):
+    def quick(self, system, text, max_tokens=300, **kw):
         if system == S.TRANSLATE_RU_TH: return "รับเรื่องแล้วครับ"
         return json.dumps(self._p)
     def vision(self, *a, **k): return "{}"

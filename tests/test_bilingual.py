@@ -10,7 +10,7 @@ import auditor as A
 class FakeClaude:
     """quick(TRANSLATE_RU_TH, ru) → тайский, сохраняя числа/латиницу из ru (имитация перевода без потерь).
     Если в ru есть 'автомобиль' — вернём รถยนต์ (проверяем, что _no_car это вычистит)."""
-    def quick(self, system, text, max_tokens=300):
+    def quick(self, system, text, max_tokens=300, **kw):
         assert system == S.TRANSLATE_RU_TH, "перевод должен идти через TRANSLATE_RU_TH"
         nums = " ".join(re.findall(r"\d+", text))
         lat = " ".join(re.findall(r"[A-Za-z]{2,}", text))
@@ -43,7 +43,7 @@ def test_no_car_ru_side():
 def test_no_car_th_side():
     # TH-сторона: LLM-переводчик СОСКОЛЬЗНУЛ на รถยนต์ → _translate_ru_th должен вычистить в รถมอเตอร์ไซค์
     class SlipClaude:
-        def quick(self, system, text, max_tokens=300): return "รถยนต์ คันนี้เสียหาย ครับ"
+        def quick(self, system, text, max_tokens=300, **kw): return "รถยนต์ คันนี้เสียหาย ครับ"
     th = S._translate_ru_th(SlipClaude(), "байк повреждён")
     assert "รถยนต์" not in th, "TH: รถยนต์ должно быть заменено"
     assert "รถมอเตอร์ไซค์" in th

@@ -311,10 +311,10 @@ async def _run_servicing_with_vis_mileage():
     bridge = _FakeBridge()
 
     class FakeClaude:
-        def quick(self, system, text, max_tokens=300):
+        def quick(self, system, text, max_tokens=300, **kw):
             return "{}"   # пустой parse — нет event из текста
 
-        def vision(self, system, img, max_tokens=400):
+        def vision(self, system, img, max_tokens=400, **kw):
             import json
             return json.dumps({"mileage": "34500", "mileage_confidence": "high",
                                "fuel": "", "damage": None, "dirt": False})

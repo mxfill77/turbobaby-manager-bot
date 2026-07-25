@@ -11,6 +11,44 @@ import shutil
 import logging
 import tempfile
 import subprocess
+import time
+
+
+# === ЛЕСТНИЦА МОДЕЛЕЙ (25.07.2026) ==========================================
+# Вызыватель передаёт ступень СТРОКОЙ: model="LIGHT" | "MAIN" | "HEAVY". Имя модели берётся
+# из окружения В МОМЕНТ ВЫЗОВА (SPLINTER_MODEL_LIGHT/_MAIN/_HEAVY), поэтому смена модели —
+# правка конфига без правки кода. Прямое имя модели тоже принимается и идёт как есть.
+# Именно СТРОКА, а не атрибут клиента: вызыватель получает клиента параметром, и в тестах
+# это двойник — обращение к атрибуту привязало бы каждый двойник к внутренностям клиента.
+_TIER_DEFAULTS = {
+    "LIGHT": "claude-haiku-4-5",   # словарные задачи: перевод, тайские названия работ
+    "MAIN":  "",                   # пусто → self.model (CLAUDE_MODEL): разбор в JSON
+    "HEAVY": "",                   # пусто → self.model: КАССА и разговорный путь
+}
+
+
+def _resolve_tier(tier, default_model):
+    """Ступень → имя модели. Неизвестная строка считается прямым именем модели."""
+    if not tier:
+        return default_model
+    if tier in _TIER_DEFAULTS:
+        return ((os.getenv("SPLINTER_MODEL_" + tier) or _TIER_DEFAULTS[tier]
+                 or default_model) or default_model).strip()
+    return tier
+
+
+def _usable(text, expect_json=False):
+    """Ответ пригоден? Пусто → нет. expect_json и не парсится → нет (повод для подъёма)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if expect_json:
+        try:
+            json.loads(_strip_code_fences(t))
+        except Exception:
+            return False
+    return True
+
 from typing import Optional, List, Dict
 from anthropic import Anthropic, AnthropicError
 
@@ -696,7 +734,9 @@ class ClaudeClient:
         return _strip_code_fences(out)
 
     def quick(self, system: str, user: str, max_tokens: int = 600,
-              raise_on_upstream: bool = False) -> str:
+              raise_on_upstream: bool = False, model: str = None,
+              tag: str = "", escalate_to: str = None,
+              expect_json: bool = False) -> str:
         """
         Одноразовый вызов Claude БЕЗ инструментов — для классификации/парсинга.
         Используется Splinter'ом чтобы разобрать сообщение Пыма в строгий JSON.
@@ -709,18 +749,44 @@ class ClaudeClient:
         ТИПИЗИРОВАННЫЙ SplinterLLMError — ОТДЕЛЬНО от «модель ответила, но парс пуст / честный
         type:none» (тот идёт штатно, это НЕ потеря). Деф off (translate/intake/servicing) —
         happy-path контракт цел: upstream-down → лог + '' (как раньше, не сырой 400)."""
+        mdl = _resolve_tier(model, self.model)
+        out, down = self._quick_once(system, user, max_tokens, raise_on_upstream,
+                                     mdl, tag or "quick", 0)
+        # Подъём ТОЛЬКО на пустом/нечитаемом ответе и ровно один раз. Отказ канала (down)
+        # моделью не лечится — там меняют канал (подписка ↔ платный API), не ступень.
+        if escalate_to and not down and not _usable(out, expect_json):
+            up = _resolve_tier(escalate_to, self.model)
+            if up != mdl:
+                log.info("LLM escalate tag=%s %s -> %s (пустой/нечитаемый ответ)",
+                         tag or "quick", mdl, up)
+                out, down = self._quick_once(system, user, max_tokens, raise_on_upstream,
+                                             up, tag or "quick", 1)
+        return out
+
+    def _quick_once(self, system, user, max_tokens, raise_on_upstream, mdl, tag, escalated):
+        """Одна попытка quick(). → (текст, отказ_канала). Пишет строку учёта на КАЖДЫЙ
+        успешный вызов: путь, модель, длительность, токены входа и выхода."""
+        t0 = time.perf_counter()
         try:
             if _splinter_llm_via_cli():
-                return self._cli_generate(system, user, self.model)
+                out = self._cli_generate(system, user, mdl)
+                log.info("LLM tag=%s model=%s channel=cli dur_s=%.2f in=na out=na escalated=%d",
+                         tag, mdl, time.perf_counter() - t0, escalated)
+                return out, False
             resp = self.client.messages.create(
-                model=self.model,
+                model=mdl,
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user}],
             )
-            _meter_spend(self.model, resp)   # §12 леджер трат (API-путь)
+            _meter_spend(mdl, resp)   # §12 леджер трат (API-путь)
             parts = [b.text for b in resp.content if b.type == "text"]
-            return "\n".join(parts).strip()
+            u = getattr(resp, "usage", None)
+            log.info("LLM tag=%s model=%s channel=api dur_s=%.2f in=%s out=%s escalated=%d",
+                     tag, getattr(resp, "model", mdl), time.perf_counter() - t0,
+                     getattr(u, "input_tokens", "na"), getattr(u, "output_tokens", "na"),
+                     escalated)
+            return "\n".join(parts).strip(), False
         except (SplinterLLMError, AnthropicError) as e:
             # UPSTREAM упал: CLI (SplinterLLMError уже типизирован) ИЛИ платный API (AnthropicError —
             # база для BadRequest/Auth/APIStatus/APITimeout). Кассе (raise_on_upstream) — громко
@@ -730,10 +796,10 @@ class ClaudeClient:
                     raise
                 raise SplinterLLMError(f"quick upstream down: {type(e).__name__}") from e
             log.error(f"Claude quick() upstream down (graceful ''): {type(e).__name__}: {e}")
-            return ""
+            return "", True
         except Exception as e:
             log.error(f"Claude quick() error: {e}")
-            return ""
+            return "", True
 
     def judge(self, system: str, user: str, max_tokens: int = 400,
               model: str = "claude-haiku-4-5") -> dict:

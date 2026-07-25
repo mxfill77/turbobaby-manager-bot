@@ -37,7 +37,7 @@ class Ctx:
 
 class FakeClaude:
     def __init__(s, parsed, vis=None): s._p = parsed; s._v = vis or {}
-    def quick(s, system, text, max_tokens=300):
+    def quick(s, system, text, max_tokens=300, **kw):
         if system == S.TRANSLATE_RU_TH: return "ครับ"
         return json.dumps(s._p)
     def vision(s, *a, **k): return json.dumps(s._v)

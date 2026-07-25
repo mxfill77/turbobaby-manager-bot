@@ -455,7 +455,8 @@ def _translate_ru_th(claude, ru_text):
     if not ru:
         return ""
     try:
-        th = (claude.quick(TRANSLATE_RU_TH, ru, max_tokens=500) or "").strip()
+        th = (claude.quick(TRANSLATE_RU_TH, ru, max_tokens=500, model="LIGHT",
+                           tag="translate", escalate_to="MAIN") or "").strip()
     except Exception:
         log.exception("  → перевод RU→TH упал")
         th = ""
@@ -1558,7 +1559,8 @@ def _learn_works_th(claude, works):
     if not unknown or not claude:
         return
     try:
-        raw = (claude.quick(_WORK_TH_SYSTEM, "\n".join(unknown), max_tokens=200) or "").strip()
+        raw = (claude.quick(_WORK_TH_SYSTEM, "\n".join(unknown), max_tokens=200,
+                            model="LIGHT", tag="work_th", escalate_to="MAIN") or "").strip()
         for line in raw.split("\n"):
             if "|" in line:
                 ru_part, th_part = line.split("|", 1)
@@ -2004,7 +2006,8 @@ async def _handle_money(msg, context, bridge, claude):
     # SplinterLLMError → громкий пуш «впиши руками» + ответ в чат, проводка НЕ теряется тихо.
     # ЧЕСТНЫЙ type:none (модель ответила) — сюда НЕ попадает, идёт штатно (тихо, как раньше).
     try:
-        raw = claude.quick(MONEY_SYSTEM, text, max_tokens=400, raise_on_upstream=True)
+        raw = claude.quick(MONEY_SYSTEM, text, max_tokens=400, raise_on_upstream=True,
+                          model="HEAVY", tag="money")
     except SplinterLLMError as e:
         _note_llm_loss(money=True, wallet=wallet, lost_text=text, detail=str(e), kind="money")
         try:
@@ -5247,7 +5250,8 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
         return False
     declared = _sp_split(sp.get("declared"))
     # Распознаём перечень факта и одометр из ответа.
-    parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300)) if text else {}
+    parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300, model="MAIN",
+                                 tag="servicing", expect_json=True)) if text else {}
     works = [str(w).strip() for w in (parsed.get("works") or []) if w and str(w).strip()]
     done = _declared_kinds(text, works, {}, strict_oil=True)   # E3(b): в ФАКТЕ oil только при явной замене
     # E3(c): накопительно — НЕ теряем ранее распознанное (подшипник и т.п.); объединяем со stored done строки.
@@ -5492,7 +5496,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Разбираем текст (если есть) на событие
     parsed = {}
     if text.strip():
-        parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300))
+        parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300, model="MAIN",
+                                 tag="servicing", expect_json=True))
 
     # Разбираем фото через vision (топливо/пробег/повреждения). На альбом — каждое фото,
     # затем агрегируем в ОДИН вердикт (один ответ вместо дубля на каждое фото).
@@ -5881,7 +5886,8 @@ def _intake_is_card(text) -> bool:
 
 
 def _intake_parse(claude, text) -> dict:
-    return _parse_json(claude.quick(INTAKE_SYSTEM, text, max_tokens=500)) or {}
+    return _parse_json(claude.quick(INTAKE_SYSTEM, text, max_tokens=500, model="MAIN",
+                              tag="intake", expect_json=True)) or {}
 
 
 def _deposit_for_model(model):

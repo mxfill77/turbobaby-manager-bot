@@ -20,7 +20,7 @@ class Msg:
 
 class FakeClaude:
     def __init__(self, parsed): self._parsed = parsed
-    def quick(self, system, text, max_tokens=300): return json.dumps(self._parsed)
+    def quick(self, system, text, max_tokens=300, **kw): return json.dumps(self._parsed)
     def vision(self, *a, **k): return "{}"
 
 class FakeBridge:

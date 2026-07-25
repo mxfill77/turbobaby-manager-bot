@@ -15,8 +15,8 @@ class Msg:
 
 class FakeClaude:
     def __init__(self, parsed=None, vis=None): self._p=parsed or {}; self._v=vis or {}
-    def quick(self,system,text,max_tokens=300): return json.dumps(self._p)
-    def vision(self,system,img,max_tokens=400): return json.dumps(self._v)
+    def quick(self,system,text,max_tokens=300, **kw): return json.dumps(self._p)
+    def vision(self,system,img,max_tokens=400, **kw): return json.dumps(self._v)
 
 class FakeBridge:
     def __init__(self): self.events=[]

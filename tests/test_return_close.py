@@ -29,7 +29,7 @@ class Ctx:
     bot = B()
 class FakeClaude:
     def __init__(s, parsed): s._p = parsed
-    def quick(s, system, text, max_tokens=300):
+    def quick(s, system, text, max_tokens=300, **kw):
         if system == S.TRANSLATE_RU_TH: return "ครับ"
         return json.dumps(s._p)
     def vision(s, *a, **k): return "{}"

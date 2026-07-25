@@ -66,7 +66,7 @@ class FakeBridge:
 
 class ClaudeUpstreamDown:
     """quick() при кассовом разборе бросает upstream-down (как платный API с кредит=0 / CLI-обвал)."""
-    def quick(self, system, text, max_tokens=400, raise_on_upstream=False):
+    def quick(self, system, text, max_tokens=400, raise_on_upstream=False, **kw):
         if raise_on_upstream:
             raise CC.SplinterLLMError("quick upstream down: BadRequestError")
         return ""
@@ -75,7 +75,7 @@ class ClaudeUpstreamDown:
 
 class ClaudeTypeNone:
     """quick() честно отвечает type:none (модель жива, просто болтовня) — это НЕ потеря."""
-    def quick(self, system, text, max_tokens=400, raise_on_upstream=False):
+    def quick(self, system, text, max_tokens=400, raise_on_upstream=False, **kw):
         return '{"type":"none"}'
     def vision(self, *a, **k): return ""
 
