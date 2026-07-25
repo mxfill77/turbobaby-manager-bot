@@ -1,7 +1,12 @@
-"""Кондуктор модели VPS-оркестратора (06.07.2026): headless-исполнитель на Claude Fable 5 с
-авто-фолбэком на прежнюю модель (Opus 4.8 1M) силами CLI (--fallback-model), модель из env
-(ORCH_MODEL / ORCH_MODEL_FALLBACK, не хардкод), --output-format json → достаём текст (result) и
-какая модель реально отработала (modelUsage). Всё мокнуто (subprocess.run), сети/claude нет."""
+"""Кондуктор модели VPS-оркестратора (06.07.2026, догнан 25.07.2026): headless-исполнитель на
+ORCH_MODEL с авто-фолбэком на ORCH_MODEL_FALLBACK силами CLI (--fallback-model), модель из env,
+не хардкод, --output-format json → достаём текст (result) и какая модель реально отработала
+(modelUsage). Всё мокнуто (subprocess.run), сети/claude нет.
+
+СОСТОЯНИЕ НАСТРОЕК на 25.07.2026: основная claude-opus-5, запасная claude-fable-5. Прежняя
+редакция описывала обратную раскладку (основная Fable 5, запасная Opus 4.8 1M) — она устарела
+06→25.07 и вводила в заблуждение. Моки modelUsage ниже НЕ хардкодят имена: они берут
+OD.ORCH_MODEL / OD.ORCH_MODEL_FALLBACK, поэтому смена модели в .env их больше не красит."""
 import os, sys, json
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
@@ -16,10 +21,13 @@ res = []
 
 import orchestrator_daemon as OD
 
-# (1) модель вынесена в env, дефолты = Fable 5 → фолбэк Opus 4.8 1M (прежняя = CLI-дефолт до правки)
+# (1) модель вынесена в env: основная claude-opus-5 → фолбэк claude-fable-5 (состояние 25.07.2026)
 print("(1) конфиг модели из env:")
-# NB: два литерала ниже ЗЕРКАЛЯТ боевой .env (ORCH_MODEL / ORCH_MODEL_FALLBACK);
-# при смене модели правятся вместе с конфигом — иначе гейт краснеет и отгрузка встаёт.
+# NB: два литерала ниже ЗЕРКАЛЯТ боевой .env (ORCH_MODEL / ORCH_MODEL_FALLBACK); при смене
+# модели правятся вместе с конфигом — иначе гейт краснеет и отгрузка встаёт ВСЕМУ репозиторию.
+# Так и вышло 24→25.07.2026: правку .env не догнали гейтом в том же заходе, push стоял 13 часов.
+# Поэтому ниже к литералу добавлена проверка СВОЙСТВА (полный идентификатор ≠ короткий алиас):
+# она переживает смену модели, а литерал остаётся якорем «конфиг и тест сверены глазами».
 res.append(ok(OD.ORCH_MODEL == "claude-opus-5", "ORCH_MODEL из .env = claude-opus-5"))
 # ЗЕРКАЛО .env: 25.07.2026 фолбэк переведён с алиаса «fable» на полный идентификатор —
 # короткий алиас API не принимает (404 not_found_error), CLI-фолбэк был мёртв.
@@ -62,7 +70,7 @@ OD.bc = _MinFakeBC()
 # (2) кондуктор в argv: --model основная + --fallback-model прежняя + json, prompt последним
 print("(2) argv кондуктора:")
 fake_run.out = json.dumps({"result": "готово", "is_error": False,
-                           "modelUsage": {"claude-fable-5": {"inputTokens": 1}}})
+                           "modelUsage": {OD.ORCH_MODEL: {"inputTokens": 1}}})
 st, r = OD.run_task(1, "проверь X", task_timeout=600)
 a = CAP["args"]
 res.append(ok(a[0] == OD.CLAUDE_BIN and a[1] == "-p", "вызов claude -p"))
@@ -78,14 +86,18 @@ res.append(ok(a[-1].endswith("проверь X"), "prompt — последним
 print("(3) парс json result:")
 res.append(ok(st == "done" and r == "готово", "result из json → чистый текст ответа"))
 
-# (4) фолбэк реально отработал (Fable недоступна → CLI взял Opus): задача НЕ упала (кондуктор не встал)
+# (4) фолбэк реально отработал (основная недоступна → CLI взял запасную): задача НЕ упала
 print("(4) фолбэк подхватил, задача жива:")
 fake_run.out = json.dumps({"result": "сделано на фолбэке", "is_error": False,
-                           "modelUsage": {"claude-opus-4-8[1m]": {"inputTokens": 1}}})
+                           "modelUsage": {OD.ORCH_MODEL_FALLBACK: {"inputTokens": 1}}})
 fake_run.rc = 0
 st4, r4 = OD.run_task(4, "поправь Y")
 res.append(ok(st4 == "done" and r4 == "сделано на фолбэке",
-              "modelUsage=фолбэк (Fable недоступна) → done, задача НЕ упала"))
+              "modelUsage=фолбэк (основная недоступна) → done, задача НЕ упала"))
+# Страховка ветки: если фолбэк совпадёт с основной, мок перестанет её задевать и проверка
+# выше станет пустой — ловим это здесь, а не через полгода на живом отказе модели.
+res.append(ok(OD.ORCH_MODEL not in json.loads(fake_run.out)["modelUsage"],
+              "мок фолбэка не содержит основную модель → ветка «отработал фолбэк» задета"))
 
 # (5) обе модели недоступны (invalid/лимит) → exit 1, is_error, modelUsage пуст → failed (не крэш)
 print("(5) обе недоступны → аккуратный failed:")
@@ -104,7 +116,7 @@ res.append(ok(st6 == "done" and r6 == "просто текст без json", "н
 # (7) NEEDS_APPROVAL детект работает на извлечённом из json result
 print("(7) красная зона через json.result:")
 fake_run.out = json.dumps({"result": "анализ\nNEEDS_APPROVAL: op=other | запись в Лист1 · Байки · смотреть diff",
-                           "is_error": False, "modelUsage": {"claude-fable-5": {}}})
+                           "is_error": False, "modelUsage": {OD.ORCH_MODEL: {}}})
 fake_run.rc = 0
 st7, r7 = OD.run_task(7, "v")
 res.append(ok(st7 == "needs_approval" and r7.startswith("op=other"),
