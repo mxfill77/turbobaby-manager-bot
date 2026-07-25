@@ -113,6 +113,10 @@ PC_SILENT_MARK = "⏱ ПК-театр не отвечает"   # маркер т
 _REJECT_PREFIX = "отклонено Филиппом"        # результат devbot-отказа («нет N»/кнопка ❌) — halt без думателя
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
+# needs_approval lifetime (класс 23.07.2026): висит до решения владельца (hard-cap 24ч), напоминание 3ч
+NA_LIFETIME = int(os.environ.get("NA_LIFETIME", "86400") or "86400")      # 24ч hard-cap needs_approval
+NA_REMINDER_SEC = int(os.environ.get("NA_REMINDER_SEC", "10800") or "10800")  # 3ч: напоминание
+_na_reminded: set = set()   # id задач, по которым >3ч-напоминание отправлено (in-memory)
 CLAUDE_BIN = "/usr/bin/claude"
 # РОЛЬ-РАЗВОД PERMISSIONS (08.07.2026): headless-задачи получают СТРОГИЙ доп-слой настроек через
 # `--settings` — ask на clasp push/redeploy/deploy/run/version/create-version/deployments.
@@ -572,7 +576,10 @@ APPROVAL_PREAMBLE = (
     "каждый значимый шаг — строка в cc_log через cclog.py (UTC-время берёт само, "
     "НЕ вычислять вручную — Bangkok UTC+7 даёт «09:xx» вместо «02:xx UTC», класс 17.07): "
     "venv/bin/python3 cclog.py PLAN/DONE/BLOCKED «текст» [--pulse «строка»] ; "
-    "статус честно: «технически готово» отдельно от «функционально подтверждено».\n"
+    "статус честно: «технически готово» отдельно от «функционально подтверждено». "
+    "ПОРЯДОК: cc_log DONE пишется ТОЛЬКО ПОСЛЕ успешного завершения операции (exit 0 финальной "
+    "команды, включая git push). НЕ пиши DONE до git push — если push провалится или заблокируется, "
+    "штаб будет видеть «готово» при несделанном состоянии (класс 23.07.2026).\n"
     "КАРТА ДЕЙСТВИЙ:\n"
     "- Зелёное/оранжевое (чтение, диагностика, правки кода, тесты, git commit, git push) — делай САМ; "
     "git push по циклу гейт→push→отчёт, БЕЗ маркера.\n"
@@ -3280,6 +3287,39 @@ def process_new():
         _maybe_curator_single(task.get("from"), tid, text, result, status=status)   # куратор цели (CURATOR=1)
 
 
+def process_na_reminders():
+    """Напоминание Филиппу о needs_approval >3ч (пуш в личку) + hard-cap 24ч → failed.
+    «нет» Филиппа devbot ставит failed сам — такие задачи сюда не попадают. (класс 23.07.2026)"""
+    global _na_reminded
+    r = bc.get_pending("needs_approval")
+    if not r.get("ok"):
+        return
+    active_ids: set = set()
+    for task in r.get("items", []):
+        tid = task.get("id")
+        active_ids.add(tid)
+        age = (_age_sec(task.get("updated")) or 0)
+        if age > NA_LIFETIME:
+            log.info("NEEDS_APPROVAL VPS id=%s hard-cap >%ss=24ч → failed", tid, NA_LIFETIME)
+            bc.complete_task(tid, "failed",
+                             "подтверждение не получено за 24ч — задача провалена (hard cap)")
+            _na_reminded.discard(tid)
+            _maybe_dec_after(task.get("task_text"), "failed")
+        elif age > NA_REMINDER_SEC and tid not in _na_reminded:
+            _na_reminded.add(tid)
+            card = str(task.get("result") or "")[:300]
+            msg = (f"⏰ задача #{tid} ждёт одобрения уже >3ч "
+                   f"(✅/❌ в теме 1160 или «да {tid}»/«нет {tid}»):\n{card}")
+            log.info("NEEDS_APPROVAL VPS id=%s >3ч — напоминание push личка", tid)
+            try:
+                import subprocess as _sp
+                _sp.run([sys.executable, os.path.join(REPO, "notify.py"), "--need", msg],
+                        timeout=15, check=False, capture_output=True)
+            except Exception as e:
+                log.warning("NA reminder push failed id=%s: %s", tid, e)
+    _na_reminded &= active_ids   # очистить id задач, которые больше не needs_approval
+
+
 def cycle():
     """Один проход: подобрать сирот in_progress (урок 138) → довести одобренное красное
     (approved) → добрать хвосты декомпозиций, финализированные мимо демона (сводка) → надзор
@@ -3288,6 +3328,7 @@ def cycle():
     _prune_chain_cache()
     _fixture_reap_open()        # закрыть фикстуры в needs_approval/approved (класс 193 рубеж 4)
     process_orphans()
+    process_na_reminders()      # напоминание >3ч + hard-cap 24ч для needs_approval (класс 23.07)
     process_approved()
     process_dec_tails()
     process_pc_chains()
@@ -3298,11 +3339,11 @@ def main():
     _banner_avail = _mem_available_mb() or 0
     _banner_crss = _live_claude_rss_mb() or 0
     _banner_cprocs = _live_claude_count() or 0
-    log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, auto_ops=%s, claude=%s, "
+    log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, na_lifetime=%ss, auto_ops=%s, claude=%s, "
              "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, gate_single_sel=%s, "
              "fact_ttl=%ss, model=%s, executor_model=%s, mem_gate=%s(min=%dMB avail=%dMB), "
              "rss_gate=%s(max=%dMB cur=%dMB), proc_gate=%s(max=%d cur=%d), chain_cache=%d) ===",
-             POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, ",".join(AUTO_OPS), CLAUDE_BIN,
+             POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, NA_LIFETIME, ",".join(AUTO_OPS), CLAUDE_BIN,
              int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), int(_curator_scope_on()),
              int(_gate_single_selective_on()),
              FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL,
