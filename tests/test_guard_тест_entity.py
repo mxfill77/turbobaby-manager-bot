@@ -34,12 +34,8 @@ def _cmd(inline_code):
     return f"venv/bin/python3 -c '{inline_code}'"
 
 
-def setUpModule():
-    # Фича ТЕСТ-сущностей определена в stash@{1}, но НИ РАЗУ не вызывается — защита не работает.
-    # SKIP (НЕ зелёный): не блокируем несвязанные деплои. Порт ~25-30 строк —
-    # см. docs/artifacts/2026-07-24-entity-port-todo.md
-    import unittest as _ut
-    raise _ut.SkipTest("entity-фича не подключена; порт ~25-30 строк, см. docs/artifacts/2026-07-24-entity-port-todo.md")
+# ПРОПУСК СНЯТ 26.07.2026: порт выполнен и вызовы врезаны (см. TestEntityWiring ниже).
+# Голден снова считается ПО-НАСТОЯЩЕМУ; setUpModule со SkipTest удалён намеренно.
 
 
 class TestExtractEntity(unittest.TestCase):
@@ -199,6 +195,60 @@ class TestRegression(unittest.TestCase):
         self.assertEqual(kind, "red")
         entity = PG._extract_first_entity(hit, blob)
         self.assertIsNone(entity)  # soft: нет HARD BLOCK
+
+
+
+class TestEntityWiring(unittest.TestCase):
+    """ВРЕЗКА (26.07.2026): решатель _entity_blocktype — три случая, как требует правило.
+    Раньше функции лежали в стэше и не вызывались, поэтому защита не работала вовсе."""
+
+    def test_test_entity_passes_soft(self):
+        """ТЕСТОВАЯ сущность → мягко: карточка с кнопкой «да», как в write-смоке."""
+        blob = _CB + '(client="ТЕСТ Иван", ' + _CT + ')'
+        self.assertIsNone(PG._entity_blocktype(_CB, blob))
+
+    def test_live_entity_is_hard(self):
+        """ЖИВАЯ сущность → жёстко: approve недоступен."""
+        blob = _CB + '(client="Jack", ' + _CT + ')'
+        self.assertEqual(PG._entity_blocktype(_CB, blob), "hard")
+        blob2 = _SFO + '(plate="AB-5580", km=12345, ' + _CT + ')'
+        self.assertEqual(PG._entity_blocktype(_SFO, blob2), "hard")
+
+    def test_unrecognised_entity_stays_soft(self):
+        """НЕОПОЗНАННАЯ сущность → мягко. Молчание не повод ужесточать: деньги и удаление
+        сущности не несут вовсе, и ложный hard остановил бы владельца без права разрешить."""
+        self.assertIsNone(PG._entity_blocktype(_AT, _AT + '(amount=500, wallet="main")'))
+        self.assertIsNone(PG._entity_blocktype(_DE, "anything"))
+        self.assertIsNone(PG._entity_blocktype("confirmed", _CT + "\n"))
+
+    def test_marker_carries_blocktype_only_when_hard(self):
+        import tempfile, shutil
+        d = tempfile.mkdtemp(prefix="guard_wire_")
+        orig = PG.GUARD_BLOCK_DIR
+        PG.GUARD_BLOCK_DIR = d
+        try:
+            PG._guard_write_marker("1", "confirmed", "карточка", blocktype="hard")
+            PG._guard_write_marker("2", "confirmed", "карточка", blocktype=None)
+            with open(os.path.join(d, "1.json"), encoding="utf-8") as f:
+                self.assertEqual(json.load(f).get("blocktype"), "hard")
+            with open(os.path.join(d, "2.json"), encoding="utf-8") as f:
+                self.assertIsNone(json.load(f).get("blocktype"))
+        finally:
+            PG.GUARD_BLOCK_DIR = orig
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_daemon_reads_hard_and_soft(self):
+        self.assertTrue(OD._guard_is_hard({"blocktype": "hard"}))
+        self.assertFalse(OD._guard_is_hard({"hit": "confirmed"}))
+        self.assertFalse(OD._guard_is_hard(None))
+
+    def test_hard_decision_is_deny_not_ask(self):
+        """Ключевое: hard обязан давать DENY. red сам по себе даёт ask — поэтому в main
+        врезка эмитит decision('block', ...), и вот это и проверяем."""
+        d = PG.decision("block", "confirmed", "живая сущность")
+        self.assertEqual(d["hookSpecificOutput"]["permissionDecision"], "deny")
+        d2 = PG.decision("red", "confirmed", "тест-сущность")
+        self.assertEqual(d2["hookSpecificOutput"]["permissionDecision"], "ask")
 
 
 if __name__ == "__main__":

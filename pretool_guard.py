@@ -148,16 +148,20 @@ def _guard_log(event, cmd, why=""):
         pass
 
 
-def _guard_write_marker(task_id, hit, card):
-    """Записать маркер красного блока для демона-наблюдателя."""
+def _guard_write_marker(task_id, hit, card, blocktype=None):
+    """Записать маркер красного блока для демона-наблюдателя. blocktype='hard' → демон закроет
+    задачу failed БЕЗ кнопки approve (живая сущность); None → прежнее поведение (needs_approval)."""
     if not task_id:
         return
     try:
         os.makedirs(GUARD_BLOCK_DIR, exist_ok=True)
         path = os.path.join(GUARD_BLOCK_DIR, f"{task_id}.json")
         tmp = path + ".tmp"
+        payload = {"task_id": task_id, "hit": hit, "card": card}
+        if blocktype:
+            payload["blocktype"] = blocktype
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"task_id": task_id, "hit": hit, "card": card}, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
         pass
@@ -294,6 +298,46 @@ def _detail(hit, blob):
         if tgt:
             bits.append("цель " + tgt)
     return " — " + ", ".join(bits) if bits else ""
+
+
+# ТЕСТ-СУЩНОСТИ (класс 23.07.2026, порт из stash@{1} 26.07.2026). Доктрина: боевую запись в живые
+# таблицы (Лист1/CRM) можно одобрять «да» ТОЛЬКО для ТЕСТ-сущностей write-смока; живая сущность —
+# решение владельца вне агента. Функции лежали в стэше и НИ РАЗУ не вызывались — защита не работала.
+_ENTITY_CLIENT_RE = re.compile(r"""\bclient\s*[=:]\s*['"](.*?)['"]""")
+_ENTITY_PLATE_RE  = re.compile(r"""\bplate\s*[=:]\s*['"](.*?)['"]""")
+
+_ENTITY_HITS_CLIENT = frozenset(("confirmed", "create_booking", "activate_booking", "closing_upsert"))
+_ENTITY_HITS_PLATE  = frozenset(("set_fleet_oil", "set_fleet_service"))
+
+
+def _extract_first_entity(hit, blob):
+    """Извлечь сущность (клиент/байк) из blob для ТЕСТ-entity классификации hard/soft.
+    Возвращает строку-сущность или None (не извлечено / хит не поддерживает сущность)."""
+    if hit in _ENTITY_HITS_CLIENT:
+        m = _ENTITY_CLIENT_RE.search(blob or "")
+        return m.group(1).strip() if m else None
+    if hit in _ENTITY_HITS_PLATE:
+        m = _ENTITY_PLATE_RE.search(blob or "")
+        return m.group(1).strip() if m else None
+    return None
+
+
+def _is_test_entity(entity):
+    """True если entity — «ТЕСТ…» сущность (approve разрешён в write-смоках)."""
+    return bool(entity) and str(entity).strip().lower().startswith("тест")
+
+
+def _entity_blocktype(hit, blob):
+    """ЧИСТЫЙ решатель (его зовут main и тесты): → 'hard' | None.
+      живая сущность извлечена и НЕ ТЕСТ → 'hard'  — approve недоступен физически;
+      ТЕСТ-сущность                      → None    — мягко, кнопка «да» как раньше;
+      сущность НЕ извлечена              → None    — мягко: молчание не повод ужесточать
+                                                     (деньги/удаление сущности не несут вовсе).
+    Ошибаемся в сторону МЯГКОГО: ложный hard остановил бы владельца без возможности разрешить."""
+    entity = _extract_first_entity(hit, blob)
+    if entity and not _is_test_entity(entity):
+        return "hard"
+    return None
 
 
 def _is_test_script(cmd):
@@ -919,7 +963,16 @@ def main():
         _emit(decision(kind, hit, why))                # т.е. approve по этой команде невозможен физически
     test = _is_test_script(cmd)                        # дальше ТОЛЬКО red: конкретная операция, каждая пушится
     card = _card(hit, blob, test, cmd=cmd)
-    _guard_write_marker(os.environ.get("CC_TASK_ID", "").strip(), hit, card)
+    # ТЕСТ-СУЩНОСТИ: запись в живые таблицы по ЖИВОЙ сущности — approve недоступен физически
+    # (deny хука + маркер blocktype=hard, по которому демон закрывает задачу failed без кнопки).
+    # ТЕСТ-сущность и неизвлечённая сущность идут прежним мягким путём — карточка с «да».
+    blocktype = _entity_blocktype(hit, blob)
+    _guard_write_marker(os.environ.get("CC_TASK_ID", "").strip(), hit, card, blocktype=blocktype)
+    if blocktype == "hard":
+        why = ("ЖИВАЯ сущность «%s»: запись в живые таблицы одобряется ТОЛЬКО для ТЕСТ-сущностей — "
+               "решение владельца вне агента" % (_extract_first_entity(hit, blob) or "?"))
+        _guard_log(hit, cmd, why)
+        _emit(decision("block", hit, why))              # block → deny: кнопки «да» здесь нет
     if not test:                  # 🧪-тестовые карточки в личку НЕ пушим (утечки 01–05.07); ask остаётся
         _push(card)
     _ask(card)

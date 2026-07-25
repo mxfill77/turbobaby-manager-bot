@@ -279,6 +279,12 @@ def _guard_marker_read(tid):
         return None
 
 
+def _guard_is_hard(data):
+    """True если маркер гарда несёт blocktype=hard (порт из stash@{1}): запись по ЖИВОЙ сущности.
+    Такая задача закрывается failed БЕЗ кнопки approve — «да» тут не предусмотрено доктриной."""
+    return bool(data) and (data or {}).get("blocktype") == "hard"
+
+
 def _guard_what(tid, data):
     """Строка needs_approval из данных маркера: op=other + hit + card."""
     hit = str((data or {}).get("hit") or "guard_block")
@@ -991,7 +997,15 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
             _guard_kill.set()
 
     if _guard_kill.is_set():
-        what = _guard_what(task_id_str, _guard_data[0] if _guard_data else None)
+        _gd = _guard_data[0] if _guard_data else None
+        what = _guard_what(task_id_str, _gd)
+        if _guard_is_hard(_gd):                        # живая сущность → кнопки «да» не предлагаем
+            log.warning("id=%s guard-block ЖЁСТКИЙ (живая сущность) → failed без approve: %.100s",
+                        task_id, what)
+            return "failed", ("✋ ЖЁСТКИЙ БЛОК: запись в живые таблицы по ЖИВОЙ сущности. Кнопки «да» "
+                              "здесь нет намеренно — по доктрине такое одобряется только для "
+                              "ТЕСТ-сущностей write-смока, а живую правит владелец сам.\n"
+                              + what)[:RESULT_MAX]
         log.info("id=%s guard-block → needs_approval: %.100s", task_id, what)
         return "needs_approval", what[:RESULT_MAX]
 
