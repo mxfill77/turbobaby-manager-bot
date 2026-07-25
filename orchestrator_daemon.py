@@ -113,6 +113,43 @@ PC_SILENT_MARK = "⏱ ПК-театр не отвечает"   # маркер т
 _REJECT_PREFIX = "отклонено Филиппом"        # результат devbot-отказа («нет N»/кнопка ❌) — halt без думателя
 OP_TIMEOUT = 180         # таймаут хардкод-операции красной зоны (git push / restart)
 APPROVED_TTL = 1800      # approved-задача живёт 30 мин; не довёл → авто-failed «approve истёк»
+
+# УЧЁТ ОПРОСОВ ОЧЕРЕДИ (класс 25.07.2026). Подтверждение НЕЛЬЗЯ гасить по APPROVED_TTL, если
+# демон в это окно мост не опрашивал: иначе «да» владельца сгорает из-за НАШЕЙ слепоты, а он
+# видит failed после нажатия. Отметки живут только в памяти — после рестарта окно считается
+# НЕпокрытым, то есть ошибка идёт в сторону сохранения задачи.
+_POLL_OK_TS: list = []      # отметки успешных get_pending
+_POLL_FAIL_N: dict = {}     # подряд-неудачи по виду опроса
+
+
+def _poll_ok(kind: str = "") -> None:
+    """Отметить УСПЕШНЫЙ опрос очереди."""
+    _POLL_OK_TS.append(time.time())
+    del _POLL_OK_TS[:-500]
+    if kind:
+        _POLL_FAIL_N[kind] = 0
+
+
+def _poll_fail(kind: str) -> int:
+    """Отметить НЕУДАЧНЫЙ опрос. -> сколько подряд."""
+    _POLL_FAIL_N[kind] = _POLL_FAIL_N.get(kind, 0) + 1
+    return _POLL_FAIL_N[kind]
+
+
+def _poll_covered(window: int) -> bool:
+    """True <=> последние `window` секунд мост опрашивался РЕГУЛЯРНО и УСПЕШНО: отметки есть,
+    самая старая покрывает начало окна, дыр больше 3*POLL_SEC нет, последняя свежая.
+    Истории нет (только стартовали) -> False: жечь чужое «да» по своим часам нельзя."""
+    now = time.time()
+    ts = [t for t in _POLL_OK_TS if t >= now - window]
+    if not ts or ts[0] > now - window + 3 * POLL_SEC:
+        return False
+    prev = ts[0]
+    for t in ts[1:]:
+        if t - prev > 3 * POLL_SEC:
+            return False
+        prev = t
+    return (now - ts[-1]) <= 3 * POLL_SEC
 # needs_approval lifetime (класс 23.07.2026): висит до решения владельца (hard-cap 24ч), напоминание 3ч
 NA_LIFETIME = int(os.environ.get("NA_LIFETIME", "86400") or "86400")      # 24ч hard-cap needs_approval
 NA_REMINDER_SEC = int(os.environ.get("NA_REMINDER_SEC", "10800") or "10800")  # 3ч: напоминание
@@ -134,7 +171,7 @@ HEADLESS_SETTINGS = os.path.join(REPO, "headless_settings.json")
 # (проверено 06.07: невалидная primary + --fallback-model=opus → CLI сам берёт opus, exit 0,
 # modelUsage=opus). Хардкода без фолбэка нет: упёршись в лимит Fable, автоматика не встаёт.
 ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "fable").strip() or "fable"
-ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-opus-4-8[1m]").strip() or "claude-opus-4-8[1m]"
+ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-fable-5").strip() or "claude-fable-5"
 # УСКОРЕНИЕ ЦЕПЕЙ ч.1 (13.07.2026): модель ИСПОЛНИТЕЛЯ headless-задач — отдельный флаг
 # EXECUTOR_MODEL (.env). Шаги цепей в основном механические по готовой спеке — быстрый
 # исполнитель ускоряет цепь; ДУМАНЬЕ (планировщик декомпозиции, самопочинка, адаптация
@@ -685,9 +722,18 @@ _CONVERT_MARK = "[конверт одобренной заявки"
 _CONVERT_RE = re.compile(r"^\s*\[конверт одобренной заявки\b")
 # Слой 2: маркеры заведомо headless-невозможного красного (clasp/живая таблица/деньги/CLI-БД/удаление/
 # календарь). Ловим в дескрипторе (what) И в тексте исходной задачи — до первого конверта.
+# СУЖЕНО 25.07.2026: ловим ИМЕНА ОПЕРАЦИЙ и команды, а не ТЕМЫ. Прежний список бил по словам
+# «деньг|касс|удал|байки|crm|календар|лист 1» — под них попадало и безобидное ЧТЕНИЕ («покажи
+# отчёт по деньгам», «удалённый доступ»), и одобренная владельцем задача закрывалась терминально
+# без единой попытки. Защита не ослаблена: несработавший слой 2 стоит РОВНО одно перерождение —
+# конверт уйдёт в обычный контур, там его встретит pretool_guard, а слой 1 закроет петлю.
 _HEADLESS_IMPOSSIBLE_RE = re.compile(
-    r"clasp|redeploy|\bsqlite3\b|set_fleet_(?:oil|service)|delete_event|confirmed\s*=\s*true|"
-    r"лист\s*1|\bcrm\b|зарплат|байки|транзакц|проводк|деньг|касс|удал(?:и|ени|яе|ён)|календар",
+    r"\bclasp\b|\bredeploy\b|\bsqlite3\b|"
+    r"\bset_fleet_(?:oil|service)\b|\bdelete_event\b|\bcreate_booking\b|"
+    r"\bactivate_booking\b|\badd_transaction\b|\bvoid_last\b|\bclosing_upsert\b|"
+    r"confirmed\s*=\s*true|\bDOWRITE\b|"
+    r"\bgspread\b|sheets\.googleapis\.com|script\.google\.com|"
+    r"os\.remove|os\.unlink|shutil\.rmtree|\brm\s+-rf\b",
     re.IGNORECASE,
 )
 
@@ -2937,7 +2983,13 @@ def process_approved():
     Инвариант: хардкод — ТОЛЬКО если op∈AUTO_OPS И билет 4.2 consume ok И не истёк таймаут approved."""
     r = bc.get_pending("approved")
     if not r.get("ok"):
+        # Раньше выходили МОЛЧА: подтверждения не обрабатывались, задача сгорала по APPROVED_TTL,
+        # и владелец видел failed после «да», а в журнале не было ни строки.
+        n = _poll_fail("approved")
+        log.warning("approved: мост не ответил (%s) — цикл пропущен, подряд неудач: %d",
+                    r.get("error") or "без поля error", n)
         return
+    _poll_ok("approved")
     for task in sorted(r.get("items", []), key=lambda x: int(x.get("id") or 0)):
         tid = task.get("id")
         # FIXTURE-GUARD (класс 193, рубеж approved): заглушка одобрена — НЕ исполнять,
@@ -2965,8 +3017,14 @@ def process_approved():
 
         # таймаут approved: одобрено давно, не довели → авто-failed
         if _approved_expired(task.get("updated")):
-            log.info("APPROVED id=%s ИСТЁК (>%ss) → failed", tid, APPROVED_TTL)
-            bc.complete_task(tid, "failed", "approve истёк (>30 мин), повтори задачу")
+            if not _poll_covered(APPROVED_TTL):
+                log.warning("APPROVED id=%s истёк по часам, но мост в это окно опрашивался с "
+                            "перебоями — НЕ гашу (класс 25.07: не жечь «да» из-за своей слепоты)",
+                            tid)
+                continue
+            log.info("APPROVED id=%s ИСТЁК (>%ss) → failed [слой ttl]", tid, APPROVED_TTL)
+            bc.complete_task(tid, "failed",
+                             "approve истёк (>30 мин), повтори задачу [закрыто: слой ttl]")
             _maybe_dec_after(task.get("task_text"), "failed")
             continue
 
@@ -2981,7 +3039,7 @@ def process_approved():
         tk = (bc.issue_write_ticket() or {}).get("ticket")
         if not tk or not bc.consume_write_ticket(tk).get("ok"):
             log.warning("APPROVED id=%s билет 4.2 не подтверждён → failed", tid)
-            bc.complete_task(tid, "failed", "билет токен-замка 4.2 не подтверждён — операция не выполнена")
+            bc.complete_task(tid, "failed", "билет токен-замка 4.2 не подтверждён — операция не выполнена [закрыто: слой 1]")
             continue
 
         log.info("APPROVED id=%s ИСПОЛНЯЮ op=%s (билет погашен)", tid, op)
@@ -3293,7 +3351,11 @@ def process_na_reminders():
     global _na_reminded
     r = bc.get_pending("needs_approval")
     if not r.get("ok"):
+        n = _poll_fail("needs_approval")
+        log.warning("na_reminders: мост не ответил (%s) — напоминания пропущены, подряд неудач: %d",
+                    r.get("error") or "без поля error", n)
         return
+    _poll_ok("needs_approval")
     active_ids: set = set()
     for task in r.get("items", []):
         tid = task.get("id")
@@ -3341,12 +3403,14 @@ def main():
     _banner_cprocs = _live_claude_count() or 0
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, na_lifetime=%ss, auto_ops=%s, claude=%s, "
              "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, gate_single_sel=%s, "
-             "fact_ttl=%ss, model=%s, executor_model=%s, mem_gate=%s(min=%dMB avail=%dMB), "
+             "fact_ttl=%ss, model=%s, fallback=%s, executor_model=%s, effort=%s, "
+             "mem_gate=%s(min=%dMB avail=%dMB), "
              "rss_gate=%s(max=%dMB cur=%dMB), proc_gate=%s(max=%d cur=%d), chain_cache=%d) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, NA_LIFETIME, ",".join(AUTO_OPS), CLAUDE_BIN,
              int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), int(_curator_scope_on()),
              int(_gate_single_selective_on()),
-             FACT_TTL, ORCH_MODEL, EXECUTOR_MODEL,
+             FACT_TTL, ORCH_MODEL, ORCH_MODEL_FALLBACK, EXECUTOR_MODEL,
+             EXECUTOR_EFFORT,
              "on" if MEM_MIN_MB > 0 else "off", MEM_MIN_MB, _banner_avail,
              "on" if CLAUDE_RSS_TOTAL_MB > 0 else "off", CLAUDE_RSS_TOTAL_MB, _banner_crss,
              "on" if MAX_CLAUDE_PROCS > 0 else "off", MAX_CLAUDE_PROCS, _banner_cprocs,

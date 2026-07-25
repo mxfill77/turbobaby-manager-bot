@@ -129,12 +129,17 @@ res.append(ok(len(fb.by_status("new")) == 0, "новых конвертов не
 
 # (2) слой 2: известное headless-невозможное красное → терминальная карта сразу, ноль конвертов
 print("(2) СЛОЙ 2: keyword-классификатор ловит красное → терминал сразу, ноль конвертов:")
+# СУЖЕНО 25.07.2026: слой 2 ловит ИМЕНА ОПЕРАЦИЙ, а не темы. Две прежние строки («деньги
+# в кассу», «удалить событие календаря») были ОПИСАНИЯМИ без имени операции — им теперь
+# положено ровно одно перерождение, терминал ставит слой 1 (проверка в блоке 2b ниже).
 cases = [
     ("op=other | clasp redeploy Bridge · прод · ping", "clasp/redeploy"),
     ("op=other | записать бронь в Лист1 Байки · confirmed=true", "живая таблица Лист1"),
-    ("op=other | провести транзакцию: деньги в кассу · Money Cashflow", "деньги/транзакция"),
+    ("op=other | add_transaction(-500) в кассу · Money Cashflow", "add_transaction"),
     ("op=other | sqlite3 memory.db UPDATE trust", "sqlite3 CLI"),
-    ("op=other | удалить событие календаря брони", "удаление события"),
+    ("op=other | delete_event(id=7) — событие календаря брони", "delete_event"),
+    ("op=other | set_fleet_oil(bike=12) · живой парк", "set_fleet_oil"),
+    ("op=other | os.remove('/root/live.db') · удаление файла", "os.remove"),
 ]
 for desc, label in cases:
     fb = fresh()
@@ -147,6 +152,28 @@ for desc, label in cases:
                                                        for x in fb.rows.values())
     res.append(ok(r["status"] == "failed" and is_manual(r["result"]) and not conv_created,
                   f"{label}: терминальная карта сразу, конвертов 0"))
+
+
+# (2b) СУЖЕНИЕ 25.07.2026: тема БЕЗ имени операции слоем 2 больше не ловится — ей положено
+# ровно одно перерождение, а терминально её закрывает слой 1. Петля всё равно мертва.
+print("(2b) тема без имени операции → конверт 1 раз, терминал ставит слой 1:")
+for desc, label in [
+        ("op=other | провести транзакцию: деньги в кассу · Money Cashflow", "деньги/транзакция"),
+        ("op=other | удалить событие календаря брони", "удаление события словами")]:
+    fb = fresh()
+    tid = fb.enqueue_task("Filipp-328-dev", "дев-задача")["id"]
+    fb.rows[tid]["status"] = "needs_approval"; fb.rows[tid]["result"] = desc
+    fb.approve(tid)
+    OD.process_approved()
+    convs = fb.by_status("new")
+    res.append(ok(len(convs) == 1 and convs[0]["task_text"].startswith("[конверт одобренной заявки"),
+                  f"{label}: конверт создан (1 перерождение, не терминал сразу)"))
+    if convs:
+        fake_run.out = "NEEDS_APPROVAL: op=other | снова красное"
+        OD.process_new()
+        cr = fb.rows[convs[0]["id"]]
+        res.append(ok(cr["status"] == "failed" and is_manual(cr["result"]),
+                      f"{label}: ре-эскалация → слой 1 терминально, петля мертва"))
 
 
 # (3) неизвестное (не-keyword) op=other → конверт 1 раз; при ре-эскалации слой 1 рвёт

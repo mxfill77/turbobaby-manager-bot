@@ -175,7 +175,8 @@ res.append(ok(fb.rows[pid]["status"] == "failed" and "не вернул нуме
 
 # (7) хелпер и преамбула
 print("(7) хелпер пометки и преамбула планировщика:")
-res.append(ok(OD._dec_red_note(["код", "clasp redeploy", "тесты", "запись в CRM"]).startswith("🔴 красные шаги: 2, 4"),
+# СУЖЕНО 25.07.2026: пометка идёт по ИМЕНИ ОПЕРАЦИИ, «запись в CRM» — тема, а не операция.
+res.append(ok(OD._dec_red_note(["код", "clasp redeploy", "тесты", "delete_event(id) в календаре"]).startswith("🔴 красные шаги: 2, 4"),
               "_dec_red_note: находит красные шаги по номерам"))
 res.append(ok(OD._dec_red_note(["код", "тесты"]) == "", "_dec_red_note: чистый план → пустая строка"))
 res.append(ok(all(OD._PLAN_LINE_RE.match(ln) is None

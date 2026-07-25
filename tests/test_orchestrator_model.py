@@ -21,7 +21,12 @@ print("(1) конфиг модели из env:")
 # NB: два литерала ниже ЗЕРКАЛЯТ боевой .env (ORCH_MODEL / ORCH_MODEL_FALLBACK);
 # при смене модели правятся вместе с конфигом — иначе гейт краснеет и отгрузка встаёт.
 res.append(ok(OD.ORCH_MODEL == "claude-opus-5", "ORCH_MODEL из .env = claude-opus-5"))
-res.append(ok(OD.ORCH_MODEL_FALLBACK == "fable", "ORCH_MODEL_FALLBACK = fable (прежняя основная)"))
+# ЗЕРКАЛО .env: 25.07.2026 фолбэк переведён с алиаса «fable» на полный идентификатор —
+# короткий алиас API не принимает (404 not_found_error), CLI-фолбэк был мёртв.
+res.append(ok(OD.ORCH_MODEL_FALLBACK == "claude-fable-5",
+              "ORCH_MODEL_FALLBACK = claude-fable-5"))
+res.append(ok(OD.ORCH_MODEL_FALLBACK.startswith("claude-"),
+              "фолбэк — ПОЛНЫЙ идентификатор модели (короткий алиас даёт 404)"))
 res.append(ok(OD.ORCH_MODEL != OD.ORCH_MODEL_FALLBACK, "основная и фолбэк — разные модели"))
 
 class FakePopen:
