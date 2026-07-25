@@ -53,3 +53,12 @@ _*.py
 *.lock
 # боевая база вебхука wa-webhook: живёт на диске, в git не хранится (25.07.2026)
 wa_queue.db
+# 25.07.2026: остатки, не попавшие под правила (отслеживание было старше правил)
+tests/test_cclog.py.bak-format3-20260716
+tests/test_curator.py.bak-curhuman-20260712
+tests/test_curator_devbot.py.bak-status285-20260713
+tests/test_inprogress_report.py.bak-stallcap-20260713
+tests/test_orchestrator_model.py.bak-execmodel-20260713
+tests/test_proc_gate.py.bak
+_allow_new_settings.json
+_claspsplit_build.py
