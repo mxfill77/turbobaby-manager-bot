@@ -218,12 +218,13 @@ LOG_PATH = os.path.join(REPO, "orchestrator_daemon.log")
 # определяем по: активный pytest / entry-point tests/test_*.py / явный флаг ORCH_DAEMON_TEST=1 →
 # логгер в NullHandler (ни файла, ни консоли). Боевой демон (systemd, argv=orchestrator_daemon.py) —
 # как раньше, пишет в LOG_PATH.
-_UNDER_TEST = (
-    "pytest" in sys.modules
-    or bool(os.environ.get("PYTEST_CURRENT_TEST"))
-    or os.path.basename((sys.argv[0] if sys.argv else "") or "").startswith("test_")
-    or os.environ.get("ORCH_DAEMON_TEST") == "1"
-)
+# 25.07.2026: признак вынесен в task_metrics.under_test и ДОПОЛНЕН ORCH_TEST_MODE=1. Прежний набор
+# опознавал тест по имени входного файла test_*, и КОПИЯ теста под другим именем (живой случай:
+# `git show <хеш>:tests/test_x.py > /tmp/old.py`) снова писала в боевой журнал — 5 строк METRICS,
+# неотличимых от живых задач. ORCH_TEST_MODE=1 ставит gate.py всем тест-процессам; в бою его нет
+# ни в .env, ни в юните, и демон сам вычищает его из дочерних окружений (child_env.pop).
+_UNDER_TEST = task_metrics.under_test(
+    (sys.argv[0] if sys.argv else ""), os.environ, sys.modules)
 if _UNDER_TEST:
     logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
 else:
@@ -1075,7 +1076,10 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
             end_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             dur_s=time.monotonic() - _t0, outcome=status, attempts=1,
             selfheals=task_metrics.selfheal_count(task_text),
-            tokens_in=_mctx.get("tokens_in"), tokens_out=_mctx.get("tokens_out")))
+            tokens_in=_mctx.get("tokens_in"), tokens_out=_mctx.get("tokens_out"),
+            task_text=task_text,
+            mode=("test" if _UNDER_TEST else "prod"),
+            src=(os.path.basename((sys.argv[0] if sys.argv else "") or "") or None)))
     except Exception as _e:
         log.warning("METRICS не записан (vps id=%s): %s", task_id, _e)
     return status, result
