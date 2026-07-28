@@ -230,8 +230,13 @@ ok(rec.get("updated") and DB._iso_ts(rec["updated"]) is not None,
 ok(DB._gen(rec) == DB._gen(src), "генерация события совпадает со строкой очереди (дедуп сойдётся)")
 ok(OD.write_claim_event(src, path="/nope/нет/такого/пути.jsonl") is False,
    "нечитаемый путь → False, исключение наружу не летит (fail-safe)")
-ok(OD.write_claim_event(src) is False and not os.path.exists(OD.CLAIM_LOG_PATH),
+live = OD.CLAIM_LOG_PATH                 # боевой журнал может УЖЕ существовать (демон работает) —
+before = os.path.getsize(live) if os.path.exists(live) else -1   # проверяем неизменность, не отсутствие
+ok(OD.write_claim_event(src) is False
+   and (os.path.getsize(live) if os.path.exists(live) else -1) == before,
    "под тестом боевой журнал не трогается (класс METRICS-мусора 25.07)")
+ok(DB._drain_claim_events(live) == [],
+   "и devbot под тестом боевой журнал не ЧИТАЕТ — живые взятия не текут в чужие тесты")
 
 print("11. Точка записи одна — synthetic-карточки демона анонса не получают:")
 with open("/root/turbobaby-manager-bot/orchestrator_daemon.py", encoding="utf-8") as f:

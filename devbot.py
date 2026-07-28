@@ -7,6 +7,7 @@ origin=agent → ЛЮБАЯ попытка красной записи лови�
 """
 import os
 import re
+import sys
 import json
 import time
 import asyncio
@@ -19,6 +20,7 @@ from collections import Counter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import bridge_client
+import task_metrics          # общий детектор тест-прогона (под тестом боевые артефакты не трогаем)
 
 log = logging.getLogger(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -254,16 +256,31 @@ def _seed_silences(it):
 # Дедуп ОБЩИЙ со снимком (_inprogress_seen, ключ номер+генерация) — двух карточек не будет.
 # Журнала нет (демон старый / не запускался) → пусто → прежнее поведение по снимку, без регресса.
 CLAIM_LOG_PATH = os.path.join(ROOT, "orchestrator_claims.jsonl")
+_LIVE_CLAIM_LOG_PATH = CLAIM_LOG_PATH   # заморожен на импорте: тесты подменяют CLAIM_LOG_PATH
 _claims_offset = 0                      # прочитано байт журнала взятий (в пределах процесса)
+
+
+def _claims_live_path(p):
+    """True → это БОЕВОЙ журнал взятий (а не тестовая подмена). Симметрия с писателем демона."""
+    try:
+        return os.path.abspath(p) == os.path.abspath(_LIVE_CLAIM_LOG_PATH)
+    except Exception:
+        return True                     # сомнение → считаем боевым (в сторону тишины под тестом)
 
 
 def _drain_claim_events(path=None):
     """Считать НОВЫЕ строки журнала взятий и вернуть их списком dict-ов (оффсет сдвигается).
     Читаем в БИНАРНОМ режиме: оффсет байтовый, seek по нему в текстовом режиме не определён.
     Недописанный хвост без '\\n' не трогаем — заберём следующим тиком (торн-райт не теряем).
-    Журнал подрезан демоном (ротация) → читаем с начала: дубли гасит дедуп по номер+генерация."""
+    Журнал подрезан демоном (ротация) → читаем с начала: дубли гасит дедуп по номер+генерация.
+    Под тестом БОЕВОЙ журнал не читаем (демон в него так же не пишет): иначе живые взятия
+    протекают карточками в чужие тесты — так и случилось на первом же прогоне 28.07, красные
+    test_inbox/test_claim_event. Тест обязан подсунуть свой путь (reset ставит CLAIM_LOG_PATH)."""
     global _claims_offset
     p = path or CLAIM_LOG_PATH
+    if _claims_live_path(p) and task_metrics.under_test(
+            (sys.argv[0] if sys.argv else ""), os.environ, sys.modules):
+        return []
     try:
         size = os.path.getsize(p)
     except OSError:
