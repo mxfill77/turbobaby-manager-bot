@@ -26,6 +26,7 @@ __pycache__/
 # === Логи ===
 *.log
 logs/
+orchestrator_claims.jsonl    # журнал взятий задач в работу (рантайм-состояние, не код)
 
 # === Выгрузки / временное ===
 topics_map.json

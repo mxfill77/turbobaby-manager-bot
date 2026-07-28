@@ -244,22 +244,101 @@ def _seed_silences(it):
     return ts < _PROC_START_TS - SEED_GRACE_SEC
 
 
+# === ХВОСТ 1 (28.07.2026): «ВЗЯЛ В РАБОТУ» ЧЕРЕЗ ЖУРНАЛ СОБЫТИЙ, А НЕ ЧЕРЕЗ СНИМОК ===
+# Анонс «🔄 в работе» рождался ТОЛЬКО из 45-секундного снимка in_progress, а задача живёт
+# 5–9 секунд — между двумя опросами она успевала родиться и умереть, в снимок не попадала и
+# анонс не приходил НИ РАЗУ (живые примеры 28.07: задачи 14 и 15, обе done без «в работе»).
+# Опрос состояния тут бессилен по природе. Демон пишет ФАКТ взятия строкой JSONL
+# (orchestrator_daemon.write_claim_event, единственная точка — process_new), мы читаем журнал
+# с байтового оффсета и выносим карточку. Событие переживает любую скорость задачи.
+# Дедуп ОБЩИЙ со снимком (_inprogress_seen, ключ номер+генерация) — двух карточек не будет.
+# Журнала нет (демон старый / не запускался) → пусто → прежнее поведение по снимку, без регресса.
+CLAIM_LOG_PATH = os.path.join(ROOT, "orchestrator_claims.jsonl")
+_claims_offset = 0                      # прочитано байт журнала взятий (в пределах процесса)
+
+
+def _drain_claim_events(path=None):
+    """Считать НОВЫЕ строки журнала взятий и вернуть их списком dict-ов (оффсет сдвигается).
+    Читаем в БИНАРНОМ режиме: оффсет байтовый, seek по нему в текстовом режиме не определён.
+    Недописанный хвост без '\\n' не трогаем — заберём следующим тиком (торн-райт не теряем).
+    Журнал подрезан демоном (ротация) → читаем с начала: дубли гасит дедуп по номер+генерация."""
+    global _claims_offset
+    p = path or CLAIM_LOG_PATH
+    try:
+        size = os.path.getsize(p)
+    except OSError:
+        return []                       # журнала нет — фоллбэк на снимок in_progress
+    if size < _claims_offset:
+        _claims_offset = 0
+    if size == _claims_offset:
+        return []
+    try:
+        with open(p, "rb") as f:
+            f.seek(_claims_offset)
+            raw = f.read()
+    except OSError as e:
+        log.warning("devbot: журнал взятий не прочитан (%s) — анонс пойдёт по снимку", e)
+        return []
+    cut = raw.rfind(b"\n")
+    if cut < 0:
+        return []
+    _claims_offset += cut + 1
+    out = []
+    for line in raw[:cut].split(b"\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line.decode("utf-8", "replace"))
+        except Exception:
+            continue                    # битая строка журнала не должна валить опрос
+        if isinstance(ev, dict) and ev.get("id") is not None \
+                and str(ev.get("from")) in QUEUE_FROMS:
+            out.append(ev)
+    return out
+
+
+def _claims_seek_end(path=None):
+    """Seed-on-start: перемотать журнал взятий в конец, ничего не вынося (история молчит)."""
+    global _claims_offset
+    try:
+        _claims_offset = os.path.getsize(path or CLAIM_LOG_PATH)
+    except OSError:
+        _claims_offset = 0
+
+
 # Потолок result у исполнителей: orchestrator_daemon.RESULT_MAX = 4500 (запас под лимит Bridge
 # 5000). Демон/ПК-агент режут отчёт ДО записи в очередь — devbot видит уже обрубок и обязан
 # сказать об этом вслух: молча срезанный хвост читался как полный отчёт (28.07.2026).
 RESULT_CAP = 4500
+
+# ХВОСТ 2 закрыт 28.07.2026: демон (orchestrator_daemon.cap_result) сам дописывает в конец result
+# машиночитаемую пометку с ПОЛНОЙ длиной ДО обрезки. Нашли её — число уже в теле карточки, свою
+# «длины взять неоткуда» НЕ добавляем (иначе карточка противоречила бы сама себе). Не нашли, а
+# result упёрся в потолок — прежняя пометка-фоллбэк: так пишет ПК-агент (чужой контур, его мы не
+# трогаем) и старые записи очереди, сделанные демоном до этой правки.
+_TRUNC_FULL_RE = re.compile(r"ОБРЕЗАН ДЕМОНОМ: полная длина (\d+) симв")
+
+
+def _result_full_len(body):
+    """Полная длина ДО обрезки из пометки исполнителя. Пометки нет → None."""
+    m = _TRUNC_FULL_RE.search(body or "")
+    return int(m.group(1)) if m else None
 
 
 def _result_body(it, empty="(пустой результат)"):
     """Текст result для карточки + ЯВНАЯ пометка обрезки, если он упёрся в потолок исполнителя."""
     raw = it.get("result")
     body = str(raw) if raw not in (None, "") else empty
+    if _result_full_len(body) is not None:
+        return body                     # исполнитель сам назвал полную длину — она уже в тексте
     n = len(body)
     if n >= RESULT_CAP:
         body += (f"\n\n✂️ РЕЗУЛЬТАТ ОБРЕЗАН: в очереди {n} симв. — это потолок исполнителя "
                  f"({RESULT_CAP}, orchestrator_daemon.RESULT_MAX), значит хвост срезан ДО записи. "
-                 f"Полная длина исходного отчёта в очередь не попала — здесь её взять неоткуда; "
-                 f"недостающее ищи в splinter.log/cc_log или переспроси задачу короче.")
+                 f"Полной длины исходного отчёта эта запись не несёт (сделана исполнителем без "
+                 f"пометки длины — ПК-агент либо демон до 28.07.2026); недостающее ищи в "
+                 f"splinter.log/cc_log или переспроси задачу короче.")
     return body
 
 
@@ -1107,6 +1186,24 @@ async def _send_card_with_retry(context, qid, chunks, topic, markup_last, label)
     return False
 
 
+async def _send_inprogress_card(context, it):
+    """Карточка «🔄 в работе» — ОДИН формат для обоих источников события: журнала взятий демона
+    (доезжает даже у 5-секундной задачи) и снимка in_progress (длинные задачи, полоса pc).
+    Дедуп ставит вызывающий: сюда попадают только непоказанные задачи."""
+    qid = it.get("id")
+    task_text = str(it.get("task_text") or "")[:120]
+    rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
+    msg = f"🔄 Задача {qid}{rep} в работе…\n\n{task_text}"
+    for chunk in _chunks(msg):
+        try:
+            m = await context.bot.send_message(chat_id=HQ_CHAT_ID,
+                                               message_thread_id=_item_topic(it), text=chunk)
+            log.info("devbot.report_results: анонс «в работе» задачи %s отправлен в тему %s, "
+                     "message_id=%s", qid, _item_topic(it), getattr(m, "message_id", "?"))
+        except Exception as e:
+            log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
+
+
 async def report_results(context) -> None:
     """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
     Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
@@ -1140,9 +1237,20 @@ async def report_results(context) -> None:
             else:
                 kept.append(str(it.get("id")))
         _report_seeded = True
+        # Журнал взятий перематываем в конец: взятия ДО старта процесса — история. Длинная
+        # задача, пережившая рестарт бота, всё равно получит анонс из снимка in_progress ниже.
+        _claims_seek_end()
         log.info("devbot.report_results: seed-on-start — погашено %d терминальных из %d; "
                  "рапортуем свежие: %s", hushed, len(finished), kept or "нет")
         return
+
+    # ХВОСТ 1: события «взял в работу» из журнала демона — ПЕРЕД карточками результата, чтобы
+    # порядок в теме был хронологическим (взял → завершил) даже у задачи, прожившей 5 секунд.
+    for ev in _drain_claim_events():
+        if _seen(_inprogress_seen, ev):
+            continue                     # снимок in_progress уже отрапортовал эту задачу
+        _mark_seen(_inprogress_seen, ev)
+        await _send_inprogress_card(context, ev)
 
     # Редактировать карточки, ожидающие вердикт куратора (если появился)
     await _check_curator_pending(context, by)
@@ -1222,14 +1330,7 @@ async def report_results(context) -> None:
         qid = it.get("id")
         if not _seen(_inprogress_seen, it):    # анонс «в работе» — один раз на задачу
             _mark_seen(_inprogress_seen, it)
-            task_text = str(it.get("task_text") or "")[:120]
-            rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
-            msg = f"🔄 Задача {qid}{rep} в работе…\n\n{task_text}"
-            for chunk in _chunks(msg):
-                try:
-                    await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
-                except Exception as e:
-                    log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
+            await _send_inprogress_card(context, it)
         if not _seen(_stalled, it):            # детект зависания — один раз на задачу (анти-спам)
             age = _task_age_sec(it.get("updated"))
             thr = _stall_threshold_sec(it)     # per-задача: потолок исполнения + люфт (урок 287)

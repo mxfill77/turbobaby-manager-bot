@@ -212,6 +212,87 @@ EXECUTOR_EFFORT = task_metrics.norm_effort(os.environ.get("EXECUTOR_EFFORT"))
 RESULT_MAX = 4500        # Bridge режет result на 5000 — оставляем запас
 LOG_PATH = os.path.join(REPO, "orchestrator_daemon.log")
 
+# === ХВОСТ 2 (28.07.2026): ДЛИНА ДО ОБРЕЗКИ НЕ ТЕРЯЕТСЯ ===
+# result режется под RESULT_MAX ДО записи в очередь, поэтому devbot видел уже обрубок и мог
+# сказать лишь «обрезано», не зная СКОЛЬКО срезано (остаток коммита 8ed16b0 дословно: «полной
+# длины ИСХОДНОГО отчёта в карточке нет и быть не может»). Теперь длину несёт сам текст:
+# машиночитаемая пометка в хвосте (её парсит devbot._TRUNC_FULL_RE), итог по-прежнему ≤ RESULT_MAX.
+TRUNC_HEAD = "✂️ РЕЗУЛЬТАТ ОБРЕЗАН ДЕМОНОМ"
+
+
+def _trunc_note(full_len, kept):
+    """Хвостовая пометка обрезки: полная длина ДО обрезки + сколько реально попало в очередь."""
+    return (f"\n\n{TRUNC_HEAD}: полная длина {full_len} симв., в очередь попало {kept} — "
+            f"срезано {full_len - kept} симв. (потолок RESULT_MAX={RESULT_MAX}). "
+            f"Полный вывод ищи в orchestrator_daemon.log / cc_log задачи.")
+
+
+def cap_result(text, limit=None):
+    """Обрезать result под потолок очереди, СОХРАНИВ полную длину прямо в тексте.
+    Короче потолка → возвращаем байт-в-байт (пометки нет, поведение прежнее).
+    Длиннее → голова + _trunc_note; итоговая длина гарантированно ≤ limit (цикл ужимает
+    голову, пока пометка со своими числами не поместится — числа сами меняют её длину)."""
+    limit = RESULT_MAX if limit is None else limit
+    s = "" if text is None else str(text)
+    n = len(s)
+    if n <= limit:
+        return s
+    keep = max(0, limit - len(_trunc_note(n, limit)))
+    while keep > 0 and keep + len(_trunc_note(n, keep)) > limit:
+        keep -= 1
+    return s[:keep] + _trunc_note(n, keep)
+
+
+# === ХВОСТ 1 (28.07.2026): ЖУРНАЛ ВЗЯТИЙ В РАБОТУ ===
+# «🔄 в работе» рождалось ТОЛЬКО из 45-секундного снимка in_progress, который делает devbot.
+# Задача, прожившая 5–9 секунд, между двумя опросами в снимок не попадала ВООБЩЕ — анонс
+# взятия не приходил ни разу (живой пример: задачи 14/15 28.07). Состояние опрашивать поздно —
+# записываем СОБЫТИЕ: строка JSONL на каждое реальное взятие из process_new. Событие лежит в
+# файле и доезжает независимо от того, сколько задача прожила; devbot читает журнал с оффсетом.
+# Пишем ТОЛЬКО из process_new (взятие задачи владельца). Synthetic-карточки демона (сводки,
+# коррекции плана, самопочинка) claim'ятся своими вызовами bc.claim_task и события НЕ порождают —
+# иначе каждая служебная карточка получала бы лишний анонс «в работе».
+CLAIM_LOG_PATH = os.path.join(REPO, "orchestrator_claims.jsonl")
+CLAIM_LOG_MAX_BYTES = 200_000    # ~800 событий; при превышении оставляем хвост
+CLAIM_LOG_KEEP_LINES = 200
+
+
+def write_claim_event(task, path=None):
+    """Записать факт взятия задачи в работу строкой JSONL. Поля повторяют строку очереди
+    (id/created/from/lane/task_text) — devbot гоняет по ним ТЕ ЖЕ helpers дедупа и маршрутизации;
+    updated = момент взятия (по нему seed-on-start гасит историю до старта бота).
+    FAIL-SAFE: любой сбой записи логируется и НЕ трогает исполнение задачи — видимость не
+    важнее работы. Под тестом в БОЕВОЙ журнал не пишем (класс METRICS-мусора 25.07): тест
+    обязан передать свой path, иначе событие не пишется вовсе."""
+    path = path or CLAIM_LOG_PATH
+    if _UNDER_TEST and os.path.abspath(path) == os.path.abspath(CLAIM_LOG_PATH):
+        return False
+    try:
+        rec = {
+            "id": task.get("id"),
+            "created": str(task.get("created") or ""),
+            "from": str(task.get("from") or ""),
+            "lane": str(task.get("lane") or ""),
+            "task_text": str(task.get("task_text") or "")[:400],
+            "updated": datetime.datetime.now(datetime.timezone.utc)
+                       .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        }
+        try:                                   # ротация: журнал не растёт бесконечно
+            if os.path.getsize(path) > CLAIM_LOG_MAX_BYTES:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    tail = f.readlines()[-CLAIM_LOG_KEEP_LINES:]
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(tail)
+        except OSError:
+            pass                               # журнала ещё нет / не прочли — просто дописываем
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except Exception as e:
+        log.warning("журнал взятий: событие id=%s не записано (%s) — анонс «в работе» "
+                    "останется на снимке in_progress", task.get("id"), e)
+        return False
+
 # §12 корень 1 (06.07.2026): под тест-прогоном НЕ трогаем боевой orchestrator_daemon.log —
 # сам ИМПОРТ модуля (test_orchestrator_*/test_convert_loop_break делают `import orchestrator_daemon`)
 # конфигурировал FileHandler на ЖИВОЙ лог, и любой log.info фикстуры лил строки в него. Тест-прогон
@@ -834,7 +915,7 @@ def _manual_card(what, orig_text=""):
     ]
     if orig_text:
         lines.append(f"Исходная задача (контекст): {str(orig_text).strip()[:300]}")
-    return "\n".join(lines)[:RESULT_MAX]
+    return cap_result("\n".join(lines))
 
 
 def parse_op(what):
@@ -1002,10 +1083,10 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
         if _guard_is_hard(_gd):                        # живая сущность → кнопки «да» не предлагаем
             log.warning("id=%s guard-block ЖЁСТКИЙ (живая сущность) → failed без approve: %.100s",
                         task_id, what)
-            return "failed", ("✋ ЖЁСТКИЙ БЛОК: запись в живые таблицы по ЖИВОЙ сущности. Кнопки «да» "
-                              "здесь нет намеренно — по доктрине такое одобряется только для "
-                              "ТЕСТ-сущностей write-смока, а живую правит владелец сам.\n"
-                              + what)[:RESULT_MAX]
+            return "failed", cap_result("✋ ЖЁСТКИЙ БЛОК: запись в живые таблицы по ЖИВОЙ сущности. "
+                                        "Кнопки «да» здесь нет намеренно — по доктрине такое "
+                                        "одобряется только для ТЕСТ-сущностей write-смока, а живую "
+                                        "правит владелец сам.\n" + what)
         log.info("id=%s guard-block → needs_approval: %.100s", task_id, what)
         return "needs_approval", what[:RESULT_MAX]
 
@@ -1071,7 +1152,7 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
         # §12 корень 3: чистая карточка провала, НЕ сырой дамп stdout+stderr (шум).
         return "failed", _fail_card(out, err, proc.returncode)
     log.info("id=%s claude -p exit=0 (вывод %d симв)", task_id, len(out))
-    return "done", (out[:RESULT_MAX] if out else "(claude -p вернул пустой вывод)")
+    return "done", (cap_result(out) if out else "(claude -p вернул пустой вывод)")
 
 
 def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
@@ -1108,8 +1189,8 @@ def _exec_git_push(task_id):
         return "failed", f"git push: таймаут {OP_TIMEOUT}s"
     out = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
     if p.returncode != 0:
-        return "failed", f"git push exit={p.returncode}: {out}"[:RESULT_MAX]
-    return "done", f"git push выполнен:\n{out}"[:RESULT_MAX]
+        return "failed", cap_result(f"git push exit={p.returncode}: {out}")
+    return "done", cap_result(f"git push выполнен:\n{out}")
 
 
 def _exec_restart_splinter(task_id):
@@ -3276,6 +3357,11 @@ def process_new():
     if not cl.get("ok"):
         log.info("claim id=%s не удался (%s) — пропускаю в этом цикле", tid, cl.get("error"))
         return
+
+    # ХВОСТ 1: событие «взял в работу» — ЕДИНСТВЕННАЯ точка записи журнала взятий. Отсюда его
+    # заберёт devbot и вынесет карточку в 328, даже если задача прожила 5 секунд и ни в один
+    # 45с-снимок in_progress не попала. Сбой записи задачу не трогает (fail-safe внутри).
+    write_claim_event(task)
 
     if _is_dec(task):
         sm = _SUM_RE.match(text)
