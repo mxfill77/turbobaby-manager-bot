@@ -152,12 +152,22 @@ _DEC_PREFIXES = ("декомпозируй:", "разбей:", "decompose:")  # 
 _STRUCT_PREFIXES = _DEC_PREFIXES + _DEV_PREFIXES + _TASK_PREFIXES  # ВСЕ командные префиксы очереди:
                                         # матчатся ПЕРВЫМИ по началу сообщения, абсолютный приоритет
                                         # над зелёным allowlist (инцидент 23:49 11.07.2026)
-_reported = set()                       # id задач, уже отрапортованных (done/failed; дедуп, память процесса)
+# === ДЕДУП КАРТОЧЕК: ключ = НОМЕР + ГЕНЕРАЦИЯ (фикс дыры видимости 28.07.2026) ===
+# Класс бага: голый id жив только до пересоздания листа очереди. Лист пересобрали — нумерация
+# снова пошла с 1, а в памяти процесса от seed-on-start лежали номера прежней очереди (1..399) →
+# новые задачи 1, 2, 3 (три failed 28.07) были отброшены как «уже показанные» и в 328 НЕ дошли.
+# Фикс: к номеру добавлена «генерация» — колонка `created` очереди (момент постановки СТРОКИ).
+# Пересобранная очередь ставит строки заново, поэтому её задача №1 несёт created=28.07, а не
+# created прошлой №1 → совпадения номеров больше не глушат карточку. Хранилища — dict
+# {str(id): генерация}: одна запись на номер (память не растёт), сверка O(1).
+_SEEN_ANY = "*"                         # пометка «по номеру» (item под рукой нет — кнопка/«нет N»);
+                                        # гасит ТОЛЬКО задачи, существовавшие на момент пометки
+_reported = {}                          # задачи, уже отрапортованные (done/failed; память процесса)
 _report_seeded = False                  # seed-on-start: не спамим историей done/failed при рестарте
-_asked = set()                          # id задач needs_approval, по которым УЖЕ задан вопрос (дедуп)
+_asked = {}                             # задачи needs_approval, по которым УЖЕ задан вопрос (дедуп)
 # heartbeat/детект-зависания (части 1-2): анонс «в работе» и предупреждение «зависла» — по разу на задачу
-_inprogress_seen = set()                # id задач in_progress, по которым УЖЕ слали «🔄 в работе» (дедуп)
-_stalled = set()                        # id задач, по которым УЖЕ слали «⚠️ зависла» (дедуп)
+_inprogress_seen = {}                   # задачи in_progress, по которым УЖЕ слали «🔄 в работе» (дедуп)
+_stalled = {}                           # задачи, по которым УЖЕ слали «⚠️ зависла» (дедуп)
 STALL_GRACE_SEC = 120                   # люфт НАД штатным потолком задачи
 # {qid: (chat_id, topic_id, msg_id, base_text, task_text, task_from, st, sent_at)}
 _curator_pending = {}                   # карточки, показывающие «куратор оценивает» — ждут edit
@@ -167,6 +177,91 @@ _CURATOR_WAIT_MAX = 240                 # сек до fallback-перерасч�
                                         # Урок задачи 287 (22:55 13.07.2026): плоский порог 12 мин
                                         # тревожил за минуту до честного done долгого «тз:» (норма
                                         # до 45 мин) — класс «долго работает ≠ умерла» (ПК-вотчдог 5167365).
+
+# Старт ПРОЦЕССА (devbot импортируется bot.py на старте) — граница seed-on-start: гасим только то,
+# что стало терминальным ДО нас. SEED_GRACE_SEC — окно рестарта: задача, финишировавшая в эти
+# секунды перед стартом, seed'ом НЕ гасится (её карточку мог не успеть отправить прошлый процесс;
+# лишний дубль лучше тишины — цена ошибки в разные стороны разная).
+_PROC_START_TS = time.time()
+SEED_GRACE_SEC = 120
+
+
+def _iso_ts(v):
+    """ISO-строка очереди ('2026-07-28T10:18:55.172Z') → epoch-секунды UTC. Мусор/пусто → None."""
+    try:
+        s = str(v or "").strip().replace("Z", "+00:00")
+        if not s:
+            return None
+        t = datetime.datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=datetime.timezone.utc)
+        return t.timestamp()
+    except Exception:
+        return None
+
+
+def _gen(it):
+    """«Генерация» задачи = created из очереди (момент постановки СТРОКИ). Именно она переживает
+    пересоздание листа: новый лист ставит строки заново, поэтому его №1 несёт другой created."""
+    return str(it.get("created") or "")
+
+
+def _seen(store, it):
+    """True → карточка по ЭТОЙ задаче уже уходила. Сверяем номер И генерацию: одинаковый номер
+    из ДРУГОЙ (пересозданной) очереди — другая задача, её показываем."""
+    prev = store.get(str(it.get("id")))
+    if prev is None:
+        return False
+    if isinstance(prev, tuple) and prev and prev[0] == _SEEN_ANY:
+        c = _iso_ts(_gen(it))           # пометка «по номеру» с моментом простановки
+        return c is None or c <= prev[1]  # созданная ПОЗЖЕ пометки — уже другая задача, не глушим
+    return prev == _gen(it)
+
+
+def _mark_seen(store, it):
+    """Пометить задачу показанной (ключ — номер+генерация)."""
+    store[str(it.get("id"))] = _gen(it)
+
+
+def _mark_seen_by_id(store, qid):
+    """Пометка по ГОЛОМУ номеру — когда строки очереди под рукой нет (кнопка/ответ «нет N»).
+    Держим момент простановки: задача с тем же номером, СОЗДАННАЯ позже, под неё не попадёт."""
+    store[str(qid)] = (_SEEN_ANY, time.time())
+
+
+def _forget_seen(store, qid):
+    """Снять пометку по номеру (одобренная задача обязана отрапортоваться штатно)."""
+    store.pop(str(qid), None)
+
+
+def _seed_silences(it):
+    """True → задача стала ТЕРМИНАЛЬНОЙ ещё до старта процесса (история) → seed её гасит.
+    Всё, что финишировало ПОСЛЕ старта — рапортуем ПРИ ЛЮБОМ номере (в этом и была дыра).
+    Время не прочли → НЕ гасим: видимость дороже лишней карточки."""
+    ts = _iso_ts(it.get("updated"))
+    if ts is None:
+        return False
+    return ts < _PROC_START_TS - SEED_GRACE_SEC
+
+
+# Потолок result у исполнителей: orchestrator_daemon.RESULT_MAX = 4500 (запас под лимит Bridge
+# 5000). Демон/ПК-агент режут отчёт ДО записи в очередь — devbot видит уже обрубок и обязан
+# сказать об этом вслух: молча срезанный хвост читался как полный отчёт (28.07.2026).
+RESULT_CAP = 4500
+
+
+def _result_body(it, empty="(пустой результат)"):
+    """Текст result для карточки + ЯВНАЯ пометка обрезки, если он упёрся в потолок исполнителя."""
+    raw = it.get("result")
+    body = str(raw) if raw not in (None, "") else empty
+    n = len(body)
+    if n >= RESULT_CAP:
+        body += (f"\n\n✂️ РЕЗУЛЬТАТ ОБРЕЗАН: в очереди {n} симв. — это потолок исполнителя "
+                 f"({RESULT_CAP}, orchestrator_daemon.RESULT_MAX), значит хвост срезан ДО записи. "
+                 f"Полная длина исходного отчёта в очередь не попала — здесь её взять неоткуда; "
+                 f"недостающее ищи в splinter.log/cc_log или переспроси задачу короче.")
+    return body
+
 
 # Маркер клона (микрофикс §7 12.07.2026, инцидент 156): демон при возврате задачи из-под чужого
 # рестарта (orchestrator_daemon._requeue_foreign_restart) дописывает «[повтор задачи N]» в КОНЕЦ
@@ -197,7 +292,7 @@ def _try_approval_reply(text, bridge):
     if word in _YES:
         r = bridge.approve_task(qid, "Filipp")
         if r.get("ok"):
-            _reported.discard(qid)   # пусть дальнейший done/failed по ней отрапортуется штатно
+            _forget_seen(_reported, qid)   # пусть дальнейший done/failed по ней отрапортуется штатно
             return (f"✅ Задача {qid} одобрена — демон выполнит approved-операцию по op-коду "
                     f"(git_push / restart_splinter) и принесёт результат сюда. Вне авто-перечня → failed "
                     f"«требуется решение владельца — переставь задачу в 328 после его ответа».")
@@ -209,7 +304,7 @@ def _try_approval_reply(text, bridge):
     else:
         r = bridge.complete_task(qid, "failed", "отклонено Филиппом")
         if r.get("ok"):
-            _reported.add(qid)       # уже сообщили «отклонена» — не дублируем failed-рапортом
+            _mark_seen_by_id(_reported, qid)   # уже сообщили «отклонена» — не дублируем failed-рапортом
             return f"🚫 Задача {qid} отклонена — статус failed."
         return f"🤖 Не удалось отклонить задачу {qid}: {r.get('error')}"
 
@@ -792,7 +887,7 @@ async def _cb_approve(context, q, qid, bridge):
         return
     r = await asyncio.to_thread(bridge.approve_task, qid, "Filipp")
     if r.get("ok"):
-        _reported.discard(qid)            # пусть дальнейший done/failed отрапортуется штатно
+        _forget_seen(_reported, qid)      # пусть дальнейший done/failed отрапортуется штатно
         await _btn_answer(q, "✅ одобрено")
         await _strip_and_mark(q, "✅ одобрено")
     elif r.get("error") == "not_awaiting":
@@ -822,7 +917,7 @@ async def _cb_reject(context, q, qid, bridge):
         return
     r = await asyncio.to_thread(bridge.complete_task, qid, "failed", "отклонено Филиппом (кнопка)")
     if r.get("ok"):
-        _reported.add(qid)                # уже сообщили «отклонена» — не дублируем failed-рапортом
+        _mark_seen_by_id(_reported, qid)  # уже сообщили «отклонена» — не дублируем failed-рапортом
         await _btn_answer(q, "❌ отклонено")
         await _strip_and_mark(q, "❌ отклонено")
     elif r.get("error") == "not_found":
@@ -1034,9 +1129,19 @@ async def report_results(context) -> None:
     finished.sort(key=lambda x: int(x[1].get("id") or 0))   # старые задачи рапортуем первыми
 
     if not _report_seeded:
+        # Seed-on-start гасит ТОЛЬКО историю — задачи, ставшие терминальными ДО старта процесса.
+        # Всё, что финишировало ПОСЛЕ старта, проходит ПРИ ЛЮБОМ номере: раньше seed сгребал
+        # весь снимок и вместе с историей глушил свежие задачи пересозданной очереди (28.07.2026).
+        kept, hushed = [], 0
         for _st, it in finished:
-            _reported.add(it.get("id"))
+            if _seed_silences(it):
+                _mark_seen(_reported, it)
+                hushed += 1
+            else:
+                kept.append(str(it.get("id")))
         _report_seeded = True
+        log.info("devbot.report_results: seed-on-start — погашено %d терминальных из %d; "
+                 "рапортуем свежие: %s", hushed, len(finished), kept or "нет")
         return
 
     # Редактировать карточки, ожидающие вердикт куратора (если появился)
@@ -1044,11 +1149,11 @@ async def report_results(context) -> None:
 
     for st, it in finished:
         qid = it.get("id")
-        if qid in _reported:
+        if _seen(_reported, it):
             continue
-        _reported.add(qid)
+        _mark_seen(_reported, it)
         emoji = "✅" if st == "done" else "❌"
-        body = it.get("result") or "(пустой результат)"
+        body = _result_body(it)      # + пометка, если исполнитель упёрся в потолок result
         rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
         task_text = str(it.get("task_text") or "")
         task_from = str(it.get("from") or "")
@@ -1067,6 +1172,11 @@ async def report_results(context) -> None:
                 m = await context.bot.send_message(**kw)
                 if i == len(chunks) - 1:
                     last_msg_obj = m
+                # След доставки в splinter.log: «карточка была» доказывается логом, а не памятью
+                # процесса (дыра 28.07: карточек не было, а следа их отсутствия — тоже).
+                log.info("devbot.report_results: карточка задачи %s (%s, чанк %d/%d) отправлена "
+                         "в тему %s, message_id=%s", qid, st, i + 1, len(chunks),
+                         _item_topic(it), getattr(m, "message_id", "?"))
             except Exception as e:
                 log.warning("devbot.report_results: отправка результата задачи %s упала (%s)", qid, e)
         # Трекинг ожидания куратора: если показали «оценивает» — редактируем потом
@@ -1089,29 +1199,29 @@ async def report_results(context) -> None:
     pend = sorted(by["needs_approval"], key=lambda x: int(x.get("id") or 0))
     for it in pend:
         qid = it.get("id")
-        if qid in _asked:
+        if _seen(_asked, it):
             continue
         _approval_topic = inbox or _item_topic(it)
-        what = it.get("result") or "(не уточнено)"
+        what = _result_body(it, empty="(не уточнено)")   # тот же потолок: конверт тоже режется
         lane = _item_lane_label(it)
         q = (f"⚠️ Задача {qid} [{lane}] требует подтверждения красной зоны:\n\n{what}\n\n"
              f"Подтвердить? Тапни кнопку ниже — или ответь «да {qid}» / «нет {qid}».")
         chunks = _chunks(q)
         # ФИКС B (тихая потеря TG-карточек, 20.07.2026): пометку «отправлено» (_asked) ставим
-        # СТРОГО ПОСЛЕ успешной доставки. Раньше _asked.add(qid) стоял ДО send_message → при
+        # СТРОГО ПОСЛЕ успешной доставки. Раньше пометка ставилась ДО send_message → при
         # Telegram-исключении карточка молча терялась (qid уже «задан» → след. тик её пропускал).
         ok = await _send_card_with_retry(context, qid, chunks, _approval_topic,
                                          _kb_approval(qid), "вопрос-конверт")
         if ok:
-            _asked.add(qid)   # успех → помечаем; провал → qid НЕ в _asked, уйдёт на следующий тик
+            _mark_seen(_asked, it)   # успех → помечаем; провал → НЕ помечаем, уйдёт на следующий тик
 
     # in_progress (heartbeat/детект-зависания, части 1-2): «🔄 в работе» один раз + «⚠️ зависла» один раз.
     # Анти-спам: дедуп _inprogress_seen / _stalled — НЕ шлём на каждом 45с-проходе.
     running = sorted(by["in_progress"], key=lambda x: int(x.get("id") or 0))
     for it in running:
         qid = it.get("id")
-        if qid not in _inprogress_seen:        # анонс «в работе» — один раз на задачу
-            _inprogress_seen.add(qid)
+        if not _seen(_inprogress_seen, it):    # анонс «в работе» — один раз на задачу
+            _mark_seen(_inprogress_seen, it)
             task_text = str(it.get("task_text") or "")[:120]
             rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
             msg = f"🔄 Задача {qid}{rep} в работе…\n\n{task_text}"
@@ -1120,11 +1230,11 @@ async def report_results(context) -> None:
                     await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
                 except Exception as e:
                     log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
-        if qid not in _stalled:                # детект зависания — один раз на задачу (анти-спам)
+        if not _seen(_stalled, it):            # детект зависания — один раз на задачу (анти-спам)
             age = _task_age_sec(it.get("updated"))
             thr = _stall_threshold_sec(it)     # per-задача: потолок исполнения + люфт (урок 287)
             if age is not None and age > thr:
-                _stalled.add(qid)
+                _mark_seen(_stalled, it)
                 mins = int(age // 60)
                 if _is_pc_item(it):
                     hint = "ПК-агент полосы pc не отвечает — проверь агента на ПК."

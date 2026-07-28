@@ -78,26 +78,32 @@ async def main():
     ok(texts == ["chunk-0", "chunk-1"], f"каждый чанк доставлен по 1 разу, факт {texts}")
 
     print("(D) тик-к-тику: провал -> не помечен -> 2-й тик доставляет -> 3-й тик НЕ дублирует:")
-    devbot._asked.discard(42)
+    # Хранилище дедупа с 28.07.2026 — dict {номер: генерация} (ключ = номер + created),
+    # поэтому пометка/сверка идут через helper'ы devbot, а не через set-API.
+    IT = {"id": 42, "created": "2026-07-28T10:00:00.000Z"}
+    devbot._forget_seen(devbot._asked, 42)
     # тик1: постоянный сбой
     bot1 = FakeBot(fail_first=99)
     ctx1 = FakeCtx(bot1)
-    if 42 not in devbot._asked:
+    if not devbot._seen(devbot._asked, IT):
         if await devbot._send_card_with_retry(ctx1, 42, ["карта"], TOPIC, MARKUP, "тест"):
-            devbot._asked.add(42)
-    ok(42 not in devbot._asked, "после провала qid НЕ в _asked (уйдёт на след. тик)")
+            devbot._mark_seen(devbot._asked, IT)
+    ok(not devbot._seen(devbot._asked, IT), "после провала qid НЕ помечен (уйдёт на след. тик)")
     # тик2: успех
     bot2 = FakeBot(fail_first=0)
     ctx2 = FakeCtx(bot2)
-    if 42 not in devbot._asked:
+    if not devbot._seen(devbot._asked, IT):
         if await devbot._send_card_with_retry(ctx2, 42, ["карта"], TOPIC, MARKUP, "тест"):
-            devbot._asked.add(42)
-    ok(42 in devbot._asked, "после успеха qid помечен")
+            devbot._mark_seen(devbot._asked, IT)
+    ok(devbot._seen(devbot._asked, IT), "после успеха qid помечен")
     ok(len(bot2.delivered) == 1, "во 2-м тике доставлено 1")
     # тик3: уже помечен → не шлём (нет дубля)
-    sent_third_tick = (42 not in devbot._asked)
+    sent_third_tick = (not devbot._seen(devbot._asked, IT))
     ok(sent_third_tick is False, "3-й тик НЕ шлёт повтор (нет дубля)")
-    devbot._asked.discard(42)
+    # та же задача из ПЕРЕСОЗДАННОЙ очереди (тот же номер, другая генерация) — НЕ считается показанной
+    ok(not devbot._seen(devbot._asked, {"id": 42, "created": "2026-07-29T09:00:00.000Z"}),
+       "номер 42 из новой очереди (другой created) не глушится пометкой старой")
+    devbot._forget_seen(devbot._asked, 42)
 
     fails = _res.count(False)
     verdict = "ВСЕ PASS" if fails == 0 else f"ЕСТЬ FAIL ({fails}/{len(_res)})"

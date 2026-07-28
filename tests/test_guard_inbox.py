@@ -147,7 +147,7 @@ b2 = ApprBridge(); SENDS.clear()
 asyncio.run(DB.handle_command(FakeMsg("нет 78", INBOX), Ctx(), b2))
 res.append(ok(b2.completed and b2.completed[0][:2] == (78, "failed"),
               f"«нет 78» из инбокса → reject (failed): {b2.completed}"))
-DB._reported.discard(78)   # не мусорим модульному состоянию других проверок
+DB._forget_seen(DB._reported, 78)   # не мусорим модульному состоянию других проверок
 b3 = ApprBridge(); SENDS.clear()
 asyncio.run(DB.handle_command(FakeMsg("тз: собери что-нибудь", INBOX), Ctx(), b3))
 res.append(ok(b3.approved == [] and b3.completed == [], "не-approval в инбоксе: очередь не тронута"))
