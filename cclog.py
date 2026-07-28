@@ -7,18 +7,18 @@
 задачи — см. CLAUDE.md.
 
 Использование (из репо; или через алиасы `cclog`/`logdone`, см. CLAUDE.md):
-  venv/bin/python3 cclog.py "<текст итога>"                 → DONE YYYY-MM-DD HH:MM UTC (Termux): <текст>
+  venv/bin/python3 cclog.py "<текст итога>"                 → DONE YYYY-MM-DD HH:MM UTC (<канал>): <текст>
   venv/bin/python3 cclog.py PLAN "<что начал>"             → PLAN ...
   venv/bin/python3 cclog.py BLOCKED "<что мешает>"         → BLOCKED ...
   Тип (первый арг, регистр не важен): DONE|PLAN|NOTE|BLOCKED|WAITING|SKIPPED. По умолчанию DONE.
-  --raw  — метка (Termux-raw) вместо (Termux); используется алиасом logdone для сырых заходов.
+  --raw  — метка (<канал>-raw) вместо (Termux); используется алиасом logdone для сырых заходов.
 
 Формат записи (канонический, одно событие = одна строка):
-  KIND YYYY-MM-DD HH:MM UTC (Termux): текст         — обычный вызов (Claude Code / cclog)
-  KIND YYYY-MM-DD HH:MM UTC (Termux-raw): текст     — сырой ручной заход (logdone, без Claude Code)
-  Метки «(Termux…)» — ЗАМОРОЖЕННЫЙ ЛЕГАСИ-ФОРМАТ строк cc_log: сама среда исключена владельцем
-  навсегда (23.07.2026), но переименование меток = миграция формата (ENTRY_RE, голдены
-  test_cclog, читатель-штаб) — отдельное решение владельца, здесь метки только КАК ФОРМАТ.
+  KIND YYYY-MM-DD HH:MM UTC (<канал>): текст         — обычный вызов (Claude Code / cclog)
+  KIND YYYY-MM-DD HH:MM UTC (<канал>-raw): текст     — сырой ручной заход (logdone, без Claude Code)
+  Метки «(Termux…)» — ЛЕГАСИ: с 28.07.2026 подпись — ФАКТИЧЕСКИЙ канал (Termux/ssh/local); старые строки не переписываются
+  Миграция выполнена 28.07.2026 по решению владельца: ENTRY_RE расширен, голдены test_cclog
+  пинуют канал через CCLOG_CHANNEL. Читателя меток в коде нет (проверено grep по обоим репо).
   H:MM обязательны в каждой записи. Переносы строк в тексте коллапсируются в пробел.
 
 Дисциплина cc_log (CLAUDE.md): новые записи СВЕРХУ, ПОД врезкой-шапкой (после её ═-only-линии);
@@ -38,6 +38,41 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from bridge_client import BridgeClient
 
+
+def _channel() -> str:
+    """Фактический канал, откуда пришла запись, — метка в подписи строки.
+
+    До 28.07.2026 подпись была прибита к «Termux», хотя записи давно шли и по ssh
+    с ПК, и локально с самого сервера: метка врала об источнике. Теперь считается.
+    Переопределяется переменной среды CCLOG_CHANNEL (тесты пинуют ею формат).
+    """
+    import os
+    forced = (os.environ.get("CCLOG_CHANNEL") or "").strip()
+    if forced:
+        return forced
+    if os.environ.get("TERMUX_VERSION") or "com.termux" in (os.environ.get("PREFIX") or ""):
+        return "Termux"
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
+        return "ssh"
+    return "local"
+
+
+def _is_flag(a: str) -> bool:
+    """Флаг, а не текст: дефис, а следом НЕ цифра (иначе «-7000» из кассы стало бы флагом)."""
+    return len(a) > 1 and a[0] == "-" and not (a[1].isdigit() or a[1] == ".")
+
+
+USAGE = """cclog — строка-итог в журнал мозга (cc_log).
+
+  cclog [ТИП] <текст>           ТИП: DONE PLAN NOTE BLOCKED WAITING SKIPPED (умолчание DONE)
+  cclog [ТИП] -- <текст>        всё после -- считается текстом (даже начинающимся с дефиса)
+  cclog ... --pulse "<строка>"  заодно перезаписать doc pulse
+  cclog ... --raw               сырой заход (метка «<канал>-raw»)
+  cclog -h | --help             эта справка — В ЖУРНАЛ НЕ ПИШЕТСЯ
+
+Метка канала считается сама: Termux / ssh / local; переопределяется CCLOG_CHANNEL."""
+
+
 # Telegram-координаты для алерта guard'а (тема 328 HQ-форума)
 _HQ_CHAT_ID = -1003853365891
 _DEVBOT_TOPIC = 328
@@ -49,7 +84,7 @@ _RELAY_KINDS = frozenset(TYPES)
 # Допускает все метки источника: Termux / Termux-raw / headless via Termux / headless via Termux-raw.
 ENTRY_RE = re.compile(
     r"^(?:DONE|PLAN|NOTE|BLOCKED|WAITING|SKIPPED) \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC "
-    r"\((?:Termux-raw|Termux|headless via Termux-raw|headless via Termux)\): .+$"
+    r"\((?:headless via )?[\w .+-]+\): .+$"
 )
 
 
@@ -85,7 +120,8 @@ def _ensure_pulse_hhmm(pulse: str, now=None) -> str:
     return pulse
 
 
-def _make_entry(kind: str, text: str, now=None, label: str = "Termux") -> str:
+def _make_entry(kind: str, text: str, now=None, label: str = "") -> str:
+    label = label or _channel()
     """Сформировать каноническую однострочную запись.
     • Нормальный текст → «KIND YYYY-MM-DD HH:MM UTC ({label}): text»
     • Ретрансляция (text начинается с KIND-слова) → «KIND ts UTC (headless via {label}): payload»
@@ -143,7 +179,7 @@ def _alert_shrink(old_len: int, new_len: int, entry_preview: str = "") -> None:
 
 
 def write_cclog(kind: str = "DONE", text: str = "", pulse=None,
-                label: str = "Termux", bridge=None) -> bool:
+                label: str = "", bridge=None) -> bool:
     """Канонический API записи в cc_log для программного использования.
 
     Единый путь: read → _make_entry → _insert_under_vrezka → length-guard → write.
@@ -176,10 +212,13 @@ def write_cclog(kind: str = "DONE", text: str = "", pulse=None,
 
 
 def main(argv) -> int:
+    if any(a in ("-h", "--help") for a in argv):
+        print(USAGE)
+        return 0
     raw = "--raw" in argv
     if raw:
         argv = [a for a in argv if a != "--raw"]
-    label = "Termux-raw" if raw else "Termux"
+    label = (_channel() + "-raw") if raw else _channel()
 
     pulse = None
     if "--pulse" in argv:
@@ -191,6 +230,14 @@ def main(argv) -> int:
     if argv and argv[0].upper() in TYPES:
         kind = argv[0].upper()
         argv = argv[1:]
+    if "--" in argv:
+        argv = argv[argv.index("--") + 1:]
+    else:
+        bad = [a for a in argv if _is_flag(a)]
+        if bad:
+            sys.stderr.write("cclog: неизвестный флаг: %s — в журнал НЕ записано\n\n%s\n"
+                             % (" ".join(bad), USAGE))
+            return 2
     text = " ".join(argv).strip()
     if not text:
         print("usage: cclog.py [DONE|PLAN|NOTE|BLOCKED|WAITING|SKIPPED] <текст> [--pulse <строка>] [--raw]",

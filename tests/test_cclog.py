@@ -3,6 +3,11 @@
 проверяем чистую функцию _insert_under_vrezka + _make_entry + разбор типа/аргументов."""
 import sys, re
 sys.path.insert(0, "/root/turbobaby-manager-bot")
+import os as _os
+# 28.07.2026: подпись строки несёт ФАКТИЧЕСКИЙ канал (_channel).
+# Голдены ниже проверяют метку КАК ФОРМАТ, поэтому канал пинуем явно —
+# иначе тот же тест зеленел бы по ssh и краснел из systemd.
+_os.environ["CCLOG_CHANNEL"] = "Termux"
 import cclog
 
 res = []
