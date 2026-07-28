@@ -88,11 +88,11 @@ class TestHardBlockMarker(unittest.TestCase):
     def test_hard_marker_written(self):
         import tempfile
         guard_dir = tempfile.mkdtemp(prefix="guard_block_hard_")
-        orig = PG.GUARD_BLOCK_DIR
-        PG.GUARD_BLOCK_DIR = guard_dir
+        orig = os.environ.get(PG.BLOCK_DIR_ENV)     # каталог маркеров теперь из env (мина 28.07)
+        os.environ[PG.BLOCK_DIR_ENV] = guard_dir
         try:
             PG._guard_write_marker("999", "confirmed", "hard карточка", blocktype="hard")
-            path = os.path.join(guard_dir, "999.json")
+            path = os.path.join(guard_dir, PG.marker_name("999"))
             self.assertTrue(os.path.exists(path))
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -100,22 +100,29 @@ class TestHardBlockMarker(unittest.TestCase):
             self.assertEqual(data.get("hit"), "confirmed")
             self.assertIn("hard карточка", data.get("card", ""))
         finally:
-            PG.GUARD_BLOCK_DIR = orig
+            if orig is None:
+                os.environ.pop(PG.BLOCK_DIR_ENV, None)
+            else:
+                os.environ[PG.BLOCK_DIR_ENV] = orig
             import shutil; shutil.rmtree(guard_dir, ignore_errors=True)
 
     def test_soft_marker_no_blocktype(self):
         import tempfile
         guard_dir = tempfile.mkdtemp(prefix="guard_block_soft_")
-        orig = PG.GUARD_BLOCK_DIR
-        PG.GUARD_BLOCK_DIR = guard_dir
+        orig = os.environ.get(PG.BLOCK_DIR_ENV)     # каталог маркеров теперь из env (мина 28.07)
+        os.environ[PG.BLOCK_DIR_ENV] = guard_dir
         try:
-            PG._guard_write_marker("998", "confirmed", "soft карточка")  # нет blocktype
-            path = os.path.join(guard_dir, "998.json")
+            # у soft-карточки обязан быть объект операции — иначе вторая линия её не пишет
+            PG._guard_write_marker("998", "confirmed", "soft карточка, байк 998")  # нет blocktype
+            path = os.path.join(guard_dir, PG.marker_name("998"))
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertIsNone(data.get("blocktype"))
         finally:
-            PG.GUARD_BLOCK_DIR = orig
+            if orig is None:
+                os.environ.pop(PG.BLOCK_DIR_ENV, None)
+            else:
+                os.environ[PG.BLOCK_DIR_ENV] = orig
             import shutil; shutil.rmtree(guard_dir, ignore_errors=True)
 
     def test_guard_is_hard_true(self):
@@ -224,17 +231,20 @@ class TestEntityWiring(unittest.TestCase):
     def test_marker_carries_blocktype_only_when_hard(self):
         import tempfile, shutil
         d = tempfile.mkdtemp(prefix="guard_wire_")
-        orig = PG.GUARD_BLOCK_DIR
-        PG.GUARD_BLOCK_DIR = d
+        orig = os.environ.get(PG.BLOCK_DIR_ENV)     # каталог маркеров теперь из env (мина 28.07)
+        os.environ[PG.BLOCK_DIR_ENV] = d
         try:
             PG._guard_write_marker("1", "confirmed", "карточка", blocktype="hard")
-            PG._guard_write_marker("2", "confirmed", "карточка", blocktype=None)
-            with open(os.path.join(d, "1.json"), encoding="utf-8") as f:
+            PG._guard_write_marker("2", "confirmed", "карточка, сумма 2", blocktype=None)
+            with open(os.path.join(d, PG.marker_name("1")), encoding="utf-8") as f:
                 self.assertEqual(json.load(f).get("blocktype"), "hard")
-            with open(os.path.join(d, "2.json"), encoding="utf-8") as f:
+            with open(os.path.join(d, PG.marker_name("2")), encoding="utf-8") as f:
                 self.assertIsNone(json.load(f).get("blocktype"))
         finally:
-            PG.GUARD_BLOCK_DIR = orig
+            if orig is None:
+                os.environ.pop(PG.BLOCK_DIR_ENV, None)
+            else:
+                os.environ[PG.BLOCK_DIR_ENV] = orig
             shutil.rmtree(d, ignore_errors=True)
 
     def test_daemon_reads_hard_and_soft(self):

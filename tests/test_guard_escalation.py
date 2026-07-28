@@ -72,26 +72,97 @@ OD.subprocess.run = lambda *a, **kw: type("P",(),{"stdout":"ok","stderr":"","ret
 # ── (1) pretool_guard._guard_write_marker ────────────────────────────────────
 print("(1) _guard_write_marker:")
 tmp_guard = tempfile.mkdtemp(prefix="guard_esc_")
-_orig_dir = PG.GUARD_BLOCK_DIR
-PG.GUARD_BLOCK_DIR = tmp_guard
+_orig_env = os.environ.get(PG.BLOCK_DIR_ENV)
+os.environ[PG.BLOCK_DIR_ENV] = tmp_guard      # каталог из env, читается В МОМЕНТ ЗАПИСИ
+_CARD42 = "нужно да: масло, байк 6789"        # у карточки есть объект операции (вторая линия)
 try:
     # записывает при наличии task_id
-    PG._guard_write_marker("42", "set_fleet_oil", "нужно да: масло")
-    path = os.path.join(tmp_guard, "42.json")
-    res.append(ok(os.path.exists(path), "маркер-файл создан"))
+    PG._guard_write_marker("42", "set_fleet_oil", _CARD42)
+    _name = PG.marker_name("42")
+    path = os.path.join(tmp_guard, _name)
+    res.append(ok(os.path.exists(path), f"маркер-файл создан ({_name})"))
     with open(path) as f:
         d = json.load(f)
-    res.append(ok(d == {"task_id": "42", "hit": "set_fleet_oil", "card": "нужно да: масло"},
+    res.append(ok(d == {"task_id": "42", "hit": "set_fleet_oil", "card": _CARD42},
                   f"содержимое маркера корректно: {d}"))
     # молчит без task_id
-    PG._guard_write_marker("", "set_fleet_oil", "карточка")
+    PG._guard_write_marker("", "set_fleet_oil", "карточка 1")
     res.append(ok(not os.path.exists(os.path.join(tmp_guard, ".json")),
                   "пустой task_id → файл не создаётся"))
     PG._guard_write_marker(None, "hit", "card")
     res.append(ok(True, "None task_id не роняет (fail-safe)"))
 finally:
-    PG.GUARD_BLOCK_DIR = _orig_dir
+    if _orig_env is None:
+        os.environ.pop(PG.BLOCK_DIR_ENV, None)
+    else:
+        os.environ[PG.BLOCK_DIR_ENV] = _orig_env
     shutil.rmtree(tmp_guard, ignore_errors=True)
+
+
+# ── (1б) МИНА 28.07: гард-тесты внутри headless-задачи не смеют писать БОЕВОЙ маркер ─────────
+print("(1б) изоляция маркера тест-прогона (мина 28.07, задача 12):")
+_ON = {"ORCH_TEST_MODE": "1"}
+_OFF = {}
+_tmp_dir = tempfile.mkdtemp(prefix="guard_blockdir_")
+res.append(ok(PG.block_dir({PG.BLOCK_DIR_ENV: _tmp_dir}) == _tmp_dir,
+              "замок 1: PRETOOL_BLOCK_DIR уводит каталог"))
+res.append(ok(PG.is_test_run(_ON) and not PG.is_test_run(_OFF),
+              "замок 2: ORCH_TEST_MODE=1 → тест-прогон; пустое окружение → бой"))
+res.append(ok(PG.is_test_run({"PRETOOL_NOPUSH": "1"}) and PG.is_test_run({"PYTEST_CURRENT_TEST": "x"}),
+              "замок 2: PRETOOL_NOPUSH и PYTEST_CURRENT_TEST — тоже признак теста"))
+res.append(ok(PG.block_dir(_ON) == PG.TEST_BLOCK_DIR != PG.GUARD_BLOCK_DIR,
+              f"замок 2: умолчание тест-прогона {PG.TEST_BLOCK_DIR} ≠ боевого"))
+res.append(ok(PG.block_dir(_OFF) == PG.GUARD_BLOCK_DIR,
+              "замок 2: в бою умолчание прежнее (регресс)"))
+res.append(ok(PG.marker_name("12", _ON) == "test-12.json" and PG.marker_name("12", _OFF) == "12.json",
+              "замок 3: тест-маркер с префиксом, боевой — прежнее имя"))
+_tmp2 = tempfile.mkdtemp(prefix="guard_obj_")
+_prev = os.environ.get(PG.BLOCK_DIR_ENV)
+os.environ[PG.BLOCK_DIR_ENV] = _tmp2
+try:
+    res.append(ok(PG.marker_has_object("add_transaction", "сумма 500")
+                  and not PG.marker_has_object("op", "подтверди операцию"),
+                  "вторая линия: объект операции распознаётся по номеру/величине"))
+    PG._guard_write_marker("77", "op", "подтверди операцию")
+    res.append(ok(not os.path.exists(os.path.join(_tmp2, PG.marker_name("77"))),
+                  "вторая линия: карточка без объекта → маркера НЕТ"))
+    PG._guard_write_marker("78", "op", "подтверди операцию", blocktype="hard")
+    res.append(ok(os.path.exists(os.path.join(_tmp2, PG.marker_name("78"))),
+                  "вторая линия: hard-блок пишется всегда (это не карточка на «да»)"))
+finally:
+    if _prev is None:
+        os.environ.pop(PG.BLOCK_DIR_ENV, None)
+    else:
+        os.environ[PG.BLOCK_DIR_ENV] = _prev
+    shutil.rmtree(_tmp2, ignore_errors=True)
+    shutil.rmtree(_tmp_dir, ignore_errors=True)
+
+# СКВОЗНОЙ РЕГРЕСС: гоняем НАСТОЯЩИЙ гард-тест ровно как гейт (gate.py:86), но с унаследованным
+# CC_TASK_ID — именно эта связка убила задачу 12. Зовём _real_run: строкой выше в этом файле
+# subprocess.run подменён моком для _POPEN-сценариев, и обычный вызов не запустил бы процесс.
+_ROOT = "/root/turbobaby-manager-bot"
+_PY = os.path.join(_ROOT, "venv", "bin", "python3")
+_FAKE = "999012"
+_live_plain = os.path.join(PG.GUARD_BLOCK_DIR, _FAKE + ".json")
+_live_pref = os.path.join(PG.GUARD_BLOCK_DIR, "test-" + _FAKE + ".json")
+_test_marker = os.path.join(PG.TEST_BLOCK_DIR, "test-" + _FAKE + ".json")
+for _p in (_live_plain, _live_pref, _test_marker):
+    try:
+        os.remove(_p)
+    except OSError:
+        pass
+_env = dict(os.environ, PYTHONPATH=_ROOT, PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1", CC_TASK_ID=_FAKE)
+_env.pop(PG.BLOCK_DIR_ENV, None)               # НАРОЧНО без подмены: проверяем УМОЛЧАНИЕ
+_real_run([_PY, os.path.join(_ROOT, "tests", "test_pretool_probe_dedup.py")],
+          cwd=_ROOT, env=_env, capture_output=True, text=True, timeout=180)
+res.append(ok(not os.path.exists(_live_plain) and not os.path.exists(_live_pref),
+              f"СКВОЗНОЙ: гард-тест с CC_TASK_ID={_FAKE} не создал НИЧЕГО в боевом каталоге"))
+res.append(ok(os.path.exists(_test_marker),
+              "СКВОЗНОЙ: маркер ушёл в тест-каталог под именем без номера живой задачи"))
+try:
+    os.remove(_test_marker)
+except OSError:
+    pass
 
 
 # ── (2) run_task: маркер уже есть ДО execute (пост-проверка) ─────────────────

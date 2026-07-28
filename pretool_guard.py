@@ -94,7 +94,61 @@ _DEDUP_TTL = 4 * 3600
 
 # Guard-маркер для headless-задач (шаг 2/6 родитель 185): когда CC_TASK_ID задан в env,
 # красный блок пишет маркер-файл → демон видит → гасит claude-подпроцесс → needs_approval.
-GUARD_BLOCK_DIR = "/tmp/cc_guard_block"
+#
+# МИНА 28.07.2026 (задача 12, воспроизведена прогоном). Гейт внутри headless-задачи отдаёт
+# тест-процессам КОПИЮ окружения (gate.py:86 — dict(os.environ, …)), вместе с ней наследуется
+# CC_TASK_ID=12. Гард-тесты запускают хук ПОДПРОЦЕССОМ с красной фикстурой, а каталог был
+# КОНСТАНТОЙ без подмены через env — патч константы в памяти на подпроцесс не действует по
+# определению. Итог: фикстура записала БОЕВОЙ /tmp/cc_guard_block/12.json, монитор демона увидел
+# его и прервал ЖИВУЮ задачу. Виновники найдены прогоном всего набора с унаследованным
+# CC_TASK_ID: test_no_push_leak, test_pretool_commit_msg, test_pretool_infoflags,
+# test_pretool_probe_dedup — каждый спавнит хук с red-фикстурой.
+GUARD_BLOCK_DIR = "/tmp/cc_guard_block"        # БОЕВОЙ каталог; путь берётся В МОМЕНТ ЗАПИСИ
+TEST_BLOCK_DIR = "/tmp/cc_guard_block_test"    # безопасное умолчание ТЕСТ-прогона
+BLOCK_DIR_ENV = "PRETOOL_BLOCK_DIR"            # явная подмена каталога тестом
+TEST_MARKER_PREFIX = "test-"                   # монитор открывает ровно «<tid>.json» → префикс ему невидим
+
+# Признак ТЕСТ-ПРОГОНА, видимый САМОМУ ХУКУ — в том числе когда его запустили ПОДПРОЦЕССОМ.
+# Почему подпроцесс это увидит: тесты строят окружение как dict(os.environ) и отдают его в
+# subprocess.run(env=…) — переменные наследуются ВНИЗ по дереву процессов, в отличие от патча
+# константы в памяти теста. Почему это НЕ спутать с боем: ORCH_TEST_MODE=1 и PRETOOL_NOPUSH=1
+# гейт ставит ВСЕМ тест-процессам (gate.py:86 и :164), а демон ОБЕ снимает с окружения боевого
+# claude -p (orchestrator_daemon.py:903-904, child_env.pop) — в живой headless-задаче их нет
+# ФИЗИЧЕСКИ. Направление ошибки безопасное: лишний «тест» уводит маркер в сторону, но САМ БЛОК
+# команды остаётся — хук всё равно возвращает deny/ask.
+_TEST_RUN_ENVS = ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PYTEST_CURRENT_TEST")
+
+
+def is_test_run(env=None):
+    """Идёт ли ТЕСТ-прогон с точки зрения ХУКА (см. _TEST_RUN_ENVS выше)."""
+    e = os.environ if env is None else env
+    return any((e.get(k) or "").strip() for k in _TEST_RUN_ENVS)
+
+
+def block_dir(env=None):
+    """Каталог маркеров: явная подмена (env) → тест-умолчание → боевой. Читается В МОМЕНТ ЗАПИСИ
+    (как PRETOOL_GUARD_LOG ниже) — поэтому подмена работает и для хука-подпроцесса."""
+    e = os.environ if env is None else env
+    explicit = (e.get(BLOCK_DIR_ENV) or "").strip()
+    if explicit:
+        return explicit
+    return TEST_BLOCK_DIR if is_test_run(e) else GUARD_BLOCK_DIR
+
+
+def marker_name(task_id, env=None):
+    """Имя файла маркера. В тест-прогоне номер ЖИВОЙ задачи в имя НЕ попадает: префикс делает
+    файл невидимым для монитора демона даже если каталог почему-то остался боевым."""
+    return "%s%s.json" % (TEST_MARKER_PREFIX if is_test_run(env) else "", task_id)
+
+
+_MARKER_OBJECT_RE = re.compile(r"\d")
+
+
+def marker_has_object(hit, card):
+    """Есть ли у маркера ОБЪЕКТ операции — номер или величина. Вторая линия: карточка без объекта
+    бессмысленна, подтверждать в ней нечего. Блок команды это НЕ ослабляет — хук всё равно вернёт
+    deny/ask; маркер лишь канал «скажи демону», и пустую карточку демону показывать незачем."""
+    return bool(_MARKER_OBJECT_RE.search("%s %s" % (hit or "", card or "")))
 
 # ── HARD-BLOCK: журнал жёстких блоков (JSONL). Путь берётся В МОМЕНТ ЗАПИСИ (тесты подменяют
 # PRETOOL_GUARD_LOG). Пишется ТОЛЬКО факт блока: событие + сама команда; значений секретов в
@@ -153,9 +207,14 @@ def _guard_write_marker(task_id, hit, card, blocktype=None):
     задачу failed БЕЗ кнопки approve (живая сущность); None → прежнее поведение (needs_approval)."""
     if not task_id:
         return
+    # Вторая линия (28.07): маркер без объекта операции демону не отдаём — подтверждать в такой
+    # карточке нечего. hard-блок исключение: это не карточка на «да», а закрытие задачи failed.
+    if blocktype != "hard" and not marker_has_object(hit, card):
+        return
     try:
-        os.makedirs(GUARD_BLOCK_DIR, exist_ok=True)
-        path = os.path.join(GUARD_BLOCK_DIR, f"{task_id}.json")
+        d = block_dir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, marker_name(task_id))
         tmp = path + ".tmp"
         payload = {"task_id": task_id, "hit": hit, "card": card}
         if blocktype:
