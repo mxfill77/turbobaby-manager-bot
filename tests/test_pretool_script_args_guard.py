@@ -20,6 +20,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 
 # ROOT берём от файла, а не константой /root/… — тест обязан идти и на VPS, и в клоне.
 # shlex (внутри гарда) съедает обратные слэши → путь держим в POSIX-форме.
@@ -28,6 +29,18 @@ sys.path.insert(0, ROOT)
 
 os.environ.setdefault("ORCH_TEST_MODE", "1")   # без сети
 os.environ.setdefault("PRETOOL_NOPUSH", "1")   # без Telegram
+
+# pretool_guard тянет fcntl (POSIX-локи дедупа). Классификация от него не зависит: на ПК
+# (Windows-клон репо) подставляем пустышку, на VPS импортируется настоящий модуль. Без этого
+# обещание докстринга «идёт и в клоне» не выполнялось — файл падал на импорте.
+if "fcntl" not in sys.modules:
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        _fake = types.ModuleType("fcntl")
+        _fake.flock = lambda *a, **k: None
+        _fake.LOCK_EX = 2
+        sys.modules["fcntl"] = _fake
 
 import pretool_guard as PG   # noqa: E402
 

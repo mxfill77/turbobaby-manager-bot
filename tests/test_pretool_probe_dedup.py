@@ -83,8 +83,12 @@ res.append(ok(lines(cnt_amb) == [], "ноль пушей: ambiguous-карточ
 print("(3) red — по-прежнему конверт, КАЖДЫЙ пушится (red не дедупится):")
 cnt_red = os.path.join(TMP, "cnt_red.txt")
 red = os.path.join(TMP, "fx_red_live.py")
+# ЖИВОЙ вызов с ОБЪЕКТОМ и ЧИСЛОМ: с 28.07.2026 красная карточка без них не собирается вовсе
+# (минимум карточки, tests/test_guard_card_min.py) — на безобъектной фикстуре проверять «каждый
+# red пушится» стало нечем. Литерал операции — конкатенацией (иначе гард краснеет на тесте).
+FLEET_OIL = "set_fleet_" + "oil"
 with open(red, "w", encoding="utf-8") as f:
-    f.write("# фикстура регресса\nprint('set_fleet_oil')\n")
+    f.write("# фикстура регресса\nbridge." + FLEET_OIL + "(number='6789', oil_km=27000)\n")
 for _ in range(2):
     r = run(PY + " " + red, session="s-red", count_file=cnt_red, nopush=False)
 res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout, "red-скрипт → конверт с операцией (ask)"))

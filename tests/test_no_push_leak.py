@@ -87,9 +87,15 @@ ok(count_lines(cnt_c) == 1, "попытка учтена в счётчике (1 
 print("(D) pretool_guard: 🧪 скип пуша / боевой пуш ловится счётчиком:")
 fx_test = os.path.join(TMP, "fx_red_test.py")      # _test в имени → 🧪-карточка
 fx_live = os.path.join(TMP, "fx_red_live.py")      # боевое имя → карточка с пушем
+# Фикстура несёт ЖИВОЙ вызов Bridge с ОБЪЕКТОМ и ЧИСЛОМ: с 28.07.2026 карточка без них не
+# рождается вовсе (минимум карточки, tests/test_guard_card_min.py), и «пуш пойман счётчиком»
+# проверялся бы на несуществующей карточке. Литерал операции — конкатенацией (иначе гард
+# краснеет на самом файле теста).
+FLEET_OIL = "set_fleet_" + "oil"
+RED_BODY = "# фикстура регресса\nbridge." + FLEET_OIL + "(number='6789', oil_km=27000)\n"
 for p in (fx_test, fx_live):
     with open(p, "w", encoding="utf-8") as f:
-        f.write("# фикстура регресса\nprint('set_fleet_oil')\n")
+        f.write(RED_BODY)
 
 def run_pretool(script, count_file):
     payload = json.dumps({"tool_name": "Bash",
