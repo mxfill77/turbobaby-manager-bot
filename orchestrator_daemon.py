@@ -340,6 +340,22 @@ NA_MARKER = "NEEDS_APPROVAL:"
 GUARD_BLOCK_DIR = "/tmp/cc_guard_block"
 _POPEN = subprocess.Popen   # module-level для замены в тестах (тест мокает OD._POPEN)
 
+# ТЕЧЬ МАРКЕРОВ (цель 36 шаг 3, 29.07.2026). Маркер удаляется РОВНО в одном месте —
+# _guard_marker_clear перед запуском задачи ТОГО ЖЕ id. После обработки (needs_approval /
+# жёсткий блок) файл остаётся в боевом каталоге НАВСЕГДА: ни одной ветки удаления «за собой»
+# в коде нет. Разведка цели 36 нашла инертные 12, 27, 399 (12/27 — наследие тест-протечки
+# CC_TASK_ID, её источник закрыт 28.07 через TEST_BLOCK_DIR/префикс; 399 — из СТАРОЙ нумерации
+# очереди, т.е. номера уже один раз сбрасывались и могут повториться).
+# Детонации «повтор номера» сегодня НЕТ (clear стоит перед КАЖДЫМ запуском — доказано тестом),
+# но копящийся мусор вреден иначе: (1) врёт при разборе инцидента — свежий блок живой задачи
+# неотличим от трёхнедельного трупа; (2) держит весь барьер на ОДНОМ вызове clear — любая
+# будущая ветка запуска claude с CC_TASK_ID без clear делает старый файл боевым (пост-проверка
+# в _run_task_impl сработает даже без монитора и выдаст ЧУЖУЮ карточку).
+# Лечение — уборка по возрасту: маркер старше GUARD_MARKER_TTL удаляется в начале cycle().
+# ГОНКИ С ЖИВЫМ МАРКЕРОМ НЕТ: демон одно-воркерный, run_task блокирующий → пока исполняется
+# задача, cycle() (а с ним уборка) не крутится; дефолт TTL(6ч) с запасом больше TASK_TIMEOUT_DEV.
+GUARD_MARKER_TTL = _env_int("GUARD_MARKER_TTL", 21600)   # 6ч; 0 = уборка выключена (откат)
+
 
 def _guard_marker_path(tid):
     return os.path.join(GUARD_BLOCK_DIR, f"{tid}.json")
@@ -387,6 +403,49 @@ def _guard_monitor_loop(tid, proc, stop_event, kill_event, card_holder):
                 pass
             kill_event.set()
             return
+
+
+def _guard_markers_sweep(directory=None, now=None):
+    """Убрать осиротевшие guard-маркеры: файлы «*.json» старше GUARD_MARKER_TTL по mtime.
+    Возврат — число убранных (для лога/теста).
+
+    ТЕСТ БОЕВОЕ НЕ ТРОГАЕТ (симметрия фикса 28.07, где тест перестал ПИСАТЬ в боевой каталог):
+    при ORCH_TEST_MODE=1 (его гейт ставит всем тест-процессам) уборка дефолтного каталога —
+    no-op; явно переданный `directory` = осознанный вызов, работает всегда.
+
+    FAIL-SAFE: TTL<=0 (рубильник) / каталога нет / listdir или stat падает / remove падает →
+    тихо пропускаем. Уборка не критична — барьер держит _guard_marker_clear перед запуском,
+    её отказ не должен ронять цикл демона."""
+    if GUARD_MARKER_TTL <= 0:
+        return 0
+    explicit = directory is not None
+    d = directory or GUARD_BLOCK_DIR
+    if not explicit and (os.environ.get("ORCH_TEST_MODE") or "").strip():
+        return 0
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    now = time.time() if now is None else now
+    killed = 0
+    for name in names:
+        if not name.endswith(".json"):
+            continue                       # чужое в каталоге не наше дело
+        path = os.path.join(d, name)
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if age < GUARD_MARKER_TTL:
+            continue                       # свежий — может принадлежать живой задаче
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        killed += 1
+        log.info("guard-маркер %s осиротел (возраст %sс > TTL %sс) → убран",
+                 name, int(age), GUARD_MARKER_TTL)
+    return killed
 
 
 def _fail_card(out, err, rc):
@@ -3490,8 +3549,10 @@ def cycle():
     """Один проход: подобрать сирот in_progress (урок 138) → довести одобренное красное
     (approved) → добрать хвосты декомпозиций, финализированные мимо демона (сводка) → надзор
     цепей ПК-театра (полоса pc, read-only + релиз/хуки своих цепей) → взять новое (new).
-    Выгрузка завершённых цепей (_prune_chain_cache): cheap check, только при превышении потолка."""
+    Выгрузка завершённых цепей (_prune_chain_cache): cheap check, только при превышении потолка.
+    Уборка осиротевших guard-маркеров (_guard_markers_sweep, цель 36): локальная ФС, до сети."""
     _prune_chain_cache()
+    _guard_markers_sweep()      # осиротевшие /tmp/cc_guard_block/*.json старше GUARD_MARKER_TTL
     _fixture_reap_open()        # закрыть фикстуры в needs_approval/approved (класс 193 рубеж 4)
     process_orphans()
     process_na_reminders()      # напоминание >3ч + hard-cap 24ч для needs_approval (класс 23.07)
