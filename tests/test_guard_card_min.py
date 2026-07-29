@@ -2,10 +2,17 @@
 """ОБЯЗАТЕЛЬНЫЙ МИНИМУМ красной карточки (28.07.2026).
 
 Доктрина: карточка красной зоны читается за ТРИ СЕКУНДЫ и несёт ЧЕТЫРЕ вещи — ЧТО меняется,
-у какого ОБЪЕКТА, какое ЧИСЛО и одну строку ОТКАТА. Нет ОБЪЕКТА или ЧИСЛА → карточки НЕТ ВОВСЕ:
-вместо неё строка `card_skipped` в журнале гарда (ни пуша владельцу, ни маркер-конверта демону).
+у какого ОБЪЕКТА, какое ЧИСЛО и одну строку ОТКАТА. Нет ОБЪЕКТА → карточки НЕТ ВОВСЕ: вместо неё
+строка `card_skipped` в журнале гарда (ни пуша владельцу, ни маркер-конверта демону).
 Решение хука при этом НЕ слабеет — ask остаётся, без «да» команда не исполняется.
-ЖЁСТКИЙ БЛОК — ИСКЛЮЧЕНИЕ: он приходит всегда, минимум ему не указ.
+ЖЁСТКИЙ БЛОК и ДЕНЬГИ — ИСКЛЮЧЕНИЯ: приходят всегда, минимум им не указ.
+
+ПРАВИЛО 29.07.2026 (секция 9) — ЧИСЛО БОЛЬШЕ НЕ ГЕЙТ. Было «нет объекта ИЛИ числа → карточки нет»,
+и это молча съело ЧЕТЫРЕ операции, которые числа не несут ПО СВОЕЙ ПРИРОДЕ: отмену последней
+проводки (ДЕНЬГИ), стоп сервиса по имени, pkill по имени, SQL в чужую БД. Гард не слабел (ask
+оставался), но владелец о них не узнавал — а первая из них денежная. Теперь гейт один и общий с
+полосой ПК — `card_gate()`: объект обязателен всегда, число живёт там, где операция его несёт,
+и честным прочерком там, где не несёт.
 
 КОРЕНЬ, который здесь и закрыт (секция 3): «есть ли объект» решала цифра в ТЕКСТЕ ГОТОВОЙ
 карточки (marker_has_object → \\d), а шаблон операций с парком несёт «Лист1» — цифра там есть
@@ -159,8 +166,8 @@ res.append(ok(o == "байк AB-5580" and n == "пробег 12345", "plate=/km=
 print("(3) КОРЕНЬ: объект больше НЕ «найден всегда» из-за номера листа в шаблоне:")
 bare_card = PG._card(SFO, BARE_WORD)
 res.append(ok("Лист1" in bare_card, "шаблон операции с парком по-прежнему несёт «Лист1» (цифра)"))
-res.append(ok(PG.marker_has_object(SFO, bare_card) is True,
-              "прежняя проверка ПО ТЕКСТУ карточки и сейчас говорит «объект есть» (близорука)"))
+res.append(ok(PG.marker_has_object(SFO, bare_card) is False,
+              "близорукость снята: проверка маркера смотрит строку «Объект:», а не «есть цифра»"))
 res.append(ok(PG.card_min(SFO, BARE_WORD) == ("", ""),
               "новое ИЗВЛЕЧЕНИЕ честно говорит «объекта и числа нет»"))
 res.append(ok(PG.card_min(SFO, "лист 1 строка 2 колонка I") == ("", ""),
@@ -212,6 +219,49 @@ res.append(ok(PG.classify("grep -n def " + ROOT.replace(os.sep, "/") + "/bot.py"
               "зелёная рутина осталась зелёной"))
 kind, hit, _b = PG.classify('python3 -c "' + AT + '(amount=500)"')
 res.append(ok(kind == "red" and hit == AT, "инлайн денежная операция → красное"))
+
+print("(9) ЧИСЛО БОЛЬШЕ НЕ ГЕЙТ: четыре операции, у которых числа НЕТ ПО ПРИРОДЕ:")
+# Живые формы. Красное и SQL — кусками: иначе гард краснеет на САМОМ файле теста.
+LIVE_VOID = "bridge." + VL + "(group='Наличка')"
+SQL_FOREIGN = ("con=connect('/var/lib/other/app.db'); "
+               "con.execute('DELETE " + "FROM sessions WHERE id=5')")
+FOUR = (
+    ("отмена последней проводки (ДЕНЬГИ)", PY + ' -c "' + LIVE_VOID + '"', VL, "кошелёк Наличка"),
+    ("стоп сервиса по имени", "systemctl stop nginx", "proc_ctl", "nginx"),
+    ("pkill по имени", PK + " ngrok", "proc_ctl", "ngrok"),
+    ("SQL в чужую БД", PY + ' -c "' + SQL_FOREIGN + '"', "sqlite", "app.db"),
+)
+for label, cmd, want_hit, want_obj in FOUR:
+    kind, hit, blob = PG.classify(cmd)
+    o, n = PG.card_min(hit, blob)
+    card = PG._card(hit, blob)
+    res.append(ok(kind == "red" and hit == want_hit, label + ": красное, hit=%s" % hit))
+    res.append(ok(PG.card_gate(hit, o, n) is True, label + ": КАРТОЧКА выписана"))
+    res.append(ok(want_obj in o, label + ": ОБЪЕКТ виден — %r" % o))
+    res.append(ok(n == "", label + ": ЧИСЛА нет по природе операции — %r" % n))
+    res.append(ok("Число: —" in card, label + ": поле «Число» честно пустое (прочерк)"))
+    res.append(ok(PG.marker_has_object(hit, card) is True, label + ": маркер демону УХОДИТ"))
+
+print("(9б) ДЕНЬГИ спрашивают всегда — даже когда объекта нет физически:")
+out, pushed, events = run_main(PY + ' -c "bridge.' + VL + '()"')
+res.append(ok('"ask"' in out, "решение ask"))
+res.append(ok(len(pushed) == 1, "пуш владельцу ЕСТЬ (получили %d)" % len(pushed)))
+res.append(ok("card_skipped" not in events, "в журнал как пропуск НЕ ушла: %r" % events))
+
+print("(9в) само правило card_gate — объект гейт, число нет:")
+res.append(ok(PG.card_gate(SFO, "байк 6789", "") is True, "объект без числа → карточка"))
+res.append(ok(PG.card_gate(SFO, "", "пробег 27000") is False,
+              "ЧИСЛО БЕЗ ОБЪЕКТА карточку НЕ рождает (закрыта дыра полосы ПК)"))
+res.append(ok(PG.card_gate(SFO, "", "") is False, "ни объекта, ни числа → журнал"))
+res.append(ok(PG.card_gate(VL, "", "") is True, "деньги — исключение, спрашивают всегда"))
+res.append(ok(PG.card_gate(AT, "", "") is True, "касса — исключение, спрашивает всегда"))
+
+print("(9г) ядро красной зоны карточку СОХРАНИЛО:")
+for label, hit, blob in (("парк", SFO, LIVE_OIL), ("CRM", CB, LIVE_BOOKING),
+                         ("деньги", AT, LIVE_MONEY), ("удаление", DE, LIVE_DELETE),
+                         ("kill по PID", "proc_ctl", "proc_target=kill 12345")):
+    o, n = PG.card_min(hit, blob)
+    res.append(ok(PG.card_gate(hit, o, n) is True, "%s: карточка на месте (объект=%r)" % (label, o)))
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)
