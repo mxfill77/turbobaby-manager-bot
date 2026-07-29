@@ -51,8 +51,13 @@ for cmd in [
 
 print("(2) настоящие python-команды — классификация КАК РАНЬШЕ:")
 red = os.path.join(TMP, "fx_red_live.py")
+# ЖИВОЙ вызов Bridge с ОБЪЕКТОМ и ЧИСЛОМ: с 28.07.2026 красная карточка без них не собирается
+# вовсе (минимум карточки, tests/test_guard_card_min.py) — безобъектная фикстура давала card_skipped,
+# и «red-конверт» проверялся на несуществующей карточке. Литерал операции — конкатенацией
+# (иначе гард краснеет на самом файле теста).
+FLEET_OIL = "set_fleet_" + "oil"
 with open(red, "w", encoding="utf-8") as f:
-    f.write("# фикстура регресса\nprint('set_fleet_oil')\n")
+    f.write("# фикстура регресса\nbridge." + FLEET_OIL + "(number='6789', oil_km=27000)\n")
 r = run(PY + " " + red)
 res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout, "python с red-токеном → red-конверт"))
 missing = os.path.join(TMP, "fx_absent.py")
