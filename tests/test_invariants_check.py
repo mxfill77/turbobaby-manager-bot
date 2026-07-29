@@ -27,10 +27,11 @@ from invariants_check import (
 from datetime import timezone
 import tempfile as _tempfile
 
-# SCRATCHPAD_WRITERS — статический ФС-инвариант: сканирует РЕПО-корень на прямые .write_doc(
-# в _*.py и ортогонален миру _make_world(). Для world-тестов этого файла нейтрализуем его,
-# указав _SCRATCHPAD_ROOT на ПУСТОЙ каталог (тот же приём, что в invariants_check._self_test),
-# иначе живые scratchpad-скрипты в корне ломают свойства «чистый мир → 0 нарушений».
+# SCRATCHPAD_WRITERS и SCRATCH_UNTRACKED — статические ФС-инварианты: сканируют РЕПО-корень
+# (прямые .write_doc( в _*.py / untracked _*.py) и ортогональны миру _make_world(). Для
+# world-тестов этого файла нейтрализуем ОБА одним knob'ом _SCRATCHPAD_ROOT → ПУСТОЙ каталог
+# (тот же приём, что в invariants_check._self_test), иначе живые scratchpad-скрипты в корне
+# ломают свойства «чистый мир → 0 нарушений».
 ic._SCRATCHPAD_ROOT = _tempfile.mkdtemp(prefix="inv_test_scratch_clean_")
 
 # ─── Вспомогательные константы ─────────────────────────────────────────────────────────────
@@ -661,6 +662,152 @@ def test_bot_data_vs_sheet_unknown_service_type_skipped():
            "interval_km": 20000, "next_km": 56000, "status": "ok"}
     r = _run(check_bot_data_vs_sheet, _make_world(bikes=bikes, services=[svc]))
     assert len(r.findings) == 0, r.findings
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ИНВАРИАНТ 10: SCRATCH_UNTRACKED — разведочные _*.py в корне репо (правило R17)
+#  ЖИВОЙ ФОРМАТ ЗАПУСКА (правило 8 CLAUDE.md): здесь РЕАЛЬНЫЙ git (init + add), а не мок
+#  индекса — вся суть инварианта в том, что именно git считает tracked. В боевом репо
+#  `_*.py` стоит в .gitignore (24.07.2026) → `git status` их не показывает вовсе, поэтому
+#  отслеживаемость берётся из `git ls-files`, и подменять её моком значило бы проверять
+#  не тот механизм. Мок-ветки (git недоступен) покрыты в invariants_check._self_test.
+# ════════════════════════════════════════════════════════════════════════════════
+import subprocess as _subprocess
+import shutil as _shutil
+
+
+def _git_repo(tracked=(), untracked=(), nested=()):
+    """Настоящий git-репо во временном каталоге. → путь.
+    `add -f`, а не `add`: фикстура не должна зависеть от глобального ignore.
+    Коммит НЕ нужен — `git ls-files` читает ИНДЕКС, staged-файл уже tracked."""
+    d = _tempfile.mkdtemp(prefix="inv_test_scratch_git_")
+    _subprocess.run(["git", "init", "-q", d], check=True, capture_output=True, timeout=30)
+    for name in list(tracked) + list(untracked):
+        with open(os.path.join(d, name), "w") as f:
+            f.write("# разведочный скрипт\n")
+    for rel in nested:
+        os.makedirs(os.path.join(d, os.path.dirname(rel)), exist_ok=True)
+        with open(os.path.join(d, rel), "w") as f:
+            f.write("# вложенный\n")
+    if tracked:
+        _subprocess.run(["git", "-C", d, "add", "-f", *tracked],
+                        check=True, capture_output=True, timeout=30)
+    return d
+
+
+def _run_scratch(root):
+    """Прогнать SCRATCH_UNTRACKED на root. → CheckRun. Каталог удаляется вызывающим."""
+    old = ic._SCRATCHPAD_ROOT
+    ic._SCRATCHPAD_ROOT = root
+    try:
+        return _run(ic.check_scratch_untracked, _make_world())
+    finally:
+        ic._SCRATCHPAD_ROOT = old
+
+
+def test_scratch_untracked_flagged():
+    """Untracked _*.py в корне → флаг с именем файла в адресе."""
+    d = _git_repo(untracked=["_recon_park.py"])
+    try:
+        r = _run_scratch(d)
+        assert len(r.findings) == 1, r.findings
+        assert "_recon_park.py" in r.findings[0][0], r.findings
+        assert "untracked" in r.findings[0][0], r.findings
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_tracked_not_flagged():
+    """Tracked _*.py (в индексе git) → НЕ флаг: осознанный файл репо, не разведочный мусор.
+    Голден живого репо: _envfix_probe.py отслеживается и флага давать не должен."""
+    d = _git_repo(tracked=["_envfix_probe.py"])
+    try:
+        r = _run_scratch(d)
+        assert len(r.findings) == 0, r.findings
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_mixed_only_untracked():
+    """Смесь: tracked молчит, оба untracked флагуются (адреса — ровно они)."""
+    d = _git_repo(tracked=["_envfix_probe.py"], untracked=["_recon.py", "_probe2.py"])
+    try:
+        r = _run_scratch(d)
+        assert len(r.findings) == 2, r.findings
+        addrs = " ".join(s for s, _ in r.findings)
+        assert "_recon.py" in addrs and "_probe2.py" in addrs, addrs
+        assert "_envfix_probe.py" not in addrs, addrs
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_gitignored_still_flagged():
+    """.gitignore с `_*.py` (как в боевом репо с 24.07.2026) НЕ прячет находку:
+    именно из-за ignore такие файлы невидимы в git status и копятся (33 шт, цель 36)."""
+    d = _git_repo(untracked=["_recon.py"])
+    try:
+        with open(os.path.join(d, ".gitignore"), "w") as f:
+            f.write("_*.py\n")
+        r = _run_scratch(d)
+        assert len(r.findings) == 1, r.findings
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_clean_repo_silent():
+    """Пустой репо (нет _*.py) → ни флагов, ни заметок (git даже не зовётся)."""
+    d = _git_repo()
+    try:
+        r = _run_scratch(d)
+        assert len(r.findings) == 0, r.findings
+        assert len(r.notes) == 0, r.notes
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_other_names_ignored():
+    """Не-разведочные имена не трогаем: обычный модуль без `_` и `_*.txt`."""
+    d = _git_repo(untracked=["recon.py", "_notes.txt", "__init__.pyc"])
+    try:
+        r = _run_scratch(d)
+        assert len(r.findings) == 0, r.findings
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_nested_not_flagged():
+    """Вложенные _*.py (tests/, tools/) — НЕ корень, инвариант их не трогает."""
+    d = _git_repo(nested=["tools/_helper.py", "tests/_fixture.py"])
+    try:
+        r = _run_scratch(d)
+        assert len(r.findings) == 0, r.findings
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_not_a_repo_failsafe():
+    """Каталог вне git → note, НЕ флаг (деградация ≠ нарушение)."""
+    d = _tempfile.mkdtemp(prefix="inv_test_scratch_nogit_")
+    try:
+        with open(os.path.join(d, "_recon.py"), "w") as f:
+            f.write("# разведка\n")
+        r = _run_scratch(d)
+        assert len(r.findings) == 0, r.findings
+        assert any("git недоступен" in n for n in r.notes), r.notes
+    finally:
+        _shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scratch_untracked_live_repo_is_clean():
+    """СТРАЖ КЛАССА (цель 36): в живом корне репо нет untracked _*.py.
+    Красный здесь = кто-то оставил разведочный скрипт в корне; лечится переносом
+    во временный каталог (/tmp/tb_scratch) или git add, если файл нужен репо."""
+    r = _run_scratch(ic.REPO)
+    assert len(r.findings) == 0, (
+        "разведочные скрипты в корне репо: "
+        + "; ".join(s for s, _ in r.findings)
+        + " — перенеси в /tmp/tb_scratch (правило R17 CLAUDE.md)"
+    )
 
 
 # ════════════════════════════════════════════════════════════════════════════════

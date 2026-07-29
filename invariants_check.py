@@ -31,14 +31,19 @@ import re
 import sys
 import json
 import datetime
+import subprocess
 import urllib.request
 import urllib.error
 from datetime import timezone
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
-# Injectable root for SCRATCHPAD_WRITERS; None → REPO (переопределяется в тестах).
+# Injectable root СТАТИЧЕСКИХ ФС-инвариантов (SCRATCHPAD_WRITERS + SCRATCH_UNTRACKED);
+# None → REPO (переопределяется в тестах одним knob'ом на оба).
 _SCRATCHPAD_ROOT = None
+# Injectable поставщик git-отслеживаемых имён для SCRATCH_UNTRACKED: callable(root) → set|None.
+# None → живой `git ls-files`. Мок нужен только самотесту (тесты в tests/ гоняют РЕАЛЬНЫЙ git).
+_TRACKED_PROVIDER = None
 # Паттерн прямой записи в мозг: .write_doc( или ._call("write_doc"
 _BRAIN_WRITE_RE = re.compile(r'\.write_doc\s*\(|_call\s*\(\s*[\'"]write_doc[\'"]')
 
@@ -589,6 +594,61 @@ def check_scratchpad_writers(world, run):
             pass
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 10: SCRATCH_UNTRACKED
+#  Разведочные скрипты `_*.py`, лежащие в КОРНЕ репо и НЕ отслеживаемые git → флаг.
+#  Правило (CLAUDE.md R17): место разведки — временный каталог, не корень репо.
+#  ЗАЧЕМ ДЕТЕКТОР, а не `git status`: с 24.07.2026 `_*.py` стоит в .gitignore («scratch /
+#  throwaway») → накопление НЕВИДИМО для `git status` (цель 36: 33 таких файла нашлись только
+#  ручным ls). Отслеживаемость берём из `git ls-files` — ignore-правила на tracked не влияют.
+#  TRACKED НЕ ФЛАГУЕМ: файл в индексе = осознанный, отревьюенный код репо (напр. _envfix_probe.py),
+#  а не разведочный мусор; правило про мусор, не про имя.
+#  FAIL-SAFE: git недоступен / не репо / ошибка → note, НЕ флаг (деградация ≠ нарушение).
+# --------------------------------------------------------------------------------------------
+def _git_tracked_top_level(root):
+    """Имена файлов ВЕРХНЕГО уровня, отслеживаемых git в root. → set | None (git недоступен).
+    ЖИВОЙ ФОРМАТ: `git ls-files -z` отдаёт NUL-разделённые пути ОТНОСИТЕЛЬНО root;
+    вложенные несут '/' → отсекаем (инвариант только про корень)."""
+    if _TRACKED_PROVIDER is not None:
+        return _TRACKED_PROVIDER(root)
+    try:
+        p = subprocess.run(["git", "-C", root, "ls-files", "-z"],
+                           capture_output=True, timeout=20)
+        if p.returncode != 0:
+            return None
+        names = p.stdout.decode("utf-8", "replace").split("\0")
+        return {n for n in names if n and "/" not in n}
+    except Exception:
+        return None
+
+
+@register("SCRATCH_UNTRACKED")
+def check_scratch_untracked(world, run):
+    root = _SCRATCHPAD_ROOT if _SCRATCHPAD_ROOT is not None else REPO
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError as e:
+        run.note(f"каталог репо недоступен: {e}")
+        return
+    on_disk = [fn for fn in entries
+               if fn.startswith("_") and fn.endswith(".py")
+               and os.path.isfile(os.path.join(root, fn))]
+    if not on_disk:
+        return
+    tracked = _git_tracked_top_level(root)
+    if tracked is None:
+        run.note("git недоступен (не репо / ошибка) — отслеживаемость _*.py не проверена")
+        return
+    for fn in on_disk:
+        if fn in tracked:
+            continue
+        run.flag(
+            f"{fn} (корень репо, untracked)",
+            "разведочный скрипт копится в корне: _*.py в .gitignore → невидим для git status; "
+            "место разведки — временный каталог (/tmp/tb_scratch), а не корень репо",
+        )
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
@@ -959,9 +1019,48 @@ def _self_test():
         shutil.rmtree(_sw_dirty_dir, ignore_errors=True)
         _SCRATCHPAD_ROOT = _old_scratch_root
 
+    # ── 10. SCRATCH_UNTRACKED (temp-каталоги + мок git-индекса) ──────────────────────────────
+    # Здесь мок tracked-множества (быстро, без сети/git); РЕАЛЬНЫЙ git проверяется в
+    # tests/test_invariants_check.py (живой формат запуска — правило 8 CLAUDE.md).
+    global _TRACKED_PROVIDER
+    _old_tracked = _TRACKED_PROVIDER
+    _su_empty_dir = tempfile.mkdtemp()
+    _su_dir = tempfile.mkdtemp()
+    try:
+        for _n in ("_recon.py", "_probe.py"):
+            with open(os.path.join(_su_dir, _n), "w") as _f:
+                _f.write("# разведка\n")
+        with open(os.path.join(_su_dir, "notes.py"), "w") as _f:
+            _f.write("# обычный модуль, не разведка\n")
+
+        for _su_title, _su_expect, _su_root, _su_prov in [
+            ("SCRATCH пусто (нет _*.py)", 0, _su_empty_dir, lambda r: set()),
+            ("SCRATCH 2 untracked _*.py → 2 флага", 2, _su_dir, lambda r: set()),
+            ("SCRATCH оба tracked → не флагуем", 0, _su_dir,
+             lambda r: {"_recon.py", "_probe.py"}),
+            ("SCRATCH смесь: tracked не флагуем, untracked флагуем", 1, _su_dir,
+             lambda r: {"_probe.py"}),
+            ("SCRATCH git недоступен → note, не флаг (fail-safe)", 0, _su_dir,
+             lambda r: None),
+        ]:
+            _SCRATCHPAD_ROOT = _su_root
+            _TRACKED_PROVIDER = _su_prov
+            _su_by_name = {r.name: r for r in run_all(_healthy_world())}
+            _su_got = len(_su_by_name.get("SCRATCH_UNTRACKED",
+                                          CheckRun("SCRATCH_UNTRACKED")).findings)
+            _su_ok = (_su_got == _su_expect)
+            allpass &= _su_ok
+            print(f"  {'PASS' if _su_ok else 'FAIL'}  [SCRATCH_UNTRACKED] {_su_title}: "
+                  f"ждали {_su_expect}, поймали {_su_got}")
+    finally:
+        shutil.rmtree(_su_empty_dir, ignore_errors=True)
+        shutil.rmtree(_su_dir, ignore_errors=True)
+        _SCRATCHPAD_ROOT = _old_scratch_root
+        _TRACKED_PROVIDER = _old_tracked
+
     # Проверяем предвычисленные ALL-результаты
     for _all_title, _all_got, _all_expect in [
-        ("чистый мир — 0 нарушений ВСЕГО (9 инвариантов)", _total_clean, 0),
+        ("чистый мир — 0 нарушений ВСЕГО (10 инвариантов)", _total_clean, 0),
         ("деградация (всё None) → 0 нарушений суммарно", _total_degraded, 0),
     ]:
         ok = (_all_got == _all_expect)
