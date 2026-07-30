@@ -74,7 +74,9 @@ print("(1) _guard_write_marker:")
 tmp_guard = tempfile.mkdtemp(prefix="guard_esc_")
 _orig_env = os.environ.get(PG.BLOCK_DIR_ENV)
 os.environ[PG.BLOCK_DIR_ENV] = tmp_guard      # каталог из env, читается В МОМЕНТ ЗАПИСИ
-_CARD42 = "нужно да: масло, байк 6789"        # у карточки есть объект операции (вторая линия)
+# Живой формат карточки (_card, правило cb4e3e2 29.07): вторая линия (marker_has_object) смотрит
+# подписанную строку «Объект:» со значением, а НЕ «есть цифра» — фикстура повторяет живой формат.
+_CARD42 = "🔴 КРАСНОЕ\nЧто: замена масла → Лист1\nОбъект: байк 6789\nЧисло: пробег 27000\nОткат: вернуть прежнее значение"
 try:
     # записывает при наличии task_id
     PG._guard_write_marker("42", "set_fleet_oil", _CARD42)
@@ -122,7 +124,7 @@ os.environ[PG.BLOCK_DIR_ENV] = _tmp2
 try:
     res.append(ok(PG.marker_has_object("add_transaction", "сумма 500")
                   and not PG.marker_has_object("op", "подтверди операцию"),
-                  "вторая линия: объект операции распознаётся по номеру/величине"))
+                  "вторая линия: деньги (_ALWAYS_CARD) проходят всегда; без строки «Объект:» — нет"))
     PG._guard_write_marker("77", "op", "подтверди операцию")
     res.append(ok(not os.path.exists(os.path.join(_tmp2, PG.marker_name("77"))),
                   "вторая линия: карточка без объекта → маркера НЕТ"))

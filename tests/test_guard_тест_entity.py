@@ -112,8 +112,9 @@ class TestHardBlockMarker(unittest.TestCase):
         orig = os.environ.get(PG.BLOCK_DIR_ENV)     # каталог маркеров теперь из env (мина 28.07)
         os.environ[PG.BLOCK_DIR_ENV] = guard_dir
         try:
-            # у soft-карточки обязан быть объект операции — иначе вторая линия её не пишет
-            PG._guard_write_marker("998", "confirmed", "soft карточка, байк 998")  # нет blocktype
+            # у soft-карточки обязана быть строка «Объект:» со значением (живой формат _card,
+            # правило cb4e3e2 29.07) — иначе вторая линия (marker_has_object) маркер не пишет
+            PG._guard_write_marker("998", "confirmed", "soft карточка\nОбъект: байк 998")  # нет blocktype
             path = os.path.join(guard_dir, PG.marker_name("998"))
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -235,7 +236,8 @@ class TestEntityWiring(unittest.TestCase):
         os.environ[PG.BLOCK_DIR_ENV] = d
         try:
             PG._guard_write_marker("1", "confirmed", "карточка", blocktype="hard")
-            PG._guard_write_marker("2", "confirmed", "карточка, сумма 2", blocktype=None)
+            # soft-маркер обязан нести «Объект:» (живой формат _card) — иначе вторая линия его гасит
+            PG._guard_write_marker("2", "confirmed", "карточка\nОбъект: касса, сумма 2", blocktype=None)
             with open(os.path.join(d, PG.marker_name("1")), encoding="utf-8") as f:
                 self.assertEqual(json.load(f).get("blocktype"), "hard")
             with open(os.path.join(d, PG.marker_name("2")), encoding="utf-8") as f:
