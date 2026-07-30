@@ -22,20 +22,25 @@ def ok(c, l):
 
 
 res = []
-RE = OD._HEADLESS_IMPOSSIBLE_RE
+# Спрашиваем РЕШЕНИЕ слоя 2, а не его внутренний регексп: с 30.07.2026 удаление судится ПО ЦЕЛИ
+# (уборка своего черновика в /tmp — не красное), и живой контракт держит именно эта функция —
+# её зовут оба боевых места (process_approved и _dec_red_note). Тест на регексп проверял бы
+# устройство, а не поведение (класс «судить по действию», ENV_PLAYBOOK п.5).
+L2 = OD._is_headless_impossible
 
 print("(1) слой 2: ТЕМЫ больше не ловятся, ОПЕРАЦИИ ловятся")
 for t in ("покажи отчёт по деньгам за неделю", "проверить удалённый доступ по ключу",
           "сводка по кассе за месяц", "выгрузи список байков", "посмотри календарь на завтра",
           "прочитай crm и скажи сколько строк", "лист 1 — только чтение",
-          "посчитай зарплату вручную в уме"):
-    res.append(ok(not RE.search(t), "тема НЕ ловится: «%s»" % t[:46]))
+          "посчитай зарплату вручную в уме",
+          "убрать свой черновик: os.remove('/tmp/tb_scratch/x.py')"):
+    res.append(ok(not L2(t), "тема НЕ ловится: «%s»" % t[:46]))
 for t in ("clasp push", "sqlite3 memory.db 'select 1'", "bridge.set_fleet_oil(...)",
           "delete_event(id=7)", "add_transaction(-500)", "void_last()",
           "closing_upsert(...)", "create_booking(...)", "activate_booking(...)",
           "os.remove('/root/a')", "shutil.rmtree(x)", "rm -rf /root/x",
           "gspread.open('Sheet')", "POST script.google.com/macros", "confirmed = true"):
-    res.append(ok(bool(RE.search(t)), "операция ловится: «%s»" % t[:46]))
+    res.append(ok(L2(t), "операция ловится: «%s»" % t[:46]))
 
 print("(2) отказ моста больше не уходит молча")
 caught = []

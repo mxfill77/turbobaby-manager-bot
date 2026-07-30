@@ -106,6 +106,60 @@ for compound in [
     res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout,
                   f"компаунд python+git -m RED_TOKEN → defer (не red): {label}"))
 
+print("(6) МНОГОСТРОЧНОЕ сообщение через закавыченный heredoc — тоже ДАННЫЕ (класс 30.07.2026):")
+# Живой инцидент 29.07.2026 08:51:35 (реплей guard_replay.py --hours 48): боевой
+#   git -C … commit -q -F /dev/stdin <<'MSG' … MSG
+# получил env_hard_block за СЛОВА В СООБЩЕНИИ — текст описывал фикс и упоминал файл секретов.
+# Имена боевых токенов в фикстурах — конкатенацией (правило репо: не цитировать их дословно).
+SECRETS = "." + "env"
+BODY = ("guard-маркеры: уборка осиротевших по возрасту (течь цели 36)\n"
+        "TTL читается из " + SECRETS + " демона, дефолт 6ч.\n"
+        "Отчёт: " + FLEET_OIL + "(number='6789', oil_km=27000) в тексте — это ОПИСАНИЕ, не вызов.\n")
+for label, cmd in [
+    ("-F /dev/stdin (живая форма инцидента)",
+     "git -C " + ROOT + " commit -q -F /dev/stdin <<'MSG'\n" + BODY + "MSG"),
+    ("-F - ", "git commit -F - <<'MSG'\n" + BODY + "MSG"),
+    ("--file=-", "git commit --file=- <<'MSG'\n" + BODY + "MSG"),
+    ("-F- приклеенный", "git commit -F- <<'MSG'\n" + BODY + "MSG"),
+    ('<<-"MSG" с табами', 'git commit -F - <<-"MSG"\n\t' + BODY + "\tMSG"),
+]:
+    r = run(cmd)
+    res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout and '"deny"' not in r.stdout,
+                  "тело сообщения коммита → defer: " + label))
+
+print("(7) fail-safe формы heredoc НЕ ослаблены (сужение по действию, а не по слову):")
+for label, cmd, want in [
+    ("голый <<MSG (шелл РАСКРЫВАЕТ тело) → блок как раньше",
+     "git commit -q -F /dev/stdin <<MSG\nтекст про " + SECRETS + "\nMSG", '"deny"'),
+    ("тело bash <<'EOF' читает ИНТЕРПРЕТАТОР → red как раньше",
+     "bash <<'EOF'\n" + PY + " -c \"bridge." + FLEET_OIL + "(number='6789', oil_km=27000)\"\nEOF", '"ask"'),
+    ("нет терминатора → команда как есть (блок)",
+     "git commit -q -F /dev/stdin <<'MSG'\nтекст про " + SECRETS, '"deny"'),
+    ("после терминатора — боевой процесс → жёсткий блок",
+     "git commit -F - <<'MSG'\nсообщение\nMSG\npkill -9 splinter", '"deny"'),
+    ("после терминатора — red-скрипт → карточка",
+     "git commit -F - <<'MSG'\nсообщение\nMSG\n" + PY + " " + red, '"ask"'),
+]:
+    r = run(cmd)
+    res.append(ok(want in r.stdout, label))
+
+print("(8) _strip_git_msg_heredoc / _git_commit_reads_stdin — границы:")
+plain = PY + " tests/test_fmt.py"
+res.append(ok(PG._strip_git_msg_heredoc(plain) == plain, "команда без heredoc — КАК ЕСТЬ"))
+cut = PG._strip_git_msg_heredoc("git commit -F - <<'MSG'\nтело с " + SECRETS + "\nMSG\ngit push")
+res.append(ok(SECRETS not in cut and "MSG" in cut and "git push" in cut,
+              "тело вырезано, открыватель+терминатор+хвост сохранены"))
+bare = "git commit -F - <<MSG\nтело с " + SECRETS + "\nMSG"
+res.append(ok(PG._strip_git_msg_heredoc(bare) == bare, "незакавыченный разделитель — НЕ трогаем"))
+nogit = "bash <<'EOF'\nrm -rf /root/x\nEOF"
+res.append(ok(PG._strip_git_msg_heredoc(nogit) == nogit, "не git commit — НЕ трогаем"))
+res.append(ok(not PG._git_commit_reads_stdin("echo git commit -F -"),
+              "слова «git commit -F -» в аргументе echo — не команда git"))
+res.append(ok(not PG._git_commit_reads_stdin("git commit -F /tmp/msg.txt"),
+              "сообщение из ФАЙЛА (не stdin) → форма не наша"))
+res.append(ok(PG._git_commit_reads_stdin("git -C " + ROOT + " commit -q -F /dev/stdin <<'MSG'"),
+              "git -C … commit -q -F /dev/stdin — распознан"))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)

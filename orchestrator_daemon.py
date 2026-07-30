@@ -787,9 +787,15 @@ APPROVAL_PREAMBLE = (
     "PRETOOL_NOPUSH=1 venv/bin/python3 <скрипт>. Ноль тестовых карточек/пушей Филиппу в личку.\n"
     "- НАСТОЯЩЕЕ КРАСНОЕ — запись в рабочие таблицы (CRM/Лист1/Байки/Зарплаты), деньги/транзакции, "
     "clasp deploy/redeploy/push, sqlite3 CLI на memory.db, боевые записи ТО парка (масло/сервис в Лист1), "
-    "подтверждённая запись в Лист1/CRM, удаление событий, любое удаление — НЕ выполняй и НЕ ищи обходных путей: выведи РОВНО "
+    "подтверждённая запись в Лист1/CRM, удаление событий, любое удаление данных и файлов ВНЕ "
+    "временных каталогов — НЕ выполняй и НЕ ищи обходных путей: выведи РОВНО "
     "одну строку «NEEDS_APPROVAL: op=other | <карточка: что · куда · последствия · на что смотреть>» "
     "и заверши работу (исполнит человек).\n"
+    "- УБОРКА СВОЕГО ЧЕРНОВИКА — ЗЕЛЁНОЕ, карточку НЕ объявлять: файл, который ты сам создал во "
+    "временном каталоге (/tmp, /var/tmp, /dev/shm), убирай сам из python-кода, назвав путь "
+    "ЛИТЕРАЛОМ (os.remove(\"/tmp/…\") / shutil.rmtree(\"/tmp/…\")) — владельцу тут решать нечего, "
+    "файл твой и живёт до перезагрузки. Маска (/tmp/*), сам корень /tmp и любая цель ВНЕ "
+    "временного каталога (файлы репо, БД, таблицы, события) — прежнее красное с карточкой.\n"
     "ВЕРИФИКАЦИЯ ЖИВЫМ ФАКТОМ (класс R11–R15, 19.07.2026): в выводе ОБЯЗАТЕЛЬНО включи блок «FACT:» "
     "с живым доказательством эффекта — для кода: «FACT: commit <хеш> в git log origin/main»; "
     "для рестарта сервиса: «FACT: PID=<новый PID>, is-active=active, баннер=<первая строка лога после старта>»; "
@@ -879,10 +885,54 @@ _HEADLESS_IMPOSSIBLE_RE = re.compile(
     r"\bset_fleet_(?:oil|service)\b|\bdelete_event\b|\bcreate_booking\b|"
     r"\bactivate_booking\b|\badd_transaction\b|\bvoid_last\b|\bclosing_upsert\b|"
     r"confirmed\s*=\s*true|\bDOWRITE\b|"
-    r"\bgspread\b|sheets\.googleapis\.com|script\.google\.com|"
-    r"os\.remove|os\.unlink|shutil\.rmtree|\brm\s+-rf\b",
+    r"\bgspread\b|sheets\.googleapis\.com|script\.google\.com",
     re.IGNORECASE,
 )
+# УДАЛЕНИЕ ВЫНЕСЕНО ИЗ СПИСКА ВЫШЕ И СУДИТСЯ ПО ЦЕЛИ (30.07.2026) — тот же класс, что сужение
+# 25.07 («имена операций, а не темы») и «данные ≠ команда» в гарде: краснеть должно ДЕЙСТВИЕ, а не
+# наличие глагола в тексте. Было: os.remove|os.unlink|shutil.rmtree|rm -rf где угодно в тексте =
+# заведомо headless-невозможное красное. Под это попадала УБОРКА СВОЕГО ЧЕРНОВИКА во временном
+# каталоге — файла, который задача сама и создала: владельцу решать нечего, а стоило это карточки,
+# «да» и терминальной карты «сделай руками» (в 328 — предложение владельцу пойти удалить файл в /tmp).
+# Теперь красным НЕ считается ровно один случай: цель названа ЛИТЕРАЛОМ, лежит внутри временного
+# каталога (/tmp, /var/tmp, /dev/shm) и является КОНКРЕТНЫМ путём под его корнем.
+# FAIL-SAFE во все стороны (сомнение → прежнее красное): цель не извлеклась (переменная,
+# os.path.join), маска (/tmp/*), сам корень /tmp, «..», путь вне временных каталогов.
+_DELETE_VERB_RE = re.compile(r"os\.remove|os\.unlink|shutil\.rmtree|\brm\s+-rf\b", re.IGNORECASE)
+# Цель обязана идти СРАЗУ за глаголом (пробелы/открывающая скобка допустимы): иначе «os.remove(p)
+# # см. /tmp/x» подцепил бы путь из комментария и позеленел бы на пустом месте.
+_DELETE_TARGET_RE = re.compile(r"^[\s(]*(?:[\"']([^\"']{1,200})[\"']|(/[^\s,)\]\"']{1,200}))")
+_TMP_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/")
+
+
+def _is_tmp_path(p):
+    """Цель — КОНКРЕТНЫЙ файл/каталог внутри временного каталога? (маски и сам корень — нет)."""
+    p = (p or "").strip().strip("'\"").strip()
+    if not p or "*" in p or "?" in p:
+        return False
+    for root in _TMP_ROOTS:
+        if p.startswith(root):
+            tail = p[len(root):].strip("/")
+            return bool(tail) and ".." not in tail.split("/")
+    return False
+
+
+def _delete_targets(blob):
+    """Цели, названные РЯДОМ с глаголом удаления → список (пустая строка = не извлеклась)."""
+    out = []
+    for m in _DELETE_VERB_RE.finditer(blob or ""):
+        t = _DELETE_TARGET_RE.match(blob[m.end():m.end() + 240])
+        out.append(((t.group(1) or t.group(2)) if t else "") or "")
+    return out
+
+
+def _delete_is_red(blob):
+    """True → в тексте есть удаление, которое НЕ является уборкой своего временного файла.
+    Глагола нет → False. Хоть одна цель вне временного каталога (или не извлечённая) → True."""
+    targets = _delete_targets(blob)
+    if not targets:
+        return False
+    return any(not _is_tmp_path(t) for t in targets)
 
 
 # === САМОПОЧИНКА ШАГА (мета-дирижёр кусок 1, KB_MASTER §4, заведено 06.07.2026) ===
@@ -952,9 +1002,13 @@ def _is_convert(text):
 
 
 def _is_headless_impossible(*texts):
-    """True → в тексте(ах) есть маркер заведомо headless-невозможного красного действия. Слой 2."""
+    """True → в тексте(ах) есть маркер заведомо headless-невозможного красного действия. Слой 2.
+    Удаление проверяется отдельно и ПО ЦЕЛИ (_delete_is_red): уборка своего черновика в /tmp
+    красным не считается, всё прочее удаление — как было."""
     blob = " ".join(str(t or "") for t in texts)
-    return bool(_HEADLESS_IMPOSSIBLE_RE.search(blob))
+    if _HEADLESS_IMPOSSIBLE_RE.search(blob):
+        return True
+    return _delete_is_red(blob)
 
 
 def _manual_card(what, orig_text=""):

@@ -418,7 +418,11 @@ PLAN с диффом → `KB_review` (канон — манифест-ключ `
 **🔴 КРАСНАЯ — строго «да» Филиппа КАЖДЫЙ раз:**
 - Bridge `clasp redeploy` (деплой Apps Script);
 - запись в рабочие таблицы (CRM / Зарплаты / Байки, `confirmed=true`; `set_fleet_oil` / `set_fleet_service`);
-- `delete_event` / любое удаление;
+- `delete_event` / любое удаление данных и файлов **ВНЕ временных каталогов**
+  (уточнено 30.07.2026: уборка СВОЕГО черновика в `/tmp` / `/var/tmp` / `/dev/shm` — 🟢, файл
+  создан этой же задачей, владельцу решать нечего; маска `/tmp/*`, сам корень `/tmp` и любая цель
+  вне временных каталогов — по-прежнему 🔴. Судим по ЦЕЛИ, а не по глаголу — `_delete_is_red`
+  в `orchestrator_daemon.py`, тесты `tests/test_delete_scope.py`);
 - деньги / проводки Bot Data (транзакции);
 - `sqlite3 memory.db` (UPDATE/DELETE/INSERT).
 

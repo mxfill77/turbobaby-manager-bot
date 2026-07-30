@@ -37,6 +37,12 @@
     скрипта вырезается из скан-представления (журнальный `cclog.py "DONE …"` краснел по ТЕКСТУ
     строки), но ТЕЛО .py читается как прежде, а операнды-улики (файл секретов, .db/SQL-write,
     $(…)/`…`) из argv НЕ вырезаются — жёсткие блоки не слабеют.
+    Тот же класс с 30.07.2026 — ТЕКСТ СВОЕГО КОММИТА В ЛЮБОЙ ФОРМЕ ПЕРЕДАЧИ: payload -m/-am/
+    --message держал _strip_git_msg, а многострочная форма `git commit -F - <<'MSG' … MSG` шла
+    под скан целиком — и 29.07.2026 боевой commit получил env_hard_block за СЛОВА в сообщении.
+    _strip_git_msg_heredoc вырезает тело ТОЛЬКО у ЗАКАВЫЧЕННОГО heredoc (шелл в нём ничего не
+    подставляет) и ТОЛЬКО когда сообщение читает git commit из stdin; голый <<MSG, тело
+    `bash <<'EOF'` и всё после терминатора остаются под сканом.
 (в) HARD-BLOCK .env: обращение к файлу секретов в ЛЮБОЙ позиции цепи (после &&/;/|, внутри
     `bash -c`, $(…), `…`) → deny БЕЗ карточки, лог `env_hard_block`, approve НЕВОЗМОЖЕН.
     Сканируется ТОЛЬКО ТЕКСТ КОМАНДЫ: содержимое .py-целей НЕ проверяется (иначе любой боевой
@@ -720,6 +726,79 @@ def _strip_git_msg(cmd):
     return " ".join(out)
 
 
+# Сообщение коммита, поданное ЧЕРЕЗ STDIN закавыченным heredoc (`git commit -F - <<'MSG' … MSG`),
+# — те же ДАННЫЕ, что payload -m (_strip_git_msg выше), только форма другая; текст сообщения НЕ
+# исполняет ничего. Течь была ровно та же, что у -m до bd5d516, и стоила боевого коммита: 29.07.2026
+# в 08:51:35 живая команда
+#   git -C … commit -q -F /dev/stdin <<'MSG'   (тело описывало фикс и упоминало файл секретов)
+# получила env_hard_block — deny на СЛОВА В СООБЩЕНИИ, задача переформулировала текст, чтобы
+# закоммитить (реплей боевого лога: guard_replay.py --hours 48).
+# СУДИМ ПО ДЕЙСТВИЮ, и сужено жёстко — иначе это дыра, а не фикс:
+#   • разделитель ОБЯЗАН быть в кавычках (<<'MSG' / <<"MSG"): тогда шелл в теле не делает НИКАКИХ
+#     подстановок и тело физически не может ничего сделать. Голый <<MSG шелл РАСКРЫВАЕТ ($(cat .env)
+#     утёк бы в историю git) → такую форму НЕ трогаем вовсе, прежний полный скан;
+#   • строка-открыватель обязана быть командой git с подкомандой commit, читающей сообщение ИЗ
+#     STDIN (-F -, -F /dev/stdin, --file=…). Тело `bash <<'EOF'` под сканом остаётся — его читает
+#     ИНТЕРПРЕТАТОР, а не git;
+#   • нужен терминатор; сама строка-открыватель и всё ПОСЛЕ терминатора остаются ДОСЛОВНО
+#     (`… MSG` + `&& pkill splinter` скану по-прежнему виден).
+# Нет совпадения / сбой разбора → команда КАК ЕСТЬ (fail-safe: скан полный, краснит охотнее).
+_HEREDOC_QUOTED_RE = re.compile(r"<<-?\s*(['\"])([A-Za-z_]\w{0,30})\1")
+_GIT_MSG_STDIN = ("-", "/dev/stdin")
+
+
+def _git_commit_reads_stdin(line):
+    """Строка — это `git … commit …`, берущий СООБЩЕНИЕ из stdin? Разбор СТРУКТУРНЫЙ (слово-команда
+    сегмента + флаг источника сообщения), а не по подстроке: `echo git commit -F -` сюда не попадёт."""
+    toks = _tokens(line)
+    i = 0
+    while i < len(toks) and _ENV_ASSIGN.match(toks[i]):
+        i += 1
+    if i >= len(toks) or _base(toks[i]) != "git":
+        return False
+    rest = toks[i + 1:]
+    if "commit" not in rest:
+        return False
+    for k, t in enumerate(rest):
+        if t in ("-F", "--file") and k + 1 < len(rest) and rest[k + 1] in _GIT_MSG_STDIN:
+            return True
+        if t.startswith("--file=") and t.split("=", 1)[1] in _GIT_MSG_STDIN:
+            return True
+        if t.startswith("-F") and t != "-F" and t[2:] in _GIT_MSG_STDIN:
+            return True
+    return False
+
+
+def _strip_git_msg_heredoc(cmd):
+    """Тело закавыченного heredoc, которое `git commit` читает КАК СООБЩЕНИЕ, → вон из скана.
+    Зовётся ДО сегментации (_units): переводы строк — шелл-разделители, поэтому тело сообщения
+    иначе разъезжается по сегментам и никакой пер-сегментный вырез его уже не соберёт."""
+    s = cmd or ""
+    if "<<" not in s or "commit" not in s:
+        return s
+    try:
+        lines = s.split("\n")
+        out, i, changed = [], 0, False
+        while i < len(lines):
+            line = lines[i]
+            out.append(line)
+            m = _HEREDOC_QUOTED_RE.search(line)
+            if m and _git_commit_reads_stdin(line):
+                word = m.group(2)
+                j = i + 1
+                while j < len(lines) and lines[j].strip() != word:
+                    j += 1
+                if j < len(lines):          # терминатор есть → ТЕЛО (только оно) выбрасываем
+                    out.append(lines[j])
+                    i = j + 1
+                    changed = True
+                    continue
+            i += 1
+        return "\n".join(out) if changed else s
+    except Exception:
+        return s
+
+
 def _strip_script_cli_args(cmd):
     """Аргументы ПОСЛЕ имени .py-скрипта — ДАННЫЕ скрипта, а не операция команды. Тот же класс,
     что текст git -m (_strip_git_msg): журнальные/логовые скрипты несут боевые слова В ТЕКСТЕ
@@ -937,6 +1016,7 @@ def _units(cmd, depth=0):
     out = []
     if depth > 2 or not (cmd or "").strip():
         return out
+    cmd = _strip_git_msg_heredoc(cmd)    # текст своего коммита — данные; вырез ДО сегментации
     for seg in _split_segments(cmd):
         for inner in _subst_inners(seg):
             out.extend(_units(inner, depth + 1))
@@ -961,7 +1041,8 @@ def _scan(cmd):
     try:
         units = _units(cmd)
         text = " ".join(t for _, t in units)
-        return units, (text if text.strip() else _strip_script_cli_args(_strip_git_msg(cmd)))
+        return units, (text if text.strip()
+                       else _strip_script_cli_args(_strip_git_msg(_strip_git_msg_heredoc(cmd))))
     except Exception:
         return [(_tokens(cmd), cmd)], _strip_script_cli_args(_strip_git_msg(cmd))
 
