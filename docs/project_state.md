@@ -102,11 +102,23 @@ Splinter (учёт/ТО/касса/аудитор), фундамент авто�
 Внутренний контур — **RU+TH** (тайцы). Клиентский контур — **RU+EN** (без тайского, тайцы с клиентами
 не общаются). НЕ смешивать.
 
-### 📒 booking-спеки в Brain
-`KB_booking_flow` (id `11HvMKGZRdSoRjojvAcmpN6_KJzkc1eRlIIx12JW6DQU`) и `KB_collect_booking_spec`
-(id `1PZ7TeEQJLtzrw66Ll3PZBXIw-K70dnkh-3ClxDEMW48`) пока читаются ТОЛЬКО по id (в BRAIN_MANIFEST НЕ
-зарегистрированы — `register_brain_doc` требует clasp redeploy, отложено). Регистрация имён — при
-следующем clasp login по другому поводу.
+### 📒 booking-спеки (читаются по id, в реестре мозга НЕТ)
+`KB_booking_flow` (id `11HvMKGZRdSoRjojvAcmpN6_KJzkc1eRlIIx12JW6DQU`, 6501 симв.) и
+`KB_collect_booking_spec` (id `1PZ7TeEQJLtzrw66Ll3PZBXIw-K70dnkh-3ClxDEMW48`, 4553 симв.)
+читаются ТОЛЬКО по id — в `BRAIN_MANIFEST` не зарегистрированы.
+
+**Причина исправлена 30.07.2026** (прежняя запись «`register_brain_doc` требует clasp redeploy»
+была НЕВЕРНА и увела задачу реестра в тупик): эндпоинт `register_brain_doc` ЖИВОЙ в прод-деплое
+(проверено пробой с пустыми аргументами → `need_name_id`, деплой не трогали). Настоящий блокер
+другой — **оба файла лежат ВНЕ папки «TurboBaby Brain»** (`1uWqHsxk7aEWoSNqaUBMmqkYOh2UKYLkY`):
+`registerBrainDoc_` сверяет родителя файла с `folder_id` манифеста и отбивает регистрацию
+`not_in_brain` (защита «не регистрируем чужое»). Обе попытки вернули `not_in_brain`, реестр
+не изменился.
+
+Чтобы имена заработали: владелец переносит оба дока в папку «TurboBaby Brain» в Drive (мышью),
+после чего регистрация проходит обычным `register_brain_doc` без деплоя. Эндпоинта переноса
+файла В Brain у Bridge нет (`move_brain_file` двигает только то, что УЖЕ в Brain) — потому шаг
+ручной. Подробности и снимок реестра: `docs/artifacts/2026-07-30-brain-registry-before.md`.
 
 ---
 
