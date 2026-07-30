@@ -67,7 +67,9 @@ res.append(ok(OD._normalize_model("claude-sonnet-4-6") == "claude-sonnet-4-6", "
 res.append(ok(OD._normalize_model("sonnet-4-6") == "claude-sonnet-4-6", "sonnet-4-6 → claude-sonnet-4-6"))
 res.append(ok(OD._normalize_model(" sonnet ") == "claude-sonnet-4-6", "голый sonnet (+пробелы) → полный id"))
 res.append(ok(OD._normalize_model("opus-4-8[1m]") == "claude-opus-4-8[1m]", "суффикс [1m] сохраняется"))
-res.append(ok(OD._normalize_model("fable") == "claude-fable-5", "fable → claude-fable-5"))
+res.append(ok(OD._normalize_model("fable") == "claude-opus-5", "короткое имя снятой → claude-opus-5"))
+res.append(ok(OD._normalize_model("fable-5") == "claude-opus-5", "семейство-версия снятой → claude-opus-5"))
+res.append(ok(OD._normalize_model("claude-fable-5") == "claude-opus-5", "ПОЛНОЕ имя снятой → claude-opus-5"))
 res.append(ok(OD._normalize_model("haiku") == "claude-haiku-4-5-20251001", "haiku → полный id с датой"))
 res.append(ok(OD._normalize_model("my-custom-model") == "my-custom-model",
               "незнакомое значение не трогаем (фолбэк-кондуктор подстрахует)"))

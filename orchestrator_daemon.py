@@ -169,9 +169,9 @@ HEADLESS_SETTINGS = os.path.join(REPO, "headless_settings.json")
 # Фолбэк исполняет САМ CLI флагом --fallback-model В РАМКАХ ОДНОГО вызова при
 # overload/недоступности/лимите/неверном имени primary → задача НЕ исполняется дважды
 # (проверено 06.07: невалидная primary + --fallback-model=opus → CLI сам берёт opus, exit 0,
-# modelUsage=opus). Хардкода без фолбэка нет: упёршись в лимит Fable, автоматика не встаёт.
-ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "fable").strip() or "fable"
-ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-fable-5").strip() or "claude-fable-5"
+# modelUsage=opus). Хардкода без фолбэка нет: упёршись в лимит основной, автоматика не встаёт.
+ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "claude-opus-5").strip() or "claude-opus-5"
+ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-opus-4-8").strip() or "claude-opus-4-8"
 # УСКОРЕНИЕ ЦЕПЕЙ ч.1 (13.07.2026): модель ИСПОЛНИТЕЛЯ headless-задач — отдельный флаг
 # EXECUTOR_MODEL (.env). Шаги цепей в основном механические по готовой спеке — быстрый
 # исполнитель ускоряет цепь; ДУМАНЬЕ (планировщик декомпозиции, самопочинка, адаптация
@@ -187,18 +187,27 @@ _MODEL_ALIASES = {
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
+# СНЯТИЕ ГОЛОВЫ (30.07.2026, решение владельца «Opus 5 — единственная голова обеих полос»):
+# слой ПОВЕРХ алиасов. Любое имя снятой модели — короткое, «семейство-версия» или полное — после
+# нормализации уводится на claude-opus-5, поэтому застрявшее в чьём-то окружении старое значение
+# не вернёт её мимо .env. Ключи слева убрать НЕЛЬЗЯ: тогда старое значение уйдёт в claude -p как
+# есть и даст 404 (класс b18ad08).
+_MODEL_RETIRED = {"claude-fable-5": "claude-opus-5"}
 
 
 def _normalize_model(name):
-    """Короткий алиас → полный model id (класс 404 b18ad08). Полные id и незнакомые
-    значения — как есть; суффиксы вида [1m] сохраняются («opus-4-8[1m]» → «claude-opus-4-8[1m]»)."""
+    """Короткий алиас → полный model id (класс 404 b18ad08); имя снятой головы → claude-opus-5.
+    Полные id и незнакомые значения — как есть; суффиксы вида [1m] сохраняются
+    («opus-4-8[1m]» → «claude-opus-4-8[1m]»)."""
     n = (name or "").strip()
     low = n.lower()
     if low in _MODEL_ALIASES:
-        return _MODEL_ALIASES[low]
-    if re.match(r"^(fable|opus|sonnet|haiku)-\d", low):  # семейство-версия без префикса claude-
-        return "claude-" + n
-    return n
+        out = _MODEL_ALIASES[low]
+    elif re.match(r"^(fable|opus|sonnet|haiku)-\d", low):  # семейство-версия без префикса claude-
+        out = "claude-" + n
+    else:
+        out = n
+    return _MODEL_RETIRED.get(out.lower(), out)
 
 
 _EXECUTOR_MODEL_RAW = (os.environ.get("EXECUTOR_MODEL") or "").strip()

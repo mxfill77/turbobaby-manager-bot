@@ -121,9 +121,12 @@ print("(5) дефолт запасной модели в КОДЕ живой")
 src = open(os.path.join(ROOT, "orchestrator_daemon.py"), encoding="utf-8").read()
 decl = [l for l in src.splitlines() if l.startswith("ORCH_MODEL_FALLBACK =")]
 res.append(ok(len(decl) == 1, "объявление фолбэка ровно одно"))
-res.append(ok(bool(decl) and "claude-opus-4-8" not in decl[0],
+# МЁРТВАЯ модель — это claude-opus-4-8[1m] (1M-вариант, 404 not_found_error), а НЕ обычный
+# claude-opus-4-8: он живой и с 30.07.2026 сам стоит запасным на ОБЕИХ полосах. Проверяем
+# именно мёртвый литерал, иначе страж запрещал бы живую запасную модель.
+res.append(ok(bool(decl) and "claude-opus-4-8[1m]" not in decl[0],
               "мёртвой модели в объявлении нет: %s" % (decl[0][:88] if decl else "нет строки")))
-res.append(ok(bool(decl) and 'or "claude-fable-5"' in decl[0], "дефолт фолбэка = claude-fable-5"))
+res.append(ok(bool(decl) and 'or "claude-opus-4-8"' in decl[0], "дефолт фолбэка = claude-opus-4-8"))
 
 print("(6) баннер печатает модель, запасную и усилия")
 i = src.find("ДЕМОН СТАРТ")

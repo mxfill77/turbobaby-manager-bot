@@ -3,7 +3,7 @@ ORCH_MODEL с авто-фолбэком на ORCH_MODEL_FALLBACK силами CL
 не хардкод, --output-format json → достаём текст (result) и какая модель реально отработала
 (modelUsage). Всё мокнуто (subprocess.run), сети/claude нет.
 
-СОСТОЯНИЕ НАСТРОЕК на 25.07.2026: основная claude-opus-5, запасная claude-fable-5. Прежняя
+СОСТОЯНИЕ НАСТРОЕК на 30.07.2026: основная claude-opus-5, запасная claude-opus-4-8. Прежняя
 редакция описывала обратную раскладку (основная Fable 5, запасная Opus 4.8 1M) — она устарела
 06→25.07 и вводила в заблуждение. Моки modelUsage ниже НЕ хардкодят имена: они берут
 OD.ORCH_MODEL / OD.ORCH_MODEL_FALLBACK, поэтому смена модели в .env их больше не красит."""
@@ -21,7 +21,7 @@ res = []
 
 import orchestrator_daemon as OD
 
-# (1) модель вынесена в env: основная claude-opus-5 → фолбэк claude-fable-5 (состояние 25.07.2026)
+# (1) модель вынесена в env: основная claude-opus-5 → фолбэк claude-opus-4-8 (состояние 30.07.2026)
 print("(1) конфиг модели из env:")
 # NB: два литерала ниже ЗЕРКАЛЯТ боевой .env (ORCH_MODEL / ORCH_MODEL_FALLBACK); при смене
 # модели правятся вместе с конфигом — иначе гейт краснеет и отгрузка встаёт ВСЕМУ репозиторию.
@@ -29,10 +29,10 @@ print("(1) конфиг модели из env:")
 # Поэтому ниже к литералу добавлена проверка СВОЙСТВА (полный идентификатор ≠ короткий алиас):
 # она переживает смену модели, а литерал остаётся якорем «конфиг и тест сверены глазами».
 res.append(ok(OD.ORCH_MODEL == "claude-opus-5", "ORCH_MODEL из .env = claude-opus-5"))
-# ЗЕРКАЛО .env: 25.07.2026 фолбэк переведён с алиаса «fable» на полный идентификатор —
-# короткий алиас API не принимает (404 not_found_error), CLI-фолбэк был мёртв.
-res.append(ok(OD.ORCH_MODEL_FALLBACK == "claude-fable-5",
-              "ORCH_MODEL_FALLBACK = claude-fable-5"))
+# ЗЕРКАЛО .env: 30.07.2026 прежняя голова снята с работы — запасной стал claude-opus-4-8,
+# полным идентификатором (короткий алиас API не принимает, 404 not_found_error).
+res.append(ok(OD.ORCH_MODEL_FALLBACK == "claude-opus-4-8",
+              "ORCH_MODEL_FALLBACK = claude-opus-4-8"))
 res.append(ok(OD.ORCH_MODEL_FALLBACK.startswith("claude-"),
               "фолбэк — ПОЛНЫЙ идентификатор модели (короткий алиас даёт 404)"))
 res.append(ok(OD.ORCH_MODEL != OD.ORCH_MODEL_FALLBACK, "основная и фолбэк — разные модели"))
