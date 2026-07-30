@@ -214,6 +214,8 @@ _EXECUTOR_MODEL_RAW = (os.environ.get("EXECUTOR_MODEL") or "").strip()
 EXECUTOR_MODEL = _normalize_model(_EXECUTOR_MODEL_RAW) if _EXECUTOR_MODEL_RAW else ORCH_MODEL
 
 import task_metrics  # единый формат строки METRICS (обе полосы) + norm_effort/extract_tokens
+import status_truth  # ПРАВДА СТАТУСА (зеркало ПК-фикса 5f2be1c/1597cbe, 30.07.2026): код причины
+                     # провала + следы работы в окне задачи. Подробности класса — в самом модуле.
 # УРОВЕНЬ УСИЛИЙ ИСПОЛНИТЕЛЯ (24.07.2026): claude -p принимает --effort (low/medium/high/xhigh/max);
 # на VPS раньше НЕ передавался -> CLI брал дефолт. Выносим в env EXECUTOR_EFFORT (дефолт xhigh —
 # доктрина «каждая задача ultrathink»); незнакомое значение -> xhigh (task_metrics.norm_effort).
@@ -470,6 +472,41 @@ def _fail_card(out, err, rc):
     etail = " / ".join([x for x in e.splitlines() if x.strip()][-2:]) if e else ""
     body = " | ".join([b for b in (summary, etail) if b]) or f"exit={rc}"
     return f"claude -p упал (exit={rc}): {body}"[:600]
+
+
+def _truthful_fail(tid, base, code, task=None, started=None, max_len=RESULT_MAX):
+    """ПРАВДА СТАТУСА (зеркало ПК-фикса 5f2be1c/1597cbe, 30.07.2026) — единая точка обрамления
+    провала: к прежнему честному диагнозу добавляются КОД ПРИЧИНЫ и СЛЕДЫ РАБОТЫ В ОКНЕ задачи.
+
+    Зачем: по статусу планируется следующий шаг. Голое «провалена» у задачи, которая успела
+    закоммитить и записать журнал, дважды за сутки увело план в неверную сторону (инцидент ПК,
+    задачи 54 и 61) — и владелец видел «упало» там, где работа лежит в git.
+    ВАЖНО: текст говорит «в окне задачи ЕСТЬ работа», а НЕ «работа выполнена» — окно ловит и
+    параллельные сессии, авторства оно не доказывает (живая проверка на ПК: 8 коммитов в окне,
+    свой — один). Смысл base и его ведущий маркер (⏱/✋) сохраняются: на маркер смотрят гейт
+    самопочинки и пропуск куратора.
+    FAIL-SAFE: любой сбой сборки (git недоступен, реестр битый, что угодно) → прежний голый
+    текст, байт-в-байт как до фикса. Правда статуса не смеет ломать закрытие задачи."""
+    try:
+        txt = status_truth.fail_result(base, code, task=task, task_id=tid, started=started,
+                                       repo=REPO, max_len=max_len)
+        log.warning(status_truth.log_line(tid, code))
+        return txt
+    except Exception as e:
+        log.warning("правда статуса: сборка итога id=%s упала (%s) — прежний голый текст", tid, e)
+        return str(base or "")[:max_len]
+
+
+def _truthful_fail_last(tid, base, task=None):
+    """То же обрамление, но код причины берётся из канала ПОСЛЕДНЕГО run_task (см. _LAST_RUN).
+    Нужен там, где терминальный текст собирает слой самопочинки: код туда не дотянуть аргументом,
+    не сломав моки его собственных сьютов.
+    Канал пуст либо принадлежит другой задаче (run_task подменён моком / путь без исполнения) →
+    прежний голый текст, байт-в-байт как до фикса."""
+    if _LAST_RUN.get("task") != tid or not _LAST_RUN.get("fail_code"):
+        return str(base or "")[:RESULT_MAX]
+    return _truthful_fail(tid, base, _LAST_RUN["fail_code"], task=task,
+                          started=_LAST_RUN.get("started"))
 
 # === ФИКС КЛАССА «самомодификация → ложный failed» (урок задачи 105, 07.07.2026) ===
 # Самомод-задача правит orchestrator_daemon.py и по доктрине ставит отложенный
@@ -1163,6 +1200,7 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
         log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
         _hb_stop.set()
         _hb.join(timeout=5)
+        _set_fail_code(_mctx, "exec_error")
         return "failed", f"ошибка запуска claude -p: {e}"
 
     # Guard-монитор: фон-поток проверяет маркер каждые 2с, при обнаружении — terminate
@@ -1188,6 +1226,7 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
 
     if _timed_out:
         log.warning("id=%s ТАЙМАУТ %ss — claude -p убит, честный failed", task_id, task_timeout)
+        _set_fail_code(_mctx, "run_timeout")
         return "failed", (f"{TIMEOUT_MARK} таймаут задачи {task_timeout}s — claude -p убит, задача "
                           f"не завершилась (лимит TASK_TIMEOUT из .env); думатель таймауты не чинит — "
                           f"упрости/раздели задачу и поставь заново")
@@ -1271,10 +1310,29 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
                 "ПОСЛЕДНИМ действием, работа к этому моменту сделана. Итоги — в cc_log (RESULT "
                 "задачи) и git log. Это НЕ сбой.")
         log.warning("id=%s claude -p exit=%s", task_id, proc.returncode)
+        # КОД ПРИЧИНЫ ставим ЗДЕСЬ, где известны сырые out/err/rc, — а не разбором готовой
+        # карточки потом: причину знает тот, кто её видел (класс «судим по действию»).
+        _set_fail_code(_mctx, status_truth.classify_exec(out, err, proc.returncode))
         # §12 корень 3: чистая карточка провала, НЕ сырой дамп stdout+stderr (шум).
         return "failed", _fail_card(out, err, proc.returncode)
     log.info("id=%s claude -p exit=0 (вывод %d симв)", task_id, len(out))
     return "done", (cap_result(out) if out else "(claude -p вернул пустой вывод)")
+
+
+def _set_fail_code(mctx, code):
+    """Записать КОД причины провала в контекст исполнения. Строкой-диагнозом причину потом не
+    «угадываем»: её кладёт тот участок, который её ВИДЕЛ (сырые out/err/rc, факт таймаута).
+    mctx=None (планировщик/думатель зовут импл напрямую) → тихо ничего, поведение прежнее."""
+    if isinstance(mctx, dict):
+        mctx["fail_code"] = code
+
+
+# ПРАВДА СТАТУСА: код причины и точный старт последнего run_task. Отдельный канал, а НЕ новый
+# аргумент/возврат run_task — её сигнатуру мокают шесть тест-сьютов лямбдами фиксированной формы,
+# и расширение сигнатуры сломало бы ровно те моки, что стерегут соседние классы.
+# Детерминизм обеспечивает вызывающий: чистит словарь ПЕРЕД вызовом и сверяет id — мок run_task
+# словарь не заполнит, значит обрамления не будет, и поведение под моком прежнее.
+_LAST_RUN: dict = {}
 
 
 def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
@@ -1299,6 +1357,8 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
             src=(os.path.basename((sys.argv[0] if sys.argv else "") or "") or None)))
     except Exception as _e:
         log.warning("METRICS не записан (vps id=%s): %s", task_id, _e)
+    _LAST_RUN.clear()
+    _LAST_RUN.update({"task": task_id, "fail_code": _mctx.get("fail_code"), "started": _start})
     return status, result
 
 
@@ -1642,9 +1702,9 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
     if hm:
         # перерождённая задача упала ПОВТОРНО → терминальный failed (без retry) — петля невозможна
         oid = hm.group(1)
-        bc.complete_task(tid, "failed",
+        bc.complete_task(tid, "failed", _truthful_fail_last(tid,
                          (f"🛑 самопочинка не помогла (попытка 1 исчерпана): перерождение задачи "
-                          f"{oid} упало повторно — нужен человек.\n{str(fail_text or '')}")[:RESULT_MAX])
+                          f"{oid} упало повторно — нужен человек.\n{str(fail_text or '')}")[:RESULT_MAX]))
         log.info("task-selfheal: id=%s (перерождение задачи %s) упал ПОВТОРНО → терминальный failed",
                  tid, oid)
         return True
@@ -1654,10 +1714,10 @@ def _maybe_task_selfheal(tid, text, fail_text, frm):
     reason = verdict["reason"] or "(без причины)"
     fixed = verdict["fixed_task"]
     if verdict["verdict"] != "retry" or not fixed:
-        bc.complete_task(tid, "failed",
+        bc.complete_task(tid, "failed", _truthful_fail_last(tid,
                          (f"задача упала → думатель: halt, причина: {reason}\n"
                           f"Перерождение не поможет (диагноз думателя выше), нужен человек.\n"
-                          f"{str(fail_text or '')}")[:RESULT_MAX])
+                          f"{str(fail_text or '')}")[:RESULT_MAX]))
         log.info("task-selfheal: id=%s → думатель halt (%s)", tid, reason[:120])
         return True
     reborn = f"[самопочинка задачи {tid}, попытка 1] {fixed}"[:RESULT_MAX]
@@ -1692,10 +1752,10 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
     step_i, step_n, pid = int(m.group(1)), int(m.group(2)), int(m.group(3))
     if _HEAL_RE.search(text):
         # перерождённый шаг упал ПОВТОРНО → терминальный halt (без retry) — петля невозможна
-        bc.complete_task(tid, "failed",
+        bc.complete_task(tid, "failed", _truthful_fail_last(tid,
                          (f"🛑 самопочинка не помогла (попытка 1 исчерпана): шаг {step_i}/{step_n} "
                           f"родителя {pid} упал повторно — цепочка остановлена, нужен человек.\n"
-                          f"{str(fail_text or '')}")[:RESULT_MAX])
+                          f"{str(fail_text or '')}")[:RESULT_MAX]))
         log.info("selfheal: id=%s шаг %s/%s родителя %s упал ПОВТОРНО → терминальный halt",
                  tid, step_i, step_n, pid)
         _maybe_dec_after(text, "failed")
@@ -1706,10 +1766,10 @@ def _maybe_selfheal(tid, text, fail_text, frm=""):
     reason = verdict["reason"] or "(без причины)"
     fixed = verdict["fixed_step"]
     if verdict["verdict"] != "retry" or not fixed:
-        bc.complete_task(tid, "failed",
+        bc.complete_task(tid, "failed", _truthful_fail_last(tid,
                          (f"шаг {step_i}/{step_n} упал → думатель: halt, причина: {reason}\n"
                           f"Цепочка остановлена (диагноз думателя выше).\n"
-                          f"{str(fail_text or '')}")[:RESULT_MAX])
+                          f"{str(fail_text or '')}")[:RESULT_MAX]))
         log.info("selfheal: id=%s шаг %s/%s родителя %s → думатель halt (%s)",
                  tid, step_i, step_n, pid, reason[:120])
         _maybe_dec_after(text, "failed")
@@ -3244,8 +3304,9 @@ def process_approved():
                             tid)
                 continue
             log.info("APPROVED id=%s ИСТЁК (>%ss) → failed [слой ttl]", tid, APPROVED_TTL)
-            bc.complete_task(tid, "failed",
-                             "approve истёк (>30 мин), повтори задачу [закрыто: слой ttl]")
+            bc.complete_task(tid, "failed", _truthful_fail(
+                tid, "approve истёк (>30 мин), повтори задачу [закрыто: слой ttl]",
+                "approval_timeout", task=task))
             _maybe_dec_after(task.get("task_text"), "failed")
             continue
 
@@ -3365,6 +3426,9 @@ def process_orphans():
                 f"до Bridge без ответа в окно его сбоя (урок задачи 138, 07.07) или демон был "
                 f"прерван до/во время исполнения. Работа не выполнялась либо оборвана — повтори "
                 f"задачу; думатель сирот не чинит.")
+        # правда статуса: код причины + следы работы в окне (сирота часто УСПЕЛА поработать —
+        # именно этот случай на ПК дважды увёл план в неверную сторону)
+        card = _truthful_fail(tid, card, "heartbeat_timeout", task=it)
         cm = bc.complete_task(tid, "failed", card[:RESULT_MAX])
         log.warning("ORPHAN id=%s: in_progress без heartbeat %sс → честный failed (bridge_ok=%s)",
                     tid, int(age), cm.get("ok"))
@@ -3532,6 +3596,7 @@ def process_new():
             _dec_plan_and_fanout(tid, text, frm=str(task.get("from") or ""))
             return
 
+    _LAST_RUN.clear()          # правда статуса: канал кода причины чист ДО вызова (см. _LAST_RUN)
     status, result = run_task(tid, text, task_timeout=_task_timeout(task))
     if status == "requeue":
         # чужой плановый рестарт погасил задачу на старте → вернуть в new (слой 2 фикса 122)
@@ -3556,6 +3621,13 @@ def process_new():
         # терминальный failed с диагнозом); False = прежний путь.
         if status == "failed" and _maybe_selfheal(tid, text, result, frm=str(task.get("from") or "")):
             return
+        # ПРАВДА СТАТУСА: думатель за задачу не взялся → это ТЕРМИНАЛЬНЫЙ провал, по нему будут
+        # планировать. Обрамляем кодом причины и следами работы в окне. Порядок важен: думатель
+        # видит ИСХОДНЫЙ текст (его ⏱-гейт и формулировки не тронуты), обрамление — только в
+        # том, что уходит в очередь и на глаза владельцу. Терминалы САМОГО думателя (halt /
+        # повторный провал перерождения) обрамляются у себя, тем же _truthful_fail_last.
+        if status == "failed":
+            result = _truthful_fail_last(tid, result, task=task)
         # FACT-верификация (R11–R15, смягчено 20.07.2026): dev-done без блока FACT: НЕ мутирует
         # сохранённый result (инвариант «финал байт-в-байт») и НЕ форсирует куратора (CURATOR_SCOPE
         # цел). Видимость ⚠️ unverified даёт devbot в ТЕКСТЕ карточки 328 недеструктивно (по
@@ -3589,8 +3661,11 @@ def process_na_reminders():
         age = (_age_sec(task.get("updated")) or 0)
         if age > NA_LIFETIME:
             log.info("NEEDS_APPROVAL VPS id=%s hard-cap >%ss=24ч → failed", tid, NA_LIFETIME)
-            bc.complete_task(tid, "failed",
-                             "подтверждение не получено за 24ч — задача провалена (hard cap)")
+            # ТОТ ЖЕ класс, что задача 54 на ПК: работа сделана, сгорело подтверждение —
+            # статус обязан назвать причину кодом и показать следы, а не молчать «провалена»
+            bc.complete_task(tid, "failed", _truthful_fail(
+                tid, "подтверждение не получено за 24ч — задача провалена (hard cap)",
+                "approval_timeout", task=task))
             _na_reminded.discard(tid)
             _maybe_dec_after(task.get("task_text"), "failed")
         elif age > NA_REMINDER_SEC and tid not in _na_reminded:

@@ -28,6 +28,10 @@
 GUARD (инцидент 17.07.2026): write_cclog() и main() проверяют length-monotonic инвариант перед
 write_doc: новый контент НИКОГДА не короче старого — если короче, запись отклоняется с алертом в 328.
 Единый канонический путь: write_cclog() или main() через cclog.py — НЕ прямой write_doc(name="cc_log").
+
+РЕЕСТР СЛЕДОВ (30.07.2026, зеркало ПК-фикса «статус не должен врать»): каждая УСПЕШНАЯ запись
+оставляет строку в cc_log_ledger.jsonl (status_truth.ledger_append). Раньше следа «журнал записан»
+не было вовсе — и когда задача падала по таймауту, доказать выполненную работу было нечем.
 """
 import sys
 import os
@@ -37,6 +41,8 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 from bridge_client import BridgeClient
+import status_truth
+import task_metrics
 
 
 def _channel() -> str:
@@ -118,6 +124,18 @@ def _ensure_pulse_hhmm(pulse: str, now=None) -> str:
         hhmm = now.strftime("%H:%M")
         return re.sub(r"^(\d{4}-\d{2}-\d{2})", r"\1 " + hhmm, pulse, count=1)
     return pulse
+
+
+def _note_written(kind: str, entry: str, label: str = "") -> None:
+    """РЕЕСТР УСПЕШНЫХ ЗАПИСЕЙ (зеркало ПК-фикса, 30.07.2026). До него следа «журнал записан»
+    не существовало вовсе: cclog писал в мозг и молчал — а когда задача потом падала по таймауту,
+    доказать, что работа была, оказывалось нечем. Отмечаем ТОЛЬКО после ok от моста (реестр
+    обещаний, а не намерений). Под тест-прогоном боевой реестр НЕ трогаем (класс METRICS-мусора
+    25.07: тестовые строки неотличимы от живых). Любой сбой реестра проглатывается внутри
+    ledger_append — запись в журнал уже состоялась, след её отменить не может."""
+    if task_metrics.under_test((sys.argv[0] if sys.argv else ""), os.environ, sys.modules):
+        return
+    status_truth.ledger_append(kind, entry, label=label)
 
 
 def _make_entry(kind: str, text: str, now=None, label: str = "") -> str:
@@ -205,6 +223,7 @@ def write_cclog(kind: str = "DONE", text: str = "", pulse=None,
     if not w.get("ok"):
         print(f"write_cclog: WRITE FAIL: {w}", file=sys.stderr)
         return False
+    _note_written(kind, entry, label=label or _channel())
     if pulse is not None:
         pulse_str = _ensure_pulse_hhmm(str(pulse))
         bridge.write_doc(text=pulse_str, name="pulse")
@@ -260,6 +279,7 @@ def main(argv) -> int:
     if not w.get("ok"):
         print("cclog: WRITE FAIL:", w, file=sys.stderr)
         return 1
+    _note_written(kind, line, label=label)
     print(f"cclog: OK cc_log ← {line}  (old={len(old)} → new={len(new)})")
 
     if pulse is not None:
