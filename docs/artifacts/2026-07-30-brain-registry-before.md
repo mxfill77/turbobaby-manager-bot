@@ -81,6 +81,99 @@ Brain, в подпапки). → **Нужен ручной перенос вла
 2. Либо новый эндпоинт `unregister_brain_doc` в `ReadDocs.js` + `clasp push` + `clasp redeploy`
    прод-деплоя — это красная зона (деплой Apps Script) и отдельная задача.
 
+## ЗАХОД 2 — 2026-07-30 ~09:02 UTC (повторная попытка «доправить реестр»)
+
+Задача пришла с посылкой «с ПК невозможно — у моста нет удаления ключа, **только `setupBrain`
+на сервере**». Посылка проверена и оказалась НЕВЕРНОЙ по трём независимым причинам (ниже).
+Реестр в этом заходе **не изменился**: 27 ключей до = 27 после.
+
+### 1. Живое чтение реестра ДО (дословный вывод `list_brain`)
+
+    ok = True | error = None
+    ВСЕГО КЛЮЧЕЙ: 27
+     1  cc_log                     1464zaINaLnOwXMsHNaEyy-4FpuQCVTYF
+     2  cc_log_archive             1haE-9OFgs1-ZeH-fV1g1mIxxM3L_BLYq
+     3  cc_userbot_log             1yqzVrSFRN-1Zr3y6kprn71c-T-1xTl1qfO1BzA-Rihg
+     4  cowork_log                 1s9Fy3xm4FB99ah9xovLjYIMOjnDKz3Jc
+     5  cowork_log_archive         1UC-fKIpjb2zwzrvCsbJjBxmgglmSlj46
+     6  cowork_log_test            1zGPT5DqNdUT8FOrOxsVI8-mI7sZjz3kU
+     7  cowork_log_test_archive    1HvhvlxKFPiHUYlMp41yQL0-50q4Dv_zq
+     8  executors_map              1NyfcErxNt09CH8JB-V0in9e-UQB-K4_uJrwZ-FG3Za8
+     9  faq                        1tv8Y-K3gLyT9Y0mXyYXZLf2c2rEzPMLHPzvg4lGqs98
+    10  folder_id                  1uWqHsxk7aEWoSNqaUBMmqkYOh2UKYLkY
+    11  index                      1-bH3b6c_oamqST551iLxn-voSDragdV0rUZkFwgmAqc
+    12  infra                      1z2wS0I0nm-dJGqF3RRpOXlEkTKwLOsuF
+    13  knowledge_base             1Mv_zi1P33jNM0MFUBX_UEf9CnzOvCFeZ
+    14  orchestrator_plan          1_ogUGFim24Ifw60mSsfcONFc8hXMPzw539oXTbhGggo
+    15  orchestrator_safety        1UB1MWs8ZQWDkwHYBqNgK7UyVD4dkPKYdEVYo3IM2-Zs
+    16  park_list                  1jD3VJGeoET8Yf5ma6iZPmwwmuw_yIYyP2A4N5RAEZho
+    17  payments_plan              13WtxQaDLdixR4EsjUFimtNhESn9nFDtk
+    18  project_state              1fuptOFp2bqZva7eJRlEanaCO6eRkAO20
+    19  pulse                      1v3ezYbEeI1kGNQFI6xi8mDhnM9uE3YSE
+    20  review                     1vDfD_n8i-8cSvJmqqvvEaLZ1YC639-in
+    21  review_archive             1K0gPMOyM-ER7nweda8-f9MK3edbepYCniZpQy0HkpAA
+    22  roadmap_master             1Z70EpgGZmaYMaZ064sXQlCCP8z8sFyZWfzVPvRB4jWE
+    23  rules                      1AnBAniKQtrpJQevVWlzxVrdb1n51aj1G
+    24  sessions_log               1gNFRnHv09SKeagkGA3moG0VNlzffECeh
+    25  sessions_log_archive       1D-iq-Rp1g_RC9uYzqsjPJtmw6TY0l6cV
+    26  state_model                1OGUzeb60UbzAaCOsLNR_aBKFy-blfdn-
+    27  turbobaby_faq              1tv8Y-K3gLyT9Y0mXyYXZLf2c2rEzPMLHPzvg4lGqs98
+
+Совпадает с таблицей «Состояние ДО» выше ключ-в-ключ и id-в-id (26 доков + `folder_id`).
+
+### 2. Пробы файлов (дословно)
+
+    booking_flow             11HvMKGZRdSo...  ok=True  error=None        chars=6501
+    collect_booking_spec     1PZ7TeEQJLtz...  ok=True  error=None        chars=4553
+    roadmap_master(мёртвый)  1Z70EpgGZmaY...  ok=False error=read_failed chars=0
+      (Bridge: «Es konnte kein Element mit der angegebenen ID gefunden werden» — файла нет)
+
+Полные id живых спеков: `11HvMKGZRdSoRjojvAcmpN6_KJzkc1eRlIIx12JW6DQU` (KB_booking_flow),
+`1PZ7TeEQJLtzrw66Ll3PZBXIw-K70dnkh-3ClxDEMW48` (KB_collect_booking_spec).
+
+### 3. Попытка регистрации (дословно) — тот же отказ, что и в заходе 1
+
+    register_brain_doc(booking_flow) -> {"action":"register_brain_doc","ok":false,
+      "error":"not_in_brain","id":"11HvMKGZRdSoRjojvAcmpN6_KJzkc1eRlIIx12JW6DQU",
+      "title":"KB_booking_flow","_status":200}
+    register_brain_doc(collect_booking_spec) -> {"action":"register_brain_doc","ok":false,
+      "error":"not_in_brain","id":"1PZ7TeEQJLtzrw66Ll3PZBXIw-K70dnkh-3ClxDEMW48",
+      "title":"KB_collect_booking_spec","_status":200}
+
+Файлы существуют и читаются (имена верные), но лежат ВНЕ папки «TurboBaby Brain»
+(`folder_id 1uWqHsxk7aEWoSNqaUBMmqkYOh2UKYLkY`) → срабатывает защита `registerBrainDoc_`.
+
+### 4. Почему `setupBrain` тут НЕ помощник (разбор посылки задачи)
+
+1. **Его нечем позвать с сервера.** В роутере `Bridge.js` действия `setup_brain` НЕТ
+   (есть только `setup_prune_trigger` / `setup_review_prune_trigger` /
+   `setup_sessions_prune_trigger`). `setupBrain()` запускается ТОЛЬКО из редактора
+   Apps Script; программный запуск = Apps Script API (`clasp run`) = красная зона.
+2. **Он не удаляет ключи.** `setupBrain` читает текущий манифест (`getBrainManifest_()`),
+   доливает в него свои ключи и пишет обратно — `roadmap_master` переживёт запуск.
+   Сверено по ВСЕМ 10 местам записи манифеста в проекте (`Archive.js` ×3, `ReadDocs.js` ×7):
+   все до одного — merge «прочитал → поставил один ключ → записал». `deleteProperty` во всём
+   проекте Bridge не встречается НИ РАЗУ (`grep -rn deleteProperty` → пусто).
+3. **Он опасен для текстов.** `setupBrain` перезаписывает содержимое четырёх base-доков
+   (`KB_knowledge_base`/`KB_project_state`/`KB_faq`/`KB_park_list`) из `.md`-исходников,
+   лежащих в папке Brain, и пересобирает `KB_index` — то есть нарушил бы границу задачи
+   «тексты не править». **Запускать его ради чистки реестра нельзя.**
+
+### 5. Что реально нужно (обе правки — рука владельца, ~3 минуты)
+
+- **Снять `roadmap_master`:** редактор Apps Script проекта «TurboBaby Bridge» →
+  ⚙ Project Settings → Script Properties → свойство `BRAIN_MANIFEST` → удалить из JSON пару
+  `"roadmap_master": "1Z70EpgGZmaYMaZ064sXQlCCP8z8sFyZWfzVPvRB4jWE",` → Save.
+  (Альтернатива без ручного JSON: завести эндпоинт `unregister_brain_doc` + `clasp push` +
+  `clasp redeploy` прод-деплоя — красная зона, отдельная задача.)
+- **Добавить два спека:** в Google Drive перетащить `KB_booking_flow` и
+  `KB_collect_booking_spec` в папку «TurboBaby Brain» (в корень папки, не в `_archive`).
+  После этого регистрация проходит С СЕРВЕРА штатно, без деплоя — команда:
+  `venv/bin/python3 cclog.py` не нужен, достаточно одной задачи «тз: зарегистрируй
+  booking_flow и collect_booking_spec в реестре мозга».
+
+Порядок между этими двумя действиями любой, они независимы.
+
 ## ОТКАТ
 
 - **Снять лишний ключ** (если регистрация двух спеков окажется нежелательной) — тем же ручным
