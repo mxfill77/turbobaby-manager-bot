@@ -56,10 +56,17 @@ red = os.path.join(TMP, "fx_red_live.py")
 # и «red-конверт» проверялся на несуществующей карточке. Литерал операции — конкатенацией
 # (иначе гард краснеет на самом файле теста).
 FLEET_OIL = "set_fleet_" + "oil"
+# СМЕНА ВЕЗУЩЕЙ ФИКСТУРЫ (01.08.2026). Этому тесту нужен ЛЮБОЙ красный конверт с кнопкой — он про
+# разбор формы команды (heredoc/компаунд/инфо-флаги), а не про доктрину живых таблиц. Прежний
+# носитель `set_fleet_oil(number='6789', oil_km=27000)` больше конверта НЕ даёт и не должен: с
+# 01.08 запись в живые таблицы по сущности без пометки ТЕСТ — жёсткий блок (deny, кнопки нет),
+# см. tests/test_probe_isolation.py. Берём денежную проводку: у неё тоже есть ОБЪЕКТ и ЧИСЛО,
+# карточка живёт, а ужесточению деньги намеренно не подлежат (сущности они не несут).
+MONEY_CALL = "add_trans" + "action(group='Наличка', amount=-500)"
 with open(red, "w", encoding="utf-8") as f:
-    f.write("# фикстура регресса\nbridge." + FLEET_OIL + "(number='6789', oil_km=27000)\n")
+    f.write("# фикстура регресса\nbridge." + MONEY_CALL + "\n")
 r = run(PY + " " + red)
-res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout, "python с red-токеном → red-конверт"))
+res.append(ok('"ask"' in r.stdout and "Cashflow" in r.stdout, "python с red-токеном → red-конверт"))
 missing = os.path.join(TMP, "fx_absent.py")
 r = run(PY + " " + missing)
 res.append(ok(r.returncode == 0 and '"ask"' not in r.stdout,
@@ -132,7 +139,7 @@ for label, cmd, want in [
     ("голый <<MSG (шелл РАСКРЫВАЕТ тело) → блок как раньше",
      "git commit -q -F /dev/stdin <<MSG\nтекст про " + SECRETS + "\nMSG", '"deny"'),
     ("тело bash <<'EOF' читает ИНТЕРПРЕТАТОР → red как раньше",
-     "bash <<'EOF'\n" + PY + " -c \"bridge." + FLEET_OIL + "(number='6789', oil_km=27000)\"\nEOF", '"ask"'),
+     "bash <<'EOF'\n" + PY + " -c \"bridge." + MONEY_CALL + "\"\nEOF", '"ask"'),
     ("нет терминатора → команда как есть (блок)",
      "git commit -q -F /dev/stdin <<'MSG'\nтекст про " + SECRETS, '"deny"'),
     ("после терминатора — боевой процесс → жёсткий блок",

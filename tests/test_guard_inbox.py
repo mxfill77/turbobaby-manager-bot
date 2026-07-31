@@ -31,7 +31,11 @@ res = []
 
 # Тест-моды глушат send_card ДО сети — для мок-проверок маршрута снимаем их явно
 # (импорт notify как тест-entrypoint ставит PRETOOL_NOPUSH через setdefault).
-os.environ.pop("PRETOOL_NOPUSH", None)
+# 01.08.2026: снимаем ВСЕ имена тест-прогона, а не одно. Признак пробы стал ЕДИНЫМ для обоих
+# каналов владельца (pretool_guard.is_probe/isolated), и гейт отдаёт тестам ещё ORCH_TEST_MODE —
+# при нём _edit глушится так же, как при NOPUSH, и секция (5) мерила бы пустоту вместо маршрута.
+for _flag in ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PYTEST_CURRENT_TEST"):
+    os.environ.pop(_flag, None)
 os.environ.pop("NOTIFY_COUNT_FILE", None)
 os.environ["INBOX_TOPIC_ID"] = str(INBOX)   # override: load_dotenv существующий env НЕ перекрывает
 

@@ -12,10 +12,21 @@
 
 ЧТО СЧИТАЕМ (порядок повторяет main() гарда, ничего не исполняя):
   hard    — kind=block (процессы/секреты) → deny, карточки владельцу НЕТ, но и команда НЕ пройдёт;
-  entity  — red + живая сущность → deny (маркер blocktype=hard, задача закрывается failed);
+  entity  — red + сущность без пометки ТЕСТ → deny (маркер blocktype=hard, задача failed);
+  probe   — карточка РОДИЛАСЬ БЫ, но команда — проба → перехват на границе, владельцу НЕ уходит;
   card    — red + card_gate() → КАРТОЧКА ВЛАДЕЛЬЦУ (пуш + маркер-конверт демону) ← главное число;
   journal — red без объекта → ask + строка card_skipped (владельцу молчим);
   defer   — green/ambiguous → штатные слои settings.
+
+ЗАЧЕМ КОРЗИНА `probe` (01.08.2026). Вопрос «сколько боевых карточек за сутки родилось из ПРОБ, а не
+из настоящих команд» инструмент раньше ответить не мог: проба и бой попадали в одну корзину `card`,
+и владелец видел одинаковые карточки, не различая источник. Теперь это отдельное число — им и
+меряется эффект изоляции: до фикса весь `probe` уходил владельцу как `card`, после — ноль.
+ВАЖНО: «проба» здесь считается ТОЛЬКО по САМОЙ КОМАНДЕ (env-префикс в её тексте или тест-путь
+скрипта), а НЕ по окружению процесса-замерщика — иначе замер, запущенный из тест-окружения или из
+гейта (там стоит PRETOOL_NOPUSH=1), объявил бы пробами ВСЕ команды подряд и показал бы красивый
+ноль на пустом месте. Это ровно тот же класс «мок ≠ живой формат»: считаем то, что видел бы хук в
+ЖИВОЙ задаче, где демон тест-флаги из окружения снимает.
 
 Запуск: venv/bin/python3 guard_replay.py [--hours 24] [--verbose] [--self-test]
 Ничего не пишет, ничего не пушит (PRETOOL_NOPUSH=1 ставится себе же на всякий случай).
@@ -24,7 +35,7 @@ import os, sys, json, glob, time, argparse, tempfile, shutil
 
 PROJECT = "/root/turbobaby-manager-bot"
 TRANSCRIPTS = "/root/.claude/projects/-root-turbobaby-manager-bot"
-BUCKETS = ("hard", "entity", "card", "journal", "defer")
+BUCKETS = ("hard", "entity", "probe", "card", "journal", "defer")
 
 os.environ.setdefault("PRETOOL_NOPUSH", "1")
 sys.path.insert(0, PROJECT)
@@ -73,6 +84,15 @@ def iter_commands(hours=24.0, root=TRANSCRIPTS, now=None):
             continue
 
 
+def probe_of_command(cmd):
+    """Проба ли ЭТА КОМАНДА — по признакам, которые видны В НЕЙ САМОЙ (env-префикс в тексте, путь
+    тест-скрипта). Окружение процесса-замерщика НЕ смотрим сознательно: см. шапку модуля."""
+    try:
+        return bool(G._cmd_declares_probe(cmd) or G._is_test_script(cmd))
+    except Exception:
+        return False                                      # сомнение → считаем боем (число не занижаем)
+
+
 def verdict(cmd, cwd=PROJECT):
     """→ (bucket, hit). Повторяет порядок решений main() гарда, НИЧЕГО не исполняя и не записывая."""
     try:
@@ -86,7 +106,10 @@ def verdict(cmd, cwd=PROJECT):
     if G._entity_blocktype(hit, blob) == "hard":
         return "entity", hit
     obj, num = G.card_min(hit, blob)
-    return ("card" if G.card_gate(hit, obj, num) else "journal"), hit
+    if not G.card_gate(hit, obj, num):
+        return "journal", hit
+    # Карточка родилась бы. Ушла бы она владельцу — решает признак пробы, и ТОЛЬКО он.
+    return ("probe" if probe_of_command(cmd) else "card"), hit
 
 
 def replay(hours=24.0, root=TRANSCRIPTS, now=None):
@@ -103,18 +126,28 @@ def replay(hours=24.0, root=TRANSCRIPTS, now=None):
 
 def _self_test():
     """Проверяет САМ ИНСТРУМЕНТ (разбор транскрипта + раскладка по корзинам) на синтетике."""
-    d = tempfile.mkdtemp(prefix="guard_replay_st_")
+    # Прямые слэши в пути фикстур: гард разбирает команду через shlex в POSIX-режиме, и обратный
+    # слэш там — экранирование. На сервере это НО-ОП (разделитель и так «/»), а на ПК-полосе без
+    # него самопроверка инструмента ложно краснела бы — притом что серверная логика цела. Тот же
+    # приём и та же причина, что в tests/test_guard_card_min.py (TMP = mkdtemp().replace(...)).
+    d = tempfile.mkdtemp(prefix="guard_replay_st_").replace(os.sep, "/")
     fails = []
     try:
-        red = os.path.join(d, "fx.py")
-        with open(red, "w", encoding="utf-8") as f:                  # живой формат: объект+число
+        # ЖИВОЙ формат полей Bridge (number=/wallet=), не идеализированный plate=/client=.
+        live = d + "/fx_live.py"       # склейка через «/», не os.path.join — см. коммент выше
+        with open(live, "w", encoding="utf-8") as f:      # байк без пометки ТЕСТ → жёсткий блок
             f.write("bridge.set_fleet_" + "oil(number='6789', oil_km=27000)\n")
+        money = d + "/fx_money.py"
+        with open(money, "w", encoding="utf-8") as f:     # деньги → мягко, объект+число есть → карточка
+            f.write("bridge.add_trans" + "action(amount=500, wallet='main')\n")
         cmds = [
             "grep -n foo /root/turbobaby-manager-bot/splinter.py",   # defer
-            "%s/venv/bin/python3 %s" % (PROJECT, red),               # card
+            "%s/venv/bin/python3 %s" % (PROJECT, live),              # entity (сущность без ТЕСТ)
+            "%s/venv/bin/python3 %s" % (PROJECT, money),             # card (боевая карточка владельцу)
+            "PRETOOL_TEST_RUN=1 %s/venv/bin/python3 %s" % (PROJECT, money),   # probe (перехват)
             "cat /root/turbobaby-manager-bot/.env",                  # hard (секреты)
         ]
-        p = os.path.join(d, "sess1234.jsonl")
+        p = d + "/sess1234.jsonl"
         with open(p, "w", encoding="utf-8") as f:
             for i, c in enumerate(cmds):
                 f.write(json.dumps({
@@ -128,7 +161,8 @@ def _self_test():
         now = time.mktime(time.strptime("2026-07-30T10:30:00", "%Y-%m-%dT%H:%M:%S")) - time.timezone
         counts, rows = replay(hours=1.0, root=d, now=now)
         for label, got, want in (("defer", counts["defer"], 1), ("card", counts["card"], 1),
-                                 ("hard", counts["hard"], 1), ("rows", len(rows), 2)):
+                                 ("entity", counts["entity"], 1), ("probe", counts["probe"], 1),
+                                 ("hard", counts["hard"], 1), ("rows", len(rows), 4)):
             if got != want:
                 fails.append("%s: %s != %s" % (label, got, want))
         # окно РЕЖЕТ: сдвигаем «сейчас» на сутки вперёд — записей в часовом окне нет
@@ -161,6 +195,11 @@ def main():
         print("  %-8s %d" % (b, counts[b]))
     print("КАРТОЧЕК ВЛАДЕЛЬЦУ: %d | жёстких блоков: %d | в журнал: %d"
           % (counts["card"], counts["hard"], counts["journal"]))
+    print("ИЗ ПРОБ (перехвачено на границе, владельцу НЕ ушло): %d" % counts["probe"])
+    reached = counts["card"] + counts["probe"]
+    if reached:
+        print("  доля проб среди рождавшихся карточек: %d из %d (%.0f%%)"
+              % (counts["probe"], reached, 100.0 * counts["probe"] / reached))
     if a.verbose:
         print("--- не-defer построчно ---")
         for ts, session, b, hit, cmd in rows:

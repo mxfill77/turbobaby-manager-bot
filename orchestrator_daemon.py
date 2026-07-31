@@ -1297,8 +1297,14 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
     # Фикс утечки тест-флагов (17.07.2026): ORCH_TEST_MODE=1/PRETOOL_NOPUSH=1 могут попасть в
     # os.environ демона если он был запущен из тест-окружения (gate.py не изолирует parent env).
     # В боевом child_env тест-флаги НИКОГДА не нужны: ban-сеть и mute-пуши ломают нормальные задачи.
-    child_env.pop("ORCH_TEST_MODE", None)
-    child_env.pop("PRETOOL_NOPUSH", None)
+    # 01.08.2026 — СНИМАЕМ ВСЕ ЧЕТЫРЕ ИМЕНИ, а не два. Гард считает тест-прогоном любое из
+    # pretool_guard._TEST_RUN_ENVS, и с 01.08 это же множество глушит ОБА канала владельца
+    # (прямой пуш + маркер демону). Пока чистились только два имени, протёкший в окружение демона
+    # PRETOOL_TEST_RUN или PYTEST_CURRENT_TEST молча увёл бы маркер ЖИВОЙ задачи в тест-каталог, и
+    # владелец не увидел бы красной карточки вовсе — тихая потеря вместо лишнего вопроса.
+    # Список держать РАВНЫМ pretool_guard._TEST_RUN_ENVS: разъедутся — вернётся ровно этот класс.
+    for _test_flag in ("ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PRETOOL_TEST_RUN", "PYTEST_CURRENT_TEST"):
+        child_env.pop(_test_flag, None)
     # Гейт-алерты только на финальном прогоне (хвост §7, 12.07.2026): внутри headless-задачи
     # промежуточные красные прогоны gate.py — штатный red-fix-green цикл, НЕ шум владельцу.
     # Флаг велит gate.py молчать в Telegram на НЕ-финальных прогонах; финальный pre-push зовёт
@@ -1795,8 +1801,9 @@ def _thinker_exec(prompt, timeout, tag):
     child_env.setdefault("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     child_env.pop("ANTHROPIC_API_KEY", None)   # как в run_task: идём по ~/.claude, не по платному API
     child_env.pop("OPENAI_API_KEY", None)
-    child_env.pop("ORCH_TEST_MODE", None)      # фикс 17.07: тест-флаги не утекают в дочерние
-    child_env.pop("PRETOOL_NOPUSH", None)
+    # фикс 17.07: тест-флаги не утекают в дочерние; 01.08 — все четыре имени, см. run_task
+    for _test_flag in ("ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PRETOOL_TEST_RUN", "PYTEST_CURRENT_TEST"):
+        child_env.pop(_test_flag, None)
     cmd = [CLAUDE_BIN, "-p",
            "--model", ORCH_MODEL,
            "--fallback-model", ORCH_MODEL_FALLBACK,

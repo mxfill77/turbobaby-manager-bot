@@ -86,12 +86,17 @@ red = os.path.join(TMP, "fx_red_live.py")
 # ЖИВОЙ вызов с ОБЪЕКТОМ и ЧИСЛОМ: с 28.07.2026 красная карточка без них не собирается вовсе
 # (минимум карточки, tests/test_guard_card_min.py) — на безобъектной фикстуре проверять «каждый
 # red пушится» стало нечем. Литерал операции — конкатенацией (иначе гард краснеет на тесте).
-FLEET_OIL = "set_fleet_" + "oil"
+# СМЕНА ВЕЗУЩЕЙ ФИКСТУРЫ (01.08.2026): тест про ДЕДУП красных конвертов, а не про доктрину живых
+# таблиц. Прежний носитель `set_fleet_oil(number='6789', oil_km=27000)` конверта больше не даёт —
+# с 01.08 это жёсткий блок (запись в живые таблицы по сущности без пометки ТЕСТ), см.
+# tests/test_probe_isolation.py. Денежная проводка несёт и объект, и число, карточка живёт,
+# а деньги ужесточению намеренно не подлежат.
+MONEY_CALL = "add_trans" + "action(group='Наличка', amount=-500)"
 with open(red, "w", encoding="utf-8") as f:
-    f.write("# фикстура регресса\nbridge." + FLEET_OIL + "(number='6789', oil_km=27000)\n")
+    f.write("# фикстура регресса\nbridge." + MONEY_CALL + "\n")
 for _ in range(2):
     r = run(PY + " " + red, session="s-red", count_file=cnt_red, nopush=False)
-res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout, "red-скрипт → конверт с операцией (ask)"))
+res.append(ok('"ask"' in r.stdout and "Cashflow" in r.stdout, "red-скрипт → конверт с операцией (ask)"))
 res.append(ok("Повтор:" not in r.stdout and "не распознал операцию" not in r.stdout,
               "в конверте нет счётчика ×N и нет формулировки ambiguous"))
 res.append(ok(len(lines(cnt_red)) == 2 and not any(t.startswith("EDIT ") for t in lines(cnt_red)),
@@ -99,7 +104,7 @@ res.append(ok(len(lines(cnt_red)) == 2 and not any(t.startswith("EDIT ") for t i
 
 print("(4) defer не ослабил red: ambiguous-звено не заслоняет красное читаемое:")
 r = run(PY + " " + red + " && " + PY + " " + missing, session="s-mix")
-res.append(ok('"ask"' in r.stdout and "Лист1" in r.stdout,
+res.append(ok('"ask"' in r.stdout and "Cashflow" in r.stdout,
               "компаунд red.py && нечитаемый.py → конверт по red"))
 
 shutil.rmtree(TMP, ignore_errors=True)
