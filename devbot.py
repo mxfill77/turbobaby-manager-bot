@@ -377,15 +377,10 @@ _APPROVAL_RE = re.compile(r"^(да|нет|yes|no)\b[\s,.:]*#?\s*(\d+)\s*$", re.I
 _YES = ("да", "yes")
 
 
-def _try_approval_reply(text, bridge):
-    """«да N» → approve_task(N); «нет N» → complete_task(N, failed). Иначе None.
-    Проверяется ПЕРВОЙ в handle_command (специфичный паттерн ответа на запрос подтверждения)."""
-    m = _APPROVAL_RE.match((text or "").strip())
-    if not m:
-        return None
-    word = m.group(1).lower()
-    qid = int(m.group(2))
-    if word in _YES:
+def _apply_verdict(bridge, qid, yes):
+    """Применить решение владельца к задаче qid. ТЕЛО ЛЕГАСИ-ПУТИ «да N»/«нет N» — вынесено
+    дословно, чтобы новая форма ответа (с названным объектом) исполнялась ТЕМ ЖЕ кодом."""
+    if yes:
         r = bridge.approve_task(qid, "Filipp")
         if r.get("ok"):
             _forget_seen(_reported, qid)   # пусть дальнейший done/failed по ней отрапортуется штатно
@@ -403,6 +398,205 @@ def _try_approval_reply(text, bridge):
             _mark_seen_by_id(_reported, qid)   # уже сообщили «отклонена» — не дублируем failed-рапортом
             return f"🚫 Задача {qid} отклонена — статус failed."
         return f"🤖 Не удалось отклонить задачу {qid}: {r.get('error')}"
+
+
+# ===== ОТВЕТ С НАЗВАННЫМ ОБЪЕКТОМ (31.07.2026, инцидент карточки 95) =====
+# ЖИВОЙ ФАКТ: 31.07 09:23 и 09:24 UTC владелец ДВАЖДЫ ответил на карточку задачи 95 текстом
+# «да systemctl restart splinter» (первый раз обычным сообщением, второй — реплаем на карточку).
+# Приёмник знал ТОЛЬКО «да N»/«нет N» → оба раза выдал общую справку и ответ не принял. Доктрина
+# требует, чтобы операции высшего вида подтверждались ответом с НАЗВАННЫМ ОБЪЕКТОМ, а не коротким
+# «да N» — но приёмник этой формы не знал вовсе, и правило жило только на бумаге.
+# ТЕПЕРЬ: «да|нет <объект>» привязывается к карточке ПО НОМЕРУ в тексте ИЛИ ПО РЕПЛАЮ на её
+# сообщение (номер вынимается ИЗ ТЕКСТА карточки — restart-proof, память процесса не нужна);
+# названный объект СВЕРЯЕТСЯ с объектами карточки; несовпадение и непонятая форма получают
+# КОНКРЕТНЫЙ отказ («не принято, потому что …» + что ожидалось), а не общую справку.
+# НЕ ТРОНУТО: «да N»/«нет N» (легаси _APPROVAL_RE → _apply_verdict, байт-в-байт) и кнопки ✅/❌.
+# ПОНЯТИЕ «высший вид карточки» НЕ ЗАВОДИМ (его в коде нет и не было): приёмник учится ФОРМЕ;
+# запрет короткого «да N» для высших операций — отдельное решение владельца, отдельным заходом.
+# ИЗОЛЯЦИЯ 328/PC: свободный текст с «да …» перехватывается ТОЛЬКО когда он реально привязан к
+# ОТКРЫТОЙ карточке (реплай или номер живой карточки); иначе — прежний путь байт-в-байт.
+
+# «да|нет [N] [объект]» — шапка ответа; объект = весь остаток (DOTALL: многострочный ответ не теряем)
+_VERDICT_HEAD_RE = re.compile(r"^(да|нет|yes|no)\b[\s,.:]*#?\s*(\d+)?\s*(.*)$", re.IGNORECASE | re.DOTALL)
+# номер карточки из ТЕКСТА сообщения, на которое ответили реплаем («⚠️ Задача 95 [vps] требует …»)
+_CARD_ID_RE = re.compile(r"задач[аиуе]\s*№?\s*(\d+)", re.IGNORECASE)
+# объект, названный в карточке: литерал в обратных кавычках (так его называет куратор/демон)
+_OBJ_BACKTICK_RE = re.compile(r"`([^`\n]{3,120})`")
+# … либо явная команда прямо в тексте карточки (карточки без обратных кавычек)
+_OBJ_CMD_RE = re.compile(
+    r"(systemctl\s+(?:restart|start|stop|disable|enable)\s+[\w.@-]+"
+    r"|clasp\s+(?:redeploy|push|deploy|run)"
+    r"|git\s+push"
+    r"|sqlite3\s+[\w./-]+)", re.IGNORECASE)
+# op-код карточки → каноническое имя объекта (зеркало AUTO_OPS демона)
+_OP_CANON = {"git_push": "git push", "restart_splinter": "systemctl restart splinter"}
+_OBJ_TRIM = " \t\n\r`'\"«»‘’“”.,:;!?()[]{}"
+_OBJ_MIN_CHARS = 4          # короче — не «названный объект», а обрывок пунктуации
+
+
+def _norm_obj(s):
+    """Нормализация объекта для сверки: снять кавычки/пунктуацию по краям, схлопнуть пробелы, lower."""
+    return re.sub(r"\s+", " ", str(s or "").strip(_OBJ_TRIM)).strip().lower()
+
+
+def _card_objects(card_text):
+    """Объекты, НАЗВАННЫЕ в карточке (порядок = приоритет показа): op-код → каноническая команда,
+    литералы в обратных кавычках, явные команды в тексте. Пусто → карточка объекта не называет,
+    сверять не с чем (это НЕ повод одобрить вслепую — см. вызывающий код)."""
+    w = str(card_text or "")
+    objs = []
+    m = _INBOX_OP_RE.search(w)
+    if m:
+        canon = _OP_CANON.get(m.group(1).lower())
+        if canon:
+            objs.append(canon)
+    objs.extend(_OBJ_BACKTICK_RE.findall(w))
+    objs.extend(_OBJ_CMD_RE.findall(w))
+    out, seen = [], set()
+    for o in objs:
+        k = _norm_obj(o)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(o.strip())
+    return out
+
+
+def _object_matches(named, card_objs):
+    """Названный владельцем объект совпал с объектом карточки → сам объект карточки, иначе None.
+    Совпадение — по нормализованному вхождению в любую сторону («restart splinter» засчитывается
+    против `systemctl restart splinter`): владелец доказывает, что ПРОЧИТАЛ карточку, а не диктует."""
+    n = _norm_obj(named)
+    if len(n) < _OBJ_MIN_CHARS:
+        return None
+    for o in card_objs:
+        c = _norm_obj(o)
+        if c and (n == c or n in c or c in n):
+            return o
+    return None
+
+
+def _card_id_from_text(t):
+    """Номер задачи из текста карточки, на которую ответили реплаем. Нет номера → None."""
+    m = _CARD_ID_RE.search(str(t or ""))
+    return int(m.group(1)) if m else None
+
+
+def _open_approval_cards(bridge):
+    """Открытые карточки needs_approval ОБЕИХ полос → (чтение удалось?, [items]). read-only."""
+    try:
+        r = bridge.get_pending("needs_approval", lane="all")
+    except Exception as e:
+        log.warning("devbot: чтение открытых карточек упало (%s)", e)
+        return False, []
+    if not r.get("ok"):
+        return False, []
+    return True, [it for it in (r.get("items") or []) if isinstance(it, dict)]
+
+
+def _open_ids_hint(items):
+    """Хвост-подсказка «какие карточки открыты» для конкретного отказа."""
+    ids = [str(it.get("id")) for it in items if it.get("id") is not None][:10]
+    if not ids:
+        return "Открытых карточек сейчас нет."
+    return "Открытые карточки: " + ", ".join(ids) + "."
+
+
+def _how_to_answer(qid=None, items=None):
+    """Подсказка «как ответить». Открыта РОВНО одна карточка → подставляем её номер вместо «N»,
+    чтобы владелец мог повторить ответ точно, не разыскивая id."""
+    if qid is None and items and len(items) == 1 and items[0].get("id") is not None:
+        qid = items[0].get("id")
+    n = qid if qid is not None else "N"
+    return (f"Как ответить: «да {n}» / «нет {n}», либо кнопкой ✅/❌ под карточкой, либо РЕПЛАЕМ на "
+            f"саму карточку — тогда можно с названным объектом («да systemctl restart splinter»).")
+
+
+def _named_object_reply(text, bridge, reply_text, lane):
+    """Новая форма ответа: «да|нет [N] [объект]». Возврат — текст ответа владельцу либо None
+    («это не ответ на карточку, обработай прежним путём»). Красное НЕ ослаблено: ничего не
+    исполняется, только approve/reject той же задачи, что и раньше."""
+    t = (text or "").strip()
+    head = _VERDICT_HEAD_RE.match(t)
+    owned = (lane == "inbox") or bool(reply_text)   # инбокс и реплай на карточку — наша территория
+    if not head:
+        return None                                  # нет «да»/«нет» в начале — это вообще не вердикт
+    word = head.group(1).lower()
+    yes = word in _YES
+    num = head.group(2)
+    obj = (head.group(3) or "").strip()
+    if not _norm_obj(obj):
+        obj = ""                                     # «да 95.» — хвост из пунктуации объектом не считаем
+    qid = int(num) if num else _card_id_from_text(reply_text)
+    ok_read, items = _open_approval_cards(bridge)
+    if qid is None:
+        if not owned:
+            return None                              # 328/PC: свободный текст не перехватываем
+        return ("🚫 Не принято, потому что не понял, к какой карточке относится ответ: номера в "
+                "тексте нет и это не реплай на карточку.\n"
+                + (_open_ids_hint(items) if ok_read else "Очередь сейчас не читается.") + "\n"
+                + _how_to_answer(items=items if ok_read else None))
+    item = next((it for it in items if str(it.get("id")) == str(qid)), None)
+    if not ok_read:
+        if not owned:
+            return None
+        return (f"🚫 Не принято, потому что очередь подтверждений сейчас не читается — сверить "
+                f"объект с карточкой {qid} не могу, вслепую не одобряю. Повтори через минуту "
+                f"или тапни ✅/❌ под карточкой.")
+    if item is None:
+        if not owned:
+            return None                              # 328: номер не от живой карточки → прежний путь
+        return (f"🚫 Не принято, потому что задачи {qid} нет среди открытых карточек (уже закрыта "
+                f"или номер не тот).\n" + _open_ids_hint(items))
+    if not obj:
+        return _apply_verdict(bridge, qid, yes)      # «да» + реплай = ровно то же, что «да N»
+    objs = _card_objects(str(item.get("result") or ""))
+    if not objs:
+        return (f"🚫 Не принято, потому что карточка задачи {qid} объект не называет (ни op-кода, "
+                f"ни команды в тексте) — сверить «{obj[:120]}» не с чем, а вслепую не одобряю.\n"
+                + _how_to_answer(qid))
+    hit = _object_matches(obj, objs)
+    if hit is None:
+        expected = " / ".join(f"«{o}»" for o in objs[:3])
+        return (f"🚫 Не принято, потому что названный объект не совпал: ты назвал «{obj[:120]}», "
+                f"а карточка задачи {qid} — про {expected}.\n"
+                f"Ожидалось: «{word} {qid} {objs[0]}» (либо «{word} {qid}» без объекта, либо кнопка).")
+    res = _apply_verdict(bridge, qid, yes)
+    return f"🔒 Объект сверён с карточкой {qid}: «{hit}».\n{res}"
+
+
+def _try_approval_reply(text, bridge, reply_text=None, lane=None):
+    """«да N» → approve_task(N); «нет N» → complete_task(N, failed) — ЛЕГАСИ, байт-в-байт.
+    Не подошло → новая форма «да|нет [N] [объект]» с привязкой по номеру ИЛИ по реплаю на
+    сообщение карточки (31.07.2026). Иначе None.
+    Проверяется ПЕРВОЙ в handle_command (специфичный паттерн ответа на запрос подтверждения).
+    FAIL-SAFE: любое исключение НОВОЙ ветки → None (прежнее поведение, не хуже)."""
+    m = _APPROVAL_RE.match((text or "").strip())
+    if m:
+        return _apply_verdict(bridge, int(m.group(2)), m.group(1).lower() in _YES)
+    try:
+        return _named_object_reply(text, bridge, reply_text, lane)
+    except Exception as e:
+        log.warning("devbot: разбор ответа с названным объектом упал (%s) — прежний путь", e)
+        return None
+
+
+def inbox_reject_hint(text, bridge):
+    """Тема-инбокс: текст, который приёмник НЕ понял → КОНКРЕТНОЕ «не принято, потому что …»
+    вместо общей справки (31.07.2026). Причина называется по форме самого текста."""
+    t = (text or "").strip()
+    if t.lower().startswith(_STRUCT_PREFIXES + _PC_TEXT_PREFIXES):
+        # постановка ТЗ/команды прилетела не в ту тему — причина конкретная, и адрес назван
+        return ("🚫 Не принято, потому что это тема-инбокс подтверждений, а не постановки: тут "
+                "принимаются только ответы на карточки. Команды и ТЗ — в тему 328 (полоса vps) "
+                "или PC-дев.")
+    ok_read, items = _open_approval_cards(bridge)
+    tail = ((_open_ids_hint(items) if ok_read else "Очередь сейчас не читается.") + "\n"
+            + _how_to_answer(items=items if ok_read else None))
+    if re.search(r"\d", t):
+        return ("🚫 Не принято, потому что в ответе нет решения: номер вижу, а «да» или «нет» — нет.\n"
+                + tail)
+    return ("🚫 Не принято, потому что это не похоже на ответ на карточку: нет ни «да»/«нет», "
+            "ни номера карточки, и это не реплай на карточку.\n" + tail)
 
 
 # ===================== РОУТЕР ТЕАТРА (кусок 3 «единый пульт», 07.07.2026) =====================
@@ -2010,7 +2204,11 @@ async def handle_command(msg, context, bridge) -> None:
     # 0) Ответ на запрос подтверждения «да N» / «нет N» — ПЕРВЫМ (специфичный паттерн).
     # Работает из 328, PC-дев И темы-инбокса (13.07.2026: карточки «ждут владельца» сходятся в
     # инбокс — ответ там же). Bridge — через to_thread (фикс 02.07): loop не встаёт, пока /exec тупит.
-    appr = await asyncio.to_thread(_try_approval_reply, msg.text or "", bridge)
+    # 31.07.2026: сюда же новая форма «да|нет <названный объект>» — привязка по номеру ИЛИ по
+    # РЕПЛАЮ на сообщение карточки, поэтому пробрасываем текст сообщения-адресата и полосу.
+    _r = getattr(msg, "reply_to_message", None)
+    reply_text = (getattr(_r, "text", None) or getattr(_r, "caption", None)) if _r else None
+    appr = await asyncio.to_thread(_try_approval_reply, msg.text or "", bridge, reply_text, lane)
     if appr is not None:
         for chunk in _chunks(appr):
             await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
@@ -2019,11 +2217,17 @@ async def handle_command(msg, context, bridge) -> None:
     # Тема-инбокс: команд/ТЗ/зелёного allowlist там НЕТ — только ответы на карточки.
     # Guard-карточки pretool_guard (интерактивное «жду да») тоже приходят сюда, но их «да» даётся
     # в терминале — «да N» применим только к задачам очереди с номером.
+    # 31.07.2026: вместо ОБЩЕЙ справки — конкретное «не принято, потому что …» по форме текста
+    # (инцидент карточки 95: два ответа владельца подряд отбиты справкой, причина не названа).
     if lane == "inbox":
-        await context.bot.send_message(
-            chat_id=msg.chat_id, message_thread_id=tid,
-            text=("🤖 Это тема-инбокс подтверждений: «да N» / «нет N» или кнопки под карточкой. "
-                  "Команды и ТЗ — в теме 328 (полоса vps) или PC-дев."))
+        try:
+            hint = await asyncio.to_thread(inbox_reject_hint, msg.text or "", bridge)
+        except Exception as e:                       # fail-safe: прежняя справка, не молчание
+            log.warning("devbot: конкретный отказ инбокса не собрался (%s)", e)
+            hint = ("🤖 Это тема-инбокс подтверждений: «да N» / «нет N» или кнопки под карточкой. "
+                    "Команды и ТЗ — в теме 328 (полоса vps) или PC-дев.")
+        for chunk in _chunks(hint):
+            await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
         return
 
     # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
