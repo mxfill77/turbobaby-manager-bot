@@ -251,22 +251,26 @@ res.append(ok("ТОЛЬКО в human" in OD.CURATOR_PREAMBLE and "НИКОГДА
 res.append(ok("смок" in OD.CURATOR_PREAMBLE and "clasp" in OD.CURATOR_PREAMBLE,
               "смок-шаги и clasp названы явно"))
 
-# (9) process_approved: ✅ владельца закрывает карточку done, БЕЗ конверта
+# (9) process_approved: ✅ владельца = РАЗРЕШЕНИЕ → задача на исполнение пунктов
+# ПЕРЕПИСАНО 31.07.2026 (класс карточек 95/100): прежний контракт «✅ → done без исполнения»
+# и был дефектом — «да» на операцию молча не рождало работы. Живой регресс на дословных
+# карточках 95/100 — tests/test_curator_human_exec.py.
 print("(9) ✅ на сводной карточке:")
 fb = setup()
 cid = fb.add("approved", "[куратор владельцу цель 42] нужно да",
              frm="Filipp-328-dec", result="🧑 нужно от владельца (цель 42)…\n1. нужно да")
 OD.process_approved()
-res.append(ok(fb.rows[cid]["status"] == "done" and "закрыта" in fb.rows[cid]["result"],
-              "✅ (approved) → карточка done «пункты приняты», без исполнения"))
-res.append(ok(fb.enq_calls == [] and not any("[конверт" in str(r["task_text"])
-                                             for r in fb.rows.values()),
-              "конверт op=other НЕ создан (пункты владельческие, headless их не берёт)"))
+res.append(ok(fb.rows[cid]["status"] == "done" and "задача id" in fb.rows[cid]["result"],
+              "✅ (approved) → карточка done со ссылкой на задачу-исполнителя"))
+res.append(ok(len(fb.enq_calls) == 1 and OD._is_convert(fb.enq_calls[0][1])
+              and "нужно да" in fb.enq_calls[0][1],
+              "задача поставлена, текст — конверт с пунктом (разрыв петли готовым контуром)"))
 fb = setup()
 cid = fb.add("approved", "[куратор владельцу цель 42] нужно да", frm="Filipp-328-dec",
              result="🧑 …", updated="2026-01-01T00:00:00+00:00")
 OD.process_approved()
-res.append(ok(fb.rows[cid]["status"] == "done" and "закрыта" in fb.rows[cid]["result"],
+res.append(ok(fb.rows[cid]["status"] == "done" and "истёк" not in fb.rows[cid]["result"]
+              and len(fb.enq_calls) == 1,
               "гвард ДО таймаута approved: старая карточка не гибнет «approve истёк»"))
 
 # (10) сирота new (демон упал между enqueue и set_needs_approval) → доводится с пунктом
