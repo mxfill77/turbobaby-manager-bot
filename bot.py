@@ -819,6 +819,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if splinter.GROUPS.get(chat_id) == "servicing":
             # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» в этой теме (дедуп, O(1) после первого раза)
             await splinter.ensure_info_pin(context, chat_id, _tid_sv)
+            # 0') ПРЕДЕЛ ЖИЗНИ ВОПРОСА О ПРОБЕГЕ (класс-фикс 4957, корень 5): протухший вопрос
+            #     снимаем ДО любого разбора — иначе он и ответ человека съедает молча (31.07 07:29 UTC),
+            #     и держит уступку голого числа в handle_service_result. Fail-safe внутри: сбой → поток как был.
+            try:
+                await splinter.expire_stale_mileage_question(context, chat_id, _tid_sv, msg.text)
+            except Exception:
+                log.exception("expire_stale_mileage_question error")
             # 0) ДВУХФАЗНЫЙ ТО (фаза 2): ответ механика по открытой заявке (готово/перечень/одометр),
             #    либо доверенное число вместо кнопки. Запись в Лист1 — ТОЛЬКО по «да» доверенного.
             if msg.text and await splinter.handle_service_result(msg, context, bridge, claude, msg.text):

@@ -519,6 +519,7 @@ VISION_RECEIPT_SYSTEM = """На фото — чек/квитанция ИЛИ к
 # === Буфер недавних фото-разборов (для вопросов "проверь фото резины/пробега") ===
 # {chat_id: [ {vis, sender, time}, ... ]} — храним последние N на группу
 import time as _time
+import hashlib as _hashlib   # подпись текста работы — разводит РАЗНЫЕ работы с одним стемом (класс 4957)
 from collections import deque
 _RECENT_PHOTOS = {}
 _RECENT_LIMIT = 12          # сколько последних фото помнить на группу
@@ -571,10 +572,28 @@ def _summary_acc(chat_id, topic_id):
     """Накопитель сводки для темы (создаёт/обновляет ts; протухший пересоздаёт)."""
     acc = _SVC_SUMMARY.get((chat_id, topic_id))
     if acc is None or _time.time() - acc.get("ts", 0) > _SVC_SUMMARY_TTL:
-        acc = {"current_km": "", "works": [], "works_km": "", "oil": None, "cols": []}
+        acc = {"current_km": "", "works": [], "works_km": "", "oil": None, "cols": [], "failed": []}
         _SVC_SUMMARY[(chat_id, topic_id)] = acc
+    acc.setdefault("failed", [])   # легаси-накопители (созданы до фикса) — не падать на .get
     acc["ts"] = _time.time()
     return acc
+
+
+def _summary_note_failed(chat_id, topic_id, failed):
+    """Работа НЕ записалась → это ВИДНО (класс-фикс 4957, корень 3). Кладём в накопитель, чтобы
+    сводка НАЗВАЛА потерю поимённо. Раньше провал записи был виден только в логе (а логи никто из
+    команды не читает) — «механик сдал четыре работы, записалась одна, и никто не узнал».
+    Fail-safe: нет chat_id / сбой накопителя → только лог, вызывающего не роняем."""
+    try:
+        if chat_id is None or not failed:
+            return
+        acc = _summary_acc(chat_id, topic_id)
+        for w, why in failed:
+            item = (str(w), str(why))
+            if item not in acc["failed"]:
+                acc["failed"].append(item)
+    except Exception:
+        log.exception("  → пометка «не записалось» в накопитель сбоила (лог остаётся)")
 
 
 async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False):
@@ -585,7 +604,10 @@ async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False):
     acc = _SVC_SUMMARY.pop((chat_id, topic_id), None)
     if not acc:
         return None
-    has = bool(acc.get("works") or acc.get("cols") or (acc.get("oil") and not skip_oil))
+    # failed в условии — обязательно: если ВСЕ работы провалились, сводки бы не было вовсе
+    # и потеря снова стала бы невидимой (класс-фикс 4957, корень 3).
+    has = bool(acc.get("works") or acc.get("cols") or acc.get("failed")
+               or (acc.get("oil") and not skip_oil))
     if not has:
         return None
     # КЛАСС-ФИКС кнопочных подтверждений: сводка-квитанция через _send_retry — ConnectTimeout (сетевой блип)
@@ -1586,8 +1608,12 @@ def msg_service_summary(bike, acc, skip_oil=False):
     🇹🇭 ЧИСТЫЙ тайский (метки столбцов из _SVC_COL_LABEL). Секции без данных опускаем. Cyrillic в 🇹🇭 НЕТ."""
     km = acc.get("current_km") or acc.get("works_km") or (acc.get("oil") or {}).get("km") or ""
     head = f"🐀 Splinter · 📌 {bike}" if bike else "🐀 Splinter"
-    th = [f"🇹🇭 ✅ บันทึกครบแล้วครับ" + (f" — เลขไมล์ปัจจุบัน {km} กม." if km else "")]
-    ru = [f"🇷🇺 ✅ Готово" + (f" — текущий пробег {km} км." if km else "")]
+    # Шапка не врёт: есть непрошедшие записи → «записал НЕ всё» (класс-фикс 4957, корень 3).
+    _bad = bool(acc.get("failed"))
+    th = [("🇹🇭 ⚠️ บันทึกได้ไม่ครบครับ" if _bad else "🇹🇭 ✅ บันทึกครบแล้วครับ")
+          + (f" — เลขไมล์ปัจจุบัน {km} กม." if km else "")]
+    ru = [("🇷🇺 ⚠️ Записал НЕ всё" if _bad else "🇷🇺 ✅ Готово")
+          + (f" — текущий пробег {km} км." if km else "")]
     oil = acc.get("oil")
     if oil and not skip_oil:
         nxt, st = oil.get("next"), str(oil.get("status", "ok"))
@@ -1616,6 +1642,15 @@ def msg_service_summary(bike, acc, skip_oil=False):
         for w in works:                       # КАЖДАЯ работа отдельной строкой, буллет « — »
             th.append(f"      — {_work_th(w)}")
             ru.append(f"      — {w}")
+    # НЕ ЗАПИСАЛОСЬ — говорим вслух (класс-фикс 4957, корень 3). Молчаливый провал записи и был
+    # тем, из-за чего «записалась одна работа из четырёх, и никто не узнал».
+    failed = [f for f in (acc.get("failed") or []) if f]
+    if failed:
+        th.append("   • ⚠️ บันทึกไม่สำเร็จ — กรุณาบันทึกเอง:")
+        ru.append("   • ⚠️ НЕ записалось (впишите вручную):")
+        for w, why in failed:
+            th.append(f"      — {_work_th(w)}")
+            ru.append(f"      — {w} ({why})")
     return head + "\n" + "\n".join(th) + "\n" + "\n".join(ru)
 
 
@@ -1657,6 +1692,55 @@ def _work_stem(w):
     return _re_pl.sub(r"[^0-9a-zа-яё]+", "", s) or "work"
 
 
+# УТОЧНИТЕЛЬ МЕСТА работы (класс-фикс 4957, корень 3): «передние колодки» и «задние колодки» — ДВЕ
+# РАЗНЫЕ работы с общим стемом. 29.07 обе получили ключ info:4957:колодки:38982 → вторая пришла
+# duplicate=True и исчезла молча (splinter.log 09:32:18). Уточнитель входит в ключ, поэтому пары
+# перед/зад (колодки, подшипники, шины, амортизаторы) больше не схлопываются.
+# Регулярки узкие НАМЕРЕННО: «передн», а не «перед» — иначе «передача» стала бы «передней».
+_WORK_QUALS = (
+    ("перед", r"передн|спереди|\bfront\b|หน้า"),
+    ("зад",   r"задн|сзади|\brear\b|\bback\b|หลัง"),
+    ("лев",   r"левы|левог|левой|левом|слева|\bleft\b|ซ้าย"),
+    ("прав",  r"правы|правог|правой|правом|справа|\bright\b|ขวา"),
+)
+
+
+def _work_qual(w):
+    """Уточнитель места работы («перед»/«зад»/«лев»/«прав») или '' — часть контентного ключа."""
+    s = str(w).lower()
+    out = [q for q, rx in _WORK_QUALS if _re_pl.search(rx, s)]
+    return "+".join(out)
+
+
+def _work_key(w):
+    """КОНТЕНТНЫЙ КЛЮЧ работы = стем + уточнитель места. Единый для идемпотентности записи (A1)
+    и дедупа рендера (A2). «замена колодок»/«тормозные колодки» → один ключ (переформулировка не
+    плодит строк), а «передние колодки»/«задние колодки» → РАЗНЫЕ (это разные работы)."""
+    stem = _work_stem(w)
+    q = _work_qual(w)
+    return f"{stem}/{q}" if q else stem
+
+
+def _work_keys_distinct(works):
+    """Ключи для ПАРТИИ работ, гарантированно различающие РАЗНЫЕ формулировки.
+    Страховка на незнакомую лексику: если два РАЗНЫХ текста работ всё же дали один ключ, обоим
+    добавляется устойчивая подпись текста — лучше лишняя строка в истории, чем молча потерянная
+    работа. Одинаковые тексты остаются одним ключом (идемпотентность повторного прогона цела)."""
+    keys = {w: _work_key(w) for w in works}
+    by_key = {}
+    for w, k in keys.items():
+        by_key.setdefault(k, []).append(w)
+    for k, ws in by_key.items():
+        if len(ws) > 1:
+            for w in ws:
+                sig = _hashlib.md5(_re_pl.sub(r"\s+", " ", str(w).strip().lower())
+                                   .encode("utf-8")).hexdigest()[:4]
+                keys[w] = f"{k}~{sig}"
+            log.warning(f"  ⚠️ разные работы дали один ключ {k!r}: {ws} — развожу подписью "
+                        f"(работа не должна теряться в дедупе)")
+    return keys
+
+
 # Инфо-работа из истории «события»: notes вида «<работа> — <км> км/กม». Отсекает шум (фото-описания,
 # напоминания) — для секции «сервис на пробеге» в карточке (ЗАХОД 3).
 _SVC_HIST_RE = r"^(.+?)\s*—\s*(\d+)\s*(?:км|กม)"   # _re_pl импортирован ниже — compile в рантайме
@@ -1664,15 +1748,16 @@ _SVC_HIST_RE = r"^(.+?)\s*—\s*(\d+)\s*(?:км|กม)"   # _re_pl импорт
 
 def _parse_service_items(items, limit=6):
     """Из read_events отобрать ИНФО-работы «<работа> — <км> км» → [{work, km}], newest-first, до limit.
-    A2: ДЕДУП по (стем-работы, км) — точный повтор (та же работа на том же км) показывается ОДИН раз;
-    та же работа на РАЗНЫХ км — обе (реальная история, не дубль)."""
+    A2: ДЕДУП по (КЛЮЧУ работы, км) — точный повтор (та же работа на том же км) показывается ОДИН раз;
+    та же работа на РАЗНЫХ км — обе (реальная история, не дубль). Ключ = стем + уточнитель места
+    (класс-фикс 4957): «передние колодки» и «задние колодки» на одном км — ДВЕ строки, не одна."""
     out = []
     seen = set()
     for it in items or []:
         m = _re_pl.match(_SVC_HIST_RE, str(it.get("notes") or "").strip(), _re_pl.IGNORECASE)
         if m:
             work = m.group(1).strip(); km = m.group(2)
-            key = (_work_stem(work), km)
+            key = (_work_key(work), km)
             if key not in seen:
                 seen.add(key)
                 out.append({"work": work, "km": km})
@@ -1824,6 +1909,53 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
     return "\n".join(out)
 
 
+def _odo_km_int(x):
+    """Число километров из ячейки/поля или None (пробелы и запятые живого формата — терпим)."""
+    try:
+        return int(str(x).replace(" ", "").replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+def _odo_current(bridge, bike, recs=None, fleet_row=None):
+    """ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ по ТЕКУЩЕМУ пробегу байка (класс-фикс 4957, корень 4).
+
+    ИСТОЧНИК = СВОЙ одометр бота: Bot Data «обслуживание».current_km. Туда — и только туда — кладёт
+    подтверждённое человеком число _odo_store (см. _odo_confirmed). Из строк байка берём САМУЮ
+    СВЕЖУЮ по updated_at: поправка вниз («вижу 38982» → «нет, 36982») обязана побеждать прежнее
+    большее число, а max по строкам её бы похоронил.
+
+    НЕ УЧАСТВУЮТ (в этом и была болезнь):
+      • Лист1 кол.H — это пробег ПРИ ПОКУПКЕ (ReadFleet.js: «стартовый, НЕ текущий»), к сегодняшнему
+        одометру отношения не имеет;
+      • км из строк «события» — это СЛЕД РАБОТЫ, а не показание одометра. Именно он держал 38982
+        поверх живых 37000 (Лист1 I16) и 36982 (кол.J) двое суток: одна ошибочная строка истории
+        назначала себя «текущим пробегом» навсегда.
+
+    ФОЛЛБЭК (только если своего одометра ещё нет): max(I/J/K/L) — это одометр НА МОМЕНТ ЗАМЕНЫ,
+    то есть реальное показание. Нет и его → '' (честное «не знаю», карточка покажет «Статус байка»).
+    Легаси-строки без updated_at → max по current_km (прежнее поведение, ничего не ломаем)."""
+    rows = recs
+    if rows is None:
+        try:
+            rows = [r for r in (bridge.service_list().get("items") or [])
+                    if _same_bike(r.get("bike"), bike)]
+        except Exception:
+            log.exception("  → одометр: service_list упал (иду в фоллбэк Лист1)")
+            rows = []
+    own = [(str(r.get("updated_at") or ""), _odo_km_int(r.get("current_km"))) for r in (rows or [])]
+    own = [(u, km) for (u, km) in own if km and km > 0]
+    if own:
+        dated = [d for d in own if d[0]]
+        if dated:
+            return str(max(dated, key=lambda d: d[0])[1])
+        return str(max(km for _, km in own))
+    fb = fleet_row if fleet_row is not None else (bridge.find_bike(bike) or {})
+    last = [_odo_km_int((fb or {}).get(f"{k}_last_km")) for k in _MAND_KINDS]
+    last = [x for x in last if x and x > 0]
+    return str(max(last)) if last else ""
+
+
 def _build_bike_card(bridge, chat_id, topic_id, bike):
     """Собрать ТЕКСТ карточки байка из ЧИТАЕМЫХ источников (find_bike + service_list + read_events).
     Ничего не пишет и не отправляет — только строит строку. Разделён с отправкой, чтобы инфо-кнопка могла
@@ -1835,26 +1967,21 @@ def _build_bike_card(bridge, chat_id, topic_id, bike):
     except Exception:
         recs = []
 
-    def _i(x):
-        try:
-            return int(str(x).replace(" ", "").replace(",", ""))
-        except (ValueError, TypeError):
-            return None
-    # ЗАХОД 3: сервис-на-пробеге — 6 последних инфо-работ из истории «события» (read_events). Считаем РАНЬШЕ
-    # пробега: их одометр — тоже кандидат в «текущий» (работа не могла быть на пробеге ВЫШЕ текущего).
+    # ЗАХОД 3: сервис-на-пробеге — 6 последних инфо-работ из истории «события» (read_events).
+    # ЭТО ИСТОРИЯ, А НЕ ОДОМЕТР: в расчёт текущего пробега их км больше НЕ входит (корень 4).
     service = []
     try:
         ev = bridge.read_events(canon, limit=6)
         service = _parse_service_items(ev.get("items", []), limit=6)
     except Exception:
         log.exception("  → read_events для карточки упал")
-    # П2: Текущий пробег = МАКСИМУМ известных одометров: Лист1 «пробег» (col H) + current_km из service_list +
-    # км выполненных работ (service events). Одометр не падает → max = лучшая оценка (иначе заниженный фото-замер
-    # прятал просрочки И показывал работы «выше текущего»: баг 5849 — colH 3500, замер 20229, работы 20829 → 20829).
-    _cands = ([_i(fb.get("mileage"))] + [_i(r.get("current_km")) for r in recs]
-              + [_i(s.get("km")) for s in service])
-    _cands = [c for c in _cands if c and c > 0]
-    cur_km = str(max(_cands)) if _cands else ""
+    # Текущий пробег — ИЗ ОДНОГО ИСТОЧНИКА (_odo_current, класс-фикс 4957 корень 4), а не max по
+    # разнородной куче. Прежний max(колH, обслуживание, км работ) держал ошибочные 38982 из строки
+    # «события» поверх живых 37000/36982 — след работы назначал себя одометром. Расхождение
+    # «работа выше текущего» (баг 5849) лечится не подтягиванием шапки вверх, а тем, что каждое
+    # подтверждённое число теперь попадает в сам источник (_odo_store); рендер такой строки
+    # деградирует мягко — _km_ago даёт «на текущем пробеге».
+    cur_km = _odo_current(bridge, bike, recs=recs, fleet_row=fb)
     # ПЛАНОВОЕ ТО — 4 ОБЯЗАТЕЛЬНЫХ вида из Лист1 (cols I/J/K/L = *_last_km), интервал из книги знаний.
     # Показываем ВСЕГДА (где нет записи → «не делалось»); gear на мото → interval None → скрыт в рендере.
     mand = [{"kind": k, "last": fb.get(f"{k}_last_km"), "interval": _service_interval(k, canon, bridge)}
@@ -1906,22 +2033,41 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
     chat_id — только для журнала отката (_km_event_journal); на саму запись не влияет."""
     grp = group_name + (f" / тема {topic_id}" if topic_id else "")
     plate = _plate_from_name(bike) or "?"
-    written, mids = [], []
-    for w in dict.fromkeys(info_works):
+    uniq = list(dict.fromkeys(info_works))
+    keys = _work_keys_distinct(uniq)
+    written, mids, failed = [], [], []
+    for w in uniq:
         note = (f"{w} — {km} км" if km else f"{w}")[:200]
-        # A1 ИДЕМПОТЕНТНОСТЬ по КОНТЕНТУ: msg_id = info:{plate}:{стем-работы}:{км}. Повторный прогон/повторное
+        # A1 ИДЕМПОТЕНТНОСТЬ по КОНТЕНТУ: msg_id = info:{plate}:{ключ-работы}:{км}. Повторный прогон/повторное
         # фото на ту же работу+км даёт ТОТ ЖЕ ключ → Bridge.addEvent дедупит (botMsgExists_ по msg_id, BotData.js).
         # msg_id_base (per-сообщение) больше НЕ используем — он плодил новое событие на каждый прогон.
-        mid = f"info:{plate}:{_work_stem(w)}:{km or '-'}"
-        r = bridge.add_event(msg_date=msg_date, group=grp, bike=bike, event_type="repair",
-                             fuel="", mileage=str(km or ""), photos=0, notes=note, msg_id=mid)
-        log.info(f"  → инфо-работа в историю: «{note}» msg_id={mid} add_event ok={(r or {}).get('ok')} "
-                 f"saved={(r or {}).get('saved')} dup={(r or {}).get('duplicate')}")
-        written.append(w)
-        mids.append(mid)
+        mid = f"info:{plate}:{keys.get(w) or _work_key(w)}:{km or '-'}"
+        try:
+            r = bridge.add_event(msg_date=msg_date, group=grp, bike=bike, event_type="repair",
+                                 fuel="", mileage=str(km or ""), photos=0, notes=note, msg_id=mid) or {}
+        except Exception:
+            log.exception(f"  → инфо-работа «{note}»: add_event упал")
+            r = {"ok": False, "error": "exception"}
+        _ok, _dup = bool(r.get("ok")), bool(r.get("duplicate"))
+        log.info(f"  → инфо-работа в историю: «{note}» msg_id={mid} add_event ok={r.get('ok')} "
+                 f"saved={r.get('saved')} dup={r.get('duplicate')}")
+        # ЧЕСТНЫЙ УЧЁТ (класс-фикс 4957, корень 3): раньше сюда попадала ЛЮБАЯ работа независимо от
+        # ответа Bridge — отказ и схлопнутый дубль выглядели как «записано». Теперь в истории считается
+        # то, что там реально есть: ok+saved (новая строка) ИЛИ duplicate (строка уже была). Отказ —
+        # это ПОТЕРЯ, и она называется вслух (сводка + WARNING), а не молчит.
+        if _ok and not _dup:
+            written.append(w); mids.append(mid)
+        elif _dup:
+            written.append(w)
+            log.warning(f"  → инфо-работа «{note}» уже была в истории (ключ {mid}) — новой строки нет")
+        else:
+            failed.append((w, str(r.get("error") or "нет ответа Bridge")))
+            log.error(f"  ⚠️ инфо-работа НЕ записана: «{note}» ключ={mid} ошибка={r.get('error')!r}")
+    if failed:
+        _summary_note_failed(chat_id, topic_id, failed)
     _km_event_journal(chat_id, topic_id, km, ids=mids, works=written, bike=bike,
                       group=group_name, msg_date=msg_date)
-    return written   # список фактически записанных работ (для пост-квитанции по факту)
+    return written   # список работ, которые РЕАЛЬНО есть в истории (для пост-квитанции по факту)
 
 
 def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_date=""):
@@ -1932,7 +2078,11 @@ def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_da
     if not pend:
         return []
     if _time.time() - pend.get("ts", 0) > _PENDING_WORKS_TTL:
-        log.info(f"  → отложенные инфо-работы протухли (>{_PENDING_WORKS_TTL//3600}ч), не пишу: {pend.get('works')}")
+        # Протухший буфер = ПОТЕРЯ работ, а не рутина: называем её вслух (класс-фикс 4957, корень 3).
+        _stale = list(pend.get("works") or [])
+        log.error(f"  ⚠️ отложенные инфо-работы протухли (>{_PENDING_WORKS_TTL//3600}ч), НЕ записаны: {_stale}")
+        _summary_note_failed(chat_id, topic_id, [(w, f"пробег так и не пришёл за {_PENDING_WORKS_TTL//3600}ч")
+                                                 for w in _stale])
         return []
     return _write_info_works(bridge, group_name, topic_id, bike or pend.get("bike", ""),
                              pend["works"], km, pend["msg_id_base"], msg_date, chat_id=chat_id)
@@ -2070,6 +2220,31 @@ def _rollback_km_events(bridge, chat_id, topic_id, *, wrong_km, right_km, sender
         return {"deleted": 0, "rewritten": [], "skip": "exception"}
 
 
+def _odo_store(bridge, chat_id, topic_id, bike, km):
+    """Подтверждённое человеком число → В ИСТОЧНИК ПРАВДЫ (класс-фикс 4957, корень 4).
+
+    Раньше подтверждённый пробег оседал в ЛЕТУЧЕМ накопителе сводки (_SVC_SUMMARY: 3 часа в памяти,
+    умирает с рестартом) и доезжал до «обслуживание» только если поток дошёл до _after_mileage —
+    а ветка B1 (открытая то_заявка «ждёт_факт») уводит в ранний return раньше. Отсюда и жили ДВА
+    пробега параллельно: свой одометр отставал, а карточка добирала недостающее из чего попало.
+    Теперь запись в свой одометр — часть самого подтверждения, а не побочный эффект ветки.
+
+    Bot Data «обслуживание» = СВОЯ таблица бота (🟢). Лист1/CRM тут не трогаются вовсе.
+    Fail-safe: нет bridge/байка/числа или Bridge сбоит → лог, путь подтверждения не рвётся."""
+    km_int = _odo_km_int(km)
+    if not bridge or not bike or not km_int or km_int <= 0:
+        return False
+    try:
+        r = bridge.service_upsert(bike=bike, topic_id=topic_id or "",
+                                  service_type="oil", current_km=km_int) or {}
+        log.info(f"  → одометр {bike} = {km_int} (подтверждено человеком) → обслуживание "
+                 f"ok={r.get('ok')} status={r.get('status')}")
+        return bool(r.get("ok"))
+    except Exception:
+        log.exception("  → запись подтверждённого одометра в «обслуживание» упала (fail-safe)")
+        return False
+
+
 def _odo_confirmed(bridge, chat_id, topic_id, bike, km, *, questioned_km=None,
                    sender="?", source="", msg_date=""):
     """ЕДИНАЯ ТОЧКА «человек подтвердил/назвал пробег». Зовётся ИЗ ВСЕХ путей подтверждения
@@ -2087,6 +2262,8 @@ def _odo_confirmed(bridge, chat_id, topic_id, bike, km, *, questioned_km=None,
     if questioned_km is not None:
         _rollback_km_events(bridge, chat_id, topic_id, wrong_km=str(questioned_km),
                             right_km=str(km), sender=sender, source=source or "confirm")
+    # 3) ОДОМЕТР — в источник правды СРАЗУ, до любых веток и ранних return (корень 4).
+    _odo_store(bridge, chat_id, topic_id, bike, km)
     written = []
     try:
         # Без bridge писать некуда — буфер НЕ трогаем (pop потерял бы работы молча).
@@ -2530,7 +2707,14 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
 
 # === Фикс B: подтверждение пробега с ФОТО приборки перед решением по ТО ===
 # vision врёт на LCD → распознанную цифру подтверждаем у человека, потом _after_mileage.
-_PENDING_MILEAGE = {}   # (chat_id, topic_id) -> (mileage:str, bike:str)
+# Значение: (mileage:str, bike:str, floor:int|None, oil_hint:bool, ts:float) — ts добавлен
+# класс-фиксом 4957 (корень 5). Легаси-кортежи без ts читаются как «без метки» → считаются свежими.
+_PENDING_MILEAGE = {}   # (chat_id, topic_id) -> (mileage, bike, floor, oil_hint, ts)
+# ПРЕДЕЛ ЖИЗНИ ВОПРОСА О ПРОБЕГЕ (класс-фикс 4957, корень 5): вопрос, заданный 29.07 в 09:32,
+# провисел в памяти 46 часов и 31.07 в 07:29 UTC МОЛЧА съел сообщение владельца — в splinter.log
+# нет даже строки «Splinter [servicing] …», перехват случился раньше неё. Ровно 3 часа, как у
+# буфера отложенных работ (_PENDING_WORKS_TTL): они живут одной парой «работы ждут пробега».
+_PENDING_MILEAGE_TTL = 3 * 3600
 _CONFIRM_YES = {"да", "ага", "верно", "ок", "окей", "yes", "ใช่", "ถูก", "ถูกต้อง", "ถูกต้องครับ"}
 _CONFIRM_NO = {"нет", "не", "no", "ไม่", "ไม่ใช่"}
 
@@ -2719,9 +2903,70 @@ def msg_correction_ask(bike, old_km, new_km):
     )
 
 
+def _mileage_q_age(pend):
+    """Возраст вопроса о пробеге в секундах; None — метки времени нет (легаси-запись/тест-фикстура)."""
+    try:
+        ts = pend[4] if (isinstance(pend, (tuple, list)) and len(pend) > 4) else None
+        return (_time.time() - float(ts)) if ts else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _mileage_q_stale(pend):
+    """Вопрос о пробеге протух? Без метки времени → НЕ протух (fail-safe: прежнее поведение)."""
+    age = _mileage_q_age(pend)
+    return bool(age is not None and age > _PENDING_MILEAGE_TTL)
+
+
 def pending_mileage_for(chat_id, topic_id):
-    """Есть ли открытое подтверждение пробега для этой темы (для перехвата в handle_text)."""
-    return _PENDING_MILEAGE.get((chat_id, topic_id))
+    """Есть ли ЖИВОЙ открытый вопрос о пробеге для этой темы (для перехвата в handle_text).
+    Протухший вопрос открытым НЕ считается (класс-фикс 4957, корень 5): иначе он и ответ съедает,
+    и держит уступку голого числа в handle_service_result. Снимает его expire_stale_mileage_question
+    — с внятным «вопрос устарел», а не молча."""
+    pend = _PENDING_MILEAGE.get((chat_id, topic_id))
+    if pend is None or _mileage_q_stale(pend):
+        return None
+    return pend
+
+
+async def expire_stale_mileage_question(context, chat_id, topic_id, text="") -> bool:
+    """КОРЕНЬ 5: у вопроса о пробеге есть предел жизни. Снимаем протухший ДО любого разбора входящего,
+    и если человек прислал именно ОТВЕТ (да/нет/число) — говорим, что вопрос устарел, вместо того
+    чтобы проглотить сообщение (31.07 07:29 UTC: ответ владельца исчез в вопросе 46-часовой давности).
+    Зовётся из роутера первой в servicing-ветке. Возвращает True, если вопрос был снят.
+    Fail-safe: любая ошибка → False, поток сообщения не меняется."""
+    try:
+        key = (chat_id, topic_id)
+        pend = _PENDING_MILEAGE.get(key)
+        if pend is None or not _mileage_q_stale(pend):
+            return False
+        age_h = int((_mileage_q_age(pend) or 0) // 3600)
+        asked_km, bike = str(pend[0]), str(pend[1] or "")
+        _PENDING_MILEAGE.pop(key, None)
+        _SOFT_ODO_PENDING.pop(key, None)
+        clear_awaiting(chat_id, topic_id)
+        log.info(f"  → вопрос о пробеге {asked_km} ({bike or '?'}) протух ({age_h}ч) — снят, "
+                 f"ответ человека НЕ перехватываем")
+        looks_like_answer = _is_bare_confirm(text) or (str(text or "").strip().lower() in _CONFIRM_NO)
+        if not looks_like_answer:
+            return True
+        b_th = f" ({bike})" if bike else ""
+        b_ru = f" по {bike}" if bike else ""
+        _pw = (_PENDING_WORKS.get(key) or {}).get("works") or []
+        tail_th = (f"\n🇹🇭 งานที่รออยู่: {_works_th_str(_pw)} — ส่งเลขไมล์เพื่อบันทึกครับ" if _pw else "")
+        tail_ru = (f"\n🇷🇺 Ждут пробега работы: {', '.join(_pw)} — пришли пробег, чтобы записать" if _pw else "")
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=(f"🐀 Splinter\n"
+                          f"🇹🇭 📟 คำถามเลขไมล์ {asked_km} กม.{b_th} ถามไว้ {age_h} ชม.ที่แล้ว — หมดอายุแล้วครับ "
+                          f"ไม่ได้นับคำตอบนี้เป็นการยืนยัน ถ้าจะบันทึก ส่งเลขไมล์ปัจจุบันมาใหม่นะครับ 🙏{tail_th}\n"
+                          f"{_SEP}\n"
+                          f"🇷🇺 📟 Вопрос про пробег {asked_km} км{b_ru} задан {age_h} ч назад — он устарел. "
+                          f"Этот ответ подтверждением НЕ засчитал. Если нужно записать — пришли текущий "
+                          f"пробег заново 🙏{tail_ru}"))
+        return True
+    except Exception:
+        log.exception("  → снятие протухшего вопроса о пробеге сбоило (fail-safe: поток не меняем)")
+        return False
 
 
 def msg_mileage_drop(bike, new_km, last_km):
@@ -2804,7 +3049,9 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
         if prev and new_km < prev[0]:
             floor = prev[0]
 
-    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor, bool(oil_hint))
+    # ts (5-й элемент) — предел жизни вопроса, класс-фикс 4957 корень 5.
+    _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor, bool(oil_hint),
+                                             _time.time())
     mark_awaiting(chat_id, topic_id)
 
     if floor is not None:
@@ -2860,6 +3107,13 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     key = (msg.chat_id, getattr(msg, "message_thread_id", None))
     pend = _PENDING_MILEAGE.get(key)
     if not pend:
+        return False
+    if _mileage_q_stale(pend):
+        # Протухший вопрос не имеет права засчитать ответ (корень 5). Штатно его снимает
+        # expire_stale_mileage_question из роутера; здесь — страховка для прямых вызовов.
+        _PENDING_MILEAGE.pop(key, None)
+        clear_awaiting(*key)
+        log.info(f"  → протухший вопрос о пробеге снят в handle_mileage_confirm — ответ отдаю обычному пути")
         return False
     mileage, bike = pend[0], pend[1]
     floor = pend[2] if len(pend) > 2 else None   # фикс B: пол пробега (флаг-режим)
@@ -4321,8 +4575,10 @@ def _o3_bike_label(bike, plate):
 
 def _o3_overdue_scan(bridge):
     """Park-wide скан просрочек 4 обязательных ТО (масло/gear[скутер]/ABS/возд.фильтр). ЧТЕНИЕ+расчёт (🟢).
-    fleet() (38 байков, *_last_km + mileage=colH) + service_list (current_km). Текущий пробег = max(colH,
-    service_list current_km) — colH ненадёжен. Просрочка: last>0 И next(=last+interval)−текущий ≤ 0.
+    fleet() (38 байков, *_last_km) + service_list (current_km). Текущий пробег — ТОТ ЖЕ единый
+    источник, что у карточки (_odo_current): свой одометр «обслуживание», фоллбэк I/J/K/L; кол.H
+    (пробег ПРИ ПОКУПКЕ) не участвует — класс-фикс 4957 закрыт на ОБЕИХ полосах, не только в карточке.
+    Просрочка: last>0 И next(=last+interval)−текущий ≤ 0.
     «НЕ ДЕЛАЛОСЬ» (last≤0) — задача ПО ФАКТУ ПОРОГА (доводка 02.07): показываем ТОЛЬКО когда текущий
     пробег ≥ интервала вида (ABS 10000 / возд.фильтр 20000 / масло-редуктор от нуля) — item nobase=True,
     next=интервал. Не дорос → не показываем; балласт-подсписок «нет базы» убран совсем.
@@ -4347,9 +4603,9 @@ def _o3_overdue_scan(bridge):
         if not name:
             continue
         plate = _plate_from_name(name) or "?"
-        cands = [_i(b.get("mileage"))] + [_i(r.get("current_km")) for r in svc if _same_bike(r.get("bike"), name)]
-        cands = [c for c in cands if c and c > 0]
-        cur = max(cands) if cands else 0
+        cur = _i(_odo_current(bridge, name,
+                              recs=[r for r in svc if _same_bike(r.get("bike"), name)],
+                              fleet_row=b)) or 0
         items = []
         for kind in _MAND_KINDS:
             interval = _service_interval(kind, name, bridge)
@@ -5111,6 +5367,18 @@ _SP_TEXT_KINDS = (
     ("pads", ("колод", "тормоз", "ผ้าเบรก")),
     ("chain", ("цеп", "chain", "โซ่")),
 )
+
+
+def _oil_named_explicitly(text, works, vis):
+    """МОТОРНОЕ масло названо ЯВНО? (класс-фикс 4957, корень 3 — граница)
+    Да, если работа классифицирована как oil (кол.I) ИЛИ в тексте прямое «моторное/เครื่อง/motor oil».
+    Слово «масло» само по себе основанием НЕ является: «поменял масло в редукторе» — это кол.J,
+    и предлагать по нему запись кол.I нельзя (живая таблица, чужой столбец)."""
+    if any(_classify_work(w) == "oil" for w in (works or [])):
+        return True
+    blob = ((text or "") + " " + str((vis or {}).get("notes", ""))).lower()
+    _oil_kws = dict(_SP_TEXT_KINDS).get("oil", ())
+    return any(kw in blob for kw in _oil_kws)
 
 
 def _declared_kinds(text, works, vis, strict_oil=False):
@@ -5985,7 +6253,14 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         # одометр довезёт до кнопки Пыма (B1), Инфо-карточка показывает «в работе». На возврате
         # (_ret_ctx) заявку не открываем — works уже легли в «события» (не наряд).
         if bike and not _ret_ctx:
-            _bkinds = [k for k in _declared_kinds(text, works, vis) if k in ("gear", "abs", "airfilter")]
+            # КЛАСС-ФИКС 4957 (корень 3): фильтр держал ровно gear/abs/airfilter, и МОТОРНОЕ МАСЛО
+            # выпадало из перечня совсем — 29.07 механик сдал масло+редуктор+две пары колодок, а в
+            # заявку легло только ['gear'] (splinter.log 09:24:47). Колодки жили в «событиях», масло
+            # не жило нигде: у него есть кол.I, но без одометра туда не пишут, а заявка его не брала.
+            # Теперь берём ВСЕ колоночные виды (_SP_COL_KINDS) — заявка доводит масло до кнопки Пыма
+            # ровно так же, как редуктор; запись в Лист1 по-прежнему только по его «да».
+            _bkinds = [k for k in _declared_kinds(text, works, vis)
+                       if k in _SP_COL_KINDS and (k != "oil" or _oil_named_explicitly(text, works, vis))]
             if _bkinds:
                 try:
                     _sp0 = _sp_open(bridge, chat_id, topic_id, bike) or {}

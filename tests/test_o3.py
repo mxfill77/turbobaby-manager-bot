@@ -153,13 +153,19 @@ res.append(ok(any("· 1 байков" in e.get("text", "") for e in EDITS), "з�
 
 # (7) 35 просрочек: кап 30 карточек + хвост в заголовке + RetryAfter-ретрай → все доставлены
 print("(7) кап 30 + троттл/RetryAfter на потоке карточек:")
+# Текущий пробег байков различаем СВОИМ одометром («обслуживание».current_km), а не кол.H:
+# с 31.07.2026 (класс-фикс 4957, корень 4) кол.H = пробег ПРИ ПОКУПКЕ и в текущий не входит вовсе,
+# поэтому порядок «худшие сверху» и хвост сверх капа должны задаваться реальным источником.
 class BR35:
     def _call(s, a, **k): return {"ok": False}
     def fleet(s): return {"data": {"bikes": [
-        {"name": f"NMAX 155CC PHUKET {5100 + i}", "status": "ДОМА", "mileage": 20000 + i * 10,
+        {"name": f"NMAX 155CC PHUKET {5100 + i}", "status": "ДОМА", "mileage": 3000,
          "oil_last_km": 1000, "gear_last_km": 19000, "abs_last_km": 15000, "airfilter_last_km": 5000}
         for i in range(35)]}}
-    def service_list(s): return {"items": []}
+    def service_list(s): return {"items": [
+        {"bike": f"NMAX 155CC PHUKET {5100 + i}", "service_type": "oil",
+         "current_km": 20000 + i * 10, "updated_at": "2026-07-30T00:00:00Z"}
+        for i in range(35)]}
 mem_c = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_c
 SENDS.clear(); SLEEPS.clear(); _ATT[0] = 0
 FAIL_AT.update({4, 12, 25})   # три отправки ловят флуд-контроль с первой попытки
