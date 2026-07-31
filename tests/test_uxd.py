@@ -55,13 +55,19 @@ res.append(ok(len(b1.events)==0 and (CHAT,TOPIC) in S._PENDING_WORKS, "рабо�
 res.append(ok(any("пробег" in s.lower() for s in SENDS) and (CHAT,TOPIC) not in S._SVC_CYCLE_MSGS,
               "пробег спрошен В КВИТАНЦИИ (одно сообщение); отдельный transient вопрос-одометр убран (фикс задвоения)"))
 
-# 2) затем фото км 37823 → flush → работы КОПЯТСЯ в накопитель сводки (НЕ шлются сразу — терминал мокнут)
+# 2) затем фото км 37823 → ПОДТВЕРЖДЕНИЕ → работы КОПЯТСЯ в накопитель сводки (НЕ шлются сразу — терминал мокнут)
+# КОНТРАКТ ИЗМЕНЁН 31.07.2026 (класс-фикс одометра, корень 1, инцидент NMAX 155 GREEN-B 4957):
+# сырой OCR с фото больше не дописывает отложенные работы — фото только спрашивает число.
+# Накопитель сводки наполняет ЕДИНАЯ точка подтверждения _odo_confirmed (текст «да»/число и кнопки).
 SENDS.clear()
 vb={"mileage":"37823","mileage_confidence":"high"}
 b2=loop.run_until_complete(run(Msg(photo=True, mid=302), p={"type":"None","works":[]}, v=vb))
 print("(2) фото км → работы в накопитель сводки (единое сообщение):")
+acc_raw=S._SVC_SUMMARY.get((CHAT,TOPIC),{})
+res.append(ok(len(acc_raw.get("works",[]))==0, "сырой OCR сам работы НЕ проводит (число не подтверждено)"))
+S._odo_confirmed(FakeBridge(), CHAT, TOPIC, "NINJA 400 6334", "37823", questioned_km="37823", source="тест")
 acc2=S._SVC_SUMMARY.get((CHAT,TOPIC),{})
-res.append(ok(len(acc2.get("works",[]))==2 and acc2.get("works_km")=="37823", "работы (колодки/цепь) накоплены для итоговой сводки (км 37823)"))
+res.append(ok(len(acc2.get("works",[]))==2 and acc2.get("works_km")=="37823", "работы (колодки/цепь) накоплены для итоговой сводки после подтверждения (км 37823)"))
 res.append(ok(not any("Записал работы на пробеге" in s for s in SENDS), "немедленной отдельной квитанции НЕТ (уйдёт в сводке на терминале)"))
 
 # 3) работы+км в ОДНОМ сообщении → запись + накопление (сводка на терминале)

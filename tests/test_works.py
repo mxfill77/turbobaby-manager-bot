@@ -72,12 +72,22 @@ res.append(ok((CHAT,TOPIC) in S._PENDING_WORKS, "b1: перечень в буф�
 res.append(ok(any("Принял работы" in s for s in SENDS), "b1: квитанция (смягчённая) отправлена"))
 res.append(ok(any("ODO" in s or "одометр" in s.lower() or "пробег" in s.lower() for s in SENDS), "b1: переспрос пробега отправлен"))
 SENDS.clear()
+# КОНТРАКТ ИЗМЕНЁН 31.07.2026 (класс-фикс одометра, корень 1, инцидент NMAX 155 GREEN-B 4957):
+# раньше здесь ожидалось, что СЫРОЙ OCR с фото сам дописывает отложенные работы — именно так в прод
+# и легла строка «замена передних тормозных колодок — 38982 км» при живом одометре 36982.
+# Теперь фото только СПРАШИВАЕТ число, буфер ждёт; дозапись — на ПОДТВЕРЖДЕНИИ, единой точкой
+# _odo_confirmed (её же зовут кнопки svc:mok/svc:sodo). Работы при этом не теряются — см. b3.
 vb={"mileage":"37823","mileage_confidence":"high","fuel":"empty"}
 br2=loop.run_until_complete(run(Msg(photo=True, mid=203), parsed={"type":"None","works":[]}, vis=vb))
 ir2=info_rows(br2)
-res.append(ok(len(ir2)==2, "b2: фото км → flush записал 2 инфо-строки"))
-res.append(ok(all("37823" in e["notes"] for e in ir2), "b2: у обеих привязан км 37823 из фото"))
-res.append(ok((CHAT,TOPIC) not in S._PENDING_WORKS, "b2: буфер очищен (pop)"))
+res.append(ok(len(ir2)==0, "b2: сырой OCR с фото инфо-работы НЕ пишет (число не подтверждено)"))
+res.append(ok((CHAT,TOPIC) in S._PENDING_WORKS, "b2: буфер ЖДЁТ подтверждения (работы не потеряны)"))
+br2b=FakeBridge()
+S._odo_confirmed(br2b, CHAT, TOPIC, "NINJA 400 6334", "37823", questioned_km="37823", source="тест")
+ir2b=info_rows(br2b)
+res.append(ok(len(ir2b)==2, "b3: подтверждённый км → дозапись 2 инфо-строк"))
+res.append(ok(all("37823" in e["notes"] for e in ir2b), "b3: у обеих привязан ПОДТВЕРЖДЁННЫЙ км 37823"))
+res.append(ok((CHAT,TOPIC) not in S._PENDING_WORKS, "b3: буфер очищен (pop)"))
 
 # (e) повторное фото км той же темы → НЕТ повторного flush (буфер пуст)
 vb2={"mileage":"37825","mileage_confidence":"high"}

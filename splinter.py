@@ -1898,13 +1898,15 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
                 text=_build_bike_card(bridge, chat_id, topic_id, bike))
 
 
-def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date=""):
+def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date="",
+                      chat_id=None):
     """Вариант A (разбор перечня по адресам): КАЖДУЮ инфо-работу — отдельной строкой в «события»
     с привязкой пробега. msg_id = info:{plate}:{стем-работы}:{км} (КОНТЕНТНЫЙ ключ) → повторный прогон той
-    же работы на том же км дедупится Bridge'ом. Колоночные работы сюда НЕ попадают — у них свой адрес."""
+    же работы на том же км дедупится Bridge'ом. Колоночные работы сюда НЕ попадают — у них свой адрес.
+    chat_id — только для журнала отката (_km_event_journal); на саму запись не влияет."""
     grp = group_name + (f" / тема {topic_id}" if topic_id else "")
     plate = _plate_from_name(bike) or "?"
-    written = []
+    written, mids = [], []
     for w in dict.fromkeys(info_works):
         note = (f"{w} — {km} км" if km else f"{w}")[:200]
         # A1 ИДЕМПОТЕНТНОСТЬ по КОНТЕНТУ: msg_id = info:{plate}:{стем-работы}:{км}. Повторный прогон/повторное
@@ -1916,6 +1918,9 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
         log.info(f"  → инфо-работа в историю: «{note}» msg_id={mid} add_event ok={(r or {}).get('ok')} "
                  f"saved={(r or {}).get('saved')} dup={(r or {}).get('duplicate')}")
         written.append(w)
+        mids.append(mid)
+    _km_event_journal(chat_id, topic_id, km, ids=mids, works=written, bike=bike,
+                      group=group_name, msg_date=msg_date)
     return written   # список фактически записанных работ (для пост-квитанции по факту)
 
 
@@ -1930,7 +1935,176 @@ def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_da
         log.info(f"  → отложенные инфо-работы протухли (>{_PENDING_WORKS_TTL//3600}ч), не пишу: {pend.get('works')}")
         return []
     return _write_info_works(bridge, group_name, topic_id, bike or pend.get("bike", ""),
-                             pend["works"], km, pend["msg_id_base"], msg_date)
+                             pend["works"], km, pend["msg_id_base"], msg_date, chat_id=chat_id)
+
+
+# ============================================================
+#  ПУТЬ ПОДТВЕРЖДЕНИЯ ОДОМЕТРА — ОДНО ПРАВИЛО НА ВСЕ ВЕТКИ ЗАПИСИ
+#  (класс-фикс 31.07.2026 по разбору инцидента NMAX 155 GREEN-B 4957, тема 79, 29.07.2026)
+#
+#  Что было: гейт сырого OCR (06c1ab2) закрыл ТОЛЬКО ветку ОБЫЧНОГО события. Ветка ИНФО-работ
+#  писала vision-км как есть → в историю байка легло «замена передних тормозных колодок — 38982 км»
+#  (splinter.log 09:32:16), хотя человек тут же поправил число на 36982. Классическая зеркальная
+#  дыра: закрыли одну ветку — через пять дней вылезла вторая. Поэтому правило ОДНО и живёт в
+#  ОДНОМ месте (_km_for_record), а не двумя копиями гейта по коду.
+# ============================================================
+
+def _msg_date_of(msg):
+    """Дата сообщения строкой YYYY-MM-DD (или '') — для дозаписи работ тем же днём."""
+    try:
+        d = getattr(msg, "date", None)
+        return str(d.date()) if d else ""
+    except Exception:
+        return ""
+
+
+def _km_for_record(parsed, vis):
+    """ЕДИНОЕ ПРАВИЛО: в ЗАПИСЬ (лист «события» — и обычное событие, и инфо-работы) идёт ТОЛЬКО
+    ЧЕЛОВЕЧЕСКОЕ число, то есть пробег из ТЕКСТА сообщения (parsed.mileage). Сырой OCR
+    (vis.mileage) до подтверждения человеком не пишется НИ ПО ОДНОМУ пути.
+    vis принимается аргументом намеренно: чтобы место решения было видно и никто не «дочинил»
+    ветку мимо этой функции. Подтверждённое фото-число приходит в запись не отсюда, а с пути
+    подтверждения: _ask_mileage_confirm → handle_mileage_confirm / кнопка → _odo_confirmed."""
+    return str((parsed or {}).get("mileage") or "")
+
+
+# Журнал СВОИХ строк «события» с привязкой к пробегу — материал для отката.
+# Ключ (chat_id, topic_id) → {"km", "ts", "ids", "works", "plain", "bike", "group", "date"}.
+# Держим только последний записанный км темы и только в окне: откат бьёт по ТОЧНЫМ msg_id.
+_KM_EVENTS_WRITTEN = {}
+_KM_EVENTS_TTL = 3 * 3600
+
+
+def _km_event_journal(chat_id, topic_id, km, *, ids=(), works=(), plain=(),
+                      bike="", group="", msg_date=""):
+    """Запомнить, что мы записали в «события» с этим пробегом (для возможного отката).
+    Fail-safe: нет chat_id/км/содержимого → ничего не пишем, вызывающего не роняем."""
+    try:
+        if chat_id is None or not str(km or "").strip() or not (ids or plain):
+            return
+        key = (chat_id, topic_id)
+        rec = _KM_EVENTS_WRITTEN.get(key)
+        if not rec or str(rec.get("km")) != str(km):
+            rec = {"km": str(km), "ts": _time.time(), "ids": [], "works": [], "plain": [],
+                   "bike": bike, "group": group, "date": msg_date}
+            _KM_EVENTS_WRITTEN[key] = rec
+        rec["ts"] = _time.time()
+        rec["bike"] = rec.get("bike") or bike
+        rec["group"] = rec.get("group") or group
+        rec["date"] = rec.get("date") or msg_date
+        for i in ids:
+            if i and i not in rec["ids"]:
+                rec["ids"].append(i)
+        for w in works:
+            if w and w not in rec["works"]:
+                rec["works"].append(w)
+        for p in plain:
+            if p:
+                rec["plain"].append(dict(p))
+                mid = str(p.get("msg_id") or "")
+                if mid and mid not in rec["ids"]:
+                    rec["ids"].append(mid)
+    except Exception:
+        log.exception("  → журнал записанных км: сбой (fail-safe, откат просто не сработает)")
+
+
+def _rollback_km_events(bridge, chat_id, topic_id, *, wrong_km, right_km, sender="?", source=""):
+    """СТРАХОВКА: человек назвал ДРУГОЕ число, а строки с прежним уже легли в «события» →
+    удаляем СВОИ строки по ТОЧНЫМ msg_id и переписываем их верным числом. Раньше отката не было
+    НИ В ОДНОЙ ветке: ошибочный км оставался в истории байка навсегда, поправка правила только
+    служебную запись обслуживания.
+    Узко и обратимо: (1) удаляем только то, что записали САМИ (ключи `info:…` / `{chat_id}:…`),
+    (2) только по журналу этой темы и только если журнал именно про WRONG_KM (растущий одометр
+    и чужие строки не трогаем), (3) только в окне _KM_EVENTS_TTL, (4) на стороне Bridge
+    deleteEvent сам отказывает на широком фильтре.
+    Возвращает {"deleted", "rewritten", "skip"} — для лога и тестов. Fail-safe: любая неготовность
+    (нет bridge/журнала/метода delete_event, то же число, протухло) = ноль действий."""
+    key = (chat_id, topic_id)
+    try:
+        if not bridge:
+            return {"deleted": 0, "rewritten": [], "skip": "no_bridge"}
+        if str(wrong_km or "") == str(right_km or "") or not str(right_km or "").strip():
+            return {"deleted": 0, "rewritten": [], "skip": "same_km"}
+        rec = _KM_EVENTS_WRITTEN.get(key)
+        if not rec or str(rec.get("km")) != str(wrong_km):
+            return {"deleted": 0, "rewritten": [], "skip": "no_journal"}
+        if _time.time() - rec.get("ts", 0) > _KM_EVENTS_TTL:
+            _KM_EVENTS_WRITTEN.pop(key, None)
+            return {"deleted": 0, "rewritten": [], "skip": "stale"}
+        if not callable(getattr(bridge, "delete_event", None)):
+            return {"deleted": 0, "rewritten": [], "skip": "no_delete_api"}
+        _KM_EVENTS_WRITTEN.pop(key, None)
+        own = (f"{chat_id}:", "info:")
+        deleted = 0
+        for mid in rec.get("ids", []):
+            if not str(mid).startswith(own):
+                log.warning(f"  → откат км: ключ {mid!r} не наш — пропускаю (чужие строки не трогаем)")
+                continue
+            try:
+                r = bridge.delete_event(msg_id=str(mid)) or {}
+                deleted += int(r.get("deleted") or 0)
+                log.info(f"  → откат км: delete_event msg_id={mid} ok={r.get('ok')} "
+                         f"deleted={r.get('deleted')} error={r.get('error')}")
+            except Exception:
+                log.exception(f"  → откат км: delete_event({mid}) упал")
+        rewritten = []
+        if rec.get("works"):
+            rewritten = _write_info_works(bridge, rec.get("group") or group_label(chat_id), topic_id,
+                                          rec.get("bike") or "", rec["works"], str(right_km), "",
+                                          rec.get("date") or "", chat_id=chat_id)
+        for p in rec.get("plain", []):
+            try:
+                kw = dict(p)
+                kw["mileage"] = str(right_km)
+                bridge.add_event(**kw)
+                rewritten.append(str(kw.get("msg_id") or ""))
+            except Exception:
+                log.exception("  → откат км: перезапись обычного события упала")
+        _odo_audit_write(bridge, chat_id, topic_id, rec.get("bike") or "", right_km, wrong_km,
+                         sender=sender, outcome=f"откат записей ({deleted} стр.) → {right_km}")
+        log.info(f"  ↩️ откат км {wrong_km}→{right_km} тема={topic_id}: удалено {deleted} строк, "
+                 f"переписано {len(rewritten)} (source={source})")
+        return {"deleted": deleted, "rewritten": rewritten, "skip": ""}
+    except Exception:
+        log.exception("  → откат записанных км упал (fail-safe: ничего не меняем)")
+        return {"deleted": 0, "rewritten": [], "skip": "exception"}
+
+
+def _odo_confirmed(bridge, chat_id, topic_id, bike, km, *, questioned_km=None,
+                   sender="?", source="", msg_date=""):
+    """ЕДИНАЯ ТОЧКА «человек подтвердил/назвал пробег». Зовётся ИЗ ВСЕХ путей подтверждения
+    (текст handle_mileage_confirm — обычный и мягкий гейт, кнопка svc:mok, кнопка svc:sodo),
+    чтобы правило жило в одном месте, а не копиями по веткам.
+    Делает ровно две вещи, которых раньше не было ни в одной ветке:
+      1) ОТКАТ — если человек назвал ЧИСЛО, ОТЛИЧНОЕ от того, о котором спрашивали (поправка
+         «36982» на вопрос «вижу 38982»), а строки с прежним числом уже записаны — они снимаются
+         и переписываются верным числом (_rollback_km_events);
+      2) ДОЗАПИСЬ — отложенные инфо-работы (буфер _PENDING_WORKS) дописываются ПОДТВЕРЖДЁННЫМ
+         числом. До этого фикса они писались сырым OCR прямо в момент фото; теперь гейт
+         _km_for_record их придерживает — и без этой дозаписи работы бы тихо протухли.
+    Возвращает список дописанных работ. Fail-safe: любое исключение логируется, путь
+    подтверждения не рвётся."""
+    if questioned_km is not None:
+        _rollback_km_events(bridge, chat_id, topic_id, wrong_km=str(questioned_km),
+                            right_km=str(km), sender=sender, source=source or "confirm")
+    written = []
+    try:
+        # Без bridge писать некуда — буфер НЕ трогаем (pop потерял бы работы молча).
+        if bridge:
+            written = _flush_pending_works(bridge, chat_id, topic_id, group_label(chat_id),
+                                           bike, str(km), msg_date)
+    except Exception:
+        log.exception("  → дозапись отложенных инфо-работ подтверждённым пробегом упала")
+    if written:
+        log.info(f"  → инфо-работы дописаны ПОДТВЕРЖДЁННЫМ пробегом {km}: {written} (source={source})")
+        try:
+            acc = _summary_acc(chat_id, topic_id)
+            acc["works"] += written
+            acc["works_km"] = str(km)
+            acc["current_km"] = str(km)
+        except Exception:
+            log.exception("  → накопитель сводки на дозаписи работ сбоил (не критично)")
+    return written
 
 
 # ============================================================
@@ -2748,6 +2922,9 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
                 _odo_audit_write(bridge, key[0], key[1], soft.get("bike", bike),
                                  num_int, floor, sender=sender,
                                  outcome=f"подтверждено ({who})")
+                _odo_confirmed(bridge, msg.chat_id, key[1], bike, num, questioned_km=mileage,
+                               sender=sender, source="текст (мягкий гейт)",
+                               msg_date=_msg_date_of(msg))
                 try:
                     await _after_mileage(context, bridge, msg.chat_id, key[1], bike, num, oil_hint)
                 except Exception:
@@ -2761,6 +2938,12 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
                 return True
     _PENDING_MILEAGE.pop(key, None)
     clear_awaiting(*key)
+    # ЕДИНАЯ ТОЧКА подтверждения: откат строк с прежним числом (если человек поправил) + дозапись
+    # отложенных инфо-работ ПОДТВЕРЖДЁННЫМ км. Стоит ДО B1 — заявка может увести нас в ранний
+    # return, а работы и откат не должны от этого зависеть.
+    _odo_confirmed(bridge, msg.chat_id, key[1], bike, num, questioned_km=mileage,
+                   sender=_sender_from_user(getattr(msg, "from_user", None)),
+                   source="текст", msg_date=_msg_date_of(msg))
     # B1 (вариант б): по байку ОТКРЫТА заявка ТО в статусе 'ждёт_факт' (механик уже отписался о работе,
     # ждали ТОЛЬКО одометр) → подтверждённый фото-одометр доводит заявку до подтверждения Пыму.
     # Сторож убывания B уже пройден выше (берём проверенное число). Запись — по-прежнему по «да» Пыма (гейт сохранён).
@@ -2862,6 +3045,11 @@ async def _apply_correction(context, bridge, chat_id, topic_id, bike, old_km, ne
             f"  🔒 _apply_correction ЗАБЛОКИРОВАНА сторожем Б: {old_km}→{new_km} тема={topic_id}"
         )
         return
+    # СТРАХОВКА-ОТКАТ (та же функция, что на пути подтверждения): текстовая правка «не верно,
+    # пробег N» исправляла ТОЛЬКО служебную запись обслуживания, а строки «события» с прежним
+    # числом оставались в истории байка. Теперь правка снимает и переписывает их тоже.
+    _rollback_km_events(bridge, chat_id, topic_id, wrong_km=str(old_km), right_km=str(new_km),
+                        sender="правка (текст)", source="_apply_correction")
     info = _run_service_tracker(bridge, chat_id, topic_id, bike, new_km)   # service_upsert(new)
     # Новый last-known = исправленное значение: будущие ФОТО сравнивает сторож B уже от него
     # (_run_service_tracker обновил _LAST_RECORDED_KM; дублируем в буфер фото как свежий high).
@@ -3631,6 +3819,10 @@ async def handle_service_button(update, context, bridge) -> None:
         _SVC_TOKENS.pop(token, None)
         _PENDING_MILEAGE.pop(key, None)
         clear_awaiting(*key)
+        # ЕДИНАЯ ТОЧКА подтверждения (зеркало текстового пути): кнопка «Да» подтверждает ровно то
+        # число, о котором спрашивали → откат не нужен, но отложенные инфо-работы дописываются.
+        _odo_confirmed(bridge, chat_id, topic_id, bike, mileage, questioned_km=mileage,
+                       sender=_sender_from_user(q.from_user), source="кнопка «Да»")
         # (2) B1-хук в КНОПОЧНОМ пути (зеркало текстового handle_mileage_confirm): открытая 'ждёт_факт' заявка →
         # подтверждённый фото-пробег доводит её до кнопки Пыма (запись только по svc:done от доверенного — гейт сохранён).
         try:
@@ -3788,6 +3980,10 @@ async def handle_service_button(update, context, bridge) -> None:
         _odo_audit_write(bridge, chat_id, topic_id, bike, new_km, prev_km,
                          sender=sender, outcome="подтверждено (кнопка механика)")
         log.info(f"  → sodo-кнопка: {sender} bike={bike} {prev_km}→{new_km}")
+        # ЕДИНАЯ ТОЧКА подтверждения (та же, что в тексте и в кнопке «Да»).
+        _odo_confirmed(bridge, chat_id, topic_id, bike,
+                       str(new_km) if new_km is not None else "",
+                       questioned_km=new_km, sender=sender, source="кнопка «Да, намеренно»")
         try:
             await _after_mileage(context, bridge, chat_id, topic_id, bike,
                                  str(new_km) if new_km is not None else "", oil_hint)
@@ -5229,6 +5425,23 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     if not sp:
         return False
     status = str(sp.get("status"))
+    # === КОРЕНЬ 2 (класс-фикс 31.07.2026, инцидент NMAX 155 GREEN-B 4957 тема 79, 29.07) ===
+    # Пока по теме ВИСИТ незакрытый вопрос о пробеге («📟 Вижу пробег 38982 км. Верно?»), голое
+    # число = ОТВЕТ на этот вопрос, а не «результат работ». Роутер bot.py зовёт нас ПЕРВЫМИ
+    # (шаг 0, bot.py:824) — раньше handle_mileage_confirm (шаг 2, bot.py:832): поправка механика
+    # «36982» уезжала одометром в заявку, а ветка подтверждения не отрабатывала ВООБЩЕ —
+    # ни сторожа убывания, ни аудит-следа, ни отката уже записанного, и неподтверждённый OCR
+    # 38982 оставался висеть в pending. Уступаем такое сообщение обычному пути (return False)
+    # → шаг 2 → handle_mileage_confirm.
+    # УЗКО, по ДЕЙСТВИЮ: только голое 4–6-значное число (ровно то, что примет handle_mileage_confirm)
+    # и только пока заявка НЕ 'ждёт_подтверждения' — там голое число ДОВЕРЕННОГО есть санкция на
+    # запись в Лист1 (ветка «ответ 2» ниже), её не трогаем.
+    if (status != "ждёт_подтверждения"
+            and pending_mileage_for(chat_id, topic_id)
+            and _re_pl.fullmatch(r"\s*\d{4,6}\s*", str(text or ""))):
+        log.info(f"  → ТО фаза2 уступает подтверждению пробега: по теме висит вопрос о пробеге, "
+                 f"голое число {str(text).strip()!r} → handle_mileage_confirm ({bike or '?'})")
+        return False
     # Запасной путь (ответ 2): заявка ждёт подтверждения, ДОВЕРЕННЫЙ прислал голое число вместо кнопки →
     # берём его число одометром и пишем факт (trust соблюдён — это Пым/владелец, не механик).
     if status == "ждёт_подтверждения":
@@ -5593,8 +5806,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     if non_oil_works:
         event_type = "repair"   # для force/_service_ctx ниже (перечень в notes НЕ лепим)
     info_works = [w for w in works if _classify_work(w) == "info"]
-    _km_conf_ok = str(vis.get("mileage_confidence", "")) != "low"
-    km_now = parsed.get("mileage") or (vis.get("mileage") if _km_conf_ok else "") or ""
+    # ОДНО ПРАВИЛО ЗАПИСИ (класс-фикс 4957): в «события» идёт только ЧЕЛОВЕЧЕСКОЕ число.
+    # Раньше здесь стоял сырой vis.mileage — и ветка инфо-работ писала OCR мимо подтверждения
+    # («колодки — 38982 км», splinter.log 29.07 09:32:16), пока ветка обычного события уже была
+    # закрыта гейтом 06c1ab2. Теперь обе ветки берут км из ОДНОЙ функции.
+    km_now = _km_for_record(parsed, vis)
     _ev_msg_id = f"{chat_id}:{msg.message_id}"
     _msg_date = str(msg.date.date()) if msg.date else ""
 
@@ -5613,7 +5829,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         _learn_works_th(claude, info_works)
         if km_now:
             # Пробег есть В ЭТОМ сообщении → пишем инфо-работы СРАЗУ, по строке на работу, с км.
-            _logged_works += _write_info_works(bridge, group_name, topic_id, bike, info_works, str(km_now), _ev_msg_id, _msg_date)
+            _logged_works += _write_info_works(bridge, group_name, topic_id, bike, info_works,
+                                               str(km_now), _ev_msg_id, _msg_date, chat_id=chat_id)
         else:
             # Пробега нет → буферизуем перечень; запишем при приходе пробега (flush). Ниже уйдёт переспрос.
             _PENDING_WORKS[(chat_id, topic_id)] = {
@@ -5622,15 +5839,19 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             log.info(f"  → инфо-работы отложены до пробега: {info_works} (тема {topic_id})")
     else:
         # Нет инфо-работ — обычное событие сообщения (фото/возврат/топливо/только колоночные) пишем как раньше.
-        # OCR-дыра (задача 383): сырой vision-пробег до подтверждения человеком НЕ пишем в события.
-        # Только text-пробег (human-provided) идёт в поле mileage; raw OCR → "" (запишем после confirm).
-        _ev_mileage = parsed.get("mileage") or ""
-        _ev_r = bridge.add_event(
+        # OCR-дыра (задача 383, гейт 06c1ab2): сырой vision-пробег до подтверждения человеком НЕ пишем
+        # в события. Число берём ТОЙ ЖЕ функцией, что и ветка инфо-работ выше — правило одно на обе.
+        _ev_mileage = _km_for_record(parsed, vis)
+        _ev_kw = dict(
             msg_date=_msg_date,
             group=group_name + (f" / тема {topic_id}" if topic_id else ""),
             bike=bike, event_type=event_type, fuel=str(fuel), mileage=str(_ev_mileage),
             photos=1 if has_photo else 0, notes=notes, msg_id=_ev_msg_id, sender=_sender,
         )
+        _ev_r = bridge.add_event(**_ev_kw)
+        if _ev_mileage and (_ev_r or {}).get("ok"):
+            _km_event_journal(chat_id, topic_id, _ev_mileage, plain=[_ev_kw], bike=bike,
+                              group=group_name, msg_date=_msg_date)
     # ДИАГ: бот раньше ВЫБРАСЫВАЛ return add_event — теперь видно saved/duplicate/error + разбор работ.
     log.info(f"  → add_event: ok={(_ev_r or {}).get('ok')} saved={(_ev_r or {}).get('saved')} "
              f"duplicate={(_ev_r or {}).get('duplicate')} error={(_ev_r or {}).get('error')} "
