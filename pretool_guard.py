@@ -248,6 +248,13 @@ def _guard_write_marker(task_id, hit, card, blocktype=None):
         path = os.path.join(d, marker_name(task_id))
         tmp = path + ".tmp"
         payload = {"task_id": task_id, "hit": hit, "card": card}
+        # ЗАМОК ПРОИСХОЖДЕНИЯ КАРТОЧКИ (31.07.2026): одноразовый токен прогона, который демон
+        # положил в env запускаемой задачи. Демон сверяет его и по нему отличает маркер, писанный
+        # ХУКОМ этого прогона, от протухшего/чужого. Токена в env нет (ручной прогон, старый
+        # демон) → поле не пишем: демон покажет карточку как несверенную, но НЕ потеряет её.
+        tok = (os.environ.get("CC_GUARD_TOKEN") or "").strip()
+        if tok:
+            payload["token"] = tok
         if blocktype:
             payload["blocktype"] = blocktype
         with open(tmp, "w", encoding="utf-8") as f:

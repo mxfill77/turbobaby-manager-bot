@@ -203,7 +203,10 @@ res.append(ok(fb.na_calls == 0 and len(fb.by_status("new")) == 0,
 print("(4) обычные op НЕ задеты:")
 fb = fresh()
 tid = fb.enqueue_task("Filipp-328-dev", "задача с push")["id"]
-fb.rows[tid]["status"] = "needs_approval"; fb.rows[tid]["result"] = "op=git_push | нужен push"
+fb.rows[tid]["status"] = "needs_approval"
+# гардовый штамп: с 31.07.2026 исполнимый класс признаётся только у карточки, рождённой
+# сверенным маркером гарда (замок происхождения) — фикстура повторяет живой формат такой карточки
+fb.rows[tid]["result"] = f"op=git_push | нужен push\n{OD.ORIGIN_GUARD_TOKEN} — перехвачена команда"
 fb.approve(tid)
 fake_run.calls = []
 OD.process_approved()

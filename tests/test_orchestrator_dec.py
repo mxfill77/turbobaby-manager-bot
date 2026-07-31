@@ -161,12 +161,20 @@ fb = fresh()
 pid = fb.enqueue_task("Filipp-328-dec", "задача с красным шагом")["id"]
 OD.process_new()                                   # план → 2 шага
 s1, s2 = sorted(r["id"] for r in fb.by_status("new"))
-fake_run.step_out = "NEEDS_APPROVAL: op=git_push | нужен push"
+# живой формат самодекларации (31.07.2026): преамбула велит исполнителю выводить ТОЛЬКО
+# «op=other» — git push и рестарты он делает сам оранжевым циклом. Исполнимый класс в заявке
+# исполнителя карточки больше не рождает (замок происхождения, tests/test_card_origin.py).
+fake_run.step_out = "NEEDS_APPROVAL: op=other | запись в CRM · строка 12 · смотреть лист"
 OD.process_new()                                   # шаг 1 → needs_approval
 res.append(ok(fb.rows[s1]["status"] == "needs_approval", "красный шаг 1 → needs_approval (кнопка)"))
 fake_run.step_out = "сводка: шаг сделан"
 OD.process_new()                                   # guard: шаг 2 НЕ берём, пока сиблинг ждёт
 res.append(ok(fb.rows[s2]["status"] == "new", "guard: шаг 2 не тронут, пока шаг 1 ждёт «да»"))
+# Дальше проверяется ветка «approve → хардкод-op исполнен → цепочка поехала». С 31.07.2026
+# исполнимый класс несёт ТОЛЬКО карточка, рождённая сверенным маркером гарда (замок
+# происхождения), поэтому подменяем тело карточки на гардовое — ровно в том виде, в каком его
+# пишет демон. Заявка исполнителя с op=git_push сюда не доходит вовсе (tests/test_card_origin.py).
+fb.rows[s1]["result"] = f"op=git_push | нужен push\n{OD.ORIGIN_GUARD_TOKEN} — перехвачена команда"
 fb.approve(s1)
 OD.process_approved()                              # хардкод-op git_push (мок) → done
 res.append(ok(fb.rows[s1]["status"] == "done", "approve → op исполнен → шаг 1 done"))

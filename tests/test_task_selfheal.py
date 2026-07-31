@@ -269,7 +269,9 @@ res.append(ok(fb.rows[tid]["status"] == "needs_approval" and fake_run.thinker_ca
               "красная одиночная → needs_approval-кнопка как раньше, думатель не зовётся"))
 fb = fresh()
 tid = fb.enqueue_task("Filipp-328-dev", "тз: упадёт, а перерождение упрётся в красное")["id"]
-fake_run.task_queue = [("", 1), ("NEEDS_APPROVAL: op=git_push | нужен push", 0)]
+# живой формат самодекларации (31.07.2026): op=other — исполнимый класс в заявке исполнителя
+# карточки не рождает (замок происхождения, tests/test_card_origin.py)
+fake_run.task_queue = [("", 1), ("NEEDS_APPROVAL: op=other | запись в CRM · строка 12", 0)]
 fake_run.thinker_out = RETRY_JSON
 OD.process_new()                                     # провал → перерождение
 OD.process_new()                                     # перерождение упёрлось в красное → кнопка

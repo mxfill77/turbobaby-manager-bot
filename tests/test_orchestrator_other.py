@@ -169,16 +169,21 @@ res.append(ok(fb.rows[tid]["status"] == "failed" and "не встал в оче�
               and "решение владельца" in fb.rows[tid]["result"],
               "enqueue не прошёл → failed с фоллбэком «требуется решение владельца»"))
 
-# (5) AUTO_OPS-путь не задет: op=git_push после approve по-прежнему хардкод
+# (5) AUTO_OPS-путь не задет: op=git_push после approve по-прежнему хардкод.
+# ЗАМОК ПРОИСХОЖДЕНИЯ (31.07.2026): исполнимый класс признаётся ТОЛЬКО у карточки, рождённой
+# сверенным маркером гарда, поэтому фикстура несёт гардовый штамп — так её и рождает демон.
+# Заявка исполнителя с тем же op=git_push (и легаси-строка без штампа) хардкод НЕ запускает —
+# это проверяет tests/test_card_origin.py секция (4).
 print("(5) op∈AUTO_OPS без изменений:")
 fb = fresh()
 tid = fb.enqueue_task("Filipp-328-dev", "задача с push")["id"]
-fb.rows[tid]["status"] = "needs_approval"; fb.rows[tid]["result"] = "op=git_push | нужен push"
+fb.rows[tid]["status"] = "needs_approval"
+fb.rows[tid]["result"] = f"op=git_push | нужен push\n{OD.ORIGIN_GUARD_TOKEN} — перехвачена команда"
 fb.approve(tid)
 fake_run.calls = []
 OD.process_approved()
 res.append(ok(fb.rows[tid]["status"] == "done" and any(a and a[0] == "git" for a in fake_run.calls),
-              "op=git_push → хардкод git push, конверт не вмешался"))
+              "op=git_push (гардовая карточка) → хардкод git push, конверт не вмешался"))
 res.append(ok(OD.AUTO_OPS == ("git_push", "restart_splinter"), "AUTO_OPS не расширены"))
 
 OD.subprocess.run = _real_run

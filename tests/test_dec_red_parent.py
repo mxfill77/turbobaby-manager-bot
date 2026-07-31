@@ -150,7 +150,10 @@ fake_run.plan_out = "1. код\n2. деплой"
 pid = fb.enqueue_task("Filipp-328-dec", "код + деплой")["id"]
 OD.process_new()                                   # план → 2 шага
 s1, s2 = sorted(r["id"] for r in fb.by_status("new"))
-fake_run.step_out = "NEEDS_APPROVAL: op=git_push | нужен push"
+# живой формат самодекларации (31.07.2026): исполнитель выводит ТОЛЬКО «op=other» (git push и
+# рестарт своих сервисов — оранжевый цикл, маркер запрещён преамбулой). Заявка с ИСПОЛНИМЫМ
+# классом карточки не рождает — замок происхождения, tests/test_card_origin.py.
+fake_run.step_out = "NEEDS_APPROVAL: op=other | запись в CRM · строка 12 · смотреть лист"
 OD.process_new()                                   # шаг 1 красный
 res.append(ok(fb.rows[s1]["status"] == "needs_approval",
               "красный шаг → needs_approval (существующая механика кнопки цела)"))

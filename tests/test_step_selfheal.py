@@ -319,7 +319,9 @@ fb = fresh()
 pid = fb.enqueue_task("Filipp-328-dec", "ТЗ с красным шагом")["id"]
 OD.process_new()
 s1, s2 = sorted(r["id"] for r in fb.by_status("new"))
-fake_run.step_queue = [("NEEDS_APPROVAL: op=git_push | нужен push", 0)]
+# живой формат самодекларации (31.07.2026): op=other — исполнимый класс в заявке исполнителя
+# карточки не рождает (замок происхождения, tests/test_card_origin.py)
+fake_run.step_queue = [("NEEDS_APPROVAL: op=other | запись в CRM · строка 12", 0)]
 OD.process_new()
 res.append(ok(fb.rows[s1]["status"] == "needs_approval" and fake_run.thinker_calls == 0,
               "красный шаг → needs_approval-кнопка как раньше, думатель не зовётся"))
