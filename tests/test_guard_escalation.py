@@ -85,8 +85,17 @@ try:
     res.append(ok(os.path.exists(path), f"маркер-файл создан ({_name})"))
     with open(path) as f:
         d = json.load(f)
-    res.append(ok(d == {"task_id": "42", "hit": "set_fleet_oil", "card": _CARD42},
-                  f"содержимое маркера корректно: {d}"))
+    # ЖИВОЙ ФОРМАТ (замок происхождения 31.07.2026): хук кладёт в маркер ещё и `token` —
+    # одноразовый CC_GUARD_TOKEN прогона, по нему демон сверяет, что маркер написан ЭТИМ хуком.
+    # Поле есть ровно тогда, когда переменная в окружении (в headless она есть всегда, в голом
+    # shell — нет), поэтому сверяем ядро полей + токен ПО ОКРУЖЕНИЮ, а не дословный словарь:
+    # жёсткое равенство краснело у любого прогона внутри headless-задачи.
+    _core_ok = ({k: d.get(k) for k in ("task_id", "hit", "card")}
+                == {"task_id": "42", "hit": "set_fleet_oil", "card": _CARD42})
+    _env_tok = (os.environ.get("CC_GUARD_TOKEN") or "").strip()
+    _tok_ok = (d.get("token") == _env_tok) if _env_tok else ("token" not in d)
+    res.append(ok(_core_ok and _tok_ok and set(d) <= {"task_id", "hit", "card", "token"},
+                  f"содержимое маркера корректно (token по окружению: {'есть' if _env_tok else 'нет'}): {d}"))
     # молчит без task_id
     PG._guard_write_marker("", "set_fleet_oil", "карточка 1")
     res.append(ok(not os.path.exists(os.path.join(tmp_guard, ".json")),
