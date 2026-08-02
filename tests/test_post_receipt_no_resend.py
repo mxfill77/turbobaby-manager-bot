@@ -181,7 +181,10 @@ def test_answer_names_the_leg_and_the_next_step():
         Resp(200, payload=dict(DOGET_REFUSAL)),
     ])
     c._blackbox_log = lambda *a, **k: None
-    r = c.add_event(kind="ТО", text="проба")
+    # ЖИВОЙ ФОРМАТ ВЫЗОВА (02.08.2026): у записи события ключ сообщения ОБЯЗАТЕЛЕН — клиент
+    # отказывает без него ДО транспорта (bridge_client.add_event). Фикстура без ключа мерила бы
+    # уже не то плечо: отказ клиента вместо отказа расписки. Ключ — живой формы «<чат>:<id>».
+    r = c.add_event(kind="ТО", text="проба", msg_id="-1002751134848:11091")
     msg = str(r.get("message") or "")
     assert "doGet" in msg, f"плечо расписки не названо: {msg}"
     assert "перечита" in msg.lower(), f"следующий шаг не назван: {msg}"
@@ -189,7 +192,7 @@ def test_answer_names_the_leg_and_the_next_step():
     # а вот отказ БЕЗ message (плечо doPost, Bridge.js:234) — тоже без пересылки:
     c2 = client([Resp(302, location=ECHO), Resp(200, payload={"ok": False, "error": "unauthorized"})])
     c2._blackbox_log = lambda *a, **k: None
-    r2 = c2.add_event(kind="ТО", text="проба")
+    r2 = c2.add_event(kind="ТО", text="проба", msg_id="-1002751134848:11092")
     assert len(posts(c2)) == 1, "write-POST переслан на отказе без message"
     assert r2.get("outcome") == "unknown"
     print("OK (7): назван объект решения — плечо расписки и «перечитай факт»")
