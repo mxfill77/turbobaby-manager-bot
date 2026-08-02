@@ -131,9 +131,12 @@ _tmp2 = tempfile.mkdtemp(prefix="guard_obj_")
 _prev = os.environ.get(PG.BLOCK_DIR_ENV)
 os.environ[PG.BLOCK_DIR_ENV] = _tmp2
 try:
-    res.append(ok(PG.marker_has_object("add_transaction", "сумма 500")
+    # 02.08.2026: денежного исключения во второй линии больше нет — она смотрит ту же величину, что
+    # card_gate (подписанная строка «Объект:» со значением), у ВСЕХ классов одинаково.
+    res.append(ok(PG.marker_has_object("add_transaction", "Объект: кошелёк Наличка\nЧисло: сумма -500")
+                  and not PG.marker_has_object("add_transaction", "Объект: —\nЧисло: —")
                   and not PG.marker_has_object("op", "подтверди операцию"),
-                  "вторая линия: деньги (_ALWAYS_CARD) проходят всегда; без строки «Объект:» — нет"))
+                  "вторая линия: цель названа → маркер; прочерки и текст без «Объект:» — нет"))
     PG._guard_write_marker("77", "op", "подтверди операцию")
     res.append(ok(not os.path.exists(os.path.join(_tmp2, PG.marker_name("77"))),
                   "вторая линия: карточка без объекта → маркера НЕТ"))

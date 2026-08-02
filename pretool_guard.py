@@ -190,27 +190,87 @@ def _node_literal(node):
     return None
 
 
+# Чисто-разборные модули: ими нельзя ни записать в кассу, ни выполнить чужой код — только читать и
+# считать. Список БЕЛЫЙ намеренно: неизвестный модуль = канал = краснее. Сюда НЕ входят и не должны
+# входить subprocess/socket/http/urllib/requests/bridge_client — это и есть каналы.
+_INERT_MODULES = frozenset((
+    "re", "json", "os", "sys", "glob", "time", "datetime", "calendar", "math", "csv", "statistics",
+    "collections", "itertools", "functools", "operator", "pathlib", "textwrap", "string", "difflib",
+    "hashlib", "random", "unicodedata", "ast", "shlex", "io", "typing", "pprint", "argparse",
+    "traceback", "base64", "binascii", "codecs", "uuid", "tempfile", "shutil", "fnmatch", "logging",
+    "warnings", "copy", "heapq", "bisect", "decimal", "fractions", "struct", "zlib", "gzip",
+    "tarfile", "zipfile", "sqlite3", "unittest", "types", "enum", "dataclasses", "abc", "inspect",
+    "platform", "locale", "getpass", "signal", "atexit", "gc", "keyword", "token", "tokenize",
+))
+# Имена, которыми тело ИСПОЛНЯЕТ чужое или ходит в сеть: их наличие = канал, даже если все импорты
+# инертны (`os.system("curl …")`, `getattr(bridge, имя)()`).
+_EXEC_CALLS = frozenset((
+    "system", "popen", "run", "Popen", "call", "check_call", "check_output", "spawn", "spawnl",
+    "execv", "execl", "exec", "eval", "compile_command", "urlopen", "request", "post", "put",
+    "patch", "send", "sendall", "getattr", "__import__", "import_module", "connect",
+))
+
+
+def _str_consts(node, depth=3):
+    """Строковые литералы, отданные ВЫЗОВУ: сам аргумент либо элемент списка/кортежа/словаря внутри
+    него. Глубина ограничена и контейнеры перечислены НАРОЧНО: ищется СЕЛЕКТОР действия
+    (`_post("add_transaction", …)`), а не всякая строка, случайно оказавшаяся в дереве аргумента —
+    иначе `any(t in line for t in (…))` из разведки снова читалось бы как операция."""
+    out = []
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        out.append(node.value)
+    elif depth > 0 and isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        for e in node.elts:
+            out += _str_consts(e, depth - 1)
+    elif depth > 0 and isinstance(node, ast.Dict):
+        for e in list(node.keys) + list(node.values):
+            if e is not None:
+                out += _str_consts(e, depth - 1)
+    return out
+
+
 def _py_code_view(src):
-    """Разбор ОДНОГО python-тела → {'text','conf','calls'} либо None (не разобралось)."""
+    """Разбор ОДНОГО python-тела → {'text','conf','calls','names','lit_args','channel'} либо None.
+
+    Три факта добавлены 02.08.2026 ради ДЕНЕЖНОГО класса (см. _money_is_action ниже):
+      names    — ИМЕНА КОДА без строк: идентификатор/атрибут/импорт/аргумент/def. Именно этим
+                 `bridge.add_transaction(…)` отличается от `"add_transaction" in line`;
+      lit_args — строковые литералы, отданные ВЫЗОВУ (сам аргумент либо элемент списка/кортежа/
+                 словаря внутри него): так выглядит имя операции, работающее СЕЛЕКТОРОМ действия
+                 (`_post("add_transaction", …)`, `data={"action": "add_transaction"}`);
+      channel  — есть ли у тела чем ДОЙТИ до кассы: импорт вне списка чисто-разборных модулей либо
+                 вызов исполняющего/сетевого имени. Список инертных модулей БЕЛЫЙ намеренно —
+                 неизвестный модуль считается каналом, то есть сомнение решается краснее."""
     try:
         tree = ast.parse(src or "")
     except Exception:
         return None
-    words, conf, calls = [], False, {}
+    words, names, conf, calls = [], [], False, {}
+    lit_args, mods = [], []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             words.append(node.id)
+            names.append(node.id)
         elif isinstance(node, ast.Attribute):
             words.append(node.attr)
+            names.append(node.attr)
         elif isinstance(node, ast.arg):
             words.append(node.arg)
+            names.append(node.arg)
         elif isinstance(node, ast.alias):
             words.append(node.name)
             words.append(node.asname or "")
+            names.append(node.name)
+            names.append(node.asname or "")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             words.append(node.name)
+            names.append(node.name)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             words.append(node.value)
+        elif isinstance(node, ast.Import):
+            mods += [(a.name or "").split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            mods.append((node.module or "").split(".")[0])
         elif isinstance(node, ast.keyword):
             words.append(node.arg or "")
             if node.arg == "confirmed" and _node_truthy(node.value):
@@ -232,7 +292,12 @@ def _py_code_view(src):
                 for k in node.keywords:
                     if k.arg:
                         kw.setdefault(k.arg, _node_literal(k.value))
-    return {"text": "\n".join(w for w in words if w), "conf": conf, "calls": calls}
+            for a in list(node.args) + [k.value for k in node.keywords]:
+                lit_args += _str_consts(a)
+    channel = (any(m and m not in _INERT_MODULES for m in mods)
+               or any(c in _EXEC_CALLS for c in calls))
+    return {"text": "\n".join(w for w in words if w), "conf": conf, "calls": calls,
+            "names": [n for n in names if n], "lit_args": lit_args, "channel": channel}
 
 
 def _code_view_parts(parts):
@@ -241,15 +306,20 @@ def _code_view_parts(parts):
     if not parts:
         return None
     text, conf, calls = [], False, {}
+    names, lit_args, channel = [], [], False
     for src in parts:
         v = _py_code_view(src)
         if v is None:
             return None
         text.append(v["text"])
         conf = conf or v["conf"]
+        names += v["names"]
+        lit_args += v["lit_args"]
+        channel = channel or v["channel"]      # канал ОДНОГО тела красит команду целиком
         for fn, kw in v["calls"].items():
             calls.setdefault(fn, {}).update(kw)
-    return {"text": "\n".join(text), "conf": conf, "calls": calls}
+    return {"text": "\n".join(text), "conf": conf, "calls": calls,
+            "names": names, "lit_args": lit_args, "channel": channel}
 
 
 def _body_has(tok, raw, view):
@@ -265,6 +335,38 @@ def _body_has(tok, raw, view):
         # (`data="confirmed=true&…"` — тоже боевая запись, только через сырой запрос)
         return view["conf"] or bool(_CONFIRMED_RE.search(view["text"]))
     return tok in view["text"]
+
+
+# ── ДЕНЕЖНЫЙ КЛАСС: КРАСНОЕ РОЖДАЕТ ДЕЙСТВИЕ, А НЕ УПОМИНАНИЕ (02.08.2026) ────────────────────
+# Пять карточек за трое суток (117, 135, 140, 181, 208) пришли владельцу как «проводка ДЕНЕГ в
+# кассу», и НИ ЗА ОДНОЙ не стояло проводки. Дословный корень 208 — тело разведки, читающей
+# splinter.log: `if ("add_event" in line or … or "add_transaction" in line):`. Дословный корень
+# 117 — инлайн-подсчёт пишущих признаков СПИСКОМ СЛОВ: `writes = ["set_fleet", "add_transaction",
+# …]`. Оба раза красное дал СТРОКОВЫЙ ЛИТЕРАЛ: у прочих операций сомнение решается краснее и это
+# терпимо (карточка гаснет объектным гейтом), а деньги обходили гейт через _ALWAYS_CARD — и
+# упоминание доезжало до владельца карточкой из одних прочерков.
+#
+# Асимметрия с остальными токенами намеренная: у денег цена ЛОЖНОЙ карточки выше, чем у прочих
+# классов, — она не просто шумит, она УБИВАЕТ задачу (в headless `ask` = отказ), и она приучает
+# владельца жать «да» на карточку, за которой ничего нет. Поэтому здесь красное требует признака
+# ДЕЙСТВИЯ, а не совпадения слова:
+#   1) РАЗОБРАННЫЙ ВЫЗОВ         — `bridge.add_transaction(…)`, `add_transaction(…)`;
+#   2) ИМЯ КОДА                  — ссылка/импорт/атрибут без скобок (`fn = bridge.void_last`,
+#                                  `from bridge_client import add_transaction`);
+#   3) ЛИТЕРАЛ-СЕЛЕКТОР + КАНАЛ  — строка отдана вызову (`_post("add_transaction", …)`,
+#                                  `data={"action": …}`) И у тела есть чем дойти до кассы.
+# Слепое тело (stdin/heredoc, неизвестный `-m`, нечитаемый .py) и несостоявшийся разбор → прежняя
+# подстрока БАЙТ-В-БАЙТ: судить по разобранному нечего, направление сомнения — краснее.
+_MONEY_HITS = ("add_transaction", "void_last")
+
+
+def _money_is_action(tok, raw, view, blind=False):
+    """Денежное имя ДЕЙСТВУЕТ (красное) или лишь УПОМЯНУТО (не красное)? См. разбор выше."""
+    if view is None or blind:
+        return tok in (raw or "")
+    if tok in (view.get("calls") or {}) or tok in (view.get("names") or ()):
+        return True
+    return bool(view.get("channel")) and any(tok in s for s in (view.get("lit_args") or ()))
 
 
 # Разбор тела последней команды — латч на прогон хука. ПОЧЕМУ ЛАТЧ, А НЕ ПАРАМЕТР: та же причина,
@@ -415,10 +517,17 @@ def marker_name(task_id, env=None):
     return "%s%s.json" % (TEST_MARKER_PREFIX if isolated(env) else "", task_id)
 
 
-# ДЕНЬГИ спрашивают ВСЕГДА — даже когда объект не извлёкся. Отмена последней проводки по своей
-# природе зовётся БЕЗ аргументов (`void_last()`: «сними последнюю»), объекта в команде нет
-# физически — а цена ошибки денежная. Это исключение того же ряда, что жёсткий блок и секреты.
-_ALWAYS_CARD = ("void_last", "add_transaction")
+# ДЕНЬГИ БОЛЬШЕ НЕ ИСКЛЮЧЕНИЕ ИЗ ПРАВИЛА ОБЪЕКТА (02.08.2026, класс пяти пустых карточек).
+# Было: `_ALWAYS_CARD = ("void_last", "add_transaction")` — деньги спрашивали ВСЕГДА, даже когда
+# объекта нет. Основанием служила природа `void_last()` («сними последнюю» зовётся без аргументов).
+# Основание оказалось ложным дважды: цель у такого вызова ЕСТЬ — это САМ РАЗОБРАННЫЙ ВЫЗОВ, и он
+# теперь называется объектом («вызов void_last()»); а прикрытие исключением получала не природа
+# операции, а СОВПАДЕНИЕ СЛОВА — карточка «проводка ДЕНЕГ в кассу · Объект: — · Число: —» об
+# операции, которой в скрипте нет. Правило стало ОДНО для всех классов: нет названной цели —
+# карточки нет, есть строка в журнале. Деньги остаются высшим видом ДРУГИМ способом: у настоящего
+# вызова цель есть всегда (кошелёк, сумма или сам вызов), поэтому настоящая проводка спрашивает
+# как прежде. Жёсткий блок (процессы/секреты/живая сущность) правила объекта не касался и не
+# касается — он приходит владельцу всегда, мимо card_gate.
 
 # Строка «Объект:» готовой карточки, У КОТОРОЙ ЕСТЬ ЗНАЧЕНИЕ (прочерк «—» значением не считаем).
 _MARKER_OBJECT_RE = re.compile(r"(?m)^Объект:[ \t]*(?!—[ \t]*$)\S")
@@ -434,9 +543,8 @@ def marker_has_object(hit, card):
     с парком несёт «Лист1» — цифра там есть ВСЕГДА (ложное «объект есть»), а `pkill ngrok`,
     `systemctl stop nginx` и `DELETE FROM sessions` цифры не несут вовсе — маркер демону НЕ
     уходил, даже когда объект честно извлечён. Теперь смотрим ту же величину, что и card_gate:
-    подписанную строку «Объект:» со значением. Деньги (_ALWAYS_CARD) проходят всегда."""
-    if hit in _ALWAYS_CARD:
-        return True
+    подписанную строку «Объект:» со значением. 02.08.2026: денежного исключения здесь больше нет —
+    обе линии говорят ОДНО И ТО ЖЕ (см. блок над этой функцией и card_gate)."""
     return bool(_MARKER_OBJECT_RE.search(card or ""))
 
 # ── HARD-BLOCK: журнал жёстких блоков (JSONL). Путь берётся В МОМЕНТ ЗАПИСИ (тесты подменяют
@@ -672,10 +780,33 @@ def _bike_bit(blob):
 # без «да» команда не шла) — но и спросить «да» было не у кого: операция молча упиралась в стену.
 # Разобранный вызов различает то, чего текст различить не может: аргумента НЕТ (голое упоминание,
 # `print('set_fleet_oil')`) и аргумент ЕСТЬ, а значение станет известно только при запуске.
-# ДЕНЬГИ ЗДЕСЬ НЕ УЧАСТВУЮТ НАМЕРЕННО: add_transaction/void_last входят в _ALWAYS_CARD, их
-# карточка не гасится никогда — этому классу там нечего чинить, и трогать денежную ветку незачем.
-_ARG_OBJ = {"bike": ("number", "plate", "bike"), "client": ("name", "client")}
-_ARG_LABEL = {"bike": "байк", "client": "клиент"}
+# ДЕНЬГИ ПОДКЛЮЧЕНЫ 02.08.2026 (кошелёк): пока их карточка не гасилась никогда, извлекать объект
+# было незачем; теперь правило объекта одно для всех, и вычисляемый `group=wallet` обязан называться
+# — иначе НАСТОЯЩАЯ проводка молча ушла бы в журнал.
+_ARG_OBJ = {"bike": ("number", "plate", "bike"), "client": ("name", "client"),
+            "wallet": ("group", "wallet", "account"), "amount": ("amount", "sum")}
+_ARG_LABEL = {"bike": "байк", "client": "клиент", "wallet": "кошелёк", "amount": "сумма"}
+
+
+def _call_args(hit):
+    """Именованные аргументы РАЗОБРАННОГО вызова операции → {имя: литерал|None} либо None, если
+    вызова в разборе нет вовсе (слепое тело, чужой синтаксис, голое упоминание)."""
+    view = _CODE_VIEW
+    if not view:
+        return None
+    return (view.get("calls") or {}).get(hit)
+
+
+def _call_arg_literal(hit, kind):
+    """ЛИТЕРАЛЬНОЕ значение аргумента разобранного вызова (или ""). Разобранный вызов ВАЖНЕЕ текста:
+    регулярка `ключ=значение` читает ВЕСЬ blob и на теле `wallet = input()` + `add_transaction(
+    group=wallet, …)` выдавала «кошелёк input» — имя ПЕРЕМЕННОЙ вместо цели. Вызов знает точно."""
+    kw = _call_args(hit) or {}
+    for a in _ARG_OBJ.get(kind, ()):
+        v = kw.get(a)
+        if v:
+            return str(v).strip()
+    return ""
 
 
 def _carried_bit(hit, kind):
@@ -691,6 +822,20 @@ def _carried_bit(hit, kind):
         if a in kw and kw[a] is None:
             return "%s — значение вычисляется (аргумент %s)" % (_ARG_LABEL[kind], a)
     return ""
+
+
+def _money_call_seen(hit, blob):
+    """Денежная операция ВЫЗВАНА (а не упомянута)? Разобранный вызов — точный ответ; имя вплотную
+    к скобке в тексте — фолбэк для слепых тел (heredoc), где разбора нет вовсе.
+
+    Зачем это объект: `void_last()` по своей природе зовётся БЕЗ аргументов («сними последнюю»), и
+    ровно этим раньше оправдывалось исключение _ALWAYS_CARD. Цель у такого вызова всё-таки есть —
+    ЭТО САМ ВЫЗОВ; назвав его, мы получаем карточку у настоящей отмены и не получаем её у слова
+    в списке (`writes = ["void_last", …]` скобки не несёт)."""
+    view = _CODE_VIEW
+    if view is not None and _money_is_action(hit, blob, view):
+        return True
+    return bool(re.search(r"\b" + re.escape(hit) + r"\s*\(", blob or ""))
 
 
 def _detail_parts(hit, blob):
@@ -709,16 +854,34 @@ def _detail_parts(hit, blob):
         v = _find(_P_KM, blob)
         if v:
             num.append("пробег " + v)
-    elif hit in ("add_transaction", "void_last"):
-        w = _find(_P_WALLET, blob)
+    elif hit in _MONEY_HITS:
+        # Порядок источников ЖЁСТКИЙ: разобранный вызов → «значение вычисляется» → текст. Текст
+        # берётся ТОЛЬКО когда вызова в разборе нет (слепое тело): иначе регулярка тянет цель из
+        # чужой строки скрипта и врёт в самом дорогом классе.
+        seen = _call_args(hit) is not None
+        w = _call_arg_literal(hit, "wallet")
         if w:
-            obj.append("кошелёк " + w.strip())
-        b = _bike_bit(blob)
+            obj.append("кошелёк " + w)
+        else:
+            cw = _carried_bit(hit, "wallet")
+            if cw:
+                obj.append(cw)
+            elif not seen:
+                w2 = _find(_P_WALLET, blob)
+                if w2:
+                    obj.append("кошелёк " + w2.strip())
+        if seen:
+            bl = _call_arg_literal(hit, "bike")
+            b = ("байк " + bl) if (bl and _P_DIGIT.search(bl)) else _carried_bit(hit, "bike")
+        else:
+            b = _bike_bit(blob)
         if b:
             obj.append(b)
-        a = _find(_P_AMOUNT, blob)
+        a = _call_arg_literal(hit, "amount") or ("" if seen else _find(_P_AMOUNT, blob))
         if a:
             num.append("сумма " + a.strip())
+        if not obj and _money_call_seen(hit, blob):
+            obj.append("вызов %s()" % hit)      # аргументов нет по природе — цель это сам вызов
     elif hit in _HITS_CRM:
         b = _bike_bit(blob) or _carried_bit(hit, "bike")
         if b:
@@ -793,7 +956,10 @@ def card_gate(hit, obj, num=""):
         • ЧИСЛО карточку НЕ гейтит НИКОГДА. Оно есть там, где операция несёт его ПО СВОЕЙ ПРИРОДЕ
           (сумма, пробег, дата, ключ, PID), и честно пусто там, где не несёт. Поле остаётся, в нём
           прочерк.
-        • Деньги (_ALWAYS_CARD), жёсткий блок и секреты спрашивают всегда — как и было.
+        • Жёсткий блок и секреты спрашивают всегда — как и было (они сюда не заходят вовсе).
+        • ДЕНЬГИ С 02.08.2026 — НЕ ИСКЛЮЧЕНИЕ: у настоящего вызова цель есть всегда (кошелёк,
+          сумма либо сам разобранный вызов), а безобъектная карточка «проводка ДЕНЕГ» пять раз
+          за трое суток означала не проводку, а совпадение слова. См. блок над marker_has_object.
 
     ЧТО ЭТИМ ЧИНИТСЯ. Правило было «нет объекта ИЛИ числа → карточки нет», и числа по природе не
     несут ЧЕТЫРЕ операции — отмена последней проводки (деньги!), стоп сервиса по имени, pkill по
@@ -801,7 +967,7 @@ def card_gate(hit, obj, num=""):
     владелец о них не узнавал. Полоса ПК тем временем гасила карточку только когда пусто И объект,
     И число — то есть безобъектная команда с любой цифрой карточку РОЖДАЛА. Обе полосы сведены
     сюда: одна функция, одно правило, одинаковое имя в обоих репозиториях."""
-    return bool((obj or "").strip()) or hit in _ALWAYS_CARD
+    return bool((obj or "").strip())
 
 
 # ТЕСТ-СУЩНОСТИ (класс 23.07.2026, порт из stash@{1} 26.07.2026). Доктрина: боевую запись в живые
@@ -1521,8 +1687,11 @@ def _analyze(cmd, cwd, scan=None):
         return "green", "", cmd
     # 1) быстрый греп по САМОЙ команде (инлайн -c, env DOWRITE, argv) — по СКАН-представлению:
     #    красное слово в поисковом шаблоне это данные, а не операция (класс «данные ≠ команда»)
+    #    ДЕНЬГИ ЗДЕСЬ ПРОПУСКАЮТСЯ (02.08.2026): их решает _money_is_action ПОСЛЕ разбора тел —
+    #    инлайн `-c` попадает в parts и судится разобранным, а всё, что разбору не досталось
+    #    (heredoc/stdin/нечитаемое), возвращается сюда же подстрокой через blind ниже.
     for tok in RED_TOKENS:
-        if tok in scan:
+        if tok in scan and tok not in _MONEY_HITS:
             return "red", RED_TOKEN_HIT[tok], cmd
     # 1а) confirmed=ИСТИНА в САМОЙ команде — по разобранному присваиванию, а не по написанию
     #     (02.08.2026): список из пяти литералов не совпадал с `confirmed  =  True`, и боевая
@@ -1541,7 +1710,13 @@ def _analyze(cmd, cwd, scan=None):
     try:
         toks = shlex.split(cmd)
     except Exception:
-        return "ambiguous", "ambiguous", cmd   # кривое квотирование → ambiguous (в3: defer)
+        # Кривое квотирование → ambiguous (в3: defer). ДЕНЬГИ ЗДЕСЬ ДОБИРАЮТСЯ ПОДСТРОКОЙ: разбора
+        # тел не будет вовсе, а пропуск денег на шаге 1 рассчитан именно на разбор — без этой
+        # ветки команда с незакрытой кавычкой стала бы тише, чем была до правки 02.08.2026.
+        for tok in _MONEY_HITS:
+            if tok in scan:
+                return "red", RED_TOKEN_HIT[tok], cmd
+        return "ambiguous", "ambiguous", cmd
     content = ""
     parts = []          # те же тела ПООТДЕЛЬНОСТИ — для канонического разбора (_code_view_parts)
     i = 0
@@ -1584,6 +1759,15 @@ def _analyze(cmd, cwd, scan=None):
     view = _code_view_parts(parts)
     set_code_view(view)
     for tok in RED_TOKENS:
+        if tok in _MONEY_HITS:
+            # Подстрока берётся по СКАН-представлению (argv скрипта и шаблон поиска — данные, класс
+            # «данные ≠ команда» цел), а слепым считается не только несобранный разбор (amb), но и
+            # имя, произнесённое ВНЕ разобранных тел: до имени скрипта, в `-m`-модуле, в heredoc.
+            # Там разбирать нечего, и молчать нельзя — это и есть регресс `<OP> перед .py`.
+            outside = tok in scan and tok not in content
+            if _money_is_action(tok, scan + "\n" + content, view, blind=amb or outside):
+                return "red", RED_TOKEN_HIT[tok], blob
+            continue
         if _body_has(tok, content, view):
             return "red", RED_TOKEN_HIT[tok], blob
     # memory.db через python-код = 🟢 (своя БД бота, доктрина «своя таблица через код = зелёное»,
