@@ -155,7 +155,11 @@ def test_wedge_recreates_session():
 
 
 def test_unauthorized_on_redirect_resends_token():
-    """(г) echo-слой съел токен → unauthorized: запрос переслан заново С токеном, ровно 1 раз."""
+    """(г) echo-слой съел токен → unauthorized: запрос переслан заново С токеном, ровно 1 раз.
+    ПРАВКА 02.08.2026: подопытный сменён с enqueue_task (write-POST) на идемпотентный POST.
+    Прежняя посылка «токен проверяется ДО исполнения, значит запрос не исполнен» опровергнута
+    замером — у write-POST'а пересылка кладёт ВТОРУЮ запись (tests/test_post_receipt_no_resend.py).
+    Здесь проверяется то, что осталось верным: повтор там, где он объявлен безопасным."""
     c = client([
         Resp(302, location=ECHO),
         Resp(200, payload={"ok": False, "error": "unauthorized",
@@ -163,7 +167,7 @@ def test_unauthorized_on_redirect_resends_token():
         Resp(302, location=ECHO),
         Resp(200, payload={"ok": True, "id": 42}),
     ])
-    r = c.enqueue_task("Filipp-328", "тест")
+    r = c.task_heartbeat(42)
     assert r.get("ok") and r.get("id") == 42
     p = posts(c)
     assert len(p) == 2, "пересылка с токеном не случилась (или случилась не один раз)"
@@ -173,17 +177,32 @@ def test_unauthorized_on_redirect_resends_token():
 
 
 def test_unauthorized_persistent_no_loop():
-    """(г2) unauthorized и на пересылке → отдаём ошибку, петли нет (ровно 2 отправки)."""
+    """(г2) unauthorized и на пересылке → отдаём ошибку, петли нет (ровно 2 отправки).
+    Подопытный тоже идемпотентный (см. правку в (г))."""
     bad = {"ok": False, "error": "unauthorized", "message": "Invalid or missing token"}
     c = client([
         Resp(302, location=ECHO), Resp(200, payload=dict(bad)),
         Resp(302, location=ECHO), Resp(200, payload=dict(bad)),
     ])
-    r = c.enqueue_task("Filipp-328", "тест")
+    r = c.task_heartbeat(42)
     assert not r.get("ok") and r.get("error") == "unauthorized"
     assert "_unauthorized" not in r, "служебный флаг утёк наружу"
     assert len(posts(c)) == 2
     print("OK (г2): постоянный unauthorized → 2 отправки максимум, честная ошибка")
+
+
+def test_write_post_unauthorized_not_resent():
+    """(г3, класс 02.08.2026) тот же отказ на write-POST → пересылки НЕТ, исход неизвестен.
+    Подробный регресс — tests/test_post_receipt_no_resend.py; здесь граница durable-слоя."""
+    c = client([
+        Resp(302, location=ECHO),
+        Resp(200, payload={"ok": False, "error": "unauthorized",
+                           "message": "Invalid or missing token"}),
+    ])
+    r = c.enqueue_task("Filipp-328", "живая задача владельца")
+    assert len(posts(c)) == 1, "write-POST переслан по отказу расписки — риск второй записи!"
+    assert not r.get("ok") and r.get("outcome") == "unknown"
+    print("OK (г3): write-POST по отказу расписки не пересылается — исход назван неизвестным")
 
 
 def test_write_post_not_retried_idempotent_retried():
@@ -219,6 +238,7 @@ if __name__ == "__main__":
     test_wedge_recreates_session()
     test_unauthorized_on_redirect_resends_token()
     test_unauthorized_persistent_no_loop()
+    test_write_post_unauthorized_not_resent()
     test_write_post_not_retried_idempotent_retried()
     test_business_error_and_timeout_contract()
     print("ВСЕ ТЕСТЫ bridge_durable ПРОШЛИ")

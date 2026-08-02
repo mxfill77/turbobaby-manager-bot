@@ -246,16 +246,53 @@ class BridgeClient:
                 data["_unauthorized"] = True
         return data
 
+    # ОТПЕЧАТОК ПЛЕЧА РАСПИСКИ (класс 02.08.2026). Отказ по токену приходит от ДВУХ разных
+    # обработчиков, и различает их ТЕЛО, а не код ответа (Apps Script код не ставит — он в теле):
+    #   · doGet  (Bridge.js:28-32) → {ok:false, error:'unauthorized', message:'Invalid or missing token'}
+    #   · doPost (Bridge.js:234)   → {ok:false, error:'unauthorized'}            ← message'а НЕТ
+    # Расписка С message пришла от doGet: POST по цепочке 302 стал голым GET без тела, и мост
+    # честно сказал «токена нет» — а плечо doPost к этому моменту УЖЕ отработало.
+    _DOGET_REFUSAL_MARK = "invalid or missing token"
+
+    def _receipt_leg(self, data: dict) -> str:
+        """Какое плечо ответило отказом: 'doGet' (тело несёт message моста) | '?' (не опознано)."""
+        return "doGet" if self._DOGET_REFUSAL_MARK in str(data.get("message") or "").lower() else "?"
+
+    def _receipt_unknown(self, action: str, data: dict) -> dict:
+        """Отказ расписки на write-POST: пересылки НЕТ, исход НЕИЗВЕСТЕН — читать факт.
+        Наружу уходит явный контракт: ok=False, outcome='unknown' + что делать дальше."""
+        leg = self._receipt_leg(data)
+        hint = ("плечо расписки doGet — тело отказа несёт message моста, значит запрос ушёл "
+                "по цепочке 302 голым GET'ом, а плечо doPost к тому моменту уже отработало"
+                if leg == "doGet" else "плечо расписки не опознано")
+        log.error(f"Bridge {action}: отказ расписки на write-POST ({hint}). Пересылки НЕТ — "
+                  f"она положила бы ВТОРУЮ запись. Исход неизвестен: перечитай факт.")
+        return {
+            "ok": False, "error": "receipt_unknown", "outcome": "unknown",
+            "bridge_error": data.get("error"), "receipt_leg": leg,
+            "message": (f"write-POST «{action}»: расписка пришла отказом по токену ({hint}). "
+                        f"Пересылки НЕТ — вторая отправка положила бы вторую запись. Исход "
+                        f"НЕИЗВЕСТЕН: перечитай факт (статус строки / содержимое документа / "
+                        f"наличие проводки), повторять запрос вслепую нельзя."),
+        }
+
     def _durable_request(self, method: str, action: str, params: dict = None,
                          body: dict = None, retry_full: bool = False) -> dict:
         """Durable-запрос к Bridge. retry_full=True (read-only GET / идемпотентные POST) —
         до retry_attempts полных повторов на timeout/request_failed. retry_full=False
         (write-POST) — РОВНО одна отправка (дубль записи страшнее потери ответа); durability
-        write-пути даёт echo-ретрай внутри _exchange. Особый случай — unauthorized: Bridge
-        проверяет токен ДО исполнения действия, значит запрос НЕ исполнен и одна пересылка
-        с токеном безопасна для ЛЮБОГО действия (ночью POST-retry терял токен на редиректе)."""
+        write-пути даёт echo-ретрай внутри _exchange.
+        ОТКАЗ РАСПИСКИ (unauthorized) — по той же границе, что и транспорт-повтор.
+        Прежняя посылка «Bridge проверяет токен ДО исполнения, значит запрос НЕ исполнен»
+        ОПРОВЕРГНУТА замером (артефакт 2026-08-02-bridge-receipt-leg-not-token.md, отпечаток
+        плеча — см. _receipt_leg выше): write_doc исполнился, а отказ пришёл вторым плечом,
+        и пересылка положила бы ВТОРУЮ запись (для кассы — дубль проводки). Поэтому:
+        GET и идемпотентный POST — пересылка с токеном как была (чтение/повтор безопасны);
+        write-POST — пересылки НЕТ, наружу outcome='unknown' + «перечитай факт»
+        (verify-паттерны вызывающего кода: _enqueue_reliable, _claim_task_verified).
+        Тесты tests/test_post_receipt_no_resend.py (в гейте)."""
         max_attempts = max(1, self.retry_attempts) if retry_full else 1
-        auth_resend_left = 1
+        auth_resend_left = 1 if retry_full else 0
         attempt = 0
         while True:
             attempt += 1
@@ -271,6 +308,8 @@ class BridgeClient:
                             f"пересылаю запрос с токеном заново")
                 self._backoff(0)
                 continue
+            if unauthorized and not retry_full:
+                return self._receipt_unknown(action, data)
             if err in ("timeout", "request_failed") and attempt < max_attempts:
                 log.warning(f"Bridge {action}: {err} — backoff-ретрай "
                             f"{attempt + 1}/{max_attempts}")
