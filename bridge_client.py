@@ -5,14 +5,17 @@ TurboBaby Bridge HTTP клиент.
 
 import os
 import re
+import sys
 import json
 import time
+import fcntl
 import random
 import logging
 import contextlib
 import contextvars
 import unicodedata
 import requests
+import task_metrics                 # общий детектор тест-прогона (стор дедупа: проба ≠ бой)
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -100,6 +103,122 @@ def agent_write(ticket: str):
     finally:
         WRITE_ORIGIN.reset(t1)
         WRITE_TICKET.reset(t2)
+
+
+# === ДЕДУП ПОСТАНОВКИ ЗАДАЧИ (класс дублей 164/165 и 167/168, 02.08.2026) ===
+# ФОРМА — ТА ЖЕ, что у транзакций и событий: запись несёт ключ ПРОИСХОЖДЕНИЯ, и повтор с тем же
+# ключом второй строки не рождает. У моста это msg_id (addTransaction/addEvent, BotData.js:468/508
+# → {ok:true, duplicate:true} вместо appendRow); у enqueueTask_ (BotData.js:290) ключа НЕТ ВОВСЕ —
+# поэтому живая сверка 02.08 (журнал ПК-контура 17:12 UTC) нашла реальные дубли РОВНО там: две
+# пары задач (164/165 — 43 с порознь, 167/168 — 46 с), при НУЛЕ денежных дублей, хотя пересылка
+# била по всем каналам одинаково. Ключ держал деньги; у постановки держать было нечем.
+#
+# КЛЮЧ, А НЕ «ТЕКСТ В ОКНЕ». 43 и 46 с — ровно тот масштаб, на котором владелец руками повторяет
+# упавшую задачу; дедуп по совпадению текста в окне съел бы этот повтор МОЛЧА. Ключ отвечает на
+# другой вопрос — «это то же САМОЕ сообщение или новое?». Осознанный повтор = новое сообщение =
+# другой ключ → задача ставится всегда, хоть через секунду. Собирает ключ devbot из (чат, id
+# сообщения) + отпечаток самой постановки (метка+текст) — см. devbot._dedup_key.
+#
+# ОКНО (ENQUEUE_DEDUP_WINDOW, деф. 600с) — НЕ различитель, а срок жизни записи в сторе: 13× от
+# наблюдавшихся 43/46 с, с запасом на всю цепочку клиента (одна отправка ~45 с + verify + повтор
+# _enqueue_reliable). Различает по-прежнему ключ, окно только не даёт стору расти вечно.
+#
+# ЧЕСТНЫЙ ПРЕДЕЛ: стор КЛИЕНТСКИЙ — ловит повторный ВЫЗОВ (реплей апдейта Telegram, ретрай
+# надёжной постановки, рестарт devbot). Пересылку ВНУТРИ одного вызова закрыл d78d5fa (write-POST
+# не пересылается); чтобы её ловил и мост, ключ уже уходит в теле полем dedup_key — enqueueTask_
+# его сегодня игнорирует (читает from/task_text/lane), сверка ключа на мосту = отдельная правка
+# Apps Script (красная зона, деплой владельцем). Тесты tests/test_enqueue_dedup.py (в гейте).
+_DEDUP_ROOT = os.path.dirname(os.path.abspath(__file__))
+_DEDUP_WINDOW_DEFAULT = 600.0
+
+
+def _dedup_file() -> str:
+    """Путь стора ключей. ENQUEUE_DEDUP_FILE — явная подмена (тесты, временные каталоги).
+    ИЗОЛЯЦИЯ ПРОБ (класс 01.08): тест-прогон метит в ОТДЕЛЬНЫЙ файл — тестовый ключ не должен
+    схлопнуть живую постановку. Признак берём общий (task_metrics.under_test), тесты вдобавок
+    подставляют свой путь — два независимых пояса."""
+    p = (os.environ.get("ENQUEUE_DEDUP_FILE") or "").strip()
+    if p:
+        return p
+    name = "enqueue_dedup.json"
+    try:
+        if task_metrics.under_test(sys.argv[0] if sys.argv else "", os.environ, sys.modules):
+            name = "enqueue_dedup.test.json"
+    except Exception:
+        pass
+    return os.path.join(_DEDUP_ROOT, name)
+
+
+def _dedup_window() -> float:
+    """Срок жизни ключа, сек. Мусор в env → дефолт (в сторону прежнего поведения)."""
+    try:
+        return max(0.0, float(os.environ.get("ENQUEUE_DEDUP_WINDOW") or _DEDUP_WINDOW_DEFAULT))
+    except (TypeError, ValueError):
+        return _DEDUP_WINDOW_DEFAULT
+
+
+class _DedupLock:
+    """flock на lock-файле — атомарность read-modify-write стора (форма spend_ledger._Lock)."""
+
+    def __init__(self, path):
+        self.path, self.f = path + ".lock", None
+
+    def __enter__(self):
+        try:
+            self.f = open(self.path, "w")
+            fcntl.flock(self.f, fcntl.LOCK_EX)
+        except Exception:
+            self.f = None
+        return self
+
+    def __exit__(self, *a):
+        try:
+            if self.f:
+                fcntl.flock(self.f, fcntl.LOCK_UN)
+                self.f.close()
+        except Exception:
+            pass
+
+
+def _dedup_lookup(key: str):
+    """id задачи, уже поставленной по этому ключу в пределах окна → id | None.
+    Любой сбой стора → None: дедуп молча выключается, постановка идёт как прежде (fail-open —
+    потерять задачу владельца хуже, чем продублировать)."""
+    try:
+        with open(_dedup_file(), encoding="utf-8") as f:
+            rec = (json.load(f) or {}).get(key)
+        if not isinstance(rec, dict):
+            return None
+        if time.time() - float(rec.get("ts") or 0) > _dedup_window():
+            return None
+        return rec.get("id")
+    except Exception:
+        return None
+
+
+def _dedup_remember(key: str, task_id) -> None:
+    """Запомнить «ключ → id» (атомарно tmp+os.replace; протухшее выметается тем же проходом).
+    Запоминается ТОЛЬКО успешная постановка: у неизвестного исхода повтор должен уходить в мост."""
+    path = _dedup_file()
+    try:
+        with _DedupLock(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    store = json.load(f)
+            except Exception:
+                store = {}
+            if not isinstance(store, dict):
+                store = {}
+            now, win = time.time(), _dedup_window()
+            fresh = {k: v for k, v in store.items()
+                     if isinstance(v, dict) and now - float(v.get("ts") or 0) <= win}
+            fresh[key] = {"id": task_id, "ts": now}
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(fresh, f, ensure_ascii=False)
+            os.replace(tmp, path)
+    except Exception as e:
+        log.debug("дедуп постановки: стор не обновлён (%s) — постановка не затронута", e)
 
 
 class BridgeClient:
@@ -494,11 +613,17 @@ class BridgeClient:
     # lane ОПЦИОНАЛЕН: None → параметр НЕ шлётся (старый Bridge не ломается; новый дефолтит vps).
     # 'all' в get_pending = обе полосы (опрос devbot).
 
-    def enqueue_task(self, from_: str, task_text: str, lane: str = None) -> dict:
+    def enqueue_task(self, from_: str, task_text: str, lane: str = None,
+                     dedup_key: str = None) -> dict:
         """Положить задачу в очередь → {ok, id}. status=new. lane: None=vps (дефолт Bridge) | 'pc'.
         FIXTURE-GUARD (класс 193): канонические тест-заглушки в живую очередь НЕ пишутся —
         мгновенный {ok:False, fixture_guard:True} БЕЗ сети. Обход для легитимных тест-контуров
-        (транспорт-тесты на фейковом URL): BRIDGE_ALLOW_FIXTURES=1 ставит сам тест."""
+        (транспорт-тесты на фейковом URL): BRIDGE_ALLOW_FIXTURES=1 ставит сам тест.
+        dedup_key (02.08.2026): ключ ПРОИСХОЖДЕНИЯ постановки — та же форма, что msg_id у
+        транзакций и событий. Повтор с тем же ключом в окне НЕ шлёт вторую отправку и отдаёт
+        {ok:True, id:<та же задача>, duplicate:True}. Пусто → дедупа нет, поведение прежнее
+        байт-в-байт (как `if (!msgId) return false` на мосту). Разбор — блок «ДЕДУП ПОСТАНОВКИ
+        ЗАДАЧИ» выше."""
         _ftxt = str(task_text or "")
         if (FIXTURE_TASK_RE.search(_ftxt) or FIXTURE_TASK_RE.search(_fixture_norm(_ftxt))) \
                 and os.environ.get("BRIDGE_ALLOW_FIXTURES") != "1":
@@ -506,10 +631,22 @@ class BridgeClient:
             return {"ok": False, "fixture_guard": True,
                     "error": "fixture_guard: тест-фикстура не пишется в живую очередь "
                              "(класс 193; тестам — мок-очередь либо TEST-/BRIDGE_ALLOW_FIXTURES=1)"}
+        key = str(dedup_key or "").strip()
+        if key:
+            prev = _dedup_lookup(key)
+            if prev is not None:
+                log.warning("enqueue: тот же ключ постановки (%s) — задача %s уже стоит, "
+                            "вторую не создаём", key, prev)
+                return {"ok": True, "id": prev, "duplicate": True, "dedup_key": key}
         kw = {"from": from_, "task_text": task_text}
         if lane is not None:
             kw["lane"] = lane
-        return self._post("enqueue_task", **kw)
+        if key:
+            kw["dedup_key"] = key      # мосту на будущее; без ключа тело запроса прежнее
+        r = self._post("enqueue_task", **kw)
+        if key and r.get("ok") and r.get("id") is not None:
+            _dedup_remember(key, r.get("id"))
+        return r
 
     def get_pending(self, status: str = "new", lane: str = None) -> dict:
         """Задачи по статусу (деф. new), newest-first → {ok, items}. Дешёвое чтение (GET).

@@ -11,9 +11,11 @@ import sys
 import json
 import time
 import asyncio
+import hashlib
 import datetime
 import logging
 import subprocess
+import contextvars
 import unicodedata
 from collections import Counter
 
@@ -783,6 +785,35 @@ def _find_enqueued(bridge, frm, text):
     return None
 
 
+# === КЛЮЧ ПОСТАНОВКИ (дедуп задач, класс дублей 164/165 и 167/168, 02.08.2026) ===
+# Ключ несёт СООБЩЕНИЕ-постановку, а не её текст: осознанный повтор владельца — это НОВОЕ
+# сообщение, у него другой ключ, и он проходит всегда. Разбор формы — bridge_client, блок
+# «ДЕДУП ПОСТАНОВКИ ЗАДАЧИ». Контекст-переменная, а не аргумент через 11 веток _try_enqueue:
+# постановка одна, а мест вызова много; asyncio.to_thread копирует контекст на КАЖДЫЙ вызов,
+# поэтому параллельные сообщения ключами не пересекаются.
+_MSG_KEY = contextvars.ContextVar("devbot_msg_key", default="")
+
+
+def _msg_key(msg):
+    """Ключ сообщения-постановки: (чат, id сообщения). Telegram нумерует id в пределах чата —
+    пара уникальна. ЛЮБОЙ сбой → «» (дедупа нет, постановка идёт как раньше)."""
+    try:
+        return f"tg:{msg.chat_id}:{msg.message_id}"
+    except Exception:
+        return ""
+
+
+def _dedup_key(frm, text):
+    """Ключ дедупа постановки: сообщение + отпечаток САМОЙ постановки (метка+текст).
+    Отпечаток нужен на случай, когда одно сообщение породит две РАЗНЫЕ постановки — они не
+    должны схлопнуться. Нет сообщения (синтетика/прямой вызов) → «» = дедупа нет."""
+    src = (_MSG_KEY.get() or "").strip()
+    if not src:
+        return ""
+    body = unicodedata.normalize("NFC", f"{frm}\x00{text}")
+    return f"{src}:{hashlib.sha1(body.encode('utf-8')).hexdigest()[:12]}"
+
+
 def _enqueue_reliable(bridge, frm, text, lane=None):
     """Постановка, которая НЕ падает наружу зря (инцидент 07.07.2026, задача 138): Bridge в сбое
     (404 на redirect-echo) может ИСПОЛНИТЬ enqueue, потеряв ответ («unauthorized»/request_failed
@@ -792,6 +823,9 @@ def _enqueue_reliable(bridge, frm, text, lane=None):
     (4) снова сбой → честная ошибка (карточка «не удалось», как раньше). Не хуже прежнего ни в
     одной ветке; красное не ослаблено (это только постановка в очередь)."""
     kw = {} if lane is None else {"lane": lane}      # без lane зовём БЕЗ kwarg (форма как раньше)
+    key = _dedup_key(frm, text)
+    if key:
+        kw["dedup_key"] = key        # без ключа форма вызова прежняя байт-в-байт
     r = bridge.enqueue_task(frm, text, **kw)
     if r.get("ok"):
         return r
@@ -830,8 +864,11 @@ def _canon_theater_prefix(t):
     return t
 
 
-def _try_enqueue(text, bridge, lane="vps"):
+def _try_enqueue(text, bridge, lane="vps", msg_key=None):
     """Если текст начинается с префикса задачи — кладём в очередь оркестратора. Иначе None.
+    msg_key (02.08.2026) — ключ сообщения-постановки (`tg:<чат>:<id>`, см. _msg_key): одно
+    сообщение = одна задача, сколько бы раз постановка ни ушла в мост. Пусто/не передан →
+    дедупа нет, поведение прежнее.
     «тз:»/«dev:» → метка QUEUE_FROM_DEV (демон даст 45 мин); «задача:» → быстрый режим (10 мин).
     Проверяется ДО allowlist (иначе ключевые слова в тексте задачи перехватили бы зелёную команду).
     lane='pc' (тема PC-дев, 04.07.2026): «тз:»/«задача:» → enqueue с lane='pc' и метками
@@ -845,6 +882,7 @@ def _try_enqueue(text, bridge, lane="vps"):
     PC_DEC_LOCAL=1 (.env, финал развязки 12.07.2026): ОБЕ ветки pc-декомпозиции (829 и 328-pc)
     ставят родителя QUEUE_FROM_PCLOC_DEC + lane='pc' — цепь целиком ведёт локальный дирижёр ПК
     (см. _pc_dec_local); 0 (дефолт) → байт-в-байт старый путь QUEUE_FROM_PC_DEC без lane."""
+    _MSG_KEY.set(str(msg_key or ""))     # ставим ВСЕГДА: чужой ключ из прежнего вызова не липнет
     t = _canon_theater_prefix(unicodedata.normalize("NFC", (text or "").strip()))
     low = t.lower()
     pc = (lane == "pc")
@@ -2232,7 +2270,7 @@ async def handle_command(msg, context, bridge) -> None:
 
     # 1) Задача оркестратору (префикс) — проверяем ПЕРЕД allowlist. enqueue_task не красная зона
     #    (служебный лист очереди), origin=human по умолчанию — гейт 4.2 не трогаем.
-    enq = await asyncio.to_thread(_try_enqueue, msg.text or "", bridge, lane)
+    enq = await asyncio.to_thread(_try_enqueue, msg.text or "", bridge, lane, _msg_key(msg))
     if enq is not None:
         for chunk in _chunks(enq):
             await context.bot.send_message(chat_id=msg.chat_id, message_thread_id=tid, text=chunk)
