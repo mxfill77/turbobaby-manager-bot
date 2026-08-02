@@ -23,13 +23,28 @@ def ok(c, label):
     res.append(bool(c))
     return c
 
+_MARKERS = tempfile.mkdtemp(prefix="nopushleak_mk_")   # канал 2 (маркер демону) — всегда сюда
+
 def child_env(count_file=None, keep_nopush=False):
     """env для подпроцессов: NOTIFY_COUNT_FILE = мок-счётчик (никакой сети даже при регрессии);
-    PRETOOL_NOPUSH убираем (проверяем, что защищаемый слой ставит его САМ), keep_nopush — оставить."""
+    признаки тест-прогона убираем (проверяем, что защищаемый слой ставит их САМ), keep_nopush —
+    оставить PRETOOL_NOPUSH.
+
+    Убираем ВСЕ ЧЕТЫРЕ имени, а не одно: с 01.08.2026 пуш глушит единый isolated(), который читает
+    их все, — оставшийся ORCH_TEST_MODE (его ставит подпроцессам сам гейт) делал «боевую фикстуру»
+    тестовой, и слой (D) мерил не то, что называл.
+
+    PRETOOL_BLOCK_DIR ставится ВСЕГДА: канал владельца не один. Урок 02.08.2026 (задача 181) —
+    снятый признак открывал не только пуш, но и МАРКЕР: хук писал боевой
+    /tmp/cc_guard_block/<CC_TASK_ID>.json с номером ЖИВОЙ задачи, демон делал из фикстуры красную
+    карточку владельцу. Мок канала 1 (счётчик) без мока канала 2 неполон."""
     e = dict(os.environ)
+    for k in ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PYTEST_CURRENT_TEST"):
+        e.pop(k, None)
     if not keep_nopush:
         e.pop("PRETOOL_NOPUSH", None)
     e.pop("NOTIFY_COUNT_FILE", None)
+    e["PRETOOL_BLOCK_DIR"] = _MARKERS
     if count_file:
         e["NOTIFY_COUNT_FILE"] = count_file
     return e

@@ -22,14 +22,28 @@ PY = os.path.join(ROOT, "venv", "bin", "python3")
 PRETOOL = os.path.join(ROOT, "pretool_guard.py")
 
 TMP = tempfile.mkdtemp(prefix="pt_pd_")
+MARKERS = os.path.join(TMP, "markers")          # канал 2 (маркер демону) — всегда сюда, см. run()
 
 
 def run(cmd, session="s-default", count_file=None, nopush=True):
+    """Хук подпроцессом. nopush=False = «окружение как в БОЮ»: снимаем ВСЕ ЧЕТЫРЕ признака
+    тест-прогона, а не один. С 01.08.2026 (единый is_probe/isolated) оставшийся ORCH_TEST_MODE —
+    его ставит подпроцессам сам гейт — глушил пуш, и мерить канал 1 было нечем: под гейтом файл
+    краснел, а поодиночке зеленел.
+
+    КАНАЛ 2 УВОДИТСЯ ВСЕГДА (PRETOOL_BLOCK_DIR), независимо от nopush. Живой урок 02.08.2026,
+    задача 181: снимая признак ради канала 1, тест снимал его и с канала 2 — маркер уходил в
+    БОЕВОЙ /tmp/cc_guard_block/<CC_TASK_ID>.json (номер ЖИВОЙ задачи наследуется из окружения),
+    демон его подхватывал, и владелец получал красную карточку «проводка ДЕНЕГ… -500» из
+    ФИКСТУРЫ. У канала 1 мок был (NOTIFY_COUNT_FILE), у канала 2 он тоже есть — просто его
+    здесь не подставляли."""
     payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd},
                           "cwd": ROOT, "session_id": session})
     env = dict(os.environ)
-    env.pop("PRETOOL_NOPUSH", None)
+    for k in ("PRETOOL_NOPUSH", "PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PYTEST_CURRENT_TEST"):
+        env.pop(k, None)
     env.pop("NOTIFY_COUNT_FILE", None)
+    env["PRETOOL_BLOCK_DIR"] = MARKERS
     if nopush:
         env["PRETOOL_NOPUSH"] = "1"
     if count_file:

@@ -148,9 +148,14 @@ finally:
     shutil.rmtree(_tmp2, ignore_errors=True)
     shutil.rmtree(_tmp_dir, ignore_errors=True)
 
-# СКВОЗНОЙ РЕГРЕСС: гоняем НАСТОЯЩИЙ гард-тест ровно как гейт (gate.py:86), но с унаследованным
-# CC_TASK_ID — именно эта связка убила задачу 12. Зовём _real_run: строкой выше в этом файле
-# subprocess.run подменён моком для _POPEN-сценариев, и обычный вызов не запустил бы процесс.
+# СКВОЗНОЙ РЕГРЕСС: хук подпроцессом ровно в том окружении, что даёт гейт (gate.py:86), и с
+# УНАСЛЕДОВАННЫМ CC_TASK_ID — именно эта связка убила задачу 12. Зовём _real_run: строкой выше в
+# этом файле subprocess.run подменён моком для _POPEN-сценариев, и обычный вызов не запустил бы
+# процесс.
+# ИНСТРУМЕНТ ЗДЕСЬ СВОЙ, а не соседний тест-файл (02.08.2026). Проверяется УМОЛЧАНИЕ каталога
+# маркеров, и оно не смеет зависеть от того, подставляет ли чужой файл свой PRETOOL_BLOCK_DIR:
+# с 02.08 канал 2 уводит у себя КАЖДЫЙ гард-тест (урок задачи 181 — фикстура доехала до владельца
+# боевой карточкой), и прежний инструмент перестал бы мерить умолчание.
 _ROOT = "/root/turbobaby-manager-bot"
 _PY = os.path.join(_ROOT, "venv", "bin", "python3")
 _FAKE = "999012"
@@ -164,8 +169,14 @@ for _p in (_live_plain, _live_pref, _test_marker):
         pass
 _env = dict(os.environ, PYTHONPATH=_ROOT, PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1", CC_TASK_ID=_FAKE)
 _env.pop(PG.BLOCK_DIR_ENV, None)               # НАРОЧНО без подмены: проверяем УМОЛЧАНИЕ
-_real_run([_PY, os.path.join(_ROOT, "tests", "test_pretool_probe_dedup.py")],
-          cwd=_ROOT, env=_env, capture_output=True, text=True, timeout=180)
+# Красная фикстура — операция ПАРКА (не деньги): живая сущность без пометки ТЕСТ = жёсткий блок,
+# а он пишет маркер всегда. Литерал операции собран конкатенацией — иначе гард краснеет на самом
+# файле теста и правка файла становится невозможной.
+_RED_FX = _PY + " -c \"bridge.set_fleet_" + "oil(number='6789', oil_km=27000)\""
+_real_run([_PY, os.path.join(_ROOT, "pretool_guard.py")],
+          input=json.dumps({"tool_name": "Bash", "tool_input": {"command": _RED_FX},
+                            "cwd": _ROOT, "session_id": "s-esc-e2e"}),
+          cwd=_ROOT, env=_env, capture_output=True, text=True, timeout=60)
 res.append(ok(not os.path.exists(_live_plain) and not os.path.exists(_live_pref),
               f"СКВОЗНОЙ: гард-тест с CC_TASK_ID={_FAKE} не создал НИЧЕГО в боевом каталоге"))
 res.append(ok(os.path.exists(_test_marker),

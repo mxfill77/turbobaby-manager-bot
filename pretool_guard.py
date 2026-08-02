@@ -73,6 +73,7 @@ green; can_approve(kind, hit) и decision(kind, hit, reason) — чистые (�
 Зона 🟢 (конфиг агента; прод Splinter/таблицы не трогает). НИЧЕГО не печатает в stdout, кроме JSON-решения.
 """
 import sys, os, json, re, shlex, time, fcntl, hashlib
+import ast
 import subprocess
 
 PROJECT = "/root/turbobaby-manager-bot"
@@ -100,6 +101,185 @@ _GREEN_MODULES = {"py_compile", "json.tool", "pytest", "unittest", "pip", "venv"
 _INFO_FLAGS = {"--version", "-V", "-VV", "--help", "-h"}
 _ENV_ASSIGN = re.compile(r"^\w+=")   # env-префикс VAR=val перед интерпретатором (PRETOOL_NOPUSH=1 …)
 _SQLITE_WRITE = re.compile(r"\b(UPDATE|DELETE\s+FROM|INSERT\s+INTO|DROP\s+TABLE)\b", re.IGNORECASE)
+
+# ── ЦЕЛЬ SQL-ЗАПИСИ (класс «корень А», 02.08.2026; зеркало ПК-фикса abd2917) ──────────────────
+# Своя БД бота — исключение доктрины 02.07 («своя таблица через код = зелёное»). Проверялось оно
+# СЛОВОМ: `".db" in blob and "memory.db" not in blob`. Текст при этом гарду никто не обещал —
+# это команда, сочинённая моделью, плюс ИСХОДНИК скрипта с комментариями и докстрингами. Хватало
+# одного упоминания своей БД где угодно в тексте, чтобы красное снялось со ВСЕХ SQL-записей
+# скрипта: комментарий «memory.db не трогаем» отбеливал запись в чужую БД.
+#
+# Теперь решает РАЗОБРАННАЯ ЦЕЛЬ ОТКРЫТИЯ, а не совпадение слова: литерал в `connect(...)` либо
+# файловый аргумент `sqlite3 <файл>.db`. Цель не разобралась — fail-closed: судим по всем
+# `.db`-именам (прежний охват), но упоминание своей БД чужую больше не отбеливает.
+_OWN_DB = "memory.db"
+_DB_TOKEN_RE = re.compile(r"[\w./\\+-]*\.db\b")
+_SQLITE_OPEN_RE = re.compile(r"\bconnect\s*\(\s*(['\"])(.*?)\1", re.S)
+# Файловый аргумент CLI. Пробел/табуляция, а НЕ \s: `import sqlite3\n` + следующая строка
+# `sqlite3.connect('memory.db')` иначе склеиваются в одну «цель» через перевод строки.
+_SQLITE_CLI_RE = re.compile(r"\bsqlite3[ \t]+(?:-\S+[ \t]+)*([^\s'\"()]+?\.db)\b")
+
+
+def _db_basename(tok):
+    return (tok or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _sql_write_is_foreign(text):
+    """Цель SQL-записи — ЧУЖАЯ БД? Судим по РАЗОБРАННОЙ цели открытия, а не по слову в тексте.
+
+    → True (чужая, красное), если названа хоть одна `.db`-цель с именем, отличным от своей БД.
+    Разобранные открытия имеют приоритет над упоминаниями: скрипт, открывающий СВОЮ БД и лишь
+    называющий чужую в комментарии, ложного красного не получает."""
+    text = text or ""
+    opened = [m.group(2) for m in _SQLITE_OPEN_RE.finditer(text)]
+    opened += [m.group(1) for m in _SQLITE_CLI_RE.finditer(text)]
+    opened = [t for t in opened if t and _db_basename(t).endswith(".db")]
+    if opened:                                  # цель названа явно — по ней и судим
+        return any(_db_basename(t) != _OWN_DB for t in opened)
+    # открытия в тексте нет → прежний охват по именам, но БЕЗ отбеливания своим именем
+    return any(_db_basename(t) != _OWN_DB for t in _DB_TOKEN_RE.findall(text))
+
+
+# ── РАЗБОР ТЕЛА СКРИПТА: где КОД, а где ПРОЗА (класс «корень А», 02.08.2026; тот же ход, что
+#    ПК-фикс f7cfb25 «судить по разобранному вызову») ──────────────────────────────────────────
+# Красное решалось ПОДСТРОКОЙ по всему телу — тексту, который гарду никто не обещал: это исходник,
+# сочинённый моделью, вместе с комментариями и докстрингами. Обе стороны били:
+#   ЛОЖНОЕ КРАСНОЕ И ЛОЖНЫЙ КЛАСС — `# проводку add_transaction тут НЕ делаем` краснело наравне с
+#     вызовом, и владельцу уходила карточка «проводка ДЕНЕГ в кассу» об операции, которой в
+#     скрипте нет;
+#   СЛЕПОТА — `confirmed=true` проверялся ПЯТЬЮ написаниями списком, и `confirmed  =  True`
+#     (два пробела) не совпадал ни с одним из пяти: БОЕВАЯ запись в Лист1 проходила молча.
+# Оба конца — один класс: судили по НАПИСАНИЮ, а не по разобранному коду.
+#
+# Тело скрипта — формальная грамматика, у неё есть канонический разбор. _py_code_view строит
+# дерево (ast) и отдаёт ТРИ факта:
+#   text  — всё, что видно как КОД: идентификаторы, имена атрибутов/аргументов/импортов и
+#           СТРОКОВЫЕ ЛИТЕРАЛЫ. Комментариев там нет ПО ПОСТРОЕНИЮ. Докстринг и строка остаются
+#           намеренно: имя операции в строке МОЖЕТ быть действием (`_call("add_transaction")`) —
+#           сомнение решаем в сторону красного;
+#   conf  — есть ли `confirmed` со значением ИСТИНА как РАЗОБРАННЫЙ именованный аргумент, ключ
+#           словаря или присваивание: сколько бы пробелов, кавычек и регистра ни стояло;
+#   calls — {имя вызванной функции: {имя именованного аргумента: литерал | None}} — видно не
+#           только ЧТО вызвано, но и ЧЕМ: аргумент есть, а значение вычисляется (переменная).
+# Разбор не удался (не python, обрывок, чужой синтаксис) → None, и вызывающий остаётся на прежнем
+# подстрочном скане БАЙТ-В-БАЙТ. Направление сомнения прежнее — краснее.
+_CONFIRMED_RE = re.compile(r"""\bconfirmed\b["']?\s*[:=]\s*["']?\s*true\b""", re.I)
+# Пять исторических написаний из RED_TOKEN_HIT: для них решает разбор, а не буквальное совпадение.
+_CONFIRMED_TOKENS = ("confirmed=true", "confirmed=True", "confirmed = true",
+                     '"confirmed": true', '"confirmed":true')
+
+
+def _node_truthy(node):
+    """Значение узла — ИСТИНА? True / 1 / 'true' в любом регистре. Иначе (в т.ч. переменная) — нет."""
+    if not isinstance(node, ast.Constant):
+        return False
+    v = node.value
+    if isinstance(v, str):
+        return v.strip().lower() == "true"
+    return v is True or v == 1
+
+
+def _node_literal(node):
+    """Литерал узла → строкой; вычисляемое значение (переменная, вызов, f-строка) → None.
+    Именно это различение и невозможно текстом: `number=plate` регулярке неотличимо от `number='6789'`."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else repr(node.value)
+    if (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+            and isinstance(node.operand, ast.Constant)):
+        return "-" + repr(node.operand.value)
+    return None
+
+
+def _py_code_view(src):
+    """Разбор ОДНОГО python-тела → {'text','conf','calls'} либо None (не разобралось)."""
+    try:
+        tree = ast.parse(src or "")
+    except Exception:
+        return None
+    words, conf, calls = [], False, {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            words.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            words.append(node.attr)
+        elif isinstance(node, ast.arg):
+            words.append(node.arg)
+        elif isinstance(node, ast.alias):
+            words.append(node.name)
+            words.append(node.asname or "")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            words.append(node.name)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            words.append(node.value)
+        elif isinstance(node, ast.keyword):
+            words.append(node.arg or "")
+            if node.arg == "confirmed" and _node_truthy(node.value):
+                conf = True
+        elif isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if (isinstance(k, ast.Constant) and isinstance(k.value, str)
+                        and k.value.strip().lower() == "confirmed" and _node_truthy(v)):
+                    conf = True
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "confirmed" and _node_truthy(node.value):
+                    conf = True
+        if isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else (fn.id if isinstance(fn, ast.Name) else "")
+            if name:
+                kw = calls.setdefault(name, {})
+                for k in node.keywords:
+                    if k.arg:
+                        kw.setdefault(k.arg, _node_literal(k.value))
+    return {"text": "\n".join(w for w in words if w), "conf": conf, "calls": calls}
+
+
+def _code_view_parts(parts):
+    """Слить разборы ВСЕХ python-тел команды (файлы + инлайн `-c`). Хоть одно не разобралось →
+    None: тогда вся команда судится по-старому, подстрокой (fail-closed, не хуже прежнего)."""
+    if not parts:
+        return None
+    text, conf, calls = [], False, {}
+    for src in parts:
+        v = _py_code_view(src)
+        if v is None:
+            return None
+        text.append(v["text"])
+        conf = conf or v["conf"]
+        for fn, kw in v["calls"].items():
+            calls.setdefault(fn, {}).update(kw)
+    return {"text": "\n".join(text), "conf": conf, "calls": calls}
+
+
+def _body_has(tok, raw, view):
+    """Есть ли красный признак в ТЕЛЕ скрипта. Разбор недоступен → прежняя подстрока.
+
+    DOWRITE судится по СЫРОМУ тексту ВСЕГДА и намеренно: это не операция, а САМООБЪЯВЛЕНИЕ автора
+    («этот скрипт реально пишет»), и оно законно живёт в комментарии-шапке — прятать его разбором
+    значило бы обесценить пометку, которую CLAUDE.md требует ставить руками."""
+    if view is None or tok == "DOWRITE":
+        return tok in raw
+    if tok in _CONFIRMED_TOKENS:
+        # разобранный аргумент/ключ/присваивание ЛИБО написание внутри строкового литерала
+        # (`data="confirmed=true&…"` — тоже боевая запись, только через сырой запрос)
+        return view["conf"] or bool(_CONFIRMED_RE.search(view["text"]))
+    return tok in view["text"]
+
+
+# Разбор тела последней команды — латч на прогон хука. ПОЧЕМУ ЛАТЧ, А НЕ ПАРАМЕТР: та же причина,
+# что у _PROBE_LATCH ниже. Разбор рождается в _analyze, а нужен он ещё и в _detail_parts, который
+# зовётся из main() и из _entity_blocktype через контракт card_min(hit, blob) — на этот контракт
+# опираются тесты ОБЕИХ полос, и протаскивать сквозь него третий параметр ради одного факта значит
+# сломать его всем. Хук — процесс на ОДНУ команду, поэтому глобальное состояние здесь честно.
+_CODE_VIEW = None
+
+
+def set_code_view(view):
+    """Взвести разбор тела на прогон (зовёт _analyze; тесты — напрямую)."""
+    global _CODE_VIEW
+    _CODE_VIEW = view
+
 
 # Дедуп ambiguous-карточек (UX-фикс 08.07.2026, спам-инцидент задачи 163). в3 (23.07.2026):
 # ambiguous → defer, путь ambiguous-карточек из main() удалён — дедуп в бою НЕ зовётся. Хелперы
@@ -485,13 +665,41 @@ def _bike_bit(blob):
     return "байк " + b if b and _P_DIGIT.search(b) else ""
 
 
+# ── ОБЪЕКТ, КОТОРЫЙ ВЫЗОВ НЕСЁТ, НО ЧЬЁ ЗНАЧЕНИЕ ВЫЧИСЛЯЕТСЯ (класс «корень А», 02.08.2026) ──
+# Извлечение объекта шло регуляркой `ключ=значение` и умело видеть ТОЛЬКО ЛИТЕРАЛ. Живой скрипт
+# пишет `set_fleet_oil(number=plate, oil_km=km)` — объект не извлекался, card_gate гасил карточку,
+# и владелец о НАСТОЯЩЕЙ записи в Лист1 не узнавал вовсе. Гард при этом не слабел (ask оставался,
+# без «да» команда не шла) — но и спросить «да» было не у кого: операция молча упиралась в стену.
+# Разобранный вызов различает то, чего текст различить не может: аргумента НЕТ (голое упоминание,
+# `print('set_fleet_oil')`) и аргумент ЕСТЬ, а значение станет известно только при запуске.
+# ДЕНЬГИ ЗДЕСЬ НЕ УЧАСТВУЮТ НАМЕРЕННО: add_transaction/void_last входят в _ALWAYS_CARD, их
+# карточка не гасится никогда — этому классу там нечего чинить, и трогать денежную ветку незачем.
+_ARG_OBJ = {"bike": ("number", "plate", "bike"), "client": ("name", "client")}
+_ARG_LABEL = {"bike": "байк", "client": "клиент"}
+
+
+def _carried_bit(hit, kind):
+    """→ подпись объекта, который РАЗОБРАННЫЙ вызов операции несёт вычисляемым значением, иначе "".
+    Разбора нет / вызова нет / аргумент литеральный (его берёт обычное извлечение) → ""."""
+    view = _CODE_VIEW
+    if not view:
+        return ""
+    kw = (view.get("calls") or {}).get(hit)
+    if not kw:
+        return ""
+    for a in _ARG_OBJ.get(kind, ()):
+        if a in kw and kw[a] is None:
+            return "%s — значение вычисляется (аргумент %s)" % (_ARG_LABEL[kind], a)
+    return ""
+
+
 def _detail_parts(hit, blob):
     """ОБЪЕКТ операции и её ЧИСЛО, извлечённые ИЗ КОМАНДЫ/ТЕЛА → (obj_bits, num_bits).
     Пустой список = НЕ извлеклось. Текст шаблона действия сюда не попадает НИКОГДА — именно этим
     новое извлечение отличается от близорукой проверки по готовой карточке (marker_has_object)."""
     obj, num = [], []
     if hit in _HITS_FLEET:
-        b = _bike_bit(blob)
+        b = _bike_bit(blob) or _carried_bit(hit, "bike")
         if b:
             obj.append(b)
         if hit == "set_fleet_service":
@@ -512,12 +720,16 @@ def _detail_parts(hit, blob):
         if a:
             num.append("сумма " + a.strip())
     elif hit in _HITS_CRM:
-        b = _bike_bit(blob)
+        b = _bike_bit(blob) or _carried_bit(hit, "bike")
         if b:
             obj.append(b)
         c = _find(_P_CLIENT, blob)
         if c:
             obj.append("клиент " + c)
+        else:
+            cc = _carried_bit(hit, "client")
+            if cc:
+                obj.append(cc)
         d = _find(_P_DATE, blob)
         if d:
             num.append("дата " + d)
@@ -1312,11 +1524,18 @@ def _analyze(cmd, cwd, scan=None):
     for tok in RED_TOKENS:
         if tok in scan:
             return "red", RED_TOKEN_HIT[tok], cmd
+    # 1а) confirmed=ИСТИНА в САМОЙ команде — по разобранному присваиванию, а не по написанию
+    #     (02.08.2026): список из пяти литералов не совпадал с `confirmed  =  True`, и боевая
+    #     запись в Лист1 проходила молча. Обобщённый признак стоит ПОСЛЕ конкретных операций —
+    #     порядок RED_TOKEN_HIT («конкретные первыми») этим сохранён.
+    if _CONFIRMED_RE.search(scan):
+        return "red", "confirmed", cmd
     # 1б) SQL-write в тексте команды (heredoc/stdin/инлайн) — в3: раньше такие формы прятались за
     #     ambiguous-ask, теперь ambiguous defer'ится → доктринальный sqlite проверяется ДО любого
     #     ambiguous-выхода. memory.db — своя БД (зелёная доктрина 02.07), скан-представление
-    #     чтит «данные ≠ команда» (UPDATE в шаблоне grep не краснит).
-    if _SQLITE_WRITE.search(scan) and ".db" in scan and "memory.db" not in scan:
+    #     чтит «данные ≠ команда» (UPDATE в шаблоне grep не краснит). 02.08.2026: своя БД
+    #     опознаётся по РАЗОБРАННОЙ ЦЕЛИ открытия, а не по слову в тексте (см. _sql_write_is_foreign).
+    if _SQLITE_WRITE.search(scan) and _sql_write_is_foreign(scan):
         return "red", "sqlite", cmd
     # 2) разобрать команду на токены
     try:
@@ -1324,13 +1543,16 @@ def _analyze(cmd, cwd, scan=None):
     except Exception:
         return "ambiguous", "ambiguous", cmd   # кривое квотирование → ambiguous (в3: defer)
     content = ""
+    parts = []          # те же тела ПООТДЕЛЬНОСТИ — для канонического разбора (_code_view_parts)
     i = 0
     saw_target = False
     amb = False        # в3: ambiguous КОПИТСЯ, а не выходит сразу — красное в ЧИТАЕМОЙ части команды
     while i < len(toks):                     # важнее (иначе `python3 red.py && python3 нет_такого.py`
         t = toks[i]                          # ушёл бы в defer, не отсканировав red.py)
         if t == "-c":                                  # инлайн-код в следующем токене
-            content += (toks[i + 1] if i + 1 < len(toks) else "")
+            inline = toks[i + 1] if i + 1 < len(toks) else ""
+            content += inline
+            parts.append(inline)
             saw_target = True
             i += 2; continue
         if t == "-":                                   # stdin: тело heredoc уже отсканировано по scan (шаг 1)
@@ -1351,15 +1573,23 @@ def _analyze(cmd, cwd, scan=None):
                     amb = True
                 else:
                     content += body
+                    parts.append(body)
                     saw_target = True
         i += 1
     blob = cmd + "\n" + content
+    # 02.08.2026: тело судится по КАНОНИЧЕСКОМУ РАЗБОРУ, а не по подстроке — имя операции в
+    # комментарии больше не рождает карточку чужого класса, а `confirmed` с любыми пробелами и
+    # кавычками больше не проходит молча. Разбор не удался → _body_has возвращает прежнюю
+    # подстроку, байт-в-байт. Взвод латча — ДО первого return: его читает _detail_parts.
+    view = _code_view_parts(parts)
+    set_code_view(view)
     for tok in RED_TOKENS:
-        if tok in content:
+        if _body_has(tok, content, view):
             return "red", RED_TOKEN_HIT[tok], blob
     # memory.db через python-код = 🟢 (своя БД бота, доктрина «своя таблица через код = зелёное»,
     # переклассификация 02.07; прямой sqlite3 CLI остаётся ask в settings). SQL-write в ИНУЮ БД → ask.
-    if _SQLITE_WRITE.search(blob) and ".db" in blob and "memory.db" not in blob:
+    # 02.08.2026: «своя» определяется целью открытия, а не упоминанием имени в комментарии/докстринге.
+    if _SQLITE_WRITE.search(blob) and _sql_write_is_foreign(blob):
         return "red", "sqlite", blob
     if amb:
         return "ambiguous", "ambiguous", blob          # доктринального красного нет → в3: defer
