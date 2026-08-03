@@ -8,8 +8,10 @@
  (1) МОЛЧАНИЕ хука: ни при каком входе (валидный/мусор/враждебный) ни байта в stdout, exit 0.
      Это обет сверх фазы: у PostToolUse нет поля permissionDecision, а мы ещё и молчим в диалоге.
  (2) ОДНО РУКОТВОРНОЕ СОБЫТИЕ доезжает в ленту: ровно одна попытка, адрес — лента (префикс FEED),
-     форма — одна строка 🔔 без кнопок, без номера карточки, без слова «да».
- (3) АДРЕС: send_feed шлёт в FEED_CHAT_ID; канал не заведён → НИКУДА (ни в личку, ни в инбокс).
+     форма — одна строка 🔔 без кнопок, без номера карточки, без слова «да»; МЕТКА ПОЛОСЫ стоит
+     (номера задач VPS и ПК пересекаются — без метки заметка врёт, чья это задача).
+ (3) АДРЕС — ПАРА (чат HQ + СВОЯ тема «ПК-дев»): тема ЗАДАНА (без неё сообщение падает в General
+     форума), она НЕ тема-инбокс; адреса нет → НИКУДА (ни в личку, ни в инбокс).
  (4) КАТАЛОГ: состояние ленты ≠ каталог маркеров гарда; файл ленты при ЖИВОМ мониторе демона
      задачу не убивает (terminate не зван) — главный риск §5.2.2 проекта.
  (5) ПОТОЛОК и ДЕДУП.
@@ -77,7 +79,8 @@ def child_env(count_file=None, extra=None, keep=()):
     e.pop("CC_TASK_ID", None)
     e["CC_FEED_SEEN_DIR"] = SEEN
     e["PRETOOL_BLOCK_DIR"] = MARKERS
-    e["FEED_CHAT_ID"] = "-1009999999999"
+    e.pop("CC_LANE", None)                 # метку полосы ставит сам тест, а не окружение прогона
+    e["PC_DEV_TOPIC_ID"] = "424242"        # адрес-заглушка: боевую тему из .env не трогаем
     if count_file:
         e["NOTIFY_COUNT_FILE"] = count_file
     if extra:
@@ -150,7 +153,7 @@ ok(len(got) == 1, "ровно одна попытка отправки (полу
 note = got[0] if got else ""
 ok(note.startswith("FEED "), "адрес — ЛЕНТА (send_feed), не карточка и не личка")
 ok("🔔" in note and "проба канала" in note, "класс назван, форма 🔔")
-ok("Termux" in note, "кто: Termux (CC_TASK_ID не задан)")
+ok("VPS · Termux" in note, "кто: полоса + Termux (CC_TASK_ID не задан)")
 ok("echo" in note, "команда в заметке видна")
 ok(not any(t in note.lower() for t in ("да ", "op=", "needs_approval", "approve", "кнопк")),
    "отвечать не на что: ни «да», ни op=, ни кнопок")
@@ -163,27 +166,52 @@ ok(PF.outcome({"interrupted": True}) == "прервано", "прерывани�
 ok(PF.outcome({"stdout": "x"}) == "выполнено", "кода нет → «выполнено», без утверждения об успехе")
 ok(PF.outcome("строка") == "выполнено" and PF.outcome(None) == "выполнено", "мусор → fail-honest")
 
+print("(2в) МЕТКА ПОЛОСЫ — заметка называет, ЧЬЯ задача (номера VPS и ПК пересекаются):")
+shutil.rmtree(SEEN, ignore_errors=True)
+cnt2b = os.path.join(TMP, "c2b.txt")
+run_hook(probe_payload(), count_file=cnt2b, extra={"CC_TASK_ID": "45", "CC_LANE": "ПК"})
+n2b = (lines(cnt2b) or [""])[0]
+ok("ПК · задача 45" in n2b, "исполнитель назвал полосу → «ПК · задача 45»")
+ok("VPS" not in n2b, "чужая метка не подмешивается")
+shutil.rmtree(SEEN, ignore_errors=True)
+cnt2c = os.path.join(TMP, "c2c.txt")
+run_hook(probe_payload(), count_file=cnt2c, extra={"CC_TASK_ID": "45"})
+ok("VPS · задача 45" in (lines(cnt2c) or [""])[0], "полосу не назвали → метка ЭТОЙ копии репо")
+_lane_saved = os.environ.get("CC_LANE")
+os.environ["CC_LANE"] = "ПК\nи очень длинный мусор из окружения"
+ok("\n" not in PF.lane() and len(PF.lane()) <= PF.LANE_MAX,
+   "мусор в метке плющится в строку и режется — форму заметки не ломает (%r)" % PF.lane())
+os.environ.pop("CC_LANE", None)
+ok(PF.lane() == PF.LANE_DEFAULT, "нет CC_LANE → константа копии (%s)" % PF.LANE_DEFAULT)
+if _lane_saved is not None:
+    os.environ["CC_LANE"] = _lane_saved
+
 # ── (3) АДРЕС ──────────────────────────────────────────────────────────────────────────────
-print("(3) адрес ленты отдельный, фолбэка нет:")
+print("(3) адрес ленты — пара (чат HQ + СВОЯ тема), фолбэка нет:")
 sent = []
 _orig_send, _orig_token = N._send_message, N._get_token
 N._send_message = lambda tok, txt, chat_id=None, thread_id=None: (
     sent.append((chat_id, thread_id, txt)), (True, 7))[1]
 N._get_token = lambda: "TKN"
-_saved = {k: os.environ.get(k) for k in ("PRETOOL_NOPUSH", "NOTIFY_COUNT_FILE", "FEED_CHAT_ID")}
+_saved = {k: os.environ.get(k) for k in ("PRETOOL_NOPUSH", "NOTIFY_COUNT_FILE",
+                                         "PC_DEV_TOPIC_ID", "INBOX_TOPIC_ID")}
 os.environ.pop("PRETOOL_NOPUSH", None)
 os.environ.pop("NOTIFY_COUNT_FILE", None)
-os.environ["FEED_CHAT_ID"] = "-1008888888888"
+os.environ["PC_DEV_TOPIC_ID"] = "424242"   # заглушки: боевые значения из .env не читаем и не печатаем
+os.environ["INBOX_TOPIC_ID"] = "1160"
 r3 = N.send_feed("🔔 проба адреса")
-ok(r3 is True and len(sent) == 1 and str(sent[0][0]) == "-1008888888888",
-   "ушло в FEED_CHAT_ID (%s)" % (sent[0][0] if sent else "—"))
-ok(sent and sent[0][0] not in (N.CHAT_ID, N.HQ_CHAT_ID), "НЕ личка и НЕ HQ/инбокс")
+ok(r3 is True and len(sent) == 1, "ровно одна отправка")
+ok(sent and sent[0][0] == N.HQ_CHAT_ID, "чат — тот же HQ-форум, что у инбокса")
+ok(sent and str(sent[0][1]) == "424242", "тема — ПК-дев (PC_DEV_TOPIC_ID)")
+ok(sent and sent[0][1], "тема ЗАДАНА: без message_thread_id сообщение падает в General форума")
+ok(sent and sent[0][1] != N._inbox_dest()[1], "тема ленты ≠ тема-инбокс — в инбокс не ушло ничего")
+ok(sent and sent[0][0] != N.CHAT_ID, "не личка")
 sent.clear()
-os.environ["FEED_CHAT_ID"] = ""          # изоляция от боевого .env: ключ есть → load_dotenv молчит
-r3b = N.send_feed("🔔 канал не заведён")
-ok(r3b is False and sent == [], "нет FEED_CHAT_ID → не ушло НИКУДА (фолбэка в личку нет)")
+os.environ["PC_DEV_TOPIC_ID"] = ""       # изоляция от боевого .env: ключ есть → load_dotenv молчит
+r3b = N.send_feed("🔔 адреса нет")
+ok(r3b is False and sent == [], "нет темы → не ушло НИКУДА (фолбэка в личку/инбокс нет)")
 os.environ["PRETOOL_NOPUSH"] = "1"
-os.environ["FEED_CHAT_ID"] = "-1008888888888"
+os.environ["PC_DEV_TOPIC_ID"] = "424242"
 r3c = N.send_feed("🔔 под мутом")
 ok(r3c is False and sent == [], "мут PRETOOL_NOPUSH глушит ленту (force у заметки нет)")
 os.environ.pop("PRETOOL_NOPUSH", None)
@@ -209,7 +237,8 @@ shutil.rmtree(SEEN, ignore_errors=True)
 cnt4 = os.path.join(TMP, "c4.txt")
 r4 = run_hook(probe_payload(), count_file=cnt4, extra={"CC_TASK_ID": LIVE_TID})
 feed_file = os.path.join(SEEN, LIVE_TID + ".json")
-ok(len(lines(cnt4)) == 1 and ("задача " + LIVE_TID) in lines(cnt4)[0], "в задаче кто = «задача 777»")
+ok(len(lines(cnt4)) == 1 and ("VPS · задача " + LIVE_TID) in lines(cnt4)[0],
+   "в задаче кто = «VPS · задача 777» (полоса + номер)")
 ok(os.path.exists(feed_file), "состояние ленты легло в СВОЙ каталог")
 _orig_block = OD.GUARD_BLOCK_DIR
 OD.GUARD_BLOCK_DIR = MARKERS

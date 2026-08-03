@@ -171,7 +171,7 @@ def run_feed(count_file, seen, keep_nopush):
     if keep_nopush:
         e["ORCH_TEST_MODE"] = "1"          # ровно то, что ставит gate.run_tests подпроцессам
     e["CC_FEED_SEEN_DIR"] = seen           # каталог ленты подставляем ВСЕГДА (урок задачи 181)
-    e["FEED_CHAT_ID"] = "-1009999999999"
+    e["PC_DEV_TOPIC_ID"] = "424242"        # адрес-заглушка ленты: боевую тему из .env не трогаем
     return subprocess.run([PY, FEED], input=FEED_PAYLOAD, capture_output=True, text=True,
                           timeout=60, env=e)
 
