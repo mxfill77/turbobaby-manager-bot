@@ -2,7 +2,8 @@
 Слои: (A) gate.py ставит PRETOOL_NOPUSH=1 подпроцессам тестов; (B/C) notify.notify мутится по
 PRETOOL_NOPUSH=1 и диверсится в мок-счётчик NOTIFY_COUNT_FILE (до токена/сети); (D) pretool_guard
 🧪-карточку (scratchpad/_test/_dryrun) НЕ пушит вовсе, боевую — пушит (счётчик ловит = канал жив);
-(E) ПОЛНЫЙ гейт (gate.py → фейк-тест → pretool_guard на красной фикстуре) → НОЛЬ исходящих пушей.
+(E) ПОЛНЫЙ гейт (gate.py → фейк-тест → pretool_guard на красной фикстуре) → НОЛЬ исходящих пушей;
+(F) ЛЕНТА (posttool_feed, третий канал к владельцу с 03.08.2026) под теми же признаками — ноль.
 Сеть НЕ дёргается нигде: все subprocess-дети получают NOTIFY_COUNT_FILE (дивёрсия вместо отправки)."""
 import os
 import sys
@@ -154,6 +155,33 @@ env_e["GATE_TESTS_DIR"] = fake_tests
 rg = subprocess.run([PY, GATE], cwd=ROOT, capture_output=True, text=True, timeout=180, env=env_e)
 ok(rg.returncode == 0 and "разрешена" in rg.stdout, "гейт зелёный на фейк-наборе (exit 0)")
 ok(count_lines(cnt_e) == 0, "ПОЛНЫЙ ГЕЙТ: ноль исходящих пушей (мок-счётчик пуст)")
+
+# ── (F) ЛЕНТА (третье состояние, 03.08.2026) — третий канал к владельцу, та же изоляция ──
+# Заметка PostToolUse не может дать прав (у события нет поля разрешения), но УТЕЧЬ она может ровно
+# как карточка: фикстура, рождающая событие ленты под гейтом, писала бы владельцу в канал «Лента».
+# Ручка изоляции ОБЩАЯ с гардом (pretool_guard.is_probe), отправка — общая ветка мута notify.
+print("(F) канал ленты: под признаками тест-прогона — ноль исходящих:")
+FEED = os.path.join(ROOT, "posttool_feed.py")
+FEED_PAYLOAD = json.dumps({"tool_name": "Bash", "cwd": ROOT,
+                           "tool_input": {"command": "CC_FEED_PROBE=1 echo фикстура ленты"},
+                           "tool_response": {"stdout": ""}})
+
+def run_feed(count_file, seen, keep_nopush):
+    e = child_env(count_file=count_file, keep_nopush=keep_nopush)
+    if keep_nopush:
+        e["ORCH_TEST_MODE"] = "1"          # ровно то, что ставит gate.run_tests подпроцессам
+    e["CC_FEED_SEEN_DIR"] = seen           # каталог ленты подставляем ВСЕГДА (урок задачи 181)
+    e["FEED_CHAT_ID"] = "-1009999999999"
+    return subprocess.run([PY, FEED], input=FEED_PAYLOAD, capture_output=True, text=True,
+                          timeout=60, env=e)
+
+cnt_f = os.path.join(TMP, "cnt_f.txt")
+rf = run_feed(cnt_f, os.path.join(TMP, "seen_gate"), keep_nopush=True)
+ok(rf.returncode == 0 and rf.stdout == "", "хук ленты: exit 0 и ни байта в stdout")
+ok(count_lines(cnt_f) == 0, "ЛЕНТА под гейтом: ноль исходящих")
+cnt_f2 = os.path.join(TMP, "cnt_f2.txt")
+run_feed(cnt_f2, os.path.join(TMP, "seen_live"), keep_nopush=False)
+ok(count_lines(cnt_f2) == 1, "контроль: без признаков теста заметка уходит (ноль выше не ложный)")
 
 for k, v in _saved.items():
     if v is not None:

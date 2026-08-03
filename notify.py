@@ -256,6 +256,49 @@ def send_card(text):
     return (mid, CHAT_ID) if ok and mid else None
 
 
+FEED_CHAT_ENV = "FEED_CHAT_ID"   # канал «TurboBaby · Лента» (заметки, на которые НЕ отвечают)
+
+
+def _feed_dest():
+    """chat_id канала-ленты из .env (`FEED_CHAT_ID`) или None = канал не заведён → МОЛЧИМ.
+    .env грузим сами (как в _inbox_dest): posttool_feed зовёт send_feed из hook-процесса, где .env
+    ещё не загружен; load_dotenv существующие env-переменные НЕ перекрывает (тест ставит своё)."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+        cid = int((os.getenv(FEED_CHAT_ENV) or "0").strip() or 0)
+    except Exception:
+        return None
+    return cid or None
+
+
+def send_feed(text) -> bool:
+    """Заметка ленты (третье состояние «выполнить и сказать», 03.08.2026). → True если отдана в канал.
+
+    АДРЕС ОТДЕЛЬНЫЙ И ФОЛБЭКА НЕТ НАМЕРЕННО. Инбокс 1160 держит РОВНО одно свойство — «всё здесь
+    ждёт меня»; заметка, на которую не отвечают, это свойство размывает. Личка — канал алармов
+    (notify_hook «Termux ждёт подтверждения», health): разбавить аларм рутиной = обучить его
+    игнорировать. Поэтому нет FEED_CHAT_ID → сообщение НЕ уходит никуда, а не «уходит куда-нибудь».
+
+    Тест-контур ОБЩИЙ с боевым пушем (_test_mode, до токена и до сети): NOTIFY_COUNT_FILE → попытка
+    в мок-счётчик; PRETOOL_NOPUSH → мут. force здесь нет и быть не может: заметка не аларм, в
+    тест-прогоне она обязана молчать (регресс test_no_push_leak: полный гейт → ноль исходящих)."""
+    mode = _test_mode()
+    if mode == "count":
+        _count_attempt("FEED " + text)
+        return True
+    if mode == "mute":
+        return False
+    dest = _feed_dest()
+    if not dest:
+        return False
+    token = _get_token()
+    if not token:
+        return False
+    ok, _mid = _send_message(token, text, chat_id=dest)
+    return ok
+
+
 def edit_card(mid, text, chat_id=None) -> bool:
     """Правка ранее отправленной send_card-карточки (счётчик ×N). chat_id — чат карточки из
     возврата send_card (инбокс/личка, 13.07.2026); None → личка (легаси-записи стора без чата).
