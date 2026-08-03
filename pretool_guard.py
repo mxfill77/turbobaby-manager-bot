@@ -43,6 +43,12 @@
     _strip_git_msg_heredoc вырезает тело ТОЛЬКО у ЗАКАВЫЧЕННОГО heredoc (шелл в нём ничего не
     подставляет) и ТОЛЬКО когда сообщение читает git commit из stdin; голый <<MSG, тело
     `bash <<'EOF'` и всё после терминатора остаются под сканом.
+(г) УДАЛЕНИЕ ФАЙЛОВ ВНЕ ВРЕМЕННЫХ КАТАЛОГОВ (03.08.2026): доктринальное красное высшего вида,
+    которое до сих пор уходило в defer (не-python команда не разбиралась вовсе) и проходило по
+    allow-паттерну — за 168 ч так молча ушли 38 файлов корня репо, включая ОТСЛЕЖИВАЕМЫЙ git.
+    Судим ПО ЦЕЛИ, а не по глаголу: уборка своего черновика в /tmp, /var/tmp, /dev/shm остаётся
+    зелёной; маска, сам корень, «..», цель вне временных каталогов и НЕИЗВЛЁКШАЯСЯ цель → ask +
+    карточка с ПУТЁМ в объекте. Правило и его текст — зеркало _delete_is_red демона. См. _del_class.
 (в) HARD-BLOCK .env: обращение к файлу секретов в ЛЮБОЙ позиции цепи (после &&/;/|, внутри
     `bash -c`, $(…), `…`) → deny БЕЗ карточки, лог `env_hard_block`, approve НЕВОЗМОЖЕН.
     Сканируется ТОЛЬКО ТЕКСТ КОМАНДЫ: содержимое .py-целей НЕ проверяется (иначе любой боевой
@@ -703,6 +709,9 @@ _ACTIONS = {
     "sqlite": ("SQL-запись в БД вне memory.db (UPDATE/DELETE/INSERT/DROP)",
                "та ли БД и таблица",
                "обратный SQL руками — бэкапа БД гард не делает"),
+    "delete_file": ("УДАЛЕНИЕ ФАЙЛОВ вне временных каталогов",
+                    "тот ли путь и лежит ли копия в git",
+                    "вернуть можно ТОЛЬКО закоммиченное; несохранённое не вернётся"),
 }
 # в3 23.07.2026: штатно НЕдостижимо (ambiguous → defer, main() до карточки не доходит);
 # оставлено фолбэком _card на случай red-hit вне _ACTIONS (карточка не падает, а страшнеет).
@@ -930,6 +939,17 @@ def _detail_parts(hit, blob):
         d = _find(_P_DOC, blob)
         if d:
             obj.append("док " + d)
+    elif hit == "delete_file":
+        # ОБЪЕКТ удаления — ПУТЬ того, что удаляют; метку del_target= кладёт classify() (тем же
+        # способом, что proc_target). Цель не извлеклась → объекта нет → карточки нет, а решение
+        # ask остаётся: команда всё равно не проходит (fail-closed, см. блок над _del_class).
+        t = _find([r"del_target=([^\n]{1,200})"], blob)
+        n = _find([r"del_count=(\d{1,5})"], blob)
+        cnt = int(n) if (n or "").isdigit() else 0
+        if t:
+            obj.append("путь " + t + (" и ещё %d" % (cnt - 1) if cnt > 1 else ""))
+        if cnt:
+            num.append("файлов " + str(cnt))
     elif hit == "proc_ctl":
         tgt = _find([r"proc_target=([^\n]{1,60})"], blob)   # маркер кладёт classify()
         if tgt:
@@ -1653,6 +1673,142 @@ def _proc_class(units):
     return red
 
 
+# ══ (г) УДАЛЕНИЕ ФАЙЛОВ ВНЕ ВРЕМЕННЫХ КАТАЛОГОВ (03.08.2026) ══════════════════════════════════
+# ДЫРА, которую это закрывает. Доктрина (CLAUDE.md, редакция Б) держит «любое удаление данных и
+# файлов ВНЕ временных каталогов» в КРАСНОМ высшего вида — том, что без «да» владельца не идёт.
+# classify при этом НЕ-python команду не разбирал вовсе → вердикт defer → решали слои settings, а
+# там на уборку своих черновиков стоит allow-паттерн. Замер 168 ч по транскриптам (27.07–03.08):
+# ЧЕТЫРЕ команды удаления прошли МОЛЧА, 38 файлов, все в корне репозитория; среди них
+# `_envfix_probe.py` — файл, ОТСЛЕЖИВАЕМЫЙ git (коммит fcff713), и в той же сессии его пришлось
+# возвращать `git checkout`. То есть дыра доставала не только до черновиков. Заметкой такое не
+# лечится: это вопрос ВЛАСТИ (операция проходила), а не внимания.
+#
+# СУДИМ ПО ЦЕЛИ, А НЕ ПО ГЛАГОЛУ — доктрина и текст правила те же, что у демона (_delete_is_red /
+# _is_tmp_path, orchestrator_daemon.py, 30.07.2026): один класс — одно правило на оба слоя. Разница
+# входа намеренная: демон судит ФРАЗУ отчёта («что задача собирается сделать»), а хук — РЕАЛЬНУЮ
+# команду, поэтому цели берутся из РАЗОБРАННОГО argv сегмента, а не регуляркой по тексту. Слово об
+# удалении в шаблоне grep, в тексте своего коммита и в echo командой не является — класс «данные ≠
+# команда» цел по построению: глагол ищется в ГОЛОВЕ сегмента (_cmd_index), как у процессов.
+# FAIL-CLOSED: глагол есть, а цель не названа (stdin/xargs/подстановка/переменная) → красное с
+# пустым объектом → карточки нет (общий гейт card_gate не тронут), но решение ask остаётся, то
+# есть команда НЕ ПРОХОДИТ. Уборка своего черновика во временном каталоге — по-прежнему ЗЕЛЁНАЯ.
+_DEL_CMDS = {"rm", "rmdir", "unlink", "shred"}
+_DEL_TMP_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/")
+_FIND_EXEC = ("-exec", "-execdir")
+
+
+def _is_tmp_target(p):
+    """Цель — КОНКРЕТНЫЙ путь под временным каталогом? Маска, сам корень и «..» — НЕТ.
+    Зеркало _is_tmp_path демона: правило одно, и расходиться этим двум слоям нельзя."""
+    p = (p or "").strip().strip("'\"").strip()
+    if not p or "*" in p or "?" in p:
+        return False
+    for root in _DEL_TMP_ROOTS:
+        if p.startswith(root):
+            tail = p[len(root):].strip("/")
+            return bool(tail) and ".." not in tail.split("/")
+    return False
+
+
+def _del_targets(name, args):
+    """Цели удаления СЕГМЕНТА → список путей; None — сегмент ничего не удаляет.
+    Пустой список = глагол есть, а цель не названа (её решает fail-closed выше)."""
+    if name in _DEL_CMDS:
+        return [a for a in args if not a.startswith("-")]
+    if name == "find":
+        kills = "-delete" in args or any(
+            args[i] in _FIND_EXEC and i + 1 < len(args) and _base(args[i + 1]) in _DEL_CMDS
+            for i in range(len(args)))
+        if not kills:
+            return None                       # обычный поиск читает, а не удаляет
+        roots = []
+        for a in args:                        # корни идут ДО первого предиката
+            if a.startswith("-"):
+                break
+            roots.append(a)
+        return roots                          # удаление ложится ПОД корни — их и судим
+    if name == "git":
+        pos = [a for a in args if not a.startswith("-")]
+        if pos[:1] == ["rm"]:
+            return pos[1:]
+    return None
+
+
+def _del_units(cmd, depth=0):
+    """Сегменты цепи в СЫРЫХ токенах (+ тела подстановок и `sh -c`), для класса удаления.
+
+    ПОЧЕМУ НЕ ОБЩИЙ _units. Тот режет из сегмента argv .py-скрипта (класс «данные ≠ команда»,
+    24.07) — и на командах удаления это калечит РАЗБОР САМОГО ДЕЙСТВИЯ: у `find … -name '_*.py'
+    -delete` пропадал предикат `-delete` (удаление переставало опознаваться вовсе), а у
+    `rm a.py b.py c.py` оставалась ПЕРВАЯ цель, то есть карточка называла бы «файлов 1» там, где
+    удаляются семнадцать. Числа в карточке — факт, а не оценка.
+    КЛАСС «ДАННЫЕ ≠ КОМАНДА» ЗДЕСЬ ДЕРЖИТСЯ ИНАЧЕ и не слабее: глагол ищется в ГОЛОВЕ сегмента
+    (_cmd_index), а текст коммита, шаблон поиска и аргумент журнальной команды — ОДИН shlex-токен,
+    головой сегмента не бывают. Единственная форма, где чужой текст ПРЕВРАЩАЕТСЯ в строки, —
+    закавыченный heredoc сообщения коммита: он вырезается ДО сегментации, как и в _units."""
+    out = []
+    if depth > 2 or not (cmd or "").strip():
+        return out
+    if depth == 0:
+        cmd = _strip_git_msg_heredoc(cmd)      # тело своего коммита — данные (класс 30.07)
+    for seg in _split_segments(cmd):
+        for inner in _subst_inners(seg):
+            out.extend(_del_units(inner, depth + 1))
+        toks = _tokens(seg)
+        i = _cmd_index(toks)
+        if i is not None and _base(toks[i]) in _SHELLS:
+            for j in range(i + 1, len(toks) - 1):
+                if toks[j] == "-c":
+                    out.extend(_del_units(toks[j + 1], depth + 1))
+                    break
+        out.append(toks)
+        if len(out) > 60:
+            break
+    return out
+
+
+def _del_named(t):
+    """Цель НАЗВАНА (владельцу есть что оценить)? Литерал и маска — да, подстановка и переменная —
+    нет: их значение на момент решения неизвестно, и «Объект: $TARGET» был бы карточкой-пустышкой.
+    Команда при этом всё равно красная — просто вместо карточки идёт строка в журнал (card_gate)."""
+    t = (t or "").strip()
+    return bool(t) and "$" not in t and "`" not in t
+
+
+def _del_class(cmd):
+    """→ (глагол, [цели ВНЕ временных каталогов]) | None; пустой список целей = цель не названа.
+    Ищем во ВСЕЙ цепи (как _proc_class): `git status && rm файл` удаляет во втором сегменте.
+    FAIL-SAFE разбора: сегментация упала → судим команду одним куском (не тише, чем было)."""
+    try:
+        units = _del_units(cmd)
+    except Exception:
+        units = [_tokens(cmd)]
+    for toks in units:
+        i = _cmd_index(toks)
+        if i is None:
+            continue
+        name, args = _base(toks[i]), toks[i + 1:]
+        tgts = _del_targets(name, args)
+        if tgts is None:
+            continue
+        if not tgts:
+            return name, []                   # цель не названа → fail-closed
+        outside = [t for t in tgts if not _is_tmp_target(t)]
+        if outside:
+            return name, outside
+    return None
+
+
+def _del_blob(cmd, dele):
+    """Метка цели в blob — тем же способом, что proc_target у процессов (её читает _detail_parts).
+    Ни одной НАЗВАННОЙ цели (подстановка/переменная) → метки нет: объекта нет, карточки нет, ask."""
+    verb, outside = dele
+    named = [t for t in outside if _del_named(t)]
+    first = named[0] if named else ""
+    return "%s\ndel_verb=%s\ndel_target=%s\ndel_count=%d" % (
+        cmd, verb, first, len(outside) if named else 0)
+
+
 def classify(cmd, cwd=None):
     """ЕДИНАЯ точка классификации (её зовут main() и тесты — исполнять ничего не требуется).
     → (kind, hit, blob): kind ∈ {'block','red','ambiguous','green'}; hit — ключ действия и,
@@ -1669,9 +1825,18 @@ def classify(cmd, cwd=None):
         return "block", "env_hard_block", cmd + "\nenv_target=" + m.group(0).strip()
     if proc:
         return "red", "proc_ctl", cmd + "\nproc_target=" + proc[1]
+    dele = _del_class(cmd)               # СВОЙ разбор (см. _del_units): общий режет argv скрипта
     if not _is_python(scan):
+        if dele:                         # удаление вне временных каталогов — доктринальное красное
+            return "red", "delete_file", _del_blob(cmd, dele)
         return "green", "", cmd          # не-python и не процесс/секрет → штатные allow/ask rules
-    return _analyze(cmd, cwd or PROJECT, scan)
+    kind, hit, blob = _analyze(cmd, cwd or PROJECT, scan)
+    # Удаление проверяется ПОСЛЕ разбора python-тела намеренно: если в одной цепи и запись в живую
+    # таблицу, и уборка файла, владелец обязан увидеть карточку про ЗАПИСЬ — она дороже. Красное
+    # тела не подменяется; зелёное и ambiguous (defer) — подменяется, иначе удаление прошло бы.
+    if dele and kind not in ("red", "block"):
+        return "red", "delete_file", _del_blob(cmd, dele)
+    return kind, hit, blob
 
 
 def _block_reason(hit, blob=""):
