@@ -235,8 +235,220 @@ def _str_consts(node, depth=3):
     return out
 
 
+# ── УДАЛЕНИЕ ИЗ ТЕЛА PYTHON: ТА ЖЕ ДОКТРИНА, ЧТО У КОМАНДЫ ОБОЛОЧКИ (03.08.2026) ──────────────
+# Остаток артефакта 2026-08-03-delete-outside-tmp.md §6.2. Класс удаления закрыли на ОБОЛОЧКЕ, а
+# `os.remove("/root/turbobaby-manager-bot/bot.py")` в теле НЕотслеживаемого скрипта по-прежнему уходил
+# в defer — то есть решал allow-слой, где на уборку черновиков стоит `Bash(rm -f …/_*.py)`. Правило
+# здесь ОДНО И ТО ЖЕ, судим ПО ЦЕЛИ, а не по глаголу (и не по поверхности, на которой глагол стоит):
+#   • цель — КОНКРЕТНЫЙ путь под /tmp, /var/tmp, /dev/shm  → уборка своего черновика, зелёное;
+#   • цель вне временных каталогов                         → красное;
+#   • цель НЕВЫЧИСЛИМА (переменная извне, f-строка, join с переменной, glob, os.environ) → красное
+#     FAIL-CLOSED: объекта нет → карточки нет (общий гейт card_gate не тронут), но решение ask
+#     остаётся — команда НЕ ПРОХОДИТ. Ровно так же оболочка судит `rm "$TARGET"`.
+#
+# ПОЧЕМУ РАЗБОРОМ, А НЕ ПОДСТРОКОЙ. Иначе вернулся бы класс 02.08 с другой стороны: слово
+# `os.remove` в комментарии-шапке или в строке-шаблоне разведки командой не является, а карточка
+# «УДАЛЕНИЕ ФАЙЛОВ» за ним пришла бы — и в headless убила бы задачу (ask = отказ). Красное здесь
+# рождает РАЗОБРАННЫЙ ВЫЗОВ, как у денег. `list.remove(x)` тем же устройством отсечён: у него
+# приёмник не `os` (у `remove` есть законный списочный смысл — у `unlink`/`rmtree` его нет).
+#
+# ПОЧЕМУ СВЯЗАННЫЕ ЛИТЕРАЛЫ. Замер 168 ч (2026-07-27 → 08-03, транскрипты): 21 живой вызов
+# удаления в питонных телах, и у 14 цель — ПЕРЕМЕННАЯ; прямое «переменная → красное» убило бы
+# законную уборку своего черновика (артефакт §6.2 назвал именно этот риск). Живые связки:
+# `tempfile.mkdtemp()` — 12, цикл по литеральному кортежу `/tmp/…` — 1, `os.path.join(DIR, n)` — 2,
+# f-строка — 1, `os.environ[…]` — 1. Поэтому цель резолвится по связкам ТЕЛА (присваивание, цикл по
+# литеральному списку, `with … as`), а `tempfile.*` считается доказанно временной: stdlib
+# возвращает путь ВНУТРИ временного каталога по построению — это и есть определение своего
+# черновика. `os.path.join(DIR, переменная)`, f-строка и glob остаются НЕВЫЧИСЛИМЫМИ намеренно:
+# так же их называет красными демонский близнец `_is_tmp_path`/`_delete_is_red` («цель не
+# извлеклась (переменная, os.path.join), маска, сам корень, ..»), и расходиться двум слоям одного
+# класса нельзя.
+_PY_DEL_FS = ("unlink", "rmtree", "rmdir", "removedirs")   # имени довольно: иного смысла у них нет
+_PY_DEL_OS = "remove"                     # list.remove — тоже `remove` → нужен приёмник-модуль os
+_PY_TMP_FACTORIES = ("mkdtemp", "mkstemp", "gettempdir", "TemporaryDirectory",
+                     "NamedTemporaryFile", "TemporaryFile")
+_PY_JOINERS = ("join",)                                    # os.path.join(…)
+_PY_PATHS = ("Path", "PosixPath")                          # pathlib.Path("/tmp/x").unlink()
+_PY_EXEC_DEL = ("run", "Popen", "call", "check_call", "check_output", "system", "popen",
+                "getoutput", "getstatusoutput")
+_PY_UNKNOWN = (None, "")                                   # цель не вычислена → fail-closed
+
+
+def _py_rel_safe(s):
+    """Хвост склейки не уводит из каталога: относительный, непустой, без «..»."""
+    s = (s or "").strip()
+    return bool(s) and not s.startswith("/") and ".." not in s.replace("\\", "/").split("/")
+
+
+def _py_join_res(parts):
+    """Склейка резолвов (`os.path.join`, `Path(…)`, `Path / 'имя'`) → один резолв.
+    Все части литеральные → точный путь: os.path.join сам обработает абсолютный хвост, и побег из
+    /tmp останется ВИДЕН в готовом литерале. Голова доказанно временная, хвосты — относительные
+    литералы без «..» → путь остаётся внутри временного каталога. Любая невычислимая часть → None."""
+    if not parts or any(len(p) != 1 for p in parts):
+        return [_PY_UNKNOWN]
+    vals = [p[0] for p in parts]
+    if any(k is None for k, _ in vals):
+        return [_PY_UNKNOWN]
+    if all(k == "path" for k, _ in vals):
+        try:
+            return [("path", os.path.join(*[v for _, v in vals]))]
+        except Exception:
+            return [_PY_UNKNOWN]
+    if vals[0][0] == "tmp" and all(k == "path" and _py_rel_safe(v) for k, v in vals[1:]):
+        return [("tmp", "")]
+    return [_PY_UNKNOWN]
+
+
+def _py_res(node, env, depth=0):
+    """Выражение-цель → СПИСОК резолвов [(вид, путь)]: 'path' — точный литерал, 'tmp' — доказанно
+    внутри временного каталога, None — невычислимо. Список, потому что переменная цикла держит
+    несколько литералов сразу, и красной цепь делает ЛЮБОЙ из них."""
+    if node is None or depth > 4:
+        return [_PY_UNKNOWN]
+    if isinstance(node, ast.Constant):
+        return [("path", node.value)] if isinstance(node.value, str) else [_PY_UNKNOWN]
+    if isinstance(node, ast.Name):
+        return list(env.get(node.id) or [_PY_UNKNOWN])
+    if isinstance(node, ast.Call):
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else (fn.id if isinstance(fn, ast.Name) else "")
+        if name in _PY_TMP_FACTORIES:
+            return [("tmp", "")]
+        if name in _PY_JOINERS + _PY_PATHS and node.args:
+            return _py_join_res([_py_res(a, env, depth + 1) for a in node.args])
+        return [_PY_UNKNOWN]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _py_join_res([_py_res(node.left, env, depth + 1),
+                             _py_res(node.right, env, depth + 1)])
+    return [_PY_UNKNOWN]
+
+
+def _py_env(tree):
+    """Связки ТЕЛА: имя → список резолвов. Два прохода, чтобы `p = os.path.join(DIR, 'x')` увидел
+    уже разобранный DIR. Имя связано несколько раз → берутся ВСЕ связки: хоть одна невычислимая
+    или ведущая наружу делает цель красной (сомнение решается краснее)."""
+    raw = {}
+    for node in ast.walk(tree):
+        pairs = []
+        if isinstance(node, ast.Assign):
+            pairs = [(t, node.value, False) for t in node.targets]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            pairs = [(node.target, node.value, False)]
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            pairs = [(node.target, node.iter, True)]
+        elif isinstance(node, ast.comprehension):
+            pairs = [(node.target, node.iter, True)]
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            pairs = [(node.optional_vars, node.context_expr, False)]
+        for tgt, val, over in pairs:
+            if isinstance(tgt, ast.Name):
+                raw.setdefault(tgt.id, []).append((val, over))
+    env = {}
+    for _ in range(2):
+        for name, binds in raw.items():
+            res = []
+            for val, over in binds:
+                if not over:
+                    res += _py_res(val, env)
+                elif isinstance(val, (ast.List, ast.Tuple, ast.Set)):
+                    for e in val.elts:                     # цикл по литеральному списку путей
+                        res += _py_res(e, env)
+                else:
+                    res.append(_PY_UNKNOWN)                # glob/listdir/чужой итератор — невычислимо
+            env[name] = res or [_PY_UNKNOWN]
+    return env
+
+
+def _py_exec_cmdline(node):
+    """Первый аргумент exec-вызова → строка команды для ОБЩЕГО разбора удаления (`_del_class`):
+    `subprocess.run(["rm","-rf","/root/x"])` и `os.system("rm -rf /root/x")` — то же удаление, что
+    в оболочке, только запущенное из тела. Литеральные элементы КАВЫЧАТСЯ (иначе `["echo","a; rm
+    /root/x"]` разъехался бы на два сегмента, и данные стали бы командой), невычислимый элемент →
+    «$X»: для `_del_named` это неназванная цель, то есть fail-closed, как переменная в оболочке."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        out = []
+        for e in node.elts:
+            if isinstance(e, ast.Constant) and isinstance(e.value, str):
+                out.append(shlex.quote(e.value))
+            else:
+                out.append("$X")
+        return " ".join(out)
+    return ""
+
+
+def _py_del_calls(tree, env):
+    """Вызовы удаления тела → [(глагол, [резолвы цели])]. Глагол — только РАЗОБРАННЫЙ вызов."""
+    osnames, bare = {"os"}, set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if (a.name or "").split(".")[0] == "os":
+                    osnames.add(a.asname or a.name)        # import os as o → o.remove(…)
+        elif isinstance(node, ast.ImportFrom) and (node.module or "") in ("os", "shutil", "pathlib"):
+            for a in node.names:
+                if a.name in _PY_DEL_FS or a.name == _PY_DEL_OS:
+                    bare.add(a.asname or a.name)           # from os import remove as rmf
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        attr = fn.attr if isinstance(fn, ast.Attribute) else ""
+        nm = fn.id if isinstance(fn, ast.Name) else ""
+        name = attr or nm
+        verb = ""
+        if name in _PY_DEL_FS or (nm and nm in bare):
+            verb = name
+        elif name == _PY_DEL_OS and attr and isinstance(fn.value, ast.Name) and fn.value.id in osnames:
+            verb = name                                    # list.remove(x) сюда НЕ попадает
+        if verb:
+            tgt = node.args[0] if node.args else None
+            if tgt is None:
+                tgt = next((k.value for k in node.keywords if k.arg in ("path", "dst")), None)
+            if tgt is None and attr:
+                tgt = fn.value          # p.unlink() / Path('/tmp/x').unlink() — цель это САМ приёмник
+            label = "%s.%s" % (fn.value.id, attr) if (attr and isinstance(fn.value, ast.Name)) else verb
+            out.append((label, _py_res(tgt, env)))
+            continue
+        if name in _PY_EXEC_DEL and node.args:
+            line = _py_exec_cmdline(node.args[0])
+            dele = _del_class(line) if line else None      # ОДИН разбор удаления на обе поверхности
+            if dele:
+                out.append(("%s %s" % (name, dele[0]),
+                            [(("path", t) if t else _PY_UNKNOWN) for t in dele[1]] or [_PY_UNKNOWN]))
+    return out
+
+
+def _py_dels(src_tree):
+    """Список удалений тела; разбор упал → пусто, то есть БАЙТ-В-БАЙТ прежнее поведение (до 03.08
+    питонная поверхность была зелёной целиком). Исключение не является доказательством удаления."""
+    try:
+        return _py_del_calls(src_tree, _py_env(src_tree))
+    except Exception:
+        return []
+
+
+def _py_del_class(view):
+    """Вид view → (глагол, [цели ВНЕ временных каталогов]) | None. Пустая строка в списке = цель
+    невычислима (fail-closed: красное, но объекта нет → карточки нет, ask остаётся)."""
+    for verb, res in (view or {}).get("dels") or ():
+        outside = []
+        for kind, path in res:
+            if kind == "tmp":
+                continue                                   # доказанно свой черновик во временном
+            if kind == "path" and _is_tmp_target(path):
+                continue
+            outside.append(path if kind == "path" else "")
+        if outside:
+            return verb, outside
+    return None
+
+
 def _py_code_view(src):
-    """Разбор ОДНОГО python-тела → {'text','conf','calls','names','lit_args','channel'} либо None.
+    """Разбор ОДНОГО python-тела → {'text','conf','calls','names','lit_args','channel','dels'} либо None.
 
     Три факта добавлены 02.08.2026 ради ДЕНЕЖНОГО класса (см. _money_is_action ниже):
       names    — ИМЕНА КОДА без строк: идентификатор/атрибут/импорт/аргумент/def. Именно этим
@@ -303,7 +515,8 @@ def _py_code_view(src):
     channel = (any(m and m not in _INERT_MODULES for m in mods)
                or any(c in _EXEC_CALLS for c in calls))
     return {"text": "\n".join(w for w in words if w), "conf": conf, "calls": calls,
-            "names": [n for n in names if n], "lit_args": lit_args, "channel": channel}
+            "names": [n for n in names if n], "lit_args": lit_args, "channel": channel,
+            "dels": _py_dels(tree)}
 
 
 def _code_view_parts(parts):
@@ -312,7 +525,7 @@ def _code_view_parts(parts):
     if not parts:
         return None
     text, conf, calls = [], False, {}
-    names, lit_args, channel = [], [], False
+    names, lit_args, channel, dels = [], [], False, []
     for src in parts:
         v = _py_code_view(src)
         if v is None:
@@ -322,10 +535,11 @@ def _code_view_parts(parts):
         names += v["names"]
         lit_args += v["lit_args"]
         channel = channel or v["channel"]      # канал ОДНОГО тела красит команду целиком
+        dels += v.get("dels") or []            # удаление ОДНОГО тела красит команду целиком
         for fn, kw in v["calls"].items():
             calls.setdefault(fn, {}).update(kw)
     return {"text": "\n".join(text), "conf": conf, "calls": calls,
-            "names": names, "lit_args": lit_args, "channel": channel}
+            "names": names, "lit_args": lit_args, "channel": channel, "dels": dels}
 
 
 def _body_has(tok, raw, view):
@@ -1940,6 +2154,13 @@ def _analyze(cmd, cwd, scan=None):
     # 02.08.2026: «своя» определяется целью открытия, а не упоминанием имени в комментарии/докстринге.
     if _SQLITE_WRITE.search(blob) and _sql_write_is_foreign(blob):
         return "red", "sqlite", blob
+    # УДАЛЕНИЕ ИЗ ТЕЛА (03.08.2026, остаток §6.2): та же доктрина, что у команды оболочки, и тот же
+    # порядок — ПОСЛЕ красного живых таблиц: если тело и пишет в Лист1, и убирает файл, владелец
+    # обязан увидеть карточку про ЗАПИСЬ, она дороже. Тело нечитаемо (amb) → слой слеп, как и был:
+    # разбирать нечего, а красное на пустом месте убило бы задачу (в headless ask = отказ).
+    pyd = _py_del_class(view)
+    if pyd:
+        return "red", "delete_file", _del_blob(blob, pyd)
     if amb:
         return "ambiguous", "ambiguous", blob          # доктринального красного нет → в3: defer
     if not saw_target:
