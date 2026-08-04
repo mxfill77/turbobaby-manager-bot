@@ -534,6 +534,7 @@ class BridgeClient:
         "add_transaction", "void_last",          # касса (проводки + отмена)
         "create_booking", "activate_booking", "close_booking",  # CRM «клиенты»
         "delete_event",                          # удаление
+        "edit_event",                            # правка строки НА МЕСТЕ (затирает прежнее значение)
         "ocr_passport", "save_passport", "upload_passport_photo",  # B2: EdenAI + Drive + Bot Data
         "make_contract",                         # B3: договор (Drive-запись + чтение CRM)
         "closing_upsert",                        # Лист закрытия (деньги-доплаты → аудит 4.1, НЕ 4.2)
@@ -543,7 +544,10 @@ class BridgeClient:
         "service_delete",                        # удаление service-строки «обслуживание» (необратимо → аудит 4.1)
     }
     _BRIEF_KEYS = ("number", "bike", "amount", "currency", "kind", "oil_km", "km",
-                   "row", "name", "group", "msg_id", "confirmed", "confirmed_by")
+                   "row", "name", "group", "msg_id", "confirmed", "confirmed_by",
+                   # правка/исправление: без этих полей в журнале останется «правил кто-то,
+                   # зачем-то» — то есть след, по которому ничего не восстановить.
+                   "fix_reason", "fixed_by", "new_msg_id")
 
     def _post(self, action: str, **fields) -> dict:
         """POST запрос к Bridge (запись данных Splinter)."""
@@ -973,14 +977,117 @@ class BridgeClient:
         не меняется без overwrite=True. Файл должен быть в Brain-папке."""
         return self._post("register_brain_doc", name=str(name), id=str(id), overwrite=bool(overwrite))
 
-    def set_fleet_oil(self, number, oil_km, confirmed: bool = False) -> dict:
+    def set_fleet_oil(self, number, oil_km, confirmed: bool = False,
+                      fix_reason: str = "", fixed_by: str = "", trusted: bool = False) -> dict:
         """GUARDED: записать «ТО Oil» (Лист1 Байки, колонка I) по НОМЕРУ байка.
         Резолв только по номеру (last 3-4 цифры, как find_bike). Пишет одну ячейку (col I).
         Требует confirmed=True. Откат (новое<старого) и неоднозначный номер — отказ без записи.
         Ошибки: missing_number / bad_oil_km / not_confirmed / not_found / ambiguous /
-        oil_decreasing / write_failed."""
+        oil_decreasing / write_failed.
+
+        ВЕТКА «ИСПРАВЛЕНИЕ ОШИБКИ» (04.08.2026). Сторож `oil_decreasing` на ОБЫЧНОМ пути
+        остаётся: одометр не убывает, молчаливое понижение почти всегда ошибка распознавания.
+        Но у ошибки, УЖЕ ЛЕЖАЩЕЙ в живой таблице, штатного лечения не было вовсе — оставалась
+        ручная правка ячейки, а владелец рулит с телефона. Ветку открывает ТОЛЬКО ПАРА
+        `fix_reason` + `fixed_by`: полумера ветку не открывает (иначе признак исправления
+        заводился бы сам собой), и клиент такую полумеру на мост даже не шлёт — `fix_incomplete`.
+
+        `trusted=True` — «понижение подтвердил Пым или владелец». Нужен, когда понижение БОЛЬШЕ
+        500 км (правило владельца; порог зеркалит `_SOFT_ODO_THRESHOLD` в splinter). Ставить его
+        имеет право только код, который РЕАЛЬНО проверил, кто подтвердил: сам по себе признак —
+        второй рубеж, а не первый.
+
+        Успех исправления несёт `correction:{reason,by,drop,trusted}`, `rollback_oil` (число, к
+        которому вернёт откат тем же вызовом) и `audit_logged`. След в боевом журнале у этой
+        ветки FAIL-CLOSED: журнал не записался → мост ОТКАТЫВАЕТ запись (`audit_failed`), потому
+        что исправление без следа в живой таблице неотличимо от порчи данных."""
+        fix_reason = str(fix_reason or "").strip()
+        fixed_by = str(fixed_by or "").strip()
+        if bool(fix_reason) != bool(fixed_by):
+            log.error("исправление пробега БЕЗ полной пары «причина+автор» не шлётся: "
+                      "number=%r oil_km=%r fix_reason=%r fixed_by=%r",
+                      number, oil_km, fix_reason, fixed_by)
+            return {"ok": False, "error": "fix_incomplete",
+                    "message": "исправление требует И причину, И автора — иначе это обычная "
+                               "запись, и понижение упрётся в сторож oil_decreasing"}
+        extra = {}
+        if fix_reason:
+            extra["fix_reason"] = fix_reason
+            extra["fixed_by"] = fixed_by
+            if trusted:
+                extra["trusted"] = True
         return self._post("set_fleet_oil", number=str(number),
-                          oil_km=oil_km, confirmed=bool(confirmed))
+                          oil_km=oil_km, confirmed=bool(confirmed), **extra)
+
+    #: поля строки «события», которые правка имеет право менять (зеркало EVENT_FIX_FIELDS моста).
+    #: recorded_at и msg_id сюда НЕ входят: метка времени записи не правится вовсе, ключ — через
+    #: new_msg_id (явно и с проверкой на конфликт).
+    EVENT_FIX_FIELDS = ("msg_date", "group", "bike", "event_type", "fuel",
+                        "mileage", "photos", "notes", "status", "sender")
+
+    def edit_event(self, msg_id: str = "", fields: dict = None, new_msg_id: str = "",
+                   reason: str = "", fixed_by: str = "", group: str = "") -> dict:
+        """Править строку листа «события» НА МЕСТЕ — БЕЗ удаления и пересоздания.
+
+        ЗАЧЕМ. Починка «удалить + добавить заново» теряет `recorded_at` (метку времени ЗАПИСИ):
+        новая строка встаёт с новым временем и уезжает в конец листа — история перестаёт быть
+        историей. Правка меняет СОДЕРЖИМОЕ, не момент записи; кол.A мост не пишет ни одной
+        веткой, поэтому сохранность метки доказывается устройством, а не аккуратностью вызова.
+
+        КЛЮЧ ПРИВОДИТСЯ К СОДЕРЖИМОМУ. У автоматики ключ синтетический и КОНТЕНТНЫЙ
+        (`info:<номер>:<работа>:<км>` и т.п., см. add_event). Поправить число и оставить прежний
+        ключ — значит оставить дедуп сверять строку по отпечатку, которого в ней уже нет:
+        правильная запись легла бы ВТОРОЙ строкой, а ошибочный отпечаток продолжал бы гасить
+        повторы. Поэтому `new_msg_id` — часть той же операции; мост проверяет, что новый ключ не
+        занят чужой строкой (`key_conflict`).
+
+        ФЕЙЛ-КЛОУЗД ВХОД — как у `add_event`: без ключа, без причины, без автора запрос на мост
+        НЕ УХОДИТ ВОВСЕ. Анонимная правка живой строки хуже ненаписанной: её нельзя ни сверить,
+        ни отозвать, а прежнее значение она уже стёрла. Причина и автор — это и есть аудит-след
+        («что было, что стало, кто исправил»), мост кладёт его В САМУ СТРОКУ (notes/status) и
+        строкой в боевой журнал.
+
+        Ключ строки берётся из `read_events` (с 04.08 отдаёт `msg_id`/`group`/`status`).
+        Успех несёт `before`/`after`, `audit` и ГОТОВЫЙ `rollback` — обратный вызов той же
+        операции. Ошибки: no_key / no_reason / no_author / not_confirmed / bad_field /
+        nothing_to_change / not_found / ambiguous / key_conflict / verify_failed / write_failed.
+        """
+        key = str(msg_id or "").strip()
+        reason = str(reason or "").strip()
+        author = str(fixed_by or "").strip()
+        new_key = str(new_msg_id or "").strip()
+        payload_fields = dict(fields or {})
+
+        def _refuse(err: str, msg: str) -> dict:
+            log.error("правка строки события НЕ отправлена (%s): msg_id=%r fields=%r "
+                      "new_msg_id=%r reason=%r fixed_by=%r",
+                      err, key, payload_fields, new_key, reason, author)
+            return {"ok": False, "error": err, "message": msg}
+
+        if not key:
+            return _refuse("no_key", "нужен точный ключ правимой строки (msg_id из read_events): "
+                                     "без него правка не сверяется и не отзывается")
+        if not reason:
+            return _refuse("no_reason", "правка без НАЗВАННОЙ причины не принимается — причина "
+                                        "и есть половина аудит-следа")
+        if not author:
+            return _refuse("no_author", "правка без автора не принимается — «кто исправил» "
+                                        "обязательная часть следа")
+        if not payload_fields and not new_key:
+            return _refuse("nothing_to_change", "не названо ни одно поле и не задан новый ключ")
+        bad = [f for f in payload_fields if f not in self.EVENT_FIX_FIELDS]
+        if bad:
+            return _refuse("bad_field", f"править можно только {', '.join(self.EVENT_FIX_FIELDS)}; "
+                                        f"метка времени записи не правится вовсе, ключ — через "
+                                        f"new_msg_id (лишние: {', '.join(bad)})")
+
+        body = {"msg_id": key, "fields": payload_fields, "reason": reason,
+                "fixed_by": author, "confirmed": True}
+        if new_key:
+            body["new_msg_id"] = new_key
+        if str(group or "").strip():
+            body["group"] = str(group).strip()
+        return self._post("edit_event", **body)
 
     def set_fleet_service(self, number, kind, km, confirmed: bool = False) -> dict:
         """GUARDED: записать регламент ТО группы B в Лист1 Байки по НОМЕРУ:

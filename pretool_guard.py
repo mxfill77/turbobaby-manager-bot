@@ -109,6 +109,11 @@ RED_TOKEN_HIT = {
     "add_transaction": "add_transaction", "void_last": "void_last",
     "create_booking": "create_booking", "activate_booking": "activate_booking",
     "closing_upsert": "closing_upsert", "delete_event": "delete_event",
+    # Правка строки НА МЕСТЕ — красное, хотя лист «события» свой. Разница с add_event (зелёное)
+    # в направлении: добавление ДОПИСЫВАЕТ строку, правка СТИРАЕТ прежнее значение той же
+    # ячейки. Стёртое возвращается только тем, кто знает, что там было, — поэтому владелец
+    # видит карточку с объектом и числом ДО, а не журнальную строку ПОСЛЕ.
+    "edit_event": "edit_event",
     "DOWRITE": "DOWRITE",
     "confirmed=true": "confirmed", "confirmed=True": "confirmed", "confirmed = true": "confirmed",
     '"confirmed": true': "confirmed", '"confirmed":true': "confirmed",
@@ -976,6 +981,9 @@ _ACTIONS = {
     "delete_event": ("УДАЛЕНИЕ события из истории",
                      "то ли событие",
                      "ОТКАТА НЕТ — строка стирается безвозвратно"),
+    "edit_event": ("ПРАВКА строки события на месте (прежнее значение стирается)",
+                   "та ли строка и то ли новое число",
+                   "вернуть прежние значения тем же вызовом — ответ несёт готовый откат"),
     "DOWRITE": ("скрипт помечен DOWRITE=1 — реальная запись (не dry-run)",
                 "что именно пишет скрипт",
                 "зависит от скрипта — прочитай его ДО «да»"),
@@ -1204,6 +1212,19 @@ def _detail_parts(hit, blob):
         g = _find(_P_WALLET, blob)
         if g:
             obj.append("группа " + g.strip())
+    elif hit == "edit_event":
+        # ОБЪЕКТ — правимая строка (её ключ), ЧИСЛО — то, ЧЕМ значение станет. Именно новое
+        # число владелец и сверяет: старое он уже видел в таблице, а ошибка правки — это
+        # неверное НОВОЕ значение либо правка не той строки.
+        e = _find(_P_MSGID, blob)
+        if e:
+            obj.append("событие " + e)
+        b = _bike_bit(blob)
+        if b:
+            obj.append(b)
+        v = _find(_P_KM, blob)
+        if v:
+            num.append("пробег → " + v.strip())
     elif hit == "sqlite":
         d = _find(_P_DBFILE, blob)
         if d:
