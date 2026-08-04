@@ -12,6 +12,7 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ.setdefault("PLAN_ADAPT", "0")  # изоляция от боевого .env (адаптация плана, кусок 2)
 os.environ["CURATOR"] = "0"  # изоляция от боевого .env (куратор целей, родитель 231; принудительно — env демона)
+os.environ["CARD_DUTY"] = "0"  # изоляция от боевого .env (дежурный по карточкам, фаза 1; принудительно — env демона)
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []

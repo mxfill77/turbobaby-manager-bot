@@ -24,6 +24,7 @@ os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["PLAN_ADAPT"] = "0"
 os.environ["CURATOR"] = "0"
 os.environ["STEP_SELFHEAL"] = "0"
+os.environ["CARD_DUTY"] = "0"  # изоляция от боевого .env (дежурный по карточкам, фаза 1; принудительно — env демона)
 os.environ["ORCH_TEST_MODE"] = "1"
 os.environ["PRETOOL_NOPUSH"] = "1"
 os.environ["MEM_MIN_MB"] = "0"          # гейт памяти выключен: тест не должен зависеть от нагрузки VPS
