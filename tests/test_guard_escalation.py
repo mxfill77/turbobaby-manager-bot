@@ -10,15 +10,25 @@
 (6) _guard_what без данных/пустые данные → fail-safe строка.
 (7) guard_marker_clear + guard_marker_read.
 (8) CC_TASK_ID выставляется в child_env перед запуском.
+(9) ПРОГОН НЕ ПИШЕТ В БОЕВОЙ КАТАЛОГ МАРКЕРОВ — своё состояние во временном каталоге с
+    уникальным суффиксом (04.08.2026; до этой правки секция (8) звала run_task(88), а он чистил
+    БОЕВОЙ /tmp/cc_guard_block/88.json — живой маркер задачи с таким номером был бы стёрт молча).
 Сети/claude нет — subprocess.Popen (_POPEN) подменён FakePopen."""
 import os, sys, json, tempfile, shutil, threading
 sys.path.insert(0, "/root/turbobaby-manager-bot")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ.setdefault("PLAN_ADAPT", "0")
 os.environ["CURATOR"] = "0"
 os.environ["STEP_SELFHEAL"] = "0"   # изоляция: не хотим think-loop в guard-тестах
 import subprocess as _sp
+
+# Страж взводится ДО импортов гарда/демона — иначе прогон слеп к тому, что делает сам импорт.
+# Путь здесь ЛИТЕРАЛОМ по необходимости (константы ещё нет), а секция (9) сверяет литерал с
+# константой: переименуют боевой каталог — тест покраснеет, а не ослепнет молча.
+import livewatch
+LW = livewatch.watch("/tmp/cc_guard_block")
 
 import pretool_guard as PG
 import orchestrator_daemon as OD
@@ -165,11 +175,19 @@ _FAKE = "999012"
 _live_plain = os.path.join(PG.GUARD_BLOCK_DIR, _FAKE + ".json")
 _live_pref = os.path.join(PG.GUARD_BLOCK_DIR, "test-" + _FAKE + ".json")
 _test_marker = os.path.join(PG.TEST_BLOCK_DIR, "test-" + _FAKE + ".json")
-for _p in (_live_plain, _live_pref, _test_marker):
-    try:
-        os.remove(_p)
-    except OSError:
-        pass
+# СВОЙ МУСОР УБИРАЕМ, В БОЕВОМ КАТАЛОГЕ НЕ СТИРАЕМ НИЧЕГО (04.08.2026). Прежняя редакция звала
+# os.remove на ОБА боевых пути «чтобы протухший файл не выдал провал за успех» — приём стоил
+# дороже пользы: фикстура получала право стирать там, где лежат находки владельца, и это ровно
+# тот приём, которым 04.08 был убит боевой спул. Боевые пути теперь только ЧИТАЮТСЯ: файл с этим
+# именем до прогона сам по себе находка (кроме регресса этого инварианта его никто не пишет) —
+# его надо НАЗВАТЬ, а не съесть. Лечится руками, как красный страж R17.
+_stale = [_p for _p in (_live_plain, _live_pref) if os.path.exists(_p)]
+res.append(ok(not _stale,
+              f"боевой каталог чист ДО прогона (иначе сверка ниже ничего не значит): {_stale}"))
+try:
+    os.remove(_test_marker)        # свой артефакт прошлого прогона, ТЕСТ-каталог
+except OSError:
+    pass
 _env = dict(os.environ, PYTHONPATH=_ROOT, PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1", CC_TASK_ID=_FAKE)
 _env.pop(PG.BLOCK_DIR_ENV, None)               # НАРОЧНО без подмены: проверяем УМОЛЧАНИЕ
 # Красная фикстура — операция ПАРКА (не деньги): живая сущность без пометки ТЕСТ = жёсткий блок,
@@ -331,6 +349,12 @@ shutil.rmtree(tmp_guard7, ignore_errors=True)
 
 # ── (8) CC_TASK_ID выставлен в child_env ─────────────────────────────────────
 print("(8) CC_TASK_ID в child_env:")
+# КАТАЛОГ МАРКЕРОВ — СВОЙ, ВРЕМЕННЫЙ. run_task чистит и читает маркер задачи по своему пути, а
+# номер здесь обычный двузначный: с боевым каталогом прогон гейта стирал /tmp/cc_guard_block/88.json,
+# то есть живой маркер задачи с таким номером исчезал бы молча — карточка владельцу не родилась бы
+# вовсе. Подмена пути (а не номера) закрывает класс: любой номер фикстуры теперь безопасен.
+tmp_guard8 = tempfile.mkdtemp(prefix="guard_esc8_")
+OD.GUARD_BLOCK_DIR = tmp_guard8
 CAP = {}
 def cap_popen(*a, **kw):
     CAP["env"] = dict(kw.get("env") or {})
@@ -340,6 +364,29 @@ fb = FakeBridge(); OD.bc = fb
 OD.run_task(88, "тест CC_TASK_ID", task_timeout=10)
 res.append(ok(CAP.get("env", {}).get("CC_TASK_ID") == "88",
               f"CC_TASK_ID=88 в child_env: {CAP.get('env',{}).get('CC_TASK_ID')!r}"))
+OD.GUARD_BLOCK_DIR = _orig_od_dir
+shutil.rmtree(tmp_guard8, ignore_errors=True)
+
+
+# ── (9) ПРОГОН НЕ ПИШЕТ В БОЕВОЙ КАТАЛОГ МАРКЕРОВ ─────────────────────────────
+# Инвариант-детектор класса, а не частности: любая будущая секция, забывшая подменить каталог,
+# краснеет здесь. Ловит ДЕЙСТВИЕ, а не остаток — удаление несуществующего файла следа не
+# оставляет, и снимок «до/после» именно поэтому живой случай run_task(88) не показывал.
+print("(9) боевой каталог маркеров за весь прогон не изменён:")
+res.append(ok(LW.dirs == (PG.GUARD_BLOCK_DIR.rstrip("/"),),
+              f"страж смотрит на боевую константу ({LW.dirs} vs {PG.GUARD_BLOCK_DIR})"))
+res.append(ok(not LW.writes(), f"ноль записей/удалений в {PG.GUARD_BLOCK_DIR}: {LW.report()}"))
+# КОНТРОЛЬ «НОЛЬ НЕ ЛОЖНЫЙ»: молчащий страж дал бы тот же зелёный. Второй страж на свой каталог
+# обязан поймать и запись, и удаление — ровно те два действия, которыми жил дефект run_task(88).
+_ctl_dir = tempfile.mkdtemp(prefix="guard_esc9_")
+_CTL = livewatch.watch(_ctl_dir)
+_ctl_file = os.path.join(_ctl_dir, "ctl.json")
+with open(_ctl_file, "w", encoding="utf-8") as _f:
+    _f.write("{}")
+os.remove(_ctl_file)
+res.append(ok(len(_CTL.writes()) >= 2 and not LW.writes(),
+              f"контроль: страж видит запись И удаление в своём каталоге ({_CTL.report()})"))
+shutil.rmtree(_ctl_dir, ignore_errors=True)
 
 
 # ── финал ─────────────────────────────────────────────────────────────────────

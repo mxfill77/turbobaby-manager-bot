@@ -19,6 +19,8 @@
  (7) ГРАНИЦА СПИСКА: с 04.08.2026 список фазы 1 подключён (шаг 2) — пять классов говорят, всё
      прочее молчит; дословные голдены и ближние промахи — в tests/test_feed_list.py.
  (8) ПОДГОТОВЛЕННЫЕ НАСТРОЙКИ: отличие от живых РОВНО в hooks.PostToolUse, permissions не тронуты.
+ (9) ПРОГОН НЕ КАСАЕТСЯ БОЕВЫХ КАТАЛОГОВ СОСТОЯНИЯ (04.08.2026): аудит-хук ловит действие,
+     снимок — остаток, своё состояние живёт во временном каталоге с уникальным суффиксом.
 
 Сети нет нигде: подпроцессам ставим NOTIFY_COUNT_FILE (дивёрсия до токена/сети), in-process
 отправка замокана. Каталог состояния ленты (CC_FEED_SEEN_DIR) и каталог маркеров гарда
@@ -62,6 +64,14 @@ SEEN = os.path.join(TMP, "seen")
 MARKERS = os.path.join(TMP, "markers")
 os.makedirs(SEEN, exist_ok=True)
 os.makedirs(MARKERS, exist_ok=True)
+
+# Страж боевых каталогов состояния — взводится ДО импортов, иначе прогон слеп к тому, что делает
+# сам импорт. Секция (9) сверяет ноль записей; подмену путей он не заменяет, а страхует.
+LIVE_STATE = ("/tmp/cc_feed_seen", "/tmp/cc_feed_seen_test", "/tmp/cc_guard_block")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import livewatch
+LW = livewatch.watch(*LIVE_STATE)
+BEFORE_LIVE = livewatch.snapshot(*LIVE_STATE)
 
 import posttool_feed as PF
 import notify as N
@@ -374,6 +384,17 @@ if applied:
 else:
     print("  WARN  не применено: владельцу выполнить "
           "cp _feed_new_settings.json .claude/settings.json + рестарт сессии")
+
+# ── (9) БОЕВЫЕ КАТАЛОГИ СОСТОЯНИЯ НЕ ТРОНУТЫ ───────────────────────────────────────────────
+# Прямой ответ на инцидент 04.08.2026 (тест гейта стёр боевой спул). Два слоя ловят РАЗНОЕ:
+# аудит-хук — САМО обращение, включая не оставившее следа (удаление несуществующего, «создал и
+# убрал»); снимок — остаток, в том числе от ПОДПРОЦЕССОВ, которых хук этого процесса не видит.
+print("(9) прогон не касается боевых каталогов состояния:")
+ok(not LW.writes(), "ноль ЗАПИСЕЙ в боевые каталоги за весь прогон: %s" % LW.report())
+_d = livewatch.diff(BEFORE_LIVE, livewatch.snapshot(*LIVE_STATE))
+ok(not _d, "снимок до/после совпал (след подпроцессов тоже): %s" % _d)
+ok(SEEN.startswith(TMP) and MARKERS.startswith(TMP) and "feedchan_" in TMP,
+   "своё состояние — временный каталог с уникальным суффиксом (%s)" % TMP)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))

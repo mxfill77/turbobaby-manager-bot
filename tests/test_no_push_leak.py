@@ -4,6 +4,8 @@ PRETOOL_NOPUSH=1 и диверсится в мок-счётчик NOTIFY_COUNT_F
 🧪-карточку (scratchpad/_test/_dryrun) НЕ пушит вовсе, боевую — пушит (счётчик ловит = канал жив);
 (E) ПОЛНЫЙ гейт (gate.py → фейк-тест → pretool_guard на красной фикстуре) → НОЛЬ исходящих пушей;
 (F) ЛЕНТА (posttool_feed, третий канал к владельцу с 03.08.2026) под теми же признаками — ноль.
+(G) БОЕВЫЕ КАТАЛОГИ СОСТОЯНИЯ не тронуты (04.08.2026): аудит-хук ловит действие, снимок — остаток;
+    состояние фикстур живёт во временных каталогах с уникальным суффиксом и убирается за собой.
 Сеть НЕ дёргается нигде: все subprocess-дети получают NOTIFY_COUNT_FILE (дивёрсия вместо отправки)."""
 import os
 import sys
@@ -17,6 +19,14 @@ PY = os.path.join(ROOT, "venv", "bin", "python3")
 GATE = os.path.join(ROOT, "gate.py")
 PRETOOL = os.path.join(ROOT, "pretool_guard.py")
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+
+# Страж боевых каталогов состояния (04.08.2026): секция (G) сверяет, что за прогон в них ничего
+# не записано и не стёрто. Взводится ДО импортов, снимок — вторым слоем (подпроцессы).
+LIVE_STATE = ("/tmp/cc_feed_seen", "/tmp/cc_feed_seen_test", "/tmp/cc_guard_block")
+import livewatch
+LW = livewatch.watch(*LIVE_STATE)
+BEFORE_LIVE = livewatch.snapshot(*LIVE_STATE)
 
 res = []
 def ok(c, label):
@@ -25,6 +35,10 @@ def ok(c, label):
     return c
 
 _MARKERS = tempfile.mkdtemp(prefix="nopushleak_mk_")   # канал 2 (маркер демону) — всегда сюда
+# Номер задачи в фикстуре — ЗАВЕДОМО НЕ ЖИВОЙ. Каталог подменён, и этого довольно для изоляции,
+# но имя файла маркера строится из CC_TASK_ID, а прогон наследует его от ЖИВОЙ задачи демона:
+# артефакт фикстуры не должен называться её номером — так его нельзя спутать с настоящим.
+_FIXTURE_TID = "999404"
 
 def child_env(count_file=None, keep_nopush=False):
     """env для подпроцессов: NOTIFY_COUNT_FILE = мок-счётчик (никакой сети даже при регрессии);
@@ -46,6 +60,7 @@ def child_env(count_file=None, keep_nopush=False):
         e.pop("PRETOOL_NOPUSH", None)
     e.pop("NOTIFY_COUNT_FILE", None)
     e["PRETOOL_BLOCK_DIR"] = _MARKERS
+    e["CC_TASK_ID"] = _FIXTURE_TID         # см. выше: артефакт фикстуры не носит живого номера
     if count_file:
         e["NOTIFY_COUNT_FILE"] = count_file
     return e
@@ -183,10 +198,22 @@ cnt_f2 = os.path.join(TMP, "cnt_f2.txt")
 run_feed(cnt_f2, os.path.join(TMP, "seen_live"), keep_nopush=False)
 ok(count_lines(cnt_f2) == 1, "контроль: без признаков теста заметка уходит (ноль выше не ложный)")
 
+# ── (G) БОЕВЫЕ КАТАЛОГИ СОСТОЯНИЯ НЕ ТРОНУТЫ ──
+# Тест про утечку к владельцу, и каталоги состояния — тот же адрес: стёртый маркер = карточка,
+# которой владелец не увидит (инцидент 04.08.2026 со спулом). Аудит-хук ловит ДЕЙСТВИЕ в этом
+# процессе, снимок — ОСТАТОК, включая след подпроцессов (гард, лента, гейт).
+print("(G) боевые каталоги состояния за прогон не изменены:")
+ok(not LW.writes(), "ноль записей/удалений в боевых каталогах: %s" % LW.report())
+_dlive = livewatch.diff(BEFORE_LIVE, livewatch.snapshot(*LIVE_STATE))
+ok(not _dlive, "снимок до/после совпал (подпроцессы тоже): %s" % _dlive)
+ok(_MARKERS.startswith(tempfile.gettempdir()) and "nopushleak_mk_" in _MARKERS,
+   "каталог маркеров фикстур — временный, с уникальным суффиксом (%s)" % _MARKERS)
+
 for k, v in _saved.items():
     if v is not None:
         os.environ[k] = v
 shutil.rmtree(TMP, ignore_errors=True)
+shutil.rmtree(_MARKERS, ignore_errors=True)   # прежде оставался в /tmp после КАЖДОГО прогона гейта
 
 print("\nИТОГ:", "ВСЕ PASS" if all(res) else "ЕСТЬ FAIL (%d/%d)" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)
