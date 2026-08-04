@@ -32,6 +32,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/posttool_feed.py"
+          }
+        ]
+      }
     ]
   },
   "permissions": {
@@ -220,5 +231,6 @@
       "/root/turbobaby-bridge-gs",
       "/root/.claude/projects/-root-turbobaby-manager-bot/memory"
     ]
-  }
+  },
+  "_comment_feed": "PREPARED для cp _feed_new_settings.json .claude/settings.json (применяет владелец в интерактивной сессии + рестарт сессии). Отличие от живого файла РОВНО одно: hooks.PostToolUse matcher=Bash → posttool_feed.py (лента заметок, третье состояние, 03.08.2026). Прав не даёт физически: у PostToolUse нет поля permissionDecision, хук ничего не печатает в stdout. permissions НЕ тронуты. Тест: tests/test_feed_channel.py."
 }

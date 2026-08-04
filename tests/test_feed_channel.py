@@ -347,11 +347,18 @@ ok(prep.get("permissions") == live.get("permissions"), "permissions НЕ тро�
 pt = (prep.get("hooks") or {}).get("PostToolUse")
 ok(isinstance(pt, list) and pt and pt[0].get("matcher") == "Bash"
    and "posttool_feed.py" in pt[0]["hooks"][0]["command"], "блок PostToolUse → posttool_feed.py")
+# СРАВНЕНИЕ СИММЕТРИЧНО, ИНАЧЕ ПРОВЕРКА КРАСНЕЕТ ОТ САМОГО ПРИМЕНЕНИЯ (04.08.2026, тот же
+# класс, что e9a07b0): ключ-комментарий вычищался ТОЛЬКО из prepared, а ключи перебирались по
+# ЖИВОМУ файлу — и в ту же секунду, когда владелец сделал cp (17:01:36 UTC), живой файл получил
+# `_comment_feed`, которого в shadow нет, и «разница ровно в одном блоке» падала при полностью
+# правильном состоянии. Ключи берём ОБЪЕДИНЕНИЕМ: заодно ловится ключ, который есть в prepared,
+# но пропал из живого (прежний перебор по live такую пропажу не видел вовсе).
+_SKIP = ("hooks", "_comment_feed")
 shadow = {k: v for k, v in prep.items() if k != "_comment_feed"}
 shadow["hooks"] = {k: v for k, v in (prep.get("hooks") or {}).items() if k != "PostToolUse"}
 live_h = {k: v for k, v in (live.get("hooks") or {}).items() if k != "PostToolUse"}
 same = shadow.get("hooks") == live_h and all(
-    shadow.get(k) == live.get(k) for k in live if k != "hooks")
+    shadow.get(k) == live.get(k) for k in (set(live) | set(shadow)) if k not in _SKIP)
 ok(same, "остальное совпадает с живым файлом (разница ровно в одном блоке)")
 if applied:
     ok((live.get("hooks") or {}).get("PostToolUse") == pt, "ПРИМЕНЕНО владельцем: живой = prepared")
