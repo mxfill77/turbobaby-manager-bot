@@ -77,13 +77,39 @@ def _alert_allowed(final):
         return True
 
 
+def _child_env():
+    """env подпроцессов гейта (тесты и py_compile) — ОДНА строка на обе точки вызова.
+
+    PRETOOL_NOPUSH=1 — тесты и ВСЕ их подпроцессы (вкл. pretool_guard-фикстуры) НЕ шлют пуши в
+    личку (утечки 01–05.07): env наследуется детьми, pretool_guard._push и notify.notify его чтут.
+    Пуш самого гейта о красных тестах НЕ затронут (переменная ставится только подпроцессам).
+
+    PYTHONPATH СОБИРАЕТСЯ, А НЕ ПЕРЕЗАПИСЫВАЕТСЯ (04.08.2026, шаг 3 цели 282). Прежняя строка
+    `dict(os.environ, PYTHONPATH=ROOT, …)` роняла УНАСЛЕДОВАННЫЙ PYTHONPATH молча, и это стоило
+    ровно одного: наблюдатель, поставленный через PYTHONPATH (sitecustomize), до подпроцессов
+    гейта не доезжал. Именно так — sitecustomize'ом на PYTHONPATH — и был найден живой случай
+    dd5f4a5 (фикстура стирала боевой /tmp/cc_guard_block/88.json), и именно подпроцессы названы
+    честным пределом в шапке tests/livewatch.py: аудит-хук живёт в СВОЁМ процессе. Порядок:
+      ROOT       — прежний договор («import splinter из tests/»), остаётся ПЕРВЫМ;
+      ROOT/tests — чтобы `import livewatch` не зависел от ФОРМЫ запуска (у прямого файла
+                   sys.path[0] и так = tests/, у `-m`/иного cwd — уже нет);
+      наследие   — то, что дал вызывающий; дубли снимаются, порядок сохраняется.
+    """
+    parts = [ROOT, os.path.join(ROOT, "tests")]
+    parts += (os.environ.get("PYTHONPATH") or "").split(os.pathsep)
+    seen, path = set(), []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.add(p)
+            path.append(p)
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(path),
+                PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1")
+
+
 def run_tests():
     """Прогнать все tests/test_*.py. Вернуть (failed:list, total:int, dt:float)."""
-    # PYTHONPATH — чтобы import splinter работал из tests/. PRETOOL_NOPUSH=1 — тесты и ВСЕ их
-    # подпроцессы (вкл. pretool_guard-фикстуры) НЕ шлют пуши в личку (утечки 01–05.07): env
-    # наследуется детьми, pretool_guard._push и notify.notify его чтут. Пуш самого гейта о красных
-    # тестах НЕ затронут (переменная ставится только подпроцессам тестов, не самому гейту).
-    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1")
+    env = _child_env()
     tests = sorted(glob.glob(os.path.join(TESTS_DIR, "test_*.py")))
     failed = []
     t0 = time.time()
@@ -161,7 +187,7 @@ def run_selective_tests(changed_files):
     """Smoke (py_compile) + тесты затронутых модулей.
     Возврат: (failed_names:list, n_tests:int, dt:float, label:str).
     Если затронутых тестов не нашли → fail-safe: полный сьют (label несёт «fail-safe»)."""
-    env = dict(os.environ, PYTHONPATH=ROOT, PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1")
+    env = _child_env()
     t0 = time.time()
     failed = []
 

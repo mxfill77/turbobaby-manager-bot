@@ -89,7 +89,10 @@ finally:
     gate.subprocess.run, gate.glob.glob = _orig_run, _orig_glob
 ok(total == 1 and not failed, "мок-прогон: 1 тест, зелёный")
 ok(captured.get("env", {}).get("PRETOOL_NOPUSH") == "1", "env подпроцесса теста несёт PRETOOL_NOPUSH=1")
-ok(captured.get("env", {}).get("PYTHONPATH") == ROOT, "PYTHONPATH сохранён (import splinter из tests/)")
+# PYTHONPATH с 04.08.2026 СОБИРАЕТСЯ (ROOT + tests/ + унаследованное), а не равен ROOT: прежнее
+# равенство роняло наблюдатель вызывающего. Договор тот же и проверяется по СУЩЕСТВУ — ROOT первым.
+_pp = (captured.get("env", {}).get("PYTHONPATH") or "").split(os.pathsep)
+ok(_pp[:1] == [ROOT], "PYTHONPATH сохранён (import splinter из tests/ — ROOT первым): %r" % (_pp[:2],))
 
 # ── (B) notify: PRETOOL_NOPUSH=1 → мут, сеть/токен не трогаются ──
 import notify as N
