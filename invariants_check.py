@@ -649,6 +649,88 @@ def check_scratch_untracked(world, run):
         )
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 11: CARD_DUTY_PURE
+#  Дежурный по карточкам (card_duty.py) решает, снимать ли вопрос владельцу. Его граница —
+#  «не может выдать себе прав и не может переписать свои правила» — держится НЕ докстрингом, а
+#  отсутствием инструментов: в модуле ровно один импорт (`re`), ни файлов, ни сети, ни
+#  подпроцессов, ни моста. Этот инвариант разбирает файл через ast и краснеет, если инструмент
+#  появился: новый импорт вне списка, вызов записи/исполнения, слово «approved» в коде.
+#  ПОЧЕМУ AST, А НЕ ГРЕП ПО ТЕКСТУ: имя в комментарии, строке и докстринге кодом не является —
+#  ровно то правило, которым 02.08 переписаны денежная и удаляющая ветви гарда.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ (а не note): нечитаемый дежурный доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_CARD_DUTY_PATH = None          # подменяется САМОТЕСТОМ; None → боевой card_duty.py в репо
+_DUTY_ALLOWED_IMPORTS = frozenset(("re",))
+# ГОЛЫЕ встроенные имена, дающие руки. Именно голые: `compile` — это исполнение, а `re.compile`
+# — сборка регулярки, и различает их ПОЗИЦИЯ, а не слово (то же правило исполняющей позиции, что
+# в гарде, 04.08). Метод объекта (`f.get`, `m.group`) сюда не попадает по построению.
+_DUTY_FORBIDDEN_CALLS = frozenset((
+    "open", "exec", "eval", "compile", "__import__", "input", "globals", "vars", "setattr",
+))
+# Модули, через которые руки приходят. Импорты и так ограничены списком выше, поэтому это
+# второй рубеж — на случай отложенного/переименованного импорта внутри функции.
+_DUTY_FORBIDDEN_ATTR_ROOTS = frozenset((
+    "os", "sys", "subprocess", "shutil", "socket", "requests", "urllib",
+    "pathlib", "tempfile", "sqlite3", "bridge_client", "notify", "bc", "builtins",
+))
+
+
+def _duty_ast_findings(src):
+    """→ список (адрес, чем плохо). Пустой список = дежурный чист. Разбор — ast, не подстрока."""
+    import ast
+    out = []
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                root = a.name.split(".")[0]
+                if root not in _DUTY_ALLOWED_IMPORTS:
+                    out.append((f"строка {node.lineno}", f"импорт «{a.name}» вне списка "
+                                f"{sorted(_DUTY_ALLOWED_IMPORTS)} — у решения появились руки"))
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root not in _DUTY_ALLOWED_IMPORTS:
+                out.append((f"строка {node.lineno}", f"импорт из «{node.module}» вне списка — "
+                            f"у решения появились руки"))
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            # ГОЛОЕ имя в исполняющей позиции — только оно; `re.compile` это НЕ `compile`.
+            if isinstance(fn, ast.Name) and fn.id in _DUTY_FORBIDDEN_CALLS:
+                out.append((f"строка {node.lineno}", f"вызов «{fn.id}» — запись/исполнение/сеть "
+                            f"в модуле, который обязан быть чистым решением"))
+            if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name) \
+                    and fn.value.id in _DUTY_FORBIDDEN_ATTR_ROOTS:
+                out.append((f"строка {node.lineno}",
+                            f"обращение к «{fn.value.id}.{fn.attr}» — модуль решения не смеет "
+                            f"трогать мир"))
+        elif isinstance(node, ast.Name) and node.id == "approved":
+            out.append((f"строка {node.lineno}",
+                        "имя «approved» в коде дежурного: одобрять он не вправе ни при каких "
+                        "условиях — вердиктов ровно два, HOLD и CLOSE"))
+    return out
+
+
+@register("CARD_DUTY_PURE")
+def check_card_duty_pure(world, run):
+    # Путь НЕ берём из _SCRATCHPAD_ROOT: самотест уводит тот корень во временные каталоги ради
+    # других инвариантов, и дежурный там честно отсутствовал бы → ложный флаг. Своя ручка.
+    path = _CARD_DUTY_PATH or os.path.join(REPO, "card_duty.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("card_duty.py", f"модуль решения не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src)
+    except SyntaxError as e:
+        run.flag("card_duty.py", f"модуль решения не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"card_duty.py:{where}", why)
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
@@ -1058,9 +1140,56 @@ def _self_test():
         _SCRATCHPAD_ROOT = _old_scratch_root
         _TRACKED_PROVIDER = _old_tracked
 
+    # ── 11. CARD_DUTY_PURE (голдены на ДОСЛОВНОМ коде, а не на пересказе) ───────────────────
+    # Живой модуль обязан быть чист; каждая «рука» обязана краснеть. Позиция важнее слова:
+    # `re.compile` и `f.get(...)` — законны, голый `compile`/`os.remove` — нет.
+    global _CARD_DUTY_PATH
+    _old_duty_path = _CARD_DUTY_PATH
+    _cd_dir = tempfile.mkdtemp()
+    try:
+        _cd_cases = [
+            ("DUTY живой модуль чист", 0, None),
+            ("DUTY re.compile и .get законны (позиция, не слово)", 0,
+             "import re\n_R = re.compile('x')\ndef f(d):\n    return d.get('a') or _R.match('b')\n"),
+            ("DUTY импорт вне списка → флаг", 1, "import re\nimport os\n"),
+            ("DUTY from-импорт вне списка → флаг", 1, "from notify import send_feed\n"),
+            ("DUTY голый open() → флаг", 1, "import re\nf = open('/tmp/x')\n"),
+            ("DUTY os.remove → флаг (импорт + вызов)", 2, "import os\nos.remove('/tmp/x')\n"),
+            ("DUTY имя approved в коде → флаг", 1, "import re\napproved = 1\n"),
+            ("DUTY слово approved в СТРОКЕ и комментарии — не флаг", 0,
+             "import re\n# approved тут только словом\nS = 'approved'\n"),
+            ("DUTY модуль не парсится → флаг (fail-closed)", 1, "def broken(:\n"),
+        ]
+        for _cd_title, _cd_expect, _cd_src in _cd_cases:
+            if _cd_src is None:
+                _CARD_DUTY_PATH = None                       # боевой card_duty.py
+            else:
+                _cd_p = os.path.join(_cd_dir, "card_duty.py")
+                with open(_cd_p, "w", encoding="utf-8") as _f:
+                    _f.write(_cd_src)
+                _CARD_DUTY_PATH = _cd_p
+            _cd_run = CheckRun("CARD_DUTY_PURE")
+            check_card_duty_pure(_healthy_world(), _cd_run)
+            _cd_got = len(_cd_run.findings)
+            _cd_ok = (_cd_got == _cd_expect)
+            allpass &= _cd_ok
+            print(f"  {'PASS' if _cd_ok else 'FAIL'}  [CARD_DUTY_PURE] {_cd_title}: "
+                  f"ждали {_cd_expect}, поймали {_cd_got}")
+        # отдельно: отсутствующий файл = флаг, а не тишина
+        _CARD_DUTY_PATH = os.path.join(_cd_dir, "нет-такого.py")
+        _cd_run = CheckRun("CARD_DUTY_PURE")
+        check_card_duty_pure(_healthy_world(), _cd_run)
+        _cd_ok = (len(_cd_run.findings) == 1)
+        allpass &= _cd_ok
+        print(f"  {'PASS' if _cd_ok else 'FAIL'}  [CARD_DUTY_PURE] DUTY файла нет → флаг "
+              f"(fail-closed): ждали 1, поймали {len(_cd_run.findings)}")
+    finally:
+        shutil.rmtree(_cd_dir, ignore_errors=True)
+        _CARD_DUTY_PATH = _old_duty_path
+
     # Проверяем предвычисленные ALL-результаты
     for _all_title, _all_got, _all_expect in [
-        ("чистый мир — 0 нарушений ВСЕГО (10 инвариантов)", _total_clean, 0),
+        ("чистый мир — 0 нарушений ВСЕГО (11 инвариантов)", _total_clean, 0),
         ("деградация (всё None) → 0 нарушений суммарно", _total_degraded, 0),
     ]:
         ok = (_all_got == _all_expect)

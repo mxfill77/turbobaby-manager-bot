@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(REPO, ".env"))
 sys.path.insert(0, REPO)
 from bridge_client import BridgeClient, FIXTURE_TASK_RE, _fixture_norm
+import card_duty          # ДЕЖУРНЫЙ ПО КАРТОЧКАМ: чистое решение без ввода-вывода (см. _maybe_card_duty)
 
 
 def _is_fixture(text: str) -> bool:
@@ -1195,6 +1196,97 @@ def _forged_op_card(what):
         "всё же требуется — поставь его отдельной задачей: когда команду РЕАЛЬНО попробуют, её "
         "перехватит гард и пришлёт карточку с кнопкой и объектом.",
     ]))
+
+
+# ═══════════════ ДЕЖУРНЫЙ ПО КАРТОЧКАМ, ФАЗА 1 (04.08.2026) ═══════════════
+# Решение живёт в card_duty.py — ЧИСТОЙ функции без ввода-вывода (там же вся доктрина, граница и
+# честный предел). Здесь — только руки: собрать факты из очереди, положить вердикт в терминальный
+# путь без кнопки и сказать владельцу заметкой. Разделение не косметическое: у модуля решения нет
+# инструментов ни выдать себе прав, ни отправить что-либо от своего имени, и это стережёт
+# инвариант CARD_DUTY_PURE в гейте, а не докстринг.
+#
+# ОТКАТ: CARD_DUTY=0 в .env (или убрать строку) + рестарт демона → ветка мертва целиком, карточки
+# уходят владельцу байт-в-байт как раньше. Дефолт — ВЫКЛЮЧЕНО (как у CURATOR): ошибка дежурного
+# гасила бы владельцу видимость красного, а это ровно то направление, где цена ошибки высшая.
+
+
+def _card_duty_on():
+    """Флаг CARD_DUTY=1 в .env (парсер как у CURATOR/STEP_SELFHEAL). 0/нет/мусор → выключено."""
+    return (os.environ.get("CARD_DUTY") or "").strip() == "1"
+
+
+def _duty_fingerprint(what):
+    """Отпечаток карточки = (op-код, текст без префикса «op=… |» и без штампа происхождения).
+    Зеркало devbot._inbox_fingerprint, плюс снятие штампа: он несёт КОНСТАНТУ, но у guard_weak
+    текст штампа другой — без снятия одинаковые по сути карточки не схлопнулись бы."""
+    body = _ORIGIN_LINE_RE.sub("", _OP_PREFIX_RE.sub("", str(what or "")))
+    return parse_op(what), " ".join(body.split())
+
+
+def _duty_queue_twins(tid, what):
+    """(dup_id, answered_id) — карточка с ТЕМ ЖЕ отпечатком, уже открытая у владельца либо уже
+    одобренная им. Читаем очередь read-only; свою задачу пропускаем.
+    FAIL-SAFE: мост не ответил / любое исключение → пустые id, то есть эти два условия просто не
+    сработают (дежурный станет строже, не мягче)."""
+    fp = _duty_fingerprint(what)
+    dup_id = answered_id = ""
+    for status, slot in (("needs_approval", "dup"), ("approved", "ans")):
+        try:
+            r = bc.get_pending(status)
+        except Exception:
+            continue
+        if not r.get("ok"):
+            continue
+        for it in r.get("items", []):
+            if str(it.get("id")) == str(tid):
+                continue
+            if _duty_fingerprint(it.get("result")) != fp:
+                continue
+            if slot == "dup" and not dup_id:
+                dup_id = str(it.get("id"))
+            elif slot == "ans" and not answered_id:
+                answered_id = str(it.get("id"))
+    return dup_id, answered_id
+
+
+def _duty_note(tid, rule, proof):
+    """Заметка в ленту 829: владелец видит закрытие ПОСТФАКТУМ и ничего не отвечает.
+    FAIL-SAFE: адреса нет / сеть / любой сбой → False. Отсутствие заметки НЕ отменяет закрытия,
+    но факт молчания попадает в журнал демона — след не теряется ни при каком исходе."""
+    try:
+        import notify
+        return bool(notify.send_feed(card_duty.note("VPS", tid, rule, proof)))
+    except Exception as e:
+        log.warning("дежурный: заметка в ленту не ушла (%s)", e)
+        return False
+
+
+def _maybe_card_duty(tid, what):
+    """CARD_DUTY=1 → вердикт дежурного по карточке. True = карточка снята и задача финализирована
+    (владельцу не пойдёт), False = прежний путь (set_needs_approval), байт-в-байт.
+
+    FAIL-SAFE НА КАЖДОМ ШАГЕ: флаг выключен, сбой сбора фактов, сбой самого решения, вердикт
+    HOLD → False. Закрытие требует положительного доказательства; всё остальное — к владельцу."""
+    if not _card_duty_on():
+        return False
+    try:
+        dup_id, answered_id = _duty_queue_twins(tid, what)
+        action, rule, proof = card_duty.decide(
+            what, _card_origin(what), op=parse_op(what),
+            dup_id=dup_id, answered_id=answered_id)
+    except Exception as e:
+        log.warning("дежурный: решение не собралось id=%s (%s) → карточка идёт владельцу", tid, e)
+        return False
+    if action != card_duty.CLOSE:
+        log.info("дежурный: карточка id=%s остаётся владельцу (%s)", tid, proof)
+        return False
+    # СЛЕД РАНЬШЕ ЗАКРЫТИЯ: заметка уходит ДО complete_task — если мост упадёт на закрытии,
+    # владелец уже знает о снятии, а карточка останется висеть (видимый, а не молчаливый сбой).
+    sent = _duty_note(tid, rule, proof)
+    cm = bc.complete_task(tid, "failed", cap_result(card_duty.close_result(what, rule, proof)))
+    log.info("DUTY-CLOSE id=%s условие=%s (%s) заметка=%s bridge_ok=%s",
+             tid, rule, proof, sent, cm.get("ok"))
+    return True
 
 
 def parse_op(what):
@@ -3899,6 +3991,11 @@ def process_new():
                         "терминальная карта, bridge_ok=%s",
                         tid, parse_op(result), _card_origin(result), cm.get("ok"))
             _maybe_dec_after(text, "failed")
+        elif _maybe_card_duty(tid, result):
+            # ДЕЖУРНЫЙ ПО КАРТОЧКАМ (CARD_DUTY=1): за карточкой доказанно нет операции, которую
+            # «да» владельца могло бы разрешить → вопрос снят, задача финализирована внутри,
+            # владельцу ушла заметка в ленту. Решение гарда НЕ менялось: команда так и не прошла.
+            _maybe_dec_after(text, "failed")     # как у forged-op: шаг цепи считается упавшим
         else:
             # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
             rr = bc.set_needs_approval(tid, result)
