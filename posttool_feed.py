@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""ЛЕНТА — канал заметок «третьего состояния», ШАГ 1: ТОЛЬКО МЕХАНИКА (03.08.2026).
+"""ЛЕНТА — канал заметок «третьего состояния». ШАГ 1: провод (03.08). ШАГ 2: СПИСОК (04.08.2026).
 
-Основание: docs/artifacts/2026-08-03-third-state-notify-design.md (устройство утверждено
-владельцем). Здесь собран ПРОВОД и ничего кроме провода: список событий мира подключает ШАГ 2,
-таблица классов ниже намеренно ПУСТА.
+Основание: docs/artifacts/2026-08-03-third-state-notify-design.md (устройство и список утверждены
+владельцем) + docs/artifacts/2026-08-04-feed-list-phase1.md (этот заход: подключение списка,
+замер на живом корпусе, честные пределы).
 
 ЗАЧЕМ ВООБЩЕ. У гарда было два состояния: «выполнить молча» и «спросить разрешения». Клетка
 «выполнить и СКАЗАТЬ» физически пуста, поэтому значимые изменения мира (рестарт клиентского бота,
@@ -14,44 +14,57 @@
 вовсе — команда уже выполнена, разрешать нечего. Заметка, живущая в этой фазе, не может выдать
 право ФИЗИЧЕСКИ, а не потому что мы аккуратно написали код. Следствия:
   1. `pretool_guard.py` не меняется НИ НА ОДНУ строку — ни один красный класс измениться не может.
+     Гард для ленты — БИБЛИОТЕКА РАЗБОРА: мы зовём его чистые ручки (`_del_units`/`_cmd_index`/
+     `_base`/`_del_targets`/`is_probe`) и НИ ОДНОЙ его пишущей ветки. Стережёт секция (8) теста
+     (ast-разбор этого файла), а не обещание в докстринге.
   2. Заблокированное в ленту не попадает: PostToolUse на невыполненной команде не срабатывает.
      Красное остаётся при своём адресе (инбокс 1160), лента говорит только о случившемся.
   3. Исход известен (`tool_response`) — заметка отличает «сделал» от «упало».
 Сверх фазы этот файл держит СОБСТВЕННЫЙ обет: он НЕ ПЕЧАТАЕТ В stdout НИЧЕГО ни при каком входе
 (включая мусорный и враждебный) — движок не получает от ленты ни решения, ни контекста, ни текста.
-Регресс: tests/test_feed_channel.py, секция (1).
 
-ТРИ ВЕЩИ ШАГА 1:
-  * канал на PostToolUse — этот файл (провод в `.claude/settings.json`, matcher Bash; headless в
-    `.claude/` писать не может → владелец применяет `cp _feed_new_settings.json .claude/settings.json`
-    + рестарт сессии; прецеденты `_restarts_new_settings.json`, `_claspsplit_new_settings.json`);
-  * СВОЙ каталог состояния `/tmp/cc_feed_seen` — НЕ `/tmp/cc_guard_block`: монитор демона открывает
-    ровно `GUARD_BLOCK_DIR/<tid>.json` (orchestrator_daemon: _guard_marker_path, _guard_monitor_loop)
-    и гасит claude-подпроцесс, увидев файл. Файл ленты в чужом каталоге задачу убить не может;
-  * отдельный адрес — СВОЯ ТЕМА того же HQ-форума, «ПК-дев» (решение владельца 03.08.2026, см.
-    notify._feed_dest: тема инертна — Splinter в ней молчит рано, devbot слышит только владельца
-    по префиксам, свои сообщения бот назад не получает). В тему-инбокс не шлём ничего: у неё
-    РОВНО одно свойство «всё здесь ждёт меня», и заметка его размывает.
+ФОРМА ЗАМЕТКИ: одна строка `🔔 <класс> · <полоса · кто> · <команда ≤120> [· <деталь>] · <исход>`.
+Кнопок нет, номера карточки нет, слова «да» нет — отвечать не на что и нечем. МЕТКА ПОЛОСЫ стоит
+всегда: в одну тему сходятся обе полосы, а номера задач VPS и ПК идут по РАЗНЫМ счётчикам.
 
-ФОРМА ЗАМЕТКИ: одна строка `🔔 <класс> · <полоса> · <кто> · <команда ≤120> · <исход>`. Кнопок нет,
-номера карточки нет, слова «да» нет — отвечать не на что и нечем.
+СПИСОК ФАЗЫ 1 (§3 проекта, утверждён владельцем; ≈4.0 заметки в сутки по замеру 120 ч):
+  • рестарт/старт/стоп КЛИЕНТСКОГО бота — единственный класс, который касается живых клиентов;
+  • вынос теста из гейта — защита слабеет молча, а гейт после этого зелёный по МЕНЬШЕМУ набору;
+  • отброс рабочего дерева — единственный класс, где НЕзакоммиченная работа исчезает без следа;
+  • стирание маркеров гарда — цель в /tmp (по правилу 30.07 это зелёная уборка, и она молчит),
+    но стираются СЛЕДЫ красных карточек, которых владелец не закрывал;
+  • push в удалённый — 84% коммитов окна трогали саму машинерию защиты.
+НЕ УВЕДОМЛЯЕМ (§4, 35 сообщений в сутки): коммиты, записи в мозг, прогоны гейта, копирование,
+рестарт ДЕМОНА, уборку своего черновика в /tmp, пробы и красное (у него свой адрес — 1160).
 
-МЕТКА ПОЛОСЫ (03.08.2026, вместе с адресом). Заметки ОБЕИХ полос сходятся в ОДНУ тему, а номера
-задач VPS и ПК идут по РАЗНЫМ счётчикам и пересекаются: «задача 45» без метки — половина правды,
-читатель не знает, чья она. Метку даёт исполнитель через `CC_LANE`, а если не назвал — константа
-`LANE_DEFAULT` ЭТОЙ копии файла. Честный предел назван прямо: копия VPS-репо говорит «VPS» за
-всякого, кто её запустил, — на VPS это правда всегда (headless-задачи демона и сессии Termux
-живут на этом же хосте), но ПК-зеркало обязано либо сменить константу, либо ставить `CC_LANE`,
-иначе оно будет честно врать чужой меткой.
+ЧТО СУДИМ — ДЕЙСТВИЕ, А НЕ СЛОВО. Разбор идёт по СЕГМЕНТАМ цепи и по ГОЛОВЕ сегмента (тем же
+парсером, что у гарда): текст коммита, шаблон поиска и аргумент журнальной команды — один
+shlex-токен и головой сегмента не бывают. Поэтому `cclog.py "…нужен systemctl restart wa-webhook…"`
+и тело коммита со словами «git reset --hard» заметки не рождают. Голдены — ДОСЛОВНЫЕ команды
+транскриптов (tests/test_feed_list.py).
 
-ЧЕСТНЫЙ ПРЕДЕЛ: точную схему `tool_response` для Bash проверить нечем, пока хук не подключён
-владельцем. Поэтому исход читается защитно: нашли код возврата/признак ошибки — говорим о нём,
-не нашли — говорим «выполнено», БЕЗ утверждения об успехе (fail-honest, не выдумываем).
+ЧЕСТНЫЕ ПРЕДЕЛЫ, названные прямо:
+  • ФОРМА ОТВЕТА ИНСТРУМЕНТА ТЕПЕРЬ ИЗМЕРЕНА (шаг 1 писал «проверить нечем»): успех приходит
+    словарём {stdout, stderr, interrupted, isImage, noOutputExpected} БЕЗ кода возврата, провал —
+    СТРОКОЙ «Error: Exit code N …», отказ движка — строкой «Error: …» без кода. Отсюда: код есть →
+    называем код; строка-отказ → заметки НЕТ ВОВСЕ (действия не было, а лента говорит только о
+    случившемся); всё прочее → «выполнено» БЕЗ утверждения об успехе.
+  • ПК-формы клиентского бота (`userbot_listen` / `moderation_bot` под pc_agent) живым корпусом
+    ЭТОЙ полосы не подтверждены — на VPS таких команд нет вовсе; форма взята из карты процессов
+    ПК (docs/project_state.md). Ложных срабатываний на VPS они дать не могут (имён нет ни в одной
+    команде окна), но и покрытие ПК-полосы этим НЕ доказано — это остаток для зеркала.
+  • `wa-webhook` в списке фазы 1 НЕТ намеренно: владелец назвал клиентского бота, транзит WA в
+    §3 проекта не входит. Расширять список молча нельзя — у класса без реакции за 14 суток по
+    §4 наступает смерть, а не рост.
+  • копия VPS-репо говорит «VPS» за всякого, кто её запустил; ПК-зеркало обязано сменить
+    `LANE_DEFAULT` либо ставить `CC_LANE`, иначе честно соврёт чужой меткой.
 """
 import hashlib
 import json
 import os
+import re
 import shlex
+import subprocess
 import sys
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
@@ -71,18 +84,284 @@ LANE_ENV = "CC_LANE"       # исполнитель называет полос�
 LANE_DEFAULT = "VPS"       # эта копия файла живёт в репозитории VPS-полосы; ПК-зеркало ставит «ПК»
 LANE_MAX = 12              # метка — короткая; длинное значение режем, чтобы не съесть команду
 
-# ─────────────────────────── ТАБЛИЦА КЛАССОВ: ПУСТА ДО ШАГА 2 ───────────────────────────
-# Сюда шаг 2 положит список фазы 1 (рестарт клиентского бота, вынос теста из гейта, отброс рабочего
-# дерева, стирание незакрытых маркеров гарда, git push) — §3 артефакта, голдены на ДОСЛОВНЫХ
-# командах транскриптов. Пока пусто: шаг 1 доказывает провод, а не детект.
-_CLASSES = ()      # ((имя класса, предикат(cmd) -> bool), …)
 
-# Единственная запись, которая работает уже сейчас, — ПРОБА САМОГО КАНАЛА, а не класс событий мира:
-# ведущий env-префикс `CC_FEED_PROBE=1 <команда>`. Почему префикс, а не отдельный ключ запуска: проба
-# идёт ТЕМ ЖЕ путём, что пойдёт настоящее событие (разбор → класс → изоляция проб → дедуп → потолок →
-# отправка), значит проверяет провод целиком, а не его половину. Имя в середине строки объявлением
-# НЕ является (иначе пометкой стал бы любой пересказ) — читаем ровно ведущие присваивания, как это
-# делает pretool_guard._cmd_declares_probe.
+# ═══════════════ РАЗБОР КОМАНДЫ: ГАРД КАК БИБЛИОТЕКА, БЕЗ ЕДИНОЙ ЕГО ПИШУЩЕЙ ВЕТКИ ═════════
+def _g():
+    """Модуль гарда как БИБЛИОТЕКА разбора. Мы его ЧИТАЕМ и не меняем ни на строку — в этом
+    смысл выбора PostToolUse. Зовём ровно чистые ручки; ни `decision`, ни `classify`, ни
+    `_guard_write_marker` лента не трогает (те пишут маркер и шлют карточку — заметка не смеет
+    ни того, ни другого). Импорт не удался → разбора нет → МОЛЧИМ (см. _units_raw)."""
+    try:
+        import pretool_guard as g
+        return g
+    except Exception:
+        return None
+
+
+def _units_raw(cmd):
+    """Сегменты цепи в СЫРЫХ токенах (+ тела подстановок и `sh -c`) — ровно тем разбором, что
+    судит удаление у гарда. Почему именно он, а не общий `_units`: тот вырезает argv .py-скрипта
+    (класс «данные ≠ команда»), и на наших классах это калечило бы разбор самого действия —
+    у `mv tests/test_x.py …` пропадали бы цели. Класс «данные ≠ команда» здесь держится иначе и
+    не слабее: глагол ищется в ГОЛОВЕ сегмента, а текст коммита и шаблон поиска — один токен."""
+    g = _g()
+    if g is None:
+        return []
+    try:
+        return g._del_units(cmd)
+    except Exception:
+        return []
+
+
+def _heads(cmd):
+    """[(имя команды сегмента, её аргументы), …]. Голова ищется структурно (env-префиксы и
+    обёртки sudo/timeout/systemd-run пропускаются) — `systemd-run --on-active=10s systemctl
+    restart splinter` виден как systemctl, а `cat splinter.log` командой управления не станет."""
+    g = _g()
+    if g is None:
+        return []
+    out = []
+    for toks in _units_raw(cmd):
+        try:
+            i = g._cmd_index(toks)
+            if i is None:
+                continue
+            out.append((g._base(toks[i]), list(toks[i + 1:])))
+        except Exception:
+            continue
+    return out
+
+
+_REDIR = re.compile(r"[<>]")
+
+
+def _pos(args):
+    """Позиционные аргументы: без флагов и без токенов перенаправления (`2>&1`, `2>/dev/null`) —
+    иначе у `git push 2>&1 | tail -20` «удалённым» стал бы редирект."""
+    return [a for a in args if not a.startswith("-") and not _REDIR.search(a)]
+
+
+_GIT_VALUE_FLAGS = ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+                    "--config-env", "--super-prefix")
+
+
+def _git_sub(args):
+    """Подкоманда git и её хвост. Флаги СО ЗНАЧЕНИЕМ пропускаются парой — живая форма
+    `git -c core.hooksPath=deploy/hooks push origin main` и `git -C <репо> push` иначе читались бы
+    как push в удалённый по имени «core.hooksPath»."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in _GIT_VALUE_FLAGS:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a, list(args[i + 1:])
+    return "", []
+
+
+# ═══════════════════════════ КЛАСС 1: КЛИЕНТСКИЙ БОТ ═══════════════════════════════════════
+# Единственный класс списка, который касается ЖИВЫХ КЛИЕНТОВ: на время рестарта они без ответа.
+# VPS: клиентский бот = сервис `splinter`. ПК: процессы `userbot_listen` / `moderation_bot` под
+# pc_agent (docs/project_state.md). Демон, wa-webhook, health и прочие юниты — НЕ клиентский бот.
+_CTL_VERB = {"restart": "рестарт", "start": "старт", "stop": "стоп", "kill": "стоп",
+             "reload-or-restart": "рестарт", "try-restart": "рестарт", "force-reload": "рестарт"}
+_CLIENT_UNITS = ("splinter",)
+_CLIENT_PROCS = ("userbot_listen", "moderation_bot", "moderbot")
+_CLIENT_SCRIPTS = ("userbot_listen.py", "moderation_bot.py")
+_KILL_HEADS = ("pkill", "killall", "taskkill")
+
+
+def _unit_name(u):
+    u = (u or "").strip().strip("'\"")
+    for suf in (".service", ".socket", ".timer"):
+        if u.endswith(suf):
+            u = u[:-len(suf)]
+    return u.lower()
+
+
+def _client_bot(cmd, cwd=None):
+    for head, args in _heads(cmd):
+        pos = _pos(args)
+        if head == "systemctl":
+            if not pos or pos[0] not in _CTL_VERB:
+                continue                       # show/status/is-active/cat — чтение, не событие
+            for u in (_unit_name(x) for x in pos[1:]):
+                if u in _CLIENT_UNITS or u in _CLIENT_PROCS:
+                    return _CTL_VERB[pos[0]] + " клиентского бота"
+            continue
+        if head in _KILL_HEADS:
+            blob = " ".join(args).lower()
+            if any(p in blob for p in _CLIENT_PROCS):
+                return "стоп клиентского бота"
+            continue
+        if head.startswith("python") or head in ("py", "pythonw"):
+            for a in pos:
+                if os.path.basename(a.strip("'\"")).lower() in _CLIENT_SCRIPTS:
+                    return "старт клиентского бота"
+    return None
+
+
+# ═══════════════════════════ КЛАСС 2: СТИРАНИЕ МАРКЕРОВ ГАРДА ══════════════════════════════
+# Цель лежит в /tmp → по правилу 30.07 это зелёная уборка, и она проходит молча. Единственное
+# оправданное исключение из «в /tmp всё ничьё»: стираются СЛЕДЫ красных карточек, которых владелец
+# не закрывал. Судим по ТОМУ, ЧТО стёрто, а не где оно лежало.
+def _marker_dirs():
+    g = _g()
+    out = set()
+    if g is None:
+        return out
+    try:
+        out.add(str(g.GUARD_BLOCK_DIR).rstrip("/"))      # боевой каталог маркеров
+    except Exception:
+        pass
+    try:
+        out.add(str(g.block_dir()).rstrip("/"))          # и тот, что настроен сейчас
+    except Exception:
+        pass
+    return {d for d in out if d}
+
+
+def _markers_wiped(cmd, cwd=None):
+    g = _g()
+    if g is None:
+        return None
+    dirs = _marker_dirs()
+    if not dirs:
+        return None
+    for toks in _units_raw(cmd):
+        try:
+            i = g._cmd_index(toks)
+            if i is None:
+                continue
+            tgts = g._del_targets(g._base(toks[i]), list(toks[i + 1:]))
+        except Exception:
+            continue
+        for t in (tgts or []):
+            p = str(t).strip().strip("'\"").rstrip("/")
+            if any(p == d or p.startswith(d + "/") for d in dirs):
+                return "стирание маркеров гарда"
+    return None
+
+
+# ═══════════════════════════ КЛАСС 3: ВЫНОС ТЕСТА ИЗ ГЕЙТА ═════════════════════════════════
+# Гейт набирает тесты глобом `tests/test_*.py` (gate.py). Файл выпадает из набора, когда уезжает
+# из каталога ИЛИ теряет префикс имени — защита слабеет молча, и следующий «гейт зелёный» уже про
+# МЕНЬШИЙ набор. Внос теста В гейт и переименование ВНУТРИ гейта событием не являются.
+def _in_gate(path):
+    p = (path or "").strip().strip("'\"").rstrip("/")
+    if not p:
+        return False
+    base = os.path.basename(p)
+    if base == "tests":                       # каталог целиком
+        return True
+    return (os.path.basename(os.path.dirname(p)) == "tests"
+            and base.startswith("test_") and base.endswith(".py"))
+
+
+def _dest_path(src, dst, many, cwd=None):
+    """Куда файл ЛЯЖЕТ: `mv a b` → b, `mv a b/` или `mv a b c/` → каталог + имя исходного."""
+    d = (dst or "").strip().strip("'\"")
+    if many or d.endswith("/") or os.path.isdir(os.path.join(cwd or PROJECT, d)):
+        return os.path.join(d.rstrip("/"), os.path.basename(src.strip("'\"").rstrip("/")))
+    return d
+
+
+def _test_out_of_gate(cmd, cwd=None):
+    for head, args in _heads(cmd):
+        if head == "git":
+            sub, rest = _git_sub(args)
+            if sub != "mv":
+                continue
+            args = rest
+        elif head != "mv":
+            continue
+        pos = _pos(args)
+        if len(pos) < 2:
+            continue
+        srcs, dst = pos[:-1], pos[-1]
+        for s in srcs:
+            if _in_gate(s) and not _in_gate(_dest_path(s, dst, len(srcs) > 1, cwd)):
+                return "вынос теста из гейта"
+    return None
+
+
+# ═══════════════════════════ КЛАСС 4: ОТБРОС РАБОЧЕГО ДЕРЕВА ═══════════════════════════════
+# Единственный класс, где НЕзакоммиченная работа исчезает без следа в git — восстановить нечем.
+# `stash list|show` читают, `pop|apply` возвращают работу — они молчат; `drop|clear` уничтожают
+# отложенное, поэтому остаются событием. `clean -n` — сухой прогон, `checkout -b`/`checkout main`
+# работу не теряют (git на грязном дереве переключение просто отклонит).
+_STASH_QUIET = ("list", "show", "pop", "apply", "branch")
+
+
+def _tree_discard(cmd, cwd=None):
+    for head, args in _heads(cmd):
+        if head != "git":
+            continue
+        sub, rest = _git_sub(args)
+        pos = _pos(rest)
+        if sub == "reset" and "--hard" in rest:
+            return "отброс рабочего дерева"
+        if sub == "checkout":
+            if "--" in rest or pos[:1] == ["."]:
+                return "отброс рабочего дерева"
+            continue
+        if sub == "restore":
+            if "--staged" in rest and "--worktree" not in rest:
+                continue                      # снятие из индекса работу не теряет
+            if pos or "--" in rest:
+                return "отброс рабочего дерева"
+            continue
+        if sub == "stash":
+            if pos[:1] and pos[0] in _STASH_QUIET:
+                continue
+            return "отброс рабочего дерева"
+        if sub == "clean":
+            short = "".join(a[1:] for a in rest if a.startswith("-") and not a.startswith("--"))
+            dry = "n" in short or "--dry-run" in rest
+            force = "f" in short or "--force" in rest
+            if force and not dry:
+                return "отброс рабочего дерева"
+    return None
+
+
+# ═══════════════════════════ КЛАСС 5: PUSH В УДАЛЁННЫЙ ═════════════════════════════════════
+# Уведомляем ПЕРЕСЕЧЕНИЕ ГРАНИЦЫ, а не шаги к нему (коммит молчит). Довод не про объём: 26 из 31
+# коммита окна трогали саму машинерию защиты — за пять суток система 26 раз молча переписала
+# собственные предохранители и уехала с этим в боевой origin.
+def _push_out(cmd, cwd=None):
+    for head, args in _heads(cmd):
+        if head != "git":
+            continue
+        sub, rest = _git_sub(args)
+        if sub != "push":
+            continue
+        if "--dry-run" in rest or "-n" in rest:
+            continue                          # сухой прогон границы не пересекает
+        pos = _pos(rest)
+        remote = pos[0] if pos else "origin"  # без имени git берёт origin (оба репо так и живут)
+        if not re.match(r"^[\w.@:/-]+$", remote or ""):
+            remote = "origin"
+        return "push в " + remote
+    return None
+
+
+# Порядок = порядок проверки; первый совпавший решает. Имя в паре — запасное (предикат обычно
+# уточняет его глаголом: «рестарт/старт/стоп клиентского бота», «push в <удалённый>»).
+_CLASSES = (
+    ("клиентский бот", _client_bot),
+    ("стирание маркеров гарда", _markers_wiped),
+    ("вынос теста из гейта", _test_out_of_gate),
+    ("отброс рабочего дерева", _tree_discard),
+    ("push в origin", _push_out),
+)
+
+# ПРОБА САМОГО КАНАЛА (шаг 1) — ведущий env-префикс `CC_FEED_PROBE=1 <команда>`. Почему префикс:
+# проба идёт ТЕМ ЖЕ путём, что и настоящее событие (разбор → класс → изоляция проб → дедуп →
+# потолок → отправка), значит проверяет провод целиком. Имя в СЕРЕДИНЕ строки объявлением НЕ
+# является — читаем ровно ведущие присваивания, как pretool_guard._cmd_declares_probe.
 PROBE_PREFIX = "CC_FEED_PROBE"
 PROBE_CLASS = "проба канала"
 
@@ -101,16 +380,17 @@ def _leading_env(cmd):
     return out
 
 
-def classify(cmd):
-    """Класс события → имя | None. ШАГ 1: только проба канала, список событий пуст."""
+def classify(cmd, cwd=None):
+    """Класс события → имя | None. Первый совпавший класс решает."""
     if (_leading_env(cmd).get(PROBE_PREFIX) or "").strip():
         return PROBE_CLASS
-    for name, pred in _CLASSES:                       # шаг 2 наполнит
+    for name, pred in _CLASSES:
         try:
-            if pred(cmd):
-                return name
+            got = pred(cmd, cwd)
         except Exception:
-            continue
+            continue                          # сбой предиката = молчание, а не мусорная заметка
+        if got:
+            return got if isinstance(got, str) else name
     return None
 
 
@@ -198,9 +478,12 @@ def _save_state(path, st):
         pass
 
 
-def _fingerprint(cls, cmd):
-    return hashlib.sha1((cls + "\x00" + " ".join((cmd or "").split())).encode("utf-8",
-                                                                              "replace")).hexdigest()[:16]
+def _fingerprint(cls, cmd, detail=""):
+    """Отпечаток для дедупа. ДЕТАЛЬ ВХОДИТ В НЕГО НАМЕРЕННО: два push подряд одной и той же
+    командой — ДВА РАЗНЫХ факта мира (разные диапазоны), и глушить второй нельзя. Для классов без
+    детали отпечаток тот же, что был."""
+    raw = cls + "\x00" + " ".join((cmd or "").split()) + "\x00" + (detail or "")
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def short_cmd(cmd, limit=120):
@@ -208,10 +491,26 @@ def short_cmd(cmd, limit=120):
     return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 
+# ─────────────────────────── ИСХОД: ФОРМА ОТВЕТА ИЗМЕРЕНА ПО ТРАНСКРИПТУ ────────────────────
+_EXIT_RE = re.compile(r"exit code\s+(-?\d+)", re.I)
+_TIMEOUT_RE = re.compile(r"timed out|timeout", re.I)
+
+
 def outcome(resp):
-    """Исход из `tool_response` — ЗАЩИТНО (схема не проверена живьём, см. честный предел в шапке).
-    Нашли код возврата / признак ошибки / прерывание — говорим о них; иначе «выполнено» БЕЗ
-    утверждения об успехе. Строковый ответ и мусор → «выполнено»."""
+    """Исход из `tool_response`. Живая форма (замер 04.08 по транскриптам сессий): успех —
+    словарь БЕЗ кода возврата, провал — СТРОКА «Error: Exit code N …», прерывание — флаг.
+    Кода не нашли → «выполнено», БЕЗ утверждения об успехе (fail-honest, не выдумываем)."""
+    if isinstance(resp, str):
+        m = _EXIT_RE.search(resp)
+        if m:
+            try:
+                code = int(m.group(1))
+            except Exception:
+                return "ошибка"
+            return "ok" if code == 0 else ("ошибка (код %d)" % code)
+        if _TIMEOUT_RE.search(resp):
+            return "прервано таймаутом"
+        return "выполнено"
     if not isinstance(resp, dict):
         return "выполнено"
     for k in ("exit_code", "exitCode", "returncode", "returnCode", "code"):
@@ -229,9 +528,102 @@ def outcome(resp):
     return "выполнено"
 
 
-def render(cls, subject, cmd, resp):
+def refused(resp):
+    """ОТКАЗ ДВИЖКА (команда НЕ исполнялась) — «Error: This command requires approval»,
+    «Error: Contains simple_expansion» и подобные. Лента говорит ТОЛЬКО о случившемся, поэтому
+    здесь заметки нет вовсе: сказать «push выполнен» о push, которого не было, — худшая из
+    возможных ошибок этого канала. Упавшая команда (есть код возврата) и таймаут отказом НЕ
+    считаются: они исполнялись, и о них лента говорит честно."""
+    if not isinstance(resp, str):
+        return False
+    s = resp.strip()
+    if not s.lower().startswith("error:"):
+        return False
+    return not (_EXIT_RE.search(s) or _TIMEOUT_RE.search(s))
+
+
+# ─────────────────────────── ДЕТАЛЬ PUSH: ВЕТКА · КОММИТЫ · ДИАПАЗОН · ⚠️ ───────────────────
+_RANGE_RE = re.compile(r"\b([0-9a-f]{6,40})\.\.([0-9a-f]{6,40})\s+(\S+)\s*->\s*(\S+)")
+_NEWBRANCH_RE = re.compile(r"\[new branch\]\s+(\S+)\s*->\s*(\S+)")
+# «Машинерия защиты» — то, из-за чего класс и включён в список: гард, демон, приёмник, гейт,
+# сама лента, дежурный, инварианты и набор тестов.
+_DEFENCE_FILES = ("pretool_guard.py", "orchestrator_daemon.py", "devbot.py", "gate.py",
+                  "posttool_feed.py", "card_duty.py", "notify.py", "invariants_check.py",
+                  "headless_settings.json")
+_DEFENCE_DIRS = ("tests/", "deploy/hooks/")
+
+
+def _resp_text(resp):
+    if isinstance(resp, dict):
+        return "\n".join(str(resp.get(k) or "") for k in ("stdout", "stderr"))
+    return str(resp or "")
+
+
+def _push_repo(cmd, cwd=None):
+    """Где считать: явный `-C <репо>` → рабочая директория сессии → каталог этого файла."""
+    for head, args in _heads(cmd):
+        if head != "git":
+            continue
+        for i, a in enumerate(args):
+            if a == "-C" and i + 1 < len(args):
+                d = args[i + 1].strip("'\"")
+                if os.path.isdir(d):
+                    return d
+    if cwd and os.path.isdir(cwd):
+        return cwd
+    return PROJECT
+
+
+def _git_read(repo, args, limit=4):
+    """Read-only обращение к git ради ЧИСЛА, а не оценки. Любой сбой/таймаут → пустая строка:
+    деталь станет короче, но заметка всё равно уйдёт (fail-soft)."""
+    try:
+        p = subprocess.run(["git", "-C", repo] + list(args), capture_output=True, text=True,
+                           timeout=limit)
+        return p.stdout if p.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _commits_word(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return "коммит"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "коммита"
+    return "коммитов"
+
+
+def push_detail(cmd, resp, cwd=None):
+    """Одна строка про push: ветка · сколько коммитов · диапазон · ⚠️ если среди файлов машинерия
+    защиты (§3.3 проекта: форма «одна заметка на push», а не «одна на коммит»). Диапазона в ответе
+    нет (up-to-date, отказ, обрезанный вывод) → детали нет: заметка не выдумывает."""
+    text = _resp_text(resp)
+    m = _RANGE_RE.search(text)
+    if not m:
+        nb = _NEWBRANCH_RE.search(text)
+        return ("%s · новая ветка" % nb.group(2)) if nb else None
+    a, b, _src, dst = m.groups()
+    rng = "%s..%s" % (a, b)
+    parts = [dst]
+    repo = _push_repo(cmd, cwd)
+    n = (_git_read(repo, ["rev-list", "--count", rng]) or "").strip()
+    if n.isdigit():
+        parts.append("%s %s" % (n, _commits_word(int(n))))
+    parts.append(rng)
+    files = [f.strip() for f in _git_read(repo, ["diff", "--name-only", rng]).split("\n")
+             if f.strip()]
+    if any(os.path.basename(f) in _DEFENCE_FILES or f.startswith(_DEFENCE_DIRS) for f in files):
+        parts.append("⚠️ среди файлов машинерия защиты")
+    return " · ".join(parts)
+
+
+def render(cls, subject, cmd, resp, detail=None):
     """Одна строка. Кнопок нет, номера карточки нет, слова «да» нет — отвечать не на что."""
-    return "🔔 %s · %s · %s · %s" % (cls, subject, short_cmd(cmd), outcome(resp))
+    parts = ["🔔 " + cls, subject, short_cmd(cmd)]
+    if detail:
+        parts.append(detail)
+    parts.append(outcome(resp))
+    return " · ".join(parts)
 
 
 def render_cap(subject):
@@ -258,19 +650,29 @@ def handle(data):
     cmd = (ti.get("command") or "") if isinstance(ti, dict) else ""
     if not cmd:
         return None
-    cls = classify(cmd)
+    resp = data.get("tool_response")
+    if refused(resp):
+        return None                      # движок отказал — события мира не было, говорить не о чем
+    cwd = str(data.get("cwd") or "") or None
+    cls = classify(cmd, cwd)
     if not cls:
-        return None                      # ШАГ 1: список пуст → настоящие команды заметок не родят
+        return None                      # вне списка фазы 1 — молчим (§4 проекта)
     if is_probe(cmd):
         return None                      # гейт, фикстуры, разведка из /tmp/tb_scratch — не лента
+    detail = None
+    if cls.startswith("push в"):
+        try:
+            detail = push_detail(cmd, resp, cwd)
+        except Exception:
+            detail = None
     key = state_key(data)
     path = _state_path(key)
     st = _load_state(path)
     if st.get("capped"):
         return None
-    fp = _fingerprint(cls, cmd)
+    fp = _fingerprint(cls, cmd, detail)
     if fp in (st.get("seen") or []):
-        return None                      # дедуп: тот же класс+команда в той же задаче — молча
+        return None                      # дедуп: тот же класс+команда+деталь в той же задаче
     if int(st.get("n") or 0) >= CAP:
         text = render_cap(who(data))
         if not send(text):
@@ -278,7 +680,7 @@ def handle(data):
         st["capped"] = True
         _save_state(path, st)
         return text
-    text = render(cls, who(data), cmd, data.get("tool_response"))
+    text = render(cls, who(data), cmd, resp, detail)
     if not send(text):
         return None                      # канал не заведён/сеть — состояние не трогаем
     st["n"] = int(st.get("n") or 0) + 1
