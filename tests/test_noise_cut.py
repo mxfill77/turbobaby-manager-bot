@@ -22,6 +22,7 @@ devbot — тест покраснеет здесь, а не в теме 328 у 
 import os
 import sys
 import asyncio
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("BRIDGE_URL", "http://x")
@@ -334,9 +335,9 @@ def sec6():
         long_body = ("итог работы. " * 60) + "\nFACT: commit abc1234 в git log origin/main"
         task = {"id": 360, "from": "Filipp-328-dev", "status": "done", "result": long_body,
                 "task_text": "тз: длинный отчёт", "updated": "2026-08-05T08:10:00Z"}
-        os.environ["REPORTS_DIR"] = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "_scratch_lenta_0805shum", "reports_test")
+        # Артефакты отчёта — во ВРЕМЕННЫЙ каталог с уникальным суффиксом: боевой reports/ прогон
+        # не трогает, а репозиторий не обрастает каталогами от гейта.
+        os.environ["REPORTS_DIR"] = tempfile.mkdtemp(prefix="tb_noisecut_")
         _run(devbot, _snapshot(done=[task]), bot)
         body = _card_body("задача", 360, "followup", tasks=["хвост"], placed=[(361, "хвост")])
         card = {"id": 362, "from": "Filipp-328-dec", "status": "done", "result": body,
