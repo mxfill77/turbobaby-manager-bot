@@ -484,7 +484,7 @@ def _py_code_view(src):
     except Exception:
         return None
     words, names, conf, calls = [], [], False, {}
-    lit_args, mods, sql_args = [], [], []
+    lit_args, mods, sql_args, strs = [], [], [], []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             words.append(node.id)
@@ -505,6 +505,7 @@ def _py_code_view(src):
             names.append(node.name)
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             words.append(node.value)
+            strs.append(node.value)      # ТОЛЬКО литералы — ими 1а отличает данные от кода
         elif isinstance(node, ast.Import):
             mods += [(a.name or "").split(".")[0] for a in node.names]
         elif isinstance(node, ast.ImportFrom):
@@ -538,7 +539,7 @@ def _py_code_view(src):
                or any(c in _EXEC_CALLS for c in calls))
     return {"text": "\n".join(w for w in words if w), "conf": conf, "calls": calls,
             "names": [n for n in names if n], "lit_args": lit_args, "channel": channel,
-            "sql_args": sql_args, "dels": _py_dels(tree)}
+            "sql_args": sql_args, "dels": _py_dels(tree), "strs": strs}
 
 
 def _code_view_parts(parts):
@@ -548,7 +549,7 @@ def _code_view_parts(parts):
         return None
     text, conf, calls = [], False, {}
     names, lit_args, channel, dels = [], [], False, []
-    sql_args = []
+    sql_args, strs = [], []
     for src in parts:
         v = _py_code_view(src)
         if v is None:
@@ -560,10 +561,12 @@ def _code_view_parts(parts):
         sql_args += v.get("sql_args") or []     # SQL ОДНОГО тела красит команду целиком
         channel = channel or v["channel"]      # канал ОДНОГО тела красит команду целиком
         dels += v.get("dels") or []            # удаление ОДНОГО тела красит команду целиком
+        strs += v.get("strs") or []            # строковые литералы ВСЕХ тел — для шага 1а
         for fn, kw in v["calls"].items():
             calls.setdefault(fn, {}).update(kw)
     return {"text": "\n".join(text), "conf": conf, "calls": calls, "sql_args": sql_args,
-            "names": names, "lit_args": lit_args, "channel": channel, "dels": dels}
+            "names": names, "lit_args": lit_args, "channel": channel, "dels": dels,
+            "strs": strs}
 
 
 def _body_has(tok, raw, view):
@@ -575,18 +578,27 @@ def _body_has(tok, raw, view):
     if view is None or tok == "DOWRITE":
         return tok in raw
     if tok in _CONFIRMED_TOKENS:
-        # разобранный аргумент/ключ/присваивание ЛИБО написание внутри строкового литерала
-        # (`data="confirmed=true&…"` — тоже боевая запись, только через сырой запрос)
-        return view["conf"] or bool(_CONFIRMED_RE.search(view["text"]))
-    if tok in _MONEY_HITS:
-        return _name_is_action(tok, raw, view)
-    # ГРАНИЦА ПРАВИЛА, ПРОВЕДЁННАЯ НЕ НАМИ (04.08.2026). Для НЕ-денежных имён строковый литерал
-    # (докстринг, печатаемая строка, список слов) краснит по-прежнему — это ЗАПИСАННОЕ решение
-    # 02.08.2026, а не недосмотр: голден так и назван — «докстринг остаётся красным НАМЕРЕННО
-    # (строка = возможное действие)», tests/test_root_a_vps.py, плюс остатки 117/135 в
-    # tests/test_money_action.py. Правило исполняющей позиции туда НЕ распространено: это снятие
-    # существующего красного в трёх классах сразу, и решать его владельцу, а не гарду.
-    return tok in view["text"]
+        # РАЗОБРАННОЕ значение (именованный аргумент, ключ словаря, присваивание) краснит ВСЕГДА и
+        # безусловно: это исполняющая позиция, доказывать для неё канал не требуется.
+        # НАПИСАНИЕ ВНУТРИ СТРОКОВОГО ЛИТЕРАЛА — вторая, слабая улика; она заведена ради СЫРОГО
+        # тела запроса (`data="confirmed=true&…"` — боевая запись в обход именованных аргументов),
+        # а у такого тела канал есть ВСЕГДА: без импорта-канала или исполняющего вызова запросу
+        # нечем уйти к мосту. Поэтому литерал краснит ТОЛЬКО при живом канале — иначе читающая
+        # разведка, у которой это написание лежит ДАННЫМИ в списке слов, получает красное за
+        # строку: дословная команда 117 (импорт ровно один, `re`) дойти до Лист1 не может ничем.
+        # Тот же класс и то же правило, что у имён операций ниже (05.08.2026).
+        return view["conf"] or bool(view.get("channel") and _CONFIRMED_RE.search(view["text"]))
+    # ГРАНИЦА СНЯТА ПО РЕШЕНИЮ ВЛАДЕЛЬЦА (05.08.2026, «класс встаёт на литерал»). Здесь стояла
+    # развилка: денежные имена судились действием, а прочие — подстрокой по view["text"], куда
+    # входят и СТРОКОВЫЕ ЛИТЕРАЛЫ. Ровно этим красное поднималось на строке внутри python-кода,
+    # когда самой операции в теле не было (живой случай полосы ПК 19:21; остаток назван адресом
+    # ещё 02.08 — artifacts/2026-08-02-money-action-not-word.md §4). Теперь правило ОДНО на ВСЕ
+    # имена операций и совпадает с правилом исполняющей позиции (5ca761d): красит имя, стоящее
+    # там, где его ИСПОЛНИТ разборщик, — вызов, имя кода, литерал-СЕЛЕКТОР при живом канале.
+    # Двух списков больше нет: денежная ветка слилась с общей, _MONEY_HITS остался только там,
+    # где у денег своя ЦЕЛЬ карточки (кошелёк/сумма). Направление сомнения не изменилось: разбора
+    # нет (heredoc/stdin/нечитаемый .py/кривые кавычки) → слепой режим выше, прежняя подстрока.
+    return _name_is_action(tok, raw, view)
 
 
 # ── ДЕНЕЖНЫЙ КЛАСС: КРАСНОЕ РОЖДАЕТ ДЕЙСТВИЕ, А НЕ УПОМИНАНИЕ (02.08.2026) ────────────────────
@@ -2267,9 +2279,25 @@ def _analyze(cmd, cwd, scan=None):
         if _body_has(tok, seen, None if (amb or outside) else view):
             return "red", RED_TOKEN_HIT[tok], blob
     # 1а ПЕРЕЕХАЛ СЮДА (см. выше): confirmed=ИСТИНА в САМОЙ команде по написанию с любыми пробелами
-    # и кавычками. Судится по ПОЛНОМУ скану, как судился, — изменилось ТОЛЬКО место в порядке, чтобы
-    # конкретная операция снова выигрывала у обобщённого признака.
-    if _CONFIRMED_RE.search(scan):
+    # и кавычками — для форм, где разбирать нечего (curl, heredoc, флаг CLI, тело tracked-исходника).
+    # 05.08.2026: судится текст команды МИНУС СОДЕРЖИМОЕ СТРОКОВЫХ ЛИТЕРАЛОВ разобранных тел.
+    # Причина — тот же класс, что строкой выше: у инлайн-кода (`-c`) тело И ЕСТЬ текст команды,
+    # поэтому полный скан судил написание ВНУТРИ python-кода второй раз и в обход разбора —
+    # дословная команда 117 краснела на ЭЛЕМЕНТЕ СПИСКА СЛОВ уже после того, как _body_has её
+    # оправдал. Вычитаются ИМЕННО ЛИТЕРАЛЫ, а не тела целиком: `-c "confirmed=true"` — это
+    # ПРИСВАИВАНИЕ, то есть код в исполняющей позиции, и оно обязано краснеть, как краснело
+    # (вычитание тел целиком глушило и его — поймано голденом test_guard_тест_entity).
+    # Написание внутри литерала уже судил _body_has: при живом канале оно красное, без канала
+    # у тела нет чем дойти до Лист1. FAIL-CLOSED: разбора нет (view is None) → литералов нет →
+    # ПОЛНЫЙ скан, байт-в-байт прежнее поведение.
+    # Вычитается ТОЛЬКО литерал, который САМ несёт написание: слепое вычитание всех литералов
+    # подряд стирало бы из текста команды и короткие строки («e», «-»), а вместе с ними — буквы
+    # НАСТОЯЩЕГО признака в другом месте команды (дыра наизнанку).
+    conf_text = scan
+    for lit in (view or {}).get("strs") or ():
+        if lit and _CONFIRMED_RE.search(lit):
+            conf_text = conf_text.replace(lit, " ")
+    if _CONFIRMED_RE.search(conf_text):
         return "red", "confirmed", cmd
     # memory.db через python-код = 🟢 (своя БД бота, доктрина «своя таблица через код = зелёное»,
     # переклассификация 02.07; прямой sqlite3 CLI остаётся ask в settings). SQL-write в ИНУЮ БД → ask.

@@ -67,7 +67,10 @@ print("КРАСНОЕ по-прежнему ask (регресс: сужение 
 tmp = tempfile.mkdtemp(prefix="pt_if_")
 red = os.path.join(tmp, "recon_fleet.py")   # боевое имя, но PRETOOL_NOPUSH=1 глушит пуш
 with open(red, "w", encoding="utf-8") as f:
-    f.write("# фикстура\nprint('set_fleet_oil')\n")
+    # ВЫЗОВ, а не печатаемое слово: с 05.08.2026 имя операции в строковом литерале красного не даёт
+    # (tests/test_literal_position.py). Предмет этого теста — что сужение инфо-флагов не пробило
+    # red-детект, поэтому фикстуре нужен НАСТОЯЩИЙ красный признак.
+    f.write("# фикстура\nimport bridge_client as bc\nbc.set_fleet_oil()\n")
 res.append(ok(is_ask(PY + " " + red), "скрипт с set_fleet_oil → ask"))
 res.append(ok(is_ask(PY + " -c \"add_transaction(amount=500)\""), "inline add_transaction → ask"))
 
