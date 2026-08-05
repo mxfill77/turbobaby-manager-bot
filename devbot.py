@@ -176,6 +176,17 @@ _stalled = {}                           # задачи, по которым УЖ
 STALL_GRACE_SEC = 120                   # люфт НАД штатным потолком задачи
 # {qid: (chat_id, topic_id, msg_id, base_text, task_text, task_from, st, sent_at)}
 _curator_pending = {}                   # карточки, показывающие «куратор оценивает» — ждут edit
+# ОДИН ОТЧЁТ О ЗАДАЧЕ (решение владельца 05.08.2026): вердикт куратора — СТРОКА в карточке задачи,
+# а не второе сообщение. Сюда попадают (вид, id) терминалов, чей вердикт УЖЕ доехал до владельца
+# внутри карточки задачи — их кураторская карточка-маркер своего сообщения в 328 не получает.
+# Пометка ставится ТОЛЬКО по факту доставки (отправка/edit прошли) — не доехало, значит не вклеено,
+# значит карточка уйдёт отдельным сообщением, как раньше: молча вердикт не исчезает.
+# ПОМЕТКА ЖИВЁТ МИНУТЫ, А НЕ ВЕЧНО: карточка-маркер приходит следующим тиком (45с), а долгая память
+# опасна — при ПЕРЕСОЗДАНИИ очереди номера начинаются заново (живой случай 28.07), и старый ключ
+# погасил бы чужую карточку. {(вид, id): monotonic-метка}.
+_curator_glued = {}
+_CURATOR_GLUED_TTL = 3600               # сек: на порядок больше тика, на порядок меньше суток
+_CURATOR_THINKING = "🧭 Куратор оценивает итог — вердикт через ~10с"
 _CURATOR_WAIT_MAX = 240                 # сек до fallback-перерасчёта (CURATOR_TIMEOUT 180 + буфер) (даём демону/реаперу самому
                                         # довести терминал done/failed раньше тревоги владельцу).
                                         # Порог «зависла» — per-задача: _stall_threshold_sec(it).
@@ -1391,40 +1402,54 @@ def _stall_threshold_sec(it):
 
 
 async def _check_curator_pending(context, by) -> None:
-    """Редактирует done/failed-карточки с «куратор оценивает» после вердикта куратора
-    или по таймауту (_CURATOR_WAIT_MAX). Вызывается из report_results с текущим by-снимком."""
+    """Дописывает вердикт куратора В УЖЕ ОТПРАВЛЕННУЮ done/failed-карточку (edit, не новое
+    сообщение) — либо снимает надпись «куратор оценивает» по таймауту (_CURATOR_WAIT_MAX).
+    Вызывается из report_results с текущим by-снимком, ДО разбора терминальных задач: пометка
+    _curator_glued должна успеть встать раньше, чем цикл дойдёт до самой карточки-маркера
+    (её id всегда БОЛЬШЕ id задачи, а цикл идёт по возрастанию)."""
     if not _curator_pending:
         return
     now = time.monotonic()
     to_remove = []
     for qid, info in list(_curator_pending.items()):
-        chat_id, topic_id, msg_id, base_text, task_text, task_from, st, sent_at = info
-        verdict = _curator_verdict_exists(qid, task_text, task_from, by)
+        chat_id, topic_id, msg_id, base_text, task_text, task_from, st, sent_at = info[:8]
+        # 9-й элемент (был ли отчёт урезан) появился 05.08.2026 — читаем мягко: старая 8-элементная
+        # запись пережившего рестарт тика и фикстуры прежних тестов должны работать как раньше.
+        full = bool(info[8]) if len(info) > 8 else False
+        kind, key = _curator_key(qid, task_text, task_from)
+        card = _curator_card_item(kind, key, by)
         timed_out = (now - sent_at) > _CURATOR_WAIT_MAX
-        if not verdict and not timed_out:
+        if card is None and not timed_out:
             continue  # ещё ждём следующего тика
         to_remove.append(qid)
-        if verdict:
-            # Куратор ответил — определяем goal_key для поиска followup-задач
-            frm = str(task_from or "")
-            kind, key = "задача", int(str(qid or 0))
-            if frm in (QUEUE_FROM_DEC, QUEUE_FROM_PC_DEC, QUEUE_FROM_PCLOC_DEC):
-                m = _SUMMARY_PARENT_RE.match(str(task_text or ""))
-                if m:
-                    kind, key = "родитель", int(m.group(1))
-            fid = _curator_followup_id(key, by)
-            new_banner = (f"⏳ Куратор поставил продолжение (задача {fid})" if fid is not None
-                          else _build_banner(qid, task_text, task_from, by))
+        line = None
+        if card is not None:
+            line = _curator_line(_result_body(card, empty=""))
+            if line is None:
+                # Сбойный вердикт (НЕ поставлено / карточка владельцу не встала) — в строку не
+                # ужать. Плашка остаётся прежней, а карточка куратора уйдёт отдельным сообщением
+                # со ВСЕМ текстом, как раньше.
+                fid = _curator_followup_id(key, by)
+                new_banner = (f"⏳ Куратор поставил продолжение (задача {fid})" if fid is not None
+                              else _build_banner(qid, task_text, task_from, by))
+            else:
+                new_banner = _build_banner(qid, task_text, task_from, by)
         else:
-            # Таймаут: closed/сбой — пересчёт плашки по текущему снимку
-            new_banner = _build_banner(qid, task_text, task_from, by)
-        new_text = base_text + "\n" + new_banner
-        markup = _kb_done(qid) if st == "done" else None
+            # Таймаут: вердикта не будет (closed или сбой думателя) — плашка по состоянию очереди,
+            # БЕЗ повторного входа в ветку ожидания (иначе текст не менялся бы вовсе).
+            new_banner = _build_banner(qid, task_text, task_from, by, curator_wait=False)
+        new_text = base_text + (("\n" + line) if line else "") + "\n" + new_banner
+        # Кнопки восстанавливаем ТЕ ЖЕ, что были на карточке: у урезанного отчёта это «📄 отчёт»
+        # (и у failed тоже — там она единственная). Правка не имеет права обеднить сообщение,
+        # ради полноты которого она и делается.
+        markup = _kb_done(qid, full=full) if st == "done" else (_kb_full(qid) if full else None)
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id, message_id=msg_id,
                 text=new_text, reply_markup=markup,
             )
+            if line:
+                _mark_glued((kind, key))          # доехало → второго сообщения не будет
         except Exception as e:
             log.warning("devbot.banner: edit_message_text задача %s упал (%s)", qid, e)
     for qid in to_remove:
@@ -1604,6 +1629,11 @@ async def report_results(context) -> None:
         if _seen(_inprogress_seen, ev):
             continue                     # снимок in_progress уже отрапортовал эту задачу
         _mark_seen(_inprogress_seen, ev)
+        # Карточка-маркер куратора живёт секунду, исполнителя у неё нет, а её вердикт вклеен в
+        # карточку задачи — анонс «🔄 в работе» о ней был чистым шумом (22 таких сообщения в 328
+        # за 28.07–05.08). Пометку _inprogress_seen оставляем: она гасит и второй путь анонса.
+        if _CURATOR_BANNER_RE.match(str(ev.get("task_text") or "")):
+            continue
         await _send_inprogress_card(context, ev)
 
     # Редактировать карточки, ожидающие вердикт куратора (если появился)
@@ -1619,21 +1649,40 @@ async def report_results(context) -> None:
         rep = " (повтор)" if _is_repeat_item(it) else ""   # клон возврата ≠ новая задача (инцидент 156)
         task_text = str(it.get("task_text") or "")
         task_from = str(it.get("from") or "")
+        # ОДНО СООБЩЕНИЕ НА ЗАДАЧУ: вердикт этого терминала уже уехал СТРОКОЙ в карточке задачи →
+        # своя карточка ему не нужна. Пометка ставится только по факту доставки, поэтому «молча
+        # съесть» вердикт нечем: не вклеился — идёт сюда и рапортуется целиком, как раньше.
+        mcur = _CURATOR_BANNER_RE.match(task_text)
+        if mcur and _is_glued((mcur.group(1), int(mcur.group(2)))):
+            log.info("devbot.report_results: карточка куратора %s не шлётся — вердикт вклеен в "
+                     "карточку %s %s", qid, mcur.group(1), mcur.group(2))
+            continue
         # 229 (FACT-верификация, недеструктивно, 20.07.2026): пометка ТОЛЬКО текста карточки 328,
         # сохранённый result в Bridge не трогаем (инвариант «финал байт-в-байт»). См. helper ниже.
         unv = _unverified_card_prefix(st, it)
         banner = _build_banner(qid, task_text, task_from, by)
+        # Вердикт куратора успел встать ДО первого рапорта (частый случай: думатель отвечает за
+        # ~10с, тик — 45с) → он едет СТРОКОЙ в этой же карточке, и карточка-маркер (её id заведомо
+        # больше, а цикл идёт по возрастанию) ниже по циклу промолчит.
+        cur_key = cur_line = None
+        if not mcur and _curator_on() and task_from in _CURATOR_ELIGIBLE_FROMS:
+            k = _curator_key(qid, task_text, task_from)
+            card = _curator_card_item(k[0], k[1], by)
+            if card is not None:
+                cur_line = _curator_line(_result_body(card, empty=""))
+                cur_key = k if cur_line else None
+        tail = (cur_line + "\n" + banner) if cur_line else banner
         # Тело длиннее порога → в чат едет итог + ссылка, полный текст в артефакт и под кнопку.
         # Короткий отчёт (digest вернул None) идёт БАЙТ-В-БАЙТ прежним путём.
         short = report_digest.digest(body)
         if short is None:
-            head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{body}\n{banner}"
+            head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{body}\n{tail}"
         else:
             art = _write_report_artifact(it, st, body)
             link = f"📄 отчёт целиком ({len(body)} симв.) — кнопка «📄 отчёт» ниже"
             if art:
                 link += f" · {art}"
-            head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{short}\n\n{link}\n{banner}"
+            head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{short}\n\n{link}\n{tail}"
         chunks = _chunks(head)
         last_msg_obj = None
         for i, chunk in enumerate(chunks):
@@ -1654,14 +1703,15 @@ async def report_results(context) -> None:
                          _item_topic(it), getattr(m, "message_id", "?"))
             except Exception as e:
                 log.warning("devbot.report_results: отправка результата задачи %s упала (%s)", qid, e)
+        if cur_key and last_msg_obj is not None:
+            _mark_glued(cur_key)         # вердикт доехал внутри карточки → второго сообщения нет
         # Трекинг ожидания куратора: если показали «оценивает» — редактируем потом
-        _CURATOR_THINKING = "🧭 Куратор оценивает итог — вердикт через ~10с"
         if banner == _CURATOR_THINKING and last_msg_obj is not None:
             last_chunk = chunks[-1]
             base_text = last_chunk.rsplit("\n", 1)[0] if "\n" in last_chunk else last_chunk
             _curator_pending[qid] = (
                 HQ_CHAT_ID, _item_topic(it), last_msg_obj.message_id,
-                base_text, task_text, task_from, st, time.monotonic(),
+                base_text, task_text, task_from, st, time.monotonic(), short is not None,
             )
         _closed_since_busy.append(qid)   # номера для сигнала «очередь пуста» (часть 3)
 
@@ -1946,21 +1996,94 @@ def _curator_on():
     return str(os.getenv("CURATOR", "0")).strip() == "1"
 
 
-def _curator_verdict_exists(qid, task_text, task_from, by):
-    """Куратор уже вынес вердикт по задаче qid?
-    Одиночка → ищем [куратор задача qid]; цепная сводка (dec) → [куратор родитель PID].
-    Ищем в by["done"] (куратор-карточки — немедленный done synthetic-задачи)."""
+def _mark_glued(key):
+    """Пометить вердикт как доехавший внутри карточки задачи + подрезать протухшие пометки."""
+    now = time.monotonic()
+    for k, t in list(_curator_glued.items()):
+        if now - t > _CURATOR_GLUED_TTL:
+            _curator_glued.pop(k, None)
+    _curator_glued[key] = now
+
+
+def _is_glued(key):
+    """Вердикт этого терминала уже доехал внутри карточки задачи (и пометка не протухла)?"""
+    t = _curator_glued.get(key)
+    return t is not None and (time.monotonic() - t) <= _CURATOR_GLUED_TTL
+
+
+def _curator_key(qid, task_text, task_from):
+    """(вид, id) кураторского терминала для карточки задачи qid:
+    одиночка → («задача», qid); цепная сводка (dec) → («родитель», PID из «[сводка родитель N]»).
+    Мусорный qid → («задача», 0): совпасть с реальной карточкой такой ключ не может."""
     frm = str(task_from or "")
-    kind, key = "задача", int(str(qid or 0))
     if frm in (QUEUE_FROM_DEC, QUEUE_FROM_PC_DEC, QUEUE_FROM_PCLOC_DEC):
         m = _SUMMARY_PARENT_RE.match(str(task_text or ""))
         if m:
-            kind, key = "родитель", int(m.group(1))
-    for it in by.get("done", []):
+            return "родитель", int(m.group(1))
+    try:
+        return "задача", int(str(qid or 0))
+    except (TypeError, ValueError):
+        return "задача", 0
+
+
+def _curator_card_item(kind, key, by):
+    """Кураторская карточка-маркер этого терминала из снимка → item | None.
+    Ищем в by["done"] (карточка — немедленный done synthetic-задачи «[куратор <вид> <id>]»)."""
+    for it in (by or {}).get("done", []) or []:
         m = _CURATOR_BANNER_RE.match(str(it.get("task_text") or ""))
         if m and m.group(1) == kind and int(m.group(2)) == key:
-            return True
-    return False
+            return it
+    return None
+
+
+def _curator_verdict_exists(qid, task_text, task_from, by):
+    """Куратор уже вынес вердикт по задаче qid? (тонкая обёртка над поиском карточки-маркера)."""
+    kind, key = _curator_key(qid, task_text, task_from)
+    return _curator_card_item(kind, key, by) is not None
+
+
+# ── ВЕРДИКТ КУРАТОРА = СТРОКА В КАРТОЧКЕ ЗАДАЧИ (05.08.2026) ─────────────────────────────
+# Было: итог задачи одним сообщением, вердикт куратора — вторым (synthetic-задача «[куратор …]»
+# рапортовалась как обычная). Замер по журналам за 28.07–05.08: 613 сообщений devbot в 328, из них
+# 88 (14 %) — кураторские карточки и анонсы «в работе» по ним. Решение владельца: отчёт о
+# выполнении — ОДНО сообщение; вердикт вклеивается строкой, продолжение цели называется НОМЕРОМ в
+# той же строке; цель закрыта без замечаний → куратор молчит (так и было: verdict=closed карточки
+# не рождает вовсе).
+# ПАРСИМ ТЕЛО, А НЕ ПЕРЕСКАЗЫВАЕМ ОЧЕРЕДЬ: строка обязана говорить то же, что сказал куратор.
+# Формат тела задаёт orchestrator_daemon._curator_card_text — регресс кормит нас ЕГО ЖЕ выводом
+# (живой формат, а не идеализированный мок), поэтому расхождение формулировок увидит тест.
+_CUR_PLACED_RE = re.compile(r"^\s*\d+\.\s*задача id (\d+)\s*:", re.M)     # «1. задача id 331: …»
+_CUR_INBOX_RE = re.compile(r"\(задач[аи]\s+([0-9]+(?:\s*,\s*[0-9]+)*)\s*,\s*инбокс\)")
+_CUR_KEEP_WHOLE = ("НЕ поставлено", "НЕ встала")   # сбои: в строку не влезут — карточка идёт целиком
+
+
+def _curator_line(body):
+    """Тело кураторской карточки → ОДНА строка вердикта для карточки задачи | None.
+
+    None = «вклеить нечем» → карточка куратора уходит отдельным сообщением, как раньше. Это
+    ГЛАВНЫЙ fail-safe правила: сокращение шума не смеет съесть ни одного слова куратора. В None
+    уходят ровно сбойные случаи — «НЕ поставлено» (ТЗ не встало: бюджет/дедуп/enqueue) и «сводная
+    карточка НЕ встала»: там текста больше, чем строка вместит, и он владельцу нужен целиком."""
+    s = str(body or "")
+    if not s.strip():
+        return None
+    if any(mark in s for mark in _CUR_KEEP_WHOLE):
+        return None
+    head = s.strip().splitlines()[0]
+    if "требует владельца" in head:
+        m = _CUR_INBOX_RE.search(s)
+        if not m:
+            return None
+        ids = [x.strip() for x in m.group(1).split(",") if x.strip()]
+        word = "карточка" if len(ids) == 1 else "карточки"
+        return f"🧭 Куратор: нужен владелец — {word} {', '.join(ids)} в инбоксе"
+    if "НЕ закрыта" in head:
+        ids = _CUR_PLACED_RE.findall(s)
+        if not ids:
+            return None
+        word = "задача" if len(ids) == 1 else "задачи"
+        return f"🧭 Куратор: цель не закрыта — продолжение: {word} {', '.join(ids)}"
+    return None
 
 
 def _curator_followup_id(goal_key, by):
@@ -1976,19 +2099,27 @@ def _curator_followup_id(goal_key, by):
     return None
 
 
-def _build_banner(qid, task_text, task_from, by):
+def _build_banner(qid, task_text, task_from, by, curator_wait=True):
     """Плашка продолжения для done/failed-карточки задачи qid.
     Fail-safe: by=None → «недоступно» (НИКОГДА не говорим «завершено» без данных очереди).
-    Порядок приоритетов: недоступно > куратор думает > конверты > активные задачи > завершено."""
+    Порядок приоритетов: недоступно > куратор думает > конверты > активные задачи > завершено.
+
+    curator_wait=False — ветку «куратор думает» не входить. Нужна ровно на ФОЛБЭКЕ по таймауту
+    (_check_curator_pending): там ждать больше нечего, а прежний код звал эту же функцию, снова
+    попадал в ту же ветку и получал ТОТ ЖЕ текст — edit падал «Message is not modified» (405 раз
+    в живом журнале), и карточка навсегда оставалась с надписью «вердикт через ~10с», хотя вердикта
+    уже не будет. Молчание куратора = verdict closed («цель закрыта, замечаний нет») ЛИБО сбой
+    думателя; различить их нечем, поэтому плашка не заявляет ни того, ни другого — показывает
+    состояние очереди, которое истинно в обоих случаях."""
     if by is None:
         return "⏳ состояние очереди недоступно — набери \"статус\""
 
     frm = str(task_from or "")
 
     # Куратор ещё думает?
-    if _curator_on() and frm in _CURATOR_ELIGIBLE_FROMS:
+    if curator_wait and _curator_on() and frm in _CURATOR_ELIGIBLE_FROMS:
         if not _curator_verdict_exists(qid, task_text, frm, by):
-            return "🧭 Куратор оценивает итог — вердикт через ~10с"
+            return _CURATOR_THINKING
 
     # Считаем активные задачи обеих полос из QUEUE_FROMS
     active_vps, active_pc = [], []

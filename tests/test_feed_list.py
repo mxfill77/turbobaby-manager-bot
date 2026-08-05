@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
-"""ЛЕНТА, ШАГ 2 — СПИСОК СОБЫТИЙ ФАЗЫ 1 (04.08.2026).
+"""ЛЕНТА, ШАГ 2 — СПИСОК СОБЫТИЙ ФАЗЫ 1 (04.08.2026; редакция шума 05.08.2026).
 
 Основание: docs/artifacts/2026-08-03-third-state-notify-design.md §3 (список утверждён владельцем)
-+ docs/artifacts/2026-08-04-feed-list-phase1.md (этот заход). Шаг 1 собрал ПРОВОД и намеренно
-оставил таблицу классов пустой; здесь она наполняется, и весь смысл теста — доказать ГРАНИЦУ
-списка: пять названных событий говорят, всё остальное молчит.
++ docs/artifacts/2026-08-04-feed-list-phase1.md (заход подключения)
++ docs/artifacts/2026-08-05-feed-noise-cut.md (отзыв класса push и поправка метки). Шаг 1 собрал
+ПРОВОД и намеренно оставил таблицу классов пустой; здесь она наполняется, и весь смысл теста —
+доказать ГРАНИЦУ списка: ЧЕТЫРЕ названных события говорят, всё остальное молчит.
+
+РЕДАКЦИЯ 05.08.2026 (владелец): класс push ОТОЗВАН по прописанному условию §3.3 (6.3 заметки в
+сутки из 8.1, реагировать не на что — коммиты видны отчётом в 328), его голдены переехали в
+секцию (3) «не уведомляем»; splinter в метке назван ВНУТРЕННИМ сервисом, «клиентский бот» остался
+только за ПК-процессами. Отдельный регресс владельца — tests/test_noise_cut.py.
 
 ГОЛДЕНЫ — ДОСЛОВНЫЕ КОМАНДЫ ЖИВЫХ ТРАНСКРИПТОВ (класс 8 дисциплины: детект проверяется на том,
 что реально печаталось, а не на сочинённом). Каждая строка ниже взята выемкой из
@@ -23,7 +29,8 @@
      проверено по транскрипту: успех = dict(stdout/stderr/interrupted/isImage/noOutputExpected)
      БЕЗ кода возврата, провал = СТРОКА «Error: Exit code N …», отказ движка = строка «Error: …»
      без кода. Отказ — НЕ событие мира: заметки быть не должно вовсе.
- (7) ДЕТАЛЬ PUSH — ветка · сколько коммитов · диапазон · ⚠️ машинерия защиты (§3.3 проекта).
+ (7) PUSH ОТОЗВАН + ДЕДУП БЕЗ ДЕТАЛИ: класса нет ни в таблице, ни в коде; дедуп по-прежнему
+     гасит повтор той же команды и пропускает ДРУГУЮ команду того же класса.
  (8) ЛЕНТА ЧИТАЕТ ГАРД, НО НЕ ЗОВЁТ ЕГО ПИШУЩИХ ВЕТОК (ast, а не обещание в докстринге).
  (9) ПРОГОН НЕ КАСАЕТСЯ БОЕВЫХ ФАЙЛОВ СОСТОЯНИЯ — прямой ответ на инцидент 04.08.2026, когда
      тест гейта стёр боевой спул и убил находки владельца. Своё состояние — во ВРЕМЕННОМ
@@ -88,10 +95,12 @@ import posttool_feed as PF
 # ── ГОЛДЕНЫ: ДОСЛОВНЫЕ КОМАНДЫ ТРАНСКРИПТОВ ────────────────────────────────────────────────
 HITS = [
     # (дословная команда, ожидаемый класс, откуда)
-    ("systemctl restart splinter", "рестарт клиентского бота", "28.07 18:46"),
-    ("systemd-run --on-active=10s systemctl restart splinter", "рестарт клиентского бота",
+    # splinter — ВНУТРЕННИЙ сервис (поправка метки 05.08.2026): клиентский контур живёт на ПК.
+    ("systemctl restart splinter", "рестарт внутреннего сервиса splinter", "28.07 18:46"),
+    ("systemd-run --on-active=10s systemctl restart splinter",
+     "рестарт внутреннего сервиса splinter",
      "форма отложенного рестарта (обёртка не прячет юнит)"),
-    ("systemctl stop splinter", "стоп клиентского бота", "форма из allow-списка"),
+    ("systemctl stop splinter", "стоп внутреннего сервиса splinter", "форма из allow-списка"),
     ("pkill -f userbot_listen.py", "стоп клиентского бота", "ПК-полоса: процесс под pc_agent"),
     ("mkdir -p /root/turbobaby-manager-bot/docs/artifacts/discarded && "
      "mv /root/turbobaby-manager-bot/tests/test_card_border.py "
@@ -111,12 +120,13 @@ HITS = [
      "форма с pathspec"),
     ("rm /tmp/cc_guard_block/12.json /tmp/cc_guard_block/27.json /tmp/cc_guard_block/399.json",
      "стирание маркеров гарда", "живая команда корпуса"),
-    ("git push origin main", "push в origin", "31.07 11:37"),
-    ("git push", "push в origin", "30.07 14:50"),
-    ("git push 2>&1 | tail -20", "push в origin", "28.07 18:44 — редирект не съедает remote"),
-    ("git -C /root/turbobaby-manager-bot push origin main", "push в origin", "02.08 17:40"),
-    ("git -c core.hooksPath=deploy/hooks push origin main", "push в origin",
-     "31.07 11:25 — подкоманда не первый позиционный токен"),
+]
+
+# Голдены классов, различающих КЛИЕНТСКИЙ и ВНУТРЕННИЙ контур (поправка метки 05.08.2026).
+# Формы ПК живым корпусом VPS не подтверждены (их тут нет вовсе) — это названный остаток зеркала.
+CLIENT_PC = [
+    ("pkill -f moderation_bot", "стоп клиентского бота", "ПК: модератор"),
+    ("python3 /root/pcport/userbot/userbot_listen.py", "старт клиентского бота", "ПК: запуск"),
 ]
 
 # Ближние промахи: слово о событии ≠ событие. Все строки — из живых транскриптов.
@@ -166,6 +176,14 @@ SILENT = [
     ("tail -50 /root/turbobaby-manager-bot/splinter.log", "чтение лога"),
     ("git status --short", "диагностика"),
     ("git log --oneline -5", "история"),
+    # PUSH — ОТОЗВАН ВЛАДЕЛЬЦЕМ 05.08.2026 (был класс, стал молчание). Голдены сохранены
+    # ДОСЛОВНО теми же строками транскриптов, что были в секции (1): доказываем не «мы удалили
+    # ветку», а «эти самые команды больше не говорят».
+    ("git push origin main", "push отозван (31.07 11:37)"),
+    ("git push", "push отозван (30.07 14:50)"),
+    ("git push 2>&1 | tail -20", "push отозван (28.07 18:44)"),
+    ("git -C /root/turbobaby-manager-bot push origin main", "push отозван (02.08 17:40)"),
+    ("git -c core.hooksPath=deploy/hooks push origin main", "push отозван (31.07 11:25)"),
 ]
 
 # Красное: у него СВОЙ адрес (инбокс 1160). Лента о нём молчит — дублировать = размыть оба.
@@ -222,9 +240,9 @@ def lines(path):
 
 # ── (1) ПОПАДАНИЯ ──────────────────────────────────────────────────────────────────────────
 print("(1) дословная команда класса → класс назван:")
-for cmd, cls, src in HITS:
+for cmd, cls, src in HITS + CLIENT_PC:
     got = PF.classify(cmd)
-    ok(got == cls, "%-28s ← %s [%s]" % (str(got), " ".join(cmd.split())[:74], src))
+    ok(got == cls, "%-34s ← %s [%s]" % (str(got), " ".join(cmd.split())[:68], src))
 
 # ── (2) БЛИЖНИЕ ПРОМАХИ ────────────────────────────────────────────────────────────────────
 print("(2) слово о событии ≠ событие:")
@@ -255,13 +273,18 @@ ok(r5.returncode == 0 and r5.stdout == "", "хук отработал молча
 ok(len(got5) == 1, "ровно одна попытка отправки (получено %d)" % len(got5))
 n5 = got5[0] if got5 else ""
 ok(n5.startswith("FEED "), "адрес — ЛЕНТА (send_feed), не карточка и не личка")
-ok("🔔" in n5 and "рестарт клиентского бота" in n5, "класс назван, форма 🔔")
+ok("🔔" in n5 and "рестарт внутреннего сервиса splinter" in n5, "класс назван, форма 🔔")
 ok("VPS · задача 271" in n5, "метка полосы + номер задачи стоят")
 ok("systemctl restart splinter" in n5, "команда видна дословно")
 ok(len(n5.split("\n")) == 1, "заметка — ОДНА строка")
 ok(not any(t in n5.lower() for t in ("да ", "op=", "needs_approval", "approve", "кнопк", "✅")),
    "ответить нечем: ни «да», ни op=, ни кнопок")
-for cmd, cls, _src in (HITS[4], HITS[5], HITS[10], HITS[11]):
+# По одному представителю КАЖДОГО из четырёх живых классов — выбираем по имени класса, а не по
+# индексу списка: индекс молча съезжает при любой правке голденов (push уехал — «сквозь хук»
+# проверял бы соседа).
+_THROUGH = [next((c, k, s) for c, k, s in HITS + CLIENT_PC if k.startswith(pref))
+            for pref in ("вынос теста", "отброс рабочего", "стирание маркеров", "стоп клиентского")]
+for cmd, cls, _src in _THROUGH:
     shutil.rmtree(SEEN, ignore_errors=True)
     c = os.path.join(TMP, "c5_%d.txt" % len(res))
     run_hook(probe_payload(cmd), count_file=c)
@@ -286,54 +309,34 @@ ok(PF.refused("Error: Exit code 1\n…") is False, "упавшая команд�
 ok(PF.refused(LIVE_OK) is False and PF.refused("обычный вывод") is False, "успех отказом не зовём")
 shutil.rmtree(SEEN, ignore_errors=True)
 c6 = os.path.join(TMP, "c6.txt")
-run_hook(probe_payload("git push origin main", resp="Error: This command requires approval"),
+# Команда ЖИВОГО класса (после отзыва push прежняя фикстура молчала бы и без ветки отказа —
+# «мок, переставший задевать ветку, хуже отсутствующего»).
+run_hook(probe_payload("systemctl restart splinter", resp="Error: This command requires approval"),
          count_file=c6)
 ok(lines(c6) == [], "ОТКАЗ движка → заметки нет вовсе: лента говорит только о случившемся")
 shutil.rmtree(SEEN, ignore_errors=True)
 c6b = os.path.join(TMP, "c6b.txt")
-run_hook(probe_payload("git push origin main",
-                       resp="Error: Exit code 1\n🔴 ТЕСТЫ КРАСНЫЕ — push заблокирован"),
+run_hook(probe_payload("systemctl restart splinter",
+                       resp="Error: Exit code 1\nFailed to restart splinter.service"),
          count_file=c6b)
 n6b = (lines(c6b) or [""])[0]
-ok("ошибка (код 1)" in n6b, "push, отбитый гейтом, назван ошибкой, а не «выполнено»")
+ok("ошибка (код 1)" in n6b, "упавшая команда названа ошибкой, а не «выполнено»")
 
-# ── (7) ДЕТАЛЬ PUSH ────────────────────────────────────────────────────────────────────────
-print("(7) деталь push — ветка · сколько коммитов · диапазон · ⚠️ машинерия защиты:")
+# ── (7) PUSH ОТОЗВАН + ДЕДУП БЕЗ ДЕТАЛИ ────────────────────────────────────────────────────
+print("(7) push отозван владельцем (05.08.2026), дедуп работает без детали:")
+ok(not any(str(n).startswith("push") for n, _p in PF._CLASSES), "класса push нет в таблице")
+ok(len(PF._CLASSES) == 4, "классов ровно четыре (было пять), факт %d" % len(PF._CLASSES))
+ok(not hasattr(PF, "_push_out") and not hasattr(PF, "push_detail"),
+   "предикат и деталь push удалены вместе с классом — мёртвого кода не осталось")
 PUSH_RESP = {"stdout": "✅ ГЕЙТ (полный): 145 тестов зелёные (52.4с) — прод-операция «push» "
                        "разрешена.\nTo https://github.com/mxfill77/turbobaby-manager-bot.git\n"
                        "   1c23895..fc07efa  main -> main\n",
              "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False}
-det = PF.push_detail("git push origin main", PUSH_RESP, cwd=ROOT)
-ok(det and "main" in det and "1c23895..fc07efa" in det, "ветка и диапазон названы: %s" % det)
-
-
-def git_read(args):
-    try:
-        p = subprocess.run(["git", "-C", ROOT] + args, capture_output=True, text=True, timeout=10)
-        return p.stdout if p.returncode == 0 else ""
-    except Exception:
-        return ""
-
-
-cnt = (git_read(["rev-list", "--count", "1c23895..fc07efa"]) or "").strip()
-files = (git_read(["diff", "--name-only", "1c23895..fc07efa"]) or "").split()
-if cnt.isdigit() and files:
-    ok(cnt in (det or ""), "число коммитов взято из git (%s)" % cnt)
-    want_warn = any(f.startswith("tests/") or os.path.basename(f) in
-                    ("pretool_guard.py", "orchestrator_daemon.py", "devbot.py", "gate.py",
-                     "posttool_feed.py", "card_duty.py", "notify.py", "invariants_check.py")
-                    for f in files)
-    ok(("⚠️" in (det or "")) == want_warn,
-       "пометка ⚠️ ровно тогда, когда в диапазоне машинерия защиты (ожидали %s)" % want_warn)
-else:
-    print("  WARN  диапазон 1c23895..fc07efa в этом клоне не разрешается — деталь без числа")
-    ok(det is not None, "деталь всё равно построена (fail-soft, без числа)")
-ok(PF.push_detail("git push origin main", {"stdout": "Everything up-to-date\n", "stderr": ""},
-                  cwd=ROOT) is None, "диапазона нет → детали нет, заметка не выдумывает")
-nb = PF.push_detail("git push -u origin feat", {"stdout": "", "stderr":
-                    " * [new branch]      feat -> feat\n"}, cwd=ROOT)
-ok(nb is not None and "feat" in nb, "новая ветка названа: %s" % nb)
-# Дедуп: два РАЗНЫХ push в одной задаче — два разных факта мира, глушить второй нельзя.
+shutil.rmtree(SEEN, ignore_errors=True)
+c7 = os.path.join(TMP, "c7.txt")
+run_hook(probe_payload("git push origin main", resp=PUSH_RESP), count_file=c7)
+ok(lines(c7) == [], "УСПЕШНЫЙ push сквозь живой хук → ноль отправок")
+# Дедуп: повтор той же команды класса гасится, ДРУГАЯ команда того же класса — нет.
 box = []
 _o_send, _o_probe = PF.send, PF.is_probe
 PF.send = lambda t: (box.append(t), True)[1]
@@ -342,13 +345,13 @@ os.environ["CC_FEED_SEEN_DIR"] = SEEN
 os.environ["CC_TASK_ID"] = "902"
 try:
     shutil.rmtree(SEEN, ignore_errors=True)
-    r2 = dict(PUSH_RESP)
-    r2["stdout"] = PUSH_RESP["stdout"].replace("1c23895..fc07efa", "aaaaaaa..bbbbbbb")
-    PF.handle(probe_payload("git push origin main", resp=PUSH_RESP))
-    PF.handle(probe_payload("git push origin main", resp=PUSH_RESP))
-    ok(len(box) == 1, "тот же push с тем же диапазоном второй заметки не рождает")
-    PF.handle(probe_payload("git push origin main", resp=r2))
-    ok(len(box) == 2, "ДРУГОЙ диапазон = другой факт → заметка есть")
+    PF.handle(probe_payload("systemctl restart splinter"))
+    PF.handle(probe_payload("systemctl restart splinter"))
+    ok(len(box) == 1, "та же команда в той же задаче второй заметки не рождает")
+    PF.handle(probe_payload("systemctl stop splinter"))
+    ok(len(box) == 2, "другая команда того же класса — другой факт → заметка есть")
+    ok(PF._fingerprint("к", "cmd") == PF._fingerprint("к", "cmd", ""),
+       "деталь пустая/отсутствует → отпечаток тот же, что был до неё")
 finally:
     PF.send, PF.is_probe = _o_send, _o_probe
     os.environ.pop("CC_TASK_ID", None)
@@ -398,11 +401,19 @@ ok(TMP.startswith(tempfile.gettempdir()) and MARKERS.startswith(TMP),
 
 # ── (10) ИЗОЛЯЦИЯ ПРОБ НА КОМАНДАХ СПИСКА ──────────────────────────────────────────────────
 print("(10) изоляция проб действует и на списке (фикстура не будит владельца):")
+# Команда ЖИВОГО класса — иначе после отзыва push проверка молчала бы сама по себе и ветку
+# изоляции не задевала вовсе (мок, переставший задевать ветку, хуже отсутствующего).
 for name in ("PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PRETOOL_NOPUSH", "PYTEST_CURRENT_TEST"):
     shutil.rmtree(SEEN, ignore_errors=True)
     c = os.path.join(TMP, "c10_%s.txt" % name)
-    run_hook(probe_payload("git push origin main"), count_file=c, extra={name: "1"})
-    ok(lines(c) == [], "%s=1 → о push из фикстуры лента молчит" % name)
+    run_hook(probe_payload("systemctl restart splinter"), count_file=c, extra={name: "1"})
+    ok(lines(c) == [], "%s=1 → о рестарте из фикстуры лента молчит" % name)
+# Контроль той же ветки: БЕЗ признака пробы та же команда заметку даёт (иначе «молчит» ничего
+# не доказывает — проверка обязана уметь краснеть).
+shutil.rmtree(SEEN, ignore_errors=True)
+c10ctl = os.path.join(TMP, "c10_ctl.txt")
+run_hook(probe_payload("systemctl restart splinter"), count_file=c10ctl)
+ok(len(lines(c10ctl)) == 1, "контроль: без признака пробы та же команда даёт заметку")
 shutil.rmtree(SEEN, ignore_errors=True)
 c10 = os.path.join(TMP, "c10_prefix.txt")
 run_hook(probe_payload("PRETOOL_TEST_RUN=1 systemctl restart splinter"), count_file=c10)
