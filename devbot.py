@@ -23,6 +23,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import bridge_client
 import task_metrics          # общий детектор тест-прогона (под тестом боевые артефакты не трогаем)
+import report_digest         # чистая функция «тело отчёта → что показать в чате» (часть 2)
 
 log = logging.getLogger(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -1008,12 +1009,21 @@ def _kb_approval(qid):
     ])
 
 
-def _kb_done(qid):
-    """Кнопки под done: многоразовые 🔄 Проверь / 📋 Дальше (✅/❌ тут не нужны — задача уже завершена)."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Проверь", callback_data=f"check:{qid}"),
-         InlineKeyboardButton("📋 Дальше", callback_data=f"next:{qid}")],
-    ])
+def _kb_done(qid, full=False):
+    """Кнопки под done: многоразовые 🔄 Проверь / 📋 Дальше (✅/❌ тут не нужны — задача уже завершена).
+    full=True → отчёт не поместился в карточку (см. report_digest): сверху встаёт «📄 отчёт» —
+    это и есть «ссылка» из правила «итог + ссылка», работающая с телефона, без путей и файлов."""
+    rows = [[InlineKeyboardButton("🔄 Проверь", callback_data=f"check:{qid}"),
+             InlineKeyboardButton("📋 Дальше", callback_data=f"next:{qid}")]]
+    if full:
+        rows.insert(0, [InlineKeyboardButton("📄 отчёт", callback_data=f"full:{qid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_full(qid):
+    """Одна кнопка «📄 отчёт» — для failed-карточки с урезанным телом (кнопок у failed не было и
+    не появляется, пока отчёт помещается целиком: без урезания карточка байт-в-байт прежняя)."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📄 отчёт", callback_data=f"full:{qid}")]])
 
 
 def _find_task(bridge, qid):
@@ -1270,6 +1280,21 @@ async def _cb_check(context, q, qid, bridge):
     await _send_thread(context, q, txt)
 
 
+async def _cb_full(context, q, qid, bridge):
+    """full:<id> → ПОЛНЫЙ отчёт задачи в тему. МНОГОРАЗОВО (кнопка остаётся → новое сообщение).
+    Источник — та же запись очереди, из которой собиралась карточка: полный текст никуда не
+    копируется ради кнопки и не может разойтись с тем, что записал исполнитель."""
+    await _btn_answer(q, "📄")
+    status, item = await asyncio.to_thread(_find_task, bridge, qid)
+    if status is None:
+        txt = (f"📄 Задача {qid}: в очереди не найдена (подрезана?) — полный отчёт остался "
+               f"файлом-артефактом, путь назван в карточке.")
+    else:
+        res = str(item.get("result") or "").strip() or "(пустой результат)"
+        txt = f"📄 Задача {qid} — полный отчёт ({len(res)} симв.):\n\n{res}"
+    await _send_thread(context, q, txt)
+
+
 async def _cb_next(context, q, qid, bridge):
     """next:<id> → подсказка по следующему шагу. МНОГОРАЗОВО (кнопка остаётся → новое сообщение)."""
     await _btn_answer(q, "📋")
@@ -1314,6 +1339,8 @@ async def handle_callback(update, context, bridge) -> None:
             await _cb_check(context, q, qid, bridge)
         elif action == "next":
             await _cb_next(context, q, qid, bridge)
+        elif action == "full":
+            await _cb_full(context, q, qid, bridge)
         else:
             await _btn_answer(q)
     except Exception as e:
@@ -1453,6 +1480,84 @@ async def _send_inprogress_card(context, it):
             log.warning("devbot.report_results: анонс in_progress %s не ушёл (%s)", qid, e)
 
 
+# ── ОТЧЁТ В 328 = ИТОГ + ССЫЛКА (разделение каналов, часть 2, 05.08.2026) ────────────────
+# Замер до правки (снимок очереди, 298 терминальных задач 28.07–05.08): средняя длина result
+# 2096 симв., медиана 2050, 72 % длиннее 600 — тема 328 читалась как простыня, последовательность
+# задач одним взглядом не видна. Решение владельца: тело длиннее порога уходит в артефакт, в чат
+# едет номер + строка сути + ссылка. Решение о ФОРМЕ карточки — чистая функция report_digest
+# (юнит на дословных телах), здесь только руки: файл и кнопка.
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _reports_dir():
+    """Каталог артефактов отчётов. REPORTS_DIR — ручка для тестов (боевые файлы не трогаем)."""
+    return os.getenv("REPORTS_DIR") or os.path.join(ROOT, "reports")
+
+
+def _write_report_artifact(it, st, body):
+    """Полное тело отчёта → файл `reports/<дата>/task-<id>.md`. → путь для карточки | None.
+
+    FAIL-SAFE: любой сбой записи (диск, права, кривая дата) = None → карточка уходит БЕЗ строки
+    пути, но с кнопкой «📄 отчёт» и полным телом в очереди. Отчёт не может пропасть из-за файла."""
+    try:
+        qid = it.get("id")
+        day = str(it.get("updated") or "")[:10]
+        if not _DAY_RE.match(day):
+            day = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        d = os.path.join(_reports_dir(), day)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"task-{qid}.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report_digest.artifact_text(qid, st, it.get("task_text"), body))
+        return os.path.relpath(path, ROOT) if path.startswith(ROOT + os.sep) else path
+    except Exception as e:
+        log.warning("devbot.report_results: артефакт отчёта %s не записан (%s)", it.get("id"), e)
+        return None
+
+
+# ── СИГНАЛ «ОЧЕРЕДЬ ПУСТА» (разделение каналов, часть 3, 05.08.2026) ──────────────────────
+# Одно короткое сообщение в 328 на ПЕРЕХОД в пустоту — не повтор каждые 45 секунд. Пустота = ни
+# одной задачи ОБЕИХ полос в очереди / в работе / в ожидании ответа / одобренной. Считается из
+# ТОГО ЖЕ снимка, что и плашка карточки (_build_banner), чтобы две правды не разошлись.
+_OPEN_STATUSES = ("new", "in_progress", "needs_approval", "approved")
+_queue_busy = None          # None = ещё не наблюдали: первый снимок сигнала НЕ рождает
+_closed_since_busy = []     # id, закрытые с момента, когда очередь последний раз была непустой
+
+
+def _queue_open_count(by):
+    """Сколько задач наших меток ещё живо в снимке. by=None сюда не доходит: без данных очереди
+    о пустоте не заявляем НИКОГДА (тот же fail-safe, что у плашки «состояние недоступно»)."""
+    n = 0
+    for st in _OPEN_STATUSES:
+        for it in by.get(st, []) or []:
+            if str(it.get("from") or "") in QUEUE_FROMS:
+                n += 1
+    return n
+
+
+async def _announce_idle(context, by):
+    """Переход «работа была → всё закрыто» → РОВНО одно сообщение в 328. Пока очередь пуста и
+    ничего нового не приходило, сообщение не повторяется; новая задача взводит сигнал заново."""
+    global _queue_busy, _closed_since_busy
+    if _queue_open_count(by):
+        _queue_busy = True
+        return
+    if _queue_busy:                     # было занято, стало пусто — это и есть переход
+        ids = sorted(set(_closed_since_busy))
+        tail = ("\nЗакрыто: " + ", ".join(str(i) for i in ids)) if ids else ""
+        msg = f"🟢 Очередь пуста — в работе 0, ждёт тебя 0, в очереди 0 (обе полосы).{tail}"
+        for chunk in _chunks(msg):
+            try:
+                await context.bot.send_message(chat_id=HQ_CHAT_ID,
+                                               message_thread_id=DEVBOT_TOPIC, text=chunk)
+                log.info("devbot.report_results: сигнал «очередь пуста» отправлен, закрыто %s",
+                         ids or "—")
+            except Exception as e:
+                log.warning("devbot.report_results: сигнал «очередь пуста» не ушёл (%s)", e)
+    _queue_busy = False
+    _closed_since_busy = []
+
+
 async def report_results(context) -> None:
     """Фоновый job (раз в ~45с): приносит в 328 результат задач from=Filipp-328, ставших done/failed.
     Дедуп: _reported (память процесса). Seed-on-start: первый прогон лишь помечает уже-завершённые
@@ -1518,13 +1623,26 @@ async def report_results(context) -> None:
         # сохранённый result в Bridge не трогаем (инвариант «финал байт-в-байт»). См. helper ниже.
         unv = _unverified_card_prefix(st, it)
         banner = _build_banner(qid, task_text, task_from, by)
-        head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{body}\n{banner}"
+        # Тело длиннее порога → в чат едет итог + ссылка, полный текст в артефакт и под кнопку.
+        # Короткий отчёт (digest вернул None) идёт БАЙТ-В-БАЙТ прежним путём.
+        short = report_digest.digest(body)
+        if short is None:
+            head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{body}\n{banner}"
+        else:
+            art = _write_report_artifact(it, st, body)
+            link = f"📄 отчёт целиком ({len(body)} симв.) — кнопка «📄 отчёт» ниже"
+            if art:
+                link += f" · {art}"
+            head = f"{emoji} Задача {qid}{rep} — {st}\n\n{unv}{short}\n\n{link}\n{banner}"
         chunks = _chunks(head)
         last_msg_obj = None
         for i, chunk in enumerate(chunks):
             kw = {"chat_id": HQ_CHAT_ID, "message_thread_id": _item_topic(it), "text": chunk}
-            if st == "done" and i == len(chunks) - 1:   # 🔄/📋 только под done, на последнем чанке
-                kw["reply_markup"] = _kb_done(qid)
+            if i == len(chunks) - 1:                    # кнопки — на последнем чанке
+                if st == "done":                        # 🔄/📋 как были (+📄, если отчёт урезан)
+                    kw["reply_markup"] = _kb_done(qid, full=short is not None)
+                elif short is not None:                 # failed: кнопка только ради урезанного тела
+                    kw["reply_markup"] = _kb_full(qid)
             try:
                 m = await context.bot.send_message(**kw)
                 if i == len(chunks) - 1:
@@ -1545,6 +1663,7 @@ async def report_results(context) -> None:
                 HQ_CHAT_ID, _item_topic(it), last_msg_obj.message_id,
                 base_text, task_text, task_from, st, time.monotonic(),
             )
+        _closed_since_busy.append(qid)   # номера для сигнала «очередь пуста» (часть 3)
 
     # needs_approval (заход 2б-2): задача упёрлась в красную зону — спрашиваем «да N»/«нет N».
     # БЕЗ seed (незакрытый вопрос после рестарта стоит переспросить); дедуп = _asked в памяти процесса.
@@ -1597,6 +1716,9 @@ async def report_results(context) -> None:
                         await context.bot.send_message(chat_id=HQ_CHAT_ID, message_thread_id=_item_topic(it), text=chunk)
                     except Exception as e:
                         log.warning("devbot.report_results: warn о зависании %s не ушло (%s)", qid, e)
+
+    # Часть 3: обе полосы пусты → РОВНО одно сообщение в 328 на переход в пустоту.
+    await _announce_idle(context, by)
 
 
 # ===================== ЗЕЛЁНЫЕ ЗАДАЧИ (read-only) =====================

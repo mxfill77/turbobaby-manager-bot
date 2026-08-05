@@ -87,6 +87,9 @@ def reset(snapshot, seeded=True, start=START):
     DB._reported.clear(); DB._asked.clear()
     DB._inprogress_seen.clear(); DB._stalled.clear()
     DB._curator_pending.clear()
+    # Сигнал «очередь пуста» (05.08.2026) — состояние ПЕРЕХОДА, а не снимка: чистим вместе с
+    # дедупами, иначе занятость из соседнего кейса протекает и одиночный снимок рождает сигнал.
+    DB._queue_busy = None; DB._closed_since_busy = []
     DB._report_seeded = seeded
     DB._PROC_START_TS = start
     DB.BRIDGE = FakeBridge(snapshot)
