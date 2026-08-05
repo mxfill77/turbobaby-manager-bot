@@ -1492,9 +1492,9 @@ def _card(hit, blob="", test=False, cmd="", count=1, repeat=0):
             "Проверь: " + check + " — жду твоё «да».")
 
 
-def _repeat_seen(data, cmd, hit, obj, num):
-    """Сколько раз ЭТА ЖЕ операция уже была разрешена владельцем в ЭТОМ заходе (0 = ни разу),
-    и заодно — отметка «про эту команду я спросил вот об этой операции».
+def _repeat_seen(data, hit, obj, num):
+    """Сколько раз ЭТА ЖЕ операция уже была разрешена владельцем в ЭТОМ заходе (0 = ни разу).
+    ТОЛЬКО ЧТЕНИЕ — пометку ставит `_repeat_mark`, и только когда вопрос действительно будет задан.
 
     Тождество берётся из ОТПЕЧАТКА (класс + объект + число), то есть из карточки, а не из текста
     команды: две разные команды с одной картой — один вопрос, одна команда с другой целью — разные.
@@ -1509,12 +1509,31 @@ def _repeat_seen(data, cmd, hit, obj, num):
         fp = repeat_ask.fingerprint(hit, obj, num)
         if not fp:
             return 0
-        key = repeat_ask.run_key(data)
-        n = repeat_ask.approved_count(key, fp, isolated())
-        repeat_ask.mark_asked(key, cmd, fp, isolated())
-        return n
+        return repeat_ask.approved_count(key_of(data), fp, isolated())
     except Exception:
         return 0
+
+
+def key_of(data):
+    """Ключ захода (задача демона либо сессия движка) — одной ручкой для чтения и пометки."""
+    return repeat_ask.run_key(data)
+
+
+def _repeat_mark(data, cmd, hit, obj, num):
+    """«Про ЭТУ команду я СПРОСИЛ вот об этой операции» — связка для PostToolUse-хука.
+
+    Ставится ТОЛЬКО на пути, который ведёт к вопросу. Раньше пометка стояла и на пути СНЯТИЯ
+    вопроса, и тогда исполнение уже-снятой операции засчитывалось ещё одним «да»: счётчик
+    «это N-й раз» считал ИСПОЛНЕНИЯ, а не разрешения владельца, и число в карточке перехода
+    было неправдой (ревизия 05.08.2026). Правом пометка не является ни в каком виде."""
+    if repeat_ask is None:
+        return
+    try:
+        fp = repeat_ask.fingerprint(hit, obj, num)
+        if fp:
+            repeat_ask.mark_asked(key_of(data), cmd, fp, isolated())
+    except Exception:
+        pass
 
 
 def _probe_intercept(card, tid=""):
@@ -2469,12 +2488,15 @@ def main():
     # штатные слои settings, и они в силе. ПЕРЕХОД (провести/отменить/создать/удалить/
     # перезапустить) — вопрос остаётся, но карточка говорит, что это ПОВТОР: иначе владелец
     # подтверждает второй факт, читая текст первого.
-    seen = _repeat_seen(data, cmd, hit, obj, num)
+    seen = _repeat_seen(data, hit, obj, num)
     if seen and repeat_ask is not None and repeat_ask.same_state(hit):
         _guard_log("repeat_withdrawn", cmd,
                    "%s: объект=%s, число=%s — владелец уже разрешил эту операцию в этом заходе "
                    "(%d), повтор состояния не меняет" % (hit, obj or "—", num or "—", seen))
         _defer()
+    # Отсюда вопрос будет задан при любом исходе ниже (карточка или строка журнала) — значит и
+    # связка «команда → операция» ставится ЗДЕСЬ, а не на пути снятия вопроса.
+    _repeat_mark(data, cmd, hit, obj, num)
     if seen:
         card = _card(hit, blob, probe, cmd=cmd, repeat=seen + 1)
     if not card_gate(hit, obj, num):
