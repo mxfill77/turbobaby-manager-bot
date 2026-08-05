@@ -731,6 +731,36 @@ def check_card_duty_pure(world, run):
         run.flag(f"card_duty.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12: CURATOR_EVENT_PURE
+#  Тождество СОБЫТИЯ между целями (curator_event.py) решает, ставить ли кураторское продолжение.
+#  Его граница та же, что у дежурного: модуль ОТВЕЧАЕТ «одно ли это событие» и НЕ ходит в мир —
+#  ни очереди, ни моста, ни файлов; ставит и отказывает только orchestrator_daemon. Держится это
+#  не докстрингом, а отсутствием инструментов: ровно один импорт (`re`). Разбор — тот же ast, что
+#  у дежурного (имя в комментарии/строке кодом не является).
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: нечитаемое правило доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_CURATOR_EVENT_PATH = None      # подменяется САМОТЕСТОМ; None → боевой curator_event.py в репо
+
+
+@register("CURATOR_EVENT_PURE")
+def check_curator_event_pure(world, run):
+    path = _CURATOR_EVENT_PATH or os.path.join(REPO, "curator_event.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("curator_event.py", f"модуль тождества не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src)
+    except SyntaxError as e:
+        run.flag("curator_event.py", f"модуль тождества не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"curator_event.py:{where}", why)
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
@@ -1189,7 +1219,7 @@ def _self_test():
 
     # Проверяем предвычисленные ALL-результаты
     for _all_title, _all_got, _all_expect in [
-        ("чистый мир — 0 нарушений ВСЕГО (11 инвариантов)", _total_clean, 0),
+        ("чистый мир — 0 нарушений ВСЕГО (все зарегистрированные инварианты)", _total_clean, 0),
         ("деградация (всё None) → 0 нарушений суммарно", _total_degraded, 0),
     ]:
         ok = (_all_got == _all_expect)

@@ -39,6 +39,7 @@ sys.path.insert(0, REPO)
 from bridge_client import BridgeClient, FIXTURE_TASK_RE, _fixture_norm
 import card_duty          # ДЕЖУРНЫЙ ПО КАРТОЧКАМ: чистое решение без ввода-вывода (см. _maybe_card_duty)
 import curator_ops        # РАЗБОР ПУНКТА СВОДКИ НА ОПЕРАЦИИ: чистая функция (см. _curator_human_place)
+import curator_event      # ТОЖДЕСТВО СОБЫТИЯ МЕЖДУ ЦЕЛЯМИ: чистая функция (см. _curator_event_seen)
 
 
 def _is_fixture(text: str) -> bool:
@@ -2370,6 +2371,11 @@ VERIFIED_FACTS_FILE = os.path.join(REPO, "verified_facts.json")
 VERIFIED_FACTS_LOCK = os.path.join(REPO, "verified_facts.lock")
 FACT_TTL = _env_int("FACT_TTL", 21600)   # 6ч по умолчанию (.env); 0 = всё устаревшее (тест)
 DEDUP_WINDOW = _env_int("DEDUP_WINDOW", 1800)  # 30 мин — окно дедупа followup-проверок куратора
+# === СОБЫТИЕ СОСЕДА (05.08.2026, класс «куратор не видит закрытую цель соседа») ===
+# Окно соседства для тождества СОБЫТИЯ (curator_event): сосед старше окна событием уже не
+# считается — факт мог протухнуть (рестарт, новые коммиты). 6ч = FACT_TTL по духу; замер на
+# живом корпусе показал одинаковый результат и при 6ч, и при 24ч (оба совпадения ~1ч).
+EVENT_WINDOW = _env_int("EVENT_WINDOW", 21600)
 # Под тест-прогоном (ORCH_DAEMON_TEST/pytest/test_*.py) реестр заглушается: _vf_write — no-op,
 # _vf_check — None. Иначе test_curator_budget/test_curator загрязняли бы production-файл
 # между тест-кейсами. test_verified_facts.py явно снимает флаг + перенаправляет пути в tmpdir.
@@ -2820,21 +2826,33 @@ def _curator_root_depth(kind, key, goal):
     return int(m.group(1)), 2
 
 
-def _curator_used(root):
+def _queue_items():
+    """Очередь ЦЕЛИКОМ одним CSV-опросом → list[dict] (у каждого item есть status), None при
+    сбое. Один опрос обслуживает и бюджеты (_curator_used), и тождество события
+    (_curator_event_seen) — второго похода к мосту за тот же снимок не делаем."""
+    try:
+        r = bc.get_pending("new,in_progress,done,failed,needs_approval,approved")
+    except Exception:
+        return None
+    if not r.get("ok"):
+        return None
+    return list(r.get("items", []))
+
+
+def _curator_used(root, items=None):
     """Срез бюджетов из маркеров очереди ОДНИМ CSV-опросом (restart-proof):
     (продолжений по корню root, куратор-задач за сегодня UTC по всем корням, max шаг корня).
     None при сбое опроса — вызывающий код задачи НЕ ставит (fail-safe: без доказанного бюджета
     не плодим, карточка объяснит владельцу). created нечитаем → считаем сегодняшней (в сторону
-    лимита, не в сторону спама)."""
-    try:
-        r = bc.get_pending("new,in_progress,done,failed,needs_approval,approved")
-        if not r.get("ok"):
-            return None
-    except Exception:
+    лимита, не в сторону спама). items — готовый снимок очереди (см. _queue_items); None →
+    опрашиваем сами (прежнее поведение)."""
+    if items is None:
+        items = _queue_items()
+    if items is None:
         return None
     per_root, today, max_step = 0, 0, 0
     now = datetime.datetime.now(datetime.timezone.utc)
-    for it in r.get("items", []):
+    for it in items:
         m = _CURATOR_GOAL_RE.match(str(it.get("task_text") or ""))
         if not m:
             continue
@@ -2853,6 +2871,62 @@ def _curator_used(root):
     return per_root, today, max_step
 
 
+# === СОБЫТИЕ СОСЕДА: тот же факт уже проверяет/проверила ДРУГАЯ цель (05.08.2026) ===
+# Куратор независим на каждом терминале и НЕ ВИДИТ соседних целей. Живой класс: ТЗ владельца
+# пришло дважды (цели 320/324 и 319/323 — дословно один заголовок), каждая цель родила свою
+# журнальную проверку одного события, все холостые («запись была с самого начала»). Реестр
+# фактов (_vf_*) и дедуп окна (_followup_dedup) их не ловят: ключ там — ТЕКСТ задачи, а
+# формулировки соседей разные. Тождество здесь считается ПО СОБЫТИЮ (curator_event: вид факта
+# × предмет-имя), ОБЛАСТЬ (файл/модуль) предметом не считается — две цели вправе править один
+# файл разными правками. FAIL-SAFE везде: снимка нет / событие не образовано / любое
+# исключение → задача ставится КАК ПРЕЖДЕ (правило умеет только НЕ ставить, а не разрешать).
+_EVENT_DEAD_STATUS = ("failed", "rejected")   # сосед умер — факт не закрыт, проверять законно
+
+
+def _curator_event_seen(root, task_text, goal, items):
+    """Сосед по СОБЫТИЮ: кураторская задача ДРУГОГО корня в окне EVENT_WINDOW, чьё событие
+    совпало с событием предлагаемого ТЗ. Возврат (id, root2, status2, «HH:MM», предмет) или
+    None. Свой корень пропускается намеренно — это шаги одной цели, их держат бюджеты.
+    Свежайший сосед выигрывает (о нём и говорим владельцу)."""
+    try:
+        if not items:
+            return None
+        by_id = {}
+        for it in items:
+            try:
+                by_id[int(it.get("id"))] = it
+            except (TypeError, ValueError):
+                continue
+        goal_text = str((by_id.get(int(root)) or {}).get("task_text") or goal or "")
+        mine = curator_event.event_of(task_text, goal_text)
+        if mine is None:
+            return None
+        best = None
+        for it in items:
+            m = _CURATOR_GOAL_RE.match(str(it.get("task_text") or ""))
+            if not m:
+                continue
+            root2 = int(m.group(1))
+            if root2 == int(root):
+                continue
+            if str(it.get("status") or "").strip().lower() in _EVENT_DEAD_STATUS:
+                continue
+            age = _age_sec(it.get("created"))
+            if age is None or age > EVENT_WINDOW:
+                continue
+            goal2 = str((by_id.get(root2) or {}).get("task_text") or "")
+            ev2 = curator_event.event_of(it.get("task_text"), goal2)
+            if not curator_event.same_event(mine, ev2):
+                continue
+            if best is None or age < best[0]:
+                best = (age, it.get("id"), root2, str(it.get("status") or ""),
+                        _vf_ts_hhmm(it.get("created")), curator_event.shared_subject(mine, ev2))
+        return best[1:] if best else None
+    except Exception as e:
+        log.warning("curator-event: сбой сверки события (%s) — fail-safe (ставим как прежде)", e)
+        return None
+
+
 def _curator_spawn(kind, key, goal, tasks):
     """Ветка followup (шаг 3/7 родитель 231): каждое ТЗ куратора → задача from=Filipp-curator
     ТОЙ ЖЕ полосы (куратор живёт только на vps-терминалах → полоса vps, дефолт enqueue) с
@@ -2865,7 +2939,8 @@ def _curator_spawn(kind, key, goal, tasks):
     if depth > CURATOR_MAX_DEPTH:
         return {"root": root, "placed": [],
                 "refused": [(t, f"глубина цепочки продолжений > {CURATOR_MAX_DEPTH}") for t in tasks]}
-    used = _curator_used(root)
+    items = _queue_items()        # ОДИН снимок очереди на бюджеты И на тождество события
+    used = _curator_used(root, items)
     if used is None:
         return {"root": root, "placed": [],
                 "refused": [(t, "очередь не опросить — бюджет не доказать") for t in tasks]}
@@ -2890,6 +2965,21 @@ def _curator_spawn(kind, key, goal, tasks):
                 refused.append((t, f"кэш: задача {cid} уже поставлена в {hm} UTC (ожидает результат)"))
             else:
                 refused.append((t, f"кэш: уже подтверждено задачей {cid} в {hm} UTC — «{cv[:80]}»"))
+            continue
+        # СОБЫТИЕ СОСЕДА: тот же факт уже закрыт/проверяется ДРУГОЙ целью (тождество по
+        # событию, не по номеру цели и не по области). Отказ виден владельцу в карточке —
+        # не согласен, дожимает «тз:» руками.
+        seen = _curator_event_seen(root, t, goal, items)
+        if seen is not None:
+            sid_, sroot, sstat, shm, subj = seen
+            closed = str(sstat).strip().lower() == "done"
+            refused.append((t, ("событие уже закрыто целью" if closed else
+                                "то же событие уже проверяет цель") +
+                            f" {sroot} (задача {sid_}, {shm} UTC" +
+                            (")" if closed else f", статус {sstat})") +
+                            (f"; общий предмет — {subj}" if subj else "")))
+            log.info("curator-event: ТЗ по цели %s не поставлено — сосед %s (цель %s, %s), предмет %s",
+                     root, sid_, sroot, sstat, subj)
             continue
         max_step += 1
         try:
