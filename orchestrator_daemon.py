@@ -40,6 +40,7 @@ from bridge_client import BridgeClient, FIXTURE_TASK_RE, _fixture_norm
 import card_duty          # ДЕЖУРНЫЙ ПО КАРТОЧКАМ: чистое решение без ввода-вывода (см. _maybe_card_duty)
 import curator_ops        # РАЗБОР ПУНКТА СВОДКИ НА ОПЕРАЦИИ: чистая функция (см. _curator_human_place)
 import curator_event      # ТОЖДЕСТВО СОБЫТИЯ МЕЖДУ ЦЕЛЯМИ: чистая функция (см. _curator_event_seen)
+import prod_drift         # ДЕТЕКТОР ДРЕЙФА ПРОДА: read-only, только говорит (см. _maybe_prod_drift)
 
 
 def _is_fixture(text: str) -> bool:
@@ -4581,12 +4582,120 @@ def process_na_reminders():
     _na_reminded &= active_ids   # очистить id задач, которые больше не needs_approval
 
 
+# ═══════════════ ДЕТЕКТОР ДРЕЙФА ПРОДА (06.08.2026, решение владельца «без рестарта») ═══════
+# Разбор и решение живут в prod_drift.py — модуле, который НЕ УМЕЕТ ни перезапускать, ни писать,
+# ни отправлять (инвариант PROD_DRIFT_READONLY в гейте: словарь внешних команд = читающий git,
+# open только на чтение, импорты по списку). Здесь — только руки: спросить факты, отдать заметку
+# в ленту 829 и запомнить эпизод, чтобы не повторяться.
+#
+# АВТОМАТИКИ РЕСТАРТА НЕТ НИ В КАКОМ ВИДЕ. Заметка информационная: кнопок нет, номера нет, слова
+# «да» нет — отвечать не на что и нечем. Когда перезапускать прод, решает владелец; система лишь
+# перестаёт молчать о разрыве (разбор цели 355: демон 49 % недели позади git, splinter 39 %,
+# самый долгий разрыв 34,4 ч закрыт ПОСТОРОННИМ апгрейдом пакетов — разрыв не видел никто).
+#
+# ПОЧЕМУ ПОСЛЕДНИМ В ЦИКЛЕ: детектор ходит в /proc и зовёт git, а очередь ждать не должна.
+# ПОЧЕМУ ТРОТТЛИНГ: цикл демона — минута, а разрыв меряется часами; лишние 60 запусков git в час
+# не купили бы ни одной заметки раньше.
+# ОТКАТ: DRIFT_HOURS=0 в .env + рестарт демона → ветка мертва целиком (вердикт пуст ДО сбора
+# фактов, git не зовётся ни разу).
+DRIFT_STATE_DIR = "/tmp/cc_drift_seen"                # эпизоды, о которых уже сказали
+DRIFT_EVERY_SEC = _env_int("DRIFT_EVERY_SEC", 900)    # как часто вообще собирать факты
+DRIFT_KEEP = 16                                       # сколько ключей эпизодов помним
+_drift_next = 0.0                                     # ближайший разрешённый замер (троттлинг)
+
+
+def _drift_dir():
+    """Каталог состояния. ORCH_TEST_MODE → тест-каталог: зеркало дисциплины _guard_markers_sweep,
+    тест НЕ пишет в боевой каталог никогда. CC_DRIFT_DIR — явная подмена (осознанный вызов)."""
+    explicit = (os.environ.get("CC_DRIFT_DIR") or "").strip()
+    if explicit:
+        return explicit
+    if (os.environ.get("ORCH_TEST_MODE") or "").strip():
+        return DRIFT_STATE_DIR + "_test"
+    return DRIFT_STATE_DIR
+
+
+def _drift_seen(key):
+    """Об этом эпизоде уже говорили? FAIL-SAFE: файла нет / мусор → False, то есть скажем ещё раз.
+    Направление выбрано в сторону лишней заметки: молчание — ровно то, что мы чиним."""
+    try:
+        with open(os.path.join(_drift_dir(), "seen.json"), encoding="utf-8") as f:
+            return str(key) in (json.load(f) or {}).get("keys", [])
+    except Exception:
+        return False
+
+
+def _drift_mark(key):
+    """Запомнить эпизод (ключ = юнит · старт процесса · первый неподхваченный коммит).
+    Best-effort: диск недоступен → худшее, что случится, — повтор заметки на следующем замере."""
+    d = _drift_dir()
+    keys = []
+    try:
+        with open(os.path.join(d, "seen.json"), encoding="utf-8") as f:
+            keys = list((json.load(f) or {}).get("keys", []))
+    except Exception:
+        keys = []
+    keys = ([str(key)] + [k for k in keys if k != str(key)])[:DRIFT_KEEP]
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, "seen.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"keys": keys}, f)
+        os.replace(tmp, os.path.join(d, "seen.json"))
+    except Exception as e:
+        log.warning("дрейф прода: состояние не сохранено (%s) — возможен повтор заметки", e)
+
+
+def _maybe_prod_drift(now=None):
+    """DRIFT_HOURS > 0 → сказать в ленту 829 о живом процессе, который отстал от origin/main.
+    → список ключей эпизодов, о которых сказали В ЭТОТ раз (для лога и теста).
+
+    НИ ОДИН ПРОЦЕСС ЗДЕСЬ НЕ ПЕРЕЗАПУСКАЕТСЯ: ветка умеет ровно два действия — прочитать факты и
+    отправить строку. FAIL-SAFE на каждом шаге (флаг, сбор фактов, вердикт, канал, состояние) →
+    молчание, то есть поведение байт-в-байт как без детектора."""
+    global _drift_next
+    try:
+        hours = prod_drift.hours_env()
+        if hours <= 0:
+            return []
+        now = time.time() if now is None else float(now)
+        if now < _drift_next:
+            return []
+        _drift_next = now + DRIFT_EVERY_SEC
+        notes = prod_drift.verdict(prod_drift.snapshot(now=now), hours)
+    except Exception as e:
+        log.warning("дрейф прода: замер пропущен (%s)", e)
+        return []
+    said = []
+    for n in notes:
+        try:
+            if _drift_seen(n.get("key")):
+                continue
+            import notify
+            if not notify.send_feed(prod_drift.render(n, "VPS")):
+                log.warning("ДРЕЙФ ПРОДА: %s позади на %s — заметка НЕ ушла (адрес/сеть); "
+                            "скажем на следующем замере", n.get("unit"),
+                            prod_drift.human_age(n.get("age")))
+                continue
+            _drift_mark(n.get("key"))
+            said.append(n.get("key"))
+            log.info("ДРЕЙФ ПРОДА: %s (PID %s) позади origin/main на %s — файлы: %s; первый "
+                     "неподхваченный коммит %s. Рестарт НЕ делается: решение владельца",
+                     n.get("unit"), n.get("pid"), prod_drift.human_age(n.get("age")),
+                     ", ".join(n.get("files") or []), n.get("sha"))
+        except Exception as e:
+            log.warning("дрейф прода: заметка не ушла (%s)", e)
+    return said
+
+
 def cycle():
     """Один проход: подобрать сирот in_progress (урок 138) → довести одобренное красное
     (approved) → добрать хвосты декомпозиций, финализированные мимо демона (сводка) → надзор
     цепей ПК-театра (полоса pc, read-only + релиз/хуки своих цепей) → взять новое (new).
     Выгрузка завершённых цепей (_prune_chain_cache): cheap check, только при превышении потолка.
-    Уборка осиротевших guard-маркеров (_guard_markers_sweep, цель 36): локальная ФС, до сети."""
+    Уборка осиротевших guard-маркеров (_guard_markers_sweep, цель 36): локальная ФС, до сети.
+    ПОСЛЕДНИМ — детектор дрейфа прода (_maybe_prod_drift, read-only + троттлинг): очередь важнее,
+    а разрыв меряется часами. Он только ГОВОРИТ (заметка в ленту), ничего не перезапуская."""
     _prune_chain_cache()
     _guard_markers_sweep()      # осиротевшие /tmp/cc_guard_block/*.json старше GUARD_MARKER_TTL
     _fixture_reap_open()        # закрыть фикстуры в needs_approval/approved (класс 193 рубеж 4)
@@ -4596,6 +4705,7 @@ def cycle():
     process_dec_tails()
     process_pc_chains()
     process_new()
+    _maybe_prod_drift()         # ДЕТЕКТОР ДРЕЙФА: read-only, только говорит (заметка в ленту 829)
 
 
 def main():
@@ -4604,12 +4714,14 @@ def main():
     _banner_cprocs = _live_claude_count() or 0
     log.info("=== ДЕМОН СТАРТ (poll=%ss, task_timeout=%ss/dev=%ss, approved_ttl=%ss, na_lifetime=%ss, auto_ops=%s, claude=%s, "
              "selfheal=%s, plan_adapt=%s, curator=%s, curator_scope=%s, gate_single_sel=%s, "
+             "drift=%sч/%sс, "
              "fact_ttl=%ss, model=%s, fallback=%s, executor_model=%s, effort=%s, "
              "mem_gate=%s(min=%dMB avail=%dMB), "
              "rss_gate=%s(max=%dMB cur=%dMB), proc_gate=%s(max=%d cur=%d), chain_cache=%d) ===",
              POLL_SEC, TASK_TIMEOUT, TASK_TIMEOUT_DEV, APPROVED_TTL, NA_LIFETIME, ",".join(AUTO_OPS), CLAUDE_BIN,
              int(_selfheal_on()), int(_plan_adapt_on()), int(_curator_on()), int(_curator_scope_on()),
              int(_gate_single_selective_on()),
+             prod_drift.hours_env(), DRIFT_EVERY_SEC,
              FACT_TTL, ORCH_MODEL, ORCH_MODEL_FALLBACK, EXECUTOR_MODEL,
              EXECUTOR_EFFORT,
              "on" if MEM_MIN_MB > 0 else "off", MEM_MIN_MB, _banner_avail,

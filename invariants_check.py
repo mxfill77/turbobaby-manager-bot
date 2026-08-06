@@ -761,6 +761,156 @@ def check_curator_event_pure(world, run):
         run.flag(f"curator_event.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 13: PROD_DRIFT_READONLY
+#  Детектор дрейфа прода (prod_drift.py) видит, что живой процесс отстал от origin/main, и
+#  ГОВОРИТ об этом. Решение владельца — «детектор без рестарта»: автоматики перезапуска живых
+#  процессов нет ни в каком виде. Это обязано держаться устройством, а не докстрингом, поэтому
+#  инвариант доказывает три «не умеет» разом:
+#    • НЕ ЗАПУСКАЕТ: единственная внешняя команда — `git`; первый элемент argv обязан быть
+#      литералом «git», `shell=True` запрещён, из subprocess разрешён только `run`;
+#    • НЕ ПИШЕТ: `open` только на чтение, ни одной пишущей/удаляющей ручки `os`;
+#    • НЕ ОТПРАВЛЯЕТ: импорты по списку — ни моста, ни notify, ни сети.
+#  Плюс словарь: слова, которыми в этой системе перезапускают процессы (`systemctl`,
+#  `systemd-run`, `pkill`, …), не смеют встречаться в КОДЕ модуля.
+#  ПОЧЕМУ ДОКСТРИНГИ ИСКЛЮЧЕНЫ ИЗ СЛОВАРЯ: документация обязана уметь НАЗВАТЬ то, чего модуль
+#  не делает («юнит берём из /proc/<pid>/cgroup, а не из вывода systemctl») — иначе честное
+#  объяснение границы стало бы нарушением границы. Исполнить докстринг всё равно нечем: голова
+#  argv проверена отдельным правилом, и она литерал.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ (нечитаемый детектор доверия не имеет).
+# --------------------------------------------------------------------------------------------
+_PROD_DRIFT_PATH = None         # подменяется САМОТЕСТОМ; None → боевой prod_drift.py в репо
+_DRIFT_ALLOWED_IMPORTS = frozenset(("ast", "os", "subprocess", "time"))
+# Ручки os, которыми пишут, удаляют, убивают и исполняют. Читающие (`os.stat`, `os.listdir`,
+# `os.sysconf`, `os.path.*`, `os.environ`) не перечислены намеренно — детектор ими и живёт.
+_DRIFT_FORBIDDEN_OS = frozenset((
+    "system", "popen", "kill", "killpg", "remove", "unlink", "rmdir", "removedirs", "rename",
+    "renames", "replace", "mkdir", "makedirs", "chmod", "chown", "truncate", "write", "fork",
+    "forkpty", "abort", "setsid", "execv", "execve", "execl", "execlp", "execvp", "spawnv",
+    "spawnl", "spawnlp", "spawnvp",
+))
+# Модули, через которые приходят руки. Импорты и так по списку — это второй рубеж на случай
+# отложенного или переименованного импорта внутри функции.
+_DRIFT_FORBIDDEN_ROOTS = frozenset((
+    "shutil", "signal", "socket", "requests", "urllib", "http", "smtplib", "sqlite3", "ctypes",
+    "multiprocessing", "pathlib", "tempfile", "bridge_client", "notify", "telegram", "builtins",
+))
+_DRIFT_FORBIDDEN_CALLS = frozenset(("exec", "eval", "compile", "__import__", "input", "setattr"))
+# Слова, которыми перезапускают процессы. В КОДЕ детектора их быть не может (см. шапку).
+_DRIFT_FORBIDDEN_WORDS = ("systemctl", "systemd-run", "pkill", "killall", "supervisorctl",
+                          "reboot", "shutdown", "initctl", "telinit")
+_DRIFT_WRITE_MODES = ("w", "a", "x", "+")
+
+
+def _drift_docstring_ids(tree):
+    """id() строковых узлов, которые являются ДОКСТРИНГАМИ (модуля, функции, класса)."""
+    import ast as _ast
+    out = set()
+    for node in _ast.walk(tree):
+        if not isinstance(node, (_ast.Module, _ast.FunctionDef, _ast.AsyncFunctionDef,
+                                 _ast.ClassDef)):
+            continue
+        body = getattr(node, "body", None) or []
+        if body and isinstance(body[0], _ast.Expr) and isinstance(body[0].value, _ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            out.add(id(body[0].value))
+    return out
+
+
+def _drift_cmd_head(node):
+    """Голова argv у subprocess.run: первый элемент списка (слева от любых «+»). → строка | None."""
+    import ast as _ast
+    cur = node
+    while isinstance(cur, _ast.BinOp) and isinstance(cur.op, _ast.Add):
+        cur = cur.left
+    if isinstance(cur, (_ast.List, _ast.Tuple)) and cur.elts:
+        first = cur.elts[0]
+        if isinstance(first, _ast.Constant) and isinstance(first.value, str):
+            return first.value
+    return None
+
+
+def _drift_ast_findings(src):
+    """→ список (адрес, чем плохо). Пустой список = детектор доказанно read-only."""
+    import ast as _ast
+    out = []
+    tree = _ast.parse(src)
+    docs = _drift_docstring_ids(tree)
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] not in _DRIFT_ALLOWED_IMPORTS:
+                    out.append((f"строка {node.lineno}", f"импорт «{a.name}» вне списка "
+                                f"{sorted(_DRIFT_ALLOWED_IMPORTS)} — у детектора появились руки"))
+        elif isinstance(node, _ast.ImportFrom):
+            if (node.module or "").split(".")[0] not in _DRIFT_ALLOWED_IMPORTS:
+                out.append((f"строка {node.lineno}", f"импорт из «{node.module}» вне списка — "
+                            f"детектор обязан только читать"))
+        elif isinstance(node, _ast.Constant) and isinstance(node.value, str) \
+                and id(node) not in docs:
+            low = node.value.lower()
+            for w in _DRIFT_FORBIDDEN_WORDS:
+                if w in low:
+                    out.append((f"строка {node.lineno}", f"слово «{w}» в коде детектора: "
+                                f"перезапускать он не вправе ни при каких условиях"))
+                    break
+        elif isinstance(node, _ast.Call):
+            fn = node.func
+            if isinstance(fn, _ast.Name) and fn.id in _DRIFT_FORBIDDEN_CALLS:
+                out.append((f"строка {node.lineno}", f"вызов «{fn.id}» — исполнение в модуле, "
+                            f"которому разрешено только чтение"))
+            if isinstance(fn, _ast.Name) and fn.id == "open":
+                mode = None
+                if len(node.args) > 1 and isinstance(node.args[1], _ast.Constant):
+                    mode = node.args[1].value
+                for kw in node.keywords:
+                    if kw.arg == "mode" and isinstance(kw.value, _ast.Constant):
+                        mode = kw.value.value
+                if isinstance(mode, str) and any(m in mode for m in _DRIFT_WRITE_MODES):
+                    out.append((f"строка {node.lineno}", f"open(…, «{mode}») — детектор не пишет "
+                                f"ничего и никуда: состояние держат руки демона"))
+            if isinstance(fn, _ast.Attribute) and isinstance(fn.value, _ast.Name):
+                root, attr = fn.value.id, fn.attr
+                if root in _DRIFT_FORBIDDEN_ROOTS:
+                    out.append((f"строка {node.lineno}", f"обращение к «{root}.{attr}» — "
+                                f"детектор не смеет ни писать, ни отправлять"))
+                elif root == "os" and attr in _DRIFT_FORBIDDEN_OS:
+                    out.append((f"строка {node.lineno}", f"«os.{attr}» — запись/удаление/"
+                                f"исполнение в read-only модуле"))
+                elif root == "subprocess":
+                    if attr != "run":
+                        out.append((f"строка {node.lineno}", f"«subprocess.{attr}» — из subprocess "
+                                    f"разрешён только run(git …)"))
+                    head = _drift_cmd_head(node.args[0]) if node.args else None
+                    if head != "git":
+                        out.append((f"строка {node.lineno}", f"внешняя команда «{head}» — "
+                                    f"словарь детектора состоит ровно из читающего git"))
+                    for kw in node.keywords:
+                        if kw.arg == "shell" and not (isinstance(kw.value, _ast.Constant)
+                                                      and kw.value.value is False):
+                            out.append((f"строка {node.lineno}", "shell=True — оболочка исполняет "
+                                        "что угодно, а не только git"))
+    return out
+
+
+@register("PROD_DRIFT_READONLY")
+def check_prod_drift_readonly(world, run):
+    path = _PROD_DRIFT_PATH or os.path.join(REPO, "prod_drift.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("prod_drift.py", f"детектор дрейфа не читается ({e}) — read-only не доказан")
+        return
+    try:
+        findings = _drift_ast_findings(src)
+    except SyntaxError as e:
+        run.flag("prod_drift.py", f"детектор дрейфа не разбирается ({e}) — read-only не доказан")
+        return
+    for where, why in findings:
+        run.flag(f"prod_drift.py:{where}", why)
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
@@ -1216,6 +1366,59 @@ def _self_test():
     finally:
         shutil.rmtree(_cd_dir, ignore_errors=True)
         _CARD_DUTY_PATH = _old_duty_path
+
+    # ── 12. PROD_DRIFT_READONLY (голдены на ДОСЛОВНОМ коде: каждая «рука» обязана краснеть) ──
+    # Смысл секции: доказать, что страж ловит именно РУКИ, а не слова. Поэтому рядом стоят пары
+    # «законное чтение → 0» и «то же самое, но с рукой → флаг»; докстринг, называющий границу,
+    # остаётся зелёным намеренно (иначе честная документация стала бы нарушением).
+    global _PROD_DRIFT_PATH
+    _old_drift_path = _PROD_DRIFT_PATH
+    _pd_dir = tempfile.mkdtemp()
+    try:
+        _pd_cases = [
+            ("DRIFT живой модуль read-only", 0, None),
+            ("DRIFT читающий git законен", 0, "import subprocess\nsubprocess.run(['git', 'log'])\n"),
+            ("DRIFT чужая команда → флаг", 1, "import subprocess\nsubprocess.run(['clasp', 'push'])\n"),
+            ("DRIFT рестарт живого процесса → 2 флага (слово + голова argv)", 2,
+             "import subprocess\nsubprocess.run(['systemctl', 'restart', 'splinter'])\n"),
+            ("DRIFT shell=True → флаг", 1,
+             "import subprocess\nsubprocess.run(['git', 'log'], shell=True)\n"),
+            ("DRIFT subprocess.Popen → флаг (разрешён только run)", 1,
+             "import subprocess\nsubprocess.Popen(['git'])\n"),
+            ("DRIFT open на чтение — не флаг", 0, "f = open('/tmp/x')\ng = open('/tmp/y', 'r')\n"),
+            ("DRIFT open на запись → флаг", 1, "f = open('/tmp/x', 'w')\n"),
+            ("DRIFT os.remove → флаг", 1, "import os\nos.remove('/tmp/x')\n"),
+            ("DRIFT импорт notify → флаг (отправлять он не вправе)", 1, "import notify\n"),
+            ("DRIFT слово рестарта в ДОКСТРИНГЕ — не флаг", 0,
+             '"""юнит берём из /proc/<pid>/cgroup, а не из вывода systemctl"""\n'),
+            ("DRIFT слово рестарта в обычной строке → флаг", 1, "S = 'systemctl restart splinter'\n"),
+            ("DRIFT модуль не парсится → флаг (fail-closed)", 1, "def broken(:\n"),
+        ]
+        for _pd_title, _pd_expect, _pd_src in _pd_cases:
+            if _pd_src is None:
+                _PROD_DRIFT_PATH = None                      # боевой prod_drift.py
+            else:
+                _pd_p = os.path.join(_pd_dir, "prod_drift.py")
+                with open(_pd_p, "w", encoding="utf-8") as _f:
+                    _f.write(_pd_src)
+                _PROD_DRIFT_PATH = _pd_p
+            _pd_run = CheckRun("PROD_DRIFT_READONLY")
+            check_prod_drift_readonly(_healthy_world(), _pd_run)
+            _pd_got = len(_pd_run.findings)
+            _pd_ok = (_pd_got == _pd_expect)
+            allpass &= _pd_ok
+            print(f"  {'PASS' if _pd_ok else 'FAIL'}  [PROD_DRIFT_READONLY] {_pd_title}: "
+                  f"ждали {_pd_expect}, поймали {_pd_got}")
+        _PROD_DRIFT_PATH = os.path.join(_pd_dir, "нет-такого.py")
+        _pd_run = CheckRun("PROD_DRIFT_READONLY")
+        check_prod_drift_readonly(_healthy_world(), _pd_run)
+        _pd_ok = (len(_pd_run.findings) == 1)
+        allpass &= _pd_ok
+        print(f"  {'PASS' if _pd_ok else 'FAIL'}  [PROD_DRIFT_READONLY] DRIFT файла нет → флаг "
+              f"(fail-closed): ждали 1, поймали {len(_pd_run.findings)}")
+    finally:
+        shutil.rmtree(_pd_dir, ignore_errors=True)
+        _PROD_DRIFT_PATH = _old_drift_path
 
     # Проверяем предвычисленные ALL-результаты
     for _all_title, _all_got, _all_expect in [
