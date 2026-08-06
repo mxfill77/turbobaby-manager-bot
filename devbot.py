@@ -21,9 +21,11 @@ from collections import Counter
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+import notify                # дверь каналов: лента 829 = заметка, на которую не отвечают
 import bridge_client
 import task_metrics          # общий детектор тест-прогона (под тестом боевые артефакты не трогаем)
 import report_digest         # чистая функция «тело отчёта → что показать в чате» (часть 2)
+import revizor_route         # чистая функция «находки ревизора → лента или карточка»
 
 log = logging.getLogger(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -1568,8 +1570,14 @@ def _queue_open_count(by):
     n = 0
     for st in _OPEN_STATUSES:
         for it in by.get(st, []) or []:
-            if str(it.get("from") or "") in QUEUE_FROMS:
-                n += 1
+            if str(it.get("from") or "") not in QUEUE_FROMS:
+                continue
+            # Карточка ревизора, целиком уехавшая сводкой в ленту, владельца НЕ ждёт: вопроса
+            # ей никто не задавал. Иначе «ждёт тебя 0» не наступило бы никогда — сводная
+            # карточка на ПК живёт, пока владелец её не закроет (06.08.2026).
+            if st == "needs_approval" and _revizor_silenced.get(str(it.get("id"))) == _gen(it):
+                continue
+            n += 1
     return n
 
 
@@ -1594,6 +1602,160 @@ async def _announce_idle(context, by):
                 log.warning("devbot.report_results: сигнал «очередь пуста» не ушёл (%s)", e)
     _queue_busy = False
     _closed_since_busy = []
+
+
+# ── НАХОДКА ПО ЗАМОРОЖЕННОМУ КОНТУРУ НЕ РОЖДАЕТ КАРТОЧКУ (06.08.2026) ─────────────────────
+# ЖИВОЙ ФАКТ: сводная карточка ревизора 244 копилась 30.3 ч, приехала владельцу списком из 24
+# находок и была отклонена кнопкой — подтверждать было нечего: 16 из 24 несут метку
+# производителя «[клиентский контур …]», а клиентский контур ЗАМОРОЖЕН решением владельца.
+# Решение («что уходит заметкой, что остаётся вопросом») — чистая функция revizor_route; здесь
+# только РУКИ: состояние дедупа, суточное окно, артефакт и отправка в ленту.
+#
+# ПОЧЕМУ СУТОЧНАЯ СВОДКА, А НЕ ЗАМЕТКА НА КАЖДУЮ НАХОДКУ — по замеру, а не по вкусу: 16
+# замороженных находок за 30.3 ч = 12.7 в сутки, а лента 829 сегодня несёт 1.9 заметки в сутки
+# (замер владельца 05.08, «три источника шума — одна цель»). Заметка на находку подняла бы ленту
+# в 7-8 раз и перевалила бы названный владельцем потолок ~10/сут — то есть перенесла бы простыню
+# из инбокса в ленту. Поэтому окно СКОЛЬЗЯЩЕЕ, 24 ч: первая находка после тишины уезжает сразу
+# (ждать нечего), дальше — не чаще одной сводки в сутки, потолок 1/сут по построению.
+_REVIZOR_STATE_LIVE = "/tmp/cc_revizor_frozen.json"   # состояние маршрута (переживает рестарт)
+_REVIZOR_NOTE_EVERY = 24 * 3600       # скользящее окно сводки, сек
+_REVIZOR_SEEN_CAP = 500               # ~38 суток при измеренных 13 находках/сут
+_revizor_silenced = {}                # {номер: генерация} — карточки, целиком уехавшие в ленту
+
+
+def _revizor_state_path():
+    """Путь состояния. Под тест-прогоном боевой файл НЕ трогаем (урок 04.08: тест гейта стёр
+    боевой спул ревизора и убил 12 находок владельца) — тест обязан подсунуть свой путь."""
+    p = os.getenv("REVIZOR_STATE_FILE") or _REVIZOR_STATE_LIVE
+    if p == _REVIZOR_STATE_LIVE and task_metrics.under_test(
+            (sys.argv[0] if sys.argv else ""), os.environ, sys.modules):
+        return p + ".test"
+    return p
+
+
+def _revizor_load():
+    """Состояние маршрута: что уже уехало заметкой, что ждёт сводки, когда была последняя.
+    Файла нет/битый → чистое состояние (сводка уйдёт заново — дубль дешевле потери)."""
+    st = {}
+    try:
+        with open(_revizor_state_path(), encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        st = {}
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("seen", [])
+    st.setdefault("pending", [])
+    st.setdefault("last_note", "")
+    return st
+
+
+def _revizor_save(st):
+    try:
+        with open(_revizor_state_path(), "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+        return True
+    except Exception as e:
+        log.warning("devbot.revizor: состояние маршрута не сохранено (%s)", e)
+        return False
+
+
+def _revizor_frozen():
+    """Множество ЗАМОРОЖЕННЫХ контуров. Ручка `CONTOUR_FREEZE` (.env), дефолт `client` =
+    сегодняшний факт по решению владельца. `CONTOUR_FREEZE=0` + рестарт → правило мертво,
+    карточки идут байт-в-байт как раньше."""
+    return revizor_route.frozen_keys(os.getenv("CONTOUR_FREEZE", "client"))
+
+
+def _revizor_absorb(st, found):
+    """Новые находки (которых нет ни в отправленных, ни в ждущих) → в очередь на сводку.
+    → список ждущих [(строка, ключ), …] (он же кладётся в состояние)."""
+    pend = [(str(x[0]), str(x[1])) for x in (st.get("pending") or [])
+            if isinstance(x, (list, tuple)) and len(x) == 2]
+    have = set(str(f) for f in (st.get("seen") or []))
+    have |= {revizor_route.fingerprint(l) for l, _k in pend}
+    for line, key in found:
+        fp = revizor_route.fingerprint(line)
+        if fp in have:
+            continue
+        have.add(fp)
+        pend.append((line, key))
+    st["pending"] = [list(x) for x in pend]
+    return pend
+
+
+def _revizor_due(st, now):
+    """Пора ли отдавать сводку: первой — сразу, дальше не чаще раза в сутки."""
+    last = _iso_ts(st.get("last_note"))
+    return last is None or (now.timestamp() - last) >= _REVIZOR_NOTE_EVERY
+
+
+def _revizor_window(st, now):
+    """Подпись окна сводки. Первая сводка — честно «первая», без выдуманного начала."""
+    last = _iso_ts(st.get("last_note"))
+    end = now.strftime("%d.%m %H:%M UTC")
+    if last is None:
+        return f"окно: по {end} (первая сводка)"
+    start = datetime.datetime.fromtimestamp(last, datetime.timezone.utc).strftime("%d.%m %H:%M")
+    return f"окно: с {start} по {end}"
+
+
+def _write_revizor_artifact(findings, label, now):
+    """Полный список находок → файл (в ленту едет итог, тело — в артефакт). → путь | None.
+    FAIL-SAFE: любой сбой записи = None → заметка уходит без пути, находки в ней названы."""
+    try:
+        d = os.path.join(_reports_dir(), "revizor")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, now.strftime("%Y-%m-%d-%H%M") + ".md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(revizor_route.artifact_text(findings, label))
+        return os.path.relpath(path, ROOT) if path.startswith(ROOT + os.sep) else path
+    except Exception as e:
+        log.warning("devbot.revizor: артефакт находок не записан (%s)", e)
+        return None
+
+
+async def _route_revizor_frozen(context, it):
+    """Находки замороженного контура из сводной карточки ревизора → заметка в ленту 829.
+
+    → разбор revizor_route.route (вызывающий берёт из него текст карточки) либо None.
+    None = ВЕСТИ СЕБЯ КАК РАНЬШЕ (карточка целиком, с кнопками): так отвечает и выключенная
+    ручка, и карточка без замороженных находок, и ЛЮБОЙ сбой — включая недоставленную заметку.
+    Последнее намеренно: гасить вопрос владельцу, не сумев сказать ему иначе, — это молчание,
+    а не маршрут."""
+    frozen = _revizor_frozen()
+    if not frozen:
+        return None
+    try:
+        r = revizor_route.route(_result_body(it, empty=""), frozen)
+        if not r["changed"]:
+            return None                  # замороженных находок нет — прежний путь до символа
+        st = _revizor_load()
+        pend = _revizor_absorb(st, r["frozen"])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if not pend or not _revizor_due(st, now):
+            _revizor_save(st)            # уже уехали ранее / ждут ближайшей суточной сводки
+            return r
+        label = _revizor_window(st, now)
+        art = _write_revizor_artifact(pend, label, now)
+        text = revizor_route.note(pend, window_label=label, artifact=art or "")
+        ok = await asyncio.to_thread(notify.send_feed, text)
+        if not ok:
+            _revizor_save(st)            # находки остаются ждущими — повтор на следующем тике
+            log.warning("devbot.revizor: сводка о %d находках замороженного контура НЕ ушла в "
+                        "ленту — карточка %s идёт владельцу как раньше", len(pend), it.get("id"))
+            return None
+        st["seen"] = (list(st.get("seen") or []) +
+                      [revizor_route.fingerprint(l) for l, _k in pend])[-_REVIZOR_SEEN_CAP:]
+        st["pending"] = []
+        st["last_note"] = now.isoformat()
+        _revizor_save(st)
+        log.info("devbot.revizor: %d находок замороженного контура ушли сводкой в ленту "
+                 "(карточка %s, артефакт %s)", len(pend), it.get("id"), art or "—")
+        return r
+    except Exception as e:
+        log.warning("devbot.revizor: маршрут находок упал (%s) — карточка идёт как раньше", e)
+        return None
 
 
 async def report_results(context) -> None:
@@ -1738,10 +1900,24 @@ async def report_results(context) -> None:
     pend = sorted(by["needs_approval"], key=lambda x: int(x.get("id") or 0))
     for it in pend:
         qid = it.get("id")
+        # Находки ревизора по ЗАМОРОЖЕННОМУ контуру уходят сводкой в ленту, а не кнопкой в
+        # инбокс (06.08.2026). Маршрут считается ДО дедупа `_asked` намеренно: сводная карточка
+        # ревизора живёт сутками и ДОПОЛНЯЕТСЯ — находки, приехавшие после первого показа, иначе
+        # не увидел бы никто. Карточка при этом показывается по-прежнему один раз.
+        route = None
+        if str(it.get("from") or "") == QUEUE_FROM_REVIZOR:
+            route = await _route_revizor_frozen(context, it)
+        if route is not None and route["card"] is None:
+            _revizor_silenced[str(qid)] = _gen(it)   # вопроса не осталось — и владельца не ждёт
+            continue
+        _revizor_silenced.pop(str(qid), None)
         if _seen(_asked, it):
             continue
         _approval_topic = inbox or _item_topic(it)
-        what = _result_body(it, empty="(не уточнено)")   # тот же потолок: конверт тоже режется
+        # тот же потолок: конверт тоже режется. У карточки ревизора с замороженными находками
+        # тело уже отфильтровано маршрутом (и несёт строку о том, сколько уехало в ленту).
+        what = (route["card"] if route is not None
+                else _result_body(it, empty="(не уточнено)"))
         lane = _item_lane_label(it)
         q = (f"⚠️ Задача {qid} [{lane}] требует подтверждения красной зоны:\n\n{what}\n\n"
              f"Подтвердить? Тапни кнопку ниже — или ответь «да {qid}» / «нет {qid}».")
