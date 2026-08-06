@@ -147,10 +147,23 @@ QUEUE_FROM_CURATOR = "Filipp-curator"   # followup-задачи куратора
                                         # ставит orchestrator_daemon (CURATOR_FROM), полоса vps →
                                         # карточки в 328. Урок 682a881: метки нет в QUEUE_FROMS →
                                         # done/failed/needs_approval куратор-задач НЕ доезжают
+QUEUE_FROM_REVIZOR = "Filipp-revizor"   # сводные карточки РЕВИЗОРА (производитель на ПК, lane=pc):
+                                        # «[ревизор-находки] …» — находки, требующие решения
+                                        # владельца (спорный тариф/политика). ТРЕТИЙ случай урока
+                                        # 682a881: метки не было в QUEUE_FROMS → фильтр отчётов
+                                        # выкидывал задачу, и needs_approval-карточка НЕ доезжала.
+                                        # ЖИВОЙ ФАКТ (снимок 06.08.2026, 372 задачи): id=244
+                                        # висела needs_approval с 03.08 — ЕДИНСТВЕННЫЙ открытый
+                                        # needs_approval очереди, владелец её не видел ни разу
+QUEUE_FROM_OWNER = "Filipp"             # ручные пробы владельца (id 14/89/90 — «проверка канала
+                                        # одобрения»): ставятся с обеих полос, тема = 328. Тот же
+                                        # класс: отчёты проб отсеивались фильтром (иронично —
+                                        # пробы КАНАЛА, чей отчёт по каналу и не доезжал)
 QUEUE_FROMS_PC = (QUEUE_FROM_PC, QUEUE_FROM_PC_DEV, QUEUE_FROM_PC_DEC,
-                  QUEUE_FROM_PCLOC_DEC)  # метки полосы pc (карточки → тема PC-дев)
+                  QUEUE_FROM_PCLOC_DEC,
+                  QUEUE_FROM_REVIZOR)    # метки полосы pc (карточки → тема PC-дев)
 QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC,
-               QUEUE_FROM_CURATOR) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
+               QUEUE_FROM_CURATOR, QUEUE_FROM_OWNER) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
 _DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
 _DEC_PREFIXES = ("декомпозируй:", "разбей:", "decompose:")  # крупное ТЗ → план шагов → по одному
