@@ -95,13 +95,13 @@ def _add(out, pos, key, label, literal):
     out.append({"pos": pos, "key": key, "label": label, "literal": str(literal).strip()})
 
 
-def operations(text):
-    """Текст пункта → список названных операций в порядке первого появления.
+def occurrences(text):
+    """ВСЕ вхождения операций с позициями, БЕЗ дедупа по семье — в порядке появления.
 
-    Возврат: [{"key": <ключ семьи>, "label": <человеческое имя>, "literal": <как написал куратор>}].
-    Ключ — ЕДИНИЦА РАЗВЕДЕНИЯ: одна семья = одна карточка. `clasp push` и `clasp redeploy` в одном
-    пункте дают ОДНУ операцию (штатный цикл деплоя моста — это один выкат, а не два), а рестарт
-    splinter и рестарт orchestrator-daemon — РАЗНЫЕ (разные объекты, разный вес).
+    Отделено от `operations` 06.08.2026 (класс карточек 349/357/358): позицию вхождения читает
+    `curator_claim.filter_claims`, решая, стоит ли имя в позиции ЗАЯВКИ. Словарь операций от этого
+    остаётся ОДИН — расходиться двум перечням негде по построению.
+    Возврат: [{"pos", "key", "label", "literal"}].
     """
     t = str(text or "")
     if not t.strip():
@@ -145,10 +145,26 @@ def operations(text):
         if m:
             _add(out, m.start(), key, _LABELS[key], m.group(0))
 
+    return sorted(out, key=lambda x: x["pos"])
+
+
+def dedup(occs):
+    """Вхождения → операции: одна семья (`key`) = одна операция, побеждает ПЕРВОЕ вхождение."""
     seen, uniq = set(), []
-    for op in sorted(out, key=lambda x: x["pos"]):
+    for op in sorted(list(occs or []), key=lambda x: x["pos"]):
         if op["key"] in seen:
             continue
         seen.add(op["key"])
         uniq.append({"key": op["key"], "label": op["label"], "literal": op["literal"]})
     return uniq
+
+
+def operations(text):
+    """Текст пункта → список названных операций в порядке первого появления.
+
+    Возврат: [{"key": <ключ семьи>, "label": <человеческое имя>, "literal": <как написал куратор>}].
+    Ключ — ЕДИНИЦА РАЗВЕДЕНИЯ: одна семья = одна карточка. `clasp push` и `clasp redeploy` в одном
+    пункте дают ОДНУ операцию (штатный цикл деплоя моста — это один выкат, а не два), а рестарт
+    splinter и рестарт orchestrator-daemon — РАЗНЫЕ (разные объекты, разный вес).
+    """
+    return dedup(occurrences(text))
