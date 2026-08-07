@@ -1,0 +1,14 @@
+[Unit]
+Description=TurboBaby слой ожиданий, ярус 2 (О1 очередь · О2 продукт процессов) — read-only наблюдатель
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/turbobaby-manager-bot
+ExecStart=/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/expectations_run.py
+User=root
+# Наблюдатель НЕ живёт на том, за чем следит: отдельный процесс, ни демона, ни splinter не
+# импортирует. Реакция информационная — заметка в ленту 829; задача ставится только когда
+# нарушение держится и её исполнитель доказанно жив. Живые процессы, данные и инфраструктуру
+# слой не трогает ни одной веткой.

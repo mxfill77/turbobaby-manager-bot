@@ -976,6 +976,86 @@ def check_prod_drift_readonly(world, run):
         run.flag(f"prod_drift.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 14: EXPECTATIONS_PURE
+#  Слой ожиданий (expectations.py) решает, нарушено ли ожидание, и возвращает вердикт СПИСКОМ.
+#  Граница владельца — «заметка и, если держится, задача; живые процессы, данные и инфраструктуру
+#  не трогать» — обязана держаться устройством, а не докстрингом, поэтому здесь доказывается
+#  сильнейшая форма: модуль НЕ УМЕЕТ НИЧЕГО, кроме арифметики над переданными фактами.
+#    • импорты РОВНО из белого списка (re, datetime) — ни os, ни subprocess, ни сети, ни моста,
+#      ни notify: собрать факты и отнести текст в канал он не может физически;
+#    • ни одной ручки ввода-вывода: open/exec/eval/__import__ запрещены как имена вызовов;
+#    • слова, которыми в этой системе перезапускают процессы, не смеют встречаться в КОДЕ.
+#  ПОЧЕМУ ДОКСТРИНГИ ИСКЛЮЧЕНЫ (то же решение, что у PROD_DRIFT_READONLY): документация обязана
+#  уметь НАЗВАТЬ то, чего модуль не делает, иначе честное объяснение границы стало бы её
+#  нарушением. Исполнить докстринг нечем — вызовов в модуле нет вовсе.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ (нечитаемое решение доверия не имеет).
+# --------------------------------------------------------------------------------------------
+_EXPECT_PATH = None                     # подменяется САМОТЕСТОМ; None → боевой expectations.py
+_EXPECT_ALLOWED_IMPORTS = frozenset(("re", "datetime"))
+_EXPECT_FORBIDDEN_CALLS = frozenset(("open", "exec", "eval", "compile", "__import__", "input",
+                                     "setattr", "delattr"))
+# Те же слова, что у детектора дрейфа: наблюдатель не перезапускает ничего ни при каких условиях.
+_EXPECT_FORBIDDEN_WORDS = _DRIFT_FORBIDDEN_WORDS
+
+
+def _expect_ast_findings(src):
+    """→ список (адрес, чем плохо). Пустой список = решение доказанно без рук."""
+    import ast as _ast
+    out = []
+    tree = _ast.parse(src)
+    docs = _drift_docstring_ids(tree)
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] not in _EXPECT_ALLOWED_IMPORTS:
+                    out.append((f"строка {node.lineno}", f"импорт «{a.name}» вне списка "
+                                f"{sorted(_EXPECT_ALLOWED_IMPORTS)} — у решения появились руки"))
+        elif isinstance(node, _ast.ImportFrom):
+            if (node.module or "").split(".")[0] not in _EXPECT_ALLOWED_IMPORTS:
+                out.append((f"строка {node.lineno}", f"импорт из «{node.module}» вне списка — "
+                            f"слой ожиданий обязан быть чистой функцией фактов"))
+        elif isinstance(node, _ast.Constant) and isinstance(node.value, str) \
+                and id(node) not in docs:
+            low = node.value.lower()
+            for w in _EXPECT_FORBIDDEN_WORDS:
+                if w in low:
+                    out.append((f"строка {node.lineno}", f"слово «{w}» в коде слоя ожиданий: "
+                                f"реакция информационная, перезапускать он не вправе"))
+                    break
+        elif isinstance(node, _ast.Call):
+            fn = node.func
+            if isinstance(fn, _ast.Name) and fn.id in _EXPECT_FORBIDDEN_CALLS:
+                out.append((f"строка {node.lineno}", f"вызов «{fn.id}» — ввод-вывод в модуле, "
+                            f"которому разрешена только арифметика над фактами"))
+            if isinstance(fn, _ast.Attribute) and isinstance(fn.value, _ast.Name):
+                root, attr = fn.value.id, fn.attr
+                if root in ("os", "subprocess", "shutil", "socket", "requests", "urllib",
+                            "bridge_client", "notify", "smtplib", "sqlite3", "pathlib",
+                            "tempfile", "signal", "multiprocessing", "ctypes"):
+                    out.append((f"строка {node.lineno}", f"обращение к «{root}.{attr}» — решение "
+                                f"не собирает факты и не носит текст в канал, это дело рук"))
+    return out
+
+
+@register("EXPECTATIONS_PURE")
+def check_expectations_pure(world, run):
+    path = _EXPECT_PATH or os.path.join(REPO, "expectations.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("expectations.py", f"слой ожиданий не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _expect_ast_findings(src)
+    except SyntaxError as e:
+        run.flag("expectations.py", f"слой ожиданий не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"expectations.py:{where}", why)
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
