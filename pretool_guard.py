@@ -48,6 +48,14 @@
     (`/root/app/.env`) открыть можно и он остаётся красным, а токен-предложение («…запрет
     cat/grep .env классом…») — нельзя ничем, это данные. Замер: 5 ложных блоков из 29 за 336 ч,
     все — журнальные строки cclog.py.
+    Тот же класс с 07.08.2026 — ГДЕ ИМЕННО СТОИТ ШАБЛОН: сам вырез шаблона жил с 23.07, но место
+    шаблона считалось ПО ПОРЯДКУ позиционных, а флаг СО ЗНАЧЕНИЕМ этот счёт сбивал. `grep -A 2
+    "<имя>" dir` — шаблоном признавалось «2», настоящий шаблон уезжал в операнды и получал
+    жёсткий блок; так же ломались `-m N`, rg-шные `-g/-t`, форма `--regexp=<шаблон>`, awk-овы
+    `-F sep`/`-v var=val` и поиск через `git grep`. Теперь роль токена берётся из интерфейса
+    утилиты ПО СЕМЬЕ (_SEARCH_VALUE_FLAGS): `-r` у grep — рекурсия без значения, у rg — замена
+    со значением. Незнакомый флаг по-прежнему считается флагом без значения (краснее), а
+    позиционный после съеденного значения не вырезается, если он ЕСТЬ ПУТЬ к файлу секретов.
 (г) УДАЛЕНИЕ ФАЙЛОВ ВНЕ ВРЕМЕННЫХ КАТАЛОГОВ (03.08.2026): доктринальное красное высшего вида,
     которое до сих пор уходило в defer (не-python команда не разбиралась вовсе) и проходило по
     allow-паттерну — за 168 ч так молча ушли 38 файлов корня репо, включая ОТСЛЕЖИВАЕМЫЙ git.
@@ -875,7 +883,41 @@ _SVC_VERBS = {"kill", "stop", "restart", "start", "reload", "try-restart",
               "force-reload", "enable", "disable", "mask", "unmask"}
 # Поисковые утилиты: их ШАБЛОН — данные (класс «данные ≠ команда»).
 _SEARCH_CMDS = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "mawk"}
-_PATTERN_FLAGS = {"-e", "-E", "-n", "--regexp", "--expression"}
+# СЕМЬЯ утилиты. Один и тот же флаг у разных утилит значит РАЗНОЕ, и путать нельзя: `-r` у grep —
+# рекурсия БЕЗ значения, у rg — замена СО значением; `-v` у grep инверсия, у awk присваивание.
+_SEARCH_FAMILY = {"grep": "grep", "egrep": "grep", "fgrep": "grep", "zgrep": "grep",
+                  "rg": "rg", "ag": "ag", "ack": "ag",
+                  "sed": "sed", "awk": "awk", "gawk": "awk", "mawk": "awk"}
+# ЗНАЧЕНИЕ флага = САМ ШАБЛОН: утилита читает его как регулярку, файла по нему не открывает.
+# `-n`/`-E` отсюда УБРАНЫ (07.08.2026): значения они не берут вовсе (`-n` — номера строк, `-E` —
+# расширенный синтаксис), и на `grep -n -r "…" dir` разборщик съедал флаг `-r` вместо шаблона,
+# а настоящий шаблон уезжал в операнды и краснил команду.
+_PATTERN_FLAGS = {"-e", "--regexp", "--expression"}
+# ЗНАЧЕНИЕ флага = ФАЙЛ, из которого утилита ЧИТАЕТ шаблоны/программу. Файл она ОТКРЫВАЕТ →
+# он остаётся под сканом (иначе `grep -f <файл секретов> dir` прошёл бы молча); позиционного
+# шаблона после такого флага не бывает — шаблон уже задан.
+_PATTERN_FILE_FLAGS = {"-f", "--file"}
+# ЗНАЧЕНИЕ флага — НЕ шаблон (число, глоб, разделитель, кодировка…): под сканом остаётся, но и
+# шаблоном не считается. Без этой таблицы разборщик принимал за шаблон ЗНАЧЕНИЕ («2» из `-A 2`),
+# а настоящий шаблон становился операндом — отсюда и разряд на слова внутри шаблона.
+# Списки — документированный интерфейс самих утилит, а не догадка о словах.
+_SEARCH_VALUE_FLAGS = {
+    "grep": {"-A", "-B", "-C", "-m", "-d", "-D",
+             "--after-context", "--before-context", "--context", "--max-count",
+             "--devices", "--directories", "--binary-files", "--label",
+             "--include", "--exclude", "--exclude-dir", "--exclude-from",
+             "--group-separator", "--context-separator"},
+    "rg": {"-A", "-B", "-C", "-m", "-g", "-t", "-T", "-M", "-j", "-r", "-E",
+           "--after-context", "--before-context", "--context", "--max-count",
+           "--glob", "--iglob", "--type", "--type-not", "--type-add", "--max-depth",
+           "--max-columns", "--threads", "--replace", "--sort", "--sortr",
+           "--color", "--colors", "--encoding", "--engine", "--ignore-file",
+           "--path-separator", "--context-separator", "--pre"},
+    "ag": {"-A", "-B", "-C", "-m", "--after", "--before", "--context", "--max-count",
+           "--ignore", "--ignore-dir", "--depth", "--pager", "--type-set"},
+    "sed": {"-l", "--line-length"},
+    "awk": {"-F", "-v", "--field-separator", "--assign"},
+}
 # Обёртки: команда-цель идёт ПОСЛЕ них (иначе `sudo systemctl stop splinter` проскочил бы).
 _WRAPPERS = {"sudo", "doas", "env", "nohup", "nice", "ionice", "time", "timeout",
              "stdbuf", "xargs", "systemd-run"}
@@ -1926,26 +1968,69 @@ def _cmd_index(toks):
     return i if i < len(toks) else None
 
 
+def _search_head(toks, idx):
+    """Индекс слова ПОИСКОВОЙ утилиты в сегменте (None — её тут нет). Отдельно разобран `git grep`:
+    голова сегмента — `git`, а ищет по СОДЕРЖИМОМУ подкоманда, и её шаблон — такие же данные."""
+    if idx is None or idx >= len(toks):
+        return None
+    if _base(toks[idx]) in _SEARCH_CMDS:
+        return idx
+    if _base(toks[idx]) == "git":
+        for j in range(idx + 1, min(idx + 7, len(toks))):
+            if toks[j] == "grep":
+                return j
+    return None
+
+
 def _strip_search_pattern(toks, idx):
-    """→ (токены БЕЗ поискового шаблона, список вырезанных). Шаблон = аргумент -n/-e/-E либо
-    ПЕРВЫЙ позиционный у grep/rg/sed/awk. Операнды-ФАЙЛЫ и прочие токены не трогаем — иначе
-    `grep -n foo .env` перестал бы блокироваться. Токен с признаком исполнения не вырезается."""
-    if idx is None or _base(toks[idx]) not in _SEARCH_CMDS:
+    """→ (токены БЕЗ поискового шаблона, список вырезанных). Шаблон = значение -e/--regexp/
+    --expression (в т.ч. форма `--regexp=…`) либо ПЕРВЫЙ ПОЗИЦИОННЫЙ у grep/rg/sed/awk/`git grep`.
+    Операнды-ФАЙЛЫ и прочие токены не трогаем — иначе `grep -n foo .env` перестал бы блокироваться.
+    Токен с признаком исполнения не вырезается.
+
+    ПОЧЕМУ РОЛЬ, А НЕ ПОРЯДОК (07.08.2026, класс «разряд секретов на шаблоне поиска»): позиция
+    шаблона считалась по счёту позиционных, а флаг СО ЗНАЧЕНИЕМ этот счёт сбивал — в `grep -A 2
+    "<имя>" dir` шаблоном признавалось «2», а НАСТОЯЩИЙ шаблон становился операндом и краснил
+    команду жёстким блоком. Теперь у каждого токена спрашивается его РОЛЬ в интерфейсе утилиты
+    (флаг · значение флага · позиционный), а роль берётся из таблиц самой утилиты по СЕМЬЕ.
+
+    НАПРАВЛЕНИЕ СОМНЕНИЯ прежнее — в красное. Незнакомый флаг считается флагом БЕЗ значения
+    (как и было), поэтому его значение по-прежнему может быть принято за шаблон; чтобы ошибка
+    таблицы не стоила жёсткого блока, ПОЗИЦИОННЫЙ, идущий после съеденного значения, не
+    вырезается, если он назван ПУТЁМ к файлу секретов С КАТАЛОГОМ (`/root/app/.env`) — такой
+    токен утилита ОТКРЫВАЕТ; голое имя (`.env`) как раз бывает шаблоном и вырезается. Там, где
+    значений флагов не было вовсе, поведение БАЙТ-В-БАЙТ прежнее."""
+    idx = _search_head(toks, idx)
+    if idx is None:
         return toks, []
-    drop, pat_seen, i = set(), False, idx + 1
+    vflags = _SEARCH_VALUE_FLAGS.get(_SEARCH_FAMILY.get(_base(toks[idx]), "grep"), ())
+    drop, pat_seen, val_eaten, i = {}, False, False, idx + 1
     while i < len(toks):
         t = toks[i]
+        head, eq, tail = t.partition("=")
         if t in _PATTERN_FLAGS and i + 1 < len(toks):
-            drop.add(i + 1); pat_seen = True; i += 2; continue
+            drop[i + 1] = toks[i + 1]; pat_seen = True; i += 2; continue
+        if eq and head in _PATTERN_FLAGS:              # --regexp=ШАБЛОН: шаблон ВНУТРИ токена,
+            drop[i] = tail; pat_seen = True; i += 1; continue   # из текста режем именно шаблон
+        if t in _PATTERN_FILE_FLAGS and i + 1 < len(toks):
+            pat_seen = True; i += 2; continue          # файл шаблонов ОСТАЁТСЯ под сканом
+        if eq and head in _PATTERN_FILE_FLAGS:
+            pat_seen = True; i += 1; continue
+        if t in vflags and i + 1 < len(toks):
+            val_eaten = True; i += 2; continue         # значение флага: не шаблон, но и не вырезаем
         if t.startswith("-") and t != "-":
             i += 1; continue
         if not pat_seen:
-            drop.add(i); pat_seen = True
+            pat_seen = True
+            if not (val_eaten and "/" in t and _env_path_arg(t)):  # fail-closed на ошибку таблицы
+                drop[i] = t
         i += 1
     keep, dropped = [], []
     for k, t in enumerate(toks):
         if k in drop and not _EXEC_IN_PATTERN.search(t):
-            dropped.append(t)
+            dropped.append(drop[k])
+            if drop[k] != t:                           # вырезали кусок токена — сам токен остаётся
+                keep.append(t)
         else:
             keep.append(t)
     return keep, dropped
