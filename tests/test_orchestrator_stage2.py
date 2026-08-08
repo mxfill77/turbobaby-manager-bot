@@ -126,7 +126,12 @@ res.append(ok("Просрочки ТО: 1 байков" in out and "4255 NMAX 15
 res.append(ok("❗не делалось" in out and "+" in out, "«просрочки»: nobase и «+N км» помечены"))
 class BR0(BR):
     def fleet(s): return {"data": {"bikes": []}}
-res.append(ok(DB._g_overdue(BR0()) == "🔧 Просрочек ТО нет 👍", "«просрочки»: пустой парк → нет 👍"))
+# БЫЛО (до 08.08.2026): пустой парк → «🔧 Просрочек ТО нет 👍» — БУКВА В БУКВУ та же строка, что и
+# на упавшем мосту, и на парке из 38 байков, у которого никто ничего не смотрел. СТАЛО: нуль без
+# знаменателя не отдаётся (контракт читателя, scan_result; регресс — tests/test_scan_contract.py).
+_out0 = DB._g_overdue(BR0())
+res.append(ok("ПРОВЕРИТЬ НЕ УДАЛОСЬ" in _out0 and "осмотрено 0" in _out0,
+              f"«просрочки»: пустой парк → не «нет 👍», а знаменатель: {_out0.splitlines()[0]}"))
 res.append(ok(DB._g_pulse(BR()).startswith("📟 2026-07-03"), "«статус»: строка пульса с 📟"))
 res.append(ok(DB._match("просрочки") is not None and DB._match("статус") is not None
               and DB._match("гейт") is not None, "allowlist матчит просрочки/статус/гейт"))

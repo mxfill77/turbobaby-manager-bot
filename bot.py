@@ -308,7 +308,13 @@ async def cmd_o3board(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # без ответа выглядел как молчание бота. Синк уже прошёл — сводка не должна его «уронить».
     try:
         m = update.effective_message
-        if m and isinstance(stats, dict):
+        if m and isinstance(stats, dict) and stats.get("scan_failed"):
+            # Скан парка не состоялся (контракт читателя, 08.08.2026): доска НЕ тронута. Сказать
+            # «синхронизирован: просрочек 0» тут значило бы выдать «не смотрели» за «всё чисто».
+            await m.reply_text("🐀 Splinter\n📋 Board НЕ синхронизирован: "
+                               + str(stats.get("scan_said") or "скан парка не состоялся")
+                               + "\nКарточки не тронуты — нуль просрочек тут означал бы «не искали».")
+        elif m and isinstance(stats, dict):
             note = (f"🐀 Splinter\n📋 Board синхронизирован: просрочек {stats.get('overdue', 0)}, "
                     f"карточек {stats.get('cards', 0)}, новых {stats.get('new', 0)}, решено {stats.get('gone', 0)}.")
             if not stats.get("new") and not stats.get("gone"):

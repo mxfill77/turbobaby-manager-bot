@@ -21,6 +21,7 @@ import html
 import logging
 import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM + паспорт B2
 import wallet_cache    # §касса: персистентный fallback-кэш баланса (переживает рестарт splinter)
+import scan_result     # контракт читателя живого текста: пара «осмотрено/разобрано» + исход
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -4600,49 +4601,83 @@ def _o3_overdue_scan(bridge):
     «НЕ ДЕЛАЛОСЬ» (last≤0) — задача ПО ФАКТУ ПОРОГА (доводка 02.07): показываем ТОЛЬКО когда текущий
     пробег ≥ интервала вида (ABS 10000 / возд.фильтр 20000 / масло-редуктор от нуля) — item nobase=True,
     next=интервал. Не дорос → не показываем; балласт-подсписок «нет базы» убран совсем.
-    Возврат {overdue:[{bike,plate,current_km,items:[{kind,last,next,over_km,nobase?}]}]} — худшие сверху."""
+
+    ВОЗВРАТ — `scan_result.ScanResult` (контракт читателя живого текста, 08.08.2026), payload =
+    [{bike,plate,current_km,items:[{kind,last,next,over_km,nobase?}]}] худшие сверху.
+    ПОЧЕМУ НЕ ПРЕЖНИЙ `{"overdue": […]}`: прежняя форма отдавала ПУСТОЙ СПИСОК и при упавшем
+    `fleet()`, и при здоровом парке без просрочек — владельцу печаталось «Просрочек ТО нет 👍» на
+    парке из 38 байков, у которого никто ничего не смотрел (перепись
+    `docs/artifacts/2026-08-08-zero-on-parse-miss-census.md`, §2 канал 16 — самое дорогое место).
+    Теперь наверх идёт ПАРА «осмотрено/разобрано» и исход:
+        источник не прочитан (исключение / ответ без списка байков) → unreadable, осмотра не было;
+        байков 0                                                    → empty, знаменатель назван;
+        байков N, решение по существу принято по 0 из них           → mismatch (ТРЕТИЙ исход:
+            текущий пробег не разобрался ни у одного — «просрочек нет» тут значит «не искали»);
+        иначе                                                       → ok.
+    РАЗОБРАН = байк, у которого ЕСТЬ имя и РАЗОБРАЛСЯ текущий пробег: без пробега вердикт
+    «не просрочено» ни на чём не стоит (`nxt - cur <= 0` при неизвестном cur — не ответ).
+    САМ СПИСОК ПРОСРОЧЕК СЧИТАЕТСЯ БАЙТ-В-БАЙТ КАК ПРЕЖДЕ (cur = разобранное или 0) — прибавились
+    только счётчики и исход."""
     def _i(x):
         try:
             return int(str(x).replace(" ", "").replace(",", ""))
         except (ValueError, TypeError):
             return None
     try:
-        bikes = ((bridge.fleet().get("data") or {}).get("bikes")) or []
-    except Exception:
+        resp = bridge.fleet()
+    except Exception as e:
         log.exception("  → O3 scan: fleet упал")
-        return {"overdue": []}
+        return scan_result.ScanResult.unreadable("байков", detail=f"fleet() упал: {e}")
+    if not isinstance(resp, dict) or resp.get("ok") is False:
+        why = (resp.get("error") if isinstance(resp, dict) else type(resp).__name__)
+        log.warning(f"  → O3 scan: fleet() ответил отказом: {why}")
+        return scan_result.ScanResult.unreadable("байков", detail=f"fleet() ответил отказом: {why}")
+    bikes = (resp.get("data") or {}).get("bikes")
+    if not isinstance(bikes, list):
+        # Ключа нет / не список — это НЕ «парк пуст», это «списка нам не дали». Прежний код тут
+        # молча подставлял [] (`or []`) и получал зелёный нуль.
+        log.warning("  → O3 scan: в ответе fleet() нет списка байков")
+        return scan_result.ScanResult.unreadable("байков", detail="в ответе fleet() нет списка байков")
     try:
         svc = bridge.service_list().get("items", []) or []
     except Exception:
         svc = []
-    overdue = []
+    overdue, parsed = [], 0
     for b in bikes:
-        name = str(b.get("name") or "").strip()
-        if not name:
-            continue
-        plate = _plate_from_name(name) or "?"
-        cur = _i(_odo_current(bridge, name,
-                              recs=[r for r in svc if _same_bike(r.get("bike"), name)],
-                              fleet_row=b)) or 0
-        items = []
-        for kind in _MAND_KINDS:
-            interval = _service_interval(kind, name, bridge)
-            if interval is None:                  # gear на мото/XADV → не трекаем
-                continue
-            last = _i(b.get(f"{kind}_last_km")) or 0
-            if last <= 0:
-                if cur >= int(interval):           # не делалось И пробег дорос до порога → пора
-                    items.append({"kind": kind, "last": 0, "next": int(interval),
-                                  "over_km": cur - int(interval), "nobase": True})
-                continue
-            nxt = last + int(interval)
-            if nxt - cur <= 0:                     # просрочено
-                items.append({"kind": kind, "last": last, "next": nxt, "over_km": cur - nxt})
-        if items:
-            items.sort(key=lambda x: x["over_km"], reverse=True)
-            overdue.append({"bike": name, "plate": plate, "current_km": cur, "items": items})
+        try:
+            name = str(b.get("name") or "").strip()
+            if not name:
+                continue                          # осмотрен, но не разобран: строка без имени
+            plate = _plate_from_name(name) or "?"
+            cur_i = _i(_odo_current(bridge, name,
+                                    recs=[r for r in svc if _same_bike(r.get("bike"), name)],
+                                    fleet_row=b))
+            cur = cur_i or 0                      # расчёт прежний; счётчик — отдельно от расчёта
+            if cur_i is not None:
+                parsed += 1                       # решение по этому байку принято ПО СУЩЕСТВУ
+            items = []
+            for kind in _MAND_KINDS:
+                interval = _service_interval(kind, name, bridge)
+                if interval is None:              # gear на мото/XADV → не трекаем
+                    continue
+                last = _i(b.get(f"{kind}_last_km")) or 0
+                if last <= 0:
+                    if cur >= int(interval):      # не делалось И пробег дорос до порога → пора
+                        items.append({"kind": kind, "last": 0, "next": int(interval),
+                                      "over_km": cur - int(interval), "nobase": True})
+                    continue
+                nxt = last + int(interval)
+                if nxt - cur <= 0:                # просрочено
+                    items.append({"kind": kind, "last": last, "next": nxt, "over_km": cur - nxt})
+            if items:
+                items.sort(key=lambda x: x["over_km"], reverse=True)
+                overdue.append({"bike": name, "plate": plate, "current_km": cur, "items": items})
+        except Exception:
+            # Байк, который не разобрался целиком, ОСМОТРЕН и НЕ РАЗОБРАН — счётчик это скажет.
+            # Прежде такая строка роняла ВЕСЬ скан (сорок байков молчали из-за одного).
+            log.exception("  → O3 scan: байк не разобран, идём дальше")
     overdue.sort(key=lambda x: x["items"][0]["over_km"], reverse=True)   # худшие (макс over_km) сверху
-    return {"overdue": overdue}
+    return scan_result.ScanResult(len(bikes), parsed, subject="байков", payload=overdue)
 
 
 def _o3_card_render(o, active_plates):
@@ -4725,7 +4760,16 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
     import asyncio
     target = O3_TEST_CHAT_ID if O3_TEST_MODE else SERVICING_CHAT
     topic = None if O3_TEST_MODE else NARYADY_TOPIC
-    overdue = _o3_overdue_scan(bridge).get("overdue") or []
+    scan = _o3_overdue_scan(bridge)
+    if not scan.ok:
+        # Контракт читателя (08.08.2026): пустой список тут значит «не смотрели», а не «чисто».
+        # Синк на нём ЗАПРЕЩЁН — он не просто напечатал бы «Просрочек нет 👍», он пометил бы
+        # «✅ решено» КАЖДУЮ висящую карточку (шаг 3 ниже): просрочки исчезли бы с доски, не
+        # перестав существовать. Молчим и говорим владельцу, что скан не состоялся.
+        log.warning(f"  → O3 board sync ОТМЕНЁН (скан не состоялся): {scan.say()}")
+        return {"overdue": 0, "cards": 0, "new": 0, "gone": 0,
+                "scan_failed": True, "scan_said": scan.say()}
+    overdue = scan.payload or []
     active = set()
     try:
         active = {str(t.get("plate")) for t in (_MEMORY.o3_tasks_active() if _MEMORY else [])}

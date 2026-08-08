@@ -31,8 +31,13 @@ class BR:
 
 # (1) скан: просрочки + порог «не делалось» (по факту), балласт-подсписок отсутствует
 print("(1) _o3_overdue_scan (порог nobase):")
-scan = S._o3_overdue_scan(BR()); ov = scan["overdue"]
-res.append(ok("nobase" not in scan, "балласт-подсписок «нет базы» убран из скана"))
+scan = S._o3_overdue_scan(BR()); ov = scan.payload or []
+# КОНТРАКТ ЧИТАТЕЛЯ (08.08.2026): скан отдаёт ScanResult — пару «осмотрено/разобрано» и исход,
+# а не голый {"overdue": […]}. Прежняя форма давала пустой список и на упавшем мосту, и на
+# здоровом парке (перепись 2026-08-08-zero-on-parse-miss-census, §2 канал 16).
+res.append(ok(scan.ok and scan.scanned == 3 and scan.parsed == 3,
+              f"скан состоялся: {scan.say()}"))
+res.append(ok(not hasattr(scan, "nobase"), "балласт-подсписок «нет базы» убран из скана"))
 res.append(ok(len(ov) == 2, f"2 байка с просрочками (NMAX+NINJA), PCX нет — {len(ov)}"))
 res.append(ok(not any("PCX" in o["bike"] for o in ov), "PCX: abs/air не делались, пробег 5000 < порогов → НЕ показан"))
 nm = [o for o in ov if "NMAX" in o["bike"]][0]

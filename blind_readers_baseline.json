@@ -1,0 +1,37 @@
+{
+  "_": "БАЗОВАЯ ЛИНИЯ ХРАПОВИКА СЛЕПЫХ ЧИТАТЕЛЕЙ. Правится РУКАМИ и только вниз: рост числа = гейт красный. Метод счёта — blind_readers.find_blind (см. его шапку). Инструмент линию НЕ ПИШЕТ намеренно: 'пересчитай базу' одной командой сделало бы храповик декорацией.",
+  "created": "2026-08-08",
+  "method": "blind_readers.find_blind: функция-читатель (берёт живой текст либо применяет шаблон), у которой return ПУСТОГО стоит в ветке промаха (except-обработчик или проверка `not X` / `X is None`). None пустым не считается — число есть НИЖНЯЯ ГРАНИЦА слепоты, не её мера.",
+  "scope": "верхний уровень репозитория, *.py, кроме черновиков _*.py; tests/ и подкаталоги вне области",
+  "census": "docs/artifacts/2026-08-08-zero-on-parse-miss-census.md — перепись руками: 469 веток, слепых около 368. Метод видит подмножество той же болезни.",
+  "total": 74,
+  "files_scanned": 42,
+  "per_file": {
+    "splinter.py": 14,
+    "orchestrator_daemon.py": 13,
+    "devbot.py": 5,
+    "expectations_run.py": 5,
+    "pretool_guard.py": 5,
+    "claude_client.py": 4,
+    "health.py": 4,
+    "notify.py": 3,
+    "bridge_client.py": 2,
+    "cclog.py": 2,
+    "gate.py": 2,
+    "invariants_check.py": 2,
+    "posttool_feed.py": 2,
+    "prod_drift.py": 2,
+    "repeat_ask.py": 2,
+    "brain_sync.py": 1,
+    "card_duty.py": 1,
+    "curator_ops.py": 1,
+    "expectations.py": 1,
+    "spend_ledger.py": 1,
+    "status_truth.py": 1,
+    "wallet_cache.py": 1
+  },
+  "history": [
+    {"date": "2026-08-08", "total": 75, "note": "первый замер методом, до перевода парк-скана просрочек ТО"},
+    {"date": "2026-08-08", "total": 74, "note": "splinter._o3_overdue_scan переведён на контракт scan_result.ScanResult (splinter.py 15 -> 14)"}
+  ]
+}

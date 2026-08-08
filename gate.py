@@ -221,6 +221,24 @@ def run_selective_tests(changed_files):
     return failed, len(test_files), time.time() - t0, f"селективный ({len(test_files)} тестов)"
 
 
+def _run_ratchet():
+    """ХРАПОВИК СЛЕПЫХ ЧИТАТЕЛЕЙ (класс «нуль по неразбору», 08.08.2026) → (ok, [строки]).
+
+    Гоняется в ОБОИХ режимах гейта, в т.ч. селективном: слепой читатель может появиться в модуле,
+    у которого своего теста нет вовсе — привязка к «затронутым тестам» пропустила бы ровно это.
+    Стоит дёшево (ast по верхнему уровню репозитория, доли секунды) и НИЧЕГО не пишет.
+
+    ПОЧЕМУ ХРАПОВИК, А НЕ ЗАМОК: замок «каждый читатель обязан вернуть ScanResult» детонировал бы
+    на ~74 старых местах и не дал бы подняться демону. Гейт судит ДЕЛЬТУ: назад сколько угодно,
+    вперёд нельзя. Сбой самого храповика — КРАСНОЕ (см. blind_readers.ratchet): недоказанное
+    зелёным не бывает. Обход — тот же, что у тестов: gate.py --override по «да» владельца."""
+    try:
+        import blind_readers
+        return blind_readers.ratchet(ROOT)
+    except Exception as e:
+        return False, [f"❌ ХРАПОВИК СЛЕПЫХ ЧИТАТЕЛЕЙ не импортировался ({e}) — считаем красным."]
+
+
 def main():
     op = _arg("--for") or "prod"
     override = _arg("--override")
@@ -241,6 +259,13 @@ def main():
     else:
         failed, total, dt = run_tests()
         label = "полный"
+
+    ratchet_ok, ratchet_lines = _run_ratchet()
+    for ln in ratchet_lines:
+        print(ln)
+    if not ratchet_ok:
+        failed = list(failed) + ["храповик:слепые-читатели"]
+        total += 1                  # храповик — такая же проверка гейта, как тест-файл
 
     if not failed:
         print(f"✅ ГЕЙТ ({label}): {total} тестов зелёные ({dt:.1f}с) — прод-операция «{op}» разрешена.")
