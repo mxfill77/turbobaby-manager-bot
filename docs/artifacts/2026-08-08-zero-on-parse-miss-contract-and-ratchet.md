@@ -275,4 +275,18 @@ $ git diff --stat
     tests/test_scan_contract.py, tests/test_blind_readers.py)
 ```
 
-Дословный вывод финального гейта и пуша — в §7 (дописан после операции).
+## 7. ФИНАЛЬНЫЙ ГЕЙТ И ПУШ (дословно, после операции)
+
+```
+$ git push origin main
+✅ храповик: слепых читателей 74 — базовая линия держится.
+✅ ГЕЙТ (полный): 182 тестов зелёные (81.2с) — прод-операция «push» разрешена.
+To https://github.com/mxfill77/turbobaby-manager-bot.git
+   352f4e5..7a209f7  main -> main
+
+$ git log origin/main --oneline -1
+7a209f7 нуль по неразбору: контракт читателя живого текста + храповик в гейте
+```
+
+**FACT: commit `7a209f7` в `git log origin/main`.** Гейт при пуше — полный (pre-push зовёт
+`gate.py --final`), храповик отработал в нём же и держит линию 74.
