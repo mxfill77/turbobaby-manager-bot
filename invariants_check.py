@@ -676,21 +676,29 @@ _DUTY_FORBIDDEN_ATTR_ROOTS = frozenset((
 ))
 
 
-def _duty_ast_findings(src):
-    """→ список (адрес, чем плохо). Пустой список = дежурный чист. Разбор — ast, не подстрока."""
+def _duty_ast_findings(src, allowed=None):
+    """→ список (адрес, чем плохо). Пустой список = дежурный чист. Разбор — ast, не подстрока.
+
+    `allowed` — какие корни импорта законны ИМЕННО для этого модуля. По умолчанию список
+    дежурного (`re`), и тогда поведение БАЙТ-В-БАЙТ прежнее для всех, кто звал функцию до
+    появления параметра. Своя ручка нужна там, где чистый модуль стоит на ДРУГОМ чистом
+    модуле: `fleet_cell` держится на контракте `scan_result`, у которого импортов ноль вовсе,
+    — разрешить ему `re` и запретить `scan_result` значило бы судить по имени, а не по тому,
+    даёт ли импорт руки."""
     import ast
+    allowed = _DUTY_ALLOWED_IMPORTS if allowed is None else allowed
     out = []
     tree = ast.parse(src)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
                 root = a.name.split(".")[0]
-                if root not in _DUTY_ALLOWED_IMPORTS:
+                if root not in allowed:
                     out.append((f"строка {node.lineno}", f"импорт «{a.name}» вне списка "
-                                f"{sorted(_DUTY_ALLOWED_IMPORTS)} — у решения появились руки"))
+                                f"{sorted(allowed)} — у решения появились руки"))
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
-            if root not in _DUTY_ALLOWED_IMPORTS:
+            if root not in allowed:
                 out.append((f"строка {node.lineno}", f"импорт из «{node.module}» вне списка — "
                             f"у решения появились руки"))
         elif isinstance(node, ast.Call):
@@ -824,6 +832,41 @@ def check_revizor_route_pure(world, run):
         return
     for where, why in findings:
         run.flag(f"revizor_route.py:{where}", why)
+
+
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12в: FLEET_CELL_PURE
+#  Контракт клетки Лист1 (fleet_cell.py) отвечает на один вопрос — ЧТО лежало в клетке ТО:
+#  ЗНАЧЕНИЕ / ПУСТО / НЕ-ЧИСЛО, и четвёртым исходом честно говорит «источник не прочитан», пока
+#  мост не прислал разметку. Он ТРАНСПОРТ, а не толкователь: не чинит значения (−5000 км и
+#  настоящий ноль доезжают как есть) и не ходит за ними сам — читает мост, зовёт bridge_client.
+#  Появись у него руки — он смог бы «дочитать» клетку в обход моста, и тогда ответ про клетку
+#  зависел бы от того, кто спросил, а не от того, что в клетке. Держится это отсутствием
+#  инструментов: импорт РОВНО ОДИН — сам контракт `scan_result` (у которого импортов ноль),
+#  ни файлов, ни сети, ни моста, ни подпроцессов. Разбор — тот же ast, что у дежурного:
+#  имя в комментарии, строке и докстринге кодом не является.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: нечитаемый контракт доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_FLEET_CELL_PATH = None         # подменяется САМОТЕСТОМ; None → боевой fleet_cell.py в репо
+_FLEET_CELL_ALLOWED_IMPORTS = frozenset(("scan_result",))
+
+
+@register("FLEET_CELL_PURE")
+def check_fleet_cell_pure(world, run):
+    path = _FLEET_CELL_PATH or os.path.join(REPO, "fleet_cell.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("fleet_cell.py", f"контракт клетки не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=_FLEET_CELL_ALLOWED_IMPORTS)
+    except SyntaxError as e:
+        run.flag("fleet_cell.py", f"контракт клетки не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"fleet_cell.py:{where}", why)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1620,6 +1663,64 @@ def _self_test():
     finally:
         shutil.rmtree(_cd_dir, ignore_errors=True)
         _CARD_DUTY_PATH = _old_duty_path
+
+    # ── 11а. FLEET_CELL_PURE (тот же приём, но список импортов у модуля СВОЙ) ────────────────
+    # Смысл секции: доказать, что страж судит НЕ ПО СЛОВУ, а по тому, даёт ли строка руки.
+    # `scan_result` — законный импорт (контракт, у которого импортов ноль вовсе), `re` — нет:
+    # у этого модуля разрешён РОВНО ОДИН импорт, и расширять список значит решать заново.
+    global _FLEET_CELL_PATH
+    _old_fc_path = _FLEET_CELL_PATH
+    _fc_dir = tempfile.mkdtemp()
+    try:
+        _fc_cases = [
+            ("CELL живой модуль чист", 0, None),
+            ("CELL импорт контракта законен", 0,
+             "from scan_result import ScanResult\ndef r(c):\n    return ScanResult(1, 1)\n"),
+            ("CELL .get и isinstance законны (позиция, не слово)", 0,
+             "from scan_result import ScanResult\n"
+             "def r(b):\n    return b.get('cells') if isinstance(b, dict) else None\n"),
+            ("CELL посторонний импорт → флаг (у модуля ровно один)", 1,
+             "from scan_result import ScanResult\nimport re\n"),
+            ("CELL импорт моста → флаг (за клеткой он ходить не вправе)", 1,
+             "import bridge_client\n"),
+            ("CELL голый open() → флаг", 1, "from scan_result import ScanResult\nf = open('/tmp/x')\n"),
+            ("CELL os.remove → флаг (импорт + вызов)", 2, "import os\nos.remove('/tmp/x')\n"),
+            ("CELL имя моста в ДОКСТРИНГЕ и комментарии — не флаг", 0,
+             '"""разметку клеток шлёт bridge_client — сам модуль за ней не ходит"""\n'
+             "from scan_result import ScanResult\n# bridge_client тут только словом\n"),
+            ("CELL модуль не парсится → флаг (fail-closed)", 1, "def broken(:\n"),
+        ]
+        for _fc_title, _fc_expect, _fc_src in _fc_cases:
+            if _fc_src is None:
+                _FLEET_CELL_PATH = None                      # боевой fleet_cell.py
+            else:
+                _fc_p = os.path.join(_fc_dir, "fleet_cell.py")
+                with open(_fc_p, "w", encoding="utf-8") as _f:
+                    _f.write(_fc_src)
+                _FLEET_CELL_PATH = _fc_p
+            _fc_run = CheckRun("FLEET_CELL_PURE")
+            check_fleet_cell_pure(_healthy_world(), _fc_run)
+            _fc_got = len(_fc_run.findings)
+            _fc_ok = (_fc_got == _fc_expect)
+            allpass &= _fc_ok
+            print(f"  {'PASS' if _fc_ok else 'FAIL'}  [FLEET_CELL_PURE] {_fc_title}: "
+                  f"ждали {_fc_expect}, поймали {_fc_got}")
+        _FLEET_CELL_PATH = os.path.join(_fc_dir, "нет-такого.py")
+        _fc_run = CheckRun("FLEET_CELL_PURE")
+        check_fleet_cell_pure(_healthy_world(), _fc_run)
+        _fc_ok = (len(_fc_run.findings) == 1)
+        allpass &= _fc_ok
+        print(f"  {'PASS' if _fc_ok else 'FAIL'}  [FLEET_CELL_PURE] CELL файла нет → флаг "
+              f"(fail-closed): ждали 1, поймали {len(_fc_run.findings)}")
+        # список дежурного НЕ пострадал от появления своей ручки у контракта клетки
+        _fc_duty_ok = (len(_duty_ast_findings("import re\n")) == 0
+                       and len(_duty_ast_findings("import os\n")) == 1)
+        allpass &= _fc_duty_ok
+        print(f"  {'PASS' if _fc_duty_ok else 'FAIL'}  [FLEET_CELL_PURE] список дежурного по "
+              f"умолчанию прежний (re законен, os — флаг)")
+    finally:
+        shutil.rmtree(_fc_dir, ignore_errors=True)
+        _FLEET_CELL_PATH = _old_fc_path
 
     # ── 12. PROD_DRIFT_READONLY (голдены на ДОСЛОВНОМ коде: каждая «рука» обязана краснеть) ──
     # Смысл секции: доказать, что страж ловит именно РУКИ, а не слова. Поэтому рядом стоят пары

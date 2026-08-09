@@ -16,6 +16,7 @@ import contextvars
 import unicodedata
 import requests
 import task_metrics                 # общий детектор тест-прогона (стор дедупа: проба ≠ бой)
+import fleet_cell                   # контракт клетки Лист1: исход вместо голого нуля
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -447,8 +448,25 @@ class BridgeClient:
     def ping(self) -> dict:
         return self._call("ping")
 
-    def fleet(self) -> dict:
+    def fleet(self, cells: bool = False) -> dict:
+        """Парк из Лист1 «Байки».
+
+        cells=True — попросить у моста РАЗМЕТКУ клеток ТО: у каждого байка появится поле
+        `cells`, где про каждую клетку сказано, ЧТО в ней лежало (значение / пусто / не число),
+        см. `fleet_cell`. Без параметра запрос и ответ БАЙТ-В-БАЙТ прежние — поэтому все
+        сегодняшние потребители (`find_bike`, `_o3_overdue_scan`, тул `get_fleet`, инварианты)
+        не видят ни одного лишнего байта, а разметку получает только тот, кто её спросил.
+
+        Старый деплой моста параметр просто игнорирует: `cells` не придёт, и `fleet_cell.read`
+        честно скажет «источник не прочитан» вместо выдуманного «пусто»."""
+        if cells:
+            return self._call("fleet", cells=1)
         return self._call("fleet")
+
+    @staticmethod
+    def cell(bike: dict, field: str):
+        """Клетка строки парка → ScanResult (исход, а не голое число). См. `fleet_cell`."""
+        return fleet_cell.read(bike, field)
 
     def find_bike(self, query: str) -> dict:
         """Найти байк в парке по НОМЕРУ (последние 3-4 цифры названия).
