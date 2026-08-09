@@ -1052,6 +1052,43 @@ def _kb_full(qid):
     return InlineKeyboardMarkup([[InlineKeyboardButton("📄 отчёт", callback_data=f"full:{qid}")]])
 
 
+# ── ЗАМОК ИНБОКСА: кнопка ВЕРДИКТА обязана уехать в 1160, что бы ни решил вызывающий ─────────
+# Признак маршрута один — «ждёт ли сообщение ответа». У карточки devbot этот признак есть в виде
+# ФАКТА, а не слова: клавиатура несёт кнопку, которая меняет судьбу задачи (approve:/reject:).
+# Навигация (🔄 Проверь / 📋 Дальше) и ссылка на отчёт (📄) ответом НЕ являются — карточка done с
+# «📄 отчёт» обязана остаться в теме постановки, иначе замок сам натаскает в инбокс информационное.
+_VERDICT_CB = ("approve:", "reject:")
+
+
+def _is_verdict_markup(markup):
+    """Несёт ли клавиатура кнопку ВЕРДИКТА владельца? Судим по callback_data реального объекта,
+    который сейчас отправляется, а не по тексту карточки: подпись можно переписать, callback —
+    это то, что нажатие сделает. Нет клавиатуры / чужая форма → False (замок не вмешивается)."""
+    try:
+        for row in (getattr(markup, "inline_keyboard", None) or []):
+            for btn in (row or []):
+                if str(getattr(btn, "callback_data", "") or "").startswith(_VERDICT_CB):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _inbox_lock_topic(topic, markup_last, qid=None):
+    """→ тема доставки. Карточка с кнопкой вердикта идёт в инбокс ВСЕГДА, даже если вызывающий
+    посчитал тему иначе (замок направления «спрашивающее — в инбоксе»). Инбокс выключен
+    (INBOX_TOPIC_ID = 0/мусор) → тема вызывающего, как было: это штатный режим «инбокса нет»,
+    и подменять его нечем. Информационная карточка не трогается вовсе."""
+    if not _is_verdict_markup(markup_last):
+        return topic
+    inbox = inbox_topic()
+    if not inbox or topic == inbox:
+        return topic
+    log.warning("devbot: ЗАМОК ИНБОКСА — карточка qid=%s с кнопкой вердикта шла в тему %s, "
+                "увожу в инбокс %s (спрашивающее мимо инбокса не уходит)", qid, topic, inbox)
+    return inbox
+
+
 def _find_task(bridge, qid):
     """Найти задачу по id среди всех статусов очереди → (status, item) | (None, None). read-only
     (get_pending, lane='all' — кнопки 🔄/📋 работают и под карточками полосы pc)."""
@@ -1091,13 +1128,18 @@ async def _send_stale_followup(context, q, next_it):
     except (TypeError, ValueError):
         return
     what = str(next_it.get("result") or "").strip()
-    tid = getattr(q.message, "message_thread_id", None) or DEVBOT_TOPIC
+    # ЗАМОК ИНБОКСА: тема бралась у НАЖАТОЙ карточки, а это СЛЕДУЮЩИЙ открытый вопрос со своими
+    # ✅/❌ — карточка, ждущая ответа. Нажми владелец легаси-карточку в 328 (инбокс тогда был
+    # выключен), и новый вопрос остался бы в 328 мимо инбокса.
+    markup = _kb_approval(next_id)
+    tid = _inbox_lock_topic(getattr(q.message, "message_thread_id", None) or DEVBOT_TOPIC,
+                            markup, next_id)
     try:
         await context.bot.send_message(
             chat_id=HQ_CHAT_ID,
             message_thread_id=tid,
             text=what[:4000] if what else f"Задача {next_id} — ждёт подтверждения",
-            reply_markup=_kb_approval(next_id),
+            reply_markup=markup,
         )
     except Exception as e:
         log.warning("devbot._send_stale_followup: send_message упал (%s)", e)
@@ -1480,7 +1522,12 @@ async def _send_card_with_retry(context, qid, chunks, topic, markup_last, label)
     """Отправить ВСЕ чанки карточки с ретраями (backoff, до _TG_SEND_RETRIES попыток).
     Возвращает True ТОЛЬКО когда доставлены ВСЕ чанки. Уже доставленные чанки
     при ретрае НЕ пересылаются (курсор sent_idx) → нет дублей. Пометку «отправлено»
-    ставит ВЫЗЫВАЮЩИЙ строго после True; False → карточка уйдёт на следующий тик."""
+    ставит ВЫЗЫВАЮЩИЙ строго после True; False → карточка уйдёт на следующий тик.
+
+    ЗАМОК ИНБОКСА стоит ЗДЕСЬ, в узком месте доставки, а не у вызывающего: тему вызывающий
+    считает сам, и следующий путь карточки-вопроса легко забудет про инбокс. Клавиатура вердикта
+    — факт об отправляемом сообщении, поэтому адрес чинится в последний момент."""
+    topic = _inbox_lock_topic(topic, markup_last, qid)
     n = len(chunks)
     sent_idx = 0
     for attempt in range(1, _TG_SEND_RETRIES + 1):

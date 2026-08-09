@@ -1056,6 +1056,115 @@ def check_expectations_pure(world, run):
         run.flag(f"expectations.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 15: INBOX_SINGLE_DOOR
+#  Инбокс 1160 держит РОВНО одно свойство — «всё здесь ждёт меня». Держится оно дверью
+#  `notify.send_inbox(text, answerable)`: адрес выбирает признак «ждёт ли сообщение ответа», а не
+#  автор сообщения. Дверь была заведена 05.08.2026, но остатком там же записано честно: она
+#  «контракт, а не забор» — ничто не мешало следующей функции в notify.py взять адрес инбокса
+#  самой и уехать туда мимо признака. Этот инвариант делает дверь ЕДИНСТВЕННОЙ по устройству:
+#    • `_inbox_dest` (единственный источник адреса инбокса) зовётся ТОЛЬКО из `_send_inbox_card`;
+#    • `_send_inbox_card` (единственный, кто этот адрес применяет) зовётся ТОЛЬКО из `send_inbox`;
+#    • `_send_message` (единственный выход в Telegram) зовётся только из трёх известных мест —
+#      новая функция с собственной отправкой обязана быть замечена, а не «просто заработать»;
+#    • у двери есть параметр `answerable` — признак маршрута ровно один и он назван.
+#  ПОЧЕМУ ЗАБОР ЖИВЁТ ТОЛЬКО ВНУТРИ notify.py: инбокс законно адресуют ещё два модуля — devbot
+#  (карточки needs_answer с кнопками ✅/❌) и bot.post_audit_card (contradiction/HIGH). Запретить
+#  им обращение к теме значило бы запретить сам инбокс, поэтому там граница держится ЗАМКОМ в
+#  коде доставки (`devbot._inbox_lock_topic`) и тестами обоих направлений, а не этим стражем.
+#  FAIL-CLOSED: файла нет / не парсится / у правила пропал предмет → ФЛАГ.
+# --------------------------------------------------------------------------------------------
+_NOTIFY_PATH = None                     # подменяется САМОТЕСТОМ; None → боевой notify.py в репо
+_DOOR_NAME = "send_inbox"               # дверь: признак «ждёт ответа» → адрес
+_DOOR_CARD = "_send_inbox_card"         # тело маршрута инбокса
+_DOOR_DEST = "_inbox_dest"              # источник адреса инбокса (chat, thread)
+_DOOR_SEND = "_send_message"            # единственный выход в Telegram внутри notify.py
+_DOOR_SEND_OK = frozenset(("notify", "_send_inbox_card", "send_feed"))
+
+
+def _door_callers(src):
+    """{имя вызываемого: {имена функций, из ТЕЛ которых он зовётся}} по ast.
+
+    Считается БЛИЖАЙШАЯ объемлющая функция (вложенная не приписывается внешней), имя в
+    комментарии и в строке вызовом не является — тот же приём, что у остальных стражей.
+    """
+    import ast as _ast
+    out = {}
+
+    def walk(node, fname):
+        for child in _ast.iter_child_nodes(node):
+            if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                walk(child, child.name)
+                continue
+            if isinstance(child, _ast.Call) and isinstance(child.func, _ast.Name):
+                out.setdefault(child.func.id, set()).add(fname)
+            walk(child, fname)
+
+    tree = _ast.parse(src)
+    walk(tree, "<модуль>")
+    return tree, out
+
+
+def _door_ast_findings(src):
+    """→ список (адрес, чем плохо). Пустой список = в инбокс ведёт ровно одна дверь."""
+    import ast as _ast
+    out = []
+    tree, callers = _door_callers(src)
+
+    def only(callee, allowed, what):
+        got = callers.get(callee) or set()
+        if not got:                       # предмет пропал: правило больше нечего охранять
+            out.append((callee, f"{what} не зовётся ниоткуда — правило потеряло предмет, "
+                                f"проверь, не переименована ли дверь"))
+            return
+        extra = sorted(got - {allowed})
+        if extra:
+            out.append((callee, f"{what} зовётся мимо двери из {extra} — в инбокс обязан вести "
+                                f"единственный путь «{allowed}»"))
+
+    only(_DOOR_DEST, _DOOR_CARD, "адрес инбокса")
+    only(_DOOR_CARD, _DOOR_NAME, "маршрут инбокса")
+
+    sends = callers.get(_DOOR_SEND) or set()
+    extra = sorted(sends - set(_DOOR_SEND_OK))
+    if extra:
+        out.append((_DOOR_SEND, f"отправка в Telegram появилась в {extra} — новый выход мимо "
+                                f"двери; известны только {sorted(_DOOR_SEND_OK)}"))
+
+    door = next((n for n in _ast.walk(tree)
+                 if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                 and n.name == _DOOR_NAME), None)
+    if door is None:
+        out.append((_DOOR_NAME, "двери в инбокс нет вовсе — признак маршрута не назван"))
+    else:
+        args = [a.arg for a in list(door.args.args) + list(door.args.kwonlyargs)]
+        if "answerable" not in args:
+            out.append((f"{_DOOR_NAME}:строка {door.lineno}",
+                        "у двери пропал параметр «answerable» — признак маршрута обязан быть "
+                        "ОДИН и назван явно, иначе адрес снова выбирает автор сообщения"))
+    return out
+
+
+@register("INBOX_SINGLE_DOOR")
+def check_inbox_single_door(world, run):
+    path = _NOTIFY_PATH or os.path.join(REPO, "notify.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("notify.py", f"канал уведомлений не читается ({e}) — единственность двери в "
+                              f"инбокс не доказана")
+        return
+    try:
+        findings = _door_ast_findings(src)
+    except SyntaxError as e:
+        run.flag("notify.py", f"канал уведомлений не разбирается ({e}) — единственность двери в "
+                              f"инбокс не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"notify.py:{where}", why)
+
+
 # ============================================================================================
 #  ТОЧКА РАСШИРЕНИЯ (будущие инварианты):
 #    @register("CRM_DATES")   — date_end < date_start (логическая ошибка брони)
