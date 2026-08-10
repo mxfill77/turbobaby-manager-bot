@@ -54,6 +54,8 @@ Thumbs.db
 spend_ledger.json
 verified_facts.json
 wallet_cache.json
+# состояние живого счёта серии цепочек (демон пишет в момент терминала; 10.08.2026)
+chain_series.json
 _pcport185
 # scratch / throwaway
 _*.py

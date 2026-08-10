@@ -42,6 +42,7 @@ import curator_claim      # ПОЗИЦИЯ ЗАЯВКИ: имя под отри�
 import curator_ops        # РАЗБОР ПУНКТА СВОДКИ НА ОПЕРАЦИИ: чистая функция (см. _curator_human_place)
 import curator_event      # ТОЖДЕСТВО СОБЫТИЯ МЕЖДУ ЦЕЛЯМИ: чистая функция (см. _curator_event_seen)
 import prod_drift         # ДЕТЕКТОР ДРЕЙФА ПРОДА: read-only, только говорит (см. _maybe_prod_drift)
+import chain_series       # СЧЁТ СЕРИИ ЦЕПОЧЕК: чистая функция без рук (см. _series_note_terminal)
 
 
 def _is_fixture(text: str) -> bool:
@@ -4548,9 +4549,11 @@ def process_new():
             # СЛОЙ 1 (ядро): конверт снова упёрся в красное → headless ДОКАЗАННО не может. НЕ ставим
             # approvable needs_approval (это был бы ре-конверт = петля). Терминальный failed с ручной
             # картой → рендер БЕЗ approve-кнопки → петля рвётся после РОВНО 1 перерождения.
-            cm = bc.complete_task(tid, "failed", _manual_card(result))
+            _mcard = _manual_card(result)
+            cm = bc.complete_task(tid, "failed", _mcard)
             log.info("CONVERT-LOOP-BREAK id=%s → failed (терминальная ручная карта), bridge_ok=%s",
                      tid, cm.get("ok"))
+            _series_note_terminal(task, "failed", _mcard)
             _maybe_dec_after(text, "failed")
         elif parse_op(result) in EXECUTORS and _card_origin(result) != "guard":
             # ЗАМОК ПРОИСХОЖДЕНИЯ (класс «подделка карточек», 31.07.2026): строка заявляет
@@ -4559,21 +4562,29 @@ def process_new():
             # текст, который задача про себя написала. Карточку не рождаем вовсе: терминальная
             # карта без кнопки. Настоящее красное придёт карточкой тогда, когда команду РЕАЛЬНО
             # попробуют — её перехватит гард (деньги и живые таблицы спрашивают как спрашивали).
-            cm = bc.complete_task(tid, "failed", _forged_op_card(result))
+            _fcard = _forged_op_card(result)
+            cm = bc.complete_task(tid, "failed", _fcard)
             log.warning("FORGED-OP id=%s: заявлен op=%s без гарда (origin=%s) → карточки нет, "
                         "терминальная карта, bridge_ok=%s",
                         tid, parse_op(result), _card_origin(result), cm.get("ok"))
+            _series_note_terminal(task, "failed", _fcard)
             _maybe_dec_after(text, "failed")
         elif _maybe_card_duty(tid, result):
             # ДЕЖУРНЫЙ ПО КАРТОЧКАМ (CARD_DUTY=1): за карточкой доказанно нет операции, которую
             # «да» владельца могло бы разрешить → вопрос снят, задача финализирована внутри,
             # владельцу ушла заметка в ленту. Решение гарда НЕ менялось: команда так и не прошла.
+            # В СЧЁТ СЕРИИ ВМЕШАТЕЛЬСТВОМ НЕ ИДЁТ: карточка до владельца не дошла вовсе (рамка
+            # прямо: «ask без объекта владельцу не отправляется»), — только терминал записи.
+            _series_note_terminal(task, "failed", result)
             _maybe_dec_after(text, "failed")     # как у forged-op: шаг цепи считается упавшим
         else:
             # Красная зона: НЕ исполняем. Ставим needs_approval — дев-бот спросит «да» Филиппа.
             rr = bc.set_needs_approval(tid, result)
             log.info("NEEDS_APPROVAL id=%s origin=%s bridge_ok=%s",
                      tid, _card_origin(result), rr.get("ok"))
+            # ЖИВОЙ СЧЁТ СЕРИИ: тело карточки записываем СЕЙЧАС — после ответа очередь его
+            # затрёт вердиктом, и вопрос «какая операция за ней стояла» станет неотвечаемым.
+            _series_note_card(tid, task, result)
     else:
         # САМОПОЧИНКА (STEP_SELFHEAL=1): провал шага декомпозиции ИЛИ одиночной «тз:»/«задача:»
         # (расширение ст4) → думатель, 1 попытка. True = финализировано внутри (перерождение/
@@ -4593,6 +4604,7 @@ def process_new():
         # _result_has_fact). _result_has_fact()/force_consult оставлены для devbot и юнит-теста §9.
         cm = bc.complete_task(tid, status, result)
         log.info("COMPLETE id=%s status=%s bridge_ok=%s", tid, status, cm.get("ok"))
+        _series_note_terminal(task, status, result)   # ЖИВОЙ СЧЁТ СЕРИИ: исход известен здесь
         _maybe_dec_after(text, status)          # шаг декомпозиции → halt-on-fail / сводка
         # Реестр фактов: done-финал followup-задачи куратора → зафиксировать вердикт (перезапишет pending)
         if status == "done" and _curator_on() and str(task.get("from") or "") == CURATOR_FROM:
@@ -4640,6 +4652,313 @@ def process_na_reminders():
             except Exception as e:
                 log.warning("NA reminder push failed id=%s: %s", tid, e)
     _na_reminded &= active_ids   # очистить id задач, которые больше не needs_approval
+    _series_cards_tick(active_ids)   # ЖИВОЙ СЧЁТ СЕРИИ: карточки, ушедшие из needs_approval
+
+
+# ═══════════════ ЖИВОЙ СЧЁТ СЕРИИ ЦЕПОЧЕК (10.08.2026, рамка §8г) ═══════════════════════════
+# Решение живёт в chain_series.py — чистой функции без рук (страж CHAIN_SERIES_PURE в гейте).
+# Здесь только руки: собрать факты, положить состояние в СВОЙ файл и записать строку в журнал.
+#
+# ПОЧЕМУ СОСТОЯНИЕ ЖИВЁТ ЗДЕСЬ, А НЕ ПЕРЕСЧИТЫВАЕТСЯ ПО ОЧЕРЕДИ. Очередь ЗАТИРАЕТ тело карточки
+# её же вердиктом: у задачи, дошедшей до владельца, `result` на момент needs_approval держал
+# карточку, а после ответа там лежит «отклонено Филиппом» либо рапорт конверта. Замер 10.08
+# померил этот пробел числом: из 106 вмешательств окна тело карточки ВОССТАНОВИМО у 46, у 60 —
+# нет. Значит вопрос «какая операция стояла за карточкой» после ответа из очереди уже не задать,
+# а демон в момент рождения карточки держит её тело в руках. Отсюда и правило рамки «где
+# считать»: исход известен демону в момент терминала — там и писать.
+#
+# СЧЁТ НИЧЕГО НЕ РЕШАЕТ. Он не ставит задач, не трогает очередь и не меняет ни одного вердикта —
+# только пишет свой файл и строку в журнал. Ошибка счёта поэтому стоит неверного числа.
+# ОТКАТ: CHAIN_SERIES=0 в .env + рестарт демона → ветка мертва ДО сбора фактов.
+CHAIN_SERIES_FILE = os.path.join(REPO, "chain_series.json")
+CHAIN_SERIES_TEST_FILE = "/tmp/cc_chain_series_test.json"   # тест-прогон в боевое НЕ пишет
+SERIES_KEEP = _env_int("SERIES_KEEP", 400)        # сколько цепочек помним (файл не растёт вечно)
+SERIES_WINDOWS = 40                               # окон исполнения для приписки рестартов
+SERIES_UNITS = (("splinter", "bot.py"),
+                ("orchestrator-daemon", "orchestrator_daemon.py"),
+                ("wa-webhook", "wa_webhook.py"))
+# Хвост после конца задачи, в который её ОТЛОЖЕННЫЙ рестарт (`systemd-run --on-active=10s`,
+# правило самомодификации) ещё считается своим. Без хвоста система штрафовала бы себя за
+# собственное правило, объявляя плановый самрестарт ремонтом руками.
+SERIES_OWN_GRACE = 180
+
+
+def _series_on():
+    """CHAIN_SERIES в .env: по умолчанию ВКЛЮЧЕНО, «0» выключает ветку целиком (ДО чтения
+    фактов). Дефолт-«включено» здесь законен ровно потому, что счёт ничего не решает."""
+    return (os.environ.get("CHAIN_SERIES") or "1").strip() != "0"
+
+
+def _series_file():
+    """Куда писать состояние. ORCH_TEST_MODE → ВРЕМЕННЫЙ файл: зеркало дисциплины `_drift_dir` —
+    тест не пишет в боевое состояние никогда, иначе счёт серии врал бы прогонами гейта.
+    CC_SERIES_FILE — явная подмена (осознанный вызов из своего сьюта)."""
+    explicit = (os.environ.get("CC_SERIES_FILE") or "").strip()
+    if explicit:
+        return explicit
+    if (os.environ.get("ORCH_TEST_MODE") or "").strip():
+        return CHAIN_SERIES_TEST_FILE
+    return CHAIN_SERIES_FILE
+
+
+def _series_load():
+    """Состояние с диска или None — «НЕ ПРОЧИТАНО». Пустой словарь здесь был бы слепым: он
+    неотличим от честного «серия только началась», и счёт молча обнулялся бы на каждом сбое
+    диска (класс «нуль по неразбору»). Различение отдаёт `_series_state`."""
+    try:
+        with open(_series_file(), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning("серия: состояние битое (%s) — счёт начнётся заново, и это будет видно "
+                    "в поле started_counting", e)
+        return None
+    except Exception as e:
+        log.warning("серия: состояние не прочитано (%s) — счёт начнётся заново", e)
+        return None
+
+
+def _series_state():
+    """Состояние для правки. Не прочитано → чистое, и МОМЕНТ НАЧАЛА СЧЁТА записывается в него:
+    обнулённая серия обязана сама говорить, с какого времени она считается."""
+    st = _series_load()
+    if st is None:
+        st = {}
+    st.setdefault("started_counting", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    return st
+
+
+def _series_save(state):
+    """Атомарная запись (tmp + replace): оборванная запись не оставит битого файла."""
+    path = _series_file()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _series_units_now():
+    """{юнит: метка старта} живых процессов. Юнита нет / проба сбоит → его в словаре нет вовсе
+    (о мёртвом сервисе говорит health, а не счётчик серии)."""
+    out = {}
+    for unit, entry in SERIES_UNITS:
+        try:
+            p = prod_drift.live(unit, entry)
+        except Exception:
+            p = None
+        if p and p.get("started"):
+            out[unit] = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(p["started"]))
+    return out
+
+
+def _series_commits(result, since):
+    """Хеши из отчёта, ДОКАЗАННО доехавшие в origin/main. Доказательство внешнее (git), а не
+    слово отчёта: «закоммитил» в тексте весом не является. git недоступен → пусто, то есть вес
+    по коммитам не доказан — молчим, а не додумываем."""
+    toks = set(re.findall(r"\b([0-9a-f]{7,40})\b", str(result or "").lower()))
+    out = (prod_drift._git(["log", "origin/main", "--format=%H", "--since=" + str(since or ""),
+                            "-n", "200"]) or "") if toks else ""
+    have = [s.strip() for s in out.splitlines() if len(s.strip()) == 40]
+    return sorted({s[:7] for s in have for t in toks if s.startswith(t)})
+
+
+def _series_chain(state, root, task):
+    """Запись цепочки в состоянии (создать при первом касании)."""
+    ch = state.setdefault("chains", {}).get(str(root))
+    if ch is None:
+        lane = str((task or {}).get("lane") or "vps")
+        ch = state["chains"][str(root)] = {
+            "root": int(root), "lane": lane,
+            "created": chain_series.stamp((task or {}).get("created")),
+            "closed_at": "", "statuses": {}, "cards": [], "refusals": [],
+            # ВЕС ПОЛОСЫ pc ОТСЮДА НЕ НАБЛЮДАЕМ (чужой репозиторий) — это «неизвестно», а не
+            # «нуль веса»: иначе слепота стала бы обвинением (класс «нуль по неразбору»).
+            "weight": {"commits": [], "restarts": 0, "known": lane != "pc"},
+        }
+    return ch
+
+
+def _series_root(tid, text, state):
+    """Корень цепочки записи. Родитель ищется по маркеру и разрешается ТРАНЗИТИВНО через уже
+    известные цепочки состояния (конверт → карточка владельцу → цель → корень)."""
+    kind, par = chain_series.parent_of(text)
+    seen = {int(tid)}
+    while par is not None and par not in seen:
+        seen.add(par)
+        # Родителя ищем и среди КАРТОЧЕК цепочки, а не только среди её записей: сводная карточка
+        # владельцу терминала в process_new не имеет (её закрывает ветка одобрения), и без этой
+        # строки конверт «[конверт одобренной заявки N]» заводил бы СВОЮ цепочку — плоский счёт,
+        # который рамка запрещает прямо.
+        owner = None
+        for r, ch in (state.get("chains") or {}).items():
+            if int(r) == par or str(par) in (ch.get("statuses") or {}) \
+                    or par in {c.get("id") for c in (ch.get("cards") or [])}:
+                owner = int(r)
+                break
+        if owner is None or owner == par:
+            return par, kind
+        par = owner
+    return int(tid), kind
+
+
+def _series_note_card(tid, task, what):
+    """КАРТОЧКА РОДИЛАСЬ. Тело записываем СЕЙЧАС — после ответа очередь его затрёт. Операции
+    называет curator_ops: ТОТ ЖЕ словарь, которым машина зовёт операции сама."""
+    if not _series_on():
+        return
+    try:
+        state = _series_state()
+        root, _kind = _series_root(tid, str((task or {}).get("task_text") or ""), state)
+        ch = _series_chain(state, root, task)
+        ops = [o["key"] for o in curator_ops.operations(str(what or ""))]
+        ch["cards"] = [c for c in ch["cards"] if c.get("id") != tid]
+        ch["cards"].append({"id": tid, "open": True, "born": chain_series.stamp(
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())), "ops": ops})
+        _series_save(state)
+        log.info("серия: карточка id=%s цепочки %s записана (операции: %s)",
+                 tid, root, ",".join(ops) or "нет")
+    except Exception as e:
+        log.warning("серия: карточку id=%s записать не удалось (%s) — счёт не тронут", tid, e)
+
+
+def _series_note_terminal(task, status, result):
+    """ТЕРМИНАЛ ЗАПИСИ. Здесь исход известен — здесь и пишем: статус, необъяснённый отказ,
+    окно исполнения (для приписки рестартов) и доказанные коммиты (вес)."""
+    if not _series_on():
+        return
+    try:
+        tid = int((task or {}).get("id"))
+        text = str((task or {}).get("task_text") or "")
+        state = _series_state()
+        root, kind = _series_root(tid, text, state)
+        ch = _series_chain(state, root, task)
+        ch["statuses"][str(tid)] = str(status or "")
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        ch["closed_at"] = max(ch.get("closed_at") or "", now)
+        why = chain_series.refusal(status, result)
+        if why:
+            ch["refusals"].append({"id": tid, "reason": why, "at": now})
+        if chain_series.is_manual_card(result):
+            # Работа ушла в руки владельца. Операция ВЫСШЕГО ВИДА §7 — это воля по конструкции
+            # (система не вправе делать её сама), своя оранжевая операция — ремонт руками.
+            v = chain_series.sort_manual_card(
+                [o["key"] for o in curator_ops.operations(str(result or ""))])
+            ch["cards"].append({"id": tid, "open": False, "sort": v["sort"], "why": v["why"],
+                                "at": now})
+        if ch["weight"].get("known"):
+            for sha in _series_commits(result, ch.get("created") or ""):
+                if sha not in ch["weight"]["commits"]:
+                    ch["weight"]["commits"].append(sha)
+        # _LAST_RUN["started"] — ISO-строка начала ИСПОЛНЕНИЯ (не постановки). Окно берётся
+        # именно по ней: `created` очереди — момент, когда задачу положили, а простоять в new
+        # она может часами, и по такому окну «своей» оказалась бы любая перезагрузка мира.
+        lo = chain_series.stamp(_LAST_RUN.get("started")) if _LAST_RUN.get("task") == tid else ""
+        if lo:
+            wins = state.setdefault("windows", [])
+            wins.append({"root": int(root), "lo": lo, "hi": now})
+            state["windows"] = wins[-SERIES_WINDOWS:]
+        _series_derive(state)
+        _series_save(state)
+    except Exception as e:
+        log.warning("серия: терминал id=%s не записан (%s) — счёт не тронут",
+                    (task or {}).get("id"), e)
+
+
+def _series_cards_tick(active_na):
+    """РАЗ В ЦИКЛ: заметить смену операционного состояния и закрыть карточки, ушедшие из
+    needs_approval. Сорт карточки ставится ЗДЕСЬ — когда известно и что она просила (тело
+    записано при рождении), и успела ли операция случиться сама (старты юнитов).
+
+    ОТВЕТ ВЛАДЕЛЬЦА В РЕШЕНИЕ НЕ ВХОДИТ ВОВСЕ: «да» и «нет» отсюда неразличимы по построению —
+    карточка просто перестала висеть. Ровно этого и требует рамка: сорт по ОПЕРАЦИИ."""
+    if not _series_on():
+        return
+    try:
+        state = _series_state()
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        units, prev = _series_units_now(), (state.get("units") or {})
+        changes = state.setdefault("changes", [])
+        first = not prev
+        for unit, at in units.items():
+            if prev.get(unit) == at:
+                continue
+            if not first:               # первое наблюдение НЕ обвиняет: истории у нас ещё нет
+                changes.append({"family": "service:" + unit, "at": at, "unit": unit})
+                _series_attribute(state, unit, at)
+        state["units"] = units
+        state["changes"] = changes[-200:]
+
+        closed = 0
+        for ch in (state.get("chains") or {}).values():
+            for c in ch.get("cards") or []:
+                if not c.get("open") or c.get("id") in (active_na or set()):
+                    continue
+                v = chain_series.sort_card(c.get("ops"), state.get("changes"), c.get("born"), now)
+                c.update({"open": False, "sort": v["sort"], "why": v["why"], "at": now})
+                closed += 1
+                log.info("серия: карточка id=%s закрыта, сорт=%s — %s",
+                         c.get("id"), v["sort"], v["why"][:120])
+        d = _series_derive(state)
+        _series_save(state)
+        if closed:
+            log.info("СЕРИЯ: %s", chain_series.render(d))
+    except Exception as e:
+        log.warning("серия: тик не отработал (%s) — счёт не тронут", e)
+
+
+def _series_attribute(state, unit, at):
+    """Старт юнита: чей он. Попал в окно исполнения задачи (+хвост на отложенный рестарт) → это
+    СВОЯ работа цепочки, она идёт ей в вес. Не попал ни в одно окно → РЕМОНТ РУКАМИ: за систему
+    сделали то, что она обязана была сделать сама. Приписываем последней цепочке — у события
+    мира своего номера в очереди нет, и приписка тут условна, о чём сказано прямо."""
+    for w in reversed(state.get("windows") or []):
+        if str(w.get("lo") or "") <= at <= _series_plus(str(w.get("hi") or ""), SERIES_OWN_GRACE):
+            ch = (state.get("chains") or {}).get(str(w.get("root")))
+            if ch:
+                ch["weight"]["restarts"] = int(ch["weight"].get("restarts") or 0) + 1
+                return
+    # Полоса важна: перезапускают юниты VPS, и повесить это на ПК-цепочку значило бы назвать
+    # чужого виновника. Приписываем последней СВОЕЙ цепочке — приписка условна и названа прямо.
+    roots = sorted((int(r) for r, ch in (state.get("chains") or {}).items()
+                    if str(ch.get("lane") or "vps") != "pc"), reverse=True)
+    if roots:
+        (state["chains"][str(roots[0])]["cards"]).append(
+            {"id": None, "open": False, "sort": chain_series.MANUAL, "at": at,
+             "why": "перезапуск %s в %s не попадает ни в одно окно исполнения — сделано руками"
+                    % (unit, at)})
+        log.info("серия: перезапуск %s в %s не приписан ни одной задаче → ремонт руками", unit, at)
+
+
+def _series_plus(ts, sec):
+    """Метка + секунды (в её же строковом виде; через полночь — граница суток)."""
+    try:
+        h, m, s = (int(x) for x in ts[11:].split(":"))
+    except (ValueError, IndexError):
+        return ts
+    t = h * 3600 + m * 60 + s + int(sec)
+    return ts[:11] + ("23:59:59" if t >= 86400
+                      else "%02d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60))
+
+
+def _series_derive(state):
+    """Пересчитать вердикты и серию чистой функцией; лишние цепочки выгрузить."""
+    chains = state.get("chains") or {}
+    for r in sorted(chains, key=lambda x: int(x))[:-SERIES_KEEP] if len(chains) > SERIES_KEEP \
+            else []:
+        chains.pop(r, None)
+    verdicts = []
+    for r in sorted(chains, key=lambda x: int(x)):
+        ch = dict(chains[r])
+        ch["statuses"] = list((chains[r].get("statuses") or {}).values())
+        ch["cards"] = [c for c in (chains[r].get("cards") or []) if not c.get("open")]
+        verdicts.append(chain_series.chain_verdict(ch))
+    d = chain_series.series(verdicts)
+    d["line"] = chain_series.render(d)
+    d["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state["derived"] = d
+    return d
 
 
 # ═══════════════ ДЕТЕКТОР ДРЕЙФА ПРОДА (06.08.2026, решение владельца «без рестарта») ═══════
