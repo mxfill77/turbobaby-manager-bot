@@ -9,10 +9,12 @@
 внутри демона молчал бы ровно в наблюдаемом случае — так сегодня устроен `_maybe_prod_drift`
 (живёт в `cycle()` и слеп, когда демон стоит), и повторять это здесь нельзя.
 
-ТРИ ИСТОЧНИКА ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
+ЧЕТЫРЕ ИСТОЧНИКА ФАКТОВ, КАЖДЫЙ ПЕРЕЖИВАЕТ СМЕРТЬ СВОЕГО ПРЕДМЕТА:
   очередь  — GET моста (одним вызовом, обе полосы);
   оборот   — файл пульса в /tmp, который демон пишет в конце cycle();
-  тик      — хвост splinter.log на диске.
+  тик      — хвост splinter.log на диске;
+  доставка — origin/main (читающий git), замыкание импортов, /proc и mtime файлов репозитория
+             (О3: дошёл ли проверенный коммит до прода; три исхода, включая «неизвестно»).
 Ни демон, ни splinter отсюда НЕ импортируются. Единственный сосед — `prod_drift`, у которого
 берётся read-only разведка /proc (кто жив и когда стартовал): она уже доказана инвариантом
 PROD_DRIFT_READONLY и покрыта своими тестами, дубль того же кода был бы второй правдой.
@@ -35,6 +37,7 @@ FAIL-SAFE: любой сбой сбора → факта нет → вердик
 """
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -144,6 +147,79 @@ def _proc(unit, entry):
     return {"pid": p["pid"], "started": p["started"]} if p else None
 
 
+# ═══════════════════ ФАКТЫ О3: ДОШЁЛ ЛИ ПРОВЕРЕННЫЙ КОММИТ ДО ПРОДА ════════════════════════
+# Собственный читающий git, а не расширение GIT_READ соседа: `prod_drift` лежит В ПАМЯТИ демона,
+# и правка ради чужой нужды сделала бы его самого отставшим. Дисциплина та же — белый список
+# подкоманд сверяется на КАЖДОМ вызове, аргументы литеральные.
+GIT_READ_RUN = frozenset(("diff", "log", "rev-parse"))
+GIT_TIMEOUT = 20
+
+
+def _git(args):
+    """Читающий git → stdout | None. Подкоманда вне белого списка не исполняется ВООБЩЕ."""
+    if not args or args[0] not in GIT_READ_RUN:
+        return None
+    try:
+        p = subprocess.run(["git"] + list(args), cwd=REPO,
+                           capture_output=True, text=True, timeout=GIT_TIMEOUT)
+    except Exception:
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def dirty_files():
+    """Файлы, которыми рабочее дерево ОТЛИЧАЕТСЯ от origin/main → (список, спросили_ли_успешно).
+
+    Это и есть замок против ложного зелёного: доставка утверждается только тогда, когда байты на
+    диске ДОКАЗАННО те же, что в origin/main. Не смогли спросить → False, и каждый файл коммита
+    станет «неизвестно», а не «доставлен»."""
+    out = _git(["diff", "--name-only", "origin/main", "--"])
+    if out is None:
+        return [], False
+    return [ln.strip() for ln in out.splitlines() if ln.strip()], True
+
+
+def delivery_facts(now):
+    """Факты О3 и ни одного решения: коммиты окна, замыкания потребителей, живые процессы,
+    время последней записи файлов, расхождение диска с origin/main.
+
+    git недоступен / ref origin/main отсутствует → ok=False, то есть выборки нет и О3 молчит
+    (о молчании честно сказано в шапке expectations.py: это не «дошло», это отсутствие фактов)."""
+    cfg_window = expectations.limit_env(expectations.DELIVER_WINDOW_ENV,
+                                        expectations.DELIVER_WINDOW_DEFAULT,
+                                        os.environ, scale=3600.0)
+    # Берём с запасом: судейское окно применяет решение, а фактов пусть будет чуть больше.
+    try:
+        commits = prod_drift.commits_since(now - max(cfg_window, 3600.0) * 2, REPO)
+    except Exception:
+        commits = []
+    if not commits and _git(["rev-parse", "--verify", "origin/main"]) is None:
+        return {"ok": False, "commits": [], "closures": {}, "units": {},
+                "mtimes": {}, "dirty": [], "dirty_ok": False}
+    closures, units = {}, {}
+    for unit, entry in prod_drift.WATCHED:
+        try:
+            closures[unit] = sorted(prod_drift.closure(entry, REPO))
+        except Exception:
+            closures[unit] = []
+        p = _proc(unit, entry)
+        units[unit] = {"alive": bool(p), "started": (p or {}).get("started"),
+                       "pid": (p or {}).get("pid"), "entry": entry}
+    mtimes = {}
+    for c in commits:
+        for rel in (c.get("files") or []):
+            rel = expectations.norm_path(rel)
+            if rel in mtimes:
+                continue
+            try:
+                mtimes[rel] = os.stat(os.path.join(REPO, rel)).st_mtime
+            except OSError:
+                continue                       # файла нет (удалён коммитом) — свидетель С1 хватит
+    dirty, dirty_ok = dirty_files()
+    return {"ok": True, "commits": commits, "closures": closures, "units": units,
+            "mtimes": mtimes, "dirty": dirty, "dirty_ok": dirty_ok}
+
+
 def snapshot(now=None):
     """ФАКТЫ и ни одного решения. Порогов здесь нет — их применяет expectations.verdict()."""
     now = time.time() if now is None else float(now)
@@ -156,6 +232,7 @@ def snapshot(now=None):
                    "claims": claims_ts()},
         "splinter": {"tick": tick.get("tick"), "log": tick.get("log"),
                      "proc": _proc("splinter", "bot.py")},
+        "delivery": delivery_facts(now),
     }
 
 
