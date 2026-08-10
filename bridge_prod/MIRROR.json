@@ -1,0 +1,28 @@
+{
+ "files_sha256": {
+  "Archive.js": "92e21884efe9f88cb488239d7d3511482714f4e18c77ba7d9eebf8db2fcff626",
+  "Booking.js": "a95bbdc9ba6b720b19dab81fc400bebf116e372bb1f0cc841f8a0ec4fc45c64b",
+  "BotData.js": "c92d414eed9643ab4e09c9e6f136336ed58a4cb72ed53b7c59ab320cc90273e7",
+  "BrainTrash.js": "3f2bc8d6455f740f41088edab9fbb18364fbf39f81eb975abffa777da871d156",
+  "Bridge.js": "28d97e2482f905a4b82b5b74e6fd9dfeafc7aac25c0620e2ffbdddc1ab7645be",
+  "Closing.js": "8fce3a78e21d92e478d64e60f3b415459904e749767ef2808a24be115652f8f9",
+  "Config.js": "7bdbea01c9e4bc189f57719f79b702dcdf289fd475f140acaddca93d7ec073db",
+  "Contract.js": "521e9ce134c85ed7b882d602d402f55f37b7bdfbd52da7c97a71f2c350e76947",
+  "Delivery.js": "f52830a40c1ba4fac3281db18d07762d0c529f9be7368fb6b8232aa7a4945810",
+  "Passport.js": "664a72b0966435357ea44ebfe2be217f3be1ddacb73ca0c42d0a15666d45cc6f",
+  "QuotePrice.js": "4a8d3d46a124d349ae310119d9e05d60002f56922eca8665b315a5f793624f13",
+  "ReadClients.js": "22569868065e98149ec1274a8e8e3ef301f99c7a19954c30eecede87f93a230c",
+  "ReadDocs.js": "d2ec0a7e7b93e040fd0590c1ed7776fd5ffddb4be65c7d2248926b00e1e1410f",
+  "ReadFinance.js": "45f4b9f23e8a7139915d1525b334cdd1f8ba438733114f96c0bed2079951c506",
+  "ReadFleet.js": "9e17393454afe1b47c18724ddc9b81f487a4dfeb9f3cd7440abffb3bdaa5e2af",
+  "ServicePending.js": "5851524c4a421bf0ddedee8c94b7b1bb94d75b3ed00a6ee44ede12008b8a57c7",
+  "appsscript.json": "41c4e8f0e37a297d4655f4bccff8e193b5ea9526aa583e320747fa856089af4e"
+ },
+ "head_diff_files": [],
+ "head_equals_prod": true,
+ "prod_version": 79,
+ "pulled_by": "deploy/bridge_prod_recon.py (read-only GET к Apps Script API)",
+ "pulled_utc": "2026-08-10 09:29:49 UTC",
+ "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
+ "что_это": "ЗЕРКАЛО задеплоенного Apps Script Bridge. Истина — Google, здесь снимок под git."
+}
