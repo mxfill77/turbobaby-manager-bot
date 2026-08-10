@@ -2085,18 +2085,50 @@ def _g_overdue(bridge):
     if not scan.ok:
         return ("🔧 Просрочки ТО: ПРОВЕРИТЬ НЕ УДАЛОСЬ — " + scan.say()
                 + "\n   нуль просрочек здесь означал бы «не искали», а не «всё чисто».")
-    ov = scan.payload or []
+    payload = scan.payload or {}
+    ov = payload.get("overdue") or []
+    unmeas = payload.get("unmeasured") or []
+    unchk = payload.get("unchecked") or []
+    imp = payload.get("impossible") or []
+    c = payload.get("counts") or {}
+
+    # ТРИ ЧИСЛА РАЗДЕЛЬНО (10.08.2026): «не измерено» — это НЕ просрочка и НЕ здоровье. Свернуть
+    # его в любое из двух соседних значило бы вернуть ровно тот дефект, ради которого мост учили
+    # различать пустую клетку и ноль (12 фантомных просрочек из 35, перепись 08.08).
+    out = [f"🔧 ТО парка: {splinter._o3_counts_line(payload)} ({scan.say()})"]
     if not ov:
-        return f"🔧 Просрочек ТО нет 👍 ({scan.say()})"
-    out = [f"🔧 Просрочки ТО: {len(ov)} байков ({scan.say()}; худшие сверху, топ-10):"]
+        out.append("  ✅ просрочек по ЗНАЧЕНИЮ нет — «не измерено» сюда не входит намеренно")
     for o in ov[:10]:
         parts = []
         for it in o["items"]:
             lbl = splinter._MAND_LABEL.get(it["kind"], (str(it["kind"]), str(it["kind"])))[1]
-            parts.append(f"{lbl} ❗не делалось" if it.get("nobase") else f"{lbl} +{it['over_km']}км")
+            mark = " ⁉️" if it.get("impossible") else ""
+            parts.append(f"{lbl} +{it['over_km']}км{mark}")
         out.append(f"  ⚠️ {splinter._o3_bike_label(o['bike'], o['plate'])} · " + ", ".join(parts))
     if len(ov) > 10:
-        out.append(f"  …ещё {len(ov) - 10} (полный board — /o3board)")
+        out.append(f"  …ещё {len(ov) - 10} просроченных (полный board — /o3board)")
+
+    if unmeas:
+        by = c.get("by_kind") or {}
+        reg = ", ".join(f"{splinter._MAND_LABEL.get(k, (k, k))[1]} {v.get('unmeasured', 0)}"
+                        for k, v in by.items() if v.get("unmeasured"))
+        out.append(f"  🔎 НЕ ИЗМЕРЕНО (клетка пуста либо не число) по регистрам: {reg}")
+        due = [o for o in unmeas if any(it.get("due_by_mileage") for it in o["items"])]
+        if due:
+            out.append(f"     из них пробег уже дорос до интервала — у {len(due)} байков: "
+                       + ", ".join(o["plate"] for o in due[:10])
+                       + (f" …ещё {len(due) - 10}" if len(due) > 10 else ""))
+    if unchk:
+        out.append(f"  ❔ НЕ УДАЛОСЬ ПРОВЕРИТЬ {c.get('unchecked_items', 0)} клеток у "
+                   f"{len(unchk)} байков: {unchk[0]['items'][0]['why']}")
+    if imp:
+        # НЕ ИСПРАВЛЯЕМ — только называем. Правка Лист1 — решение владельца (🔴 живая таблица).
+        out.append(f"  ⁉️ ЗНАЧЕНИЯ, КОТОРЫХ НЕ БЫВАЕТ ({len(imp)}) — не исправлял, только называю:")
+        for x in imp[:10]:
+            lbl = splinter._MAND_LABEL.get(x["kind"], (x["kind"], x["kind"]))[1]
+            out.append(f"     {x['plate']} · {lbl} = {x['value']} — {x['why']}")
+        if len(imp) > 10:
+            out.append(f"     …ещё {len(imp) - 10}")
     return "\n".join(out)
 
 

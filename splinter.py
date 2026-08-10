@@ -22,6 +22,7 @@ import logging
 import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM + паспорт B2
 import wallet_cache    # §касса: персистентный fallback-кэш баланса (переживает рестарт splinter)
 import scan_result     # контракт читателя живого текста: пара «осмотрено/разобрано» + исход
+import fleet_cell      # контракт клетки Лист1: значение / пусто / не-число / нечитаемо
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -4592,39 +4593,86 @@ def _o3_bike_label(bike, plate):
     return f"{plate} {name}".strip()
 
 
+def _o3_cell_km(cell):
+    """ЗНАЧЕНИЕ клетки → целые км. None = число есть, а километрами не стало (nan/inf/мусор).
+
+    Контракт уже поручился, что это число, поэтому None здесь — не «пусто», а «взять нечего»:
+    такая клетка уходит в «не удалось проверить», а НЕ в «не измерено» (мы не знаем, что там было)."""
+    try:
+        return int(cell.payload)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _o3_impossible_why(bike_row, kind, last):
+    """Значение ЕСТЬ, но пробегом быть не может → фраза-причина. Иначе "".
+
+    СУДИТ, НО НЕ ЧИНИТ. Транспорт (`fleet_cell`) донёс число как есть — здесь оно называется
+    невозможным вслух и уходит в отдельный список владельцу. Никакой подмены значения: −5000 так
+    и останется −5000 в расчёте, потому что править живой Лист1 — решение владельца, а не скана."""
+    why = []
+    if last < 0:
+        why.append(f"отрицательное ({last})")
+    elif last == 0:
+        why.append("нулевое (замена на нулевом пробеге)")
+    buy = fleet_cell.read(bike_row, "mileage")          # кол.H — пробег ПРИ ПОКУПКЕ
+    if buy.ok:
+        buy_km = _o3_cell_km(buy)
+        if buy_km is not None and last > 0 and buy_km > last:
+            why.append(f"пробег при покупке {buy_km} больше пробега замены {last}")
+    return " · ".join(why)
+
+
 def _o3_overdue_scan(bridge):
     """Park-wide скан просрочек 4 обязательных ТО (масло/gear[скутер]/ABS/возд.фильтр). ЧТЕНИЕ+расчёт (🟢).
-    fleet() (38 байков, *_last_km) + service_list (current_km). Текущий пробег — ТОТ ЖЕ единый
-    источник, что у карточки (_odo_current): свой одометр «обслуживание», фоллбэк I/J/K/L; кол.H
-    (пробег ПРИ ПОКУПКЕ) не участвует — класс-фикс 4957 закрыт на ОБЕИХ полосах, не только в карточке.
-    Просрочка: last>0 И next(=last+interval)−текущий ≤ 0.
-    «НЕ ДЕЛАЛОСЬ» (last≤0) — задача ПО ФАКТУ ПОРОГА (доводка 02.07): показываем ТОЛЬКО когда текущий
-    пробег ≥ интервала вида (ABS 10000 / возд.фильтр 20000 / масло-редуктор от нуля) — item nobase=True,
-    next=интервал. Не дорос → не показываем; балласт-подсписок «нет базы» убран совсем.
+    fleet(cells=True) (38 байков, *_last_km + РАЗМЕТКА клеток) + service_list (current_km). Текущий
+    пробег — ТОТ ЖЕ единый источник, что у карточки (_odo_current): свой одометр «обслуживание»,
+    фоллбэк I/J/K/L; кол.H (пробег ПРИ ПОКУПКЕ) не участвует — класс-фикс 4957 закрыт на ОБЕИХ
+    полосах, не только в карточке.
 
-    ВОЗВРАТ — `scan_result.ScanResult` (контракт читателя живого текста, 08.08.2026), payload =
-    [{bike,plate,current_km,items:[{kind,last,next,over_km,nobase?}]}] худшие сверху.
+    ТРИ СОСТОЯНИЯ КЛЕТКИ ВМЕСТО ОДНОГО НУЛЯ (10.08.2026, контракт `fleet_cell`, мост @79):
+        ЗНАЧЕНИЕ    → судим по нему: next = last+interval, next−текущий ≤ 0 → ПРОСРОЧКА;
+        ПУСТО       → «НЕ ИЗМЕРЕНО»: мерить было нечего, срок отсчитывать не от чего;
+        НЕ-ЧИСЛО    → «НЕ ИЗМЕРЕНО»: содержимое есть («-», слово, дата), пробегом не стало;
+        нечитаемо   → «НЕ УДАЛОСЬ ПРОВЕРИТЬ»: разметки не прислали (старый деплой моста) — и это
+                      НЕ повод молчать и НЕ повод считать просрочку.
+    ПОЧЕМУ ЭТО ГЛАВНАЯ ПРАВКА, А НЕ КОСМЕТИКА. Прежде `last = _i(…) or 0` схлопывал пустую клетку,
+    прочерк, настоящий ноль и отрицательное в ОДНО «last ≤ 0» → ветку `nobase` («не делалось»,
+    порог `cur ≥ interval`), и байк попадал в ТОТ ЖЕ список просрочек. Перепись
+    `docs/artifacts/2026-08-08-park-overdue-35-of-38-census.md`: из 35 просроченных байков 12 —
+    фантомы ровно отсюда, встречное число 23. «Не измерено» и «просрочено» — РАЗНЫЕ вопросы к
+    владельцу: первый лечится замером, второй — заменой, и складывать их в одно число значит
+    требовать работу там, где никто ничего не мерил.
+    НАСТОЯЩИЙ НОЛЬ ОСТАЁТСЯ ПРОСРОЧКОЙ (числа те же, что давал `nobase`: next=interval): замена
+    БЫЛА, записана на нулевом пробеге — но вслух названа невозможной (`impossible`).
+
+    ВОЗВРАТ — `scan_result.ScanResult`, payload = СЛОВАРЬ (прежде был список просрочек):
+        {"overdue": [{bike,plate,current_km,items:[{kind,last,next,over_km,impossible}]}],  худшие сверху
+         "unmeasured": [{bike,plate,current_km,items:[{kind,state,why,due_by_mileage}]}],
+         "unchecked":  [{bike,plate,current_km,items:[{kind,why}]}],
+         "impossible": [{bike,plate,kind,value,why}],
+         "counts": {overdue_bikes, overdue_items, unmeasured_bikes, unmeasured_items,
+                    unchecked_bikes, unchecked_items, by_kind:{kind:{overdue,unmeasured,unchecked}}}}
+    Три числа НЕ сворачиваются одно в другое НИГДЕ — ни в скане, ни у потребителей.
     ПОЧЕМУ НЕ ПРЕЖНИЙ `{"overdue": […]}`: прежняя форма отдавала ПУСТОЙ СПИСОК и при упавшем
     `fleet()`, и при здоровом парке без просрочек — владельцу печаталось «Просрочек ТО нет 👍» на
     парке из 38 байков, у которого никто ничего не смотрел (перепись
     `docs/artifacts/2026-08-08-zero-on-parse-miss-census.md`, §2 канал 16 — самое дорогое место).
-    Теперь наверх идёт ПАРА «осмотрено/разобрано» и исход:
+    Исход прохода — как и был:
         источник не прочитан (исключение / ответ без списка байков) → unreadable, осмотра не было;
         байков 0                                                    → empty, знаменатель назван;
         байков N, решение по существу принято по 0 из них           → mismatch (ТРЕТИЙ исход:
             текущий пробег не разобрался ни у одного — «просрочек нет» тут значит «не искали»);
         иначе                                                       → ok.
     РАЗОБРАН = байк, у которого ЕСТЬ имя и РАЗОБРАЛСЯ текущий пробег: без пробега вердикт
-    «не просрочено» ни на чём не стоит (`nxt - cur <= 0` при неизвестном cur — не ответ).
-    САМ СПИСОК ПРОСРОЧЕК СЧИТАЕТСЯ БАЙТ-В-БАЙТ КАК ПРЕЖДЕ (cur = разобранное или 0) — прибавились
-    только счётчики и исход."""
+    «не просрочено» ни на чём не стоит (`nxt - cur <= 0` при неизвестном cur — не ответ)."""
     def _i(x):
         try:
             return int(str(x).replace(" ", "").replace(",", ""))
         except (ValueError, TypeError):
             return None
     try:
-        resp = bridge.fleet()
+        resp = bridge.fleet(cells=True)   # просим РАЗМЕТКУ клеток: без неё три состояния неразличимы
     except Exception as e:
         log.exception("  → O3 scan: fleet упал")
         return scan_result.ScanResult.unreadable("байков", detail=f"fleet() упал: {e}")
@@ -4642,7 +4690,8 @@ def _o3_overdue_scan(bridge):
         svc = bridge.service_list().get("items", []) or []
     except Exception:
         svc = []
-    overdue, parsed = [], 0
+    overdue, unmeasured, unchecked, impossible, parsed = [], [], [], [], 0
+    by_kind = {k: {"overdue": 0, "unmeasured": 0, "unchecked": 0} for k in _MAND_KINDS}
     for b in bikes:
         try:
             name = str(b.get("name") or "").strip()
@@ -4655,29 +4704,79 @@ def _o3_overdue_scan(bridge):
             cur = cur_i or 0                      # расчёт прежний; счётчик — отдельно от расчёта
             if cur_i is not None:
                 parsed += 1                       # решение по этому байку принято ПО СУЩЕСТВУ
-            items = []
+            items, unmeas, unchk = [], [], []
             for kind in _MAND_KINDS:
                 interval = _service_interval(kind, name, bridge)
-                if interval is None:              # gear на мото/XADV → не трекаем
+                if interval is None:              # gear на мото/XADV → не трекаем ВООБЩЕ
                     continue
-                last = _i(b.get(f"{kind}_last_km")) or 0
-                if last <= 0:
-                    if cur >= int(interval):      # не делалось И пробег дорос до порога → пора
-                        items.append({"kind": kind, "last": 0, "next": int(interval),
-                                      "over_km": cur - int(interval), "nobase": True})
+                cell = fleet_cell.read(b, f"{kind}_last_km")
+                if cell.outcome == scan_result.OUTCOME_UNREADABLE:
+                    # Разметки не прислали. НЕ «не измерено» (мы не знаем, что в клетке) и уж точно
+                    # НЕ просрочка: третье число говорит владельцу, что вопрос остался открытым.
+                    unchk.append({"kind": kind, "why": cell.say()})
+                    by_kind[kind]["unchecked"] += 1
                     continue
+                if not cell.ok:                   # ПУСТО либо НЕ-ЧИСЛО → НЕ ИЗМЕРЕНО
+                    unmeas.append({"kind": kind, "state": cell.outcome, "why": cell.say(),
+                                   # мерить пора? — прежний порог `nobase`, теперь ПОМЕТКА внутри
+                                   # «не измерено», а не билет в список просрочек
+                                   "due_by_mileage": bool(cur >= int(interval))})
+                    by_kind[kind]["unmeasured"] += 1
+                    continue
+                last = _o3_cell_km(cell)
+                if last is None:                  # значение есть, километрами не стало
+                    unchk.append({"kind": kind, "why": f"значение не стало километрами ({cell.payload!r})"})
+                    by_kind[kind]["unchecked"] += 1
+                    continue
+                why = _o3_impossible_why(b, kind, last)
+                if why:                           # называем вслух, НЕ чиним и НЕ выкидываем из счёта
+                    impossible.append({"bike": name, "plate": plate, "kind": kind,
+                                       "value": last, "why": why})
                 nxt = last + int(interval)
-                if nxt - cur <= 0:                # просрочено
-                    items.append({"kind": kind, "last": last, "next": nxt, "over_km": cur - nxt})
+                if nxt - cur <= 0:                # ПРОСРОЧКА — и только она
+                    items.append({"kind": kind, "last": last, "next": nxt, "over_km": cur - nxt,
+                                  "impossible": why})
+                    by_kind[kind]["overdue"] += 1
             if items:
                 items.sort(key=lambda x: x["over_km"], reverse=True)
                 overdue.append({"bike": name, "plate": plate, "current_km": cur, "items": items})
+            if unmeas:
+                unmeasured.append({"bike": name, "plate": plate, "current_km": cur, "items": unmeas})
+            if unchk:
+                unchecked.append({"bike": name, "plate": plate, "current_km": cur, "items": unchk})
         except Exception:
             # Байк, который не разобрался целиком, ОСМОТРЕН и НЕ РАЗОБРАН — счётчик это скажет.
             # Прежде такая строка роняла ВЕСЬ скан (сорок байков молчали из-за одного).
             log.exception("  → O3 scan: байк не разобран, идём дальше")
     overdue.sort(key=lambda x: x["items"][0]["over_km"], reverse=True)   # худшие (макс over_km) сверху
-    return scan_result.ScanResult(len(bikes), parsed, subject="байков", payload=overdue)
+    payload = {
+        "overdue": overdue, "unmeasured": unmeasured, "unchecked": unchecked,
+        "impossible": impossible,
+        "counts": {
+            "overdue_bikes": len(overdue), "overdue_items": sum(len(o["items"]) for o in overdue),
+            "unmeasured_bikes": len(unmeasured),
+            "unmeasured_items": sum(len(o["items"]) for o in unmeasured),
+            "unchecked_bikes": len(unchecked),
+            "unchecked_items": sum(len(o["items"]) for o in unchecked),
+            "by_kind": by_kind,
+        },
+    }
+    return scan_result.ScanResult(len(bikes), parsed, subject="байков", payload=payload)
+
+
+def _o3_counts_line(payload):
+    """ТРИ ЧИСЛА ОДНОЙ СТРОКОЙ, и ни одно не свёрнуто в другое (ТЗ 10.08.2026).
+
+    Единицы названы явно: просрочка — про БАЙКА (историческое «35 из 38» считало байков), а
+    «не измерено» и «не удалось проверить» — про КЛЕТКИ (у одного байка их до четырёх). Без
+    единицы числа снова стали бы сравнимыми на глаз и слиплись бы в одно."""
+    c = (payload or {}).get("counts") or {}
+    return (f"просрочено {c.get('overdue_bikes', 0)} байков "
+            f"({c.get('overdue_items', 0)} клеток) · "
+            f"не измерено {c.get('unmeasured_items', 0)} клеток "
+            f"у {c.get('unmeasured_bikes', 0)} байков · "
+            f"не удалось проверить {c.get('unchecked_items', 0)} клеток "
+            f"у {c.get('unchecked_bikes', 0)} байков")
 
 
 def _o3_card_render(o, active_plates):
@@ -4691,12 +4790,11 @@ def _o3_card_render(o, active_plates):
     ru = [f"⚠️ {lbl}"]
     for it in o["items"]:
         lbl_th, lbl_ru = _MAND_LABEL.get(it["kind"], (str(it["kind"]), str(it["kind"])))
-        if it.get("nobase"):
-            th.append(f"{lbl_th} — ❗ ยังไม่เคยทำ (เลขไมล์ {o['current_km']} ≥ {it['next']} ถึงเวลาแล้ว)")
-            ru.append(f"{lbl_ru} — ❗ не делалось (пробег {o['current_km']} ≥ {it['next']}, пора)")
-        else:
-            th.append(f"{lbl_th} — เลยกำหนด {it['over_km']} กม.")
-            ru.append(f"{lbl_ru} — просрочено {it['over_km']} км")
+        # Ветка «❗ не делалось» (nobase) УБРАНА 10.08.2026 вместе со своим источником: клетка без
+        # замера больше не приходит сюда вовсе — она уходит в «не измерено» (см. _o3_overdue_scan).
+        # В карточке-наряде остаётся ровно то, что ею и является: просрочка по ЗНАЧЕНИЮ.
+        th.append(f"{lbl_th} — เลยกำหนด {it['over_km']} กม.")
+        ru.append(f"{lbl_ru} — просрочено {it['over_km']} км")
         mk = _O3_KIND_MARK.get(it["kind"])
         if mk:
             th[-1] += " · " + mk[0]
@@ -4713,12 +4811,26 @@ def _o3_card_render(o, active_plates):
     return _bilingual(None, th, ru), kb
 
 
-def _o3_header_render(n_total, extra_plates):
-    """(text, kb) заголовка board: счётчик просрочек + [🔄 Обновить]; байки сверх капа карточек — строкой."""
+def _o3_header_render(n_total, extra_plates, payload=None):
+    """(text, kb) заголовка board: счётчик просрочек + [🔄 Обновить]; байки сверх капа карточек — строкой.
+
+    ТРИ ЧИСЛА РАЗДЕЛЬНО (10.08.2026): под счётчиком просрочек — строка «не измерено» и «не удалось
+    проверить». Карточки-наряды по-прежнему только на ПРОСРОЧКИ (наряд = работа), но молчать о двух
+    других числах нельзя: «просрочек нет 👍» на парке, где половина клеток не измерена, — это
+    ровно тот зелёный нуль, ради которого заведён контракт."""
+    c = ((payload or {}).get("counts") or {})
+    un_i, un_b = c.get("unmeasured_items", 0), c.get("unmeasured_bikes", 0)
+    nk_i, nk_b = c.get("unchecked_items", 0), c.get("unchecked_bikes", 0)
     th = [f"🔧 ใบสั่งงาน · เลยกำหนดเซอร์วิส · {n_total} คัน"]
     ru = [f"🔧 Наряды · просрочки парка · {n_total} байков"]
     if not n_total:
         th.append("ไม่มีรายการเลยกำหนด 👍"); ru.append("Просрочек нет 👍")
+    if un_i:
+        th.append(f"🔎 ยังไม่ได้วัด {un_i} ช่อง / {un_b} คัน — ไม่นับว่าเลยกำหนด")
+        ru.append(f"🔎 не измерено {un_i} клеток у {un_b} байков — это НЕ просрочка, это замер")
+    if nk_i:
+        th.append(f"❔ ตรวจไม่ได้ {nk_i} ช่อง / {nk_b} คัน")
+        ru.append(f"❔ не удалось проверить {nk_i} клеток у {nk_b} байков")
     if extra_plates:
         th.append(f"…อีก {len(extra_plates)} คัน นอกการ์ด: " + ", ".join(extra_plates))
         ru.append(f"…ещё {len(extra_plates)} вне карточек: " + ", ".join(extra_plates))
@@ -4754,6 +4866,11 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
     /o3board / после отправки наряда) дубли НЕ плодят: msg_id карточек в memory.db o3_card →
     существующие обновляются editMessageText, новые просрочки досылаются, ушедшие из просрочки
     помечаются «✅ решено» (след остаётся, msg_id забывается), байк в наряде — «✅ в наряде» без кнопки.
+    «РЕШЕНО» ГОВОРИТСЯ ТОЛЬКО О РЕШЁННОМ (10.08.2026): байк, ушедший из просрочек потому, что его
+    клетка оказалась ПУСТОЙ или НЕ-ЧИСЛОМ, помечается «🔎 не измерено» и msg_id за ним СОХРАНЯЕТСЯ —
+    вопрос не закрыт, а сменил вид. Прежняя ветка сказала бы «✅ решено, просрочек нет» ровно тем
+    двенадцати фантомам, ради которых правка и делалась: доска показала бы починку там, где никто
+    ничего не мерил.
     Троттл _O3_CARD_PAUSE между карточками + _send_retry (RetryAfter) — урок pin_info_all.
     Предохранитель: карточек ≤ _O3_CARD_CAP (худшие сверху), остальное строкой в заголовке.
     Скан/хранение 🟢, постинг 🟠. Лист1/CRM/касса/state_set НЕ трогаем."""
@@ -4769,7 +4886,12 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
         log.warning(f"  → O3 board sync ОТМЕНЁН (скан не состоялся): {scan.say()}")
         return {"overdue": 0, "cards": 0, "new": 0, "gone": 0,
                 "scan_failed": True, "scan_said": scan.say()}
-    overdue = scan.payload or []
+    payload = scan.payload or {}
+    overdue = payload.get("overdue") or []
+    # Байки, ушедшие из просрочек НЕ потому, что их починили: клетка пуста / не число / не прочитана.
+    # Их карточки нельзя гасить словом «решено» — см. докстринг.
+    pending = {o["plate"] for o in (payload.get("unmeasured") or [])}
+    pending |= {o["plate"] for o in (payload.get("unchecked") or [])}
     active = set()
     try:
         active = {str(t.get("plate")) for t in (_MEMORY.o3_tasks_active() if _MEMORY else [])}
@@ -4787,7 +4909,7 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
     extra = [o["plate"] for i, o in enumerate(overdue) if i >= _O3_CARD_CAP and o["plate"] not in cards]
 
     # 1) заголовок: edit существующего / новый (только при allow_post_header)
-    htext, hkb = _o3_header_render(len(overdue), extra)
+    htext, hkb = _o3_header_render(len(overdue), extra, payload)
     if header_mid:
         await _o3_msg_edit(context, target, header_mid, htext, hkb)
     elif allow_post_header:
@@ -4821,8 +4943,11 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
                         log.exception("  → O3 board: карточка не персистнулась")
         await asyncio.sleep(_O3_CARD_PAUSE)
 
-    # 3) ушедшие из просрочки → «✅ решено» (след остаётся), msg_id забыть (новая просрочка = новая карточка)
-    gone = [(p, m) for p, m in cards.items() if p not in shown]
+    # 3) ушедшие из просрочки → «✅ решено» (след остаётся), msg_id забыть (новая просрочка = новая карточка).
+    #    НО: ушёл из-за неизмеренной/непрочитанной клетки → «🔎 не измерено», msg_id СОХРАНЯЕТСЯ.
+    left = [(p, m) for p, m in cards.items() if p not in shown]
+    gone = [(p, m) for p, m in left if p not in pending]
+    unmet = [(p, m) for p, m in left if p in pending]
     for plate, mid in gone:
         done = _bilingual(None, [f"✅ {plate} — เรียบร้อยแล้ว ไม่มีงานเลยกำหนด"],
                           [f"✅ {plate} — решено, просрочек нет"])
@@ -4833,9 +4958,21 @@ async def _o3_board_sync(context, bridge, allow_post_header=True):
             except Exception:
                 log.exception("  → O3 board: карточка не забылась")
         await asyncio.sleep(_O3_CARD_PAUSE)
+    for plate, mid in unmet:
+        note = _bilingual(None, [f"🔎 {plate} — ยังไม่ได้วัด: ช่องว่าง/ไม่ใช่ตัวเลข ยังไม่ใช่งานเลยกำหนด"],
+                          [f"🔎 {plate} — не измерено: клетка пуста либо не число. "
+                           f"Это не «решено» — просрочку по ней судить не от чего"])
+        await _o3_msg_edit(context, target, mid, note, None)
+        await asyncio.sleep(_O3_CARD_PAUSE)
+    c = payload.get("counts") or {}
     log.info(f"  → O3 board sync: просрочек={len(overdue)}, карточек={len(show)}, новых={new_cnt}, "
-             f"решено={len(gone)}, test={O3_TEST_MODE}, chat={target}, topic={topic}")
-    return {"overdue": len(overdue), "cards": len(show), "new": new_cnt, "gone": len(gone)}
+             f"решено={len(gone)}, не измерено={c.get('unmeasured_items', 0)} клеток, "
+             f"не проверено={c.get('unchecked_items', 0)} клеток, «не измерено» карточек={len(unmet)}, "
+             f"test={O3_TEST_MODE}, chat={target}, topic={topic}")
+    return {"overdue": len(overdue), "cards": len(show), "new": new_cnt, "gone": len(gone),
+            "unmeasured": c.get("unmeasured_items", 0), "unmeasured_bikes": c.get("unmeasured_bikes", 0),
+            "unchecked": c.get("unchecked_items", 0), "unchecked_bikes": c.get("unchecked_bikes", 0),
+            "counts_line": _o3_counts_line(payload)}
 
 
 async def o3_post_board(context, bridge):

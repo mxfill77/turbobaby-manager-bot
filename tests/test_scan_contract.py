@@ -11,7 +11,9 @@
   · «осмотрено > 0, разобрано 0» — ТРЕТИЙ исход (`mismatch`), он произносится вслух;
   · «источник не прочитан» — это НЕ «осмотрено 0»: измерения не было вовсе (`scanned=None`);
   · владельцу на недоступном источнике говорится «ПРОВЕРИТЬ НЕ УДАЛОСЬ», а не «просрочек нет 👍»;
-  · сам список просрочек на здоровом парке считается КАК ПРЕЖДЕ (перевод не тронул расчёт);
+  · сам список просрочек на здоровом парке считается тем же порядком «худшие сверху» (перевод
+    контракта читателя расчёт не трогал; ЧТО считать просрочкой, изменено позже и отдельно —
+    10.08.2026, три состояния клетки, регресс `tests/test_overdue_cells.py`);
   · доска нарядов на несостоявшемся скане НЕ синкается: иначе «✅ решено» встало бы на каждую
     висящую карточку — просрочки исчезли бы с доски, не перестав существовать.
 
@@ -46,9 +48,34 @@ import devbot as DB
 SC = SR.ScanResult
 
 # --- Парк-фикстура: ТА ЖЕ, что в tests/test_o3.py (живые имена и формат листа) ---------------
+# РАЗМЕТКА КЛЕТОК (контракт `fleet_cell`, мост @79 от 10.08.2026): скан зовёт `fleet(cells=True)`,
+# и мок обязан повторять живой формат — иначе он моделирует несуществующий мост. 0 в плоском поле
+# означал «замену не делали», то есть ПУСТУЮ клетку; ABS у NMAX поднят до значения 5000, чтобы
+# парк остался просроченным ПО-НАСТОЯЩЕМУ (предмет этого файла — исход прохода, а не толкование
+# клетки; толкование закреплено в tests/test_overdue_cells.py).
+_CELL_FIELDS = ("mileage", "oil_last_km", "gear_last_km", "abs_last_km", "airfilter_last_km")
+
+
+def cells(row):
+    mk = {}
+    for f in _CELL_FIELDS:
+        v = row.get(f) or 0
+        if isinstance(v, str):              # живая строка одометра «35200 Km, 05.07.2026» — не число
+            mk[f] = {"state": "text", "raw": v}
+        elif v:
+            mk[f] = {"state": "value", "num": v, "raw": str(v)}
+        else:
+            mk[f] = {"state": "empty", "raw": ""}
+    return dict(row, cells=mk)
+
+
+def fleet_resp(rows, cells_wanted):
+    return {"data": {"bikes": [cells(r) if cells_wanted else dict(r) for r in rows]}}
+
+
 _BIKES = [
     {"name": "NMAX 155CC PHUKET 4255", "status": "ДОМА", "mileage": 3000,
-     "oil_last_km": 24000, "gear_last_km": 27000, "abs_last_km": 0, "airfilter_last_km": 5000},
+     "oil_last_km": 24000, "gear_last_km": 27000, "abs_last_km": 5000, "airfilter_last_km": 5000},
     {"name": "NINJA 400CC PHUKET 6334", "status": "ДОМА", "mileage": 40000,
      "oil_last_km": 38000, "gear_last_km": 0, "abs_last_km": 25000, "airfilter_last_km": 10000},
     {"name": "PCX 160CC PHUKET 1111", "status": "ДОМА", "mileage": 5000,
@@ -58,26 +85,26 @@ _BIKES = [
 
 class BR:                                   # здоровый мост, здоровый парк
     def _call(s, a, **k): return {"ok": False}
-    def fleet(s): return {"data": {"bikes": [dict(b) for b in _BIKES]}}
+    def fleet(s, cells=False): return fleet_resp(_BIKES, cells)
     def service_list(s): return {"items": [
         {"bike": "NMAX 155CC PHUKET 4255", "current_km": 30000},
     ]}
 
 
 class BR_RAISE(BR):                         # мост упал (исключение) — как в проде при таймауте
-    def fleet(s): raise RuntimeError("Bridge timeout")
+    def fleet(s, cells=False): raise RuntimeError("Bridge timeout")
 
 
 class BR_NOTOK(BR):                         # мост ответил ОТКАЗОМ, без исключения
-    def fleet(s): return {"ok": False, "error": "unauthorized"}
+    def fleet(s, cells=False): return {"ok": False, "error": "unauthorized"}
 
 
 class BR_NOKEY(BR):                         # ответ есть, списка байков в нём нет (сменилась форма)
-    def fleet(s): return {"ok": True, "data": {}}
+    def fleet(s, cells=False): return {"ok": True, "data": {}}
 
 
 class BR_EMPTY(BR):                         # список есть и он пуст
-    def fleet(s): return {"data": {"bikes": []}}
+    def fleet(s, cells=False): return {"data": {"bikes": []}}
 
 
 # ЖИВАЯ форма промаха шаблона, а не выдуманная: колонка одометра в проде держит СТРОКУ
@@ -89,10 +116,10 @@ _LIVE_ODO_STRING = "35200 Km, 05.07.2026"
 class BR_ODO_DEAD(BR):
     """Парк на месте, а ТЕКУЩИЙ ПРОБЕГ не разбирается НИ У ОДНОГО байка — это и есть третий исход.
     Прежний код отдал бы отсюда пустой список просрочек, и владелец прочитал бы «нет 👍»."""
-    def fleet(s):
+    def fleet(s, cells=False):
         dead = {f"{k}_last_km": _LIVE_ODO_STRING
                 for k in ("oil", "gear", "abs", "airfilter")}
-        return {"data": {"bikes": [dict(b, mileage=_LIVE_ODO_STRING, **dead) for b in _BIKES]}}
+        return fleet_resp([dict(b, mileage=_LIVE_ODO_STRING, **dead) for b in _BIKES], cells)
     def service_list(s): return {"items": [
         {"bike": b["name"], "current_km": _LIVE_ODO_STRING} for b in _BIKES
     ]}
@@ -161,23 +188,23 @@ res.append(ok(r_empty.outcome == SR.OUTCOME_EMPTY and r_empty.scanned == 0,
 r_dead = S._o3_overdue_scan(BR_ODO_DEAD())
 res.append(ok(r_dead.outcome == SR.OUTCOME_MISMATCH and r_dead.scanned == 3 and r_dead.parsed == 0,
               f"пробег не разобрался ни у одного из 3 → ТРЕТИЙ исход: {r_dead.say()}"))
-res.append(ok(not r_dead.ok and (r_dead.payload or []) == [],
+res.append(ok(not r_dead.ok and ((r_dead.payload or {}).get("overdue") or []) == [],
               "у третьего исхода находок нет — но это «не искали», и «.ok» об этом говорит"))
 
 # === (5) здоровый парк: расчёт БАЙТ-В-БАЙТ прежний ============================================
 print("(5) здоровый парк — исход ok, список просрочек прежний:")
 good = S._o3_overdue_scan(BR())
-ov = good.payload or []
+ov = (good.payload or {}).get("overdue") or []
 res.append(ok(good.outcome == SR.OUTCOME_OK and good.scanned == 3 and good.parsed == 3,
               f"осмотрено 3, разобрано 3 → ok ({good.say()})"))
 res.append(ok(len(ov) == 2, f"2 байка с просрочками (NMAX+NINJA), PCX нет — {len(ov)}"))
 res.append(ok(not any("PCX" in o["bike"] for o in ov),
-              "PCX: abs/air не делались, пробег 5000 < порогов → НЕ показан (расчёт не тронут)"))
+              "PCX: abs/air НЕ ИЗМЕРЕНЫ (клетки пусты) → в просрочки не идёт (класс 10.08.2026)"))
 nm = [o for o in ov if "NMAX" in o["bike"]][0]
 res.append(ok(nm["current_km"] == 30000, "NMAX текущий = max(colH, service_list) = 30000"))
 res.append(ok(ov[0] is nm and nm["items"][0]["kind"] == "abs"
-              and nm["items"][0].get("nobase") is True and nm["items"][0]["over_km"] == 20000,
-              "NMAX первый: ABS nobase-просрочка, порядок «худшие сверху» прежний"))
+              and nm["items"][0]["last"] == 5000 and nm["items"][0]["over_km"] == 15000,
+              "NMAX первый: ABS просрочен ПО ЗНАЧЕНИЮ, порядок «худшие сверху» прежний"))
 res.append(ok([it["kind"] for it in nm["items"]] == ["abs", "airfilter", "oil"],
               "NMAX: abs>airfilter>oil по over_km — сортировка прежняя"))
 ninja = [o for o in ov if "NINJA" in o["bike"]][0]
@@ -188,13 +215,16 @@ res.append(ok([it["kind"] for it in ninja["items"]] == ["airfilter", "abs"]
 
 class BR_ONE_BAD(BR):
     """Один байк ломает разбор (строка вместо словаря) — остальные обязаны доехать."""
-    def fleet(s): return {"data": {"bikes": [dict(_BIKES[0]), "мусор из листа", dict(_BIKES[1])]}}
+    def fleet(s, cells=False):
+        rows = fleet_resp([_BIKES[0], _BIKES[1]], cells)["data"]["bikes"]
+        return {"data": {"bikes": [rows[0], "мусор из листа", rows[1]]}}
 
 
 r_one = S._o3_overdue_scan(BR_ONE_BAD())
 res.append(ok(r_one.scanned == 3 and r_one.parsed == 2 and r_one.outcome == SR.OUTCOME_OK,
               f"битая строка: осмотрено 3, разобрано 2 — скан не падает целиком ({r_one.say()})"))
-res.append(ok(len(r_one.payload or []) == 2, "просрочки уцелевших байков посчитаны"))
+res.append(ok(len((r_one.payload or {}).get("overdue") or []) == 2,
+              "просрочки уцелевших байков посчитаны"))
 
 # === (6) владелец: было → стало ===============================================================
 print("(6) владелец — «было» (нуль как здоровье) → «стало»:")
@@ -210,25 +240,31 @@ res.append(ok("осмотрено" in DB._g_overdue(BR_ODO_DEAD()),
 res.append(ok("не искали" in DB._g_overdue(BR_RAISE()),
               "владельцу сказано прямо: нуль тут означал бы «не искали»"))
 out_good = DB._g_overdue(BR())
-res.append(ok("Просрочки ТО: 2 байков" in out_good and "4255 NMAX 155CC PHUKET" in out_good,
-              "здоровый парк: список как прежде, байк на месте"))
+res.append(ok("просрочено 2 байков" in out_good and "4255 NMAX 155CC PHUKET" in out_good,
+              "здоровый парк: список на месте, байк назван"))
 res.append(ok("осмотрено 3 байков" in out_good,
               f"…и со знаменателем: {out_good.splitlines()[0]}"))
-res.append(ok("❗не делалось" in out_good and "+" in out_good,
-              "nobase и «+N км» помечены — рендер не тронут"))
+# С 10.08.2026 «❗не делалось» из ПРОСРОЧЕК ушло вместе со своим источником: неизмеренная клетка
+# больше не выдаётся за просроченную, она называется отдельным числом (tests/test_overdue_cells.py).
+res.append(ok("+" in out_good and "❗не делалось" not in out_good
+              and "не измерено" in out_good,
+              "«+N км» на месте, «не делалось» из просрочек ушло, «не измерено» названо отдельно"))
 
 
 class BR_CLEAN(BR):
     """Парк здоров и просрочек ПРАВДА нет: это единственный случай, где «нет 👍» законно."""
-    def fleet(s): return {"data": {"bikes": [
+    def fleet(s, cells=False): return fleet_resp([
         {"name": "PCX 160CC PHUKET 1111", "status": "ДОМА", "mileage": 100,
-         "oil_last_km": 90, "gear_last_km": 90, "abs_last_km": 90, "airfilter_last_km": 90}]}}
+         "oil_last_km": 90, "gear_last_km": 90, "abs_last_km": 90, "airfilter_last_km": 90}], cells)
     def service_list(s): return {"items": []}
 
 
 clean = DB._g_overdue(BR_CLEAN())
-res.append(ok(clean.startswith(BYLO) and "осмотрено 1" in clean,
-              f"настоящий нуль остаётся «нет 👍», но СО ЗНАМЕНАТЕЛЕМ: «{clean}»"))
+res.append(ok("просрочек по ЗНАЧЕНИЮ нет" in clean and "осмотрено 1" in clean
+              and "просрочено 0" in clean,
+              f"настоящий нуль остаётся нулём, но СО ЗНАМЕНАТЕЛЕМ: «{clean}»"))
+res.append(ok("не измерено 0 клеток" in clean,
+              "и рядом честный нуль второго числа: мерить было что, и всё измерено"))
 
 # === (7) доска нарядов: несостоявшийся скан → синк отменён ====================================
 print("(7) доска нарядов — на несостоявшемся скане не синкается:")

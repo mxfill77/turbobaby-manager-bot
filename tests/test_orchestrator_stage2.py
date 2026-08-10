@@ -111,21 +111,33 @@ res.append(ok(set(("Filipp-328", "Filipp-328-dev", "Filipp-328-dec",
 
 # (6) новые зелёные команды B
 print("(6) зелёные команды B:")
-class BR:                                  # парк как в test_o3: NMAX просрочен (abs nobase+air+oil)
+class BR:                                  # парк как в test_o3: NMAX просрочен (abs+air+oil по значению)
+    # РАЗМЕТКА КЛЕТОК (мост @79, 10.08.2026): скан зовёт fleet(cells=True) и различает пустую
+    # клетку, прочерк и число. Без разметки живой скан честно скажет «не удалось проверить» —
+    # поэтому мок повторяет живой формат. ABS здесь ЗНАЧЕНИЕ 5000 (было 0 = пустая клетка):
+    # предмет этого файла — зелёные команды devbot, и парк должен остаться просроченным
+    # по-настоящему. Смысл трёх состояний закреплён в tests/test_overdue_cells.py.
     def _call(s, a, **k):
         if a == "read_doc" and k.get("name") == "pulse":
             return {"ok": True, "text": "2026-07-03 | 🟢 | тестовый пульс"}
         return {"ok": False}
-    def fleet(s): return {"data": {"bikes": [
-        {"name": "NMAX 155CC PHUKET 4255", "status": "ДОМА", "mileage": 30000,
-         "oil_last_km": 24000, "gear_last_km": 27000, "abs_last_km": 0, "airfilter_last_km": 5000}]}}
+    def fleet(s, cells=False):
+        row = {"name": "NMAX 155CC PHUKET 4255", "status": "ДОМА", "mileage": 30000,
+               "oil_last_km": 24000, "gear_last_km": 27000, "abs_last_km": 5000,
+               "airfilter_last_km": 5000}
+        if cells:
+            row = dict(row, cells={f: {"state": "value", "num": row[f], "raw": str(row[f])}
+                                   for f in ("mileage", "oil_last_km", "gear_last_km",
+                                             "abs_last_km", "airfilter_last_km")})
+        return {"data": {"bikes": [row]}}
     def service_list(s): return {"items": []}
 out = DB._g_overdue(BR())
-res.append(ok("Просрочки ТО: 1 байков" in out and "4255 NMAX 155CC PHUKET" in out,
+res.append(ok("просрочено 1 байков" in out and "4255 NMAX 155CC PHUKET" in out,
               "«просрочки»: скан O3 переиспользован, байк в списке"))
-res.append(ok("❗не делалось" in out and "+" in out, "«просрочки»: nobase и «+N км» помечены"))
+res.append(ok("+" in out and "не измерено 0 клеток" in out,
+              "«просрочки»: «+N км» на месте, второе число названо отдельно (10.08.2026)"))
 class BR0(BR):
-    def fleet(s): return {"data": {"bikes": []}}
+    def fleet(s, cells=False): return {"data": {"bikes": []}}
 # БЫЛО (до 08.08.2026): пустой парк → «🔧 Просрочек ТО нет 👍» — БУКВА В БУКВУ та же строка, что и
 # на упавшем мосту, и на парке из 38 байков, у которого никто ничего не смотрел. СТАЛО: нуль без
 # знаменателя не отдаётся (контракт читателя, scan_result; регресс — tests/test_scan_contract.py).

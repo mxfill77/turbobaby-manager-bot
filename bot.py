@@ -315,8 +315,13 @@ async def cmd_o3board(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                + str(stats.get("scan_said") or "скан парка не состоялся")
                                + "\nКарточки не тронуты — нуль просрочек тут означал бы «не искали».")
         elif m and isinstance(stats, dict):
+            # ТРИ ЧИСЛА РАЗДЕЛЬНО (10.08.2026): «не измерено» не сворачивается ни в просрочку,
+            # ни в «решено» — иначе сводка снова выдаёт неизмеренное за здоровое.
             note = (f"🐀 Splinter\n📋 Board синхронизирован: просрочек {stats.get('overdue', 0)}, "
-                    f"карточек {stats.get('cards', 0)}, новых {stats.get('new', 0)}, решено {stats.get('gone', 0)}.")
+                    f"карточек {stats.get('cards', 0)}, новых {stats.get('new', 0)}, решено {stats.get('gone', 0)}."
+                    f"\n🔎 не измерено {stats.get('unmeasured', 0)} клеток у {stats.get('unmeasured_bikes', 0)} байков; "
+                    f"❔ не удалось проверить {stats.get('unchecked', 0)} клеток "
+                    f"у {stats.get('unchecked_bikes', 0)} байков.")
             if not stats.get("new") and not stats.get("gone"):
                 note += "\nНовых сообщений нет — существующие карточки обновлены НА МЕСТЕ (они выше в ленте)."
             await m.reply_text(note)

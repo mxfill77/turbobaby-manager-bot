@@ -14,24 +14,56 @@ def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []; loop = asyncio.new_event_loop()
 HQ = S.O3_TEST_CHAT_ID
 
+# --- РАЗМЕТКА КЛЕТОК (контракт `fleet_cell`, мост @79 от 10.08.2026) --------------------------
+# Скан просит у моста разметку (`fleet(cells=True)`) и по ней РАЗЛИЧАЕТ пустую клетку, прочерк и
+# настоящее число. Мок обязан повторять ЖИВОЙ формат запуска (§8 свода среды), иначе он проверяет
+# несуществующий мост: без `cells` живой скан честно скажет «не удалось проверить» и не найдёт
+# НИ ОДНОЙ просрочки. Форма снята с прода 10.08.2026:
+#     значение {"state":"value","num":18302,"raw":"18302"} · пусто {"state":"empty","raw":""}
+#     не-число {"state":"text","raw":"-"}
+# ПЕРЕВОД ФИКСТУР: 0 в плоском поле означал здесь «замену не делали» — то есть ПУСТУЮ клетку;
+# так и переведено. Единственная правка значения — ABS у NMAX (было 0): предмет ЭТОГО файла —
+# механика доски (карточки, троттл, кап, паритет RU/TH), и байк должен остаться просроченным
+# ПО-НАСТОЯЩЕМУ. Смысл «пустая клетка = не просрочка, а замер» закреплён отдельно —
+# tests/test_overdue_cells.py.
+_CELL_FIELDS = ("mileage", "oil_last_km", "gear_last_km", "abs_last_km", "airfilter_last_km")
+
+
+def cells(row):
+    """Строка парка → та же строка + `cells` в живой форме моста (0 → пусто, число → значение)."""
+    mk = {}
+    for f in _CELL_FIELDS:
+        v = row.get(f) or 0
+        mk[f] = {"state": "value", "num": v, "raw": str(v)} if v else {"state": "empty", "raw": ""}
+    return dict(row, cells=mk)
+
+
+def fleet_resp(rows, cells_wanted):
+    """Ответ моста: разметка приезжает ТОЛЬКО по явной просьбе — как в проде."""
+    return {"data": {"bikes": [cells(r) if cells_wanted else dict(r) for r in rows]}}
+
+
 # --- mock bridge: knowledge_base fail → фоллбэк-интервалы (oil ск4000/мо5000, gear ск4000/мо None, abs 10000, air 20000)
+_ROWS = [
+    {"name": "NMAX 155CC PHUKET 4255", "status": "ДОМА", "mileage": 3000,
+     "oil_last_km": 24000, "gear_last_km": 27000, "abs_last_km": 5000, "airfilter_last_km": 5000},
+    {"name": "NINJA 400CC PHUKET 6334", "status": "ДОМА", "mileage": 40000,
+     "oil_last_km": 38000, "gear_last_km": 0, "abs_last_km": 25000, "airfilter_last_km": 10000},
+    {"name": "PCX 160CC PHUKET 1111", "status": "ДОМА", "mileage": 5000,
+     "oil_last_km": 4000, "gear_last_km": 4000, "abs_last_km": 0, "airfilter_last_km": 0},
+]
+
+
 class BR:
     def _call(s, a, **k): return {"ok": False}
-    def fleet(s): return {"data": {"bikes": [
-        {"name": "NMAX 155CC PHUKET 4255", "status": "ДОМА", "mileage": 3000,
-         "oil_last_km": 24000, "gear_last_km": 27000, "abs_last_km": 0, "airfilter_last_km": 5000},
-        {"name": "NINJA 400CC PHUKET 6334", "status": "ДОМА", "mileage": 40000,
-         "oil_last_km": 38000, "gear_last_km": 0, "abs_last_km": 25000, "airfilter_last_km": 10000},
-        {"name": "PCX 160CC PHUKET 1111", "status": "ДОМА", "mileage": 5000,
-         "oil_last_km": 4000, "gear_last_km": 4000, "abs_last_km": 0, "airfilter_last_km": 0},
-    ]}}
+    def fleet(s, cells=False): return fleet_resp(_ROWS, cells)
     def service_list(s): return {"items": [
         {"bike": "NMAX 155CC PHUKET 4255", "current_km": 30000},   # выше colH(3000) → max=30000 (тест max)
     ]}
 
-# (1) скан: просрочки + порог «не делалось» (по факту), балласт-подсписок отсутствует
-print("(1) _o3_overdue_scan (порог nobase):")
-scan = S._o3_overdue_scan(BR()); ov = scan.payload or []
+# (1) скан: просрочки ПО ЗНАЧЕНИЮ клетки (10.08.2026: пустая клетка = «не измерено», не просрочка)
+print("(1) _o3_overdue_scan (просрочка = значение, по которому срок вышел):")
+scan = S._o3_overdue_scan(BR()); ov = (scan.payload or {}).get("overdue") or []
 # КОНТРАКТ ЧИТАТЕЛЯ (08.08.2026): скан отдаёт ScanResult — пару «осмотрено/разобрано» и исход,
 # а не голый {"overdue": […]}. Прежняя форма давала пустой список и на упавшем мосту, и на
 # здоровом парке (перепись 2026-08-08-zero-on-parse-miss-census, §2 канал 16).
@@ -39,16 +71,20 @@ res.append(ok(scan.ok and scan.scanned == 3 and scan.parsed == 3,
               f"скан состоялся: {scan.say()}"))
 res.append(ok(not hasattr(scan, "nobase"), "балласт-подсписок «нет базы» убран из скана"))
 res.append(ok(len(ov) == 2, f"2 байка с просрочками (NMAX+NINJA), PCX нет — {len(ov)}"))
-res.append(ok(not any("PCX" in o["bike"] for o in ov), "PCX: abs/air не делались, пробег 5000 < порогов → НЕ показан"))
+res.append(ok(not any("PCX" in o["bike"] for o in ov),
+              "PCX: abs/air НЕ ИЗМЕРЕНЫ (клетки пусты), пробег 5000 < порогов → НЕ показан"))
+res.append(ok([o["plate"] for o in (scan.payload or {}).get("unmeasured") or []] == ["1111"],
+              "и PCX назван вслух в «не измерено» — молча он больше не исчезает"))
 nm = [o for o in ov if "NMAX" in o["bike"]][0]
 res.append(ok(nm["current_km"] == 30000, "NMAX текущий=max(colH,service_list)=30000"))
-res.append(ok(ov[0] is nm and nm["items"][0]["kind"] == "abs" and nm["items"][0].get("nobase") is True
-              and nm["items"][0]["next"] == 10000 and nm["items"][0]["over_km"] == 20000,
-              "NMAX первый: ABS не делалось, пробег 30000 ≥ 10000 → nobase-просрочка (порог=10000)"))
+res.append(ok(ov[0] is nm and nm["items"][0]["kind"] == "abs"
+              and nm["items"][0]["last"] == 5000 and nm["items"][0]["next"] == 15000
+              and nm["items"][0]["over_km"] == 15000,
+              "NMAX первый: ABS просрочен ПО ЗНАЧЕНИЮ 5000 (next=15000, пробег 30000)"))
 res.append(ok([it["kind"] for it in nm["items"]] == ["abs", "airfilter", "oil"], "NMAX: abs>airfilter>oil (по over_km)"))
 ninja = [o for o in ov if "NINJA" in o["bike"]][0]
 res.append(ok([it["kind"] for it in ninja["items"]] == ["airfilter", "abs"]
-              and not any(it.get("nobase") for it in ninja["items"]), "NINJA: airfilter+abs просрочены (база есть)"))
+              and all(it["last"] > 0 for it in ninja["items"]), "NINJA: airfilter+abs просрочены (база есть)"))
 res.append(ok("gear" not in [it["kind"] for it in ninja["items"]], "NINJA мото: gear пропущен (interval None)"))
 
 # (2) o3_task + o3_card CRUD
@@ -113,8 +149,9 @@ res.append(ok(len(hdr) == 1 and "· 2 байков" in hdr[0]["text"], "заго
 res.append(ok(hdr and btn(hdr[0]["kb"]).callback_data == "o3:rescan", "заголовок с кнопкой [🔄 Обновить] (o3:rescan)"))
 card_nm = [s for s in SENDS if "⚠️ 4255" in s["text"]]
 res.append(ok(len(card_nm) == 1, "NMAX = своё сообщение-карточка"))
-res.append(ok(card_nm and "ABS — ❗ не делалось (пробег 30000 ≥ 10000, пора)" in card_nm[0]["text"],
-              "строка «не делалось (пробег ≥ порога, пора)» в карточке"))
+res.append(ok(card_nm and "ABS — просрочено 15000 км" in card_nm[0]["text"],
+              "строка «просрочено N км» у ABS (ветка «❗ не делалось» убрана вместе с источником:"
+              " неизмеренная клетка в наряд больше не попадает)"))
 res.append(ok(card_nm and "Возд. фильтр — просрочено 5000 км" in card_nm[0]["text"], "строка «просрочено N км»"))
 res.append(ok(card_nm and btn(card_nm[0]["kb"]).text == "🔧 สร้างใบสั่งงาน / Собрать наряд"
               and btn(card_nm[0]["kb"]).callback_data.startswith("o3:pick:"), "кнопка [🔧 …/ Собрать наряд] → o3:pick (TH+RU)"))
@@ -142,12 +179,12 @@ res.append(ok(e_nm and "✅ в наряде" in e_nm[0]["text"] and e_nm[0].get(
 # (6) байк ушёл из просрочки → «✅ решено» (след остаётся), msg_id забыт
 print("(6) пометка «решено»:")
 class BR2(BR):   # NMAX обслужили (база свежая), NINJA всё ещё просрочен
-    def fleet(s): return {"data": {"bikes": [
+    def fleet(s, cells=False): return fleet_resp([
         {"name": "NMAX 155CC PHUKET 4255", "status": "ДОМА", "mileage": 3000,
          "oil_last_km": 30000, "gear_last_km": 30000, "abs_last_km": 30000, "airfilter_last_km": 30000},
         {"name": "NINJA 400CC PHUKET 6334", "status": "ДОМА", "mileage": 40000,
          "oil_last_km": 38000, "gear_last_km": 0, "abs_last_km": 25000, "airfilter_last_km": 10000},
-    ]}}
+    ], cells)
 EDITS.clear()
 loop.run_until_complete(S._o3_refresh_board(ctx, BR2()))
 e_done = [e for e in EDITS if e["message_id"] == cards_db["4255"]]
@@ -163,10 +200,10 @@ print("(7) кап 30 + троттл/RetryAfter на потоке карточе�
 # поэтому порядок «худшие сверху» и хвост сверх капа должны задаваться реальным источником.
 class BR35:
     def _call(s, a, **k): return {"ok": False}
-    def fleet(s): return {"data": {"bikes": [
+    def fleet(s, cells=False): return fleet_resp([
         {"name": f"NMAX 155CC PHUKET {5100 + i}", "status": "ДОМА", "mileage": 3000,
          "oil_last_km": 1000, "gear_last_km": 19000, "abs_last_km": 15000, "airfilter_last_km": 5000}
-        for i in range(35)]}}
+        for i in range(35)], cells)
     def service_list(s): return {"items": [
         {"bike": f"NMAX 155CC PHUKET {5100 + i}", "service_type": "oil",
          "current_km": 20000 + i * 10, "updated_at": "2026-07-30T00:00:00Z"}
@@ -258,9 +295,9 @@ res.append(ok(mem_b.o3_cards(HQ).get("__header__") == 555000, "rescan усыно
 # (13) пустой парк без просрочек → карточек нет, заголовок «Просрочек нет»
 print("(13) просрочек нет:")
 class BR0(BR):
-    def fleet(s): return {"data": {"bikes": [
+    def fleet(s, cells=False): return fleet_resp([
         {"name": "PCX 160CC PHUKET 1111", "status": "ДОМА", "mileage": 5000,
-         "oil_last_km": 4000, "gear_last_km": 4000, "abs_last_km": 0, "airfilter_last_km": 0}]}}
+         "oil_last_km": 4000, "gear_last_km": 4000, "abs_last_km": 0, "airfilter_last_km": 0}], cells)
     def service_list(s): return {"items": []}
 mem_0 = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_0
 SENDS.clear()
@@ -317,8 +354,13 @@ print("(15) фикс «/o3board молчит»:")
 mem_f = M.Memory(db_path=tempfile.mktemp(suffix=".db")); S._MEMORY = mem_f
 SENDS.clear()
 st1 = loop.run_until_complete(S.o3_post_board(ctx, BR()))
-res.append(ok(st1 == {"overdue": 2, "cards": 2, "new": 2, "gone": 0},
+res.append(ok({k: st1.get(k) for k in ("overdue", "cards", "new", "gone")}
+              == {"overdue": 2, "cards": 2, "new": 2, "gone": 0},
               f"первый пост: stats {{overdue:2, cards:2, new:2, gone:0}} — {st1}"))
+res.append(ok(st1.get("unmeasured") == 2 and st1.get("unmeasured_bikes") == 1
+              and "не измерено 2" in st1.get("counts_line", ""),
+              "и сводка НЕСЁТ второе число отдельно (PCX: две неизмеренные клетки) — "
+              "прежде оно молча пропадало между «просрочено» и «решено»"))
 n15 = len(SENDS)
 st2 = loop.run_until_complete(S.o3_post_board(ctx, BR()))
 res.append(ok(st2 and st2["new"] == 0 and st2["cards"] == 2 and len(SENDS) == n15,
