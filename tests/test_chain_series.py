@@ -21,6 +21,7 @@
 (7) замок против подлога: вес, три состояния веса, порог по замеру
 (8) руки демона: тело карточки пишется при РОЖДЕНИИ, сорт ставится при закрытии, ремонт руками
 (9) границы: CHAIN_SERIES=0 → ветка мертва; счёт не меняет НИ ОДНОГО вердикта очереди
+(10) изоляция состояния: прогон СЬЮТА боевого файла не касается ни одним слоем
 """
 import ast
 import json
@@ -374,6 +375,28 @@ res.append(ok(not touch, "(9) руки счёта НЕ трогают очере
 res.append(ok(CS.WEIGHT_MIN_SHARE == 0.25,
               "(9) порог веса — 0.25, поставлен по замеру 10.08 (min окна 23.3 %, медиана 60 %)"))
 shutil.rmtree(tmp2, ignore_errors=True)
+
+print("(10) ИЗОЛЯЦИЯ СОСТОЯНИЯ — прогон сьюта боевого файла не касается")
+# СУДИМ ПУТЬ, А НЕ ФАЙЛ, и это не вкусовщина. Проверка «mtime боевого файла не изменился за
+# прогон» дала бы ЛОЖНОЕ КРАСНОЕ: боевой демон пишет то же состояние на терминале задачи, а гейт
+# гоняется РОВНО в такие моменты — сьют штрафовался бы за чужую законную запись. Путь же
+# принадлежит этому процессу целиком.
+env_was = (os.environ.get("CC_SERIES_FILE"), os.environ.get("ORCH_TEST_MODE"))
+res.append(ok(os.path.basename(OD.CHAIN_SERIES_FILE) == "chain_series.json"
+              and OD.CHAIN_SERIES_FILE == os.path.join(OD.REPO, "chain_series.json"),
+              "(10) боевой путь по умолчанию НЕ тронут: %s" % OD.CHAIN_SERIES_FILE))
+res.append(ok(OD._series_file() != OD.CHAIN_SERIES_FILE,
+              "(10) подстановка сьюта (CC_SERIES_FILE) уводит запись из боевого файла"))
+os.environ.pop("CC_SERIES_FILE", None)
+res.append(ok(OD._series_file() == OD.CHAIN_SERIES_TEST_FILE,
+              "(10) забыли подставить — второй слой (ORCH_TEST_MODE) держит: %s"
+              % os.path.basename(OD._series_file())))
+os.environ.pop("ORCH_TEST_MODE", None)
+res.append(ok(not OD._IS_DAEMON and OD._series_file() != OD.CHAIN_SERIES_FILE,
+              "(10) сняты ОБА признака — третий слой (личность пишущего) не пускает в боевой"))
+if env_was[0] is not None:
+    os.environ["CC_SERIES_FILE"] = env_was[0]
+os.environ["ORCH_TEST_MODE"] = env_was[1] or "1"
 
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)
