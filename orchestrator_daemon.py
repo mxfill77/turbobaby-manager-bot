@@ -1683,6 +1683,7 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     _mctx = {"model": None, "tokens_in": None, "tokens_out": None}
     _t0 = time.monotonic()
     _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    _expect_busy(task_id, task_timeout)   # ярус 2: заход идёт — это продукт, а не остановка
     status, result = _run_task_impl(task_id, task_text, task_timeout, preamble, _mctx)
     try:
         _is_planner = preamble is not None and preamble.startswith(PLANNER_PREAMBLE)
@@ -1971,6 +1972,9 @@ def _thinker_exec(prompt, timeout, tag):
            "--max-turns", "1",
            "--settings", HEADLESS_SETTINGS,    # тот же строгий headless-слой (единообразие забора)
            prompt]                             # prompt последним (тест-моки читают args[-1])
+    # Ярус 2: думатель тоже крутится СИНХРОННО внутри cycle() — перештамповываем окно доверия
+    # своим таймаутом, иначе «задача 45 мин, следом думатель 3 мин» снова читалось бы остановкой.
+    _expect_busy(tag, timeout)
     try:
         proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
                               timeout=timeout, env=child_env)
@@ -4763,6 +4767,7 @@ def _maybe_prod_drift(now=None):
 EXPECT_PULSE_DIR = "/tmp/cc_expect_pulse"
 _EXPECT_STARTED = time.time()      # старт ЭТОГО экземпляра демона (эпизод О2 ключуется им)
 _expect_turns = 0                  # сколько оборотов сделал экземпляр
+_expect_last_ts = 0.0              # когда состоялся ПОСЛЕДНИЙ оборот (штамп занятости его не двигает)
 
 
 def _expect_pulse_dir():
@@ -4776,19 +4781,46 @@ def _expect_pulse_dir():
     return EXPECT_PULSE_DIR
 
 
-def _expect_pulse():
-    """Отметить состоявшийся оборот. Best-effort и МОЛЧА: сбой записи не смеет уронить цикл —
-    худшее, что случится, — ярус 2 скажет «оборота нет», то есть ошибётся в сторону заметки."""
-    global _expect_turns
-    _expect_turns += 1
+def _expect_write(busy=None):
+    """Записать пульс атомарно. busy=None — чистый оборот (ключа busy в файле НЕТ вовсе, то есть
+    штамп занятости снимается САМИМ фактом состоявшегося оборота, отдельной уборки не требуется).
+    Best-effort и МОЛЧА: сбой записи не смеет уронить цикл — худшее, что случится, — ярус 2
+    скажет «оборота нет», то есть ошибётся в сторону заметки, а не молчания."""
     try:
         d = _expect_pulse_dir()
         os.makedirs(d, exist_ok=True)
+        rec = {"ts": _expect_last_ts, "n": _expect_turns,
+               "pid": os.getpid(), "started": _EXPECT_STARTED}
+        if busy:
+            rec["busy"] = busy
         tmp = os.path.join(d, "pulse.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"ts": time.time(), "n": _expect_turns,
-                       "pid": os.getpid(), "started": _EXPECT_STARTED}, f)
+            json.dump(rec, f)
         os.replace(tmp, os.path.join(d, "pulse.json"))
+    except Exception:                                                # noqa: BLE001
+        pass
+
+
+def _expect_pulse():
+    """Отметить состоявшийся оборот — и ТЕМ ЖЕ действием снять штамп занятости."""
+    global _expect_turns, _expect_last_ts
+    _expect_turns += 1
+    _expect_last_ts = time.time()
+    _expect_write()
+
+
+def _expect_busy(task_id, limit_sec):
+    """Штамп «занят объявленной синхронной работой» ПЕРЕД claude -p (исполнитель, планировщик,
+    думатель). Ярус 2 иначе читает длинный заход как остановку демона: claude -p крутится ВНУТРИ
+    cycle(), а пульс пишется последней строкой — замер 10.08.2026 дал 10 ложных заметок из 10.
+
+    Штамп НЕ подменяет продукт: поле ts (последний СОСТОЯВШИЙСЯ оборот) не двигается, меняется
+    только объявление «я занят с T и обещал себе уложиться в L». Каждый следующий claude -p
+    перештамповывает окно своим таймаутом, поэтому доверие всегда привязано к ИДУЩЕМУ вызову,
+    а не к самому длинному за оборот. Снимается штамп состоявшимся оборотом (_expect_pulse)."""
+    try:
+        _expect_write({"since": time.time(), "limit": float(limit_sec or 0),
+                       "task": task_id, "pid": os.getpid()})
     except Exception:                                                # noqa: BLE001
         pass
 

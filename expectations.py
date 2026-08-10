@@ -198,6 +198,18 @@ NEW_MIN_ENV, NEW_MIN_DEFAULT = "EXPECT_NEW_MIN", 30.0     # О1: строка ж
 TURN_MIN_ENV, TURN_MIN_DEFAULT = "EXPECT_TURN_MIN", 10.0  # О2: оборот cycle() демона (мин)
 TICK_MIN_ENV, TICK_MIN_DEFAULT = "EXPECT_TICK_MIN", 10.0  # О2: тик devbot_report splinter (мин)
 HOLD_MIN_ENV, HOLD_MIN_DEFAULT = "EXPECT_HOLD_MIN", 60.0  # «нарушение держится» → задача (мин)
+# О2 демона: ЗАХОД — НЕ ОСТАНОВКА. Демон исполняет claude -p СИНХРОННО внутри cycle(), а пульс
+# пишет последней строкой — значит любой заход длиннее порога выглядел остановкой. ЗАМЕР 10.08.2026
+# (журнал таймера, 338 прогонов, 2.42 суток): заметок О2-демон 10, ЛОЖНЫХ 10, настоящих 0 — каждая
+# приходилась ровно на окно «ИСПОЛНЕНИЕ id=N через claude -p» в журнале демона (разрывы пульса
+# 11–17 мин при заходах 14–34 мин). 4.13 заметки в сутки — вдвое больше, чем весь остальной слой.
+# Поэтому демон штампует в пульсе «занят с T, объявленный таймаут L» (_expect_busy), и штамп
+# держит порог ровно столько, сколько демон САМ СЕБЕ объявил, плюс хвост оборота.
+# ЗУБЫ ПРИ ЭТОМ ЦЕЛЫ: простаивающий демон штампа не имеет вовсе → судится как раньше; штамп
+# мёртвого экземпляра не оправдывает ничего; слепота ограничена СВЕРХУ (объявленный таймаут +
+# хвост) — дольше этого должен был сработать собственный kill демона, и молчать уже нечестно.
+BUSY_GRACE_SEC = 600.0     # хвост оборота ПОСЛЕ последнего claude -p: kill + запись в мост + думатель
+BUSY_MAX_SEC = 3600.0      # потолок доверия к объявленному таймауту (мусор/огромное значение)
 # О3: сколько коммит вправе лежать в origin/main, не дойдя до прода (мин; 0 → ветка мертва).
 DELIVER_MIN_ENV, DELIVER_MIN_DEFAULT = "EXPECT_DELIVER_MIN", 240.0
 # О3: окно судейства (часы). Коммит старше — не судится ВОВСЕ: первый прогон после установки
@@ -429,8 +441,46 @@ def _o1(facts, cfg, now):
     return out
 
 
+def _busy_state(pulse, proc, now):
+    """Штамп «демон занят объявленной синхронной работой» → {"since","age","allow",…} | None.
+
+    Признаётся ТОЛЬКО у наблюдаемого ЖИВОГО экземпляра и только если поставлен ПОСЛЕ его старта:
+    штамп прошлого экземпляра (демон умер внутри захода) не оправдывает ничего — иначе смерть
+    посреди задачи выглядела бы работой ВЕЧНО, то есть детектор терял бы зубы там, где нужнее.
+    Потолок доверия — объявленный самим демоном таймаут захода плюс хвост оборота: дольше него
+    должен был сработать его СОБСТВЕННЫЙ kill по этому таймауту, и молчание перестаёт быть
+    честным. Мусор/огромное значение в штампе → BUSY_MAX_SEC, а не бесконечность."""
+    busy = (pulse or {}).get("busy")
+    if not isinstance(busy, dict):
+        return None
+    try:
+        since = float(busy.get("since") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if since <= 0:
+        return None
+    if not isinstance(proc, dict):
+        return None                            # живого процесса не видно — занятость не оправдание
+    try:
+        if since < float(proc.get("started") or 0.0):
+            return None                        # штамп ПРЕЖНЕГО экземпляра: протух вместе с ним
+    except (TypeError, ValueError):
+        return None
+    try:
+        declared = float(busy.get("limit") or 0.0)
+    except (TypeError, ValueError):
+        declared = 0.0
+    declared = min(max(declared, 0.0), BUSY_MAX_SEC)
+    return {"since": since, "age": now - since, "limit": declared,
+            "allow": declared + BUSY_GRACE_SEC, "task": busy.get("task")}
+
+
 def _o2_daemon(facts, cfg, now):
-    """О2 — демон не дал оборота cycle() за отведённое время."""
+    """О2 — демон не дал оборота cycle() за отведённое время.
+
+    Идущий заход остановкой НЕ считается (см. BUSY_GRACE_SEC): продукт в производстве — это
+    работа, а не поломка. Зато заход, переживший собственный объявленный таймаут, судится как
+    нарушение и называет виновника номером."""
     limit = float(cfg.get("turn") or 0.0)
     if limit <= 0:
         return []
@@ -455,6 +505,11 @@ def _o2_daemon(facts, cfg, now):
     age = now - last
     if age <= limit:
         return []
+    busy = _busy_state(pulse, proc, now)
+    if busy is not None and busy["age"] <= busy["allow"]:
+        # ОБОРОТ ИДЁТ: демон синхронно исполняет claude -p внутри cycle(). Это его продукт в
+        # производстве, а не остановка — все 10 заметок замера 10.08 были ровно этим случаем.
+        return []
     return [{
         "kind": "o2_daemon",
         "key": "o2d|%d|%d" % (int(float(pulse.get("started") or 0.0)), int(last)),
@@ -463,6 +518,10 @@ def _o2_daemon(facts, cfg, now):
         "pid": (proc or {}).get("pid") if isinstance(proc, dict) else None,
         "alive": isinstance(proc, dict),
         "turns": pulse.get("n"),
+        # Заход пережил СВОЙ объявленный таймаут: нарушение остаётся, но называет виновника.
+        "busy_task": busy.get("task") if busy else None,
+        "busy_age": busy.get("age") if busy else None,
+        "busy_limit": busy.get("limit") if busy else None,
         # Исполнитель задачи И ЕСТЬ предмет нарушения → задача невозможна по правилу 4.2.
         "can_task": False,
     }]
@@ -826,6 +885,12 @@ def render(v, lane="VPS"):
             else "живого процесса демона не видно вовсе",
             "очередь не движется, пока это так",
         ]
+        if v.get("busy_task") is not None:
+            # Идущий заход молчание оправдывает (это работа), но ПЕРЕЖИВШИЙ свой таймаут — нет:
+            # значит не сработал собственный kill демона, и владелец должен это прочитать.
+            parts.append(
+                "заход id=%s идёт %s при объявленном таймауте %s — свой kill не сработал"
+                % (v.get("busy_task"), human_age(v.get("busy_age")), _mins(v.get("busy_limit"))))
     elif kind == "o2_splinter":
         parts += [
             "последний тик devbot_report %s назад (порог %s)" % (human_age(v.get("age")),

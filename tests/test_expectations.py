@@ -89,12 +89,22 @@ def row(rid, status, age_min, lane="vps", frm="Filipp-328-dev", text="ultrathink
 
 def facts(rows=None, queue_ok=True, pulse_age=1.0, pulse=True, daemon_alive=True,
           tick_age=1.0, tick=True, log_age=None, splinter_alive=True, claims_age=5.0,
-          daemon_age_min=600.0, splinter_age_min=600.0):
-    """Собрать факты в той же форме, в какой их отдаёт expectations_run.snapshot()."""
+          daemon_age_min=600.0, splinter_age_min=600.0, busy=None):
+    """Собрать факты в той же форме, в какой их отдаёт expectations_run.snapshot().
+
+    busy — штамп занятости демона (см. orchestrator_daemon._expect_busy): либо готовый словарь,
+    либо кортеж (возраст_штампа_мин, объявленный_таймаут_сек, id_задачи)."""
     d = {"pulse": None, "proc": None, "claims": None}
     if pulse:
         d["pulse"] = {"ts": NOW - pulse_age * MIN, "n": 42, "pid": 111,
                       "started": NOW - daemon_age_min * MIN}
+        if busy is not None:
+            if isinstance(busy, (tuple, list)) and len(busy) == 3:
+                b_age, b_limit, b_task = busy
+                d["pulse"]["busy"] = {"since": NOW - b_age * MIN, "limit": b_limit,
+                                      "task": b_task, "pid": 111}
+            else:
+                d["pulse"]["busy"] = busy      # словарь как есть / заведомый мусор — проверка формы
     if daemon_alive:
         d["proc"] = {"pid": 111, "started": NOW - daemon_age_min * MIN}
     if claims_age is not None:
@@ -563,6 +573,123 @@ if ER and EX:
         res += [ok(False, "(14) живой прогон")] * 4
 else:
     res += [ok(False, "(14) живой прогон")] * 4
+
+# ═══════════ (15) О2 ДЕМОН: ЗАХОД — НЕ ОСТАНОВКА ═══════════════════════════════════════════
+print("\n(15) Идущий claude -p внутри cycle() — работа, а не поломка (замер 10.08: 10 ложных из 10)")
+if EX:
+    # ГОЛДЕНЫ НА ДОСЛОВНЫХ ЛОЖНЫХ ЗАМЕТКАХ. Пары «разрыв пульса, окно исполнения» сняты с журнала
+    # таймера и журнала демона 08–10.08.2026; task_timeout дев-ТЗ = 2700с (TASK_TIMEOUT_DEV).
+    LIVE_FALSE = [(13.6, 18.0, 398), (14.4, 14.0, 399), (11.1, 26.0, 402), (14.3, 14.0, 405),
+                  (14.1, 34.0, 406), (15.4, 15.0, 410), (14.9, 21.0, 417), (14.3, 21.0, 422),
+                  (16.1, 20.0, 426), (17.2, 30.0, 430)]
+    quiet = 0
+    for gap, win, tid in LIVE_FALSE:
+        v = EX.verdict(facts(pulse_age=gap, busy=(win, 2700.0, tid)), CFG)
+        quiet += 1 if v == [] else 0
+    res.append(ok(quiet == len(LIVE_FALSE),
+                  "(15) все 10 ЖИВЫХ ложных заметок замера теперь молчат (%d/10)" % quiet))
+
+    # ЗУБЫ ЦЕЛЫ: простой без штампа судится ровно как раньше — это и есть случай, ради которого О2 заведён.
+    res.append(ok(kinds(EX.verdict(facts(pulse_age=23), CFG)) == ["o2_daemon"],
+                  "(15) демон СТОИТ без штампа занятости → заметка как прежде"))
+    # ПОТОЛОК СЛЕПОТЫ НАЗВАН ЧИСЛОМ: объявленный таймаут (45 мин) + хвост оборота (10 мин) = 55.
+    res.append(ok(kinds(EX.verdict(facts(pulse_age=50, busy=(50.0, 2700.0, 401)), CFG)) == [],
+                  "(15) заход 50 мин при таймауте 45 мин — внутри хвоста оборота → молчим"))
+    res.append(ok(kinds(EX.verdict(facts(pulse_age=56, busy=(56.0, 2700.0, 401)), CFG))
+                  == ["o2_daemon"],
+                  "(15) 56 мин — за потолком (45+10) → молчание кончилось, слепота ограничена"))
+    over = EX.verdict(facts(pulse_age=90, busy=(70.0, 600.0, 401)), CFG)
+    res.append(ok(kinds(over) == ["o2_daemon"] and over[0].get("busy_task") == 401,
+                  "(15) заход ПЕРЕЖИЛ свой объявленный таймаут (70 мин при 10) → нарушение стоит"))
+    t = EX.render(over[0]) if over else ""
+    res.append(ok("401" in t and "kill" in t,
+                  "(15) заметка называет виновника номером: %s" % t.split("\n")[-1][:70]))
+
+    # ШТАМП ПРОШЛОГО ЭКЗЕМПЛЯРА НИЧЕГО НЕ ОПРАВДЫВАЕТ — иначе смерть посреди задачи = «работа» вечно.
+    stale = {"since": NOW - 700 * MIN, "limit": 2700.0, "task": 399, "pid": 111}
+    res.append(ok(kinds(EX.verdict(facts(pulse_age=23, busy=stale, daemon_age_min=600.0), CFG))
+                  == ["o2_daemon"],
+                  "(15) штамп ПОСТАВЛЕН ДО старта экземпляра (протух с ним) → заметка остаётся"))
+    res.append(ok(kinds(EX.verdict(facts(pulse_age=40, busy=(5.0, 2700.0, 399),
+                                         daemon_alive=False), CFG)) == ["o2_daemon"],
+                  "(15) живого процесса не видно вовсе → занятость не оправдание"))
+
+    # МУСОР В ШТАМПЕ → ПОТОЛОК, А НЕ БЕСКОНЕЧНОСТЬ (иначе кривое поле глушило бы детектор навсегда).
+    huge = {"since": NOW - 300 * MIN, "limit": 10 ** 9, "task": 399, "pid": 111}
+    res.append(ok(kinds(EX.verdict(facts(pulse_age=300, busy=huge), CFG)) == ["o2_daemon"],
+                  "(15) объявленный таймаут 10^9 с → срезан потолком BUSY_MAX_SEC, заметка есть"))
+    for bad in ({"since": "мусор", "limit": 2700}, {"since": 0, "limit": 2700}, {"limit": 2700},
+                "не словарь", None):
+        v = EX.verdict(facts(pulse_age=23, busy=bad), CFG) if bad is not None else \
+            EX.verdict(facts(pulse_age=23), CFG)
+        if kinds(v) != ["o2_daemon"]:
+            break
+    else:
+        bad = None
+    res.append(ok(bad is None, "(15) мусор вместо штампа → судим как без штампа (fail-safe с зубами)"))
+    res.append(ok(EX.verdict(facts(pulse_age=5, busy=(3.0, 2700.0, 399)), CFG) == [],
+                  "(15) НОРМАЛЬНАЯ РАБОТА со штампом → молчание (штамп не создаёт нарушений)"))
+    dead = dict(CFG, turn=0.0)
+    res.append(ok(EX.verdict(facts(pulse_age=999, busy=(999.0, 1.0, 399)), dead) == [],
+                  "(15) порог 0 → ветка мертва ДО чтения штампа (откат не сломан)"))
+else:
+    res += [ok(False, "(15) заход — не остановка")] * 12
+
+# ═══════════ (16) ШТАМП ПИШЕТ ДЕМОН: ФОРМА ФАЙЛА ОДНА У ОБЕИХ СТОРОН ════════════════════════
+print("\n(16) Демон штампует занятость и НЕ подменяет ею продукт (ts последнего оборота)")
+_busy_tmp = tempfile.mkdtemp(prefix="o2busy_")
+os.environ["CC_EXPECT_DIR"] = _busy_tmp
+_s16 = len(res)
+try:
+    import orchestrator_daemon as OD
+    _pulse_file = os.path.join(OD._expect_pulse_dir(), "pulse.json")
+
+    def _read_pulse():
+        with open(_pulse_file, encoding="utf-8") as f:
+            return json.load(f)
+
+    OD._expect_pulse()                                   # оборот состоялся
+    p1 = _read_pulse()
+    res.append(ok(p1.get("ts", 0) > 0 and "busy" not in p1,
+                  "(16) чистый оборот: ts есть, штампа занятости НЕТ"))
+
+    OD._expect_busy(432, 2700)                           # начался заход
+    p2 = _read_pulse()
+    res.append(ok(p2.get("ts") == p1.get("ts"),
+                  "(16) штамп НЕ двигает ts — продукт остаётся последним СОСТОЯВШИМСЯ оборотом"))
+    res.append(ok(isinstance(p2.get("busy"), dict) and p2["busy"].get("task") == 432
+                  and float(p2["busy"].get("limit")) == 2700.0,
+                  "(16) штамп несёт номер задачи и ОБЪЯВЛЕННЫЙ таймаут захода"))
+    res.append(ok(p2["busy"].get("since", 0) >= p1.get("ts", 0),
+                  "(16) штамп поставлен ПОСЛЕ оборота — время идёт вперёд"))
+
+    OD._expect_busy(433, 180)                            # следом думатель: окно перештамповано
+    p3 = _read_pulse()
+    res.append(ok(p3["busy"].get("task") == 433 and float(p3["busy"]["limit"]) == 180.0,
+                  "(16) следующий claude -p перештамповывает окно СВОИМ таймаутом"))
+
+    OD._expect_pulse()                                   # оборот завершился
+    p4 = _read_pulse()
+    res.append(ok("busy" not in p4 and p4.get("ts", 0) > p1.get("ts", 0),
+                  "(16) состоявшийся оборот СНИМАЕТ штамп сам — отдельной уборки не нужно"))
+
+    # СКВОЗНАЯ СВЯЗКА: файл, написанный демоном, читается решением и молчит на живом заходе.
+    OD._expect_busy(434, 2700)                            # дев-ТЗ: 45 мин собственного таймаута
+    p5 = _read_pulse()
+    live = {"pulse": p5, "proc": {"pid": os.getpid(), "started": p1["ts"] - 600},
+            "claims": None}
+    now3 = p5["busy"]["since"] + 20 * MIN                  # заход идёт 20 мин, пульсу 20+ мин
+    v = EX.verdict({"now": now3, "queue": {"ok": False, "rows": []}, "daemon": live,
+                    "splinter": {"tick": None, "log": None, "proc": None}}, CFG) if EX else None
+    res.append(ok(v == [], "(16) СКВОЗНОЕ: файл демона → решение яруса 2 → молчание на живом заходе"))
+except Exception as e:                                   # noqa: BLE001
+    # Тот же файл гоняется по дереву ДО правки: там штампа нет вовсе, и это ЧЕСТНЫЙ красный,
+    # а не крушение прогона — иначе «до» не сосчитать (метод git worktree тем же файлом).
+    print("  (штамп занятости демону недоступен: %s)" % e)
+    res += [ok(False, "(16) штамп занятости демона")] * (7 - (len(res) - _s16))
+finally:
+    os.environ.pop("CC_EXPECT_DIR", None)
+    shutil.rmtree(_busy_tmp, ignore_errors=True)
 
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)
