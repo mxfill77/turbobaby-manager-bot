@@ -18,8 +18,10 @@
 
 PRETOOL_NOPUSH: _alert мокируется → нет живых пушей Филиппу.
 """
+import contextlib
 import os
 import sys
+import tempfile
 from unittest.mock import patch, MagicMock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +33,18 @@ PROD_ID = bridge_deploy.PROD_ID
 
 
 # ──────────────────────────── вспомогательные ────────────────────────────────
+
+@contextlib.contextmanager
+def _build_dir():
+    """Годный каталог сборки захода: существует и несёт настройки проекта.
+
+    Цели по умолчанию у выкладки нет (10.08.2026), поэтому каждый прогон цикла называет
+    каталог явно. Каталог НАСТОЯЩИЙ, не мок: годность судится живыми os-вызовами.
+    """
+    with tempfile.TemporaryDirectory(prefix="tb_bridge_build_") as d:
+        with open(os.path.join(d, bridge_deploy.CLASP_SETTINGS), "w") as fh:
+            fh.write('{"scriptId":"test"}')
+        yield d
 
 def _client_ok(zones=16):
     c = MagicMock()
@@ -92,12 +106,13 @@ def _base_runner(gate_rc=0, harness_rc=0, version=66, redeploy_rc=0, rollback_rc
 
 def _run(runner, client):
     """Запустить deploy() с моками. Возвращает (code, alert_mock, log_mock)."""
-    with patch("bridge_deploy.subprocess.run", side_effect=runner), \
+    with _build_dir() as target, \
+         patch("bridge_deploy.subprocess.run", side_effect=runner), \
          patch("bridge_deploy._make_bridge_client", return_value=client), \
          patch("bridge_deploy.time.sleep"), \
          patch("bridge_deploy._alert") as mock_alert, \
          patch("bridge_deploy._log_cc") as mock_log:
-        code = bridge_deploy.deploy()
+        code = bridge_deploy.deploy(target=target)
     return code, mock_alert, mock_log
 
 
@@ -342,12 +357,13 @@ def test_sleep_after_redeploy():
             return MagicMock(returncode=0, stdout=f"- {PROD_ID} @66\n")
         return MagicMock(returncode=0, stdout="")
 
-    with patch("bridge_deploy.subprocess.run", side_effect=runner), \
+    with _build_dir() as target, \
+         patch("bridge_deploy.subprocess.run", side_effect=runner), \
          patch("bridge_deploy._make_bridge_client", return_value=_client_ok()), \
          patch("bridge_deploy.time.sleep", side_effect=lambda t: sleep_calls.append(t)), \
          patch("bridge_deploy._alert"), \
          patch("bridge_deploy._log_cc"):
-        bridge_deploy.deploy()
+        bridge_deploy.deploy(target=target)
 
     assert sleep_calls, "time.sleep должен вызываться после redeploy"
     assert all(s > 0 for s in sleep_calls), f"sleep > 0с: {sleep_calls}"

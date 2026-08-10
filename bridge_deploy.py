@@ -3,16 +3,26 @@
 bridge_deploy.py — Оранжевый цикл clasp redeploy (§7 шаг 2, 15.07.2026).
 
 ЖЁСТКИЕ УСЛОВИЯ (все или деплой не стартует):
+  0. Цель выкладки названа явно и годится (см. `target_refusal`) — проверяется ПЕРВОЙ,
+     до гейта и до любого обращения к clasp
   1. Только redeploy PROD_ID (hardcoded; другой deployment, create, удаление — красные навсегда)
   2. Полный гейт (gate.py) + Node-харнессы (tests/*_harness.js) зелёные
   3. После redeploy — read-only смок: ping alive + delivery_zones_get непустой
   4. Смок упал → автооткат к prev_version (-V N) + алерт Филиппу
   5. Отчёт постфактум в cc_log + пульс
 
+ЦЕЛИ ПО УМОЛЧАНИЮ НЕТ (10.08.2026). Прежде скрипт был намертво нацелен на долгоживущую папку
+`/root/turbobaby-bridge-gs`, а она 10.08.2026 обезврежена как источник выкладки: на свежем
+отпечатке прод стоял @79, а папка отставала на 4 файла из 17 — заливка стёрла бы 18 функций и
+5 маршрутов живого моста. Теперь каталог называется явно, а долгоживущая папка запрещена
+БЕЗУСЛОВНО: запрет судит ПУТЬ, а не состояние папки, поэтому возврат в неё `.clasp.json`
+(«зарядка») отказ не снимает.
+
 delivery_zones_init и любые боевые записи — КРАСНАЯ ЗОНА, вне этого скрипта.
 
-Запуск (из репо):
-  venv/bin/python3 bridge_deploy.py
+Запуск (из репо), каталогом сборки ЗАХОДА:
+  venv/bin/python3 bridge_deploy.py /root/<каталог-сборки-захода>
+  (то же можно задать переменной окружения BRIDGE_BUILD_DIR)
 """
 import glob
 import os
@@ -22,11 +32,61 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-BRIDGE_ROOT = "/root/turbobaby-bridge-gs"
 TESTS_DIR = os.path.join(ROOT, "tests")
 PY = os.path.join(ROOT, "venv", "bin", "python3")
 
 PROD_ID = "AKfycbxNC9gCM7-a635gDMk_jtPKsBNeCcBA23uuyrWXcMWHNREANzFSnpE1kXISAYZ_hXNOqw"
+
+# Долгоживущая папка моста. Здесь она НЕ цель выкладки, а ЗАПРЕЩЁННАЯ цель — имя нужно
+# ровно для того, чтобы отказ назвал её вслух. Обезврежена 10.08.2026 (см. CLAUDE.md).
+LEGACY_GS_ROOT = "/root/turbobaby-bridge-gs"
+CLASP_SETTINGS = ".clasp.json"
+BUILD_DIR_ENV = "BRIDGE_BUILD_DIR"
+
+POINTER = ("выкладка только из каталога сборки захода; истина прода — bridge_prod/, "
+           "см. CLAUDE.md")
+
+
+# ────────────────────────── цель выкладки: годна или нет ──────────────────────
+
+def _cli_target(argv=None, env=None):
+    """Каталог сборки захода из argv[1] или BRIDGE_BUILD_DIR. None — цель не названа."""
+    argv = sys.argv if argv is None else argv
+    env = os.environ if env is None else env
+    if len(argv) > 1 and argv[1].strip():
+        return argv[1].strip()
+    return (env.get(BUILD_DIR_ENV) or "").strip() or None
+
+
+def target_refusal(target):
+    """Причина отказа выкладывать из `target` (строка) либо None, если каталог годится.
+
+    Fail-closed: годится ТОЛЬКО названный существующий каталог с настройками проекта,
+    не лежащий в долгоживущей папке. Всё остальное — отказ.
+
+    Запрет папки судит ПУТЬ, а не её состояние: «разряжена» она или кто-то вернул в неё
+    `.clasp.json` — выкладка из долгоживущей папки запрещена одинаково. Проверка пути идёт
+    ПЕРЕД проверкой существования, иначе подкаталог запрещённой папки получил бы мягкий
+    отказ «не существует» и выглядел бы починимым созданием каталога.
+    """
+    target = (target or "").strip()
+    if not target:
+        return ("каталог сборки захода не назван (аргумент команды или %s) — "
+                "цели по умолчанию у выкладки нет" % BUILD_DIR_ENV)
+
+    real = os.path.realpath(target)
+    legacy = os.path.realpath(LEGACY_GS_ROOT)
+    if real == legacy or real.startswith(legacy + os.sep):
+        return ("цель лежит в долгоживущей папке %s — она обезврежена как источник выкладки "
+                "10.08.2026 (замер того дня: прод @79, папка позади на 4 файла из 17 — "
+                "заливка стёрла бы 18 функций и 5 маршрутов живого моста)" % LEGACY_GS_ROOT)
+
+    if not os.path.isdir(real):
+        return "цель %s не существует или не каталог" % target
+    if not os.path.isfile(os.path.join(real, CLASP_SETTINGS)):
+        return ("в цели %s нет настроек проекта %s — это не каталог сборки захода"
+                % (target, CLASP_SETTINGS))
+    return None
 
 
 # ─────────────────────────── шаги оранжевого цикла ───────────────────────────
@@ -53,11 +113,15 @@ def _node_harnesses_ok():
     return not fails, fails
 
 
-def _get_current_version():
-    """Текущая версия @N для PROD_ID через 'clasp deployments'. None если не удалось."""
+def _get_current_version(target):
+    """Текущая версия @N для PROD_ID через 'clasp deployments'. None если не удалось.
+
+    `target` обязателен и без значения по умолчанию НАМЕРЕННО: у clasp-вызовов не должно
+    быть каталога «по привычке» — иначе запрет папки обходится прямым зовом этой функции.
+    """
     r = subprocess.run(
         ["clasp", "deployments"],
-        capture_output=True, text=True, timeout=30, cwd=BRIDGE_ROOT,
+        capture_output=True, text=True, timeout=30, cwd=target,
     )
     if r.returncode != 0:
         return None
@@ -69,11 +133,11 @@ def _get_current_version():
     return None
 
 
-def _do_redeploy():
-    """clasp redeploy PROD_ID. Возвращает (ok, out_str)."""
+def _do_redeploy(target):
+    """clasp redeploy PROD_ID из каталога `target`. Возвращает (ok, out_str)."""
     r = subprocess.run(
         ["clasp", "redeploy", PROD_ID],
-        capture_output=True, text=True, timeout=90, cwd=BRIDGE_ROOT,
+        capture_output=True, text=True, timeout=90, cwd=target,
     )
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
@@ -105,11 +169,11 @@ def _smoke_ok():
         return False, f"смок-исключение: {e}"
 
 
-def _do_rollback(prev_version):
-    """Откат: clasp redeploy PROD_ID -V prev_version. Возвращает (ok, out_str)."""
+def _do_rollback(prev_version, target):
+    """Откат: clasp redeploy PROD_ID -V prev_version из каталога `target`. (ok, out_str)."""
     r = subprocess.run(
         ["clasp", "redeploy", PROD_ID, "-V", str(prev_version)],
-        capture_output=True, text=True, timeout=90, cwd=BRIDGE_ROOT,
+        capture_output=True, text=True, timeout=90, cwd=target,
     )
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
@@ -139,42 +203,54 @@ def _log_cc(text, pulse=None):
 
 # ──────────────────────────── главный цикл ───────────────────────────────────
 
-def deploy():
+def deploy(target=None):
     """
     Оранжевый цикл redeploy. Возвращает exit-код:
       0 — успех (redeploy + смок пройдены)
       1 — ошибка деплоя или смока (с возможным откатом)
       2 — предварительный блок (гейт или Node-харнессы красные)
+      3 — цель выкладки не годится (проверяется ПЕРВОЙ, до гейта и до clasp)
     """
     print("=== bridge_deploy: оранжевый цикл clasp redeploy ===")
 
-    # [1/5] Полный гейт
-    print("[1/5] gate.py (полный сьют)…")
+    # [1/6] Цель выкладки — раньше всего: отказ не должен стоить 3 минут гейта,
+    # а тем более доходить до сети. Ни одного обращения к clasp по этой ветке нет.
+    if target is None:
+        target = _cli_target()
+    reason = target_refusal(target)
+    if reason:
+        print(f"⛔ ВЫКЛАДКА НЕ НАЧАТА: {reason}")
+        print(f"   {POINTER}")
+        return 3
+    print(f"[1/6] Цель выкладки: {target} ✅")
+
+    # [2/6] Полный гейт
+    print("[2/6] gate.py (полный сьют)…")
     ok, out = _gate_ok()
     if not ok:
         print(f"❌ ГЕЙТ КРАСНЫЙ — деплой заблокирован.\n{out}")
         return 2
     print(f"✅ Гейт зелёный.\n{out}")
 
-    # [2/5] Node-харнессы
-    print("[2/5] Node-харнессы…")
+    # [3/6] Node-харнессы
+    print("[3/6] Node-харнессы…")
     ok, fails = _node_harnesses_ok()
     if not ok:
         print(f"❌ Node-харнессы КРАСНЫЕ: {fails} — деплой заблокирован.")
         return 2
     print("✅ Node-харнессы зелёные.")
 
-    # [3/5] Текущая версия (бэкап-точка для возможного отката)
-    print("[3/5] Текущая версия деплоя…")
-    prev_ver = _get_current_version()
+    # [4/6] Текущая версия (бэкап-точка для возможного отката)
+    print("[4/6] Текущая версия деплоя…")
+    prev_ver = _get_current_version(target)
     if prev_ver is None:
         print("⚠️ Не удалось определить текущую версию — продолжаю, откат ограничен.")
     else:
         print(f"📌 Текущая версия: @{prev_ver}")
 
-    # [4/5] clasp redeploy
-    print("[4/5] clasp redeploy…")
-    ok, out = _do_redeploy()
+    # [5/6] clasp redeploy
+    print("[5/6] clasp redeploy…")
+    ok, out = _do_redeploy(target)
     if not ok:
         msg = f"bridge_deploy: clasp redeploy упал — {out[:200]}"
         print(f"❌ {msg}")
@@ -183,8 +259,8 @@ def deploy():
         return 1
     print(f"✅ redeploy выполнен: {out[:120]}")
 
-    # [5/5] Смок-тест
-    print("[5/5] Смок (ping + delivery_zones_get)…")
+    # [6/6] Смок-тест
+    print("[6/6] Смок (ping + delivery_zones_get)…")
     time.sleep(3)   # GAS прогревается после деплоя
     ok, detail = _smoke_ok()
     if ok:
@@ -206,7 +282,7 @@ def deploy():
 
     print(f"🔄 Откат к @{prev_ver}…")
     _alert(f"🟡 bridge_deploy: смок упал ({detail}), откат к @{prev_ver}…")
-    rok, rout = _do_rollback(prev_ver)
+    rok, rout = _do_rollback(prev_ver, target)
     if rok:
         msg = f"bridge_deploy: смок упал ({detail}), откат к @{prev_ver} — OK"
         print(f"✅ Откат выполнен: {rout[:80]}")
