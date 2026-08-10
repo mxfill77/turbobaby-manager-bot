@@ -461,7 +461,10 @@ if ER and EX:
         # берём free_wait прямо из фикстуры.
         ER.update_waits = lambda st, f, now: None
         state = {"f": facts(rows=[row(390, "new", 47)], pulse_age=1, claims_age=5)}
-        ER.snapshot = lambda now=None: state["f"]
+        # Подпись повторяет ЖИВУЮ (10.08: снимку передаются состояние и пороги — у моста и ПК
+        # факт составной). Заглушка обязана принимать то же, что боевой вызов, иначе она молча
+        # разойдётся с кодом и тест начнёт проверять несуществующую форму.
+        ER.snapshot = lambda now=None, st=None, cfg=None: state["f"]
         ER.send_note = lambda t: (sent.append(t), True)[1]
         ER.enqueue_escalation = lambda v: (tasks.append(v.get("key")), 700 + len(tasks))[1]
         ER.write_proof = lambda v, f, n: "/dev/null"      # ФС в тесте не трогаем

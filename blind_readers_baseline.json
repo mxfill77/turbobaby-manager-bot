@@ -4,13 +4,13 @@
   "method": "blind_readers.find_blind: функция-читатель (берёт живой текст либо применяет шаблон), у которой return ПУСТОГО стоит в ветке промаха (except-обработчик или проверка `not X` / `X is None`). None пустым не считается — число есть НИЖНЯЯ ГРАНИЦА слепоты, не её мера.",
   "scope": "верхний уровень репозитория, *.py, кроме черновиков _*.py; tests/ и подкаталоги вне области",
   "census": "docs/artifacts/2026-08-08-zero-on-parse-miss-census.md — перепись руками: 469 веток, слепых около 368. Метод видит подмножество той же болезни.",
-  "total": 74,
-  "files_scanned": 42,
+  "total": 72,
+  "files_scanned": 43,
   "per_file": {
     "splinter.py": 14,
     "orchestrator_daemon.py": 13,
     "devbot.py": 5,
-    "expectations_run.py": 5,
+    "expectations_run.py": 3,
     "pretool_guard.py": 5,
     "claude_client.py": 4,
     "health.py": 4,
@@ -32,6 +32,7 @@
   },
   "history": [
     {"date": "2026-08-08", "total": 75, "note": "первый замер методом, до перевода парк-скана просрочек ТО"},
-    {"date": "2026-08-08", "total": 74, "note": "splinter._o3_overdue_scan переведён на контракт scan_result.ScanResult (splinter.py 15 -> 14)"}
+    {"date": "2026-08-08", "total": 74, "note": "splinter._o3_overdue_scan переведён на контракт scan_result.ScanResult (splinter.py 15 -> 14)"},
+    {"date": "2026-08-10", "total": 72, "note": "expectations_run.queue_facts перестала отдавать голое {ok:false,rows:[]} из двух веток промаха: О5 сделала пробу моста фактом, и оба промаха теперь несут ПРИЧИНУ (err) и различают «пробы не было» от «проба провалилась» (expectations_run.py 5 -> 3)"}
   ]
 }
