@@ -52,7 +52,9 @@ if "fcntl" not in sys.modules:                     # страховка для �
         _fake.LOCK_EX = 2
         sys.modules["fcntl"] = _fake
 
-GS = "/root/turbobaby-bridge-gs/"
+# .js берём из ЗЕРКАЛА ПРОДА `bridge_prod/` (задеплоенная версия, паспорт MIRROR.json), а не из
+# рабочей папки выкладки: она обезврежена 10.08.2026 и отстаёт от прода.
+GS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge_prod")
 HERE = os.path.dirname(os.path.abspath(__file__))
 EV_HARNESS = os.path.join(HERE, "eventfix_gs_harness.js")
 FL_HARNESS = os.path.join(HERE, "fleetfix_gs_harness.js")
@@ -85,7 +87,8 @@ def _cases(harness):
 
 def test_bridge_js_syntax():
     for f in ("BotData.js", "ReadFleet.js", "Bridge.js", "Config.js"):
-        p = subprocess.run(["node", "--check", GS + f], capture_output=True, text=True, timeout=30)
+        p = subprocess.run(["node", "--check", os.path.join(GS, f)],
+                           capture_output=True, text=True, timeout=30)
         assert p.returncode == 0, f"{f}: {p.stderr}"
 
 
@@ -120,7 +123,7 @@ def test_fleet_fix_harness_green():
 # ─────────────────────────── (4) роутинг и замок моста ───────────────────────────
 
 def test_bridge_routes_and_locks_edit_event():
-    src = open(GS + "Bridge.js", encoding="utf-8").read()
+    src = open(os.path.join(GS, "Bridge.js"), encoding="utf-8").read()
     assert ("case '" + A_EDIT + "'") in src, "действие правки не разведено в роутере Bridge.js"
     assert "editEvent(body)" in src, "роутер не зовёт обработчик правки"
     # замок 4.2: правка живой строки — красное, agent без билета не проходит

@@ -1,15 +1,20 @@
 'use strict';
 /**
- * Харнесс: delivery_zones_init / delivery_zones_get из /root/turbobaby-bridge-gs/Delivery.js
+ * Харнесс: delivery_zones_init / delivery_zones_get из bridge_prod/Delivery.js
  * исполняется в Node.js с мок-SpreadsheetApp (Config.js нужен для CONFIG.SHEETS.MANAGER).
  * Печатает JSON {cases:[{name, pass, detail}]}; exit 1 при провалах.
  * Запускается из tests/test_delivery_gs.py (в гейте).
  */
 const fs = require('fs');
 const vm = require('vm');
+const path = require('path');
 
-const CONFIG_JS   = '/root/turbobaby-bridge-gs/Config.js';
-const DELIVERY_JS = '/root/turbobaby-bridge-gs/Delivery.js';
+// Источник .js — ЗЕРКАЛО ПРОДА `bridge_prod/` в этом репо (задеплоенная версия, паспорт
+// MIRROR.json). Рабочая папка /root/turbobaby-bridge-gs обезврежена 10.08.2026 и ОТСТАЁТ от
+// прода — харнесс, читающий её, проверял бы не тот код, что живёт в мосте.
+const GS_DIR      = path.join(__dirname, '..', 'bridge_prod');
+const CONFIG_JS   = path.join(GS_DIR, 'Config.js');
+const DELIVERY_JS = path.join(GS_DIR, 'Delivery.js');
 
 // ── мок листа поверх 2D-массива (1-indexed, AppScript-стиль) ──
 function makeSheet(rows) {

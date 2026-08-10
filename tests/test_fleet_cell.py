@@ -19,7 +19,8 @@
      в обход моста он не может.
 
 ФИКСТУРА ПИТОНА — НЕ ПЕРЕСКАЗ ФОРМАТА: node-харнесс исполняет РЕАЛЬНЫЙ
-/root/turbobaby-bridge-gs/ReadFleet.js и печатает рядом с кейсами сам ответ моста с разметкой;
+bridge_prod/ReadFleet.js (зеркало ЗАДЕПЛОЕННОГО моста) и печатает рядом с кейсами сам ответ с
+разметкой;
 питон кормит этим ответом `fleet_cell.read`. Формат живёт в одном месте — расходиться нечему
 (урок «мок, переставший задевать ветку, хуже отсутствующего»).
 
@@ -45,7 +46,9 @@ import fleet_cell                                                          # noq
 from scan_result import (OUTCOME_EMPTY, OUTCOME_MISMATCH,                  # noqa: E402
                          OUTCOME_OK, OUTCOME_UNREADABLE)
 
-GS = "/root/turbobaby-bridge-gs/"
+# .js берём из ЗЕРКАЛА ПРОДА `bridge_prod/` (задеплоенная версия, паспорт MIRROR.json), а не из
+# рабочей папки выкладки: она обезврежена 10.08.2026 и отстаёт от прода.
+GS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge_prod")
 HERE = os.path.dirname(os.path.abspath(__file__))
 HARNESS = os.path.join(HERE, "fleet_cells_harness.js")
 PROBE_DIR = "/tmp/tb_fleetcell_probe_0809"
@@ -80,7 +83,8 @@ def _plain_bikes():
 
 def test_bridge_js_syntax():
     for f in ("ReadFleet.js", "Bridge.js"):
-        p = subprocess.run(["node", "--check", GS + f], capture_output=True, text=True, timeout=30)
+        p = subprocess.run(["node", "--check", os.path.join(GS, f)],
+                           capture_output=True, text=True, timeout=30)
         assert p.returncode == 0, f"{f}: {p.stderr}"
 
 

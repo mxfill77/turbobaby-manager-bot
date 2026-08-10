@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Харнесс O3-2a: исполняет РЕАЛЬНЫЙ /root/turbobaby-bridge-gs/Booking.js в node
+ * Харнесс O3-2a: исполняет РЕАЛЬНЫЙ bridge_prod/Booking.js в node
  * с мок-SpreadsheetApp/Utilities (Apps Script локально не исполнить — но Booking.js
  * зовёт сервисы только внутри функций, поэтому vm-загрузка + мок листа работает).
  * Печатает JSON {cases:[{name, pass, detail}]}; exit 1, если есть провалы.
@@ -8,8 +8,13 @@
  */
 const fs = require('fs');
 const vm = require('vm');
+const path = require('path');
 
-const BOOKING_JS = '/root/turbobaby-bridge-gs/Booking.js';
+// Источник .js — ЗЕРКАЛО ПРОДА `bridge_prod/` в этом репо (задеплоенная версия, паспорт
+// MIRROR.json). Рабочая папка /root/turbobaby-bridge-gs обезврежена 10.08.2026 и ОТСТАЁТ от
+// прода — харнесс, читающий её, проверял бы не тот код, что живёт в мосте.
+const GS_DIR = path.join(__dirname, '..', 'bridge_prod');
+const BOOKING_JS = path.join(GS_DIR, 'Booking.js');
 const NMAX = 'NMAX 155CC GREEN-B PHUKET 4957';
 const CB = 'CB 300CC R 9011';
 

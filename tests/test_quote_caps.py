@@ -10,7 +10,10 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 
-QP_JS = "/root/turbobaby-bridge-gs/QuotePrice.js"
+# .js берём из ЗЕРКАЛА ПРОДА `bridge_prod/` (задеплоенная версия, паспорт MIRROR.json), а не из
+# рабочей папки выкладки: она обезврежена 10.08.2026 и отстаёт от прода.
+QP_JS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge_prod", "QuotePrice.js")
 
 # 12 строк блока капов — ровно то, что заносится в «Календарь бронирования» (карточка 05.07)
 CAP_BLOCK = [

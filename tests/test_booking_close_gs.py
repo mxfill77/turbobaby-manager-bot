@@ -1,4 +1,4 @@
-"""O3-3b фаза I: closeBooking в Booking.js (зеркало = /root/turbobaby-bridge-gs/Booking.js).
+"""O3-3b фаза I: closeBooking в Booking.js (зеркало прода = bridge_prod/Booking.js).
 Тот же node-vm харнесс tests/booking_gs_harness.js (реальный Booking.js + мок-SpreadsheetApp),
 что и O3-2a. Покрытие: штатное закрытие (A=Завершена, N=km_end, K=paid_total), not_active
 (Бронь — сначала выдача), not_found, ambiguous (две "В аренде" без date_start) + уточнение
@@ -21,8 +21,11 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 
-BOOKING_JS = "/root/turbobaby-bridge-gs/Booking.js"
-BRIDGE_JS = "/root/turbobaby-bridge-gs/Bridge.js"
+# .js берём из ЗЕРКАЛА ПРОДА `bridge_prod/` (задеплоенная версия, паспорт MIRROR.json), а не из
+# рабочей папки выкладки: она обезврежена 10.08.2026 и отстаёт от прода.
+GS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge_prod")
+BOOKING_JS = os.path.join(GS_DIR, "Booking.js")
+BRIDGE_JS = os.path.join(GS_DIR, "Bridge.js")
 HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "booking_gs_harness.js")
 
 _harness_cache = {}

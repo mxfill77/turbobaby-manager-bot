@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -176,6 +177,53 @@ def test_bridge_gs_has_pointer():
     text = open(p, encoding="utf-8").read()
     for must in ("bridge_prod", "bridge_prod_diff.py", "DISARMED"):
         assert must in text, "указатель не называет главного: %s" % must
+
+
+# ---------- (4) гейт читает ЗЕРКАЛО, а не обезвреженную папку ----------
+
+def test_gate_reads_mirror_not_the_folder():
+    """Ни один тест гейта не открывает .js ИЗ рабочей папки (заведено 10.08.2026).
+
+    Класс: харнессы и .js-тесты исполняли код из `/root/turbobaby-bridge-gs`, а он отстаёт от
+    прода (замер того же дня: 4 файла из 17, у Bridge.js нет 4 маршрутов и `edit_event`) — гейт
+    зеленел на коде, которого в мосте уже нет. Источник .js теперь один: зеркало `bridge_prod/`.
+
+    Судим ПУТЬ, а не слово: флагуется строковый литерал, который ЦЕЛИКОМ есть путь в папку —
+    кавычка, сразу путь, без пробелов внутри (так тест называет и файл `.../Booking.js`, и
+    каталог-префикс `.../` — оба живых способа туда сходить). Имя папки в прозе комментария и
+    внутри команды-фикстуры (`rm -rf …`, `node --check …`) путём-литералом не является и не
+    флагуется: фикстура папку НЕ открывает.
+
+    ЕДИНСТВЕННОЕ исключение — константа ЭТОГО файла, равная корню папки: здесь папка сама
+    предмет (замок «обезврежена»), и открывают в ней не код, а настройки проекта. Любой другой
+    литерал даже здесь — находка.
+    """
+    lit = re.compile(r"""['"](/root/turbobaby-bridge-gs[^'"\s]*)['"]""")
+    tests_dir = os.path.join(ROOT, "tests")
+    bad = []
+    for name in sorted(os.listdir(tests_dir)):
+        if not (name.endswith(".py") or name.endswith(".js")):
+            continue
+        with open(os.path.join(tests_dir, name), encoding="utf-8", errors="ignore") as fh:
+            src = fh.read()
+        for m in lit.finditer(src):
+            if name == os.path.basename(__file__) and m.group(1) == GS:
+                continue                       # замок папки: её корень, а не путь к коду
+            bad.append("%s:%d → %s" % (name, src[:m.start()].count("\n") + 1, m.group(0)))
+    assert not bad, (
+        "тест гейта открывает .js из обезвреженной папки: " + "; ".join(bad) +
+        " — источник один, зеркало bridge_prod/ (лечится путём, а не правкой этого теста)")
+
+
+def test_harnesses_name_the_mirror():
+    """Каждый node-харнесс называет зеркало — проверка не только «нет старого», но и «есть новое»."""
+    tests_dir = os.path.join(ROOT, "tests")
+    harnesses = [n for n in sorted(os.listdir(tests_dir)) if n.endswith("_harness.js")]
+    assert harnesses, "харнессы пропали — проверять нечего, это тоже находка"
+    for name in harnesses:
+        with open(os.path.join(tests_dir, name), encoding="utf-8", errors="ignore") as fh:
+            src = fh.read()
+        assert "bridge_prod" in src, "%s не называет зеркало прода" % name
 
 
 if __name__ == "__main__":

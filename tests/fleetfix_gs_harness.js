@@ -1,7 +1,7 @@
 'use strict';
 /**
  * Харнесс «понижение пробега по подтверждённому числу»: исполняет РЕАЛЬНЫЕ
- * /root/turbobaby-bridge-gs/{Config,BotData,ReadFleet}.js в node с мок-SpreadsheetApp
+ * bridge_prod/{Config,BotData,ReadFleet}.js в node с мок-SpreadsheetApp
  * (схема botdata_gs_harness.js). BotData.js грузится ради НАСТОЯЩЕГО logWrite_ — аудит-след
  * проверяется на живом коде журнала, а не на заглушке.
  *
@@ -22,7 +22,11 @@
 const fs = require('fs');
 const vm = require('vm');
 
-const GS = '/root/turbobaby-bridge-gs/';
+// Источник .js — ЗЕРКАЛО ПРОДА `bridge_prod/` в этом репо (задеплоенная версия, паспорт
+// MIRROR.json). Рабочая папка /root/turbobaby-bridge-gs обезврежена 10.08.2026 и ОТСТАЁТ от
+// прода — харнесс, читающий её, проверял бы не тот код, что живёт в мосте.
+const path = require('path');
+const GS = path.join(__dirname, '..', 'bridge_prod');
 
 function makeSheet(rows) {
   const WIDTH = 30;
@@ -109,7 +113,7 @@ global.Logger = { log: () => {} };
 global.DriveApp = { getFileById: () => ({}), getFolderById: () => ({ addFile: () => {} }), getRootFolder: () => ({ removeFile: () => {} }) };
 
 for (const f of ['Config.js', 'BotData.js', 'ReadFleet.js'])
-  vm.runInThisContext(fs.readFileSync(GS + f, 'utf8'), { filename: GS + f });
+  vm.runInThisContext(fs.readFileSync(path.join(GS, f), 'utf8'), { filename: path.join(GS, f) });
 
 const cases = [];
 function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: detail === undefined ? '' : String(detail) }); }

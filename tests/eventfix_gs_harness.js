@@ -1,7 +1,7 @@
 'use strict';
 /**
  * Харнесс «правка строки события НА МЕСТЕ»: исполняет РЕАЛЬНЫЙ
- * /root/turbobaby-bridge-gs/BotData.js в node с мок-SpreadsheetApp/PropertiesService
+ * bridge_prod/BotData.js в node с мок-SpreadsheetApp/PropertiesService
  * (схема botdata_gs_harness.js / booking_gs_harness.js).
  *
  * Фокус — то, чего до 04.08.2026 в мосте НЕ БЫЛО ВОВСЕ: действие правки строки листа
@@ -24,8 +24,13 @@
  */
 const fs = require('fs');
 const vm = require('vm');
+const path = require('path');
 
-const BOTDATA_JS = '/root/turbobaby-bridge-gs/BotData.js';
+// Источник .js — ЗЕРКАЛО ПРОДА `bridge_prod/` в этом репо (задеплоенная версия, паспорт
+// MIRROR.json). Рабочая папка /root/turbobaby-bridge-gs обезврежена 10.08.2026 и ОТСТАЁТ от
+// прода — харнесс, читающий её, проверял бы не тот код, что живёт в мосте.
+const GS_DIR = path.join(__dirname, '..', 'bridge_prod');
+const BOTDATA_JS = path.join(GS_DIR, 'BotData.js');
 
 // ── мок листа поверх 2D-массива (1-indexed строки/колонки как в Apps Script) ──
 function makeSheet(rows) {

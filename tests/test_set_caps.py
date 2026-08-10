@@ -12,8 +12,11 @@ os.environ.setdefault("BRIDGE_TOKEN", "x")
 
 from test_quote_caps import CAPS_ANCHOR, CAP_BLOCK, EXPECTED_CAPS, norm_cap, read_caps_mirror
 
-QP_JS = "/root/turbobaby-bridge-gs/QuotePrice.js"
-BRIDGE_JS = "/root/turbobaby-bridge-gs/Bridge.js"
+# .js берём из ЗЕРКАЛА ПРОДА `bridge_prod/` (задеплоенная версия, паспорт MIRROR.json), а не из
+# рабочей папки выкладки: она обезврежена 10.08.2026 и отстаёт от прода.
+GS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge_prod")
+QP_JS = os.path.join(GS_DIR, "QuotePrice.js")
+BRIDGE_JS = os.path.join(GS_DIR, "Bridge.js")
 
 CAP_HEADER_ROW = CAPS_ANCHOR["header_row"]  # 3 (Z3)
 CAP_COL = CAPS_ANCHOR["col"]                # 26 (Z)

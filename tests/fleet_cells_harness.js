@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Харнесс контракта клетки ТО: исполняет РЕАЛЬНЫЙ /root/turbobaby-bridge-gs/ReadFleet.js в node
+ * Харнесс контракта клетки ТО: исполняет РЕАЛЬНЫЙ bridge_prod/ReadFleet.js в node
  * с мок-SpreadsheetApp (схема botdata_gs_harness.js: сервисы зовутся только внутри функций →
  * vm-загрузка + мок листа работает).
  *
@@ -18,7 +18,11 @@
 const fs = require('fs');
 const vm = require('vm');
 
-const READFLEET_JS = '/root/turbobaby-bridge-gs/ReadFleet.js';
+// Источник .js — ЗЕРКАЛО ПРОДА `bridge_prod/` в этом репо (задеплоенная версия, паспорт
+// MIRROR.json). Рабочая папка /root/turbobaby-bridge-gs обезврежена 10.08.2026 и ОТСТАЁТ от
+// прода — харнесс, читающий её, проверял бы не тот код, что живёт в мосте.
+const path = require('path');
+const READFLEET_JS = path.join(__dirname, '..', 'bridge_prod', 'ReadFleet.js');
 const WIDTH = 34;
 
 function pad(arr) { const a = arr.slice(); while (a.length < WIDTH) a.push(''); return a; }

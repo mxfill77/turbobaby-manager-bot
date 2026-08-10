@@ -1,4 +1,4 @@
-"""O3-2a: докрутка Booking.js (Apps Script, зеркало = /root/turbobaby-bridge-gs/Booking.js).
+"""O3-2a: докрутка Booking.js (Apps Script, зеркало прода = bridge_prod/Booking.js).
 Apps Script локально не исполнить КАК СЕРВИС — но Booking.js зовёт SpreadsheetApp только внутри
 функций, поэтому реальный код гоняется node-харнессом tests/booking_gs_harness.js с мок-листом
 (схема репо: node --check на синтаксис + исполнение/парс реального .js, ср. test_set_caps.py).
@@ -18,7 +18,10 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 
-BOOKING_JS = "/root/turbobaby-bridge-gs/Booking.js"
+# .js берём из ЗЕРКАЛА ПРОДА `bridge_prod/` (задеплоенная версия, паспорт MIRROR.json), а не из
+# рабочей папки выкладки: она обезврежена 10.08.2026 и отстаёт от прода.
+GS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge_prod")
+BOOKING_JS = os.path.join(GS_DIR, "Booking.js")
 HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "booking_gs_harness.js")
 
 _harness_cache = {}

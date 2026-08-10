@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Харнесс O3-3c часть А: исполняет РЕАЛЬНЫЙ /root/turbobaby-bridge-gs/BotData.js в node
+ * Харнесс O3-3c часть А: исполняет РЕАЛЬНЫЙ bridge_prod/BotData.js в node
  * с мок-SpreadsheetApp/PropertiesService (схема booking_gs_harness.js: сервисы зовутся
  * только внутри функций → vm-загрузка + мок листа работает).
  * Фокус: col N booking_id в листе транзакций — TX_HEADERS, appendRow, дострой заголовка N1
@@ -11,8 +11,13 @@
  */
 const fs = require('fs');
 const vm = require('vm');
+const path = require('path');
 
-const BOTDATA_JS = '/root/turbobaby-bridge-gs/BotData.js';
+// Источник .js — ЗЕРКАЛО ПРОДА `bridge_prod/` в этом репо (задеплоенная версия, паспорт
+// MIRROR.json). Рабочая папка /root/turbobaby-bridge-gs обезврежена 10.08.2026 и ОТСТАЁТ от
+// прода — харнесс, читающий её, проверял бы не тот код, что живёт в мосте.
+const GS_DIR = path.join(__dirname, '..', 'bridge_prod');
+const BOTDATA_JS = path.join(GS_DIR, 'BotData.js');
 
 // ── мок листа поверх 2D-массива (1-indexed строки/колонки как в Apps Script) ──
 function makeSheet(rows) {

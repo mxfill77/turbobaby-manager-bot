@@ -1,4 +1,4 @@
-"""O3-3c часть А: col N booking_id в листе транзакций Bot Data (зеркало = bridge-gs/BotData.js).
+"""O3-3c часть А: col N booking_id в листе транзакций Bot Data (зеркало = bridge_prod/BotData.js).
 Реальный .js гоняется node-харнессом tests/botdata_gs_harness.js с мок-листом (схема
 booking_gs_harness.js). Покрытие: TX_HEADERS 14 колонок (booking_id последней, msg_id на месте —
 dedup цел), appendRow с booking_id → col N заполнен, БЕЗ booking_id (старые вызовы) → col N пуст,
@@ -7,7 +7,10 @@ import json
 import os
 import subprocess
 
-BOTDATA_JS = "/root/turbobaby-bridge-gs/BotData.js"
+# .js берём из ЗЕРКАЛА ПРОДА `bridge_prod/` (задеплоенная версия, паспорт MIRROR.json), а не из
+# рабочей папки выкладки: она обезврежена 10.08.2026 и отстаёт от прода.
+BOTDATA_JS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bridge_prod", "BotData.js")
 HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botdata_gs_harness.js")
 
 _harness_cache = {}
