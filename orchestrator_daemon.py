@@ -4689,14 +4689,28 @@ def _series_on():
     return (os.environ.get("CHAIN_SERIES") or "1").strip() != "0"
 
 
+_IS_DAEMON = False   # ставится в main(): БОЕВОЕ состояние серии пишет только боевой процесс
+
+
 def _series_file():
     """Куда писать состояние. ORCH_TEST_MODE → ВРЕМЕННЫЙ файл: зеркало дисциплины `_drift_dir` —
     тест не пишет в боевое состояние никогда, иначе счёт серии врал бы прогонами гейта.
-    CC_SERIES_FILE — явная подмена (осознанный вызов из своего сьюта)."""
+    CC_SERIES_FILE — явная подмена (осознанный вызов из своего сьюта).
+
+    ТРЕТИЙ РУБЕЖ — ЛИЧНОСТЬ ПИШУЩЕГО, и он заведён по ЖИВОМУ ФАКТУ, а не про запас. Признак
+    тест-прогона живёт в окружении, а харнесс, запущенный руками (`venv/bin/python3 своя_проба.py`),
+    НЕ НЕСЁТ НИ ОДНОГО из четырёх имён изоляции — импортировал демона, позвал руки счёта и написал
+    в боевой файл. Ровно это и случилось 10.08.2026: боевой `chain_series.json` к 18:25 держал
+    синтетическую цепочку 101 (`created` пуст, окна исполнения нулевой длины), тогда как боевой
+    демон поднят в 08:08:56 и кода счёта в памяти не имел вовсе — в его журнале НИ ОДНОЙ строки
+    «СЕРИЯ». То есть боевое состояние метрики целиком было следом пробы. Поэтому боевой путь
+    отдаётся ТОЛЬКО процессу, который и есть демон (флаг ставит `main()`), а всякий импорт со
+    стороны — в тест-файл. Направление ошибки названо: промах этого рубежа стоит СЧЁТА (демон
+    считал бы во временный файл), а не подлога в боевом, — и виден он сразу, первой же сверкой."""
     explicit = (os.environ.get("CC_SERIES_FILE") or "").strip()
     if explicit:
         return explicit
-    if (os.environ.get("ORCH_TEST_MODE") or "").strip():
+    if (os.environ.get("ORCH_TEST_MODE") or "").strip() or not _IS_DAEMON:
         return CHAIN_SERIES_TEST_FILE
     return CHAIN_SERIES_FILE
 
@@ -4955,6 +4969,15 @@ def _series_derive(state):
         ch["cards"] = [c for c in (chains[r].get("cards") or []) if not c.get("open")]
         verdicts.append(chain_series.chain_verdict(ch))
     d = chain_series.series(verdicts)
+    # ПАМЯТЬ ПРОТИВ УРЕЗКИ. `best` и `breaks` считаются по цепочкам, которые состояние ЕЩЁ помнит
+    # (потолок SERIES_KEEP), поэтому забывание старых цепочек молча УКОРАЧИВАЛО бы рекорд и
+    # стирало дату последнего обрыва — то есть файл переставал бы отвечать на два из четырёх
+    # вопросов рамки §8г, ничего об этом не сказав. Оба поля переносятся вперёд: рекорд не
+    # уменьшается никогда, последний обрыв держится, пока его не сменит новый.
+    prev = state.get("derived") or {}
+    d["best_ever"] = max(int(prev.get("best_ever") or 0), int(d.get("best") or 0))
+    if not d.get("last_break"):
+        d["last_break"] = prev.get("last_break")
     d["line"] = chain_series.render(d)
     d["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     state["derived"] = d
@@ -5168,6 +5191,8 @@ def cycle():
 
 
 def main():
+    global _IS_DAEMON
+    _IS_DAEMON = True          # с этой строки боевой файл состояния серии пишет этот процесс
     _banner_avail = _mem_available_mb() or 0
     _banner_crss = _live_claude_rss_mb() or 0
     _banner_cprocs = _live_claude_count() or 0

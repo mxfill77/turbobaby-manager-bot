@@ -352,10 +352,16 @@ def chain_verdict(chain):
 def series(verdicts):
     """Вердикты цепочек В ПОРЯДКЕ КОРНЕЙ → состояние серии.
 
-    → {"current", "best", "breaks": [...], "chains", "weight_share", "weight_in_current",
-       "qualified"}. `qualified` — зачётная ли ИДУЩАЯ серия: длина ≥ SERIES_TARGET И доля
-    цепочек с весом внутри неё ≥ WEIGHT_MIN_SHARE. Оба условия обязательны: длина без веса
-    не считается (замок), вес без длины — не серия."""
+    → {"current", "best", "breaks": [...], "last_break", "chains", "weight_share",
+       "weight_in_current", "qualified"}. `qualified` — зачётная ли ИДУЩАЯ серия: длина ≥
+    SERIES_TARGET И доля цепочек с весом внутри неё ≥ WEIGHT_MIN_SHARE. Оба условия обязательны:
+    длина без веса не считается (замок), вес без длины — не серия.
+
+    `last_break` — ПОСЛЕДНИЙ обрыв отдельным полем (дата · сорт · цепочка · почему), а не только
+    хвост списка. Так требует рамка §8г от файла состояния, и так он переживает урезку: список
+    `breaks` живёт ровно столько цепочек, сколько их помнит состояние (SERIES_KEEP), а «когда и
+    чем оборвалось в последний раз» — это факт о прошлом, который от забывания старых цепочек
+    ложным не становится."""
     cur = best = 0
     cur_weight = cur_known = 0
     best_span, cur_span, breaks = [], [], []
@@ -387,6 +393,7 @@ def series(verdicts):
         "current_known": cur_known, "current_weight_share": round(share_cur, 4),
         "best": best, "best_span": best_span,
         "breaks": breaks,
+        "last_break": dict(breaks[-1]) if breaks else None,
         "weight_share": round((with_weight / len(known_all)), 4) if known_all else 0.0,
         "weight_chains": with_weight, "weight_known": len(known_all),
         "open": len(list(verdicts or [])) - total,

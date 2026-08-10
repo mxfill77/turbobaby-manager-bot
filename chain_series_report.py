@@ -18,7 +18,12 @@
     venv/bin/python3 chain_series_report.py                     # живой снимок очереди
     venv/bin/python3 chain_series_report.py --snapshot f.json   # из файла
     venv/bin/python3 chain_series_report.py --verify            # сверка с файлом демона
+    venv/bin/python3 chain_series_report.py --verify --state s.json   # сверка с указанным файлом
     venv/bin/python3 chain_series_report.py --weeks             # доля шума по неделям
+
+СВЕРКА (`--verify`) возвращает ТРИ исхода кодом: 0 сходится · 1 РАСХОЖДЕНИЕ (красное, названо
+поимённо) · 2 НЕ СВЕРЕНО (файла нет · файл пуст · факты мира не прочитаны · общая почва пуста).
+Файл она НЕ ПРАВИТ ни при каком исходе — см. блок «СВЕРКА» ниже и страж в tests/.
 """
 import json
 import os
@@ -353,6 +358,215 @@ def _from_days(days):
     return "%04d-%02d-%02d" % (y + (1 if m <= 2 else 0), m, d)
 
 
+# ── СВЕРКА: реплей против файла демона ──────────────────────────────────────────────────────
+# ЗАЧЕМ ОНА ВООБЩЕ. Живой счёт демона — единственный источник числа, а число без сверки есть
+# ощущение с точностью до знака. Сверка отвечает на один вопрос: не противоречит ли файл тому,
+# что о тех же цепочках всё ещё говорит очередь. Она НИЧЕГО НЕ ЧИНИТ — расхождение обязано быть
+# КРАСНЫМ, а не тихой правкой файла: молча подогнанный счётчик перестаёт быть свидетелем, и
+# следующий раз соврёт уже без свидетелей вовсе (тот же довод, по которому гейт не правит тест).
+#
+# ИСХОДОВ ТРИ, А НЕ ДВА (замок против ложного зелёного — приём О3/О4/О5):
+#   0 СХОДИТСЯ      — на общей почве ни одного противоречия, и почва не пуста;
+#   1 РАСХОЖДЕНИЕ   — противоречие названо поимённо: цепочка, что говорит файл, что реплей;
+#   2 НЕ СВЕРЕНО    — сверять нечем или не с чем (файла нет · файл пуст · факты мира не
+#                     прочитаны · общая почва пуста). Это НЕ «сходится»: пустое пересечение
+#                     сходимостью объявить нельзя, иначе чистая установка выдавала бы зелёное
+#                     ровно там, где не проверено ничего.
+#
+# АСИММЕТРИЯ СЛЕПОТЫ НАЗВАНА ПРЯМО И СЧИТАЕТСЯ ОТДЕЛЬНО. Реплей структурно слеп там, где очередь
+# затёрла тело карточки её же вердиктом (замер 10.08: тело восстановимо у 46 вмешательств из 106).
+# Поэтому «файл говорит ОБРЫВ, реплей молчит, и тело у реплея затёрто» — не противоречие, а ровно
+# та причина, по которой файл и заведён; такие цепочки считаются числом. А вот обратное — «реплей
+# доказывает обрыв, файл его не знает» — КРАСНОЕ ВСЕГДА: это направление, в котором счёт надувает
+# серию, и слепотой оно не оправдывается ничем.
+def _file_verdicts(live):
+    """Вердикты цепочек ИЗ ФАЙЛА — теми же чистыми функциями, какими их считает демон
+    (`_series_derive`): статусы записей → список, открытые карточки в вердикт не входят."""
+    out = {}
+    for r, ch in ((live or {}).get("chains") or {}).items():
+        c = dict(ch)
+        c["statuses"] = list((ch.get("statuses") or {}).values())
+        c["cards"] = [x for x in (ch.get("cards") or []) if not x.get("open")]
+        try:
+            out[int(r)] = cs.chain_verdict(c)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _cause_ids(chain, cause):
+    """Номера ЗАПИСЕЙ, на которых стоит обрыв этой цепочки. `chain_verdict` называет причину, а
+    сверке нужно знать, ЧЕМ она доказана: сверять две картины можно только по одной и той же
+    записи очереди."""
+    cards = [c for c in (chain.get("cards") or []) if not c.get("open")]
+    if cause in (cs.NOISE, cs.MANUAL):
+        return [c.get("id") for c in cards if c.get("sort") == cause]
+    if cause == "отказ":
+        return [r.get("id") for r in (chain.get("refusals") or [])]
+    return []
+
+
+def _replay_saw(chain, ids):
+    """Разобрал ли РЕПЛЕЙ хоть одну из этих записей как вмешательство. `неизвестно` разбором не
+    считается: это и есть его слепота (тело затёрто вердиктом очереди)."""
+    for i in ids:
+        if i is None:
+            continue
+        if any(c.get("id") == i and c.get("sort") != cs.UNKNOWN
+               for c in (chain.get("cards") or [])):
+            return True
+        if any(r.get("id") == i for r in (chain.get("refusals") or [])):
+            return True
+    return False
+
+
+def _attributed(chain, verdict):
+    """Стоит ли обрыв на ПРИПИСАННОМ ремонте — перезапуске юнита, у которого своего номера в
+    очереди нет вовсе. Приписка условна у ОБЕИХ сторон, и обе говорят это прямо в коде: демон
+    вешает такой старт на последнюю свою цепочку, реплей — на цепочку, живую в ту минуту. Значит
+    хозяин у него может разойтись законно, и по цепочке он не сверяется — сверяется его ЧИСЛО."""
+    if not verdict.get("break") or verdict.get("cause") != cs.MANUAL:
+        return False
+    ids = _cause_ids(chain, cs.MANUAL)
+    return bool(ids) and all(i is None for i in ids)
+
+
+def verify(live, replay_chains, unread=(), windows_read=True):
+    """(код возврата, строки отчёта). Ничего не пишет и не правит — только судит."""
+    # `blocking` — то, из-за чего сверка НЕВОЗМОЖНА (код 2); `notes` — оговорки, которые её не
+    # отменяют. Разделять обязательно: файл всегда знает цепочки, закрывшиеся ПОСЛЕ снимка, и
+    # считать это «не сверено» значило бы никогда не сверить ничего — то есть выключить сверку
+    # молчанием. Она проверяет проверяемое и ПРЯМО НАЗЫВАЕТ, чего не касалась.
+    out, red, blocking, notes = [], [], [], []
+    if not live:
+        return 2, ["СВЕРКА: НЕ СВЕРЕНО — файла демона нет или он не прочитан "
+                   "(живой счёт ещё не писал состояния)"]
+    fv = _file_verdicts(live)
+    if not fv:
+        return 2, ["СВЕРКА: НЕ СВЕРЕНО — в файле ноль цепочек: счёт установлен, но ещё не считал. "
+                   "Сходимостью пустое пересечение не объявляем"]
+    if unread:
+        blocking.append("журнал юнитов не прочитан (%s) — реплей не судит ремонт руками"
+                        % ", ".join(unread))
+    if not windows_read:
+        blocking.append("окна исполнения не прочитаны — реплей не отличит свой рестарт от ремонта")
+
+    rch = {int(r): ch for r, ch in (replay_chains or {}).items()}   # ключи бывают и строками
+    rv = {r: cs.chain_verdict(ch) for r, ch in rch.items()}
+    rmax = max(rv) if rv else 0
+    # ЦЕПОЧКА ФАЙЛА, КОТОРОЙ В СНИМКЕ НЕТ. Внутри охвата снимка это красное (файл говорит о том,
+    # чего очередь не знает); новее снимка — просто «снимок старше файла», и обвинять тут нечего.
+    for r in sorted(set(fv) - set(rv)):
+        if r <= rmax:
+            red.append("цепочка %s: файл её знает, а в снимке очереди её НЕТ" % r)
+        else:
+            notes.append("цепочка %s новее снимка — в сверку не входит" % r)
+    outside = sorted(set(rv) - set(fv))
+
+    fch = {int(r): ch for r, ch in ((live or {}).get("chains") or {}).items()}
+    # ФОРМА ЗАПИСИ — ЧЕЙ ЭТО СЛЕД. Сверка по исходу ловит спор о мире, но не ловит подделку,
+    # СЛУЧАЙНО совпавшую с миром: 10.08.2026 боевой файл держал синтетическую цепочку 101 от
+    # пробы, и по исходу («done, обрывов нет») она сошлась с настоящей цепочкой 101 из очереди —
+    # сверка вернула зелёное на состоянии, которого демон не писал НИ ОДНОЙ строкой. Дату рождения
+    # цепочке даёт запись очереди (`created` задачи), и у настоящего счёта она есть всегда:
+    # пустая — след писавшего БЕЗ задачи в руках, то есть правка файла не демоном.
+    for r in sorted(fv):
+        if not str((fch.get(r) or {}).get("created") or "").strip():
+            red.append("цепочка %s в файле БЕЗ ДАТЫ РОЖДЕНИЯ — живой счёт так не пишет: "
+                       "состояние правлено не демоном" % r)
+    common, blind, uncomparable, attributed = [], [], [], []
+    for r in sorted(set(fv) & set(rv)):
+        f, p = fv[r], rv[r]
+        if not (f.get("closed") and p.get("closed")):
+            uncomparable.append(r)          # исход есть не в обеих картинах — сравнивать нечего
+            continue
+        common.append(r)
+        if f.get("break") == p.get("break") and f.get("cause") == p.get("cause"):
+            continue
+        if _attributed(fch[r], f) or _attributed(rch[r], p):
+            attributed.append(r)            # хозяин приписанного ремонта расходится законно
+            continue
+        if f.get("break") and not p.get("break") \
+                and not _replay_saw(rch[r], _cause_ids(fch[r], f.get("cause"))):
+            blind.append(r)                 # ровно та слепота, ради которой файл и заведён
+            continue
+        red.append("цепочка %s: файл — %s, реплей — %s%s"
+                   % (r, ("обрыв «%s»" % f.get("cause")) if f.get("break") else "без обрыва",
+                      ("обрыв «%s»" % p.get("cause")) if p.get("break") else "без обрыва",
+                      " (запись %s реплей разобрал сам — оба видели одно и то же)"
+                      % _cause_ids(fch[r], f.get("cause"))
+                      if f.get("break") and not p.get("break") else ""))
+    if attributed:
+        fman = sum(1 for r in common if fv[r].get("cause") == cs.MANUAL)
+        pman = sum(1 for r in common if rv[r].get("cause") == cs.MANUAL)
+        notes.append("ремонт руками на общей почве: файл %d · реплей %d (приписка условна у обеих "
+                     "сторон — сверяется число, не хозяин; расходятся цепочки %s)"
+                     % (fman, pman, attributed[:8]))
+
+    # (а) ФАЙЛ САМ СЕБЕ: выводится ли его `derived` из его же цепочек. Ловит правку файла руками
+    # и расхождение самого счёта с решением — то есть ту самую «тихую правку», которая запрещена.
+    d = live.get("derived") or {}
+    own = cs.series([fv[r] for r in sorted(fv)])
+    if d.get("current") is not None and (d.get("current") != own["current"]
+                                         or d.get("best") != own["best"]
+                                         or d.get("chains") != own["chains"]):
+        red.append("файл сам себе противоречит: заявлено current=%s best=%s цепочек=%s, а из его "
+                   "же цепочек выводится current=%s best=%s цепочек=%s"
+                   % (d.get("current"), d.get("best"), d.get("chains"),
+                      own["current"], own["best"], own["chains"]))
+    out.append("СВЕРКА: цепочек в файле %d · в снимке %d · общая почва %d "
+               "(вне окна файла %d · не сравнимы %d · слепота реплея %d · приписка ремонта %d)"
+               % (len(fv), len(rv), len(common), len(outside), len(uncomparable), len(blind),
+                  len(attributed)))
+    out.append("  файл: %s" % (d.get("line") or "строки нет"))
+    out.append("  рекорд файла best_ever=%s (реплеем не проверяется — файл помнит дольше своего "
+               "окна) · последний обрыв: %s"
+               % (d.get("best_ever"), _last_break_line(d.get("last_break"))))
+
+    # (б) ЧИСЛА НА ОБЩЕЙ ПОЧВЕ — обе стороны считаются ОДНОЙ чистой функцией по ОДНОМУ набору
+    # корней. Красное только при нулевой слепоте: где реплей ослеп, числа обязаны разойтись, и
+    # объявлять это расхождением значило бы наказывать файл за то, ради чего он существует.
+    if common:
+        fs = cs.series([fv[r] for r in common])
+        ps = cs.series([rv[r] for r in common])
+        out.append("  на общей почве: файл current=%d best=%d обрывов=%d | реплей current=%d "
+                   "best=%d обрывов=%d"
+                   % (fs["current"], fs["best"], len(fs["breaks"]),
+                      ps["current"], ps["best"], len(ps["breaks"])))
+        if not blind and not attributed \
+                and (fs["current"] != ps["current"] or fs["best"] != ps["best"]):
+            red.append("числа на общей почве разошлись при нулевой слепоте реплея: "
+                       "файл current=%d best=%d, реплей current=%d best=%d"
+                       % (fs["current"], fs["best"], ps["current"], ps["best"]))
+    else:
+        blocking.append("общая почва пуста — сверять нечего")
+
+    for line in notes:
+        out.append("  ОГОВОРКА: " + line)
+    for line in blocking:
+        out.append("  НЕ СВЕРЕНО: " + line)
+    for line in red:
+        out.append("  РАСХОЖДЕНИЕ: " + line)
+    if red:
+        out.append("ИТОГ СВЕРКИ: РАСХОЖДЕНИЕ (%d) — красное. Файл НЕ правим: расходится счёт с "
+                   "миром, а не файл с ожиданием" % len(red))
+        return 1, out
+    if blocking:
+        out.append("ИТОГ СВЕРКИ: НЕ СВЕРЕНО — о сходимости не заявляем")
+        return 2, out
+    out.append("ИТОГ СВЕРКИ: СХОДИТСЯ на %d цепочках (слепота реплея %d — не расхождение)"
+               % (len(common), len(blind)))
+    return 0, out
+
+
+def _last_break_line(b):
+    """Дата последнего обрыва и его сорт — то, что файл обязан отвечать по рамке §8г."""
+    if not b:
+        return "не было ни одного"
+    return "%s · %s · цепочка %s" % (str(b.get("at") or "без даты")[:16], b.get("cause"),
+                                     b.get("root"))
+
+
 def main(argv):
     snap = None
     if "--snapshot" in argv:
@@ -439,18 +653,20 @@ def main(argv):
                  100.0 * b["weight"] / b.get("wknown", 0) if b.get("wknown") else 0))
 
     if "--verify" in argv:
+        path = argv[argv.index("--state") + 1] if "--state" in argv else STATE_FILE
+        live = None
         try:
-            live = json.load(open(STATE_FILE, encoding="utf-8"))
-        except OSError as e:
-            # Код 2 — «НЕ СВЕРЕНО», а не 0: успех и невозможность сверки должны различаться
+            with open(path, encoding="utf-8") as f:
+                live = json.load(f)
+        except (OSError, ValueError) as e:
+            # Код 2 — «НЕ СВЕРЕНО», а не 0: успех и невозможность сверки обязаны различаться
             # кодом возврата (тот же приём, что у deploy/bridge_prod_diff.py).
-            print("\nСВЕРКА: файла демона нет (%s) — живой счёт ещё не писался" % e)
-            return 2
-        d = live.get("derived") or {}
-        print("\nСВЕРКА с файлом демона: живой current=%s best=%s chains=%s | "
-              "пересчёт current=%s best=%s chains=%s"
-              % (d.get("current"), d.get("best"), d.get("chains"),
-                 st["current"], st["best"], st["chains"]))
+            print("\nСВЕРКА: файл демона не прочитан (%s)" % e)
+        code, lines = verify(live, chains, unread, windows is not None)
+        print("")
+        for line in lines:
+            print(line)
+        return code
     return 0
 
 
