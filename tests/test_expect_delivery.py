@@ -400,6 +400,79 @@ except Exception as e:                                                   # noqa:
     print("   ОШИБКА: %r" % e)
     res += [ok(False, "(14) живой прогон")] * 4
 
+# ═══ (15) ПРИЧИНА РАСХОЖДЕНИЯ ДИСКА НАЗВАНА, А ВЕРДИКТ НЕ ТРОНУТ (10.08.2026, цель 458) ═══
+# Живой случай ДОСЛОВНО: 10.08 19:29:56 наблюдатель дал o3_unknown про 7bcddba, потому что
+# orchestrator_daemon.py лежал правленым с 19:20:32; коммит a59ce6e закрыл окно в 19:35:55
+# (15 м 23 с), и в 19:40:12 боевой журнал закрыл эпизод. Замер реплеем за 7 суток: 341 из 341
+# таких вердиктов — правка МОЛОЖЕ судимого коммита.
+print("\n(15) причина названа, вердикт прежний (живой случай 7bcddba / a59ce6e)")
+C_O2FIX = {"sha": "7bcddba", "ct": T("2026-08-10T08:05:04Z"),
+           "subject": "О2: идущий заход — работа, а не остановка",
+           "files": ["CLAUDE.md", "expectations.py", "orchestrator_daemon.py",
+                     "tests/test_expectations.py"]}
+LIVE_NOW = T("2026-08-10T19:29:56Z")            # такт, на котором заметка ушла в ленту
+LIVE_MT = T("2026-08-10T19:20:32Z")             # mtime orchestrator_daemon.py в тот момент
+f15 = facts([C_O2FIX], now=LIVE_NOW, daemon=T("2026-08-10T08:08:56Z"),
+            dirty=["orchestrator_daemon.py"], mtimes={"orchestrator_daemon.py": LIVE_MT})
+st15 = E.delivery_state(C_O2FIX, f15)
+# 15a. ВЕРДИКТ НЕ ИЗМЕНИЛСЯ — это главное требование ТЗ, а не побочная проверка.
+res.append(ok(st15["state"] == E.UNKNOWN,
+              "(15a) вердикт остался «неизвестно»: %s" % st15["state"]))
+res.append(ok(not any(p == "orchestrator_daemon.py" for p, _ in st15["done"] + st15["missing"]),
+              "(15a) разошедшийся файл НЕ объявлен ни доставленным, ни недоставкой"))
+why15 = dict((p, w) for p, w in st15["unknown"]).get("orchestrator_daemon.py", "")
+print("      причина: " + why15)
+res.append(ok(E.DIRTY_WHY in why15, "(15b) прежняя формулировка НЕ выброшена, а дополнена"))
+res.append(ok(E.DIRTY_WIP in why15, "(15b) названа причина: правка моложе коммита"))
+res.append(ok("11 ч 15 мин" in why15,
+              "(15b) названо ЧИСЛО — насколько правка моложе коммита (19:20:32 − 08:05:04)"))
+v15 = [v for v in E.verdict(f15, CFG) if str(v.get("kind")).startswith("o3")]
+res.append(ok(len(v15) == 1 and v15[0]["kind"] == "o3_unknown",
+              "(15c) вид вердикта прежний: %s" % [v["kind"] for v in v15]))
+n15 = E.render(v15[0], "VPS")
+print("      заметка: " + n15)
+res.append(ok("не знаю" in n15.lower() and "НЕ «дошло»" in n15,
+              "(15c) заголовок и отрицание зелёного прочтения на месте"))
+res.append(ok("рабочий цикл" in n15 and "закроется сам" in n15,
+              "(15c) причина названа В ТЕКСТЕ ЗАМЕТКИ отдельной строкой"))
+res.append(ok("вердикт всё равно «не знаю»" in n15,
+              "(15c) и та же строка прямо повторяет, что вердикт НЕ смягчён"))
+res.append(ok("не дошёл до прода" not in n15, "(15c) незнание не выдаётся за недоставку"))
+# 15d. ОБРАТНЫЙ СЛУЧАЙ (за 7 суток замера — ноль): правка СТАРШЕ коммита звучит иначе.
+f15d = facts([C_O2FIX], now=LIVE_NOW, daemon=T("2026-08-10T08:08:56Z"),
+             dirty=["orchestrator_daemon.py"],
+             mtimes={"orchestrator_daemon.py": T("2026-08-10T07:00:00Z")})
+why15d = dict((p, w) for p, w in E.delivery_state(C_O2FIX, f15d)["unknown"]).get(
+    "orchestrator_daemon.py", "")
+print("      причина (правка старше): " + why15d)
+res.append(ok(E.delivery_state(C_O2FIX, f15d)["state"] == E.UNKNOWN,
+              "(15d) и здесь вердикт «неизвестно» — различитель судит ТЕКСТ, не исход"))
+res.append(ok(E.DIRTY_WIP not in why15d and "СТАРШЕ" in why15d,
+              "(15d) странный случай назван странным, а не рутиной"))
+res.append(ok("рабочий цикл" not in E.render(
+    [v for v in E.verdict(f15d, CFG) if str(v.get("kind")).startswith("o3")][0], "VPS"),
+    "(15d) объяснения «это просто работа» на нём НЕ появляется"))
+# 15e. ФАКТА О ЗАПИСИ НЕТ → прежняя строка БАЙТ-В-БАЙТ, без догадок.
+f15e = facts([C_O2FIX], now=LIVE_NOW, dirty=["orchestrator_daemon.py"])
+f15e["delivery"]["mtimes"] = {}
+why15e = dict((p, w) for p, w in E.delivery_state(C_O2FIX, f15e)["unknown"]).get(
+    "orchestrator_daemon.py", "")
+res.append(ok(why15e == E.DIRTY_WHY, "(15e) mtime неизвестен → прежний текст без изменений"))
+res.append(ok(E.dirty_why("x.py", 0, {"x.py": 1.0}) == E.DIRTY_WHY,
+              "(15e) времени коммита нет → тоже прежний текст"))
+res.append(ok(E.dirty_why("x.py", 100.0, {"x.py": "мусор"}) == E.DIRTY_WHY,
+              "(15e) мусор вместо mtime не роняет разбор и не рождает догадку"))
+# 15f. ЗАМОК ЦЕЛ: сила исходов не переставлена, «неизвестно» по-прежнему бьёт «доставлен».
+f15f = facts([C_O2FIX], now=LIVE_NOW, daemon=T("2026-08-10T08:08:56Z"),
+             dirty=["expectations.py"], mtimes={"expectations.py": LIVE_MT})
+st15f = E.delivery_state(C_O2FIX, f15f)
+res.append(ok(st15f["state"] == E.UNKNOWN and any(u == "orchestrator-daemon"
+                                                  for _p, u in st15f["done"]),
+              "(15f) один файл доставлен, другой неизвестен → исход всё равно «неизвестно»"))
+# 15g. Замер приложен к делу: у обеих веток есть свой корпус, и он назван в модуле.
+res.append(ok("341" in (E.__doc__ or "") and "a59ce6e" in (E.__doc__ or ""),
+              "(15g) числа замера и живой случай названы в самом модуле, а не только в артефакте"))
+
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)
 if fails:
