@@ -43,6 +43,9 @@ import curator_ops        # РАЗБОР ПУНКТА СВОДКИ НА ОПЕР
 import curator_event      # ТОЖДЕСТВО СОБЫТИЯ МЕЖДУ ЦЕЛЯМИ: чистая функция (см. _curator_event_seen)
 import prod_drift         # ДЕТЕКТОР ДРЕЙФА ПРОДА: read-only, только говорит (см. _maybe_prod_drift)
 import chain_series       # СЧЁТ СЕРИИ ЦЕПОЧЕК: чистая функция без рук (см. _series_note_terminal)
+import curator_state      # СВЕРКА ПУНКТА С ЖИВЫМ СОСТОЯНИЕМ: чистая функция (см. _curator_state_check)
+import scan_result        # КОНТРАКТ ЧИТАТЕЛЯ: нуль без знаменателя наверх не отдаётся
+import expectations       # ПРИБОР О3 «коммит дошёл до прода»: чистое решение, зовём его, а не свой глаз
 
 
 def _is_fixture(text: str) -> bool:
@@ -3302,9 +3305,143 @@ def _curator_human_split(root, item, ops):
         return None
 
 
+def _curator_state_on():
+    """CURATOR_STATE в .env: по умолчанию ВКЛЮЧЕНО, «0» гасит сверку ЦЕЛИКОМ и ДО сбора фактов —
+    ни одного обращения к git и /proc, путь пункта байт-в-байт прежний. Дефолт-«включено» законен
+    ровно потому, что сверка умеет ТОЛЬКО не показать пункт, которому прибор нашёл подтверждение,
+    а во всех прочих случаях (включая любой сбой) пункт уезжает владельцу как раньше."""
+    return (os.environ.get("CURATOR_STATE") or "1").strip() != "0"
+
+
+CURATOR_STATE_GIT_TIMEOUT = 20
+
+
+def _curator_state_dirty():
+    """Файлы, которыми рабочее дерево ОТЛИЧАЕТСЯ от origin/main → ScanResult.
+
+    Это замок против ложного зелёного, тот же, что у наблюдателя: доставку утверждаем только когда
+    байты на диске ДОКАЗАННО те же, что в origin/main. Поэтому пустой список ЗДЕСЬ обязан иметь
+    знаменатель (контракт `scan_result`, класс «нуль по неразбору»): «дерево чистое» и «спросить
+    не удалось» — РАЗНЫЕ вещи, и вторая обязана дойти до прибора как «неизвестно», а не как
+    молчаливое «расхождений нет». Иначе умерший git читался бы как разрешение закрыть пункт.
+
+    ПОЧЕМУ СВОЙ ВЫЗОВ, А НЕ `expectations_run.dirty_files`: замыкание импортов (prod_drift.closure)
+    берёт импорты ЛЮБОГО уровня, поэтому импорт рук наблюдателя внёс бы `expectations_run.py` в
+    память демона — и О3 стало бы объявлять демона отставшим при каждой правке НАБЛЮДАТЕЛЯ.
+    Дисциплина сохранена: подкоманда одна и читающая, аргументы литеральные, ничего не пишется."""
+    subj = "файлов расхождения с origin/main"
+    try:
+        p = subprocess.run(["git", "diff", "--name-only", "origin/main", "--"], cwd=REPO,
+                           capture_output=True, text=True, timeout=CURATOR_STATE_GIT_TIMEOUT)
+    except Exception as e:
+        return scan_result.ScanResult.unreadable(subj, detail=f"git не ответил: {str(e)[:100]}")
+    if p.returncode != 0:
+        return scan_result.ScanResult.unreadable(
+            subj, detail=f"git diff вернул код {p.returncode}")
+    rows = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
+    return scan_result.ScanResult(scanned=len(rows), parsed=len(rows), subject=subj, payload=rows)
+
+
+def _curator_state_answers(named):
+    """Коммиты, названные пунктом → ответ ПРИБОРА О3 по каждому: {"ok","state","families"}.
+
+    Своего суждения о доставке здесь нет ни одного: факты собирает тот же read-only разведчик
+    `prod_drift`, которым живёт наблюдатель (замыкания импортов, /proc, mtime, окно origin/main),
+    а судит их сам `expectations.delivery_state` — то есть ровно тот код, что говорит владельцу
+    «дошёл коммит до прода или нет». Три исхода прибора переводятся в трёхзначное `ok`:
+    доставлен → True, не доставлен → False, всё остальное (включая «коммит вне окна прибора») →
+    None, то есть дырка, которую решение обязано прочитать как «неизвестно»."""
+    now = time.time()
+    win = expectations.limit_env(expectations.DELIVER_WINDOW_ENV,
+                                 expectations.DELIVER_WINDOW_DEFAULT, os.environ, scale=3600.0)
+    commits = {}
+    for c in prod_drift.commits_since(now - max(win, 3600.0) * 2, REPO):
+        commits[str(c.get("sha") or "")[:7]] = c
+    watched = {u for u, _e in prod_drift.WATCHED}
+    closures, units = {}, {}
+    for unit, entry in prod_drift.WATCHED:
+        try:
+            closures[unit] = sorted(prod_drift.closure(entry, REPO))
+        except Exception:
+            closures[unit] = []
+        try:
+            p = prod_drift.live(unit, entry, repo=REPO)
+        except Exception:
+            p = None
+        units[unit] = {"alive": bool(p), "started": (p or {}).get("started"),
+                       "pid": (p or {}).get("pid"), "entry": entry}
+    mtimes = {}
+    for c in commits.values():
+        for rel in (c.get("files") or []):
+            rel = expectations.norm_path(rel)
+            if rel in mtimes:
+                continue
+            try:
+                mtimes[rel] = os.stat(os.path.join(REPO, rel)).st_mtime
+            except OSError:
+                continue
+    # Знаменатель читаем ДО находок: «дерево чистое» (исход empty) разрешает судить доставку,
+    # «спросить не удалось» (unreadable) — нет, и прибор честно ответит «неизвестно».
+    d = _curator_state_dirty()
+    if d.outcome == scan_result.OUTCOME_UNREADABLE:
+        log.info("curator-state: %s — доставку не подтверждаем", d.say())
+    facts = {"delivery": {"closures": closures, "units": units, "mtimes": mtimes,
+                          "dirty": list(d.payload or ()) if d.scanned is not None else [],
+                          "dirty_ok": d.outcome != scan_result.OUTCOME_UNREADABLE}}
+    out = {}
+    for sha in named:
+        c = commits.get(sha[:7])
+        if not c:
+            out[sha] = {"ok": None, "state": "коммита нет в окне прибора", "families": []}
+            continue
+        st = expectations.delivery_state(c, facts)
+        ok = {expectations.DELIVERED: True, expectations.UNDELIVERED: False}.get(st["state"])
+        # Семью засчитываем ТОЛЬКО там, где прибор назвал живой юнит: у доставки «с диска» вторым
+        # полем стоит не юнит, а способ, и записать его в операцию значило бы выдумать за прибор.
+        fams = {"service:" + u for _p, u in (st.get("done") or []) if u in watched}
+        out[sha] = {"ok": ok, "state": st["state"], "families": sorted(fams)}
+    return out
+
+
+def _curator_state_check(root, item):
+    """Пункт ПЕРЕД выпиской владельцу → строка-обоснование, если прибор подтвердил, что операция
+    УЖЕ состоялась; None — во всех прочих случаях (пункт выписывается, как выписывался).
+
+    Здесь и живёт замок: «состоялось» возвращается ровно одним путём — прибор назвал каждый
+    коммит пункта доставленным и сам засчитал доставку каждой названной операции. Флаг выключен,
+    операции нет, коммита нет, git молчит, процесс не наблюдается, разбор упал, прибор ответил
+    «неизвестно» — всё это None, то есть вопрос владельцу остаётся. Молчание опаснее лишнего
+    вопроса, поэтому сомнение здесь НИКОГДА не решается в сторону тишины."""
+    if not _curator_state_on():
+        return None
+    try:
+        named = curator_state.shas(item)
+        occs = curator_ops.occurrences(item)
+        kept, _demoted = curator_claim.filter_claims(item, occs)
+        ops = [o["key"] for o in curator_ops.dedup(kept)]
+        answers = _curator_state_answers(named) if (ops and named) else {}
+        v = curator_state.verdict(ops, answers)
+    except Exception as e:
+        log.warning("curator-state: сверка пункта цели %s с живым состоянием упала (%s) — "
+                    "пункт выписывается владельцу, как раньше", root, e)
+        return None
+    if v["state"] != curator_state.SETTLED:
+        log.info("curator-state: пункт цели %s владельцу выписывается (%s: %s)",
+                 root, v["state"], v["why"][:160])
+        return None
+    log.info("curator-state: пункт цели %s владельцу НЕ выписан — %s", root, v["why"][:200])
+    return v["why"]
+
+
 def _curator_human_place(root, item):
     """Точка входа ветки human: пункт с ДВУМЯ и более названными операциями разводится по
     карточкам, всё прочее идёт прежним путём БАЙТ-В-БАЙТ.
+
+    ПЕРВЫМ ДЕЛОМ — СВЕРКА С ЖИВЫМ СОСТОЯНИЕМ (11.08.2026, повод — 437/460/463/429): куратор судит
+    по отчёту задачи, а отчёт стареет с минуты написания. Пункт, чью операцию прибор О3 нашёл уже
+    состоявшейся, закрывается ЗДЕСЬ — карточки владельцу не рождается вовсе, след остаётся в
+    журнале демона и в карточке-отчёте 328. Подтвердить не удалось — пункт идёт дальше прежним
+    путём (см. `_curator_state_check`: сомнение всегда в сторону вопроса).
 
     ПОЧЕМУ ПОРОГ ДВА, А НЕ ОДИН. Замер живого корпуса (19 сводных карточек за 14 суток, 28.07–
     05.08): больше одной операции несли 4 (251, 254, 257, 264), ровно одну — 10, ни одной — 5.
@@ -3328,6 +3465,9 @@ def _curator_human_place(root, item):
     одной кнопкой лежит весь пункт. Цена — гранулярность; замер живого корпуса: случаев
     «демотировано И осталось ≥2 заявок» за 7 суток НОЛЬ.
     FAIL-SAFE: любое исключение в разборе или в позиции — прежний путь БАЙТ-В-БАЙТ."""
+    settled = _curator_state_check(root, item)
+    if settled is not None:
+        return (None, "settled", settled)
     try:
         occs = curator_ops.occurrences(item)
         kept_occs, demoted = curator_claim.filter_claims(item, occs)
@@ -3367,7 +3507,15 @@ def _curator_card_text(kind, key, v, spawn=None, hum=None):
         lines = [f"🧭 куратор: цель ({kind} {key}) требует владельца — задачи НЕ ставятся.",
                  f"что нужно: {v.get('human') or '(куратор не уточнил)'}",
                  f"причина: {reason}"]
-        if hum:
+        if hum and hum[1] == "settled":
+            # Пункт закрыт сверкой с живым состоянием — карточки владельцу нет вовсе. Маркер тут
+            # НЕ «⚠️» намеренно: им devbot узнаёт карточку, которую нельзя вклеивать строкой
+            # (частичный развод), а здесь клеить как раз можно — это обычный отчёт о цели.
+            lines.append("🧑 карточка владельцу НЕ создавалась: приборы подтвердили, что операция "
+                         "пункта УЖЕ состоялась — вопрос закрыт без владельца.")
+            if len(hum) > 2 and hum[2]:
+                lines.append(f"🔍 {hum[2]}")
+        elif hum:
             word = {"split": "пункт РАЗВЕДЁН по отдельным карточкам — по одной на операцию",
                     "created": "создана сводная карточка владельцу",
                     "edited": "пункт добавлен в сводную карточку владельцу",
