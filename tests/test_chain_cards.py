@@ -256,8 +256,9 @@ OD._series_note_pc_cards(PC_ROWS)
 res.append(ok(not os.path.exists(os.environ["CC_CARDS_FILE"]),
               "(7) CHAIN_SERIES=0 → журнала нет вовсе: ветка мертва ДО сбора фактов"))
 os.environ["CHAIN_SERIES"] = "1"
-res.append(ok(CS.WEIGHT_MIN_SHARE == 0.25 and CS.SERIES_TARGET == 30,
-              "(7) порог веса и критерий выхода из фазы не тронуты (0.25 / 30)"))
+res.append(ok(CS.WEIGHT_MIN_SHARE == 0.30 and CS.SERIES_TARGET == 30,
+              "(7) порог веса и критерий выхода из фазы на своих местах (0.30 по замеру 11.08 / "
+              "30 — критерий рамки, его этот заход не трогал)"))
 src_cs = open(os.path.join(REPO, "chain_series.py"), encoding="utf-8").read()
 res.append(ok(src_cs.count("\nimport ") == 1 and "\nimport re" in src_cs,
               "(7) решение осталось чистым: импорт по-прежнему ровно один"))

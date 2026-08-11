@@ -4982,15 +4982,30 @@ def _series_units_now():
     return out
 
 
-def _series_commits(result, since):
-    """Хеши из отчёта, ДОКАЗАННО доехавшие в origin/main. Доказательство внешнее (git), а не
-    слово отчёта: «закоммитил» в тексте весом не является. git недоступен → пусто, то есть вес
-    по коммитам не доказан — молчим, а не додумываем."""
-    toks = set(re.findall(r"\b([0-9a-f]{7,40})\b", str(result or "").lower()))
-    out = (prod_drift._git(["log", "origin/main", "--format=%H", "--since=" + str(since or ""),
-                            "-n", "200"]) or "") if toks else ""
-    have = [s.strip() for s in out.splitlines() if len(s.strip()) == 40]
-    return sorted({s[:7] for s in have for t in toks if s.startswith(t)})
+def _series_commits(lo, hi):
+    """Коммиты origin/main, попавшие в ОКНО ИСПОЛНЕНИЯ цепочки [lo, hi] — её вес.
+
+    ТЕКСТ ОТЧЁТА НЕ ЧИТАЕТСЯ ВООБЩЕ (замок 11.08.2026, `chain_series` §4). Прежде эта функция
+    искала хеши В ОТЧЁТЕ и сверяла их с origin/main — и мерила ДИСЦИПЛИНУ НАЗЫВАНИЯ: цепочка,
+    процитировавшая ЧУЖОЙ коммит, получала чужой вес (замер нашёл шесть таких, у одной девять
+    чужих хешей), а сделавшая работу молча не получала своего. Теперь свидетель внешний целиком:
+    коммит есть в origin/main И его метка лежит внутри окна, когда исполнялась ИМЕННО эта задача.
+
+    Окно — исполнения, а не постановки: задача может простоять в new часами, и по такому окну
+    «своей» оказалась бы любая чужая работа. Хвоста нет намеренно (в отличие от рестартов):
+    коммит рождается ВНУТРИ исполнения по построению. git недоступен / окна нет → пусто, то есть
+    вес не доказан — молчим, а не додумываем."""
+    if not lo or not hi:
+        return []
+    out = prod_drift._git(["log", "origin/main", "--format=%H|%cI", "--since=" + str(lo),
+                           "-n", "400"]) or ""
+    got = []
+    for line in out.splitlines():
+        sha, _, iso = line.strip().partition("|")
+        at = chain_series.stamp(iso)
+        if len(sha) == 40 and at and lo <= at <= hi:
+            got.append(sha[:7])
+    return sorted(set(got))
 
 
 def _series_chain(state, root, task):
@@ -5131,10 +5146,6 @@ def _series_note_terminal(task, status, result):
                 [o["key"] for o in curator_ops.operations(str(result or ""))])
             ch["cards"].append({"id": tid, "open": False, "sort": v["sort"], "why": v["why"],
                                 "at": now})
-        if ch["weight"].get("known"):
-            for sha in _series_commits(result, ch.get("created") or ""):
-                if sha not in ch["weight"]["commits"]:
-                    ch["weight"]["commits"].append(sha)
         # _LAST_RUN["started"] — ISO-строка начала ИСПОЛНЕНИЯ (не постановки). Окно берётся
         # именно по ней: `created` очереди — момент, когда задачу положили, а простоять в new
         # она может часами, и по такому окну «своей» оказалась бы любая перезагрузка мира.
@@ -5143,6 +5154,13 @@ def _series_note_terminal(task, status, result):
             wins = state.setdefault("windows", [])
             wins.append({"root": int(root), "lo": lo, "hi": now})
             state["windows"] = wins[-SERIES_WINDOWS:]
+        # ВЕС — ПО ОПЕРАЦИИ В ЭТОМ ЖЕ ОКНЕ, а не по хешу в отчёте (замок 11.08.2026). Окна нет
+        # (задачу исполнял не этот процесс) → коммитов не приписываем ВОВСЕ: чужую работу забрать
+        # себе хуже, чем недосчитать свою.
+        if ch["weight"].get("known") and lo:
+            for sha in _series_commits(lo, now):
+                if sha not in ch["weight"]["commits"]:
+                    ch["weight"]["commits"].append(sha)
         _series_derive(state)
         _series_save(state)
     except Exception as e:

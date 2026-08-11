@@ -45,7 +45,9 @@ CARDS_FILE = chain_cards.CARDS_FILE
 # правило самомодификации) ещё считается СВОИМ. Без хвоста плановый самрестарт демона выглядел
 # бы ремонтом руками — то есть система штрафовала бы себя за собственное правило.
 OWN_RESTART_GRACE = 180
-_SHA = re.compile(r"\b([0-9a-f]{7,40})\b")
+# РАЗБОРА ХЕША ЗДЕСЬ НЕТ И НЕ ДОЛЖНО БЫТЬ: вес приписывается ОКНОМ ИСПОЛНЕНИЯ, а не тем, что
+# цепочка о себе написала (замок 11.08.2026, см. `build`). Прежняя `_SHA` снята намеренно —
+# вернуть её значит вернуть прибор, меривший дисциплину называния.
 _MANUAL_CARD = re.compile(r"✋ ТРЕБУЕТСЯ РУЧНОЕ ДЕЙСТВИЕ|✋ одобрено, но шаг снова упирается")
 _REJECTED = re.compile(r"отклонено Филиппом")
 _EXPIRED = re.compile(r"причина=approval_timeout|подтверждение не получено")
@@ -237,13 +239,24 @@ def build(entries, starts, commits, windows, journal=None):
         if why:
             ch["refusals"].append({"id": i, "reason": why, "at": closed})
 
-        # --- вес: коммит, доехавший в origin/main внутри окна цепочки ---
-        for tok in (set(_SHA.findall(res.lower())) if commits else set()):
-            for sha, at in commits.items():
-                if sha.startswith(tok) and opened <= at <= (closed or "9999"):
-                    if sha[:7] not in ch["weight"]["commits"]:
-                        ch["weight"]["commits"].append(sha[:7])
-                    break
+    # --- вес: коммит origin/main, попавший в ОКНО ИСПОЛНЕНИЯ цепочки ---
+    # ТЕКСТ ОТЧЁТА НЕ ЧИТАЕТСЯ ВООБЩЕ (замок 11.08.2026). Прежде хеш искался в терминале, и
+    # прибор мерил дисциплину называния: цепочка, процитировавшая ЧУЖОЙ коммит, получала чужой
+    # вес (361 — девять таких хешей), а сделавшая работу молча не получала своего. Окно берётся
+    # то же, которым приписываются перезапуски (METRICS, mode=prod), но БЕЗ хвоста: коммит
+    # рождается ВНУТРИ исполнения по построению, а хвост отдал бы цепочке чужую соседнюю работу.
+    cspans = []
+    for e in entries:
+        w = (windows or {}).get(int(e["id"]))
+        if w and w[0] and w[1]:
+            cspans.append((w[0], w[1], roots.get(int(e["id"]), (int(e["id"]), ""))[0]))
+    for sha, at in (commits or {}).items():
+        owner = next((r for lo, hi, r in cspans if lo <= at <= hi), None)
+        if owner is None or owner not in chains:
+            continue                       # ничьё окно — коммит владельца, ПК или чужой машины
+        w = chains[owner]["weight"]
+        if w.get("known") and sha[:7] not in w["commits"]:
+            w["commits"].append(sha[:7])
 
     # --- старты юнитов: свой (внутри ОКНА ИСПОЛНЕНИЯ задачи) или ремонт руками ---
     # ОКНО БЕРЁТСЯ ИЗ METRICS, А НЕ ИЗ ОЧЕРЕДИ, и это не мелочь: `created` очереди — момент
@@ -644,10 +657,11 @@ def main(argv):
              "НЕ ПРОЧИТАНЫ" if windows is None else len(windows)))
     print(cs.render(st))
     print("\nСЕРИЯ ИДЁТ: %d цепочек %s   ВЕС В НЕЙ: %d из %d наблюдаемых (%.1f%%)   "
-          "ЗАЧЁТНАЯ: %s (порог %d/%.0f%%)"
+          "ЗАЧЁТНАЯ: %s (порог длины %d · веса %.0f%% при знаменателе ≥%d)"
           % (st["current"], st["current_span"][:12], st["current_weight"], st["current_known"],
-             100 * st["current_weight_share"], "да" if st["qualified"] else "НЕТ",
-             cs.SERIES_TARGET, 100 * cs.WEIGHT_MIN_SHARE))
+             100 * st["current_weight_share"], st["qualified"].upper(),
+             cs.SERIES_TARGET, 100 * cs.WEIGHT_MIN_SHARE, cs.WEIGHT_MIN_KNOWN))
+    print("   почему: %s" % st["qualified_why"])
     print("ЛУЧШАЯ СЕРИЯ: %d %s (перешагнула неразобранных %d)"
           % (st["best"], st["best_span"][:12], st["best_unresolved"]))
     # ТРИ ИСХОДА У ЗАКРЫТОЙ ЦЕПОЧКИ — печатаются вместе, иначе «чистая» читается как «всё
@@ -704,6 +718,18 @@ def main(argv):
               % (cs.SERIES_TARGET, len(w), 100 * w[0], 100 * q(0.10), 100 * q(0.50),
                  100 * q(0.90), 100 * w[-1], 100 * cs.WEIGHT_MIN_SHARE,
                  sum(1 for x in w if x < cs.WEIGHT_MIN_SHARE)))
+    # ПОРОГ ОТЧИТЫВАЕТСЯ ПЕРЕД ЖИВОЙ РАБОТОЙ. Окно здесь — ТА САМАЯ единица, к которой он
+    # применяется (SERIES_TARGET ЧИСТЫХ цепочек подряд), а не ряд наблюдаемых: именно на ней
+    # порог и выведен, и именно она отвечает «скольким живым сериям он отказал бы».
+    qw, thin = cs.qualify_windows(verdicts)
+    if qw or thin:
+        print("ПОРОГ ПРОТИВ ЖИВОЙ РАБОТЫ — окно %d ЧИСТЫХ цепочек подряд: судимых окон %d "
+              "(тонкая почва, знаменатель <%d: %d)%s"
+              % (cs.SERIES_TARGET, len(qw), cs.WEIGHT_MIN_KNOWN, thin,
+                 ("   min %.1f%% · медиана %.1f%% · max %.1f%%   НИЖЕ ПОРОГА %.0f%%: %d"
+                  % (100 * qw[0], 100 * qw[len(qw) // 2], 100 * qw[-1],
+                     100 * cs.WEIGHT_MIN_SHARE,
+                     sum(1 for x in qw if x < cs.WEIGHT_MIN_SHARE))) if qw else ""))
 
     print("\nПО НЕДЕЛЯМ (доля шума на цепочку; «шум/разобр.» — среди карточек, чьё тело уцелело):")
     print("  %-12s %6s %6s %8s %7s %6s %7s %10s %6s"

@@ -136,10 +136,18 @@ res.append(ok(fb.rows[conv["id"]]["status"] == "done"
 # (2) билет 4.2 на конверт НЕ жжётся (демон красное сам не исполняет)
 # read-only проба `systemctl show run-*` (пауза приёма, фикс дыры 48d9c64/122) — НЕ хардкод,
 # из запрета исключена; хардкод-исполнители (git push / systemctl restart|is-active) — под запретом.
+# ЧИТАЮЩИЙ git исключён ПО ТОЙ ЖЕ ПРИЧИНЕ и по чужому словарю, а не по своему: с 11.08.2026 живой
+# счёт серии спрашивает `git log origin/main` о весе цепочки (вес считается по ОПЕРАЦИИ, а не по
+# хешу в отчёте). Список читающих подкоманд берётся у `prod_drift.GIT_READ` — того самого места,
+# где он и стережётся; писать здесь второй список значит завести расхождение.
 print("(2) конверт без билета/хардкода:")
-res.append(ok(not any(a and (a[0] == "git" or (a[0] == "systemctl" and list(a[1:2]) != ["show"]))
+import prod_drift as _PD                                              # noqa: E402
+_ro = [a for a in fake_run.calls if a and a[0] == "git" and list(a[1:2]) and a[1] in _PD.GIT_READ]
+res.append(ok(not any(a and ((a[0] == "git" and (not list(a[1:2]) or a[1] not in _PD.GIT_READ))
+                             or (a[0] == "systemctl" and list(a[1:2]) != ["show"]))
                       for a in fake_run.calls),
-              "хардкод-команды (git/systemctl кроме read-only show) при конверте не звались"))
+              "хардкод-команды (git push / systemctl restart) при конверте не звались "
+              "(читающих git-проб веса: %d)" % len(_ro)))
 
 # (3) шаг декомпозиции: конверт запрещён (guard цепочки) → прежний failed + halt
 print("(3) шаг декомпозиции op=other → прежний failed:")

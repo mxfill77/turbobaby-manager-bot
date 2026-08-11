@@ -259,17 +259,21 @@ res.append(ok(pc["weight_known"] is False and pc["weight"] is False,
               "(7) полоса pc: вес НЕ НАБЛЮДАЕМ — это третье состояние, а не нуль"))
 long_ok = [CS.chain_verdict(chain(i, commits=(["c%06d" % i] if i % 2 else [])))
            for i in range(1, 41)]
-res.append(ok(CS.series(long_ok)["qualified"],
+# ИСХОДОВ ЗАЧЁТНОСТИ ТРИ С 11.08.2026 (`tests/test_chain_series_weight.py` — предмет целиком):
+# `qualified` больше не булев, и «слепота» отделена от «нет». Здесь проверяется то же, что и
+# раньше, но новым словарём — предмет секции (7) не изменился.
+res.append(ok(CS.series(long_ok)["qualified"] == CS.QUAL_YES,
               "(7) 40 цепочек, вес половина — серия ЗАЧЁТНАЯ (порог %.0f%%)"
               % (100 * CS.WEIGHT_MIN_SHARE)))
 long_light = [CS.chain_verdict(chain(i)) for i in range(1, 41)]
-res.append(ok(not CS.series(long_light)["qualified"],
+res.append(ok(CS.series(long_light)["qualified"] == CS.QUAL_NO,
               "(7) 40 цепочек БЕЗ веса → НЕ зачётная: подлог длиной не проходит"))
 blind = [CS.chain_verdict(chain(i, known=False, lane="pc")) for i in range(1, 41)]
-res.append(ok(not CS.series(blind)["qualified"],
-              "(7) 40 цепочек с ненаблюдаемым весом → не зачётная (слепота ≠ зачёт)"))
+res.append(ok(CS.series(blind)["qualified"] == CS.QUAL_UNKNOWN,
+              "(7) 40 цепочек с ненаблюдаемым весом → НЕИЗВЕСТНО, а не «нет»: слепота не зачёт, "
+              "но и не обвинение (порогом за чужой репозиторий не карают)"))
 res.append(ok(CS.series([CS.chain_verdict(chain(i, commits=["c"])) for i in range(1, 10)])
-              ["qualified"] is False, "(7) вес есть, длины нет → не зачётная"))
+              ["qualified"] == CS.QUAL_NO, "(7) вес есть, длины нет → не зачётная"))
 w = CS.weight_windows([CS.chain_verdict(chain(i, commits=(["c"] if i <= 15 else [])))
                        for i in range(1, 41)], size=10)
 res.append(ok(w and w[0] == 0.0 and w[-1] == 1.0,
@@ -372,8 +376,10 @@ touch = [n.name for f in series_fns for n in ast.walk(f)
          if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
          and isinstance(n.func.value, ast.Name) and n.func.value.id == "bc"]
 res.append(ok(not touch, "(9) руки счёта НЕ трогают очередь ни одним вызовом моста (%s)" % touch))
-res.append(ok(CS.WEIGHT_MIN_SHARE == 0.25,
-              "(9) порог веса — 0.25, поставлен по замеру 10.08 (min окна 23.3 %, медиана 60 %)"))
+res.append(ok(CS.WEIGHT_MIN_SHARE == 0.30 and CS.WEIGHT_MIN_KNOWN == 10,
+              "(9) порог веса — 0.30 при знаменателе ≥10, поставлен по замеру 11.08 (дно окна "
+              "35.0 % = 7 из 20, шаг одной цепочки 5.0 п.п.); прежние 0.25 выведены 10.08 по "
+              "другой единице и прибором, читавшим текст"))
 shutil.rmtree(tmp2, ignore_errors=True)
 
 print("(10) ИЗОЛЯЦИЯ СОСТОЯНИЯ — прогон сьюта боевого файла не касается")
@@ -449,7 +455,7 @@ res.append(ok(not will["unresolved"] and CS.series([will])["current"] == 1,
 blindwall = [CS.chain_verdict(chain(i, cards=[{"sort": CS.UNKNOWN, "why": "x"}]))
              for i in range(1, 41)]
 sb = CS.series(blindwall)
-res.append(ok(sb["current"] == 0 and sb["best"] == 0 and not sb["qualified"]
+res.append(ok(sb["current"] == 0 and sb["best"] == 0 and sb["qualified"] == CS.QUAL_NO
               and sb["unresolved"] == 40,
               "(11) 40 неразобранных подряд → серия 0 и НЕ зачётная: длину незнанием не набить"))
 tail = [CS.chain_verdict(chain(i)) for i in range(1, 18)] + \
