@@ -56,6 +56,8 @@ verified_facts.json
 wallet_cache.json
 # состояние живого счёта серии цепочек (демон пишет в момент терминала; 10.08.2026)
 chain_series.json
+# журнал рождения карточек: тело сохраняется в момент рождения, читает его замер (11.08.2026)
+chain_cards.jsonl
 _pcport185
 # scratch / throwaway
 _*.py

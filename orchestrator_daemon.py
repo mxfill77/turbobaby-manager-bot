@@ -43,6 +43,7 @@ import curator_ops        # РАЗБОР ПУНКТА СВОДКИ НА ОПЕР
 import curator_event      # ТОЖДЕСТВО СОБЫТИЯ МЕЖДУ ЦЕЛЯМИ: чистая функция (см. _curator_event_seen)
 import prod_drift         # ДЕТЕКТОР ДРЕЙФА ПРОДА: read-only, только говорит (см. _maybe_prod_drift)
 import chain_series       # СЧЁТ СЕРИИ ЦЕПОЧЕК: чистая функция без рук (см. _series_note_terminal)
+import chain_cards        # ЖУРНАЛ РОЖДЕНИЯ КАРТОЧЕК: тело сохраняется при рождении (см. _series_note_card)
 import curator_state      # СВЕРКА ПУНКТА С ЖИВЫМ СОСТОЯНИЕМ: чистая функция (см. _curator_state_check)
 import scan_result        # КОНТРАКТ ЧИТАТЕЛЯ: нуль без знаменателя наверх не отдаётся
 import expectations       # ПРИБОР О3 «коммит дошёл до прода»: чистое решение, зовём его, а не свой глаз
@@ -4033,6 +4034,9 @@ def process_pc_chains():
     items = _pc_fetch_items()
     if items is None:
         return
+    # ЖУРНАЛ РОЖДЕНИЯ: тело pc-карточки живо, пока она висит в needs_approval, и снимок уже в
+    # руках — ни одного лишнего запроса к мосту. Надзор от этого не зависит: своя ветка try.
+    _series_note_pc_cards(items)
     chains = _pc_group_chains(items)
     for pid in sorted(set(chains) - _summarized):
         try:
@@ -4820,6 +4824,8 @@ def process_na_reminders():
 # ОТКАТ: CHAIN_SERIES=0 в .env + рестарт демона → ветка мертва ДО сбора фактов.
 CHAIN_SERIES_FILE = os.path.join(REPO, "chain_series.json")
 CHAIN_SERIES_TEST_FILE = "/tmp/cc_chain_series_test.json"   # тест-прогон в боевое НЕ пишет
+CHAIN_CARDS_FILE = os.path.join(REPO, "chain_cards.jsonl")  # журнал рождения карточек (11.08.2026)
+CHAIN_CARDS_TEST_FILE = "/tmp/cc_chain_cards_test.jsonl"
 SERIES_KEEP = _env_int("SERIES_KEEP", 400)        # сколько цепочек помним (файл не растёт вечно)
 SERIES_WINDOWS = 40                               # окон исполнения для приписки рестартов
 SERIES_UNITS = (("splinter", "bot.py"),
@@ -4861,6 +4867,67 @@ def _series_file():
     if (os.environ.get("ORCH_TEST_MODE") or "").strip() or not _IS_DAEMON:
         return CHAIN_SERIES_TEST_FILE
     return CHAIN_SERIES_FILE
+
+
+def _cards_file():
+    """Куда писать журнал рождения карточек. Три рубежа изоляции — ЗЕРКАЛО `_series_file` и по
+    тем же причинам: явная подмена сьюта (`CC_CARDS_FILE`) → признак тест-прогона → ЛИЧНОСТЬ
+    пишущего. Промах любого рубежа стоит записи в тест-файл, а не подлога в боевом журнале."""
+    explicit = (os.environ.get("CC_CARDS_FILE") or "").strip()
+    if explicit:
+        return explicit
+    if (os.environ.get("ORCH_TEST_MODE") or "").strip() or not _IS_DAEMON:
+        return CHAIN_CARDS_TEST_FILE
+    return CHAIN_CARDS_FILE
+
+
+# КАРТОЧКИ, ЧЬЁ СОХРАНЕНИЕ НЕ УДАЛОСЬ. Держим в памяти процесса и выкладываем в состояние первым
+# же успешным тиком: карточка, которую не записали, иначе исчезает МОЛЧА, и цепочка идёт в серию
+# ЧИСТОЙ — то есть счёт утверждает «вмешательства не было» ровно там, где не знает ничего.
+_SERIES_LOST = {}
+# pc-карточки, уже записанные в журнал. Память процесса — ТОЛЬКО экономия: настоящий дедуп живёт
+# в самом журнале (`chain_cards.note` не плодит строк по тому же номеру), поэтому очистка набора
+# при рестарте или переполнении не создаёт дублей.
+_pc_carded = set()
+
+
+def _series_note_lost(tid, task, why):
+    """Запомнить, что карточка родилась, а записать её не вышло. Само по себе ничего не пишет —
+    диск в этот момент как раз и подвёл; выкладку делает `_series_flush_lost` на следующем тике."""
+    try:
+        _SERIES_LOST[int(tid)] = {
+            "lane": str((task or {}).get("lane") or "vps"),
+            "created": chain_series.stamp((task or {}).get("created")),
+            "text": str((task or {}).get("task_text") or "")[:400],
+            "why": str(why)[:200],
+        }
+    except (TypeError, ValueError):
+        pass
+
+
+def _series_flush_lost(state):
+    """ЗАМОК: несохранённая карточка становится видимой пометкой «сорт не читается», а не тишиной.
+    `sort` вне перечня `chain_series.SORTS` → вердикт кладёт её в `unread` → цепочка НЕ РАЗОБРАНА:
+    серию не удлиняет и не рвёт. Улучшить это нечем — тела карточки у нас уже нет; но соврать
+    длиной счёт больше не может."""
+    for tid, info in list(_SERIES_LOST.items()):
+        try:
+            root, _kind = _series_root(tid, info.get("text") or "", state)
+            ch = _series_chain(state, root, {"lane": info.get("lane"),
+                                             "created": info.get("created")})
+            if any(c.get("id") == tid for c in ch["cards"]):
+                _SERIES_LOST.pop(tid, None)
+                continue
+            ch["cards"].append({"id": tid, "open": False, "sort": "",
+                                "why": "карточка родилась, но сохранить её не удалось (%s) — "
+                                       "сорт не читается, цепочка не разобрана"
+                                       % info.get("why"), "at": ""})
+            _SERIES_LOST.pop(tid, None)
+            log.warning("серия: карточка id=%s помечена НЕРАЗОБРАННОЙ — тело сохранить не удалось",
+                        tid)
+        except Exception as e:
+            log.warning("серия: карточку id=%s пометить не удалось (%s) — попробуем следующим "
+                        "тиком", tid, e)
 
 
 def _series_load():
@@ -4967,22 +5034,77 @@ def _series_root(tid, text, state):
 
 def _series_note_card(tid, task, what):
     """КАРТОЧКА РОДИЛАСЬ. Тело записываем СЕЙЧАС — после ответа очередь его затрёт. Операции
-    называет curator_ops: ТОТ ЖЕ словарь, которым машина зовёт операции сама."""
+    называет curator_ops: ТОТ ЖЕ словарь, которым машина зовёт операции сама.
+
+    Пишем В ДВА МЕСТА, и это не дубль: состояние (`chain_series.json`) нужно ЖИВОМУ счёту, а
+    журнал (`chain_cards.jsonl`) — ЗАМЕРУ, который считает по снимку очереди и тела карточки уже
+    не находит. Замер 11.08: из 64 неразобранных цепочек 58 держатся ровно на затёртом теле.
+    Провалы двух записей независимы: журнал не лёг — живой счёт всё равно знает операцию (и это
+    названо в карточке полем `journal`); не легло состояние — цепочка помечается НЕ РАЗОБРАННОЙ
+    (см. `_series_flush_lost`), а не уходит в серию чистой."""
     if not _series_on():
         return
+    ops, born = [], chain_series.stamp(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()))
+    journal = False
+    try:
+        ops = [o["key"] for o in curator_ops.operations(str(what or ""))]
+        chain_cards.note(_cards_file(), tid, born, (task or {}).get("lane") or "vps",
+                         chain_cards.BORN, ops, str(what or ""))
+        journal = True
+    except Exception as e:
+        log.warning("серия: карточку id=%s в журнал рождения записать не удалось (%s) — замер "
+                    "по снимку её сорт не восстановит", tid, e)
     try:
         state = _series_state()
         root, _kind = _series_root(tid, str((task or {}).get("task_text") or ""), state)
         ch = _series_chain(state, root, task)
-        ops = [o["key"] for o in curator_ops.operations(str(what or ""))]
         ch["cards"] = [c for c in ch["cards"] if c.get("id") != tid]
-        ch["cards"].append({"id": tid, "open": True, "born": chain_series.stamp(
-            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())), "ops": ops})
+        ch["cards"].append({"id": tid, "open": True, "born": born, "ops": ops,
+                            "journal": journal})
+        _series_flush_lost(state)
         _series_save(state)
-        log.info("серия: карточка id=%s цепочки %s записана (операции: %s)",
-                 tid, root, ",".join(ops) or "нет")
+        log.info("серия: карточка id=%s цепочки %s записана (операции: %s, журнал: %s)",
+                 tid, root, ",".join(ops) or "нет", "да" if journal else "НЕТ")
     except Exception as e:
-        log.warning("серия: карточку id=%s записать не удалось (%s) — счёт не тронут", tid, e)
+        log.warning("серия: карточку id=%s записать не удалось (%s) — цепочка будет помечена "
+                    "неразобранной", tid, e)
+        _series_note_lost(tid, task, e)
+
+
+def _series_note_pc_cards(items):
+    """КАРТОЧКА ЧУЖОЙ ПОЛОСЫ: записываем при ПЕРВОМ ВИДЕ — раньше нельзя, позже поздно.
+
+    Полосу pc исполняет ПК-агент, и рождения её карточек VPS не видит вовсе. Зато надзор
+    `process_pc_chains` каждый оборот берёт read-only снимок полосы — и пока карточка висит в
+    `needs_approval`, её тело лежит в `result` живым. После ответа владельца очередь затрёт его
+    вердиктом: замер 11.08 не смог восстановить 41 такую карточку из 64 неразобранных цепочек —
+    больше, чем любая другая причина.
+
+    Ни одного лишнего обращения к мосту: снимок уже в руках. В состояние ЖИВОГО счёта эти
+    карточки НЕ идут намеренно — терминалов полосы pc демон не исполняет, и такая цепочка в
+    состоянии никогда бы не закрылась. Журнал же читает замер, который цепочки pc считает."""
+    if not _series_on():
+        return
+    for it in (items or []):
+        try:
+            if str(it.get("status") or "") != "needs_approval":
+                continue
+            tid = int(it.get("id"))
+            if tid in _pc_carded:
+                continue
+            body = str(it.get("result") or "")
+            ops = [o["key"] for o in curator_ops.operations(body)]
+            chain_cards.note(_cards_file(), tid,
+                             chain_series.stamp(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())),
+                             it.get("lane") or PC_LANE, chain_cards.SEEN, ops, body)
+            if len(_pc_carded) > 2000:
+                _pc_carded.clear()          # набор — только экономия чтений, дедуп живёт в журнале
+            _pc_carded.add(tid)
+            log.info("серия: pc-карточка id=%s увидена живой, тело записано (операции: %s)",
+                     tid, ",".join(ops) or "нет")
+        except Exception as e:
+            log.warning("серия: pc-карточку id=%s записать не удалось (%s) — замер её сорт не "
+                        "восстановит", (it or {}).get("id"), e)
 
 
 def _series_note_terminal(task, status, result):
@@ -5062,6 +5184,7 @@ def _series_cards_tick(active_na):
                 closed += 1
                 log.info("серия: карточка id=%s закрыта, сорт=%s — %s",
                          c.get("id"), v["sort"], v["why"][:120])
+        _series_flush_lost(state)      # ЗАМОК: несохранённая карточка → цепочка «не разобрана»
         d = _series_derive(state)
         _series_save(state)
         if closed:

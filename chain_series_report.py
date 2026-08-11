@@ -34,11 +34,13 @@ import sys
 REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 import chain_series as cs                      # noqa: E402  чистое решение
+import chain_cards                             # noqa: E402  журнал рождения карточек (факт мира)
 import curator_ops                             # noqa: E402  словарь операций (тот же, что у машины)
 
 UNITS = ("splinter", "orchestrator-daemon", "wa-webhook")
 DAEMON_LOG = os.path.join(REPO, "orchestrator_daemon.log")
 STATE_FILE = os.path.join(REPO, "chain_series.json")
+CARDS_FILE = chain_cards.CARDS_FILE
 # Хвост после конца задачи, в который её отложенный рестарт (`systemd-run --on-active=10s`,
 # правило самомодификации) ещё считается СВОИМ. Без хвоста плановый самрестарт демона выглядел
 # бы ремонтом руками — то есть система штрафовала бы себя за собственное правило.
@@ -162,8 +164,14 @@ def ops_of(body):
     return [o["key"] for o in curator_ops.operations(body or "")]
 
 
-def build(entries, starts, commits, windows):
-    """Записи очереди + факты мира → упорядоченные вердикты цепочек."""
+def build(entries, starts, commits, windows, journal=None):
+    """Записи очереди + факты мира → упорядоченные вердикты цепочек.
+
+    `journal` — {id: запись} журнала рождения карточек (`chain_cards.load(...)["cards"]`) или
+    None/пусто. Он тут ФАКТ МИРА, а не мнение: карточку, попавшую в журнал, демон ВИДЕЛ живой в
+    `needs_approval`, и операции ей называл тот же `curator_ops`, что и здесь. Задним числом
+    журнал ничего не сортирует — в нём есть только то, что записано в момент события; чего в нём
+    нет, остаётся НЕИЗВЕСТНЫМ, и цепочка — неразобранной."""
     roots = cs.resolve_roots([{"id": e.get("id"), "text": e.get("task_text")} for e in entries])
     by_id = {int(e["id"]): e for e in entries}
     envelopes = {}
@@ -198,8 +206,12 @@ def build(entries, starts, commits, windows):
         opened, closed = cs.stamp(e.get("created")), cs.stamp(e.get("updated"))
 
         # --- вмешательство: карточка дошла до владельца? ---
+        jrec = (journal or {}).get(i)
         answered = bool(str(e.get("approved_by") or "").strip()) or bool(_REJECTED.search(res))
-        reached = answered or kind in ("owner_card", "revizor_card") or bool(_EXPIRED.search(res))
+        # ЗАПИСЬ В ЖУРНАЛЕ — ФАКТ, а не признак: карточку видели живой в needs_approval, значит
+        # владельцу её показали. Прочие условия остаются эвристикой и не тронуты.
+        reached = (answered or kind in ("owner_card", "revizor_card")
+                   or bool(_EXPIRED.search(res)) or jrec is not None)
         if _MANUAL_CARD.search(res):
             v = cs.sort_manual_card(ops_of(res))
             ch["cards"].append({"id": i, "sort": v["sort"], "why": v["why"], "at": closed})
@@ -208,6 +220,13 @@ def build(entries, starts, commits, windows):
             if body:
                 v = cs.sort_card(ops_of(body), starts, opened, closed)
                 v["why"] += " [тело: %s]" % src
+            elif jrec is not None:
+                # Тело затёрто вердиктом, но операции записаны В МОМЕНТ РОЖДЕНИЯ карточки —
+                # ровно то, чего разбору не хватало. Нижняя граница окна берётся из журнала:
+                # там метка, когда карточку ВИДЕЛИ, а не когда задачу поставили в очередь.
+                v = cs.sort_card(jrec.get("ops"), starts, cs.stamp(jrec.get("at")) or opened,
+                                 closed)
+                v["why"] += " [тело: журнал рождения карточек, %s]" % (jrec.get("src") or "?")
             else:
                 v = {"sort": cs.UNKNOWN, "why": "тело карточки затёрто вердиктом очереди — "
                                                 "операция из снимка не восстановима"}
@@ -596,8 +615,19 @@ def main(argv):
     since = (entries[0].get("created") or "")[:10] if entries else "2026-07-01"
     starts, unread = unit_starts(since)
     commits, windows = origin_commits(), metrics_windows()
-    verdicts, chains, order, rst = build(entries, starts, commits, windows)
+    cards_path = argv[argv.index("--cards") + 1] if "--cards" in argv else CARDS_FILE
+    jr = chain_cards.load(cards_path)
+    journal = (jr or {}).get("cards") or {}
+    verdicts, chains, order, rst = build(entries, starts, commits, windows, journal)
     st = cs.series(verdicts)
+    if jr is None:
+        print("ЖУРНАЛ РОЖДЕНИЯ КАРТОЧЕК не прочитан (%s) — тела затёртых карточек не "
+              "восстанавливаются, такие цепочки остаются НЕРАЗОБРАННЫМИ" % cards_path)
+    else:
+        used = sum(1 for r in order for c in chains[r]["cards"]
+                   if "журнал рождения" in str(c.get("why") or ""))
+        print("ЖУРНАЛ РОЖДЕНИЯ КАРТОЧЕК: записей %d (битых строк %d) → сорт восстановлен у %d "
+              "карточек, чьё тело очередь затёрла" % (len(journal), jr.get("broken", 0), used))
     if unread:
         print("ВНИМАНИЕ: журнал не прочитан у юнитов %s — их перезапуски в счёт не вошли ВОВСЕ"
               % ", ".join(unread))
