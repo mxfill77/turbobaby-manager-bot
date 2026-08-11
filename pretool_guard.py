@@ -116,6 +116,10 @@ try:
     import repeat_ask
 except Exception:
     repeat_ask = None
+try:
+    import env_out                    # вынос ЗНАЧЕНИЯ секрета наружу (11.08.2026) — чистое решение
+except Exception:
+    env_out = None                    # модуля нет → класс мёртв, поведение байт-в-байт прежнее
 
 PROJECT = "/root/turbobaby-manager-bot"
 
@@ -980,11 +984,27 @@ _BLOCK_TEXT = {
 }
 
 
+def _hide(text):
+    """Текст БЕЗ ЗНАЧЕНИЙ специфичных переменных окружения (`env_out.mask`).
+
+    Заведено 11.08.2026 вместе с классом «вынос значения наружу»: до него команда физически не
+    могла нести значение секрета (файл секретов заблокирован), и журнал гарда был безопасен сам
+    собой. Теперь может — значит вычищаем в ОДНОМ месте, у самого писателя, а не надеемся, что
+    каждый следующий читатель вспомнит. FAIL-SAFE: модуля нет / разбор упал → текст как есть."""
+    if env_out is None:
+        return text or ""
+    try:
+        return env_out.mask(text or "", os.environ)
+    except Exception:
+        return text or ""
+
+
 def _guard_log(event, cmd, why=""):
     """Строка JSONL о жёстком блоке. Best-effort: сбой журнала НЕ отменяет блок (решение важнее)."""
     try:
         line = json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event,
-                           "cmd": " ".join((cmd or "").split())[:400], "why": why},
+                           # вычистка ДО обрезки: обрезанное пополам значение маской уже не ловится
+                           "cmd": _hide(" ".join((cmd or "").split()))[:400], "why": _hide(why)},
                           ensure_ascii=False)
         with open(os.environ.get("PRETOOL_GUARD_LOG") or GUARD_LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -1102,6 +1122,9 @@ _ACTIONS = {
     "delete_file": ("УДАЛЕНИЕ ФАЙЛОВ вне временных каталогов",
                     "тот ли путь и лежит ли копия в git",
                     "вернуть можно ТОЛЬКО закоммиченное; несохранённое не вернётся"),
+    "env_out": ("ВЫНОС значения секрета из окружения наружу (файл/журнал/сообщение/сеть)",
+                "тот ли канал и должен ли ключ туда попасть — само значение в карточке НЕ показано",
+                "ОТКАТА НЕТ: ушедшее значение считается раскрытым — ключ придётся менять"),
 }
 # в3 23.07.2026: штатно НЕдостижимо (ambiguous → defer, main() до карточки не доходит);
 # оставлено фолбэком _card на случай red-hit вне _ACTIONS (карточка не падает, а страшнеет).
@@ -1353,6 +1376,19 @@ def _detail_parts(hit, blob):
             obj.append("путь " + t + (" и ещё %d" % (cnt - 1) if cnt > 1 else ""))
         if cnt:
             num.append("файлов " + str(cnt))
+    elif hit == "env_out":
+        # ОБЪЕКТ — ИМЯ переменной и КАНАЛ, которым значение уходит. САМОГО ЗНАЧЕНИЯ в карточке нет
+        # и быть не может: blob вычищен `_hide` ещё в classify(), а метки несут только имя, вид
+        # улики и ярлык канала. ЧИСЛА у класса нет по природе — в поле честный прочерк.
+        var = _find([r"env_var=([^\n]{1,60})"], blob)
+        ch = _find([r"env_ch=([^\n]{1,40})"], blob)
+        how = _find([r"env_how=([^\n]{1,40})"], blob)
+        if var:
+            obj.append("снимок ВСЕГО окружения" if var == "*" else "переменная " + var)
+        if ch:
+            obj.append("канал: " + ch)
+        if how:
+            obj.append("улика: " + how)
     elif hit == "proc_ctl":
         tgt = _find([r"proc_target=([^\n]{1,60})"], blob)   # маркер кладёт classify()
         if tgt:
@@ -1573,7 +1609,11 @@ def _repeat_mark(data, cmd, hit, obj, num):
     try:
         fp = repeat_ask.fingerprint(hit, obj, num)
         if fp:
-            repeat_ask.mark_asked(key_of(data), cmd, fp, isolated())
+            # Команда кладётся на диск ВЫЧИЩЕННОЙ (11.08.2026): значение секрета не переносится
+            # никуда, включая состояние памяти захода. Следствие названо: у класса env_out
+            # PostToolUse не найдёт связку по СЫРОЙ команде — значит разрешение не засчитается и
+            # вопрос будет задан снова. Направление верное: снимать вопрос по секрету не нужно.
+            repeat_ask.mark_asked(key_of(data), _hide(cmd), fp, isolated())
     except Exception:
         pass
 
@@ -2347,6 +2387,49 @@ def _del_blob(cmd, dele):
         cmd, verb, first, len(outside) if named else 0)
 
 
+# ══ (г) ВЫНОС ЗНАЧЕНИЯ СЕКРЕТА НАРУЖУ ═════════════════════════════════════════════════════════
+# Класс, порог специфичности и его замер — в шапке `env_out.py`; там же решение. Здесь РУКИ:
+# сегментация команды и метки для карточки. Две границы этого места названы прямо.
+#   (1) ЖЁСТКИЙ БЛОК НА ФАЙЛЕ НЕ ОСЛАБЛЕН НИ НА СТРОКУ: `.env` по-прежнему deny выше по classify(),
+#       раньше всего остального. Здесь другой предмет — ЗНАЧЕНИЕ, уже лежащее в окружении, и другое
+#       решение: КАРТОЧКА (ask), потому что владельцу есть что решать — ключ может уходить законно.
+#   (2) НИЧЕГО НЕ ВЫТЕСНЯЕТ: судится ПОСЛЕ всех красных и только там, где команда была бы зелёной
+#       или ambiguous. Приоритет живых таблиц, денег, SQL, процессов и удаления не изменён.
+def _env_out_segments(cmd):
+    """Сегменты цепи для судейства канала: СЫРЫЕ токены (`_del_units` — он не режет argv скрипта,
+    иначе пропал бы сам редирект) + голова сегмента (`_cmd_index`, он уже умеет пропускать
+    обёртки sudo/env/timeout). Разбор упал → один сегмент целиком, не тише прежнего."""
+    try:
+        units = _del_units(cmd)
+    except Exception:
+        units = [_tokens(cmd)]
+    segs = []
+    for toks in units:
+        i = _cmd_index(toks)
+        segs.append({"name": _base(toks[i]) if i is not None else "", "toks": toks})
+    return segs
+
+
+def _env_out_class(cmd, text):
+    """→ вердикт env_out | None. Окружение ЖИВОЕ (`os.environ`): демон отдаёт задаче КОПИЮ своего
+    окружения, значит те же значения видит и хук — сравнивать есть с чем, файл не открывается."""
+    if env_out is None:
+        return None
+    try:
+        return env_out.verdict(text or cmd, os.environ, segments=_env_out_segments(cmd),
+                               code=text or cmd, is_tmp=_is_tmp_target)
+    except Exception:
+        return None                    # FAIL-SAFE в зелёное: цена ложного красного в headless —
+                                       # убитая задача, цена пропуска — состояние до правки
+
+
+def _env_out_blob(text, v):
+    """Blob карточки: текст БЕЗ ЗНАЧЕНИЙ + метки для `_detail_parts`. Вычистка стоит ЗДЕСЬ — до
+    первого читателя (карточка, пуш, маркер демону, журнал), а не у каждого из них."""
+    return "%s\nenv_var=%s\nenv_how=%s\nenv_ch=%s" % (
+        _hide(text), v.get("var", ""), v.get("how", ""), v.get("channel", ""))
+
+
 def classify(cmd, cwd=None):
     """ЕДИНАЯ точка классификации (её зовут main() и тесты — исполнять ничего не требуется).
     → (kind, hit, blob): kind ∈ {'block','red','ambiguous','green'}; hit — ключ действия и,
@@ -2367,6 +2450,9 @@ def classify(cmd, cwd=None):
     if not _is_python(scan):
         if dele:                         # удаление вне временных каталогов — доктринальное красное
             return "red", "delete_file", _del_blob(cmd, dele)
+        v = _env_out_class(cmd, cmd)     # вынос значения секрета наружу — ПОСЛЕ всех красных
+        if v:
+            return "red", "env_out", _env_out_blob(cmd, v)
         return "green", "", cmd          # не-python и не процесс/секрет → штатные allow/ask rules
     kind, hit, blob = _analyze(cmd, cwd or PROJECT, scan)
     # Удаление проверяется ПОСЛЕ разбора python-тела намеренно: если в одной цепи и запись в живую
@@ -2374,6 +2460,12 @@ def classify(cmd, cwd=None):
     # тела не подменяется; зелёное и ambiguous (defer) — подменяется, иначе удаление прошло бы.
     if dele and kind not in ("red", "block"):
         return "red", "delete_file", _del_blob(cmd, dele)
+    # Вынос значения секрета — ПОСЛЕДНИМ и только по зелёному/ambiguous: тело здесь уже прочитано,
+    # поэтому в blob попадает и literal-значение из СКРИПТА, а не только из строки команды.
+    if kind not in ("red", "block"):
+        v = _env_out_class(cmd, blob)
+        if v:
+            return "red", "env_out", _env_out_blob(blob, v)
     return kind, hit, blob
 
 
