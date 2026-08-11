@@ -48,6 +48,10 @@ os.environ["STEP_SELFHEAL"] = "0"   # изоляция от боевого .env 
 os.environ["PLAN_ADAPT"] = "0"
 os.environ["CURATOR"] = "1"
 os.environ["CURATOR_SCOPE"] = "0"
+# CURATOR_STATE=0 — регресс 95/100 утверждает «✅ ВСЕГДА ставит задачу»; со сверкой прибора это
+# утверждение условно (обогнанный пункт задачи не рождает), и при боевом флаге голдены зависели
+# бы от живого прода. Второе окно судит tests/test_curator_state.py секция (8).
+os.environ["CURATOR_STATE"] = "0"
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []

@@ -190,6 +190,7 @@ class FakeBridge:
 
     def __init__(s):
         s.rows, s.nid, s.calls = {}, 700, []
+        s.completed = []          # (id, статус, тело) — чем ЗАКРЫТА карточка, а не только «звали»
 
     def get_pending(s, status="new", lane=None):
         s.calls.append("get_pending")
@@ -216,6 +217,7 @@ class FakeBridge:
 
     def complete_task(s, tid, status, result=""):
         s.calls.append("complete_task")
+        s.completed.append((int(tid), status, str(result or "")))
         return {"ok": True}
 
 
@@ -416,6 +418,121 @@ IC._CURATOR_STATE_PATH = "/tmp/cc_curator_state_missing_fixture.py"
 IC.check_curator_state_pure(None, run3)
 IC._CURATOR_STATE_PATH = None
 res.append(ok(bool(run3.flags), "файла нет → ФЛАГ (нечитаемое правило доверия не имеет)"))
+
+# ══════════════ (8) ВТОРОЕ ОКНО: ОТВЕТ ВЛАДЕЛЬЦА СВЕРЯЕТСЯ ПЕРЕД ИСПОЛНЕНИЕМ ═══════════════
+# Сверка при рождении делается ОДИН раз, а карточка висит часами. Живой случай 437: рождена
+# 08:59:03, splinter перезапущен задачей 438 в 09:09:45, кнопка нажата в 09:20:35 — «да» поехало
+# делать сделанное. Дверь исполнения ровно одна (`_convert_curator_human_approved`), её и судим.
+print("\n(8) второе окно: ответ владельца сверяется ПЕРЕД исполнением")
+
+
+def card_of(item, root=344, op=None):
+    """Тело карточки — БОЕВЫМ рендером (живой формат: справка, подпись, служебные строки)."""
+    return OD._curator_human_render(root, [(item, 1)], op)
+
+
+def answer(body, task_text, facts=None, tid=800):
+    """✅ на карточке → боевой конверт-путь. Возврат: (что звали у моста, чем закрыта карточка)."""
+    fb, keep = FakeBridge(), OD.bc
+    task = {"id": tid, "task_text": task_text, "result": body, "updated": NOW_ISO}
+    OD.bc = fb
+    try:
+        if facts is None:
+            OD._convert_curator_human_approved(tid, task, body)
+        else:
+            with_facts(facts, OD._convert_curator_human_approved, tid, task, body)
+    finally:
+        OD.bc = keep
+    return fb
+
+
+TT347 = "[куратор владельцу цель 344] " + CARD347
+TT436 = "[куратор владельцу цель 435] " + CARD436
+
+# (8.1) ОБОГНАННЫЙ ПУНКТ НЕ ИСПОЛНЯЕТСЯ
+f8 = Facts(["curator_event.py"], started_after=True, unit="orchestrator-daemon")
+fb8 = answer(card_of(CARD347), TT347, f8)
+res.append(ok("enqueue_task" not in fb8.calls,
+              "обогнанный пункт: конверт НЕ ставится (звали: %s)" % fb8.calls))
+res.append(ok(len(fb8.completed) == 1 and fb8.completed[0][1] == "done",
+              "карточка закрыта ровно одним ответом, статус done (%s)"
+              % [(c[0], c[1]) for c in fb8.completed]))
+done_txt = fb8.completed[0][2] if fb8.completed else ""
+res.append(ok("НЕ ставилась" in done_txt and "🔍" in done_txt,
+              "владельцу сказано ЯВНО: задачи не будет, вопрос снят по факту"))
+res.append(ok("4a7ef75" in done_txt and "service:orchestrator-daemon" in done_txt,
+              "названо, ЧЕМ снят вопрос: коммит и операция, которые подтвердил прибор"))
+res.append(ok(CARD347[:60] in done_txt,
+              "пункт в теле ДОСЛОВНО — «да» владельца не пропадает молча"))
+res.append(ok("⚠️" not in done_txt, "закрытие не метится «⚠️» (devbot клеит его строкой)"))
+res.append(ok(f8.calls["dirty"] == 1 and f8.calls["live"] >= 1,
+              "прибор спрошен по-настоящему: git+/proc (%s)" % f8.calls))
+
+# (8.2) НЕИЗВЕСТНЫЙ ПУНКТ ИСПОЛНЯЕТСЯ, КАК ИСПОЛНЯЛСЯ
+fb9 = answer(card_of(CARD436), TT436,
+             Facts(["splinter.py"], started_after=False, unit="splinter"), tid=801)
+res.append(ok("enqueue_task" in fb9.calls, "неизвестный пункт: конверт ПОСТАВЛЕН (%s)" % fb9.calls))
+res.append(ok(fb9.completed and fb9.completed[0][1] == "done"
+              and "задача id" in fb9.completed[0][2],
+              "карточка закрыта ссылкой на задачу-исполнителя, как раньше"))
+res.append(ok(fb9.completed and "конверт одобренной заявки 801"
+              in str(list(fb9.rows.values())[0]["task_text"]),
+              "у конверта прежний маркер разрыва петли"))
+
+# (8.3) ЗАМОК: КАЖДАЯ ДЫРКА В ФАКТАХ → ОТВЕТ ИСПОЛНЯЕТСЯ
+for name, facts in HOLES + (("сбор фактов упал", Boom()),):
+    fbh = answer(card_of(CARD347), TT347, facts, tid=802)
+    res.append(ok("enqueue_task" in fbh.calls,
+                  "%s → ответ владельца исполняется (замок в сторону работы)" % name))
+
+# (8.4) ПО ТАЙМЕРУ НЕ СНИМАЕТСЯ НИЧЕГО: возраст карточки правила не касается
+old_task = {"id": 803, "task_text": TT436, "result": card_of(CARD436),
+            "updated": "2026-07-01T00:00:00+00:00"}
+fb_old, keep_bc = FakeBridge(), OD.bc
+OD.bc = fb_old
+try:
+    with_facts(Facts(["splinter.py"], started_after=False, unit="splinter"),
+               OD._convert_curator_human_approved, 803, old_task, old_task["result"])
+finally:
+    OD.bc = keep_bc
+res.append(ok("enqueue_task" in fb_old.calls,
+              "карточка, висевшая с 01.07, исполняется: её никто не обогнал (%s)" % fb_old.calls))
+
+# (8.5) ОПЕРАЦИОННАЯ КАРТОЧКА: коммит назван в СПРАВКЕ — вопрос прибору её видит
+_occs = OD.curator_ops.occurrences(CARD347)
+_kept, _dem = OD.curator_claim.filter_claims(CARD347, _occs)
+_ops = OD.curator_ops.dedup(_kept)
+res.append(ok(len(_ops) == 1 and _ops[0]["key"] == "service:orchestrator-daemon",
+              "живой разбор 347 даёт ровно одну операцию (%s)" % [o["key"] for o in _ops]))
+_line = OD._human_op_line(_ops[0])
+_meta = {"idx": 1, "total": 2, "label": _ops[0]["label"], "ctx": CARD347, "siblings": ["другая"]}
+res.append(ok(not curator_state.shas(_line),
+              "в строке операционной карточки коммита нет — без справки опоры не было бы"))
+fb_op = answer(card_of(_line, op=_meta),
+               "[куратор владельцу цель 344, операция %s] %s" % (_ops[0]["key"], _line),
+               Facts(["curator_event.py"], started_after=True), tid=804)
+res.append(ok("enqueue_task" not in fb_op.calls and fb_op.completed
+              and "НЕ ставилась" in fb_op.completed[0][2],
+              "операционная карточка: обогнанный пункт тоже не исполняется (%s)" % fb_op.calls))
+
+# (8.6) ОТКАТ: CURATOR_STATE=0 гасит ОБА окна одной ручкой и ДО чтения фактов
+os.environ["CURATOR_STATE"] = "0"
+f_off8 = Facts(["curator_event.py"], started_after=True, unit="orchestrator-daemon")
+fb_off8 = answer(card_of(CARD347), TT347, f_off8, tid=805)
+os.environ["CURATOR_STATE"] = "1"
+res.append(ok("enqueue_task" in fb_off8.calls,
+              "при выключенной сверке ответ исполняется байт-в-байт прежним путём"))
+res.append(ok(f_off8.calls == {"commits": 0, "closure": 0, "live": 0, "dirty": 0},
+              "ветка мертва ДО чтения фактов: ни git, ни /proc (%s)" % f_off8.calls))
+
+# (8.7) ГРАНИЦЫ: дверь исполнения одна, счёт серии и гард не тронуты
+od_src = open(os.path.join(REPO, "orchestrator_daemon.py"), encoding="utf-8").read()
+res.append(ok(od_src.count("_convert_curator_human_approved(") == 2,
+              "дверь исполнения ответа по-прежнему ровно одна (определение + вызов)"))
+h0b = hashlib.sha256(open(series, "rb").read()).hexdigest() if os.path.exists(series) else None
+answer(card_of(CARD347), TT347, Facts(["curator_event.py"], started_after=True), tid=806)
+h1b = hashlib.sha256(open(series, "rb").read()).hexdigest() if os.path.exists(series) else None
+res.append(ok(h0b == h1b, "файл счёта серии сверкой ответа не тронут ни на байт"))
 
 print("\n%d/%d" % (sum(1 for x in res if x), len(res)))
 sys.exit(0 if all(res) else 1)

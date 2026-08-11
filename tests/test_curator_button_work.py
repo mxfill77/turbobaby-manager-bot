@@ -40,6 +40,11 @@ os.environ.setdefault("BRIDGE_TOKEN", "x")
 # (урок e9a07b0 — при включении CARD_DUTY семь легаси-сьютов покраснели). setdefault НЕ хватает.
 for _k in ("STEP_SELFHEAL", "PLAN_ADAPT", "CARD_DUTY"):
     os.environ[_k] = "0"
+# CURATOR_STATE=0 — ТОТ ЖЕ приём и ровно та же причина: предмет этого сьюта «✅ ВСЕГДА рождает
+# задачу», а со сверкой прибора утверждение стало условным («если пункт не обогнали»). Оставь
+# флаг боевым — голдены зависели бы от состояния ЖИВОГО прода (какой сервис когда перезапущен),
+# то есть краснели бы по календарю. Новую ветку судит tests/test_curator_state.py секция (8).
+os.environ["CURATOR_STATE"] = "0"
 os.environ["CURATOR"] = "1"
 
 import orchestrator_daemon as OD  # noqa: E402
