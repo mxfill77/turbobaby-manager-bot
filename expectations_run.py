@@ -519,6 +519,15 @@ def enqueue_escalation(v):
         return 0
 
 
+def _bump_quiet(st, key):
+    """Счётчик эпизодов, которые закрылись сами раньше отсрочки. Владельцу их не показывали —
+    тем важнее, чтобы система их не забыла: число живёт в состоянии, имена — последними восемью."""
+    q = st.get("quiet") if isinstance(st.get("quiet"), dict) else {}
+    q["n"] = int(q.get("n") or 0) + 1
+    q["last"] = ([str(key)] + [k for k in (q.get("last") or []) if k != str(key)])[:8]
+    return q
+
+
 def run(dry=False, now=None):
     """Один прогон яруса 2. → словарь итога (для теста, лога и ручной проверки)."""
     now = time.time() if now is None else float(now)
@@ -537,11 +546,23 @@ def run(dry=False, now=None):
     if isinstance(pc, dict) and pc.get("ok"):
         st["pc"] = {k: pc.get(k) for k in ("ok", "fetched", "last", "line", "n")}
     open_eps = dict(st.get("open") or {})
-    out = {"verdicts": len(verdicts), "notes": [], "tasks": [], "closed": [], "dry": bool(dry)}
+    out = {"verdicts": len(verdicts), "notes": [], "tasks": [], "closed": [],
+           # ОТСРОЧЕННЫЕ И ПОГАШЕННЫЕ ОТСРОЧКОЙ — В СЧЁТЕ, А НЕ В НЕБЫТИИ: владельцу их не
+           # показывали, но итог прогона уходит в журнал таймера, и там они названы числом.
+           "held": [], "quiet": [], "dry": bool(dry)}
 
     # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: владелец обязан узнать, что кончилось, даже если сейчас
     #    открылось что-то новое.
     for key in expectations.closures(facts, cfg, list(open_eps.keys())):
+        if not (open_eps.get(key) or {}).get("noted"):
+            # ЗАКРЫЛСЯ, НЕ ДОЖИВ ДО ОБЪЯВЛЕНИЯ. Владелец о нём не слышал — значит и «снова
+            # выполняется» ему не о чем: закрытие того, чего не объявляли, было бы той же
+            # заметкой, только задом наперёд. Тишина здесь полная и намеренная.
+            open_eps.pop(key, None)
+            out["quiet"].append(key)
+            if not dry:
+                st["quiet"] = _bump_quiet(st, key)
+            continue
         if dry:
             out["closed"].append(key)
             open_eps.pop(key, None)
@@ -556,15 +577,30 @@ def run(dry=False, now=None):
         key = str(v.get("key"))
         rec = open_eps.get(key) or {}
         first = float(rec.get("first") or now)
-        if not rec:                                        # ПЕРВОЕ ОБНАРУЖЕНИЕ → одна заметка
+        if not rec.get("noted"):                           # ВЛАДЕЛЬЦУ ЕЩЁ НЕ СКАЗАНО
+            defer = float(v.get("defer") or 0.0)
+            if defer > 0 and (now - first) < defer:
+                # ОТСРОЧКА. Запись заводится СРАЗУ и переживает прогон — иначе отсрочка стала бы
+                # отменой: без памяти о первом обнаружении эпизод отсчитывал бы её заново каждый
+                # раз и не был бы объявлен НИКОГДА. Исход мог смениться — храним свежий.
+                rec.update({"first": first, "noted": 0, "task": 0,
+                            "kind": v.get("kind"), "defer": defer})
+                open_eps[key] = rec
+                out["held"].append(key)
+                continue
             if dry:
                 out["notes"].append(key)
-                open_eps[key] = {"first": now, "noted": now, "task": 0, "kind": v.get("kind")}
+                open_eps[key] = {"first": first, "noted": now, "task": 0, "kind": v.get("kind")}
                 continue
-            proof = write_proof(v, facts, now)             # доказательство ДО канала: улики летучи
-            if not send_note(expectations.render(v, LANE)):
+            shown = dict(v)
+            if rec and now > first:
+                shown["held"] = now - first                # заметка САМА скажет, сколько её ждали
+            proof = write_proof(shown, facts, now)         # доказательство ДО канала: улики летучи
+            if not send_note(expectations.render(shown, LANE)):
+                if rec:
+                    open_eps[key] = rec                    # память о первом обнаружении не теряем
                 continue                                   # не помечаем — скажем на следующем прогоне
-            open_eps[key] = {"first": now, "noted": now, "task": 0,
+            open_eps[key] = {"first": first, "noted": now, "task": 0,
                              "kind": v.get("kind"), "proof": proof}
             out["notes"].append(key)
             continue

@@ -24,6 +24,8 @@
 (12) ЗАКРЫТИЕ: только ДОКАЗАННАЯ доставка, а не исчезновение коммита из виду
 (13) РУКИ: белый список git, замок «диск не сверен», факты собираются на живой машине
 (14) ЖИВОЙ ПРОГОН: ни один PID не сменился, в канал не ушло ничего
+(15) ПРИЧИНА расхождения диска названа, а вердикт не тронут
+(16) ОТСРОЧКА объявления окна правки: тот же вердикт, другой момент; оба замка против слепоты
 """
 import os
 import sys
@@ -472,6 +474,137 @@ res.append(ok(st15f["state"] == E.UNKNOWN and any(u == "orchestrator-daemon"
 # 15g. Замер приложен к делу: у обеих веток есть свой корпус, и он назван в модуле.
 res.append(ok("341" in (E.__doc__ or "") and "a59ce6e" in (E.__doc__ or ""),
               "(15g) числа замера и живой случай названы в самом модуле, а не только в артефакте"))
+
+# ═══ (16) ОТСРОЧКА ОБЪЯВЛЕНИЯ ОКНА ПРАВКИ: ВЕРДИКТ ТОТ ЖЕ, МОМЕНТ ДРУГОЙ (10.08.2026) ═══
+# Основание — тот же замер: 341 из 341, медиана жизни эпизода 20 мин, окно «правка → коммит»
+# по 178 файлам медиана 5 / p90 15 мин. Величина отсрочки = 30 мин (два p90, три такта).
+# ЗДЕСЬ ЖЕ ОБА ЗАМКА ПРОТИВ СЛЕПОТЫ, названные ТЗ: переживший отсрочку объявляется обязательно
+# (16e), а правка СТАРШЕ коммита не откладывается ВООБЩЕ (16b).
+print("\n(16) отсрочка объявления: вердикт не тронут, замки против слепоты на месте")
+CFG_D = E.config({"EXPECT_DIRTY_DEFER_MIN": "30"})
+CFG_OFF = E.config({"EXPECT_DIRTY_DEFER_MIN": "0"})
+DEFER = CFG_D["dirty_defer"]
+res.append(ok(DEFER == 1800.0 and E.config({})["dirty_defer"] == 1800.0,
+              "(16) боевая отсрочка 30 мин и по умолчанию, и явным ключом: %s" % DEFER))
+
+# 16a. ОКНО ПРАВКИ (живой случай 7bcddba) — единственный откладываемый исход.
+st16 = E.delivery_state(C_O2FIX, f15)
+res.append(ok(E.o3_defer(st16, CFG_D) == DEFER,
+              "(16a) окно правки откладывается на %s" % E.human_age(E.o3_defer(st16, CFG_D))))
+v16 = [v for v in E.verdict(f15, CFG_D) if str(v.get("kind")).startswith("o3")]
+v16z = [v for v in E.verdict(f15, CFG_OFF) if str(v.get("kind")).startswith("o3")]
+FIELDS = ("kind", "key", "sha", "state", "missing", "unknown", "age", "limit", "can_task")
+res.append(ok([{k: v[k] for k in FIELDS} for v in v16] == [{k: v[k] for k in FIELDS} for v in v16z],
+              "(16a) ВЕРДИКТ НЕ ИЗМЕНЁН НИ ОДНИМ ПОЛЕМ — отложен только момент объявления"))
+res.append(ok(v16[0]["defer"] == DEFER and v16z[0]["defer"] == 0.0,
+              "(16a) отсрочка живёт ОТДЕЛЬНЫМ полем, а откат гасит её до разбора"))
+res.append(ok(st16["state"] == E.UNKNOWN and E.delivery_state(C_O2FIX, f15)["state"] == E.UNKNOWN,
+              "(16a) исход как был: «%s»" % st16["state"]))
+
+# 16b. ЗАМОК: правка СТАРШЕ коммита (за 341 случай — ноль) НЕ откладывается вовсе.
+st16b = E.delivery_state(C_O2FIX, f15d)
+res.append(ok(E.o3_defer(st16b, CFG_D) == 0.0,
+              "(16b) правка СТАРШЕ коммита объявляется НЕМЕДЛЕННО: отсрочка %s"
+              % E.o3_defer(st16b, CFG_D)))
+res.append(ok(E.DIRTY_WIP not in dict(st16b["unknown"]).get("orchestrator_daemon.py", ""),
+              "(16b) и различает их та же причина, что и в тексте заметки"))
+
+# 16c. ЗАМОК: любая ДРУГАЯ причина рядом — и отсрочки нет. Пять дорог, каждая на живых фикстурах.
+f16_und = facts([C_FLEET])                                   # недоставка — не ждёт никогда
+f16_mix = facts([C_O2FIX], now=LIVE_NOW, daemon=T("2026-08-10T08:08:56Z"),
+                dirty=["orchestrator_daemon.py", "expectations.py"],
+                mtimes={"orchestrator_daemon.py": LIVE_MT})  # одно окно + одна другая причина
+f16_tree = facts([C_O2FIX], now=LIVE_NOW, dirty=["orchestrator_daemon.py"],
+                 mtimes={"orchestrator_daemon.py": LIVE_MT}, dirty_ok=False)
+f16_proc = facts([C_FLEET], now=LIVE_NOW, alive=(False, True))   # памяти не у кого спросить
+f16_out = facts([C_UNITS], now=LIVE_NOW)                     # вид доставки неподотчётен
+for label, ff, cc in (("недоставка", f16_und, C_FLEET), ("причина другого рода", f16_mix, C_O2FIX),
+                      ("дерево не сверено", f16_tree, C_O2FIX),
+                      ("процесс не наблюдается", f16_proc, C_FLEET),
+                      ("вид неподотчётен", f16_out, C_UNITS)):
+    res.append(ok(E.o3_defer(E.delivery_state(cc, ff), CFG_D) == 0.0,
+                  "(16c) «%s» → говорим сразу" % label))
+
+# ── РУКИ: отсрочку исполняют они, и обе половины замка проверяются сквозным прогоном ──
+try:
+    import expectations_run as ER
+
+    def drive(ticks, defer_min="30"):
+        """Прогнать руки по тактам. Состояние — в памяти, боевой /tmp и reports/ не трогаем."""
+        os.environ["EXPECT_DIRTY_DEFER_MIN"] = str(defer_min)
+        box, sent, outs = {"st": {}}, [], []
+        keep = (ER.load_state, ER.save_state, ER.snapshot, ER.send_note, ER.write_proof,
+                ER.enqueue_escalation)
+        ER.load_state = lambda: dict(box["st"])
+        ER.save_state = lambda s: box.__setitem__("st", dict(s))
+        ER.send_note = lambda t: (sent.append(t), True)[1]
+        ER.write_proof = lambda v, f, n: ""
+        ER.enqueue_escalation = lambda v: 0
+        try:
+            for tnow, ff in ticks:
+                ER.snapshot = lambda a=None, b=None, c=None, _f=ff: _f
+                outs.append(ER.run(now=tnow))
+        finally:
+            (ER.load_state, ER.save_state, ER.snapshot, ER.send_note, ER.write_proof,
+             ER.enqueue_escalation) = keep
+            os.environ.pop("EXPECT_DIRTY_DEFER_MIN", None)
+        return outs, sent, box["st"]
+
+    def window_facts(t):
+        """Окно правки на такте t: файл лежит правленым, коммит доставлен ещё утром."""
+        return facts([C_O2FIX], now=t, daemon=T("2026-08-10T08:08:56Z"),
+                     dirty=["orchestrator_daemon.py"], mtimes={"orchestrator_daemon.py": LIVE_MT})
+
+    TICKS = [LIVE_NOW + i * 600.0 for i in range(6)]
+    KEY = "o3|7bcddba"
+
+    # 16d. ОТКАТ: отсрочки нет → заметка на ПЕРВОМ такте, как было до правки.
+    o, sent, _st = drive([(TICKS[0], window_facts(TICKS[0]))], defer_min="0")
+    res.append(ok(o[0]["notes"] == [KEY] and len(sent) == 1 and not o[0]["held"],
+                  "(16d) EXPECT_DIRTY_DEFER_MIN=0 → прежнее поведение: заметка сразу"))
+
+    # 16e. ЗАМОК ПРОТИВ СЛЕПОТЫ: эпизод, ПЕРЕЖИВШИЙ отсрочку, объявляется ОБЯЗАТЕЛЬНО.
+    o, sent, stt = drive([(t, window_facts(t)) for t in TICKS[:5]])
+    held = [i for i, r in enumerate(o) if r["held"]]
+    noted = [i for i, r in enumerate(o) if r["notes"]]
+    res.append(ok(held == [0, 1, 2] and noted == [3],
+                  "(16e) три такта молчания, на четвёртом (30 мин) заметка: держали %s, сказали %s"
+                  % (held, noted)))
+    res.append(ok(len(sent) == 1, "(16e) и ровно ОДНА заметка за пять тактов: %d" % len(sent)))
+    res.append(ok("держал заметку 30 мин" in sent[0] and "отсрочка не отмена" in sent[0],
+                  "(16e) заметка САМА называет, сколько её держали"))
+    res.append(ok(E.DIRTY_WHY in sent[0] and "не знаю" in sent[0].lower(),
+                  "(16e) и остаётся тем же вердиктом, что был бы без отсрочки"))
+    res.append(ok(all(r["verdicts"] == 1 for r in o),
+                  "(16e) ОСТАЁТСЯ В СЧЁТЕ на каждом такте: %s" % [r["verdicts"] for r in o]))
+    res.append(ok(float((stt.get("open") or {}).get(KEY, {}).get("first") or 0) == TICKS[0],
+                  "(16e) память о ПЕРВОМ обнаружении пережила прогоны — иначе отсрочка вечна"))
+
+    # 16f. ЭПИЗОД, ЗАКРЫВШИЙСЯ РАНЬШЕ ОТСРОЧКИ: владелец не увидел НИЧЕГО — ни заметки, ни
+    #      закрытия. Но из счёта он не исчез.
+    done = facts([C_O2FIX], now=TICKS[1], daemon=T("2026-08-10T19:00:00Z"))   # правка уехала
+    o, sent, stt = drive([(TICKS[0], window_facts(TICKS[0])), (TICKS[1], done)])
+    res.append(ok(sent == [], "(16f) в канал не ушло НИЧЕГО: %s" % sent))
+    res.append(ok(o[0]["held"] == [KEY] and o[1]["quiet"] == [KEY] and o[1]["closed"] == [],
+                  "(16f) эпизод погашен отсрочкой, а не «закрыт» заметкой: %s" % o[1]))
+    res.append(ok(int((stt.get("quiet") or {}).get("n") or 0) == 1
+                  and KEY in ((stt.get("quiet") or {}).get("last") or []),
+                  "(16f) но в счёте остался: %s" % stt.get("quiet")))
+    res.append(ok(KEY not in (stt.get("open") or {}),
+                  "(16f) и не завис открытым эпизодом навсегда"))
+
+    # 16g. ЗАМОК: исход СМЕНИЛСЯ на недоставку внутри отсрочки → говорим НЕМЕДЛЕННО, не досиживая.
+    # демон поднят ДО коммита, а файл переписан ПОСЛЕ его старта → не сработал ни один свидетель
+    undel = facts([C_O2FIX], now=TICKS[1], daemon=T("2026-08-10T07:00:00Z"),
+                  mtimes={"orchestrator_daemon.py": T("2026-08-10T09:30:00Z")})
+    o, sent, _st = drive([(TICKS[0], window_facts(TICKS[0])), (TICKS[1], undel)])
+    res.append(ok(o[0]["held"] == [KEY] and o[1]["notes"] == [KEY] and len(sent) == 1,
+                  "(16g) недоставка, вскрывшаяся под окном правки, ждать не стала: %s" % o[1]))
+    res.append(ok("не дошёл до прода" in sent[0] and "держал заметку 10 мин" in sent[0],
+                  "(16g) и заметка честно называет и исход, и то, что 10 минут её держали"))
+except Exception as e:                                                   # noqa: BLE001
+    print("   ОШИБКА: %r" % e)
+    res += [ok(False, "(16) руки: отсрочка")] * 13
 
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)
