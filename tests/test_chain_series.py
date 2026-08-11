@@ -398,6 +398,82 @@ if env_was[0] is not None:
     os.environ["CC_SERIES_FILE"] = env_was[0]
 os.environ["ORCH_TEST_MODE"] = env_was[1] or "1"
 
+print("(11) ЗАМОК ТРЕТЬЕГО ИСХОДА У ЦЕПОЧКИ — «не разобрана» (11.08.2026)")
+# ДОСЛОВНАЯ карточка 429 (снимок очереди, запись 429 от 09.08 19:19:49, отклонена владельцем):
+# куратор просил «да» на выкладку моста ИЗ ОБЕЗВРЕЖЕННОЙ ПАПКИ — той самой, заливка из которой
+# стёрла бы 18 функций живого моста. Состояние выкладки с этой машины не наблюдается ВООБЩЕ,
+# значит сорт её вмешательства неизвестен — и до 11.08 цепочка 426 шла в серию ЧИСТОЙ, то есть
+# счёт утверждал «вмешательства не было» ровно там, где не знал ничего.
+C429 = ("[куратор владельцу цель 426] Нужно твоё «да» на выкат моста (`clasp push` + "
+        "`clasp redeploy` прод-деплоя из /root/turbobaby-bridge-gs): правки ReadFleet/Bridge под "
+        "контракт трёх состояний живут только в папке — прод-мост о них не знает")
+import curator_ops as CO                                               # noqa: E402
+ops429 = [o["key"] for o in CO.operations(C429)]
+v429 = CS.sort_card(ops429, [], "2026-08-09T19:19:49", "2026-08-09T19:33:12")
+res.append(ok("bridge_deploy" in ops429 and v429["sort"] == CS.UNKNOWN,
+              "(11) дословная 429: выкладка моста отсюда не наблюдается → сорт НЕИЗВЕСТЕН (%s)"
+              % v429["sort"]))
+u426 = CS.chain_verdict(chain(426, cards=[{"id": 429, "sort": v429["sort"], "why": v429["why"]}]))
+res.append(ok(u426["unresolved"] and not u426["break"],
+              "(11) цепочка 426 НЕ РАЗОБРАНА и при этом НЕ обрыв — без факта не обвиняем"))
+res.append(ok("не наблюдается" in u426["unresolved_why"],
+              "(11) неразобранность называет СВОЮ причину, а не отмалчивается"))
+
+trio = [CS.chain_verdict(chain(1)), u426, CS.chain_verdict(chain(3))]
+st11 = CS.series(trio)
+res.append(ok(st11["current"] == 2 and not st11["breaks"],
+              "(11) неразобранная серию НЕ рвёт: соседи считаются подряд (current=%d, обрывов %d)"
+              % (st11["current"], len(st11["breaks"]))))
+res.append(ok(st11["unresolved"] == 1 and st11["current_unresolved"] == 1
+              and st11["clean"] == 2,
+              "(11) и НЕ засчитывается как чистая: чистых 2 · не разобрано 1 (а не 3 чистых)"))
+res.append(ok(426 in (st11["unresolved_roots"] or []),
+              "(11) неразобранная названа номером — молчаливого пропуска нет"))
+res.append(ok("не разобрано 1" in CS.render(st11)
+              and "перешагнула неразобранных 1" in CS.render(st11),
+              "(11) строка журнала называет и число неразобранных, и сколько их перешагнула серия"))
+
+legacy = CS.chain_verdict(chain(5, cards=[{"id": 77}]))                # запись без поля sort
+res.append(ok(legacy["unresolved"] and legacy["unreadable"] == 1,
+              "(11) нечитаемый сорт (легаси-запись состояния) → не разобрана, а не молча чистая"))
+hang = CS.chain_verdict(chain(6, cards=[{"id": 88, "open": True, "ops": ["service:splinter"]}]))
+res.append(ok(hang["unresolved"] and hang["hanging"] == 1 and "ещё висит" in hang["unresolved_why"],
+              "(11) карточка ЕЩЁ ВИСИТ у владельца → цепочка не разобрана, пока он не ответил"))
+mix = CS.chain_verdict(chain(7, cards=[{"sort": CS.NOISE, "why": "n"},
+                                       {"sort": CS.UNKNOWN, "why": "u"}]))
+res.append(ok(mix["break"] and not mix["unresolved"],
+              "(11) обрыв — ФАКТ, он сильнее незнания: шум + неизвестное = обрыв"))
+will = CS.chain_verdict(chain(8, cards=[{"sort": CS.WILL, "why": "w"}]))
+res.append(ok(not will["unresolved"] and CS.series([will])["current"] == 1,
+              "(11) граница: ВОЛЯ разобрана — она чистая цепочка, а не «неизвестно»"))
+blindwall = [CS.chain_verdict(chain(i, cards=[{"sort": CS.UNKNOWN, "why": "x"}]))
+             for i in range(1, 41)]
+sb = CS.series(blindwall)
+res.append(ok(sb["current"] == 0 and sb["best"] == 0 and not sb["qualified"]
+              and sb["unresolved"] == 40,
+              "(11) 40 неразобранных подряд → серия 0 и НЕ зачётная: длину незнанием не набить"))
+tail = [CS.chain_verdict(chain(i)) for i in range(1, 18)] + \
+       [CS.chain_verdict(chain(18, cards=[{"sort": CS.UNKNOWN, "why": "тело затёрто"}]))]
+res.append(ok(CS.series(tail)["best"] == 17,
+              "(11) живой случай рекорда: 17 доказанных + 1 неразобранная = 17, а не 18 "
+              "(в корпусе так и было — цепочка 181 замыкала прежний рекорд 18)"))
+
+# руки демона: висящая карточка доезжает до решения, а не отбрасывается рукой
+tmp11 = tempfile.mkdtemp(prefix="cc_series_hang_")
+os.environ["CC_SERIES_FILE"] = os.path.join(tmp11, "chain_series.json")
+st_hang = {"chains": {"90": {"root": 90, "lane": "vps", "created": "2026-08-11T01:00:00",
+                             "closed_at": "2026-08-11T02:00:00", "statuses": {"90": "done"},
+                             "cards": [{"id": 91, "open": True, "ops": ["service:splinter"],
+                                        "born": "2026-08-11T01:30:00"}],
+                             "refusals": [],
+                             "weight": {"commits": [], "restarts": 0, "known": True}}}}
+d11 = OD._series_derive(st_hang)
+res.append(ok(d11["unresolved"] == 1 and d11["current"] == 0,
+              "(11) РУКИ: цепочка с висящим вопросом владельца в серию НЕ идёт (current=%d)"
+              % d11["current"]))
+shutil.rmtree(tmp11, ignore_errors=True)
+os.environ["CC_SERIES_FILE"] = os.path.join(tmp, "chain_series.json")
+
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)
 if fails:

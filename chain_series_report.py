@@ -386,7 +386,7 @@ def _file_verdicts(live):
     for r, ch in ((live or {}).get("chains") or {}).items():
         c = dict(ch)
         c["statuses"] = list((ch.get("statuses") or {}).values())
-        c["cards"] = [x for x in (ch.get("cards") or []) if not x.get("open")]
+        c["cards"] = list(ch.get("cards") or [])      # висящие судит решение, а не рука
         try:
             out[int(r)] = cs.chain_verdict(c)
         except (TypeError, ValueError):
@@ -474,13 +474,21 @@ def verify(live, replay_chains, unread=(), windows_read=True):
         if not str((fch.get(r) or {}).get("created") or "").strip():
             red.append("цепочка %s в файле БЕЗ ДАТЫ РОЖДЕНИЯ — живой счёт так не пишет: "
                        "состояние правлено не демоном" % r)
-    common, blind, uncomparable, attributed = [], [], [], []
+    common, blind, uncomparable, attributed, unres_gap = [], [], [], [], []
     for r in sorted(set(fv) & set(rv)):
         f, p = fv[r], rv[r]
         if not (f.get("closed") and p.get("closed")):
             uncomparable.append(r)          # исход есть не в обеих картинах — сравнивать нечего
             continue
         common.append(r)
+        # «НЕ РАЗОБРАНА» У ОДНОЙ СТОРОНЫ РАСХОЖДЕНИЕМ НЕ ЯВЛЯЕТСЯ, и обе стороны безопасны в
+        # РАЗНЫЕ стороны: реплей не разобрал там, где очередь затёрла тело (ровно его слепота, и
+        # он на этом теряет длину), а файл, объявивший неразобранным то, что реплей разобрал,
+        # СЕБЯ УКОРАЧИВАЕТ — надуть серию таким расхождением нельзя ни одной из сторон. Опасное
+        # направление у неразобранности одно — «реплей ДОКАЗАЛ обрыв, файл его не знает», и оно
+        # разбирается ниже прежней веткой, до всякой скидки на незнание.
+        if bool(f.get("unresolved")) != bool(p.get("unresolved")):
+            unres_gap.append(r)
         if f.get("break") == p.get("break") and f.get("cause") == p.get("cause"):
             continue
         if _attributed(fch[r], f) or _attributed(rch[r], p):
@@ -502,6 +510,13 @@ def verify(live, replay_chains, unread=(), windows_read=True):
         notes.append("ремонт руками на общей почве: файл %d · реплей %d (приписка условна у обеих "
                      "сторон — сверяется число, не хозяин; расходятся цепочки %s)"
                      % (fman, pman, attributed[:8]))
+    if unres_gap:
+        only_replay = [r for r in unres_gap if rv[r].get("unresolved")]
+        notes.append("не разобрано на общей почве: реплей %d · файл %d (из них только у реплея "
+                     "%d — тело карточки затёрто вердиктом очереди; неразобранная цепочка "
+                     "длины не даёт и серию не рвёт)"
+                     % (sum(1 for r in common if rv[r].get("unresolved")),
+                        sum(1 for r in common if fv[r].get("unresolved")), len(only_replay)))
 
     # (а) ФАЙЛ САМ СЕБЕ: выводится ли его `derived` из его же цепочек. Ловит правку файла руками
     # и расхождение самого счёта с решением — то есть ту самую «тихую правку», которая запрещена.
@@ -515,9 +530,10 @@ def verify(live, replay_chains, unread=(), windows_read=True):
                    % (d.get("current"), d.get("best"), d.get("chains"),
                       own["current"], own["best"], own["chains"]))
     out.append("СВЕРКА: цепочек в файле %d · в снимке %d · общая почва %d "
-               "(вне окна файла %d · не сравнимы %d · слепота реплея %d · приписка ремонта %d)"
+               "(вне окна файла %d · не сравнимы %d · слепота реплея %d · приписка ремонта %d · "
+               "разошлась неразобранность %d)"
                % (len(fv), len(rv), len(common), len(outside), len(uncomparable), len(blind),
-                  len(attributed)))
+                  len(attributed), len(unres_gap)))
     out.append("  файл: %s" % (d.get("line") or "строки нет"))
     out.append("  рекорд файла best_ever=%s (реплеем не проверяется — файл помнит дольше своего "
                "окна) · последний обрыв: %s"
@@ -529,11 +545,14 @@ def verify(live, replay_chains, unread=(), windows_read=True):
     if common:
         fs = cs.series([fv[r] for r in common])
         ps = cs.series([rv[r] for r in common])
-        out.append("  на общей почве: файл current=%d best=%d обрывов=%d | реплей current=%d "
-                   "best=%d обрывов=%d"
-                   % (fs["current"], fs["best"], len(fs["breaks"]),
-                      ps["current"], ps["best"], len(ps["breaks"])))
-        if not blind and not attributed \
+        out.append("  на общей почве: файл current=%d best=%d обрывов=%d не разобрано=%d | "
+                   "реплей current=%d best=%d обрывов=%d не разобрано=%d"
+                   % (fs["current"], fs["best"], len(fs["breaks"]), fs["unresolved"],
+                      ps["current"], ps["best"], len(ps["breaks"]), ps["unresolved"]))
+        # Неразобранность у одной стороны ЗАКОННО двигает длину (пропущенная цепочка не даёт +1),
+        # поэтому она снимает красное с ЧИСЕЛ ровно так же, как слепота обрыва, — но не снимает
+        # его с самих обрывов: те разобраны выше и по записям.
+        if not blind and not attributed and not unres_gap \
                 and (fs["current"] != ps["current"] or fs["best"] != ps["best"]):
             red.append("числа на общей почве разошлись при нулевой слепоте реплея: "
                        "файл current=%d best=%d, реплей current=%d best=%d"
@@ -599,7 +618,25 @@ def main(argv):
           % (st["current"], st["current_span"][:12], st["current_weight"], st["current_known"],
              100 * st["current_weight_share"], "да" if st["qualified"] else "НЕТ",
              cs.SERIES_TARGET, 100 * cs.WEIGHT_MIN_SHARE))
-    print("ЛУЧШАЯ СЕРИЯ: %d %s" % (st["best"], st["best_span"][:12]))
+    print("ЛУЧШАЯ СЕРИЯ: %d %s (перешагнула неразобранных %d)"
+          % (st["best"], st["best_span"][:12], st["best_unresolved"]))
+    # ТРИ ИСХОДА У ЗАКРЫТОЙ ЦЕПОЧКИ — печатаются вместе, иначе «чистая» читается как «всё
+    # остальное» и неразобранное молча уходит в длину (ровно тот дефект, что закрыт 11.08).
+    print("ИСХОДЫ ЗАКРЫТЫХ ЦЕПОЧЕК: чистых %d · НЕ РАЗОБРАНО %d · обрывов %d   (из %d)"
+          % (st["clean"], st["unresolved"], len(st["breaks"]), st["chains"]))
+    unres_why = {}
+    for r in order:
+        v = next((x for x in verdicts if x.get("root") == r), None)
+        if not (v or {}).get("unresolved"):
+            continue
+        w = str(v.get("unresolved_why") or "")
+        k = ("тело карточки затёрто" if "затёрто" in w else
+             ("семья не наблюдается" if "не наблюдается" in w else
+              ("сорт не читается" if "не читается" in w else "прочее")))
+        unres_why[k] = unres_why.get(k, 0) + 1
+    if unres_why:
+        print("  НЕ РАЗОБРАНЫ ПОЧЕМУ: " + " · ".join("%s %d" % (k, n)
+                                                     for k, n in sorted(unres_why.items())))
 
     print("\nОБРЫВЫ (%d) — по сортам:" % len(st["breaks"]))
     for name in (cs.NOISE, cs.MANUAL, "отказ"):

@@ -5114,7 +5114,10 @@ def _series_derive(state):
     for r in sorted(chains, key=lambda x: int(x)):
         ch = dict(chains[r])
         ch["statuses"] = list((chains[r].get("statuses") or {}).values())
-        ch["cards"] = [c for c in (chains[r].get("cards") or []) if not c.get("open")]
+        # ВИСЯЩИЕ КАРТОЧКИ ОТДАЁМ РЕШЕНИЮ, А НЕ ОТБРАСЫВАЕМ. Прежде они выбрасывались здесь, и
+        # цепочка с ещё не отвеченным вопросом владельца шла в серию чистой; теперь их судит
+        # chain_verdict — «не разобрана» до закрытия карточки.
+        ch["cards"] = list(chains[r].get("cards") or [])
         verdicts.append(chain_series.chain_verdict(ch))
     d = chain_series.series(verdicts)
     # ПАМЯТЬ ПРОТИВ УРЕЗКИ. `best` и `breaks` считаются по цепочкам, которые состояние ЕЩЁ помнит

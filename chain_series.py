@@ -39,6 +39,29 @@
 (значит длину им не надуть) — оба конца закрыты, и число неизвестных печатается всегда.
 
 ────────────────────────────────────────────────────────────────────────────────────────────
+ЗАМОК: ТРЕТИЙ ИСХОД ЕСТЬ И У ЦЕПОЧКИ, А НЕ ТОЛЬКО У ВМЕШАТЕЛЬСТВА (11.08.2026).
+
+Первая редакция довела третий исход до КАРТОЧКИ и остановилась: цепочка с неразобранным
+вмешательством не рвала серию — и молча шла в неё ЧИСТОЙ, то есть +1 к длине. Это и есть
+догадка: «сорт не определён» превращалось в «вмешательства не было». Замер по живому корпусу
+(снимок очереди 11.08.2026, 489 записей, 304 закрытых цепочки) назвал цену числом: чистыми
+считались 246 цепочек, а у 64 из них (26 %) сорт хотя бы одного вмешательства НЕ ОПРЕДЕЛЁН;
+рекорд серии держался на одной из них — 18 против 17 по факту.
+
+Теперь исходов у ЗАКРЫТОЙ цепочки три: ЧИСТАЯ (+1 к серии) · ОБРЫВ (серия в нуль) ·
+НЕ РАЗОБРАНА — не считается ни чистой, ни обрывом, и серия через неё ПЕРЕШАГИВАЕТ ровно так же,
+как через ещё идущую. Направление у обеих половин правила разное и намеренно: не рвать —
+потому что обвинять без факта нельзя; не засчитывать — потому что длина есть УТВЕРЖДЕНИЕ, а
+утверждать без факта нельзя тем более. Перешагнули — значит об этом сказано числом
+(`current_unresolved` / `best_unresolved`): серия, прошедшая через неразобранные цепочки, сама
+называет, сколько их было, и читатель видит, чем эта длина оплачена.
+
+НЕЧИТАЕМЫЙ СОРТ = НЕРАЗОБРАННЫЙ. Карточка, чей `sort` не входит в перечень (пусто, легаси-запись
+состояния, мусор на диске), прежде выпадала из счёта МОЛЧА и делала цепочку чистой — тот же
+класс «нуль по неразбору». Теперь она неразобранная: fail-closed стоит одной строки в отчёте,
+а молчание стоило бы завышенной серии.
+
+────────────────────────────────────────────────────────────────────────────────────────────
 ТРИ СОРТА, СЧИТАТЬ РАЗДЕЛЬНО (рамка §8г):
 
   (1) ШУМ — ложная карточка; «да», купившее ничего.                          РВЁТ СЕРИЮ
@@ -323,12 +346,23 @@ def chain_verdict(chain):
 
     ОБРЫВ даёт шум, ремонт руками и необъяснённый отказ; воля и неизвестное — не дают.
     Причина обрыва называется ОДНА и в этом порядке: шум → ремонт → отказ (сначала то, что
-    касается владельца, потом то, что касается контура)."""
+    касается владельца, потом то, что касается контура).
+
+    ЗАМОК ТРЕТЬЕГО ИСХОДА: обрыв — ФАКТ, поэтому он сильнее незнания и судится первым; если же
+    факта обрыва нет, а сорт хотя бы одного вмешательства не определён (неизвестно · сорт не
+    читается), цепочка НЕ РАЗОБРАНА — ни чистая, ни обрыв."""
     sorts = {s: [] for s in SORTS}
+    unread, hanging = [], []
     for c in chain.get("cards") or []:
+        if c.get("open"):
+            # КАРТОЧКА ЕЩЁ ВИСИТ У ВЛАДЕЛЬЦА: сорт ей ставят при закрытии, и до тех пор он не
+            # «отсутствует», а НЕИЗВЕСТЕН. Прежде обе руки такие карточки просто отбрасывали, и
+            # цепочка, все записи которой уже терминальны, шла в серию ЧИСТОЙ, пока вопрос ещё
+            # стоял перед владельцем. Это та же догадка, вид сбоку.
+            hanging.append(c)
+            continue
         s = str(c.get("sort") or "")
-        if s in sorts:
-            sorts[s].append(c)
+        (sorts[s] if s in sorts else unread).append(c)
     refusals = list(chain.get("refusals") or [])
     w = chain.get("weight") or {}
     weight = bool(w.get("commits")) or int(w.get("restarts") or 0) > 0
@@ -340,11 +374,24 @@ def chain_verdict(chain):
         cause, why = MANUAL, str(sorts[MANUAL][0].get("why") or "")
     elif refusals:
         cause, why = "отказ", "%s (запись %s)" % (refusals[0].get("reason"), refusals[0].get("id"))
+    unresolved, u_why = False, ""
+    if cause is None and (sorts[UNKNOWN] or unread or hanging):
+        unresolved = True
+        if hanging:
+            u_why = ("вмешательство ещё висит (запись %s) — сорт станет известен, когда карточка "
+                     "закроется" % hanging[0].get("id"))
+        elif sorts[UNKNOWN]:
+            u_why = str(sorts[UNKNOWN][0].get("why") or "сорт вмешательства не определён")
+        else:
+            u_why = ("сорт вмешательства (запись %s) не читается — угадывать его счёт не будет"
+                     % (unread[0].get("id") if isinstance(unread[0], dict) else "?"))
     return {
         "root": chain.get("root"), "lane": chain.get("lane"), "created": chain.get("created"),
         "closed_at": chain.get("closed_at"), "break": cause is not None, "cause": cause,
         "why": why, "weight": weight and known, "weight_known": known,
         "closed": chain_closed(chain.get("statuses")),
+        "unresolved": unresolved, "unresolved_why": u_why, "unreadable": len(unread),
+        "hanging": len(hanging),
         "counts": {s: len(sorts[s]) for s in SORTS},
     }
 
@@ -361,9 +408,16 @@ def series(verdicts):
     хвост списка. Так требует рамка §8г от файла состояния, и так он переживает урезку: список
     `breaks` живёт ровно столько цепочек, сколько их помнит состояние (SERIES_KEEP), а «когда и
     чем оборвалось в последний раз» — это факт о прошлом, который от забывания старых цепочек
-    ложным не становится."""
+    ложным не становится.
+
+    НЕРАЗОБРАННАЯ ЦЕПОЧКА ПРОПУСКАЕТСЯ, КАК ОТКРЫТАЯ: длину не даёт (утверждать без факта
+    нельзя) и в нуль не сбрасывает (обвинять без факта нельзя). Чтобы пропуск не стал тихой
+    подпоркой длины, серия НАЗЫВАЕТ ЧИСЛОМ, сколько неразобранных цепочек она перешагнула:
+    `current_unresolved` — в идущей, `best_unresolved` — в рекордной, `unresolved` — всего."""
     cur = best = 0
     cur_weight = cur_known = 0
+    cur_unres = best_unres = 0
+    unres_roots = []
     best_span, cur_span, breaks = [], [], []
     for v in verdicts or []:
         if not v.get("closed", True):
@@ -371,8 +425,13 @@ def series(verdicts):
         if v.get("break"):
             breaks.append({"root": v.get("root"), "cause": v.get("cause"), "why": v.get("why"),
                            "at": v.get("closed_at") or v.get("created"), "lane": v.get("lane"),
-                           "broke_len": cur})
-            cur, cur_weight, cur_known, cur_span = 0, 0, 0, []
+                           "broke_len": cur, "stepped_over": cur_unres})
+            cur, cur_weight, cur_known, cur_span, cur_unres = 0, 0, 0, [], 0
+            continue
+        if v.get("unresolved"):
+            # НЕ РАЗОБРАНА: ни +1, ни в нуль. Считаем и запоминаем — молчаливого пропуска нет.
+            unres_roots.append(v.get("root"))
+            cur_unres += 1
             continue
         cur += 1
         cur_span.append(v.get("root"))
@@ -381,7 +440,7 @@ def series(verdicts):
             if v.get("weight"):
                 cur_weight += 1
         if cur > best:
-            best, best_span = cur, list(cur_span)
+            best, best_span, best_unres = cur, list(cur_span), cur_unres
     closed = [v for v in (verdicts or []) if v.get("closed", True)]
     total = len(closed)
     known_all = [v for v in closed if v.get("weight_known", True)]
@@ -394,6 +453,9 @@ def series(verdicts):
         "best": best, "best_span": best_span,
         "breaks": breaks,
         "last_break": dict(breaks[-1]) if breaks else None,
+        "unresolved": len(unres_roots), "unresolved_roots": unres_roots[-40:],
+        "current_unresolved": cur_unres, "best_unresolved": best_unres,
+        "clean": total - len(unres_roots) - len(breaks),
         "weight_share": round((with_weight / len(known_all)), 4) if known_all else 0.0,
         "weight_chains": with_weight, "weight_known": len(known_all),
         "open": len(list(verdicts or [])) - total,
@@ -420,12 +482,15 @@ def weight_windows(verdicts, size=None):
 
 
 def render(state):
-    """Одна строка для журнала/сводки. Числа, не ощущения."""
-    return ("серия цепочек: идёт %d (вес %d из %d наблюдаемых), лучшая %d, всего цепочек %d, "
+    """Одна строка для журнала/сводки. Числа, не ощущения. Неразобранные названы ЗДЕСЬ ЖЕ и
+    рядом с длиной: строка, молчащая о них, снова выдавала бы пропуск за чистоту."""
+    return ("серия цепочек: идёт %d (вес %d из %d наблюдаемых, перешагнула неразобранных %d), "
+            "лучшая %d, всего цепочек %d, не разобрано %d, "
             "обрывов %d [шум %d · ремонт %d · отказ %d], вес по наблюдаемым %.1f%%"
             % (state.get("current", 0), state.get("current_weight", 0),
-               state.get("current_known", 0),
-               state.get("best", 0), state.get("chains", 0), len(state.get("breaks") or []),
+               state.get("current_known", 0), state.get("current_unresolved", 0),
+               state.get("best", 0), state.get("chains", 0), state.get("unresolved", 0),
+               len(state.get("breaks") or []),
                sum(1 for b in (state.get("breaks") or []) if b.get("cause") == NOISE),
                sum(1 for b in (state.get("breaks") or []) if b.get("cause") == MANUAL),
                sum(1 for b in (state.get("breaks") or []) if b.get("cause") == "отказ"),
