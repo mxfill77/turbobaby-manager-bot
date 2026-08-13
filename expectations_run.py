@@ -566,6 +566,36 @@ def _trim_v(v):
     return {k: (v or {}).get(k) for k in _KEEP_V if (v or {}).get(k) is not None}
 
 
+def keep_number(rec, v):
+    """ЧИСЛО ЗАМЕРА ЗАМОРАЖИВАЕТСЯ ПРИ ОБНАРУЖЕНИИ — ГОТОВОЙ СТРОКОЙ, а не набором полей.
+
+    ПОВОД (живая запись 13.08 13:46, единственная запись слоя в мозге на тот час): «ОЖИДАНИЕ О5 ·
+    мост отвечает дольше отведённого времени · опрос очереди 0 с при отведённых 0 с · длилось
+    20 мин». Длительность цела, а замер и порог обнулены — при том, что числа БЫЛИ измерены и
+    лежат в доказательстве того же эпизода (`reports/2026-08-13/expect-o5s-1786626993.md`:
+    «опрос очереди занял 127 с при отведённых 120 с»). Эпизод открылся в 13:26 одной редакцией
+    рук, а закрылся в 13:47 другой — и на переносе оба числа исчезли разом.
+
+    ПОЧЕМУ ИМЕННО ГОТОВАЯ СТРОКА. К закрытию вердикта уже нет: эпизод закрылся ровно потому, что
+    нарушения в фактах больше нет. Значит число обязано пережить эпизод внутри его записи, а
+    единственная дорога туда — `_trim_v`, белый список ИМЁН полей. Список угадывает задним числом:
+    запись прежней редакции его не проходила вовсе, а вид, чьё поле в список не внесли (завтрашнее
+    О6), не пройдёт и завтра — и оба числа пропадут ОДНОВРЕМЕННО, как пропали здесь. Готовая
+    строка снимается там, где вердикт ЦЕЛЫЙ, и списком не режется.
+
+    ЗАМЕР НЕ ПЕРЕПИСЫВАЕТСЯ ПОЗЖЕ: строка журнала говорит «начало», и число принадлежит ему же —
+    тому такту, чьи улики легли в доказательство. Числа нет (вид их не несёт / запись легаси) →
+    возвращаем "", и `line()` честно скажет «неизвестно», а не ноль: это принятый контракт."""
+    have = str((rec or {}).get("num") or "").strip()
+    if have:
+        return have
+    try:
+        num = expect_journal.number(v)
+    except Exception:                                                # noqa: BLE001
+        return ""
+    return "" if (not num or num == expect_journal.NO_NUMBER) else num
+
+
 def close_detail(key, facts):
     """Чем закрытие эпизода объясняет само себя. Для О4 это ДОСЛОВНАЯ первая строка вернувшегося
     ПК: он единственный знает, почему молчал («🛌 ПК СПАЛ 51 м 43 с — весь контур стоял»), и
@@ -653,7 +683,8 @@ def run(dry=False, now=None):
             first = float(rec.get("first") or now)
             v = rec.get("v") or {"kind": rec.get("kind"), "key": key}
             if not write_journal(expect_journal.line(v, LANE, first, now, "закрыт",
-                                                     rec.get("ticks"), detail)):
+                                                     rec.get("ticks"), detail,
+                                                     num=rec.get("num"))):
                 continue                       # не записалось → эпизод жив, скажем на следующем
             rec["closed_j"] = 1
             open_eps[key] = rec
@@ -689,9 +720,15 @@ def run(dry=False, now=None):
             is_heavy, why = bool(rec.get("heavy")), str(rec.get("why") or "")
         else:
             is_heavy, why = expect_journal.heavy(v, facts, frozen)
+        # ЧИСЛО СНИМАЕТСЯ ЗДЕСЬ, ПОКА ВЕРДИКТ ЦЕЛЫЙ, и дальше не переписывается (см. keep_number).
+        # Поля `v` при этом СЛИВАЮТСЯ, а не замещаются: замер, однажды измеренный, не должен
+        # пропадать оттого, что следующий такт принёс вердикт беднее прежнего.
+        num = keep_number(rec, v)
         rec.update({"first": first, "last": now, "ticks": int(rec.get("ticks") or 0) + 1,
-                    "kind": v.get("kind"), "v": _trim_v(v),
+                    "kind": v.get("kind"), "v": dict(rec.get("v") or {}, **_trim_v(v)),
                     "heavy": bool(is_heavy), "why": why})
+        if num:
+            rec["num"] = num
         rec.setdefault("noted", 0)
         rec.setdefault("task", 0)
         open_eps[key] = rec
@@ -713,7 +750,8 @@ def run(dry=False, now=None):
             # ли о нём вдобавок владелец.
             if brain and held >= defer and not rec.get("held_j") and not dry:
                 if write_journal(expect_journal.line(v, LANE, first, now, "держится",
-                                                     rec.get("ticks"), addr_why)):
+                                                     rec.get("ticks"), addr_why,
+                                                     num=rec.get("num"))):
                     rec["held_j"] = 1
                     out["journal"].append(key)
             if addr == expect_journal.BRAIN_AND_OWNER:

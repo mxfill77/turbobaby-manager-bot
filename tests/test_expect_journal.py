@@ -161,11 +161,14 @@ import expectations_run as ER                                          # noqa: E
 
 
 def drive(ticks, verdicts_at, closes_at, brain="1", defer_min="60", journal_ok=True,
-          note_ok=True):
-    """Прогнать РУКИ по тактам. Канал подменён, боевой мозг и reports/ не трогаются."""
+          note_ok=True, st0=None):
+    """Прогнать РУКИ по тактам. Канал подменён, боевой мозг и reports/ не трогаются.
+
+    `st0` — состояние ДО первого такта: им подаётся запись, заведённая ПРЕЖНЕЙ редакцией рук
+    (ровно так и родился живой ноль 13.08: эпизод открыт одной редакцией, закрыт другой)."""
     os.environ["EXPECT_TO_BRAIN"] = brain
     os.environ["EXPECT_OWNER_DEFER_MIN"] = defer_min
-    box, sent, wrote, outs = {"st": {}}, [], [], []
+    box, sent, wrote, outs = {"st": dict(st0 or {})}, [], [], []
     keep = (ER.load_state, ER.save_state, ER.snapshot, ER.send_note, ER.write_proof,
             ER.enqueue_escalation, ER.write_journal, E.verdict, E.closures)
     ER.load_state = lambda: dict(box["st"])
@@ -362,6 +365,70 @@ try:
 except Exception as e:                                                   # noqa: BLE001
     print("   ОШИБКА: %r" % e)
     res += [ok(False, "(12) изоляция")] * 2
+
+# ═══════════ (13) ЗАМОК: НЕПУСТОЙ ЗАМЕР НЕ СТАНОВИТСЯ НУЛЁМ ═══════════
+# ЖИВОЙ ПОВОД (единственная запись слоя в мозге на 13.08 13:46): «ОЖИДАНИЕ О5 · мост отвечает
+# дольше отведённого времени · опрос очереди 0 с при отведённых 0 с · длилось 20 мин». Числа БЫЛИ
+# измерены — доказательство того же эпизода говорит «занял 127 с при отведённых 120 с», — и
+# пропали на переносе эпизода в запись: открыт он был одной редакцией рук, закрыт другой.
+print("\n(13) ЗАМОК: замер был непустым → в записи стоит он, а не ноль и не пустота")
+ZERO = "0 с при отведённых 0 с"
+try:
+    # (а) ЖИВАЯ ФОРМА: эпизод продержался два такта и закрылся сам — числа обязаны доехать.
+    outs, sent, wrote, st = drive(T[:3], {0: [V_SLOW], 1: [V_SLOW]}, {2: ["o5s|1786614515"]})
+    closing = [w for w in wrote if "длилось" in w]
+    res.append(ok(len(closing) == 1 and "174" in closing[0] and "120" in closing[0],
+                  "(13a) замер и порог доехали в запись: %s"
+                  % (closing[0][:120] if closing else wrote)))
+    res.append(ok(all(ZERO not in w and J.NO_NUMBER not in w for w in wrote),
+                  "(13b) ни нуля, ни «неизвестно» там, где замер БЫЛ: %s" % wrote))
+    # (б) ГЛАВНЫЙ ЗАМОК. Поля вердикта доезжают в запись через белый список ИМЁН (`_KEEP_V`), и
+    #     ровно он подвёл живьём: запись прежней редакции его не проходила. Снимаем dt/limit из
+    #     списка — это и есть та ситуация (а заодно завтрашний вид, чьё поле в список не внесли).
+    #     Число обязано уцелеть: руки снимают его ГОТОВОЙ строкой в момент обнаружения.
+    keep_v = ER._KEEP_V
+    ER._KEEP_V = tuple(k for k in keep_v if k not in ("dt", "limit"))
+    try:
+        _o2, _s2, wrote2, _st2 = drive(T[:3], {0: [V_SLOW], 1: [V_SLOW]},
+                                       {2: ["o5s|1786614515"]})
+    finally:
+        ER._KEEP_V = keep_v
+    closing2 = [w for w in wrote2 if "длилось" in w]
+    res.append(ok(len(closing2) == 1 and "174" in closing2[0] and "120" in closing2[0]
+                  and ZERO not in closing2[0],
+                  "(13c) поля вердикта до записи НЕ доехали, а замер доехал: %s"
+                  % (closing2[0][:120] if closing2 else wrote2)))
+    # (в) ДОСЛОВНЫЙ ЖИВОЙ ЭПИЗОД o5s|1786626993: заведён прежней редакцией, замера в его записи
+    #     нет вовсе → «неизвестно», а НЕ ноль. Это принятый контракт, а не поражение.
+    legacy_st = {"open": {"o5s|1786626993": {"first": NOW - 1200, "kind": "o5_bridge_slow"}}}
+    _o3, _s3, wrote3, _st3 = drive([NOW], {}, {0: ["o5s|1786626993"]}, st0=legacy_st)
+    res.append(ok(len(wrote3) == 1 and J.NO_NUMBER in wrote3[0] and ZERO not in wrote3[0],
+                  "(13d) запись прежней редакции: «неизвестно», а не нули: %s"
+                  % (wrote3[0][:140] if wrote3 else wrote3)))
+    # (г) ИЗМЕРЕННЫЙ НОЛЬ — ЭТО ФАКТ, и руки его не глотают (зеркало 8j на стороне рук).
+    res.append(ok("опрос очереди 0 с при отведённых 240 с"
+                  == ER.keep_number({}, dict(V_SLOW, dt=0.0, limit=240.0)),
+                  "(13e) измеренный ноль сохраняется как ноль: %s"
+                  % ER.keep_number({}, dict(V_SLOW, dt=0.0, limit=240.0))))
+    res.append(ok(ER.keep_number({}, {"kind": "o5_bridge_slow", "key": "x"}) == "",
+                  "(13f) замера нет → руки не выдумывают числа, строка скажет «неизвестно»"))
+    # (д) ЧИСЛО ПРИНАДЛЕЖИТ НАЧАЛУ ЭПИЗОДА: строка говорит «начало», и доказательство снято там же.
+    _o4, _s4, wrote4, _st4 = drive(T[:3], {0: [V_SLOW], 1: [dict(V_SLOW, dt=999.0)]},
+                                   {2: ["o5s|1786614515"]})
+    c4 = [w for w in wrote4 if "длилось" in w]
+    res.append(ok(len(c4) == 1 and "174" in c4[0] and "999" not in c4[0],
+                  "(13g) замер не переписывается поздним тактом: %s"
+                  % (c4[0][:120] if c4 else wrote4)))
+    # (е) СТРОКА «ДЕРЖИТСЯ» — тот же замок: у самого долгого нарушения число тоже обязано быть.
+    _o5, _s5, wrote5, _st5 = drive(T[:8], {i: [V_FLEET] for i in range(8)}, {})
+    held = [w for w in wrote5 if "ещё идёт" in w]
+    res.append(ok(len(held) == 1 and "7e348d4" in held[0] and J.NO_NUMBER not in held[0]
+                  and "при пороге 4 ч 0 мин" in held[0],
+                  "(13h) и «держится» несёт замер: %s" % (held[0][:130] if held else wrote5)))
+except Exception as e:                                                   # noqa: BLE001
+    print("   ОШИБКА: %r" % e)
+    res += [ok(False, "(13) замок нуля")] * 8
+
 
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)
