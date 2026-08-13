@@ -25,6 +25,7 @@ import scan_result     # контракт читателя живого текс
 import fleet_cell      # контракт клетки Лист1: значение / пусто / не-число / нечитаемо
 import card_deadline   # общий дедлайн сборки карточки «Инфо» + слова о непрочитанном
 import write_fact      # синк зеркала по ПЕРЕЧИТАННОМУ факту, а не по флагу расписки
+import balance_fact    # §касса: свежий баланс / «не сверено» + дата / нечего сказать; факт проводки
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -1252,9 +1253,69 @@ def _balance_parts(bal):
     return parts
 
 
-def _balance_block(label, bal):
-    """Баланс столбиком: строка-метка «<label>:», затем валюты с отступом 2 пробела."""
-    return [f"{label}:", *[f"  {p}" for p in _balance_parts(bal)]]
+def _cash_fact_on():
+    """Ручка отката всего класса: `CASH_FACT=0` + рестарт splinter → путь кассы БАЙТ-В-БАЙТ прежний
+    (кэш молча, расписка не читается). Читается на КАЖДЫЙ ответ, а не при импорте: иначе тест не
+    смог бы доказать откат, не поднимая процесс заново."""
+    return str(os.getenv("CASH_FACT", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+# ── §касса: ЧИСЛО ИЗ КЭША НЕ ВЫГЛЯДИТ КАК СВЕЖИЙ БАЛАНС (13.08.2026) ───────────────────────────
+# Группа двуязычная, и решение «ждать или считать наличные руками» принимает Пым — значит слово
+# «не сверено» обязано стоять на ОБОИХ языках и РЯДОМ С ЧИСЛОМ, а не только в метке блока: число
+# читают первым. Дата — часть ответа: без неё «не сверено» неотличимо от «не сверено вчера».
+_UNVERIFIED_HEAD = {
+    "ru": "⚠️ Баланс НЕ СВЕРЕН — таблица не ответила",
+    "th": "⚠️ ยอดยังไม่ได้ตรวจสอบ — ตารางไม่ตอบ",
+}
+_UNVERIFIED_TAIL = {
+    "ru": "последнее сверенное значение, {when}",
+    "th": "ยอดล่าสุดที่ตรวจสอบแล้ว {when}",
+}
+_UNVERIFIED_NOTIME = {"ru": "время неизвестно", "th": "ไม่ทราบเวลา"}
+_UNVERIFIED_EMPTY = {
+    "ru": "⚠️ Баланс НЕ СВЕРЕН — таблица не ответила, последнего значения нет",
+    "th": "⚠️ ยอดยังไม่ได้ตรวจสอบ — ตารางไม่ตอบ ไม่มียอดล่าสุด",
+}
+
+
+def _when_utc(at):
+    """Метка «когда это число было верно». None → честное «время неизвестно», а не выдумка."""
+    if at is None:
+        return None
+    try:
+        from datetime import datetime, timezone
+        # Осознанно tz-aware: `utcfromtimestamp` объявлен устаревшим и шумит в боевой лог,
+        # а метка обязана быть именно UTC (класс 17.07: локальные «09:xx» вместо «02:xx UTC»).
+        return datetime.fromtimestamp(float(at), timezone.utc).strftime("%d.%m %H:%M UTC")
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
+
+
+def _bal_verdict(bal):
+    """Принять И вердикт, И голый dict. Голый dict = путь, где ответ моста уже потерян вызывающим,
+    и назвать его иначе, чем свежим, нечем — поведение таких мест остаётся прежним байт-в-байт."""
+    if isinstance(bal, balance_fact.Balance):
+        return bal
+    return balance_fact.Balance(balance_fact.STATE_FRESH, bal or {})
+
+
+def _balance_block(label, bal, lang="ru"):
+    """Баланс столбиком: строка-метка «<label>:», затем валюты с отступом 2 пробела.
+
+    СВЕЖИЙ баланс печатается БАЙТ-В-БАЙТ как прежде. Не сверенный — под своей меткой и с пометкой
+    у самого числа; сказать нечего — не печатаем числа ВОВСЕ (нуль вместо баланса врал бы громче
+    молчания)."""
+    v = _bal_verdict(bal)
+    if v.fresh:
+        return [f"{label}:", *[f"  {p}" for p in _balance_parts(v.value)]]
+    lang = "th" if lang == "th" else "ru"
+    if not v.shows_number:
+        return [_UNVERIFIED_EMPTY[lang]]
+    when = _when_utc(v.at) or _UNVERIFIED_NOTIME[lang]
+    tail = _UNVERIFIED_TAIL[lang].format(when=when)
+    parts = _balance_parts(v.value)
+    return [_UNVERIFIED_HEAD[lang], f"  {parts[0]}  · {tail}", *[f"  {p}" for p in parts[1:]]]
 
 
 # ============================================================
@@ -1284,23 +1345,46 @@ def _recorded_unit(amount, currency):
     return f"{sign}{_fmt(abs(amount or 0))} {_cur_unit(cur)}"
 
 
-def msg_recorded_each(amount, bal, currency: str = "THB", wallet: str = "Самоорганизация"):
+# ── §касса: «ЗАПИСАЛ» — ЭТО УТВЕРЖДЕНИЕ, И ОНО ТРЕБУЕТ РАСПИСКИ ────────────────────────────────
+# Расписка потеряна → лист перечитан (`balance_fact.tx_verdict`). Строки нет — говорим прямо, что
+# НЕ записали. Перечитать не удалось — говорим, что не знаем, и просим проверить ПЕРЕД повтором:
+# главный риск здесь не потерянная строка, а вторая такая же, вписанная руками поверх легшей.
+_TX_ABSENT = {
+    "ru": "❌ НЕ записал  {rec} — строки в таблице нет, запиши вручную",
+    "th": "❌ บันทึกไม่สำเร็จ  {rec} — ไม่มีในตาราง กรุณาบันทึกด้วยมือ",
+}
+_TX_UNKNOWN = {
+    "ru": "⚠️ Записал ли  {rec} — НЕ ЗНАЮ, таблица не ответила. Проверь строку, прежде чем писать повторно",
+    "th": "⚠️ ไม่ทราบว่าบันทึก  {rec} สำเร็จหรือไม่ — ตารางไม่ตอบ กรุณาตรวจก่อนบันทึกซ้ำ",
+}
+
+
+def _recorded_head(word, rec, tx, lang):
+    """Шапка подтверждения. Расписки не спрашивали или факт доказан → прежнее слово байт-в-байт."""
+    if tx is None or getattr(tx, "landed", False):
+        return f"{word}  {rec}"
+    if getattr(tx, "absent", False):
+        return _TX_ABSENT[lang].format(rec=rec)
+    return _TX_UNKNOWN[lang].format(rec=rec)
+
+
+def msg_recorded_each(amount, bal, currency: str = "THB", wallet: str = "Самоорганизация", tx=None):
     """Касса (Самоорганизация): подтверждение каждой записи."""
     rec = _recorded_unit(amount, currency)
     return _bilingual(
         wallet,
-        [f"บันทึกแล้ว  {rec}", *_balance_block("ยอดคงเหลือ", bal)],
-        [f"Учтено  {rec}", *_balance_block("Баланс", bal)],
+        [_recorded_head("บันทึกแล้ว", rec, tx, "th"), *_balance_block("ยอดคงเหลือ", bal, "th")],
+        [_recorded_head("Учтено", rec, tx, "ru"), *_balance_block("Баланс", bal)],
     )
 
 
-def msg_recorded_cf(amount, bal, currency: str = "THB", wallet: str = "Money Cashflow"):
+def msg_recorded_cf(amount, bal, currency: str = "THB", wallet: str = "Money Cashflow", tx=None):
     """Money Cashflow: подтверждение записи."""
     rec = _recorded_unit(amount, currency)
     return _bilingual(
         wallet,
-        [f"บันทึกแล้ว  {rec}", *_balance_block("ยอดคงเหลือ", bal)],
-        [f"Записал  {rec}", *_balance_block("Баланс", bal)],
+        [_recorded_head("บันทึกแล้ว", rec, tx, "th"), *_balance_block("ยอดคงเหลือ", bal, "th")],
+        [_recorded_head("Записал", rec, tx, "ru"), *_balance_block("Баланс", bal)],
     )
 
 
@@ -1309,7 +1393,7 @@ def msg_topup_pettycash(amount, bal, wallet: str = "Самоорганизаци
     a = _fmt(abs(amount or 0))
     return _bilingual(
         wallet,
-        [f"เติมเงิน  +{a} ฿  (โอนมาจาก {source})", *_balance_block("ยอดคงเหลือ", bal),
+        [f"เติมเงิน  +{a} ฿  (โอนมาจาก {source})", *_balance_block("ยอดคงเหลือ", bal, "th"),
          "", f"{PYM_HANDLE} ถูกต้องไหมครับ?"],
         [f"Пополнение  +{a} ฿  (перенос из {source})", *_balance_block("Баланс", bal),
          "", f"{PYM_HANDLE}, всё верно?"],
@@ -1320,7 +1404,7 @@ def msg_reconcile(wallet, bal):
     """Периодическая сверка с Пымом — только по текущему кошельку."""
     return _bilingual(
         wallet,
-        [*_balance_block("ยอดคงเหลือ", bal), "",
+        [*_balance_block("ยอดคงเหลือ", bal, "th"), "",
          f"{PYM_HANDLE} เงินสดในมือตรงกับยอดในระบบไหมครับ? มีรายการตกหล่นไหม? 🙏"],
         [*_balance_block("Баланс", bal), "",
          f"{PYM_HANDLE} наличные на руках сходятся с балансом? Ничего не упустили? 🙏"],
@@ -1342,7 +1426,7 @@ def msg_undo(amount, description, bal, wallet: str = "Money Cashflow"):
     desc = f" ({description})" if description else ""
     return _bilingual(
         wallet,
-        [f"ยกเลิกรายการล่าสุดแล้ว:  {sign}{a} ฿", *_balance_block("ยอดคงเหลือ", bal)],
+        [f"ยกเลิกรายการล่าสุดแล้ว:  {sign}{a} ฿", *_balance_block("ยอดคงเหลือ", bal, "th")],
         [f"Отменил последнюю запись:  {sign}{a} ฿{desc}", *_balance_block("Баланс", bal)],
     )
 
@@ -2544,11 +2628,15 @@ async def _handle_money(msg, context, bridge, claude):
         _entry_counts[chat_id] = 0
 
     elif ptype == "question":
-        # Отвечаем балансом ТОЛЬКО этого кошелька (не палим другие кошельки)
-        this_bal = bridge.get_balance(group=wallet).get("balance", {})
+        # Отвечаем балансом ТОЛЬКО этого кошелька (не палим другие кошельки).
+        # Прямой вопрос «сколько в кассе?» — тот же класс: молчащий мост давал здесь «0 ฿»,
+        # то есть НОЛЬ вместо баланса, и кэша у этой ветки не было вовсе.
+        this_bal = (wallet_cache.answer(wallet, bridge.get_balance(group=wallet))
+                    if _cash_fact_on() else
+                    bridge.get_balance(group=wallet).get("balance", {}))
         await _send(context,
             chat_id=chat_id,
-            text=_bilingual(wallet, _balance_block("ยอดคงเหลือ", this_bal),
+            text=_bilingual(wallet, _balance_block("ยอดคงเหลือ", this_bal, "th"),
                             _balance_block("Баланс", this_bal)),
         )
 
@@ -2707,8 +2795,10 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
     # Возвраты депозита (минус) не трогаем — на возврате бронь уже «Завершена», подсказка спамила бы.
     dep_move = next((m for m in moves if m.get("deposit") and (m.get("amount") or 0) > 0), None)
     dep_link = _deposit_resolve_booking(bridge, dep_move.get("bike")) if dep_move else None
+    tx_facts = {}          # id(move) → balance_fact.TxFact; пусто = расписки в порядке
+    lost = []              # движения, чья расписка потеряна: их факт перечитываем ИЗ ЛИСТА
     for i, mv in enumerate(moves):
-        bridge.add_transaction(
+        r = bridge.add_transaction(
             msg_date=str(msg.date.date()) if msg.date else "",
             group=wallet,
             sender="@" + (msg.from_user.username or ""),
@@ -2722,6 +2812,24 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
             msg_id=f"{chat_id}:{msg.message_id}:m{i}",
             booking_id=(dep_link["booking_id"] if (dep_link and mv is dep_move) else ""),
         )
+        # РАСПИСКА ПРОВОДКИ ЧИТАЕТСЯ (13.08.2026). Писчее плечо пересылок не имеет намеренно и при
+        # молчании транспорта отдаёт «исход неизвестен: перечитай факт» — прежде это требование
+        # было адресовано некому: возврат не присваивался вовсе, и 13.08 проводка ушла в HTTP 302
+        # молча. Решение «перечитывать ли» берётся готовым у write_fact (форма _claim_task_verified).
+        if _cash_fact_on() and balance_fact.needs_verify(r):
+            lost.append(mv)
+            log.warning(f"  → касса: расписка проводки {mv.get('amount')} "
+                        f"{mv.get('currency')} потеряна ({(r or {}).get('error')}) — перечитаю лист")
+    if lost:
+        # ОДНО чтение на сообщение, а не на движение: лист у всех движений один и тот же.
+        # Здоровый путь сюда не заходит вовсе — цена платится только больным мостом.
+        summary = bridge.tx_summary(period="today")
+        for mv in lost:
+            sig = balance_fact.signature(mv.get("amount", 0), mv.get("currency") or "THB",
+                                         mv.get("category", "other"), mv.get("bike") or "")
+            fact = balance_fact.tx_verdict(sig, summary)
+            tx_facts[id(mv)] = fact
+            log.warning(f"  → касса: {fact.say()}")
 
     money_move = next((m for m in moves if m.get("currency") != "PASSPORT"), None)
     money_amount = money_move.get("amount", 0) if money_move else 0
@@ -2749,8 +2857,12 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
                               f"🧾 {PYM_HANDLE}, на чеке {_fmt(ramount)} {u}, а записано {_fmt(wamount)} {u} — "
                               f"не сходится, глянь пожалуйста 🙏"))
 
-    wallet_bal = wallet_cache.get_balance_with_fallback(
-        wallet, bridge.get_balance(group=wallet).get("balance", {}))
+    # БАЛАНС СУДИТСЯ ПО ЦЕЛОМУ ОТВЕТУ МОСТА, А НЕ ПО ИСТИННОСТИ СЛОВАРЯ (13.08.2026): `ok` с пустым
+    # балансом — честный ноль пустого кошелька, а молчание моста обязано звучать «не сверено».
+    wallet_bal = (wallet_cache.answer(wallet, bridge.get_balance(group=wallet))
+                  if _cash_fact_on() else
+                  wallet_cache.get_balance_with_fallback(
+                      wallet, bridge.get_balance(group=wallet).get("balance", {})))
 
     # === Перенос в мелкую кассу === (только денежное движение, паспорт не переносим)
     is_transfer = parsed.get("transfer_to_pettycash") and money_move and chat_id != PETTYCASH_CHAT_ID
@@ -2768,7 +2880,9 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
             raw=text,
             msg_id=f"{chat_id}:{msg.message_id}:topup",
         )
-        pc_bal = bridge.get_balance(group=PETTYCASH_LABEL).get("balance", {})
+        pc_bal = (wallet_cache.answer(PETTYCASH_LABEL, bridge.get_balance(group=PETTYCASH_LABEL))
+                  if _cash_fact_on() else
+                  bridge.get_balance(group=PETTYCASH_LABEL).get("balance", {}))
         await _send(context, chat_id=PETTYCASH_CHAT_ID,
                     text=msg_topup_pettycash(plus, pc_bal, wallet=PETTYCASH_LABEL, source=wallet))
 
@@ -2782,14 +2896,18 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
     elif dep_move:
         link_note = "\n⚠️ депозит: бронь по байку не определил — уточни бронь"
         log.info(f"  → депозит {dep_move.get('bike') or '—'}: бронь не определена (0/несколько)")
+    # Показываем факт ТОГО движения, которое и названо в подтверждении.
+    disp_tx = tx_facts.get(id(display_move)) if display_move is not None else None
     _entry_counts[chat_id] = _entry_counts.get(chat_id, 0) + 1
     if chat_id in MONEY_CONFIRM_EACH:
         await _send_retry(context, chat_id=chat_id,
-                          text=msg_recorded_each(disp_amount, wallet_bal, disp_currency, wallet=wallet) + link_note)
+                          text=msg_recorded_each(disp_amount, wallet_bal, disp_currency,
+                                                 wallet=wallet, tx=disp_tx) + link_note)
         _entry_counts[chat_id] = 0
     else:
         await _send_retry(context, chat_id=chat_id,
-                          text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency, wallet=wallet) + link_note)
+                          text=msg_recorded_cf(disp_amount, wallet_bal, disp_currency,
+                                               wallet=wallet, tx=disp_tx) + link_note)
         if _entry_counts[chat_id] >= RECONCILE_EVERY:
             await _send_retry(context, chat_id=chat_id, text=msg_reconcile(wallet, wallet_bal))
             _entry_counts[chat_id] = 0

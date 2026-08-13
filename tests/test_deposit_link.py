@@ -12,6 +12,7 @@ import os
 import sys
 import asyncio
 import datetime
+import tempfile
 import time
 
 sys.path.insert(0, "/root/turbobaby-manager-bot")
@@ -19,6 +20,11 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "x")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["PRETOOL_NOPUSH"] = "1"
+# §касса, 13.08.2026: кэш баланса — БОЕВОЕ состояние в корне репо. Без этой строки прогон писал в
+# него фикстурное «Money Cashflow: 1000» (так оно там и оказалось), и при больном мосте касса
+# подставила бы группе выдуманное тестом число. Сьют держит своё состояние в своём каталоге.
+os.environ["WALLET_CACHE_FILE"] = os.path.join(
+    tempfile.mkdtemp(prefix="tb_deposit_link_"), "wallet_cache.json")
 
 import splinter as S
 
@@ -64,7 +70,9 @@ class FakeBridge:
         return {"ok": True, "saved": True}
 
     def get_balance(self, **kw):
-        return {"balance": {"THB": 1000}}
+        # ЖИВОЙ ФОРМАТ ответа моста: `ok` есть ВСЕГДА (Bridge.js:284-285 → BotData.getBalance).
+        # Без него касса законно считает мост молчащим — а этот сьют про здоровый путь.
+        return {"ok": True, "balance": {"THB": 1000}}
 
 
 def crm(row, status, bike, booking_id):

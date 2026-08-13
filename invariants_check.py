@@ -1048,6 +1048,40 @@ def check_card_deadline_pure(world, run):
 _EXPECT_JOURNAL_PATH = None     # подменяется САМОТЕСТОМ; None → боевой expect_journal.py в репо
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12к: BALANCE_FACT_PURE
+#  Решение кассы (balance_fact.py) отвечает на два вопроса: свеж ли показанный баланс и стоит ли
+#  наша проводка в листе. Оно ОБЯЗАНО быть слепым к миру ровно потому, ради чего написано: появись
+#  у него сеть — оно смогло бы спросить мост САМО, и «сверено» стало бы зависеть от того, КАК
+#  спросили, а не от того, что ответил лист; появись файл — оно прочло бы кэш само и снова начало
+#  бы выдавать кэш за свежее число, то есть воскресило бы подмену, против которой стоит.
+#  Импорт РОВНО ОДИН — `write_fact` (у него свой один, `scan_result`): вокабуляр исходов записи и
+#  решение «перечитывать ли после этого ответа» берутся готовыми, второго словаря о тех же
+#  смыслах здесь не заводится. Разбор — тот же ast: имя в комментарии, строке и докстринге кодом
+#  не является (модуль о мосте и кэше ГОВОРИТ, и это законно).
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: нечитаемое решение доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_BALANCE_FACT_PATH = None       # подменяется САМОТЕСТОМ; None → боевой balance_fact.py в репо
+
+
+@register("BALANCE_FACT_PURE")
+def check_balance_fact_pure(world, run):
+    path = _BALANCE_FACT_PATH or os.path.join(REPO, "balance_fact.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("balance_fact.py", f"решение кассы не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset(("write_fact",)))
+    except SyntaxError as e:
+        run.flag("balance_fact.py", f"решение кассы не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"balance_fact.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")
