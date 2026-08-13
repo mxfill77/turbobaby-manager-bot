@@ -968,6 +968,41 @@ def check_fleet_cell_pure(world, run):
 
 
 # --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12г: WRITE_FACT_PURE
+#  Решение «легло / не легло / неизвестно» (write_fact.py) отвечает на один вопрос: стоит ли в
+#  перечитанной клетке ИМЕННО наша величина. Оно судит ПРИНЕСЁННОЕ и обязано быть слепым к миру:
+#  появись у него руки — оно смогло бы сходить за клеткой само, и тогда «записано» зависело бы от
+#  того, КАК спросили, а не от того, что в клетке. Хуже того, руками можно было бы ДОПИСАТЬ
+#  недостающее и назвать это фактом — ровно тот подлог, против которого модуль и стоит.
+#  Импорт РОВНО ОДИН — контракт `scan_result` (у которого импортов ноль): исходы клетки берутся
+#  готовыми, второго словаря о тех же смыслах здесь не заводится. Разбор — тот же ast, что у
+#  дежурного: имя в комментарии, строке и докстринге кодом не является.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: нечитаемое решение доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_WRITE_FACT_PATH = None         # подменяется САМОТЕСТОМ; None → боевой write_fact.py в репо
+_WRITE_FACT_ALLOWED_IMPORTS = frozenset(("scan_result",))
+
+
+@register("WRITE_FACT_PURE")
+def check_write_fact_pure(world, run):
+    path = _WRITE_FACT_PATH or os.path.join(REPO, "write_fact.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("write_fact.py", f"решение о факте записи не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=_WRITE_FACT_ALLOWED_IMPORTS)
+    except SyntaxError as e:
+        run.flag("write_fact.py", f"решение о факте записи не разбирается ({e}) — чистота "
+                                  f"не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"write_fact.py:{where}", why)
+
+
+# --------------------------------------------------------------------------------------------
 #  ИНВАРИАНТ 12з: CARD_DEADLINE_PURE
 #  Общий дедлайн сборки карточки «Инфо» (card_deadline.py) отвечает на один вопрос — сколько
 #  бюджета осталось и влезает ли в него ещё одно плечо. Он ОБЯЗАН быть слеп к миру: узнай он
@@ -1883,6 +1918,60 @@ def _self_test():
     finally:
         shutil.rmtree(_fc_dir, ignore_errors=True)
         _FLEET_CELL_PATH = _old_fc_path
+
+    # ── 11б. WRITE_FACT_PURE (решение о факте записи: судит принесённое, за клеткой не ходит) ─
+    # Смысл секции: доказать, что страж ловит РУКИ, а не слова. У модуля разрешён РОВНО ОДИН
+    # импорт — `scan_result`; мост в докстринге законен (модуль о нём ГОВОРИТ), мост в импорте —
+    # нет (тогда он смог бы сходить за клеткой сам, и «записано» перестало бы быть фактом).
+    global _WRITE_FACT_PATH
+    _old_wf_path = _WRITE_FACT_PATH
+    _wf_dir = tempfile.mkdtemp()
+    try:
+        _wf_cases = [
+            ("FACT живой модуль чист", 0, None),
+            ("FACT импорт контракта законен", 0,
+             "from scan_result import OUTCOME_EMPTY\ndef v(c):\n    return OUTCOME_EMPTY\n"),
+            ("FACT getattr/isinstance законны (судит принесённое)", 0,
+             "from scan_result import OUTCOME_EMPTY\n"
+             "def v(c):\n    return getattr(c, 'ok', False) if isinstance(c, object) else None\n"),
+            ("FACT посторонний импорт → флаг (у модуля ровно один)", 1,
+             "from scan_result import OUTCOME_EMPTY\nimport re\n"),
+            ("FACT импорт моста → флаг (за клеткой ходить не вправе)", 1,
+             "import bridge_client\n"),
+            ("FACT голый open() → флаг", 1,
+             "from scan_result import OUTCOME_EMPTY\nf = open('/tmp/x')\n"),
+            ("FACT bc.set_fleet_oil → флаг (импорт + рука в живую таблицу)", 2,
+             "import bridge_client as bc\nbc.set_fleet_oil(number='1', oil_km=1)\n"),
+            ("FACT имя моста в ДОКСТРИНГЕ и комментарии — не флаг", 0,
+             '"""клетку приносит bridge_client — сам модуль за ней не ходит"""\n'
+             "from scan_result import OUTCOME_EMPTY\n# bridge_client тут только словом\n"),
+            ("FACT модуль не парсится → флаг (fail-closed)", 1, "def broken(:\n"),
+        ]
+        for _wf_title, _wf_expect, _wf_src in _wf_cases:
+            if _wf_src is None:
+                _WRITE_FACT_PATH = None                      # боевой write_fact.py
+            else:
+                _wf_p = os.path.join(_wf_dir, "write_fact.py")
+                with open(_wf_p, "w", encoding="utf-8") as _f:
+                    _f.write(_wf_src)
+                _WRITE_FACT_PATH = _wf_p
+            _wf_run = CheckRun("WRITE_FACT_PURE")
+            check_write_fact_pure(_healthy_world(), _wf_run)
+            _wf_got = len(_wf_run.findings)
+            _wf_ok = (_wf_got == _wf_expect)
+            allpass &= _wf_ok
+            print(f"  {'PASS' if _wf_ok else 'FAIL'}  [WRITE_FACT_PURE] {_wf_title}: "
+                  f"ждали {_wf_expect}, поймали {_wf_got}")
+        _WRITE_FACT_PATH = os.path.join(_wf_dir, "нет-такого.py")
+        _wf_run = CheckRun("WRITE_FACT_PURE")
+        check_write_fact_pure(_healthy_world(), _wf_run)
+        _wf_ok = (len(_wf_run.findings) == 1)
+        allpass &= _wf_ok
+        print(f"  {'PASS' if _wf_ok else 'FAIL'}  [WRITE_FACT_PURE] FACT файла нет → флаг "
+              f"(fail-closed): ждали 1, поймали {len(_wf_run.findings)}")
+    finally:
+        shutil.rmtree(_wf_dir, ignore_errors=True)
+        _WRITE_FACT_PATH = _old_wf_path
 
     # ── 12. PROD_DRIFT_READONLY (голдены на ДОСЛОВНОМ коде: каждая «рука» обязана краснеть) ──
     # Смысл секции: доказать, что страж ловит именно РУКИ, а не слова. Поэтому рядом стоят пары

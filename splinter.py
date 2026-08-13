@@ -24,6 +24,7 @@ import wallet_cache    # §касса: персистентный fallback-кэ�
 import scan_result     # контракт читателя живого текста: пара «осмотрено/разобрано» + исход
 import fleet_cell      # контракт клетки Лист1: значение / пусто / не-число / нечитаемо
 import card_deadline   # общий дедлайн сборки карточки «Инфо» + слова о непрочитанном
+import write_fact      # синк зеркала по ПЕРЕЧИТАННОМУ факту, а не по флагу расписки
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -6060,6 +6061,40 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     return True
 
 
+def _sp_fact_after_write(bridge, bike, plate, kind, km):
+    """РУКИ перечитывания: расписки нет → сходить в Лист1 и принести КЛЕТКУ (решение — `write_fact`).
+
+    Зовётся ТОЛЬКО после неудачи записи (`write_fact.needs_verify`), поэтому здоровый путь не
+    платит ни одного лишнего обращения к мосту — замер и цена в докстринге `write_fact`.
+    Форма взята у `_claim_task_verified`: после клиентского сбоя write — немедленное read-only
+    чтение целевого места. Любая дырка в фактах (мост молчит · строки парка нет · номер
+    неоднозначен · разметки клеток нет) → `unknown`, и записанным это НЕ считается."""
+    field = write_fact.field_for(kind)
+    if field is None:
+        return write_fact.unknown(km, f"вид «{kind}» в колонке Лист1 не живёт — перечитывать нечего")
+    want = str(plate or _plate_from_name(bike) or "")
+    if not want:
+        return write_fact.unknown(km, f"номер байка из «{bike}» не выделен — искать строку нечем")
+    try:
+        fr = bridge.fleet(cells=True)
+    except Exception as e:
+        return write_fact.unknown(km, f"парк не прочитан (fleet упал: {e})")
+    if not isinstance(fr, dict) or not fr.get("ok"):
+        why = (fr or {}).get("error") if isinstance(fr, dict) else "ответ не словарь"
+        return write_fact.unknown(km, f"парк не прочитан (мост: {why})")
+    rows = ((fr.get("data") or {}).get("bikes") or [])
+    hits = [b for b in rows if isinstance(b, dict)
+            and _plate_from_name(b.get("name", "")) == want]
+    if len(hits) != 1:
+        return write_fact.unknown(km, f"строк парка по номеру {want}: {len(hits)} из "
+                                      f"{len(rows)} — судить не на чем")
+    try:
+        cell = bridge.cell(hits[0], field)
+    except Exception as e:
+        return write_fact.unknown(km, f"клетка «{field}» не прочитана ({e})")
+    return write_fact.verdict(km, cell)
+
+
 async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=""):
     """ШАГ 5 (КРАСНЫЙ): по «да» доверенного пишем СДЕЛАННЫЕ позиции. Сторож km_decreasing НЕ трогаем
     (он на стороне set_fleet_*). Каждая колоночная позиция: set_fleet_* (кол.I/J/K/L, confirmed=True)
@@ -6092,7 +6127,15 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                     r = bridge.set_fleet_oil(number=plate, oil_km=odo_int, confirmed=True)
                 else:
                     r = bridge.set_fleet_service(number=plate, kind=k, km=odo_int, confirmed=True)
-                if r.get("ok"):
+                # СИНК РЕШАЕТ ПЕРЕЧИТАННЫЙ ФАКТ, А НЕ ФЛАГ РАСПИСКИ (13.08.2026). Расписка не
+                # пришла → величина в Лист1 могла ЛЕЧЬ (плечо одно, пересылок нет), и прежний
+                # `if r.get("ok")` гасил синк зеркала на ровном месте. См. `write_fact`.
+                fact = None
+                if not r.get("ok") and write_fact.needs_verify(r):
+                    fact = _sp_fact_after_write(bridge, bike, plate, k, odo_int)
+                    log.warning(f"  → ТО {bike} {k} {odo_int}: расписка не пришла "
+                                f"({r.get('error')}) — {fact.say()}")
+                if r.get("ok") or (fact is not None and fact.landed):
                     bridge.service_upsert(bike=bike, service_type=k, current_km=odo_int,
                                           last_service_km=odo_int, interval_km=iv)
                     try:
@@ -6101,7 +6144,9 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                         pass
                     written.append(k)
                 else:
-                    failed.append((k, r.get("error")))
+                    # Исход неудачи называется вслух: «не легло» и «неизвестно» — РАЗНЫЕ вещи.
+                    failed.append((k, r.get("error") if fact is None
+                                   else f"{r.get('error')}/{fact.state}"))
             else:
                 # фильтр/колодки/цепь/прочее — регистра нет → событие с одометром (фаза2 scope)
                 lbl = _SP_KIND_LABEL.get(k, (k, k))[1]
