@@ -40,6 +40,11 @@ os.environ["STEP_SELFHEAL"] = "0"
 os.environ["PLAN_ADAPT"] = "0"
 os.environ["CARD_DUTY"] = "0"
 os.environ["CURATOR"] = "0"
+# АДРЕС НАБЛЮДЕНИЯ ЗАФИКСИРОВАН НА ДО-13.08: секция (13) судит РУКИ и утверждает прежний
+# договор «нарушение найдено → заметка владельцу немедленно». С 13.08 наблюдение уходит в мозг,
+# а владельцу — только тяжёлое, пережившее отсрочку (свой регресс — tests/test_expect_journal.py).
+# Форсируем, а не setdefault: headless-тест наследует env демона с боевыми флагами (класс CURATOR).
+os.environ["EXPECT_TO_BRAIN"] = "0"
 os.environ["ORCH_TEST_MODE"] = "1"
 os.environ["PRETOOL_NOPUSH"] = "1"
 

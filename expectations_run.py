@@ -36,6 +36,24 @@ PROD_DRIFT_READONLY и покрыта своими тестами, дубль т
 ту же вставшую очередь и создаст ВИДИМОСТЬ действия), поэтому у нарушения «демон не даёт
 оборота» задачи не бывает никогда.
 
+АДРЕС НАБЛЮДЕНИЯ — МОЗГ, А НЕ ВЛАДЕЛЕЦ (13.08.2026, решение владельца). Замер 5.65 суток:
+владельцу ушло 67 сообщений слоя, ОТВЕТА ждало НОЛЬ — ни у одной заметки нет ни кнопки, ни
+номера, ни слова «да». По §3 рамки карточки идут в инбокс, а наблюдение карточкой не является,
+значит его место — журнал мозга. Теперь: наблюдение пишется в `cc_log` (канонический путь
+`cclog.write_cclog`, R16), а владельцу уходит ТОЛЬКО то, что пережило отсрочку И задевает
+деньги, живые таблицы или клиентский контур (решает чистая функция `expect_journal`).
+
+ОТСРОЧКА ВЗЯТА ЗАМЕРОМ ЖИЗНИ ЭПИЗОДОВ, а не на глаз: из 33 закрытых эпизодов окна 31 прожил
+≤42 мин (o5s 6…18 · o2d 10…30 · o3 10…42), а два оставшихся — 642 и 785 мин. Между 42 и 642
+ПУСТО, поэтому любое значение из [43, 641] мин гасит РОВНО те же 31; внутри этой полосы взято
+число, которое слой уже означает словом «нарушение держится», — `EXPECT_HOLD_MIN` = 60 мин.
+Своя ручка `EXPECT_OWNER_DEFER_MIN` (мин) её переопределяет.
+
+ОДНА СТРОКА НА ЭПИЗОД, А НЕ НА ТИК. Длительность растёт в СОСТОЯНИИ (поле `ticks`/`last`), а на
+диск идёт одна строка — при закрытии, с началом, концом и длительностью. Эпизод, переживший
+отсрочку, получает вторую и последнюю строку «держится»: иначе о самом долгом нарушении в
+журнале не было бы ни слова до его конца. На замере это 35 строк на 33 эпизода.
+
 ПРОТИВ read-and-ignore: одно сообщение на эпизод и одно на его закрытие. Повторов-напоминаний
 НЕТ намеренно — это ровно тот шум, за который 05.08 отозван класс push из ленты.
 
@@ -46,6 +64,8 @@ FAIL-SAFE: любой сбой сбора → факта нет → вердик
 соответствующей ветки = 0 в .env (EXPECT_NEW_MIN / EXPECT_TURN_MIN / EXPECT_TICK_MIN /
 EXPECT_PC_MIN / EXPECT_BRIDGE_MIN / EXPECT_BRIDGE_SLOW_SEC), либо EXPECT_TASK=0 — тогда живут
 только заметки, задач не ставится вовсе. У О4 и О5 задачи не бывает НИКОГДА и без этого флага.
+ОТКАТ АДРЕСА отдельной ручкой: `EXPECT_TO_BRAIN=0` — в мозг не пишется ничего, все заметки
+уходят владельцу в ленту БАЙТ-В-БАЙТ как до 13.08.2026.
 """
 import json
 import os
@@ -60,9 +80,13 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(REPO, ".env"))
 
 import expectations
+import expect_journal              # чистая функция «вердикт → адрес и строка журнала»
 import prod_drift                  # только read-only разведка /proc (live/started_at)
 
 LANE = "VPS"                       # метка полосы в заметке; на зеркале ПК обязана стать «ПК»
+# Журнал СВОЕЙ полосы: у VPS это cc_log. Зеркало ПК обязано сменить ключ на свой (cowork_log).
+JOURNAL_DOC = "cc_log"
+OWNER_DEFER_ENV, OWNER_DEFER_DEFAULT = "EXPECT_OWNER_DEFER_MIN", 60.0   # замер: полоса [43,641]
 PULSE_DIR = "/tmp/cc_expect_pulse"          # сюда демон пишет оборот cycle() (см. _expect_pulse)
 STATE_DIR = "/tmp/cc_expect_seen"           # открытые эпизоды: о чём уже сказали
 SPLINTER_LOG = os.path.join(REPO, "splinter.log")
@@ -485,6 +509,63 @@ def send_note(text):
         return False
 
 
+def _is_test_run():
+    """Прогон под тестом/гейтом. Изоляция канала обязательна: строка фикстуры, доехавшая до
+    боевого cc_log, портит журнал мозга ровно так же, как её доехавший пуш портил личку
+    владельцу (класс «канал 2 изоляции проб»)."""
+    for name in ("ORCH_TEST_MODE", "PYTEST_CURRENT_TEST", "PRETOOL_TEST_RUN"):
+        if (os.environ.get(name) or "").strip():
+            return True
+    return False
+
+
+def write_journal(text):
+    """СТРОКА НАБЛЮДЕНИЯ В МОЗГ. Канонический путь — `cclog.write_cclog` (правило R16: прямой
+    `write_doc(name="cc_log")` минует length-guard и защиту от затирки).
+
+    Не удалось записать → False, и эпизод НЕ помечается: скажем на следующем прогоне. Терять
+    наблюдение молча нельзя — ради этого адрес и менялся."""
+    if _is_test_run():
+        print("[тест] в мозг НЕ пишем: %s" % str(text)[:160])
+        return True
+    try:
+        import cclog
+        return bool(cclog.write_cclog("NOTE", str(text), label="expectations"))
+    except Exception as e:                                           # noqa: BLE001
+        print("наблюдение не записано в мозг (%s)" % e, file=sys.stderr)
+        return False
+
+
+def _to_brain():
+    """Ручка отката адреса: EXPECT_TO_BRAIN=0 → поведение до 13.08.2026 байт-в-байт."""
+    return str(os.environ.get("EXPECT_TO_BRAIN") or "1").strip() not in ("0", "no", "off")
+
+
+def _frozen_client():
+    """Заморожен ли КЛИЕНТСКИЙ контур. Та же ручка, что у `revizor_route`/devbot: одно решение
+    владельца обязано читаться одним способом, иначе у него будет две правды."""
+    try:
+        import revizor_route
+        return "client" in revizor_route.frozen_keys(os.environ.get("CONTOUR_FREEZE", "client"))
+    except Exception:                                                # noqa: BLE001
+        return True            # не смогли спросить → считаем замороженным (как сегодня в проде)
+
+
+def _owner_defer():
+    """Сколько эпизод обязан прожить, прежде чем тяжёлое дойдёт до владельца (сек)."""
+    return expectations.limit_env(OWNER_DEFER_ENV, OWNER_DEFER_DEFAULT, os.environ)
+
+
+# Поля вердикта, которые переживают эпизод в состоянии: по ним строится ЧИСЛО журнальной строки.
+# Числа остаются теми, что были В МОМЕНТ ОБНАРУЖЕНИЯ, — это сказано в самой строке словом
+# «начало», и подменять их свежими при закрытии значило бы переписать историю задним числом.
+_KEEP_V = ("kind", "key", "id", "sha", "dt", "limit", "free", "age")
+
+
+def _trim_v(v):
+    return {k: (v or {}).get(k) for k in _KEEP_V if (v or {}).get(k) is not None}
+
+
 def close_detail(key, facts):
     """Чем закрытие эпизода объясняет само себя. Для О4 это ДОСЛОВНАЯ первая строка вернувшегося
     ПК: он единственный знает, почему молчал («🛌 ПК СПАЛ 51 м 43 с — весь контур стоял»), и
@@ -549,27 +630,50 @@ def run(dry=False, now=None):
     out = {"verdicts": len(verdicts), "notes": [], "tasks": [], "closed": [],
            # ОТСРОЧЕННЫЕ И ПОГАШЕННЫЕ ОТСРОЧКОЙ — В СЧЁТЕ, А НЕ В НЕБЫТИИ: владельцу их не
            # показывали, но итог прогона уходит в журнал таймера, и там они названы числом.
-           "held": [], "quiet": [], "dry": bool(dry)}
+           "held": [], "quiet": [], "journal": [], "dry": bool(dry)}
+    brain = _to_brain()
+    frozen = _frozen_client()
+    owner_defer = _owner_defer()
 
-    # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: владелец обязан узнать, что кончилось, даже если сейчас
-    #    открылось что-то новое.
+    # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: закончившееся обязано быть названо раньше начавшегося.
     for key in expectations.closures(facts, cfg, list(open_eps.keys())):
-        if not (open_eps.get(key) or {}).get("noted"):
-            # ЗАКРЫЛСЯ, НЕ ДОЖИВ ДО ОБЪЯВЛЕНИЯ. Владелец о нём не слышал — значит и «снова
-            # выполняется» ему не о чем: закрытие того, чего не объявляли, было бы той же
-            # заметкой, только задом наперёд. Тишина здесь полная и намеренная.
-            open_eps.pop(key, None)
-            out["quiet"].append(key)
-            if not dry:
-                st["quiet"] = _bump_quiet(st, key)
-            continue
+        rec = open_eps.get(key) or {}
+        detail = close_detail(key, facts)
         if dry:
             out["closed"].append(key)
             open_eps.pop(key, None)
             continue
-        if send_note(expectations.render_close(key, LANE, close_detail(key, facts))):
+        # 1а. В МОЗГ — ВСЕГДА И ПРО ЛЮБОЙ эпизод, включая тот, о котором владелец не слышал:
+        #     «не пошло владельцу» не значит «не было». Это и есть одна строка на эпизод —
+        #     с началом, концом и длительностью, которая копилась в состоянии.
+        #     ПОМЕТКА СТАВИТСЯ СРАЗУ ПОСЛЕ ЗАПИСИ и переживает прогон: иначе провал СЛЕДУЮЩЕГО
+        #     шага (заметка владельцу) вернул бы нас сюда и положил в журнал вторую строку об
+        #     одном эпизоде — ровно то, что правило «одна строка на эпизод» и запрещает.
+        if brain and not rec.get("closed_j"):
+            first = float(rec.get("first") or now)
+            v = rec.get("v") or {"kind": rec.get("kind"), "key": key}
+            if not write_journal(expect_journal.line(v, LANE, first, now, "закрыт",
+                                                     rec.get("ticks"), detail)):
+                continue                       # не записалось → эпизод жив, скажем на следующем
+            rec["closed_j"] = 1
+            open_eps[key] = rec
+            out["journal"].append(key)
+        elif not brain and not rec.get("noted"):
+            # ОТКАТ (EXPECT_TO_BRAIN=0): прежняя тишина о том, чего не объявляли.
             open_eps.pop(key, None)
+            out["quiet"].append(key)
+            st["quiet"] = _bump_quiet(st, key)
+            continue
+        # 1б. ВЛАДЕЛЬЦУ — только если ему объявляли начало: закрытие того, о чём он не слышал,
+        #     было бы той же заметкой, только задом наперёд.
+        if rec.get("noted") and not send_note(expectations.render_close(key, LANE, detail)):
+            continue
+        if not rec.get("noted"):
+            out["quiet"].append(key)
+            st["quiet"] = _bump_quiet(st, key)
+        else:
             out["closed"].append(key)
+        open_eps.pop(key, None)
 
     # 2. НАРУШЕНИЯ.
     task_on = str(os.environ.get("EXPECT_TASK") or "1").strip() not in ("0", "no", "off")
@@ -577,37 +681,66 @@ def run(dry=False, now=None):
         key = str(v.get("key"))
         rec = open_eps.get(key) or {}
         first = float(rec.get("first") or now)
+        # ДЛИТЕЛЬНОСТЬ ОБНОВЛЯЕТСЯ КАЖДЫЙ ТИК, А НА ДИСК НЕ ХОДИТ: журнал получит ОДНУ строку с
+        # готовым числом при закрытии. Вес считается ОДИН раз — при первом обнаружении, пока
+        # факты под рукой (у закрытия их уже не будет: эпизод закрылся именно потому, что
+        # нарушения в фактах больше нет).
+        if rec:
+            is_heavy, why = bool(rec.get("heavy")), str(rec.get("why") or "")
+        else:
+            is_heavy, why = expect_journal.heavy(v, facts, frozen)
+        rec.update({"first": first, "last": now, "ticks": int(rec.get("ticks") or 0) + 1,
+                    "kind": v.get("kind"), "v": _trim_v(v),
+                    "heavy": bool(is_heavy), "why": why})
+        rec.setdefault("noted", 0)
+        rec.setdefault("task", 0)
+        open_eps[key] = rec
+        held = max(0.0, now - first)
+        # Отсрочка адреса и отсрочка самого О3 (окно правки) складываются по СИЛЬНЕЙШЕЙ: обе
+        # говорят «рано», и уступить надо той, что говорит это дольше.
+        defer = max(owner_defer if brain else 0.0, float(v.get("defer") or 0.0))
         if not rec.get("noted"):                           # ВЛАДЕЛЬЦУ ЕЩЁ НЕ СКАЗАНО
-            defer = float(v.get("defer") or 0.0)
-            if defer > 0 and (now - first) < defer:
-                # ОТСРОЧКА. Запись заводится СРАЗУ и переживает прогон — иначе отсрочка стала бы
-                # отменой: без памяти о первом обнаружении эпизод отсчитывал бы её заново каждый
-                # раз и не был бы объявлен НИКОГДА. Исход мог смениться — храним свежий.
-                rec.update({"first": first, "noted": 0, "task": 0,
-                            "kind": v.get("kind"), "defer": defer})
-                open_eps[key] = rec
+            if brain:
+                addr, addr_why = expect_journal.address(v, facts, held, defer, frozen)
+            else:                                          # ОТКАТ: прежний путь байт-в-байт
+                addr = (expect_journal.BRAIN_AND_OWNER if held >= defer
+                        else expect_journal.BRAIN)
+                addr_why = "откат EXPECT_TO_BRAIN=0: адрес не судится"
+            # СТРОКА «ДЕРЖИТСЯ» — ПЕРЕЖИВШЕМУ ОТСРОЧКУ, БЕЗ ОГЛЯДКИ НА АДРЕС. Эпизод может не
+            # закрыться никогда, и тогда закрывающей строки не будет вовсе: без этой в журнале
+            # не осталось бы ни слова о самом долгом нарушении. Пишется РОВНО один раз (`held_j`),
+            # и одинаково для тяжёлого и лёгкого — в мозг идёт ВСЁ, а адрес решает только, узнает
+            # ли о нём вдобавок владелец.
+            if brain and held >= defer and not rec.get("held_j") and not dry:
+                if write_journal(expect_journal.line(v, LANE, first, now, "держится",
+                                                     rec.get("ticks"), addr_why)):
+                    rec["held_j"] = 1
+                    out["journal"].append(key)
+            if addr == expect_journal.BRAIN_AND_OWNER:
+                if dry:
+                    out["notes"].append(key)
+                    rec["noted"] = now
+                else:
+                    shown = dict(v)
+                    if held > 0:
+                        shown["held"] = held               # заметка САМА скажет, сколько её ждали
+                    proof = write_proof(shown, facts, now)  # доказательство ДО канала: улики летучи
+                    if send_note(expectations.render(shown, LANE)):
+                        rec["noted"] = now
+                        rec["proof"] = proof
+                        out["notes"].append(key)
+                    # не ушла → не помечаем, скажем на следующем прогоне
+            else:
+                # ВЛАДЕЛЬЦУ НЕ ИДЁТ. Эпизод жив, длительность копится; в журнал он попадёт при
+                # закрытии одной строкой (а если переживёт отсрочку — строкой «держится» выше).
                 out["held"].append(key)
-                continue
-            if dry:
-                out["notes"].append(key)
-                open_eps[key] = {"first": first, "noted": now, "task": 0, "kind": v.get("kind")}
-                continue
-            shown = dict(v)
-            if rec and now > first:
-                shown["held"] = now - first                # заметка САМА скажет, сколько её ждали
-            proof = write_proof(shown, facts, now)         # доказательство ДО канала: улики летучи
-            if not send_note(expectations.render(shown, LANE)):
-                if rec:
-                    open_eps[key] = rec                    # память о первом обнаружении не теряем
-                continue                                   # не помечаем — скажем на следующем прогоне
-            open_eps[key] = {"first": first, "noted": now, "task": 0,
-                             "kind": v.get("kind"), "proof": proof}
-            out["notes"].append(key)
-            continue
-        # ЭПИЗОД УЖЕ ОБЪЯВЛЕН. Повторов нет; единственное, что может добавиться, — задача.
+        # ЗАДАЧА-ЭСКАЛАЦИЯ ЖИВЁТ СВОИМ ПРАВИЛОМ И ОТ АДРЕСА ЗАМЕТКИ НЕ ЗАВИСИТ. До правки она
+        # стояла за проверкой «владельцу уже сказано», и это было БЕЗ РАЗНИЦЫ (заметка уходила
+        # сразу, значит `noted` стоял всегда). Теперь большинство эпизодов владельцу не идёт —
+        # оставить её там значило бы молча отнять реакцию, а менялся только АДРЕС.
         if rec.get("task") or not task_on or not v.get("can_task"):
             continue
-        if now - first < float(cfg.get("hold") or 0):
+        if held < float(cfg.get("hold") or 0):
             continue                                       # ещё не «держится»
         if _tasks_today(st, now) + len(out["tasks"]) >= TASK_CAP_DAY:
             continue                                       # потолок суток — страховка от петли
@@ -621,9 +754,17 @@ def run(dry=False, now=None):
         open_eps[key] = rec
         st.setdefault("tasks", []).append({"ts": now, "id": tid, "key": key})
         out["tasks"].append({"key": key, "id": tid})
-        send_note("🔔 нарушение держится · %s · поставил задачу %s на разбор причины (read-only; "
-                  "живые процессы и данные не трогаются) · %s"
-                  % (LANE, tid, expectations.render(v, LANE).split(" · ", 2)[-1]))
+        said = ("🔔 нарушение держится · %s · поставил задачу %s на разбор причины (read-only; "
+                "живые процессы и данные не трогаются) · %s"
+                % (LANE, tid, expectations.render(v, LANE).split(" · ", 2)[-1]))
+        # Владельцу — только если ему объявляли сам эпизод: иначе он получил бы сообщение о
+        # задаче по нарушению, о котором не слышал. О самой задаче он и так узнает её отчётом
+        # в 328, когда она отработает, — вторая дверь тут лишняя.
+        if rec.get("noted"):
+            send_note(said)
+        elif brain:
+            write_journal("%s %s · %s" % (expect_journal.TAG,
+                                          expect_journal.SHORT.get(str(v.get("kind")), "?"), said))
 
     if not dry:
         st["open"] = dict(list(open_eps.items())[-STATE_KEEP:])

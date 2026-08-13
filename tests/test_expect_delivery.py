@@ -35,6 +35,12 @@ sys.path.insert(0, REPO)
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["PRETOOL_NOPUSH"] = "1"
+# АДРЕС НАБЛЮДЕНИЯ ЗАФИКСИРОВАН НА ДО-13.08: секция (16) судит РУКИ и меряет ОТСРОЧКУ ОКНА
+# ПРАВКИ (30 мин) — её голдены стоят на том, что пережившее отсрочку уходит владельцу СРАЗУ.
+# С 13.08 поверх лежит вторая отсрочка (адрес, 60 мин), и без этой строки секция мерила бы
+# сумму двух правил вместо своего. Предмет секции не изменён; новый адрес судит свой регресс
+# tests/test_expect_journal.py. Форсируем, а не setdefault (класс CURATOR: env демона).
+os.environ["EXPECT_TO_BRAIN"] = "0"
 
 import expectations as E
 
