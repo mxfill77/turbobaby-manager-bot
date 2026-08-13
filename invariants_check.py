@@ -968,6 +968,38 @@ def check_fleet_cell_pure(world, run):
 
 
 # --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12з: CARD_DEADLINE_PURE
+#  Общий дедлайн сборки карточки «Инфо» (card_deadline.py) отвечает на один вопрос — сколько
+#  бюджета осталось и влезает ли в него ещё одно плечо. Он ОБЯЗАН быть слеп к миру: узнай он
+#  время сам — и «сколько осталось» перестало бы зависеть от того, когда открыли бюджет; получи
+#  он сеть или файл — и решение о потолке могло бы само стоить секунд, которые считает. Держится
+#  это отсутствием инструментов: импортов НОЛЬ (ни времени, ни сети, ни файлов, ни подпроцессов).
+#  Руки живут отдельно: `bridge_client.card_budget` (кто открывает бюджет и режет лестницы) и
+#  `splinter._build_bike_card` (кто собирает карточку) — их проверяет tests/test_info_card_deadline.py.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_CARD_DEADLINE_PATH = None      # подменяется САМОТЕСТОМ; None → боевой card_deadline.py в репо
+
+
+@register("CARD_DEADLINE_PURE")
+def check_card_deadline_pure(world, run):
+    path = _CARD_DEADLINE_PATH or os.path.join(REPO, "card_deadline.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("card_deadline.py", f"решение дедлайна не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("card_deadline.py", f"решение дедлайна не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"card_deadline.py:{where}", why)
+
+
+# --------------------------------------------------------------------------------------------
 #  ИНВАРИАНТ 13: PROD_DRIFT_READONLY
 #  Детектор дрейфа прода (prod_drift.py) видит, что живой процесс отстал от origin/main, и
 #  ГОВОРИТ об этом. Решение владельца — «детектор без рестарта»: автоматики перезапуска живых

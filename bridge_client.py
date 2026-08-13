@@ -17,6 +17,7 @@ import unicodedata
 import requests
 import task_metrics                 # общий детектор тест-прогона (стор дедупа: проба ≠ бой)
 import fleet_cell                   # контракт клетки Лист1: исход вместо голого нуля
+import card_deadline                # общий дедлайн сборки карточки: решение (у модуля ноль импортов)
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -222,6 +223,91 @@ def _dedup_remember(key: str, task_id) -> None:
         log.debug("дедуп постановки: стор не обновлён (%s) — постановка не затронута", e)
 
 
+# ============ ОБЩИЙ ДЕДЛАЙН СБОРКИ ОДНОЙ КАРТОЧКИ (13.08.2026, замер 06:53) ============
+# Решение — чистый `card_deadline` (у него ноль импортов, он не умеет ни узнать время, ни сходить
+# в сеть). Здесь — РУКИ: кто открывает бюджет и кто режет по нему три вложенные лестницы повторов
+# (полные попытки `_durable_request` × хопы редиректа `_exchange` × попытки эхо `_fetch_redirect_
+# target`). Потолок — на ВСЮ карточку: лестницы остаются, но исчерпать бюджет целиком не могут.
+#
+# ContextVar, а не поле клиента: клиент один на процесс и его делят разные потоки/задачи, а бюджет
+# принадлежит ОДНОЙ сборке. Вне открытого бюджета значение None → все проверки ниже пропускают,
+# то есть путь БАЙТ-В-БАЙТ прежний (демон, аудитор, health моста дедлайна не видят вовсе).
+_CARD_BUDGET = contextvars.ContextVar("bridge_card_budget", default=None)
+
+CARD_DEADLINE_ERROR = "card_deadline"
+
+# Ошибки, после которых источник считается НЕ ПРОЧИТАННЫМ — карточка обязана сказать это вслух.
+# Семантический отказ моста сюда НЕ входит: `service_pending_get` отвечает `not_found`, когда
+# открытой заявки просто НЕТ, — источник ответил, и ответ «пусто». Смешать их значило бы кричать
+# «не прочитано» на каждой здоровой карточке, а крик, звучащий всегда, перестают слышать.
+UNREAD_ERRORS = frozenset((
+    "timeout", "request_failed", "json_parse_error", "unauthorized",
+    "receipt_unknown", "unknown_action", CARD_DEADLINE_ERROR,
+))
+
+
+class CardBudgetExpired(Exception):
+    """Общий бюджет карточки исчерпан — новое HTTP-плечо не начинаем.
+    Ловится в `_one_exchange` и превращается в честный контракт {ok:false, error:'card_deadline'}:
+    наружу уходит ОТВЕТ, а не исключение, — сборка карточки продолжается и досказывает остальное."""
+
+
+class CardBudget:
+    """Состояние одной сборки: до какого момента она вправе идти и что не успела прочитать.
+
+    Копит НЕ ПРОЧИТАННОЕ по ходу дела, потому что спросить об этом задним числом уже не у кого:
+    `find_bike` на сбое моста отдаёт `{}` — ровно то же, что при «байка нет в парке». Отличить
+    молчание источника от честной пустоты может только тот, кто видел ответ, — то есть это место."""
+
+    def __init__(self, budget, started, deadline):
+        self.budget = budget
+        self.started = started
+        self.deadline = deadline
+        self.unread = {}        # действие → ошибка, из-за которой источник не прочитан
+        self.answered = set()   # действия, ответившие ХОТЬ ЧЕМ-ТО (в т.ч. честным «not_found»)
+        self.deadline_hit = False
+
+    def note(self, action, data):
+        """Записать исход действия. `ok` или семантический отказ → источник ответил."""
+        err = str((data or {}).get("error") or "")
+        if (data or {}).get("ok") or err not in UNREAD_ERRORS:
+            self.answered.add(action)
+            self.unread.pop(action, None)
+            return
+        self.unread[action] = err
+        if err == CARD_DEADLINE_ERROR:
+            self.deadline_hit = True
+
+    def note_deadline(self):
+        self.deadline_hit = True
+
+    def missing(self):
+        """Источники, которые НЕ ответили. Действие, ответившее хоть раз, отсюда уходит: карточка
+        показывает его данные, и жаловаться на него — врать в другую сторону."""
+        return [a for a in self.unread if a not in self.answered]
+
+    def spent(self, now):
+        return float(now) - float(self.started)
+
+
+@contextlib.contextmanager
+def card_budget(budget, now=None):
+    """Открыть общий бюджет на сборку одной карточки. `budget<=0` → дедлайна нет (откат
+    `INFO_CARD_BUDGET_SEC=0`), но учёт непрочитанного остаётся: он не стоит ни запроса, ни секунды."""
+    now = time.monotonic() if now is None else now
+    state = CardBudget(budget, now, card_deadline.deadline_at(now, budget))
+    token = _CARD_BUDGET.set(state)
+    try:
+        yield state
+    finally:
+        _CARD_BUDGET.reset(token)
+
+
+def current_card_budget():
+    """Бюджет текущей сборки или None (вне карточки)."""
+    return _CARD_BUDGET.get()
+
+
 class BridgeClient:
     """Клиент к Apps Script Bridge Web App."""
 
@@ -285,6 +371,35 @@ class BridgeClient:
         """Экспоненциальная пауза + jitter перед повтором (attempt с 0)."""
         time.sleep(self.retry_base * (2 ** attempt) + random.uniform(0, self.retry_jitter))
 
+    # --- ОБЩИЙ ДЕДЛАЙН КАРТОЧКИ: три ручки, которыми режутся все три лестницы повторов ---
+
+    def _leg_timeout(self):
+        """Бюджет ОДНОГО HTTP-плеча с оглядкой на общий дедлайн карточки.
+        Без этого плечо, начатое за 2 с до дедлайна, честно провисит все 60 и перекроет общий
+        потолок в 30 раз — то есть потолок остался бы на бумаге."""
+        state = _CARD_BUDGET.get()
+        if state is None:
+            return self.timeout
+        return card_deadline.leg_timeout(state.deadline, time.monotonic(), self.timeout)
+
+    def _card_room(self, what: str = "плечо"):
+        """Есть ли в бюджете карточки место ещё на одно плечо. Нет → CardBudgetExpired."""
+        state = _CARD_BUDGET.get()
+        if state is None:
+            return
+        if not card_deadline.may_start_leg(state.deadline, time.monotonic()):
+            state.note_deadline()
+            raise CardBudgetExpired(
+                f"общий бюджет карточки {card_deadline._num(state.budget)} с исчерпан — {what} не начинаю")
+
+    def _card_may_wait(self, pause: float) -> bool:
+        """Влезает ли в бюджет карточки пауза backoff И плечо после неё. Ждать, чтобы потом
+        упереться в исчерпанный бюджет, — чистая потеря времени человека у кнопки."""
+        state = _CARD_BUDGET.get()
+        if state is None:
+            return True
+        return card_deadline.may_wait(state.deadline, time.monotonic(), pause)
+
     def _fetch_redirect_target(self, url: str):
         """GET на Location redirect-echo слоя googleusercontent с backoff-ретраями на
         404/5xx/timeout. Ретраить БЕЗОПАСНО даже после write-POST: сам POST уже исполнен
@@ -293,10 +408,16 @@ class BridgeClient:
         last_err = None
         for attempt in range(max(1, self.retry_attempts)):
             if attempt:
+                # ЛЕСТНИЦА 3 (эхо-слой) под общим дедлайном карточки: не влезает пауза + плечо —
+                # выходим с последней ошибкой, а не жжём остаток на заведомо бесполезный повтор.
+                if not self._card_may_wait(self.retry_base * (2 ** (attempt - 1))):
+                    log.warning("Bridge: echo-ретрай отменён — общий бюджет карточки не вмещает его")
+                    break
                 log.warning(f"Bridge: echo-слой сбоит ({last_err}) — ретрай {attempt + 1}/{self.retry_attempts}")
                 self._backoff(attempt - 1)
+            self._card_room("плечо эхо-слоя")
             try:
-                r = self._session.get(url, timeout=self.timeout, allow_redirects=False)
+                r = self._session.get(url, timeout=self._leg_timeout(), allow_redirects=False)
             except requests.exceptions.RequestException as e:
                 last_err = e
                 continue
@@ -313,14 +434,18 @@ class BridgeClient:
         """Один HTTP-обмен с Bridge: явный follow-redirect-as-GET. POST/GET на /exec идёт с
         allow_redirects=False; 3xx → GET на Location руками (не полагаемся на авто-follow
         requests, который на редиректе терял тело/токен). Возвращает финальный Response."""
+        self._card_room("обмен с мостом")
         if method == "GET":
-            r = self._session.get(self.url, params=params, timeout=self.timeout,
+            r = self._session.get(self.url, params=params, timeout=self._leg_timeout(),
                                   allow_redirects=False)
         else:
-            r = self._session.post(self.url, json=body, timeout=self.timeout,
+            r = self._session.post(self.url, json=body, timeout=self._leg_timeout(),
                                    allow_redirects=False)
         cur_url, hops = self.url, 0
         while r.status_code in _REDIRECT_CODES and hops < 6:
+            # ЛЕСТНИЦА 2 (хопы редиректа) под общим дедлайном карточки: шесть хопов, каждый со
+            # своей лестницей эхо, — второй множитель потолка 57 плеч.
+            self._card_room("хоп редиректа")
             loc = r.headers.get("Location") or r.headers.get("location")
             if not loc:
                 break
@@ -334,6 +459,11 @@ class BridgeClient:
         _unauthorized (токен не дошёл/отвергнут) снимается в _durable_request, наружу не уходит."""
         try:
             r = self._exchange(method, params=params, body=body)
+        except CardBudgetExpired as e:
+            # Наружу — ОТВЕТ, а не исключение: сборка карточки идёт дальше и досказывает то, что
+            # уже прочитано, а этот источник честно помечается «не прочитан» (третий исход).
+            log.warning(f"Bridge {action}: {e}")
+            return {"ok": False, "error": CARD_DEADLINE_ERROR, "message": str(e)}
         except requests.exceptions.Timeout:
             log.error(f"Bridge timeout (>{self.timeout}s) for action={action}")
             return {"ok": False, "error": "timeout", "message": f"Timeout >{self.timeout}s"}
@@ -410,7 +540,30 @@ class BridgeClient:
         GET и идемпотентный POST — пересылка с токеном как была (чтение/повтор безопасны);
         write-POST — пересылки НЕТ, наружу outcome='unknown' + «перечитай факт»
         (verify-паттерны вызывающего кода: _enqueue_reliable, _claim_task_verified).
-        Тесты tests/test_post_receipt_no_resend.py (в гейте)."""
+        ОБЩИЙ ДЕДЛАЙН КАРТОЧКИ (13.08.2026) — ЕДИНАЯ ДВЕРЬ: любой запрос к мосту идёт через это
+        место, поэтому здесь же и записывается исход (кто ответил, кто нет), и здесь же бюджет
+        обрывает работу ДО сети. Обойти дверь нельзя: у `_call` и `_post` иного пути наружу нет.
+        Тесты tests/test_post_receipt_no_resend.py и tests/test_info_card_deadline.py (в гейте)."""
+        state = _CARD_BUDGET.get()
+        if state is not None and card_deadline.expired(state.deadline, time.monotonic()):
+            # Бюджет уже исчерпан — сети не касаемся ВОВСЕ. Именно это делает потолок потолком
+            # ВСЕЙ карточки: оставшиеся действия не начинают своих лестниц, а честно молчат.
+            state.note_deadline()
+            data = {"ok": False, "error": CARD_DEADLINE_ERROR,
+                    "message": (f"общий бюджет карточки {card_deadline._num(state.budget)} с исчерпан — "
+                                f"«{action}» не запрашивался")}
+            log.warning(f"Bridge {action}: {data['message']}")
+            state.note(action, data)
+            return data
+        data = self._durable_request_impl(method, action, params=params, body=body,
+                                          retry_full=retry_full)
+        if state is not None:
+            state.note(action, data)
+        return data
+
+    def _durable_request_impl(self, method: str, action: str, params: dict = None,
+                              body: dict = None, retry_full: bool = False) -> dict:
+        """Тело durable-запроса (см. `_durable_request` — там дверь бюджета и запись исхода)."""
         max_attempts = max(1, self.retry_attempts) if retry_full else 1
         auth_resend_left = 1 if retry_full else 0
         attempt = 0
@@ -422,7 +575,7 @@ class BridgeClient:
             self._note_transport(failed=err in ("timeout", "request_failed"))
             if data.get("ok"):
                 return data
-            if unauthorized and auth_resend_left > 0:
+            if unauthorized and auth_resend_left > 0 and self._card_may_wait(self.retry_base):
                 auth_resend_left -= 1
                 log.warning(f"Bridge {action}: unauthorized (токен потерян на редиректе?) — "
                             f"пересылаю запрос с токеном заново")
@@ -431,6 +584,12 @@ class BridgeClient:
             if unauthorized and not retry_full:
                 return self._receipt_unknown(action, data)
             if err in ("timeout", "request_failed") and attempt < max_attempts:
+                # ЛЕСТНИЦА 1 (полные попытки) под общим дедлайном карточки — первый множитель
+                # потолка 57 плеч: не влезает пауза + плечо → отдаём то, что есть.
+                if not self._card_may_wait(self.retry_base * (2 ** (attempt - 1))):
+                    log.warning(f"Bridge {action}: backoff-ретрай отменён — общий бюджет карточки "
+                                f"не вмещает его")
+                    return data
                 log.warning(f"Bridge {action}: {err} — backoff-ретрай "
                             f"{attempt + 1}/{max_attempts}")
                 self._backoff(attempt - 1)

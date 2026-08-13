@@ -23,6 +23,7 @@ import bridge_client   # токен-замок 4.2 (agent_write) для крас
 import wallet_cache    # §касса: персистентный fallback-кэш баланса (переживает рестарт splinter)
 import scan_result     # контракт читателя живого текста: пара «осмотрено/разобрано» + исход
 import fleet_cell      # контракт клетки Лист1: значение / пусто / не-число / нечитаемо
+import card_deadline   # общий дедлайн сборки карточки «Инфо» + слова о непрочитанном
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -1841,12 +1842,23 @@ def _km_ago(cur, km, th):
     return f"{d} กม.ที่แล้ว" if th else f"{d} км назад"
 
 
-def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_last=None):
+def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_last=None, unread=None):
     """КАРТОЧКА байка (HTML) — аккуратная двуязычная справка (фикс вёрстки 30.06).
+
+    `unread` — ТРЕТИЙ ИСХОД сборки (13.08.2026): None → карточка полная и её вид БАЙТ-В-БАЙТ
+    прежний; иначе {"missing": [ключи источников], "budget": сек, "spent": сек,
+    "deadline_hit": bool}. Непрочитанный источник обязан НАЗВАТЬСЯ, а не оставить пустое место:
+    пустая секция читается как факт о байке («ничего в работе», «сервиса не было»), а строка ТО
+    без данных вообще превращается в «❗ не делалось» — ложь в обе стороны сразу (подтолкнёт к
+    лишней работе там, где её делали, и успокоит там, где не делали).
     \U0001f400 имя → пустая → [\U0001f1f9\U0001f1ed блок] → пустая → _SEP (вставляет _send) → [\U0001f1f7\U0001f1fa блок].
     Каждый блок: ШАПКА (флаг + <b>пробег</b> сверху) → аренда → Плановое ТО → В работе → История.
     Секции = жирная МЕТКА + пустая строка-отступ (без ─────-линий); вид ТО на своей строке. Данные те же — только вёрстка."""
     head = f"\U0001f400 <b>{_hb(bike)}</b>" if bike else "\U0001f400 Splinter"
+    _u = unread or {}
+    miss = set(_u.get("missing") or ())
+    _UNREAD_TH = "⚠️ <b>อ่านไม่ได้</b> (ไม่ใช่ว่าไม่มี)"
+    _UNREAD_RU = "⚠️ <b>не прочитано</b> (это не «нет»)"
 
     def _rent(th):
         if not rental:
@@ -1869,13 +1881,19 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
 
     by_kind = {m.get("kind"): m for m in (mand or [])}
     to_th, to_ru = [], []
-    for kind in _MAND_KINDS:
-        m = by_kind.get(kind)
-        if not m:
-            continue
-        line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km)
-        if line:
-            to_th.append(line[0]); to_ru.append(line[1])
+    if "fleet" in miss:
+        # Отметки ТО живут в строке байка. Строка не прочитана → `last` пуст у ВСЕХ видов, и
+        # _mand_line сказал бы «❗ не делалось» про каждый — про масло, которое, возможно, меняли
+        # вчера. Поэтому вместо четырёх выдуманных строк — одна честная.
+        to_th, to_ru = [_UNREAD_TH], [_UNREAD_RU]
+    else:
+        for kind in _MAND_KINDS:
+            m = by_kind.get(kind)
+            if not m:
+                continue
+            line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km)
+            if line:
+                to_th.append(line[0]); to_ru.append(line[1])
 
     work_th, work_ru = [], []
     if sp_open and (sp_open.get("kinds") or sp_open.get("works")):
@@ -1892,14 +1910,25 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
         hist_th.append(f"ล่าสุด: {_dl_th}" + (f" · {_lo} กม." if _lo else "") + (f" ({_ld})" if _ld else ""))
         hist_ru.append(f"Последний сервис: {_dl_ru}" + (f" · {_lo} км" if _lo else "") + (f" ({_ld})" if _ld else ""))
     # service (доп. работы на пробеге, read_events) рендерятся БЛОЧНО в _block ниже — не сплошной строкой.
+    # Источник не ответил → секция ОБЯЗАНА сказать это сама: молча пустая «В работе» читается как
+    # «работ нет», а пустая «История» — как «сервиса не было».
+    if "service_pending_get" in miss:
+        work_th, work_ru = [_UNREAD_TH], [_UNREAD_RU]
+    if "service_pending_list" in miss:
+        hist_th, hist_ru = [_UNREAD_TH], [_UNREAD_RU]
+    # Шапка: пробега нет И источники пробега не прочитаны → «не прочитан», а не «Статус байка»
+    # (последнее выглядит как «пробег неизвестен по природе», хотя он просто не доехал).
+    _odo_unread = (not cur_km) and bool(miss & {"service_list", "fleet"})
 
     def _block(th):
         if th:
-            L = ["\U0001f1f9\U0001f1ed " + (f"<b>ไมล์ {cur_km} กม.</b>" if cur_km else "<b>สถานะรถ</b>")]
+            L = ["\U0001f1f9\U0001f1ed " + (f"<b>ไมล์ {cur_km} กม.</b>" if cur_km else
+                                            ("<b>⚠️ อ่านไมล์ไม่ได้</b>" if _odo_unread else "<b>สถานะรถ</b>"))]
             rl, tos, wk, hs = _rent(True), to_th, work_th, hist_th
             sec_to, sec_wk, sec_hs = "<b>เซอร์วิสตามกำหนด</b>", "<b>กำลังทำ</b>", "<b>ประวัติ</b>"
         else:
-            L = ["\U0001f1f7\U0001f1fa " + (f"<b>пробег {cur_km} км</b>" if cur_km else "<b>Статус байка</b>")]
+            L = ["\U0001f1f7\U0001f1fa " + (f"<b>пробег {cur_km} км</b>" if cur_km else
+                                            ("<b>⚠️ пробег не прочитан</b>" if _odo_unread else "<b>Статус байка</b>"))]
             rl, tos, wk, hs = _rent(False), to_ru, work_ru, hist_ru
             sec_to, sec_wk, sec_hs = "<b>Плановое ТО</b>", "<b>В работе</b>", "<b>История</b>"
         if rl:
@@ -1922,6 +1951,17 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
                 _par = f" ({_ago})" if _ago else ""
                 _nm = _hb(_work_th(_wk)) if th else _hb(_wk)
                 L += ["", (f"{_km} กม.{_par}" if th else f"{_km} км{_par}"), _nm]
+        elif "read_events" in miss:
+            L += ["", ("<b>ประวัติเซอร์วิสเพิ่มเติมตามไมล์:</b>" if th
+                       else "<b>Обслужено дополнительно на пробегах:</b>"),
+                  (_UNREAD_TH if th else _UNREAD_RU)]
+        # ТРЕТИЙ ИСХОД целиком: чего не хватило и почему. Список составляет card_deadline —
+        # у него ярлыки источников на обоих языках и он не умеет ничего, кроме как их сложить.
+        _blk = card_deadline.missing_block(miss, th=th, budget=_u.get("budget"),
+                                           spent=_u.get("spent"),
+                                           deadline_hit=bool(_u.get("deadline_hit")))
+        if _blk:
+            L += [""] + _blk
         return L
 
     out = [head, ""] + _block(True) + ["", ""] + _block(False)
@@ -1975,10 +2015,30 @@ def _odo_current(bridge, bike, recs=None, fleet_row=None):
     return str(max(last)) if last else ""
 
 
+def _info_card_budget():
+    """Бюджет одной сборки карточки, сек. Ручка `INFO_CARD_BUDGET_SEC` (.env), `0` = дедлайна нет.
+    Величина и её вывод из замера 13.08.2026 — в шапке `card_deadline`."""
+    return card_deadline.parse_budget(_os.getenv(card_deadline.BUDGET_ENV))
+
+
 def _build_bike_card(bridge, chat_id, topic_id, bike):
     """Собрать ТЕКСТ карточки байка из ЧИТАЕМЫХ источников (find_bike + service_list + read_events).
     Ничего не пишет и не отправляет — только строит строку. Разделён с отправкой, чтобы инфо-кнопка могла
-    показать loading-заглушку и заменить её editMessageText (П4). Все Bridge-вызовы синхронны → def, не async."""
+    показать loading-заглушку и заменить её editMessageText (П4). Все Bridge-вызовы синхронны → def, не async.
+
+    ОБЩИЙ ДЕДЛАЙН (13.08.2026): вся сборка идёт внутри ОДНОГО бюджета `bridge_client.card_budget`.
+    Потолок стоит на КАРТОЧКЕ, а не на плече: три вложенные лестницы повторов (полные попытки ×
+    хопы редиректа × попытки эхо-слоя = 57 плеч на действие) остаются, но исчерпать бюджет целиком
+    больше не могут — исчерпавшись, он гасит оставшиеся действия ДО сети. Что не успело прочитаться,
+    карточка называет вслух (`unread`), а не показывает пустым местом."""
+    _budget = _info_card_budget()
+    with bridge_client.card_budget(_budget) as _cb:
+        _text = _build_bike_card_body(bridge, chat_id, topic_id, bike, _cb)
+    return _text
+
+
+def _build_bike_card_body(bridge, chat_id, topic_id, bike, _cb=None):
+    """Тело сборки карточки (см. `_build_bike_card` — там открывается общий бюджет)."""
     fb = bridge.find_bike(bike) or {}
     canon = fb.get("name") or bike
     try:
@@ -2036,7 +2096,16 @@ def _build_bike_card(bridge, chat_id, topic_id, bike):
                            "date": str(_c0.get("updated_at") or "")[:10]}
     except Exception:
         log.exception("  → карточка: чтение закрытых то_заявки упало")
-    return msg_bike_card(canon, cur_km, mand, rental, service, sp_open=sp_open, sp_last=sp_last)
+    unread = None
+    if _cb is not None:
+        _missing = _cb.missing()
+        if _missing:
+            unread = {"missing": _missing, "budget": _cb.budget,
+                      "spent": _cb.spent(_time.monotonic()), "deadline_hit": _cb.deadline_hit}
+            log.warning(f"  → карточка {canon}: источники не прочитаны {_missing} "
+                        f"(бюджет {_cb.budget} с, дедлайн исчерпан: {_cb.deadline_hit})")
+    return msg_bike_card(canon, cur_km, mand, rental, service, sp_open=sp_open, sp_last=sp_last,
+                         unread=unread)
 
 
 async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
