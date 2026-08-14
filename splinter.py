@@ -28,6 +28,7 @@ import write_fact      # синк зеркала по ПЕРЕЧИТАННОМУ
 import balance_fact    # §касса: свежий баланс / «не сверено» + дата / нечего сказать; факт проводки
 import service_receipt # квитанция ТО: ОБЕ половины (тайская+русская) из ОДНОГО исхода записи
 import odo_ceiling     # верхняя граница пробега при записи ТО: обе двери под одним гейтом
+import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -4218,6 +4219,14 @@ async def handle_service_button(update, context, bridge) -> None:
     except Exception:
         await _btn_answer(q)
         return
+    if action == "undo":
+        # ОТМЕНА ПОСЛЕДНЕЙ ЗАПИСИ ТО — своя память (`_SVC_UNDO`), поэтому решается ДО общего
+        # поиска в `_SVC_TOKENS`: у отмены свои отказы, и общее «кнопка устарела, пришли фото»
+        # тут врало бы о том, что делать. Нажать может ЛЮБОЙ в теме (механик и Пым) — записи
+        # эта ветка НЕ делает вовсе, она только просит владельца.
+        await _svc_undo_ask(q, context, token)
+        return
+
     data = _SVC_TOKENS.get(token)
     if not data:
         await _btn_answer(q)
@@ -4377,7 +4386,8 @@ async def handle_service_button(update, context, bridge) -> None:
                           text=(f"🐀 Splinter · 📌 {bike}\n"
                                 f"🇹🇭 {rec['th']}\n"
                                 f"{_SEP}\n"
-                                f"🇷🇺 {rec['ru']}"))
+                                f"🇷🇺 {rec['ru']}"),
+                          reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
         log.info(f"  → ТО фаза2 запись по «да» {cb}: written={written} failed={failed} odo={odo} "
                  f"исход={rec['state']}")
     elif action == "km":
@@ -4455,7 +4465,8 @@ async def handle_service_button(update, context, bridge) -> None:
                           text=(f"🐀 Splinter · 📌 {bike}\n"
                                 f"🇹🇭 {rec['th']}\n"
                                 f"{_SEP}\n"
-                                f"🇷🇺 {rec['ru']}"))
+                                f"🇷🇺 {rec['ru']}"),
+                          reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
         log.info(f"  → ТО фаза2 запись по «да» верхней границы {cb}: written={written} "
                  f"failed={failed} odo={odo} исход={rec['state']}")
 
@@ -5762,6 +5773,106 @@ _SP_ASK_THROTTLE_SEC = 90       # E4: не переспрашивать чаще
 _SVC_WRITE_DEDUP = {}           # (plate_or_bike, kind, km_int) -> ts последней успешной записи
 _SVC_DEDUP_WIN_SEC = int(os.getenv("SERVICE_DEDUP_WIN_MIN", "60")) * 60
 
+# ── ОТМЕНА ПОСЛЕДНЕЙ ЗАПИСИ ОБСЛУЖИВАНИЯ (14.08.2026) ────────────────────────────────────────
+# РУКИ модуля `undo_last` (решение там; здесь только память и отправка). Журнал заполняется ИЗ
+# РАСПИСКИ моста — той самой, из которой прежде читался один флаг `ok`, — поэтому механизм не
+# платит ни одного лишнего обращения к мосту.
+_SVC_UNDO = {}                  # tok(int) -> запись акта (undo_last.act)
+_SVC_UNDO_LAST = {}             # (chat, topic) -> tok ПОСЛЕДНЕГО акта темы (замок «только последняя»)
+_SVC_UNDO_SEQ = [0]             # свой счётчик токенов: кнопка отмены живёт своей памятью, не _SVC_TOKENS
+
+
+def _svc_undo_on():
+    """Ветка жива? Ручка `SERVICE_UNDO` (.env). `0` → ни журнала, ни кнопки, путь записи прежний."""
+    return undo_last.enabled(_os.getenv(undo_last.FLAG_ENV))
+
+
+def _svc_undo_remember(chat_id, topic_id, bike, plate, by, odo, positions, blind):
+    """Запомнить акт записи. Возвращает токен либо None (нечего помнить / ветка выключена).
+
+    Помним ТОЛЬКО акт с хотя бы одной НАЗВАННОЙ позицией: кнопка отмены не должна изображать
+    возможность там, где прежнее значение неизвестно и возвращать не на что. Неназванный акт
+    ОБНУЛЯЕТ указатель темы — иначе кнопка новой квитанции отменяла бы ПРОШЛУЮ запись."""
+    if not _svc_undo_on():
+        return None
+    if not positions:
+        _SVC_UNDO_LAST[(chat_id, topic_id)] = None
+        return None
+    try:
+        _SVC_UNDO_SEQ[0] += 1
+        tok = _SVC_UNDO_SEQ[0]
+        key = (chat_id, topic_id)
+        _SVC_UNDO[tok] = undo_last.act(tok, _time.time(), chat_id, topic_id, bike, plate, by, odo,
+                                       positions, blind)
+        _SVC_UNDO_LAST[key] = tok
+        if len(_SVC_UNDO) > 200:                       # держим последние 200 (как _SVC_TOKENS)
+            for k in sorted(_SVC_UNDO)[:-200]:
+                _SVC_UNDO.pop(k, None)
+        return tok
+    except Exception:
+        log.exception("  → журнал отмены ТО: не записал акт (fail-safe: кнопки не будет)")
+        return None
+
+
+def _svc_undo_kb(tok):
+    """Клавиатура квитанции: одна кнопка «запись неверна». None = кнопки нет (и это честно)."""
+    if not tok:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(undo_last.BUTTON_LABEL,
+                                                      callback_data=f"svc:undo:{tok}")]])
+
+
+async def _svc_undo_ask(q, context, token):
+    """Нажата «Запись неверна» → замки `undo_last` → карточка владельцу либо честный отказ.
+
+    ЖИВУЮ ТАБЛИЦУ ЭТА ВЕТКА НЕ ТРОГАЕТ ВООБЩЕ: ни одного вызова записи здесь нет и быть не
+    должно — отмена правит Лист1, а это «да» владельца. Работа ветки — назвать объект (байк ·
+    регистр · строка · какое число убираем и на что возвращаем) и не изобразить возможность
+    там, где её нет. Trust НЕ требуется: сказать «запись неверна» вправе и механик — от его
+    слов в таблице не меняется ничего."""
+    entry = _SVC_UNDO.get(token)
+    key = (entry.get("chat"), entry.get("topic")) if isinstance(entry, dict) else (None, None)
+    v = undo_last.verdict(entry, token, _SVC_UNDO_LAST.get(key), _time.time(),
+                          undo_last.TTL_DEFAULT)
+    who = getattr(q, "from_user", None)
+    asked_by = ("@" + who.username) if (who and getattr(who, "username", None)) \
+        else f"id{getattr(who, 'id', '?')}"
+    chat_id = key[0] if key[0] is not None else getattr(getattr(q, "message", None), "chat_id", None)
+    topic_id = key[1] if key[0] is not None else getattr(getattr(q, "message", None),
+                                                         "message_thread_id", None)
+    th, ru = undo_last.reply(v, _SP_KIND_LABEL)
+
+    if v["state"] == undo_last.STATE_CARD:
+        text = undo_last.card(v, asked_by=asked_by, labels=_SP_KIND_LABEL)
+        sent = False
+        try:
+            import notify
+            sent = bool(notify.send_card(text))     # инбокс 1160: карточка ЖДЁТ ответа владельца
+        except Exception:
+            log.exception("  → отмена ТО: карточка владельцу не отправлена")
+        if sent:
+            entry["asked"] = True                   # отмена отмены запрещена
+            log.info(f"  ↩️ отмена ТО от {asked_by}: {undo_last.say(v)}")
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        else:
+            # Молчать нельзя: мы НЕ довезли до владельца то, что требует его воли.
+            th = ("⚠️ ส่งให้เจ้าของไม่สำเร็จครับ — รบกวนบอกเจ้าของเองนะครับ")
+            ru = ("⚠️ Карточку владельцу отправить НЕ смог — скажи ему сам: "
+                  + undo_last._short(v["entry"]))
+            log.warning(f"  ↩️ отмена ТО от {asked_by}: карточка НЕ доехала — {undo_last.say(v)}")
+    else:
+        log.info(f"  ↩️ отмена ТО от {asked_by}: {undo_last.say(v)}")
+
+    await _btn_answer(q)
+    if chat_id is None:                    # адреса нет — отвечать некуда, молча не падаем
+        log.warning("  ↩️ отмена ТО: адрес темы не восстановлен, ответ не отправлен")
+        return
+    await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                      text=(f"🐀 Splinter\n🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}"))
+
 # B2: маркеры «работа завершена» (ДОВОДЯТ заявку к гейту Пыма, САМИ в Лист1 НЕ пишут).
 # Длинные/distinctive — подстрокой; короткие/неоднозначные (да/ок/все) — ТОЛЬКО как целое слово (без ложных срабатываний).
 _SP_DONE_SUBSTR = ("закончил", "законч", "готов", "сделал", "сделан", "поменял", "заменил", "замен",
@@ -6161,7 +6272,8 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
                         text=(f"🐀 Splinter · 📌 {bike}\n"
                               f"🇹🇭 {rec['th']}\n"
                               f"{_SEP}\n"
-                              f"🇷🇺 {rec['ru']}"))
+                              f"🇷🇺 {rec['ru']}"),
+                        reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
             log.info(f"  → ТО фаза2 запись по числу-да {cb}: written={written} failed={failed} "
                      f"odo={m.group(1)} исход={rec['state']}")
             return True
@@ -6340,6 +6452,7 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
         if stop:
             return [], [("odo", odo_ceiling.ERR)]
     written, failed = [], []
+    undo_pos, undo_blind = [], 0     # позиции отмены и сколько их осталось БЕЗ названного объекта
     for k in done:
         try:
             if k in _SP_COL_KINDS:
@@ -6376,6 +6489,21 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                         _SVC_WRITE_DEDUP[_dedup_key] = _time.time()
                     except Exception:
                         pass
+                    # ОТМЕНА: объект берётся из ТОЙ ЖЕ расписки, из которой выше прочитан флаг
+                    # `ok`. Прежнего значения в ней нет (нуль по неразбору · расписка не пришла и
+                    # факт перечитан) → позиция не называется, и кнопка её не изображает.
+                    try:
+                        _pos, _why = undo_last.position(
+                            k, fleet_cell.FIELD_COL.get(write_fact.field_for(k), ""), r,
+                            want_km=odo_int)
+                        if _pos:
+                            undo_pos.append(_pos)
+                        else:
+                            undo_blind += 1
+                            log.info(f"  → отмена ТО {bike} {k}: объект не назван — {_why}")
+                    except Exception:
+                        undo_blind += 1
+                        log.exception("  → отмена ТО: разбор расписки упал (позиция не названа)")
                     written.append(k)
                 else:
                     # Исход неудачи называется вслух: «не легло» и «неизвестно» — РАЗНЫЕ вещи.
@@ -6392,6 +6520,11 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
         except Exception:
             log.exception(f"  → ТО фаза2 запись {k} упала")
             failed.append((k, "exception"))
+    _tok = _svc_undo_remember(chat_id, topic_id, bike, plate, confirmed_by, odo_int,
+                              undo_pos, undo_blind)
+    if _tok:
+        log.info(f"  → отмена ТО: акт {_tok} запомнен ({len(undo_pos)} позиц., без объекта "
+                 f"{undo_blind}) — кнопка живёт {undo_last.TTL_DEFAULT // 3600} ч")
     try:
         bridge.service_pending_close(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
                                      note=f"written={','.join(written)} by {confirmed_by}")

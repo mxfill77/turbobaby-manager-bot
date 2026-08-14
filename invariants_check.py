@@ -1210,6 +1210,38 @@ def check_odo_ceiling_pure(world, run):
         run.flag(f"odo_ceiling.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12н: UNDO_LAST_PURE
+#  Отмена последней записи ТО (undo_last.py) решает, назван ли объект и можно ли ещё отменять, —
+#  и стоит на пути живой таблицы Лист1. Импортов РОВНО НОЛЬ: и расписку моста, и «сейчас», и порог
+#  приносят руки (`splinter._sp_write_done`, `splinter._svc_undo_ask`). Будь у неё сеть — она
+#  смогла бы спросить мост САМА, и «прежнее значение» снова зависело бы от того, КАК спросили, а не
+#  от расписки той самой записи; будь у неё отправка — рядом с решением завёлся бы второй путь
+#  наружу, и владелец мог бы получить карточку о том, чего решение не решало; будь у неё запись —
+#  красная зона исполнялась бы мимо «да» владельца.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_UNDO_LAST_PATH = None          # подменяется САМОТЕСТОМ; None → боевой undo_last.py в репо
+
+
+@register("UNDO_LAST_PURE")
+def check_undo_last_pure(world, run):
+    path = _UNDO_LAST_PATH or os.path.join(REPO, "undo_last.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("undo_last.py", f"решение отмены не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("undo_last.py", f"решение отмены не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"undo_last.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")
