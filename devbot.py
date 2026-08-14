@@ -26,6 +26,7 @@ import bridge_client
 import task_metrics          # общий детектор тест-прогона (под тестом боевые артефакты не трогаем)
 import report_digest         # чистая функция «тело отчёта → что показать в чате» (часть 2)
 import revizor_route         # чистая функция «находки ревизора → лента или карточка»
+import scan_result           # контракт читателя живого текста: «осмотрено/разобрано» + исход
 
 log = logging.getLogger(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -2446,12 +2447,26 @@ _OPEN_STEP_STATUSES = ("new", "in_progress", "needs_approval", "approved")  # н
 _LIVE_PARENT_STATUSES = ("new", "in_progress")   # живой родитель (план строится / шаги идут)
 
 # Контракт тика ревизора (зеркало ПК-фикса 1403fa2, «честный тик»): тик = NOTE-строка
-# cowork_log (журнал ПК-контура, Bridge read_doc) с «ревизор:» сразу после автора NOTE —
-# живой формат «NOTE Orchestrator: ревизор: 2 окон с активностью…» (разведка cowork_log
-# 13.07.2026). Маркеры очереди «[ревизор дата=…]» — дедуп/бюджет маршрутизации находок,
-# НЕ тики (живой призрак 23:10 13.07: они давали «ревизор (время неизвестно)»). Время
-# показываем ТОЛЬКО если оно есть в NOTE; NOTE нет → «ревизор: тиков ещё не было».
-_REV_NOTE_RE = re.compile(r"^NOTE(?:\s+[^:]{0,40})?:\s*ревизор:\s*(.+)", re.I)
+# cowork_log (журнал ПК-контура, Bridge read_doc) с «ревизор:» сразу после штампа и автора.
+# Маркеры очереди «[ревизор дата=…]» — дедуп/бюджет маршрутизации находок, НЕ тики (живой
+# призрак 23:10 13.07: они давали «ревизор (время неизвестно)»). Время показываем ТОЛЬКО
+# если оно есть в строке.
+#
+# ЯКОРЬ КЛАССА «НУЛЬ ПО НЕРАЗБОРУ» ЗАКРЫТ 14.08.2026 (см. `scan_result` и
+# `docs/artifacts/2026-08-14-revizor-tick-reader-contract-vps.md`). Прежний шаблон
+# `^NOTE(?:\s+[^:]{0,40})?:\s*ревизор:` держал в голове ОДНО поле без двоеточий, а живая строка
+# журнала несёт ШТАМП ВРЕМЕНИ (в нём двоеточие) и автора ПОСЛЕ штампа:
+#     «NOTE 2026-08-13 13:26 UTC: Orchestrator: ревизор: 1 окон, чисто»
+# — шаблон не совпал НИ С ОДНОЙ из 970 непустых строк живого журнала, а читатель отвечал
+# «тиков ещё не было». Шесть суток (08.08 → 14.08) на доске владельца стояло, что ревизор не
+# тикал ни разу, при 37 разобранных тиках в том же журнале и последнем тике 13.08 13:26 UTC.
+# ГОЛОВА ОГРАНИЧЕНА (80 символов) НАМЕРЕННО — то же правило ПОЗИЦИИ, что у маркера
+# NEEDS_APPROVAL (`5ca761d`) и у литерала (`40c8425`): тик ОБЪЯВЛЯЕТСЯ в начале строки, сразу
+# за штампом и автором; те же слова в прозе отчёта (живые строки «…Ревизор исхода находки…»,
+# «ARTIFACT … читатель тика ревизора …») тиком не становятся. На живом журнале 14.08 голова
+# ловит 37 строк и НИ ОДНОЙ прозаической из 70, где слово «ревизор» встречается.
+_REV_NOTE_RE = re.compile(r"^NOTE\b(?P<head>.{0,80}?)\bревизор:\s*(?P<body>.+)$", re.I)
+_REV_SUBJ = "строк журнала"                # знаменатель: непустые строки cowork_log
 _REV_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}")
 _REV_HHMM_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
 _REV_WIN_RE = re.compile(r"окон\D{0,3}(\d+)")
@@ -2510,10 +2525,14 @@ def _active_chains(items):
     return out
 
 
-def _parse_revisor(tick):
-    """Строка «👁 надзор: …» из текста тик-NOTE: честное время (ТОЛЬКО если есть в NOTE —
-    никакого «время неизвестно»), окна/находки (что распарсилось), иначе короткий текст тика."""
-    tm = _REV_TIME_RE.search(tick) or _REV_HHMM_RE.search(tick)
+def _parse_revisor(tick, head=""):
+    """Строка «👁 надзор: …» из текста тик-NOTE: честное время (ТОЛЬКО если есть в строке —
+    никакого «время неизвестно»), окна/находки (что распарсилось), иначе короткий текст тика.
+    `head` — голова строки ДО «ревизор:»: в живом формате штамп времени стоит ИМЕННО там
+    («NOTE 2026-08-13 13:26 UTC: Orchestrator: ревизор: …»), а не в теле тика; полная дата
+    в голове сильнее любого «чч:мм» из тела."""
+    tm = (_REV_TIME_RE.search(head) or _REV_TIME_RE.search(tick)
+          or _REV_HHMM_RE.search(head) or _REV_HHMM_RE.search(tick))
     mw = _REV_WIN_RE.search(tick) or _REV_WIN_RE2.search(tick)
     mf = _REV_FIND_RE.search(tick)
     parts = []
@@ -2526,21 +2545,65 @@ def _parse_revisor(tick):
             (", ".join(parts) if parts else _short(tick)))
 
 
-def _revisor_line(cowork_fn=None):
-    """Последний тик ревизора — свежая NOTE «ревизор: …» в cowork_log (новые сверху, первая
-    совпавшая). NOTE нет → честное «тиков ещё не было»; журнал не прочитался → честное
-    «недоступен» (отсутствие данных ≠ тишина; сводку в любом случае не валим)."""
+def _revisor_scan(cowork_fn=None):
+    """Проход по cowork_log за последним тиком ревизора → `scan_result.ScanResult`.
+
+    ОСМОТРЕНО — непустые строки журнала; РАЗОБРАНО — сколько из них прочитаны как тик;
+    payload — САМЫЙ СВЕЖИЙ тик (новые записи сверху) парой (тело, голова).
+    Исход отвечает на единственный вопрос вызывающего — «этому нулю можно верить?»:
+        журнал не прочитан            → unreadable  осмотра НЕ БЫЛО (не «строк 0»)
+        строк 0                       → empty       событий не было, знаменатель назван
+        строки есть, тиков 0          → mismatch    ТРЕТИЙ исход: сказать «тиков не было»
+                                                    здесь значит выдать НЕЗНАНИЕ за ФАКТ
+        иначе                         → ok          тик разобран, его и показываем
+    Внутри `mismatch` две разные беды, и `detail` их РАЗЛИЧАЕТ (свернуть их в одну фразу —
+    это ровно тот же грех, что свернуть промах в пусто): слово «ревизор» в журнале есть, но
+    шаблон с ним разошёлся — или его нет вовсе (журнал подрезан / тиков правда не было).
+    Вердикт в обоих случаях ГРОМКИЙ: различить «событий не было» и «не узнал события» одним
+    шаблоном НЕЛЬЗЯ, а молчание тут дороже лишней строки — на живом журнале молчание уже
+    стоило шести суток (08.08 → 14.08)."""
     try:
         text = cowork_fn() if cowork_fn else None
-    except Exception:
-        text = None
+    except Exception as e:
+        return scan_result.ScanResult.unreadable(
+            _REV_SUBJ, detail=f"чтение cowork_log упало: {str(e)[:80]}")
     if text is None:
-        return "👁 надзор: cowork_log недоступен — тик ревизора неизвестен"
-    for line in text.splitlines():
+        return scan_result.ScanResult.unreadable(
+            _REV_SUBJ, detail="мост не отдал текст cowork_log")
+    scanned = parsed = named = 0
+    freshest = None
+    for line in str(text).splitlines():
+        if not line.strip():
+            continue
+        scanned += 1
+        if "ревизор" in line.lower():
+            named += 1                      # строка-кандидат: ревизор в ней хотя бы УПОМЯНУТ
         m = _REV_NOTE_RE.match(line)
-        if m:
-            return _parse_revisor(m.group(1))
-    return "👁 надзор: ревизор: тиков ещё не было"
+        if not m:
+            continue
+        parsed += 1
+        if freshest is None:
+            freshest = (m.group("body"), m.group("head"))
+    detail = ""
+    if scanned and not parsed:
+        detail = (f"строк со словом «ревизор» {named} — тик-шаблон не совпал ни с одной"
+                  if named else "слова «ревизор» нет ни в одной строке журнала")
+    return scan_result.ScanResult(scanned, parsed, subject=_REV_SUBJ,
+                                  payload=freshest, detail=detail)
+
+
+def _revisor_line(cowork_fn=None):
+    """Строка «👁 надзор: …» для сводки «статус». Три НЕ-ok исхода звучат владельцу по-разному
+    и ни один не сворачивается в другой; числа («осмотрено/разобрано») несёт сам контракт."""
+    res = _revisor_scan(cowork_fn)
+    if res.ok:
+        body, head = res.payload
+        return _parse_revisor(body, head)
+    if res.outcome == scan_result.OUTCOME_UNREADABLE:
+        return "👁 надзор: cowork_log НЕДОСТУПЕН, тик ревизора неизвестен — " + res.say()
+    if res.outcome == scan_result.OUTCOME_EMPTY:
+        return "👁 надзор: ревизор: тиков ещё не было — " + res.say()
+    return "👁 надзор: ⚠️ тик ревизора НЕ РАЗОБРАН — " + res.say()
 
 
 def _system_summary(items, goals, cowork_fn=None):

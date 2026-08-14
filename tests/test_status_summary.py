@@ -8,11 +8,18 @@ approved); терминальный родитель (done/failed) без нез
 ярлык — открытый шаг «шаг i/N», иначе «план строится»; synthetic-маркеры родителями не
 считаются. Плюс new/in_progress/approved одиночки обеих полос и кураторские цели счётчиком.
 🧑 ждёт тебя — все needs_approval: красные вопросы и сводные карточки владельцу.
-👁 надзор — честный тик ревизора из свежей NOTE «ревизор: …» в cowork_log (живой формат
-«NOTE Orchestrator: ревизор: 2 окон с активностью…» — разведка cowork_log 13.07.2026);
-NOTE нет → «ревизор: тиков ещё не было»; НИКАКОГО «время неизвестно»; маркеры очереди
-«[ревизор …]» — не тики. Всё пусто → «🟢 ТИХО»; Bridge-молчит ≠ ТИХО.
-Сети/Telegram нет — всё мокнуто."""
+👁 надзор — честный тик ревизора из свежей NOTE «ревизор: …» в cowork_log; НИКАКОГО «время
+неизвестно»; маркеры очереди «[ревизор …]» — не тики. Всё пусто → «🟢 ТИХО»; Bridge-молчит ≠ ТИХО.
+Сети/Telegram нет — всё мокнуто.
+
+ЯКОРЬ КЛАССА «НУЛЬ ПО НЕРАЗБОРУ» (14.08.2026). Прежние голдены надзора стояли на ВЫДУМАННОЙ
+строке «NOTE Orchestrator: ревизор: 2 окон…» — они были зелёными, пока живой журнал шесть суток
+отвечал владельцу «тиков ещё не было» при 37 тиках в нём. Поэтому фикстуры надзора теперь
+ДОСЛОВНЫЕ строки боевого cowork_log (снимок 14.08.2026, вместе с хвостовыми пробелами), а сам
+прежний шаблон живёт в тесте литералом `_OLD_RE` — регресс доказывает на ЖИВОЙ строке, что он
+не совпадал, а нынешний совпадает. Читатель отвечает контрактом `scan_result.ScanResult`:
+осмотрено/разобрано + исход, и три НЕ-ok состояния (пусто · недоступен · не разобрал) звучат
+владельцу по-разному."""
 import inspect
 import os, sys
 sys.path.insert(0, "/root/turbobaby-manager-bot")
@@ -21,11 +28,26 @@ os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_T
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
 
+import re
 import devbot as DB
+import scan_result
 
-# cowork_log без тик-NOTE ревизора (живые нетиковые строки: NOTE о задачах тик-паттерн не матчят)
-_COWORK_NO_TICK = ("NOTE Orchestrator: задача #287 → done · Готово. Косметика «статус контура»\n"
-                   "DONE Dispatch 16:05: статус контура — секция «в работе» без призраков\n")
+# --- ДОСЛОВНЫЕ строки боевого cowork_log (снимок 14.08.2026, хвостовые пробелы сохранены) ---
+# Тики: живой формат несёт ШТАМП ВРЕМЕНИ и автора ПОСЛЕ него — на этом и разошёлся прежний шаблон.
+_L_TICK_NEW = "NOTE 2026-08-13 13:26 UTC: Orchestrator: ревизор: 1 окон, чисто  "
+_L_TICK_OLD = ("NOTE 2026-08-13 13:24 UTC: Orchestrator: ревизор: 1 окон с активностью "
+               "с прошлого прогона — пакеты собраны  ")
+# Проза о ревизоре — тиком НЕ является (те же слова, но не в заявляющей позиции):
+_L_PROSE_NOTE = ("NOTE 2026-08-09 14:22 UTC: Orchestrator: задача #419 → done · Ревизор исхода "
+                 "находки не помнил вообще — единственной «памятью» был мердж строк  ")
+_L_PROSE_DONE = ("DONE 2026-08-11 03:41 UTC: ARTIFACT якорь класса «нуль по неразбору» → "
+                 "docs/artifacts/2026-08-11-revizor-tick-reader-contract.md: читатель тика "
+                 "ревизора, 7 состояний источника — было 2 фразы владельцу, стало 3  ")
+_COWORK_LIVE = "\n".join([_L_PROSE_NOTE, _L_TICK_NEW, _L_TICK_OLD, _L_PROSE_DONE]) + "\n"
+# Журнал БЕЗ тика, но с живыми строками (прежде читатель врал тут «тиков ещё не было»):
+_COWORK_NO_TICK = "\n".join([_L_PROSE_NOTE, _L_PROSE_DONE]) + "\n"
+# Прежний шаблон читателя ДОСЛОВНО (регресс «до/после» на живой строке, а не на выдуманной):
+_OLD_RE = re.compile(r"^NOTE(?:\s+[^:]{0,40})?:\s*ревизор:\s*(.+)", re.I)
 
 _ITEMS = [
     # живая pc-цепь 291 (pcloc-dec): родитель уже done, но есть НЕЗАКРЫТЫЙ шаг 2/5 (in_progress)
@@ -75,7 +97,7 @@ _ITEMS = [
 
 
 class Q:
-    cowork = _COWORK_NO_TICK
+    cowork = _COWORK_LIVE
     def __init__(self, items): self._items = items
     def get_pending_multi(self, statuses, lane=None):
         assert lane == "all", "снимок обязан опрашивать ОБЕ полосы (lane='all')"
@@ -119,44 +141,82 @@ print("(3) дайджест куратора жив:")
 res.append(ok("🧭 кураторские цели (2):" in out and "цель 231" in out and "цель 245" in out,
               "дайджест под сводкой (цели 231/245)"))
 
-# (4) надзор: тик-NOTE ревизора в cowork_log нет → честное «тиков ещё не было»
-print("(4) 👁 надзор (честный тик из cowork_log):")
-res.append(ok("👁 надзор: ревизор: тиков ещё не было" in out,
-              "NOTE «ревизор: …» нет → «тиков ещё не было»"))
+# (4) надзор на ДОСЛОВНОМ живом журнале: тик виден, время — из штампа строки, а не выдумано
+print("(4) 👁 надзор (ДОСЛОВНАЯ строка боевого cowork_log 14.08.2026):")
+res.append(ok("👁 надзор: ревизор 2026-08-13 13:26 — окон 1" in out,
+              "живая строка «NOTE <штамп> UTC: Orchestrator: ревизор: 1 окон, чисто» разобрана"))
 res.append(ok("время неизвестно" not in out, "никакого «время неизвестно»"))
+res.append(ok("тиков ещё не было" not in out,
+              "ГЛАВНОЕ: при живом тике доска НЕ говорит «тиков ещё не было»"))
+# регресс «до/после» на ЖИВОЙ строке: прежний шаблон её не брал — отсюда и родился класс
+res.append(ok(_OLD_RE.match(_L_TICK_NEW) is None and DB._REV_NOTE_RE.match(_L_TICK_NEW),
+              "прежний шаблон живую строку НЕ брал, нынешний берёт (штамп времени в голове)"))
+res.append(ok(DB._REV_NOTE_RE.match(_L_PROSE_NOTE) is None
+              and DB._REV_NOTE_RE.match(_L_PROSE_DONE) is None,
+              "проза о ревизоре (те же слова не в заявляющей позиции) тиком НЕ становится"))
 
 # (5) маркеры очереди «[ревизор …]» — дедуп/бюджет маршрутизации, НЕ тики (корень призрака)
 rev_items = _ITEMS + [
     {"id": 500, "status": "done", "from": "Filipp-pcloc-dec", "lane": "pc",
      "task_text": "[ревизор дата=2026-07-13 класс=greeting] проверить приветствие"},
 ]
-out_rev = DB._g_pulse(Q(rev_items))
-res.append(ok("👁 надзор: ревизор: тиков ещё не было" in out_rev
-              and "время неизвестно" not in out_rev,
+class QMark(Q):
+    cowork = _COWORK_NO_TICK              # тика в журнале нет — соблазн взять «тик» из очереди
+out_rev = DB._g_pulse(QMark(rev_items))
+res.append(ok("2026-07-13" not in out_rev.split("👁")[-1] and "время неизвестно" not in out_rev,
               "маркер очереди [ревизор дата=…] тиком НЕ считается (призрак убит)"))
 res.append(ok("500" not in out_rev.split("👁")[0], "маркер-карточки не мусорят секции работы"))
 
-# (6) тик из cowork_log: живой формат (разведка 13.07) и формат с временем; свежая NOTE сверху
-print("(6) тик ревизора из cowork_log:")
-live = ("NOTE Orchestrator: ревизор: 2 окон с активностью с прошлого прогона — пакеты собраны\n"
-        "NOTE Orchestrator: ревизор: 5 окон — старый тик\n")
-line = DB._revisor_line(lambda: live)
-res.append(ok(line == "👁 надзор: ревизор — окон 2",
-              "живой формат NOTE (без времени): окна есть, время не выдумано"))
-timed = ("NOTE Orchestrator: задача #287 → done · про ревизора, но не тик\n"
-         "NOTE Orchestrator: ревизор: тик 2026-07-13 06:10 — окон 12, находок 2\n"
-         "NOTE Orchestrator: ревизор: тик 2026-07-13 05:00 — окон 9, находок 0\n")
-line_t = DB._revisor_line(lambda: timed)
-res.append(ok(line_t == "👁 надзор: ревизор 2026-07-13 06:10 — окон 12, находок 2 ❗",
-              "NOTE с временем: честное время + окна + находки с ❗; свежая (верхняя) NOTE"))
-res.append(ok("окон 9" not in line_t, "старый тик не показывается"))
-res.append(ok(DB._revisor_line(lambda: "журнал без тик-NOTE")
-              == "👁 надзор: ревизор: тиков ещё не было", "нет NOTE → «тиков ещё не было»"))
-res.append(ok(DB._revisor_line(None)
-              == "👁 надзор: cowork_log недоступен — тик ревизора неизвестен",
-              "cowork_log не прочитался → честное «недоступен», не «тиков не было»"))
+# (6) КОНТРАКТ читателя: осмотрено/разобрано + исход; три НЕ-ok состояния звучат по-разному
+print("(6) контракт читателя тика (scan_result.ScanResult):")
+sc_live = DB._revisor_scan(lambda: _COWORK_LIVE)
+res.append(ok(sc_live.outcome == scan_result.OUTCOME_OK
+              and (sc_live.scanned, sc_live.parsed) == (4, 2),
+              "живой журнал: осмотрено 4, разобрано 2 (две прозаические строки — не тики)"))
+res.append(ok(DB._revisor_line(lambda: _COWORK_LIVE) == "👁 надзор: ревизор 2026-08-13 13:26 — окон 1",
+              "показан САМЫЙ СВЕЖИЙ тик (новые записи сверху), время из его штампа"))
+res.append(ok("13:24" not in DB._revisor_line(lambda: _COWORK_LIVE), "старый тик не показывается"))
+# состояние 1: строки есть, разобрать не смог — ТРЕТИЙ исход, ради которого весь заход
+sc_mis = DB._revisor_scan(lambda: _COWORK_NO_TICK)
+line_mis = DB._revisor_line(lambda: _COWORK_NO_TICK)
+res.append(ok(sc_mis.outcome == scan_result.OUTCOME_MISMATCH
+              and (sc_mis.scanned, sc_mis.parsed) == (2, 0),
+              "строки есть, тиков 0 → mismatch, а НЕ «пусто» (осмотрено 2, разобрано 0)"))
+res.append(ok("НЕ РАЗОБРАН" in line_mis and "осмотрено 2" in line_mis and "разобрано 0" in line_mis,
+              "владельцу: «НЕ РАЗОБРАН» + оба числа (нуль без знаменателя не отдаётся)"))
+res.append(ok("тиков ещё не было" not in line_mis,
+              "ЯКОРЬ: непустой журнал без разбора НЕ выдаётся за «тиков не было»"))
+res.append(ok("строк со словом «ревизор» 2" in line_mis,
+              "detail различает беды внутри mismatch: слово в журнале есть, шаблон разошёлся"))
+res.append(ok("слова «ревизор» нет ни в одной строке" in DB._revisor_line(lambda: "просто строка"),
+              "вторая беда mismatch названа отдельно (слова нет вовсе)"))
+# состояние 2: событий не было — знаменатель 0, и он назван вслух
+sc_empty = DB._revisor_scan(lambda: "")
+line_empty = DB._revisor_line(lambda: "")
+res.append(ok(sc_empty.outcome == scan_result.OUTCOME_EMPTY and sc_empty.scanned == 0,
+              "пустой журнал → empty (осмотрено 0)"))
+res.append(ok("тиков ещё не было" in line_empty and "осмотрено 0" in line_empty,
+              "владельцу: «тиков ещё не было» ТОЛЬКО со знаменателем 0"))
+# состояние 3: источник недоступен — осмотра НЕ БЫЛО (не «строк 0»)
+sc_unread = DB._revisor_scan(None)
+line_unread = DB._revisor_line(None)
+res.append(ok(sc_unread.outcome == scan_result.OUTCOME_UNREADABLE and sc_unread.scanned is None,
+              "журнал не прочитан → unreadable, осмотрено НЕИЗВЕСТНО (None, не 0)"))
+res.append(ok("НЕДОСТУПЕН" in line_unread and "осмотрено" not in line_unread,
+              "владельцу: «НЕДОСТУПЕН», без выдуманного знаменателя"))
+def _boom(): raise RuntimeError("сеть упала")
+res.append(ok(DB._revisor_scan(_boom).outcome == scan_result.OUTCOME_UNREADABLE,
+              "исключение чтения → unreadable, а не пустой журнал"))
+# три фразы РАЗНЫЕ — ни одна не сворачивается в другую
+res.append(ok(len({line_mis, line_empty, line_unread}) == 3,
+              "три НЕ-ok состояния звучат владельцу по-разному"))
 res.append(ok("время неизвестно" not in DB._parse_revisor("пакеты собраны, деталей нет"),
               "тик без чисел/времени — без «время неизвестно» (короткий текст тика)"))
+# легаси-формат без штампа (как писал ПК до 13.07) читается по-прежнему
+legacy = ("NOTE Orchestrator: ревизор: 2 окон с активностью с прошлого прогона — пакеты собраны\n"
+          "NOTE Orchestrator: ревизор: 5 окон — старый тик\n")
+res.append(ok(DB._revisor_line(lambda: legacy) == "👁 надзор: ревизор — окон 2",
+              "легаси-NOTE без штампа: окна есть, время не выдумано"))
 
 # (7) пустой случай: «🟢 ТИХО» — сигнал «всё завершено»
 print("(7) пустой случай:")
