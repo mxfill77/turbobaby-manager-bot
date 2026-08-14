@@ -47,6 +47,7 @@ import chain_cards        # ЖУРНАЛ РОЖДЕНИЯ КАРТОЧЕК: те
 import curator_state      # СВЕРКА ПУНКТА С ЖИВЫМ СОСТОЯНИЕМ: чистая функция (см. _curator_state_check)
 import scan_result        # КОНТРАКТ ЧИТАТЕЛЯ: нуль без знаменателя наверх не отдаётся
 import expectations       # ПРИБОР О3 «коммит дошёл до прода»: чистое решение, зовём его, а не свой глаз
+import deliver_card       # ДОСТАВКА ПО ВЕРДИКТУ О3: чистое решение «предложить ли карточку» (путь C)
 
 
 def _is_fixture(text: str) -> bool:
@@ -3343,22 +3344,27 @@ def _curator_state_dirty():
     return scan_result.ScanResult(scanned=len(rows), parsed=len(rows), subject=subj, payload=rows)
 
 
-def _curator_state_answers(named):
-    """Коммиты, названные пунктом → ответ ПРИБОРА О3 по каждому: {"ok","state","families"}.
+def _delivery_facts(now=None):
+    """ФАКТЫ О3 и ни одного решения: коммиты окна, замыкания потребителей, живые процессы, время
+    последней записи файлов, расхождение диска с origin/main. Форма — та же, что у наблюдателя
+    (`expectations_run.delivery_facts`), потому что судит их ОДИН И ТОТ ЖЕ прибор.
 
-    Своего суждения о доставке здесь нет ни одного: факты собирает тот же read-only разведчик
-    `prod_drift`, которым живёт наблюдатель (замыкания импортов, /proc, mtime, окно origin/main),
-    а судит их сам `expectations.delivery_state` — то есть ровно тот код, что говорит владельцу
-    «дошёл коммит до прода или нет». Три исхода прибора переводятся в трёхзначное `ok`:
-    доставлен → True, не доставлен → False, всё остальное (включая «коммит вне окна прибора») →
-    None, то есть дырка, которую решение обязано прочитать как «неизвестно»."""
-    now = time.time()
+    ОДИН СБОРЩИК НА ДВУХ ЧИТАТЕЛЕЙ ВНУТРИ ДЕМОНА (14.08.2026): сверку пункта куратора
+    (`_curator_state_answers`) и предложение карточки доставки (`_maybe_deliver_ask`). Две
+    реализации одной команды — ровно тот класс, который в этом файле уже назван остатком; здесь
+    он не заводится.
+
+    ЗНАМЕНАТЕЛЬ ЧИТАЕТСЯ ДО НАХОДОК: «дерево чистое» разрешает судить доставку, «спросить не
+    удалось» — нет, и тогда каждый файл станет «неизвестно», а не «доставлен» (замок против
+    ложного зелёного, контракт `scan_result`)."""
+    now = time.time() if now is None else float(now)
     win = expectations.limit_env(expectations.DELIVER_WINDOW_ENV,
                                  expectations.DELIVER_WINDOW_DEFAULT, os.environ, scale=3600.0)
-    commits = {}
-    for c in prod_drift.commits_since(now - max(win, 3600.0) * 2, REPO):
-        commits[str(c.get("sha") or "")[:7]] = c
-    watched = {u for u, _e in prod_drift.WATCHED}
+    try:
+        commits = prod_drift.commits_since(now - max(win, 3600.0) * 2, REPO)
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("доставка: коммиты окна не прочитаны (%s) — фактов нет", e)
+        commits = []
     closures, units = {}, {}
     for unit, entry in prod_drift.WATCHED:
         try:
@@ -3372,7 +3378,7 @@ def _curator_state_answers(named):
         units[unit] = {"alive": bool(p), "started": (p or {}).get("started"),
                        "pid": (p or {}).get("pid"), "entry": entry}
     mtimes = {}
-    for c in commits.values():
+    for c in commits:
         for rel in (c.get("files") or []):
             rel = expectations.norm_path(rel)
             if rel in mtimes:
@@ -3380,15 +3386,31 @@ def _curator_state_answers(named):
             try:
                 mtimes[rel] = os.stat(os.path.join(REPO, rel)).st_mtime
             except OSError:
-                continue
-    # Знаменатель читаем ДО находок: «дерево чистое» (исход empty) разрешает судить доставку,
-    # «спросить не удалось» (unreadable) — нет, и прибор честно ответит «неизвестно».
+                continue                     # файла нет (удалён коммитом) — свидетеля С1 хватит
     d = _curator_state_dirty()
-    if d.outcome == scan_result.OUTCOME_UNREADABLE:
-        log.info("curator-state: %s — доставку не подтверждаем", d.say())
-    facts = {"delivery": {"closures": closures, "units": units, "mtimes": mtimes,
-                          "dirty": list(d.payload or ()) if d.scanned is not None else [],
-                          "dirty_ok": d.outcome != scan_result.OUTCOME_UNREADABLE}}
+    dirty_ok = d.outcome != scan_result.OUTCOME_UNREADABLE
+    if not dirty_ok:
+        log.info("доставка/curator-state: %s — доставку не подтверждаем", d.say())
+    return {"ok": bool(commits) or dirty_ok,
+            "commits": commits, "closures": closures, "units": units, "mtimes": mtimes,
+            "dirty": list(d.payload or ()) if d.scanned is not None else [],
+            "dirty_ok": dirty_ok}
+
+
+def _curator_state_answers(named):
+    """Коммиты, названные пунктом → ответ ПРИБОРА О3 по каждому: {"ok","state","families"}.
+
+    Своего суждения о доставке здесь нет ни одного: факты собирает тот же read-only разведчик
+    `prod_drift`, которым живёт наблюдатель (замыкания импортов, /proc, mtime, окно origin/main),
+    а судит их сам `expectations.delivery_state` — то есть ровно тот код, что говорит владельцу
+    «дошёл коммит до прода или нет». Три исхода прибора переводятся в трёхзначное `ok`:
+    доставлен → True, не доставлен → False, всё остальное (включая «коммит вне окна прибора») →
+    None, то есть дырка, которую решение обязано прочитать как «неизвестно»."""
+    facts = {"delivery": _delivery_facts()}
+    commits = {}
+    for c in (facts["delivery"].get("commits") or []):
+        commits[str(c.get("sha") or "")[:7]] = c
+    watched = {u for u, _e in prod_drift.WATCHED}
     out = {}
     for sha in named:
         c = commits.get(sha[:7])
@@ -4375,6 +4397,71 @@ def _convert_curator_human_approved(tid, task, what):
     log.info("curator-human: карточка %s одобрена (✅) → задача %s на исполнение пунктов", tid, nid)
 
 
+def _convert_deliver_approved(tid, task, what):
+    """✅ на карточке ДОСТАВКИ (путь C) → задача «гейт → перезапуск → проверка старта».
+
+    Демон здесь НИЧЕГО НЕ ПЕРЕЗАПУСКАЕТ САМ, и это не осторожность, а устройство: он ставит
+    строку в очередь, а перезапуск делает задача-исполнитель, у которой перед рестартом стоит
+    гейт. Так операция остаётся ровно там, где ей место по рамке (решение владельца → работа
+    исполнителя), а машинерия — уже готовый конверт (`_enqueue_convert_verified`), то есть
+    ни одной новой двери к операциям не открывается.
+
+    ВТОРОЕ ОКНО ПРИБОРА (приём `f1f0164`): между рождением карточки и нажатием проходят часы, и
+    коммит мог доехать сам — любым другим рестартом. Прибор спрашивается ЕЩЁ РАЗ, и подтверждённая
+    доставка закрывает карточку БЕЗ задачи: перезапускать прод второй раз «на всякий случай» —
+    это ровно та операция, которой владелец не просил. ПО ТАЙМЕРУ НЕ СНИМАЕТСЯ НИЧЕГО: возраст
+    карточки роли не играет, признак один — прибор ДОКАЗАЛ доставку. Не смог доказать (мост,
+    git, коммит вне окна, разбор упал) → ответ исполняется, как исполнялся.
+
+    ЮНИТ НЕ УГАДЫВАЕТСЯ: он лежит в строке очереди, которую писал сам демон (`row_text`). Строка
+    не разобралась → карточка закрывается FAILED с пунктом дословно — «да» видно как незакрытое
+    дело, но перезапускать наугад мы не станем."""
+    text = str(task.get("task_text") or "")
+    sha = deliver_card.sha_of(text)
+    units = deliver_card.units_of(text)
+    ans = {}
+    try:
+        if sha:
+            ans = _curator_state_answers([sha])
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("доставка: второе окно прибора по коммиту %s не сработало (%s) — ответ "
+                    "владельца исполняется, как исполнялся", sha, e)
+    a = ans.get(sha) or {}
+    if a.get("ok") is True:
+        bc.complete_task(tid, "done", cap_result(
+            f"🔍 карточка доставки коммита {sha} (✅ принято): задача НЕ ставилась — прибор О3 "
+            f"подтверждает, что коммит доехал до прода, ПОКА карточка ждала ответа ({a.get('state')}). "
+            f"Вопрос снят ПО ФАКТУ, а не по времени: второй перезапуск владелец не просил. "
+            f"Считаешь иначе — «тз:» в 328."))
+        log.info("доставка: карточка %s одобрена, но коммит %s уже доставлен (%s) — задачи нет",
+                 tid, sha, a.get("state"))
+        return
+    if not sha or not units:
+        bc.complete_task(tid, "failed", cap_result(
+            f"🧑 карточка доставки (✅): «да» ПРИНЯТО, но строка карточки не разобрана "
+            f"(коммит={sha or '—'}, юниты={', '.join(units) or '—'}) — перезапускать наугад не "
+            f"стану. Дожми руками: гейт → перезапуск нужного сервиса, либо поставь «тз:» в 328."))
+        log.warning("доставка: карточка %s одобрена, но разбор строки не дал коммит/юниты "
+                    "(text=%.80s)", tid, text)
+        return
+    off = {"sha": sha, "units": units,
+           "subject": str(what or "").splitlines()[0][:70] if what else ""}
+    nid = _enqueue_convert_verified(tid, cap_result(deliver_card.tz(tid, off)))
+    if nid is None:
+        bc.complete_task(tid, "failed", cap_result(
+            f"🧑 карточка доставки коммита {sha} (✅): «да» ПРИНЯТО, но задача-доставщик НЕ встала "
+            f"в очередь даже с повтором — доставки СЕЙЧАС не будет. Дожми руками: гейт "
+            f"(`venv/bin/python3 gate.py`) → перезапуск {', '.join(units)}."))
+        log.warning("доставка: карточка %s одобрена, но задача-доставщик не встала → failed", tid)
+        return
+    bc.complete_task(tid, "done", cap_result(
+        f"🚚 карточка доставки коммита {sha} (✅) → задача id {nid}: гейт → перезапуск "
+        f"{', '.join(units)} → проверка чистого старта (from=Filipp-328{DEV_FROM_SUFFIX}, таймаут "
+        f"45 мин). Красный гейт = перезапуска не будет, придёт честный отчёт по задаче {nid}."))
+    log.info("доставка: карточка %s одобрена (✅) → задача %s (коммит %s, юниты %s)",
+             tid, nid, sha, ", ".join(units))
+
+
 def process_approved():
     """Довести одобренные Филиппом красные шаги (status=approved). claude ПОВТОРНО НЕ зовётся —
     op∈AUTO_OPS исполняется хардкод-командой (билет 4.2 + чёрный ящик); op=other (заведено 03.07)
@@ -4411,6 +4498,14 @@ def process_approved():
         # human-пункты той же цели после закрытия пойдут НОВОЙ карточкой (upsert ищет открытые).
         if _CURATOR_HUMAN_RE.match(str(task.get("task_text") or "")):
             _convert_curator_human_approved(tid, task, what)
+            continue
+
+        # КАРТОЧКА ДОСТАВКИ (путь C, 14.08.2026): ✅ = «доставь этот коммит», а не «принял к
+        # сведению» — тот же урок карточек 95/100. ДО проверки таймаута approved по той же
+        # причине, что у сводной: «approve истёк» сжёг бы «да» владельца, а прибор во втором
+        # окне и так не даст сделать уже сделанное.
+        if deliver_card.sha_of(str(task.get("task_text") or "")):
+            _convert_deliver_approved(tid, task, what)
             continue
 
         # таймаут approved: одобрено давно, не довели → авто-failed
@@ -5416,6 +5511,163 @@ def _maybe_prod_drift(now=None):
     return said
 
 
+# ═════ ДОСТАВКА ПРОВЕРЕННОГО КОММИТА: ОДНА КНОПКА ВМЕСТО РУЧНОГО РЕСТАРТА (14.08.2026) ═════
+# ПУТЬ C цели 538, выбранный владельцем кнопкой на карточке 541. Детектор дрейфа и О3 умели
+# ГОВОРИТЬ о недоставке, но говорили в канал, на который не отвечают (лента/журнал мозга), —
+# и доставка оставалась случайной: за наблюдение 10–14.08 из 13 перезапусков руками сделаны 2,
+# и ровно они рвали серию цепочек. Здесь вердикт прибора превращается в ВОПРОС владельцу.
+#
+# ГРАНИЦА НЕ ТРОНУТА: ни одной операции без «да». Ветка умеет ровно два действия — прочитать
+# факты и поставить строку очереди в needs_approval (карточку в инбокс 1160 несёт devbot).
+# Перезапуск делает ЗАДАЧА, рождённая ответом владельца, и она же гоняет гейт.
+#
+# ТРОТТЛИНГ И ПОТОЛОК: факты собираются не чаще DELIVER_EVERY_SEC (замер О3: ~8 настоящих
+# недоставок в неделю, то есть ~1 карточка в сутки — минутный цикл здесь не купил бы ничего),
+# карточек за прогон не больше одной, за сутки — не больше DELIVER_DAY_CAP.
+# ОТКАТ: DELIVER_CARD=0 в .env + рестарт демона → ветка мертва ДО сбора фактов.
+DELIVER_STATE_DIR = "/tmp/cc_deliver_asked"           # коммиты, о которых уже спрашивали
+DELIVER_EVERY_SEC = _env_int("DELIVER_EVERY_SEC", 900)
+DELIVER_DAY_CAP = _env_int("DELIVER_DAY_CAP", 3)      # потолок вопросов владельцу в сутки
+DELIVER_KEEP = 32                                     # сколько коммитов помним
+_deliver_next = 0.0                                   # ближайший разрешённый замер (троттлинг)
+
+
+def _deliver_dir():
+    """Каталог состояния. Зеркало дисциплины `_drift_dir`: тест НЕ пишет в боевой каталог."""
+    explicit = (os.environ.get("CC_DELIVER_DIR") or "").strip()
+    if explicit:
+        return explicit
+    if (os.environ.get("ORCH_TEST_MODE") or "").strip():
+        return DELIVER_STATE_DIR + "_test"
+    return DELIVER_STATE_DIR
+
+
+def _deliver_asked():
+    """Память вопросов {коммит: когда спросили} → ScanResult (payload = этот словарь).
+
+    ЗНАМЕНАТЕЛЬ ОБЯЗАТЕЛЕН И ЗДЕСЬ (контракт `scan_result`): «мы ещё никого не спрашивали» и
+    «память не прочиталась» — РАЗНЫЕ вещи, и вторая обязана дойти наверх как незнание. Иначе
+    испорченный файл читался бы как чистая память, и владелец получил бы ВТОРОЙ вопрос по тому
+    же коммиту — ровно тот шум, ради которого дедуп и заведён.
+    Файла нет — это законный ноль (первый прогон), а не сбой; мусор и ошибка ввода-вывода —
+    «не прочитано», и тогда ветка молчит до следующего замера."""
+    subj = "коммитов, о которых уже спрашивали"
+    path = os.path.join(_deliver_dir(), "asked.json")
+    if not os.path.exists(path):
+        return scan_result.ScanResult(scanned=0, parsed=0, subject=subj, payload={})
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = (json.load(f) or {}).get("asked") or {}
+        asked = {str(k): float(v or 0) for k, v in raw.items()}
+    except Exception as e:                                           # noqa: BLE001
+        return scan_result.ScanResult.unreadable(subj, detail=f"память не прочитана: {e}")
+    return scan_result.ScanResult(scanned=len(asked), parsed=len(asked), subject=subj,
+                                  payload=asked)
+
+
+def _deliver_mark(sha, now):
+    """Запомнить вопрос. Best-effort: диск недоступен → второй рубеж (маркер в очереди) удержит
+    дубль открытой карточки, а после ответа возможен повтор вопроса по тому же коммиту."""
+    asked = dict(_deliver_asked().payload or {})
+    asked[str(sha)] = float(now)
+    keep = dict(sorted(asked.items(), key=lambda kv: -kv[1])[:DELIVER_KEEP])
+    try:
+        d = _deliver_dir()
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, "asked.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"asked": keep}, f)
+        os.replace(tmp, os.path.join(d, "asked.json"))
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("доставка: состояние не сохранено (%s) — возможен повтор вопроса", e)
+
+
+def _deliver_open_shas():
+    """Коммиты, карточки которых уже висят в needs_approval → ScanResult (payload = множество).
+
+    Второй рубеж дедупа, и знаменатель ему нужен по той же причине, что памяти на диске: «в
+    очереди таких карточек нет» и «очередь не прочиталась» — разные вещи. Не прочиталось —
+    карточку НЕ ставим вовсе: дубль вопроса владельцу хуже, чем вопрос на четверть часа позже."""
+    subj = "открытых карточек доставки в очереди"
+    try:
+        r = bc.get_pending("needs_approval")
+    except Exception as e:                                           # noqa: BLE001
+        return scan_result.ScanResult.unreadable(subj, detail=f"мост не ответил: {e}")
+    if not r.get("ok"):
+        return scan_result.ScanResult.unreadable(
+            subj, detail=f"мост не ответил: {r.get('error') or 'без поля error'}")
+    rows = list(r.get("items", []))
+    out = {sha for sha in (deliver_card.sha_of(str((it or {}).get("task_text") or ""))
+                           for it in rows) if sha}
+    return scan_result.ScanResult(scanned=len(rows), parsed=len(rows), subject=subj, payload=out)
+
+
+def _maybe_deliver_ask(now=None):
+    """Вердикт О3 «не доставлен» → карточка владельцу «доставить коммит?» → список id карточек.
+
+    FAIL-SAFE НА КАЖДОМ ШАГЕ (флаг, факты, вердикт, дедуп, очередь) → молчание, то есть
+    поведение байт-в-байт как без ветки. Ни одного перезапуска здесь не делается и сделать
+    нечем: сама возможность лежит в задаче, которую поставит «да»."""
+    global _deliver_next
+    try:
+        if not deliver_card.on(os.environ):
+            return []
+        now = time.time() if now is None else float(now)
+        if now < _deliver_next:
+            return []
+        _deliver_next = now + DELIVER_EVERY_SEC
+        facts = _delivery_facts(now)
+        facts = {"now": now, "delivery": facts}
+        notes = expectations.verdict(facts, expectations.config(os.environ))
+        watched = {u for u, _e in prod_drift.WATCHED}
+        offers = [o for o in (deliver_card.offer(n, watched) for n in notes) if o]
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("доставка: замер пропущен (%s)", e)
+        return []
+    if not offers:
+        return []
+    mem = _deliver_asked()
+    if mem.outcome == scan_result.OUTCOME_UNREADABLE:
+        log.warning("доставка: %s — вопрос не задаём (дубль владельцу хуже задержки)", mem.say())
+        return []
+    asked = dict(mem.payload or {})
+    today = [ts for ts in asked.values() if now - ts < 86400.0]
+    if DELIVER_DAY_CAP > 0 and len(today) >= DELIVER_DAY_CAP:
+        log.info("доставка: за сутки уже %d вопросов (потолок %d) — молчу, недоставку видно в О3",
+                 len(today), DELIVER_DAY_CAP)
+        return []
+    seen = _deliver_open_shas()
+    if seen.outcome == scan_result.OUTCOME_UNREADABLE:
+        log.warning("доставка: %s — вопрос не задаём", seen.say())
+        return []
+    open_shas = set(seen.payload or ())
+    said = []
+    for off in offers:
+        sha = off["sha"]
+        if sha in asked or sha in open_shas:
+            continue
+        try:
+            r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", deliver_card.row_text(off))
+            if not r.get("ok"):
+                log.warning("доставка: карточка по коммиту %s не встала (%s)", sha, r.get("error"))
+                continue
+            sid = r.get("id")
+            bc.claim_task(sid)      # даже если claim не прошёл — set_needs_approval финализирует
+            rr = bc.set_needs_approval(sid, cap_result(deliver_card.render(off)))
+            if not rr.get("ok"):
+                log.warning("доставка: карточка %s не доведена в needs_approval (%s)",
+                            sid, rr.get("error"))
+                continue
+            _deliver_mark(sha, now)
+            said.append(sid)
+            log.info("ДОСТАВКА: коммит %s не доехал до %s → карточка %s владельцу (✅ = задача "
+                     "гейт+перезапуск, ❌ = ничего)", sha, ", ".join(off["units"]), sid)
+        except Exception as e:                                       # noqa: BLE001
+            log.warning("доставка: карточка по коммиту %s не поставлена (%s)", sha, e)
+        break                       # РОВНО ОДИН вопрос за прогон: очередь важнее доставки
+    return said
+
+
 # ════════════════════ ПУЛЬС ОБОРОТА — О2 СЛОЯ ОЖИДАНИЙ (07.08.2026) ════════════════════════
 # ЕДИНСТВЕННАЯ НОВАЯ ЗАПИСЬ ВО ВСЁМ СЛОЕ. Ожидание О2 («главный процесс произвёл свой результат,
 # а не просто существует») требует продукта, который процесс выдаёт И БЕЗ СПРОСА: успешный опрос
@@ -5513,6 +5765,7 @@ def cycle():
     process_pc_chains()
     process_new()
     _maybe_prod_drift()         # ДЕТЕКТОР ДРЕЙФА: read-only, только говорит (заметка в ленту 829)
+    _maybe_deliver_ask()        # ДОСТАВКА (путь C): вердикт О3 «не доставлен» → вопрос владельцу
     _expect_pulse()             # ПУЛЬС ОБОРОТА (О2): факт «оборот состоялся» для яруса 2
 
 
