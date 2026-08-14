@@ -18,7 +18,11 @@
                   и в живую таблицу НЕ уходит ни одного вызова;
     (6) НЕ ИЗОБРАЖАЕМ возможности: объекта нет → кнопки нет вовсе;
     (7) ОТКАТ     `SERVICE_UNDO=0` → ни журнала, ни кнопки, путь записи байт-в-байт прежний;
-    (8) ГРАНИЦА   у решения импортов ноль (ast), а в ветке отмены нет ни одного вызова записи.
+    (8) ГРАНИЦА   у решения импортов ноль (ast), в ветке отмены нет ни одного вызова записи,
+                  а КАЖДАЯ пишущая дверь помнит акт (иначе кнопка снова минует дверь);
+    (9) ДВЕРЬ МАСЛА (достройка 14.08): обе двери масла (`_write_oil`, `_write_oil_backdated`)
+                  отменяемы, к мосту ходят РОВНО столько же раз, сколько без механизма; чужая
+                  тема и старше окна — отказ; сводка без записи кнопки не несёт.
 """
 import ast
 import asyncio
@@ -202,7 +206,9 @@ SENDS = []
 
 
 async def _rec_send(context, *, chat_id, text, message_thread_id=None, reply_markup=None, **kw):
-    SENDS.append((text, reply_markup))
+    # Тема записывается тоже: у двери масла проверяется «только СВОЯ» — ответ обязан уехать в тему
+    # АКТА, а не в тему нажавшего (адрес берётся из журнала, а не из сообщения кнопки).
+    SENDS.append((text, reply_markup, message_thread_id))
 
 
 S._send = _rec_send
@@ -218,43 +224,64 @@ class FakeBridge:
         self.sp = sp
         self.closed = False
         self.oil_calls, self.svc_calls, self.upserts, self.events = [], [], [], []
+        # ВСЕ обращения к мосту по порядку: «лишних обращений ноль» доказывается сравнением этого
+        # списка с флагом отмены и без него, а не обещанием в комментарии.
+        self.calls = []
 
     def service_list(self):
+        self.calls.append("service_list")
         return {"ok": True, "items": [{"bike": BIKE_2478, "current_km": "24000",
                                        "updated_at": "2026-07-15T11:15:32"}]}
 
     def set_fleet_oil(self, number, oil_km, confirmed=False):
+        self.calls.append("set_fleet_oil")
         self.oil_calls.append((number, oil_km, confirmed))
         return dict(self.oil_answer)
 
     def set_fleet_service(self, number, kind, km, confirmed=False):
+        self.calls.append("set_fleet_service")
         self.svc_calls.append((number, kind, km, confirmed))
         return dict(self.svc_answer)
 
     def service_upsert(self, **kw):
+        self.calls.append("service_upsert")
         self.upserts.append(kw)
         return {"ok": True, "next_km": 29997, "status": "ok"}
 
     def add_event(self, **kw):
+        self.calls.append("add_event")
         self.events.append(kw)
         return {"ok": True}
 
     def service_pending_get(self, chat_id, topic_id, bike):
+        self.calls.append("service_pending_get")
         if self.sp and not self.closed:
             return {"ok": True, "item": dict(self.sp)}
         return {"ok": False, "error": "not_found"}
 
     def service_pending_upsert(self, **kw):
+        self.calls.append("service_pending_upsert")
         return {"ok": True}
 
     def service_pending_close(self, **kw):
+        self.calls.append("service_pending_close")
         self.closed = True
         return {"ok": True}
 
+    def service_set_pin(self, **kw):
+        self.calls.append("service_set_pin")
+        return {"ok": True}
+
+    def important_list(self, status=""):
+        self.calls.append("important_list")
+        return {"ok": True, "items": []}
+
     def find_bike(self, q):
+        self.calls.append("find_bike")
         return {"name": q}
 
     def fleet(self, cells=False):
+        self.calls.append("fleet")
         return {"ok": True, "data": {"bikes": []}}
 
     @staticmethod
@@ -293,6 +320,7 @@ def reset(flag=None):
     S._SVC_WRITE_DEDUP.clear()
     S._SVC_UNDO.clear()
     S._SVC_UNDO_LAST.clear()
+    S._SVC_SUMMARY.clear()          # накопитель сводки: дверь масла шлёт квитанцию именно им
     S._TOPIC_BIKE_OVERRIDE[(CHAT, TOPIC)] = BIKE_2478
     S._TOPIC_NAMES[(CHAT, TOPIC)] = BIKE_2478
     os.environ["ODO_CEILING_KM"] = "0"        # верхняя граница — чужая цель, её не трогаем
@@ -314,7 +342,8 @@ def door_button(b, odo="24997", done=("oil",), uname="Pleummmm"):
 
 def undo_kb():
     """Токен кнопки отмены с ПОСЛЕДНЕЙ квитанции, либо None."""
-    for text, kb in reversed(SENDS):
+    for rec in reversed(SENDS):
+        kb = rec[1]
         if kb is not None:
             for row in kb.inline_keyboard:
                 for btn in row:
@@ -419,6 +448,172 @@ def sec_rollback():
     reset()
 
 
+# ═══════════════ (9) ДВЕРЬ МАСЛА ═══════════════
+# Достройка 14.08.2026: у двери масла своей квитанции нет вовсе (итог уезжает ОБЩЕЙ закрепляемой
+# сводкой `_emit_summary`), поэтому кнопке было негде сесть, а расписка читалась на один флаг `ok`.
+# Голдены — ДОСЛОВНЫЕ расписки журнала (31.07 4957 и 15.07 2478).
+
+TOPIC2 = 84
+BIKE_9890 = "ADV 350CC RED BKK 9890"
+#: ДОСЛОВНАЯ расписка двери масла, 10.06 10:02:01 (байк 9890) — вторая тема в проверке «только СВОЯ».
+R_OIL_9890 = {"action": "set_fleet_oil", "ok": True, "number": "9890", "bike_name": BIKE_9890,
+              "row": 33, "old_oil": 12800, "new_oil": 19130, "_status": 200}
+
+
+def door_oil(b, km="24997", uname="Pleummmm", topic=TOPIC, bike=BIKE_2478):
+    """Живая дверь [После замены]: svc:oil → `_write_oil` (боевая запись кол.I)."""
+    tok = S._svc_put({"chat": CHAT, "topic": topic, "bike": bike, "km": km})
+    run(S.handle_service_button(_upd(FakeQ(f"svc:oil:{tok}", uname)), context=None, bridge=b))
+
+
+def door_oilbk(b, km="24997", uname="Pleummmm"):
+    """Вторая дверь масла: svc:oilbk → `_write_oil_backdated` (запись задним числом)."""
+    tok = S._svc_put({"chat": CHAT, "topic": TOPIC, "bike": BIKE_2478, "km": km})
+    run(S.handle_service_button(_upd(FakeQ(f"svc:oilbk:{tok}", uname)), context=None, bridge=b))
+
+
+def press(tok, topic=TOPIC, b=None):
+    q = FakeQ(f"svc:undo:{tok}")
+    q.message = type("M", (), {"chat_id": CHAT, "message_thread_id": topic})()
+    run(S.handle_service_button(_upd(q), context=None, bridge=b or FakeBridge()))
+    return q
+
+
+def sec_oil_door():
+    print("\n(9) дверь масла: запись отменяема")
+    reset()
+    b = FakeBridge()
+    door_oil(b)
+    ok("запись прошла как прежде", b.oil_calls == [("2478", 24997, True)], str(b.oil_calls))
+    tok = undo_kb()
+    ok("на сводке этого акта появилась кнопка отмены", tok is not None, str(SENDS))
+    e = S._SVC_UNDO.get(tok) or {}
+    ok("акт помнит, КТО подтвердил", e.get("by") == "@Pleummmm", str(e.get("by")))
+    ok("объект взят из расписки: кол.I 24997 → 17900",
+       e.get("pos") and (e["pos"][0]["column"], e["pos"][0]["new"], e["pos"][0]["old"])
+       == ("I", 24997, 17900), str(e.get("pos")))
+
+    # ЛИШНИХ ОБРАЩЕНИЙ К МОСТУ НОЛЬ + ОТКАТ — тем же корпусом вызовов и тем же текстом сводки
+    calls_on, text_on = list(b.calls), SENDS[-1][0]
+    reset(flag="0")
+    b_off = FakeBridge()
+    door_oil(b_off)
+    ok("к мосту ходим РОВНО столько же, сколько без отмены", calls_on == b_off.calls,
+       f"{calls_on} != {b_off.calls}")
+    ok("текст сводки БАЙТ-В-БАЙТ прежний", SENDS and SENDS[-1][0] == text_on,
+       str(SENDS[-1][0])[:120])
+    ok("с выключенной ручкой кнопки нет", undo_kb() is None)
+    ok("с выключенной ручкой журнал пуст", not S._SVC_UNDO)
+
+    # НАЖАТИЕ: карточка владельцу, живая таблица не тронута
+    reset()
+    b2 = FakeBridge()
+    door_oil(b2)
+    tok = undo_kb()
+    before = (len(b2.oil_calls), len(b2.svc_calls), len(b2.events), len(b2.upserts))
+    # тело карточки судим ЦЕЛИКОМ (мок-счётчик режет строку на 200 символах) и ДО нажатия —
+    # после него акт помечен «уже отправлено», и карточки по нему больше нет по замыслу
+    body = U.card(U.verdict(S._SVC_UNDO[tok], tok, tok, S._SVC_UNDO[tok]["ts"] + 60), "@earth", LBL)
+    q = press(tok, b=b2)
+    ok("ЖИВАЯ ТАБЛИЦА НЕ ТРОНУТА нажатием",
+       (len(b2.oil_calls), len(b2.svc_calls), len(b2.events), len(b2.upserts)) == before)
+    card = counted()
+    ok("карточка владельцу РОВНО одна", len(card) == 1, str(card))
+    ok("ушедшая карточка красная и с байком",
+       card and "ЖИВАЯ ТАБЛИЦА" in card[0] and "2478" in card[0], str(card)[:160])
+    for what, frag in (("байк", "2478"), ("регистр", "кол.I"), ("строку", "строка 22"),
+                       ("старое число", "17900"), ("новое число", "24997"),
+                       ("кто записал", "@Pleummmm")):
+        ok(f"карточка называет {what}", frag in body, body[:200])
+    ok("кнопка с квитанции снята", q.markup_cleared)
+    press(tok, b=b2)
+    ok("отмена отмены: второй карточки нет", len(counted()) == 1, str(counted()))
+
+    # СТАРАЯ — не отменяем (и говорим почему)
+    reset()
+    b3 = FakeBridge()
+    door_oil(b3)
+    tok = undo_kb()
+    S._SVC_UNDO[tok]["ts"] -= U.TTL_DEFAULT + 60
+    press(tok, b=b3)
+    ok("старше окна 3 ч → карточки НЕТ", len(counted()) == 0, str(counted()))
+    ok("отказ по окну назван человеку", "окно 3 ч" in SENDS[-1][0], SENDS[-1][0])
+    ok("отказ НАЗЫВАЕТ объект (донести владельцу сами)",
+       "24997" in SENDS[-1][0] and "17900" in SENDS[-1][0], SENDS[-1][0])
+
+    # ЧУЖАЯ — журнал ключуется темой: ответ и объект берутся из АКТА, а не из места нажатия
+    reset()
+    S._TOPIC_BIKE_OVERRIDE[(CHAT, TOPIC2)] = BIKE_9890
+    S._TOPIC_NAMES[(CHAT, TOPIC2)] = BIKE_9890
+    b4 = FakeBridge()
+    door_oil(b4)
+    tok_a = undo_kb()
+    b4.oil_answer = dict(R_OIL_9890)
+    SENDS.clear()
+    door_oil(b4, km="19130", topic=TOPIC2, bike=BIKE_9890)
+    tok_b = undo_kb()
+    ok("у каждой темы свой акт", tok_a and tok_b and tok_a != tok_b)
+    SENDS.clear()
+    press(tok_b, topic=TOPIC)          # нажали «из» темы 83 токен темы 84
+    ok("ответ уехал в тему АКТА, а не нажавшего", SENDS[-1][2] == TOPIC2, str(SENDS[-1]))
+    ok("назван объект СВОЕЙ темы (9890, не 2478)",
+       "19130" in SENDS[-1][0] and "24997" not in SENDS[-1][0], SENDS[-1][0])
+    SENDS.clear()
+    press(tok_a, topic=TOPIC)
+    ok("запись соседней темы прежнюю кнопку НЕ гасит", "Отправил владельцу" in SENDS[-1][0],
+       SENDS[-1][0])
+    ok("карточек по двум темам две", len(counted()) == 2, str(counted()))
+
+    # НОВАЯ ЗАПИСЬ В ТОЙ ЖЕ ТЕМЕ → прежняя кнопка «не последняя»
+    reset()
+    b5 = FakeBridge()
+    door_oil(b5)
+    old_tok = undo_kb()
+    b5.oil_answer = dict(R_OIL_2478, old_oil=24997, new_oil=25500)
+    SENDS.clear()
+    door_oil(b5, km="25500")
+    ok("вторая запись — свой токен", undo_kb() not in (None, old_tok))
+    press(old_tok, b=b5)
+    ok("старая кнопка отвечает «не последняя»", "не последняя" in SENDS[-1][0], SENDS[-1][0])
+    ok("карточки по старой кнопке НЕ было", len(counted()) == 0, str(counted()))
+
+    # ПРЕЖНЕЕ ЗНАЧЕНИЕ НУЛЬ → кнопки нет ВОВСЕ, запись при этом прошла
+    reset()
+    b6 = FakeBridge(oil_answer=dict(R_OIL_2478, old_oil=0))
+    door_oil(b6)
+    ok("нуль в old_oil → кнопки нет вовсе", undo_kb() is None, str(SENDS))
+    ok("запись при этом прошла", b6.oil_calls == [("2478", 24997, True)])
+    reset()
+    b7 = FakeBridge(oil_answer={"ok": False, "error": "oil_decreasing", "old_oil": 30000})
+    door_oil(b7)
+    ok("мост отказал → кнопки нет", undo_kb() is None, str(SENDS))
+    ok("отказ моста журнала не заводит", not S._SVC_UNDO)
+
+    # СВОДКА БЕЗ ЗАПИСИ КНОПКИ НЕ НЕСЁТ ([Просто пробег] — в кол.I не пишем)
+    reset()
+    b8 = FakeBridge()
+    door_oil(b8)
+    ok("акт масла в памяти", undo_kb() is not None)
+    SENDS.clear()
+    tok_km = S._svc_put({"chat": CHAT, "topic": TOPIC, "bike": BIKE_2478, "km": "24500",
+                         "status": "ok"})
+    run(S.handle_service_button(_upd(FakeQ(f"svc:km:{tok_km}", "Pleummmm")), context=None,
+                                bridge=b8))
+    ok("сводка «просто пробег» кнопки отмены НЕ несёт", undo_kb() is None, str(SENDS))
+
+    # ВТОРАЯ ДВЕРЬ МАСЛА: задним числом — кнопка на своей квитанции
+    reset()
+    b9 = FakeBridge()
+    door_oilbk(b9)
+    tok_bk = undo_kb()
+    ok("задним числом: запись прошла", b9.oil_calls == [("2478", 24997, True)], str(b9.oil_calls))
+    ok("задним числом: кнопка на квитанции", tok_bk is not None, str(SENDS))
+    press(tok_bk, b=b9)
+    ok("задним числом: карточка владельцу ушла", len(counted()) == 1, str(counted()))
+    ok("задним числом: живая таблица не тронута нажатием", len(b9.oil_calls) == 1)
+    reset()
+
+
 # ═══════════════ (8) ГРАНИЦА УСТРОЙСТВОМ ═══════════════
 
 WRITE_NAMES = ("set_fleet_oil", "set_fleet_service", "add_event", "edit_event", "delete_event",
@@ -443,6 +638,17 @@ def sec_purity():
        not [c for c in calls if c in WRITE_NAMES], str(calls))
     ok("ветка отмены зовёт дверь инбокса (карточка ЖДЁТ ответа)", "send_card" in calls, str(calls))
 
+    # ЗАМОК КЛАССА: дверь, которая ПИШЕТ, обязана помнить акт. Иначе кнопка снова не попадёт в
+    # дверь масла — ровно тем способом, каким не попала в первый раз (расписка прочитана на один
+    # флаг и выброшена). Проверяем разбором, а не обещанием.
+    for door in ("_write_oil", "_write_oil_backdated", "_sp_write_done"):
+        fn = [n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef) and n.name == door]
+        names = [n.func.id for n in ast.walk(fn[0]) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Name)] if fn else []
+        ok(f"дверь {door} помнит акт записи",
+           any(x.startswith("_svc_undo_remember") for x in names), str(names))
+
 
 def main():
     print("═══ ОТМЕНА ПОСЛЕДНЕЙ ЗАПИСИ ОБСЛУЖИВАНИЯ ═══")
@@ -453,6 +659,7 @@ def main():
     sec_live()
     sec_no_object()
     sec_rollback()
+    sec_oil_door()
     sec_purity()
     try:
         os.remove(COUNT_FILE)                      # свой черновик во временном каталоге

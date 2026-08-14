@@ -604,11 +604,17 @@ def _summary_note_failed(chat_id, topic_id, failed):
         log.exception("  → пометка «не записалось» в накопитель сбоила (лог остаётся)")
 
 
-async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False):
+async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False, reply_markup=None):
     """ТЕРМИНАЛ цикла → собрать ОДНУ сводку из накопителя, отправить, накопитель очистить.
     skip_oil=True (overdue [Просто пробег]) — масло уже в закрепе, в сводке его не дублируем;
     тогда шлём сводку ТОЛЬКО если есть работы/столбцы. Возвращает отправленный Message (для закрепа
-    итога) ИЛИ None если ничего не отправили."""
+    итога) ИЛИ None если ничего не отправили.
+
+    `reply_markup` — клавиатура квитанции (кнопка отмены записи, 14.08.2026). У двери масла
+    СВОЕГО сообщения нет вовсе: её единственный видимый след — эта сводка, поэтому кнопке негде
+    было сесть и её тут не было. Значение приносит ТОЛЬКО дверь, которая ПРЯМО СЕЙЧАС записала
+    (`_write_oil`); у прочих зовущих (ветка «просто пробег», столбцы) остаётся None, и путь
+    байт-в-байт прежний — иначе кнопка отмены появилась бы на сводке, за которой записи не было."""
     acc = _SVC_SUMMARY.pop((chat_id, topic_id), None)
     if not acc:
         return None
@@ -621,7 +627,8 @@ async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False):
     # КЛАСС-ФИКС кнопочных подтверждений: сводка-квитанция через _send_retry — ConnectTimeout (сетевой блип)
     # не оставляет владельца в тишине после нажатия кнопки. Действие уже выполнено, переотправка идемпотентна.
     return await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
-                             text=msg_service_summary(bike, acc, skip_oil=skip_oil))
+                             text=msg_service_summary(bike, acc, skip_oil=skip_oil),
+                             reply_markup=reply_markup)
 
 
 # Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
@@ -3950,9 +3957,23 @@ async def _close_service_reminder(context, bridge, chat_id, topic_id, bike):
         log.exception("  → ТО: ошибка закрытия important")
 
 
-async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
+async def _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=""):
     """Боевая запись ТО Oil в Лист1 кол.I (set_fleet_oil confirmed=True) + снять закреп + отчёт.
-    Вызывается ТОЛЬКО после [После замены] от доверенного. Резолвит ГОЛЫЙ номер байка."""
+    Вызывается ТОЛЬКО после [После замены] от доверенного. Резолвит ГОЛЫЙ номер байка.
+
+    ЧЕМ ЭТА ДВЕРЬ ОТЛИЧАЕТСЯ ОТ ДВЕРИ ФАЗЫ 2 И ПОЧЕМУ КНОПКА ОТМЕНЫ СЮДА НЕ ПОПАЛА (14.08.2026):
+    у двери фазы 2 есть СВОЯ квитанция акта, и кнопка села в её клавиатуру одной строкой
+    (`reply_markup=_svc_undo_kb(...)` в ветках `done`/`codo`/«число-да»). Здесь своего сообщения
+    нет вовсе: результат уезжает в накопитель `_summary_acc`, а единственный видимый след акта —
+    ОБЩАЯ и ЗАКРЕПЛЯЕМАЯ сводка `_emit_summary`, у которой параметра клавиатуры не было. Плюс
+    расписка `res` читалась ровно на один флаг `ok` и умирала — журнала отмены эта дверь не вела
+    вовсе. Теперь акт помнится ИЗ ТОЙ ЖЕ расписки (лишних обращений к мосту ноль), а кнопка едет
+    на сводке этого акта — НОВЫХ сообщений в группу не добавлено ни одного.
+
+    ДОЛГАЯ ЖИЗНЬ ЗАКРЕПА КНОПКЕ НЕ СТРАШНА: сводка висит закреплённой до следующего цикла, но
+    замки живут не в кнопке, а в `undo_last.verdict` — старше 3 ч отвечает честным «не ручаюсь,
+    что запись всё ещё последняя», после новой записи — «не последняя», после рестарта бота —
+    «журнала нет». Кнопка, пережившая своё окно, не отменяет, а объясняет."""
     plate = _plate_from_name(bike)
     if not plate:
         fb = bridge.find_bike(bike) or {}
@@ -3975,11 +3996,17 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
         # накопитель, ниже одна сводка. next = km + интервал (из книги знаний, фоллбэк на хардкод).
         _canon = res.get("bike_name", bike)
         _iv = _service_interval("oil", _canon, bridge) or _oil_interval(_canon)
+        # ОТМЕНА: акт помним ИЗ ТОЙ ЖЕ расписки, из которой строкой выше прочитан флаг `ok`.
+        # Журнал трогаем ТОЛЬКО на успехе: провал записи мир не менял, и обнулять указатель темы
+        # (то есть гасить кнопку прошлой, ЛЕГШЕЙ записи) ему не за что.
+        _undo_tok = _svc_undo_remember_write(chat_id, topic_id, _canon or bike, plate,
+                                             confirmed_by, km_int, "oil", res)
         acc = _summary_acc(chat_id, topic_id)
         acc["current_km"] = str(km_int)
         acc["oil"] = {"km": km_int, "next": (km_int + _iv) if _iv else None, "status": "ok"}
         await _close_service_reminder(context, bridge, chat_id, topic_id, bike)   # снимает ВСЕ старые пины (unpin_all)
-        _sum_msg = await _emit_summary(context, chat_id, topic_id, bike)
+        _sum_msg = await _emit_summary(context, chat_id, topic_id, bike,
+                                       reply_markup=_svc_undo_kb(_undo_tok))
         await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: финал → чистим вопросы
         # П.3: ЗАКРЕП ИТОГА после замены масла. Старый итог/просрочка-пин уже сняты unpin_all выше →
         # не копятся. Сводку (итог) закрепляем сверху; на следующей замене unpin_all снимет её перед новой.
@@ -4016,10 +4043,14 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km):
                           text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
 
-async def _write_oil_backdated(context, bridge, chat_id, topic_id, bike, oil_km):
+async def _write_oil_backdated(context, bridge, chat_id, topic_id, bike, oil_km, confirmed_by=""):
     """Боевая запись задним числом: set_fleet_oil(oil_km=N, confirmed=True) → кол.I.
     Одометр НЕ трогается: service_upsert только last_service_km, current_km НЕ передаём.
-    Вызывается ТОЛЬКО после svc:oilbk от доверенного (Пым/владелец)."""
+    Вызывается ТОЛЬКО после svc:oilbk от доверенного (Пым/владелец).
+
+    ВТОРАЯ ДВЕРЬ МАСЛА, и она отличается от первой: СВОЯ квитанция у неё ЕСТЬ (сообщение ниже),
+    не было только журнала акта и клавиатуры. Поэтому кнопка садится прямо на квитанцию — тем же
+    вызовом `_svc_undo_kb`, что у двери фазы 2."""
     plate = _plate_from_name(bike)
     if not plate:
         fb = bridge.find_bike(bike) or {}
@@ -4046,13 +4077,17 @@ async def _write_oil_backdated(context, bridge, chat_id, topic_id, bike, oil_km)
         # service_upsert: только last_service_km — current_km НЕ передаём (не трогаем одометр)
         bridge.service_upsert(bike=bike, service_type="oil",
                               last_service_km=km_int, interval_km=_iv)
+        # ОТМЕНА: та же расписка, ноль лишних обращений к мосту (см. `_write_oil`).
+        _undo_tok = _svc_undo_remember_write(chat_id, topic_id, _canon or bike, plate,
+                                             confirmed_by, km_int, "oil", res)
         next_str = f" · следующее ТО на {_next} км" if _next else ""
         next_th = f" · ТО ครั้งถัดไปที่ {_next} กม." if _next else ""
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
                           text=(f"🐀 Splinter\n"
                                 f"🇹🇭 ✅ บันทึก ТО น้ำมัน{b_th} ย้อนหลัง = {km_int} กม. แล้วครับ{next_th}\n"
                                 f"{_SEP}\n"
-                                f"🇷🇺 ✅ ТО Oil{b_ru} задним числом записано: {km_int} км{next_str}"))
+                                f"🇷🇺 ✅ ТО Oil{b_ru} задним числом записано: {km_int} км{next_str}"),
+                          reply_markup=_svc_undo_kb(_undo_tok))
         log.info(f"  → backdated ТО Oil ЗАПИСАНО: {bike} oil_km={km_int} next={_next}")
     else:
         err = res.get("error", "")
@@ -4346,7 +4381,9 @@ async def handle_service_button(update, context, bridge) -> None:
         except Exception:
             pass
         _SVC_TOKENS.pop(token, None)
-        await _write_oil(context, bridge, chat_id, topic_id, bike, km)
+        # Кто подтвердил — в журнал отмены («Записал: …» в карточке владельцу), как у двери фазы 2.
+        _cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
+        await _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=_cb)
     elif action == "done":
         # ШАГ 5 (КРАСНЫЙ): подтверждение записи факта ТО по заявке. ТОЛЬКО доверенный (trust не ослаблен).
         # Пишет СДЕЛАННЫЕ позиции (кол.I/J/K/L set_fleet_* confirmed=True под сторожем + синк «обслуживание»),
@@ -4436,7 +4473,8 @@ async def handle_service_button(update, context, bridge) -> None:
         except Exception:
             pass
         _SVC_TOKENS.pop(token, None)
-        await _write_oil_backdated(context, bridge, chat_id, topic_id, bike, km)
+        _cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
+        await _write_oil_backdated(context, bridge, chat_id, topic_id, bike, km, confirmed_by=_cb)
     elif action == "codo":
         # ВЕРХНЯЯ ГРАНИЦА: «да, число верное» на переспрос о разрыве вверх (14.08.2026).
         # Trust НЕ ослаблен — это тот же ШАГ 5 (запись в Лист1), что и ветка `done`: подтверждает
@@ -5812,6 +5850,35 @@ def _svc_undo_remember(chat_id, topic_id, bike, plate, by, odo, positions, blind
     except Exception:
         log.exception("  → журнал отмены ТО: не записал акт (fail-safe: кнопки не будет)")
         return None
+
+
+def _svc_undo_remember_write(chat_id, topic_id, bike, plate, by, odo, kind, answer):
+    """Одна запись ОДНОГО регистра (двери масла) → журнал отмены. Токен либо None.
+
+    ОДИН разбор расписки на обе двери масла (`_write_oil`, `_write_oil_backdated`) — разойтись им
+    тогда негде (класс двух зеркальных течей). Логика та же, что у двери фазы 2 в `_sp_write_done`:
+    объект берётся из ТОЙ ЖЕ расписки, из которой строкой выше прочитан флаг `ok`, поэтому лишних
+    обращений к мосту РОВНО ноль. Прежнего значения в расписке нет (нуль по неразбору · мост его
+    не назвал) → позиции нет, а значит нет и кнопки: возможность, которой нет, не изображается."""
+    if not _svc_undo_on():
+        return None
+    pos, blind = [], 0
+    try:
+        _p, _why = undo_last.position(
+            kind, fleet_cell.FIELD_COL.get(write_fact.field_for(kind), ""), answer, want_km=odo)
+        if _p:
+            pos.append(_p)
+        else:
+            blind = 1
+            log.info(f"  → отмена ТО {bike} {kind}: объект не назван — {_why}")
+    except Exception:
+        blind = 1
+        log.exception("  → отмена ТО: разбор расписки упал (позиция не названа)")
+    tok = _svc_undo_remember(chat_id, topic_id, bike, plate, by, odo, pos, blind)
+    if tok:
+        log.info(f"  → отмена ТО: акт {tok} запомнен ({kind}, дверь масла) — кнопка живёт "
+                 f"{undo_last.TTL_DEFAULT // 3600} ч")
+    return tok
 
 
 def _svc_undo_kb(tok):
