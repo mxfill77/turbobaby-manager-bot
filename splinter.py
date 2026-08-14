@@ -29,6 +29,7 @@ import balance_fact    # §касса: свежий баланс / «не све
 import service_receipt # квитанция ТО: ОБЕ половины (тайская+русская) из ОДНОГО исхода записи
 import odo_ceiling     # верхняя граница пробега при записи ТО: обе двери под одним гейтом
 import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
+import work_name       # история обслуживания: слова механика — человеку, ярлык вида — расчётам
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -6325,7 +6326,11 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
         if m and _is_trusted_user(getattr(msg, "from_user", None)):
             done = _sp_split(sp.get("done"))
             cb = ("@" + msg.from_user.username) if (msg.from_user and msg.from_user.username) else "trusted"
-            written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, m.group(1), confirmed_by=cb)
+            # Слова механика у этой двери УЖЕ на руках (`sp` прочитан выше) — передаём их, чтобы
+            # ветка истории не спрашивала мост второй раз о том же самом.
+            written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done,
+                                                   m.group(1), confirmed_by=cb,
+                                                   works=_sp_works_from_note(sp.get("note")))
             # ДВЕРЬ 2 (голое число доверенного) — тот же выход, что у кнопки. Именно эта дверь
             # 14.08 случайно записала ВЕРНОЕ число там, где кнопка записала бы 367474.
             if _sp_ceiling_asked(failed):
@@ -6495,8 +6500,27 @@ def _sp_ceiling_asked(failed):
         return False
 
 
+def _work_name_on():
+    """Ветка «названная работа в истории» жива? Ручка `WORK_NAME` (.env). `0` → прежний ярлык."""
+    return work_name.enabled(_os.getenv(work_name.FLAG_ENV))
+
+
+def _sp_words_said(bridge, chat_id, topic_id, bike):
+    """Дословные работы механика по ОТКРЫТОЙ заявке (сегмент `WORKS:{…}` поля note).
+
+    Зовётся ЛЕНИВО и ТОЛЬКО из ветки «регистра нет»: колоночный путь (кол. I/J/K/L) слов не
+    читает и не платит за них НИ ОДНОГО обращения к мосту — это проверяется счётчиком вызовов
+    в тесте, а не обещанием. Любая дырка (мост молчит · заявки нет · сегмента нет) → пустой
+    список, то есть прежний ярлык: незнание слов записью в историю не наказывается."""
+    try:
+        return _sp_works_from_note((_sp_open(bridge, chat_id, topic_id, bike) or {}).get("note"))
+    except Exception:
+        log.exception("  → история ТО: дословные работы не прочитались — пойдёт ярлык вида")
+        return []
+
+
 async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by="",
-                         ceiling_ok=False):
+                         ceiling_ok=False, works=None):
     """ШАГ 5 (КРАСНЫЙ): по «да» доверенного пишем СДЕЛАННЫЕ позиции. Сторож km_decreasing НЕ трогаем
     (он на стороне set_fleet_*). Каждая колоночная позиция: set_fleet_* (кол.I/J/K/L, confirmed=True)
     + service_upsert (синк «обслуживание» — закрывает разрыв _write_oil→обслуживание). Прочее → событие.
@@ -6520,6 +6544,7 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
             return [], [("odo", odo_ceiling.ERR)]
     written, failed = [], []
     undo_pos, undo_blind = [], 0     # позиции отмены и сколько их осталось БЕЗ названного объекта
+    said = works                     # слова механика; None = ещё не спрашивали (см. _sp_words_said)
     for k in done:
         try:
             if k in _SP_COL_KINDS:
@@ -6577,12 +6602,22 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                     failed.append((k, r.get("error") if fact is None
                                    else f"{r.get('error')}/{fact.state}"))
             else:
-                # фильтр/колодки/цепь/прочее — регистра нет → событие с одометром (фаза2 scope)
-                lbl = _SP_KIND_LABEL.get(k, (k, k))[1]
+                # фильтр/колодки/цепь/прочее — регистра нет → событие с одометром (фаза2 scope).
+                # В ИСТОРИЮ ИДЁТ НАЗВАННАЯ РАБОТА, А НЕ ЯРЛЫК (14.08.2026, живой случай 9548:
+                # механик сказал «замена аккумулятора», в таблицу ушло «прочие работы»). Ярлык
+                # никуда не делся — он по-прежнему адресует расчёт и держит `msg_id`, то есть
+                # дедуп; человеку же достаются слова человека. Разбор — `work_name`, слова —
+                # ленивым чтением ТОЙ ЖЕ заявки (колоночный путь выше сюда не заходит вовсе).
+                _on = _work_name_on()
+                if _on and said is None:
+                    said = _sp_words_said(bridge, chat_id, topic_id, bike)
+                v = work_name.history_note(k, said, odo_int, _SP_KIND_LABEL, _service_kind, on=_on)
                 bridge.add_event(group="обслуживание" + (f" / тема {topic_id}" if topic_id else ""),
                                  bike=bike, event_type="repair", mileage=str(odo_int),
-                                 notes=f"{lbl} — {odo_int} км", sender=str(confirmed_by or ""),
+                                 notes=v["text"], sender=str(confirmed_by or ""),
                                  msg_id=f"sp:{chat_id}:{topic_id}:{k}:{odo_int}")
+                log.info(f"  → история ТО {bike} вид={k}: «{v['text']}» "
+                         f"источник={v['source']} ({v['why']})")
                 written.append(k)
         except Exception:
             log.exception(f"  → ТО фаза2 запись {k} упала")

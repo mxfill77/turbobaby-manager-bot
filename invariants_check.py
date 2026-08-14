@@ -1242,6 +1242,37 @@ def check_undo_last_pure(world, run):
         run.flag(f"undo_last.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12п: WORK_NAME_PURE
+#  Строка истории обслуживания (work_name.py) решает, что человек прочитает о сделанной работе:
+#  свои слова механика или ярлык вида. Импортов РОВНО НОЛЬ — и слова, и классификатор видов, и
+#  словарь ярлыков, и километры приносят руки (`splinter._sp_write_done`). Будь у решения сеть,
+#  оно спросило бы заявку САМО, и «что сказал механик» снова зависело бы от того, КАК спросили,
+#  а не от той заявки, по которой идёт запись; будь у него запись — рядом с историей завёлся бы
+#  второй путь в живые таблицы, мимо `confirmed=true` и «да» доверенного.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_WORK_NAME_PATH = None          # подменяется САМОТЕСТОМ; None → боевой work_name.py в репо
+
+
+@register("WORK_NAME_PURE")
+def check_work_name_pure(world, run):
+    path = _WORK_NAME_PATH or os.path.join(REPO, "work_name.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("work_name.py", f"решение имени работы не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("work_name.py", f"решение имени работы не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"work_name.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")
