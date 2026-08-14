@@ -1082,6 +1082,38 @@ def check_balance_fact_pure(world, run):
         run.flag(f"balance_fact.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12л: SERVICE_RECEIPT_PURE
+#  Квитанция ТО (service_receipt.py) отвечает на один вопрос: что случилось с записью и как это
+#  звучит на обоих языках. Она ОБЯЗАНА быть слепа к миру ровно потому, ради чего написана: появись
+#  у неё сеть — она смогла бы спросить мост САМА, и «записано» снова стало бы зависеть от того,
+#  КАК спросили, а не от того, что ответил лист; появись отправка — половины опять поехали бы
+#  врозь, потому что рядом с рендером завёлся бы второй путь наружу.
+#  Импорт РОВНО ОДИН — `write_fact` (у него свой один, `scan_result`): вокабуляр определённых
+#  отказов берётся готовым, второго словаря о тех же смыслах не заводится.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_SERVICE_RECEIPT_PATH = None    # подменяется САМОТЕСТОМ; None → боевой service_receipt.py в репо
+
+
+@register("SERVICE_RECEIPT_PURE")
+def check_service_receipt_pure(world, run):
+    path = _SERVICE_RECEIPT_PATH or os.path.join(REPO, "service_receipt.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("service_receipt.py", f"решение квитанции не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset(("write_fact",)))
+    except SyntaxError as e:
+        run.flag("service_receipt.py", f"решение квитанции не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"service_receipt.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")

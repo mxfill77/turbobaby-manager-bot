@@ -26,6 +26,7 @@ import fleet_cell      # контракт клетки Лист1: значени
 import card_deadline   # общий дедлайн сборки карточки «Инфо» + слова о непрочитанном
 import write_fact      # синк зеркала по ПЕРЕЧИТАННОМУ факту, а не по флагу расписки
 import balance_fact    # §касса: свежий баланс / «не сверено» + дата / нечего сказать; факт проводки
+import service_receipt # квитанция ТО: ОБЕ половины (тайская+русская) из ОДНОГО исхода записи
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -4358,17 +4359,20 @@ async def handle_service_button(update, context, bridge) -> None:
         odo = data.get("odo", "")
         cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
         written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=cb)
-        rep_ru = (f"✅ Записано: {_sp_labels_ru(written)} на {odo} км" if written else "⚠️ ничего не записано")
-        if failed:
-            rep_ru += f" · не прошло: {', '.join(k for k, _ in failed)}"
+        # ОБЕ ПОЛОВИНЫ КВИТАНЦИИ — ИЗ ОДНОГО ИСХОДА (14.08.2026). Прежде русская несла
+        # отрицательную ветку, а тайская печатала «บันทึกแล้ว» БЕЗУСЛОВНО: 13.08 в одной строке
+        # механик читал успех, владелец — «ничего не записано» (байки 4957/37015 и 4724/20747).
+        # Три исхода (записано · не записано · неизвестен) и имена работ — в `service_receipt`.
+        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL)
         # E1: подтверждение через _send_retry — запись (_sp_write_done) УЖЕ прошла и идемпотентна,
         # переотправка безопасна. Без retry ConnectTimeout «съедал» подтверждение → владелец дублировал «Да».
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
                           text=(f"🐀 Splinter · 📌 {bike}\n"
-                                f"🇹🇭 ✅ บันทึกแล้ว: {_sp_labels_th(written)} ที่ {odo} กม.\n"
+                                f"🇹🇭 {rec['th']}\n"
                                 f"{_SEP}\n"
-                                f"🇷🇺 {rep_ru}"))
-        log.info(f"  → ТО фаза2 запись по «да» {cb}: written={written} failed={failed} odo={odo}")
+                                f"🇷🇺 {rec['ru']}"))
+        log.info(f"  → ТО фаза2 запись по «да» {cb}: written={written} failed={failed} odo={odo} "
+                 f"исход={rec['state']}")
     elif action == "km":
         # [Просто пробег] → в кол.I НЕ пишем. Квитанцию шлём ВСЕГДА (раньше при уже-закреплённой
         # просрочке _pin_overdue_reminder выходил молча → человек видел тишину).
@@ -6105,13 +6109,16 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             done = _sp_split(sp.get("done"))
             cb = ("@" + msg.from_user.username) if (msg.from_user and msg.from_user.username) else "trusted"
             written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, m.group(1), confirmed_by=cb)
+            # ТА ЖЕ дверь, что у кнопки: здесь до 14.08 БЕЗУСЛОВНЫ были ОБЕ половины, а отказ
+            # дописывался хвостом только по-русски — тайская молчала о нём вовсе.
+            rec = service_receipt.receipt(written, failed, m.group(1), _SP_KIND_LABEL)
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=(f"🐀 Splinter · 📌 {bike}\n"
-                              f"🇹🇭 ✅ บันทึกแล้ว: {_sp_labels_th(written)} ที่ {m.group(1)} กม.\n"
+                              f"🇹🇭 {rec['th']}\n"
                               f"{_SEP}\n"
-                              f"🇷🇺 ✅ Записано: {_sp_labels_ru(written)} на {m.group(1)} км"
-                              + (f" · не прошло: {', '.join(k for k,_ in failed)}" if failed else "")))
-            log.info(f"  → ТО фаза2 запись по числу-да {cb}: written={written} odo={m.group(1)}")
+                              f"🇷🇺 {rec['ru']}"))
+            log.info(f"  → ТО фаза2 запись по числу-да {cb}: written={written} failed={failed} "
+                     f"odo={m.group(1)} исход={rec['state']}")
             return True
         return False
     if status not in ("заявлено", "ждёт_факт"):
