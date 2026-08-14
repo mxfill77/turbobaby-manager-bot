@@ -81,6 +81,7 @@ load_dotenv(os.path.join(REPO, ".env"))
 
 import expectations
 import expect_journal              # чистая функция «вердикт → адрес и строка журнала»
+import queue_state                 # чистая функция «факты очереди → писать ли слепок и чем»
 import prod_drift                  # только read-only разведка /proc (live/started_at)
 
 LANE = "VPS"                       # метка полосы в заметке; на зеркале ПК обязана стать «ПК»
@@ -541,6 +542,149 @@ def _to_brain():
     return str(os.environ.get("EXPECT_TO_BRAIN") or "1").strip() not in ("0", "no", "off")
 
 
+# ═══════════════════ СЛЕПОК СОСТОЯНИЯ ОЧЕРЕДИ В МОЗГ (14.08.2026) ═══════════════════════════
+# РУКИ чистого решения `queue_state`: спросить упавших (дорого — значит по факту), записать
+# слепок в свой документ мозга, запомнить опубликованное. Решает не здесь: здесь только берут
+# и кладут.
+#
+# ПОЧЕМУ СЛЕПОК ЖИВЁТ У НАБЛЮДАТЕЛЯ, А НЕ У ДЕМОНА. Демон исполняет `claude -p` СИНХРОННО
+# внутри `cycle()`: живой замер — задача 536 держала оборот 1026 с, рекорд наблюдения 41.6 мин.
+# Слепок, который пишет сам демон, публиковал бы «занято» ПОСЛЕ конца работы, то есть ровно
+# тогда, когда это перестало быть нужно. Наблюдатель яруса 2 — отдельный процесс с диска, он
+# тикает свои 10 минут независимо от того, чем занят демон, и уже берёт снимок открытых строк
+# ОБЕИХ полос (`queue_facts`) — открытая половина слепка достаётся даром.
+def _qstate_on():
+    """Ручка отката: QUEUE_STATE=0 → ветка мертва ДО единого обращения к мосту."""
+    return str(os.environ.get("QUEUE_STATE") or "1").strip() not in ("0", "no", "off")
+
+
+def failed_facts():
+    """Упавшие строки ОБЕИХ полос → список | None (мост не ответил — исход честно «не сверен»).
+
+    Дорогой вопрос: 301 КБ ответа (замер 14.08). Поэтому его задаёт РЕШЕНИЕ (`needs_closed`),
+    а не таймер: спрашиваем, когда строка ушла из открытых, либо реестр старше часа."""
+    try:
+        from bridge_client import BridgeClient
+        bc = BridgeClient(timeout=QUEUE_TIMEOUT)
+        r = bc.get_pending("failed", lane="all")
+    except Exception as e:                                           # noqa: BLE001
+        print("упавшие не прочитаны (%s) — исход закрытых будет «не сверен»" % str(e)[:120],
+              file=sys.stderr)
+        return None
+    if not r.get("ok"):
+        return None
+    rows = []
+    for it in (r.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        rows.append({"id": it.get("id"), "lane": it.get("lane"),
+                     "task_text": str(it.get("task_text") or "")[:200],
+                     "result": str(it.get("result") or "")[:400],
+                     "at": expectations.parse_iso(it.get("updated"))})
+    return rows
+
+
+def closed_facts():
+    """РАЗОВЫЙ засев реестра: закрытые строки ОБЕИХ полос → список | None.
+
+    Самый дорогой вопрос контура (2745 КБ на замере 14.08) и потому задаётся РОВНО ОДИН РАЗ на
+    жизнь состояния: без него первые сутки раздел «закрыто за сутки» был бы пуст при 26 реально
+    закрытых — ложный нуль вместо знания."""
+    try:
+        from bridge_client import BridgeClient
+        bc = BridgeClient(timeout=QUEUE_TIMEOUT)
+        r = bc.get_pending("done,failed", lane="all")
+    except Exception as e:                                           # noqa: BLE001
+        print("засев реестра закрытых не удался (%s)" % str(e)[:120], file=sys.stderr)
+        return None
+    if not r.get("ok"):
+        return None
+    rows = []
+    for it in (r.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        rows.append({"id": it.get("id"), "lane": it.get("lane"), "status": it.get("status"),
+                     "task_text": str(it.get("task_text") or "")[:200],
+                     "result": str(it.get("result") or "")[:400],
+                     "at": expectations.parse_iso(it.get("updated"))})
+    return rows
+
+
+def write_queue_state(text):
+    """Слепок в свой документ мозга ЦЕЛИКОМ (перезапись, не журнал). → True | False.
+
+    Изоляция та же, что у `write_journal`: под тестом/гейтом в боевой мозг не пишем НИКОГДА.
+    Не записалось → отпечаток НЕ запоминаем, значит следующий прогон попробует снова."""
+    if _is_test_run():
+        print("[тест] слепок очереди НЕ пишем: %d симв." % len(str(text)))
+        return True
+    try:
+        from bridge_client import BridgeClient
+        bc = BridgeClient(timeout=QUEUE_TIMEOUT)
+        r = bc.write_doc(str(text), name=queue_state.DOC_KEY)
+    except Exception as e:                                           # noqa: BLE001
+        print("слепок очереди не записан (%s)" % str(e)[:120], file=sys.stderr)
+        return False
+    if not r.get("ok"):
+        print("слепок очереди не записан (%s)" % str(r.get("error"))[:120], file=sys.stderr)
+        return False
+    return True
+
+
+def queue_state_step(st, facts, now, dry=False):
+    """Один шаг слепка. → {"write","why","wrote"} для итога прогона (и для теста).
+
+    FAIL-SAFE ВЕЗДЕ В СТОРОНУ МОЛЧАНИЯ: ручка выключена · решение сказало «не менялось» ·
+    запись не прошла → состояние не помечается, документ остаётся прежним со СВОИМ временем
+    снятия — то есть врать свежестью ему по-прежнему нечем."""
+    if not _qstate_on():
+        return {"write": False, "why": "QUEUE_STATE=0 — ветка выключена", "wrote": False}
+    prev = st.get("qstate") if isinstance(st.get("qstate"), dict) else {}
+    q = facts.get("queue") if isinstance(facts.get("queue"), dict) else {"ok": False}
+    rows = q.get("rows") or []
+    prev_open = prev.get("open") if isinstance(prev.get("open"), dict) else {}
+    gone, closed_at = list(prev.get("gone") or []), prev.get("closed_at")
+    since = prev.get("since")
+    if q.get("ok"):
+        # ЗАСЕВ — один раз на жизнь состояния и ТОЛЬКО при живой очереди: реестр, засеянный
+        # вслепую, был бы тем же ложным нулём, только дороже.
+        if queue_state.needs_seed(since):
+            seeded = closed_facts()
+            if seeded is not None:
+                gone = queue_state.seed(seeded, now)
+                since, closed_at = now - queue_state.SHOW_SEC, now
+        failed = None
+        if queue_state.needs_closed(prev_open, rows, closed_at, now):
+            failed = failed_facts()
+            if failed is not None:
+                closed_at = now
+        gone = queue_state.ledger(gone, prev_open, rows, failed, now)
+    v = queue_state.verdict(prev, q, gone, now, closed_at, LANE, since)
+    out = {"write": bool(v.get("write")), "why": v.get("why"), "wrote": False}
+    if dry:
+        return out
+
+    # ДВА РАЗНЫХ СРОКА ГОДНОСТИ, и путать их нельзя. То, за что УЖЕ ЗАПЛАЧЕНО мосту (засев,
+    # реестр, наблюдение), кладётся в состояние ВСЕГДА — иначе тихая очередь платила бы дорогой
+    # засев каждые десять минут заново. А отпечаток «что опубликовано» ставится ТОЛЬКО по факту
+    # удавшейся записи: он утверждает про ДОКУМЕНТ, а не про наши знания.
+    new = dict(prev)
+    new.update({"gone": gone[:64], "closed_at": closed_at, "since": since})
+    if q.get("ok"):
+        new["open"] = queue_state.open_map(rows)
+    st["qstate"] = new
+    if not v.get("write"):
+        return out
+    if not write_queue_state(v.get("text")):
+        return out                       # отпечаток НЕ помечаем: скажем на следующем прогоне
+    out["wrote"] = True
+    new["fp"] = v.get("fp")
+    if v.get("verified"):                          # отказ не стирает память о верном снимке
+        new["at"] = now                            # время ПОСЛЕДНЕГО ВЕРНОГО снимка
+        new["text"] = v.get("text")
+    return out
+
+
 def _frozen_client():
     """Заморожен ли КЛИЕНТСКИЙ контур. Та же ручка, что у `revizor_route`/devbot: одно решение
     владельца обязано читаться одним способом, иначе у него будет две правды."""
@@ -803,6 +947,16 @@ def run(dry=False, now=None):
         elif brain:
             write_journal("%s %s · %s" % (expect_journal.TAG,
                                           expect_journal.SHORT.get(str(v.get("kind")), "?"), said))
+
+    # 3. СЛЕПОК СОСТОЯНИЯ ОЧЕРЕДИ — ПОСЛЕДНИМ и вне вердиктов: он не про нарушения, а про то,
+    #    что Штаб обязан видеть ВСЕГДА. Своей ручкой и своим fail-safe; упади он — ожидания
+    #    уже отработали.
+    try:
+        out["qstate"] = queue_state_step(st, facts, now, dry)
+    except Exception as e:                                           # noqa: BLE001
+        print("слепок очереди не снят (%s) — документ остался прежним" % str(e)[:160],
+              file=sys.stderr)
+        out["qstate"] = {"write": False, "why": "сбой шага: %s" % str(e)[:80], "wrote": False}
 
     if not dry:
         st["open"] = dict(list(open_eps.items())[-STATE_KEEP:])

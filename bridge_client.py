@@ -1154,6 +1154,19 @@ class BridgeClient:
         не меняется без overwrite=True. Файл должен быть в Brain-папке."""
         return self._post("register_brain_doc", name=str(name), id=str(id), overwrite=bool(overwrite))
 
+    def create_brain_plain(self, name, key: str = "", text: str = "") -> dict:
+        """Создать НОВЫЙ plain-text файл в папке Brain и (опц.) зарегистрировать ключ манифеста.
+        → {ok, name, key, id, chars}. Маршрут прода @79 (`createBrainPlain_`), деплой не нужен.
+
+        Заводить новый узел мозга — шаг РЕДКИЙ и осознанный (правило гигиены: штаб не плодит
+        файлы россыпью). Он законен там, где у документа СВОЁ свойство, несовместимое с
+        существующими: слепок состояния очереди (`queue_state`) ЗАМЕНЯЕТСЯ целиком, а журналы
+        только копятся. Обратимо: `unregister_brain_doc` + `trash_brain_file`."""
+        fields = {"name": str(name), "text": str(text)}
+        if key:
+            fields["key"] = str(key)
+        return self._post("create_brain_plain", **fields)
+
     def set_fleet_oil(self, number, oil_km, confirmed: bool = False,
                       fix_reason: str = "", fixed_by: str = "", trusted: bool = False) -> dict:
         """GUARDED: записать «ТО Oil» (Лист1 Байки, колонка I) по НОМЕРУ байка.
