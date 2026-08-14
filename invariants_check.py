@@ -1179,6 +1179,37 @@ def check_service_receipt_pure(world, run):
         run.flag(f"service_receipt.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12м: ODO_CEILING_PURE
+#  Верхняя граница пробега (odo_ceiling.py) — единственный гейт, который может ОСТАНОВИТЬ запись
+#  ТО, и стоит он на пути живой таблицы Лист1. Спросить мир ему нечем ПО ПОСТРОЕНИЮ: импортов
+#  РОВНО НОЛЬ. Будь у него сеть — он смог бы узнать «текущий пробег» сам, и тогда решение
+#  зависело бы от того, КАК он спросил, а не от единого источника правды `splinter._odo_current`,
+#  который приносят руки; будь у него отправка — рядом с гейтом завёлся бы второй путь наружу,
+#  и вопрос владельцу мог бы разойтись с тем, что гейт на самом деле решил.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_ODO_CEILING_PATH = None        # подменяется САМОТЕСТОМ; None → боевой odo_ceiling.py в репо
+
+
+@register("ODO_CEILING_PURE")
+def check_odo_ceiling_pure(world, run):
+    path = _ODO_CEILING_PATH or os.path.join(REPO, "odo_ceiling.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("odo_ceiling.py", f"решение верхней границы не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("odo_ceiling.py", f"решение верхней границы не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"odo_ceiling.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")

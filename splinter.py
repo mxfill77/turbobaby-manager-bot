@@ -27,6 +27,7 @@ import card_deadline   # общий дедлайн сборки карточки
 import write_fact      # синк зеркала по ПЕРЕЧИТАННОМУ факту, а не по флагу расписки
 import balance_fact    # §касса: свежий баланс / «не сверено» + дата / нечего сказать; факт проводки
 import service_receipt # квитанция ТО: ОБЕ половины (тайская+русская) из ОДНОГО исхода записи
+import odo_ceiling     # верхняя граница пробега при записи ТО: обе двери под одним гейтом
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -4359,6 +4360,12 @@ async def handle_service_button(update, context, bridge) -> None:
         odo = data.get("odo", "")
         cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
         written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=cb)
+        # ДВЕРЬ 1 (кнопка). Верхняя граница переспросила → вопрос уже отправлен, квитанции быть
+        # не должно: «не записано» рядом с вопросом читалось бы как отказ, а это ОЖИДАНИЕ ответа.
+        if _sp_ceiling_asked(failed):
+            log.info(f"  → ТО фаза2 кнопка {cb}: верхняя граница переспросила, запись не начиналась "
+                     f"odo={odo} bike={bike or '?'}")
+            return
         # ОБЕ ПОЛОВИНЫ КВИТАНЦИИ — ИЗ ОДНОГО ИСХОДА (14.08.2026). Прежде русская несла
         # отрицательную ветку, а тайская печатала «บันทึกแล้ว» БЕЗУСЛОВНО: 13.08 в одной строке
         # механик читал успех, владелец — «ничего не записано» (байки 4957/37015 и 4724/20747).
@@ -4420,6 +4427,38 @@ async def handle_service_button(update, context, bridge) -> None:
             pass
         _SVC_TOKENS.pop(token, None)
         await _write_oil_backdated(context, bridge, chat_id, topic_id, bike, km)
+    elif action == "codo":
+        # ВЕРХНЯЯ ГРАНИЦА: «да, число верное» на переспрос о разрыве вверх (14.08.2026).
+        # Trust НЕ ослаблен — это тот же ШАГ 5 (запись в Лист1), что и ветка `done`: подтверждает
+        # Пым или владелец. Механик своё же число утвердить не может.
+        if not _is_trusted_user(q.from_user):
+            await _btn_answer(q, f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец",
+                              show_alert=False)
+            return   # токен и кнопка живут — Пым нажмёт позже
+        await _btn_answer(q, "กำลังบันทึก… · Записываю ТО…")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        done = data.get("done", []) or []
+        odo = data.get("odo", "")
+        cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
+        log.info(f"  → верхняя граница подтверждена кнопкой {cb}: {bike or '?'} odo={odo} "
+                 f"(было текущим {data.get('cur') or '?'}, разрыв {data.get('gap') or '?'})")
+        # ceiling_ok=True — единственное место, где граница снимается. Прочие сторожа (trust,
+        # km_decreasing на мосту, confirmed=true в коде Bridge) не ослаблены ни одним словом.
+        written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo,
+                                               confirmed_by=cb, ceiling_ok=True)
+        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL)
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=(f"🐀 Splinter · 📌 {bike}\n"
+                                f"🇹🇭 {rec['th']}\n"
+                                f"{_SEP}\n"
+                                f"🇷🇺 {rec['ru']}"))
+        log.info(f"  → ТО фаза2 запись по «да» верхней границы {cb}: written={written} "
+                 f"failed={failed} odo={odo} исход={rec['state']}")
+
     elif action == "sodo":
         # Мягкий гейт ODO ≤500 км: кнопка «Да, намеренно» от механика.
         new_km = data.get("new_km")
@@ -6109,6 +6148,12 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             done = _sp_split(sp.get("done"))
             cb = ("@" + msg.from_user.username) if (msg.from_user and msg.from_user.username) else "trusted"
             written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, m.group(1), confirmed_by=cb)
+            # ДВЕРЬ 2 (голое число доверенного) — тот же выход, что у кнопки. Именно эта дверь
+            # 14.08 случайно записала ВЕРНОЕ число там, где кнопка записала бы 367474.
+            if _sp_ceiling_asked(failed):
+                log.info(f"  → ТО фаза2 число-да {cb}: верхняя граница переспросила, запись не "
+                         f"начиналась odo={m.group(1)} bike={bike or '?'}")
+                return True
             # ТА ЖЕ дверь, что у кнопки: здесь до 14.08 БЕЗУСЛОВНЫ были ОБЕ половины, а отказ
             # дописывался хвостом только по-русски — тайская молчала о нём вовсе.
             rec = service_receipt.receipt(written, failed, m.group(1), _SP_KIND_LABEL)
@@ -6220,16 +6265,80 @@ def _sp_fact_after_write(bridge, bike, plate, kind, km):
     return write_fact.verdict(km, cell)
 
 
-async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=""):
+def _odo_ceiling_limit():
+    """Порог верхней границы, км. Ручка `ODO_CEILING_KM` (.env), `0` = ветка мертва.
+    Величина и её вывод из замера 14.08.2026 — в шапке `odo_ceiling`."""
+    return odo_ceiling.parse_limit(_os.getenv(odo_ceiling.LIMIT_ENV))
+
+
+async def _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_int):
+    """РУКИ верхней границы: спросить прибор о текущем пробеге и, если разрыв вверх больше порога,
+    НЕ писать, а переспросить кнопкой. True = запись остановлена (вопрос уже отправлен).
+
+    FAIL-SAFE В СТОРОНУ ЗАПИСИ, симметрично нижней границе: `_ask_mileage_confirm` при неизвестном
+    прежнем числе floor не ставит и пропускает запись — здесь так же. Молчание моста не повод
+    останавливать работу механика; цена названа в шапке `odo_ceiling`."""
+    try:
+        limit = _odo_ceiling_limit()
+        if not limit:
+            return False
+        cur = _odo_current(bridge, bike)          # единый источник правды, '' = не прочитан
+        v = odo_ceiling.verdict(odo_int, cur, limit)
+        if v["state"] != odo_ceiling.STATE_ASK:
+            log.info(f"  → верхняя граница {bike or '?'}: {odo_ceiling.say(v)}")
+            return False
+        log.warning(f"  🔒 верхняя граница {bike or '?'}: {odo_ceiling.say(v)}")
+        tok = _svc_put({"kind": "codo", "chat": chat_id, "topic": topic_id, "bike": bike or "",
+                        "done": list(done or []), "odo": str(odo_int),
+                        "cur": str(v.get("cur") or ""), "gap": str(v.get("gap") or "")})
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ ใช่ เลขถูกต้อง / Да, число верное",
+                                 callback_data=f"svc:codo:{tok}"),
+        ]])
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=(f"🐀 Splinter · 📌 {bike}\n"
+                          f"🇹🇭 {odo_ceiling.question_th(bike, v)}\n"
+                          f"{_SEP}\n"
+                          f"🇷🇺 {odo_ceiling.question_ru(bike, v)}"),
+                    reply_markup=kb)
+        return True
+    except Exception:
+        log.exception("  → верхняя граница: исключение — fail-safe, пишем как прежде")
+        return False
+
+
+def _sp_ceiling_asked(failed):
+    """Записи не было — верхняя граница переспросила, и вопрос УЖЕ отправлен. Обе двери читают
+    сигнал ОДНИМ предикатом: разойтись в чтении им должно быть так же негде, как в самом гейте."""
+    try:
+        return any(e == odo_ceiling.ERR for _, e in (failed or []))
+    except Exception:
+        return False
+
+
+async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by="",
+                         ceiling_ok=False):
     """ШАГ 5 (КРАСНЫЙ): по «да» доверенного пишем СДЕЛАННЫЕ позиции. Сторож km_decreasing НЕ трогаем
     (он на стороне set_fleet_*). Каждая колоночная позиция: set_fleet_* (кол.I/J/K/L, confirmed=True)
     + service_upsert (синк «обслуживание» — закрывает разрыв _write_oil→обслуживание). Прочее → событие.
-    Возвращает (written:list, failed:list)."""
+    Возвращает (written:list, failed:list).
+
+    ВЕРХНЯЯ ГРАНИЦА ПРОБЕГА СТОИТ ЗДЕСЬ, А НЕ В ДВЕРЯХ (14.08.2026). Дверей записи две — кнопка
+    Пыма (`handle_service_button`, ветка `done`) и голое число доверенного (`handle_service_result`,
+    ветка `ждёт_подтверждения`), — и до 14.08 они вели себя ПО-РАЗНОМУ: 14.08 09:06 по байку
+    NMAX RED WHITE 9548 обе получили `odo=367474` при текущем 36474, но легло верное число только
+    потому, что владелец ответил сообщением, а не кнопкой. Гейт стоит в ЕДИНСТВЕННОМ общем месте —
+    разойтись дверям тогда физически негде. Порог и его вывод из замера 74 суток — в шапке
+    `odo_ceiling`; `ceiling_ok=True` приходит ТОЛЬКО с кнопки «да, число верное» (svc:codo)."""
     plate = _plate_from_name(bike) or _plate_from_name((bridge.find_bike(bike) or {}).get("name", ""))
     try:
         odo_int = int(str(odo).replace(" ", "").replace(",", ""))
     except (ValueError, TypeError):
         return [], [("odo", "bad_odometer")]
+    if not ceiling_ok:
+        stop = await _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_int)
+        if stop:
+            return [], [("odo", odo_ceiling.ERR)]
     written, failed = [], []
     for k in done:
         try:

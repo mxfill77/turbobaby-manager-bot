@@ -75,6 +75,9 @@ SETTLED_ERRORS = frozenset((
     "missing_number", "bad_oil_km", "bad_km", "bad_kind", "not_confirmed", "not_found",
     "ambiguous", "oil_decreasing", "km_decreasing", "write_failed", "fix_incomplete",
     "oil_drop_needs_trusted", "audit_failed", "card_deadline",
+    # верхняя граница пробега (`odo_ceiling.ERR`): мост не звали вовсе — исход определён,
+    # перечитывать нечего, запись не начиналась.
+    "odo_ceiling",
 ))
 
 
