@@ -26,6 +26,7 @@ import bridge_client
 import task_metrics          # общий детектор тест-прогона (под тестом боевые артефакты не трогаем)
 import report_digest         # чистая функция «тело отчёта → что показать в чате» (часть 2)
 import revizor_route         # чистая функция «находки ревизора → лента или карточка»
+import revizor_age           # чистая функция «штамп тика + сейчас + порог → возраст на доске»
 import scan_result           # контракт читателя живого текста: «осмотрено/разобрано» + исход
 
 log = logging.getLogger(__name__)
@@ -2525,12 +2526,37 @@ def _active_chains(items):
     return out
 
 
-def _parse_revisor(tick, head=""):
+def _revizor_tick_hours():
+    """Порог «⚠️ тик старый» в часах — `.env` `REVIZOR_TICK_HOURS`.
+
+    Дефолт берётся у решения (`revizor_age.DEFAULT_HOURS` = 9 ч, середина пустого промежутка
+    живого замера 14.08: штатный ход ревизора ≤6.05 ч, следующая пауза только 11.83 ч);
+    **0 = ветка мертва** — приписка пустая, строка доски байт-в-байт прежняя, это и есть откат.
+    Мусор → дефолт: опечатка в конфиге не вправе молча гасить громкий слой. Лениво на каждый
+    вызов — bot.py импортирует devbot ДО load_dotenv() (как `pc_dev_topic`)."""
+    raw = str(os.getenv("REVIZOR_TICK_HOURS", "") or "").strip()
+    if not raw:
+        return revizor_age.DEFAULT_HOURS
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return revizor_age.DEFAULT_HOURS
+
+
+def _parse_revisor(tick, head="", now=None, hours=None):
     """Строка «👁 надзор: …» из текста тик-NOTE: честное время (ТОЛЬКО если есть в строке —
-    никакого «время неизвестно»), окна/находки (что распарсилось), иначе короткий текст тика.
+    никакого «время неизвестно»), ВОЗРАСТ этого времени, окна/находки (что распарсилось),
+    иначе короткий текст тика.
+
     `head` — голова строки ДО «ревизор:»: в живом формате штамп времени стоит ИМЕННО там
     («NOTE 2026-08-13 13:26 UTC: Orchestrator: ревизор: …»), а не в теле тика; полная дата
-    в голове сильнее любого «чч:мм» из тела."""
+    в голове сильнее любого «чч:мм» из тела.
+
+    ВОЗРАСТ КЛЕИТСЯ К ШТАМПУ, А НЕ К КОНЦУ СТРОКИ (14.08.2026): время без возраста читается
+    как «только что» — 14.08 в 10:32 UTC на доске стоял тик 13.08 13:26, ему шёл двадцать
+    первый час. Судит `revizor_age` (чистая функция); «сейчас» и порог ПРИНОСЯТ отсюда —
+    у решения нет способа спросить их у мира, поэтому тест пришпиливает время, а не гоняется
+    за живыми часами."""
     tm = (_REV_TIME_RE.search(head) or _REV_TIME_RE.search(tick)
           or _REV_HHMM_RE.search(head) or _REV_HHMM_RE.search(tick))
     mw = _REV_WIN_RE.search(tick) or _REV_WIN_RE2.search(tick)
@@ -2541,8 +2567,11 @@ def _parse_revisor(tick, head=""):
     if mf:
         f = _int0(mf.group(1))
         parts.append(f"находок {f}" + (" ❗" if f else ""))
-    return ("👁 надзор: ревизор" + (f" {tm.group(0)}" if tm else "") + " — " +
-            (", ".join(parts) if parts else _short(tick)))
+    stamp = tm.group(0) if tm else ""
+    age = revizor_age.mark(stamp, now or datetime.datetime.now(datetime.timezone.utc),
+                           _revizor_tick_hours() if hours is None else hours)
+    return ("👁 надзор: ревизор" + (f" {stamp}" if stamp else "") + (f" {age}" if age else "") +
+            " — " + (", ".join(parts) if parts else _short(tick)))
 
 
 def _revisor_scan(cowork_fn=None):
@@ -2592,13 +2621,14 @@ def _revisor_scan(cowork_fn=None):
                                   payload=freshest, detail=detail)
 
 
-def _revisor_line(cowork_fn=None):
+def _revisor_line(cowork_fn=None, now=None, hours=None):
     """Строка «👁 надзор: …» для сводки «статус». Три НЕ-ok исхода звучат владельцу по-разному
-    и ни один не сворачивается в другой; числа («осмотрено/разобрано») несёт сам контракт."""
+    и ни один не сворачивается в другой; числа («осмотрено/разобрано») несёт сам контракт.
+    `now`/`hours` — только для пришпиливания времени в тестах; в бою оба берутся живыми."""
     res = _revisor_scan(cowork_fn)
     if res.ok:
         body, head = res.payload
-        return _parse_revisor(body, head)
+        return _parse_revisor(body, head, now=now, hours=hours)
     if res.outcome == scan_result.OUTCOME_UNREADABLE:
         return "👁 надзор: cowork_log НЕДОСТУПЕН, тик ревизора неизвестен — " + res.say()
     if res.outcome == scan_result.OUTCOME_EMPTY:
