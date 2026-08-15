@@ -1,5 +1,5 @@
 """log.info '→ photo servicing' появляется ДО _servicing_caption_to_brain в _route_photos (класс G)."""
-import sys, os, asyncio, logging, types
+import sys, os, asyncio, logging, types, contextlib
 from unittest.mock import AsyncMock, patch
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
@@ -34,7 +34,8 @@ class FakeAuditor:
 
 
 _stub("dotenv", load_dotenv=lambda *a, **k: None)
-_stub("bridge_client", BridgeClient=lambda *a, **k: FakeBridge(), agent_write=lambda *a, **k: None)
+_stub("bridge_client", BridgeClient=lambda *a, **k: FakeBridge(), agent_write=lambda *a, **k: None,
+      card_budget=lambda *a, **k: contextlib.nullcontext())   # общий бюджет опроса (15.08.2026)
 _stub("claude_client", ClaudeClient=FakeClaude)
 _stub("memory", Memory=FakeMem)
 _stub("auditor", Auditor=FakeAuditor)

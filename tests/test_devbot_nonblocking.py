@@ -1,7 +1,7 @@
 """Фикс заморозки event loop (разбор таймаутов get_pending 02.07): опрос очереди в
 devbot.report_results идёт через asyncio.to_thread + короткий timeout + склейка статусов.
 Проверяем: (N1-N2) loop НЕ встаёт и бот отвечает во время долгого Bridge-вызова;
-(N3) poll-клиент = 15с; (N4-N6) get_pending_multi: 1 CSV-вызов / фоллбэк / без добивания
+(N3) poll-клиент = своё плечо (45с с 15.08.2026); (N4-N6) get_pending_multi: 1 CSV-вызов / фоллбэк / без добивания
 при таймауте; (N7) регресс — done-рапорт через новый путь. Сеть/бот замоканы."""
 import sys, asyncio, time
 sys.path.insert(0, "/root/turbobaby-manager-bot")
@@ -73,13 +73,17 @@ def test_bot_responds_while_bridge_hangs():
     assert dt < 0.3, f"бот должен ответить за ~0.05с во время Bridge-вызова, ждал {dt:.2f}с"
 
 
-# N3: poll-клиент опроса очереди — отдельный BridgeClient c timeout=15 (не 60), тот же url/token
+# N3: poll-клиент опроса очереди — отдельный BridgeClient со СВОИМ плечом (не 60 главного),
+# тот же url/token. Число плеча 15.08.2026 поднято 15→45 по замеру распределения (см.
+# tests/test_poll_leg.py и docs/artifacts/2026-08-15-poll-leg-not-cutting-live-answers.md):
+# предмет теста — «у опроса ОТДЕЛЬНЫЙ клиент со своим, более коротким плечом», а не сама цифра.
 def test_poll_bridge_short_timeout():
     real = bridge_client.BridgeClient(url="http://x", token="x")    # основной клиент (timeout=60)
     _reset(real)
     pb = DB._get_poll_bridge()
     assert pb is not real, "для опроса должен создаваться ОТДЕЛЬНЫЙ клиент"
-    assert pb.timeout == DB.POLL_TIMEOUT == 15
+    assert pb.timeout == DB.POLL_TIMEOUT == 45
+    assert DB.POLL_TIMEOUT < real.timeout, "плечо опроса короче плеча главного клиента"
     assert (pb.url, pb.token) == (real.url, real.token)
     assert DB._get_poll_bridge() is pb, "клиент кэшируется, не плодится на каждый тик"
 
@@ -151,4 +155,4 @@ if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
         fn(); print(f"  ✓ {fn.__name__}")
-    print(f"OK — {len(fns)} тестов фикса заморозки event loop (to_thread + timeout 15с + склейка)")
+    print(f"OK — {len(fns)} тестов фикса заморозки event loop (to_thread + своё плечо опроса + склейка)")

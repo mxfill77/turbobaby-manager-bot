@@ -259,10 +259,14 @@ class CardBudget:
     `find_bike` на сбое моста отдаёт `{}` — ровно то же, что при «байка нет в парке». Отличить
     молчание источника от честной пустоты может только тот, кто видел ответ, — то есть это место."""
 
-    def __init__(self, budget, started, deadline):
+    def __init__(self, budget, started, deadline, label="карточки"):
         self.budget = budget
         self.started = started
         self.deadline = deadline
+        # Чей это бюджет — словом, для журнала. Механизм общий (его открыл и опрос очереди
+        # devbot, 15.08.2026), а строка «общий бюджет карточки» о заходе опроса просто врала бы
+        # читателю журнала. Умолчание «карточки» → путь карточки байт-в-байт прежний.
+        self.label = label
         self.unread = {}        # действие → ошибка, из-за которой источник не прочитан
         self.answered = set()   # действия, ответившие ХОТЬ ЧЕМ-ТО (в т.ч. честным «not_found»)
         self.deadline_hit = False
@@ -291,11 +295,13 @@ class CardBudget:
 
 
 @contextlib.contextmanager
-def card_budget(budget, now=None):
+def card_budget(budget, now=None, label="карточки"):
     """Открыть общий бюджет на сборку одной карточки. `budget<=0` → дедлайна нет (откат
-    `INFO_CARD_BUDGET_SEC=0`), но учёт непрочитанного остаётся: он не стоит ни запроса, ни секунды."""
+    `INFO_CARD_BUDGET_SEC=0`), но учёт непрочитанного остаётся: он не стоит ни запроса, ни секунды.
+
+    `label` — чей это заход, для журнала (опрос очереди devbot зовёт то же самое, 15.08.2026)."""
     now = time.monotonic() if now is None else now
-    state = CardBudget(budget, now, card_deadline.deadline_at(now, budget))
+    state = CardBudget(budget, now, card_deadline.deadline_at(now, budget), label=label)
     token = _CARD_BUDGET.set(state)
     try:
         yield state
@@ -390,7 +396,13 @@ class BridgeClient:
         if not card_deadline.may_start_leg(state.deadline, time.monotonic()):
             state.note_deadline()
             raise CardBudgetExpired(
-                f"общий бюджет карточки {card_deadline._num(state.budget)} с исчерпан — {what} не начинаю")
+                f"общий бюджет {state.label} {card_deadline._num(state.budget)} с исчерпан — {what} не начинаю")
+
+    def _card_label(self) -> str:
+        """Чей бюджет сейчас открыт — словом, для журнала. Вне бюджета — «карточки»: так строка
+        остаётся прежней у пути, ради которого механизм и заведён."""
+        state = _CARD_BUDGET.get()
+        return state.label if state is not None else "карточки"
 
     def _card_may_wait(self, pause: float) -> bool:
         """Влезает ли в бюджет карточки пауза backoff И плечо после неё. Ждать, чтобы потом
@@ -411,7 +423,8 @@ class BridgeClient:
                 # ЛЕСТНИЦА 3 (эхо-слой) под общим дедлайном карточки: не влезает пауза + плечо —
                 # выходим с последней ошибкой, а не жжём остаток на заведомо бесполезный повтор.
                 if not self._card_may_wait(self.retry_base * (2 ** (attempt - 1))):
-                    log.warning("Bridge: echo-ретрай отменён — общий бюджет карточки не вмещает его")
+                    log.warning("Bridge: echo-ретрай отменён — общий бюджет %s не вмещает его",
+                                self._card_label())
                     break
                 log.warning(f"Bridge: echo-слой сбоит ({last_err}) — ретрай {attempt + 1}/{self.retry_attempts}")
                 self._backoff(attempt - 1)
@@ -550,7 +563,7 @@ class BridgeClient:
             # ВСЕЙ карточки: оставшиеся действия не начинают своих лестниц, а честно молчат.
             state.note_deadline()
             data = {"ok": False, "error": CARD_DEADLINE_ERROR,
-                    "message": (f"общий бюджет карточки {card_deadline._num(state.budget)} с исчерпан — "
+                    "message": (f"общий бюджет {state.label} {card_deadline._num(state.budget)} с исчерпан — "
                                 f"«{action}» не запрашивался")}
             log.warning(f"Bridge {action}: {data['message']}")
             state.note(action, data)
@@ -587,8 +600,8 @@ class BridgeClient:
                 # ЛЕСТНИЦА 1 (полные попытки) под общим дедлайном карточки — первый множитель
                 # потолка 57 плеч: не влезает пауза + плечо → отдаём то, что есть.
                 if not self._card_may_wait(self.retry_base * (2 ** (attempt - 1))):
-                    log.warning(f"Bridge {action}: backoff-ретрай отменён — общий бюджет карточки "
-                                f"не вмещает его")
+                    log.warning(f"Bridge {action}: backoff-ретрай отменён — общий бюджет "
+                                f"{self._card_label()} не вмещает его")
                     return data
                 log.warning(f"Bridge {action}: {err} — backoff-ретрай "
                             f"{attempt + 1}/{max_attempts}")

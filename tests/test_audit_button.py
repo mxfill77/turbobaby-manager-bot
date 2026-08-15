@@ -5,7 +5,7 @@ BadRequest «Query is too old» — 👍/✏️/👎 выглядели «мёр
 (A2) устаревший токен при мёртвом ack — честное «карточка устарела»; (A3) 👎 при мёртвом ack;
 (A4) живой ack — регресс. Тяжёлые зависимости bot.py (Bridge/Claude/Memory/Auditor) застаблены
 ДО импорта — тест НЕ трогает живую memory.db и не требует ключей."""
-import sys, types, asyncio
+import sys, types, asyncio, contextlib
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 import os
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
@@ -37,7 +37,8 @@ def _stub(name, **attrs):
     sys.modules[name] = m
 
 _stub("dotenv", load_dotenv=lambda *a, **k: None)
-_stub("bridge_client", BridgeClient=lambda *a, **k: FakeBridge(), agent_write=lambda *a, **k: None)
+_stub("bridge_client", BridgeClient=lambda *a, **k: FakeBridge(), agent_write=lambda *a, **k: None,
+      card_budget=lambda *a, **k: contextlib.nullcontext())   # общий бюджет опроса (15.08.2026)
 _stub("claude_client", ClaudeClient=FakeClaude)
 _stub("memory", Memory=FakeMemory)
 _stub("auditor", Auditor=FakeAuditor)
