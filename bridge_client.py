@@ -234,6 +234,10 @@ def _dedup_remember(key: str, task_id) -> None:
 # то есть путь БАЙТ-В-БАЙТ прежний (демон, аудитор, health моста дедлайна не видят вовсе).
 _CARD_BUDGET = contextvars.ContextVar("bridge_card_budget", default=None)
 
+# Плечо, ВЫДАННОЕ последнему HTTP-обмену этого контекста (см. `BridgeClient._timeout_said`).
+# Диагностическая величина: её пишет `_leg_timeout`, читает журнал таймаута — и никто больше.
+_LAST_LEG = contextvars.ContextVar("bridge_last_leg", default=None)
+
 CARD_DEADLINE_ERROR = "card_deadline"
 
 # Ошибки, после которых источник считается НЕ ПРОЧИТАННЫМ — карточка обязана сказать это вслух.
@@ -382,11 +386,52 @@ class BridgeClient:
     def _leg_timeout(self):
         """Бюджет ОДНОГО HTTP-плеча с оглядкой на общий дедлайн карточки.
         Без этого плечо, начатое за 2 с до дедлайна, честно провисит все 60 и перекроет общий
-        потолок в 30 раз — то есть потолок остался бы на бумаге."""
+        потолок в 30 раз — то есть потолок остался бы на бумаге.
+
+        Выданное число ЗАПОМИНАЕТСЯ (`_LAST_LEG`): журнал таймаута обязан назвать его, а не
+        настроенное плечо (класс 15.08.2026, см. `_timeout_said`)."""
         state = _CARD_BUDGET.get()
         if state is None:
-            return self.timeout
-        return card_deadline.leg_timeout(state.deadline, time.monotonic(), self.timeout)
+            issued = self.timeout
+        else:
+            issued = card_deadline.leg_timeout(state.deadline, time.monotonic(), self.timeout)
+        _LAST_LEG.set(issued)
+        return issued
+
+    # --- ЖУРНАЛ ТАЙМАУТА НАЗЫВАЕТ ВЫДАННОЕ ПЛЕЧО, А НЕ НАСТРОЕННОЕ (15.08.2026) ---
+    #
+    # КЛАСС. Строка `Bridge timeout (>Ns)` печатала `self.timeout` — НАСТРОЕННОЕ плечо, — тогда
+    # как запросу выдавался `_leg_timeout()`, урезанный остатком общего бюджета. В журнале стояло
+    # «>45s» там, где плечо реально прождало ~14 с: замер по splinter.log читал настройку вместо
+    # факта и завышал время ожидания. Родня класса — «нуль по неразбору» (`scan_result`) и
+    # «баланс из кэша молча» (`balance_fact`): число печатается, а откуда оно — умалчивается.
+    #
+    # ПОЧЕМУ ContextVar, А НЕ ПОЛЕ КЛИЕНТА: клиент один на процесс и его делят потоки (опрос
+    # очереди живёт в `asyncio.to_thread`), а выданное плечо принадлежит ОДНОМУ обмену. Поле
+    # клиента дало бы чужое число из соседнего потока — ту же ложь с другой стороны. У контекстных
+    # переменных контекст свой на поток, поэтому разойтись им негде; ровно этим уже живёт
+    # `_CARD_BUDGET` двадцатью строками выше.
+    #
+    # ФОРМА ГОЛОВЫ СТРОКИ НЕ ТРОНУТА: `Bridge timeout (>Ns) for action=…` — по ней ходят разборщики
+    # журнала; пометка урезки клеится ПОСЛЕ, отдельным хвостом. Когда урезки не было, строка
+    # БАЙТ-В-БАЙТ прежняя (число печатает `card_deadline._num`: 45.0 → «45», как печаталось int'ом).
+    _LEG_CUT_NOTE = "выдано остатком общего бюджета"
+
+    def _timeout_said(self):
+        """(число для журнала, хвост-пометка) о плече, которое сейчас истекло.
+
+        Правило одно: пометка объясняет, ПОЧЕМУ число не равно настроенному, — поэтому она
+        появляется ровно тогда, когда числа РАЗЛИЧАЮТСЯ на глаз. Плечо не записано (никто не
+        звал `_leg_timeout` — так бывает только у подменённой сессии) → прежнее поведение
+        байт-в-байт: печатаем настройку."""
+        issued = _LAST_LEG.get()
+        base = self.timeout
+        if issued is None:
+            return card_deadline._num(base), ""
+        said, want = card_deadline._num(issued), card_deadline._num(base)
+        if said == want:
+            return said, ""
+        return said, f" — {self._LEG_CUT_NOTE} {self._card_label()} (настроено {want}s)"
 
     def _card_room(self, what: str = "плечо"):
         """Есть ли в бюджете карточки место ещё на одно плечо. Нет → CardBudgetExpired."""
@@ -478,8 +523,9 @@ class BridgeClient:
             log.warning(f"Bridge {action}: {e}")
             return {"ok": False, "error": CARD_DEADLINE_ERROR, "message": str(e)}
         except requests.exceptions.Timeout:
-            log.error(f"Bridge timeout (>{self.timeout}s) for action={action}")
-            return {"ok": False, "error": "timeout", "message": f"Timeout >{self.timeout}s"}
+            said, cut = self._timeout_said()
+            log.error(f"Bridge timeout (>{said}s) for action={action}{cut}")
+            return {"ok": False, "error": "timeout", "message": f"Timeout >{said}s{cut}"}
         except requests.exceptions.RequestException as e:
             log.error(f"Bridge request error ({action}): {e}")
             return {"ok": False, "error": "request_failed", "message": str(e)}
