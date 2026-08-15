@@ -612,6 +612,224 @@ except Exception as e:                                                   # noqa:
     print("   ОШИБКА: %r" % e)
     res += [ok(False, "(16) руки: отсрочка")] * 13
 
+# ═══ (17) ДОСТАВКА СУДИТСЯ ПО СОДЕРЖИМОМУ ФАЙЛА, А НЕ ПО ЧИСТОТЕ ДЕРЕВА (15.08.2026) ═══
+# ЖИВОЙ СЛУЧАЙ 10:17 15.08: горячий `invariants_check.py` тронут ОДИННАДЦАТЬЮ коммитами окна
+# фактов — и одной незакоммиченной правкой в нём все одиннадцать становились «неизвестными»
+# РАЗОМ. Фикстура дословная: шаблоны файлов — вывод `git log --name-only`, блобы — вывод
+# `git rev-parse <коммит>:invariants_check.py`, старты юнитов — журнал systemd того утра
+# (splinter 15.08 03:14:41, демон 15.08 05:28:09), то есть ПОЗЖЕ всех одиннадцати.
+print("\n(17) вердикт О3 по содержимому файла: грязь соседа больше не хоронит коммит")
+HOT11 = [
+    ("baf5d30", 1786731717, "37a5042924b113756c35427fbf40673ebc711edd",
+     ["CLAUDE.md", "docs/artifacts/2026-08-14-named-work-in-history.md", "invariants_check.py",
+      "splinter.py", "tests/test_work_name.py", "work_name.py"]),
+    ("f70f186", 1786723187, "77b81a339f2d4460d4550eb10896f37c59d44e4b",
+     ["CLAUDE.md", "docs/artifacts/2026-08-14-undo-last-service-record.md",
+      "docs/knowledge_base.md", "invariants_check.py", "splinter.py", "tests/test_undo_last.py",
+      "undo_last.py"]),
+    ("4db98fe", 1786716983, "7796c07b0272c0a1379058bf12628f525a04aca3",
+     ["docs/artifacts/2026-08-14-odo-ceiling.md", "docs/knowledge_base.md",
+      "invariants_check.py", "odo_ceiling.py", "splinter.py", "tests/test_odo_ceiling.py",
+      "write_fact.py"]),
+    ("1552fab", 1786710424, "094b2d7c11c080ef70e642adabece1df0a11527c",
+     ["CLAUDE.md", "deliver_card.py", "docs/artifacts/2026-08-14-deliver-card-path-c.md",
+      "invariants_check.py", "orchestrator_daemon.py", "tests/test_deliver_card.py"]),
+    ("82caf4c", 1786707340, "b65f3585ec45ce05e2a068322d3f917dd7710cf3",
+     ["CLAUDE.md", "bridge_client.py", "docs/artifacts/2026-08-14-queue-state-in-brain.md",
+      "expectations_run.py", "invariants_check.py", "queue_state.py",
+      "tests/test_queue_state.py"]),
+    ("d5d5c19", 1786704178, "f171ed49eef164386d595d1d4525986fdbb5539a",
+     ["CLAUDE.md", "devbot.py", "docs/artifacts/2026-08-14-revizor-tick-age.md",
+      "invariants_check.py", "revizor_age.py", "tests/test_revizor_age.py",
+      "tests/test_status_summary.py"]),
+    ("497c857", 1786701152, "8ae6f9ad9e00353d4a1e5a545a9a8d464b0a51f3",
+     ["CLAUDE.md", "docs/artifacts/2026-08-14-service-receipt-both-halves.md",
+      "docs/knowledge_base.md", "invariants_check.py", "service_receipt.py", "splinter.py",
+      "tests/test_service_receipt.py"]),
+    ("a4489a5", 1786653455, "8d65e75426fda6e1cac92f3db3ef15969bc6bd3a",
+     ["CLAUDE.md", "balance_fact.py", "docs/artifacts/2026-08-13-cash-balance-not-verified.md",
+      "docs/knowledge_base.md", "invariants_check.py", "splinter.py",
+      "tests/test_cash_balance_fact.py", "tests/test_deposit_link.py", "wallet_cache.py"]),
+    ("c3e5543", 1786634284, "246a6ad2ab1b2f1c22c6cbfa585c08a862221dd7",
+     ["docs/artifacts/2026-08-13-mirror-sync-by-fact.md", "docs/knowledge_base.md",
+      "invariants_check.py", "splinter.py", "tests/test_write_fact.py", "write_fact.py"]),
+    ("a9ac39a", 1786629117, "08d424f7b35acfa2bff99cb4508516b24806acd5",
+     ["CLAUDE.md", "docs/artifacts/2026-08-13-observations-go-to-brain.md", "expect_journal.py",
+      "expectations.py", "expectations_run.py", "invariants_check.py",
+      "tests/test_expect_delivery.py", "tests/test_expect_journal.py",
+      "tests/test_expect_pc_bridge.py", "tests/test_expectations.py"]),
+    ("9a23c61", 1786615411, "7772213bc93494cd89a879aa04ff72b9652c5fc8",
+     ["CLAUDE.md", "bridge_client.py", "card_deadline.py",
+      "docs/artifacts/2026-08-13-info-card-deadline.md", "invariants_check.py", "splinter.py",
+      "tests/test_info_card_deadline.py"]),
+]
+NOW17 = T("2026-08-15T10:17:00Z")
+D17, S17 = T("2026-08-15T05:28:09Z"), T("2026-08-15T03:14:41Z")   # журнал systemd того утра
+HOT = "invariants_check.py"
+WIP_BLOB = "f" * 40                        # правка на диске: такого блоба нет ни в одном коммите
+C17 = [{"sha": s, "ct": ct, "subject": "живой коммит окна", "files": list(fs)}
+       for s, ct, _b, fs in HOT11]
+BLOBS17 = {HOT: {s: b for s, _ct, b, _fs in HOT11}}
+
+
+def hot_facts(disk_blob, hot_mtime, blobs=BLOBS17, dirty=(HOT,), dirty_ok=True, commits=C17):
+    """Факты той же формы, что собирают боевые руки, — с двумя хешами про спорный файл."""
+    f = facts(commits, now=NOW17, daemon=D17, splinter=S17,
+              mtimes={HOT: hot_mtime}, dirty=dirty, dirty_ok=dirty_ok)
+    f["delivery"]["blobs"] = blobs
+    f["delivery"]["disk"] = {HOT: disk_blob} if disk_blob else {}
+    return f
+
+
+def states(f):
+    return [E.delivery_state(c, f)["state"] for c in C17]
+
+
+def collections_count(rows):
+    """«исход×сколько» — число в голдене, а не пересказ (правило «сводка гипотеза, числа факт»)."""
+    return ", ".join("%s×%d" % (s, rows.count(s)) for s in sorted(set(rows)))
+
+
+try:
+    # 17a. ДО ПРАВКИ (фактов о содержимом нет — прежний код) — все ОДИННАДЦАТЬ «неизвестно».
+    before = states(hot_facts(None, NOW17 - 60, blobs={}))
+    res.append(ok(before.count(E.UNKNOWN) == 11,
+                  "(17a) прежнее правило: один грязный файл → 11 «неизвестно» разом: %s"
+                  % collections_count(before)))
+
+    # 17b. ПОСЛЕ: незакоммиченная правка, написанная ПОЗЖЕ всех одиннадцати, легла ПОВЕРХ них.
+    after = states(hot_facts(WIP_BLOB, NOW17 - 60))
+    res.append(ok(after.count(E.UNKNOWN) == 0 and after.count(E.DELIVERED) == 11,
+                  "(17b) по содержимому: те же 11 судятся и все доставлены: %s"
+                  % collections_count(after)))
+    why = E.disk_carries(HOT, C17[-1], hot_facts(WIP_BLOB, NOW17 - 60))
+    res.append(ok(why[0] is True and "ПОЗЖЕ коммита" in why[1] and "ПОВЕРХ" in why[1],
+                  "(17b) и причина названа словами, а не молчанием: %s" % (why[1],)))
+
+    # 17c. ЛОКАЛЬНЫЙ КОММИТ, ЕЩЁ НЕ ЗАПУШЕННЫЙ: на диске содержимое НОВЕЙШЕГО из одиннадцати —
+    # старшие им перекрыты, а не потеряны (в этом репозитории случай ежедневный).
+    newer = hot_facts(HOT11[0][2], NOW17 - 60)
+    res.append(ok(states(newer).count(E.UNKNOWN) == 0,
+                  "(17c) содержимое более нового коммита закрывает и старшие: %s"
+                  % collections_count(states(newer))))
+    v = E.disk_carries(HOT, C17[-1], newer)
+    res.append(ok(v[0] is True and "baf5d30" in v[1] and "перекрыт" in v[1],
+                  "(17c) и заметка называет ИМЕННО тот коммит, чьё содержимое лежит: %s" % (v[1],)))
+
+    # 17d. ЗАМОК ← ОТКАТ НАЗАД. На диске содержимое СТАРЕЙШЕГО, судим НОВЕЙШИЙ: это не «дошло»
+    # и не «не дошло» — рестарт такого не лечит. Третий исход остаётся, и он назван вслух.
+    back = hot_facts(HOT11[-1][2], NOW17 - 60)
+    st = E.delivery_state(C17[0], back)
+    res.append(ok(st["state"] == E.UNKNOWN
+                  and any("откатили назад" in w for _p, w in st["unknown"]),
+                  "(17d) откат дерева назад → «неизвестно» со странной причиной: %s"
+                  % (st["unknown"][:1],)))
+
+    # 17e. ЗАМОК ← НАСТОЯЩАЯ НЕДОСТАВКА ОБЪЯВЛЯЕТСЯ. Живой случай 15.08: 107b7ce правит
+    # bridge_client.py (память обоих юнитов), а оба подняты РАНЬШЕ него; рядом грязен сосед.
+    C_LIVE = {"sha": "107b7ce", "ct": T("2026-08-15T10:23:58Z"),
+              "subject": "журнал таймаута называет ВЫДАННОЕ плечо",
+              "files": ["CLAUDE.md", "bridge_client.py", "tests/test_timeout_leg_log.py"]}
+    live = hot_facts(WIP_BLOB, T("2026-08-15T10:40:00Z"), commits=[C_LIVE] + C17)
+    live["delivery"]["mtimes"]["bridge_client.py"] = T("2026-08-15T10:23:00Z")
+    live["now"] = T("2026-08-15T10:46:00Z")
+    stl = E.delivery_state(C_LIVE, live)
+    res.append(ok(stl["state"] == E.UNDELIVERED and len(stl["missing"]) == 2,
+                  "(17e) недоставка при грязном соседе ЗВУЧИТ, а не тонет: %s" % (stl["missing"],)))
+    res.append(ok(states(live).count(E.UNKNOWN) == 0,
+                  "(17e) и соседние одиннадцать в это же время судятся по существу"))
+
+    # 17f. ТРЕТИЙ ИСХОД ← ПРАВКА СТАРШЕ КОММИТА: содержимое ниоткуда не опознано, времени
+    # правки нечем объяснить — прежнее «неизвестно» с прежней формулировкой.
+    old = hot_facts(WIP_BLOB, T("2026-08-13T09:00:00Z"))
+    sto = E.delivery_state(C17[0], old)
+    res.append(ok(sto["state"] == E.UNKNOWN
+                  and any("СТАРШЕ коммита" in w for _p, w in sto["unknown"]),
+                  "(17f) правка старше коммита осталась «неизвестно»: %s" % (sto["unknown"][:1],)))
+
+    # 17g. ТРЕТИЙ ИСХОД ← ХЕШЕЙ НЕ СНЯЛИ: ветка байт-в-байт прежняя, вместе с причиной, форму
+    # которой читает o3_defer (отсрочка окна правки не тронута ни на бит).
+    blind = hot_facts(None, NOW17 - 60, blobs={})
+    stb = E.delivery_state(C17[0], blind)
+    res.append(ok(stb["state"] == E.UNKNOWN
+                  and any(E.DIRTY_WIP in w for _p, w in stb["unknown"]),
+                  "(17g) без хешей — прежнее «неизвестно» и прежняя причина: %s"
+                  % (stb["unknown"][:1],)))
+    res.append(ok(E.o3_defer({"state": E.UNKNOWN, "missing": [], "unknown": stb["unknown"]},
+                             {"dirty_defer": 30.0}) == 30.0,
+                  "(17g) и отсрочка окна правки работает ровно как работала"))
+
+    # 17h. ЗАМОК ← ДЕРЕВО НЕ СВЕРЕНО СИЛЬНЕЕ ЛЮБОГО СОДЕРЖИМОГО: спросить не смогли — не судим.
+    nogit = hot_facts(HOT11[0][2], NOW17 - 60, dirty_ok=False)
+    res.append(ok(states(nogit).count(E.UNKNOWN) == 11,
+                  "(17h) «дерево с origin не сверено» бьёт содержимое: %s"
+                  % collections_count(states(nogit))))
+
+    # 17i. ГРАНИЦА: коммит, тронувший ТОЛЬКО неподотчётный вид, содержимым не спасается.
+    C_OUT = {"sha": "abc1234", "ct": NOW17 - 7200, "subject": "выкладка",
+             "files": ["bridge_prod/Bridge.js"]}
+    stx = E.delivery_state(C_OUT, hot_facts(WIP_BLOB, NOW17 - 60, commits=[C_OUT]))
+    res.append(ok(stx["state"] == E.UNKNOWN and "не умею" in stx["unknown"][0][1],
+                  "(17i) неподотчётный вид доставки не тронут: %s" % (stx["unknown"],)))
+    # 17j. ЗАПИСАННЫЙ ЖИВОЙ ПРОМАХ, ради которого всё это и делается. Заметка 10.08 07:36
+    # (reports/2026-08-10/expect-o3-7a209f7.md, строка 11) сказала владельцу ДОСЛОВНО:
+    #   «не знаю, дошёл ли коммит до прода · … · проверить не могу: blind_readers_baseline.json
+    #    → на диске лежит не то, что в origin/main · это НЕ «дошло» и НЕ «не дошло»»
+    # — а правдой было «не дошёл»: секция (4) этого же сьюта доказывает, что у демона не было
+    # scan_result.py. Один грязный ФАЙЛ ДАННЫХ подменил ответ о ЧУЖОМ файле.
+    # Числа ниже — ДОСЛОВНО из блока «Сырые факты снимка» того же артефакта: старты юнитов
+    # 1786349336.12 и 1786352985.87, момент 1786357206.23, mtime спорного файла 1786356872.34.
+    DIRTY1 = "blind_readers_baseline.json"
+    snap = facts([C_SCAN], now=1786357206.23, daemon=1786349336.12, splinter=1786352985.87,
+                 dirty=(DIRTY1,), mtimes={DIRTY1: 1786356872.3369622,
+                                          "blind_readers.py": 1786191664.102177,
+                                          "scan_result.py": 1786191547.3299513})
+    was = E.delivery_state(C_SCAN, snap)
+    res.append(ok(was["state"] == E.UNKNOWN
+                  and [p for p, _w in was["unknown"]] == [DIRTY1] and not was["missing"],
+                  "(17j) дословный промах 10.08 воспроизведён прежним правилом: %s, «%s»"
+                  % (was["state"], was["unknown"][0][0])))
+    snap["delivery"]["blobs"] = {DIRTY1: {"7a209f7":
+                                          "185ab8d4230a9ed490bfe76aad56af48aa8e8ad8"}}
+    snap["delivery"]["disk"] = {DIRTY1: WIP_BLOB}
+    st_now = E.delivery_state(C_SCAN, snap)
+    res.append(ok(st_now["state"] == E.DELIVERED and not st_now["unknown"],
+                  "(17j) новым — тот же коммит и те же факты дают ОТВЕТ: %s" % st_now["state"]))
+except Exception as e:                                                   # noqa: BLE001
+    print("   ОШИБКА: %r" % e)
+    res += [ok(False, "(17) вердикт по содержимому")] * 14
+
+
+# ═══ (18) РУКИ: ДВА ХЕША — ФАКТ, А НЕ ДОГАДКА; ЧИСТОЕ ДЕРЕВО НЕ ПЛАТИТ НИЧЕГО ═══
+print("\n(18) руки: хеш блоба совпадает с git, а на чистом дереве команда не зовётся вовсе")
+try:
+    import subprocess as SP
+    import expectations_run as ER
+
+    mine = ER.blob_sha1(os.path.join(REPO, "expectations.py"))
+    his = SP.run(["git", "hash-object", "expectations.py"], cwd=REPO,
+                 capture_output=True, text=True).stdout.strip()
+    res.append(ok(mine and mine == his,
+                  "(18a) свой хеш блоба == git hash-object на живом файле: %s" % (mine or "")[:12]))
+
+    calls = []
+    real = ER._git
+    ER._git = lambda a: (calls.append(a), real(a))[1]
+    try:
+        res.append(ok(ER.commit_blobs("2026-08-13 00:00:00 +0000", []) == {} and not calls,
+                      "(18b) спорных файлов нет → ни одной команды git: вызовов %d" % len(calls)))
+        got = ER.commit_blobs("2026-08-13 00:00:00 +0000", ["invariants_check.py"])
+    finally:
+        ER._git = real
+    res.append(ok(got.get("invariants_check.py", {}).get("baf5d30") == HOT11[0][2],
+                  "(18c) на живом репозитории блоб коммита прочитан верно: %s"
+                  % str(got.get("invariants_check.py", {}).get("baf5d30"))[:12]))
+    res.append(ok(all(len(v) == 40 for m in got.values() for v in m.values()),
+                  "(18c) и все хеши полные, а не сокращённые"))
+except Exception as e:                                                   # noqa: BLE001
+    print("   ОШИБКА: %r" % e)
+    res += [ok(False, "(18) руки: хеши")] * 4
+
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)
 if fails:

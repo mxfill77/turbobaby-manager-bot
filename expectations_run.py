@@ -67,6 +67,7 @@ EXPECT_PC_MIN / EXPECT_BRIDGE_MIN / EXPECT_BRIDGE_SLOW_SEC), либо EXPECT_TAS
 ОТКАТ АДРЕСА отдельной ручкой: `EXPECT_TO_BRAIN=0` — в мозг не пишется ничего, все заметки
 уходят владельцу в ленту БАЙТ-В-БАЙТ как до 13.08.2026.
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -309,6 +310,64 @@ def dirty_files():
     return [ln.strip() for ln in out.splitlines() if ln.strip()], True
 
 
+# ═══ ЧЕМ ОТВЕЧАЮТ НА ВОПРОС «А ЧТО ЖЕ ЛЕЖИТ НА ДИСКЕ» (15.08.2026) ════════════════════════════
+# Расхождение с origin/main говорит ТОЛЬКО «файл не такой, как в ветке» — этого мало, чтобы
+# судить доставку: коммит мог быть перекрыт более новым, а мог и не быть. Поэтому здесь снимаются
+# ДВА хеша, и оба — факт: что коммит ОСТАВИЛ в файле (печатает git) и что в файле лежит СЕЙЧАС
+# (считается из байтов). Решение по ним принимает `expectations.disk_carries`, здесь решений нет.
+_BLOB_MAX = 8 * 1024 * 1024        # больше — не хешируем: «не знаю» дешевле долгого прогона
+_ZERO_BLOB = "0" * 40              # git так печатает post-image удалённого файла
+
+
+def blob_sha1(path):
+    """Содержимое файла → хеш В ФОРМЕ БЛОБА git (`sha1("blob <длина>\\0" + байты)`).
+
+    Ровно то же число, что печатает `git hash-object`, — сверено на живом файле. Считаем сами,
+    а не зовём git: подкоманды записи в белом списке нет, и заводить её ради чтения незачем."""
+    try:
+        with open(path, "rb") as fh:
+            body = fh.read(_BLOB_MAX + 1)
+    except OSError:
+        return None
+    if len(body) > _BLOB_MAX:
+        return None                                        # не судим — честнее, чем судить долго
+    return hashlib.sha1(b"blob %d\0" % len(body) + body).hexdigest()
+
+
+def commit_blobs(since, paths):
+    """{путь: {коммит: хеш содержимого ПОСЛЕ него}} — одна команда на весь список путей.
+
+    `--raw` печатает post-image каждого изменения, то есть ровно то, что коммит ОСТАВИЛ в файле.
+    Спрашиваем только про пути, разошедшиеся с origin/main в ЭТОМ прогоне: на чистом дереве
+    стоимость ровно ноль (команда не зовётся вовсе), а грязных файлов бывает единицы.
+    Коммиты ключуются так же, как в `commits_since`, — семью знаками."""
+    paths = sorted(paths or ())
+    if not paths:
+        return {}
+    out = _git(["log", "origin/main", "--since=" + since, "--format=%H", "--raw", "--no-abbrev",
+                "--"] + paths)
+    if not out:
+        return {}
+    blobs, sha = {}, None
+    for ln in out.splitlines():
+        ln = ln.rstrip()
+        if not ln:
+            continue
+        if ln.startswith(":"):
+            meta, _, rest = ln.partition("\t")
+            f = meta.split()
+            # У переименования путей два — берём ПОСЛЕДНИЙ, то есть назначение: именно оно лежит
+            # на диске и именно его имя стоит в списке файлов коммита.
+            rel = expectations.norm_path(rest.split("\t")[-1])
+            if len(f) < 5 or not rel or sha is None or f[3] == _ZERO_BLOB:
+                continue                                   # удаление: сравнивать нечего с чем
+            blobs.setdefault(rel, {})[sha[:7]] = f[3]
+            continue
+        if len(ln) == 40 and not ln.strip("0123456789abcdef"):
+            sha = ln
+    return blobs
+
+
 def delivery_facts(now):
     """Факты О3 и ни одного решения: коммиты окна, замыкания потребителей, живые процессы,
     время последней записи файлов, расхождение диска с origin/main.
@@ -319,13 +378,14 @@ def delivery_facts(now):
                                         expectations.DELIVER_WINDOW_DEFAULT,
                                         os.environ, scale=3600.0)
     # Берём с запасом: судейское окно применяет решение, а фактов пусть будет чуть больше.
+    since_ts = max(0.0, now - max(cfg_window, 3600.0) * 2)
     try:
-        commits = prod_drift.commits_since(now - max(cfg_window, 3600.0) * 2, REPO)
+        commits = prod_drift.commits_since(since_ts, REPO)
     except Exception:
         commits = []
     if not commits and _git(["rev-parse", "--verify", "origin/main"]) is None:
-        return {"ok": False, "commits": [], "closures": {}, "units": {},
-                "mtimes": {}, "dirty": [], "dirty_ok": False}
+        return {"ok": False, "commits": [], "closures": {}, "units": {}, "mtimes": {},
+                "dirty": [], "dirty_ok": False, "blobs": {}, "disk": {}}
     closures, units = {}, {}
     for unit, entry in prod_drift.WATCHED:
         try:
@@ -346,8 +406,18 @@ def delivery_facts(now):
             except OSError:
                 continue                       # файла нет (удалён коммитом) — свидетель С1 хватит
     dirty, dirty_ok = dirty_files()
+    # ХЕШИ СНИМАЮТСЯ ТОЛЬКО ПРО СПОРНЫЕ ФАЙЛЫ — те, что разошлись с origin/main И тронуты
+    # коммитами окна. Чистое дерево (обычный случай) не платит ни одной лишней команды.
+    hot = sorted({expectations.norm_path(x) for x in dirty} & set(mtimes))
+    since = time.strftime("%Y-%m-%d %H:%M:%S +0000", time.gmtime(since_ts))
+    blobs = commit_blobs(since, hot) if (hot and dirty_ok) else {}
+    disk = {}
+    for rel in (hot if blobs else ()):
+        h = blob_sha1(os.path.join(REPO, rel))
+        if h:
+            disk[rel] = h
     return {"ok": True, "commits": commits, "closures": closures, "units": units,
-            "mtimes": mtimes, "dirty": dirty, "dirty_ok": dirty_ok}
+            "mtimes": mtimes, "dirty": dirty, "dirty_ok": dirty_ok, "blobs": blobs, "disk": disk}
 
 
 def snapshot(now=None, st=None, cfg=None):
