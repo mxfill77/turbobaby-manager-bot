@@ -5176,7 +5176,31 @@ def _series_root(tid, text, state):
     return int(tid), kind
 
 
-def _series_note_card(tid, task, what):
+def _series_commit_root(state, sha):
+    """Коммит → корень цепочки, В ЧЬЁ ОКНО ИСПОЛНЕНИЯ он попал | None.
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ ПРИПИСКА У КАРТОЧКИ ДОСТАВКИ. Своего места в счёте у неё НЕТ по устройству:
+    строка очереди `[доставка коммита X] …` маркера родителя не несёт, а цепочка из одной
+    карточки без единой записи не закроется НИКОГДА — `chain_series.chain_closed` требует хотя бы
+    один терминал, и такая цепочка вечно считалась бы открытой, то есть вмешательство молча
+    выпало бы из серии (ровно это и случилось с 565/566). Зато у карточки назван КОММИТ, а
+    коммит уже приписан цепочке ТЕМ ЖЕ свидетелем, которым считается её вес — окном исполнения
+    (`_series_commits`, замок 11.08: текст отчёта не читается вовсе). То есть приписка здесь
+    ФАКТ, а не догадка.
+
+    Коммита нет ни в одном окне (сделан рукой владельца · цепочка забыта потолком SERIES_KEEP) →
+    None. Это честное незнание: последней цепочке такую карточку счёт НЕ вешает — обвинять
+    произвольную цепочку в чужом вмешательстве хуже, чем промолчать и сказать это в журнал."""
+    s = str(sha or "")[:7]
+    if not s:
+        return None
+    for r, ch in sorted((state.get("chains") or {}).items(), key=lambda kv: -int(kv[0])):
+        if s in ((ch.get("weight") or {}).get("commits") or []):
+            return int(r)
+    return None
+
+
+def _series_note_card(tid, task, what, commit=None):
     """КАРТОЧКА РОДИЛАСЬ. Тело записываем СЕЙЧАС — после ответа очередь его затрёт. Операции
     называет curator_ops: ТОТ ЖЕ словарь, которым машина зовёт операции сама.
 
@@ -5185,7 +5209,11 @@ def _series_note_card(tid, task, what):
     не находит. Замер 11.08: из 64 неразобранных цепочек 58 держатся ровно на затёртом теле.
     Провалы двух записей независимы: журнал не лёг — живой счёт всё равно знает операцию (и это
     названо в карточке полем `journal`); не легло состояние — цепочка помечается НЕ РАЗОБРАННОЙ
-    (см. `_series_flush_lost`), а не уходит в серию чистой."""
+    (см. `_series_flush_lost`), а не уходит в серию чистой.
+
+    `commit` — карточка просит доставить ИМЕННО ЭТОТ коммит (дверь `_maybe_deliver_ask`): корень
+    берётся у цепочки коммита, а не у самой карточки (см. `_series_commit_root`). Цепочки нет →
+    в журнал пишем, в живой счёт НЕ идём и говорим об этом вслух."""
     if not _series_on():
         return
     ops, born = [], chain_series.stamp(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()))
@@ -5200,7 +5228,16 @@ def _series_note_card(tid, task, what):
                     "по снимку её сорт не восстановит", tid, e)
     try:
         state = _series_state()
-        root, _kind = _series_root(tid, str((task or {}).get("task_text") or ""), state)
+        if commit:
+            root = _series_commit_root(state, commit)
+            if root is None:
+                log.info("серия: карточка id=%s о коммите %s — цепочки этого коммита в состоянии "
+                         "нет (сделан руками / забыта потолком). В журнал рождения записана, в "
+                         "живой счёт НЕ идёт: своей цепочки у карточки доставки не бывает",
+                         tid, commit)
+                return
+        else:
+            root, _kind = _series_root(tid, str((task or {}).get("task_text") or ""), state)
         ch = _series_chain(state, root, task)
         ch["cards"] = [c for c in ch["cards"] if c.get("id") != tid]
         ch["cards"].append({"id": tid, "open": True, "born": born, "ops": ops,
@@ -5653,7 +5690,8 @@ def _maybe_deliver_ask(now=None):
                 continue
             sid = r.get("id")
             bc.claim_task(sid)      # даже если claim не прошёл — set_needs_approval финализирует
-            rr = bc.set_needs_approval(sid, cap_result(deliver_card.render(off)))
+            body = cap_result(deliver_card.render(off))
+            rr = bc.set_needs_approval(sid, body)
             if not rr.get("ok"):
                 log.warning("доставка: карточка %s не доведена в needs_approval (%s)",
                             sid, rr.get("error"))
@@ -5662,6 +5700,13 @@ def _maybe_deliver_ask(now=None):
             said.append(sid)
             log.info("ДОСТАВКА: коммит %s не доехал до %s → карточка %s владельцу (✅ = задача "
                      "гейт+перезапуск, ❌ = ничего)", sha, ", ".join(off["units"]), sid)
+            # ЖИВОЙ СЧЁТ СЕРИИ (§8г): карточка доставки — ВМЕШАТЕЛЬСТВО владельца, и по рамке
+            # его сорт решает ОПЕРАЦИЯ, а не ответ. Прежде эта дверь счёт не звала вовсе:
+            # карточки 565 (`b5478ce`) и 566 (`baf5d30`) от 14.08 не попали ни в состояние, ни в
+            # журнал — хотя обе шум (splinter перезапущен 15.08 03:14:40, «да» купило бы ничего).
+            # Тело пишем ТО ЖЕ, что видит владелец, и СЕЙЧАС: после ответа очередь его затрёт.
+            _series_note_card(sid, {"id": sid, "lane": "vps",
+                                    "task_text": deliver_card.row_text(off)}, body, commit=sha)
         except Exception as e:                                       # noqa: BLE001
             log.warning("доставка: карточка по коммиту %s не поставлена (%s)", sha, e)
         break                       # РОВНО ОДИН вопрос за прогон: очередь важнее доставки
