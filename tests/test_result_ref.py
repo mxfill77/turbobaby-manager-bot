@@ -528,8 +528,32 @@ for fname in sorted(os.listdir(REPO)):
             importers.append(fname)
         elif isinstance(node, ast.ImportFrom) and node.module == "result_ref":
             importers.append(fname)
-ok(sorted(set(importers)) == ["bridge_client.py"],
-   f"адрес импортирует РОВНО одна дверь записи, и ни один судья: {sorted(set(importers))}")
+# ПУНКТ 2 КОНТРАКТА СУДЬЮ ПОСТРОИЛ (16.08.2026, `docs/artifacts/2026-08-16-result-judge.md`),
+# и замок от этого НЕ ослаблен, а уточнён. Прежняя редакция требовала «адрес импортирует ровно
+# одна дверь записи, и ни один судья»; судья теперь есть — но смысл замка был не в его
+# отсутствии, а в том, что ПО АДРЕСУ НЕКОМУ СХОДИТЬ В ЖИВОМ ПРОЦЕССЕ. Поэтому условий стало
+# ДВА, и оба обязаны держаться: список читателей адреса ТОЧНЫЙ (третий читатель — красное), и
+# сам судья НИКЕМ НЕ ЗОВОМ (подключат — красное). Ослаблением это быть не может: подключение
+# судьи, которое прежняя строка не заметила бы вовсе, теперь роняет тест.
+ok(sorted(set(importers)) == ["bridge_client.py", "result_judge.py"],
+   f"адрес читают РОВНО двое — дверь записи и судья пункта 2: {sorted(set(importers))}")
+
+judge_callers = []
+for fname in sorted(os.listdir(REPO)):
+    if not fname.endswith(".py") or fname in ("result_judge.py", "result_judge_facts.py"):
+        continue
+    try:
+        with open(os.path.join(REPO, fname), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError):
+        continue
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(a.name == "result_judge" for a in node.names):
+            judge_callers.append(fname)
+        elif isinstance(node, ast.ImportFrom) and node.module == "result_judge":
+            judge_callers.append(fname)
+ok(not judge_callers,
+   f"судью адреса не зовёт ни один боевой модуль — по адресу некому сходить: {judge_callers}")
 
 with open(os.path.join(REPO, "orchestrator_daemon.py"), encoding="utf-8") as f:
     daemon_src = f.read()
