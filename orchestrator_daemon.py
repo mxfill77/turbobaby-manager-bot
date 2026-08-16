@@ -5383,6 +5383,12 @@ def _series_note_terminal(task, status, result):
 # работающий механизм. ОТКАТ: SHADOW_RULE=0 в .env + рестарт демона → ветка мертва ДО чтения поля.
 SHADOW_FILE_NAME = "shadow-rule.jsonl"          # reports/<дата>/shadow-rule.jsonl — место названо
 SHADOW_TEST_DIR = "/tmp/cc_shadow_rule_test"    # тест-прогон в боевые отчёты НЕ пишет
+# ЦЕПОЧЕЧНАЯ ТЕНЬ ПИШЕТ В СВОЙ ФАЙЛ, а не подмешивается к пошаговой. Так «оба счёта рядом»
+# (поправка Штаба, п.3) есть ФАКТ на диске: пошаговый журнал не тронут ни одной строкой, и
+# сравнить два счёта можно, не разбирая один поток на два вида записей.
+SHADOW_CHAIN_FILE_NAME = "shadow-chain.jsonl"
+SHADOW_KIN_KEEP = 4000                          # потолок памяти родства (см. _shadow_root)
+SHADOW_CHAIN_KEEP = 400                         # потолок памяти цепочек тени
 
 
 def _shadow_on():
@@ -5422,6 +5428,7 @@ def _shadow_note_terminal(task, status):
     уронить закрытие задачи (тот же fail-safe, что у счёта серии)."""
     if not _shadow_on():
         return
+    v = None
     try:
         v = _shadow_verdict(task)
         rec = shadow_rule.shadow(status, [v["state"]])
@@ -5443,6 +5450,116 @@ def _shadow_note_terminal(task, status):
                  shadow_rule.render(rec), (v.get("kind") or "не назван"))
     except Exception as e:
         log.warning("тень: терминал id=%s не посчитан (%s) — вердикт и ход не тронуты",
+                    (task or {}).get("id"), e)
+    # ЦЕПОЧЕЧНАЯ ТЕНЬ — СВОЯ ДВЕРЬ И СВОЙ FAIL-SAFE, но ТОТ ЖЕ вердикт (второй раз за факты не
+    # платим). Стоит ПОСЛЕ пошаговой записи намеренно: пошаговый счёт старше и не смеет зависеть
+    # от исхода нового.
+    _shadow_note_chain(task, status, v)
+
+
+# ── ЕДИНИЦА — ЦЕПОЧКА (поправка Штаба к контракту, 16.08.2026) ───────────────────────────────
+# Контракт повесил адрес результата на ШАГ, и первая редакция тени судила шаги поштучно. Это
+# ошибка ЕДИНИЦЫ того же рода, что запрещённый рамкой §8г плоский счёт записей: промежуточный
+# служебный шаг своего продукта не имеет и иметь не должен, а суди его по собственному адресу —
+# и цепочка обрывается на ровном месте. Продукт принадлежит ЦЕПОЧКЕ: корневой записи со шагами.
+#
+# РОДСТВО ЖИВЁТ В ПАМЯТИ ПРОЦЕССА, а не в файле, и это НАЗВАННЫЙ предел, а не недосмотр. Тень
+# ничего не решает — платить за неё новым состоянием на диске (ещё одним файлом, который надо
+# чинить, чистить и сверять) дороже, чем её польза. Рестарт демона память теряет: цепочка,
+# начатая до рестарта, досчитается с того места, где демон её увидел, и скажет об этом числом
+# `steps_seen`. Ровно так же живут `_summarized` и `_adapt_finish`.
+#
+# ЦЕНА — НОЛЬ ЛИШНИХ ОБРАЩЕНИЙ К МИРУ: корень берётся из маркера текста (`chain_series.parent_of`,
+# чистая функция), вердикт приходит готовым из пошаговой ветки, очередь не спрашивается вовсе.
+_SHADOW_KIN = {}        # id записи → id родителя | None   (родство, память процесса)
+_SHADOW_CHAIN = {}      # корень → накопленные факты цепочки (та же память)
+
+
+def _shadow_root(tid, text):
+    """Корень цепочки записи по ПАМЯТИ РОДСТВА. Маркер даёт прямого родителя, дальше вверх идём
+    по уже виденным записям (конверт → карточка → цель → корень). Родителя не видели → он и есть
+    корень: подниматься выше нечем, а выдумывать предка хуже, чем остановиться на названном."""
+    tid = int(tid)
+    _kind, par = chain_series.parent_of(text)
+    _SHADOW_KIN[tid] = int(par) if par is not None else None
+    while len(_SHADOW_KIN) > SHADOW_KIN_KEEP:            # потолок памяти: старое уходит первым
+        _SHADOW_KIN.pop(next(iter(_SHADOW_KIN)))
+    cur, seen = tid, {tid}
+    while True:
+        p = _SHADOW_KIN.get(cur)
+        if p is None or p in seen:                       # родителя нет / петля маркеров
+            return cur
+        seen.add(p)
+        if p not in _SHADOW_KIN:
+            return p
+        cur = p
+
+
+def _shadow_chain_state(root, task):
+    """Запись цепочки в памяти тени (завести при первом касании)."""
+    ch = _SHADOW_CHAIN.get(root)
+    if ch is None:
+        ch = _SHADOW_CHAIN[root] = {
+            "root": root, "lane": str((task or {}).get("lane") or "vps"),
+            "first": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            # Зелёное ЦЕПОЧКИ здесь — «ни один её терминал не пришёл не-зелёным». Чистоту (сорт
+            # вмешательства, отказ, вес) считает `chain_series` своим прибором; тень о ней не
+            # заявляет и второго определения не заводит.
+            "green": True, "terminals": 0,
+            "root_state": None, "root_kind": "", "root_pointer": "", "root_why": "",
+            "steps": {},
+        }
+        while len(_SHADOW_CHAIN) > SHADOW_CHAIN_KEEP:
+            _SHADOW_CHAIN.pop(next(iter(_SHADOW_CHAIN)))
+    return ch
+
+
+def _shadow_note_chain(task, status, v=None):
+    """ТЕРМИНАЛ ЗАПИСИ → теневой вердикт ЕЁ ЦЕПОЧКИ, строкой в `reports/<дата>/shadow-chain.jsonl`.
+
+    Строка пишется на КАЖДЫЙ терминал и говорит о цепочке НА ЭТОТ МОМЕНТ: закрыта ли она, тень
+    отсюда не знает (это стоило бы снимка очереди) и не выдумывает — ИТОГ ЦЕПОЧКИ ЕСТЬ ПОСЛЕДНЯЯ
+    ЕЁ СТРОКА. Любое исключение съедается здесь же: тень не смеет уронить закрытие задачи."""
+    if not _shadow_on():
+        return
+    try:
+        tid = int((task or {}).get("id"))
+        text = str((task or {}).get("task_text") or "")
+        v = v or {"state": result_judge.UNKNOWN, "why": "вердикт шага не посчитан",
+                  "kind": "", "pointer": ""}
+        root = _shadow_root(tid, text)
+        ch = _shadow_chain_state(root, task)
+        ch["terminals"] += 1
+        if str(status or "") != shadow_rule.GREEN:
+            ch["green"] = False
+        named = bool(v.get("kind"))
+        if tid == root:
+            # КОРНЕВАЯ ЗАПИСЬ: её адрес и есть адрес цепочки. Не назвала — так и запишем (None),
+            # и судья получит НЕИЗВЕСТНО: зелёное надо заработать.
+            ch["root_state"] = v.get("state") if named else None
+            ch["root_kind"] = v.get("kind") or ""
+            ch["root_pointer"] = v.get("pointer") or ""
+            ch["root_why"] = v.get("why") or ""
+        else:
+            ch["steps"][str(tid)] = {"id": tid, "named": named, "state": v.get("state"),
+                                     "why": v.get("why") or ""}
+        rec = shadow_rule.chain_shadow(ch["green"], ch.get("root_state"),
+                                       list(ch["steps"].values()))
+        row = dict(rec)
+        row.update({
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "root": root, "id": tid, "lane": ch["lane"], "terminals": ch["terminals"],
+            "root_kind": ch["root_kind"], "root_pointer": ch["root_pointer"],
+            "root_why": ch["root_why"], "root_seen": ch["root_state"] is not None
+            or bool(ch["root_kind"]),
+        })
+        d = _shadow_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, SHADOW_CHAIN_FILE_NAME), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        log.info("ТЕНЬ ЦЕПИ root=%s (запись %s) %s", root, tid, shadow_rule.render_chain(rec))
+    except Exception as e:
+        log.warning("тень цепочки: терминал id=%s не посчитан (%s) — вердикт и ход не тронуты",
                     (task or {}).get("id"), e)
 
 
