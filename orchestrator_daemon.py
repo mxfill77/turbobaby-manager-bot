@@ -1898,6 +1898,8 @@ def process_dec_tails():
         return
     if not r.get("ok"):
         return
+    # ТЕРМИНАЛ КАРТОЧКИ: снимок failed уже на руках — «нет» владельца читается отсюда бесплатно.
+    _card_end_rejects(r.get("items", []))
     pids = set()
     for it in r.get("items", []):
         m = _STEP_RE.match(str(it.get("task_text") or ""))
@@ -4504,6 +4506,11 @@ def process_approved():
             log.warning("fixture-guard/approved: id=%s заглушка (%.40s…) → failed", tid, _ftxt_ap)
             continue
         what = str(task.get("result") or "")        # сохранённый дескриптор (op=… | текст) — одобренный
+        # ТЕРМИНАЛ КАРТОЧКИ: «разрешено» доказано самим статусом — approved очередь ставит только
+        # по вызову devbot'а из ветки «да». Пишем ДО разбора ветвей: что демон сделает с
+        # одобренным дальше — уже другая история, а ответ владельца состоялся здесь.
+        _card_end_note(tid, chain_cards.APPROVED, body=what,
+                       lane=str(task.get("lane") or "vps"))
 
         # Сводная карточка владельцу (куратор, шаг 4/7): ✅ = РАЗРЕШЕНИЕ на пункты, а не «принял
         # к сведению» (класс карточек 95/100, 31.07.2026 — раньше здесь стоял голый done, и «да»
@@ -4940,6 +4947,10 @@ def process_na_reminders():
             bc.complete_task(tid, "failed", _truthful_fail(
                 tid, "подтверждение не получено за 24ч — задача провалена (hard cap)",
                 "approval_timeout", task=task))
+            # ТЕРМИНАЛ КАРТОЧКИ: истечение доказывать нечем и не нужно — его сделал сам демон,
+            # прямо здесь. Тело карточки ещё на руках, объект берём из него.
+            _card_end_note(tid, chain_cards.EXPIRED, body=str(task.get("result") or ""),
+                           lane=str(task.get("lane") or "vps"))
             _na_reminded.discard(tid)
             _maybe_dec_after(task.get("task_text"), "failed")
         elif age > NA_REMINDER_SEC and tid not in _na_reminded:
@@ -4956,6 +4967,166 @@ def process_na_reminders():
                 log.warning("NA reminder push failed id=%s: %s", tid, e)
     _na_reminded &= active_ids   # очистить id задач, которые больше не needs_approval
     _series_cards_tick(active_ids)   # ЖИВОЙ СЧЁТ СЕРИИ: карточки, ушедшие из needs_approval
+    _card_end_watch(r.get("items", []))   # ТЕРМИНАЛ КАРТОЧКИ: кто из карточек ушёл из вопросов
+
+
+# ═══════════════ ТЕРМИНАЛ КАРТОЧКИ В ЖУРНАЛ (16.08.2026, зеркало ПК-коммита cc1c779) ═════════
+# ДЫРА, ЗАМЕРЕННАЯ У СЕБЯ (числа — в docs/artifacts/2026-08-16-guard-terminal-log-vps.md). Журнал
+# знал РОЖДЕНИЕ карточки и не знал её КОНЦА: за 58 суток журнала демона (19.06–16.08) — 126
+# рождений, 0 строк об отказе владельца, 0 об истечении, а «да» видно лишь косвенно, по тому, что
+# демон взялся исполнять approved (61 номер). Сам вердикт применяет devbot, и он не пишет о нём
+# НИ СЛОВА: «нет» уходит в поле `result` очереди, которое тем же движением ЗАТИРАЕТ тело карточки.
+# То есть на вопрос «чем кончилась карточка N» после ответа владельца не отвечал никто.
+#
+# ЭТО ТОЛЬКО ЗАПИСЬ. Ни одного решения здесь не принимается: гард не тронут ни на строку, вердикты
+# карточек, их число и их тексты не меняются (замок A сьюта). Ошибка этого слоя стоит строки в
+# журнале, а не работы.
+#
+# ЧЕТЫРЕ ДВЕРИ, У КАЖДОЙ СВОЁ ДОКАЗАТЕЛЬСТВО, И НИ ОДНОЙ ДОГАДКИ:
+#   · «разрешено» — очередь отдала задачу в статусе approved (process_approved). Статус ставит
+#     мост по вызову devbot'а из ветки «да», иначе он не появляется вовсе;
+#   · «отказ» — в снимке failed лежит вердикт devbot'а `_REJECT_PREFIX` (process_dec_tails берёт
+#     этот снимок КАЖДЫЙ оборот и без нас — лишних обращений к мосту слой не платит);
+#   · «истекло» — hard-cap 24ч сделал сам демон, тут доказывать нечего;
+#   · «закрыто» — карточка перестала висеть, а ни одно доказательство не пришло. Честное слово о
+#     незнании: «раз не одобрено — значит отклонено» было бы выводом из чужого молчания.
+# ЗАДНИМ ЧИСЛОМ НЕ ПИШЕМ (правило журнала): терминал получают ТОЛЬКО карточки, которых этот
+# процесс ВИДЕЛ ЖИВЫМИ. Иначе первый же оборот после выкладки насыпал бы «закрыто» на всю историю.
+# ОТКАТ: CARD_END_LOG=0 в .env + рестарт демона → ветка мертва ДО чтения снимков.
+_CARD_OPEN: dict = {}          # карточки, увиденные живыми: id → {"ops": [...], "lane": "vps"}
+_CARD_END_PENDING: dict = {}   # ушли из needs_approval, исход ещё не назван: id → {..., "try": n}
+_CARD_ENDED: set = set()       # чей терминал уже записан. Память процесса — ТОЛЬКО экономия:
+                               # настоящий дедуп живёт в самом журнале (`note_end`), поэтому её
+                               # потеря при рестарте дублей не создаёт. Без неё карточка,
+                               # закрытая ДЕМОНОМ (hard-cap) и потому ещё живая в ТОМ ЖЕ снимке,
+                               # заходила бы на второй круг и просила журнал о том, что в нём уже
+                               # записано.
+CARD_END_TRIES = 3             # столько оборотов пытаемся дописать строку, потом громко сдаёмся
+CARD_OPEN_MAX = 2000           # память процесса не растёт вечно (карточек в сутки — единицы)
+
+
+def _card_end_on():
+    """CARD_END_LOG в .env: по умолчанию ВКЛЮЧЕНО, «0» гасит ветку целиком. Дефолт-«включено»
+    законен ровно потому, что слой ничего не решает — он только записывает уже случившееся."""
+    return (os.environ.get("CARD_END_LOG") or "1").strip() != "0"
+
+
+def _card_end_ops(tid, body=""):
+    """ОБЪЕКТ операции для строки терминала — ярлыками семей, а не текстом.
+
+    Порядок источников: что запомнили при первом виде карточки → что записано при её рождении →
+    разбор тела, если оно ещё есть на руках. Ничего не назвали → пустой список, и читатель видит
+    честное «объект не назван». Тела в журнал не попадает: `curator_ops` отдаёт КЛЮЧИ семей
+    (`service:splinter`, `set_fleet_oil`, `git_push`…) — закрытый словарь, в котором нет места ни
+    команде, ни пути, ни содержимому конфига (замок D сьюта)."""
+    known = (_CARD_OPEN.get(int(tid)) or {}).get("ops")
+    if known:
+        return list(known)
+    try:
+        j = chain_cards.load(_cards_file())
+        born = (j or {}).get("cards", {}).get(int(tid)) if j is not None else None
+        if born and born.get("ops"):
+            return [str(o) for o in born["ops"]]
+    except Exception as e:                       # журнал не прочитан — объект возьмём из тела
+        log.warning("терминал карточки: журнал id=%s не прочитан (%s)", tid, e)
+    try:
+        return [o["key"] for o in curator_ops.operations(str(body or ""))]
+    except Exception:
+        return []
+
+
+def _card_end_note(tid, outcome, body="", lane="vps"):
+    """Записать строку терминала. Best-effort: журнал — не работа, его сбой не валит оборот.
+    Дедуп живёт в самом журнале (`note_end`), поэтому доказанный исход, пришедший раньше, не
+    перебивается ничем — и «закрыто» поверх «отказа» лечь не может физически."""
+    if not _card_end_on():
+        return False
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return False
+    if tid in _CARD_ENDED:
+        return True                     # уже записан: журнал не спрашиваем второй раз за то же
+    ops = _card_end_ops(tid, body)
+    try:
+        chain_cards.note_end(_cards_file(), tid,
+                             time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                             (_CARD_OPEN.get(tid) or {}).get("lane") or lane, outcome, ops)
+        _CARD_END_PENDING.pop(tid, None)
+        _CARD_OPEN.pop(tid, None)
+        if len(_CARD_ENDED) > CARD_OPEN_MAX:
+            _CARD_ENDED.clear()
+        _CARD_ENDED.add(tid)
+        log.info("терминал карточки id=%s: %s (объект: %s)",
+                 tid, outcome, ",".join(ops) or "не назван")
+        return True
+    except Exception as e:
+        log.warning("терминал карточки id=%s (%s) в журнал не записан (%s)", tid, outcome, e)
+        return False
+
+
+def _card_end_watch(items):
+    """Кто из карточек жив, а кто ушёл — по ТОМУ ЖЕ снимку needs_approval, который демон берёт и
+    без нас. Ничего не пишет: живую карточку берём на заметку (её объект понадобится, когда тело
+    затрут вердиктом), ушедшую — в ожидание исхода до конца оборота, чтобы доказательства этого
+    же оборота успели назвать его словом.
+
+    ОТСЮДА ЖЕ ГРАНИЦА ПОЛОСЫ: снимок идёт без параметра полосы, то есть отдаёт vps — карточки ПК
+    сюда не попадают вовсе, и терминала им этот слой не пишет (их конец видит их же полоса)."""
+    if not _card_end_on():
+        return
+    alive = set()
+    for it in (items or []):
+        try:
+            tid = int(it.get("id"))
+        except (TypeError, ValueError):
+            continue
+        alive.add(tid)
+        if tid in _CARD_ENDED:
+            continue                    # конец этой карточки уже записан — второй раз не судим
+        if tid not in _CARD_OPEN:
+            if len(_CARD_OPEN) > CARD_OPEN_MAX:
+                _CARD_OPEN.clear()      # память — только экономия: дедуп живёт в самом журнале
+            _CARD_OPEN[tid] = {"lane": str(it.get("lane") or "vps"),
+                               "ops": _card_end_ops(tid, str(it.get("result") or ""))}
+    for tid in sorted(set(_CARD_OPEN) - alive):
+        _CARD_END_PENDING.setdefault(tid, {"lane": (_CARD_OPEN.get(tid) or {}).get("lane") or "vps",
+                                           "try": 0})
+
+
+def _card_end_rejects(items):
+    """ОТКАЗ ВЛАДЕЛЬЦА — по вердикту, который devbot кладёт в очередь своей же рукой. Снимок
+    failed уже взят `process_dec_tails`, поэтому строка стоит НОЛЬ обращений к мосту.
+
+    Судим ТОЛЬКО карточки, чей уход мы видели сами (`_CARD_END_PENDING`): снимок failed несёт всю
+    историю очереди, и без этого условия первый же оборот после выкладки переписал бы прошлое."""
+    if not _card_end_on() or not _CARD_END_PENDING:
+        return
+    for it in (items or []):
+        try:
+            tid = int(it.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if tid in _CARD_END_PENDING and str(it.get("result") or "").startswith(_REJECT_PREFIX):
+            _card_end_note(tid, chain_cards.REJECTED, lane=str(it.get("lane") or "vps"))
+
+
+def _card_end_flush():
+    """САМОЕ ПОСЛЕДНЕЕ слово оборота: карточкам, чей исход никто не доказал, пишем честное
+    «закрыто». Позиция в обороте и есть замок: доказательства (approved / вердикт отказа /
+    hard-cap) говорят РАНЬШЕ, а дедуп журнала не даёт «закрыто» лечь поверх них."""
+    if not _card_end_on():
+        return
+    for tid, info in sorted(_CARD_END_PENDING.items()):
+        if _card_end_note(tid, chain_cards.CLOSED, lane=info.get("lane") or "vps"):
+            continue
+        info["try"] = int(info.get("try") or 0) + 1
+        if info["try"] >= CARD_END_TRIES:
+            _CARD_END_PENDING.pop(tid, None)
+            _CARD_OPEN.pop(tid, None)
+            log.warning("терминал карточки id=%s: журнал не принял строку за %d оборота — конец "
+                        "карточки останется незаписанным, и это сказано здесь", tid,
+                        CARD_END_TRIES)
 
 
 # ═══════════════ ЖИВОЙ СЧЁТ СЕРИИ ЦЕПОЧЕК (10.08.2026, рамка §8г) ═══════════════════════════
@@ -6151,6 +6322,7 @@ def cycle():
     process_new()
     _maybe_prod_drift()         # ДЕТЕКТОР ДРЕЙФА: read-only, только говорит (заметка в ленту 829)
     _maybe_deliver_ask()        # ДОСТАВКА (путь C): вердикт О3 «не доставлен» → вопрос владельцу
+    _card_end_flush()           # ТЕРМИНАЛ КАРТОЧКИ: недоказанным исходам — честное «закрыто»
     _expect_pulse()             # ПУЛЬС ОБОРОТА (О2): факт «оборот состоялся» для яруса 2
 
 
