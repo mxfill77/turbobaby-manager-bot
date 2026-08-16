@@ -565,9 +565,16 @@ ok(sorted(set(judge_callers)) == ["orchestrator_daemon.py", "shadow_rule.py"],
 # держалась ровно до тех пор, пока тени не было. Замена ей не мягче, а точнее: имена адреса и
 # судьи вправе стоять в демоне ТОЛЬКО внутри теневых рук (`_shadow_*`) и в самих строках
 # импорта. Тронет их вердикт шага — тест краснеет, и краснеет на КОНКРЕТНОЙ функции.
+# 16.08.2026, пункт 3 контракта: дверей стало ДВЕ — к тени добавился СЧЁТ СЕРИИ
+# (`_series_rule_note`, правило зелёного включено в счёте решением владельца). Список ИМЕННОЙ и
+# короткий намеренно: он и есть замок. Вердикт шага обе двери по-прежнему не касаются — это
+# проверяется отдельно, посимвольным равенством терминалов (`tests/test_rule_on_count.py` §7).
 with open(os.path.join(REPO, "orchestrator_daemon.py"), encoding="utf-8") as f:
     daemon_src = f.read()
 _WATCH = {"result_ref", "result_judge", "result_judge_facts", "shadow_rule"}
+
+
+_DOORS = ("_shadow", "_series_rule_note")      # тень (журнал) и счёт серии (правило зелёного)
 
 
 class _Where(ast.NodeVisitor):
@@ -585,17 +592,17 @@ class _Where(ast.NodeVisitor):
         if node.id in _WATCH:
             fn = self.stack[-1] if self.stack else "<модуль>"
             self.seen.append(fn)
-            if not fn.startswith("_shadow"):
+            if not fn.startswith(_DOORS):
                 self.bad.append((fn, node.lineno))
 
 
 _w = _Where()
 _w.visit(ast.parse(daemon_src))
 ok(not _w.bad,
-   f"в демоне адрес и судья видны РОВНО теневым рукам `_shadow_*` (чужие места: {_w.bad})")
+   f"в демоне адрес и судья видны РОВНО двум дверям {list(_DOORS)} (чужие места: {_w.bad})")
 # Замок обязан ЗАДЕВАТЬ ветку: «нарушений 0» на слепом обходе стоило бы ноль. Считаем, сколько
 # обращений он вообще увидел, и где именно.
-ok(len(_w.seen) >= 4 and set(_w.seen) and all(f.startswith("_shadow") for f in _w.seen),
+ok(len(_w.seen) >= 4 and set(_w.seen) and all(f.startswith(_DOORS) for f in _w.seen),
    f"обход не слеп: обращений увидено {len(_w.seen)}, все в {sorted(set(_w.seen))}")
 
 # Страж чистоты: у решения нет рук, чтобы сходить по адресу.

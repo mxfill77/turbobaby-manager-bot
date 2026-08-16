@@ -47,6 +47,10 @@ os.environ["PLAN_ADAPT"] = "0"
 os.environ["CARD_DUTY"] = "0"
 os.environ["CURATOR"] = "0"
 os.environ["CURATOR_STATE"] = "0"
+# Предмет сьюта — карточка доставки В СЧЁТЕ по ПРЕЖНЕМУ определению чистоты. Правило зелёного
+# (RULE_ON_COUNT, 16.08.2026) судится своим сьютом; здесь выключено принудительно (изоляция
+# легаси-сьюта, класс CURATOR/PLAN_ADAPT/CARD_DUTY).
+os.environ["RULE_ON_COUNT"] = "0"
 os.environ["DELIVER_CARD"] = "1"
 os.environ["CHAIN_SERIES"] = "1"
 os.environ["PRETOOL_NOPUSH"] = "1"

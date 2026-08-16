@@ -5310,6 +5310,90 @@ def _series_note_pc_cards(items):
                         "восстановит", (it or {}).get("id"), e)
 
 
+# ── ПРАВИЛО ЗЕЛЁНОГО В СЧЁТЕ СЕРИИ (16.08.2026, пункт 3 контракта третьего исхода) ───────────
+# ТОЛЬКО В СЧЁТЕ. Ход цепи не меняется ни на байт: правило живёт ПОСЛЕ терминала, в файле метрики,
+# и снять зелёное у живой задачи ему нечем — вердикт очереди к этому моменту уже поставлен, а
+# `_maybe_dec_after` двигает цепь НАСТОЯЩИМ статусом, как двигал.
+#
+# ЧТО МЕНЯЕТСЯ: чистой цепочкой считается только ДОКАЗАННАЯ — та, по чьему названному адресу и
+# правда лежит продукт. НЕ ДОКАЗАН и НЕИЗВЕСТНО = обрыв (решение владельца 16.08, узел
+# `orchestrator_plan`). Прошлое НЕ пересчитывается: счёт начинается с нуля от момента включения,
+# прежние числа переезжают в `rule.before` вместе с определением, по которому считались.
+#
+# ЦЕНА — НОЛЬ ЛИШНИХ ОБРАЩЕНИЙ К МИРУ: вердикт адреса записи считает `_ref_verdict` РОВНО ОДИН раз
+# за терминал, и тень берёт тот же самый (кэш на одну запись). Адреса нет → фактов не спрашиваем
+# вовсе. К мосту не ходим никогда.
+# ОТКАТ: RULE_ON_COUNT=0 в .env + рестарт демона → счёт возвращается к прежнему определению
+# БАЙТ-В-БАЙТ (ветка мертва ДО чтения фактов), сохранённые прежние числа остаются лежать рядом.
+RULE_ON_NOTE = ("прежнее определение (до 16.08.2026): чистой считалась цепочка, которую не "
+                "оборвали шум, ремонт руками или необъяснённый отказ; продукт по названному "
+                "адресу не спрашивался вовсе — правила зелёного в счёте не было")
+
+
+def _rule_on_count():
+    """RULE_ON_COUNT в .env: по умолчанию ВКЛЮЧЕНО, «0» гасит ветку ДО чтения фактов. Дефолт-
+    «включено» законен ровно потому, что счёт ничего не решает (тот же довод, что у _series_on)."""
+    return (os.environ.get("RULE_ON_COUNT") or "1").strip() != "0"
+
+
+def _rule_since(state):
+    """Момент включения правила в счёте | '' (правило выключено).
+
+    ВКЛЮЧЕНИЕ СЛУЧАЕТСЯ ОДИН РАЗ И ОСТАВЛЯЕТ СЛЕД. Прежние числа целиком переезжают в
+    `rule.before` — не пересказом, а тем самым блоком `derived`, каким он был, — и рядом ложится
+    `definition`: по какому определению они считались. Затирать их новым счётом нельзя: метрика
+    фазы читается годами, а число без определения — то же самое утверждение без привязки, за
+    которое заведён гейт `doc_state_claims`."""
+    if not _rule_on_count():
+        return ""
+    r = state.get("rule") or {}
+    since = str(r.get("since") or "")
+    if since:
+        return since
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state["rule"] = {"since": since, "definition": RULE_ON_NOTE,
+                     "before": dict(state.get("derived") or {})}
+    log.info("СЕРИЯ: правило зелёного включено в счёте с %s (счёт с нуля); прежние числа "
+             "сохранены в rule.before: %s", since,
+             (state["rule"]["before"] or {}).get("line") or "прежнего счёта не было")
+    return since
+
+
+def _series_rule_note(ch, tid, kind, task):
+    """Записать в цепочку факты правила зелёного: ВИД записи (для служебных корней) и вердикт.
+
+    Вердикт цепочки считает ЧУЖАЯ чистая функция — `shadow_rule.chain_shadow`, та же, которой
+    живёт тень: второго определения одного понятия рядом не заводится (тот же приём, каким
+    `result_judge` берёт вокабуляр у `result_ref`). Ей отдаётся `real_green=True` — вопрос здесь
+    ровно один: СНИМАЕТ ли правило зелёное с этой цепочки. Причину настоящего обрыва (шум,
+    ремонт, отказ) называет счёт своими фактами, и доказанный адрес её не отменяет.
+
+    FAIL-SAFE: любое исключение съедается здесь же — терминал записи уже записан, и потерять его
+    из-за правила нельзя. Цепочка тогда остаётся БЕЗ вердикта правила, а это честное «прибор
+    молчал» (не разобрана), а не зелёное."""
+    try:
+        ch.setdefault("kinds", {})[str(tid)] = str(kind or "")
+        if not _rule_on_count():
+            return
+        v = _ref_verdict(task)
+        refs = ch.setdefault("refs", {})
+        refs[str(tid)] = {"named": bool(v.get("kind")), "state": v.get("state"),
+                          "kind": v.get("kind") or "", "pointer": (v.get("pointer") or "")[:200],
+                          "why": (v.get("why") or "")[:200]}
+        root = str(ch.get("root"))
+        rr = refs.get(root) or {}
+        root_state = rr.get("state") if rr.get("named") else None
+        rec = shadow_rule.chain_shadow(True, root_state,
+                                       [r for i, r in refs.items() if i != root])
+        ch["rule"] = {"green": bool(rec.get("shadow_green")), "judge": rec.get("judge") or "",
+                      "why": rec.get("why") or "", "judge_why": (rr.get("why") or "")[:160],
+                      "root_named": bool(root_state), "steps_named": rec.get("steps_named", 0),
+                      "at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())}
+    except Exception as e:
+        log.warning("серия: правило зелёного для записи id=%s не посчитано (%s) — цепочка "
+                    "останется без вердикта правила (не разобрана, но не зелёная)", tid, e)
+
+
 def _series_note_terminal(task, status, result):
     """ТЕРМИНАЛ ЗАПИСИ. Здесь исход известен — здесь и пишем: статус, необъяснённый отказ,
     окно исполнения (для приписки рестартов) и доказанные коммиты (вес)."""
@@ -5349,6 +5433,9 @@ def _series_note_terminal(task, status, result):
             for sha in _series_commits(lo, now):
                 if sha not in ch["weight"]["commits"]:
                     ch["weight"]["commits"].append(sha)
+        # ПРАВИЛО ЗЕЛЁНОГО В СЧЁТЕ (RULE_ON_COUNT): вид записи и вердикт её адреса — сюда же,
+        # одним состоянием и одной записью файла. Своего исключения не бросает никогда.
+        _series_rule_note(ch, tid, kind, task)
         _series_derive(state)
         _series_save(state)
     except Exception as e:
@@ -5420,6 +5507,25 @@ def _shadow_verdict(task):
     return result_judge.verdict(ref, result_judge_facts.gather([ref], brain=False))
 
 
+_REF_VERDICT = {"key": None, "v": None}     # вердикт адреса записи: считаем ОДИН раз за терминал
+
+
+def _ref_verdict(task):
+    """Вердикт судьи по адресу ЭТОЙ записи, посчитанный РОВНО ОДИН раз.
+
+    Спрашивают его двое — тень (журнал `shadow-*.jsonl`) и счёт серии (правило зелёного), — а
+    факты стоят подпроцессов (`git log`, `os.stat`, `systemctl show`). Кэш на ОДНУ запись: кто
+    пришёл первым, тот и заплатил, второй берёт готовое; разойтись им негде по построению.
+    Ключ — (id, ТЕКСТ записи), а не один id: номера очереди начинаются заново при её
+    пересоздании, и по голому id кэш отдал бы вердикт чужой задачи."""
+    key = ((task or {}).get("id"), str((task or {}).get("task_text") or ""))
+    if _REF_VERDICT["key"] == key and _REF_VERDICT["v"] is not None:
+        return _REF_VERDICT["v"]
+    v = _shadow_verdict(task)
+    _REF_VERDICT.update({"key": key, "v": v})
+    return v
+
+
 def _shadow_note_terminal(task, status):
     """ТЕРМИНАЛ ШАГА: посчитать теневой вердикт и записать его РЯДОМ с настоящим.
 
@@ -5430,7 +5536,7 @@ def _shadow_note_terminal(task, status):
         return
     v = None
     try:
-        v = _shadow_verdict(task)
+        v = _ref_verdict(task)          # тот же вердикт, что взял счёт серии: платим за факты раз
         rec = shadow_rule.shadow(status, [v["state"]])
         row = dict(rec)
         row.update({
@@ -5642,6 +5748,11 @@ def _series_plus(ts, sec):
 
 def _series_derive(state):
     """Пересчитать вердикты и серию чистой функцией; лишние цепочки выгрузить."""
+    since = _rule_since(state)
+    # ПЕРВЫЙ ПЕРЕСЧЁТ ПОД ПРАВИЛОМ: счёт начинается С НУЛЯ. Рекорд и последний обрыв ПРЕЖНЕГО
+    # определения вперёд не переносятся — иначе новая метрика унаследовала бы чужое число и
+    # молча выдала бы его за своё (прошлое НЕ пересчитывается, решение владельца 16.08).
+    fresh = bool(since) and not (state.get("derived") or {}).get("rule_since")
     chains = state.get("chains") or {}
     for r in sorted(chains, key=lambda x: int(x))[:-SERIES_KEEP] if len(chains) > SERIES_KEEP \
             else []:
@@ -5654,14 +5765,14 @@ def _series_derive(state):
         # цепочка с ещё не отвеченным вопросом владельца шла в серию чистой; теперь их судит
         # chain_verdict — «не разобрана» до закрытия карточки.
         ch["cards"] = list(chains[r].get("cards") or [])
-        verdicts.append(chain_series.chain_verdict(ch))
-    d = chain_series.series(verdicts)
+        verdicts.append(chain_series.chain_verdict(ch, since=since))
+    d = chain_series.series(verdicts, since=since)
     # ПАМЯТЬ ПРОТИВ УРЕЗКИ. `best` и `breaks` считаются по цепочкам, которые состояние ЕЩЁ помнит
     # (потолок SERIES_KEEP), поэтому забывание старых цепочек молча УКОРАЧИВАЛО бы рекорд и
     # стирало дату последнего обрыва — то есть файл переставал бы отвечать на два из четырёх
     # вопросов рамки §8г, ничего об этом не сказав. Оба поля переносятся вперёд: рекорд не
     # уменьшается никогда, последний обрыв держится, пока его не сменит новый.
-    prev = state.get("derived") or {}
+    prev = {} if fresh else (state.get("derived") or {})
     d["best_ever"] = max(int(prev.get("best_ever") or 0), int(d.get("best") or 0))
     if not d.get("last_break"):
         d["last_break"] = prev.get("last_break")

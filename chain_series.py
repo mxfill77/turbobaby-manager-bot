@@ -157,6 +157,39 @@ def resolve_roots(entries):
     return out
 
 
+def service_root(chain):
+    """Служебная ли цепочка → ВИД маркера её КОРНЕВОЙ записи | '' (не служебная / не знаем).
+
+    ПРИЗНАК НАЗВАН И ОН ОДИН: вид маркера корневой записи ∈ `SERVICE_KINDS`. Это ровно тот
+    признак, которым служебность считает разведка покрытия (`91dc01d`,
+    `docs/artifacts/2026-08-16-refcoverage-vps.md` §4: «из 176 безадресных корней 12 суть
+    служебные записи контура — 11 конвертов одобренной заявки и 1 вердикт куратора»), и второго
+    определения рядом не заводится. Виды приходят фактом — `chain["kinds"]` (id записи → вид),
+    их пишут руки в момент терминала.
+
+    ПОЧЕМУ ВООБЩЕ ИСКЛЮЧАЕМ. Конверт, сводка, вердикт куратора, карточка владельцу и карточка
+    ПК-театра — записи, которые контур породил САМ. Продукта у них нет и адрес им не полагается
+    (это и признала поправка `fda5528`: «шаг без адреса цепочку не обрывает»), а значит правило
+    зелёного мерило бы на них не работу, а дисциплину заполнения поля у собственной болтовни.
+    Единицей метрики такая запись не является — ни чистой, ни обрывом; рамка §8г запрещает
+    плоский счёт записей прямо.
+
+    КОРНЕВОЙ ЗАПИСИ МОГЛИ НЕ ВИДЕТЬ ВОВСЕ — родитель вне корпуса (история обрезана, потолок
+    SERIES_KEEP, счёт начат позже). Тогда решают ВСЕ виденные записи: все служебные → служебная
+    (продукт принадлежит той, внешней цепочке); хоть одна рабочая → судим как обычную.
+    Видов нет ни одного (легаси-цепочка, записанная до этой правки) → '': не знаем — не
+    объявляем, и цепочка идёт в счёт как шла."""
+    kinds = {str(k): str(v or "") for k, v in (chain.get("kinds") or {}).items() if str(v or "")}
+    if not kinds:
+        return ""
+    root = str(chain.get("root"))
+    if root in kinds:
+        return kinds[root] if kinds[root] in SERVICE_KINDS else ""
+    if all(v in SERVICE_KINDS for v in kinds.values()):
+        return kinds[min(kinds, key=lambda i: int(i) if i.lstrip("-").isdigit() else 0)]
+    return ""
+
+
 # ────────────────────────────────────────────────────────────────────────────────────────────
 # 2. СОРТ ВМЕШАТЕЛЬСТВА
 # ────────────────────────────────────────────────────────────────────────────────────────────
@@ -370,6 +403,24 @@ SERIES_TARGET = 30            # критерий выхода из фазы (р�
 # ЗАЧЁТНОСТЬ СЕРИИ — ТРИ ИСХОДА, А НЕ ДВА (тот же замок, что у веса цепочки и у О3/О4/О5).
 QUAL_YES, QUAL_NO, QUAL_UNKNOWN = "да", "нет", "неизвестно"
 
+# ── ПРАВИЛО ЗЕЛЁНОГО В СЧЁТЕ (16.08.2026, пункт 3 контракта третьего исхода) ─────────────────
+# ЧИСТОЙ СЧИТАЕТСЯ ТОЛЬКО ДОКАЗАННАЯ ЦЕПОЧКА: по адресу, названному её корневой записью, и
+# правда лежит её продукт. НЕ ДОКАЗАН и НЕИЗВЕСТНО — обрыв (решение владельца 16.08, узел
+# `orchestrator_plan`): длина есть УТВЕРЖДЕНИЕ о сделанной работе, и утверждать её без факта
+# нельзя. Прежде «неизвестно» оставляло цепочку неразобранной — та ветка осталась ровно за
+# молчанием ПРИБОРА (вердикта нет вовсе), и это разные вещи: судья сказал «не знаю» — это факт о
+# цепочке; прибор не считал — это факт о нас.
+#
+# ВОКАБУЛЯРА ТРЕТЬЕГО ТУТ НЕТ. Исход правила приходит ГОТОВЫМ, в той форме, которую отдаёт
+# `shadow_rule.chain_shadow` (`green`/`judge`/`why`), — чтобы второго определения одного понятия
+# не завелось рядом. Отсюда и импорт этого модуля по-прежнему ровно один (`re`): судить адреса
+# счёту нечем ФИЗИЧЕСКИ, он только читает уже вынесенный вердикт.
+#
+# ПРАВИЛО ОДНОСТОРОННЕЕ И ЗДЕСЬ: оно умеет СНЯТЬ чистоту и не умеет её ДАТЬ. Цепочку, оборванную
+# шумом, ремонтом или отказом, доказанный адрес не спасает — причина обрыва называется прежняя и
+# в прежнем порядке, а `правило` встаёт последним.
+RULE_CAUSE = "правило"
+
 
 TERMINAL = frozenset(("done", "failed", "rejected"))
 
@@ -382,17 +433,25 @@ def chain_closed(statuses):
     return bool(st) and all(s in TERMINAL for s in st)
 
 
-def chain_verdict(chain):
+def chain_verdict(chain, since=""):
     """Накопленные факты цепочки → вердикт. Ключи входа: root, lane, created, closed_at,
-    statuses [..], cards [{sort, why, id}], refusals [{id, reason}], weight {commits, restarts}.
+    statuses [..], cards [{sort, why, id}], refusals [{id, reason}], weight {commits, restarts},
+    а с 16.08.2026 ещё kinds {id: вид} и rule {green, judge, why} — факты правила зелёного.
 
     ОБРЫВ даёт шум, ремонт руками и необъяснённый отказ; воля и неизвестное — не дают.
-    Причина обрыва называется ОДНА и в этом порядке: шум → ремонт → отказ (сначала то, что
-    касается владельца, потом то, что касается контура).
+    Причина обрыва называется ОДНА и в этом порядке: шум → ремонт → отказ → правило (сначала то,
+    что касается владельца, потом то, что касается контура, и последним — правило зелёного:
+    оно судит ПРОДУКТ, а не жизнь цепочки).
 
     ЗАМОК ТРЕТЬЕГО ИСХОДА: обрыв — ФАКТ, поэтому он сильнее незнания и судится первым; если же
     факта обрыва нет, а сорт хотя бы одного вмешательства не определён (неизвестно · сорт не
-    читается), цепочка НЕ РАЗОБРАНА — ни чистая, ни обрыв."""
+    читается), цепочка НЕ РАЗОБРАНА — ни чистая, ни обрыв.
+
+    `since` — МОМЕНТ ВКЛЮЧЕНИЯ ПРАВИЛА ЗЕЛЁНОГО, и он же его выключатель: пусто → правило
+    выключено и вердикт БАЙТ-В-БАЙТ прежний (все ветки ниже мертвы ДО чтения фактов). Непусто →
+    (1) служебные корни в счёт не входят вовсе, (2) цепочка старше момента включения не входит
+    тоже — прошлое не пересчитывается, счёт начинается с нуля, (3) чистой остаётся только
+    ДОКАЗАННАЯ."""
     sorts = {s: [] for s in SORTS}
     unread, hanging = [], []
     for c in chain.get("cards") or []:
@@ -416,8 +475,36 @@ def chain_verdict(chain):
         cause, why = MANUAL, str(sorts[MANUAL][0].get("why") or "")
     elif refusals:
         cause, why = "отказ", "%s (запись %s)" % (refusals[0].get("reason"), refusals[0].get("id"))
+    # ── ПРАВИЛО ЗЕЛЁНОГО: КТО ВООБЩЕ ЕДИНИЦА И ЧТО СЧИТАЕТСЯ ЧИСТЫМ ──────────────────────────
+    rl = dict(chain.get("rule") or {})
+    svc, counted, skip_why, silent = "", True, "", False
+    if since:
+        svc = service_root(chain)
+        born = stamp(chain.get("created"))
+        if svc:
+            counted = False
+            skip_why = ("служебный корень (%s): запись породил контур сам, продукта у неё нет и "
+                        "адреса ей не полагается — единицей метрики она не является" % svc)
+        elif not born or born < stamp(since):
+            counted = False
+            skip_why = ("цепочка старше включения правила (создана %s, правило с %s) — прошлое "
+                        "не пересчитываем" % (born or "время неизвестно", stamp(since)))
+        elif not rl:
+            # МОЛЧАНИЕ ПРИБОРА, А НЕ «НЕИЗВЕСТНО» СУДЬИ. Вердикта адреса нет вовсе (ветка правила
+            # не отработала) — это факт о нас, а не о цепочке: ни +1, ни обрыва.
+            silent = True
+        elif not rl.get("green") and cause is None:
+            cause = RULE_CAUSE
+            why = ("%s [вердикт адреса: %s%s]"
+                   % (rl.get("why") or "правило зелёного сняло зелёное с цепочки",
+                      rl.get("judge") or UNKNOWN,
+                      (", " + str(rl.get("judge_why"))) if rl.get("judge_why") else ""))
     unresolved, u_why = False, ""
-    if cause is None and (sorts[UNKNOWN] or unread or hanging):
+    if cause is None and silent and not (sorts[UNKNOWN] or unread or hanging):
+        unresolved = True
+        u_why = ("правило зелёного эту цепочку не судило: вердикта адреса нет — прибор молчал, "
+                 "а молчание прибора не факт о цепочке")
+    elif cause is None and (sorts[UNKNOWN] or unread or hanging):
         unresolved = True
         if hanging:
             u_why = ("вмешательство ещё висит (запись %s) — сорт станет известен, когда карточка "
@@ -435,11 +522,21 @@ def chain_verdict(chain):
         "unresolved": unresolved, "unresolved_why": u_why, "unreadable": len(unread),
         "hanging": len(hanging),
         "counts": {s: len(sorts[s]) for s in SORTS},
+        # ── ПРАВИЛО ЗЕЛЁНОГО. `counted` — входит ли цепочка в счёт ВООБЩЕ (служебный корень и
+        # прошлое не входят), `service` — вид служебного корня, `rule_state` — что сказал прибор.
+        "counted": counted, "service": svc, "skip_why": skip_why,
+        "rule_state": {"judged": bool(rl), "green": bool(rl.get("green")) if rl else None,
+                       "judge": str(rl.get("judge") or "") if rl else ""},
     }
 
 
-def series(verdicts):
+def series(verdicts, since=""):
     """Вердикты цепочек В ПОРЯДКЕ КОРНЕЙ → состояние серии.
+
+    `since` — момент включения правила зелёного; пусто → счёт БАЙТ-В-БАЙТ прежний. Непусто →
+    цепочки, помеченные вердиктом как `counted=False` (служебный корень · прошлое), пропускаются
+    ВОВСЕ: они не дают ни длины, ни обрыва. МОЛЧАЛИВОГО ПРОПУСКА НЕТ — и те, и другие названы
+    числом (`service` · `before_rule`) и попадают в строку `render`.
 
     → {"current", "best", "breaks": [...], "last_break", "chains", "weight_share",
        "weight_in_current", "qualified"}. `qualified` — зачётная ли ИДУЩАЯ серия, и это НЕ
@@ -468,10 +565,16 @@ def series(verdicts):
     cur_weight = cur_known = 0
     cur_unres = best_unres = 0
     unres_roots = []
+    svc_roots, old_roots = [], []
     best_span, cur_span, breaks = [], [], []
     for v in verdicts or []:
         if not v.get("closed", True):
             continue                 # ещё идёт — не исход; в серию не входит ни в одну сторону
+        if not v.get("counted", True):
+            # ЕДИНИЦЕЙ НЕ ЯВЛЯЕТСЯ. Пропускаем как открытую — ни +1, ни в нуль; но считаем и
+            # называем: молчаливый пропуск снова выдавал бы «не судили» за «чисто».
+            (svc_roots if v.get("service") else old_roots).append(v.get("root"))
+            continue
         if v.get("break"):
             breaks.append({"root": v.get("root"), "cause": v.get("cause"), "why": v.get("why"),
                            "at": v.get("closed_at") or v.get("created"), "lane": v.get("lane"),
@@ -491,7 +594,7 @@ def series(verdicts):
                 cur_weight += 1
         if cur > best:
             best, best_span, best_unres = cur, list(cur_span), cur_unres
-    closed = [v for v in (verdicts or []) if v.get("closed", True)]
+    closed = [v for v in (verdicts or []) if v.get("closed", True) and v.get("counted", True)]
     total = len(closed)
     known_all = [v for v in closed if v.get("weight_known", True)]
     with_weight = sum(1 for v in known_all if v.get("weight"))
@@ -526,8 +629,13 @@ def series(verdicts):
         "clean": total - len(unres_roots) - len(breaks),
         "weight_share": round((with_weight / len(known_all)), 4) if known_all else 0.0,
         "weight_chains": with_weight, "weight_known": len(known_all),
-        "open": len(list(verdicts or [])) - total,
+        "open": sum(1 for v in (verdicts or []) if not v.get("closed", True)),
         "qualified": qual, "qualified_why": qual_why,
+        # ── ПРАВИЛО ЗЕЛЁНОГО: что в счёт не вошло и почему (при выключенном правиле — нули).
+        "rule_since": stamp(since) or "",
+        "service": len(svc_roots), "service_roots": svc_roots[-40:],
+        "before_rule": len(old_roots), "before_rule_roots": old_roots[-40:],
+        "rule_breaks": sum(1 for b in breaks if b.get("cause") == RULE_CAUSE),
     }
 
 
@@ -578,7 +686,20 @@ def qualify_windows(verdicts, size=None, min_known=None):
 
 def render(state):
     """Одна строка для журнала/сводки. Числа, не ощущения. Неразобранные названы ЗДЕСЬ ЖЕ и
-    рядом с длиной: строка, молчащая о них, снова выдавала бы пропуск за чистоту."""
+    рядом с длиной: строка, молчащая о них, снова выдавала бы пропуск за чистоту.
+
+    Правило зелёного выключено → строка БАЙТ-В-БАЙТ прежняя. Включено → хвост называет момент
+    включения и всё, что в счёт не вошло: служебные корни и цепочки старше включения."""
+    tail = ""
+    if state.get("rule_since"):
+        tail = (" | правило зелёного с %s: обрывов по правилу %d, служебных корней %d, прежних "
+                "цепочек %d (в счёт не входят)"
+                % (state.get("rule_since"), state.get("rule_breaks", 0),
+                   state.get("service", 0), state.get("before_rule", 0)))
+    return tail and (_render_base(state) + tail) or _render_base(state)
+
+
+def _render_base(state):
     return ("серия цепочек: идёт %d (вес %d из %d наблюдаемых, перешагнула неразобранных %d), "
             "лучшая %d, всего цепочек %d, не разобрано %d, "
             "обрывов %d [шум %d · ремонт %d · отказ %d], вес по наблюдаемым %.1f%%, "
