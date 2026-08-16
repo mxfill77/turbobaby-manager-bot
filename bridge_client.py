@@ -18,6 +18,7 @@ import requests
 import task_metrics                 # общий детектор тест-прогона (стор дедупа: проба ≠ бой)
 import fleet_cell                   # контракт клетки Лист1: исход вместо голого нуля
 import card_deadline                # общий дедлайн сборки карточки: решение (у модуля ноль импортов)
+import result_ref as _result_ref    # адрес результата шага: форма поля очереди (импорт ровно один — re)
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -854,8 +855,15 @@ class BridgeClient:
     # 'all' в get_pending = обе полосы (опрос devbot).
 
     def enqueue_task(self, from_: str, task_text: str, lane: str = None,
-                     dedup_key: str = None) -> dict:
+                     dedup_key: str = None, result_ref=None) -> dict:
         """Положить задачу в очередь → {ok, id}. status=new. lane: None=vps (дефолт Bridge) | 'pc'.
+        result_ref (16.08.2026, пункт 1 контракта третьего исхода): АДРЕС РЕЗУЛЬТАТА шага —
+        пара (вид, указатель) либо словарь того же вида, что отдаёт `result_ref.parse`. Виды —
+        `result_ref.KINDS`. Кладётся строкой в task_text ПЕРВЫМ действием, до fixture-guard и
+        дедупа: адрес — часть СОЗДАВАЕМОГО шага, а не приписка после. None (сегодня — все
+        вызовы) → ни одной новой строки не исполняется, тело запроса БАЙТ-В-БАЙТ прежнее
+        (тот же приём, что у lane=None). Названный криво адрес бросает ValueError ДО сети —
+        молча съеденный адрес вернул бы класс, против которого писан контракт.
         FIXTURE-GUARD (класс 193): канонические тест-заглушки в живую очередь НЕ пишутся —
         мгновенный {ok:False, fixture_guard:True} БЕЗ сети. Обход для легитимных тест-контуров
         (транспорт-тесты на фейковом URL): BRIDGE_ALLOW_FIXTURES=1 ставит сам тест.
@@ -864,6 +872,9 @@ class BridgeClient:
         {ok:True, id:<та же задача>, duplicate:True}. Пусто → дедупа нет, поведение прежнее
         байт-в-байт (как `if (!msgId) return false` на мосту). Разбор — блок «ДЕДУП ПОСТАНОВКИ
         ЗАДАЧИ» выше."""
+        if result_ref is not None:
+            _rk, _rp = _result_ref.as_pair(result_ref)
+            task_text = _result_ref.attach(task_text, _rk, _rp)
         _ftxt = str(task_text or "")
         if (FIXTURE_TASK_RE.search(_ftxt) or FIXTURE_TASK_RE.search(_fixture_norm(_ftxt))) \
                 and os.environ.get("BRIDGE_ALLOW_FIXTURES") != "1":
