@@ -535,8 +535,14 @@ for fname in sorted(os.listdir(REPO)):
 # ДВА, и оба обязаны держаться: список читателей адреса ТОЧНЫЙ (третий читатель — красное), и
 # сам судья НИКЕМ НЕ ЗОВОМ (подключат — красное). Ослаблением это быть не может: подключение
 # судьи, которое прежняя строка не заметила бы вовсе, теперь роняет тест.
-ok(sorted(set(importers)) == ["bridge_client.py", "result_judge.py"],
-   f"адрес читают РОВНО двое — дверь записи и судья пункта 2: {sorted(set(importers))}")
+# ПУНКТ 3 ЗАВЁЛ ТЕНЬ (16.08.2026, `docs/artifacts/2026-08-16-shadow-rule.md`), и замок снова
+# УТОЧНЁН, а не ослаблен. Теперь по адресу СХОДИТЬ ЕСТЬ КОМУ — теневой прогон в демоне; но он
+# СЧИТАЕТ, А НЕ ПРИМЕНЯЕТ, и смысл замка переезжает туда, где он теперь и живёт: список
+# читателей адреса остаётся ТОЧНЫМ (четвёртый — красное), а в самом демоне адрес виден РОВНО в
+# теневых руках (проверка ниже). Вердикт шага от адреса по-прежнему не зависит ни одним байтом
+# — это доказано посимвольным равенством терминалов в `tests/test_shadow_rule.py` (замок A).
+ok(sorted(set(importers)) == ["bridge_client.py", "orchestrator_daemon.py", "result_judge.py"],
+   f"адрес читают РОВНО трое — дверь записи, судья и тень: {sorted(set(importers))}")
 
 judge_callers = []
 for fname in sorted(os.listdir(REPO)):
@@ -552,13 +558,45 @@ for fname in sorted(os.listdir(REPO)):
             judge_callers.append(fname)
         elif isinstance(node, ast.ImportFrom) and node.module == "result_judge":
             judge_callers.append(fname)
-ok(not judge_callers,
-   f"судью адреса не зовёт ни один боевой модуль — по адресу некому сходить: {judge_callers}")
+ok(sorted(set(judge_callers)) == ["orchestrator_daemon.py", "shadow_rule.py"],
+   f"судью зовут РОВНО двое — тень и её решение: {sorted(set(judge_callers))}")
 
+# ГДЕ ИМЕННО ДЕМОН ЗНАЕТ ОБ АДРЕСЕ. Прежняя строка требовала «не знает ни одним словом» — она
+# держалась ровно до тех пор, пока тени не было. Замена ей не мягче, а точнее: имена адреса и
+# судьи вправе стоять в демоне ТОЛЬКО внутри теневых рук (`_shadow_*`) и в самих строках
+# импорта. Тронет их вердикт шага — тест краснеет, и краснеет на КОНКРЕТНОЙ функции.
 with open(os.path.join(REPO, "orchestrator_daemon.py"), encoding="utf-8") as f:
     daemon_src = f.read()
-ok(daemon_src.count("result_ref") == 0,
-   "orchestrator_daemon.py не знает об адресе ни одним словом (вердикт шага не тронут)")
+_WATCH = {"result_ref", "result_judge", "result_judge_facts", "shadow_rule"}
+
+
+class _Where(ast.NodeVisitor):
+    def __init__(self):
+        self.stack, self.bad, self.seen = [], [], []
+
+    def visit_FunctionDef(self, node):
+        self.stack.append(node.name)
+        self.generic_visit(node)
+        self.stack.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Name(self, node):
+        if node.id in _WATCH:
+            fn = self.stack[-1] if self.stack else "<модуль>"
+            self.seen.append(fn)
+            if not fn.startswith("_shadow"):
+                self.bad.append((fn, node.lineno))
+
+
+_w = _Where()
+_w.visit(ast.parse(daemon_src))
+ok(not _w.bad,
+   f"в демоне адрес и судья видны РОВНО теневым рукам `_shadow_*` (чужие места: {_w.bad})")
+# Замок обязан ЗАДЕВАТЬ ветку: «нарушений 0» на слепом обходе стоило бы ноль. Считаем, сколько
+# обращений он вообще увидел, и где именно.
+ok(len(_w.seen) >= 4 and set(_w.seen) and all(f.startswith("_shadow") for f in _w.seen),
+   f"обход не слеп: обращений увидено {len(_w.seen)}, все в {sorted(set(_w.seen))}")
 
 # Страж чистоты: у решения нет рук, чтобы сходить по адресу.
 import invariants_check as IC

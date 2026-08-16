@@ -273,20 +273,33 @@ _time_calls = [n.func.attr for n in ast.walk(_tree)
 ok(not _time_calls, f"судья не спрашивает время у системы: вызовов {len(_time_calls)}")
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
-print("\n(6) НИКЕМ НЕ ЗОВОМ: вызовов судьи из боевого кода обязано быть НОЛЬ")
+print("\n(6) ЗОВОМ РОВНО ИЗ ОДНОЙ ДВЕРИ — ТЕНИ, КОТОРАЯ НИЧЕГО НЕ РЕШАЕТ")
 # ════════════════════════════════════════════════════════════════════════════════════════════
 import prod_drift as PD
 
+# ПУНКТ 3 КОНТРАКТА (16.08.2026, `docs/artifacts/2026-08-16-shadow-rule.md`) ПОДКЛЮЧИЛ СУДЬЮ —
+# и ровно в одном месте: ТЕНЕВОЙ прогон правила зелёного в демоне. Прежняя редакция требовала
+# «судьи нет в памяти НИ ОДНОЙ живой точки входа»; смысл её был не в отсутствии кода, а в том,
+# что ПО АДРЕСУ НИКТО НЕ СУДИТ ЖИВОЙ ШАГ. Поэтому замок не снят, а сужен до списка: судья вправе
+# жить в памяти РОВНО демона (там тень), и ни одной другой точки входа. Что он там ничего не
+# решает — доказано отдельно: терминалы done и failed посимвольно равны прежним при тени
+# включённой и выключенной (`tests/test_shadow_rule.py`, замок A), а имена судьи видны в демоне
+# только внутри `_shadow_*` (`tests/test_result_ref.py`).
 ENTRIES = ("bot.py", "orchestrator_daemon.py", "expectations_run.py", "pretool_guard.py",
            "posttool_feed.py", "health.py", "splinter.py", "devbot.py")
+SHADOW_ENTRY = "orchestrator_daemon.py"
 _in_closure = []
 for e in ENTRIES:
     cl = PD.closure(e, REPO)
     for name in ("result_judge.py", "result_judge_facts.py"):
-        if name in cl:
+        if name in cl and e != SHADOW_ENTRY:
             _in_closure.append((e, name))
 ok(not _in_closure,
-   f"судьи нет в памяти ни одной живой точки входа ({len(ENTRIES)} проверено): {_in_closure}")
+   f"судьи нет в памяти ни одной живой точки входа, кроме тени ({len(ENTRIES)} проверено): "
+   f"{_in_closure}")
+_shadow_cl = PD.closure(SHADOW_ENTRY, REPO)
+ok("result_judge.py" in _shadow_cl and "shadow_rule.py" in _shadow_cl,
+   "судья и теневое правило ЕСТЬ в памяти демона — тень считается там, где рождается вердикт")
 
 _prod_py = sorted(n for n in os.listdir(REPO)
                   if n.endswith(".py") and not n.startswith("_")
@@ -303,8 +316,9 @@ for n in _prod_py:
         elif isinstance(node, ast.ImportFrom):
             if (node.module or "").split(".")[0] in ("result_judge", "result_judge_facts"):
                 _mentions.append((n, node.lineno))
-ok(not _mentions,
-   f"вызовов судьи из боевого кода: {len(_mentions)} (проверено файлов {len(_prod_py)})")
+ok(sorted({n for n, _ in _mentions}) == ["orchestrator_daemon.py", "shadow_rule.py"],
+   f"судью зовут РОВНО двое — тень и её решение: {sorted({n for n, _ in _mentions})} "
+   f"(проверено файлов {len(_prod_py)})")
 
 _hands_src = open(os.path.join(REPO, "result_judge_facts.py"), encoding="utf-8").read()
 _hands_imports = [a.name for node in ast.walk(ast.parse(_hands_src))
