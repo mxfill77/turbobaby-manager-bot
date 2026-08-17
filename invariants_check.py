@@ -1400,6 +1400,34 @@ def check_result_judge_pure(world, run):
 #  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
 # --------------------------------------------------------------------------------------------
 _SHADOW_RULE_PATH = None        # подменяется САМОТЕСТОМ; None → боевой shadow_rule.py в репо
+_PROD_GATE_PATH = None          # подменяется САМОТЕСТОМ; None → боевой prod_gate.py в репо
+
+
+@register("PROD_GATE_PURE")
+def check_prod_gate_pure(world, run):
+    """ИНВАРИАНТ 12у: PROD_GATE_PURE.
+
+    Решение «чем дано право на доставку в прод» (prod_gate.py, 17.08.2026) стоит РЯДОМ с самой
+    операцией: за словом «право дано» идёт перезапуск живого сервиса. Поэтому вызвать операцию
+    ему обязано быть НЕЧЕМ: импортов ровно два, и оба — готовый вокабуляр операций (`curator_ops`
+    — тот же словарь, которым машина зовёт операции сама; `curator_claim` — позиция заявки), ни
+    файлов, ни сети, ни моста, ни подпроцессов. Тогда худшее, что ошибка в его логике стоит, —
+    лишние ~55 с полного набора, а не прод, перезапущенный по частичному.
+    FAIL-CLOSED: файла нет / не парсится → ФЛАГ: нечитаемое правило доверия не имеет."""
+    path = _PROD_GATE_PATH or os.path.join(REPO, "prod_gate.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("prod_gate.py", f"правило права на прод не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset(("curator_ops", "curator_claim")))
+    except SyntaxError as e:
+        run.flag("prod_gate.py", f"правило права на прод не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"prod_gate.py:{where}", why)
 
 
 @register("SHADOW_RULE_PURE")

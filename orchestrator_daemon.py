@@ -52,6 +52,7 @@ import result_ref         # АДРЕС РЕЗУЛЬТАТА ШАГА: форма
 import result_judge       # СУДЬЯ АДРЕСА: три исхода по названному адресу — читается, не применяется
 import result_judge_facts  # РУКИ СУДЬИ (только чтение): одна реализация фактов, а не вторая рядом
 import shadow_rule        # ТЕНЕВОЙ ПРОГОН ПРАВИЛА ЗЕЛЁНОГО: считаем рядом, вердикт НЕ трогаем
+import prod_gate          # ПРАВО НА ПРОД ТРЕБУЕТ ПОЛНОГО ГЕЙТА: чистое решение (см. _run_task_impl)
 
 
 def _is_fixture(text: str) -> bool:
@@ -1501,6 +1502,19 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
         elif not _sm and (os.environ.get("GATE_SINGLE_SELECTIVE") or "").strip() == "1":
             # Одиночные «тз:»/«задача:» + GATE_SINGLE_SELECTIVE=1 → тоже селективный гейт.
             child_env["GATE_STEP_SELECTIVE"] = "1"
+    # ПРАВО НА ПРОД ТРЕБУЕТ ПОЛНОГО НАБОРА (17.08.2026, `prod_gate.py`). Флаг селективности ВЫШЕ
+    # не тронут ни на строку — задача доставки получает его, как получала (замок «обычные заходы
+    # не задеты» держится тем, что решение живёт в ОДНОМ месте, в самом гейте). Здесь только
+    # МЕТКА: демон говорит гейту, что этот прогон обслуживает доставку в прод, и гейт сам поднимет
+    # набор до полного, если права попросит селективный без названной причины. Метка в окружении, а
+    # не в тексте ТЗ, ровно потому, что окружение наследуется всеми детьми задачи: «забыть
+    # правило» исполнитель физически не может. Сброс унаследованного — та же гигиена, что у
+    # GATE_STEP_SELECTIVE: метку задаём ТОЛЬКО отсюда.
+    child_env.pop(prod_gate.ENV_MARK, None)
+    if preamble is None and prod_gate.is_delivery(task_text):
+        child_env[prod_gate.ENV_MARK] = "1"
+        log.info("ДОСТАВКА В ПРОД id=%s: право даёт ТОЛЬКО полный набор гейта (%s)",
+                 task_id, prod_gate.why_delivery(task_text))
     prompt = (preamble if preamble is not None else APPROVAL_PREAMBLE) + task_text
     # Heartbeat: фон-поток бьёт updated, пока claude -p блокирующе исполняется. Останавливаем в finally.
     _hb_stop = threading.Event()

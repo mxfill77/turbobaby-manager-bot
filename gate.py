@@ -21,12 +21,32 @@
 ЭНФОРСМЕНТ: git push — нативный pre-push hook (deploy/hooks/pre-push) зовёт gate.py автоматически.
 clasp redeploy / systemctl restart — по правилу CLAUDE.md (дисциплинарно). Будущий дев-бот/оркестратор
 зовёт gate.py в деплой-пути и обойти НЕ может — обход только Филипп («да» → --override).
+
+ПРАВО НА ПРОД ТРЕБУЕТ ПОЛНОГО НАБОРА (17.08.2026, `prod_gate.py`). Перезапуск живого сервиса ради
+коммита поднимает в память ВЕСЬ HEAD, а не затронутые модули, поэтому селективный набор такому
+прогону права не даёт: гейт САМ поднимает набор до полного. Единственное исключение — НАЗВАННАЯ
+причина (`--selective-reason «…»`), она уезжает в отчёт и в боевой_лог. Замер, из которого правило
+выросло: за 15.08–17.08 путь конвертов дал 5 доставок в прод, право получил селективный набор
+трижды (77/78/79 тестов при полном 216), и причину назвала лишь одна из трёх. Обычные заходы не
+затронуты: судится РОВНО доставка (метка демона `CC_PROD_DELIVERY` или ярлык операции вида
+restart/deliver), а `--for push` и умолчание `prod` в неё не входят.
 """
 import os
 import sys
 import glob
 import time
 import subprocess
+
+try:
+    import prod_gate                      # чистое решение «чем дано право» (импортов ровно два)
+except Exception:                         # noqa: BLE001
+    prod_gate = None                      # см. _prod_delivery: правило деградирует в ПОЛНЫЙ набор
+
+# Зеркало prod_gate.ENV_MARK — нужно РОВНО для случая, когда самого модуля решения нет на диске:
+# сильнейший сигнал (метку ставит демон) гейт обязан понимать и тогда. Равенство литералов
+# стережёт tests/test_prod_gate.py, разойтись молча они не могут.
+_ENV_MARK_FALLBACK = "CC_PROD_DELIVERY"
+_REASON_FLAG_FALLBACK = "--selective-reason"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PY = os.path.join(ROOT, "venv", "bin", "python3")
@@ -221,6 +241,36 @@ def run_selective_tests(changed_files):
     return failed, len(test_files), time.time() - t0, f"селективный ({len(test_files)} тестов)"
 
 
+def _prod_delivery(op):
+    """Этот прогон обслуживает ДОСТАВКУ В ПРОД? (метка демона задаче доставки или ярлык операции)
+
+    Модуля решения нет на диске → верим одной метке окружения: правило деградирует в «доставка →
+    полный набор», то есть в сторону прода, а обычный заход (метки нет) идёт как шёл."""
+    if prod_gate is None:
+        return (os.environ.get(_ENV_MARK_FALLBACK) or "").strip() == "1"
+    try:
+        return prod_gate.env_says_delivery(os.environ) or prod_gate.op_is_delivery(op)
+    except Exception:                                                # noqa: BLE001
+        return (os.environ.get(_ENV_MARK_FALLBACK) or "").strip() == "1"
+
+
+def _prod_verdict(delivery, selective, reason):
+    """Вердикт prod_gate | безопасная замена, если модуля решения нет.
+    Замена ровно одна: доставка → полный набор, обычный заход → как выбрал гейт."""
+    if prod_gate is None:
+        if delivery:
+            return {"delivery": True, "authorizes": not selective, "run": "full", "reason": "",
+                    "say": "модуль решения (prod_gate) не прочитан — гоню ПОЛНЫЙ набор."}
+        return {"delivery": False, "authorizes": True,
+                "run": "selective" if selective else "full", "reason": "", "say": ""}
+    try:
+        return prod_gate.decide(delivery, selective, reason)
+    except Exception as e:                                           # noqa: BLE001
+        return {"delivery": bool(delivery), "authorizes": not (delivery and selective),
+                "run": "full" if delivery else ("selective" if selective else "full"),
+                "reason": "", "say": "решение о праве не собралось (%s) — гоню ПОЛНЫЙ набор." % e}
+
+
 def _run_ratchet():
     """ХРАПОВИК СЛЕПЫХ ЧИТАТЕЛЕЙ (класс «нуль по неразбору», 08.08.2026) → (ok, [строки]).
 
@@ -253,7 +303,15 @@ def main():
 
     # Selective mode: промежуточный шаг цепи (GATE_STEP_SELECTIVE=1) + не финальный прогон →
     # smoke + тесты затронутых модулей. --final (pre-push) всегда полный сьют.
-    if _step_selective() and not final:
+    selective = _step_selective() and not final
+    # ПРАВО НА ПРОД: доставка (перезапуск живого сервиса ради коммита) права у селективного набора
+    # не берёт. Решение — prod_gate; здесь только руки. Обычный заход: verdict["run"] == прежний
+    # выбор, verdict["say"] пуст — путь БАЙТ-В-БАЙТ прежний.
+    verdict = _prod_verdict(selective=selective, delivery=_prod_delivery(op),
+                            reason=_arg(_REASON_FLAG_FALLBACK))
+    if verdict["say"]:
+        print("🚚 ДОСТАВКА В ПРОД: " + verdict["say"])
+    if verdict["run"] == "selective":
         changed = _changed_py_files()
         failed, total, dt, label = run_selective_tests(changed)
     else:
@@ -269,6 +327,19 @@ def main():
 
     if not failed:
         print(f"✅ ГЕЙТ ({label}): {total} тестов зелёные ({dt:.1f}с) — прод-операция «{op}» разрешена.")
+        if verdict["delivery"]:
+            # Чем именно дано право — строкой, которую исполнитель уносит в отчёт. Плюс запись в
+            # боевой_лог: причина обязана жить не только в прозе отчёта (образец — test_override).
+            # Обычный заход этой записи НЕ платит: ветка живёт только у доставки (10 ТЗ из 295).
+            if verdict["reason"]:
+                print(f"   🚚 ПРАВО НА ДОСТАВКУ В ПРОД дано СЕЛЕКТИВНЫМ набором ({total} тестов) "
+                      f"по НАЗВАННОЙ причине: «{verdict['reason']}».")
+                _log("prod_delivery_selective_reason",
+                     f"op={op}; набор {label} ({total}); причина: {verdict['reason'][:200]}")
+            else:
+                print(f"   🚚 ПРАВО НА ДОСТАВКУ В ПРОД дано ПОЛНЫМ набором ({total} тестов); "
+                      f"селективный набор такого права не даёт.")
+                _log("prod_delivery_full", f"op={op}; набор {label} ({total}); причина не нужна")
         return 0
 
     # КРАСНЫЙ → блок + лог; пуш владельцу — только на финальном прогоне (см. _alert_allowed)
