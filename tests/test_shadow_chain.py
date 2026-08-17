@@ -421,8 +421,16 @@ fb = reset()
 run_one(fb, "нечто\n[result_ref: file shadow_rule.py]")
 res.append(ok(len(gathers) == 1 and len(gathers[0][0]) == 1,
               "(8) адрес назван → РОВНО один сбор фактов на ОБА счёта (%d)" % len(gathers)))
-res.append(ok(gathers and gathers[0][1].get("brain") is False,
-              "(8) сбор с brain=False — к мосту за узлами не ходим"))
+# 17.08.2026: было «brain=False — к мосту за узлами не ходим». Запрет снят (решение Штаба): он
+# стоял на чужом числе и делал вердикт ДОКАЗАН для вида `brain` физически недостижимым. Мост
+# теперь спрашивается ТОЛЬКО под адрес-узел и под общим бюджетом; здесь адрес — файл, значит
+# запросов ноль, и это проверяется самим видом адреса, а не флагом.
+res.append(ok(gathers and gathers[0][1].get("brain") is True,
+              "(8) сбор с brain=True — узел спрашиваем живьём, когда адрес его назвал"))
+_ref0 = (gathers[0][0] or [{}])[0] if gathers else {}
+_kind0 = _ref0.get("kind") if isinstance(_ref0, dict) else (list(_ref0) + [""])[0]
+res.append(ok(_kind0 == "file",
+              "(8) адрес здесь не узел (вид «%s») → к мосту не ушло ни одного запроса" % _kind0))
 OD.result_judge_facts.gather = _real_gather
 res.append(ok(fb.calls.count("complete_task") == 1 and "set_needs_approval" not in fb.calls,
               "(8) очередь тронута РОВНО одним терминалом, тень к ней не ходила (%s)" % fb.calls))

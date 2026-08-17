@@ -353,9 +353,19 @@ gathers.clear()
 run_one("нечто\n[result_ref: file shadow_rule.py]")
 res.append(ok(len(gathers) == 1 and len(gathers[0][0]) == 1,
               "(8) адрес назван → РОВНО один сбор фактов под РОВНО один адрес (%s)" % gathers))
-res.append(ok(len(gathers) == 1 and gathers[0][1].get("brain") is False,
-              "(8) сбор идёт с brain=False — к мосту за узлами не ходим (kwargs=%s)"
-              % (gathers[0][1] if gathers else None)))
+# 17.08.2026: прежде здесь стояло «brain=False — к мосту за узлами не ходим». Запрет снят
+# решением Штаба: он стоял на ЧУЖОМ числе (543 с — верхняя оценка cc_log, а не цена узла; живая
+# проба 17.08 — 2 с) и стоил виду `brain` всей работы (3 обрыва живой серии из 3). Цена не
+# исчезла, а СУЗИЛАСЬ: к мосту идём ТОЛЬКО когда адрес назвал узел, и под общим бюджетом 120 с.
+# Здесь адрес — файл, поэтому мост не спрашивается ВООБЩЕ, и это ниже проверено числом.
+res.append(ok(len(gathers) == 1 and gathers[0][1].get("brain") is True,
+              "(8) сбор идёт с brain=True — узел спрашиваем живьём, если адрес его назвал "
+              "(kwargs=%s)" % (gathers[0][1] if gathers else None)))
+_ref0 = (gathers[0][0] or [{}])[0] if gathers else {}
+_kind0 = _ref0.get("kind") if isinstance(_ref0, dict) else (list(_ref0) + [""])[0]
+res.append(ok(_kind0 == "file",
+              "(8) но АДРЕС здесь не узел (вид «%s»), значит к мосту не ушло ни одного запроса"
+              % _kind0))
 OD.result_judge_facts.gather = _real_gather
 
 print("\n(9) ГРАНИЦЫ")

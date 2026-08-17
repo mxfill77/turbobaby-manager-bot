@@ -129,17 +129,16 @@ neg("brain", "узел прочитан, названного НЕ содерж�
     ("brain", "cc_log СТРОКА-КОТОРОЙ-НЕТ-42"),
     {"brain": {"cc_log": {"read": True, "text": "иные строки", "len": 11, "len_before": 5}}},
     RJ.UNPROVEN)
-neg("brain", "узел содержит, но НЕ ВЫРОС (могло лежать и до шага)",
-    ("brain", "cc_log DONE 16.08"),
-    {"brain": {"cc_log": {"read": True, "text": "DONE 16.08 …", "len": 12, "len_before": 12}}},
-    RJ.UNPROVEN)
 neg("brain", "мост не спрошен (источник недоступен)",
     ("brain", "cc_log DONE 16.08"),
     RF.gather([("brain", "cc_log DONE 16.08")], brain=False), RJ.UNKNOWN)
-neg("brain", "содержит, но длину не с чем сравнить → НЕ зелёное",
-    ("brain", "cc_log DONE 16.08"),
-    {"brain": {"cc_log": {"read": True, "text": "DONE 16.08 …", "len": 12, "len_before": None}}},
-    RJ.UNKNOWN)
+# ДВА ПРЕЖНИХ ОТРИЦАТЕЛЬНЫХ СЛУЧАЯ ОТСЮДА УШЛИ — 17.08.2026, решением Штаба, а не потому, что
+# «краснели». Это были голдены СТАРОГО определения («содержит И ВЫРОС»): узел без прироста давал
+# НЕ ДОКАЗАН, узел без прежней длины — НЕИЗВЕСТНО. Доказательством теперь считается НАЙДЕННАЯ
+# ПОДСТРОКА, прежняя длина не обязательна, и оба случая стали ДОКАЗАН. Они не выброшены, а
+# ПЕРЕЕХАЛИ на другую сторону — в секцию (3) ниже и в `tests/test_brain_ref_provable.py` (6),
+# чтобы смена определения краснела, если её вернут молча. Что при этом ПОТЕРЯНО, названо прямо
+# в докстринге `result_judge._judge_brain`: подстрока могла лежать в узле и ДО шага.
 
 # ── service_start ────────────────────────────────────────────────────────────────────────────
 _sha_old = (_live_commits.get("shas") or ["0" * 40])[-1]
@@ -201,6 +200,18 @@ v = RJ.verdict(("brain", "cc_log DONE 16.08"),
                {"brain": {"cc_log": {"read": True, "text": "DONE 16.08 итог", "len": 15,
                                      "len_before": 5}}})
 ok(v["state"] == RJ.PROVEN, f"узел содержит названное и вырос → {v['state']} ({v['why'][:60]})")
+
+# ПЕРЕЕХАВШИЕ ГОЛДЕНЫ (см. секцию 1): с 17.08.2026 длина вердикта не решает — она справка.
+v = RJ.verdict(("brain", "cc_log DONE 16.08"),
+               {"brain": {"cc_log": {"read": True, "text": "DONE 16.08 …", "len": 12,
+                                     "len_before": 12}}})
+ok(v["state"] == RJ.PROVEN,
+   f"узел содержит названное и НЕ вырос → {v['state']} (прежде «не доказан»; {v['why'][:50]})")
+v = RJ.verdict(("brain", "cc_log DONE 16.08"),
+               {"brain": {"cc_log": {"read": True, "text": "DONE 16.08 …", "len": 12,
+                                     "len_before": None}}})
+ok(v["state"] == RJ.PROVEN,
+   f"прежней длины нет вовсе → {v['state']} (прежде «неизвестно» — так молчал КАЖДЫЙ узел)")
 
 _unit_live = RF.unit_fact("splinter")
 _older = ([s for s in (_live_commits.get("shas") or [])

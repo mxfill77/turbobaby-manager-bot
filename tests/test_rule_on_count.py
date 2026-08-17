@@ -451,8 +451,12 @@ run_one(fb, "цель\n[result_ref: file chain_series.py]")
 res.append(ok(len(gathers) == 1,
               "(8) ЦЕНА: адрес есть → факты собраны РОВНО раз на двоих (счёт и тень), вызовов %d"
               % len(gathers)))
+# 17.08.2026: подпись говорила «brain=False», а проверяла ВИД АДРЕСА — и после снятия запрета
+# (узлы читаются живьём) стала бы зелёной ложью. Проверка та же и по-прежнему верная: адрес здесь
+# файл, значит к мосту не ушло ни одного запроса, — но названа теперь тем, что и правда судит.
 res.append(ok(all("brain" not in str(g) for g in gathers) and len(gathers) == 1,
-              "(8) к мосту за узлом мозга счёт не ходит (brain=False, как у тени)"))
+              "(8) адрес здесь не узел → к мосту за узлом мозга счёт не ходит (%s)"
+              % [g[0].get("kind") for g in gathers if g and isinstance(g[0], dict)]))
 OD.result_judge_facts.gather = _real_gather
 fb = reset()
 run_one(fb, "цель\n[result_ref: file chain_series.py]")

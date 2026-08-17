@@ -10,8 +10,9 @@
   • база — открывается URI-режимом `mode=ro`, условие уезжает ПАРАМЕТРАМИ (адрес приходит из
     живого текста очереди, и пускать его в текст запроса нельзя);
   • systemd — `systemctl show`, свойства только читающие;
-  • мозг — `read_doc` через мост; импорт моста ЛЕНИВЫЙ, внутри функции: модуль обязан
-    импортироваться и на машине, где моста нет вовсе.
+  • мозг — `_call("read_doc", name=…)` через мост, ТА ЖЕ дверь, которой ходят все живые
+    читатели узлов; импорт моста ЛЕНИВЫЙ, внутри функции: модуль обязан импортироваться и на
+    машине, где моста нет вовсе.
 
 НИКЕМ НЕ ЗОВОМ, как и сам судья: ни одна живая точка входа его не импортирует (доказано
 замыканием импортов в `tests/test_result_judge.py`). Читатели сегодня двое — тест и замер захода.
@@ -39,6 +40,28 @@ SYSTEMCTL_TIMEOUT = 15
 # Свойства systemd только читающие; `show` ничего не меняет ни при каком наборе свойств.
 UNIT_PROPS = ("ActiveState", "ExecMainStartTimestamp")
 DB_TIMEOUT = 10
+
+# ── УЗЕЛ МОЗГА: ОДНА ЖИВАЯ ДВЕРЬ И ЧЕСТНАЯ ПРИЧИНА ОТКАЗА (17.08.2026) ────────────────────────
+# Дверь чтения мозга в этом репозитории ОДНА и называется `_call("read_doc", name=…)`: так ходят
+# `brain_sync.py`, `cclog.py`, `health.py`, `expectations_run.py`, `devbot.py`, и `brain_sync`
+# прямо оговаривает — «своего метода-обёртки нет». Прежний код звал у клиента метод `read_doc`,
+# которого НЕТ ВОВСЕ, и `AttributeError` попадал в широкий `except`, выходя наружу словами «мост
+# не отвечает». Так НАША поломка представлялась молчанием мира: вид `brain` не мог дать ДОКАЗАН
+# ни при каком состоянии моста, а причина в отчёте называла невиновного (разбор 17.08, §3).
+BRAIN_ACTION = "read_doc"
+BRAIN_ENTRY = "_call"
+BRAIN_BUDGET_LABEL = "адрес результата"
+BROKEN = "РУКИ СЛОМАНЫ"       # слова НАШЕЙ поломки — их нельзя спутать с молчанием моста
+
+# ОБЩИЙ БЮДЖЕТ НА ОДНО ЧТЕНИЕ УЗЛА — 120 с, и число НЕ ВЫДУМАНО. Это порог О5 для ЧТЕНИЯ МОЗГА,
+# выведенный из корпуса 515 живых `read_doc` (137 прогонов `splinter-health` за 21 сутки):
+# медиана 2.1 · p95 5.7 · p99 45 · хвост 45·49·51·55·66 — и сразу 207, между 66 и 207 ПУСТО.
+# Любое число из пустого промежутка режет РОВНО патологию и не режет ни одного честного чтения;
+# 120 стоит внутри него и устойчиво к ±50 с. Из О5 этот порог ушёл только потому, что О5 мерит
+# ДРУГОЕ действие (опрос очереди, свой корпус, 240 с) — для своего корпуса он остался верным.
+# Живая проба 17.08: `pulse` (218 знаков) 3.05 с · `business_rules` (14 588 знаков) 2.25 с —
+# цена здесь круговая, а не размерная. Откат: BRAIN_REF_BUDGET_SEC=0 → дедлайна нет, путь как был.
+BRAIN_BUDGET_DEFAULT = 120
 
 
 def _git(args):
@@ -155,32 +178,106 @@ def _stamp_secs(stamp):
         return None
 
 
-def brain_fact(key, before=None):
-    """Узел мозга → {"read","text","len","len_before"}. Мост импортируется ЛЕНИВО.
+def _brain_budget():
+    """Бюджет одного чтения узла: BRAIN_REF_BUDGET_SEC либо 120 с. Мусор → дефолт, «0» → без
+    дедлайна (законный откат: путь становится прежним, а не выключается)."""
+    try:
+        return float(os.environ.get("BRAIN_REF_BUDGET_SEC") or BRAIN_BUDGET_DEFAULT)
+    except (TypeError, ValueError):
+        return float(BRAIN_BUDGET_DEFAULT)
 
-    `before` — длина узла ДО шага; сегодня её не записывает никто, поэтому по умолчанию None, и
-    судья на таком факте отвечает НЕИЗВЕСТНО, а не зелёным. Это не дыра, а честное состояние
-    записей: пока длина при создании шага не сохраняется, «содержит» от «уже содержало»
-    неотличимо."""
+
+def _brain_door():
+    """Живая дверь чтения узла → {"door","hold","deadline_err","why","broken"}. Мира НЕ трогает.
+
+    РЕЗОЛВИНГ СТОИТ ОТДЕЛЬНО ОТ ВЫЗОВА, и в этом весь смысл функции. До сети здесь не доходит
+    НИЧЕГО, поэтому всё, что падает ЗДЕСЬ, — наша поломка (`broken`), а всё, что упадёт ПОСЛЕ, —
+    уже мир. Развести их можно ТОЛЬКО порядком: по типу исключения нельзя (`AttributeError`
+    бывает и внутри транспорта), и ровно один широкий `except` вокруг обоих этапов породил класс
+    17.08 — несуществующий метод семьдесят дней выдавал себя за молчание моста.
+
+    Отсутствие самого моста поломкой НЕ считается: модуль обязан жить и на машине, где моста нет
+    вовсе (о том же говорит шапка). Это «источник недоступен», и вердикт по нему — НЕИЗВЕСТНО."""
+    out = {"door": None, "hold": None, "deadline_err": "card_deadline", "why": "", "broken": False}
     try:
         import bridge_client
-        reply = bridge_client.BridgeClient().read_doc(name=key)
-    except Exception as e:                       # noqa: BLE001 — мост может отсутствовать вовсе
+    except Exception as e:                       # noqa: BLE001 — моста может не быть на машине
+        out["why"] = "моста нет на этой машине (%s)" % type(e).__name__
+        return out
+    door = getattr(bridge_client.BridgeClient, BRAIN_ENTRY, None)
+    hold = getattr(bridge_client, "card_budget", None)
+    if not callable(door):
+        out["why"] = "%s: у клиента моста нет входа «%s» — узел читать нечем" % (BROKEN,
+                                                                                BRAIN_ENTRY)
+        out["broken"] = True
+        return out
+    if not callable(hold):
+        out["why"] = "%s: у моста нет общего бюджета «card_budget»" % BROKEN
+        out["broken"] = True
+        return out
+    try:
+        client = bridge_client.BridgeClient()
+    except Exception as e:                       # noqa: BLE001 — настроек моста может не быть
+        out["why"] = "клиент моста не собран (%s)" % type(e).__name__
+        return out
+    out["door"] = getattr(client, BRAIN_ENTRY)
+    out["hold"] = hold
+    out["deadline_err"] = str(getattr(bridge_client, "CARD_DEADLINE_ERROR", "card_deadline"))
+    return out
+
+
+def brain_fact(key, before=None, budget=None):
+    """Узел мозга → {"read","text","len","len_before","why","broken"}. Мост импортируется ЛЕНИВО.
+
+    ЧИТАЕТСЯ ТЕМ ЖЕ ПУТЁМ, ЧТО У ВСЕХ ЖИВЫХ ЧИТАТЕЛЕЙ: `_call("read_doc", name=…)`.
+
+    ПРИЧИН ОТКАЗА ЧЕТЫРЕ, И ОНИ РАЗНЫЕ СЛОВАМИ: наша поломка (`broken=True` — входа нет либо
+    ответ не того вида) · моста нет / клиент не собран · мост не отвечает · мост ответил отказом.
+    Вердикт у всех один и тот же — НЕИЗВЕСТНО, потому что НЕ ПРОЧИТАНО, — но читателю отчёта они
+    говорят РАЗНОЕ, и это вся разница между «чини свой код» и «подожди Google».
+
+    ПОВИСНУТЬ ЗДЕСЬ НЕЛЬЗЯ: чтение идёт под общим бюджетом (`card_budget`, тот же механизм, что у
+    карточки «Инфо» и опроса очереди) — исчерпание возвращает ОТВЕТ, а не исключение, и узел
+    остаётся честно непрочитанным.
+
+    `before` — длина узла ДО шага; её не пишет никто, и с 17.08.2026 судья её НЕ ТРЕБУЕТ (решение
+    Штаба; забор Честертона назван в `result_judge._judge_brain`). Здесь она осталась ДАННЫМИ:
+    руки отдают то, что им дали, а судья вправе назвать прирост справкой."""
+    d = _brain_door()
+    if d["door"] is None:
         return {"read": False, "text": "", "len": 0, "len_before": before,
-                "why": "мост не отвечает (%s)" % type(e).__name__}
-    if not isinstance(reply, dict) or not reply.get("ok"):
-        why = (reply or {}).get("error") if isinstance(reply, dict) else "ответ не разобран"
+                "why": d["why"], "broken": d["broken"]}
+    budget = _brain_budget() if budget is None else budget
+    try:
+        with d["hold"](budget, label=BRAIN_BUDGET_LABEL):
+            reply = d["door"](BRAIN_ACTION, name=key)
+    except Exception as e:                       # noqa: BLE001 — дальше входа начинается мир
         return {"read": False, "text": "", "len": 0, "len_before": before,
-                "why": "узел не прочитан (%s)" % (why or "без причины")}
+                "why": "мост не отвечает (%s)" % type(e).__name__, "broken": False}
+    if not isinstance(reply, dict):
+        return {"read": False, "text": "", "len": 0, "len_before": before,
+                "why": "%s: ответ моста не разобран (%s)" % (BROKEN, type(reply).__name__),
+                "broken": True}
+    if not reply.get("ok"):
+        err = str(reply.get("error") or "")
+        why = ("общий бюджет %g с исчерпан — узел не спрошен" % float(budget)
+               if err == d["deadline_err"] else
+               "мост ответил отказом (%s)" % (err or "без причины"))
+        return {"read": False, "text": "", "len": 0, "len_before": before,
+                "why": why, "broken": False}
     text = str(reply.get("text") or reply.get("content") or "")
-    return {"read": True, "text": text, "len": len(text), "len_before": before}
+    return {"read": True, "text": text, "len": len(text), "len_before": before, "broken": False}
 
 
-def gather(refs, before=None, brain=True):
+def gather(refs, before=None, brain=True, budget=None):
     """Список адресов → факты РОВНО под них (каждый источник спрашивается один раз).
 
     `brain=False` — не ходить к мосту вовсе: тогда узлы останутся непрочитанными и судья скажет
-    по ним НЕИЗВЕСТНО. Это законный режим замера, а не тихое зелёное."""
+    по ним НЕИЗВЕСТНО. Это законный режим замера, а не тихое зелёное.
+
+    К МОСТУ ХОДИМ ТОЛЬКО ПОД АДРЕС ВИДА `brain`: адрес назвал файл, коммит, строку или юнит —
+    словарь узлов пуст, и `brain_fact` не зовётся НИ РАЗУ (цена названа числом в тесте).
+    `budget` — потолок ОДНОГО чтения узла в секундах (None → BRAIN_REF_BUDGET_SEC либо 120)."""
     facts = {"commits": None, "files": {}, "rows": {}, "brain": {}, "units": {}}
     need_commits = False
     for ref in refs or ():
@@ -205,7 +302,7 @@ def gather(refs, before=None, brain=True):
     facts["rows"] = {k: row_fact(v["db"], v["table"], v["conds"]) for k, v in facts["rows"].items()}
     facts["units"] = {u: unit_fact(u) for u in facts["units"]}
     facts["brain"] = {
-        k: (brain_fact(k, (before or {}).get(k)) if brain else
+        k: (brain_fact(k, (before or {}).get(k), budget=budget) if brain else
             {"read": False, "text": "", "len": 0, "len_before": None,
              "why": "к мосту не ходили"})
         for k in facts["brain"]}
