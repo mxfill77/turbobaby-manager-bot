@@ -144,7 +144,10 @@ res.append(ok(J.heavy(None, None, True)[0] is True and J.heavy({}, None, True)[0
 # У О7 (18.08.2026) СВОИ ветки, и веса у них РАЗНЫЕ намеренно: «ребёнок не жив» называет сам
 # клиентский процесс (тяжёлое), «строки о детях нет» — отсутствие сведений (лёгкое).
 PC_KINDS = {"o4_pc_silent", "o6_pc_task", "o7_child_down", "o7_pulse_lost"}
-res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | PC_KINDS == set(E.KINDS),
+# У О8 (18.08.2026) ветка тоже СВОЯ, и предмет у неё не машина ПК, а ВНЕШНИЙ ДОСТУП, без которого
+# не работает ни одна полоса: `CONTOUR_FREEZE` его не касается, поэтому вес тяжёлый безусловно.
+LANE_KINDS = {"o8_lane_dead"}
+res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | PC_KINDS | LANE_KINDS == set(E.KINDS),
               "(3e) все сегодняшние виды названы явно — «неизвестный вид» это про БУДУЩИЕ"))
 res.append(ok(J.heavy({"kind": "o7_child_down", "child": "moderation_bot"}, None, True)[0] is True
               and J.heavy({"kind": "o7_pulse_lost"}, None, True)[0] is False,

@@ -277,12 +277,13 @@ def pc_facts(st, now, cfg):
         out["cached"] = True
         return out
     child_limit = float((cfg or {}).get("pc_child") or 0.0)
-    if limit <= 0 and task_limit <= 0 and child_limit <= 0:
-        # ВСЕ ТРИ ветки выключены → журнал не читается вовсе: мосту не платится ни одного вызова.
-        # О7 добавлен в это условие, а не рядом с ним: журнал у трёх читателей ОДИН, и выключить
-        # чтение вправе только их общее молчание.
+    run_limit = float((cfg or {}).get("lane_run") or 0.0)
+    if limit <= 0 and task_limit <= 0 and child_limit <= 0 and run_limit <= 0:
+        # ВСЕ ЧЕТЫРЕ ветки выключены → журнал не читается вовсе: мосту не платится ни одного
+        # вызова. О7 и О8 добавлены в это условие, а не рядом с ним: журнал у читателей ОДИН, и
+        # выключить чтение вправе только их общее молчание.
         return dict(prev, cached=True) if prev else {"ok": False,
-                                                     "err": "ветки О4, О6 и О7 выключены"}
+                                                     "err": "ветки О4, О6, О7 и О8 выключены"}
     t0 = time.time()
     try:
         from bridge_client import BridgeClient
@@ -302,9 +303,12 @@ def pc_facts(st, now, cfg):
     # То же и у О7: периодическая строка о детях лежит в ЭТОМ же тексте, и своего обращения к
     # мосту у него нет ни одного — цена третьего читателя ровно ноль вызовов.
     children = expectations.pc_children_facts(text, now)
+    # И у О8 то же: заходы и их исходы лежат в ЭТОМ же тексте, своего обращения к мосту у него
+    # нет ни одного — цена четвёртого читателя ровно ноль вызовов (контракт наблюдения, п. 2).
+    runs = expectations.pc_runs_facts(text, now)
     return {"ok": True, "err": "", "fetched": now, "dt": time.time() - t0,
             "last": f.get("last"), "line": f.get("line"), "n": f.get("n"),
-            "lane": lane, "children": children, "cached": False}
+            "lane": lane, "children": children, "runs": runs, "cached": False}
 
 
 def _proc(unit, entry):
@@ -829,7 +833,11 @@ def _owner_defer():
 # Поля вердикта, которые переживают эпизод в состоянии: по ним строится ЧИСЛО журнальной строки.
 # Числа остаются теми, что были В МОМЕНТ ОБНАРУЖЕНИЯ, — это сказано в самой строке словом
 # «начало», и подменять их свежими при закрытии значило бы переписать историю задним числом.
-_KEEP_V = ("kind", "key", "id", "sha", "dt", "limit", "free", "age", "pc_task_id", "child")
+_KEEP_V = ("kind", "key", "id", "sha", "dt", "limit", "free", "age", "pc_task_id", "child",
+           # О8: длина череды и ДОСЛОВНЫЙ ответ внешней системы. Второе — не украшение строки:
+           # к закрытию эпизода вердикта уже нет, а именно этим текстом владелец (и Штаб,
+           # читающий журнал) отличит перегрузку от кончившегося способа оплаты.
+           "run", "err")
 
 
 def _trim_v(v):
@@ -900,6 +908,14 @@ def close_detail(key, facts):
         if str(key).startswith("o7l|"):
             ch = ((facts or {}).get("pc") or {}).get("children") or {}
             return ("строка вернулась: «%s»" % str(ch.get("line"))[:150]) if ch.get("line") else ""
+        if str(key).startswith("o8|"):
+            # Чем ИМЕННО полоса доказала, что снова работает, — её собственной строкой об исходе.
+            # Пересказ здесь потерял бы диагноз (тот же довод, что у О4, О6 и О7).
+            runs = (((facts or {}).get("pc") or {}).get("runs") or {}).get("runs") or []
+            for r in reversed(runs):
+                if isinstance(r, dict) and not r.get("ext"):
+                    return "полоса снова выполнила заход: «%s»" % str(r.get("line"))[:150]
+            return ""                    # своих слов не нашлось — чужие не подставляем
         if str(key).startswith("o5"):
             dt = ((facts or {}).get("bridge") or {}).get("dt")
             return "проба прошла за %s" % expectations._secs(dt) if dt is not None else ""
@@ -952,7 +968,7 @@ def run(dry=False, now=None):
     pc = facts.get("pc")
     if isinstance(pc, dict) and pc.get("ok"):
         st["pc"] = {k: pc.get(k) for k in ("ok", "fetched", "last", "line", "n", "lane",
-                                           "children")}
+                                           "children", "runs")}
     open_eps = dict(st.get("open") or {})
     out = {"verdicts": len(verdicts), "notes": [], "tasks": [], "closed": [],
            # ОТСРОЧЕННЫЕ И ПОГАШЕННЫЕ ОТСРОЧКОЙ — В СЧЁТЕ, А НЕ В НЕБЫТИИ: владельцу их не

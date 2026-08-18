@@ -460,8 +460,11 @@ try:
                       and p.get("lane") is not None and p.get("last") is not None,
                       "(15) ОДНО чтение принесло факты О4, О6 и О7 разом"))
         calls[:] = []
-        ER.pc_facts({}, NOW, cfg(pc=0.0, pc_task=0.0, pc_child=0.0))
-        res.append(ok(not calls, "(15) все три порога 0 → мост не зовётся ВОВСЕ"))
+        # ЧИТАТЕЛЕЙ ЖУРНАЛА СТАЛО ЧЕТЫРЕ (18.08.2026, О8 «полоса не выполняет заходов»):
+        # выключить чтение вправе только их ОБЩЕЕ молчание, поэтому гасится и четвёртый порог.
+        # Предмет проверки прежний — «читателей нет → мосту ни одного вызова».
+        ER.pc_facts({}, NOW, cfg(pc=0.0, pc_task=0.0, pc_child=0.0, lane_run=0.0))
+        res.append(ok(not calls, "(15) все четыре порога 0 → мост не зовётся ВОВСЕ"))
         calls[:] = []
         ER.pc_facts({}, NOW, cfg(pc=0.0, pc_task=0.0))
         res.append(ok(len(calls) == 1,
@@ -505,9 +508,9 @@ res.append(ok(E.pc_task_state(facts(LIVE, NOW), C, NOW)[0] == E.PCT_MOVING,
               "(17) О6: взятая задача закрыта → «движется»"))
 res.append(ok(E.bridge_state(facts(LIVE, NOW), C, NOW)[0] == E.BRIDGE_OK,
               "(17) О5: проба прошла → «отвечает»"))
-res.append(ok(len(E.KINDS) == 11 and "o7_child_down" in E.KINDS
+res.append(ok(len(E.KINDS) == 12 and "o7_child_down" in E.KINDS
               and "o7_pulse_lost" in E.KINDS,
-              "(17) видов стало 11, оба новых названы поимённо"))
+              "(17) видов стало 12 (О8 добавлен 18.08), оба вида О7 названы поимённо"))
 res.append(ok(all(k in E.NOTE_HEAD for k in E.KINDS),
               "(17) у каждого вида есть свой заголовок заметки"))
 res.append(ok(all(k in J.SHORT and k in J.WHAT for k in E.KINDS),

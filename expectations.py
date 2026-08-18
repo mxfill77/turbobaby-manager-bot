@@ -18,6 +18,14 @@
        Факт: собственная проба наблюдателя — тот самый GET очереди, который он и так делает:
        был ли УСПЕХ и СКОЛЬКО он занял. Пороги 30 минут (нет успеха) и 120 секунд (один вызов).
        ТРИ ИСХОДА: отвечает · не отвечает · НЕИЗВЕСТНО.
+  О8 — ЗАХОДЫ ПОЛОСЫ ДОХОДЯТ ДО ИСПОЛНЕНИЯ (18.08.2026).
+       Факт: тот же журнал полосы ПК — исходы заходов, уже записанные там (своего обращения к
+       мосту нет ни одного). Судится ПОДРЯД идущая череда ВНЕШНИХ отказов, а не единичный:
+       порог 2 захода, окно свежести 6 часов. ТРИ ИСХОДА: идут · не идут · НЕИЗВЕСТНО.
+       Повод: 18.08 заходы падали внешним отказом, система честно говорила «ждём восстановления»
+       и ждала бы ВЕЧНО — у владельца был отключён способ оплаты, само бы не восстановилось.
+       В теле тревоги стоит ДОСЛОВНЫЙ ответ внешней системы: перегрузку от кончившихся денег
+       отличит по нему владелец. Сама система их не различает и притворяться не должна.
 
 ────────────────────────────────────────────────────────────────────────────────────────────
 ПОЧЕМУ УСЛОВИЕ «ПРИ СВОБОДНОМ ИСПОЛНИТЕЛЕ» — ЭТО ВЕСЬ ПОРОГ, А НЕ УКРАШЕНИЕ
@@ -518,6 +526,31 @@ PC_TASK_ENV, PC_TASK_DEFAULT = "EXPECT_PC_TASK_MIN", 210.0
 # 0 → ветка мертва ЦЕЛИКОМ — гаснут ОБА исхода, и «ребёнок не жив», и «строки нет»).
 # 720 = ДВА объявленных периода публикации (360 мин), запас ровно в один период — вывод в шапке.
 PC_CHILD_ENV, PC_CHILD_DEFAULT = "EXPECT_PC_CHILD_MIN", 720.0
+# О8: сколько ЗАХОДОВ ПОДРЯД вправе упасть внешним отказом, прежде чем это станет нарушением
+# (ШТУКИ, не минуты — отсюда scale=1; 0 → ветка мертва ЦЕЛИКОМ, до чтения фактов).
+#
+# 2, А НЕ 4 ИЗ ПОВОДА — ЧИСЛО ИЗМЕРЕНО, А НЕ ВЗЯТО СО СЛОВ. Замер по живому снимку журнала
+# полосы (18.08.2026, 1298 строк, окно 28.07 15:11 → 18.08 18:15 = 21.1 суток, 238 заходов с
+# записью об исходе): дословных внешних отказов 6 (0.28 в сутки), и длины ПОДРЯД идущих черед
+# такие — 1 · 1 · 1 · 1 · 2, где двойка это и есть повод (задачи #9 в 17:18 и #10 в 17:25).
+#     порог 2 → 1 эпизод за 21.1 суток (сегодняшний, настоящий), ложных 0;
+#     порог 3 → 0 эпизодов, В ТОМ ЧИСЛЕ 0 на самом поводе — прибор, не видящий повода, бесполезен;
+#     порог 4 (число из ТЗ) → 0 эпизодов тем более.
+# ПРЕМИСА ПОВОДА ПРОВЕРЕНА ЖИВЫМ ЧТЕНИЕМ И ПОДТВЕРДИЛАСЬ НАПОЛОВИНУ: в окне 16:26–17:25 UTC
+# полоса сделала ПЯТЬ заходов, внешним отказом упали ТРИ (#5, #9, #10), но подряд они не шли —
+# между ними полоса выполнила #7 (needs_approval) и #8 (done). «Четыре подряд» корпус не
+# подтверждает; «один — обычная жизнь» подтверждает прямо: все четыре одиночных отказа
+# (29.07 ×2, 04.08, 05.08) полоса пережила сама, следующий заход у каждого прошёл.
+# ВТОРОЙ ФИЛЬТР ЖИВЁТ ОТДЕЛЬНО И ЕГО НЕ НАДО ДУБЛИРОВАТЬ ПОРОГОМ: владельцу эпизод уходит,
+# только пережив отсрочку `EXPECT_OWNER_DEFER_MIN` (60 мин, expect_journal.address) — то есть
+# транзиентный перегруз, который полоса перемогает сама, до владельца не доходит вовсе.
+LANE_RUN_ENV, LANE_RUN_DEFAULT = "EXPECT_LANE_RUN", 2.0
+# О8: насколько СВЕЖЕЙ обязана быть череда, чтобы по ней объявляли нарушение (ЧАСЫ; 0 → окна нет).
+# 6 ч = p90 пауз между заходами полосы (318 мин по 236 паузам того же снимка: медиана 37 · p75 71 ·
+# p90 318 · p95 617 · max 1826 мин): за это время полоса в 92 % случаев успевает дать свежий факт.
+# Окно нужно РОЖДЕНИЮ эпизода, а не его продолжению — иначе первый же прогон после установки
+# выкрикнул бы историю (тот же довод, что у окна судейства О3).
+LANE_FRESH_ENV, LANE_FRESH_DEFAULT = "EXPECT_LANE_FRESH_H", 6.0
 # О5: сколько мост вправе не давать НИ ОДНОГО успеха (мин; 0 → ветка мертва). 60, а не 30 из
 # проекта: при пробе раз в 10 минут порог 30 дал бы на живом корпусе 4 ложных эпизода (шапка).
 BRIDGE_MIN_ENV, BRIDGE_MIN_DEFAULT = "EXPECT_BRIDGE_MIN", 60.0
@@ -546,7 +579,7 @@ STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")   # зе
 
 KINDS = ("o1_new_vps", "o2_daemon", "o2_splinter", "o3_undelivered", "o3_unknown",
          "o4_pc_silent", "o5_bridge_down", "o5_bridge_slow", "o6_pc_task",
-         "o7_child_down", "o7_pulse_lost")
+         "o7_child_down", "o7_pulse_lost", "o8_lane_dead")
 
 
 def limit_env(name, default, env=None, scale=60.0):
@@ -581,6 +614,9 @@ def config(env=None):
         "pc_fresh": limit_env(PC_FRESH_ENV, PC_FRESH_DEFAULT, env),
         "pc_task": limit_env(PC_TASK_ENV, PC_TASK_DEFAULT, env),
         "pc_child": limit_env(PC_CHILD_ENV, PC_CHILD_DEFAULT, env),
+        # ШТУКИ, а не время: порог О8 — длина череды заходов, отсюда scale=1.
+        "lane_run": limit_env(LANE_RUN_ENV, LANE_RUN_DEFAULT, env, scale=1.0),
+        "lane_fresh": limit_env(LANE_FRESH_ENV, LANE_FRESH_DEFAULT, env, scale=3600.0),
         "bridge": limit_env(BRIDGE_MIN_ENV, BRIDGE_MIN_DEFAULT, env),
         # СЕКУНДЫ: длительность одного вызова, а не возраст факта — отсюда scale=1.
         "bridge_slow": limit_env(BRIDGE_SLOW_ENV, BRIDGE_SLOW_DEFAULT, env, scale=1.0),
@@ -766,6 +802,129 @@ def pc_lane_facts(text, now=None):
         open_ep = {"num": num, "since": ts, "line": line}
         takes += 1
     return {"open": open_ep, "takes": takes, "answers": answers, "lost": lost, "closed": closed}
+
+
+# ═════════ О8: ЗАХОДЫ ПОЛОСЫ ДОХОДЯТ ДО ИСПОЛНЕНИЯ (18.08.2026) ═════════════════════════════
+# ЖИВЫЕ ФОРМЫ дословного ответа внешней системы (снимок 18.08.2026, 6 строк из 1298 — ВСЕ шесть
+# устроены одинаково):
+#   «DONE 2026-08-18 17:23 UTC: ✅ Code-сессия завершена: API Error: 529 Overloaded. This is a
+#    server-side issue, usually temporary — try again in a moment. …»
+#   «NOTE 2026-08-05 02:51 UTC: Orchestrator: задача #291 → failed · провал [причина=exec_error ·
+#    ошибка выполнения]: claude exit=1: API Error: Unable to connect to API (ConnectionRefused).»
+#
+# ПОЗИЦИЯ, А НЕ ПОДСТРОКА (класс 5ca761d/6a7baf9/40c8425). Отказом считается маркер `API Error:`
+# ТОЛЬКО сразу после машинного зачина — «Code-сессия завершена: » либо «claude exit=1: ». Проверено
+# на живом корпусе: в заявляющей позиции 6 из 6, вне её 0. А ПЕРЕСКАЗ отказом не становится, и это
+# видно там же: три строки того же дня («…claude exit=1 по API 529 Overloaded…», «…транзиентный
+# серверный 529 Overloaded…») — слова ДУМАТЕЛЯ о причине, и маркера в них нет. Судится факт (что
+# ответила внешняя система), а не чужое суждение о нём.
+LANE_ERR_HEADS = ("Code-сессия завершена: ", "claude exit=1: ")
+LANE_ERR_MARK = "API Error:"
+# Сколько заходов помнить. Их читает решение (последняя череда) и объяснение закрытия; глубже
+# незачем — состояние живёт в /tmp и второй копией журнала быть не должно (довод CLOSED_KEEP).
+RUNS_KEEP = 12
+
+
+def lane_err(line):
+    """Строка журнала → ДОСЛОВНЫЙ текст ответа внешней системы | "" (маркер не в позиции).
+
+    Возвращается ровно то, что ответила внешняя сторона, — по нему владелец и отличит перегрузку
+    от кончившихся денег. Сама система их не различает и не берётся: своего суждения о причине
+    здесь нет ни одного слова."""
+    raw = str(line or "")
+    i = raw.find(LANE_ERR_MARK)
+    if i < 0:
+        return ""
+    before = raw[:i]
+    if not any(before.endswith(h) for h in LANE_ERR_HEADS):
+        return ""                                     # цитата/пересказ — не заявление отказа
+    return raw[i + len(LANE_ERR_MARK):].strip()[:200]
+
+
+def pc_runs_facts(text, now=None):
+    """Текст журнала полосы ПК → ЗАХОДЫ и их исходы.
+
+    → {"runs": [ {"num","since","ts","word","ext","err","line"} … ], "run", "first", "last",
+       "err", "err_ts", "nums", "total"}
+
+    ЗАХОД — взятая полосой задача, ДОШЕДШАЯ до записи об исходе. `ext=True` значит «внешняя
+    система ответила отказом», и доказывается это ДОСЛОВНЫМ текстом, найденным либо в самой
+    строке исхода, либо в строке, легшей между взятием и исходом (у формы «Code-сессия завершена»
+    отказ пишется отдельной строкой — так было у обеих задач повода).
+
+    `run` — сколько ПОСЛЕДНИХ подряд заходов упали внешним отказом; успешный заход обрывает счёт
+    (контракт, отрицательный тест 1: «заходы идут нормально либо падают по разным причинам —
+    тревоги нет»). `first` — время ПЕРВОГО отказа в этой череде: им ключуется эпизод, поэтому
+    новый отказ той же череды не заводит второго нарушения.
+
+    ХОД РАЗБОРА СТРОГО ВПЕРЁД ПО ВРЕМЕНИ — по тому же доводу, что у `pc_lane_facts`: номера
+    очереди повторяются, и ответ засчитывается только взятию, которое было ДО него.
+
+    СОБЫТИЯ ИЗ БУДУЩЕГО НЕ СУДЯТСЯ (приём `cowork_facts`): часы ПК вправе разойтись с нашими, а в
+    теле записей живёт чужое время (местное время ПК на семь часов вперёд). Строка позже
+    `now + COWORK_SKEW` в череду не идёт — иначе уехавшие часы одной записи решали бы за прибор."""
+    events = []
+    try:
+        cap = None if now is None else float(now) + COWORK_SKEW
+    except (TypeError, ValueError):
+        cap = None
+    for idx, raw in enumerate(str(text or "").splitlines()):
+        m = COWORK_TS_RE.search(raw)
+        if not m:
+            continue
+        try:
+            ts = datetime.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                   int(m.group(4)), int(m.group(5)), int(m.group(6) or 0),
+                                   tzinfo=datetime.timezone.utc).timestamp()
+        except (ValueError, OverflowError, OSError):
+            continue
+        if cap is not None and ts > cap:
+            continue                                  # запись из будущего — не факт о прошлом
+        err = lane_err(raw)
+        took = PC_TOOK_RE.search(raw)
+        if took:
+            events.append((ts, -idx, "take", int(took.group(1)), "", "", raw.strip()[:200]))
+            continue
+        out = PC_OUT_RE.search(raw)
+        if out:
+            events.append((ts, -idx, "answer", int(out.group(1)),
+                           out.group(2).strip(" .,;»«"), err, raw.strip()[:200]))
+            continue
+        if err:
+            events.append((ts, -idx, "err", 0, "", err, raw.strip()[:200]))
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    runs, opened, pending = [], {}, []
+    for (ts, _idx, kind, num, word, err, line) in events:
+        if kind == "err":
+            pending.append((ts, err))                 # отказ ждёт захода, в чьё окно он попал
+            continue
+        if kind == "take":
+            opened[num] = ts
+            continue
+        since = opened.pop(num, None)
+        hit, hit_ts = err, (ts if err else None)
+        if not hit and since is not None:
+            for (ets, etext) in pending:
+                if since <= ets <= ts:
+                    hit, hit_ts = etext, ets
+        runs.append({"num": num, "since": since, "ts": ts, "word": word,
+                     "ext": bool(hit), "err": hit, "err_ts": hit_ts, "line": line})
+        pending = [p for p in pending if p[0] > ts]
+    del runs[:-RUNS_KEEP]
+
+    tail = []
+    for r in reversed(runs):
+        if not r.get("ext"):
+            break
+        tail.append(r)
+    tail.reverse()
+    return {"runs": runs, "run": len(tail), "total": len(runs),
+            "first": (tail[0].get("err_ts") or tail[0].get("ts")) if tail else None,
+            "last": runs[-1].get("ts") if runs else None,
+            "err": tail[-1].get("err") if tail else "",
+            "err_ts": tail[-1].get("err_ts") if tail else None,
+            "nums": [r.get("num") for r in tail]}
 
 
 # ═════════ О7: ПЕРИОДИЧЕСКАЯ СТРОКА О ДЕТЯХ КЛИЕНТСКОГО КОНТУРА (18.08.2026) ════════════════
@@ -1899,6 +2058,103 @@ def _o7(facts, cfg, now):
     }]
 
 
+RUNS_OK, RUNS_DEAD, RUNS_UNKNOWN = "идут", "не идут", "проверить не удалось"
+
+
+def lane_runs_state(facts, cfg, now):
+    """ТРИ ИСХОДА про способность полосы ПК ВЫПОЛНЯТЬ заходы → (состояние, подробности).
+
+    ИДУТ — последняя череда внешних отказов короче порога (в том числе её нет вовсе).
+    НЕ ИДУТ — последние `lane_run` заходов ПОДРЯД упали внешним отказом, и череда СВЕЖАЯ.
+    ПРОВЕРИТЬ НЕ УДАЛОСЬ — на каждую дырку: ветка выключена · журнал не прочитан · срез устарел ·
+    разбора нет · заходов в снимке нет вовсе · череда ушла из окна свежести.
+
+    ЗАМОК ПРОТИВ ЛОЖНОГО ЗЕЛЁНОГО ТОТ ЖЕ, ЧТО У О3 И О7: «идут» возвращается ровно одним путём —
+    журнал прочитан свежим, заходы в нём есть, и последний из них ДОКАЗАННО не внешний отказ.
+    Молчание источника выздоровлением не считается никогда."""
+    limit = float((cfg or {}).get("lane_run") or 0.0)
+    if limit <= 0:
+        return RUNS_UNKNOWN, {"why": "ветка О8 выключена (EXPECT_LANE_RUN=0)"}      # откат
+    p = (facts or {}).get("pc")
+    if not isinstance(p, dict) or not p.get("ok"):
+        return RUNS_UNKNOWN, {"why": "журнал полосы ПК не прочитан: %s"
+                                     % (str(p.get("err"))[:80] if isinstance(p, dict)
+                                        else "фактов нет")}
+    try:
+        fetched = float(p.get("fetched") or 0.0)
+    except (TypeError, ValueError):
+        fetched = 0.0
+    fresh = float((cfg or {}).get("pc_fresh") or 0.0)
+    if fetched <= 0 or (fresh > 0 and now - fetched > fresh):
+        return RUNS_UNKNOWN, {"why": "срез журнала ПК устарел (%s назад) — полоса могла ответить "
+                                     "после" % human_age(now - fetched if fetched > 0 else 0)}
+    r = p.get("runs")
+    if not isinstance(r, dict):
+        return RUNS_UNKNOWN, {"why": "разбора заходов полосы нет вовсе (запись прежней редакции)"}
+    if not r.get("total"):
+        # Ни одного захода с записью об исходе. Полосе могли не давать работы — это НЕ отказ и НЕ
+        # исполнение: судить не на чем (тот же довод, что у «взятой задачи нет» в О6).
+        return RUNS_UNKNOWN, {"why": "ни одного захода с записью об исходе в снимке журнала"}
+    run = int(r.get("run") or 0)
+    info = {"run": run, "limit": limit, "total": r.get("total"), "err": r.get("err"),
+            "err_ts": r.get("err_ts"), "first": r.get("first"), "last": r.get("last"),
+            "nums": list(r.get("nums") or []), "runs": r.get("runs")}
+    if run < limit:
+        info["why"] = ("последний заход исполнился" if run == 0
+                       else "череда короче порога: %d при пороге %d" % (run, int(limit)))
+        return RUNS_OK, info
+    # СВЕЖЕСТЬ ЧЕРЕДЫ — условие РОЖДЕНИЯ, а не продолжения: иначе первый прогон после установки
+    # объявил бы нарушением историю, в которой полоса с тех пор просто не бралась за работу.
+    window = float((cfg or {}).get("lane_fresh") or 0.0)
+    try:
+        last_err = float(r.get("err_ts") or r.get("last") or 0.0)
+    except (TypeError, ValueError):
+        last_err = 0.0
+    age = (now - last_err) if last_err > 0 else 0.0
+    info["age"] = age
+    info["window"] = window
+    if window > 0 and (last_err <= 0 or age > window):
+        info["why"] = ("череда старше окна судейства (%s при окне %s) — с тех пор полоса за работу "
+                       "не бралась, и это НЕ доказательство, что заходы пошли"
+                       % (human_age(age), human_age(window)))
+        return RUNS_UNKNOWN, info
+    return RUNS_DEAD, info
+
+
+def _o8(facts, cfg, now):
+    """О8 — полоса ПК не может выполнить ни одного захода: подряд идущая череда ВНЕШНИХ отказов.
+
+    Прибор ничего не чинит и не ретраит (`can_task=False` — задача-эскалация сама была бы ещё
+    одним заходом и упала бы так же). Он только называет владельцу факт и ДОСЛОВНЫЙ ответ
+    внешней системы: перегрузку от кончившихся денег отличит по нему владелец, а не мы."""
+    if float((cfg or {}).get("lane_run") or 0.0) <= 0:
+        return []                                     # откат: ветка мертва ДО чтения фактов
+    state, info = lane_runs_state(facts, cfg, now)
+    if state != RUNS_DEAD:
+        return []
+    bstate, binfo = bridge_state(facts, cfg, now)
+    if bstate != BRIDGE_OK:
+        # Тот же довод, что у О4, О6 и О7: канал не доказан живым → о соседней полосе ни слова.
+        return []
+    return [{
+        "kind": "o8_lane_dead",
+        # Ключ — ПЕРВЫЙ отказ череды: пока полоса не выполнит ни одного захода, это ОДНО и то же
+        # нарушение, сколько бы новых отказов ни легло следом. Успешный заход обрывает череду —
+        # и следующая беда получит свой ключ.
+        "key": "o8|%d" % int(info.get("first") or 0),
+        "run": info.get("run"),
+        "limit": info.get("limit"),
+        # ДОСЛОВНО и в кавычках: это единственное, чем владелец отличит перегрузку от денег.
+        "err": info.get("err"),
+        "err_ts": info.get("err_ts"),
+        "age": info.get("age"),
+        "window": info.get("window"),
+        "nums": info.get("nums"),
+        "probe": binfo.get("dt"),
+        "can_task": False,
+    }]
+
+
 def _o5(facts, cfg, now):
     """О5 — мост не дал успеха дольше порога ЛИБО дал его дольше отведённого времени."""
     out = []
@@ -1954,7 +2210,7 @@ def verdict(facts, cfg=None):
     if now <= 0:
         return []
     out = []
-    for fn in (_o1, _o2_daemon, _o2_splinter, _o3, _o4, _o5, _o6, _o7):
+    for fn in (_o1, _o2_daemon, _o2_splinter, _o3, _o4, _o5, _o6, _o7, _o8):
         try:
             out.extend(fn(facts, cfg, now) or [])
         except Exception:                                            # noqa: BLE001
@@ -1983,6 +2239,7 @@ def closures(facts, cfg, open_keys):
     pct_st = pc_task_state(facts, cfg, now)[0] if now > 0 else PCT_UNKNOWN
     ch_st, ch_info = children_state(facts, cfg, now) if now > 0 else (CH_UNKNOWN, {})
     br_st, br_info = bridge_state(facts, cfg, now) if now > 0 else (BRIDGE_UNKNOWN, {})
+    runs_st = lane_runs_state(facts, cfg, now)[0] if now > 0 else RUNS_UNKNOWN
     out = []
     for key in (open_keys or []):
         key = str(key)
@@ -2010,6 +2267,11 @@ def closures(facts, cfg, open_keys):
         elif kind == "o7" and (ch_info.get("states") or {}).get(key.partition("|")[2]) == CH_ALIVE:
             # ИМЕННО ЭТОТ ребёнок назван живым СВЕЖЕЙ строкой. Ни «неизвестно» о нём, ни его
             # исчезновение из строки эпизода не закрывают: выздоровление обязано быть ДОКАЗАНО.
+            out.append(key)
+        elif kind == "o8" and runs_st == RUNS_OK:
+            # Полоса ДОКАЗАННО выполнила заход, и доказано это СВЕЖИМ чтением журнала. «Проверить
+            # не удалось» (срез устарел, череда ушла из окна, журнал не прочитан) эпизода НЕ
+            # закрывает: молчание источника не есть выздоровление — тот же замок, что у О6/О7.
             out.append(key)
         elif kind == "o7l" and ch_st != CH_UNKNOWN:
             out.append(key)                          # публикация вернулась и уложилась в порог
@@ -2053,6 +2315,8 @@ NOTE_HEAD = {
     "o7_child_down": "🔔 ребёнок клиентского контура ПК назван не живым",
     # Третий исход — своим заголовком: «сказать нечего» это НЕ «дети мертвы» (контракт, п.3).
     "o7_pulse_lost": "🔔 полоса ПК перестала говорить о детях — сказать о них нечего",
+    # О8 говорит про СПОСОБНОСТЬ работать, а не про одну задачу: предмет — череда, а не случай.
+    "o8_lane_dead": "🔔 полоса ПК не может выполнить ни одного захода",
 }
 CLOSE_HEAD = "🔔 ожидание снова выполняется"
 # Строка, которой заканчивается КАЖДАЯ заметка: граница владельца названа в самом сообщении.
@@ -2187,6 +2451,22 @@ def render(v, lane="VPS"):
             % _secs(v.get("probe")),
             "это НЕ «дети мертвы», а «сказать о них нечего»: живы они или нет — не знаю",
         ]
+    elif kind == "o8_lane_dead":
+        parts += [
+            "заходов подряд с внешним отказом: %s (порог %s), последний %s назад"
+            % (_count(v.get("run")), _count(v.get("limit")), human_age(v.get("age"))),
+            # ДОСЛОВНО И ПЕРВЫМ ДЕЛОМ: это и есть то, по чему владелец отличит перегрузку от
+            # кончившихся денег. Своего суждения о причине здесь нет ни одного слова.
+            "внешняя система ответила дословно: «%s»" % (str(v.get("err") or "")[:200]
+                                                         or "текст не записан"),
+            "это ответ от %s; задачи полосы: %s" % (utc_stamp(v.get("err_ts")),
+                                                    _lane_nums(v.get("nums"))),
+            # Канал доказан живым ТЕМ ЖЕ прогоном — иначе заметки бы не было вовсе.
+            "мост в этом же прогоне ответил за %s — молчит не канал" % _secs(v.get("probe")),
+            "перегрузка это или кончившийся способ оплаты — С СЕРВЕРА НЕ РАЗЛИЧИТЬ, и я не гадаю: "
+            "обе причины чинит владелец, поэтому текст выше приведён слово в слово",
+            "сам я не ретраю и полосу не трогаю ничем",
+        ]
     elif kind == "o5_bridge_down":
         parts += [
             "последний успешный опрос %s назад (порог %s)" % (human_age(v.get("age")),
@@ -2206,6 +2486,25 @@ def render(v, lane="VPS"):
         parts.append("нарушение ожидания")
     parts.append(TAIL)
     return " · ".join(parts)
+
+
+def _count(x):
+    """Штуки целым числом: порог О8 живёт в конфиге как float, а «порог 2.0 захода» в заметке
+    читается как опечатка. НЕТ факта → «?» (тот же довод, что у `_num` в журнале)."""
+    try:
+        return "%d" % int(round(float(x)))
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _lane_nums(nums, cap=4):
+    """«#9, #10» — какие именно заходы упали. Пусто → так и говорим: номер мог не разобраться,
+    и придумывать его нечем."""
+    rows = [str(n) for n in (nums or []) if n is not None]
+    if not rows:
+        return "номера не разобраны"
+    tail = "" if len(rows) <= cap else " и ещё %d" % (len(rows) - cap)
+    return ", ".join("#%s" % n for n in rows[:cap]) + tail
 
 
 def _children_others(v, cap=4):
