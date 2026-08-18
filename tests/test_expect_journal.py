@@ -141,9 +141,14 @@ res.append(ok(J.heavy(None, None, True)[0] is True and J.heavy({}, None, True)[0
               "(3d) мусор вместо вердикта → ТЯЖЁЛОЕ (сомнение в сторону владельца)"))
 # Ветка ПК в `heavy` одна на два вида: и «следа нет», и «взяла и молчит» — наблюдения о МАШИНЕ
 # ПК, а вес у неё один (см. `expect_journal.heavy`). Поэтому оба перечислены здесь рядом.
-res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | {"o4_pc_silent", "o6_pc_task"}
-              == set(E.KINDS),
+# У О7 (18.08.2026) СВОИ ветки, и веса у них РАЗНЫЕ намеренно: «ребёнок не жив» называет сам
+# клиентский процесс (тяжёлое), «строки о детях нет» — отсутствие сведений (лёгкое).
+PC_KINDS = {"o4_pc_silent", "o6_pc_task", "o7_child_down", "o7_pulse_lost"}
+res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | PC_KINDS == set(E.KINDS),
               "(3e) все сегодняшние виды названы явно — «неизвестный вид» это про БУДУЩИЕ"))
+res.append(ok(J.heavy({"kind": "o7_child_down", "child": "moderation_bot"}, None, True)[0] is True
+              and J.heavy({"kind": "o7_pulse_lost"}, None, True)[0] is False,
+              "(3e) …и оба веса О7 названы ЯВНО, а не достались умолчанием"))
 
 
 # ═══════════ (4) АДРЕС: ОБА УСЛОВИЯ ОБЯЗАТЕЛЬНЫ ═══════════
