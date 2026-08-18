@@ -436,6 +436,23 @@ def delivery_facts(now):
                 mtimes[rel] = os.stat(os.path.join(REPO, rel)).st_mtime
             except OSError:
                 continue                       # файла нет (удалён коммитом) — свидетель С1 хватит
+    # ТИК-ПОТРЕБИТЕЛИ: код поднимается НОВЫМ процессом с диска каждый прогон, поэтому факт его
+    # исполнения НАБЛЮДАЕМ. Здесь свидетель сильнейший из возможных — СОБСТВЕННЫЙ старт: этот
+    # процесс И ЕСТЬ прогон яруса 2, он прочитал байты, лежавшие на диске в момент своего запуска.
+    # Спрашивать о нём кого-то ещё незачем, и ни одной внешней команды это не стоит.
+    ticks = {}
+    for unit, entry in expectations.TICK_UNITS:
+        try:
+            closure = sorted(prod_drift.closure(entry, REPO))
+        except Exception:
+            closure = []
+        last = None
+        if os.path.basename(entry) == os.path.basename(__file__):
+            try:
+                last = prod_drift.started_at(os.getpid())
+            except Exception:
+                last = None
+        ticks[unit] = {"entry": entry, "closure": closure, "last": last}
     dirty, dirty_ok = dirty_files()
     # ХЕШИ СНИМАЮТСЯ ТОЛЬКО ПРО СПОРНЫЕ ФАЙЛЫ — те, что разошлись с origin/main И тронуты
     # коммитами окна. Чистое дерево (обычный случай) не платит ни одной лишней команды.
@@ -447,7 +464,8 @@ def delivery_facts(now):
         h = blob_sha1(os.path.join(REPO, rel))
         if h:
             disk[rel] = h
-    return {"ok": True, "commits": commits, "closures": closures, "units": units,
+    return {"ok": True, "commits": commits, "closures": closures, "units": units, "ticks": ticks,
+            "now": now,
             "mtimes": mtimes, "dirty": dirty, "dirty_ok": dirty_ok, "blobs": blobs, "disk": disk}
 
 

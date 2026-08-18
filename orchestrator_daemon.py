@@ -3375,6 +3375,59 @@ def _curator_state_dirty():
     return scan_result.ScanResult(scanned=len(rows), parsed=len(rows), subject=subj, payload=rows)
 
 
+def _tick_facts():
+    """ТИК-ПОТРЕБИТЕЛИ: юниты, чей код перечитывается С ДИСКА каждым запуском → {unit: {...}}.
+
+    ЗАЧЕМ ДЕМОНУ ЭТО ЗНАТЬ, если сам он такой код не исполняет: карточку владельцу выписывает
+    ОН, и без этого факта её текст утверждал «живой процесс его НЕ ЧИТАЛ» о коммите, который
+    ярус 2 исполнял уже четыре часа (живой случай 4e6e0ce, 18.08.2026). Требование от этого не
+    исчезает — память демона и правда отстала, — но ложного слова о живой системе в карточке
+    больше нет.
+
+    ЧЕМ СПРАШИВАЕМ — СВОИМ, И ЭТО НЕ НЕБРЕЖНОСТЬ. Рядом лежит готовый `result_judge_facts.
+    unit_fact`, но у судьи адреса стоит ЗАМОК (`tests/test_result_ref.py`): в демоне его имена
+    видны РОВНО двум дверям — теневому прогону и заметке правила, — потому что судья здесь
+    «читается, а не применяется». Позвать его из живой ветки доставки значило бы снять этот
+    забор; забор старше нашей правки и остаётся, а метку читаем СВОИМ вызовом.
+
+    ШКАЛА — MONOTONIC, тем же приёмом, что у `_restart_probe` (признак ВРЕМЯ, 48d9c64): строку
+    вида «Tue … UTC» пришлось бы разбирать вторым парсером и гадать о зоне, а монотонная метка
+    systemd переводится в эпоху одной общей поправкой и о зонах не знает вовсе.
+
+    ПОЧЕМУ НЕ ИМПОРТ РУК НАБЛЮДАТЕЛЯ: замыкание импортов берёт импорты любого уровня, и
+    `import expectations_run` внёс бы наблюдателя в ПАМЯТЬ демона — О3 начало бы объявлять демона
+    отставшим при каждой правке наблюдателя (та же причина, что у `_curator_state_dirty` выше).
+
+    FAIL-SAFE: юнит не прочитан / метка пуста или не разобрана → `last=None`, и прибор прочитает
+    это как «прогона не наблюдали», то есть вернётся к прежнему поведению, а не к зелёному."""
+    out = {}
+    shift = time.time() - time.monotonic()          # монотонная шкала → эпоха, одной поправкой
+    for unit, entry in expectations.TICK_UNITS:
+        try:
+            closure = sorted(prod_drift.closure(entry, REPO))
+        except Exception:
+            closure = []
+        last = None
+        try:
+            p = subprocess.run(
+                ["systemctl", "show", unit,
+                 "--property=ExecMainStartTimestampMonotonic"],
+                capture_output=True, text=True, timeout=10)
+            for line in (p.stdout or "").splitlines():
+                k, _sep, v = line.partition("=")
+                if k.strip() != "ExecMainStartTimestampMonotonic":
+                    continue
+                usec = int(v.strip())
+                if usec > 0:
+                    last = shift + usec / 1e6
+            if last is None:
+                log.info("доставка: прогон %s не наблюдается — метка старта пуста", unit)
+        except Exception as e:                                       # noqa: BLE001
+            log.info("доставка: прогон %s не наблюдается (%s)", unit, e)
+        out[unit] = {"entry": entry, "closure": closure, "last": last}
+    return out
+
+
 def _delivery_facts(now=None):
     """ФАКТЫ О3 и ни одного решения: коммиты окна, замыкания потребителей, живые процессы, время
     последней записи файлов, расхождение диска с origin/main. Форма — та же, что у наблюдателя
@@ -3424,6 +3477,7 @@ def _delivery_facts(now=None):
         log.info("доставка/curator-state: %s — доставку не подтверждаем", d.say())
     return {"ok": bool(commits) or dirty_ok,
             "commits": commits, "closures": closures, "units": units, "mtimes": mtimes,
+            "ticks": _tick_facts(), "now": now,
             "dirty": list(d.payload or ()) if d.scanned is not None else [],
             "dirty_ok": dirty_ok}
 
