@@ -16,7 +16,9 @@
   доставка — origin/main (читающий git), замыкание импортов, /proc и mtime файлов репозитория
              (О3: дошёл ли проверенный коммит до прода; три исхода, включая «неизвестно»);
   ПК       — журнал ПК-контура `cowork_log` через мост: его пишет ТОЛЬКО ПК, а читаем его мы,
-             значит факт переживает смерть машины, которая его произвела (О4);
+             значит факт переживает смерть машины, которая его произвела. ОДНО чтение кормит ДВА
+             ожидания: О4 (следа нет вовсе) и О6 (взятая полосой задача не получила записи об
+             исходе). Своего вызова к мосту у О6 нет — он разбирает ТОТ ЖЕ текст;
   мост     — СОБСТВЕННАЯ проба: тот же GET очереди, но с замером «удался ли» и «сколько занял»
              (О5). Отдельного вызова ради этого не делается — канал судится по следу того, кто
              через него ходит, а не по словам самого канала о себе.
@@ -24,11 +26,20 @@
 берётся read-only разведка /proc (кто жив и когда стартовал): она уже доказана инвариантом
 PROD_DRIFT_READONLY и покрыта своими тестами, дубль того же кода был бы второй правдой.
 
-ПОЧЕМУ ЖУРНАЛ ПК ЧИТАЕТСЯ НЕ КАЖДЫЙ ПРОГОН. Он весит ≈310 КБ, и путь его чтения — ровно тот,
-у которого замер 08.08 нашёл разброс до 207 с. Порог О4 — часы, значит часовое разрешение
-достаточно: журнал читается раз в PC_PROBE_MIN, а рядом с порогом (когда до нарушения остаётся
-меньше «свежести» факта) — каждый прогон. Так заявление «следа нет» всегда стоит на чтении не
-старше EXPECT_PC_FRESH_MIN, а нагрузка на мост остаётся 24 чтения в сутки вместо 144.
+ПОЧЕМУ ЖУРНАЛ ПК ЧИТАЕТСЯ НЕ КАЖДЫЙ ПРОГОН. Он весит ≈420 КБ (снимок 18.08), и путь его чтения —
+ровно тот, у которого замер 08.08 нашёл разброс до 207 с. Порог О4 — часы, значит часовое
+разрешение достаточно: журнал читается раз в PC_PROBE_MIN, а рядом с порогом (когда до нарушения
+остаётся меньше «свежести» факта) — каждый прогон. Так заявление «следа нет» всегда стоит на
+чтении не старше EXPECT_PC_FRESH_MIN, а нагрузка на мост остаётся 24 чтения в сутки вместо 144.
+
+У О6 ПОВОД ЧИТАТЬ ЧАЩЕ СВОЙ, И ОН НЕ СТОИТ НИ ОДНОГО ЛИШНЕГО ВЫЗОВА В ОБЫЧНОЙ РАБОТЕ. Момент
+взятия задачи известен из ПРОШЛОГО чтения и сам по себе не стареет — возраст обязательства
+считается арифметикой, без обращения к миру. Частые чтения включаются ТОЛЬКО когда этот возраст
+подошёл к порогу вплотную (limit − fresh); при медиане ответа полосы 18 мин и пороге 210 сюда не
+доходит ни одна здоровая задача, а на настоящем зависании это 2–3 лишних чтения на эпизод.
+ЦЕНА ЗАПАЗДЫВАНИЯ НАЗВАНА: задача, взятая сразу ПОСЛЕ чтения, станет нам видна лишь следующим
+(до PC_PROBE_MIN), но объявление считается от НАСТОЯЩЕГО момента взятия, а не от момента, когда
+мы о нём узнали, — то есть запаздывает знание, а не число в заметке.
 
 ГРАНИЦА ВЛАДЕЛЬЦА (реакция): заметка в ленту 829 и, если нарушение ДЕРЖИТСЯ, задача в очередь.
 Ни одна ветка не перезапускает процессов, не правит данных и не трогает инфраструктуру. Задача
@@ -62,8 +73,10 @@ FAIL-SAFE: любой сбой сбора → факта нет → вердик
 
 ОТКАТ: остановить и выключить таймер `expectations` (одна команда владельца), либо порог
 соответствующей ветки = 0 в .env (EXPECT_NEW_MIN / EXPECT_TURN_MIN / EXPECT_TICK_MIN /
-EXPECT_PC_MIN / EXPECT_BRIDGE_MIN / EXPECT_BRIDGE_SLOW_SEC), либо EXPECT_TASK=0 — тогда живут
-только заметки, задач не ставится вовсе. У О4 и О5 задачи не бывает НИКОГДА и без этого флага.
+EXPECT_PC_MIN / EXPECT_BRIDGE_MIN / EXPECT_BRIDGE_SLOW_SEC / EXPECT_PC_TASK_MIN), либо
+EXPECT_TASK=0 — тогда живут только заметки, задач не ставится вовсе. У О4, О5 и О6 задачи не
+бывает НИКОГДА и без этого флага. При EXPECT_PC_MIN=0 И EXPECT_PC_TASK_MIN=0 журнал ПК не
+читается вовсе — мосту не платится ни одного вызова.
 ОТКАТ АДРЕСА отдельной ручкой: `EXPECT_TO_BRAIN=0` — в мозг не пишется ничего, все заметки
 уходят владельцу в ленту БАЙТ-В-БАЙТ как до 13.08.2026.
 """
@@ -240,18 +253,32 @@ def pc_facts(st, now, cfg):
     every = expectations.limit_env(PC_PROBE_ENV, PC_PROBE_DEFAULT, os.environ)
     limit = float((cfg or {}).get("pc") or 0.0)
     fresh = float((cfg or {}).get("pc_fresh") or 0.0)
+    task_limit = float((cfg or {}).get("pc_task") or 0.0)
     try:
         fetched = float(prev.get("fetched") or 0.0)
         last = float(prev.get("last") or 0.0)
     except (TypeError, ValueError):
         fetched, last = 0.0, 0.0
     near = bool(limit > 0 and last > 0 and (now - last) >= (limit - fresh))
-    if prev.get("ok") and fetched > 0 and (now - fetched) < every and not near:
+    # ВТОРОЙ ПОВОД ЧИТАТЬ КАЖДЫЙ ПРОГОН — О6: взятая задача подошла к своему порогу. Момент взятия
+    # известен из ПРОШЛОГО чтения и сам по себе не стареет, поэтому возраст считается без единого
+    # лишнего вызова; частые чтения включаются ТОЛЬКО у задачи, которая уже почти нарушение, —
+    # в обычной работе (медиана ответа 18 мин) сюда не доходит ни одна.
+    prev_lane = prev.get("lane") if isinstance(prev.get("lane"), dict) else {}
+    prev_open = prev_lane.get("open") if isinstance(prev_lane.get("open"), dict) else {}
+    try:
+        open_since = float(prev_open.get("since") or 0.0)
+    except (TypeError, ValueError):
+        open_since = 0.0
+    near_task = bool(task_limit > 0 and open_since > 0
+                     and (now - open_since) >= (task_limit - fresh))
+    if prev.get("ok") and fetched > 0 and (now - fetched) < every and not (near or near_task):
         out = dict(prev)
         out["cached"] = True
         return out
-    if limit <= 0:
-        return dict(prev, cached=True) if prev else {"ok": False, "err": "ветка О4 выключена"}
+    if limit <= 0 and task_limit <= 0:
+        # ОБЕ ветки выключены → журнал не читается вовсе: мосту не платится ни одного вызова.
+        return dict(prev, cached=True) if prev else {"ok": False, "err": "ветки О4 и О6 выключены"}
     t0 = time.time()
     try:
         from bridge_client import BridgeClient
@@ -259,14 +286,18 @@ def pc_facts(st, now, cfg):
     except Exception as e:                                           # noqa: BLE001
         return {"ok": False, "err": "журнал ПК не прочитан: %s" % str(e)[:100],
                 "fetched": 0, "last": prev.get("last"), "line": prev.get("line"),
-                "dt": time.time() - t0}
+                "lane": prev.get("lane"), "dt": time.time() - t0}
     if not r.get("ok"):
         return {"ok": False, "err": str(r.get("error") or "мост ответил без ok")[:100],
                 "fetched": 0, "last": prev.get("last"), "line": prev.get("line"),
-                "dt": time.time() - t0}
-    f = expectations.cowork_facts(r.get("text") or "", now)
+                "lane": prev.get("lane"), "dt": time.time() - t0}
+    text = r.get("text") or ""
+    f = expectations.cowork_facts(text, now)
+    # Разбор полосы (О6) идёт ПО ТОМУ ЖЕ тексту и тем же чтением: своего вызова к мосту у О6 нет.
+    lane = expectations.pc_lane_facts(text, now)
     return {"ok": True, "err": "", "fetched": now, "dt": time.time() - t0,
-            "last": f.get("last"), "line": f.get("line"), "n": f.get("n"), "cached": False}
+            "last": f.get("last"), "line": f.get("line"), "n": f.get("n"),
+            "lane": lane, "cached": False}
 
 
 def _proc(unit, entry):
@@ -773,7 +804,7 @@ def _owner_defer():
 # Поля вердикта, которые переживают эпизод в состоянии: по ним строится ЧИСЛО журнальной строки.
 # Числа остаются теми, что были В МОМЕНТ ОБНАРУЖЕНИЯ, — это сказано в самой строке словом
 # «начало», и подменять их свежими при закрытии значило бы переписать историю задним числом.
-_KEEP_V = ("kind", "key", "id", "sha", "dt", "limit", "free", "age")
+_KEEP_V = ("kind", "key", "id", "sha", "dt", "limit", "free", "age", "pc_task_id")
 
 
 def _trim_v(v):
@@ -818,6 +849,21 @@ def close_detail(key, facts):
         if str(key).startswith("o4|"):
             line = ((facts or {}).get("pc") or {}).get("line")
             return ("ПК о себе говорит так: «%s»" % str(line)[:150]) if line else ""
+        if str(key).startswith("o6|"):
+            # Чем ИМЕННО полоса сдвинулась — её собственными словами: своя запись об исходе либо
+            # взятие следующей задачи. Пересказ здесь потерял бы диагноз (тот же довод, что у О4).
+            # ИЩЕТСЯ СТРОГО ПО КЛЮЧУ ЭТОГО ЭПИЗОДА: «последний ответ журнала» ответил бы словами
+            # СОСЕДА (18.08: #43 закрылась в 07:13, а последним ответом лежал #44 от 07:38).
+            want = str(key)[3:]
+            for a in (((facts or {}).get("pc") or {}).get("lane") or {}).get("closed") or []:
+                if not isinstance(a, dict) or str(a.get("key")) != want:
+                    continue
+                if a.get("moved_to"):
+                    return ("записи об исходе задачи #%s полоса так и не оставила, но ушла "
+                            "дальше — взяла #%s: «%s»"
+                            % (a.get("num"), a.get("moved_to"), str(a.get("line"))[:120]))
+                return "полоса о ней говорит так: «%s»" % str(a.get("line"))[:150]
+            return ""                    # своих слов не нашлось — чужие не подставляем
         if str(key).startswith("o5"):
             dt = ((facts or {}).get("bridge") or {}).get("dt")
             return "проба прошла за %s" % expectations._secs(dt) if dt is not None else ""
@@ -869,7 +915,7 @@ def run(dry=False, now=None):
     remember_bridge(st, facts, now, cfg)
     pc = facts.get("pc")
     if isinstance(pc, dict) and pc.get("ok"):
-        st["pc"] = {k: pc.get(k) for k in ("ok", "fetched", "last", "line", "n")}
+        st["pc"] = {k: pc.get(k) for k in ("ok", "fetched", "last", "line", "n", "lane")}
     open_eps = dict(st.get("open") or {})
     out = {"verdicts": len(verdicts), "notes": [], "tasks": [], "closed": [],
            # ОТСРОЧЕННЫЕ И ПОГАШЕННЫЕ ОТСРОЧКОЙ — В СЧЁТЕ, А НЕ В НЕБЫТИИ: владельцу их не

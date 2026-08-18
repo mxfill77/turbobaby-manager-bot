@@ -139,7 +139,10 @@ res.append(ok(h_new is True and "не известен" in w_new,
               "(3c) ВИД, которого правило не знает (появится О6) → ТЯЖЁЛОЕ: %s" % w_new))
 res.append(ok(J.heavy(None, None, True)[0] is True and J.heavy({}, None, True)[0] is True,
               "(3d) мусор вместо вердикта → ТЯЖЁЛОЕ (сомнение в сторону владельца)"))
-res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | {"o4_pc_silent"} == set(E.KINDS),
+# Ветка ПК в `heavy` одна на два вида: и «следа нет», и «взяла и молчит» — наблюдения о МАШИНЕ
+# ПК, а вес у неё один (см. `expect_journal.heavy`). Поэтому оба перечислены здесь рядом.
+res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | {"o4_pc_silent", "o6_pc_task"}
+              == set(E.KINDS),
               "(3e) все сегодняшние виды названы явно — «неизвестный вид» это про БУДУЩИЕ"))
 
 

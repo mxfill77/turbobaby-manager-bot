@@ -389,9 +389,17 @@ try:
         st13["pc"] = {"ok": False, "fetched": 0, "last": None}
         ER.pc_facts(st13, NOW, C)
         res.append(ok(len(calls) == 1, "(13) прошлое чтение провалилось → пробуем сразу, не через час"))
+        # ОТКАТ ГАСИТ ЧТЕНИЕ, КОГДА ВЫКЛЮЧЕНЫ ВСЕ ПОТРЕБИТЕЛИ ЖУРНАЛА. С 18.08.2026 их двое:
+        # О4 (следа нет вовсе) и О6 (взятая задача без записи об исходе) — одно чтение кормит оба.
+        # Поэтому EXPECT_PC_MIN=0 в одиночку чтение НЕ гасит: иначе откат О4 молча убил бы О6.
+        # Предмет проверки прежний — откат не платит мосту НИ ОДНОГО вызова.
+        calls[:] = []
+        ER.pc_facts({}, NOW, cfg(pc=0, pc_task=0))
+        res.append(ok(calls == [], "(13) ОТКАТ: при EXPECT_PC_MIN=0 И EXPECT_PC_TASK_MIN=0 "
+                                   "моста не зовём вовсе"))
         calls[:] = []
         ER.pc_facts({}, NOW, cfg(pc=0))
-        res.append(ok(calls == [], "(13) ОТКАТ: при EXPECT_PC_MIN=0 моста не зовём вовсе"))
+        res.append(ok(len(calls) == 1, "(13) а при выключенном ТОЛЬКО О4 журнал читает О6"))
     finally:
         if real is not None:
             sys.modules["bridge_client"] = real

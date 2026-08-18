@@ -76,7 +76,7 @@ BRAIN, BRAIN_AND_OWNER = "мозг", "мозг+владелец"
 SHORT = {
     "o1_new_vps": "О1", "o2_daemon": "О2-демон", "o2_splinter": "О2-splinter",
     "o3_undelivered": "О3", "o3_unknown": "О3", "o4_pc_silent": "О4",
-    "o5_bridge_down": "О5", "o5_bridge_slow": "О5",
+    "o5_bridge_down": "О5", "o5_bridge_slow": "О5", "o6_pc_task": "О6",
 }
 WHAT = {
     "o1_new_vps": "строка очереди не взята при свободном исполнителе",
@@ -87,6 +87,7 @@ WHAT = {
     "o4_pc_silent": "с ПК нет ни одного следа",
     "o5_bridge_down": "мост не отвечает",
     "o5_bridge_slow": "мост отвечает дольше отведённого времени",
+    "o6_pc_task": "полоса ПК взяла задачу и не оставила записи об исходе",
 }
 
 
@@ -137,6 +138,9 @@ def subject(v, facts=None):
         return "", False                        # строка ушла из снимка — судить нечем
     if kind == "o4_pc_silent":
         return str(v.get("line") or ""), True
+    if kind == "o6_pc_task":
+        # Предмет — ДОСЛОВНАЯ строка взятия: по ней и судим, чего задача касается.
+        return str(v.get("line") or ""), True
     return "", True                             # у юнита и канала предмета-артефакта нет вовсе
 
 
@@ -148,7 +152,10 @@ def heavy(v, facts=None, frozen_client=True):
     kind = str(v.get("kind") or "")
     if kind in INFRA_KINDS:
         return False, "предмет — юнит или канал: денег и живых таблиц в нём не бывает"
-    if kind == "o4_pc_silent":
+    if kind in ("o4_pc_silent", "o6_pc_task"):
+        # ОДИН ПРЕДМЕТ — ОДИН ВЕС: и «следа нет», и «взяла и молчит» суть наблюдения о МАШИНЕ ПК,
+        # а она несёт клиентский контур. Развести их весами значило бы дать одному решению
+        # владельца («контур заморожен») две правды — ровно то, чего избегает `_frozen_client`.
         if frozen_client:
             # Контур заморожен решением владельца: по нему находки идут в список, а не в вопрос
             # (тот же довод, что у `revizor_route`). Разморозят — ветка оживёт сама.
@@ -235,6 +242,13 @@ def number(v):
             return NO_NUMBER
         return "коммит %s лежит в origin/main %s при пороге %s" % (
             v.get("sha"), _age(v.get("age")), _age(v.get("limit")))
+    if kind == "o6_pc_task":
+        if v.get("age") is None and v.get("limit") is None:
+            return NO_NUMBER
+        # Предмет О6 — ЗАДАЧА, и число обязано её назвать: «3 ч 30 мин при пороге 3 ч 30 мин» без
+        # номера не даёт связать строку журнала ни с заметкой, ни с полосой.
+        return "задача #%s взята полосой ПК %s назад при пороге %s, записи об исходе нет" % (
+            v.get("pc_task_id"), _age(v.get("age")), _age(v.get("limit")))
     if v.get("age") is None and v.get("limit") is None:
         return NO_NUMBER
     return "%s при пороге %s" % (_age(v.get("age")), _age(v.get("limit")))
