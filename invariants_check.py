@@ -1115,6 +1115,56 @@ def check_revizor_age_pure(world, run):
 
 
 # --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12п: FAILURE_TEXT_PURE
+#  Разбор упавшего тела (failure_text.py) отвечает на ОДИН вопрос: что дословно ответила внешняя
+#  система — и слепота к миру здесь и есть замок. Появись у модуля сеть или файл, он смог бы
+#  спросить очередь САМ, и «внешний отказ» стал бы зависеть от того, КОГДА спросили; появись
+#  запись — цитата поехала бы наружу мимо единственной двери. Но главное другое: модуль стоит
+#  между чужими словами и владельцем, и он обязан УМЕТЬ ТОЛЬКО ЦИТИРОВАТЬ. Импортов РОВНО ДВА, и
+#  оба — ГОТОВЫЙ ВОКАБУЛЯР: `expectations` (машинные зачины у `lane_err`) и `status_truth` (слова,
+#  которыми система уже узнаёт отказ внешней стороны в `classify_exec`). Второго словаря о тех же
+#  смыслах не заводится — он бы разошёлся с первым молча (довод service_receipt → write_fact).
+#  ОГОВОРКА НАЗВАНА ПРЯМО: `status_truth` сам НЕ чист (у него `subprocess` ради git), поэтому
+#  вокабуляр разрешено ЧИТАТЬ, но не ЗВАТЬ — вызов чего угодно из него здесь ФЛАГ, иначе руки
+#  пришли бы в решение чужим ключом.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_FAILURE_TEXT_PATH = None       # подменяется САМОТЕСТОМ; None → боевой failure_text.py в репо
+
+
+@register("FAILURE_TEXT_PURE")
+def check_failure_text_pure(world, run):
+    path = _FAILURE_TEXT_PATH or os.path.join(REPO, "failure_text.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("failure_text.py",
+                 f"разбор упавшего тела не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset(("expectations", "status_truth")))
+    except SyntaxError as e:
+        run.flag("failure_text.py",
+                 f"разбор упавшего тела не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"failure_text.py:{where}", why)
+    # ВОКАБУЛЯР ЧИТАЕТСЯ, А НЕ ЗОВЁТСЯ: `status_truth` держит `subprocess` ради git, и один его
+    # вызов отсюда дал бы решению руки в обход всей проверки выше.
+    import ast as _ast
+    for node in _ast.walk(_ast.parse(src)):
+        if not isinstance(node, _ast.Call):
+            continue
+        fn = node.func
+        if (isinstance(fn, _ast.Attribute) and isinstance(fn.value, _ast.Name)
+                and fn.value.id == "status_truth"):
+            run.flag(f"failure_text.py:строка {node.lineno}",
+                     f"вызов «status_truth.{fn.attr}» — вокабуляр читают, а не зовут: у него "
+                     f"subprocess, и через него в решение придут руки")
+
+
+# --------------------------------------------------------------------------------------------
 #  ИНВАРИАНТ 12н: QUEUE_STATE_PURE
 #  Слепок состояния очереди (queue_state.py) отвечает на три вопроса: сменилось ли состояние,
 #  как оно выглядит текстом и чем кончилась ушедшая задача. Слепота к миру здесь и есть замок:

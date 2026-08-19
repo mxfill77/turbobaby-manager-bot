@@ -40,7 +40,10 @@
 """
 import datetime
 
-FORM = "2"                      # версия формы слепка: сменилась → первый же прогон перепишет док
+FORM = "3"                      # версия формы слепка: сменилась → первый же прогон перепишет док
+#   "3" (19.08.2026) — у упавшей строки появилась строка «ОТВЕТ ВНЕШНЕЙ СИСТЕМЫ, дословно».
+#   Форму поднимают ИМЕННО затем, что карта строк при этом не меняется: без метки документ так и
+#   остался бы с прежним текстом, где чужих слов нет, — то есть врал бы полнотой.
 TAG = "СОСТОЯНИЕ ОЧЕРЕДИ"
 DOC_KEY = "queue_state"         # ключ манифеста мозга: read_doc(name=queue_state)
 UNVERIFIED_FP = "не-сверено"    # отпечаток ветки «очередь не прочитана» — один на весь отказ
@@ -55,6 +58,12 @@ SHOW_SEC = 86400.0              # окно раздела «закрыто за 
 CLOSED_FLOOR_SEC = 3600.0       # предел старения реестра закрытых, если закрытий не случалось
 HEAD_MAX = 90                   # сколько символов первой строки цели показываем
 WHY_MAX = 160                   # сколько символов причины падения показываем
+# Дословный ответ внешней системы (19.08.2026). Он НЕ заменяет строку «почему» и не режет её:
+# идёт ОТДЕЛЬНОЙ строкой рядом. Причина падения — наш разбор, а это чужие слова, и путать их
+# нельзя: по ним владелец отличает перегрузку сервера от кончившегося способа оплаты, а сама
+# система их не различает (см. failure_text.py). Снимает строку тот, у кого тело ЦЕЛОЕ, —
+# `expectations_run._failed_row`; сюда она приезжает готовой полем `ext`.
+EXT_MAX = 200                   # тот же потолок, что у failure_text.TEXT_MAX и у показа О8
 
 _STATUS_RU = {"in_progress": "в работе", "needs_approval": "ждёт «да»",
               "approved": "одобрено, ждёт исполнения", "new": "стоит в очереди"}
@@ -93,6 +102,18 @@ def head(text):
         if line:
             return line[:HEAD_MAX] + ("…" if len(line) > HEAD_MAX else "")
     return "(цель пуста)"
+
+
+def _with_ext(rec, row):
+    """Дописать записи реестра ДОСЛОВНЫЙ ответ внешней системы, если он у строки есть.
+
+    Своего разбора здесь нет ни одной буквы: поле приходит готовым от того, кто держал тело
+    ЦЕЛЫМ (тут его уже урезали). Нет поля — запись БАЙТ-В-БАЙТ прежняя, и это и есть ответ
+    отрицательного теста (б): наша причина ничего не приобретает и внешней не притворяется."""
+    ext = str((row or {}).get("ext") or "").strip()
+    if ext:
+        rec["ext"] = ext[:EXT_MAX]
+    return rec
 
 
 def lane_of(row):
@@ -167,9 +188,10 @@ def seed(closed_rows, now, window=SHOW_SEC):
         if not rid or (float(now) - at) > float(window):
             continue
         fell = str(r.get("status") or "") == "failed"
-        out.append({"id": rid, "lane": lane_of(r), "head": head(r.get("task_text")),
-                    "at": at, "outcome": "упала" if fell else "сдана",
-                    "why": head(r.get("result"))[:WHY_MAX] if fell else ""})
+        rec = {"id": rid, "lane": lane_of(r), "head": head(r.get("task_text")),
+               "at": at, "outcome": "упала" if fell else "сдана",
+               "why": head(r.get("result"))[:WHY_MAX] if fell else ""}
+        out.append(_with_ext(rec, r) if fell else rec)
     out.sort(key=lambda r: float(r.get("at") or 0), reverse=True)
     return out
 
@@ -219,9 +241,10 @@ def ledger(prev_gone, prev_open, rows, failed, now, keep=KEEP_SEC):
         else:
             outcome, why = "сдана", ""
         known.add(rid)
-        out.append({"id": rid, "lane": str(was.get("lane") or "vps"),
-                    "head": str(was.get("head") or head(was.get("text"))),
-                    "at": float(now), "outcome": outcome, "why": why})
+        rec = {"id": rid, "lane": str(was.get("lane") or "vps"),
+               "head": str(was.get("head") or head(was.get("text"))),
+               "at": float(now), "outcome": outcome, "why": why}
+        out.append(_with_ext(rec, f))
 
     for rid, f in fmap.items():          # упавшие, которых наблюдатель открытыми не застал
         if rid in known:
@@ -234,8 +257,9 @@ def ledger(prev_gone, prev_open, rows, failed, now, keep=KEEP_SEC):
         if (float(now) - at) > float(keep):
             continue
         known.add(rid)
-        out.append({"id": rid, "lane": lane_of(f), "head": head(f.get("task_text")),
-                    "at": at, "outcome": "упала", "why": head(f.get("result"))[:WHY_MAX]})
+        out.append(_with_ext({"id": rid, "lane": lane_of(f), "head": head(f.get("task_text")),
+                              "at": at, "outcome": "упала",
+                              "why": head(f.get("result"))[:WHY_MAX]}, f))
 
     out.sort(key=lambda r: float(r.get("at") or 0), reverse=True)
     return out
@@ -335,6 +359,11 @@ def body(rows, gone, now, closed_at=None, lane="VPS", since=None):
                                                          r.get("id"), utc(r.get("at")),
                                                          r.get("head")))
             out.append("      почему: %s" % (r.get("why") or "причина не записана"))
+            # ДОСЛОВНО И ОТДЕЛЬНОЙ СТРОКОЙ. Строка «почему» — НАШ разбор (её первые слова обычно
+            # пересказ думателя), а это слова ЧУЖИЕ, и в одну строку их сводить нельзя. Показ тот
+            # же, что у О8 («внешняя система ответила дословно: «…»»): один факт — один вид.
+            if r.get("ext"):
+                out.append("      ОТВЕТ ВНЕШНЕЙ СИСТЕМЫ, дословно: «%s»" % r.get("ext"))
         for r in unsure:
             out.append("  ИСХОД НЕ СВЕРЕН · %s · #%s · %s · %s"
                        % (str(r.get("lane") or "vps"), r.get("id"), utc(r.get("at")),

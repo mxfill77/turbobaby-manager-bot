@@ -96,6 +96,7 @@ load_dotenv(os.path.join(REPO, ".env"))
 import expectations
 import expect_journal              # чистая функция «вердикт → адрес и строка журнала»
 import queue_state                 # чистая функция «факты очереди → писать ли слепок и чем»
+import failure_text                # чистая функция «тело упавшей строки → ответ внешней системы»
 import prod_drift                  # только read-only разведка /proc (live/started_at)
 
 LANE = "VPS"                       # метка полосы в заметке; на зеркале ПК обязана стать «ПК»
@@ -501,6 +502,11 @@ def snapshot(now=None, st=None, cfg=None):
                      "proc": _proc("splinter", "bot.py")},
         "delivery": delivery_facts(now),
         "bridge": bridge_facts(q, st, now),
+        # ДОСЛОВНЫЙ ОТВЕТ ВНЕШНЕЙ СИСТЕМЫ у судьи под рукой. Факт СОСТАВНОЙ (снят прошлым
+        # прогоном, несёт своё время) — как у моста и ПК; нового обращения к миру не стоит НИ
+        # ОДНОГО. Сегодня его не читает ни одно ожидание: О8 не тронут ни одним условием, новых
+        # ожиданий заход не заводит — это плата за прямой запрет, а не недосмотр.
+        "failed": failed_fact(st, now),
         # Журнал ПК читается ТОЛЬКО когда канал в этом же прогоне ответил: тянуть второй вызов в
         # лежащий мост незачем — исход всё равно «неизвестно», а лишний вызов стоит времени.
         "pc": pc_facts(st, now, cfg) if q.get("ok") else
@@ -688,6 +694,33 @@ def _qstate_on():
     return str(os.environ.get("QUEUE_STATE") or "1").strip() not in ("0", "no", "off")
 
 
+# СРЕЗ ТЕЛА ОСТАЁТСЯ, А ДОСЛОВНАЯ СТРОКА ИДЁТ МИМО НЕГО (19.08.2026).
+# ЗАЧЕМ СРЕЗ (забор Честертона, одной строкой): наблюдатель не смеет становиться второй копией
+# очереди — ответ моста на `failed` весит 301 КБ (замер 14.08), реестр держит до 64 записей и
+# живёт в /tmp, переписываясь каждым прогоном; без среза тела чужих отчётов (до 4500 символов
+# каждое) переехали бы в состояние целиком. Тот же довод, что у RUNS_KEEP и CLOSED_KEEP.
+# ЧТО СЛОМАЕТСЯ, ЕСЛИ ПУСКАТЬ МИМО НЕГО ВСЁ ТЕЛО: состояние распухнет в сотни килобайт, а слепок
+# в мозге — документ, который переписывается ЦЕЛИКОМ, — потянет за собой чужие простыни.
+# Поэтому мимо среза идёт не тело, а ОДНА НАЗВАННАЯ СТРОКА со своим потолком (200 символов,
+# `failure_text.TEXT_MAX`), и снимается она ДО среза: на живом корпусе все пять внешних отказов
+# лежат на символах 406…641, то есть из урезанного тела решение читает «причина наша» 5 раз из 5.
+def _failed_row(it):
+    """Строка ответа моста → факт для реестра. Дословный ответ внешней системы снимается ЗДЕСЬ,
+    пока тело ЦЕЛОЕ; в реестр и в состояние едет только он, а не тело."""
+    body = str(it.get("result") or "")
+    row = {"id": it.get("id"), "lane": it.get("lane"),
+           "task_text": str(it.get("task_text") or "")[:200],
+           "result": body[:400],
+           "at": expectations.parse_iso(it.get("updated"))}
+    try:
+        ext = failure_text.external(body)
+    except Exception:                                                # noqa: BLE001
+        ext = ""                       # разбор упал → прежний путь байт-в-байт, молча и без вреда
+    if ext:
+        row["ext"] = ext
+    return row
+
+
 def failed_facts():
     """Упавшие строки ОБЕИХ полос → список | None (мост не ответил — исход честно «не сверен»).
 
@@ -707,10 +740,7 @@ def failed_facts():
     for it in (r.get("items") or []):
         if not isinstance(it, dict):
             continue
-        rows.append({"id": it.get("id"), "lane": it.get("lane"),
-                     "task_text": str(it.get("task_text") or "")[:200],
-                     "result": str(it.get("result") or "")[:400],
-                     "at": expectations.parse_iso(it.get("updated"))})
+        rows.append(_failed_row(it))
     return rows
 
 
@@ -733,11 +763,56 @@ def closed_facts():
     for it in (r.get("items") or []):
         if not isinstance(it, dict):
             continue
-        rows.append({"id": it.get("id"), "lane": it.get("lane"), "status": it.get("status"),
-                     "task_text": str(it.get("task_text") or "")[:200],
-                     "result": str(it.get("result") or "")[:400],
-                     "at": expectations.parse_iso(it.get("updated"))})
+        # Тот же разбор, что у упавших: засев кладёт в реестр те же записи, и дословная строка
+        # у них обязана быть по тому же правилу — иначе первая суточная выборка молчала бы там,
+        # где следующая заговорит.
+        rows.append(dict(_failed_row(it), status=it.get("status")))
     return rows
+
+
+# ═══════ ДОСЛОВНАЯ СТРОКА ДОЕЗЖАЕТ И ДО СУДЬИ, А НЕ ТОЛЬКО ДО СЛЕПКА (19.08.2026) ═══════════
+FAILED_KEEP = 8                    # сколько последних внешних отказов помнить (≤200 симв. каждый)
+
+
+def remember_failed(st, failed, now):
+    """Запомнить ДОСЛОВНЫЕ ответы внешней системы, за которые уже заплачено этим же GET.
+
+    ПОЧЕМУ ЧЕРЕЗ СОСТОЯНИЕ, А НЕ ПРЯМО В ВЕРДИКТ. Вопрос про упавших дорогой (301 КБ) и потому
+    УСЛОВНЫЙ — его задаёт решение `needs_closed`, а не такт; вдобавок он задаётся ПОСЛЕ вердикта,
+    последним шагом прогона. Перенести его ВПЕРЁД значило бы поставить дорогой и медленный вызов
+    перед всеми ожиданиями сразу: больной мост (замер О5 — до 417 с на опрос) задерживал бы тогда
+    заметку о вставшем демоне. Поэтому факт СОСТАВНОЙ — ровно как у моста и у журнала ПК: снят
+    прошлым прогоном, лежит в состоянии, несёт своё время и стареет ЧЕСТНО. Цена названа: судья
+    видит отказ тактом позже, чем слепок (≤10 минут).
+
+    Кладётся ТОЛЬКО названная строка, не тело: второй копией очереди состояние быть не должно."""
+    rows = []
+    for f in (failed or []):
+        ext = str((f or {}).get("ext") or "").strip()
+        if not ext:
+            continue
+        rows.append({"id": f.get("id"), "lane": f.get("lane"), "at": f.get("at"),
+                     "text": ext[:failure_text.TEXT_MAX]})
+    rows.sort(key=lambda r: float(r.get("at") or 0))
+    st["failed"] = {"at": float(now), "n": len(failed or []), "ext": len(rows),
+                    "rows": rows[-FAILED_KEEP:]}
+
+
+def failed_fact(st, now):
+    """Состояние → факт для судьи. Ни одного обращения к миру: только то, что уже снято.
+
+    `ok=False` — вопрос ещё не задавался в этой жизни состояния. Это НЕ «внешних отказов нет»:
+    молчание источника выздоровлением не считается (замок тот же, что у О3, О7 и О8)."""
+    d = st.get("failed") if isinstance(st.get("failed"), dict) else None
+    if not d:
+        return {"ok": False, "err": "упавших ещё не спрашивали в этой жизни состояния"}
+    rows = [r for r in (d.get("rows") or []) if isinstance(r, dict)]
+    try:
+        age = max(0.0, float(now) - float(d.get("at") or 0.0))
+    except (TypeError, ValueError):
+        age = 0.0
+    return {"ok": True, "fetched": d.get("at"), "age": age, "n": d.get("n"),
+            "ext": d.get("ext"), "rows": rows, "last": rows[-1] if rows else None}
 
 
 def write_queue_state(text):
@@ -788,6 +863,7 @@ def queue_state_step(st, facts, now, dry=False):
             failed = failed_facts()
             if failed is not None:
                 closed_at = now
+                remember_failed(st, failed, now)
         gone = queue_state.ledger(gone, prev_open, rows, failed, now)
     v = queue_state.verdict(prev, q, gone, now, closed_at, LANE, since)
     out = {"write": bool(v.get("write")), "why": v.get("why"), "wrote": False}
