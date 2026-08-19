@@ -13,6 +13,11 @@ os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ.setdefault("PLAN_ADAPT", "0")
 os.environ["CURATOR"] = "0"  # изоляция от боевого .env
+# Изоляция от МЕТКИ ДОСТАВКИ (`prod_gate.ENV_MARK` = CC_PROD_DELIVERY): её ставит демон задаче
+# доставки, окружение наследуют все дети, и на ней gate.main() поднимает селективный набор до
+# полного — предмет этих проверок замолкал бы, пока снаружи идёт конверт доставки. Саму доставку
+# судит tests/test_prod_gate.py (в т.ч. «селективный набор доставку НЕ авторизует»).
+os.environ["CC_PROD_DELIVERY"] = "0"
 
 res = []
 

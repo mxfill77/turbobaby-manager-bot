@@ -14,6 +14,11 @@ os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ.setdefault("PLAN_ADAPT", "0")
 os.environ["CURATOR"] = "0"
 os.environ["GATE_SINGLE_SELECTIVE"] = "0"   # изоляция: боевой .env может иметь =0/=1
+# Изоляция от МЕТКИ ДОСТАВКИ (`prod_gate.ENV_MARK` = CC_PROD_DELIVERY): её ставит демон задаче
+# доставки, окружение наследуют все дети, и на ней gate.main() поднимает селективный набор до
+# полного — smoke (12) краснел бы, пока снаружи идёт конверт доставки. Саму доставку судит
+# tests/test_prod_gate.py.
+os.environ["CC_PROD_DELIVERY"] = "0"
 
 res = []
 
