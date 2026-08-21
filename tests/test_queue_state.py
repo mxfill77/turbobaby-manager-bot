@@ -275,7 +275,16 @@ src = open(os.path.join(ROOT, "queue_state.py"), encoding="utf-8").read()
 tree = ast.parse(src)
 imports = {n.names[0].name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)}
 imports |= {(n.module or "").split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
-res.append(ok(imports == {"datetime"}, f"импорт РОВНО ОДИН — datetime (нашлось: {sorted(imports)})"))
+# 22.08.2026: импортов стало ДВА. Второй — `owner_refusal`, ВОКАБУЛЯР исходов закрытой задачи
+# (у него самого импортов НОЛЬ, страж OWNER_REFUSAL_PURE), взятый ГОТОВЫМ вместо второго
+# определения «чей это исход» рядом со слепком. Предмет проверки не изменился: рук и часов у
+# слепка по-прежнему нет — это доказывают две строки ниже.
+res.append(ok(imports == {"datetime", "owner_refusal"},
+              f"импортов РОВНО ДВА — datetime и вокабуляр исходов (нашлось: {sorted(imports)})"))
+_or_src = open(os.path.join(ROOT, "owner_refusal.py"), encoding="utf-8").read()
+res.append(ok(not [n for n in ast.walk(ast.parse(_or_src))
+                   if isinstance(n, (ast.Import, ast.ImportFrom))],
+              "и у самого вокабуляра импортов НОЛЬ — рук через него не втечёт"))
 banned = {"open", "exec", "eval", "compile", "__import__", "input", "print"}
 hands = [n.func.id for n in ast.walk(tree)
          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in banned]

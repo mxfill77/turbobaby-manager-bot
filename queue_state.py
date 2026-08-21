@@ -37,10 +37,23 @@
 сам стал бы той же ложью о свежести, ради которой замок и написан: возраст стареет вместе с
 документом, а метка UTC — нет. Единственное исключение названо в самом тексте — возраст строк
 внутри разделов, и он подписан «на момент снятия».
+
+ОТКАЗ ВЛАДЕЛЬЦА — ОТДЕЛЬНЫЙ ИСХОД, А НЕ «УПАЛО» (22.08.2026). Терминальных статусов у очереди два,
+и под `failed` лежат обе половины: сбой машины и решение человека. Замер полосы сервера 21.08.2026
+20:51:44 UTC: из 5 упавших строк суток ЧЕТЫРЕ (#4, #6, #16, #20) закрыты словами «отклонено
+Филиппом (кнопка)» — 80 % «падений» были нажатой кнопкой, и слепок называл их сбоем. Признак и его
+позиция живут в `owner_refusal.py` (импортов ноль); здесь — только исход и его показ. Разрез
+делается на ЧТЕНИИ: ни одна строка очереди не переписывается, статус закрытой задачи не меняется.
 """
 import datetime
 
-FORM = "3"                      # версия формы слепка: сменилась → первый же прогон перепишет док
+import owner_refusal
+
+FORM = "4"                      # версия формы слепка: сменилась → первый же прогон перепишет док
+#   "4" (22.08.2026) — отказ владельца отделён от падения: свой счётчик в шапке и свой раздел.
+#   Форма поднята по той же причине, что и в прошлый раз: карта открытых строк при этом не
+#   меняется, и без метки документ остался бы с прежним текстом, где решение владельца названо
+#   сбоем, — то есть врал бы полнотой.
 #   "3" (19.08.2026) — у упавшей строки появилась строка «ОТВЕТ ВНЕШНЕЙ СИСТЕМЫ, дословно».
 #   Форму поднимают ИМЕННО затем, что карта строк при этом не меняется: без метки документ так и
 #   остался бы с прежним текстом, где чужих слов нет, — то есть врал бы полнотой.
@@ -176,7 +189,8 @@ def needs_seed(since):
 
 def seed(closed_rows, now, window=SHOW_SEC):
     """Разовый засев реестра из закрытых строк очереди → записи за окно. Исход берётся из
-    СТАТУСА строки: тут гадать не о чем, очередь его и хранит."""
+    СТАТУСА строки, а внутри `failed` — из позиции маркера отказа (`owner_refusal`): очередь
+    хранит статус, но чей это исход — человека или машины, — она не различает вовсе."""
     out = []
     for r in (closed_rows or []):
         rid = _rid(r)
@@ -187,11 +201,13 @@ def seed(closed_rows, now, window=SHOW_SEC):
             continue
         if not rid or (float(now) - at) > float(window):
             continue
-        fell = str(r.get("status") or "") == "failed"
+        oc = owner_refusal.outcome(r.get("status"), r.get("result"))
         rec = {"id": rid, "lane": lane_of(r), "head": head(r.get("task_text")),
-               "at": at, "outcome": "упала" if fell else "сдана",
-               "why": head(r.get("result"))[:WHY_MAX] if fell else ""}
-        out.append(_with_ext(rec, r) if fell else rec)
+               "at": at, "outcome": oc or "сдана",
+               "why": head(r.get("result"))[:WHY_MAX] if oc else ""}
+        # Дословный ответ ВНЕШНЕЙ системы бывает только у сбоя: отказ владельца ничем наружу не
+        # ходил — там ответила кнопка, а не чужая машина.
+        out.append(_with_ext(rec, r) if oc == owner_refusal.FAILURE else rec)
     out.sort(key=lambda r: float(r.get("at") or 0), reverse=True)
     return out
 
@@ -206,7 +222,11 @@ def ledger(prev_gone, prev_open, rows, failed, now, keep=KEEP_SEC):
     значило бы спрятать падение — ровно то, ради чего раздел и заведён.
 
     ПАДЕНИЕ, КОТОРОГО МЫ НЕ ВИДЕЛИ ОТКРЫТЫМ, тоже попадает в реестр — из самого списка упавших
-    (задача может родиться и упасть между двумя прогонами наблюдателя)."""
+    (задача может родиться и упасть между двумя прогонами наблюдателя).
+
+    ОТКАЗ ВЛАДЕЛЬЦА ОТДЕЛЯЕТСЯ ЗДЕСЬ ЖЕ (22.08.2026): внутри `failed` исход спрашивается у
+    `owner_refusal`, а записи, снятые ДО разреза, пересуживаются односторонне (`regrade`) — иначе
+    реестр 48 часов подряд называл бы вчерашнее решение владельца сбоем."""
     out = []
     known = set()
     for rec in (prev_gone or []):
@@ -219,7 +239,9 @@ def ledger(prev_gone, prev_open, rows, failed, now, keep=KEEP_SEC):
         except (TypeError, ValueError):
             continue
         known.add(rid)
-        out.append(dict(rec))
+        rec = dict(rec)
+        rec["outcome"] = owner_refusal.regrade(rec.get("outcome"), rec.get("why"))
+        out.append(rec)
 
     fmap = {}
     for f in (failed or []):
@@ -235,7 +257,8 @@ def ledger(prev_gone, prev_open, rows, failed, now, keep=KEEP_SEC):
         was = was if isinstance(was, dict) else {}
         f = fmap.get(rid)
         if f is not None:
-            outcome, why = "упала", head(f.get("result"))[:WHY_MAX]
+            outcome = owner_refusal.outcome("failed", f.get("result"))
+            why = head(f.get("result"))[:WHY_MAX]
         elif failed is None:
             outcome, why = "не сверен", ""
         else:
@@ -244,7 +267,7 @@ def ledger(prev_gone, prev_open, rows, failed, now, keep=KEEP_SEC):
         rec = {"id": rid, "lane": str(was.get("lane") or "vps"),
                "head": str(was.get("head") or head(was.get("text"))),
                "at": float(now), "outcome": outcome, "why": why}
-        out.append(_with_ext(rec, f))
+        out.append(_with_ext(rec, f) if outcome == owner_refusal.FAILURE else rec)
 
     for rid, f in fmap.items():          # упавшие, которых наблюдатель открытыми не застал
         if rid in known:
@@ -257,9 +280,10 @@ def ledger(prev_gone, prev_open, rows, failed, now, keep=KEEP_SEC):
         if (float(now) - at) > float(keep):
             continue
         known.add(rid)
-        out.append(_with_ext({"id": rid, "lane": lane_of(f), "head": head(f.get("task_text")),
-                              "at": at, "outcome": "упала",
-                              "why": head(f.get("result"))[:WHY_MAX]}, f))
+        oc = owner_refusal.outcome("failed", f.get("result"))
+        rec = {"id": rid, "lane": lane_of(f), "head": head(f.get("task_text")),
+               "at": at, "outcome": oc, "why": head(f.get("result"))[:WHY_MAX]}
+        out.append(_with_ext(rec, f) if oc == owner_refusal.FAILURE else rec)
 
     out.sort(key=lambda r: float(r.get("at") or 0), reverse=True)
     return out
@@ -335,15 +359,17 @@ def body(rows, gone, now, closed_at=None, lane="VPS", since=None):
                 fresh.append(rec)
         except (TypeError, ValueError):
             continue
-    fell = [r for r in fresh if r.get("outcome") == "упала"]
+    fell = [r for r in fresh if r.get("outcome") == owner_refusal.FAILURE]
+    turned = [r for r in fresh if r.get("outcome") == owner_refusal.REFUSAL]
     unsure = [r for r in fresh if r.get("outcome") == "не сверен"]
     done = [r for r in fresh if r.get("outcome") == "сдана"]
     try:
         full = since is not None and (float(now) - float(since)) >= SHOW_SEC
     except (TypeError, ValueError):
         full = False
-    out.append("ЗАКРЫТО ЗА СУТКИ — на момент снятия (%d: сдано %d, упало %d, исход не сверен %d):"
-               % (len(fresh), len(done), len(fell), len(unsure)))
+    out.append("ЗАКРЫТО ЗА СУТКИ — на момент снятия (%d: сдано %d, упало %d, отклонено владельцем "
+               "%d, исход не сверен %d):" % (len(fresh), len(done), len(fell), len(turned),
+                                             len(unsure)))
     if not full:
         out.append("  ⚠️ СПИСОК НЕ ПОЛОН: сданные известны только с %s — раньше этого момента"
                    % (utc(since) if since is not None else "начала наблюдения (ещё не начато)"))
@@ -364,14 +390,26 @@ def body(rows, gone, now, closed_at=None, lane="VPS", since=None):
             # же, что у О8 («внешняя система ответила дословно: «…»»): один факт — один вид.
             if r.get("ext"):
                 out.append("      ОТВЕТ ВНЕШНЕЙ СИСТЕМЫ, дословно: «%s»" % r.get("ext"))
+        # РЕШЕНИЕ ЧЕЛОВЕКА — СВОИМ РАЗДЕЛОМ И СВОИМИ СЛОВАМИ. Пояснение стоит ОДИН раз над
+        # списком, а не строкой под каждой задачей: оно одинаково для всех и повторением
+        # превратилось бы в обои. Слово «упала» здесь не звучит вовсе — в этом и разрез.
+        if turned:
+            out.append("  ОТКЛОНЕНО ВЛАДЕЛЬЦЕМ (%d) — в очереди эти строки лежат под `failed`, но"
+                       % len(turned))
+            out.append("  %s." % owner_refusal.NOTE)
+            for r in turned:
+                out.append("    · %s · #%s · %s · %s" % (str(r.get("lane") or "vps"), r.get("id"),
+                                                         utc(r.get("at")), r.get("head")))
         for r in unsure:
             out.append("  ИСХОД НЕ СВЕРЕН · %s · #%s · %s · %s"
                        % (str(r.get("lane") or "vps"), r.get("id"), utc(r.get("at")),
                           r.get("head")))
     # УПАВШИЕ ЧИТАЮТСЯ ИЗ САМОЙ ОЧЕРЕДИ, а не из наблюдения, поэтому их половина полна за сутки
     # с первого же прогона — и это сказано отдельно, чтобы неполнота сданных не бросала тень на
-    # тех, о ком спрашивали прибор.
-    out.append("  (упавшие сверены с очередью %s — эта половина за сутки ПОЛНА)" % utc(closed_at)
+    # тех, о ком спрашивали прибор. Отклонённые приезжают ТЕМ ЖЕ вопросом (они и лежат в `failed`),
+    # значит их полнота ровно та же, и называются они здесь вместе.
+    out.append("  (упавшие и отклонённые сверены с очередью %s — эта половина за сутки ПОЛНА)"
+               % utc(closed_at)
                if closed_at is not None else
                "  (упавшие в этом снимке НЕ сверены — исход ушедших задач может быть неточен)")
     return "\n".join(out)
