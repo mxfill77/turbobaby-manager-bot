@@ -1,0 +1,34 @@
+{
+ "added": [
+  "ServiceUndo.js"
+ ],
+ "base_prod_version": 79,
+ "base_sha256": {
+  "Bridge.js": "28d97e2482f905a4b82b5b74e6fd9dfeafc7aac25c0620e2ffbdddc1ab7645be",
+  "ReadFleet.js": "9e17393454afe1b47c18724ddc9b81f487a4dfeb9f3cd7440abffb3bdaa5e2af"
+ },
+ "build_sha256": {
+  "Bridge.js": "93c9eefff48ae4c999d30f510b20848dde1ba7c0ad7d88f4de31603174f91be2",
+  "ReadFleet.js": "5a9f4ddfc5701d8df3e029d538befe0813d9bf25ec0169c4ee38cf2f7c2ddc3f",
+  "ServiceUndo.js": "e408de9f9a56c022d3cf580af0b23a87247105f0998783d4ce4e1047033e1827"
+ },
+ "changed": [
+  "Bridge.js",
+  "ReadFleet.js"
+ ],
+ "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
+ "база": "bridge_prod/ (зеркало задеплоенной версии)",
+ "выкладке_подлежат": [
+  "Bridge.js",
+  "ReadFleet.js",
+  "ServiceUndo.js"
+ ],
+ "не_каталог_выкладки": "настроек проекта (.clasp.json) здесь НЕТ намеренно: bridge_deploy отказывает такой цели, а заряженного ствола в репозитории быть не должно. Выкладка следующим заходом собирает свой каталог и СНАЧАЛА снимает свежий отпечаток прода.",
+ "перед_выкладкой": [
+  "deploy/bridge_prod_diff.py — прод не ушёл вперёд с 10.08.2026 (@79)?",
+  "base_sha256 здесь совпадает с bridge_prod/ — база не съехала (стережёт гейт)",
+  "после выкладки обновить зеркало bridge_prod/ и его паспорт"
+ ],
+ "тема": "отмена записи ТО: память о вытеснении + дверь возврата по ссылке на акт",
+ "что_это": "КАТАЛОГ СБОРКИ ЗАХОДА. Здесь лежит НЕ прод, а то, что заход предлагает выложить. Истина о проде — bridge_prod/ (зеркало под паспортом MIRROR.json); править его запрещено замком tests/test_bridge_prod_mirror.py, поэтому стройка идёт сюда."
+}
