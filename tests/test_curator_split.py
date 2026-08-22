@@ -336,6 +336,30 @@ try:
     names = [k for k, v in PG.RED_TOKEN_HIT.items() if v not in ("DOWRITE", "confirmed")]
     miss = [n for n in names if not curator_ops.operations(f"нужно {n} по байку")]
     res.append(ok(not miss, f"все write-действия гарда узнаются (не узнано: {miss})"))
+    # ДЫРА СТРАЖА, ЗАКРЫТАЯ 22.08.2026. Прежде страж читал ТОЛЬКО `RED_TOKEN_HIT` — карту
+    # токенов, — а красные классы, которые гард считает РАЗБОРОМ КОМАНДЫ (`_del_class`), мимо
+    # него проходили молча: класс `delete_file` завёлся у гарда 03.08, а словарь операций узнал
+    # о нём 22.08, и три сводные карточки (463, 484, 489) всё это время числились «шумом».
+    # Теперь страж перечисляет классы САМ — по карте карточек гарда, а не по одной её половине.
+    # ключ класса гарда → (проба, ключ семьи, которым словарь обязан её назвать)
+    shell = {
+        "delete_file": ("нужно твоё «да»: rm -rf /root/turbobaby-manager-bot/дерево", "delete_file"),
+        "sqlite": ("нужно sqlite3 по базе памяти", "sqlite"),
+        "proc_ctl": ("нужен рестарт splinter", "service:splinter"),
+    }
+    # НЕ покрыто НАМЕРЕННО, и причина названа: `env_out` — вынос ЗНАЧЕНИЯ секрета наружу; он
+    # рождается из живой команды и её окружения, пунктом сводки назван быть не может (сам ФАЙЛ
+    # секретов словарь называет — семья `env_file`).
+    on_purpose = {"env_out"}
+    miss2 = [k for k, (probe, key) in shell.items()
+             if key not in [o["key"] for o in curator_ops.operations(probe)]]
+    res.append(ok(not miss2, f"красные классы гарда ВНЕ RED_TOKEN_HIT узнаются (не узнано: {miss2})"))
+    # ПОЛНОТА ПЕРЕЧНЯ. Класс, который гард умеет показать владельцу карточкой, обязан быть либо в
+    # карте токенов, либо разобран здесь, либо назван непокрытым НАМЕРЕННО. Появится новый —
+    # страж краснеет, а не молчит: ровно этой строки не хватало с 03.08 по 22.08.2026.
+    known = set(PG.RED_TOKEN_HIT.values()) | set(shell) | on_purpose
+    unknown = sorted(k for k in PG._ACTIONS if k not in known)
+    res.append(ok(not unknown, f"перечень классов гарда полон (не учтено: {unknown})"))
 except Exception as e:
     res.append(ok(False, f"страж словаря не отработал: {e}"))
 
