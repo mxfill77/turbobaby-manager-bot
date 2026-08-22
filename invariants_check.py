@@ -1361,6 +1361,39 @@ def check_work_name_pure(world, run):
         run.flag(f"work_name.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12х: EPISODE_END_PURE
+#  Правило окончания эпизода ожидания (episode_end.py, 22.08.2026) решает СУДЬБУ УЖЕ ОТКРЫТОГО
+#  наблюдения: снять его как НЕИЗВЕСТНО либо поднять до владельца. Обе ошибки дороги и разные —
+#  снятое зря наблюдение исчезает молча, поднятое зря будит владельца, — поэтому «оно только
+#  решает» обязано держаться устройством: ИМПОРТОВ НОЛЬ, ни файлов, ни сети, ни моста, ни
+#  подпроцессов. Пороги приходят готовым cfg, факты готовым facts, «сейчас» приносят руки.
+#  Спросить мир, закрыть задачу или отправить сообщение этой функции нечем ФИЗИЧЕСКИ.
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_EPISODE_END_PATH = None        # подменяется САМОТЕСТОМ; None → боевой episode_end.py в репо
+
+
+@register("EPISODE_END_PURE")
+def check_episode_end_pure(world, run):
+    path = _EPISODE_END_PATH or os.path.join(REPO, "episode_end.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("episode_end.py",
+                 f"правило окончания эпизода не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("episode_end.py",
+                 f"правило окончания эпизода не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"episode_end.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")

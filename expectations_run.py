@@ -95,6 +95,7 @@ load_dotenv(os.path.join(REPO, ".env"))
 
 import expectations
 import expect_journal              # чистая функция «вердикт → адрес и строка журнала»
+import episode_end                 # чистая функция «открытый эпизод → идёт · поднять · снять»
 import queue_state                 # чистая функция «факты очереди → писать ли слепок и чем»
 import failure_text                # чистая функция «тело упавшей строки → ответ внешней системы»
 import prod_drift                  # только read-only разведка /proc (live/started_at)
@@ -103,6 +104,10 @@ LANE = "VPS"                       # метка полосы в заметке; 
 # Журнал СВОЕЙ полосы: у VPS это cc_log. Зеркало ПК обязано сменить ключ на свой (cowork_log).
 JOURNAL_DOC = "cc_log"
 OWNER_DEFER_ENV, OWNER_DEFER_DEFAULT = "EXPECT_OWNER_DEFER_MIN", 60.0   # замер: полоса [43,641]
+# ПРАВИЛО ОКОНЧАНИЯ ЭПИЗОДА (22.08.2026, episode_end.py). Общий выключатель гасит ОБЕ ветки ДО
+# всякого разбора; множитель периодов — только ветку Б («источник жив, а прибора о предмете нет»).
+EPISODE_END_ENV = "EXPECT_EPISODE_END"
+LOST_PERIODS_ENV = "EXPECT_LOST_PERIODS"
 PULSE_DIR = "/tmp/cc_expect_pulse"          # сюда демон пишет оборот cycle() (см. _expect_pulse)
 STATE_DIR = "/tmp/cc_expect_seen"           # открытые эпизоды: о чём уже сказали
 SPLINTER_LOG = os.path.join(REPO, "splinter.log")
@@ -906,6 +911,18 @@ def _owner_defer():
     return expectations.limit_env(OWNER_DEFER_ENV, OWNER_DEFER_DEFAULT, os.environ)
 
 
+def _episode_end():
+    """Правило окончания эпизода (22.08) → (включено, множитель периодов ветки Б).
+
+    ДВЕ РУЧКИ, А НЕ ОДНА, и это не роскошь: ветки А и Б независимы по существу — первая СНИМАЕТ
+    эпизод, вторая БУДИТ владельца, и цена ошибки у них разная. Общий выключатель гасит обе ДО
+    всякого разбора; множитель 0 гасит только ветку Б."""
+    on = str(os.environ.get(EPISODE_END_ENV) or "1").strip() not in ("0", "no", "off")
+    mult = expectations.limit_env(LOST_PERIODS_ENV, episode_end.LOST_PERIODS,
+                                  os.environ, scale=1.0)
+    return on, mult
+
+
 # Поля вердикта, которые переживают эпизод в состоянии: по ним строится ЧИСЛО журнальной строки.
 # Числа остаются теми, что были В МОМЕНТ ОБНАРУЖЕНИЯ, — это сказано в самой строке словом
 # «начало», и подменять их свежими при закрытии значило бы переписать историю задним числом.
@@ -1049,10 +1066,15 @@ def run(dry=False, now=None):
     out = {"verdicts": len(verdicts), "notes": [], "tasks": [], "closed": [],
            # ОТСРОЧЕННЫЕ И ПОГАШЕННЫЕ ОТСРОЧКОЙ — В СЧЁТЕ, А НЕ В НЕБЫТИИ: владельцу их не
            # показывали, но итог прогона уходит в журнал таймера, и там они названы числом.
-           "held": [], "quiet": [], "journal": [], "dry": bool(dry)}
+           "held": [], "quiet": [], "journal": [], "dry": bool(dry),
+           # ПРАВИЛО ОКОНЧАНИЯ ЭПИЗОДА (22.08): снятые как НЕИЗВЕСТНО и поднятые до владельца.
+           # Своими списками, а не внутри `closed`/`notes`: это РАЗНЫЕ события, и слить их значило
+           # бы потерять счёт того, сколько эпизодов кончилось не выздоровлением.
+           "dropped": [], "raised": []}
     brain = _to_brain()
     frozen = _frozen_client()
     owner_defer = _owner_defer()
+    ep_on, ep_mult = _episode_end()
 
     # 1. ЗАКРЫТИЕ ЭПИЗОДОВ — первым: закончившееся обязано быть названо раньше начавшегося.
     for key in expectations.closures(facts, cfg, list(open_eps.keys())):
@@ -1095,6 +1117,41 @@ def run(dry=False, now=None):
             out["closed"].append(key)
         open_eps.pop(key, None)
 
+    # 1в. СНЯТИЕ ЭПИЗОДА, ЧЕЙ ЗАКРЫВАЮЩИЙ ФАКТ БОЛЬШЕ НЕ МОЖЕТ ПОЯВИТЬСЯ (22.08, ветка А).
+    #     Стоит ПОСЛЕ выздоровлений и судит только то, что из вердикта уже выпало: выздоровление
+    #     сильнее снятия, и эпизод, который мог закрыться честно, закрывается честно.
+    if ep_on:
+        live_now = {str(v.get("key")) for v in verdicts}
+        for key in list(open_eps.keys()):
+            rec = open_eps.get(key) or {}
+            if key in live_now:
+                continue                     # нарушение идёт — судьбу записи не трогаем
+            outcome, why, _n = episode_end.state(key, rec, facts, cfg, now, False, ep_mult)
+            if outcome != episode_end.DROP:
+                continue
+            if dry:
+                out["dropped"].append(key)
+                open_eps.pop(key, None)
+                continue
+            # В МОЗГ — ВСЕГДА, как у выздоровления: «не пошло владельцу» не значит «не было».
+            # Причина снятия едет ДЕТАЛЬЮ той же строки, а вид эпизода уже говорит «неизвестно».
+            if brain and not rec.get("closed_j"):
+                v = rec.get("v") or {"kind": rec.get("kind"), "key": key}
+                if not write_journal(expect_journal.line(v, LANE, float(rec.get("first") or now),
+                                                         now, "закрыт", rec.get("ticks"),
+                                                         "СНЯТ КАК НЕИЗВЕСТНО: %s" % why,
+                                                         num=rec.get("num"))):
+                    continue                 # не записалось → эпизод жив, скажем на следующем
+                rec["closed_j"] = 1
+                open_eps[key] = rec
+                out["journal"].append(key)
+            # ВЛАДЕЛЬЦУ — только если ему объявляли начало (тот же довод, что у выздоровления).
+            if rec.get("noted") and not send_note(
+                    episode_end.drop_text(key, rec, why, LANE, now)):
+                continue
+            open_eps.pop(key, None)
+            out["dropped"].append(key)
+
     # 2. НАРУШЕНИЯ.
     task_on = str(os.environ.get("EXPECT_TASK") or "1").strip() not in ("0", "no", "off")
     for v in verdicts:
@@ -1121,6 +1178,31 @@ def run(dry=False, now=None):
         rec.setdefault("noted", 0)
         rec.setdefault("task", 0)
         open_eps[key] = rec
+        # 2б. ПЕРЕХОД ЭПИЗОДА (22.08, ветка Б): длящееся нарушение сменило СМЫСЛ. Судится ДО
+        #     адреса, потому что меняет именно его: «отсутствие сведений о предмете» владельцу
+        #     решать нечего, а «наблюдение потеряно, источник при этом жив» — факт о мире и его
+        #     дело. Вердикт при этом не трогается ни одним полем: меняется адрес, не нарушение.
+        if ep_on and not rec.get("raised"):
+            r_out, r_why, r_num = episode_end.state(key, rec, facts, cfg, now, True, ep_mult)
+            if r_out == episode_end.RAISE:
+                said = episode_end.raise_text(key, r_why, r_num, LANE)
+                if dry:
+                    rec["raised"] = now
+                    out["raised"].append(key)
+                else:
+                    if brain and not rec.get("raised_j") and write_journal(
+                            "%s %s · %s" % (expect_journal.TAG,
+                                            expect_journal.SHORT.get(str(v.get("kind")), "?"),
+                                            said)):
+                        rec["raised_j"] = 1
+                        out["journal"].append(key)
+                    if send_note(said):
+                        rec["raised"] = now
+                        # ВЛАДЕЛЬЦУ СКАЗАНО — значит и КОНЕЦ эпизода до него дойдёт: закрытие
+                        # адресуется по этому же признаку. Иначе он услышал бы только начало.
+                        rec["noted"] = rec.get("noted") or now
+                        out["raised"].append(key)
+                open_eps[key] = rec
         held = max(0.0, now - first)
         # Отсрочка адреса и отсрочка самого О3 (окно правки) складываются по СИЛЬНЕЙШЕЙ: обе
         # говорят «рано», и уступить надо той, что говорит это дольше.
