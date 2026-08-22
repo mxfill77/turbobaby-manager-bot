@@ -53,6 +53,7 @@ import result_judge       # СУДЬЯ АДРЕСА: три исхода по н
 import result_judge_facts  # РУКИ СУДЬИ (только чтение): одна реализация фактов, а не вторая рядом
 import shadow_rule        # ТЕНЕВОЙ ПРОГОН ПРАВИЛА ЗЕЛЁНОГО: считаем рядом, вердикт НЕ трогаем
 import prod_gate          # ПРАВО НА ПРОД ТРЕБУЕТ ПОЛНОГО ГЕЙТА: чистое решение (см. _run_task_impl)
+import ask_ledger         # ОДИН ОБЪЕКТ — ОДИН ВОПРОС: дедуп между дверьми одобрения (см. _ask_dedup_check)
 
 
 def _is_fixture(text: str) -> bool:
@@ -3284,6 +3285,10 @@ def _curator_human_split(root, item, ops):
             open_items = None
         if open_items is None:
             return None              # дедуп не доказать — вторых карточек не плодим
+        try:
+            objs = curator_state.shas(item)      # предмет — тем же разбором, что у сверки
+        except Exception:                                            # noqa: BLE001
+            objs = []
         labels = [o["label"] for o in ops]
         placed, refused, drawn = [], [], []
         for i, o in enumerate(ops, 1):
@@ -3306,6 +3311,7 @@ def _curator_human_split(root, item, ops):
                 if rr.get("ok"):
                     placed.append((tid, o["label"]))
                     drawn.append((tid, meta, items))   # чем отрендерена — для дописи нехватки
+                    _ask_dedup_note(DOOR_CURATOR, [o["key"]], objs, tid)
                 else:
                     refused.append((o["label"], "правка карточки не прошла"))
                 continue
@@ -3319,6 +3325,7 @@ def _curator_human_split(root, item, ops):
             if rr.get("ok"):
                 placed.append((sid, o["label"]))
                 drawn.append((sid, meta, [(line, 1)]))
+                _ask_dedup_note(DOOR_CURATOR, [o["key"]], objs, sid)
             else:
                 refused.append((o["label"], "карточка не встала в needs_approval"))
         if not placed:
@@ -3583,6 +3590,20 @@ def _curator_human_place(root, item):
     except Exception as e:
         log.warning("curator-human: разбор пункта на операции упал (%s) — прежний путь", e)
         ops, demoted = [], []
+    # ДЕДУП МЕЖДУ ДВЕРЬМИ (22.08.2026): о ТОМ ЖЕ объекте владельца могла уже спросить дверь
+    # доставки. Предмет берём тем же `curator_state.shas`, каким его берёт сверка с прибором
+    # строкой выше, — второго понятия «названный коммит» здесь не заводится. Стоит ПОСЛЕ сверки
+    # с прибором намеренно: та закрывает пункт по СОСТОЯНИЮ МИРА (операция уже состоялась), а
+    # эта — по СОСТОЯНИЮ ВНИМАНИЯ ВЛАДЕЛЬЦА (об объекте уже спрошено); первое сильнее.
+    try:
+        objs = curator_state.shas(item)
+    except Exception:                                                # noqa: BLE001
+        objs = []
+    op_keys = [o["key"] for o in ops]
+    asked_already = _ask_dedup_check(DOOR_CURATOR, op_keys, objs)
+    if asked_already:
+        log.info("curator-human: пункт цели %s владельцу НЕ выписан — %s", root, asked_already)
+        return (None, "asked", asked_already)
     if demoted:
         log.info("curator-human: в пункте цели %s имена %s заявкой не сочтены (%s) — развода нет, "
                  "пункт владельцу целиком", root,
@@ -3591,11 +3612,15 @@ def _curator_human_place(root, item):
         res = _curator_human_upsert(root, item, demoted)
         if res is None:
             return None
+        _ask_dedup_note(DOOR_CURATOR, op_keys, objs, res[0])
         return (res[0], res[1],
                 "имена, названные в пункте, но заявкой НЕ сочтённые (карточек на них нет): "
                 + "; ".join(f"{d['label']} — {d['why']}" for d in demoted)
                 + " — развод пункта по операциям поэтому не выполнялся")
     if len(ops) >= 2:
+        # Развод пишет реестр САМ, по карточке на её СОБСТВЕННУЮ операцию: ответ владельца
+        # приходит номером карточки, и запись «все операции пункта за первым номером» сделала бы
+        # ответ на одну карточку ответом за соседние.
         res = _curator_human_split(root, item, ops)
         if res is not None:
             log.info("curator-human: пункт цели %s разведён по %d операциям (%s) → карточки %s",
@@ -3603,7 +3628,10 @@ def _curator_human_place(root, item):
             return res
         log.warning("curator-human: развести пункт цели %s по %d операциям не вышло — "
                     "прежний путь (общая карточка)", root, len(ops))
-    return _curator_human_upsert(root, item)
+    res = _curator_human_upsert(root, item)
+    if res is not None:
+        _ask_dedup_note(DOOR_CURATOR, op_keys, objs, res[0])
+    return res
 
 
 def _curator_card_text(kind, key, v, spawn=None, hum=None):
@@ -3623,6 +3651,14 @@ def _curator_card_text(kind, key, v, spawn=None, hum=None):
                          "пункта УЖЕ состоялась — вопрос закрыт без владельца.")
             if len(hum) > 2 and hum[2]:
                 lines.append(f"🔍 {hum[2]}")
+        elif hum and hum[1] == "asked":
+            # ДЕДУП МЕЖДУ ДВЕРЬМИ: об этом объекте владельца уже спросила соседняя дверь. Маркер
+            # НЕ «⚠️» намеренно — им devbot узнаёт карточку, которую нельзя вклеивать строкой
+            # (частичный развод); здесь же обычный отчёт о цели, и терять из него нечего.
+            lines.append("🔗 карточка владельцу НЕ создавалась: об ЭТОМ объекте его уже спросила "
+                         "соседняя дверь — вопрос не задаётся дважды, ответ будет один.")
+            if len(hum) > 2 and hum[2]:
+                lines.append(f"🔗 {hum[2]}")
         elif hum:
             word = {"split": "пункт РАЗВЕДЁН по отдельным карточкам — по одной на операцию",
                     "created": "создана сводная карточка владельцу",
@@ -5107,11 +5143,15 @@ def _card_end_note(tid, outcome, body="", lane="vps"):
     """Записать строку терминала. Best-effort: журнал — не работа, его сбой не валит оборот.
     Дедуп живёт в самом журнале (`note_end`), поэтому доказанный исход, пришедший раньше, не
     перебивается ничем — и «закрыто» поверх «отказа» лечь не может физически."""
-    if not _card_end_on():
-        return False
     try:
         tid = int(tid)
     except (TypeError, ValueError):
+        return False
+    # ОТВЕТ ВЛАДЕЛЬЦА → В РЕЕСТР ВОПРОСОВ (22.08.2026), и ДО флага журнала намеренно: это разные
+    # слои, и выключенный журнал терминалов не смеет оставить реестр с вечно «стоящим» вопросом.
+    # Повторный зов безвреден — доказанный ответ `ask_ledger.answer` не перебивает.
+    _ask_dedup_answer(tid, outcome)
+    if not _card_end_on():
         return False
     if tid in _CARD_ENDED:
         return True                     # уже записан: журнал не спрашиваем второй раз за то же
@@ -6136,6 +6176,170 @@ def _maybe_prod_drift(now=None):
     return said
 
 
+# ═════════ ОДИН ОБЪЕКТ — ОДИН ВОПРОС: ДЕДУП МЕЖДУ ДВЕРЬМИ ОДОБРЕНИЯ (22.08.2026) ═════════
+# РУКИ к чистому решению `ask_ledger` (там же — повод, числа и границы). Здесь только реестр на
+# диске и три точки касания: обе двери спрашивают его ПЕРЕД постановкой карточки и записывают
+# заданный вопрос ПОСЛЕ неё, а ответ владельца прикладывает `_card_end_note` — та самая ветка,
+# которая уже сегодня знает все четыре исхода карточки и зовётся на каждом из них.
+#
+# ЦЕНА — НОЛЬ ОБРАЩЕНИЙ К МОСТУ: реестр это локальный файл рядом с `chain_cards.jsonl` (оба в
+# .gitignore — это состояние, а не код). Потеря файла стоит РОВНО сегодняшнего поведения: вердикт
+# станет «спросить», то есть обе двери спросят, как спрашивали.
+#
+# ЗАДНИМ ЧИСЛОМ РЕЕСТР НЕ ЗАПОЛНЯЕТСЯ — та же дисциплина, что у журнала рождения карточек: в нём
+# только то, что записано в момент события. Карточка, родившаяся ДО этой правки, дедупом не
+# прикрыта, и это честнее догадки о том, чего никто не наблюдал.
+#
+# ОТКАТ: ASK_DEDUP=0 в .env + рестарт демона → ветка мертва ДО чтения реестра, обе двери
+# байт-в-байт как были.
+ASK_LEDGER_FILE = os.path.join(REPO, "ask_ledger.json")
+ASK_LEDGER_TEST_FILE = "/tmp/cc_ask_ledger_test.json"
+# ОКНО — НЕ ВКУС: за пределами `EXPECT_DELIVER_WINDOW_H` прибор О3 объявляет коммит «вне окна» и
+# дверь доставки о нём не спрашивает ФИЗИЧЕСКИ (см. `_curator_state_answers`). Значит ровно
+# столько и живёт горизонт, внутри которого второй вопрос об одном коммите вообще возможен;
+# брать шире — говорить об объекте, о котором уже никто не спросит, брать уже — забыть вопрос,
+# который ещё стоит. Своя ручка оставлена для отката ветки по отдельности.
+ASK_DEDUP_WINDOW_ENV = "ASK_DEDUP_WINDOW_H"
+DOOR_CURATOR = "куратор"
+DOOR_DELIVERY = "доставка"
+
+
+def _ask_dedup_on():
+    """Ветка жива? `ASK_DEDUP=0` гасит ДО чтения реестра. Дефолт «включено» законен ровно потому,
+    что правило умеет ТОЛЬКО не задать вопрос и не умеет ни исполнить, ни разрешить."""
+    try:
+        return str(os.environ.get("ASK_DEDUP") or "1").strip() != "0"
+    except Exception:                                                # noqa: BLE001
+        return False
+
+
+def _ask_dedup_window():
+    """Горизонт реестра в секундах. Берётся у прибора О3 тем же вызовом, каким его читает сам
+    прибор, — второго понятия «окно» здесь не заводится."""
+    try:
+        w = expectations.limit_env(expectations.DELIVER_WINDOW_ENV,
+                                   expectations.DELIVER_WINDOW_DEFAULT, os.environ, scale=3600.0)
+    except Exception:                                                # noqa: BLE001
+        w = expectations.DELIVER_WINDOW_DEFAULT * 3600.0
+    try:
+        own = (os.environ.get(ASK_DEDUP_WINDOW_ENV) or "").strip()
+        if own:
+            w = float(own) * 3600.0
+    except (TypeError, ValueError):
+        pass
+    return max(float(w or 0), 0.0)
+
+
+def _ask_ledger_file():
+    """Файл реестра. Зеркало дисциплины `_cards_file`: тест НЕ пишет в боевой."""
+    explicit = (os.environ.get("CC_ASK_LEDGER_FILE") or "").strip()
+    if explicit:
+        return explicit
+    if (os.environ.get("ORCH_TEST_MODE") or "").strip():
+        return ASK_LEDGER_TEST_FILE
+    return ASK_LEDGER_FILE
+
+
+def _ask_ledger_load():
+    """Реестр → словарь | None. None — «НЕ ПРОЧИТАН», и это не то же, что пустой: пустой значит
+    «никого не спрашивали» (законный ноль первого прогона), а непрочитанный обязан дойти наверх
+    как незнание и обернуться вопросом владельцу (знаменатель, контракт `scan_result`)."""
+    path = _ask_ledger_file()
+    if not os.path.exists(path):
+        return ask_ledger.empty()
+    try:
+        with open(path, encoding="utf-8") as f:
+            led = json.load(f)
+        return led if isinstance(led, dict) else None
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("дедуп вопросов: реестр не прочитан (%s) — вопрос задаём, как задавали", e)
+        return None
+
+
+def _ask_ledger_save(led):
+    """Записать реестр атомарно. Best-effort и в сторону ВОПРОСА: не легло — следующая дверь
+    спросит владельца ещё раз, то есть вернётся сегодняшнее поведение, а не тишина.
+
+    НИЧЕГО НЕ ВОЗВРАЩАЕТ, и это контракт, а не небрежность (зеркало `_deliver_mark`/`_expect_write`,
+    храповик слепых читателей): булев ответ «не сохранилось» наверху всё равно никем не читается, а
+    отданное из ветки промаха пустое неотличимо от честного «сохранять было нечего». Провал назван
+    там, где он виден человеку, — строкой журнала."""
+    try:
+        path = _ask_ledger_file()
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(led, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("дедуп вопросов: реестр не сохранён (%s) — возможен повтор вопроса", e)
+
+
+def _ask_dedup_check(door, ops, objs):
+    """Дверь собирается спросить владельца → None (спрашивай) | строка-причина (не спрашивай).
+
+    ЗАМОК: причина возвращается РОВНО одним путём — ключи есть, реестр прочитан, и КАЖДЫЙ ключ
+    покрыт записью внутри окна. Всё прочее (ветка выключена, операции нет, предмета нет, реестр
+    не прочитан, запись старше окна, разбор упал) — None, то есть прежний путь БАЙТ-В-БАЙТ."""
+    if not _ask_dedup_on():
+        return None
+    try:
+        ks = ask_ledger.card_keys(ops, objs)
+        if not ks:
+            return None                       # сравнить можно только НАЗВАННОЕ
+        led = _ask_ledger_load()
+        v = ask_ledger.verdict(ks, led, time.time(), _ask_dedup_window())
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("дедуп вопросов: разбор упал (%s) — дверь «%s» спрашивает, как спрашивала",
+                    e, door)
+        return None
+    if v["state"] == ask_ledger.ASK:
+        return None
+    _ask_ledger_save(ask_ledger.skip(led))
+    log.info("ДЕДУП ВОПРОСОВ: дверь «%s» карточку НЕ ставит — %s (снято всего: %s)",
+             door, v["why"], ask_ledger.skipped(_ask_ledger_load()))
+    return v["why"]
+
+
+def _ask_dedup_note(door, ops, objs, card):
+    """Карточка ВСТАЛА — записать заданный вопрос. Зовётся только по факту постановки: реестр
+    обещает «об этом уже спрашивали», и обещание обязано быть правдой."""
+    if not _ask_dedup_on():
+        return
+    try:
+        ks = ask_ledger.card_keys(ops, objs)
+        if not ks:
+            return
+        led = _ask_ledger_load()
+        if led is None:
+            led = ask_ledger.empty()          # не прочитан — заводим заново, вопрос уже задан
+        _ask_ledger_save(ask_ledger.remember(led, ks, door, card, time.time()))
+        log.info("дедуп вопросов: карточка %s двери «%s» записана по объектам %s",
+                 card, door, ", ".join(ks))
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("дедуп вопросов: карточку %s в реестр записать не удалось (%s)", card, e)
+
+
+def _ask_dedup_answer(card, outcome):
+    """Ответ владельца → приложить его к вопросам этой карточки. Слово исхода приходит ГОТОВЫМ от
+    `chain_cards` (разрешено | отказ | истекло | закрыто) и здесь не толкуется."""
+    if not _ask_dedup_on():
+        return
+    try:
+        led = _ask_ledger_load()
+        if led is None:
+            return
+        led, n = ask_ledger.answer(led, card, outcome, time.time())
+        if n:
+            _ask_ledger_save(led)
+            log.info("дедуп вопросов: карточка %s — ответ «%s» приложен к %d объекту(ам)",
+                     card, outcome, n)
+    except Exception as e:                                           # noqa: BLE001
+        log.warning("дедуп вопросов: ответ карточки %s в реестр не записан (%s)", card, e)
+
+
 # ═════ ДОСТАВКА ПРОВЕРЕННОГО КОММИТА: ОДНА КНОПКА ВМЕСТО РУЧНОГО РЕСТАРТА (14.08.2026) ═════
 # ПУТЬ C цели 538, выбранный владельцем кнопкой на карточке 541. Детектор дрейфа и О3 умели
 # ГОВОРИТЬ о недоставке, но говорили в канал, на который не отвечают (лента/журнал мозга), —
@@ -6271,6 +6475,15 @@ def _maybe_deliver_ask(now=None):
         sha = off["sha"]
         if sha in asked or sha in open_shas:
             continue
+        # ДЕДУП МЕЖДУ ДВЕРЬМИ (22.08.2026): оба рубежа выше — ПАМЯТЬ ЭТОЙ ЖЕ ДВЕРИ, и о вопросе
+        # соседней двери они не знают ничего. Живой случай 14.08: куратор спросил о b5478ce в
+        # 18:02, эта дверь спросила о нём же в 22:09 — владельцу две карточки об одном объекте.
+        # `continue`, а не `break`: снятый вопрос не должен съедать прогон у настоящего.
+        dedup = _ask_dedup_check(DOOR_DELIVERY,
+                                 ["service:" + u for u in (off.get("units") or ())], [sha])
+        if dedup:
+            log.info("ДОСТАВКА: карточка по коммиту %s НЕ ставится — %s", sha, dedup)
+            continue
         try:
             r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", deliver_card.row_text(off))
             if not r.get("ok"):
@@ -6285,6 +6498,8 @@ def _maybe_deliver_ask(now=None):
                             sid, rr.get("error"))
                 continue
             _deliver_mark(sha, now)
+            _ask_dedup_note(DOOR_DELIVERY,
+                            ["service:" + u for u in (off.get("units") or ())], [sha], sid)
             said.append(sid)
             log.info("ДОСТАВКА: коммит %s не доехал до %s → карточка %s владельцу (✅ = задача "
                      "гейт+перезапуск, ❌ = ничего)", sha, ", ".join(off["units"]), sid)

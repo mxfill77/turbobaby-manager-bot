@@ -1046,6 +1046,7 @@ def check_card_deadline_pure(world, run):
 #  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
 # --------------------------------------------------------------------------------------------
 _EXPECT_JOURNAL_PATH = None     # подменяется САМОТЕСТОМ; None → боевой expect_journal.py в репо
+_ASK_LEDGER_PATH = None         # подменяется САМОТЕСТОМ; None → боевой ask_ledger.py в репо
 
 
 # --------------------------------------------------------------------------------------------
@@ -1549,6 +1550,35 @@ def check_prod_gate_pure(world, run):
         return
     for where, why in findings:
         run.flag(f"prod_gate.py:{where}", why)
+
+
+@register("ASK_LEDGER_PURE")
+def check_ask_ledger_pure(world, run):
+    """ИНВАРИАНТ 12ф: ASK_LEDGER_PURE.
+
+    Решение «об этом объекте владельца уже спрашивали?» (ask_ledger.py, 22.08.2026) стоит ПЕРЕД
+    единственным местом, где рождается вопрос владельцу, — и умеет ровно одно: не дать его задать.
+    Значит инструментов у него быть не должно НИКАКИХ: импортов НОЛЬ. Узнай он время сам — и
+    «старше окна» перестало бы зависеть от такта, который его спросил; получи он файл — и реестр
+    начал бы читать себя мимо рук, то есть решение о ТИШИНЕ стало бы само эту тишину и хранить;
+    получи он очередь — рядом с двумя дверями завелась бы третья, умеющая ставить карточки.
+    Руки живут отдельно, в `orchestrator_daemon._ask_dedup_*`, и их проверяет
+    tests/test_ask_dedup.py.
+    FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет."""
+    path = _ASK_LEDGER_PATH or os.path.join(REPO, "ask_ledger.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("ask_ledger.py", f"решение дедупа не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("ask_ledger.py", f"решение дедупа не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"ask_ledger.py:{where}", why)
 
 
 @register("SHADOW_RULE_PURE")
