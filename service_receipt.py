@@ -167,14 +167,29 @@ def _half(v, odo, labels, lang):
     return line
 
 
-def receipt(written, failed, odo, labels=None):
+def receipt(written, failed, odo, labels=None, ledger=None):
     """ЕДИНСТВЕННАЯ дверь квитанции: обе половины + исход, из одного вердикта.
 
     `labels` — словарь `вид → (тайский ярлык, русский ярлык)` (`splinter._SP_KIND_LABEL`).
     Возвращает `{"state", "written", "settled", "unknown", "th", "ru"}`; половины врозь не
-    выдаются намеренно — расхождение половин и есть тот класс, ради которого модуль написан."""
+    выдаются намеренно — расхождение половин и есть тот класс, ради которого модуль написан.
+
+    `ledger` — ГОТОВЫЙ вердикт сторожа партии (`works_ledger.tally`, приносят руки
+    `splinter._svc_ledger_take`): «принято N · записано M» и каждая не легшая позиция поимённо.
+    Сюда он приходит УЖЕ РАЗЛОЖЕННЫМ на две половины намеренно — импорт у квитанции остаётся
+    ровно один (`write_fact`, страж `SERVICE_RECEIPT_PURE`), а обе половины сторожа рендерит одна
+    его функция из одного счёта, как и обе половины исхода здесь. Сторож умеет только ДОБАВИТЬ
+    строку о потере: сошлось (`agree`) либо вердикта нет — квитанция БАЙТ-В-БАЙТ прежняя."""
     v = verdict(written, failed)
     out = dict(v)
     out["th"] = _half(v, odo, labels, TH)
     out["ru"] = _half(v, odo, labels, RU)
+    tail_th = str((ledger or {}).get("th") or "")
+    tail_ru = str((ledger or {}).get("ru") or "")
+    if tail_th or tail_ru:
+        # Половины расходиться не должны и здесь: пустая сторона получает то же, что и полная.
+        out["th"] += "\n" + (tail_th or tail_ru)
+        out["ru"] += "\n" + (tail_ru or tail_th)
+        out["ledger"] = {"n": (ledger or {}).get("n"), "m": (ledger or {}).get("m"),
+                         "lost": list((ledger or {}).get("lost") or [])}
     return out

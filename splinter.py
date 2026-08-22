@@ -30,6 +30,7 @@ import service_receipt # квитанция ТО: ОБЕ половины (та�
 import odo_ceiling     # верхняя граница пробега при записи ТО: обе двери под одним гейтом
 import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
 import work_name       # история обслуживания: слова механика — человеку, ярлык вида — расчётам
+import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -536,7 +537,16 @@ _RECENT_TTL = 3 * 3600      # 3 часа — потом считаем уста�
 
 # Отложенные ИНФО-работы (колодки/цепь/масл.фильтр/вилка/прочее) — техник назвал работы ТЕКСТОМ
 # без пробега; пишем их в историю «события» строкой-на-работу, КОГДА в теме придёт чёткий пробег
-# (фото/число). {(chat_id, topic_id): {"works":[...], "bike":str, "msg_id_base":str, "ts":float}}
+# (фото/число).
+# {(chat_id, topic_id): {"works":[...], "at":{ключ-работы: ts}, "bike":str, "msg_id_base":str, "ts":float}}
+# БУФЕР ДОПИСЫВАЕТСЯ, А НЕ ЗАМЕЩАЕТСЯ (класс-фикс 22.08.2026, разбор 5960). До этого дня здесь
+# стояло голое присваивание по ключу темы, и ВТОРАЯ партия работ в той же теме молча стирала
+# первую: 01.08 в 05:53:50 отложено четыре работы, в 07:31:02 в ту же ячейку легло три — «долив
+# тормозной жидкости» исчез без единой строки в журнале. Добавление идёт по КОНТЕНТНОМУ ключу
+# (`_work_key`, тот же, которым дедупится запись), поэтому переформулировка той же работы
+# («передняя шина» → «замена передней шины») партию не раздувает, а РАЗНЫЕ работы не схлопываются.
+# Срок годности — у КАЖДОЙ позиции свой (`at`): иначе свежая работа наследовала бы возраст старой
+# и протухала бы вместе с ней.
 _PENDING_WORKS = {}
 _PENDING_WORKS_TTL = 3 * 3600   # 3 часа — потом перечень протух, не пишем
 
@@ -2211,7 +2221,7 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
 
 
 def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date="",
-                      chat_id=None):
+                      chat_id=None, failed_out=None):
     """Вариант A (разбор перечня по адресам): КАЖДУЮ инфо-работу — отдельной строкой в «события»
     с привязкой пробега. msg_id = info:{plate}:{стем-работы}:{км} (КОНТЕНТНЫЙ ключ) → повторный прогон той
     же работы на том же км дедупится Bridge'ом. Колоночные работы сюда НЕ попадают — у них свой адрес.
@@ -2250,27 +2260,143 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
             log.error(f"  ⚠️ инфо-работа НЕ записана: «{note}» ключ={mid} ошибка={r.get('error')!r}")
     if failed:
         _summary_note_failed(chat_id, topic_id, failed)
+    if failed_out is not None:
+        # Сторожу партии нужна ПРИЧИНА, а не только факт «в написанных нет»: список отказов
+        # уезжает наружу тем же составом, каким лёг в накопитель сводки.
+        failed_out.extend(failed)
     _km_event_journal(chat_id, topic_id, km, ids=mids, works=written, bike=bike,
                       group=group_name, msg_date=msg_date)
     return written   # список работ, которые РЕАЛЬНО есть в истории (для пост-квитанции по факту)
 
 
-def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_date=""):
-    """Пришёл чёткий пробег в теме → дописать ОТЛОЖЕННЫЕ инфо-работы (буфер прошлого сообщения) с этим
-    км. pop() = ровно один раз (без задвоения). Протухший (> TTL) буфер не пишем.
-    Возвращает СПИСОК записанных работ (для пост-квитанции) или []."""
+def _pw_slot(w):
+    """Ключ ПОЗИЦИИ БУФЕРА = нормализованный ТЕКСТ работы (регистр и пробелы не считаются).
+
+    ПОЧЕМУ НЕ КОНТЕНТНЫЙ КЛЮЧ `_work_key`, хотя он и стоит рядом. `_work_key` — СТЕМ, он
+    намеренно грубый и склеивает РАЗНЫЕ работы: у «долив тормозной жидкости», «полная замена
+    тормозной жидкости», «прокачка тормозов» и «прокачка тормозной системы» стем ОДИН —
+    `колодки`. Сама запись это переживает, потому что `_write_info_works` разводит совпавшие
+    стемы подписью текста (`_work_keys_distinct`), — а дедуп буфера разводить нечем: он не
+    пишет, он ВЫБРАСЫВАЕТ. Возьми буфер стем — и вторая партия 01.08 («полная замена тормозной
+    жидкости», «прокачка тормозов») схлопнулась бы в уже лежащий «долив тормозной жидкости»,
+    то есть две названные работы исчезли бы МОЛЧА и сторож партии их даже не увидел бы: они не
+    были бы ПРИНЯТЫ. Это ровно тот класс, ради которого заход и делается, только с другой
+    стороны. Поэтому здесь дедупится ПОВТОР ТЕХ ЖЕ СЛОВ, и ничего кроме.
+
+    НАПРАВЛЕНИЕ СОМНЕНИЯ — В СОХРАНЕНИЕ ПОЗИЦИИ, и цена названа: переформулировка («передняя
+    шина» → «замена передней шины», у них и стемы разные) остаётся ДВУМЯ позициями и даёт две
+    строки в истории. Лишняя строка видна человеку и стоит секунды; проглоченная работа — это
+    невыполненное ТО живого байка. Тот же выбор уже сделан у `_work_keys_distinct` дословно:
+    «лучше лишняя строка в истории, чем молча потерянная работа»."""
+    return _re_pl.sub(r"\s+", " ", str(w or "").strip().lower())
+
+
+def _pw_add(chat_id, topic_id, works, bike, msg_id_base):
+    """ДОПИСАТЬ работы в буфер темы (а не заместить его). Возвращает актуальный перечень буфера.
+
+    Класс 22.08.2026: присваивание по ключу темы стирало предыдущую партию МОЛЧА — 01.08 в
+    05:53:50 отложено четыре работы, в 07:31:02 в ту же ячейку легло три, и «долив тормозной
+    жидкости» исчез без единой строки. Дедуп идёт по ПОВТОРУ ТЕХ ЖЕ СЛОВ (`_pw_slot`, см. там
+    почему не стем). У каждой позиции свой возраст: срок годности старой не убивает свежую."""
+    key = (chat_id, topic_id)
+    cur = _PENDING_WORKS.get(key) or {}
+    names = list(cur.get("works") or [])
+    at = dict(cur.get("at") or {})
+    now = _time.time()
+    seen = {_pw_slot(w) for w in names}
+    again = []
+    for w in (works or []):
+        k = _pw_slot(w)
+        if not k or k in seen:
+            again.append(w)
+            continue
+        seen.add(k)
+        names.append(w)
+        at[k] = now
+    _PENDING_WORKS[key] = {"works": names, "at": at, "bike": bike or cur.get("bike", ""),
+                           "msg_id_base": msg_id_base or cur.get("msg_id_base", ""), "ts": now}
+    if again:
+        log.info(f"  → инфо-работы: те же слова уже в буфере, не дублирую: {again} (тема {topic_id})")
+    return names
+
+
+def _pw_take(chat_id, topic_id):
+    """Забрать буфер темы РАЗ И НАВСЕГДА, разделив его на СВЕЖИЕ и ПРОТУХШИЕ позиции.
+    Возвращает (fresh:list, stale:list, bike, msg_id_base). Буфера нет → ([], [], "", "")."""
     pend = _PENDING_WORKS.pop((chat_id, topic_id), None)
     if not pend:
-        return []
-    if _time.time() - pend.get("ts", 0) > _PENDING_WORKS_TTL:
+        return [], [], "", ""
+    at = pend.get("at") or {}
+    now, ttl = _time.time(), _PENDING_WORKS_TTL
+    born = pend.get("ts", 0)
+    fresh, stale = [], []
+    for w in (pend.get("works") or []):
+        ts = at.get(_pw_slot(w), born)      # легаси-буфер (до 22.08) возраста позиций не знает
+        (stale if now - ts > ttl else fresh).append(w)
+    return fresh, stale, pend.get("bike", ""), pend.get("msg_id_base", "")
+
+
+def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_date="", lost_out=None):
+    """Пришёл чёткий пробег в теме → дописать ОТЛОЖЕННЫЕ инфо-работы (буфер темы) с этим км.
+    Забор буфера = ровно один раз (без задвоения). Протухшие (> TTL) позиции не пишем, но и молча
+    не теряем — называем вслух. Возвращает СПИСОК записанных работ (для пост-квитанции) или [].
+    `lost_out` — сюда сторож партии забирает (работа, причина) по каждой НЕ легшей позиции."""
+    fresh, stale, pend_bike, msg_id_base = _pw_take(chat_id, topic_id)
+    if stale:
         # Протухший буфер = ПОТЕРЯ работ, а не рутина: называем её вслух (класс-фикс 4957, корень 3).
-        _stale = list(pend.get("works") or [])
-        log.error(f"  ⚠️ отложенные инфо-работы протухли (>{_PENDING_WORKS_TTL//3600}ч), НЕ записаны: {_stale}")
+        log.error(f"  ⚠️ отложенные инфо-работы протухли (>{_PENDING_WORKS_TTL//3600}ч), НЕ записаны: {stale}")
         _summary_note_failed(chat_id, topic_id, [(w, f"пробег так и не пришёл за {_PENDING_WORKS_TTL//3600}ч")
-                                                 for w in _stale])
+                                                 for w in stale])
+        if lost_out is not None:
+            lost_out.extend((w, "no_km", "") for w in stale)
+    if not fresh:
         return []
-    return _write_info_works(bridge, group_name, topic_id, bike or pend.get("bike", ""),
-                             pend["works"], km, pend["msg_id_base"], msg_date, chat_id=chat_id)
+    _failed = []
+    written = _write_info_works(bridge, group_name, topic_id, bike or pend_bike,
+                                fresh, km, msg_id_base, msg_date, chat_id=chat_id,
+                                failed_out=_failed)
+    if lost_out is not None:
+        lost_out.extend((w, "write_failed", str(why or "")) for w, why in _failed)
+    return written
+
+
+def _km_door(bridge, chat_id, topic_id, bike, km, *, source, msg_date="", lost_out=None):
+    """ЕДИНАЯ ДВЕРЬ ВЫГРУЗКИ БУФЕРА: любой ПОДТВЕРЖДЁННЫЙ пробег дописывает отложенные работы.
+
+    Класс 22.08.2026 (разбор 5960): выгрузка висела на дверях подтверждения пробега — кнопке и
+    числу в самом сообщении, — а фаза 2 берёт одометр СВОИМ разбором (`splinter.py`, ветка
+    `handle_service_result`) и буфера не касалась вовсе. Из-за этого 01.08 и 22.08 разошлись на
+    ровном месте: 22.08 число пришло кнопкой → работы легли, 01.08 то же число `41357` пришло
+    текстом → четыре работы остались в буфере и не легли никуда. Дверей у пробега три (текст,
+    кнопка, фаза 2), логика выгрузки — ОДНА, и живёт она здесь; каждая дверь только зовёт её и
+    сама решает, что делать с записанным (накопитель сводки, квитанция).
+
+    Возвращает (written:list, lost:list[(работа, код причины, хвост)]). Без моста писать некуда —
+    буфер НЕ трогаем (забрали бы работы в пустоту), но и не молчим о них."""
+    if not bridge:
+        peek = list((_PENDING_WORKS.get((chat_id, topic_id)) or {}).get("works") or [])
+        if peek:
+            log.error(f"  ⚠️ дозапись отложенных работ невозможна (моста нет), в буфере остались: {peek}")
+            # Единственная дорога потери, у которой до этой строки был ТОЛЬКО лог, — а логов из
+            # команды не читает никто (класс-фикс 4957, корень 3). Двери 1 и 3 квитанции не
+            # печатают вовсе: их единственный видимый след — сводка, значит потеря обязана
+            # называться ИМЕННО там, иначе «моста нет» снова стало бы тишиной.
+            _summary_note_failed(chat_id, topic_id,
+                                 [(w, "писать было некуда — буфер не выгружен") for w in peek])
+            if lost_out is not None:
+                lost_out.extend((w, "no_bridge", "") for w in peek)
+            return [], [(w, "no_bridge", "") for w in peek]
+        return [], []
+    lost = [] if lost_out is None else lost_out
+    written = []
+    try:
+        written = _flush_pending_works(bridge, chat_id, topic_id, group_label(chat_id),
+                                       bike, str(km), msg_date, lost_out=lost)
+    except Exception:
+        log.exception("  → дозапись отложенных инфо-работ подтверждённым пробегом упала")
+    if written:
+        log.info(f"  → инфо-работы дописаны ПОДТВЕРЖДЁННЫМ пробегом {km}: {written} (source={source})")
+    return written, list(lost)
 
 
 # ============================================================
@@ -2449,16 +2575,11 @@ def _odo_confirmed(bridge, chat_id, topic_id, bike, km, *, questioned_km=None,
                             right_km=str(km), sender=sender, source=source or "confirm")
     # 3) ОДОМЕТР — в источник правды СРАЗУ, до любых веток и ранних return (корень 4).
     _odo_store(bridge, chat_id, topic_id, bike, km)
-    written = []
-    try:
-        # Без bridge писать некуда — буфер НЕ трогаем (pop потерял бы работы молча).
-        if bridge:
-            written = _flush_pending_works(bridge, chat_id, topic_id, group_label(chat_id),
-                                           bike, str(km), msg_date)
-    except Exception:
-        log.exception("  → дозапись отложенных инфо-работ подтверждённым пробегом упала")
+    # ДВЕРЬ 1 и 2 (текст/кнопка подтверждения). Логика выгрузки — одна на все три двери (`_km_door`);
+    # без bridge писать некуда — буфер там НЕ трогается (забрали бы работы в пустоту).
+    written, _ = _km_door(bridge, chat_id, topic_id, bike, km, source=source or "confirm",
+                          msg_date=msg_date)
     if written:
-        log.info(f"  → инфо-работы дописаны ПОДТВЕРЖДЁННЫМ пробегом {km}: {written} (source={source})")
         try:
             acc = _summary_acc(chat_id, topic_id)
             acc["works"] += written
@@ -3615,14 +3736,34 @@ def _plate_from_name(text):
     return nums[-1] if nums else None
 
 
+#: Кол.J — регистр ЗАМЕНЫ МАСЛА в трансмиссии, и берётся он по ДЕЙСТВИЮ, а не по слову.
+#: Узел (где) и предмет (что) нужны ОБА: «масло в редукторе» — кол.J, «замена ремня» — нет.
+_GEAR_NODE = ("редуктор", "трансмис", "gear", "เกียร์", "เฟือง", "шестер")
+_GEAR_SUBST = ("масл", "oil", "น้ำมัน")
+
+
 def _classify_work(w):
     """Класс работы для маршрутизации (Фаза 1) → адрес записи:
       'oil'       — моторное масло → Лист1 кол.I (set_fleet_oil, отдельный кнопочный флоу);
-      'gear'      — масло редуктора/трансмиссии/ремень/шестерни → кол.J (set_fleet_service);
+      'gear'      — ЗАМЕНА МАСЛА редуктора/трансмиссии → кол.J (set_fleet_service);
       'abs'       — ABS oil → кол.K;
       'airfilter' — воздушный (аир) фильтр → кол.L;
-      'info'      — без столбца (масляный фильтр, колодки, цепь, вилка, прочее) → «события».
-    Порядок проверок важен: воздушный фильтр → airfilter; иной фильтр → info (раньше масла)."""
+      'info'      — без столбца (масляный фильтр, колодки, цепь, вилка, ремень, прочее) → «события».
+    Порядок проверок важен: воздушный фильтр → airfilter; иной фильтр → info (раньше масла).
+
+    РЕГИСТР РЕДУКТОРА БЕРЁТСЯ ПО ДЕЙСТВИЮ, А НЕ ПО СОВПАДЕНИЮ ПОДСТРОКИ (22.08.2026). Прежде здесь
+    стояло `any(k in s for k in (... "ремн" ...))`, и слово «ремня» одной подстрокой уводило работу
+    в кол.J: 22.08 в 10:07:12 «замена ремня» записала кол.J = 41641 км по байку NMAX 155 GREY 5960,
+    владелец отменил это через 28 секунд, а вернуть число пришлось РУКОЙ в таблице (мост понижение
+    отвергает, `setFleetService_` → `km_decreasing`). Ремень вариатора на скутере — расходник со
+    СВОИМ сроком, у которого регистра нет вовсе; заняв чужой, он обнуляет его смысл — таблица
+    начинает утверждать, что масло редуктора меняли тогда, когда его не трогали. Тот же класс, что
+    у литерала (`40c8425`), имени в аргументе (`05c110b`) и цитаты маркера (`6a7baf9`): решение
+    по слову, а не по действию. Теперь кол.J требует ДВУХ признаков сразу — УЗЕЛ (редуктор/
+    трансмиссия/gear/เกียร์/เฟือง/шестерни) И ПРЕДМЕТ (масло), — и порядок слов роли не играет:
+    «масло в редукторе», «редуктор — замена масла», «gear oil» дают кол.J, а «замена ремня» и
+    «полная чистка вариатора» — нет ни при каком порядке. Работа без своего регистра идёт СОБЫТИЕМ
+    со словами человека (`work_name`), то есть не теряется: меняется адрес, а не факт записи."""
     s = str(w).lower()
     is_filter = ("фильтр" in s or "filter" in s or "กรอง" in s)
     if is_filter and ("возд" in s or "air" in s or "аир" in s or "อากาศ" in s):
@@ -3631,8 +3772,8 @@ def _classify_work(w):
         return "info"               # масляный/прочий фильтр — столбца нет → события
     if "abs" in s or "абс" in s:
         return "abs"                # ABS oil → кол.K
-    if any(k in s for k in ("gear", "ремн", "шестер", "редуктор", "трансмис", "เกียร์")):
-        return "gear"               # масло редуктора → кол.J
+    if any(k in s for k in _GEAR_NODE) and any(k in s for k in _GEAR_SUBST):
+        return "gear"               # ЗАМЕНА МАСЛА редуктора → кол.J (узел + предмет, оба)
     if "вилк" in s or "fork" in s:
         return "info"               # масло вилки — столбца нет → события
     if any(k in s for k in ("масл", "oil", "น้ำมัน")):
@@ -4417,7 +4558,8 @@ async def handle_service_button(update, context, bridge) -> None:
         # отрицательную ветку, а тайская печатала «บันทึกแล้ว» БЕЗУСЛОВНО: 13.08 в одной строке
         # механик читал успех, владелец — «ничего не записано» (байки 4957/37015 и 4724/20747).
         # Три исхода (записано · не записано · неизвестен) и имена работ — в `service_receipt`.
-        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL)
+        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL,
+                                     ledger=_svc_ledger_take(chat_id, topic_id))
         # E1: подтверждение через _send_retry — запись (_sp_write_done) УЖЕ прошла и идемпотентна,
         # переотправка безопасна. Без retry ConnectTimeout «съедал» подтверждение → владелец дублировал «Да».
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
@@ -4499,7 +4641,8 @@ async def handle_service_button(update, context, bridge) -> None:
         # km_decreasing на мосту, confirmed=true в коде Bridge) не ослаблены ни одним словом.
         written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo,
                                                confirmed_by=cb, ceiling_ok=True)
-        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL)
+        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL,
+                                     ledger=_svc_ledger_take(chat_id, topic_id))
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
                           text=(f"🐀 Splinter · 📌 {bike}\n"
                                 f"🇹🇭 {rec['th']}\n"
@@ -6339,7 +6482,8 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
                 return True
             # ТА ЖЕ дверь, что у кнопки: здесь до 14.08 БЕЗУСЛОВНЫ были ОБЕ половины, а отказ
             # дописывался хвостом только по-русски — тайская молчала о нём вовсе.
-            rec = service_receipt.receipt(written, failed, m.group(1), _SP_KIND_LABEL)
+            rec = service_receipt.receipt(written, failed, m.group(1), _SP_KIND_LABEL,
+                                         ledger=_svc_ledger_take(chat_id, topic_id))
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=(f"🐀 Splinter · 📌 {bike}\n"
                               f"🇹🇭 {rec['th']}\n"
@@ -6519,6 +6663,48 @@ def _sp_words_said(bridge, chat_id, topic_id, bike):
         return []
 
 
+#: Вердикт сторожа партии: кладёт `_sp_write_done` (там факты), забирает дверь квитанции (там текст).
+#: Накопитель по теме — тот же приём, что у `_SVC_SUMMARY`/`_SVC_UNDO_LAST`; живёт до квитанции.
+_SVC_LEDGER = {}
+
+
+def _svc_ledger_take(chat_id, topic_id):
+    """Забрать вердикт сторожа РОВНО ОДИН РАЗ — иначе он приклеился бы ко второй квитанции."""
+    return _SVC_LEDGER.pop((chat_id, topic_id), None)
+
+
+def _sp_ledger_note(chat_id, topic_id, done, written, failed, info_written, info_lost):
+    """СТОРОЖ ПАРТИИ (класс 22.08.2026): принято N · записано M, и каждая потеря — поимённо.
+
+    Считается ФАКТ, а не намерение: колоночная позиция засчитывается регистром только если она
+    в `written` (то есть мост подтвердил либо перечитанный факт доказал), инфо-работа — только
+    если её вернул `_write_info_works` (там `ok+saved` или `duplicate`, отказ туда не попадает).
+    Всё прочее — потеря с названной причиной. Решение и обе половины текста — `works_ledger`."""
+    fail_why = {}
+    for item in (failed or []):
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            fail_why[str(item[0])] = str(item[1] or "")
+    pos = []
+    for k in (done or []):
+        pair = _SP_KIND_LABEL.get(k) or (k, k)
+        if k in (written or []):
+            out = works_ledger.IN_REGISTER if k in _SP_COL_KINDS else works_ledger.AS_EVENT
+            pos.append(works_ledger.position(pair[1], out, name_th=pair[0]))
+        else:
+            pos.append(works_ledger.position(pair[1], works_ledger.LOST, why="write_failed",
+                                             detail=fail_why.get(str(k), ""), name_th=pair[0]))
+    for w in (info_written or []):
+        pos.append(works_ledger.position(w, works_ledger.AS_EVENT, name_th=_work_th(w)))
+    for item in (info_lost or []):
+        w, why, detail = (list(item) + ["", ""])[:3]
+        pos.append(works_ledger.position(w, works_ledger.LOST, why=why, detail=detail,
+                                         name_th=_work_th(w)))
+    v = works_ledger.tally(pos)
+    _SVC_LEDGER[(chat_id, topic_id)] = v
+    log.info("  → " + works_ledger.line(v))
+    return v
+
+
 async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by="",
                          ceiling_ok=False, works=None):
     """ШАГ 5 (КРАСНЫЙ): по «да» доверенного пишем СДЕЛАННЫЕ позиции. Сторож km_decreasing НЕ трогаем
@@ -6622,6 +6808,17 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
         except Exception:
             log.exception(f"  → ТО фаза2 запись {k} упала")
             failed.append((k, "exception"))
+    # ДВЕРЬ ФАЗЫ 2 (кнопка Пыма / число доверенного) — ТОЖЕ подтверждённый пробег, значит тоже
+    # выгружает буфер отложенных работ. До 22.08.2026 этой двери у буфера не было вовсе: фаза 2
+    # берёт одометр своим разбором, и 01.08 четыре работы остались лежать, пока то же число
+    # писалось в регистры. Логика выгрузки одна на все три двери — `_km_door`.
+    _info_written, _info_lost = _km_door(bridge, chat_id, topic_id, bike, odo_int,
+                                         source=f"фаза 2 ({confirmed_by or 'trusted'})")
+    # СТОРОЖ ПАРТИИ: принято N · записано M. Расходятся — квитанция назовёт каждую потерю.
+    try:
+        _sp_ledger_note(chat_id, topic_id, done, written, failed, _info_written, _info_lost)
+    except Exception:
+        log.exception("  → сторож партии сбоил (квитанция уйдёт прежней)")
     _tok = _svc_undo_remember(chat_id, topic_id, bike, plate, confirmed_by, odo_int,
                               undo_pos, undo_blind)
     if _tok:
@@ -6871,7 +7068,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         _pend_peek = _PENDING_WORKS.get((chat_id, topic_id))
         if _pend_peek:
             _learn_works_th(claude, _pend_peek.get("works", []))
-        _logged_works += _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, str(km_now), _msg_date)
+        # ДВЕРЬ 3 (пробег назван В ЭТОМ сообщении) — та же единая логика выгрузки, что у кнопки и фазы 2.
+        _fl_written, _ = _km_door(bridge, chat_id, topic_id, bike, str(km_now),
+                                  source="пробег в сообщении", msg_date=_msg_date)
+        _logged_works += _fl_written
 
     _ev_r = None
     if info_works:
@@ -6882,11 +7082,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             _logged_works += _write_info_works(bridge, group_name, topic_id, bike, info_works,
                                                str(km_now), _ev_msg_id, _msg_date, chat_id=chat_id)
         else:
-            # Пробега нет → буферизуем перечень; запишем при приходе пробега (flush). Ниже уйдёт переспрос.
-            _PENDING_WORKS[(chat_id, topic_id)] = {
-                "works": info_works, "bike": bike, "msg_id_base": _ev_msg_id, "ts": _time.time(),
-            }
-            log.info(f"  → инфо-работы отложены до пробега: {info_works} (тема {topic_id})")
+            # Пробега нет → ДОПИСЫВАЕМ перечень в буфер (не замещаем: класс 22.08 — вторая партия
+            # темы стирала первую молча); запишем при приходе пробега (flush). Ниже уйдёт переспрос.
+            _pw_all = _pw_add(chat_id, topic_id, info_works, bike, _ev_msg_id)
+            log.info(f"  → инфо-работы отложены до пробега: {info_works} (тема {topic_id})"
+                     + (f" | в буфере всего {len(_pw_all)}: {_pw_all}" if len(_pw_all) > len(info_works) else ""))
     else:
         # Нет инфо-работ — обычное событие сообщения (фото/возврат/топливо/только колоночные) пишем как раньше.
         # OCR-дыра (задача 383, гейт 06c1ab2): сырой vision-пробег до подтверждения человеком НЕ пишем

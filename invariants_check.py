@@ -1395,6 +1395,38 @@ def check_episode_end_pure(world, run):
         run.flag(f"episode_end.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12ц: WORKS_LEDGER_PURE
+#  Сторож партии работ (works_ledger.py, 22.08.2026) отвечает на один вопрос: сколько позиций
+#  партия ПРИНЯЛА, сколько ЛЕГЛО и как назвать каждую потерю на обоих языках. Он обязан быть слеп
+#  к миру ровно потому, ради чего написан: появись у него мост — он спросил бы судьбу записи САМ,
+#  и «записано» снова зависело бы от того, КАК спросили, а не от того, что ответил лист; появись
+#  отправка — рядом с квитанцией завёлся бы второй путь наружу, и половины поехали бы врозь
+#  (класс 14.08, `service_receipt`). ИМПОРТОВ НОЛЬ: списки, причины и имена приносят руки
+#  (`splinter._sp_ledger_note`).
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_WORKS_LEDGER_PATH = None       # подменяется САМОТЕСТОМ; None → боевой works_ledger.py в репо
+
+
+@register("WORKS_LEDGER_PURE")
+def check_works_ledger_pure(world, run):
+    path = _WORKS_LEDGER_PATH or os.path.join(REPO, "works_ledger.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("works_ledger.py", f"сторож партии не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("works_ledger.py", f"сторож партии не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"works_ledger.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")
