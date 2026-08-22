@@ -3,6 +3,11 @@
 import os, sys, json, asyncio, datetime, types
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
+# Предмет этого сьюта — поведение веток ДО замка повторов (22.08.2026): сценарии гоняют ОДИН и
+# тот же байк с ОДНИМ и тем же состоянием подряд, и живой замок законно счёл бы их повторами.
+# Изоляция принудительная (не setdefault): иначе флаг приезжает из боевого .env процесса.
+# Тот же приём, что у CURATOR / PLAN_ADAPT / CARD_DUTY / ASK_DEDUP.
+os.environ["HINTS_DEDUP"] = "0"
 import splinter as S
 
 CHAT = -1002751134848

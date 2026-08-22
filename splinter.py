@@ -31,6 +31,7 @@ import odo_ceiling     # верхняя граница пробега при з�
 import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
 import work_name       # история обслуживания: слова механика — человеку, ярлык вида — расчётам
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
+import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 14 мест
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -646,6 +647,103 @@ async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False, reply_
 # не повторять чаще раза в 10 мин на тему. {(chat_id, topic_id): ts}. Волатильный — ок для троттлинга.
 _ODOMETER_ASK_TS = {}
 _ODOMETER_ASK_COOLDOWN = 600   # сек
+
+# ============================================================================================
+#  ЗАМОК ПОВТОРНЫХ ПОДСКАЗОК — РУКИ (решение живёт в hint_dedup.py, импортов там ноль)
+# ============================================================================================
+#  ОДНА дверь `_hint_send` на ВСЕ 14 мест переписи 22.08.2026 — не 14 заплат. Правило одно:
+#  та же подсказка по тому же байку не уходит второй раз, пока не изменилось СОСТОЯНИЕ,
+#  её породившее; долго держащееся состояние даёт право на повтор через `_HINT_REPEAT_H`
+#  (24 ч — число выведено из корпуса, обоснование в докстринге hint_dedup).
+#
+#  ПРЕЖНИЕ ТРОТТЛЫ НЕ ТРОНУТЫ: `_should_ask_odometer` (10 мин), `_sp_ask_ok` (90 с),
+#  `_SP_LAST_SENT`/`last_reminded_at` (6 ч), закреп ТО (5 суток) живут как жили. Замок стоит
+#  ПОВЕРХ них и умеет РОВНО одно — не повторять; разрешить он не умеет физически.
+#
+#  ПАМЯТЬ НА ДИСКЕ, а не только в процессе: splinter за окно переписи перезапускался 126 раз
+#  (≈2 раза в сутки), а у половины видов своей персистентной защиты нет вовсе — держи замок
+#  только в памяти, и каждый рестарт открывал бы повтору дверь. Файл свой, рабочих таблиц и
+#  зеркала «обслуживание» не касается.
+#  Путь памяти переопределяется `HINT_DEDUP_STATE` — чтобы прогон тестов НИКОГДА не писал в
+#  боевое состояние. Класс известен этому репозиторию: в боевом `wallet_cache.json` однажды
+#  лежала фикстура `tests/test_deposit_link.py`, попадавшая туда на каждом прогоне гейта.
+_HINT_STATE_PATH = os.getenv("HINT_DEDUP_STATE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hint_dedup_state.json")
+_HINT_SEEN = None               # кэш в памяти процесса; None = ещё не читали с диска
+
+#  «Повтор подавлен» — ОТДЕЛЬНЫЙ ответ, а не None. Это не эстетика: `_send` вправе вернуть что
+#  угодно, включая None (так делает любой мок), и если бы подавление опознавалось по None, то
+#  подавлением считалась бы ЛЮБАЯ отправка, ничего не вернувшая. Живой случай поймал сьют
+#  tests/test_service_pending.py: у висяка отметка `_SP_LAST_SENT` после такого «подавления» не
+#  ставилась вовсе — то есть замок повторов МОЛЧА ломал прежний троттл 6 ч и давал ДВА
+#  напоминания вместо одного. Разводим по существу: подавил замок — свой ответ, и только он.
+HINT_SKIPPED = object()
+
+
+def _hint_enabled() -> bool:
+    """Ручка отката: HINTS_DEDUP=0 в .env + рестарт splinter → путь байт-в-байт прежний."""
+    return str(os.getenv("HINTS_DEDUP", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _hint_repeat_h() -> float:
+    """Право на повтор при долго держащемся состоянии, часы. 0 → замок повторов не держит."""
+    try:
+        return float(os.getenv("HINT_REPEAT_H", hint_dedup.REPEAT_H_DEFAULT))
+    except (TypeError, ValueError):
+        return hint_dedup.REPEAT_H_DEFAULT
+
+
+def _hint_load():
+    """Память замка с диска. Любая беда → пустая память, то есть подсказка снова «первая»
+    (направление сомнения — В ОТПРАВКУ: замолчать по незнанию нельзя)."""
+    global _HINT_SEEN
+    if _HINT_SEEN is None:
+        try:
+            with open(_HINT_STATE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            _HINT_SEEN = data if isinstance(data, dict) else {}
+        except Exception:
+            _HINT_SEEN = {}
+    return _HINT_SEEN
+
+
+def _hint_save():
+    """Запись памяти замка. Не удалась → факт отправки не запомнен; хуже лишней подсказки
+    ничего не случится (сбой в сторону разговорчивости, а не молчания)."""
+    try:
+        with open(_HINT_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_HINT_SEEN or {}, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning(f"  → память замка подсказок не записалась: {e}")
+
+
+async def _hint_send(context, *, kind, bike, state, chat_id, topic_id, text, **kw):
+    """ЕДИНАЯ ДВЕРЬ ПОДСКАЗКИ. Спрашивает замок ДО отправки, запоминает факт ПОСЛЕ неё —
+    упавшая отправка подсказку не тратит. Возвращает то же, что `_send`, либо `HINT_SKIPPED`,
+    если повтор подавлен (место отправки обязано это учесть: подавлено = сообщения НЕТ)."""
+    global _HINT_SEEN
+    if not _hint_enabled():
+        # Ручка отката гасит ветку ДО чтения памяти: ни файла, ни решения — путь байт-в-байт
+        # прежний. Это же и держит прогон тестов подальше от боевого состояния.
+        return await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id, **kw)
+    seen = _hint_load()
+    now = _time.time()
+    v = hint_dedup.verdict(kind, bike, state, seen.get(hint_dedup.key(chat_id, topic_id, bike, kind)),
+                           now, chat_id=chat_id, topic_id=topic_id,
+                           repeat_h=_hint_repeat_h())     # выключенная ветка ушла выше, до памяти
+    if not v["send"]:
+        _age = f"{v['age_h']:.1f}ч" if v.get("age_h") is not None else "?"
+        log.info(f"  🔁 подсказка {kind} ПОДАВЛЕНА (замок повторов): {v['why']}, прошло {_age} "
+                 f"< {_hint_repeat_h():.0f}ч · байк={bike or '—'} тема={topic_id or '—'}")
+        return HINT_SKIPPED
+    sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id, **kw)
+    if v["key"]:
+        seen[v["key"]] = {"fp": v["fp"], "ts": now}
+        _HINT_SEEN = hint_dedup.prune(seen, now)
+        _hint_save()
+    log.info(f"  ✅ подсказка {kind} отправлена ({v['why']}) · байк={bike or '—'}")
+    return sent
+
 
 # Трекер «бот ждёт ответа»: (chat_id, topic_id) -> время вопроса бота.
 # Если бот недавно задал вопрос в теме — следующее сообщение владельца/Пыма
@@ -3429,16 +3527,20 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
     ])
     b_th = f" ({bike})" if bike else ""
     b_ru = f" по {bike}" if bike else ""
-    sent = await _send(
-        context,
-        chat_id=chat_id,
+    # ЗАМОК ПОВТОРОВ (вид L). Состояние = САМО РАСПОЗНАННОЕ ЧИСЛО: другая цифра — другой
+    # вопрос, он уходит снова; та же цифра, снятая с фото второй раз, — повтор.
+    # `_PENDING_MILEAGE`/`mark_awaiting` выставлены ВЫШЕ и замком не трогаются: ответ «да»
+    # или числом работает и на подавленном повторе (вопрос-то уже стоял).
+    sent = await _hint_send(
+        context, kind="L", bike=bike, state=("mileage_confirm", mileage),
+        chat_id=chat_id, topic_id=topic_id,
         text=(f"🐀 Splinter\n"
               f"🇹🇭 อ่านเลขไมล์ได้ {mileage} กม.{b_th} ถูกต้องไหมครับ? กดปุ่ม «ใช่» หรือส่งเลขที่ถูกต้อง 🙏\n"
               f"🇷🇺 📟 Вижу пробег {mileage} км{b_ru} (с фото). Верно? Нажми «Да» или пришли правильное число 🙏"),
-        message_thread_id=topic_id,
         reply_markup=kb,
     )
-    _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
+    if sent is not HINT_SKIPPED:
+        _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
 
 
 async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
@@ -3994,9 +4096,15 @@ async def _ask_oil_or_km(context, chat_id, topic_id, bike, km, status, next_km, 
         [InlineKeyboardButton("🔧 หลังเปลี่ยนน้ำมัน / После замены", callback_data=f"svc:oil:{tok}")],
         [InlineKeyboardButton("📷 แค่เลขไมล์ / Просто пробег", callback_data=f"svc:km:{tok}")],
     ])
-    sent = await _send(context, chat_id=chat_id, text=msg_oil_or_km(bike, km),
-                       message_thread_id=topic_id, reply_markup=kb)
-    _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
+    # ЗАМОК ПОВТОРОВ (вид H). Состояние = ВЕРДИКТ ТО (статус + следующий порог), а НЕ текущий
+    # пробег: он ползёт с каждой поездкой и делал бы вопрос «новым» на каждом фото приборки.
+    # Заменили масло → next_km прыгнул → состояние другое → вопрос снова законен.
+    sent = await _hint_send(context, kind="H", bike=bike,
+                            state=("oil_or_km", status, next_km),
+                            chat_id=chat_id, topic_id=topic_id,
+                            text=msg_oil_or_km(bike, km), reply_markup=kb)
+    if sent is not HINT_SKIPPED:
+        _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
 
 
 async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_hint=False):
@@ -4363,7 +4471,20 @@ async def _pin_overdue_reminder(context, bridge, chat_id, topic_id, bike, km, ne
     canon = rec.get("bike") or bike
     text = msg_service_due(bike, stype, km, next_km, status)
     try:
-        sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id)
+        # ЗАМОК ПОВТОРОВ (вид E для масла, E2 для gear/abs/возд.фильтра). Состояние = ВЕРДИКТ
+        # регламента (тип + статус + следующий порог), а НЕ текущий пробег: он ползёт сам и
+        # выдавал бы просрочку за новый повод на каждом замере. ТО сделали → next_km прыгнул →
+        # состояние другое → напоминание законно снова.
+        # always_notify — ответ на КНОПКУ человека [Просто пробег]: спросили — отвечаем ВСЕГДА,
+        # замок сюда не лезет (повтор по просьбе повтором бота не является).
+        if always_notify:
+            sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id)
+        else:
+            sent = await _hint_send(context, kind=("E" if stype == "oil" else "E2"), bike=bike,
+                                    state=("service_due", stype, status, next_km),
+                                    chat_id=chat_id, topic_id=topic_id, text=text)
+            if sent is HINT_SKIPPED:
+                return      # повтор подавлен → сообщения НЕТ, значит и крепить нечего
         if need_remind or not pinned:   # крепим/обновляем ТОЛЬКО когда реально нужно
             if pinned:   # не копим: снимаем ПРОШЛЫЙ закреп перед новым
                 try:
@@ -6362,8 +6483,10 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
     bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
                                   declared=_sp_join(declared), done=_sp_join(done), status="ждёт_факт")
     if _sp_ask_ok(chat_id, topic_id):
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=msg_ask_odometer(bike, kinds=done))
+        # ЗАМОК ПОВТОРОВ (вид A3). Состояние = перечень сделанного по заявке из мозга.
+        await _hint_send(context, kind="A3", bike=bike, state=("e2b_ask_odo", done),
+                         chat_id=chat_id, topic_id=topic_id,
+                         text=msg_ask_odometer(bike, kinds=done))
     mark_awaiting(chat_id, topic_id)
     log.info(f"  → E2b-заявка без одометра: {bike} {kind} → ждёт_факт")
 
@@ -6532,8 +6655,13 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, status="ждёт_факт")
         if _sp_ask_ok(chat_id, topic_id):
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=msg_sp_ask_done(bike, declared))
+            # ЗАМОК ПОВТОРОВ (вид B). Состояние = сама заявка: перечень заявленного и статус.
+            # Механик дозаявил работу — состояние другое, переспрос уходит снова. Троттл 90 с
+            # (`_sp_ask_ok`) НЕ тронут и стоит выше.
+            await _hint_send(context, kind="B", bike=bike,
+                             state=("sp_ask_done", declared, "ждёт_факт"),
+                             chat_id=chat_id, topic_id=topic_id,
+                             text=msg_sp_ask_done(bike, declared))
             log.info("  → ТО фаза2: переспрос «что сделал»")
         else:
             log.info("  → ТО фаза2: переспрос «что сделал» ПОДАВЛЕН (троттл E4)")
@@ -6547,8 +6675,12 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, done=_sp_join(done), status="ждёт_факт")
         if _sp_ask_ok(chat_id, topic_id):
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=msg_ask_odometer(bike, kinds=(done or declared)))   # (b) текст по факту работ заявки
+            # ЗАМОК ПОВТОРОВ (вид A2). Состояние = что уже сделано по заявке: механик назвал
+            # ещё одну работу — состояние другое, переспрос уходит снова.
+            await _hint_send(context, kind="A2", bike=bike,
+                             state=("sp_ask_odo", (done or declared), "ждёт_факт"),
+                             chat_id=chat_id, topic_id=topic_id,
+                             text=msg_ask_odometer(bike, kinds=(done or declared)))   # (b) текст по факту работ заявки
             log.info("  → ТО фаза2: переспрос одометра")
         else:
             log.info("  → ТО фаза2: переспрос одометра ПОДАВЛЕН (троттл E4)")
@@ -6845,11 +6977,16 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
     except Exception:
         log.exception("  → B4 эскалация владельцу (notify) упала")
     try:
-        await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
-                    text=(f"🐀 Splinter · 📌 {bike}\n"
-                          f"🇹🇭 ⚠️ งานเซอร์วิส ({_sp_labels_th(declared)}) ค้างนาน {age_th} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
-                          f"{_SEP}\n"
-                          f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_ru} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
+        # ЗАМОК ПОВТОРОВ (вид G) — только на сообщение В ТЕМУ БАЙКА. Алерт владельцу (notify
+        # выше) и пометка note=escalated замком НЕ трогаются: класс — подсказки в темах.
+        # Состояние = сама заявка (рождение + перечень); возраст в состояние не входит.
+        await _hint_send(context, kind="G", bike=bike,
+                         state=("sp_escalate", declared),
+                         chat_id=int(chat_id), topic_id=(int(topic_id) if topic_id else None),
+                         text=(f"🐀 Splinter · 📌 {bike}\n"
+                               f"🇹🇭 ⚠️ งานเซอร์วิส ({_sp_labels_th(declared)}) ค้างนาน {age_th} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
+                               f"{_SEP}\n"
+                               f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_ru} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
     except Exception:
         log.exception(f"  → B4 эскалация в тему {bike} упала")
     try:
@@ -6899,11 +7036,23 @@ async def scheduled_service_pending_reminder(context, bridge):
             except Exception:
                 pass
         try:
-            await _send(context, chat_id=int(chat_id), message_thread_id=(int(topic_id) if topic_id else None),
-                        text=(f"🐀 Splinter · 📌 {bike}\n"
-                              f"🇹🇭 ⏳ {bike} แจ้งเข้าเซอร์วิส ({_sp_labels_th(declared)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
-                              f"{_SEP}\n"
-                              f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(declared)}), результат не отписан — закончили?"))
+            # ЗАМОК ПОВТОРОВ (вид F) — ЗДЕСЬ ОН И РЕШАЕТ КЛАСС. Состояние = САМА ЗАЯВКА: когда
+            # родилась, в каком статусе, что заявлено. Возраст и номер попытки состоянием НЕ
+            # являются — на них и держались серии ×6/×6/×5 (за все три статус не менялся ни
+            # разу: 'ждёт_факт' от первой отправки до последней). Механик дозаявил работу или
+            # заявка сменила статус → состояние другое → напоминание уходит снова; заявку
+            # закрыли и открыли новую → другое рождение → тоже снова (живой случай NMAX 9548
+            # 14.08: возраст сбросился 23.0 ч → 6.4 ч — это ВТОРАЯ заявка, а не повтор первой).
+            # Троттл 6 ч и TTL 48 ч НЕ тронуты и стоят выше — замок лишь режет ПОВТОР ТЕКСТА.
+            if await _hint_send(context, kind="F", bike=bike,
+                                state=("sp_stuck", it.get("created_at"), status, declared),
+                                chat_id=int(chat_id),
+                                topic_id=(int(topic_id) if topic_id else None),
+                                text=(f"🐀 Splinter · 📌 {bike}\n"
+                                      f"🇹🇭 ⏳ {bike} แจ้งเข้าเซอร์วิส ({_sp_labels_th(declared)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
+                                      f"{_SEP}\n"
+                                      f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(declared)}), результат не отписан — закончили?")) is HINT_SKIPPED:
+                continue        # повтор подавлен → ни отметки времени, ни записи в заявку
             _SP_LAST_SENT[_k] = now
             bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
                                           last_reminded_at=__import__("datetime").datetime.now(
@@ -7213,8 +7362,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         # RU — основа (с конкретикой повреждения + депозит), TH = точный перевод этого RU (вариант 1).
         _ru_dmg = (f"⚠️ {PYM_HANDLE}, на фото повреждения: {vis['damage']} — глянь. "
                    f"Если это возврат — посмотри по депозиту 🙏")
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=bilingual_from_ru(claude, _ru_dmg))
+        # ЗАМОК ПОВТОРОВ (вид J). Состояние = ЧТО назвал vision: другое повреждение — другое
+        # состояние, подсказка уходит снова; тот же скол, снятый второй раз, — повтор.
+        await _hint_send(context, kind="J", bike=bike, state=("damage", vis["damage"]),
+                         chat_id=chat_id, topic_id=topic_id,
+                         text=bilingual_from_ru(claude, _ru_dmg))
         return
 
     # === Пояснение работ ТЕКСТОМ без свежего пробега В ЭТОМ сообщении ===
@@ -7254,8 +7406,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                     log.info(f"  → работы группы B без пробега → то_заявка ждёт_факт: {_bkinds} ({bike})")
                 except Exception:
                     log.exception("  → заявка на работы группы B (без пробега) упала")
-        await _send(context, chat_id=chat_id,
-                    text=msg_work_receipt(bike, works), message_thread_id=topic_id)
+        # ЗАМОК ПОВТОРОВ (вид I). Состояние = ПЕРЕЧЕНЬ работ: назвали другие работы — другое
+        # состояние, квитанция уходит снова; тот же перечень второй раз — повтор.
+        await _hint_send(context, kind="I", bike=bike, state=("works", works),
+                         chat_id=chat_id, topic_id=topic_id, text=msg_work_receipt(bike, works))
         return
 
     # Масло-контекст, но БЕЗ чёткого пробега в ЭТОМ сообщении → САМ просим ЧЁТКОЕ фото одометра.
@@ -7263,10 +7417,14 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Ничего в ТО не пишем, число не выдумываем. Анти-спам: буфер high-пробега + троттлинг.
     no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
     if _is_oil_context(text, vis) and no_clear_km and _should_ask_odometer(chat_id, topic_id):
-        sent = await _send(context,
-            chat_id=chat_id, text=msg_ask_odometer(bike, kinds=["oil"]), message_thread_id=topic_id  # (b) масло по факту oil-контекста
-        )
-        _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос
+        # ЗАМОК ПОВТОРОВ (вид A1). Состояние = «просим одометр под масло, чёткого пробега нет».
+        # Пришёл пробег — ветка не срабатывает вовсе; не пришёл — просить второй раз за сутки
+        # нечего. Кулдаун 10 мин (`_should_ask_odometer`) НЕ тронут и стоит выше.
+        sent = await _hint_send(context, kind="A1", bike=bike, state=("ask_odo", "oil"),
+                                chat_id=chat_id, topic_id=topic_id,
+                                text=msg_ask_odometer(bike, kinds=["oil"]))  # (b) масло по факту oil-контекста
+        if sent is not HINT_SKIPPED:
+            _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос
         return
 
     # Только ГРЯЗЬ (без повреждений) → мягко просим помыть/обработать. Пыма НЕ тегаем.
@@ -7278,20 +7436,22 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                     or _svc_question_open(chat_id, topic_id))
     # HANDOVER: байк выдаётся клиенту — совет «помыть/воск/чехол» (стоянка) неуместен → гасим.
     if vis.get("dirt") and not _service_ctx and not _ho_ctx:
-        await _send(context,
-            chat_id=chat_id,
-            text=msg_dirty_care(bike),
-            message_thread_id=topic_id,
-        )
+        # ЗАМОК ПОВТОРОВ (вид C). Состояние = вердикт vision о грязи. Пока байк числится
+        # грязным, состояние не меняется — совет «помыть» второй раз за сутки ничего не
+        # сообщает; помыли (dirt отпал) — ветка не срабатывает вовсе, замок тут ни при чём.
+        await _hint_send(context, kind="C", bike=bike, state=("dirt", vis.get("dirt")),
+                         chat_id=chat_id, topic_id=topic_id, text=msg_dirty_care(bike))
         return
 
     # Возврат без топлива/пробега → напоминаем фото. НЕ при handover (выдача — свой флоу) и НЕ если
     # пробег темы уже свежий в буфере (бот уже видел одометр — не нудим повторно).
     if (event_type in ("return", "handover") and (not fuel or not mileage)
             and not _ho_ctx and not last_mileage_in_topic(chat_id, topic_id)):
-        await _send(context,
-            chat_id=chat_id, text=msg_photo_reminder(bike), message_thread_id=topic_id
-        )
+        # ЗАМОК ПОВТОРОВ (вид D). Состояние = вид события И ЧЕГО не хватает: пришло топливо,
+        # но не пробег — состояние другое, напоминание уходит снова.
+        await _hint_send(context, kind="D", bike=bike,
+                         state=("no_photo", event_type, bool(fuel), bool(mileage)),
+                         chat_id=chat_id, topic_id=topic_id, text=msg_photo_reminder(bike))
 
 
 def msg_mileage_ok(bike, km, next_km, km_left):

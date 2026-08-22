@@ -60,6 +60,8 @@ chain_series.json
 chain_cards.jsonl
 # реестр заданных вопросов: дедуп между дверьми одобрения, состояние а не код (22.08.2026)
 ask_ledger.json
+# память замка повторных подсказок: байк × вид × состояние (рантайм splinter, 22.08.2026)
+hint_dedup_state.json
 _pcport185
 # scratch / throwaway
 _*.py

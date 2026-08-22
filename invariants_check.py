@@ -1047,6 +1047,7 @@ def check_card_deadline_pure(world, run):
 # --------------------------------------------------------------------------------------------
 _EXPECT_JOURNAL_PATH = None     # подменяется САМОТЕСТОМ; None → боевой expect_journal.py в репо
 _ASK_LEDGER_PATH = None         # подменяется САМОТЕСТОМ; None → боевой ask_ledger.py в репо
+_HINT_DEDUP_PATH = None         # подменяется САМОТЕСТОМ; None → боевой hint_dedup.py в репо
 
 
 # --------------------------------------------------------------------------------------------
@@ -1611,6 +1612,35 @@ def check_ask_ledger_pure(world, run):
         return
     for where, why in findings:
         run.flag(f"ask_ledger.py:{where}", why)
+
+
+@register("HINT_DEDUP_PURE")
+def check_hint_dedup_pure(world, run):
+    """ИНВАРИАНТ 12ц: HINT_DEDUP_PURE.
+
+    Замок повторных подсказок (hint_dedup.py, 22.08.2026) стоит ПЕРЕД каждой из 14 дверей,
+    которыми Splinter сам говорит человеку в тему байка, и умеет ровно одно — не повторять.
+    Инструментов у такого решения быть не должно НИКАКИХ: импортов НОЛЬ. Узнай оно время
+    само — и «прошли ли сутки» перестало бы зависеть от того такта, который его спросил;
+    получи оно диск — решение о МОЛЧАНИИ само бы это молчание и хранило, мимо рук; получи
+    оно мост — «изменилось ли состояние» зависело бы от того, КАК замок спросил заявку, а не
+    от той заявки, по которой идёт подсказка. Руки живут отдельно, в `splinter._hint_send`,
+    и их проверяет tests/test_hint_dedup.py.
+    FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет."""
+    path = _HINT_DEDUP_PATH or os.path.join(REPO, "hint_dedup.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("hint_dedup.py", f"замок повторов не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("hint_dedup.py", f"замок повторов не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"hint_dedup.py:{where}", why)
 
 
 @register("SHADOW_RULE_PURE")

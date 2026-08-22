@@ -4,6 +4,11 @@
 import os, sys, json, asyncio, datetime
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
+# Предмет этого сьюта — поведение фазы 2 ДО замка повторов (22.08.2026): сценарии гоняют ОДИН
+# байк с ОДНИМ состоянием заявки подряд, и живой замок законно счёл бы их повторами (троттл E4
+# при этом остаётся предметом проверки и не тронут). Изоляция принудительная — иначе флаг
+# приезжает из боевого .env процесса. Приём тот же, что у CURATOR / PLAN_ADAPT / CARD_DUTY.
+os.environ["HINTS_DEDUP"] = "0"
 import splinter as S
 
 CHAT = -1002751134848
