@@ -424,7 +424,7 @@ class HandsEndToEnd(unittest.TestCase):
         os.environ["HINT_DEDUP_STATE"] = cls.state
         import splinter
         cls.S = splinter
-        cls.S._HINT_STATE_PATH = cls.state          # модуль мог загрузиться до подмены env
+        # путь считается на КАЖДОМ зове, поэтому подмены env довольно
 
     @classmethod
     def tearDownClass(cls):
@@ -504,13 +504,39 @@ class HandsEndToEnd(unittest.TestCase):
         self.ctx.bot = good
         self.assertIsNot(self.door("C", st), self.S.HINT_SKIPPED, "после падения подсказка обязана уйти")
 
+    def test_test_run_marker_alone_diverts_the_path(self):
+        """Даже БЕЗ явной подмены пути прогон тестов в боевой файл не пишет: путь судит признак
+        прогона теми же четырьмя именами, что и гард. Изоляция сьютов по одному была бы игрой
+        в догонялки — новый сьют открыл бы дыру снова (так и случилось на первом полном гейте:
+        в боевом файле оказались РЕАЛЬНЫЕ байки 4957/4248/4724/6334 из легаси-фикстур)."""
+        live = os.path.abspath(os.path.join(REPO, "hint_dedup_state.json"))
+        saved = os.environ.pop("HINT_DEDUP_STATE", None)
+        try:
+            for mark in self.S._HINT_TEST_MARKS:
+                had = os.environ.get(mark)
+                os.environ[mark] = "1"
+                try:
+                    got = os.path.abspath(self.S._hint_state_path())
+                    self.assertNotEqual(got, live,
+                                        f"признака {mark} довольно, чтобы увести память из боевого файла")
+                    self.assertIn(str(os.getpid()), got,
+                                  "файл прогона — СВОЙ НА ПРОЦЕСС: общее имя течёт между прогонами гейта")
+                finally:
+                    if had is None:
+                        os.environ.pop(mark, None)
+                    else:
+                        os.environ[mark] = had
+        finally:
+            if saved is not None:
+                os.environ["HINT_DEDUP_STATE"] = saved
+
     def test_never_touches_the_live_state_file(self):
         live = os.path.join(REPO, "hint_dedup_state.json")
         before = os.path.getmtime(live) if os.path.exists(live) else None
         self.door("C", ("dirt", True))
         after = os.path.getmtime(live) if os.path.exists(live) else None
         self.assertEqual(before, after, "прогон теста НЕ смеет писать в боевое состояние")
-        self.assertNotEqual(os.path.abspath(self.S._HINT_STATE_PATH), os.path.abspath(live))
+        self.assertNotEqual(os.path.abspath(self.S._hint_state_path()), os.path.abspath(live))
 
 
 # --------------------------------------------------------------------------- (8) чистота
