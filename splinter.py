@@ -1912,6 +1912,7 @@ _WORK_STEMS = (
     ("подшип", "подшипник"), ("bearing", "подшипник"), ("ลูกปืน", "подшипник"),
     ("цеп", "цепь"), ("chain", "цепь"), ("โซ่", "цепь"),
     ("вилк", "вилка"),
+    ("покрышк", "шина"), ("tyre", "шина"), ("tire", "шина"), ("ยาง", "шина"),
     ("воздушн", "воздфильтр"),
     ("редуктор", "редуктор"), ("gear", "редуктор"),
     ("фильтр", "фильтр"),
@@ -1920,9 +1921,17 @@ _WORK_STEMS = (
 )
 
 
+#: ШИНА судится ГРАНИЦЕЙ СЛОВА, а не подстрокой (23.08.2026). Подстрока «шин» живёт внутри
+#: «маШИНа»/«маШИНы», и простой `"шин" in s` сделал бы мойку машины заменой шины. `\bшин` этого
+#: не может физически: в «машина» перед «шин» стоит буква, границы слова там нет.
+_TYRE_RE = r"\bшин|покрышк|\btyre\b|\btire\b|ยาง"
+
+
 def _work_stem(w):
     """Стабильный стем работы (ключ дедупа по контенту). Известные → канонический ключ; иначе — нормализованный текст."""
     s = str(w).lower()
+    if _re_pl.search(_TYRE_RE, s):
+        return "шина"
     for kw, stem in _WORK_STEMS:
         if kw in s:
             return stem
@@ -2405,7 +2414,7 @@ async def _send_bike_card(context, bridge, chat_id, topic_id, bike):
 
 
 def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id_base, msg_date="",
-                      chat_id=None, failed_out=None):
+                      chat_id=None, failed_out=None, sender=""):
     """Вариант A (разбор перечня по адресам): КАЖДУЮ инфо-работу — отдельной строкой в «события»
     с привязкой пробега. msg_id = info:{plate}:{стем-работы}:{км} (КОНТЕНТНЫЙ ключ) → повторный прогон той
     же работы на том же км дедупится Bridge'ом. Колоночные работы сюда НЕ попадают — у них свой адрес.
@@ -2422,8 +2431,16 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
         # msg_id_base (per-сообщение) больше НЕ используем — он плодил новое событие на каждый прогон.
         mid = f"info:{plate}:{keys.get(w) or _work_key(w)}:{km or '-'}"
         try:
+            # `sender` дописывается ТОЛЬКО когда он назван: пустой не передаётся вовсе, поэтому
+            # дверь буфера (она зовёт без него) остаётся байт-в-байт прежней.
+            # `msg_id=` остаётся ЯВНЫМ аргументом, а через `**` едет только необязательный
+            # `sender`: страж `tests/test_event_key.py` считает ЖИВЫЕ вызовы с явным ключом
+            # (`explicit >= 6`) — свернуть ключ в словарь значило бы спрятать его от стража,
+            # то есть ослабить проверку, не ослабив инварианта. Лечится путём, а не правкой теста.
+            _extra = {"sender": str(sender)} if sender else {}
             r = bridge.add_event(msg_date=msg_date, group=grp, bike=bike, event_type="repair",
-                                 fuel="", mileage=str(km or ""), photos=0, notes=note, msg_id=mid) or {}
+                                 fuel="", mileage=str(km or ""), photos=0, notes=note,
+                                 msg_id=mid, **_extra) or {}
         except Exception:
             log.exception(f"  → инфо-работа «{note}»: add_event упал")
             r = {"ok": False, "error": "exception"}
@@ -6344,6 +6361,7 @@ _SP_KIND_LABEL = {
     "filter": ("ไส้กรองน้ำมัน", "масляный фильтр"),
     "pads": ("ผ้าเบรก", "тормозные колодки"),
     "chain": ("โซ่", "цепь"),
+    "tyre": ("ยาง", "шина"),
     "other": ("งานอื่น ๆ", "прочие работы"),
 }
 _SP_COL_KINDS = ("oil", "gear", "abs", "airfilter")   # пишутся в Лист1 (столбец); прочее — событийно
@@ -6511,6 +6529,11 @@ def _service_kind(w):
         return "pads"
     if any(k in s for k in ("цеп", "chain", "โซ่")):
         return "chain"
+    # ШИНА — ОТДЕЛЬНЫЙ ВИД (23.08.2026, решение владельца). До этого она сваливалась в «прочие
+    # работы» и теряла имя вида; регистра у неё нет и не заводится — её адрес ИСТОРИЯ байка.
+    # Граница слова обязательна: см. `_TYRE_RE` (иначе «машина» стала бы шиной).
+    if _re_pl.search(_TYRE_RE, s):
+        return "tyre"
     return "other"
 
 
@@ -7104,7 +7127,8 @@ def _svc_ledger_take(chat_id, topic_id):
     return _SVC_LEDGER.pop((chat_id, topic_id), None)
 
 
-def _sp_ledger_note(chat_id, topic_id, done, written, failed, info_written, info_lost):
+def _sp_ledger_note(chat_id, topic_id, done, written, failed, info_written, info_lost,
+                    expanded=()):
     """СТОРОЖ ПАРТИИ (класс 22.08.2026): принято N · записано M, и каждая потеря — поимённо.
 
     Считается ФАКТ, а не намерение: колоночная позиция засчитывается регистром только если она
@@ -7116,7 +7140,13 @@ def _sp_ledger_note(chat_id, topic_id, done, written, failed, info_written, info
         if isinstance(item, (tuple, list)) and len(item) >= 2:
             fail_why[str(item[0])] = str(item[1] or "")
     pos = []
+    _exp = set(expanded or ())
     for k in (done or []):
+        # Вид, разошедшийся на именованные работы, позицией НЕ считается — его позиции суть сами
+        # работы, и они уже пришли в `info_written`/`info_lost`. Иначе одна работа считалась бы
+        # дважды (как вид и как работа), а пятёрка работ — как одна позиция.
+        if k in _exp:
+            continue
         pair = _SP_KIND_LABEL.get(k) or (k, k)
         if k in (written or []):
             out = works_ledger.IN_REGISTER if k in _SP_COL_KINDS else works_ledger.AS_EVENT
@@ -7162,6 +7192,10 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     written, failed = [], []
     undo_pos, undo_blind = [], 0     # позиции отмены и сколько их осталось БЕЗ названного объекта
     said = works                     # слова механика; None = ещё не спрашивали (см. _sp_words_said)
+    # ПОЗИЦИИ ИСТОРИИ — по РАБОТЕ, а не по виду (23.08.2026). `expanded` перечисляет виды, которые
+    # разошлись на именованные работы: сторож обязан считать ИХ, а не вид целиком, иначе пятёрка
+    # работ дала бы «принято 1» и потеря четырёх осталась бы невидимой.
+    named_rows, named_lost, expanded = [], [], []
     for k in done:
         try:
             if k in _SP_COL_KINDS:
@@ -7228,14 +7262,52 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                 _on = _work_name_on()
                 if _on and said is None:
                     said = _sp_words_said(bridge, chat_id, topic_id, bike)
-                v = work_name.history_note(k, said, odo_int, _SP_KIND_LABEL, _service_kind, on=_on)
-                bridge.add_event(group="обслуживание" + (f" / тема {topic_id}" if topic_id else ""),
-                                 bike=bike, event_type="repair", mileage=str(odo_int),
-                                 notes=v["text"], sender=str(confirmed_by or ""),
-                                 msg_id=f"sp:{chat_id}:{topic_id}:{k}:{odo_int}")
-                log.info(f"  → история ТО {bike} вид={k}: «{v['text']}» "
-                         f"источник={v['source']} ({v['why']})")
-                written.append(k)
+                # СТРОКА НА КАЖДУЮ НАЗВАННУЮ РАБОТУ (23.08.2026, решение владельца). Прежде вид
+                # давал РОВНО ОДНУ строку: `work_name.history_note` склеивал все слова этого вида
+                # через `JOIN` («; ») в один `notes`, а ключ `sp:{chat}:{topic}:{вид}:{км}` был
+                # один на всю партию — пять работ вида «прочие» ложились ОДНОЙ строкой, и карточка
+                # показывала их одной работой (её `_SVC_HIST_RE` нежадный, берёт всё до « — »).
+                # Соседняя дверь того же класса (`_write_info_works`, выгрузка буфера) пишет строку
+                # на работу с 29.07 — здесь зовётся ОНА ЖЕ, чтобы двум путям истории было негде
+                # разойтись (класс «две зеркальные течи», ENV_PLAYBOOK п.9). Ключ там КОНТЕНТНЫЙ
+                # (`info:{plate}:{ключ-работы}:{км}`), поэтому забор идемпотентности из шапки
+                # `work_name` цел: та же работа ДРУГИМИ словами даёт тот же `_work_key` → ту же
+                # строку, а РАЗНЫЕ работы — разные ключи → разные строки.
+                _mine = work_name.words_of(k, said, _service_kind) if _on else []
+                if _mine:
+                    _iw_fail = []
+                    try:
+                        import datetime as _dt
+                        _dnow = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+                    except Exception:
+                        _dnow = ""   # даты нет → строка всё равно ложится (у неё есть recorded_at)
+                    _iw_ok = _write_info_works(bridge, "обслуживание", topic_id, bike, _mine,
+                                               odo_int, "", msg_date=_dnow, chat_id=chat_id,
+                                               failed_out=_iw_fail,
+                                               sender=str(confirmed_by or ""))
+                    named_rows.extend(_iw_ok)
+                    named_lost.extend((w, "write_failed", d) for w, d in _iw_fail)
+                    expanded.append(k)
+                    log.info(f"  → история ТО {bike} вид={k}: строк {len(_iw_ok)} из "
+                             f"{len(_mine)} названных (работы: {_mine})")
+                    if _iw_ok:
+                        written.append(k)
+                    else:
+                        failed.append((k, "history_write_failed"))
+                else:
+                    # Слов этого вида механик не сказал вовсе (вид опознан сканом свободного
+                    # текста) — ярлык, БАЙТ-В-БАЙТ прежняя строка и прежний ключ. Ярлык здесь не
+                    # подменяет слова: подменять нечего, а «прочие работы» называют себя
+                    # КАТЕГОРИЕЙ и никого за название не выдают (см. шапку `work_name`).
+                    v = work_name.history_note(k, said, odo_int, _SP_KIND_LABEL, _service_kind,
+                                               on=_on)
+                    bridge.add_event(group="обслуживание" + (f" / тема {topic_id}" if topic_id else ""),
+                                     bike=bike, event_type="repair", mileage=str(odo_int),
+                                     notes=v["text"], sender=str(confirmed_by or ""),
+                                     msg_id=f"sp:{chat_id}:{topic_id}:{k}:{odo_int}")
+                    log.info(f"  → история ТО {bike} вид={k}: «{v['text']}» "
+                             f"источник={v['source']} ({v['why']})")
+                    written.append(k)
         except Exception:
             log.exception(f"  → ТО фаза2 запись {k} упала")
             failed.append((k, "exception"))
@@ -7246,8 +7318,12 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     _info_written, _info_lost = _km_door(bridge, chat_id, topic_id, bike, odo_int,
                                          source=f"фаза 2 ({confirmed_by or 'trusted'})")
     # СТОРОЖ ПАРТИИ: принято N · записано M. Расходятся — квитанция назовёт каждую потерю.
+    # Строки истории этой двери подмешиваются к работам буфера ТЕМ ЖЕ составом: у сторожа
+    # позиция — РАБОТА, и происхождение работы (буфер или прямая дверь) на счёт не влияет.
     try:
-        _sp_ledger_note(chat_id, topic_id, done, written, failed, _info_written, _info_lost)
+        _sp_ledger_note(chat_id, topic_id, done, written, failed,
+                        list(_info_written) + named_rows, list(_info_lost) + named_lost,
+                        expanded=expanded)
     except Exception:
         log.exception("  → сторож партии сбоил (квитанция уйдёт прежней)")
     _tok = _svc_undo_remember(chat_id, topic_id, bike, plate, confirmed_by, odo_int,
