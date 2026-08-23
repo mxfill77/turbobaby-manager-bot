@@ -24,7 +24,7 @@ class FakeBridge:
 
 SENDS=[]; SVC_COL=[]
 async def rec_send(context,*,chat_id,text,message_thread_id=None,**kw): SENDS.append(text)
-async def rec_svc(context,chat_id,topic_id,bike,kind,km): SVC_COL.append((kind,km))
+async def rec_svc(context,chat_id,topic_id,bike,kind,km,**kw): SVC_COL.append((kind,km))
 async def rec_after(context,bridge,chat_id,topic_id,bike,mileage,oil_hint=False): pass
 async def rec_conf(context,chat_id,topic_id,bike,km,oil_hint=False): pass
 async def rec_dl(pm): return b"img"

@@ -32,7 +32,7 @@ class FakeBridge:
 # ---- перехват исходящих ----
 SENDS = []; SVC_COL = []; AFTER_MIL = []; ASK_CONF = []
 async def rec_send(context, *, chat_id, text, message_thread_id=None, **kw): SENDS.append(text)
-async def rec_svc_col(context, chat_id, topic_id, bike, kind, km): SVC_COL.append((kind, km))
+async def rec_svc_col(context, chat_id, topic_id, bike, kind, km, **kw): SVC_COL.append((kind, km))
 async def rec_after(context, bridge, chat_id, topic_id, bike, mileage, oil_hint=False): AFTER_MIL.append(mileage)
 async def rec_conf(context, chat_id, topic_id, bike, km, oil_hint=False): ASK_CONF.append(km)
 async def rec_dl(pm): return None

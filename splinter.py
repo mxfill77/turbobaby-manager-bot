@@ -31,6 +31,7 @@ import odo_ceiling     # верхняя граница пробега при з�
 import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
 import work_name       # история обслуживания: слова механика — человеку, ярлык вида — расчётам
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
+import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
 import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 14 мест
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
@@ -4115,10 +4116,141 @@ def _run_service_tracker(bridge, chat_id, topic_id, bike, mileage):
             "km_left": res.get("km_left"), "stype": res.get("service_type", "oil")}
 
 
-async def _ask_oil_or_km(context, chat_id, topic_id, bike, km, status, next_km, km_left):
-    """Задать вопрос кнопками [После замены]/[Просто пробег] (фиксация через явный ответ)."""
+def _service_debt_on():
+    """Ветка жива? Ручка `SERVICE_DEBT` (.env). `0` → ни строки долга, ни своей ветки сторожа."""
+    return service_debt.enabled(_os.getenv(service_debt.FLAG_ENV))
+
+
+def _sp_debt_open(bridge, chat_id, topic_id, bike, kinds, km, door, oil_hint=False):
+    """ДОЛГ ЗАВОДИТСЯ ДО ПОКАЗА КНОПКИ — руки для ОБЕИХ кнопочных дверей (решение — `service_debt`).
+
+    Почему именно ДО, а не после нажатия: носителей у принятой работы было два, и оба нестойкие —
+    токен в памяти процесса (`_SVC_TOKENS`, рестарт стирает) и текст сообщения с кнопкой (его
+    удаляет `_clear_cycle_msgs` на терминале другого цикла). Строка листа переживает и то и другое,
+    поэтому она обязана появиться РАНЬШЕ, чем человек увидит кнопку: только так работа переживает
+    ненажатие. Доказанный случай — `tok=18` (NMAX 155 GREY 5960, 01.08: принято 2, записано 0).
+
+    FAIL-SAFE В СТОРОНУ КНОПКИ: мост молчит → строку не завели, но кнопку показываем как
+    показывали. Долг — это добавленная видимость, а не новый забор перед работой человека.
+    """
+    if not _service_debt_on() or not bike:
+        return None
+    # ПРИЁМ СУДИТСЯ ПЕРВЫМ, ДО ЕДИНОГО ОБРАЩЕНИЯ К МОСТУ: работа не принята (числа нет · замену
+    # никто не объявлял) → выходим здесь, и вопрос человеку не платит мосту ничего.
+    _ok, _why = service_debt.accepted(door, kinds, km, oil_hint=oil_hint)
+    if not _ok:
+        return None
+    try:
+        prev = _sp_open(bridge, chat_id, topic_id, bike) or {}
+    except Exception:
+        log.exception("  → долг ТО: открытую заявку не прочитать — сольём перечни без неё")
+        prev = {}
+    f = service_debt.open_fields(door, kinds, km, oil_hint=oil_hint,
+                                 prev_declared=_sp_split(prev.get("declared")),
+                                 prev_done=_sp_split(prev.get("done")))
+    if f is None:
+        return None
+    try:
+        r = bridge.service_pending_upsert(
+            chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+            declared=_sp_join(f["declared"]), done=_sp_join(f["done"]),
+            odometer=f["odometer"], status=f["status"])
+    except Exception:
+        log.exception(f"  → долг ТО {bike}: строка НЕ завелась (мост упал) — кнопку всё равно даём")
+        return None
+    if not (isinstance(r, dict) and r.get("ok")):
+        log.warning(f"  → долг ТО {bike}: строка НЕ завелась ({(r or {}).get('error')}) — "
+                    f"кнопку даём, но следа у работы нет")
+        return None
+    log.info(f"  → долг ТО заведён ДО кнопки: {bike} [{','.join(f['kinds'])}] "
+             f"{f['odometer']} км · дверь «{door}» · {f['why']}")
+    return f
+
+
+def _sp_debt_cell(bridge, bike, kinds, odometer):
+    """РУКИ признака «перечитанная клетка регистра»: сходить в Лист1 и принести ВЕЛИЧИНУ.
+
+    Своего суждения не выносит — сравнение `клетка ≥ долг` делает `service_debt.verdict`. Здесь
+    важно именно `≥`, а не `==` (`write_fact` требует равенства): владелец, записавший работу
+    рукой, кладёт СВОЁ число, обычно большее. Любая дырка → `read=False`, и записанным это НЕ
+    считается. Цену платит только строка, которая иначе будет ШУМЕТЬ, — вызов стоит за порогом
+    громкости, здоровый путь не платит ничего.
+    """
+    ks = [k for k in (kinds or []) if k in _SP_COL_KINDS]
+    if not ks:
+        return {"read": False, "km": None, "detail": "колоночных видов в долге нет — регистра нет"}
+    want = str(_plate_from_name(bike) or "")
+    if not want:
+        return {"read": False, "km": None, "detail": f"номер байка из «{bike}» не выделен"}
+    try:
+        fr = bridge.fleet(cells=True)
+    except Exception as e:
+        return {"read": False, "km": None, "detail": f"парк не прочитан ({e})"}
+    if not isinstance(fr, dict) or not fr.get("ok"):
+        return {"read": False, "km": None,
+                "detail": f"парк не прочитан (мост: {(fr or {}).get('error')})"}
+    rows = ((fr.get("data") or {}).get("bikes") or [])
+    hits = [b for b in rows if isinstance(b, dict) and _plate_from_name(b.get("name", "")) == want]
+    if len(hits) != 1:
+        return {"read": False, "km": None, "detail": f"строк парка по {want}: {len(hits)}"}
+    best = None
+    for k in ks:
+        field = write_fact.field_for(k)
+        if field is None:
+            continue
+        try:
+            cell = bridge.cell(hits[0], field)
+        except Exception as e:
+            return {"read": False, "km": None, "detail": f"клетка «{field}» не прочитана ({e})"}
+        if not getattr(cell, "ok", False):
+            say = getattr(cell, "say", None)
+            return {"read": False, "km": None,
+                    "detail": f"клетка «{field}»: {say() if callable(say) else 'не разобрана'}"}
+        got = service_debt._int(getattr(cell, "payload", None))
+        # Партия закрыта, только если КАЖДАЯ её колоночная позиция легла → берём слабейшую клетку.
+        if got is None:
+            return {"read": False, "km": None, "detail": f"клетка «{field}» без числа"}
+        best = got if best is None else min(best, got)
+    return {"read": True, "km": best, "detail": f"регистры {','.join(ks)} прочитаны"}
+
+
+def _sp_debt_close(bridge, chat_id, topic_id, bike, write=None, cell=None, human=None,
+                   odometer=None, kinds=()):
+    """ЗАКРЫТИЕ ДОЛГА — только по вердикту `service_debt.verdict`, то есть только по ДОКАЗАННОМУ.
+
+    ЗАМОК: не доказано — строка остаётся открытой, и молчать о ней нельзя. «Проверить не удалось»
+    закрытием не является; по таймеру не закрывается ничего и никогда (у `verdict` параметра
+    возраста нет вовсе)."""
+    if not _service_debt_on() or not bike:
+        return None
+    v = service_debt.verdict(write=write, cell=cell, human=human, odometer=odometer)
+    log.info("  → " + service_debt.line(v, bike, kinds))
+    if not v["closed"]:
+        return v
+    try:
+        bridge.service_pending_close(
+            chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+            note=f"долг закрыт: {v['by']} — {v['why']}"[:200])
+    except Exception:
+        log.exception(f"  → долг ТО {bike}: закрытие строки упало (долг остался открытым)")
+    return v
+
+
+async def _ask_oil_or_km(context, chat_id, topic_id, bike, km, status, next_km, km_left,
+                         oil_hint=False, bridge=None):
+    """Задать вопрос кнопками [После замены]/[Просто пробег] (фиксация через явный ответ).
+
+    ДОЛГ ЗАВОДИТСЯ ТОЛЬКО ПРИ `oil_hint`, и это ЗАМЕР, а не вкус: за 83 суток трекер отработал 129
+    раз, `due/overdue` вышло 55, а записей масла — 8. Заводи долг на каждом показе кнопки — и ≥47
+    строк висели бы по работе, которую НИКТО не заявлял (байку просто пришёл срок, человек прислал
+    фото приборки). Сторож, который держит всегда, не лучше того, который не держит никогда.
+    `oil_hint` = `_is_oil_done_marker` = человек СКАЗАЛ, что замена сделана, — вот это принятая
+    работа; сам срок ТО есть НАШ вопрос человеку, а не его заявка."""
+    _debt = (_sp_debt_open(bridge, chat_id, topic_id, bike, ["oil"], km,
+                           service_debt.DOOR_OIL, oil_hint=oil_hint) if bridge is not None else None)
     tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike or "", "km": str(km),
-                    "status": status, "next_km": next_km, "km_left": km_left})
+                    "status": status, "next_km": next_km, "km_left": km_left,
+                    "debt": bool(_debt)})
     # Кнопки в ДВА ряда, тайский ПЕРВЫМ (тайцы — основные в обслуживании; RU не теряется на узком экране).
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔧 หลังเปลี่ยนน้ำมัน / После замены", callback_data=f"svc:oil:{tok}")],
@@ -4146,7 +4278,8 @@ async def _after_mileage(context, bridge, chat_id, topic_id, bike, mileage, oil_
     _sp_owns = bool(_sp_open(bridge, chat_id, topic_id, bike))
     if (info["status"] in ("due", "overdue") or oil_hint) and not _sp_owns:
         await _ask_oil_or_km(context, chat_id, topic_id, bike, info["km"],
-                             info["status"], info["next_km"], info["km_left"])
+                             info["status"], info["next_km"], info["km_left"],
+                             oil_hint=oil_hint, bridge=bridge)
         # НЕ финал — задали вопрос [После замены]/[Просто пробег], цикл продолжается. Промежутки НЕ чистим.
     else:
         # ТО в норме = ТЕРМИНАЛ цикла. Масло → накопитель; ОДНА сводка (масло+история+столбцы) вместо
@@ -4279,6 +4412,10 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=
         # (то есть гасить кнопку прошлой, ЛЕГШЕЙ записи) ему не за что.
         _undo_tok = _svc_undo_remember_write(chat_id, topic_id, _canon or bike, plate,
                                              confirmed_by, km_int, "oil", res)
+        # ПРИЗНАК 1 ИЗ ТРЁХ — ДОКАЗАННАЯ ЗАПИСЬ (зеркало двери столбца, см. `_write_service_col`).
+        _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=["oil"], odometer=km_int,
+                       write={"landed": True, "known": True,
+                              "detail": f"oil = {km_int} км, расписка моста ok"})
         acc = _summary_acc(chat_id, topic_id)
         acc["current_km"] = str(km_int)
         acc["oil"] = {"km": km_int, "next": (km_int + _iv) if _iv else None, "status": "ok"}
@@ -4394,12 +4531,19 @@ _SVC_COL_LABEL = {
 }
 
 
-async def _ask_service_col(context, chat_id, topic_id, bike, kind, km):
+async def _ask_service_col(context, chat_id, topic_id, bike, kind, km, bridge=None):
     """Кнопка-фиксация регламента группы B (gear→J/abs→K/airfilter→L) в свой столбец Лист1.
-    Боевая запись — ТОЛЬКО доверенным (как масло). Пробег показываем в кнопке — человек сверяет."""
+    Боевая запись — ТОЛЬКО доверенным (как масло). Пробег показываем в кнопке — человек сверяет.
+
+    ДОЛГ ЗАВОДИТСЯ ДО КНОПКИ И БЕЗУСЛОВНО: сюда заходят только с НАЗВАННОЙ работой (`works`) и
+    числом — то есть работа уже принята, и вопрос лишь в том, ляжет ли она. У двери масла условие
+    строже (`oil_hint`), и разница объяснена в её шапке."""
     th_lbl, ru_lbl = _SVC_COL_LABEL.get(kind, (kind, kind))
+    _debt = (_sp_debt_open(bridge, chat_id, topic_id, bike, [kind], km,
+                           service_debt.DOOR_COL) if bridge is not None else None)
     tok = _svc_put({"kind": "svc_col", "chat": chat_id, "topic": topic_id,
-                    "bike": bike or "", "svc_kind": kind, "km": str(km)})
+                    "bike": bike or "", "svc_kind": kind, "km": str(km),
+                    "debt": bool(_debt)})
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ บันทึก {th_lbl} / Зафиксировать {ru_lbl}", callback_data=f"svc:col:{tok}")],
     ])
@@ -4438,6 +4582,11 @@ async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km)
         # Фаза 2: трекинг срока (зеркало масла). service_upsert сбрасывает цикл (next_km=km+интервал).
         # gear на мото/XADV (iv=None) — НЕ трекаем, но столбец записан (next в сводке тогда без срока).
         canon = res.get("bike_name", bike)
+        # ПРИЗНАК 1 ИЗ ТРЁХ — ДОКАЗАННАЯ ЗАПИСЬ. Долг гасит ОТВЕТ МИРА (расписка сказала `ok`), а
+        # не наше намерение записать: строка закрывается вердиктом `service_debt`, а не флагом.
+        _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=[kind], odometer=km_int,
+                       write={"landed": True, "known": True,
+                              "detail": f"{kind} = {km_int} км, расписка моста ok"})
         iv = _service_interval(kind, canon, bridge)
         _col_next = None
         if iv:
@@ -4732,6 +4881,15 @@ async def handle_service_button(update, context, bridge) -> None:
             km_int = int(str(km).replace(" ", ""))
         except (ValueError, TypeError):
             km_int = km
+        # ПРИЗНАК 3 ИЗ ТРЁХ — ЯВНОЕ РЕШЕНИЕ ЧЕЛОВЕКА. «Просто пробег» и означает «работы не было»:
+        # человек здесь авторитет, а не свидетель, доказательств сверх его слов не требуется.
+        # Зовём ТОЛЬКО если долг на этой двери заводился (`debt` в токене) — иначе платили бы мосту
+        # за закрытие несуществующей строки на каждом нажатии.
+        if data.get("debt"):
+            _uname = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "человек"
+            _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=["oil"], odometer=km_int,
+                           human={"decided": True, "who": _uname,
+                                  "detail": "нажато «Просто пробег» — замены не было"})
         if data.get("status") in ("due", "overdue"):
             # Просрочка/срок → ПОЛНОЕ напоминание-закреп (msg_service_due). Масло — в закрепе; в сводке
             # его НЕ дублируем (skip_oil), сводку шлём ТОЛЬКО если есть работы/столбцы.
@@ -7025,6 +7183,79 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
     log.info(f"  → ТО висяк ЭСКАЛАЦИЯ: {bike} age={age_ru} declared={declared} → владельцу+Пыму, тайцам стоп")
 
 
+async def _sp_debt_voice(context, bridge, it, now):
+    """СТОРОЖ ВИСЯКОВ — ВЕТКА ДОЛГА (`ждёт_подтверждения`): напоминание и эскалация по ВОЗРАСТУ.
+
+    ПОРЯДОК ЗДЕСЬ И ЕСТЬ ЗАМОК. Сначала спрашиваем, вправе ли мы вообще говорить (`voice` —
+    возраст), и только пройдя порог идём к миру за признаком 2 из трёх (перечитанная клетка
+    регистра). Оба шага в эту сторону безопасны: возраст НЕ закрывает долг ни в одной ветке —
+    `service_debt.voice` не умеет вернуть ни один из `CLOSERS` физически, — а клетка закрывает
+    его ПО ФАКТУ, а не по времени. Молчим ровно в двух случаях: порог не пройден (ещё рано) либо
+    запись ДОКАЗАНА (говорить не о чем). «Проверить не удалось» молчанием не является.
+
+    ЦЕНУ ПЛАТИТ ТОЛЬКО ШУМЯЩАЯ СТРОКА: чтение парка стоит за порогом громкости, поэтому здоровый
+    путь (долг моложе 6 ч, либо долгов нет вовсе) не платит мосту ни одного лишнего обращения."""
+    bike = it.get("bike", "")
+    chat_id = it.get("chat_id")
+    topic_id = it.get("topic_id") or None
+    declared = _sp_split(it.get("declared"))
+    done = _sp_split(it.get("done")) or declared
+    note = str(it.get("note") or "")
+    age_h = _sp_age_hours(it.get("created_at"), now)
+    v = service_debt.voice(service_debt.STATUS, age_h, escalated=("escalated" in note),
+                           remind_after_h=_SP_REMIND_AFTER_MIN / 60.0,
+                           max_age_h=_SP_REMIND_MAX_AGE_H)
+    if v["speak"] == service_debt.QUIET:
+        return
+    # ПРИЗНАК 2 ИЗ ТРЁХ — записали мимо бота (владелец рукой в Лист1). Спрашиваем ПЕРЕД тем как
+    # шуметь: кричать о работе, которая уже лежит в регистре, — тот же ложный сторож наоборот.
+    closed = _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=done,
+                            odometer=it.get("odometer"),
+                            cell=_sp_debt_cell(bridge, bike, done, it.get("odometer")))
+    if closed is not None and closed.get("closed"):
+        return
+    if v["speak"] == service_debt.ESCALATE:
+        await _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note)
+        return
+    # B5 + троттл `last_reminded_at` — те же, что у прежней ветки (персист между рестартами).
+    _k = (str(chat_id), str(topic_id or ""), bike)
+    if now - _SP_LAST_SENT.get(_k, 0) < _SP_REMIND_THROTTLE_MIN * 60:
+        return
+    lr = it.get("last_reminded_at")
+    if lr:
+        try:
+            import datetime as _dt
+            ts = _dt.datetime.fromisoformat(str(lr).replace("Z", "+00:00")).timestamp()
+            if (now - ts) / 60 < _SP_REMIND_THROTTLE_MIN:
+                return
+        except Exception:
+            pass
+    _age_ru = f"{int(age_h)}ч" if age_h is not None else "долго"
+    _age_th = f"{int(age_h)} ชม." if age_h is not None else "นาน"
+    # ЗАМОК ПОВТОРОВ (вид F, своё состояние). Текст адресован Пыму/владельцу и говорит «кнопка не
+    # нажата», а НЕ «отпишись»: механик уже отписался, гонять его по своей же работе незачем.
+    if await _hint_send(context, kind="F", bike=bike,
+                        state=("sp_debt", it.get("created_at"), _sp_join(done)),
+                        chat_id=int(chat_id),
+                        topic_id=(int(topic_id) if topic_id else None),
+                        text=(f"🐀 Splinter · 📌 {bike}\n"
+                              f"🇹🇭 ⏳ งาน ({_sp_labels_th(done)}) ทำแล้วแต่ยังไม่ได้กดยืนยัน {_age_th} — "
+                              f"{PYM_HANDLE}/เจ้าของ กดปุ่มยืนยันหน่อยครับ 🙏\n"
+                              f"{_SEP}\n"
+                              f"🇷🇺 ⏳ Работа ({_sp_labels_ru(done)}) сделана, но кнопку подтверждения "
+                              f"не нажали {_age_ru} — {PYM_HANDLE}/владелец, подтвердите 🙏")) is HINT_SKIPPED:
+        return
+    _SP_LAST_SENT[_k] = now
+    try:
+        bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                      last_reminded_at=__import__("datetime").datetime.now(
+                                          __import__("datetime").timezone.utc).isoformat())
+    except Exception:
+        log.exception(f"  → долг ТО {bike}: отметка времени напоминания не легла")
+    log.info(f"  → ДОЛГ ТО напоминание {bike} [{_sp_join(done)}] "
+             f"age={(f'{age_h:.1f}ч' if age_h is not None else '?')} → {v['to']} ({v['why']})")
+
+
 async def scheduled_service_pending_reminder(context, bridge):
     """Висяк: открытые заявки (заявлено/ждёт_факт) старше порога без отписки → напоминание (throttle + TTL).
     B4: старше _SP_REMIND_MAX_AGE_H → ОДНА эскалация владельцу, тайцам стоп. B5: in-memory анти-дубль. B6: лог отправок."""
@@ -7037,8 +7268,20 @@ async def scheduled_service_pending_reminder(context, bridge):
     now = _time.time()
     for it in items:
         status = str(it.get("status"))
-        if status == "ждёт_подтверждения":
-            continue   # ждёт Пыма, не механика — отдельный канал (кнопка висит)
+        if status == service_debt.STATUS:
+            # ДОЛГ ПРОХОДИТ ПРОВЕРКУ ВОЗРАСТА, А НЕ ПРОПУСКАЕТСЯ ДО НЕЁ (23.08.2026). Прежде здесь
+            # стоял голый `continue`, и он стоял ВЫШЕ проверки возраста (строки 7040-7041) —
+            # поэтому работа, ждущая кнопки, не получала НИ висяк-напоминания, НИ B4-эскалации
+            # владельцу: строка жила, и о ней не говорил никто. Комментарий «отдельный канал» был
+            # верен по замыслу и ложен по факту — канала не существовало. Теперь он есть, и он
+            # ЗДЕСЬ; отличается только адресат (Пым/владелец, а не механик: механик своё сделал).
+            # Ручка `SERVICE_DEBT=0` возвращает прежний `continue` байт-в-байт.
+            if _service_debt_on():
+                try:
+                    await _sp_debt_voice(context, bridge, it, now)
+                except Exception:
+                    log.exception(f"  → долг ТО {it.get('bike')}: ветка сторожа упала")
+            continue
         bike = it.get("bike", "")
         chat_id = it.get("chat_id"); topic_id = it.get("topic_id") or None
         declared = _sp_split(it.get("declared"))
@@ -7380,7 +7623,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                 seen_kinds.append(k)
         for k in seen_kinds:
             try:
-                await _ask_service_col(context, chat_id, topic_id, bike, k, str(mileage))
+                await _ask_service_col(context, chat_id, topic_id, bike, k, str(mileage),
+                                      bridge=bridge)
             except Exception:
                 log.exception(f"  → ошибка кнопки фиксации группы B ({k})")
 
