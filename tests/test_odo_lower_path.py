@@ -350,6 +350,229 @@ def test_no_lowering_no_new_machinery_twin():
     assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None
 
 
+# ============================================================================================
+#  (3) ДВЕРЬ РЕГИСТРА САМА ОТКРЫВАЕТ ВОПРОС О ПРИЧИНЕ (шаг 2 цели 120, 23.08.2026)
+#
+#  До этого шага `_write_oil` на отказе понижения печатала слова, которые ОБЕЩАЛИ выбор
+#  («понизить можно: выбери причину…»), а выбирать было не из чего: `_odo_lower_ask(register=
+#  "oil")` из живого кода не звался ни откуда. Здесь проверяется и обещание, и его цена —
+#  у каждого положительного случая стоит близнец «то же, но вопрос открывать НЕ за что».
+# ============================================================================================
+OIL_LOWER_RES = {"ok": False, "error": "oil_decreasing",
+                 "old_oil": RECORDED, "new_oil": SENT}
+
+
+class _WriteStubs:
+    """Тяжёлый успешный хвост двери глушим: предмет секции — вопрос о причине, а не сводка."""
+
+    NAMES = ("_close_service_reminder", "_emit_summary", "_clear_cycle_msgs",
+             "_repin_info", "_sp_debt_close", "_service_interval")
+
+    def __enter__(self):
+        self.saved = {n: getattr(S, n) for n in self.NAMES}
+
+        async def _anoop(*a, **k):
+            return None
+        S._close_service_reminder = _anoop
+        S._emit_summary = _anoop
+        S._clear_cycle_msgs = _anoop
+        S._repin_info = _anoop
+        S._sp_debt_close = lambda *a, **k: None
+        S._service_interval = lambda *a, **k: None
+        return self
+
+    def __exit__(self, *a):
+        for k, v in self.saved.items():
+            setattr(S, k, v)
+        return False
+
+
+def _refuse(res, lower_on=True):
+    """Прогнать дверь регистра до отказа. Возвращает (отправленное, мост)."""
+    _clean()
+    br = _FakeBridge(answers={OP_REGISTER: res})
+    ctx = _Ctx()
+    old = os.environ.get("ODO_LOWER", "1")
+    os.environ["ODO_LOWER"] = "1" if lower_on else "0"
+    try:
+        with _Stubs(), _WriteStubs():
+            _run(S._write_oil(ctx, br, CHAT, TOPIC, BIKE, SENT, confirmed_by=WHO))
+    finally:
+        os.environ["ODO_LOWER"] = old
+    return ctx.bot.sent, br
+
+
+def test_register_refusal_opens_the_question_about_the_reason():
+    """ГЛАВНЫЙ СЛУЧАЙ ШАГА: отказ понижения открывает выбор причины, а не просто говорит о нём."""
+    sent, br = _refuse(OIL_LOWER_RES)
+    assert sent, "дверь промолчала — это запрещено правилом 1"
+    body = sent[-1]["text"]
+    # (а) расхождение названо ВСЕМИ ТРЕМЯ числами
+    for n in ("41200", "38500", "2700"):
+        assert n in body, (n, body)
+    # (б) выбор из трёх причин ПРЕДЛОЖЕН, а не обещан
+    kb = sent[-1].get("reply_markup")
+    assert kb is not None, "обещание выбора без кнопок — тот же класс, что и раньше"
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert len(labels) == 3, labels
+    # (в) вопрос открыт и помнит, что метит в регистр масла
+    low = S._ODO_LOWER_PENDING.get((CHAT, TOPIC))
+    assert low and low["register"] == "oil", low
+    assert (low["recorded"], low["sent"]) == (RECORDED, SENT), low
+    # (г) внутренний код моста человеку не показан ни одной веткой
+    assert "oil_decreasing" not in body, body
+
+
+def test_question_replaces_the_old_words_and_does_not_double_speak():
+    """Вопрос ЕСТЬ ответ: прежние слова отказа рядом не печатаются — одно и то же дважды."""
+    sent, _ = _refuse(OIL_LOWER_RES)
+    joined = "\n".join(m["text"] for m in sent)
+    assert joined.count("38500") >= 1, joined
+    assert "Что делать:" not in joined, ("слова отказа задвоили вопрос", joined)
+    assert len(sent) == 1, [m["text"] for m in sent]
+
+
+def test_full_path_from_register_refusal_reaches_the_fix_branch():
+    """Путь ЦЕЛИКОМ от отказа двери: кнопка → пояснение → запись веткой исправления."""
+    _clean()
+    br = _FakeBridge(answers={OP_REGISTER: OIL_LOWER_RES})
+    ctx = _Ctx()
+    words = "поставили новую приборку, счёт пошёл с нуля"
+    with _Stubs(), _WriteStubs():
+        _run(S._write_oil(ctx, br, CHAT, TOPIC, BIKE, SENT, confirmed_by=WHO))
+        # мост теперь принимает исправление (ветка с причиной и автором)
+        br._answers[OP_REGISTER] = {"ok": True}
+        tok = next(t for t, d in S._SVC_TOKENS.items()
+                   if d.get("kind") == "odo_lower" and d.get("reason") == L.ODO_REPLACED)
+        _run(S.handle_service_button(_Upd(_Query(f"svc:lowr:{tok}")), ctx, br))
+        _run(S.handle_mileage_confirm(_Msg(words), ctx, br, words))
+    reg = br.calls.of(OP_REGISTER)
+    assert len(reg) == 2, [c[2] for c in reg]
+    kw = reg[1][2]
+    assert kw.get("fix_reason") and kw.get("fixed_by"), kw
+    assert words in kw["fix_reason"], kw["fix_reason"]
+    assert kw.get("confirmed") is True, kw
+    assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, "вопрос обязан закрыться"
+
+
+def test_router_gate_sees_the_open_question_from_this_door():
+    """БЕЗ ЭТОГО ШАГ МЁРТВ В ПРОДЕ: роутер зовёт обработчик по гейту, а не по прямому вызову.
+
+    У двери регистра записи о вопросе про пробег нет вовсе — значит открытый вопрос обязан
+    видеть свой гейт, иначе написанное пояснение не дойдёт до обработчика НИ РАЗУ."""
+    sent, br = _refuse(OIL_LOWER_RES)
+    assert S.pending_mileage_for(CHAT, TOPIC) is None, "прежний гейт этой двери и не должен видеть"
+    assert S.pending_odo_lower_for(CHAT, TOPIC), "новый гейт обязан видеть открытый вопрос"
+    # БЛИЗНЕЦ: протухший вопрос открытым не считается (тот же срок, что у вопроса о пробеге)
+    S._ODO_LOWER_PENDING[(CHAT, TOPIC)]["ts"] -= S._PENDING_MILEAGE_TTL + 60
+    assert S.pending_odo_lower_for(CHAT, TOPIC) is None, "протухший вопрос перехватывать нельзя"
+    # БЛИЗНЕЦ: вопроса нет вовсе
+    _clean()
+    assert S.pending_odo_lower_for(CHAT, TOPIC) is None
+
+
+def test_router_wiring_is_actually_present_in_bot_py():
+    """Замок против «починили в splinter, а роутер не знает»: гейт обязан стоять в bot.py."""
+    src = open("/root/turbobaby-manager-bot/bot.py", encoding="utf-8").read()
+    assert "pending_odo_lower_for" in src, "роутер не спрашивает про открытое понижение"
+
+
+# ── БЛИЗНЕЦЫ: «то же, но вопрос открывать НЕ за что» ────────────────────────────────────────
+def _expected_old_words(res):
+    """Эталон прежних слов. Собирается ЖИВЫМИ функциями — `_refuse_words` (что сказать) и
+    `_with_separator` (как транспорт единообразно разводит 🇹🇭/🇷🇺). Переписывать их руками
+    нельзя: тогда эталон проверял бы мою копию, а не дверь."""
+    ru, th = S._refuse_words(res, plate="4242", sent=SENT)
+    return S._with_separator(f"🐀 Splinter\n🇹🇭 ⚠️ {th}\n🇷🇺 ⚠️ {ru}")
+
+
+def test_rollback_switch_keeps_the_old_refusal_byte_for_byte():
+    """ОТКАТ `ODO_LOWER=0`: прежние слова БАЙТ-В-БАЙТ и ни следа новой машинерии."""
+    sent, br = _refuse(OIL_LOWER_RES, lower_on=False)
+    assert len(sent) == 1, [m["text"] for m in sent]
+    assert sent[0]["text"] == _expected_old_words(OIL_LOWER_RES), sent[0]["text"]
+    assert sent[0].get("reply_markup") is None, sent[0]
+    assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, "при откате состояние не заводится"
+
+
+def test_trusted_threshold_refusal_does_not_reopen_the_question():
+    """БЛИЗНЕЦ: причина УЖЕ названа (ветка исправления) — переспрашивать её нельзя, это петля."""
+    res = {"ok": False, "error": "oil_drop_needs_trusted", "old_oil": RECORDED,
+           "drop": 2700, "threshold": 500}
+    sent, br = _refuse(res)
+    assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, "второй раз причину не спрашиваем"
+    assert sent[0]["text"] == _expected_old_words(res), sent[0]["text"]
+    assert "oil_drop_needs_trusted" not in sent[0]["text"], sent[0]["text"]
+
+
+def test_refusal_without_the_recorded_number_falls_back_to_words():
+    """БЛИЗНЕЦ: расписка не назвала записанного числа — расхождения нет, вопрос не открываем."""
+    res = {"ok": False, "error": "oil_decreasing"}
+    sent, br = _refuse(res)
+    assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, "без числа вопрос не строится"
+    assert sent[0]["text"] == _expected_old_words(res), sent[0]["text"]
+
+
+def test_contradictory_receipt_does_not_open_the_question():
+    """БЛИЗНЕЦ: код говорит «ниже», а числа — «выше». Верим ЧИСЛАМ, вопрос не открываем."""
+    res = {"ok": False, "error": "oil_decreasing", "old_oil": SENT - 100, "new_oil": SENT}
+    sent, br = _refuse(res)
+    assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, res
+    assert sent[0]["text"] == _expected_old_words(res), sent[0]["text"]
+
+
+def test_unknown_refusal_code_keeps_the_old_path():
+    """БЛИЗНЕЦ: чужой код — прежний путь, и код человеку по-прежнему не показан."""
+    for err in ("verify_failed", "write_failed", "not_found", "receipt_unknown", ""):
+        res = {"ok": False, "error": err, "old_oil": RECORDED}
+        sent, br = _refuse(res)
+        assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, err
+        assert sent[0]["text"] == _expected_old_words(res), (err, sent[0]["text"])
+        if err:
+            assert err not in sent[0]["text"], (err, sent[0]["text"])
+
+
+def test_broken_question_still_speaks_the_old_words():
+    """FAIL-SAFE: вопрос сорвался → человек всё равно слышит слова. Молчание запрещено правилом 1."""
+    _clean()
+    br = _FakeBridge(answers={OP_REGISTER: OIL_LOWER_RES})
+    ctx = _Ctx()
+    saved = S._odo_lower_ask
+
+    async def _boom(*a, **k):
+        S._ODO_LOWER_PENDING[(CHAT, TOPIC)] = {"bike": BIKE, "ts": 0}   # успел наследить
+        raise RuntimeError("телеграм лежит")
+    S._odo_lower_ask = _boom
+    try:
+        with _Stubs(), _WriteStubs():
+            _run(S._write_oil(ctx, br, CHAT, TOPIC, BIKE, SENT, confirmed_by=WHO))
+    finally:
+        S._odo_lower_ask = saved
+    assert ctx.bot.sent, "дверь промолчала — это запрещено правилом 1"
+    assert ctx.bot.sent[-1]["text"] == _expected_old_words(OIL_LOWER_RES), ctx.bot.sent[-1]["text"]
+    assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, \
+        "недооткрытый вопрос обязан быть убран: иначе он съест следующий текст темы"
+
+
+def test_successful_write_opens_nothing():
+    """БЛИЗНЕЦ границы: запись прошла — ни вопроса, ни состояния понижения."""
+    _clean()
+    br = _FakeBridge(answers={OP_REGISTER: {"ok": True, "bike_name": BIKE}})
+    ctx = _Ctx()
+    with _Stubs(), _WriteStubs():
+        _run(S._write_oil(ctx, br, CHAT, TOPIC, BIKE, SENT, confirmed_by=WHO))
+    assert S._ODO_LOWER_PENDING.get((CHAT, TOPIC)) is None, "на успехе вопросов не задаём"
+
+
+def test_asking_costs_no_extra_bridge_call():
+    """ЦЕНА: записанное число берётся ИЗ ТОЙ ЖЕ расписки — у моста ни одного лишнего раза."""
+    sent, br = _refuse(OIL_LOWER_RES)
+    assert br.calls.names() == [OP_REGISTER], br.calls.names()
+    # БЛИЗНЕЦ: при откате цена та же, счёт не меняется от ручки
+    _, br2 = _refuse(OIL_LOWER_RES, lower_on=False)
+    assert br2.calls.names() == [OP_REGISTER], br2.calls.names()
+
+
 def test_nothing_was_written_to_live_tables_across_the_suite():
     """ЗАМОК ГИГИЕНЫ: за весь путь боевой мост не звался ни разу — все вызовы поймала заглушка."""
     sent, br = _walk(L.WRONG_NUMBER, "ошибся на одну цифру")

@@ -3499,6 +3499,29 @@ def pending_mileage_for(chat_id, topic_id):
     return pend
 
 
+def pending_odo_lower_for(chat_id, topic_id):
+    """Есть ли ЖИВОЙ открытый вопрос о ПОНИЖЕНИИ для этой темы (для перехвата в handle_text).
+
+    ЗАЧЕМ ОТДЕЛЬНАЯ ДВЕРЬ (23.08.2026, шаг 2 цели 120). Роутер зовёт `handle_mileage_confirm`
+    только при живом `pending_mileage_for`, то есть по состоянию `_PENDING_MILEAGE`. Вопрос о
+    понижении живёт в ДРУГОМ состоянии (`_ODO_LOWER_PENDING`), и до сих пор он ездил зайцем:
+    единственный его источник `_ask_mileage_confirm` двумя строками выше заводил и запись о
+    вопросе про пробег. У двери регистра такой записи нет вовсе — пояснение, написанное после
+    её отказа, не дошло бы до обработчика НИ РАЗУ, и вопрос висел бы вечно. Прямой вызов
+    обработчика в тесте этого не ловит: он входит МИМО роутерного гейта.
+
+    ПРЕДЕЛ ЖИЗНИ — ТОТ ЖЕ `_PENDING_MILEAGE_TTL`, а не новое число: это тот же по смыслу
+    «открытый вопрос в теме», и второй величины об одном сроке заводить не за чем. Протухший
+    открытым НЕ считается — тогда текст идёт обычным путём, как у вопроса о пробеге."""
+    low = _ODO_LOWER_PENDING.get((chat_id, topic_id))
+    if not low:
+        return None
+    ts = low.get("ts")
+    if ts is not None and (_time.time() - ts) > _PENDING_MILEAGE_TTL:
+        return None
+    return low
+
+
 async def expire_stale_mileage_question(context, chat_id, topic_id, text="") -> bool:
     """КОРЕНЬ 5: у вопроса о пробеге есть предел жизни. Снимаем протухший ДО любого разбора входящего,
     и если человек прислал именно ОТВЕТ (да/нет/число) — говорим, что вопрос устарел, вместо того
@@ -4728,9 +4751,43 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=
     else:
         # ОТКАЗ ГОВОРИТ, ЧТО ДЕЛАТЬ (правило владельца 23.08). Прежние ветки называли числа, но
         # не действие, а последняя печатала человеку внутренний код моста дословно.
-        detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
-        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
-                          text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+        #
+        # ДВЕРЬ САМА ОТКРЫВАЕТ ВОПРОС О ПРИЧИНЕ (23.08.2026, шаг 2 цели 120). Слова этого отказа
+        # уже обещали выбор — `reply_floor._SAY["oil_decreasing"]` дословно говорит «понизить
+        # можно: выбери причину и напиши пояснение своими словами», — а выбирать было НЕ ИЗ
+        # ЧЕГО: `_odo_lower_ask(register="oil")` был написан и покрыт тестом, но из этой ветки
+        # не звался, и живым `register="oil"` не приходил НИ ОТКУДА. Обещание без машины и есть
+        # тот класс, что уже ловили у карточек владельцу: обещанное обязано случаться.
+        #
+        # ЗАПИСАННОЕ ЧИСЛО БЕРЁТСЯ ИЗ ТОЙ ЖЕ РАСПИСКИ, из которой строкой выше прочитан флаг
+        # `ok` (`old_oil`), — у моста НЕ спрашиваем НИ ОДНОГО лишнего раза, тем же приёмом, что
+        # у `_svc_undo_remember_write`. Нет числа в расписке → `odo_lower.ask` не построит
+        # расхождения, вопрос не откроется, и человек получит прежние слова.
+        _res = res if isinstance(res, dict) else {}
+        _asked = False
+        if odo_lower.opens_question(_res.get("error")) and _odo_lower_on():
+            _rec = _res.get("old_oil")
+            if _rec is None:
+                _rec = _res.get("old_km")
+            try:
+                _asked = await _odo_lower_ask(context, chat_id, topic_id,
+                                              _res.get("bike_name") or bike, _rec, km_int,
+                                              source="кнопка записи", register="oil")
+            except Exception:
+                # Сорвался вопрос — человек всё равно услышит слова отказа. Правило 1 («никогда
+                # не молчать») сильнее нового удобства: молчание — единственный запрещённый исход.
+                log.exception("  → ПОНИЖЕНИЕ: не смог открыть вопрос о причине (fail-safe: слова)")
+                _ODO_LOWER_PENDING.pop((chat_id, topic_id), None)
+                _asked = False
+        if not _asked:
+            # ПРЕЖНИЙ ПУТЬ БАЙТ-В-БАЙТ: ручка `ODO_LOWER=0`, чужой код отказа, число не названо
+            # или понижения нет вовсе. Молчанием ни один из этих случаев не кончается.
+            detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
+            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
+                              text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+        # Открылся вопрос — он и ЕСТЬ ответ: те же три числа плюс выбор причины. Печатать рядом
+        # ещё и слова отказа значило бы сказать одно дважды, причём вторая копия снова обещала
+        # бы выбор, который уже на экране.
 
 
 def _refuse_words(res, *, plate="", sent=None):

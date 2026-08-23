@@ -845,8 +845,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if splinter.pending_correction_for(chat_id, _tid_sv):
                 if await splinter.handle_correction_confirm(msg, context, bridge, msg.text):
                     return
-            # 2) ответ на подтверждение распознанного с фото пробега (сущ. Фикс B)
-            if splinter.pending_mileage_for(chat_id, _tid_sv):
+            # 2) ответ на подтверждение распознанного с фото пробега (сущ. Фикс B), а также
+            #    ПОЯСНЕНИЕ к понижению: вопрос о причине живёт в своём состоянии, и у двери
+            #    регистра записи о вопросе про пробег нет вовсе — без второго условия пояснение
+            #    после её отказа не дошло бы до обработчика ни разу (шаг 2 цели 120, 23.08.2026).
+            #    Порядок «или» безразличен: обработчик сам решает, чем является текст, и на
+            #    невзятом тексте возвращает False — поток идёт дальше, как шёл.
+            if (splinter.pending_mileage_for(chat_id, _tid_sv)
+                    or splinter.pending_odo_lower_for(chat_id, _tid_sv)):
                 if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
                     return
             # 2.5) масло-нарратив задним числом («было на N», «поменял на N») →
