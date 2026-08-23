@@ -379,9 +379,14 @@ def test_live_number_door_success_both_halves():
 
 
 def test_live_write_path_untouched():
-    """Границы: правка трогает СЛОВА, а не запись — вызовы моста прежние (confirmed=True)."""
+    """Границы: правка трогает СЛОВА, а не запись — вызовы моста прежние (confirmed=True).
+
+    Фикстура догнана 23.08: с этого дня закрытие строки заявки идёт через дверь вердикта и
+    ПЕРЕД записью спрашивает, есть ли что закрывать (дыра «строка-эхо» — слепой close дописывал
+    заявку, которой не было). Без открытой строки этот assert проверял бы ровно ту дыру."""
     reset()
-    b = FakeBridge()
+    b = FakeBridge(sp={"declared": "oil,gear", "done": "oil,gear",
+                       "status": "ждёт_подтверждения", "odometer": "20316"})
     tok = S._svc_put({"chat": CHAT, "topic": TOPIC, "bike": BIKE_4724, "done": ["oil", "gear"],
                       "odo": "20316", "kind": "sp_done"})
     run(S.handle_service_button(_upd(FakeQ(f"svc:done:{tok}", "Pleummmm")), context=None, bridge=b))

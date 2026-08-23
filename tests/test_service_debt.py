@@ -107,6 +107,16 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _open_row(declared="gear", done="gear", status=service_debt.STATUS, odometer="12212",
+              note="", bike=FAKE_BIKE, created_at="2026-08-23T00:00:00Z"):
+    """Ответ моста «открытая строка есть» в ЖИВОМ формате `servicePendingGet_`."""
+    return {"ok": True, "item": {"created_at": created_at, "updated_at": created_at,
+                                 "chat_id": str(FAKE_CHAT), "topic_id": str(FAKE_TOPIC),
+                                 "bike": bike, "declared": declared, "done": done,
+                                 "status": status, "odometer": odometer,
+                                 "last_reminded_at": "", "note": note, "_row": 2}}
+
+
 # ============================== (1) ГРАНИЦЫ УСТРОЙСТВОМ ======================================
 class T1Structure(unittest.TestCase):
     """«По таймеру долг не гаснет» — свойство кода, а не обещание докстринга."""
@@ -453,7 +463,9 @@ class T6NegativeAndTwin(unittest.TestCase):
 
     # ---------- БЛИЗНЕЦ: кнопку нажали, запись доказана ----------
     def test_twin_button_pressed_and_write_proven_debt_closes(self):
-        bus = _Bus()
+        # Стенд ОБЯЗАН отвечать на «есть ли что закрывать»: с 23.08 дверь спрашивает мир ПЕРЕД
+        # записью (дыра Н1 — слепой close дописывал строку-эхо). Фикстура догнана до живого пути.
+        bus = _Bus({"service_pending_get": _open_row(done="gear", note="DEBT:{gear@12212}")})
         v = self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["gear"],
                                    odometer=12212,
                                    write={"landed": True, "known": True, "detail": "расписка ok"})
@@ -471,7 +483,8 @@ class T6NegativeAndTwin(unittest.TestCase):
         self.assertEqual(said, [], "долг уже лежит в регистре — шуметь не о чем")
 
     def test_twin_human_said_no_work(self):
-        bus = _Bus()
+        bus = _Bus({"service_pending_get": _open_row(declared="oil", done="oil",
+                                                     note="DEBT:{oil@12212}")})
         v = self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
                                    odometer=12212,
                                    human={"decided": True, "who": "@pym",
@@ -578,6 +591,551 @@ class T10LiveAdv(unittest.TestCase):
         v = service_debt.verdict(cell={"read": True, "km": 99999}, odometer=self.LIVE["odometer"])
         self.assertFalse(v["closed"])
         self.assertEqual(v["state"], service_debt.UNKNOWN)
+
+
+# =========== (11)-(15) ШЕСТЬ ДЫР РЕВИЗИИ 930da84: ПОРЧА И ЕЁ БЛИЗНЕЦ ==========================
+#
+# У КАЖДОГО ОТРИЦАТЕЛЬНОГО ТЕСТА ЕСТЬ БЛИЗНЕЦ «ТО ЖЕ БЕЗ ПОРЧИ — ПРОХОДИТ». Иначе доказано
+# только то, что механизм умеет НЕ работать: сторож, который держит всегда, не лучше того,
+# который не держит никогда (правило заведено 23.08 в секции (6)(7) и здесь продолжено).
+class T11SurvivesNeighbourVisit(unittest.TestCase):
+    """ДЫРА 1: строка долга обязана ПЕРЕЖИТЬ следующий визит того же байка.
+
+    Живой 5960: 01.08 приняли `abs,pads` при 41357 (кнопку не нажали) — 22.08 приезд редуктора
+    переписал ТУ ЖЕ строку в `gear` при 41641. Мост сливает визиты в одну строку по паре
+    тема × байк и кладёт `declared`/`done`/`odometer`/`status` целиком; уцелеть долг мог только
+    в поле, которого новый визит не передаёт. Это `note` — и она же проверена на ЖИВОМ коде
+    моста node-харнессом (`pending_debt_harness.js`), а не рассуждением."""
+
+    NEIGHBOUR = "DEBT:{abs@41357; pads@41357}"
+
+    def setUp(self):
+        import splinter
+        self.sp = splinter
+        os.environ.pop("SERVICE_DEBT", None)
+        self.sp._SP_LAST_SENT.clear()
+
+    def _voice(self, row):
+        import time as _t
+        self.sp._SP_LAST_SENT.clear()       # троттл — свойство ПРОЦЕССА, а не дороги под тестом
+        said = []
+
+        async def _fake_hint(*a, **k):
+            said.append(k.get("text", ""))
+            return type("M", (), {"message_id": 1})()
+        bus = _Bus({"fleet": {"ok": True, "data": {"bikes": [{"name": FAKE_BIKE}]}},
+                    "cell": _Clip(False, None, "клетка пуста")})
+        real = self.sp._hint_send
+        try:
+            self.sp._hint_send = _fake_hint
+            _run(self.sp._sp_debt_voice(None, bus, row, _t.time()))
+        finally:
+            self.sp._hint_send = real
+        return said, bus
+
+    def _row(self, **kw):
+        import datetime as dt
+        born = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25)
+        base = {"chat_id": FAKE_CHAT, "topic_id": FAKE_TOPIC, "bike": FAKE_BIKE,
+                "declared": "abs,pads", "done": "abs,pads", "status": service_debt.STATUS,
+                "odometer": "41357", "last_reminded_at": "", "note": self.NEIGHBOUR,
+                "created_at": born.isoformat().replace("+00:00", "Z")}
+        base.update(kw)
+        return base
+
+    # ---------- ПОРЧА: приехал сосед и переписал строку ----------
+    def test_negative_neighbour_visit_overwrites_the_row_and_debt_still_speaks(self):
+        """Поля перезаписаны редуктором — след в ноте цел, и сторож говорит о СВОИХ позициях."""
+        spoiled = self._row(declared="gear", done="gear", odometer="41641", status="ждёт_факт")
+        said, bus = self._voice(spoiled)
+        self.assertEqual(len(said), 1, "визит соседа заставил долг ЗАМОЛЧАТЬ — это класс 5960")
+        for lost in ("ABS", "колодки"):
+            self.assertIn(lost, said[0], f"о потерянной позиции «{lost}» не сказано: {said[0]}")
+        self.assertNotIn("редуктор", said[0], "сторож заговорил о работе СОСЕДА, а не о долге")
+        self.assertEqual(bus.count("service_pending_close"), 0, "долг закрылся сам")
+
+    def test_negative_the_ledger_is_read_at_the_neighbours_number_not_ours(self):
+        """Сверять надо с ЧИСЛОМ ДОЛГА (41357), а не с числом соседа (41641)."""
+        led = service_debt.ledger_read(self.NEIGHBOUR)
+        self.assertEqual([k for k, _o in led], ["abs", "pads"])
+        self.assertEqual(service_debt.ledger_odometer(led), 41357)
+
+    def test_negative_the_watchman_routes_by_the_trail_not_by_the_status(self):
+        """Статус принадлежит последнему визиту: по нему строка уехала бы в ЧУЖУЮ ветку."""
+        seen = []
+
+        async def _spy(context, bridge, it, now):
+            seen.append(it.get("bike"))
+        spoiled = self._row(declared="gear", done="gear", odometer="41641", status="ждёт_факт")
+        bus = _Bus({"service_pending_list": {"ok": True, "items": [spoiled]}})
+        real = self.sp._sp_debt_voice
+        try:
+            self.sp._sp_debt_voice = _spy
+            _run(self.sp.scheduled_service_pending_reminder(None, bus))
+        finally:
+            self.sp._sp_debt_voice = real
+        self.assertEqual(seen, [FAKE_BIKE], "строка с висящим долгом ушла мимо ветки долга")
+
+    def test_negative_a_settled_trail_gives_the_row_back_to_the_old_path(self):
+        """`DEBT:{}` — не мусор, а слово «долг снят»: иначе стёртый след замолчал бы навсегда."""
+        seen = []
+
+        async def _spy(context, bridge, it, now):
+            seen.append(it.get("bike"))
+        row = self._row(note=service_debt.LEDGER_EMPTY, status=service_debt.STATUS)
+        bus = _Bus({"service_pending_list": {"ok": True, "items": [row]}})
+        real = self.sp._sp_debt_voice
+        try:
+            self.sp._sp_debt_voice = _spy
+            _run(self.sp.scheduled_service_pending_reminder(None, bus))
+        finally:
+            self.sp._sp_debt_voice = real
+        self.assertEqual(seen, [], "снятый долг снова заговорил как долг")
+
+    # ---------- БЛИЗНЕЦ: соседа не было ----------
+    def test_twin_without_the_neighbour_the_same_debt_speaks_the_same_way(self):
+        said, bus = self._voice(self._row())
+        self.assertEqual(len(said), 1)
+        for k in ("ABS", "колодки"):
+            self.assertIn(k, said[0])
+        self.assertEqual(bus.count("service_pending_close"), 0)
+
+    def test_twin_the_pair_differs_by_exactly_one_thing(self):
+        """Один различитель — визит соседа. Обе дороги идут через ЖИВОЙ `_sp_debt_voice`."""
+        a, _ = self._voice(self._row())
+        b, _ = self._voice(self._row(declared="gear", done="gear",
+                                     odometer="41641", status="ждёт_факт"))
+        self.assertEqual(len(a), len(b), "визит соседа изменил САМ ФАКТ разговора о долге")
+
+    def test_twin_the_neighbours_own_upsert_does_not_carry_a_note(self):
+        """Носитель работает ровно потому, что новый визит ноту НЕ ПЕРЕДАЁТ (мост берёт `cur`)."""
+        bus = _Bus()
+
+        async def _fake_send(*a, **k):
+            return type("M", (), {"message_id": 1})()
+        real = self.sp._send
+        try:
+            self.sp._send = _fake_send
+            _run(self.sp._sp_advance_to_confirm(None, bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE,
+                                                ["gear"], ["gear"], "41641"))
+        finally:
+            self.sp._send = real
+        ups = [kw for n, kw in bus.seen if n == "service_pending_upsert"]
+        self.assertEqual(len(ups), 1)
+        self.assertNotIn("note", ups[0], "визит соседа передал ноту — след долга был бы затёрт")
+
+    def test_twin_phase1_intake_builds_the_note_on_top_of_the_existing_one(self):
+        """Вторая дорога того же класса: заявка с дословными работами строила ноту с нуля."""
+        bus = _Bus({"service_pending_get": _open_row(note=self.NEIGHBOUR)})
+
+        async def _fake_send(*a, **k):
+            return type("M", (), {"message_id": 1})()
+        real = self.sp._send
+        try:
+            self.sp._send = _fake_send
+            _run(self.sp.service_phase1_intake(None, bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE,
+                                               ["gear"], works_raw=["замена редуктора"]))
+        finally:
+            self.sp._send = real
+        ups = [kw for n, kw in bus.seen if n == "service_pending_upsert"]
+        self.assertEqual(len(ups), 1)
+        self.assertIn("замена редуктора", ups[0]["note"], "дословные работы потеряны")
+        self.assertEqual([k for k, _o in service_debt.ledger_read(ups[0]["note"])],
+                         ["abs", "pads"], "новая заявка стёрла позиции висящего долга")
+
+
+class T12BatchClosesPositionally(unittest.TestCase):
+    """ДЫРА 2: запись ОДНОЙ позиции из двух закрывает одну, а не всю партию."""
+
+    def setUp(self):
+        import splinter
+        self.sp = splinter
+        os.environ.pop("SERVICE_DEBT", None)
+        # Дедуп записи — окно ПРОЦЕССА (класс E): без чистки второй прогон той же тройки
+        # (байк, вид, км) засчитался бы записанным и близнец сравнивал бы не то.
+        self.sp._SVC_WRITE_DEDUP.clear()
+
+    def _phase2(self, fails=()):
+        """Живая дверь фазы 2 на партии gear+abs; `fails` — какие позиции мост не принял."""
+        self.sp._SVC_WRITE_DEDUP.clear()     # окно дедупа переживает вызов — близнец судил бы не то
+        def _svc(*a, **kw):
+            return ({"ok": False, "error": "not_found"} if kw.get("kind") in fails
+                    else {"ok": True, "bike_name": FAKE_BIKE})
+        bus = _Bus({"set_fleet_service": _svc,
+                    "service_pending_get": _open_row(declared="gear,abs", done="gear,abs",
+                                                     odometer="41357",
+                                                     note="DEBT:{gear@41357; abs@41357}")})
+        written, failed = _run(self.sp._sp_write_done(
+            None, bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, ["gear", "abs"], "41357",
+            confirmed_by="@pym", ceiling_ok=True))
+        return written, failed, bus
+
+    # ---------- ПОРЧА: одна позиция партии не легла ----------
+    def test_negative_one_position_failed_the_row_stays_open_with_it(self):
+        written, failed, bus = self._phase2(fails=("abs",))
+        self.assertEqual(written, ["gear"])
+        self.assertEqual([k for k, _e in failed], ["abs"])
+        self.assertEqual(bus.count("service_pending_close"), 0,
+                         "партия ушла в закрыто вместе с не легшей позицией — потеря молчком")
+        ups = [kw for n, kw in bus.seen if n == "service_pending_upsert"]
+        self.assertTrue(ups, "след не обновлён — о висящей позиции не узнает никто")
+        self.assertEqual([k for k, _o in service_debt.ledger_read(ups[-1]["note"])], ["abs"],
+                         f"в следе не осталось ровно не легшей позиции: {ups[-1]['note']!r}")
+
+    def test_negative_the_surviving_position_still_gets_a_voice(self):
+        """Позиция осталась в следе — значит сторож обязан о ней ЗАГОВОРИТЬ."""
+        import datetime as dt
+        import time as _t
+        born = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25)
+        row = {"chat_id": FAKE_CHAT, "topic_id": FAKE_TOPIC, "bike": FAKE_BIKE,
+               "declared": "gear,abs", "done": "gear,abs", "status": service_debt.STATUS,
+               "odometer": "41357", "last_reminded_at": "", "note": "DEBT:{abs@41357}",
+               "created_at": born.isoformat().replace("+00:00", "Z")}
+        said = []
+
+        async def _fake_hint(*a, **k):
+            said.append(k.get("text", ""))
+            return type("M", (), {"message_id": 1})()
+        self.sp._SP_LAST_SENT.clear()
+        bus = _Bus({"fleet": {"ok": True, "data": {"bikes": [{"name": FAKE_BIKE}]}},
+                    "cell": _Clip(False, None, "клетка пуста")})
+        real = self.sp._hint_send
+        try:
+            self.sp._hint_send = _fake_hint
+            _run(self.sp._sp_debt_voice(None, bus, row, _t.time()))
+        finally:
+            self.sp._hint_send = real
+        self.assertEqual(len(said), 1)
+        self.assertIn("ABS", said[0])
+        self.assertNotIn("редуктор", said[0], "сторож зовёт по легшей позиции")
+
+    # ---------- БЛИЗНЕЦ: легли обе ----------
+    def test_twin_whole_batch_written_closes_the_row_once(self):
+        written, failed, bus = self._phase2(fails=())
+        self.assertEqual(written, ["gear", "abs"])
+        self.assertEqual(failed, [])
+        self.assertEqual(bus.count("service_pending_close"), 1,
+                         "партия легла целиком, а строка осталась висеть")
+
+    def test_twin_the_pair_differs_by_exactly_one_thing(self):
+        """Различитель ровно один — приняла ли вторую позицию живая таблица."""
+        self.assertEqual(self._phase2(fails=())[2].count("service_pending_close"), 1)
+        self.assertEqual(self._phase2(fails=("abs",))[2].count("service_pending_close"), 0)
+
+    def test_pure_settle_is_positional(self):
+        s = service_debt.settle("DEBT:{gear@41357; abs@41357}", declared=["gear", "abs"],
+                                done=["gear", "abs"], closing=["gear"], row_terminal=True)
+        self.assertTrue(s["own"])
+        self.assertFalse(s["close_row"])
+        self.assertEqual(s["remaining"], ["abs"])
+
+
+class T13OneClosingDoor(unittest.TestCase):
+    """ДЫРА 3: вторая дверь закрытия, ходившая мимо вердикта, убрана."""
+
+    def setUp(self):
+        import splinter
+        self.sp = splinter
+        os.environ.pop("SERVICE_DEBT", None)
+        self.sp._SVC_WRITE_DEDUP.clear()
+
+    def tearDown(self):
+        os.environ.pop("SERVICE_DEBT", None)
+
+    @staticmethod
+    def _tree(func):
+        return ast.parse(inspect.getsource(func))
+
+    @staticmethod
+    def _names_in(node):
+        out = []
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Attribute):
+                    out.append(f"{getattr(f.value, 'id', '?')}.{f.attr}")
+                elif isinstance(f, ast.Name):
+                    out.append(f.id)
+        return out
+
+    # ---------- ПОРЧА: непустой failed на легаси-хвосте ----------
+    def test_negative_phase2_does_not_close_past_the_verdict(self):
+        """Единственное прямое закрытие в теле — ветка ОТКАТА, и это доказано ast, а не глазом.
+
+        Разбирается ДЕРЕВО: прямой `bridge.service_pending_close` обязан лежать в `orelse`
+        того самого `if _service_debt_on():`, в чьём `body` стоит дверь вердикта."""
+        tree = self._tree(self.sp._sp_write_done)
+        direct = [c for c in self._names_in(tree) if c == "bridge.service_pending_close"]
+        self.assertEqual(len(direct), 1,
+                         f"прямых закрытий мимо вердикта не одна штука: {direct}")
+        guarded = False
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.If) or "_service_debt_on" not in self._names_in(n.test):
+                continue
+            body = [c for b in n.body for c in self._names_in(b)]
+            orelse = [c for b in n.orelse for c in self._names_in(b)]
+            if "bridge.service_pending_close" in orelse and "_sp_debt_close" in body:
+                guarded = True
+        self.assertTrue(guarded,
+                        "прямое закрытие стоит ВНЕ ветки отката — это вторая дверь, а не откат")
+
+    def test_negative_a_failed_position_is_never_closed_by_the_verdict_door(self):
+        """Вердикт судит ФАКТ: не легло — не закрываем, сколько бы ни просили."""
+        s = service_debt.settle("DEBT:{gear@41357; abs@41357}", declared=["gear", "abs"],
+                                done=["gear", "abs"], closing=["abs"], row_terminal=True)
+        self.assertEqual(s["remaining"], ["gear"])
+        v = service_debt.verdict(write={"landed": False, "known": True, "detail": "not_found"})
+        self.assertFalse(v["closed"], "непринятая запись закрыла долг")
+
+    def test_negative_nothing_written_at_all_leaves_the_row_alone(self):
+        def _svc(*a, **kw):
+            return {"ok": False, "error": "not_found"}
+        bus = _Bus({"set_fleet_service": _svc,
+                    "service_pending_get": _open_row(declared="gear", done="gear",
+                                                     note="DEBT:{gear@41357}")})
+        written, failed = _run(self.sp._sp_write_done(
+            None, bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, ["gear"], "41357",
+            confirmed_by="@pym", ceiling_ok=True))
+        self.assertEqual(written, [])
+        self.assertEqual(bus.count("service_pending_close"), 0,
+                         "не легло НИЧЕГО, а строка закрыта — ровно легаси-дыра Н4")
+
+    # ---------- БЛИЗНЕЦ: всё легло → закрывает ТА ЖЕ дверь ----------
+    def test_twin_everything_written_closes_through_the_verdict_door(self):
+        seen = []
+        real = self.sp._sp_debt_close
+
+        def _spy(*a, **kw):
+            seen.append(kw)
+            return real(*a, **kw)
+        bus = _Bus({"set_fleet_service": {"ok": True, "bike_name": FAKE_BIKE},
+                    "service_pending_get": _open_row(declared="gear", done="gear",
+                                                     note="DEBT:{gear@41357}")})
+        try:
+            self.sp._sp_debt_close = _spy
+            _run(self.sp._sp_write_done(None, bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE,
+                                        ["gear"], "41357", confirmed_by="@pym",
+                                        ceiling_ok=True))
+        finally:
+            self.sp._sp_debt_close = real
+        self.assertEqual(len(seen), 1, "фаза 2 закрыла строку не через дверь вердикта")
+        self.assertTrue(seen[0]["row_terminal"], "терминал заявки не назван терминалом")
+        self.assertEqual(bus.count("service_pending_close"), 1)
+
+    def test_twin_rollback_restores_the_old_direct_close(self):
+        """`SERVICE_DEBT=0` → прежний путь: прямое закрытие, ноль обращений к двери вердикта."""
+        os.environ["SERVICE_DEBT"] = "0"
+        bus = _Bus({"set_fleet_service": {"ok": True, "bike_name": FAKE_BIKE}})
+        _run(self.sp._sp_write_done(None, bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, ["gear"],
+                                    "41357", confirmed_by="@pym", ceiling_ok=True))
+        self.assertEqual(bus.count("service_pending_close"), 1)
+        self.assertEqual(bus.count("service_pending_get"), 0,
+                         "выключенная ветка всё равно спросила мир")
+        note = [kw for n, kw in bus.seen if n == "service_pending_close"][0]["note"]
+        self.assertTrue(note.startswith("written="), f"нота отката не прежняя: {note!r}")
+
+    def test_row_terminal_keeps_the_legacy_notdone_outcome(self):
+        """Забор Честертона: «не сделано» у фазы 2 — законный исход, а не висящий хвост."""
+        s = service_debt.settle("", declared=["gear", "abs"], done=["gear"], closing=["gear"],
+                                batch=["gear"], odometer=41357, row_terminal=True)
+        self.assertTrue(s["close_row"], "заявка с «не сделано» перестала закрываться")
+        s2 = service_debt.settle("", declared=["gear", "abs"], done=["gear"], closing=["gear"],
+                                 batch=["gear"], odometer=41357, row_terminal=False)
+        self.assertFalse(s2["close_row"], "кнопочная дверь закрыла ЧУЖОЕ заявленное")
+
+
+class T14NoEchoRow(unittest.TestCase):
+    """ДЫРА 4: безусловное закрытие дописывало строку-эхо о заявке, которой не было."""
+
+    def setUp(self):
+        import splinter
+        self.sp = splinter
+        os.environ.pop("SERVICE_DEBT", None)
+
+    # ---------- ПОРЧА: закрывать нечего ----------
+    def test_negative_no_open_row_means_no_write_at_all(self):
+        bus = _Bus({"service_pending_get": {"ok": False, "error": "not_found"}})
+        v = self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                                   odometer=12212,
+                                   write={"landed": True, "known": True, "detail": "ok"})
+        self.assertTrue(v["closed"], "вердикт обязан остаться прежним — судят факты, не строка")
+        self.assertEqual(bus.count("service_pending_close"), 0, "дописана строка-эхо")
+        self.assertEqual(bus.count("service_pending_upsert"), 0, "дописана строка-эхо")
+        self.assertEqual(bus.names(), ["service_pending_get"],
+                         f"вместо одного чтения ушло что-то ещё: {bus.names()}")
+
+    def test_negative_a_silent_bridge_is_not_a_reason_to_write(self):
+        """Мост молчит → «строки нет» неотличимо от «не знаем» → не пишем (сомнение в долг)."""
+        def _boom(*a, **k):
+            raise RuntimeError("мост лёг")
+        bus = _Bus({"service_pending_get": _boom})
+        v = self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                                   odometer=12212, write={"landed": True, "known": True})
+        self.assertTrue(v["closed"])
+        self.assertEqual(bus.count("service_pending_close"), 0)
+        self.assertEqual(bus.count("service_pending_upsert"), 0)
+
+    # ---------- БЛИЗНЕЦ: строка есть ----------
+    def test_twin_an_existing_row_is_closed_exactly_once(self):
+        bus = _Bus({"service_pending_get": _open_row(declared="oil", done="oil",
+                                                     note="DEBT:{oil@12212}")})
+        v = self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                                   odometer=12212,
+                                   write={"landed": True, "known": True, "detail": "ok"})
+        self.assertTrue(v["closed"])
+        self.assertEqual(bus.count("service_pending_close"), 1)
+
+    def test_twin_the_pair_differs_by_exactly_one_thing(self):
+        """Одна дорога, один различитель — есть ли что закрывать."""
+        yes = _Bus({"service_pending_get": _open_row(declared="oil", done="oil")})
+        no = _Bus({"service_pending_get": {"ok": False, "error": "not_found"}})
+        for bus in (yes, no):
+            self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                                   odometer=12212, write={"landed": True, "known": True})
+        self.assertEqual((yes.count("service_pending_close"),
+                          no.count("service_pending_close")), (1, 0))
+
+
+class T15NotSomeoneElsesRow(unittest.TestCase):
+    """ДЫРА 5: закрытие гасило ЧУЖУЮ открытую строку — цепь, которую никто не записывал."""
+
+    CHAIN = {"declared": "chain", "done": "", "status": "ждёт_факт", "note": ""}
+
+    def setUp(self):
+        import splinter
+        self.sp = splinter
+        os.environ.pop("SERVICE_DEBT", None)
+
+    # ---------- ПОРЧА: открыта строка о ДРУГОЙ работе ----------
+    def test_negative_oil_door_does_not_close_the_chain_claim(self):
+        bus = _Bus({"service_pending_get": _open_row(**self.CHAIN)})
+        v = self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                                   odometer=12212,
+                                   write={"landed": True, "known": True, "detail": "ok"})
+        self.assertTrue(v["closed"], "вердикт о записи масла верен — судится ПРИМЕНЕНИЕ")
+        self.assertEqual(bus.count("service_pending_close"), 0,
+                         "масляная дверь погасила заявку по цепи — работа исчезла молча")
+        self.assertEqual(bus.count("service_pending_upsert"), 0)
+        self.assertIn("не наша", v["applied"])
+
+    def test_negative_a_merged_neighbour_keeps_the_row_open(self):
+        """Слитая строка: масло легло, а цепь всё ещё заявлена → строка обязана жить."""
+        bus = _Bus({"service_pending_get": _open_row(declared="chain,oil", done="oil",
+                                                     note="DEBT:{oil@12212}")})
+        self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                               odometer=12212, write={"landed": True, "known": True})
+        self.assertEqual(bus.count("service_pending_close"), 0,
+                         "закрыв свою позицию, дверь закрыла чужое заявленное")
+        ups = [kw for n, kw in bus.seen if n == "service_pending_upsert"]
+        self.assertEqual(len(ups), 1)
+        self.assertEqual(service_debt.ledger_read(ups[0]["note"]), [],
+                         "позиция долга не снята")
+        self.assertTrue(service_debt.ledger_present(ups[0]["note"]),
+                        "след стёрт пустой строкой — мост читает её как «поле не передали»")
+
+    # ---------- БЛИЗНЕЦ: строка НАША ----------
+    def test_twin_its_own_row_is_closed(self):
+        bus = _Bus({"service_pending_get": _open_row(declared="oil", done="oil",
+                                                     note="DEBT:{oil@12212}")})
+        self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                               odometer=12212, write={"landed": True, "known": True})
+        self.assertEqual(bus.count("service_pending_close"), 1)
+
+    def test_twin_the_pair_differs_by_exactly_one_thing(self):
+        """Различитель ровно один — называет ли строка закрываемую позицию."""
+        mine = _Bus({"service_pending_get": _open_row(declared="oil", done="oil")})
+        alien = _Bus({"service_pending_get": _open_row(**self.CHAIN)})
+        for bus in (mine, alien):
+            self.sp._sp_debt_close(bus, FAKE_CHAT, FAKE_TOPIC, FAKE_BIKE, kinds=["oil"],
+                                   odometer=12212, write={"landed": True, "known": True})
+        self.assertEqual((mine.count("service_pending_close"),
+                          alien.count("service_pending_close")), (1, 0))
+
+    def test_pure_ownership_never_widens_by_itself(self):
+        """Ни один набор фактов не делает чужую строку своей: судится ИМЯ позиции."""
+        for closing in (["oil"], ["gear"], ["abs"], ["airfilter"], ["other"]):
+            s = service_debt.settle("", declared=["chain"], done=[], closing=closing,
+                                    batch=closing, odometer=12212)
+            self.assertFalse(s["own"], f"строка по цепи признана своей для {closing}")
+            self.assertFalse(s["changed"])
+
+
+class T16LedgerForm(unittest.TestCase):
+    """След — соседям по ноте не враг: `WORKS:{…}` и `escalated` не теряются НИКОГДА."""
+
+    def test_neighbours_in_the_note_survive_every_operation(self):
+        note = "WORKS:{замена масла; колодки} | escalated"
+        with_debt = service_debt.ledger_add(note, ["oil", "pads"], 41357)
+        self.assertIn("WORKS:{замена масла; колодки}", with_debt)
+        self.assertIn("escalated", with_debt)
+        self.assertEqual([k for k, _o in service_debt.ledger_read(with_debt)], ["oil", "pads"])
+        s = service_debt.settle(with_debt, declared=["oil", "pads"], done=["oil", "pads"],
+                                closing=["oil", "pads"], row_terminal=True)
+        self.assertTrue(s["close_row"])
+        self.assertIn("WORKS:{замена масла; колодки}", s["note"])
+        self.assertIn("escalated", s["note"])
+        self.assertEqual(service_debt.ledger_read(s["note"]), [])
+
+    def test_requirement_only_grows(self):
+        """Второй заход с меньшим числом требование НЕ ослабляет."""
+        n = service_debt.ledger_add("", ["gear"], 41357)
+        self.assertEqual(service_debt.ledger_odometer(service_debt.ledger_read(
+            service_debt.ledger_add(n, ["gear"], 40000))), 41357)
+        self.assertEqual(service_debt.ledger_odometer(service_debt.ledger_read(
+            service_debt.ledger_add(n, ["gear"], 42000))), 42000)
+
+    def test_separators_cannot_be_smuggled_into_a_value(self):
+        n = service_debt.ledger_add("", ["ge}ar;x|y@z"], 41357)
+        self.assertEqual(len(service_debt.ledger_read(n)), 1)
+        self.assertEqual(service_debt.ledger_read(n)[0][0], "gearxyz")
+        self.assertEqual(service_debt.ledger_note("", []), "")
+
+    def test_garbage_note_never_raises_and_never_invents_a_debt(self):
+        for junk in (None, "", "DEBT:{", "DEBT:}", "DEBT:{}", "мусор", "DEBT:{;;;}",
+                     "DEBT:{@}", "DEBT:{oil@не-число}", 12345, {"a": 1}):
+            self.assertIsInstance(service_debt.ledger_read(junk), list)
+        self.assertEqual(service_debt.ledger_read("DEBT:{;;;}"), [])
+        self.assertEqual(service_debt.ledger_read("DEBT:{oil@не-число}"), [("oil", "")])
+        self.assertTrue(service_debt.ledger_present("DEBT:{}"))
+        self.assertFalse(service_debt.ledger_present("мусор"))
+
+    def test_ledger_is_capped(self):
+        many = [f"k{i}" for i in range(40)]
+        n = service_debt.ledger_add("", many, 100)
+        self.assertEqual(len(service_debt.ledger_read(n)), service_debt.LEDGER_MAX)
+
+
+class T17LiveBridgeProperties(unittest.TestCase):
+    """Свойства МИРА, на которых стоит лечение, — на ЖИВОМ коде моста, а не на рассуждении.
+
+    Мост в этом заходе не правится и не выкладывается (запрет задания), поэтому харнесс
+    доказывает не наш фикс, а то, что лечить можно ТОЛЬКО со стороны `splinter`: нота переживает
+    визит соседа, поля — нет; закрытие без строки дописывает эхо; закрытие гасит чужую открытую
+    строку; пустой нотой след не стереть."""
+
+    HARNESS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "pending_debt_harness.js")
+
+    def test_harness_all_green(self):
+        import json
+        import shutil
+        import subprocess
+        if not shutil.which("node"):
+            self.skipTest("node на машине нет — харнесс не запускается")
+        p = subprocess.run(["node", self.HARNESS], capture_output=True, text=True, timeout=120)
+        data = json.loads(p.stdout)
+        bad = [c for c in data["cases"] if not c["pass"]]
+        self.assertEqual(bad, [], f"живой мост ведёт себя иначе: {bad}")
+        self.assertEqual(p.returncode, 0, p.stderr[-400:])
+        self.assertGreaterEqual(data["negatives"], 8,
+                                "отрицательных проверок стало меньше — забор ослаб")
+        self.assertGreaterEqual(len(data["cases"]), 16, len(data["cases"]))
+
+    def test_harness_reads_the_mirror_not_the_disarmed_folder(self):
+        with open(self.HARNESS, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("'bridge_prod'", src)
+        self.assertNotIn("turbobaby-bridge-gs", src)
 
 
 if __name__ == "__main__":

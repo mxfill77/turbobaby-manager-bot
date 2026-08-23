@@ -33,6 +33,12 @@
   3. `BY_HUMAN`  — **явное решение человека**: «работы не было» / «не надо» / закрыл рукой. Человек
      здесь авторитет, а не свидетель, поэтому доказательства сверх его слов не требуется.
 
+ДОЛГ ПРИВЯЗАН К ПОЗИЦИИ, А НЕ К БАЙКУ (23.08.2026, шесть дыр ревизии `930da84`). Признаки решают,
+ЗАКРЫТ ли долг; `settle` решает, ЧЬЯ строка и КАКАЯ ИМЕННО позиция гаснет. Разбор — в шапке секции
+«ПОЗИЦИОННЫЙ СЛЕД» ниже; коротко: строка «то_заявки» одна на пару тема × байк, поэтому следующий
+визит того же байка затирал висящий долг соседа, партия из двух позиций гасла по первой записи,
+безусловное закрытие дописывало строку-эхо и гасило чужую открытую строку.
+
 ПО ТАЙМЕРУ ДОЛГ НЕ ГАСНЕТ НИКОГДА, И ЭТО УСТРОЙСТВО, А НЕ ОБЕЩАНИЕ: у `verdict()` параметра
 возраста НЕТ ВОВСЕ — передать его физически некуда, поэтому «повисел и рассосался» невыразимо в
 этом модуле. Возраст живёт в `voice()`, а `voice()` не умеет вернуть ни один из `CLOSERS`: старый
@@ -155,6 +161,209 @@ def _merge(prev, add):
             if k and k not in out:
                 out.append(k)
     return out
+
+
+# ================= ПОЗИЦИОННЫЙ СЛЕД: ДОЛГ ПРИВЯЗАН К ПОЗИЦИИ, А НЕ К БАЙКУ ====================
+#
+# ПОЧЕМУ ПОНАДОБИЛСЯ (ревизия 23.08.2026, `930da84`, находка Н5). Строка «то_заявки» одна на
+# ПАРУ тема × байк: `servicePendingFind_` ищет открытую строку по chat+topic+bike, а
+# `servicePendingUpsert_` кладёт `declared`/`done`/`odometer`/`status` ЦЕЛИКОМ (`pick`,
+# `bridge_prod/ServicePending.js:55`). Значит СЛЕДУЮЩИЙ ВИЗИТ ТОГО ЖЕ БАЙКА пишет своё поверх
+# чужого долга: живой 5960 — 01.08 приняли `abs,pads` при 41357, кнопку не нажали, а 22.08 приезд
+# редуктора переписал ту же строку в `gear` при 41641, и висевшие позиции исчезли БЕЗ СЛЕДА.
+# Долг, стоящий на полях `done`/`status`, переживает рестарт и удаление сообщения — но не сосед.
+#
+# ЧТО ИМЕННО ЧИНИТСЯ — НОСИТЕЛЬ, А НЕ ПРИЗНАК. Позиции долга переезжают в `note`, потому что это
+# ЕДИНСТВЕННОЕ поле строки, которого новый визит не передаёт, а `pick` сохраняет из `cur`
+# (проверено node-харнессом на ЖИВОМ коде моста, не рассуждением). Мост при этом не меняется ни
+# на строку — выкладка запрещена, а класс закрывается всё равно.
+#
+# ФОРМА — ЗЕРКАЛО УЖЕ ЖИВУЩЕГО В ЭТОМ ЖЕ ПОЛЕ СЕГМЕНТА `WORKS:{…}` (`splinter._sp_note_set_works`):
+#     `DEBT:{gear@41357; abs@41357} | WORKS:{…} | escalated`
+# Соседи по ноте не теряются НИКОГДА (`_rest_of`), иначе лечение одного класса рождало бы другой.
+#
+# ПУСТОЙ СЕГМЕНТ `DEBT:{}` — НЕ МУСОР, А СЛОВО. Мост читает пустую строку как «поле не передали»
+# (`p[k] !== ''`), то есть СТЕРЕТЬ ноту нечем: единственный способ сказать листу «позиций больше
+# нет» — написать непустое. Поэтому «сегмент есть и пуст» означает «долг снят», и сторож по этому
+# признаку возвращает строку прежнему пути, а не молчит о ней.
+LEDGER_KEY = "DEBT"
+LEDGER_ODO = "@"
+LEDGER_SEP = "; "
+LEDGER_EMPTY = LEDGER_KEY + ":{}"
+LEDGER_MAX = 12          # потолок позиций: видов ТО всего 8, запас на удвоение
+
+
+def _word(x):
+    """Кусок, безопасный для сегмента: разделители формы внутрь значения не пускаем."""
+    s = str(x if x is not None else "")
+    for bad in ("{", "}", ";", "|", LEDGER_ODO, "\n", "\r"):
+        s = s.replace(bad, "")
+    return s.strip()
+
+
+def _clean(seq):
+    out = []
+    for k in (seq or ()):
+        k = _word(k)
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+def _segment(note):
+    """(начало, конец, тело) сегмента долга или None. Регулярки нет — импортов ноль."""
+    s = str(note or "")
+    head = LEDGER_KEY + ":{"
+    i = s.find(head)
+    if i < 0:
+        return None
+    j = s.find("}", i + len(head))
+    if j < 0:
+        return None
+    return i, j + 1, s[i + len(head):j]
+
+
+def ledger_present(note):
+    """Сегмент долга в ноте ЕСТЬ (пусть и пустой)? Пустой = «долг снят», а не «долга не было»."""
+    return _segment(note) is not None
+
+
+def ledger_read(note):
+    """Открытые позиции долга: [(вид, число-как-строка)]. Порядок сказанного сохранён."""
+    seg = _segment(note)
+    if seg is None:
+        return []
+    out = []
+    for chunk in seg[2].split(";"):
+        k, _, o = chunk.strip().partition(LEDGER_ODO)
+        k = _word(k)
+        if not k:
+            continue
+        km = _int(o)
+        hit = [i for i, (kk, _o) in enumerate(out) if kk == k]
+        if hit:
+            # Вид назван дважды — держим БОЛЬШЕЕ требование: закрыть труднее, чем ослабить.
+            was = _int(out[hit[0]][1])
+            if km is not None and (was is None or km > was):
+                out[hit[0]] = (k, str(km))
+            continue
+        out.append((k, str(km) if km is not None else ""))
+    return out[:LEDGER_MAX]
+
+
+def _rest_of(note):
+    """Всё, что в ноте НЕ долг (`WORKS:{…}`, `escalated`, чужой текст), — не теряется никогда."""
+    s = str(note or "")
+    seg = _segment(s)
+    if seg is not None:
+        s = s[:seg[0]] + s[seg[1]:]
+    return " | ".join(p for p in (x.strip() for x in s.split("|")) if p)
+
+
+def ledger_note(note, positions):
+    """Нота с ПЕРЕПИСАННЫМ сегментом долга; соседние сегменты сохранены дословно."""
+    rest = _rest_of(note)
+    body = LEDGER_SEP.join((k + LEDGER_ODO + o) if o else k
+                           for k, o in list(positions or ())[:LEDGER_MAX])
+    seg = (LEDGER_KEY + ":{" + body + "}") if body else ""
+    if seg and rest:
+        return seg + " | " + rest
+    return seg or rest
+
+
+def ledger_add(note, kinds, km):
+    """Долг ЗАВЕДЁН по названным позициям. Требование позиции только РАСТЁТ (берём большее число):
+    ослабить его вторым заходом значило бы закрыть долг числом, которое его не покрывает."""
+    out = list(ledger_read(note))
+    o = _int(km)
+    for k in _clean(kinds):
+        hit = [i for i, (kk, _o) in enumerate(out) if kk == k]
+        if hit:
+            was = _int(out[hit[0]][1])
+            if o is not None and (was is None or o > was):
+                out[hit[0]] = (k, str(o))
+        elif len(out) < LEDGER_MAX:
+            out.append((k, str(o) if o is not None else ""))
+    return ledger_note(note, out)
+
+
+def ledger_odometer(positions):
+    """Число, которым закрываются ВСЕ названные позиции разом, — наибольшее из их требований."""
+    best = None
+    for _k, o in (positions or ()):
+        v = _int(o)
+        if v is not None and (best is None or v > best):
+            best = v
+    return best
+
+
+def settle(note="", declared=(), done=(), closing=(), batch=(), odometer=None,
+           row_terminal=False):
+    """ЧТО ДОКАЗАННОЕ ЗАКРЫТИЕ ЗНАЧИТ ДЛЯ СТРОКИ. `verdict` отвечает «долг закрыт ли», эта —
+    «какой именно позиции и что с самой строкой»; двух ответов на один вопрос не заводится.
+
+    ТРИ ВЕЩИ, КОТОРЫХ ДО 23.08 НЕ БЫЛО, И КАЖДАЯ — ЖИВАЯ ДЫРА РЕВИЗИИ `930da84`:
+
+      * **строки нет → закрывать нечего** (Н1). Прежде закрытие звалось БЕЗУСЛОВНО, а
+        `servicePendingClose_` — это upsert: не найдя открытой строки, мост ДОПИСЫВАЛ пустую
+        («ok/row=2/saved», declared и done пусты). Строка-эхо о заявке, которой не было.
+      * **чужую строку не гасим** (Н2). Открытая `ждёт_факт` по цепи закрывалась от масляной
+        двери, хотя цепь никто не записывал. Своя — та, что НАЗЫВАЕТ хоть одну закрываемую
+        позицию (в следе, в `declared` или в `done`); иначе не наша, и мы её не трогаем.
+      * **партия гаснет ПОЗИЦИОННО** (Н3). `gear,abs` уходила в закрыто ЦЕЛИКОМ по записи одного
+        `gear`. Теперь снимаются РОВНО доказанные позиции, остальные остаются висеть и получают
+        голос сторожа.
+
+    СТРОКА ЗАКРЫВАЕТСЯ, только когда за ней не осталось НИ ОДНОГО обязательства: ни позиции
+    долга, ни заявленного-без-отписки (`declared` минус `done`). Исключение ровно одно и оно
+    названо — `row_terminal`: дверь фазы 2 («да» доверенного) и ЕСТЬ терминал самой заявки, у неё
+    «не сделано» — законный исход, а не незакрытый хвост.
+
+    → {"own", "close_row", "note", "changed", "remaining", "why"}
+    """
+    cur = str(note or "")
+    led = ledger_read(cur)
+    dec, dn, cl = _clean(declared), _clean(done), _clean(closing)
+    bt = _clean(batch) or list(cl)
+    if not cl:
+        return _st(False, False, cur, False, [k for k, _o in led],
+                   "закрывать нечего — ни одна позиция не названа")
+    names = set(k for k, _o in led) | set(dec) | set(dn)
+    if not (names & set(cl)):
+        return _st(False, False, cur, False, [k for k, _o in led],
+                   "строка не наша: ни одной закрываемой позиции она не называет")
+    if led:
+        base = list(led)
+    elif set(cl) & set(bt):
+        # Следа ещё нет (легаси-строка или дверь фазы 2) — партией считаем то, что дверь
+        # ПРИНЕСЛА САМА. Своего перечня работ этот модуль не выдумывает.
+        o = _int(odometer)
+        base = [(k, str(o) if o is not None else "") for k in bt]
+    else:
+        return _st(True, False, cur, False, [],
+                   "закрываемая позиция вне партии этой двери — след не трогаем")
+    remaining = [(k, o) for k, o in base if k not in cl]
+    owed = [k for k in dec if k not in dn]
+    close_row = (not remaining) and (row_terminal or not owed)
+    new = ledger_note(cur, [] if close_row else remaining)
+    if not new and cur:
+        # Пустую строку мост читает как «поле не передали» → стереть след нечем. Говорим словом.
+        new = LEDGER_EMPTY
+    if remaining:
+        why = ("закрыты позиции " + ",".join(cl) + "; висят " +
+               ",".join(k for k, _o in remaining) + " — строка остаётся открытой")
+    elif close_row:
+        why = "за строкой обязательств не осталось — закрываем её"
+    else:
+        why = ("позиции долга сняты, но строка ждёт заявленное (" + ",".join(owed) +
+               ") — открытой оставляем")
+    return _st(True, close_row, new, close_row or (new != cur),
+               [k for k, _o in remaining], why)
+
+
+def _st(own, close_row, note, changed, remaining, why):
+    return {"own": bool(own), "close_row": bool(close_row), "note": note,
+            "changed": bool(changed), "remaining": list(remaining), "why": why}
 
 
 def verdict(write=None, cell=None, human=None, odometer=None):

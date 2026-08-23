@@ -189,10 +189,28 @@ class FakeBridge:
         return {"ok": True, "data": {"bikes": []}}
 
 
+_WORDS_READS = []          # сколько раз дверь ходила к заявке ЗА СЛОВАМИ
+
+
 def run_done(bridge, done, works=None):
-    return asyncio.run(
-        S._sp_write_done(None, bridge, CHAT, TOPIC, BIKE, done, str(ODO),
-                         confirmed_by="@turbophuket1", ceiling_ok=True, works=works))
+    """Прогон живой двери фазы 2. Чтения ЗА СЛОВАМИ считаются точечно — спаем на
+    `_sp_words_said`, а не по числу `service_pending_get`: с 23.08 у той же двери есть ВТОРОЕ,
+    законное чтение — дверь вердикта спрашивает, есть ли что закрывать, ПЕРЕД тем как писать
+    (иначе слепой close дописывал строку-эхо). Считать оба обращения одним счётчиком значило бы
+    мерить не свой предмет: слова читаются ровно так же лениво, как читались."""
+    _WORDS_READS.clear()
+    _real = S._sp_words_said
+
+    def _spy(*a, **kw):
+        _WORDS_READS.append(1)
+        return _real(*a, **kw)
+    S._sp_words_said = _spy
+    try:
+        return asyncio.run(
+            S._sp_write_done(None, bridge, CHAT, TOPIC, BIKE, done, str(ODO),
+                             confirmed_by="@turbophuket1", ceiling_ok=True, works=works))
+    finally:
+        S._sp_words_said = _real
 
 
 NOTE_9548 = S._sp_note_set_works("", SAID_9548)
@@ -212,8 +230,8 @@ check("дверь: адрес события прежний",
 
 b2 = FakeBridge(note_text=NOTE_9548)
 written2, _ = run_done(b2, ["other"], works=SAID_9548)
-check("слова переданы дверью 2 → мост о заявке НЕ спрашивается",
-      "service_pending_get" not in b2.calls and b2.events[0]["notes"].startswith("замена аккумулятора"))
+check("слова переданы дверью 2 → за словами к заявке НЕ ходим",
+      not _WORDS_READS and b2.events[0]["notes"].startswith("замена аккумулятора"))
 
 # --- (4) расчёт не сломан: колоночная ветка ---
 bcol = FakeBridge(note_text=NOTE_9548)
@@ -227,8 +245,7 @@ check("кол.J/K/L: set_fleet_service по ВИДУ и тем же числом
 check("регистры считаются по ярлыку: service_upsert(service_type=вид)",
       [u["service_type"] for u in bcol.upserts] == ["oil", "gear", "abs", "airfilter"])
 check("колоночный путь не пишет строк истории", bcol.events == [])
-check("колоночный путь НЕ платит ни одного обращения за словами",
-      "service_pending_get" not in bcol.calls)
+check("колоночный путь НЕ платит ни одного обращения за словами", not _WORDS_READS)
 
 # --- (5) откат ---
 os.environ["WORK_NAME"] = "0"
@@ -236,8 +253,7 @@ boff = FakeBridge(note_text=NOTE_9548)
 run_done(boff, ["other"])
 check("откат WORK_NAME=0: прежний ярлык байт-в-байт",
       boff.events[0]["notes"] == "прочие работы — 36474 км")
-check("откат: слова не читаются вовсе (мост о заявке не спрошен)",
-      "service_pending_get" not in boff.calls)
+check("откат: слова не читаются вовсе (за словами к заявке не ходим)", not _WORDS_READS)
 os.environ.pop("WORK_NAME", None)
 
 # --- (6) fail-safe ---

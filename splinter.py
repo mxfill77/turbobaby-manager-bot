@@ -4150,11 +4150,15 @@ def _sp_debt_open(bridge, chat_id, topic_id, bike, kinds, km, door, oil_hint=Fal
                                  prev_done=_sp_split(prev.get("done")))
     if f is None:
         return None
+    # ПОЗИЦИОННЫЙ СЛЕД В `note` — единственное поле строки, которого следующий визит того же
+    # байка НЕ передаёт, а мост сохраняет из `cur`. Долг, стоявший на `done`/`status`, сосед
+    # затирал молча (живой 5960: 01.08 abs,pads@41357 → 22.08 gear@41641 в ТОЙ ЖЕ строке).
+    _note = service_debt.ledger_add(prev.get("note"), f["kinds"], f["odometer"])
     try:
         r = bridge.service_pending_upsert(
             chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
             declared=_sp_join(f["declared"]), done=_sp_join(f["done"]),
-            odometer=f["odometer"], status=f["status"])
+            odometer=f["odometer"], status=f["status"], note=_note)
     except Exception:
         log.exception(f"  → долг ТО {bike}: строка НЕ завелась (мост упал) — кнопку всё равно даём")
         return None
@@ -4215,24 +4219,60 @@ def _sp_debt_cell(bridge, bike, kinds, odometer):
 
 
 def _sp_debt_close(bridge, chat_id, topic_id, bike, write=None, cell=None, human=None,
-                   odometer=None, kinds=()):
-    """ЗАКРЫТИЕ ДОЛГА — только по вердикту `service_debt.verdict`, то есть только по ДОКАЗАННОМУ.
+                   odometer=None, kinds=(), batch=None, row_terminal=False, row=None):
+    """ЕДИНСТВЕННАЯ ДВЕРЬ ЗАКРЫТИЯ — только по вердикту `service_debt.verdict`, то есть только по
+    ДОКАЗАННОМУ. Второй двери в системе нет: прямой `service_pending_close` из `_sp_write_done`
+    (легаси-хвост фазы 2, находка Н4 ревизии `930da84`) ходил мимо вердикта и закрывал строку даже
+    при непустом `failed` — теперь и он идёт сюда.
 
     ЗАМОК: не доказано — строка остаётся открытой, и молчать о ней нельзя. «Проверить не удалось»
     закрытием не является; по таймеру не закрывается ничего и никогда (у `verdict` параметра
-    возраста нет вовсе)."""
+    возраста нет вовсе).
+
+    ЧТО ДЕЛАЕТ ВЕРДИКТ, А ЧТО `settle`: первый отвечает «долг закрыт ли», вторая — «чья строка и
+    какая позиция». Поэтому ПЕРЕД тем как что-то закрыть, дверь СПРАШИВАЕТ МИР (одно чтение), а
+    не пишет вслепую: раньше на месте этого чтения стоял слепой POST, и он же дописывал строку-эхо
+    там, где закрывать было нечего. Чтение вместо записи — строго дешевле по последствиям.
+
+      batch        — что дверь принесла ЦЕЛИКОМ (партия), если следа в ноте ещё нет;
+      row_terminal — дверь и есть терминал самой заявки (фаза 2), «не сделано» ей законно;
+      row          — уже прочитанная строка (сторож её держит в руках — не платим за второе чтение).
+    """
     if not _service_debt_on() or not bike:
         return None
     v = service_debt.verdict(write=write, cell=cell, human=human, odometer=odometer)
     log.info("  → " + service_debt.line(v, bike, kinds))
     if not v["closed"]:
         return v
+    it = row if row is not None else _sp_open(bridge, chat_id, topic_id, bike)
+    if not it:
+        # Н1: открытой строки нет (или мост молчит) — закрывать НЕЧЕГО. Прежде здесь уходил
+        # слепой close, а он upsert: мост ДОПИСЫВАЛ пустую строку о заявке, которой не было.
+        v["applied"] = "открытой строки нет — эха не пишем"
+        log.info(f"  → долг ТО {bike}: {v['applied']}")
+        return v
+    s = service_debt.settle(it.get("note"),
+                            declared=_sp_split(it.get("declared")),
+                            done=_sp_split(it.get("done")),
+                            closing=list(kinds or ()),
+                            batch=list(batch if batch is not None else (kinds or ())),
+                            odometer=odometer, row_terminal=row_terminal)
+    v["applied"] = s["why"]
+    v["remaining"] = s["remaining"]
+    if not s["own"] or not s["changed"]:
+        log.info(f"  → долг ТО {bike}: {s['why']} — строку не трогаем")
+        return v
     try:
-        bridge.service_pending_close(
-            chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
-            note=f"долг закрыт: {v['by']} — {v['why']}"[:200])
+        if s["close_row"]:
+            bridge.service_pending_close(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                         bike=bike, note=s["note"])
+            log.info(f"  → долг ТО {bike}: строка ЗАКРЫТА по признаку «{v['by']}» — {s['why']}")
+        else:
+            bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                          bike=bike, note=s["note"])
+            log.info(f"  → долг ТО {bike}: {s['why']} (признак «{v['by']}»)")
     except Exception:
-        log.exception(f"  → долг ТО {bike}: закрытие строки упало (долг остался открытым)")
+        log.exception(f"  → долг ТО {bike}: применение закрытия упало (долг остался открытым)")
     return v
 
 
@@ -6681,7 +6721,14 @@ async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declar
     """Фаза 1: фиксируем НАМЕРЕНИЕ (заявка). В Лист1/обслуживание НИЧЕГО не пишем.
     Z4: дословные работы (works_raw) кладём в note (для правдивой карточки «в работе»)."""
     try:
-        _note = _sp_note_set_works("", works_raw) if works_raw else ""
+        # НОТА СТРОИТСЯ ПОВЕРХ СУЩЕСТВУЮЩЕЙ, А НЕ ПОВЕРХ ПУСТОТЫ (23.08.2026). База `""` затирала
+        # ноту открытой строки целиком, а с 23.08 в ней живут ПОЗИЦИИ ДОЛГА — и новый визит того
+        # же байка стирал бы висящую работу соседа ровно тем движением, которым фиксирует свою.
+        # Чтение платится только там, где ноту и правда пишем (за 83 суток таких заявок 18).
+        _note = ""
+        if works_raw:
+            _base = (_sp_open(bridge, chat_id, topic_id, bike) or {}).get("note")
+            _note = _sp_note_set_works(_base, works_raw)
         _extra = {"note": _note} if _note else {}
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
                                       bike=bike, declared=_sp_join(declared), status="заявлено", **_extra)
@@ -7142,11 +7189,29 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     if _tok:
         log.info(f"  → отмена ТО: акт {_tok} запомнен ({len(undo_pos)} позиц., без объекта "
                  f"{undo_blind}) — кнопка живёт {undo_last.TTL_DEFAULT // 3600} ч")
-    try:
-        bridge.service_pending_close(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
-                                     note=f"written={','.join(written)} by {confirmed_by}")
-    except Exception:
-        log.exception("  → service_pending_close упал")
+    # ЗАКРЫТИЕ ОДНО И СУДИТСЯ ВЕРДИКТОМ (23.08.2026, находка Н4 ревизии `930da84`). Прежде здесь
+    # стояла ВТОРАЯ дверь — прямой `service_pending_close` мимо `service_debt.verdict`, и она
+    # закрывала строку ЦЕЛИКОМ даже при непустом `failed`: партия `gear,abs`, у которой лёг один
+    # `gear`, уходила в «закрыто» вместе с не легшим `abs`, и о потере не говорил никто. Теперь
+    # дверь та же, что у кнопок: гаснут РОВНО доказанные позиции, неудавшиеся остаются висеть и
+    # получают голос сторожа. `row_terminal=True` — потому что «да» доверенного и есть терминал
+    # самой заявки: «не сделано» ей законный исход, а не незакрытый хвост.
+    # Ветка `else` — ОТКАТ (`SERVICE_DEBT=0`), прежний путь байт-в-байт, а не вторая дверь.
+    if _service_debt_on():
+        _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=list(written), batch=list(done),
+                       odometer=odo_int, row_terminal=True,
+                       write={"landed": bool(written), "known": True,
+                              "detail": (f"фаза 2 ({confirmed_by or 'trusted'}): записано "
+                                         f"{','.join(written) or '—'}"
+                                         + (f", не легло {','.join(k for k, _e in failed)}"
+                                            if failed else ""))})
+    else:
+        try:
+            bridge.service_pending_close(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                         bike=bike,
+                                         note=f"written={','.join(written)} by {confirmed_by}")
+        except Exception:
+            log.exception("  → service_pending_close упал")
     return written, failed
 
 
@@ -7199,8 +7264,14 @@ async def _sp_debt_voice(context, bridge, it, now):
     chat_id = it.get("chat_id")
     topic_id = it.get("topic_id") or None
     declared = _sp_split(it.get("declared"))
-    done = _sp_split(it.get("done")) or declared
     note = str(it.get("note") or "")
+    # ГОЛОС ИДЁТ ПО ПОЗИЦИЯМ СЛЕДА, а не по полю `done`: `done` принадлежит ПОСЛЕДНЕМУ визиту
+    # байка (мост кладёт его целиком), а долг — тем позициям, которые так и не легли. Следа нет
+    # (легаси-строка) → прежний путь по `done` байт-в-байт.
+    _led = service_debt.ledger_read(note)
+    done = [k for k, _o in _led] or _sp_split(it.get("done")) or declared
+    _want = service_debt.ledger_odometer(_led)
+    odo_want = it.get("odometer") if _want is None else _want
     age_h = _sp_age_hours(it.get("created_at"), now)
     v = service_debt.voice(service_debt.STATUS, age_h, escalated=("escalated" in note),
                            remind_after_h=_SP_REMIND_AFTER_MIN / 60.0,
@@ -7210,8 +7281,8 @@ async def _sp_debt_voice(context, bridge, it, now):
     # ПРИЗНАК 2 ИЗ ТРЁХ — записали мимо бота (владелец рукой в Лист1). Спрашиваем ПЕРЕД тем как
     # шуметь: кричать о работе, которая уже лежит в регистре, — тот же ложный сторож наоборот.
     closed = _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=done,
-                            odometer=it.get("odometer"),
-                            cell=_sp_debt_cell(bridge, bike, done, it.get("odometer")))
+                            odometer=odo_want, row=it,
+                            cell=_sp_debt_cell(bridge, bike, done, odo_want))
     if closed is not None and closed.get("closed"):
         return
     if v["speak"] == service_debt.ESCALATE:
@@ -7268,7 +7339,19 @@ async def scheduled_service_pending_reminder(context, bridge):
     now = _time.time()
     for it in items:
         status = str(it.get("status"))
-        if status == service_debt.STATUS:
+        # ВЕТКУ ВЫБИРАЕТ СЛЕД, А НЕ СТАТУС (23.08.2026, находка Н5). Статус принадлежит
+        # ПОСЛЕДНЕМУ визиту байка: приезд редуктора переводил строку в `ждёт_факт`, и висевшие
+        # позиции соседа замолкали — «строка живёт, о ней не говорит никто», ровно тот класс,
+        # что закрыт 23.08 с другой стороны. Открытые позиции следа есть → долг, чей бы визит
+        # ни переписал поля. Сегмент есть и ПУСТ → долг снят, строку ведёт прежний путь.
+        # Сегмента нет вовсе → как было, по статусу. При `SERVICE_DEBT=0` — прежний `continue`.
+        if _service_debt_on():
+            _note_it = str(it.get("note") or "")
+            _debt_row = bool(service_debt.ledger_read(_note_it)) or (
+                status == service_debt.STATUS and not service_debt.ledger_present(_note_it))
+        else:
+            _debt_row = (status == service_debt.STATUS)
+        if _debt_row:
             # ДОЛГ ПРОХОДИТ ПРОВЕРКУ ВОЗРАСТА, А НЕ ПРОПУСКАЕТСЯ ДО НЕЁ (23.08.2026). Прежде здесь
             # стоял голый `continue`, и он стоял ВЫШЕ проверки возраста (строки 7040-7041) —
             # поэтому работа, ждущая кнопки, не получала НИ висяк-напоминания, НИ B4-эскалации

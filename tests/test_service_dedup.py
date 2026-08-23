@@ -21,7 +21,20 @@ class FakeBridge:
         self.svc_calls.append((number, kind, km, confirmed)); return {"ok": True}
     def service_upsert(self, **kw): self.upserts.append(kw); return {"ok": True, "next_km": 24316, "status": "ok"}
     def add_event(self, **kw): self.events.append(kw); return {"ok": True}
+    def service_pending_upsert(self, **kw): self.upserts.append(kw); return {"ok": True}
     def service_pending_close(self, **kw): self.closed = True; return {"ok": True}
+    # Открытая заявка у фазы 2 есть ВСЕГДА — она и есть причина, по которой дверь работает.
+    # Фикстура догнана 23.08: закрытие идёт через дверь вердикта и ПЕРЕД записью спрашивает, есть
+    # ли что закрывать (слепой close дописывал строку-эхо). Без ответа этот сьют проверял бы
+    # закрытие несуществующей строки, то есть ровно убранную дыру.
+    def service_pending_get(self, chat_id, topic_id, bike):
+        if self.closed:
+            return {"ok": False, "error": "not_found"}
+        kinds = "oil,gear,abs,airfilter,pads,chain,other"
+        return {"ok": True, "item": {"chat_id": str(CHAT), "topic_id": str(TOPIC), "bike": BIKE,
+                                     "declared": kinds, "done": kinds,
+                                     "status": "ждёт_подтверждения", "odometer": "20316",
+                                     "last_reminded_at": "", "note": "", "_row": 2}}
     def find_bike(self, q): return {"name": BIKE}
 
 def run(c): return asyncio.run(c)
