@@ -374,8 +374,18 @@ function setFleetOil_(body) {
       }
     }
 
+    // ── ПАМЯТЬ О ВЫТЕСНЕНИИ (22.08.2026) ─────────────────────────────────────────────────
+    // Пишется при КАЖДОЙ записи регистра, а не только в ветке исправления: без строки о том,
+    // ЧТО эта запись вытеснила, отменять её нечем, и «отмена» была бы неотличима от скрутки.
+    // Best-effort: журнал не лёг → запись состоялась, но неотменяема, и это сказано полями
+    // ответа (`act: null`, `act_logged: false`), а не умолчано. Аудит-след исправления выше —
+    // ОТДЕЛЬНАЯ, фейл-клоузд запись, он не ослаблен ни на строку.
+    var mem = undoRemember_({ p: number, b: hit.name, c: 9, k: 'oil', o: old_oil, r: hit.raw,
+                              n: oil_km, w: (isFix ? fixedBy : String(p.by || 'bot')) });
+
     var out = { ok: true, number: number, bike_name: hit.name, row: hit.sheetRow,
-                old_oil: old_oil, new_oil: oil_km, verified: true, full_address: full_address };
+                old_oil: old_oil, new_oil: oil_km, verified: true, full_address: full_address,
+                act: mem.act, act_logged: mem.logged };
     if (isFix) {
       out.correction = { reason: fixReason, by: fixedBy, drop: drop, trusted: p.trusted === true };
       out.rollback_oil = old_oil;      // откат описан ДАННЫМИ: тем же вызовом вернуть это число
@@ -431,7 +441,9 @@ function setFleetService_(body) {
         var raw = data[i][col - 1];
         var oldVal = (raw === '' || raw === null || raw === undefined) ? 0 : Number(raw);
         if (!isFinite(oldVal)) oldVal = 0;
-        matches.push({ sheetRow: i + 3, name: name, old_km: oldVal });
+        // raw хранится ради ОТМЕНЫ (зеркало приёма кол.I): пустая клетка обязана вернуться
+        // пустой, а не нулём — иначе возврат сам испортил бы живую таблицу.
+        matches.push({ sheetRow: i + 3, name: name, old_km: oldVal, raw: raw });
       }
     }
 
@@ -458,9 +470,16 @@ function setFleetService_(body) {
     if (!vr.ok)
       return { ok: false, error: 'verify_failed', full_address: full_address, mismatches: vr.mismatches };
 
+    // ── ПАМЯТЬ О ВЫТЕСНЕНИИ (22.08.2026) ─────────────────────────────────────────────────
+    // Прежде боевой журнал знал РОВНО одну запись регистра — ветку исправления масла; все
+    // J/K/L не оставляли на мосту ни строки, и отменять их было нечем. Теперь помнит каждую.
+    var mem = undoRemember_({ p: number, b: hit.name, c: col, k: kind, o: hit.old_km,
+                              r: hit.raw, n: km, w: String(p.by || 'bot') });
+
     return { ok: true, number: number, bike_name: hit.name, row: hit.sheetRow,
              kind: kind, column: col, old_km: hit.old_km, new_km: km,
-             verified: true, full_address: full_address };
+             verified: true, full_address: full_address,
+             act: mem.act, act_logged: mem.logged };
   } catch (err) {
     return { ok: false, error: 'write_failed', message: String(err) };
   }

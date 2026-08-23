@@ -242,7 +242,7 @@ function doPost(e) {
     // Защищаем ТОЛЬКО agent-записи. origin=human/отсутствует → пропускаем (замок спит, люди как сейчас).
     // origin=agent на КРАСНОМ экшене → нужен валидный одноразовый билет, иначе ЖЁСТКИЙ отказ + лог rejected.
     var REDZONE_LOCK = {
-      set_fleet_oil: 1, set_fleet_service: 1, add_transaction: 1, void_last: 1,
+      set_fleet_oil: 1, set_fleet_service: 1, service_undo: 1, add_transaction: 1, void_last: 1,
       create_booking: 1, activate_booking: 1, close_booking: 1, delete_event: 1,
       edit_event: 1,                                                // правка строки НА МЕСТЕ: затирает прежнее значение
       ocr_passport: 1, save_passport: 1, upload_passport_photo: 1,  // B2: внешний вызов + Drive + Bot Data
@@ -460,6 +460,11 @@ function doPost(e) {
       case 'set_fleet_service':
         return jsonResponse(Object.assign({ action }, setFleetService_(body)));
 
+      // ОТМЕНА записи регистра ТО по ССЫЛКЕ НА АКТ (см. ServiceUndo.gs). Числа вниз снаружи
+      // дверь не принимает вовсе: прежнее значение мост достаёт из своей памяти сам.
+      case 'service_undo':
+        return jsonResponse(Object.assign({ action }, serviceUndo_(body)));
+
       case 'prune_cc_log':
         return jsonResponse(Object.assign({ action }, pruneCcLog_()));
 
@@ -500,7 +505,7 @@ function doPost(e) {
           ok: false,
           error: 'unknown_action',
           message: `Unknown POST action: ${action}`,
-          actions: ['add_transaction', 'add_event', 'delete_event', 'read_events', 'check_balance', 'get_balance', 'tx_summary', 'void_last', 'service_upsert', 'service_list', 'service_set_pin', 'important_add', 'important_list', 'important_due', 'important_touch', 'important_close', 'audit_log', 'audit_list', 'audit_update', 'create_booking', 'activate_booking', 'close_booking', 'write_doc', 'migrate_journal', 'create_brain_plain', 'log_write', 'read_write_log', 'issue_write_ticket', 'consume_write_ticket', 'set_fleet_oil', 'set_fleet_service', 'prune_cc_log', 'setup_prune_trigger', 'prune_review', 'prune_review_size', 'setup_review_prune_trigger', 'prune_sessions_log', 'setup_sessions_prune_trigger', 'prune_cowork_log', 'setup_cowork_prune_trigger', 'prune_cowork_selftest', 'list_project_triggers', 'enqueue_task', 'claim_task', 'complete_task', 'set_needs_approval', 'approve_task', 'task_heartbeat', 'get_pending', 'upload_passport_photo', 'ocr_passport', 'save_passport', 'make_contract', 'seed_cost_models', 'closing_upsert', 'closing_get', 'closing_list', 'state_set', 'state_get', 'state_list', 'trash_brain_file', 'move_brain_file', 'register_brain_doc', 'move_into_brain', 'unregister_brain_doc', 'edit_event']
+          actions: ['add_transaction', 'add_event', 'delete_event', 'read_events', 'check_balance', 'get_balance', 'tx_summary', 'void_last', 'service_upsert', 'service_list', 'service_set_pin', 'important_add', 'important_list', 'important_due', 'important_touch', 'important_close', 'audit_log', 'audit_list', 'audit_update', 'create_booking', 'activate_booking', 'close_booking', 'write_doc', 'migrate_journal', 'create_brain_plain', 'log_write', 'read_write_log', 'issue_write_ticket', 'consume_write_ticket', 'set_fleet_oil', 'set_fleet_service', 'service_undo', 'prune_cc_log', 'setup_prune_trigger', 'prune_review', 'prune_review_size', 'setup_review_prune_trigger', 'prune_sessions_log', 'setup_sessions_prune_trigger', 'prune_cowork_log', 'setup_cowork_prune_trigger', 'prune_cowork_selftest', 'list_project_triggers', 'enqueue_task', 'claim_task', 'complete_task', 'set_needs_approval', 'approve_task', 'task_heartbeat', 'get_pending', 'upload_passport_photo', 'ocr_passport', 'save_passport', 'make_contract', 'seed_cost_models', 'closing_upsert', 'closing_get', 'closing_list', 'state_set', 'state_get', 'state_list', 'trash_brain_file', 'move_brain_file', 'register_brain_doc', 'move_into_brain', 'unregister_brain_doc', 'edit_event']
         }, 400);
     }
 

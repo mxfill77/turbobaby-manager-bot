@@ -112,7 +112,12 @@ global.PropertiesService = { getScriptProperties: () => ({ getProperty: () => 'f
 global.Logger = { log: () => {} };
 global.DriveApp = { getFileById: () => ({}), getFolderById: () => ({ addFile: () => {} }), getRootFolder: () => ({ removeFile: () => {} }) };
 
-for (const f of ['Config.js', 'BotData.js', 'ReadFleet.js'])
+// ServiceUndo.js добавлен 23.08.2026 вместе со сведением зеркала к проду @83. У Apps Script все
+// файлы проекта живут в ОДНОЙ глобальной области, и с @83 `ReadFleet.js` зовёт оттуда
+// `undoRemember_` при КАЖДОЙ записи регистра. Без него харнесс падал бы «undoRemember_ is not
+// defined» — то есть судил бы код, которого в проде не существует. Набор и порядок те же, что у
+// tests/undo_door_harness.js.
+for (const f of ['Config.js', 'BotData.js', 'ReadFleet.js', 'ServiceUndo.js'])
   vm.runInThisContext(fs.readFileSync(path.join(GS, f), 'utf8'), { filename: path.join(GS, f) });
 
 const cases = [];

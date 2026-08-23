@@ -109,24 +109,58 @@ def test_five_named_negatives_are_present():
         assert twin in names, "у отрицательного случая пропал близнец: %s" % twin
 
 
-# ─────────────── (2) зеркало прода не правили — оно же замер «до» ───────────────
+# ─────────────── (2) зеркало несёт дверь, потому что её несёт ПРОД ───────────────
 
-def test_mirror_untouched_and_has_no_door():
-    """У ЗАДЕПЛОЕННОЙ версии двери отмены нет вовсе — это и есть состояние «до правки».
+def test_mirror_carries_the_deployed_door():
+    """У ЗАДЕПЛОЕННОЙ версии дверь отмены ЕСТЬ — значит она обязана быть и в зеркале.
 
-    Заодно доказывает, что заход не полез в зеркало: появись эти имена там, «истина о проде»
-    начала бы врать, а замок паспорта покраснел бы.
+    ИСТОРИЯ ПРЕМИСЫ (важно, иначе тест снова протухнет молча). До 23.08.2026 здесь стояло
+    обратное утверждение — «у прода двери нет вовсе, это и есть замер „до правки“». Оно было
+    верным ровно до выкладки: владелец выложил сборку захода 23.08.2026 06:40 UTC как @83, и
+    премиса умерла вместе с @79. Тот же класс, что описан в CLAUDE.md («утверждение о состоянии
+    не живёт без способа его проверить»), только пойманный не документом, а гейтом — тест
+    покраснел, как и должен был. Разбор: docs/artifacts/2026-08-23-bridge-mirror-sync.md.
+
+    ЗАЧЕМ ЭТОТ ТЕСТ ТЕПЕРЬ — он и есть противомина. Зеркало @79 не знало двери, а прод её уже
+    обслуживал: следующая сборка, взяв базой такое зеркало, стёрла бы дверь МОЛЧА. Пропади
+    ServiceUndo.js или зов памяти из зеркала снова — здесь красное.
+
+    Чего этот тест НЕ доказывает: что зеркало не правили руками вместо сборки. Это отдельный
+    замок и он не ослаблен — tests/test_bridge_prod_mirror.py::test_mirror_files_match_passport
+    сверяет каждый байт зеркала с паспортом MIRROR.json.
     """
-    assert not os.path.exists(os.path.join(MIRROR, "ServiceUndo.js")), \
-        "в зеркале появился новый файл — его правили вместо сборки"
+    assert os.path.exists(os.path.join(MIRROR, "ServiceUndo.js")), \
+        "в зеркале нет модуля отмены, а прод его обслуживает — зеркало отстало от прода"
     fleet = _read(os.path.join(MIRROR, "ReadFleet.js"))
     bridge = _read(os.path.join(MIRROR, "Bridge.js"))
-    assert "undoRemember_" not in fleet and "serviceUndo_" not in fleet
-    assert "serviceUndo_" not in bridge and ("'%s'" % A_UNDO) not in bridge
-    # артефакт 22.08 §5: боевой журнал зовётся из ReadFleet РОВНО ОДИН раз и только в ветке
-    # исправления масла — вот почему отменять J/K/L было нечем.
+    assert fleet.count("undoRemember_(") == 2, \
+        "в зеркале память о вытеснении стоит не у обоих писателей: %d" % fleet.count("undoRemember_(")
+    assert "serviceUndo_(body)" in bridge and ("case '%s':" % A_UNDO) in bridge, \
+        "в зеркале нет маршрута отмены, хотя прод его знает"
+    # аудит-след исправления масла — прежний, фейл-клоузд, ОДИН зов: выкладка его не размножила
     assert fleet.count("logWrite_(") == 1, \
-        "премиса замера «журнал зовётся ровно один раз» больше не верна: %d" % fleet.count("logWrite_(")
+        "аудит-след исправления в зеркале задет: зовов %d" % fleet.count("logWrite_(")
+
+
+def test_mirror_fingerprint_knows_the_door():
+    """Отпечаток, который мост печатает на неизвестное действие, в зеркале ТОТ ЖЕ, что у прода.
+
+    По этому списку сверяют, что реально задеплоено (CLAUDE.md, «отпечаток прода обязателен
+    перед push»). Живой замер 23.08.2026: прод отдал 67 действий, среди них дверь отмены;
+    зеркало @79 несло 66 и о двери молчало. Число здесь не хардкодим — сверяем СОСТАВ зеркала
+    со сборкой, а живую сверку с мостом делает deploy/bridge_prod_diff.py (ему нужна сеть,
+    в гейте её нет).
+    """
+    mir = _read(os.path.join(MIRROR, "Bridge.js"))
+    bld = _read(os.path.join(BUILD, "Bridge.js"))
+    def post_list(src):
+        blocks = [b.split("]")[0] for b in src.split("actions: [")[1:]]
+        post = [b for b in blocks if ("'%s'" % A_OIL) in b]
+        assert post, "в отпечатке не нашёлся список действий POST"
+        return sorted(re.findall(r"'([^']+)'", post[0]))
+    m, b = post_list(mir), post_list(bld)
+    assert A_UNDO in m, "отпечаток зеркала молчит о двери отмены, а прод о ней говорит"
+    assert m == b, "отпечаток зеркала разошёлся со сборкой: %s" % (set(m) ^ set(b))
 
 
 def test_build_remembers_every_register_write():
@@ -217,16 +251,43 @@ def test_diff_from_mirror_removes_no_guard_line():
 # ─────────────── (5) каталог сборки: паспорт, база, не заряженный ствол ───────────────
 
 def test_build_passport_matches_the_mirror_base():
-    """База сборки — тот самый прод @N, что лежит в зеркале. Съехала — пересобирать."""
+    """У каталога сборки ДВА состояния, и в каждом сверяется своё.
+
+    (а) НЕ ВЫЛОЖЕН — база сборки обязана быть тем самым продом @N, что лежит в зеркале.
+        Съехала — пересобирать поверх свежего прода. Это прежний замок, он не тронут.
+
+    (б) ВЫЛОЖЕН (в паспорте есть `delivered_as_version`) — сверяется утверждение СИЛЬНЕЕ:
+        содержимое сборки обязано совпасть с зеркалом побайтно, то есть «мы выложили ровно то,
+        что построили, и зеркало это подтверждает».
+
+    Почему понадобилось (б), 23.08.2026: сборку выложили как @83, зеркало свели к проду — и
+    база @79 законно разошлась с зеркалом @83. Прежняя ветка требовала «пересобрать», но
+    пересобирать нечего: дельта уже в проде. Состояние «выложено» автор просто не моделировал
+    («Выкладки в этом заходе НЕТ» — шапка этого файла). Зубы замка на месте: следующий заход,
+    который начнёт строить в этом каталоге новое, обязан снять `delivered_as_version` и
+    объявить свежую базу — иначе красное здесь.
+    """
     meta = json.load(open(os.path.join(BUILD, "BUILD.json"), encoding="utf-8"))
     mirror = json.load(open(os.path.join(MIRROR, "MIRROR.json"), encoding="utf-8"))
-    assert meta["base_prod_version"] == mirror["prod_version"]
     assert meta["script_id"] == mirror["script_id"]
-    for name, sha in meta["base_sha256"].items():
-        assert mirror["files_sha256"].get(name) == sha, \
-            "база сборки разошлась с зеркалом по %s — собери заново поверх свежего прода" % name
     assert set(meta["changed"]) == {"Bridge.js", "ReadFleet.js"}
     assert meta["added"] == ["ServiceUndo.js"]
+
+    delivered = meta.get("delivered_as_version")
+    if delivered is None:
+        assert meta["base_prod_version"] == mirror["prod_version"]
+        for name, sha in meta["base_sha256"].items():
+            assert mirror["files_sha256"].get(name) == sha, \
+                "база сборки разошлась с зеркалом по %s — собери заново поверх свежего прода" % name
+        return
+
+    assert delivered == mirror["prod_version"], (
+        "сборка объявлена выложенной как @%s, а зеркало описывает @%s — сведи зеркало к проду"
+        % (delivered, mirror["prod_version"]))
+    for name, sha in meta["build_sha256"].items():
+        assert mirror["files_sha256"].get(name) == sha, (
+            "выложенная сборка разошлась с зеркалом по %s: в проде НЕ то, что построено "
+            "(либо сборку правили после выкладки, либо зеркало сведено не к тому проду)" % name)
 
 
 def test_build_is_not_a_deploy_folder():
