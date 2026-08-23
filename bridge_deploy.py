@@ -9,7 +9,22 @@ bridge_deploy.py — Оранжевый цикл clasp redeploy (§7 шаг 2, 1
   2. Полный гейт (gate.py) + Node-харнессы (tests/*_harness.js) зелёные
   3. После redeploy — read-only смок: ping alive + delivery_zones_get непустой
   4. Смок упал → автооткат к prev_version (-V N) + алерт Филиппу
-  5. Отчёт постфактум в cc_log + пульс
+  5. Удачный redeploy + удачный смок → СВЕЖИЙ ОТПЕЧАТОК и сведение зеркала `bridge_prod/`
+  6. Отчёт постфактум в cc_log + пульс
+
+ЗЕРКАЛО СВОДИТ МАШИНА, А НЕ ПАМЯТЬ ИСПОЛНИТЕЛЯ (23.08.2026). Прежде за пунктом «после выкладки
+обновить зеркало» не стояло ни одной машины: скрипт называл `bridge_prod/` один раз строкой-
+подсказкой, а у паспорта зеркала за всю жизнь был РОВНО ОДИН коммит. Цена измерена живым случаем:
+прод уехал @79 → @83 выкладкой 23.08 06:40, зеркало сведено только в 12:20 отдельным заходом —
+5 ч 40 мин прод и зеркало расходились, и следующая сборка «поверх зеркала» стёрла бы дверь
+`service_undo` МОЛЧА. Теперь после УДАЧНОГО redeploy шаг [7/7] снимает свежий отпечаток
+(`deploy/bridge_prod_recon.py` — read-only GET'ы к Apps Script API, clasp тут не участвует),
+решение принимает чистая функция `mirror_sync.plan`, а запись проверяется ОБРАТНЫМ ЧТЕНИЕМ.
+
+ОТКАЗ ГРОМКИЙ, А НЕ ТИХИЙ. Отпечаток не снят / снимок неполон / прод уронил файл — зеркало НЕ
+трогается, но и код возврата 0 не выдаётся: цикл возвращает 4 «прод выложен, зеркало НЕ сведено»
++ алерт + запись в cc_log. Отставшее МОЛЧА зеркало и есть мина, ради которой всё это заведено;
+ноль обязан значить «прод выложен И зеркало ему соответствует».
 
 ЦЕЛИ ПО УМОЛЧАНИЮ НЕТ (10.08.2026). Прежде скрипт был намертво нацелен на долгоживущую папку
 `/root/turbobaby-bridge-gs`, а она 10.08.2026 обезврежена как источник выкладки: на свежем
@@ -25,15 +40,22 @@ delivery_zones_init и любые боевые записи — КРАСНАЯ �
   (то же можно задать переменной окружения BRIDGE_BUILD_DIR)
 """
 import glob
+import hashlib
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TESTS_DIR = os.path.join(ROOT, "tests")
 PY = os.path.join(ROOT, "venv", "bin", "python3")
+
+sys.path.insert(0, ROOT)
+import mirror_sync                     # noqa: E402  (чистое решение, импортов у него НОЛЬ)
 
 PROD_ID = "AKfycbxNC9gCM7-a635gDMk_jtPKsBNeCcBA23uuyrWXcMWHNREANzFSnpE1kXISAYZ_hXNOqw"
 
@@ -45,6 +67,14 @@ BUILD_DIR_ENV = "BRIDGE_BUILD_DIR"
 
 POINTER = ("выкладка только из каталога сборки захода; истина прода — bridge_prod/, "
            "см. CLAUDE.md")
+
+# ── сведение зеркала после удачной выкладки (23.08.2026) ─────────────────────
+MIRROR_DIR = os.path.join(ROOT, "bridge_prod")
+RECON = os.path.join(ROOT, "deploy", "bridge_prod_recon.py")
+SNAP_PREFIX = "tb_bridge_recon_"
+MIRROR_SYNC_ENV = "MIRROR_SYNC"       # «0» — ветка мертва ДО единого обращения к отпечатку
+PULLED_BY = ("bridge_deploy.py после удачного redeploy "
+             "(отпечаток deploy/bridge_prod_recon.py, read-only GET к Apps Script API)")
 
 
 # ────────────────────────── цель выкладки: годна или нет ──────────────────────
@@ -178,6 +208,128 @@ def _do_rollback(prev_version, target):
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+# ───────────── руки сведения зеркала: снять отпечаток, положить, перечитать ──────────────
+#
+# Решение здесь не принимается НИ ОДНО — его целиком держит чистый `mirror_sync`. Руки умеют
+# ровно три вещи: спросить мир (отпечаток), сложить факты как есть и, если решение сказало
+# «сводить», положить файлы и ПЕРЕЧИТАТЬ их с диска.
+
+def _mirror_enabled(env=None):
+    """Ручка отката `MIRROR_SYNC=0`: ветка гаснет ДО обращения к отпечатку, поведение прежнее."""
+    env = os.environ if env is None else env
+    return str(env.get(MIRROR_SYNC_ENV, "1")).strip() != "0"
+
+
+def _sha_file(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def _dir_hashes(folder, skip_local=False):
+    """{имя: sha256} файлов каталога. None — каталога нет или он не читается.
+
+    None, а не пустой словарь, НАМЕРЕННО: «не прочитали» и «пусто» — разные ответы, и решение
+    отвечает на них по-разному (пустой снимок и нечитаемое зеркало ловятся отдельными ветками).
+    """
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    out = {}
+    for n in names:
+        p = os.path.join(folder, n)
+        if not os.path.isfile(p):
+            continue
+        if skip_local and mirror_sync.is_local_only(n):
+            continue
+        try:
+            out[n] = _sha_file(p)
+        except OSError:
+            return None
+    return out
+
+
+def _read_json(path):
+    """Прочитанный json либо None. Нечитаемое и неразбираемое — одинаково «не прочитали»."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _recon(snap_dir):
+    """Свежий отпечаток прода в `snap_dir` (read-only GET'ы; clasp НЕ участвует). (rc, хвост)."""
+    r = subprocess.run(
+        [PY, RECON, snap_dir], capture_output=True, text=True, timeout=600, cwd=ROOT,
+    )
+    return r.returncode, (r.stdout + r.stderr).strip()[-400:]
+
+
+def _mirror_facts(snap_dir, mirror_dir, rc, tail):
+    """Факты о снимке и зеркале — как есть, без единого суждения (судит `mirror_sync.plan`)."""
+    meta = _read_json(os.path.join(snap_dir, "meta.json"))
+    ver = meta.get("prod_version") if isinstance(meta, dict) else None
+    live = None
+    if isinstance(ver, int) and not isinstance(ver, bool):
+        live = _dir_hashes(os.path.join(snap_dir, "prod_v%d" % ver))
+    return {
+        "recon_rc": rc,
+        "recon_tail": tail,
+        "meta": meta,
+        "live": live,
+        "head": _dir_hashes(os.path.join(snap_dir, "head")),
+        "mirror": _dir_hashes(mirror_dir, skip_local=True),
+        "mirror_meta": _read_json(os.path.join(mirror_dir, mirror_sync.PASSPORT_NAME)),
+    }
+
+
+def _mirror_apply(pl, snap_dir, mirror_dir, pulled_utc):
+    """Положить файлы прода в зеркало + паспорт, затем ПЕРЕЧИТАТЬ написанное. (ok, деталь).
+
+    Удаления здесь нет ни одного вызова: план с исчезнувшим у прода файлом решение не отдаёт
+    вовсе (это красная зона владельца), поэтому руки умеют только класть.
+    """
+    pp = mirror_sync.passport(pl, pulled_utc, PULLED_BY)
+    if pp is None:
+        return False, "паспорт не собран (нет времени снятия) — зеркало не тронуто"
+    src = os.path.join(snap_dir, "prod_v%d" % pl["version"])
+    try:
+        for n in pl["write"]:
+            shutil.copyfile(os.path.join(src, n), os.path.join(mirror_dir, n))
+        with open(os.path.join(mirror_dir, mirror_sync.PASSPORT_NAME), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(pp, ensure_ascii=False, indent=1, sort_keys=True) + "\n")
+    except OSError as e:
+        return False, "запись зеркала не удалась (%s) — зеркало в неопределённом состоянии" % e
+
+    v = mirror_sync.verify(pl, _dir_hashes(mirror_dir, skip_local=True))
+    if not v["ok"]:
+        return False, v["reason"]
+    return True, "@%d: положено %d, совпадало %d" % (pl["version"], len(pl["write"]), len(pl["same"]))
+
+
+def sync_mirror(mirror_dir=None, snap_dir=None, env=None):
+    """Свести зеркало к свежему отпечатку прода. Возвращает (ok, деталь, версия|None).
+
+    Снимок НЕ убирается намеренно: это доказательство того, ЧТО именно легло в зеркало, и живёт
+    оно во временном каталоге до перезагрузки. Каталог свой на каждый прогон — чужой (а тем более
+    протухший) снимок не должен даже теоретически стать источником записи в репозиторий.
+    """
+    mirror_dir = MIRROR_DIR if mirror_dir is None else mirror_dir
+    if snap_dir is None:
+        snap_dir = tempfile.mkdtemp(prefix=SNAP_PREFIX)
+    rc, tail = _recon(snap_dir)
+    facts = _mirror_facts(snap_dir, mirror_dir, rc, tail)
+    pl = mirror_sync.plan(facts)
+    if not pl["ok"]:
+        return False, pl["reason"], None
+    # Паспорт переписывается ДАЖЕ когда все файлы совпали: версия и время снятия — тоже
+    # утверждения о проде, и зеркало @83 при живом @84 врёт ими молча, хотя байты те же.
+    ok, detail = _mirror_apply(pl, snap_dir, mirror_dir,
+                               time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+    return ok, detail, (pl["version"] if ok else None)
+
+
 # ──────────────────────────── вспомогательные ────────────────────────────────
 
 def _alert(text):
@@ -203,13 +355,16 @@ def _log_cc(text, pulse=None):
 
 # ──────────────────────────── главный цикл ───────────────────────────────────
 
-def deploy(target=None):
+def deploy(target=None, mirror_dir=None):
     """
     Оранжевый цикл redeploy. Возвращает exit-код:
-      0 — успех (redeploy + смок пройдены)
+      0 — успех (redeploy + смок пройдены + зеркало сведено к свежему отпечатку)
       1 — ошибка деплоя или смока (с возможным откатом)
       2 — предварительный блок (гейт или Node-харнессы красные)
       3 — цель выкладки не годится (проверяется ПЕРВОЙ, до гейта и до clasp)
+      4 — ПРОД ВЫЛОЖЕН, А ЗЕРКАЛО НЕ СВЕДЕНО (отпечаток не снят / снимок неполон / нужен
+          ход владельца). Прод при этом жив и смок пройден — но нулём такое звать нельзя:
+          молча отставшее зеркало и есть мина, которую следующая сборка выложит поверх прода.
     """
     print("=== bridge_deploy: оранжевый цикл clasp redeploy ===")
 
@@ -264,16 +419,51 @@ def deploy(target=None):
     time.sleep(3)   # GAS прогревается после деплоя
     ok, detail = _smoke_ok()
     if ok:
-        _log_cc(
-            f"bridge_deploy: redeploy ok, смок ok ({detail}), прежняя @{prev_ver}",
-            pulse=f"🟢 bridge_deploy done, смок ok, @{prev_ver}→новая",
-        )
         print(f"✅ Смок пройден: {detail}")
+
+        # [7/7] Свежий отпечаток → зеркало. Пункт «после выкладки обновить зеркало» получил
+        # машину 23.08.2026; до неё он жил прозой и один раз уже стоил 5 ч 40 мин расхождения.
+        if not _mirror_enabled():
+            print("⚠️ ЗЕРКАЛО НЕ СВЕДЕНО: ветка выключена ручкой "
+                  f"{MIRROR_SYNC_ENV}=0 — сведи руками ДО следующей сборки "
+                  "(venv/bin/python3 deploy/bridge_prod_diff.py покажет расхождение).")
+            _log_cc(
+                f"bridge_deploy: redeploy ok, смок ok ({detail}), прежняя @{prev_ver}; "
+                f"зеркало НЕ сведено (ручка {MIRROR_SYNC_ENV}=0) — свести руками",
+                pulse=f"🟡 bridge_deploy done, смок ok, @{prev_ver}→новая, зеркало НЕ сведено",
+            )
+            print("🟢 ДЕПЛОЙ УСПЕШЕН (зеркало на ручном режиме).")
+            return 0
+
+        print("[7/7] Свежий отпечаток → зеркало bridge_prod/…")
+        mok, mdetail, mver = sync_mirror(mirror_dir=mirror_dir)
+        if not mok:
+            msg = (f"bridge_deploy: ПРОД ВЫЛОЖЕН (смок ok: {detail}), а ЗЕРКАЛО НЕ СВЕДЕНО — "
+                   f"{mdetail}")
+            print(f"⛔ {msg}")
+            print("   Следующая сборка «поверх зеркала» выложит устаревшее МОЛЧА — сведи "
+                  "зеркало руками: venv/bin/python3 deploy/bridge_prod_diff.py")
+            _alert(f"🟡 {msg}. Зеркало bridge_prod/ отстало от прода — свести руками.")
+            _log_cc(msg, pulse="🟡 bridge_deploy: прод выложен, зеркало НЕ сведено — свести руками")
+            return 4
+
+        _log_cc(
+            f"bridge_deploy: redeploy ok, смок ok ({detail}), прежняя @{prev_ver}; "
+            f"зеркало сведено к проду {mdetail}",
+            pulse=f"🟢 bridge_deploy done, смок ok, @{prev_ver}→@{mver}, зеркало сведено",
+        )
+        print(f"✅ Зеркало сведено: {mdetail}")
+        print(f"   Каталог сборки, объявленный выложенным, теперь обязан называть @{mver} "
+              "(delivered_as_version) — иначе tests/test_undo_door.py покраснеет.")
         print("🟢 ДЕПЛОЙ УСПЕШЕН.")
         return 0
 
-    # Смок упал → откат
+    # Смок упал → откат. Зеркало НЕ трогаем ни в одной ветке ниже: прод либо откачен, либо
+    # в неопределённом состоянии, и сводить зеркало «к чему-нибудь» здесь значило бы записать
+    # в репозиторий утверждение о проде, которого никто не проверял.
     print(f"❌ Смок УПАЛ: {detail}")
+    print("ℹ️ Зеркало bridge_prod/ НЕ сведено (и не должно быть): состояние прода определяется "
+          "откатом ниже, сверка — deploy/bridge_prod_diff.py")
     if prev_ver is None:
         msg = f"bridge_deploy: смок упал ({detail}), версия неизвестна — ОТКАТ НЕВОЗМОЖЕН"
         _alert(f"🔴 {msg}. Ручная проверка Bridge!")

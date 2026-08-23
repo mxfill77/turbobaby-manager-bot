@@ -28,6 +28,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ.setdefault("PRETOOL_NOPUSH", "1")
 
+# ПРЕДМЕТ ЭТОГО СЬЮТА — цикл redeploy/смок/автооткат, каким он был ДО машины сведения зеркала
+# (23.08.2026). Шаг [7/7] здесь принудительно выключен: `subprocess.run` тут замокан целиком,
+# поэтому отпечаток «удаётся» с пустым каталогом снимка, машина честно отказывает — и голдены
+# начинают судить не своё. Тот же приём изоляции, что у CURATOR/PLAN_ADAPT/CARD_DUTY/ASK_DEDUP.
+# Цикл С ВКЛЮЧЁННОЙ машиной (успех, громкий отказ, откат ручкой) проверяет tests/test_mirror_sync.py.
+os.environ["MIRROR_SYNC"] = "0"
+
 import bridge_deploy
 PROD_ID = bridge_deploy.PROD_ID
 
@@ -376,13 +383,24 @@ def test_prod_id_matches_claude_md():
 
 
 def test_happy_path_log_contains_pulse():
-    """Happy path: _log_cc вызывается с pulse (содержит 🟢)."""
+    """Happy path: _log_cc вызывается с pulse, и пульс называет состояние ЗЕРКАЛА.
+
+    ЧТО ИЗМЕНИЛОСЬ 23.08.2026 И ПОЧЕМУ ЭТО НЕ МОЛЧАЛИВАЯ ПРАВКА ГОЛДЕНА. Прежде пульс удачного
+    цикла был «🟢 …» безусловно. С появлением машины сведения зеркала у удачи ДВА разных исхода:
+    прод выложен И зеркало сведено (🟢) — и прод выложен, а зеркало осталось позади (🟡), потому
+    что ветку выключили ручкой `MIRROR_SYNC=0`, как выключена она в шапке этого сьюта. Ручка
+    возвращает прежнее ДЕЙСТВИЕ (ничего не пишем, отпечаток не снимаем, код 0), но не прежнее
+    МОЛЧАНИЕ: именно молча отставшее зеркало 23.08 и стоило 5 ч 40 мин расхождения с продом.
+    Зелёный пульс на этом пути живёт в tests/test_mirror_sync.py, где машина включена.
+    """
     code, _, mock_log = _run(_base_runner(version=71), _client_ok(zones=14))
     assert code == 0
     call_kwargs = mock_log.call_args[1] if mock_log.call_args[1] else {}
     pulse_arg = call_kwargs.get("pulse") or (
         mock_log.call_args[0][1] if len(mock_log.call_args[0]) > 1 else "")
-    assert "🟢" in pulse_arg, f"pulse должен содержать '🟢': {pulse_arg}"
+    assert "🟡" in pulse_arg, f"pulse при выключенной машине зеркала — 🟡: {pulse_arg}"
+    assert "зеркало НЕ сведено" in pulse_arg, \
+        f"пульс обязан назвать состояние зеркала, а не умолчать о нём: {pulse_arg}"
 
 
 if __name__ == "__main__":

@@ -25,6 +25,9 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+import mirror_sync                     # noqa: E402  (чистое решение, импортов у него НОЛЬ)
+
 MIRROR = os.path.join(ROOT, "bridge_prod")
 RECON = os.path.join(ROOT, "deploy", "bridge_prod_recon.py")
 PY = os.path.join(ROOT, "venv", "bin", "python3")
@@ -39,8 +42,13 @@ def _local_only(name):
     проекте не бывает вовсе, паспорт зеркала тоже наш. Не исключи их — команда кричала бы о
     расхождении ВСЕГДА и перестала бы что-либо значить (поймано живым прогоном 10.08.2026:
     README зеркала выдавал себя за «прод впереди»).
+
+    ДОМ ПРАВИЛА ОДИН (23.08.2026): его держит `mirror_sync.is_local_only`, потому что тем же
+    различителем машина сведения решает, чего в зеркале НЕ ТРОГАТЬ. Разойдись две реализации —
+    разошлись бы в обе стороны: сверка перестала бы видеть расхождение, а запись снесла бы
+    документацию зеркала.
     """
-    return name == META or name.lower().endswith(".md")
+    return mirror_sync.is_local_only(name)
 
 
 def _sha(path):

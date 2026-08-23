@@ -100,7 +100,11 @@ def main():
             print("  ВНИМАНИЕ: HEAD впереди прода. redeploy опубликует ЭТО ТОЖЕ — назови владельцу.")
 
     with open(os.path.join(base, "meta.json"), "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"prod_version": prod_ver, "versions_tail": vers[-6:],
+        # script_id пишется в снимок с 23.08.2026: по нему машина сведения зеркала
+        # (`mirror_sync.plan`) отвечает «чей это мост» — иначе отпечаток чужого проекта
+        # молча переписал бы наше зеркало, и паспорт заявил бы о нём как о нашем проде.
+        fh.write(json.dumps({"prod_version": prod_ver, "script_id": SCRIPT_ID,
+                             "versions_tail": vers[-6:],
                              "head_files": names_head, "prod_files": prod_files},
                             ensure_ascii=False, indent=1))
     print("мета:", os.path.join(base, "meta.json"))

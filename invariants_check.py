@@ -1048,6 +1048,7 @@ def check_card_deadline_pure(world, run):
 _EXPECT_JOURNAL_PATH = None     # подменяется САМОТЕСТОМ; None → боевой expect_journal.py в репо
 _ASK_LEDGER_PATH = None         # подменяется САМОТЕСТОМ; None → боевой ask_ledger.py в репо
 _HINT_DEDUP_PATH = None         # подменяется САМОТЕСТОМ; None → боевой hint_dedup.py в репо
+_MIRROR_SYNC_PATH = None        # подменяется САМОТЕСТОМ; None → боевой mirror_sync.py в репо
 
 
 # --------------------------------------------------------------------------------------------
@@ -1708,6 +1709,38 @@ def check_hint_dedup_pure(world, run):
         return
     for where, why in findings:
         run.flag(f"hint_dedup.py:{where}", why)
+
+
+@register("MIRROR_SYNC_PURE")
+def check_mirror_sync_pure(world, run):
+    """ИНВАРИАНТ 12ч: MIRROR_SYNC_PURE.
+
+    Решение «сводить ли зеркало прод-моста к свежему отпечатку» (mirror_sync.py, 23.08.2026)
+    стоит ПЕРЕД единственным местом, где содержимое прода ложится в репозиторий, и умеет ровно
+    одно — сказать «сводить» или назвать причину отказа. Импортов НОЛЬ, и это замок: появись у
+    него сеть — он спросил бы Apps Script САМ, и «отпечаток снят» перестало бы зависеть от того,
+    снят ли отпечаток на самом деле; появись файл — зеркало переписывалось бы мимо единственной
+    двери записи, той самой, которая перечитывает написанное; появись время — «снято в …» стало
+    бы временем РЕНДЕРА, а не СНЯТИЯ, то есть паспорт начал бы врать свежестью ровно тем
+    способом, против которого написан. Руки живут отдельно, в `bridge_deploy._mirror_*` /
+    `sync_mirror`, и их проверяет tests/test_mirror_sync.py.
+    FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет."""
+    path = _MIRROR_SYNC_PATH or os.path.join(REPO, "mirror_sync.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("mirror_sync.py",
+                 f"решение о сведении зеркала не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("mirror_sync.py",
+                 f"решение о сведении зеркала не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"mirror_sync.py:{where}", why)
 
 
 @register("SHADOW_RULE_PURE")
