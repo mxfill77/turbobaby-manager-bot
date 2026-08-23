@@ -9,12 +9,23 @@ E. handle_mileage_confirm: не-Пым/не-владелец пытается �
 F. handle_mileage_confirm: Пым подтверждает >500 → разрешено + аудит
 G. Аудит-след при отказе («нет»)
 H. OCR-дыра: сырой vision-пробег НЕ попадает в mileage поля add_event
+
+ЛЕГАСИ-СЬЮТ ПРЕЖНЕГО ОПРЕДЕЛЕНИЯ, ИЗОЛИРОВАН `ODO_LOWER=0` (23.08.2026). Его предмет — дверь
+понижения ДО правила владельца 23.08: там расхождение подтверждалось односложным «намеренно», а
+понижение больше 500 км уходило к Пыму/владельцу. Правило 23.08 отменило ОБА («пустое пояснение
+и односложное согласие причиной не считаются»; «подтвердить понижение может ТОТ ЖЕ человек,
+который прислал число, отдельный подтверждающий не требуется» — владелец назвал цену прямо:
+меняем предотвращение на прослеживаемость). Новое определение живёт в `tests/test_odo_lower.py`
+и `tests/test_odo_lower_path.py`; здесь флаг отката держит ПРЕЖНИЙ путь, чтобы он оставался
+доказанным байт-в-байт. Приём тот же, что у CURATOR / PLAN_ADAPT / CARD_DUTY / CURATOR_STATE.
 """
 import os, sys, asyncio, time, datetime
 from unittest.mock import patch, AsyncMock, MagicMock
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
+# setdefault НЕ хватает: сьют наследует окружение гейта, а боевой дефолт ветки — «1».
+os.environ["ODO_LOWER"] = "0"
 import splinter as S
 
 CHAT = -1002751134848

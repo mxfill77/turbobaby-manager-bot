@@ -34,6 +34,9 @@ import works_ledger    # сторож партии: принято N · запи
 import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
 import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 14 мест
 import odo_fresh       # срок годности подтверждённого пробега: не спрашиваем число, которое знаем
+import odo_lower       # понижение пробега: расхождение ЧИСЛОМ + причина + письменное пояснение
+import reply_floor     # пол ответа: бот не молчит и не отказывает глухо (правила владельца 23.08)
+import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -81,6 +84,21 @@ def _with_separator(text):
     return text
 
 
+#: Сколько раз мы заговорили в ЭТОЙ задаче обработки обновления. Читается сразу после дверей
+#: разбора: не выросло — бот промолчал, а молчание владелец запретил как исход (23.08).
+_SPOKE = _ctxvars.ContextVar("splinter_spoke", default=0)
+
+
+def _never_silent_on():
+    """Ручка отката пола ответа. `NEVER_SILENT=0` → ветка мертва ДО сбора фактов."""
+    return str(_os_env("NEVER_SILENT", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _os_env(name, default=""):
+    """Значение окружения без импорта наверх (os уже импортирован модулем)."""
+    return os.getenv(name, default)
+
+
 async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group="", reply_markup=None, parse_mode=None):
     """Единая точка отправки сообщений Splinter в группы.
     Перед отправкой прогоняет текст через auditor.check_response_text — тот
@@ -107,7 +125,18 @@ async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=Tru
         kw["reply_markup"] = reply_markup
     if parse_mode is not None:
         kw["parse_mode"] = parse_mode
-    return await context.bot.send_message(**kw)
+    sent = await context.bot.send_message(**kw)
+    # СВИДЕТЕЛЬ РЕЧИ (правило владельца 23.08 «никогда не молчать»). `_send` — ЕДИНСТВЕННАЯ дверь
+    # к `send_message` во всём модуле, поэтому счётчик здесь и есть полный ответ на вопрос
+    # «сказали ли мы хоть слово». Отметка ставится ПОСЛЕ удачной отправки: упавшая отправка речью
+    # не является. ContextVar, а не поле/глобаль: PTB даёт каждому обновлению свою задачу со СВОЕЙ
+    # копией контекста, и ответ соседнего сообщения не имеет права сойти за наш (глобаль дала бы
+    # ложное «мы говорили», то есть ровно запрещённое молчание).
+    try:
+        _SPOKE.set(_SPOKE.get() + 1)
+    except Exception:      # свидетель не имеет права уронить отправку
+        pass
+    return sent
 
 
 async def _send_retry(context, *, attempts=3, delay=1.5, **kw):
@@ -3573,6 +3602,133 @@ def msg_soft_odo_need_owner(bike):
     )
 
 
+#: (chat_id, topic_id) → {bike, recorded, sent, reason, oil_hint, register, ts}.
+#: Живёт между «выбрал причину» и «написал пояснение». Пустая `reason` — причину ещё не выбрали.
+_ODO_LOWER_PENDING = {}
+
+
+def _odo_lower_on():
+    """Ручка отката понижения с пояснением. `ODO_LOWER=0` → прежний путь БАЙТ-В-БАЙТ."""
+    return str(_os_env("ODO_LOWER", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _odo_lower_kb(tok_by_reason):
+    """Три кнопки причин в порядке правила владельца. Четвёртой («просто да») здесь нет намеренно."""
+    rows = []
+    for key in odo_lower.REASON_ORDER:
+        lbl = odo_lower.REASONS[key]
+        rows.append([InlineKeyboardButton(f"{lbl['th']} / {lbl['ru']}",
+                                          callback_data=f"svc:lowr:{tok_by_reason[key]}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _odo_lower_ask(context, chat_id, topic_id, bike, recorded, sent,
+                         oil_hint=False, source="", register=""):
+    """Показать расхождение ЧИСЛОМ и дать выбор причины. Руки; решение — `odo_lower.ask`.
+
+    `register` — если понижение метит в регистр Лист1 (сегодня только «oil»), запись пойдёт
+    веткой исправления моста с причиной и автором; пусто — понижение живёт в теме и в журнале."""
+    say = odo_lower.ask(bike, recorded, sent, source=source)
+    if say is None:                       # понижения нет — звать было не за чем
+        return False
+    _ODO_LOWER_PENDING[(chat_id, topic_id)] = {
+        "bike": bike or "", "recorded": say["recorded"], "sent": say["sent"],
+        "reason": "", "oil_hint": bool(oil_hint), "register": str(register or ""),
+        "ts": _time.time(),
+    }
+    mark_awaiting(chat_id, topic_id)
+    toks = {k: _svc_put({"kind": "odo_lower", "chat": chat_id, "topic": topic_id,
+                         "bike": bike or "", "reason": k})
+            for k in odo_lower.REASON_ORDER}
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=f"🐀 Splinter\n🇹🇭 {say['th']}\n🇷🇺 {say['ru']}",
+                reply_markup=_odo_lower_kb(toks))
+    log.info(f"  → ПОНИЖЕНИЕ: {bike} записано={say['recorded']} прислано={say['sent']} "
+             f"(−{say['drop']}) — жду причину и пояснение, регистр={register or 'нет'}")
+    return True
+
+
+async def _odo_lower_explanation(msg, context, bridge, text, low) -> bool:
+    """Пришёл текст, когда причина уже выбрана: это и есть письменное пояснение.
+
+    Не принято — говорим, ЧТО дописать, и вопрос ОСТАЁТСЯ открытым (глухого «нет» тут нет по
+    построению). Принято — понижение идёт, а слова человека уезжают вместе с числом."""
+    key = (msg.chat_id, getattr(msg, "message_thread_id", None))
+    who = _sender_from_user(getattr(msg, "from_user", None))
+    plan = odo_lower.plan(low.get("reason"), text, who)
+    if not plan["ok"]:
+        log.info(f"  → ПОНИЖЕНИЕ: пояснение не принято ({plan['state']}) — вопрос остаётся")
+        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+                    text=f"🐀 Splinter\n🇹🇭 ⚠️ {plan['say_th']}\n🇷🇺 ⚠️ {plan['say_ru']}")
+        return True
+    await _odo_lower_commit(context, bridge, key[0], key[1], low, plan, who,
+                            msg_date=_msg_date_of(msg))
+    return True
+
+
+async def _odo_lower_commit(context, bridge, chat_id, topic_id, low, plan, who, msg_date=""):
+    """Пояснение принято → понижение идёт. Пояснение сохраняется ТРЕМЯ следами, и это не роскошь:
+    квитанция человеку СЕЙЧАС, строка аудита в «события» — чтобы прочитать ПОТОМ, и (когда
+    понижение метит в регистр) причина+автор в самой ветке исправления моста, где след
+    fail-closed: журнал не лёг → мост откатывает правку."""
+    bike = low.get("bike") or ""
+    recorded, sent = low.get("recorded"), low.get("sent")
+    _ODO_LOWER_PENDING.pop((chat_id, topic_id), None)
+    _SOFT_ODO_PENDING.pop((chat_id, topic_id), None)
+    _PENDING_MILEAGE.pop((chat_id, topic_id), None)
+    clear_awaiting(chat_id, topic_id)
+    _odo_drop_record(bike)
+
+    # (1) СЛЕД, КОТОРЫЙ ЧИТАЮТ ПОТОМ. Слова человека едут ДОСЛОВНО — ярлык причины их
+    # предваряет, а не заменяет (правило полноты истории 23.08).
+    _odo_audit_write(bridge, chat_id, topic_id, bike, sent, recorded, sender=who,
+                     outcome=f"понижение принято · {plan['line']}")
+
+    # (2) РЕГИСТР ЛИСТ1 — только веткой исправления, то есть С ПРИЧИНОЙ И АВТОРОМ. Обычный путь
+    # понижения не знает и знать не должен: пара «причина+автор» и есть то, что его открывает.
+    failed = None
+    if low.get("register") == "oil" and bridge is not None:
+        plate = _plate_from_name(bike)
+        if plate:
+            res = bridge.set_fleet_oil(number=plate, oil_km=sent, confirmed=True,
+                                       fix_reason=plan["line"], fixed_by=who)
+            if not (isinstance(res, dict) and res.get("ok")):
+                failed = res if isinstance(res, dict) else {"error": ""}
+            log.info(f"  → ПОНИЖЕНИЕ регистра: {plate} → {sent} ok={(res or {}).get('ok')}")
+
+    # (3) ЗАМЕНА ОДОМЕТРА — СОБЫТИЕ, А НЕ ПРАВКА СТАРОЙ ЗАПИСИ (правило владельца 23.08):
+    # пробег начинается заново, и это отдельная строка истории байка.
+    if plan["writes_history"] and bridge is not None:
+        try:
+            bridge.add_event(msg_date=msg_date or "", group="сервис", bike=str(bike),
+                             event_type="odometer_replaced", fuel="", mileage=str(sent),
+                             photos=0, notes=f"замена одометра: {plan['explanation']}"[:300],
+                             msg_id=f"odo_new:{chat_id}:{topic_id}:{sent}", sender=who)
+        except Exception:
+            log.exception("  → ПОНИЖЕНИЕ: строка истории о замене одометра не легла (fail-safe)")
+
+    if failed is not None:
+        # Отказ моста не отменяет сказанного человеку: он видит числа, что случилось и что делать.
+        detail_ru, detail_th = _refuse_words(failed, plate=_plate_from_name(bike), sent=sent)
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}\n"
+                                f"🇷🇺 Пояснение я сохранил: «{plan['explanation']}»"))
+        return False
+
+    rec = odo_lower.receipt(bike, recorded, sent, low.get("reason"), plan["explanation"], who)
+    await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                      text=f"🐀 Splinter\n🇹🇭 {rec['th']}\n🇷🇺 {rec['ru']}")
+    _odo_confirmed(bridge, chat_id, topic_id, bike, str(sent), questioned_km=sent,
+                   sender=who, source=f"понижение с пояснением ({plan['reason']})",
+                   msg_date=msg_date)
+    try:
+        await _after_mileage(context, bridge, chat_id, topic_id, bike, str(sent),
+                             bool(low.get("oil_hint")))
+    except Exception:
+        log.exception("  → ПОНИЖЕНИЕ: ошибка ТО-трекера после записи")
+    return True
+
+
 async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hint=False):
     """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting.
     Фикс B (сторож пробега): если распознанное число МЕНЬШЕ последнего известного по теме —
@@ -3605,7 +3761,21 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
             "new_km": new_km, "prev_km": floor, "bike": bike or "",
             "escalate": escalate, "ts": _time.time(),
         }
-        if escalate:
+        if _odo_lower_on():
+            # ПРАВИЛО ВЛАДЕЛЬЦА 23.08: односложное согласие причиной не считается. Прежняя
+            # единственная кнопка «✅ Да, намеренно» была ровно им — и ничего не сохраняла.
+            # Теперь расхождение названо ЧИСЛОМ, причина выбирается из трёх, а пояснение
+            # человек пишет словами; без него понижение не идёт.
+            #
+            # ЭСКАЛАЦИЯ ЗДЕСЬ БОЛЬШЕ НЕ ДЕЛИТ ПУТЬ, и это прямая буква правила: «подтвердить
+            # понижение может ТОТ ЖЕ человек, который прислал число, отдельный подтверждающий
+            # не требуется… цена названа владельцем сознательно: меняем предотвращение на
+            # прослеживаемость». Второй рубеж при этом НЕ снят — он стоит там, где и стоял, у
+            # самой живой таблицы: мост сам отвергает понижение регистра больше своего порога
+            # (`oil_drop_needs_trusted`), и этот отказ теперь ГОВОРИТ, что делать.
+            await _odo_lower_ask(context, chat_id, topic_id, bike, floor, new_km,
+                                 oil_hint=oil_hint, source="фото")
+        elif escalate:
             await _send(context, chat_id=chat_id,
                         text=msg_soft_odo_escalate(bike, new_km, floor, reason),
                         message_thread_id=topic_id)
@@ -3650,6 +3820,12 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     """Перехват ответа на подтверждение пробега. Возвращает True если обработал (был pending
     и ответ распознан как да/число/нет). Иначе False → обычный путь (гейт не трогаем)."""
     key = (msg.chat_id, getattr(msg, "message_thread_id", None))
+    # ПОНИЖЕНИЕ ЖДЁТ ПОЯСНЕНИЯ — этот текст и есть оно. Проверка стоит ПЕРЕД `pend` намеренно:
+    # вопрос о пробеге к этому моменту уже отвечен числом, и его отсутствие не должно уводить
+    # пояснение в общий путь, где оно молча стало бы новым сообщением ни о чём.
+    low = _ODO_LOWER_PENDING.get(key)
+    if low and low.get("reason"):
+        return await _odo_lower_explanation(msg, context, bridge, text, low)
     pend = _PENDING_MILEAGE.get(key)
     if not pend:
         return False
@@ -4550,26 +4726,37 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=
         # ПОСЛЕ итога, чтобы кнопка была СВЕРХУ (Q2 — всегда видна). Любой unpin_all в теме → следом _repin_info.
         await _repin_info(context, chat_id, topic_id)
     else:
-        err = res.get("error", "")
-        if err == "oil_decreasing":
-            detail_ru = f"новое {km_int} меньше прошлого ТО {res.get('old_oil')} — не записал, проверь число"
-            detail_th = f"ค่าใหม่ {km_int} น้อยกว่าครั้งก่อน {res.get('old_oil')} — ไม่บันทึก"
-        elif err == "ambiguous":
-            detail_ru = f"несколько байков с номером {plate} — уточни какой"
-            detail_th = f"มีรถหลายคันเลข {plate} — ระบุให้ชัด"
-        elif err == "not_found":
-            detail_ru = f"не нашёл байк с номером {plate} в Лист1"
-            detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
-        elif err == "verify_failed":
-            # запись НЕ подтвердилась перечитыванием ячейки — считаем ПРОВАЛОМ, не «done»
-            _addr = res.get("full_address") or "Лист1"
-            detail_ru = f"запись в {_addr} не подтвердилась при проверке — НЕ записал, повтори"
-            detail_th = f"ยืนยันการบันทึก {_addr} ไม่ผ่าน — ไม่บันทึก ลองใหม่"
-        else:
-            detail_ru = f"не удалось записать ({err or 'ошибка'})"
-            detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
+        # ОТКАЗ ГОВОРИТ, ЧТО ДЕЛАТЬ (правило владельца 23.08). Прежние ветки называли числа, но
+        # не действие, а последняя печатала человеку внутренний код моста дословно.
+        detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
                           text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+
+
+def _refuse_words(res, *, plate="", sent=None):
+    """Ответ моста → ЧЕЛОВЕЧЕСКИЕ слова отказа: что случилось · какие числа · что делать.
+
+    ЕДИНАЯ ДВЕРЬ слов отказа для обеих дверей записи: две формулировки об одном отказе разошлись
+    бы, и человек получил бы два разных ответа на одно событие. Внутренний код в текст не идёт ни
+    одной веткой — он уходит в журнал отдельным полем (правило владельца 23.08 «внутренние коды
+    человеку не показываются»). Решение — `reply_floor.refusal`, здесь только руки."""
+    r = res if isinstance(res, dict) else {}
+    err = str(r.get("error") or "")
+    recorded = r.get("old_oil")
+    if recorded is None:
+        recorded = r.get("old_km")
+    got = sent if sent is not None else r.get("new_oil", r.get("new_km"))
+    drop = r.get("drop")
+    if drop is None:
+        drop = odo_lower.diff(recorded, got)["drop"]
+    say = reply_floor.refusal(err, {
+        "plate": plate or r.get("number") or "",
+        "recorded": recorded, "sent": got, "drop": drop,
+        "threshold": r.get("threshold"), "who": PYM_HANDLE,
+    })
+    log.info(f"  → отказ записи: код={say['log']} исход={say['state']} "
+             f"(человеку показаны слова, не код)")
+    return say["ru"], say["th"]
 
 
 async def _write_oil_backdated(context, bridge, chat_id, topic_id, bike, oil_km, confirmed_by=""):
@@ -4619,20 +4806,9 @@ async def _write_oil_backdated(context, bridge, chat_id, topic_id, bike, oil_km,
                           reply_markup=_svc_undo_kb(_undo_tok))
         log.info(f"  → backdated ТО Oil ЗАПИСАНО: {bike} oil_km={km_int} next={_next}")
     else:
-        err = res.get("error", "")
-        if err == "oil_decreasing":
-            detail_ru = f"новое {km_int} меньше прошлого ТО {res.get('old_oil')} — не записал"
-            detail_th = f"ค่าใหม่ {km_int} น้อยกว่าครั้งก่อน {res.get('old_oil')} — ไม่บันทึก"
-        elif err == "not_found":
-            detail_ru = f"байк с номером {plate} не найден в Лист1"
-            detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
-        elif err == "verify_failed":
-            _addr = res.get("full_address") or "Лист1"
-            detail_ru = f"запись в {_addr} не подтвердилась — повтори"
-            detail_th = f"ยืนยันการบันทึก {_addr} ไม่ผ่าน — ลองใหม่"
-        else:
-            detail_ru = f"не удалось записать ({err or 'ошибка'})"
-            detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
+        # Та же дверь слов отказа, что у первой двери масла: двум формулировкам об одном отказе
+        # разойтись негде по построению.
+        detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
                           text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
@@ -4719,24 +4895,10 @@ async def _write_service_col(context, bridge, chat_id, topic_id, bike, kind, km)
         await _emit_summary(context, chat_id, topic_id, bike)
         await _clear_cycle_msgs(context, chat_id, topic_id)   # ЧАСТЬ D: финал → чистим вопросы
     else:
-        err = res.get("error", "")
-        if err == "km_decreasing":
-            detail_ru = f"новое {km_int} меньше прошлого {res.get('old_km')} — не записал, проверь число"
-            detail_th = f"ค่าใหม่ {km_int} น้อยกว่าครั้งก่อน {res.get('old_km')} — ไม่บันทึก"
-        elif err == "ambiguous":
-            detail_ru = f"несколько байков с номером {plate} — уточни какой"
-            detail_th = f"มีรถหลายคันเลข {plate} — ระบุให้ชัด"
-        elif err == "not_found":
-            detail_ru = f"не нашёл байк с номером {plate} в Лист1"
-            detail_th = f"ไม่พบรถเลข {plate} ใน Лист1"
-        elif err == "verify_failed":
-            # запись НЕ подтвердилась перечитыванием ячейки — считаем ПРОВАЛОМ, не «done»
-            _addr = res.get("full_address") or "Лист1"
-            detail_ru = f"запись в {_addr} не подтвердилась при проверке — НЕ записал, повтори"
-            detail_th = f"ยืนยันการบันทึก {_addr} ไม่ผ่าน — ไม่บันทึก ลองใหม่"
-        else:
-            detail_ru = f"не удалось записать ({err or 'ошибка'})"
-            detail_th = f"บันทึกไม่สำเร็จ ({err or 'error'})"
+        # Третья дверь записи — та же единая дверь слов. Понижение колонок J/K/L мост не умеет
+        # вовсе (в отличие от кол.I), и отказ теперь говорит об этом ПРЯМО и с действием, а не
+        # «не записал, проверь число» про число, которое человек прислал верно.
+        detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
                           text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
 
@@ -5072,6 +5234,35 @@ async def handle_service_button(update, context, bridge) -> None:
                           reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
         log.info(f"  → ТО фаза2 запись по «да» верхней границы {cb}: written={written} "
                  f"failed={failed} odo={odo} исход={rec['state']}")
+
+    elif action == "lowr":
+        # Кнопка причины понижения. Она НИЧЕГО не записывает — она только называет причину;
+        # запись открывает написанное следом пояснение (правило владельца 23.08).
+        key = (chat_id, topic_id)
+        low = _ODO_LOWER_PENDING.get(key)
+        reason = str(data.get("reason") or "")
+        if not low:
+            await _btn_answer(q, "คำถามหมดอายุแล้ว · Вопрос уже закрыт", show_alert=True)
+            return
+        if not odo_lower.reason_ok(reason):
+            await _btn_answer(q, "ไม่รู้จักเหตุผลนี้ · Причина не опознана", show_alert=True)
+            return
+        low["reason"] = reason
+        _SVC_TOKENS.pop(token, None)
+        lbl = odo_lower.REASONS[reason]
+        await _btn_answer(q, f"{lbl['th']} · {lbl['ru']}")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        log.info(f"  → ПОНИЖЕНИЕ: причина «{reason}» выбрана, жду пояснение словами")
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=(f"🐀 Splinter\n"
+                          f"🇹🇭 ✍️ เหตุผล: {lbl['th']} — ช่วยพิมพ์อธิบายเป็นคำพูดของคุณด้วยครับ "
+                          f"ว่าเกิดอะไรขึ้น (แค่ «ใช่» ไม่นับ)\n"
+                          f"🇷🇺 ✍️ Причина: {lbl['ru']} — теперь напиши пояснение своими словами, "
+                          f"что случилось. Одного «да» не хватит: пояснение сохранится "
+                          f"вместе с записью, его будут читать потом."))
 
     elif action == "sodo":
         # Мягкий гейт ODO ≤500 км: кнопка «Да, намеренно» от механика.
@@ -8563,6 +8754,38 @@ def is_splinter_group(chat_id: int) -> bool:
     return chat_id in GROUPS
 
 
+async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
+    """Заход отработал и не сказал НИ СЛОВА → сказать. Молчание запрещено как исход (23.08).
+
+    Что именно сказать, решает `reply_floor.fallback`; здесь только руки. Ответ уходит В ТУ ЖЕ
+    тему, откуда пришло сообщение, — иначе «бот ответил» было бы правдой не для того человека.
+    Сам пол молчит РОВНО в двух случаях: ручка выключена и мы уже говорили; всё прочее — речь."""
+    if not _never_silent_on():
+        return False
+    if _SPOKE.get() != spoke_before:
+        return False                      # уже сказали — второе слово было бы шумом
+    topic_id = getattr(msg, "message_thread_id", None)
+    try:
+        bike = _topic_name_from_msg(msg) or ""
+    except Exception:
+        bike = ""
+    say = reply_floor.fallback({
+        "bike": bike,
+        "crashed": bool(crashed),
+        "photo": bool(getattr(msg, "photo", None)),
+    })
+    log.info(f"  → ПОЛ ОТВЕТА: заход промолчал (исход {say['state']}, упал={bool(crashed)}) "
+             f"— отвечаю сам, тема={topic_id}")
+    try:
+        await _send_retry(context, chat_id=msg.chat_id, message_thread_id=topic_id,
+                          text=f"🐀 Splinter\n🇹🇭 {say['th']}\n🇷🇺 {say['ru']}")
+        return True
+    except Exception:
+        # Пол не имеет права стать новой причиной падения: он последний в цепи.
+        log.exception("  → ПОЛ ОТВЕТА: не смог отправить ответ (fail-safe)")
+        return False
+
+
 async def handle(update, context, bridge, claude, album_msgs=None):
     """Вызывается из bot.py для сообщений из операционных групп.
     album_msgs — список сообщений-фото альбома (склейка по media_group_id); для одиночного
@@ -8591,6 +8814,10 @@ async def handle(update, context, bridge, claude, album_msgs=None):
     except Exception:
         pass
 
+    # ПОЛ ОТВЕТА (правило владельца 23.08 «никогда не молчать»). Снимок свидетеля ДО разбора;
+    # после разбора он либо вырос (мы говорили), либо нет — и тогда говорим сами.
+    _spoke_before = _SPOKE.get()
+    _crashed = False
     try:
         if mode == "money":
             await _handle_money(msg, context, bridge, claude)
@@ -8603,4 +8830,10 @@ async def handle(update, context, bridge, claude, album_msgs=None):
         elif mode == "intake":
             await _handle_intake(msg, context, bridge, claude, photo_msgs)
     except Exception:
+        _crashed = True
         log.exception(f"Splinter error in {mode} ({msg.chat_id})")
+    # ОБЛАСТЬ УЖЕ (и это прямой запрет задания): пол стоит ТОЛЬКО на темах байков внутреннего
+    # контура. Клиентский контур (`intake`) не трогается ни одним словом — там разговор ведёт
+    # менеджер, и лишняя реплика бота видна клиенту.
+    if mode == "servicing":
+        await _reply_floor_speak(context, msg, crashed=_crashed, spoke_before=_spoke_before)
