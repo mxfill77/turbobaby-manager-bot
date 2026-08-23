@@ -33,6 +33,7 @@ import work_name       # история обслуживания: слова м�
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
 import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
 import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 14 мест
+import odo_fresh       # срок годности подтверждённого пробега: не спрашиваем число, которое знаем
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
 # claude_client урезанным стабом без этого имени — тогда безопасный локальный фоллбэк (money-raise
@@ -2209,6 +2210,66 @@ def _odo_km_int(x):
         return None
 
 
+def _odo_own_freshest(rows):
+    """САМАЯ СВЕЖАЯ строка СВОЕГО одометра: `(км строкой, updated_at строкой)`, иначе `('', '')`.
+
+    ОДНО ПРАВИЛО ВЫБОРА НА ДВУХ ЧИТАТЕЛЕЙ — `_odo_current` (какое число показать/записать) и
+    `_odo_known_fresh` (спрашивать ли его вообще). Две копии этого правила разошлись бы молча:
+    карточка брала бы одну строку, а решение о вопросе — другую.
+
+    Правило то же, что было в `_odo_current` до выноса: строки байка с `current_km > 0`; есть
+    датированные — берём МАКСИМУМ по `updated_at` (поправка вниз обязана побеждать прежнее большее
+    число); датированных нет вовсе — легаси-ветка `max` по числу, и время тогда пустое (возраст
+    неизвестен → срок годности такой строке не считается)."""
+    own = [(str(r.get("updated_at") or ""), _odo_km_int(r.get("current_km"))) for r in (rows or [])]
+    own = [(u, km) for (u, km) in own if km and km > 0]
+    if not own:
+        return "", ""
+    dated = [d for d in own if d[0]]
+    if dated:
+        at, km = max(dated, key=lambda d: d[0])
+        return str(km), at
+    return str(max(km for _, km in own)), ""
+
+
+def _odo_fresh_ttl():
+    """Окно свежести подтверждённого числа, мин. Ручка `ODO_FRESH_MIN` (.env), `0` = ветка мертва.
+    Величина и её вывод из корпуса 23.08.2026 — в шапке `odo_fresh`."""
+    return odo_fresh.parse_ttl(_os.getenv(odo_fresh.TTL_ENV))
+
+
+def _odo_known_fresh(bridge, bike, recs=None, now_ts=None):
+    """РУКИ срока годности: что бот УЖЕ знает о пробеге этого байка и не протухло ли оно.
+
+    Решение — чистый `odo_fresh.verdict`; здесь только сбор фактов. Источник РОВНО ОДИН и тот же,
+    что у `_odo_current`: СВОЙ одометр Bot Data «обслуживание» (`current_km` + `updated_at`).
+    ФОЛЛБЭК Лист1 сюда НЕ входит НАМЕРЕННО: max(I/J/K/L) — это одометр НА МОМЕНТ ЗАМЕНЫ, у него нет
+    времени подтверждения вовсе, и выдать его за «свежее известное число» значило бы записать
+    прошлогодний пробег молча.
+
+    Цена: одно read-only чтение `service_list` — и только в той ветке, где иначе ушёл бы ВОПРОС
+    человеку (за 60 суток таких веток 38). Здоровый путь не платит ничего.
+    FAIL-SAFE: мост молчит / строки нет / разбор упал → «неизвестно», то есть спрашиваем, как
+    спрашивали."""
+    ttl = _odo_fresh_ttl()
+    if ttl <= 0:
+        return odo_fresh.verdict("", "", 0, 0)
+    rows = recs
+    if rows is None:
+        try:
+            rows = [r for r in (bridge.service_list().get("items") or [])
+                    if _same_bike(r.get("bike"), bike)]
+        except Exception:
+            log.exception("  → свежесть одометра: service_list упал (fail-safe: спрашиваем)")
+            rows = []
+    try:
+        km, at = _odo_own_freshest(rows)
+        return odo_fresh.verdict(km, at, _time.time() if now_ts is None else now_ts, ttl)
+    except Exception:
+        log.exception("  → свежесть одометра: разбор строк упал (fail-safe: спрашиваем)")
+        return odo_fresh.verdict("", "", 0, ttl)
+
+
 def _odo_current(bridge, bike, recs=None, fleet_row=None):
     """ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ по ТЕКУЩЕМУ пробегу байка (класс-фикс 4957, корень 4).
 
@@ -2235,13 +2296,9 @@ def _odo_current(bridge, bike, recs=None, fleet_row=None):
         except Exception:
             log.exception("  → одометр: service_list упал (иду в фоллбэк Лист1)")
             rows = []
-    own = [(str(r.get("updated_at") or ""), _odo_km_int(r.get("current_km"))) for r in (rows or [])]
-    own = [(u, km) for (u, km) in own if km and km > 0]
-    if own:
-        dated = [d for d in own if d[0]]
-        if dated:
-            return str(max(dated, key=lambda d: d[0])[1])
-        return str(max(km for _, km in own))
+    km, _at = _odo_own_freshest(rows)
+    if km:
+        return km
     fb = fleet_row if fleet_row is not None else (bridge.find_bike(bike) or {})
     last = [_odo_km_int((fb or {}).get(f"{k}_last_km")) for k in _MAND_KINDS]
     last = [x for x in last if x and x > 0]
@@ -6903,6 +6960,15 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     if completed and not done:
         done = list(declared)
     if not odo:
+        # СНАЧАЛА СПРАШИВАЕМ СВОЙ ОДОМЕТР, а уже потом человека (23.08.2026). До этого дверь судила
+        # ТОЛЬКО текущее сообщение: за 60 суток из 20 переспросов у 8 число по этому байку УЖЕ было
+        # подтверждено, трижды — минутой ранее (замер в шапке `odo_fresh`). Свежее число НЕ пишется
+        # никуда само: оно едет в ту же кнопку Пыму, где он видит его глазами и подтверждает.
+        _known = _odo_known_fresh(bridge, bike)
+        if _known.get("use"):
+            odo = _known["km"]
+            log.info(f"  → ТО фаза2: переспрос одометра НЕ нужен — {_known['why']} ({bike})")
+    if not odo:
         # факт есть, пробега в ТЕКСТЕ нет → просим одометр; фото-одометр доведёт заявку через
         # handle_mileage_confirm (B1) — в статусе ждёт_факт. done сохраняем в строке заявки.
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
@@ -7751,16 +7817,40 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             _bkinds = [k for k in _declared_kinds(text, works, vis)
                        if k in _SP_COL_KINDS and (k != "oil" or _oil_named_explicitly(text, works, vis))]
             if _bkinds:
+                _sp0 = {}
+                _decl_all = _done_all = []
+                _staged = False
                 try:
                     _sp0 = _sp_open(bridge, chat_id, topic_id, bike) or {}
+                    _decl_all = _sp_merge_done(_sp_split(_sp0.get("declared")), _bkinds)
+                    _done_all = _sp_merge_done(_sp_split(_sp0.get("done")), _bkinds)
                     bridge.service_pending_upsert(
                         chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
-                        declared=_sp_join(_sp_merge_done(_sp_split(_sp0.get("declared")), _bkinds)),
-                        done=_sp_join(_sp_merge_done(_sp_split(_sp0.get("done")), _bkinds)),
+                        declared=_sp_join(_decl_all), done=_sp_join(_done_all),
                         status="ждёт_факт")
                     log.info(f"  → работы группы B без пробега → то_заявка ждёт_факт: {_bkinds} ({bike})")
+                    _staged = True
                 except Exception:
                     log.exception("  → заявка на работы группы B (без пробега) упала")
+                # СНАЧАЛА СПРАШИВАЕМ СВОЙ ОДОМЕТР, а уже потом человека (23.08.2026). Дверь судила
+                # ТОЛЬКО текущее сообщение: за 60 суток из 18 таких вопросов у 8 число по этому
+                # байку УЖЕ было подтверждено, у трёх — минутами ранее (замер в шапке `odo_fresh`).
+                # Свежее число САМО НИКУДА НЕ ПИШЕТСЯ: оно едет в кнопку Пыму — тот же гейт Лист1,
+                # где он видит цифру глазами и подтверждает «да». Уже висящую кнопку с тем же
+                # числом вторым вопросом не подпираем (заявка уже 'ждёт_подтверждения').
+                if _staged:
+                    try:
+                        _known = _odo_known_fresh(bridge, bike)
+                        if (_known.get("use")
+                                and str(_sp0.get("status") or "") != "ждёт_подтверждения"):
+                            log.info(f"  → «принял работы — пришли пробег» НЕ нужен — "
+                                     f"{_known['why']} ({bike})")
+                            await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike,
+                                                         _decl_all, _done_all, _known["km"])
+                            return
+                    except Exception:
+                        log.exception("  → короткий путь по своему одометру не удался "
+                                      "(fail-safe: спрашиваем пробег, как спрашивали)")
         # ЗАМОК ПОВТОРОВ (вид I). Состояние = ПЕРЕЧЕНЬ работ: назвали другие работы — другое
         # состояние, квитанция уходит снова; тот же перечень второй раз — повтор.
         await _hint_send(context, kind="I", bike=bike, state=("works", works),
