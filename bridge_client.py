@@ -1359,6 +1359,26 @@ class BridgeClient:
         return self._post("set_fleet_service", number=str(number), kind=str(kind),
                           km=km, confirmed=bool(confirmed))
 
+    def service_undo(self, act, by: str = "", confirmed: bool = False) -> dict:
+        """GUARDED: отменить ПОСЛЕДНЮЮ запись регистра ТО по ССЫЛКЕ НА АКТ (ServiceUndo.js
+        serviceUndo_, маршрут Bridge.js:465, в проде с @83 от 23.08.2026).
+
+        ЧИСЛА СНАРУЖИ ДВЕРЬ НЕ ПРИНИМАЕТ ВОВСЕ — это её главный замок: прежнее значение мост
+        достаёт из СВОЕЙ строки боевого журнала, написанной в момент вытеснения, и возвращает
+        только если в клетке ДО СИХ ПОР ровно то число, которое записал названный акт. Поэтому
+        отмена отличима от скрутки, а `act` — единственный адрес операции. Ключ акта отдаёт
+        расписка любой записи регистра (`act`/`act_logged`), читает её `undo_last.position`,
+        а тело этого вызова собирает `undo_last.request` из ответа владельца.
+
+        Требует confirmed=True (без него — not_confirmed, ни одной записи). Возвращаются ОБЕ
+        базы: живой Лист1 и зеркало «обслуживание»; вторая не вернулась → отказ ЦЕЛИКОМ с
+        компенсацией первой. Ошибки: need_act / not_confirmed / journal_unavailable /
+        act_not_found / undo_of_undo / raw_not_restorable / already_undone / not_last /
+        not_found / ambiguous / cell_changed / write_failed / verify_failed / mirror_changed /
+        mirror_failed / mirror_unavailable / undo_audit_failed / undo_failed."""
+        return self._post("service_undo", act=str(act), by=str(by or ""),
+                          confirmed=bool(confirmed))
+
     def set_caps(self, caps, confirmed: bool = False) -> dict:
         """GUARDED: записать блок капов в «Календарь бронирования» (QuotePrice.js setCaps, адрес
         CAPS_ANCHOR Z3:AB15). caps = [{model, cap, active}, ...]. Требует confirmed=True.

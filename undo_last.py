@@ -146,7 +146,16 @@ def position(kind, column, answer, want_km=None):
             "old": old, "new": new,
             "address": str(answer.get("full_address") or ""),
             "bike_name": str(answer.get("bike_name") or ""),
-            "number": str(answer.get("number") or "")}, ""
+            "number": str(answer.get("number") or ""),
+            # КЛЮЧ АКТА — единственный адрес, по которому дверь отмены вообще принимает просьбу
+            # (`ServiceUndo.js:232` — body {act, by, confirmed}; числа снаружи она не принимает
+            # вовсе). Мост кладёт его в расписку КАЖДОЙ записи регистра с 22.08.2026
+            # (`ReadFleet.js:388` и `:482`, поля `act`/`act_logged`), а читался он ДО СИХ ПОР
+            # ниоткуда: карточка владельцу называла объект, а «да» на неё сесть было некуда.
+            # Журнал не лёг → мост честно отвечает `act: null` — позиция остаётся (объект назван,
+            # карточка нужна), но зовущему сказано, что этой записи мост не помнит.
+            "act": str(answer.get("act") or ""),
+            "act_logged": answer.get("act_logged") is True}, ""
 
 
 def act(tok, ts, chat, topic, bike, plate, by, odo, positions, blind=0):
@@ -291,6 +300,54 @@ def reply(v, labels=None):
 
 #: Подпись кнопки на квитанции: обе половины в одной подписи — как у прочих кнопок фазы 2.
 BUTTON_LABEL = "↩️ บันทึกผิด / Запись неверна"
+
+
+#: Почему по этой позиции дверь позвать нечем. Формулировки в ОДНОМ месте — их видит и человек,
+#: и журнал, и второй такой же список разошёлся бы с первым.
+NO_ACT_WHY = ("мост не назвал ключ акта (act_logged=false) — этой записи он не помнит, "
+              "вернуть можно только рукой в клетке")
+NO_POS_WHY = "объект не назван — отменять нечем"
+NO_YES_WHY = ("подтверждения владельца нет — дверь отвечает not_confirmed и НЕ пишет "
+              "(возврат значения в Лист1 требует confirmed=true)")
+
+
+def request(entry, by="", confirmed=False):
+    """ОТВЕТ ВЛАДЕЛЬЦА → ВЫЗОВЫ ДВЕРИ ОТМЕНЫ → (calls, refusals). Ход D, 26.08.2026.
+
+    ЧТО ЭТИМ ЧИНИТСЯ. Карточка называла объект, а «да» на неё сесть было НЕКУДА: `bridge_client`
+    двери отмены не знал вовсе (104 метода, ни одного), и ключ акта, который мост кладёт в
+    расписку КАЖДОЙ записи регистра, не читался ниоткуда. Круг замыкался снаружи гарда: спросить
+    можно, ответить нечем.
+
+    ЧТО ВОЗВРАЩАЕТСЯ. `calls` — тела для `bridge_client.service_undo(**call)` (по одному на
+    позицию акта: кнопка «да» пишет несколько регистров разом, и у каждого СВОЙ ключ акта);
+    `refusals` — [(объект, почему)] для позиций, по которым звать нечем. Никогда не бросает и
+    ничего не отправляет: модуль чистый (импортов ноль), руки — у зовущего.
+
+    ПОДТВЕРЖДЕНИЕ НЕ ПОДРАЗУМЕВАЕТСЯ: `confirmed` приходит РОВНО из ответа владельца. Не пришло —
+    тела всё равно строятся (с `confirmed=False`), но рядом стоит названная причина, и дверь на
+    такое тело отвечает `not_confirmed` и не пишет. Замки «последняя · своя · окно · отмена
+    отмены» живут в `verdict` и здесь НЕ дублируются — второй их список разошёлся бы с первым."""
+    out, refusals = [], []
+    if not isinstance(entry, dict):
+        return out, [("", NO_POS_WHY)]
+    pos = entry.get("pos") or []
+    if not pos:
+        return out, [(str(entry.get("bike") or entry.get("plate") or ""), NO_POS_WHY)]
+    who = str(by or entry.get("by") or "").strip()
+    for p in pos:
+        if not isinstance(p, dict):
+            continue
+        act_id = str(p.get("act") or "").strip()
+        what = "%s кол.%s %s → %s" % (entry.get("bike") or entry.get("plate") or "?",
+                                      p.get("column") or "?", p.get("new"), p.get("old"))
+        if not act_id:
+            refusals.append((what, NO_ACT_WHY))
+            continue
+        if confirmed is not True:
+            refusals.append((what, NO_YES_WHY))
+        out.append({"act": act_id, "by": who, "confirmed": confirmed is True})
+    return out, refusals
 
 
 def say(v):

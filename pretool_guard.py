@@ -491,6 +491,70 @@ def _py_del_class(view):
     return None
 
 
+#: Служебные ключи протокола: они говорят, КАК идёт запрос, а не ЧТО он меняет. В объект карточки
+#: не идут НИКОГДА — вместе с ними отсекаются и носители секретов (`token`, `ticket`, `key`),
+#: чтобы значение секрета не уехало в карточку тем же ходом (дисциплина env_out: значение НЕ несём).
+_CONF_NOISE_ARGS = frozenset((
+    "confirmed", "action", "token", "origin", "ticket", "trusted", "by", "fixed_by", "fix_reason",
+    "url", "method", "headers", "timeout", "password", "secret", "key", "api_key", "auth",
+))
+
+#: Имена, которыми тело ДОСТАВЛЯЕТ запрос, а не называет дверь: у такого вызова имя двери стоит
+#: ЛИТЕРАЛОМ-СЕЛЕКТОРОМ в первом позиционном аргументе (`_post("service_undo", …)`) — тот же
+#: различитель «селектор действия», которым уже живёт _name_is_action (правило 04.08.2026).
+_TRANSPORT_CALLS = frozenset((
+    "_post", "post", "_call", "call", "_request", "request", "_durable_request", "_exchange",
+    "_one_exchange", "put", "patch", "send", "urlopen", "fetch", "do_post",
+))
+
+
+def _conf_call(node, name):
+    """Вызов, у которого ПОДТВЕРЖДЕНИЕ стоит исполняющим аргументом → паспорт вызова
+    {'name', 'sel', 'args'}; не несёт подтверждения → None. (Ход A, 26.08.2026.)
+
+    Зачем паспорт. Красное класса `confirmed` рождает ДЕЙСТВИЕ — вызов двери, требующей
+    `confirmed=true`. Имя двери и адрес операции у разбора уже есть: имя стоит либо самим вызовом
+    (`bridge.service_undo(act=…, confirmed=True)`), либо литералом-селектором у доставщика
+    (`_post("service_undo", act=…, confirmed=True)`), а адрес — литеральным аргументом. Здесь эти
+    три факта лишь СВЯЗЫВАЮТСЯ с конкретным вызовом: `calls` держит аргументы без селектора, а
+    `lit_args` — литералы без привязки к вызову, и по ним не сказать, ЧЬИ они.
+
+    Читаются ОБА живых способа передать тело: именованные аргументы и словарь-тело запроса
+    (`_post(url, {"act": …, "confirmed": True})`). Значение вычисляется (переменная, f-строка) →
+    в паспорт не идёт: имя переменной объектом не является (класс «кошелёк input», 02.08.2026)."""
+    pairs, conf = [], False
+    for k in node.keywords:
+        if not k.arg:
+            continue
+        if k.arg.strip().lower() == "confirmed":
+            conf = conf or _node_truthy(k.value)
+            continue
+        v = _node_literal(k.value)
+        if isinstance(v, str) and v.strip():
+            pairs.append((k.arg.strip(), v.strip()))
+    for a in list(node.args) + [k.value for k in node.keywords]:
+        if not isinstance(a, ast.Dict):
+            continue
+        for dk, dv in zip(a.keys, a.values):
+            if not (isinstance(dk, ast.Constant) and isinstance(dk.value, str)):
+                continue
+            key = dk.value.strip()
+            if key.lower() == "confirmed":
+                conf = conf or _node_truthy(dv)
+                continue
+            v = _node_literal(dv)
+            if isinstance(v, str) and v.strip():
+                pairs.append((key, v.strip()))
+    if not conf:
+        return None
+    sel = ""
+    for a in node.args:
+        if isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.strip():
+            sel = a.value.strip()
+            break
+    return {"name": name, "sel": sel, "args": pairs}
+
+
 def _py_code_view(src):
     """Разбор ОДНОГО python-тела → {'text','conf','calls','names','lit_args','channel','dels'} либо None.
 
@@ -509,6 +573,7 @@ def _py_code_view(src):
         return None
     words, names, conf, calls = [], [], False, {}
     lit_args, mods, sql_args, strs = [], [], [], []
+    conf_calls = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Name):
             words.append(node.id)
@@ -555,6 +620,9 @@ def _py_code_view(src):
                 for k in node.keywords:
                     if k.arg:
                         kw.setdefault(k.arg, _node_literal(k.value))
+                passport = _conf_call(node, name)      # вызов, несущий подтверждение (ход A)
+                if passport:
+                    conf_calls.append(passport)
             for a in list(node.args) + [k.value for k in node.keywords]:
                 lit_args += _str_consts(a)
                 if name in _SQL_EXEC_CALLS:
@@ -563,7 +631,8 @@ def _py_code_view(src):
                or any(c in _EXEC_CALLS for c in calls))
     return {"text": "\n".join(w for w in words if w), "conf": conf, "calls": calls,
             "names": [n for n in names if n], "lit_args": lit_args, "channel": channel,
-            "sql_args": sql_args, "dels": _py_dels(tree), "strs": strs}
+            "sql_args": sql_args, "dels": _py_dels(tree), "strs": strs,
+            "conf_calls": conf_calls}
 
 
 def _code_view_parts(parts):
@@ -573,7 +642,7 @@ def _code_view_parts(parts):
         return None
     text, conf, calls = [], False, {}
     names, lit_args, channel, dels = [], [], False, []
-    sql_args, strs = [], []
+    sql_args, strs, conf_calls = [], [], []
     for src in parts:
         v = _py_code_view(src)
         if v is None:
@@ -586,11 +655,12 @@ def _code_view_parts(parts):
         channel = channel or v["channel"]      # канал ОДНОГО тела красит команду целиком
         dels += v.get("dels") or []            # удаление ОДНОГО тела красит команду целиком
         strs += v.get("strs") or []            # строковые литералы ВСЕХ тел — для шага 1а
+        conf_calls += v.get("conf_calls") or []  # вызовы подтверждения ВСЕХ тел (ход A)
         for fn, kw in v["calls"].items():
             calls.setdefault(fn, {}).update(kw)
     return {"text": "\n".join(text), "conf": conf, "calls": calls, "sql_args": sql_args,
             "names": names, "lit_args": lit_args, "channel": channel, "dels": dels,
-            "strs": strs}
+            "strs": strs, "conf_calls": conf_calls}
 
 
 def _body_has(tok, raw, view):
@@ -1290,6 +1360,68 @@ def _money_call_seen(hit, blob):
     return bool(re.search(r"\b" + re.escape(hit) + r"\s*\(", blob or ""))
 
 
+def _cut(v, n):
+    """Значение в объект карточки: одна строка, не длиннее n. Карточку читает человек."""
+    s = " ".join(str(v or "").split())
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def _pair(passport, key):
+    """Литерал названного аргумента паспорта вызова (или "")."""
+    for k, v in passport.get("args") or ():
+        if k.lower() == key:
+            return v
+    return ""
+
+
+def _door_bits():
+    """ОБЪЕКТ ПО РАЗОБРАННОМУ ВЫЗОВУ ПОДТВЕРЖДЕНИЯ → биты объекта либо [] (ход A, 26.08.2026).
+
+    ЧТО ЭТИМ ЧИНИТСЯ. Словарь полей (шаг C, 26.08.2026) выучил имена ШЕСТИ известных дверей —
+    и лечит класс подтверждения, а не класс НЕЗНАКОМЫХ дверей: седьмая дверь с новым именем поля
+    снова уходит в молчание (`card_gate` гасит карточку, маркер демону и пуш владельцу в той ветке
+    НЕДОСТИЖИМЫ). Из 89 меток роутера моста гард знает по имени 9. Здесь объект называется не
+    словарём полей, а САМИМ ДЕЙСТВИЕМ: дверь, к которой обращаются, и адрес, по которому она
+    обращается. Это ровно та ветка, что с 02.08.2026 живёт у денег (`вызов void_last()`), только
+    имя двери у общего класса приходится ещё и УЗНАТЬ — оно не совпадает с именем хита.
+
+    ЗАЩИТА НЕ ОСЛАБЛЕНА, И ЭТО УСТРОЙСТВО, А НЕ ОБЕЩАНИЕ. Правило «нет объекта — нет карточки»
+    (29.07.2026) не тронуто ни символом; ветка требует РАЗОБРАННОГО вызова с подтверждением в
+    исполняющей позиции. Разбора нет (heredoc/stdin/нечитаемый .py/кривые кавычки) или вызова нет
+    (написание лежит ДАННЫМИ — в списке слов, в докстринге, в шаблоне поиска, в печатаемой строке)
+    → объекта нет, как не было: команда по-прежнему уходит строкой в журнал, а решение `ask`
+    остаётся. Из 21 живой команды, срезанной правилом объекта за 30 суток, 21 была читающей
+    разведкой — ни одна из них вызова подтверждения не несёт.
+
+    ОДНОСТОРОННЕЕ: умеет только ДОБАВИТЬ карточку там, где её не было; снять `ask`/`deny` не умеет
+    ничем. Зовётся ТОЛЬКО когда прежнее извлечение (байк, клиент, поля дверей) дало пусто, поэтому
+    прежний объект не может быть ни подменён, ни укорочен."""
+    view = _CODE_VIEW
+    if not view:
+        return []
+    for c in view.get("conf_calls") or ():
+        name = (c.get("name") or "").strip()
+        sel = (c.get("sel") or "").strip()
+        if name in _TRANSPORT_CALLS:
+            # У доставщика имя двери — селектор: первый позиционный литерал либо ключ `action`
+            # (`c.post(url, {"action": "service_undo", …})`). Оба написания названы селектором
+            # действия ещё в разборе тела (_py_code_view), второго словаря о том же не заводим.
+            door = sel or _pair(c, "action")
+        else:
+            door = name or sel
+        bits = []
+        if door:
+            bits.append("дверь моста " + _cut(door, 40))
+        for k, v in c.get("args") or ():
+            if k.lower() in _CONF_NOISE_ARGS:
+                continue
+            bits.append("ключ %s=%s" % (_cut(k, 20), _cut(v, 60)))
+            break            # первый НЕслужебный литерал и есть адрес операции у этой двери
+        if bits:
+            return bits
+    return []
+
+
 def _detail_parts(hit, blob, doors=True):
     """ОБЪЕКТ операции и её ЧИСЛО, извлечённые ИЗ КОМАНДЫ/ТЕЛА → (obj_bits, num_bits).
     Пустой список = НЕ извлеклось. Текст шаблона действия сюда не попадает НИКОГДА — именно этим
@@ -1378,6 +1510,12 @@ def _detail_parts(hit, blob, doors=True):
             m_ = _find(_P_MODEL, blob)
             if m_:
                 obj.append("модель " + m_)
+            if not obj:
+                # Поля не назвали НИЧЕГО — спрашиваем сам разобранный вызов (ход A, см. _door_bits).
+                # Стоит ПОСЛЕДНИМ и под условием пустоты: словарь полей называет объект точнее
+                # («акт …» человеку понятнее, чем «дверь моста …»), а эта ветка — общее лекарство
+                # для двери, чьего поля словарь не знает.
+                obj += _door_bits()
         for pats, lab in ((_P_KM, "пробег "), (_P_AMOUNT, "сумма ")):
             v = _find(pats, blob)
             if v:
