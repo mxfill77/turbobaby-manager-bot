@@ -62,6 +62,8 @@ chain_cards.jsonl
 ask_ledger.json
 # память замка повторных подсказок: байк × вид × состояние (рантайм splinter, 22.08.2026)
 hint_dedup_state.json
+# метки кнопок ТО: переживают перезапуск splinter (рантайм-состояние, не код; 25.08.2026)
+svc_tokens.json
 _pcport185
 # scratch / throwaway
 _*.py

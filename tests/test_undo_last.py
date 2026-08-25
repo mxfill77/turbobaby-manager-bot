@@ -463,7 +463,15 @@ R_OIL_9890 = {"action": "set_fleet_oil", "ok": True, "number": "9890", "bike_nam
 def door_oil(b, km="24997", uname="Pleummmm", topic=TOPIC, bike=BIKE_2478):
     """Живая дверь [После замены]: svc:oil → `_write_oil` (боевая запись кол.I)."""
     tok = S._svc_put({"chat": CHAT, "topic": topic, "bike": bike, "km": km})
-    run(S.handle_service_button(_upd(FakeQ(f"svc:oil:{tok}", uname)), context=None, bridge=b))
+    q = FakeQ(f"svc:oil:{tok}", uname)
+    # ЖИВОЙ ФОРМАТ (25.08.2026): кнопка лежит В ТОМ САМОМ сообщении, которое ушло в тему метки, —
+    # значит и нажата она может быть только оттуда. Прежде фикстура держала тему прибитой (83) и
+    # нажимала ею метку темы 84; с 25.08 метка сверяется с местом нажатия, и такой пресс —
+    # ровно та подделка, против которой сверка и заведена (подделку проверяет
+    # `tests/test_card_one_source.py` секция 4). Соседний `press(...)` бьёт по svc:undo — у него
+    # своя память и своя ветка ДО сверки, его намерение «нажали из чужой темы» не тронуто.
+    q.message = type("M", (), {"chat_id": CHAT, "message_thread_id": topic})()
+    run(S.handle_service_button(_upd(q), context=None, bridge=b))
 
 
 def door_oilbk(b, km="24997", uname="Pleummmm"):

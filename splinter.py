@@ -30,6 +30,7 @@ import service_receipt # квитанция ТО: ОБЕ половины (та�
 import odo_ceiling     # верхняя граница пробега при записи ТО: обе двери под одним гейтом
 import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
 import work_name       # история обслуживания: слова механика — человеку, ярлык вида — расчётам
+import card_works      # «в работе»: ОДИН список на обе половины; доказанно записанное уходит
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
 import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
 import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 14 мест
@@ -1954,7 +1955,16 @@ _WORK_STEMS = (
 #: ШИНА судится ГРАНИЦЕЙ СЛОВА, а не подстрокой (23.08.2026). Подстрока «шин» живёт внутри
 #: «маШИНа»/«маШИНы», и простой `"шин" in s` сделал бы мойку машины заменой шины. `\bшин` этого
 #: не может физически: в «машина» перед «шин» стоит буква, границы слова там нет.
-_TYRE_RE = r"\bшин|покрышк|\btyre\b|\btire\b|ยาง"
+#: «РЕЗИНА» — ТА ЖЕ РАБОТА, И КЛЮЧ У НЕЁ ОБЯЗАН БЫТЬ ТОТ ЖЕ (25.08.2026, разбор 5960). Механик
+#: назвал работу «передняя резина», а в историю она легла словами «замена передней шины»:
+#: ключи выходили `передняярезина/перед` (стема нет → нормализованный текст) против `шина/перед`,
+#: и ОДНА И ТА ЖЕ работа не сходилась сама с собой ни в дедупе записи, ни в снятии с ожидания.
+#: Форма узкая НАМЕРЕННО — только именные окончания: `\bрезин[аыуое]\b` берёт «резина/резины/
+#: резину/резине», но не трогает «прорезиненный» (границы слова там нет) и не делает шиной
+#: «резиновый коврик». Правило ОДНО на обе роли (стем ключа и вид работы): «резина» и есть шина,
+#: и вид `tyre` у неё законный — он заведён решением владельца 23.08 ровно затем, чтобы шина не
+#: сваливалась в «прочие работы».
+_TYRE_RE = r"\bшин|покрышк|\bрезин[аыуое]\b|\btyre\b|\btire\b|ยาง"
 
 
 def _work_stem(w):
@@ -2171,8 +2181,22 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
     work_th, work_ru = [], []
     if sp_open and (sp_open.get("kinds") or sp_open.get("works")):
         _st = str(sp_open.get("status") or ""); _odo = str(sp_open.get("odo") or "")
-        _th_w = _sp_labels_th(sp_open.get("kinds") or [])
-        _ru_w = ", ".join(_hb(w) for w in (sp_open.get("works") or [])) or _sp_labels_ru(sp_open.get("kinds") or [])
+        _pos = sp_open.get("pos")
+        if _pos is None:
+            # ЛЕГАСИ-ВЫЗОВ (единый список не собрался / карточка построена не нашими руками) —
+            # прежний рендер БАЙТ-В-БАЙТ: две колонки, как до 25.08.2026.
+            _th_w = _sp_labels_th(sp_open.get("kinds") or [])
+            _ru_w = ", ".join(_hb(w) for w in (sp_open.get("works") or [])) or _sp_labels_ru(sp_open.get("kinds") or [])
+        else:
+            # ОДИН СПИСОК — ОБЕ ПОЛОВИНЫ (25.08.2026). Половины различаются ТОЛЬКО языком имени:
+            # слово механика есть → оно (по-тайски через словарь работ `_work_th`), слова нет →
+            # ярлык вида. Длина, порядок и состав у половин общие по построению.
+            _th_w = ", ".join(_work_th(p["word"]) if p.get("word")
+                              else _SP_KIND_LABEL.get(p.get("kind"), (p.get("kind"), p.get("kind")))[0]
+                              for p in _pos) or "—"
+            _ru_w = ", ".join(_hb(p["word"]) if p.get("word")
+                              else _hb(_SP_KIND_LABEL.get(p.get("kind"), (p.get("kind"), p.get("kind")))[1])
+                              for p in _pos) or "—"
         work_th = [f"<b>{_th_w}</b>" + (f" · ไมล์ {_odo}" if _odo else "") + f" · {_SP_STATUS_TH.get(_st, _st)}"]
         work_ru = [f"<b>{_ru_w}</b>" + (f" · одометр {_odo}" if _odo else "") + f" · {_SP_STATUS_RU.get(_st, _st)}"]
 
@@ -2409,6 +2433,30 @@ def _build_bike_card_body(bridge, chat_id, topic_id, bike, _cb=None):
             sp_open = {"kinds": (_sp_split(_it.get("declared")) or _sp_split(_it.get("done"))),
                        "works": _sp_works_from_note(_it.get("note")),
                        "odo": str(_it.get("odometer") or ""), "status": str(_it.get("status") or "")}
+            # ОДИН ИСТОЧНИК НА ОБЕ ПОЛОВИНЫ + СНЯТИЕ ЗАПИСАННОГО (25.08.2026, разбор 5960).
+            # До этого тайская половина рендерила `kinds`, а русская — `works`, то есть ДВЕ
+            # РАЗНЫЕ колонки одной строки заявки, и совпадали они ровно тогда, когда механик
+            # работ словами не называл. Теперь список ОДИН (`pos`), обе половины рендерят его.
+            # ФАКТЫ УЖЕ НА РУКАХ — ни одного лишнего обращения к мосту: регистры это `fb`
+            # (строка парка, прочитана выше ради планового ТО), история это `service`
+            # (`read_events`, прочитан выше ради секции «сервис на пробеге»). Источник НЕ
+            # прочитан → `None`, и позиция остаётся ВИДИМОЙ с исходом «неизвестно»: незнание
+            # мира снимать работу с ожидания не вправе.
+            try:
+                _miss_now = set(_cb.missing()) if _cb is not None else set()
+                _regs = None if "fleet" in _miss_now else {
+                    k: fb.get(f"{k}_last_km") for k in _SP_COL_KINDS}
+                _hist = None if "read_events" in _miss_now else service
+                _res = card_works.pending(
+                    sp_open["kinds"], sp_open["works"], kind_of=_service_kind, key_of=_work_key,
+                    col_kinds=_SP_COL_KINDS, registers=_regs, history=_hist, odo=sp_open["odo"])
+                sp_open["pos"] = _res["show"]
+                if _res["gone"]:
+                    log.info("  → " + card_works.line(_res))
+            except Exception:
+                # Решение споткнулось → рендер идёт ПРЕЖНИМ путём (две колонки), то есть не
+                # хуже, чем было до правки: `pos` просто не появляется.
+                log.exception("  → карточка: единый список «в работе» не собрался — прежний рендер")
     except Exception:
         log.exception("  → карточка: чтение открытой то_заявки упало")
     try:
@@ -2627,7 +2675,37 @@ def _km_door(bridge, chat_id, topic_id, bike, km, *, source, msg_date="", lost_o
         log.exception("  → дозапись отложенных инфо-работ подтверждённым пробегом упала")
     if written:
         log.info(f"  → инфо-работы дописаны ПОДТВЕРЖДЁННЫМ пробегом {km}: {written} (source={source})")
+        _sp_note_settle_works(bridge, chat_id, topic_id, bike, written)
     return written, list(lost)
+
+
+def _sp_note_settle_works(bridge, chat_id, topic_id, bike, written):
+    """ЗАПИСАННОЕ СНИМАЕТСЯ С ОЖИДАНИЯ (25.08.2026, разбор 5960 §3.2).
+
+    Писавшая дверь о заявке НЕ ЗНАЛА: `_write_info_works` зовёт `add_event` и не касается
+    `service_pending_*` ни одним вызовом — поэтому 25.08 колодки и шина легли в историю на 41666,
+    а в «в работе» висели дальше. Единая дверь пробега (`_km_door`) знает, что РЕАЛЬНО легло
+    (`written` — там только `ok+saved` либо `duplicate`), значит снятие живёт здесь, и оно одно
+    на все три двери подтверждённого пробега.
+
+    ЦЕНА НАЗВАНА: одно чтение заявки, и ТОЛЬКО когда что-то действительно записано (за 60 суток
+    таких дверей 38). Снимать нечего → мосту не пишем вовсе — ни одного обращения.
+
+    FAIL-SAFE: заявки нет · мост молчит · разбор споткнулся → нота остаётся как была. Карточка от
+    этого не соврёт: она судит мир САМА (`card_works`), а нота — вторая, не единственная опора."""
+    try:
+        sp = _sp_open(bridge, chat_id, topic_id, bike)
+        if not sp:
+            return
+        base = str(sp.get("note") or "")
+        fresh = _sp_note_drop_works(base, written)
+        if fresh == base:
+            return
+        bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                      bike=bike, note=fresh)
+        log.info(f"  → «в работе» {bike}: снято записанное {written} → note={fresh!r}")
+    except Exception:
+        log.exception("  → снятие записанных работ с ожидания упало (нота осталась прежней)")
 
 
 # ============================================================
@@ -4410,24 +4488,169 @@ def _is_trusted_user(u):
     return bool(u and u.username and u.username.lower() in TRUSTED_AUTHORS)
 
 
+# ── МЕТКА КНОПКИ ПЕРЕЖИВАЕТ ПЕРЕЗАПУСК (25.08.2026, разбор 5960 §5) ──────────────────────────
 # Хранилище токенов вопроса «после замены/просто пробег» (callback_data ≤64б → короткий int-токен).
+# ЖИВОЙ СЛУЧАЙ: кнопка Пыму выдана 25.08 09:23:04 (`svc:done:6`), splinter перезапущен в 10:10:21 —
+# и метка умерла вместе с памятью процесса; нажатие отвечало «⚠️ Кнопка устарела», не записав
+# ничего. Хуже того, счётчик `_SVC_SEQ` при старте начинался с НУЛЯ: выдав свою шестую метку,
+# процесс воскресил бы мёртвую кнопку и увёл её на ЧУЖУЮ операцию (возможно, по другому байку).
+#
+# Лечится тем же приёмом, каким уже живёт замок подсказок (`hint_dedup_state.json`): память на
+# диске рядом с модулем, у прогона тестов — свой файл на процесс. Три следствия:
+#   • метка переживает перезапуск — кнопка механика и кнопка Пыма работают после рестарта;
+#   • НОМЕРА НЕ ПОВТОРЯЮТСЯ: счётчик поднимается до максимума прочитанного, поэтому «шестая метка
+#     нового процесса» больше не может оказаться шестой меткой прошлого;
+#   • ПОДДЕЛЬНАЯ/ЧУЖАЯ метка отвергается: запись помнит свои чат и тему, и `_svc_get` сверяет их
+#     с сообщением, на котором НАЖАЛИ. Метка чужой темы не исполняется — даже если номер угадан.
+# ВОЗРАСТ: `SVC_TOKEN_TTL_H` (дефолт 48 ч) — ровно горизонт жизни самой заявки
+# (`_SP_REMIND_MAX_AGE_H`): пока о заявке напоминают, её кнопка обязана работать, а после
+# эскалации владельцу висящая метка не должна оживать.
+# FAIL-SAFE В ОБЕ СТОРОНЫ: файл не прочитан/не записан → память живёт только в процессе, то есть
+# РОВНО прежнее поведение. Откат: `SVC_TOKENS_PERSIST=0` + рестарт splinter.
 _SVC_TOKENS = {}   # token(int) -> {chat,topic,bike,km,status,next_km,km_left}
 _SVC_SEQ = [0]
+_SVC_TOKENS_LOADED = False      # память с диска поднимается один раз за процесс
+_SVC_TOKENS_SAID = False        # путь памяти называем в журнале ОДИН раз
+_SVC_TOKEN_AT = "_at"           # когда метка выдана (сек. эпохи) — по нему судится возраст
+_SVC_TOKEN_OLD = "_restored"    # метка поднята с диска, а не выдана этим процессом
+
+
+def _svc_tokens_persist():
+    """Ручка отката: `SVC_TOKENS_PERSIST=0` + рестарт splinter → метки снова живут только в памяти."""
+    return str(os.getenv("SVC_TOKENS_PERSIST", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _svc_tokens_ttl():
+    """Сколько живёт метка, секунд. `0` → возраст не судим вовсе (метка живёт, пока лежит в файле)."""
+    try:
+        return max(0.0, float(os.getenv("SVC_TOKEN_TTL_H", _SP_REMIND_MAX_AGE_H))) * 3600.0
+    except (TypeError, ValueError):
+        return _SP_REMIND_MAX_AGE_H * 3600.0
+
+
+def _svc_tokens_path():
+    """Файл памяти меток. Явная подмена сильнее всего; признак прогона тестов уводит во временный
+    каталог — со СВОИМ именем на процесс, иначе память одного прогона гейта утекала бы в следующий
+    (живой урок замка подсказок)."""
+    global _SVC_TOKENS_SAID
+    p = os.getenv("SVC_TOKENS_STATE")
+    if not p:
+        p = (f"/tmp/svc_tokens_test_{os.getpid()}.json"
+             if any(os.getenv(m) for m in _HINT_TEST_MARKS)
+             else os.path.join(os.path.dirname(os.path.abspath(__file__)), "svc_tokens.json"))
+    if not _SVC_TOKENS_SAID:
+        _SVC_TOKENS_SAID = True
+        log.info(f"  🔖 метки кнопок ТО: память в {p}")
+    return p
+
+
+def _svc_tokens_load():
+    """Поднять метки с диска ОДИН раз за процесс: протухшие отбросить, счётчик увести за максимум
+    прочитанного номера (номера не повторяются → воскресшей чужой кнопки не бывает).
+    Любая беда → пустая память, то есть прежнее «кнопка устарела»: хуже, чем было, не станет."""
+    global _SVC_TOKENS_LOADED
+    if _SVC_TOKENS_LOADED or not _svc_tokens_persist():
+        return
+    _SVC_TOKENS_LOADED = True
+    try:
+        with open(_svc_tokens_path(), encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return
+        ttl, now, kept, gone = _svc_tokens_ttl(), _time.time(), 0, 0
+        top = 0
+        for k, v in raw.items():
+            try:
+                tok = int(k)
+            except (TypeError, ValueError):
+                continue
+            top = max(top, tok)          # номер занят, даже если запись протухла
+            if not isinstance(v, dict):
+                continue
+            if ttl and (now - float(v.get(_SVC_TOKEN_AT) or 0)) > ttl:
+                gone += 1
+                continue
+            v[_SVC_TOKEN_OLD] = True
+            _SVC_TOKENS[tok] = v
+            kept += 1
+        _SVC_SEQ[0] = max(_SVC_SEQ[0], top)
+        log.info(f"  🔖 метки кнопок ТО подняты с диска: живых {kept}, протухших {gone}, "
+                 f"счётчик с {_SVC_SEQ[0] + 1}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"  → память меток кнопок не прочиталась ({e}) — метки живут только в памяти")
+
+
+def _svc_tokens_save():
+    """Записать память меток. Не удалась → метка живёт в процессе, как жила до 25.08 (сбой в
+    сторону прежнего поведения, а не в сторону исполнения чужой кнопки)."""
+    if not _svc_tokens_persist():
+        return
+    try:
+        with open(_svc_tokens_path(), "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in (_SVC_TOKENS or {}).items()},
+                      f, ensure_ascii=False, default=str)
+    except Exception as e:
+        log.warning(f"  → память меток кнопок не записалась: {e}")
 
 
 def _svc_put(data):
+    _svc_tokens_load()
     _SVC_SEQ[0] += 1
     tok = _SVC_SEQ[0]
+    try:
+        data = dict(data or {})
+        data.setdefault(_SVC_TOKEN_AT, _time.time())
+    except Exception:
+        pass
     _SVC_TOKENS[tok] = data
     if len(_SVC_TOKENS) > 200:                       # держим последние 200
         for k in sorted(_SVC_TOKENS)[:-200]:
             _SVC_TOKENS.pop(k, None)
+    _svc_tokens_save()
     return tok
 
 
+def _svc_get(token, chat_id=None, topic_id=None):
+    """Метка по номеру — либо None, и тогда кнопка отвечает «устарела», как отвечала.
+
+    ТРИ ОТКАЗА, и каждый назван в журнале: метки нет · метка старше TTL · метка НЕ ЭТОЙ темы.
+    Третий — замок против подделки и против воскресшего номера: адрес операции берётся из метки,
+    поэтому метка, чей адрес расходится с местом нажатия, не исполняется вовсе. Место нажатия
+    неизвестно (мок/личка) → сверять нечем, ведём себя как прежде."""
+    _svc_tokens_load()
+    d = _SVC_TOKENS.get(token)
+    if not d:
+        return None
+    ttl = _svc_tokens_ttl()
+    if ttl and (_time.time() - float(d.get(_SVC_TOKEN_AT) or 0)) > ttl:
+        log.warning(f"  🔖 метка {token} старше {ttl / 3600:.0f} ч — не исполняю")
+        _svc_drop(token)
+        return None
+    if chat_id is not None and d.get("chat") is not None and d.get("chat") != chat_id:
+        log.warning(f"  🔖 метка {token} принадлежит чату {d.get('chat')}, нажата в {chat_id} — не исполняю")
+        return None
+    if topic_id is not None and d.get("topic") is not None and d.get("topic") != topic_id:
+        log.warning(f"  🔖 метка {token} принадлежит теме {d.get('topic')}, нажата в {topic_id} — не исполняю")
+        return None
+    return d
+
+
+def _svc_drop(token):
+    """Метка отработала (или отвергнута) — убрать и из памяти, и с диска: иначе после перезапуска
+    уже нажатая кнопка сработала бы ВТОРОЙ раз, то есть записала бы то же дважды."""
+    _SVC_TOKENS.pop(token, None)
+    _svc_tokens_save()
+
+
 def _svc_question_open(chat_id, topic_id):
-    """Открыт ли по этой теме вопрос [После замены]/[Просто пробег] (ждём нажатия кнопки)."""
-    return any(d.get("chat") == chat_id and d.get("topic") == topic_id
+    """Открыт ли по этой теме вопрос [После замены]/[Просто пробег] (ждём нажатия кнопки).
+
+    Поднятые с диска метки СЮДА НЕ ВХОДЯТ намеренно: этот предикат гасит ПОВТОРНЫЙ вопрос в
+    текущем разговоре, а не отвечает «висит ли где-то кнопка». Считай мы их — после перезапуска
+    вчерашняя метка глушила бы сегодняшний вопрос. Поведение остаётся байт-в-байт прежним."""
+    return any(d.get("chat") == chat_id and d.get("topic") == topic_id and not d.get(_SVC_TOKEN_OLD)
                for d in _SVC_TOKENS.values())
 
 
@@ -5241,7 +5464,13 @@ async def handle_service_button(update, context, bridge) -> None:
         await _svc_undo_ask(q, context, token)
         return
 
-    data = _SVC_TOKENS.get(token)
+    # МЕТКА СВЕРЯЕТСЯ С МЕСТОМ НАЖАТИЯ (25.08.2026). Адрес операции — чат, тема, байк, пробег —
+    # берётся ИЗ МЕТКИ и раньше не сверялся ни с чем: угаданный (или воскресший после рестарта)
+    # номер увёл бы запись на чужую тему. Где нажали — знает само сообщение; не знаем (мок, личка)
+    # → сверять нечем, ведём себя как прежде.
+    _msg = getattr(q, "message", None)
+    data = _svc_get(token, getattr(_msg, "chat_id", None),
+                    getattr(_msg, "message_thread_id", None))
     if not data:
         await _btn_answer(q)
         try:
@@ -5272,7 +5501,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         _PENDING_CORRECTION.pop(key, None)
         clear_awaiting(*key)
         log.info(f"  🔧 fix-btn: @{uname} bike={bike} {old_km}→{new_km}")
@@ -5303,7 +5532,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         _PENDING_MILEAGE.pop(key, None)
         clear_awaiting(*key)
         # ЕДИНАЯ ТОЧКА подтверждения (зеркало текстового пути): кнопка «Да» подтверждает ровно то
@@ -5343,7 +5572,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         await _write_service_col(context, bridge, chat_id, topic_id, bike, svc_kind, km)
         return
 
@@ -5359,7 +5588,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         # Кто подтвердил — в журнал отмены («Записал: …» в карточке владельцу), как у двери фазы 2.
         _cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
         await _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=_cb)
@@ -5380,7 +5609,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         done = data.get("done", []) or []
         odo = data.get("odo", "")
         cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
@@ -5425,7 +5654,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         try:
             await _batch_odo_ask(context, bridge, chat_id, topic_id, bike,
                                  data.get("done", []) or [])
@@ -5447,7 +5676,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         try:
             km_int = int(str(km).replace(" ", ""))
         except (ValueError, TypeError):
@@ -5493,7 +5722,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         _cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
         await _write_oil_backdated(context, bridge, chat_id, topic_id, bike, km, confirmed_by=_cb)
     elif action == "codo":
@@ -5509,7 +5738,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         done = data.get("done", []) or []
         odo = data.get("odo", "")
         cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
@@ -5543,7 +5772,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await _btn_answer(q, "ไม่รู้จักเหตุผลนี้ · Причина не опознана", show_alert=True)
             return
         low["reason"] = reason
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         lbl = odo_lower.REASONS[reason]
         await _btn_answer(q, f"{lbl['th']} · {lbl['ru']}")
         try:
@@ -5577,7 +5806,7 @@ async def handle_service_button(update, context, bridge) -> None:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
-        _SVC_TOKENS.pop(token, None)
+        _svc_drop(token)
         _SOFT_ODO_PENDING.pop(key, None)
         _PENDING_MILEAGE.pop(key, None)
         clear_awaiting(chat_id, topic_id)
@@ -7144,6 +7373,40 @@ def _sp_note_set_works(base_note, raw_works):
     if seg and rest:
         return seg + " | " + rest
     return seg or rest
+
+
+def _sp_note_drop_works(base_note, drop_works, key_of=None):
+    """Z4-СНЯТИЕ: убрать из `WORKS:{…}` работы, которые ДОКАЗАННО легли, сохранив прочий текст note.
+
+    Близнец `_sp_note_set_works`, которого не было вовсе (разбор 5960, §3.1): нота умела только
+    ДОПОЛНЯТЬСЯ, и работа, ушедшая в историю другой дверью, оставалась в «в работе» навсегда.
+
+    СНИМАЕТСЯ ПО КОНТЕНТНОМУ КЛЮЧУ, а не по буквальному совпадению строк: в историю уходят слова
+    одной двери («замена передней шины»), в ноте лежат слова другой («передняя резина»), и
+    сравнение текстов не сняло бы НИЧЕГО. Ключ — тот же `_work_key`, которым дедупится сама
+    запись, поэтому «снято» и «записано» здесь означают ровно одно и то же.
+
+    ПУСТОЙ СЕГМЕНТ ПИШЕТСЯ КАК `WORKS:{}`, А НЕ КАК ПУСТАЯ СТРОКА: мост берёт поле, только если
+    оно `!== ''` (`servicePendingUpsert_` → `pick()`), то есть очистить ноту в ноль физически
+    нельзя — тот же приём, которым живёт `service_debt.LEDGER_EMPTY`.
+
+    Снимать нечего → возвращаем ноту БАЙТ-В-БАЙТ: мосту в этом случае не пишем вовсе."""
+    existing = _sp_works_from_note(base_note)
+    if not existing:
+        return str(base_note or "")
+    kf = key_of or _work_key
+    def _k(w):
+        try:
+            return kf(str(w).strip())
+        except Exception:
+            return str(w).strip().lower()
+    drop = {_k(w) for w in (drop_works or []) if str(w).strip()}
+    keep = [w for w in existing if _k(w) not in drop]
+    if len(keep) == len(existing):
+        return str(base_note or "")
+    rest = _re_pl.sub(r"WORKS:\{.*?\}\s*\|?\s*", "", str(base_note or "")).strip(" |")
+    seg = "WORKS:{" + "; ".join(keep) + "}"
+    return (seg + " | " + rest) if rest else seg
 
 
 def _rental_expired(status, end_date):
