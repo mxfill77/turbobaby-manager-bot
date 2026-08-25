@@ -34,7 +34,8 @@ import works_ledger    # сторож партии: принято N · запи
 import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
 import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 14 мест
 import odo_fresh       # срок годности подтверждённого пробега: не спрашиваем число, которое знаем
-import odo_lower       # понижение пробега: расхождение ЧИСЛОМ + причина + письменное пояснение
+import odo_lower
+import batch_odo     # работы на другом пробеге: третий исход карточки подтверждения работ       # понижение пробега: расхождение ЧИСЛОМ + причина + письменное пояснение
 import reply_floor     # пол ответа: бот не молчит и не отказывает глухо (правила владельца 23.08)
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
@@ -3752,6 +3753,205 @@ async def _odo_lower_commit(context, bridge, chat_id, topic_id, low, plan, who, 
     return True
 
 
+#  ============================================================
+#  РАБОТЫ БЫЛИ НА ДРУГОМ ПРОБЕГЕ — ТРЕТИЙ ИСХОД КАРТОЧКИ ПОДТВЕРЖДЕНИЯ (25.08.2026)
+#  Решение — `batch_odo` (чистая функция), здесь только РУКИ. Пробег в разговоре ОДИН на тему, и
+#  у отдельной работы своего пробега нет вовсе; партия прошлым числом получает СВОИ пробег и дату
+#  и ложится ТОЛЬКО в историю — текущий одометр байка не двигается ни одной веткой.
+#  ============================================================
+
+#: (chat_id, topic_id) → {bike, done, works, km, date_iso, date_human, expl, stage, ts}.
+#: `stage`: "ask" — ждём пробег и дату; "expl" — ждём письменное пояснение (партия ниже записанного).
+_BATCH_ODO_PENDING = {}
+
+
+def _batch_odo_on():
+    """Ручка отката. `BATCH_ODO=0` → третьей кнопки нет вовсе, путь мёртв ДО разбора чего-либо."""
+    return batch_odo.enabled(_os_env("BATCH_ODO", "1"))
+
+
+def pending_batch_odo_for(chat_id, topic_id):
+    """Есть ли ЖИВОЙ открытый вопрос о партии на другом пробеге (для перехвата в роутере).
+
+    Дверь отдельная по той же причине, что у `pending_odo_lower_for`: вопрос живёт в СВОЁМ
+    состоянии, а `handle_mileage_confirm` роутер зовёт по `_PENDING_MILEAGE`, которого у этой
+    ветки нет вовсе — без своей двери ответ человека не дошёл бы до обработчика НИ РАЗУ.
+    Предел жизни — тот же `_PENDING_MILEAGE_TTL`: это тот же по смыслу «открытый вопрос в теме»,
+    и второй величины об одном сроке заводить не за чем."""
+    pend = _BATCH_ODO_PENDING.get((chat_id, topic_id))
+    if not pend:
+        return None
+    ts = pend.get("ts")
+    if ts is not None and (_time.time() - ts) > _PENDING_MILEAGE_TTL:
+        return None
+    return pend
+
+
+def _batch_odo_names(bridge, chat_id, topic_id, bike, done):
+    """Виды партии → СЛОВА ЧЕЛОВЕКА, а не ярлыки (правило полноты истории 23.08).
+
+    Разбор — ТОТ ЖЕ `work_name.words_of` с ТЕМ ЖЕ живым `_service_kind`, что у `_sp_write_done`:
+    второй мерки «какие слова относятся к этому виду» здесь не заводится. Слов вида нет вовсе →
+    ярлык, как и там: подменять нечего."""
+    said = None
+    on = _work_name_on()
+    if on:
+        try:
+            said = _sp_words_said(bridge, chat_id, topic_id, bike)
+        except Exception:
+            log.exception("  → партия на другом пробеге: слова заявки не прочитаны (беру ярлыки)")
+            said = None
+    names, seen = [], set()
+    for k in (done or []):
+        mine = work_name.words_of(k, said, _service_kind) if on else []
+        if not mine:
+            pair = _SP_KIND_LABEL.get(k) or (k, k)
+            mine = [pair[1]]
+        for w in mine:
+            slot = _pw_slot(w)
+            if slot and slot not in seen:
+                seen.add(slot)
+                names.append(w)
+    return names
+
+
+async def _batch_odo_ask(context, bridge, chat_id, topic_id, bike, done):
+    """Нажата третья кнопка → спросить ПРОБЕГ и ДАТУ партии. Ничего не пишет."""
+    works = _batch_odo_names(bridge, chat_id, topic_id, bike, done)
+    cur = ""
+    try:
+        cur = _odo_current(bridge, bike) if bike else ""
+    except Exception:
+        log.exception("  → партия на другом пробеге: текущий пробег не прочитан (спрошу без него)")
+    _BATCH_ODO_PENDING[(chat_id, topic_id)] = {
+        "bike": bike or "", "done": list(done or []), "works": list(works),
+        "km": None, "date_iso": "", "date_human": "", "expl": "",
+        "current_km": str(cur or ""), "stage": "ask", "ts": _time.time(),
+    }
+    mark_awaiting(chat_id, topic_id)
+    say = batch_odo.question(bike, works, cur)
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=f"🐀 Splinter\n🇹🇭 {say['th']}\n{_SEP}\n🇷🇺 {say['ru']}")
+    log.info(f"  → ПАРТИЯ на другом пробеге: {bike or '?'} виды={list(done or [])} "
+             f"работы={works} текущий={cur or '?'} — жду пробег и дату")
+    return True
+
+
+async def _batch_odo_answer(msg, context, bridge, text, pend) -> bool:
+    """Пришёл текст при открытом вопросе о партии. Два этапа в одной двери: сперва пробег+дата,
+    потом (если партия ниже записанного) письменное пояснение.
+
+    Вопрос НЕ закрывается глухо ни на одном отказе: каждый отказ говорит, ЧТО прислать, и ждёт
+    дальше — глухого «нет» тут нет по построению (правило «бот не молчит и не отказывает глухо»)."""
+    chat_id = msg.chat_id
+    topic_id = getattr(msg, "message_thread_id", None)
+    who = _sender_from_user(getattr(msg, "from_user", None))
+
+    if pend.get("stage") == "expl":
+        # ДОРОГА ПОНИЖЕНИЯ НЕ ИЗОБРЕТАЕТСЯ ВТОРОЙ РАЗ: приёмку пояснения целиком судит `odo_lower`
+        # (его словарь согласия, его порог букв, его исходы) — через `batch_odo.explanation_verdict`.
+        v = batch_odo.explanation_verdict(text)
+        if not v["ok"]:
+            log.info(f"  → ПАРТИЯ: пояснение не принято ({v['state']}) — вопрос остаётся")
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=f"🐀 Splinter\n🇹🇭 ⚠️ {v['say_th']}\n{_SEP}\n🇷🇺 ⚠️ {v['say_ru']}")
+            return True
+        pend["expl"] = v["text"]
+        await _batch_odo_commit(context, bridge, chat_id, topic_id, pend, who)
+        return True
+
+    today = None
+    try:
+        today = msg.date.date() if getattr(msg, "date", None) else None
+    except Exception:
+        today = None
+    v = batch_odo.verdict(text, today=today)
+    if not v["ok"]:
+        log.info(f"  → ПАРТИЯ: ответ не полон ({v['state']}) — вопрос остаётся")
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=f"🐀 Splinter\n🇹🇭 ⚠️ {v['say_th']}\n{_SEP}\n🇷🇺 ⚠️ {v['say_ru']}")
+        pend["ts"] = _time.time()
+        return True
+    pend["km"], pend["date_iso"], pend["date_human"] = v["km"], v["date_iso"], v["date_human"]
+
+    low = batch_odo.lowering(pend.get("current_km"), v["km"])
+    if low["known"] and low["lower"]:
+        pend["stage"] = "expl"
+        pend["ts"] = _time.time()
+        say = batch_odo.explanation_ask(pend.get("bike"), low)
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=f"🐀 Splinter\n🇹🇭 {say['th']}\n{_SEP}\n🇷🇺 {say['ru']}")
+        log.info(f"  → ПАРТИЯ ниже записанного: {pend.get('bike') or '?'} записано={low['recorded']} "
+                 f"партия={low['named']} (−{low['drop']}) — жду письменное пояснение")
+        return True
+    await _batch_odo_commit(context, bridge, chat_id, topic_id, pend, who)
+    return True
+
+
+async def _batch_odo_commit(context, bridge, chat_id, topic_id, pend, who):
+    """Партия ложится на НАЗВАННЫЙ пробег и НАЗВАННУЮ дату — и только в историю.
+
+    ОДОМЕТР НЕ ДВИГАЕТСЯ НИ ОДНОЙ ВЕТКОЙ, и это устройством, а не обещанием: здесь нет ни
+    `_odo_store`, ни `_odo_confirmed`, ни `service_upsert(current_km=…)`, ни `set_fleet_*` —
+    приём взят у `_write_oil_backdated`, где одометр цел ровно потому, что его никто не шлёт.
+    Дверь истории ОДНА и та же, что у выгрузки буфера (`_write_info_works`): ключ там
+    КОНТЕНТНЫЙ (`info:{номер}:{ключ-работы}:{км}`), поэтому две партии на РАЗНЫХ пробегах дают
+    РАЗНЫЕ ключи, то есть две группы строк, а не одну."""
+    bike = pend.get("bike") or ""
+    km = pend.get("km")
+    date_iso, date_human = pend.get("date_iso") or "", pend.get("date_human") or ""
+    works = list(pend.get("works") or [])
+    expl = pend.get("expl") or ""
+    _BATCH_ODO_PENDING.pop((chat_id, topic_id), None)
+    clear_awaiting(chat_id, topic_id)
+
+    failed = []
+    written = []
+    try:
+        written = _write_info_works(bridge, "обслуживание", topic_id, bike, works, km, "",
+                                    msg_date=date_iso, chat_id=chat_id, failed_out=failed,
+                                    sender=str(who or "")) or []
+    except Exception:
+        log.exception("  → ПАРТИЯ: запись истории упала")
+        failed = [(w, "exception") for w in works]
+
+    # СЛЕД ПОЯСНЕНИЯ, КОТОРЫЙ ЧИТАЮТ ПОТОМ — тот же приём, что у понижения: слова человека едут
+    # ДОСЛОВНО отдельной строкой, а не только в квитанции, которая живёт в чате один экран.
+    if expl and bridge is not None:
+        try:
+            bridge.add_event(msg_date=date_iso, group="обслуживание", bike=str(bike),
+                             event_type="repair", fuel="", mileage=str(km), photos=0,
+                             notes=f"партия прошлым числом ({date_human}): {expl}"[:300],
+                             msg_id=f"batch:{chat_id}:{topic_id}:{km}", sender=str(who or ""))
+        except Exception:
+            log.exception("  → ПАРТИЯ: строка с пояснением не легла (fail-safe, квитанция скажет)")
+
+    lost = [w for w, _e in failed]
+    regs = [(_SP_KIND_LABEL.get(k) or (k, k))[1] for k in (pend.get("done") or [])
+            if k in _SP_COL_KINDS]
+    rec = batch_odo.receipt(bike, written, lost, km, date_human, explanation=expl,
+                            current_km=pend.get("current_km"), registers=regs)
+    await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                      text=f"🐀 Splinter\n🇹🇭 {rec['th']}\n{_SEP}\n🇷🇺 {rec['ru']}")
+    log.info(f"  → ПАРТИЯ записана: {bike or '?'} км={km} дата={date_iso} "
+             f"строк={len(written)} потерь={len(lost)} исход={rec['state']} "
+             f"регистры НЕ тронуты={regs or '—'}")
+
+    # Заявка закрывается ТОЙ ЖЕ дверью, что у обычного пути (`_sp_debt_close` по вердикту), а не
+    # второй: работы СДЕЛАНЫ, просто датированы прошлым. Не закрылась — история уже записана,
+    # и висящая заявка честнее потерянной строки.
+    try:
+        if _service_debt_on():
+            _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=list(pend.get("done") or []),
+                           batch=list(pend.get("done") or []), odometer=km, row_terminal=True,
+                           write={"landed": bool(written), "known": True,
+                                  "detail": (f"партия прошлым числом {date_human} на {km} км "
+                                             f"({who or 'trusted'}): строк {len(written)}")})
+    except Exception:
+        log.exception("  → ПАРТИЯ: закрытие заявки упало (история записана, заявка осталась)")
+    return written, failed
+
+
 async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hint=False):
     """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting.
     Фикс B (сторож пробега): если распознанное число МЕНЬШЕ последнего известного по теме —
@@ -3849,6 +4049,12 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     low = _ODO_LOWER_PENDING.get(key)
     if low and low.get("reason"):
         return await _odo_lower_explanation(msg, context, bridge, text, low)
+    # ПАРТИЯ НА ДРУГОМ ПРОБЕГЕ ЖДЁТ ЧИСЛА И ДАТЫ — по той же причине и на том же месте, что и
+    # пояснение к понижению: своего `_PENDING_MILEAGE` у этой ветки нет, и без перехвата здесь
+    # ответ человека ушёл бы в общий путь и стал бы сообщением ни о чём.
+    _batch = _BATCH_ODO_PENDING.get(key)
+    if _batch:
+        return await _batch_odo_answer(msg, context, bridge, text, _batch)
     pend = _PENDING_MILEAGE.get(key)
     if not pend:
         return False
@@ -5201,6 +5407,38 @@ async def handle_service_button(update, context, bridge) -> None:
                           reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
         log.info(f"  → ТО фаза2 запись по «да» {cb}: written={written} failed={failed} odo={odo} "
                  f"исход={rec['state']}")
+    elif action == "bodo":
+        # [Работы на другом пробеге] — ТРЕТИЙ ИСХОД карточки. Кнопка НИЧЕГО не пишет: она только
+        # открывает вопрос о пробеге и дате партии. Доверие — то же, что у «Подтвердить запись»:
+        # карточка адресована Пыму, и разводить два разных права на одной карточке нельзя.
+        if not _is_trusted_user(q.from_user):
+            await _btn_answer(q, f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Подтверждает {PYM_HANDLE} или владелец",
+                              show_alert=False)
+            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                              text=("🐀 Splinter\n"
+                                    f"🇹🇭 🔧 บันทึกผลเซอร์วิส ยืนยันโดย {PYM_HANDLE} หรือเจ้าของเท่านั้นครับ\n"
+                                    f"{_SEP}\n"
+                                    f"🇷🇺 🔧 Запись результата ТО подтверждает {PYM_HANDLE} или владелец"))
+            return   # токен и кнопки живут — Пым нажмёт позже
+        await _btn_answer(q, "เลขไมล์อื่น… · Другой пробег…")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        _SVC_TOKENS.pop(token, None)
+        try:
+            await _batch_odo_ask(context, bridge, chat_id, topic_id, bike,
+                                 data.get("done", []) or [])
+        except Exception:
+            log.exception("  → ПАРТИЯ: вопрос о пробеге и дате не открылся (fail-safe)")
+            _BATCH_ODO_PENDING.pop((chat_id, topic_id), None)
+            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                              text=("🐀 Splinter\n"
+                                    "🇹🇭 ⚠️ เปิดคำถามเรื่องเลขไมล์ของงานชุดนี้ไม่สำเร็จ "
+                                    "ส่งงานพร้อมเลขไมล์และวันที่มาใหม่ได้ครับ\n"
+                                    f"{_SEP}\n"
+                                    "🇷🇺 ⚠️ Не смог открыть вопрос о пробеге партии. "
+                                    "Пришли работы вместе с пробегом и датой ещё раз 🙏"))
     elif action == "km":
         # [Просто пробег] → в кол.I НЕ пишем. Квитанцию шлём ВСЕГДА (раньше при уже-закреплённой
         # просрочке _pin_overdue_reminder выходил молча → человек видел тишину).
@@ -6973,8 +7211,16 @@ async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, decla
                                   done=_sp_join(done), odometer=str(odo), status="ждёт_подтверждения")
     tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike,
                     "done": done, "odo": str(odo), "kind": "sp_done"})
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-        "✅ ยืนยันบันทึก / Подтвердить запись", callback_data=f"svc:done:{tok}")]])
+    rows = [[InlineKeyboardButton("✅ ยืนยันบันทึก / Подтвердить запись",
+                                  callback_data=f"svc:done:{tok}")]]
+    # ТРЕТИЙ ИСХОД (25.08.2026): до него у человека было ровно два — подтвердить всё на ТЕКУЩЕМ
+    # числе либо не подтверждать ничего, а работы разных дней цеплялись к одному пробегу.
+    if _batch_odo_on():
+        tok2 = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike,
+                         "done": done, "odo": str(odo), "kind": "batch_odo"})
+        rows.append([InlineKeyboardButton(batch_odo.BUTTON_LABEL,
+                                          callback_data=f"svc:bodo:{tok2}")])
+    kb = InlineKeyboardMarkup(rows)
     await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                 text=msg_sp_confirm_pym(bike, done, notdone, odo), reply_markup=kb)
     mark_awaiting(chat_id, topic_id)

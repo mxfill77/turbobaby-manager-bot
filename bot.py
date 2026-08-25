@@ -851,8 +851,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             #    после её отказа не дошло бы до обработчика ни разу (шаг 2 цели 120, 23.08.2026).
             #    Порядок «или» безразличен: обработчик сам решает, чем является текст, и на
             #    невзятом тексте возвращает False — поток идёт дальше, как шёл.
+            #    Тем же «или» едет вопрос о ПАРТИИ на другом пробеге (25.08.2026): у него тоже
+            #    своё состояние и нет записи о вопросе про пробег — без своей двери ответ
+            #    человека («24500 15.07.2026») не дошёл бы до обработчика ни разу.
             if (splinter.pending_mileage_for(chat_id, _tid_sv)
-                    or splinter.pending_odo_lower_for(chat_id, _tid_sv)):
+                    or splinter.pending_odo_lower_for(chat_id, _tid_sv)
+                    or splinter.pending_batch_odo_for(chat_id, _tid_sv)):
                 if await splinter.handle_mileage_confirm(msg, context, bridge, msg.text):
                     return
             # 2.5) масло-нарратив задним числом («было на N», «поменял на N») →
