@@ -114,13 +114,22 @@ def _save_ids(ids):
         pass
 
 
-def _send_message(token, text, chat_id=None, thread_id=None):
+def _send_message(token, text, chat_id=None, thread_id=None, buttons=None):
     """Низкоуровневая отправка. → (ok, message_id|None). Токен только в URL, не печатается.
-    chat_id по умолчанию — личка Филиппа; thread_id → message_thread_id (тема форума)."""
+    chat_id по умолчанию — личка Филиппа; thread_id → message_thread_id (тема форума).
+
+    `buttons` — [[(подпись, callback_data), …], …] либо None. НЕ НАЗВАНЫ → пайлоад БАЙТ-В-БАЙТ
+    прежний (проверяется тестом): кнопки нужны ровно одной карточке — отмене записи ТО, у которой
+    ответ владельца обязан быть НАЖАТИЕМ, а не словом в чат. Объекты PTB сюда не заводятся
+    намеренно: модуль зовут хуки, у которых PTB нет вовсе."""
     url = "https://api.telegram.org/bot" + token + "/sendMessage"
     payload = {"chat_id": chat_id if chat_id else CHAT_ID, "text": text}
     if thread_id:
         payload["message_thread_id"] = int(thread_id)
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": [
+            [{"text": str(label), "callback_data": str(data)} for label, data in row]
+            for row in buttons]}
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
@@ -229,7 +238,7 @@ def notify(text, track=False, clear_first=False, force=False) -> bool:
     return ok
 
 
-def send_inbox(text, answerable):
+def send_inbox(text, answerable, buttons=None):
     """ЕДИНСТВЕННАЯ ДВЕРЬ В ИНБОКС 1160 (разделение каналов по назначению, 05.08.2026).
 
     РЕШЕНИЕ ВЛАДЕЛЬЦА: в инбоксе живёт ТОЛЬКО то, на что он ОТВЕЧАЕТ — карточки красной зоны и
@@ -253,18 +262,19 @@ def send_inbox(text, answerable):
     if not answerable:
         send_feed(text)
         return None
-    return _send_inbox_card(text)
+    return _send_inbox_card(text, buttons=buttons)
 
 
-def send_card(text):
+def send_card(text, buttons=None):
     """Отправить guard-карточку pretool_guard. → (message_id, chat_id) | None.
     Карточка гарда — красная зона, она ВСЕГДА ждёт ответа владельца (граница решения 05.08.2026:
     «карточки красной зоны из 1160 не убирать ни при каких условиях»), поэтому идёт в дверь с
-    answerable=True и её маршрут байт-в-байт прежний."""
-    return send_inbox(text, answerable=True)
+    answerable=True и её маршрут байт-в-байт прежний.
+    `buttons` НЕ названы (вызов гарда) → пайлоад тоже байт-в-байт прежний."""
+    return send_inbox(text, answerable=True, buttons=buttons)
 
 
-def _send_inbox_card(text):
+def _send_inbox_card(text, buttons=None):
     """Тело маршрута инбокса (13.07.2026), вынесено под дверь send_inbox.
     chat_id в возврате нужен дедупу (08.07: повтор той же нераспознанной команды правит ЭТУ
     карточку через edit_card В ТОМ ЖЕ чате, а не шлёт новую — спам-инцидент 163).
@@ -284,10 +294,12 @@ def _send_inbox_card(text):
         return None
     dest = _inbox_dest()
     if dest:
-        ok, mid = _send_message(token, text, chat_id=dest[0], thread_id=dest[1])
+        ok, mid = _send_message(token, text, chat_id=dest[0], thread_id=dest[1], buttons=buttons)
         if ok and mid:
             return mid, dest[0]
-    ok, mid = _send_message(token, text)   # фолбэк: личка (инбокс выключен / форум недоступен)
+    # фолбэк: личка (инбокс выключен / форум недоступен). Кнопки едут и туда — иначе владелец
+    # получил бы карточку, обещающую нажатие, и нечего было бы нажать.
+    ok, mid = _send_message(token, text, buttons=buttons)
     return (mid, CHAT_ID) if ok and mid else None
 
 

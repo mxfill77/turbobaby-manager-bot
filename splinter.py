@@ -29,6 +29,7 @@ import balance_fact    # §касса: свежий баланс / «не све
 import service_receipt # квитанция ТО: ОБЕ половины (тайская+русская) из ОДНОГО исхода записи
 import odo_ceiling     # верхняя граница пробега при записи ТО: обе двери под одним гейтом
 import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
+import undo_exec       # ответ двери отмены → слова человеку (кнопка на карточке владельца)
 import work_name       # история обслуживания: слова механика — человеку, ярлык вида — расчётам
 import card_works      # «в работе»: ОДИН список на обе половины; доказанно записанное уходит
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
@@ -5463,6 +5464,11 @@ async def handle_service_button(update, context, bridge) -> None:
         # эта ветка НЕ делает вовсе, она только просит владельца.
         await _svc_undo_ask(q, context, token)
         return
+    if action == "undogo":
+        # ИСПОЛНЕНИЕ отмены по нажатию владельца на карточке. Единственная ветка splinter, которая
+        # правит живую таблицу без второго вопроса, — и право на это даёт сама карточка.
+        await _svc_undo_run(q, context, bridge, token)
+        return
 
     # МЕТКА СВЕРЯЕТСЯ С МЕСТОМ НАЖАТИЯ (25.08.2026). Адрес операции — чат, тема, байк, пробег —
     # берётся ИЗ МЕТКИ и раньше не сверялся ни с чем: угаданный (или воскресший после рестарта)
@@ -5471,6 +5477,13 @@ async def handle_service_button(update, context, bridge) -> None:
     _msg = getattr(q, "message", None)
     data = _svc_get(token, getattr(_msg, "chat_id", None),
                     getattr(_msg, "message_thread_id", None))
+    # МЕТКА ОТМЕНЫ ЧУЖОМУ ДЕЙСТВИЮ НЕ ОТДАЁТСЯ. Метки кнопок ТО живут в ОДНОМ пространстве
+    # номеров, а читаются разными ветками: ниже метка разбирается как заявка на ЗАПИСЬ пробега
+    # (`bike`, `km`, `status`), которых у метки отмены нет вовсе — и запись ушла бы по пустому
+    # адресу. Номер угадать нечем, но замок стоит на РАЗБОРЕ, а не на недоступности номера.
+    if isinstance(data, dict) and data.get(undo_exec.KIND_FIELD) == undo_exec.KIND:
+        log.warning(f"  🔖 метка {token} — метка отмены, действие «{action}» ей не принадлежит")
+        data = None
     if not data:
         await _btn_answer(q)
         try:
@@ -7162,6 +7175,46 @@ def _svc_undo_remember_write(chat_id, topic_id, bike, plate, by, odo, kind, answ
     return tok
 
 
+def _svc_undo_arm(entry):
+    """Завести МЕТКУ ИСПОЛНЕНИЯ отмены — ТЕМ ЖЕ механизмом, что у прочих кнопок ТО (`_svc_put`).
+
+    ВТОРОЙ ПАМЯТИ ЗДЕСЬ НЕ ЗАВОДИТСЯ НАМЕРЕННО. У меток кнопок уже есть всё, что нужно этой:
+    файл на диске (`svc_tokens.json`, поэтому метка переживает перезапуск), возраст с TTL,
+    сверка места нажатия, снятие. Своя память означала бы второй файл, второй TTL и второй способ
+    ошибиться — при том, что журнал акта (`_SVC_UNDO`) живёт ТОЛЬКО в памяти процесса и рестарт
+    его стирает. Поэтому в метку кладётся САМ АКТ целиком: после перезапуска кнопка работает от
+    метки, а не от журнала.
+
+    ПОДТВЕРЖДЕНИЯ В МЕТКЕ НЕТ. Метка несёт АДРЕС (ключи актов и объект), а `confirmed` приходит
+    РОВНО из нажатия владельца (`_svc_undo_run`) — иначе право писать в живую таблицу лежало бы
+    на диске и ждало любого, кто до него доберётся."""
+    if not isinstance(entry, dict) or not entry.get("pos"):
+        return None
+    try:
+        return _svc_put({undo_exec.KIND_FIELD: undo_exec.KIND,
+                         "chat": None, "topic": None,          # заполнится по факту доставки
+                         "entry": entry,
+                         "origin_chat": entry.get("chat"), "origin_topic": entry.get("topic")})
+    except Exception:
+        log.exception("  → отмена ТО: метку исполнения завести не удалось")
+        return None
+
+
+def _svc_undo_pin(mark, sent):
+    """Прикрепить метку к чату, где карточка ЛЕГЛА (инбокс 1160 либо личка-фолбэк).
+
+    Адрес известен только ПОСЛЕ отправки, поэтому метка правится на месте и сохраняется тем же
+    `_svc_tokens_save`, что и завела: второго файла ради одного поля не заводим."""
+    try:
+        chat = sent[1] if isinstance(sent, (tuple, list)) and len(sent) > 1 else None
+        d = _SVC_TOKENS.get(mark)
+        if isinstance(d, dict) and chat:
+            d["chat"] = chat
+            _svc_tokens_save()
+    except Exception:
+        log.warning("  → отмена ТО: метку не удалось привязать к чату карточки")
+
+
 def _svc_undo_kb(tok):
     """Клавиатура квитанции: одна кнопка «запись неверна». None = кнопки нет (и это честно)."""
     if not tok:
@@ -7191,13 +7244,24 @@ async def _svc_undo_ask(q, context, token):
     th, ru = undo_last.reply(v, _SP_KIND_LABEL)
 
     if v["state"] == undo_last.STATE_CARD:
-        text = undo_last.card(v, asked_by=asked_by, labels=_SP_KIND_LABEL)
+        # МЕТКА ИСПОЛНЕНИЯ ЗАВОДИТСЯ ДО ОТПРАВКИ: её номер и есть адрес кнопки. Не завелась →
+        # карточка уезжает БЕЗ кнопки и без обещания её (`armed=False`), то есть ровно как до
+        # 26.08 — молча пообещать нажатие, которого не будет, нельзя.
+        mark = _svc_undo_arm(v["entry"])
+        text = undo_last.card(v, asked_by=asked_by, labels=_SP_KIND_LABEL, armed=bool(mark))
         sent = False
         try:
             import notify
-            sent = bool(notify.send_card(text))     # инбокс 1160: карточка ЖДЁТ ответа владельца
+            kb = [[(undo_last.EXEC_LABEL, f"svc:undogo:{mark}")]] if mark else None
+            sent = notify.send_card(text, buttons=kb)   # инбокс 1160: карточка ЖДЁТ владельца
         except Exception:
             log.exception("  → отмена ТО: карточка владельцу не отправлена")
+        if sent and mark:
+            # Где карточка ЛЕГЛА — то и есть законное место нажатия: `_svc_get` сверит его с
+            # местом клика и чужую (или воскресшую) метку не отдаст.
+            _svc_undo_pin(mark, sent)
+        elif mark:
+            _svc_drop(mark)          # карточки нет → метке жить незачем: кнопки не существует
         if sent:
             entry["asked"] = True                   # отмена отмены запрещена
             log.info(f"  ↩️ отмена ТО от {asked_by}: {undo_last.say(v)}")
@@ -7220,6 +7284,97 @@ async def _svc_undo_ask(q, context, token):
         return
     await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
                       text=(f"🐀 Splinter\n🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}"))
+
+async def _svc_undo_run(q, context, bridge, mark):
+    """Нажата кнопка ИСПОЛНЕНИЯ на карточке владельца → дверь отмены → ответ СЛОВАМИ.
+
+    ЗДЕСЬ И ТОЛЬКО ЗДЕСЬ отмена правит живую таблицу, и право на это даёт РОВНО одно — нажатие
+    владельца на карточке, которую он видел целиком. Замки стоят слоями и ни один не дублирует
+    соседа: место нажатия сверяет `_svc_get`, «это метка отмены, а не заявка на запись» — признак
+    `undo_exec.KIND`, «повтор» — отметка в самой метке, «последняя · своя · окно» — `undo_last`,
+    «в клетке до сих пор наше число · отмена отмены · уже отменяли» — САМА дверь моста, которая
+    числа снаружи не принимает вовсе.
+
+    ЧИСЛА СЮДА НЕ ПОПАДАЮТ: наружу уходит только ключ акта, подтверждение и кто нажал. Что
+    вернуть — мост знает из СВОЕЙ строки журнала."""
+    msg = getattr(q, "message", None)
+    chat_id = getattr(msg, "chat_id", None)
+    topic_id = getattr(msg, "message_thread_id", None)
+    who = getattr(q, "from_user", None)
+    by = ("@" + who.username) if (who and getattr(who, "username", None)) \
+        else f"id{getattr(who, 'id', '?')}"
+    data = _svc_get(mark, chat_id, topic_id)
+
+    async def _answer(th, ru, drop_kb=False):
+        await _btn_answer(q)
+        if drop_kb:
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        if chat_id is None:
+            log.warning("  ↩️ отмена ТО: адрес нажатия неизвестен, ответ не отправлен")
+            return
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=(f"🐀 Splinter\n🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}"))
+
+    # ЧУЖАЯ / ПРОТУХШАЯ МЕТКА. Общее «кнопка устарела, пришли фото» тут врало бы о том, что
+    # делать: у отмены свой отказ и своё действие.
+    if not isinstance(data, dict) or data.get(undo_exec.KIND_FIELD) != undo_exec.KIND:
+        log.warning(f"  ↩️ отмена ТО: метка {mark} не принята (нет/чужая/протухла), нажал {by}")
+        await _answer("⚠️ ปุ่มนี้ใช้ไม่ได้แล้วครับ · ถ้ายังต้องยกเลิก รบกวนกดปุ่มบนใบเสร็จอีกครั้ง",
+                      "⚠️ Эта кнопка больше не действует (метка не найдена или устарела). "
+                      "Что делать: если отменить всё ещё нужно — нажми «Запись неверна» на "
+                      "квитанции заново, я пришлю свежую карточку.")
+        return
+
+    # ПОВТОР ПО ТОМУ ЖЕ АКТУ. Отметка живёт В САМОЙ МЕТКЕ, значит переживает перезапуск вместе с
+    # ней; дверь моста ловит это же вторым рубежом (`already_undone` / `undo_of_undo`).
+    if data.get(undo_exec.DONE_MARK):
+        log.info(f"  ↩️ отмена ТО: повтор по метке {mark} отвергнут, нажал {by}")
+        await _answer(undo_exec.REPEAT_TH, undo_exec.REPEAT_RU, drop_kb=True)
+        return
+
+    entry = data.get("entry")
+    calls, refusals = undo_last.request(entry, by=by, confirmed=True)
+    by_act = {str(p.get("act") or ""): p for p in ((entry or {}).get("pos") or [])
+              if isinstance(p, dict)}
+    results = []
+    for call in calls:
+        what = undo_last.pos_what(entry, by_act.get(str(call.get("act") or "")) or {})
+        try:
+            answer = bridge.service_undo(**call)
+        except Exception as e:
+            # Исключение на НАШЕЙ стороне — это «не знаю», а не «не вернул»: запрос мог долететь.
+            log.exception("  ↩️ отмена ТО: дверь не ответила")
+            answer = {"ok": False, "error": "", "detail": str(e)}
+        results.append((what, answer))
+
+    v = undo_exec.verdict(results, refusals)
+    # СНАЧАЛА ПОМЕТИТЬ, ПОТОМ ГОВОРИТЬ: метка отработала в тот момент, когда дверь позвана, а не
+    # когда ответ доехал. Иначе сбой на отправке ответа оставил бы кнопку живой — и второе
+    # нажатие пошло бы во ВТОРУЮ отмену.
+    try:
+        data[undo_exec.DONE_MARK] = _time.time()
+        data["undo_state"] = v.get("state")
+        _svc_tokens_save()
+    except Exception:
+        log.warning("  ↩️ отмена ТО: метку не удалось пометить исполненной")
+    log.info(f"  ↩️ отмена ТО исполнена ({by}): {undo_exec.say(v)}")
+
+    th, ru = undo_exec.reply(v)
+    await _answer(th, ru, drop_kb=True)
+
+    # ТОТ, КТО ПРОСИЛ, ОБЯЗАН УЗНАТЬ ИСХОД. Просил механик в теме байка, а нажимал владелец в
+    # инбоксе: смолчать в теме значило бы оставить просьбу без ответа навсегда.
+    o_chat, o_topic = data.get("origin_chat"), data.get("origin_topic")
+    if o_chat is not None and o_chat != chat_id:
+        try:
+            await _send_retry(context, chat_id=o_chat, message_thread_id=o_topic,
+                              text=(f"🐀 Splinter\n🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}"))
+        except Exception:
+            log.warning("  ↩️ отмена ТО: исход не доехал в тему, где просили")
+
 
 # B2: маркеры «работа завершена» (ДОВОДЯТ заявку к гейту Пыма, САМИ в Лист1 НЕ пишут).
 # Длинные/distinctive — подстрокой; короткие/неоднозначные (да/ок/все) — ТОЛЬКО как целое слово (без ложных срабатываний).
