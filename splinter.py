@@ -34,11 +34,12 @@ import work_name       # история обслуживания: слова м�
 import card_works      # «в работе»: ОДИН список на обе половины; доказанно записанное уходит
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
 import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
-import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 14 мест
+import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 15 мест
 import odo_fresh       # срок годности подтверждённого пробега: не спрашиваем число, которое знаем
 import odo_lower
 import batch_odo     # работы на другом пробеге: третий исход карточки подтверждения работ       # понижение пробега: расхождение ЧИСЛОМ + причина + письменное пояснение
 import reply_floor     # пол ответа: бот не молчит и не отказывает глухо (правила владельца 23.08)
+import work_intent     # приём работ: вопрос о работе — не заявка на неё (повод 22.08, ADV 350 372)
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
@@ -91,10 +92,24 @@ def _with_separator(text):
 #: разбора: не выросло — бот промолчал, а молчание владелец запретил как исход (23.08).
 _SPOKE = _ctxvars.ContextVar("splinter_spoke", default=0)
 
+#: ВИД СНИМКА ЭТОГО обновления — свидетель для пола ответа (30.08.2026). Пол стоит в `handle`,
+#: то есть СНАРУЖИ `_handle_servicing`, где живёт разбор фото, и получал о снимке ровно один
+#: факт: что он был. Отсюда «переснимите приборку» на шлемы и на снятую деталь.
+#: ContextVar, А НЕ ГЛОБАЛЬ, и это не вкус: PTB даёт каждому обновлению свою копию контекста,
+#: а глобаль отдала бы полу вид снимка СОСЕДНЕГО сообщения — ту же ложь с другой стороны.
+#: Тот же довод, что у `_SPOKE` выше и у `_CARD_BUDGET` в `bridge_client`.
+_PHOTO_KIND = _ctxvars.ContextVar("splinter_photo_kind", default="")
+
 
 def _never_silent_on():
     """Ручка отката пола ответа. `NEVER_SILENT=0` → ветка мертва ДО сбора фактов."""
     return str(_os_env("NEVER_SILENT", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _work_intent_on():
+    """Ручка отката гейта намерения. `WORK_INTENT=0` → ветка мертва ДО разбора слов:
+    заявка заводится ровно так, как заводилась до 30.08, и переспроса не бывает вовсе."""
+    return str(_os_env("WORK_INTENT", "1")).strip() not in ("0", "", "нет", "no", "off")
 
 
 def _os_env(name, default=""):
@@ -685,7 +700,7 @@ _ODOMETER_ASK_COOLDOWN = 600   # сек
 # ============================================================================================
 #  ЗАМОК ПОВТОРНЫХ ПОДСКАЗОК — РУКИ (решение живёт в hint_dedup.py, импортов там ноль)
 # ============================================================================================
-#  ОДНА дверь `_hint_send` на ВСЕ 14 мест переписи 22.08.2026 — не 14 заплат. Правило одно:
+#  ОДНА дверь `_hint_send` на ВСЕ 15 мест переписи 22.08.2026 — не 15 заплат. Правило одно:
 #  та же подсказка по тому же байку не уходит второй раз, пока не изменилось СОСТОЯНИЕ,
 #  её породившее; долго держащееся состояние даёт право на повтор через `_HINT_REPEAT_H`
 #  (24 ч — число выведено из корпуса, обоснование в докстринге hint_dedup).
@@ -1765,6 +1780,37 @@ def msg_work_receipt(bike, works):
         f"🐀 Splinter\n"
         f"🇹🇭 รับงานแล้วครับ{b}{th_part} — รบกวนส่งเลขไมล์ด้วยครับ 🙏\n"
         f"🇷🇺 Принял работы{b}{ru_part} — пришли пробег 🙏"
+    )
+
+
+def msg_intent_recheck(bike, works, state):
+    """ПЕРЕСПРОС ВМЕСТО ЗАЯВКИ (30.08.2026): работу назвали, но намерение не прочитано как отписка.
+
+    Говорит три вещи, и все три обязательны: (1) что именно услышано — работа названа ДОСЛОВНО,
+    иначе человек не поймёт, о чём его спрашивают; (2) что ничего не записано — иначе переспрос
+    читается как «принял»; (3) как ответить, чтобы работа записалась. Двуязычно, тайский первым.
+
+    Слова разведены по исходу: у `QUESTION` мы поняли, что спрашивают, и говорим это прямо;
+    у `UNCLEAR` — честное «не понял, вопрос это или отписка», а не выдуманная уверенность.
+    Третьего текста тут не заводится: `CLAIM` до этой двери не доходит вовсе."""
+    b = f" {bike}" if bike else ""
+    works_str = ", ".join(dict.fromkeys(str(w).strip() for w in works if str(w).strip()))
+    th_str = _works_th_str(works)
+    th_part = f" ({th_str})" if th_str else ""
+    ru_part = f" ({works_str})" if works_str else ""
+    if state == work_intent.QUESTION:
+        head_th = f"❓ ดูเหมือนเป็นคำถามเรื่องงาน{th_part} ไม่ใช่การแจ้งว่าทำแล้วครับ"
+        head_ru = f"❓ Это похоже на ВОПРОС о работе{ru_part}, а не на отписку о сделанном."
+    else:
+        head_th = f"❓ ผมไม่แน่ใจว่าเป็นคำถามหรือแจ้งผลงาน{th_part} ครับ"
+        head_ru = f"❓ Не понял, вопрос это или отписка о работе{ru_part}."
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 {head_th} ผมยังไม่ได้เปิดงานและไม่ได้บันทึกอะไร{(' ' + bike) if bike else ''} — "
+        f"ถ้าทำเสร็จแล้ว พิมพ์ว่า «เปลี่ยน…แล้ว» พร้อมเลขไมล์ ผมจะบันทึกให้ครับ 🙏\n"
+        f"{_SEP}\n"
+        f"🇷🇺 {head_ru} Заявку НЕ открыл и ничего не записал{b}. "
+        f"Если работа сделана — напиши «заменил …» и пришли пробег, я запишу 🙏"
     )
 
 
@@ -6805,6 +6851,16 @@ def _aggregate_album_vis(vis_list):
         if v.get("tire"):
             agg["tire"] = v.get("tire")
             break
+    # ВИД СНИМКА У АЛЬБОМА (30.08.2026). Прежде `kind` переживал только одиночное фото (ветка
+    # `len == 1` возвращает разбор целиком), а у альбома терялся молча — и пол ответа не мог
+    # отличить альбом с приборкой от альбома деталей. Правило то же, каким альбом уже живёт
+    # выше: приборка в пачке ЕСТЬ, если она есть хоть на одном снимке (оттуда же берётся и
+    # пробег). Приборки нет — берём первый названный вид.
+    kinds = [str(v.get("kind")).strip().lower() for v in vis_list if v.get("kind")]
+    if reply_floor.DASHBOARD in kinds:
+        agg["kind"] = reply_floor.DASHBOARD
+    elif kinds:
+        agg["kind"] = kinds[0]
     dmgs = [str(v.get("damage")) for v in vis_list if v.get("damage")]
     if dmgs:
         agg["damage"] = "; ".join(dict.fromkeys(dmgs))[:200]
@@ -8530,12 +8586,23 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             # логирует «upstream down (graceful '')» и отдаёт '' → лог БЕЗ пуша, разбор деградирует
             # штатно (raise_on_upstream не включаем — громкий пуш только на ДЕНЬГАХ).
             v = _parse_json(claude.vision(VISION_BIKE_SYSTEM, img, max_tokens=400))
+            # ВИД СНИМКА В ЖУРНАЛ (30.08.2026). Разбор возвращал `kind` всегда, а строка его не
+            # печатала — и замер «сколько раз просили переснять приборку там, где приборки не
+            # было» задним числом упирался в потолок: слепой к цифрам снимок приборки и снимок
+            # шлемов дают одинаковые пять `None`. Теперь вид виден, и следующий замер точен.
             log.info(f"  → vision: fuel={v.get('fuel')} mileage={v.get('mileage')} "
-                     f"conf={v.get('mileage_confidence')} tire={v.get('tire')} damage={v.get('damage')}")
+                     f"conf={v.get('mileage_confidence')} tire={v.get('tire')} "
+                     f"damage={v.get('damage')} kind={v.get('kind')}")
             # Копим разбор в буфер недавних фото ЭТОЙ ТЕМЫ (для вопросов "проверь фото резины/пробега")
             _remember_recent_photo(chat_id, v, pm, topic_id=topic_id)
             vis_list.append(v)
         vis = _aggregate_album_vis(vis_list)
+        # Свидетель для пола ответа: он стоит снаружи этой функции и сам разбора не видит.
+        # Кладём РОВНО то, что назвал разбор; не назвал — пусто, и пол скажет «не узнал».
+        try:
+            _PHOTO_KIND.set(str(vis.get("kind") or "").strip().lower())
+        except Exception:
+            pass
         if len(vis_list) > 1:
             log.info(f"  → альбом: склеил {len(vis_list)} фото → mileage={vis.get('mileage')} "
                      f"conf={vis.get('mileage_confidence')} damage={vis.get('damage')} dirt={vis.get('dirt')}")
@@ -8588,9 +8655,29 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Записываем intake-событие для истории и НЕ продолжаем (заявка != факт). Факт = отдельное «готово».
     # Сигнал заявки = СТРОГО event_type=="intake" («привёз/пригнал на ТО» — будущее намерение, как в
     # реальном логе 06-20). НЕ ловим оил-контекст в общем — иначе перехватим пояснения работ (буфер-флоу).
+    # === НАМЕРЕНИЕ: ВОПРОС О РАБОТЕ — НЕ ЗАЯВКА НА НЕЁ (30.08.2026) ===
+    # Разборщик отдаёт `works` и по вопросу, и по отписке — он извлекает ПРЕДМЕТ, и это его
+    # законная работа. Намерение до сих пор не спрашивал никто: 22.08 «в редукторе тоже меняли
+    # масло?» родило заявку ['gear'], по которой сторож напоминал трижды. Считаем ОДИН раз здесь
+    # и держим на ОБЕИХ дверях заявки (фаза 1 ниже и группа B дальше) — двум определениям
+    # намерения разойтись негде. Решение чистое (`work_intent`), руки здесь.
+    _intent = {"state": work_intent.CLAIM, "why": "гейт намерения выключен", "clause": "", "n": 0}
+    if _work_intent_on() and works:
+        try:
+            _intent = work_intent.verdict(text, works)
+        except Exception:
+            # FAIL-SAFE В СТОРОНУ ПРЕЖНЕГО ПУТИ: разбор упал → заявка заводится, как заводилась.
+            log.exception("  → намерение: разбор слов упал (fail-safe: считаем утверждением)")
+            _intent = {"state": work_intent.CLAIM, "why": "разбор упал", "clause": "", "n": 0}
+    _intent_claim = (_intent["state"] == work_intent.CLAIM)
+    if not _intent_claim:
+        log.info(f"  → намерение: {_intent['state']} ({_intent['why']}) "
+                 f"клауза={_intent['clause']!r} works={works}")
+
     _sp_declared = _declared_kinds(text, works, vis)
     _sp_is_intake = (parsed.get("event_type") == "intake") and not _is_oil_done_marker(text, vis)
-    if _sp_is_intake and _sp_declared and bike and not _ret_ctx and not _sp_open(bridge, chat_id, topic_id, bike):
+    if (_sp_is_intake and _intent_claim and _sp_declared and bike and not _ret_ctx
+            and not _sp_open(bridge, chat_id, topic_id, bike)):
         try:
             bridge.add_event(msg_date=(str(msg.date.date()) if msg.date else ""),
                              group=group_name + (f" / тема {topic_id}" if topic_id else ""),
@@ -8786,6 +8873,19 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     #   (mileage уже = parsed.mileage или vis.mileage; буфер сюда НЕ входит — он и давал ложное подавление).
     # В столбец БЕЗ пробега НЕ пишем: запись группы B/масла выше по потоку требует mileage — её не трогаем.
     km_this_msg = bool(mileage) and _conf_ok
+    if works and not km_this_msg and not _intent_claim:
+        # ВОПРОС ЗАЯВКИ НЕ ЗАВОДИТ. Это ЕДИНСТВЕННАЯ дверь, через которую прошёл повод (22.08
+        # 07:12:14, `то_заявка ждёт_факт: ['gear']`), и здесь же он и останавливается. Ничего не
+        # пишем — ни в заявку, ни в Лист1, ни в события: сомнение стоит одного вопроса человеку.
+        # МОЛЧАНИЕ ЗАПРЕЩЕНО (правило владельца 23.08) — переспрашиваем и делаем это ЧЕРЕЗ ту же
+        # дверь подсказки, что и все прочие: замок повторов сам не даст спросить дважды об одном.
+        # Подавил замок — заявки всё равно нет: спрашивали недавно, ответа ждём.
+        await _hint_send(context, kind="K", bike=bike,
+                         state=("intent", _intent["state"], works),
+                         chat_id=chat_id, topic_id=topic_id,
+                         text=msg_intent_recheck(bike, works, _intent["state"]))
+        return
+
     if works and not km_this_msg:
         # (a) НЕ ЗАДВАИВАТЬ: ОДНО сообщение. msg_work_receipt уже называет работы И просит пробег
         # («Принял работы {works} — пришли пробег») → пробег покрыт для ВСЕХ работ (правило «пробег всегда»).
@@ -9490,13 +9590,18 @@ async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
         bike = _topic_name_from_msg(msg) or ""
     except Exception:
         bike = ""
+    try:
+        _pk = _PHOTO_KIND.get()
+    except Exception:
+        _pk = ""                      # свидетеля нет → «вид не узнан», а не «это приборка»
     say = reply_floor.fallback({
         "bike": bike,
         "crashed": bool(crashed),
         "photo": bool(getattr(msg, "photo", None)),
+        "photo_kind": _pk,
     })
-    log.info(f"  → ПОЛ ОТВЕТА: заход промолчал (исход {say['state']}, упал={bool(crashed)}) "
-             f"— отвечаю сам, тема={topic_id}")
+    log.info(f"  → ПОЛ ОТВЕТА: заход промолчал (исход {say['state']}, упал={bool(crashed)}, "
+             f"вид снимка={_pk or '—'}) — отвечаю сам, тема={topic_id}")
     try:
         await _send_retry(context, chat_id=msg.chat_id, message_thread_id=topic_id,
                           text=f"🐀 Splinter\n🇹🇭 {say['th']}\n🇷🇺 {say['ru']}")
