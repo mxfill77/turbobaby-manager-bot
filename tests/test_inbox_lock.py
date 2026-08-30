@@ -119,15 +119,21 @@ def sec_fence():
        "новая отправка в Telegram замечена отдельным флагом")
 
     # (б) у двери пропал признак маршрута.
-    noflag = src.replace("def send_inbox(text, answerable):", "def send_inbox(text):")
+    # Подделка строится ЛИТЕРАЛОМ живой сигнатуры, поэтому её приходится вести за сигнатурой
+    # (26.08: у двери появился необязательный `buttons` — кнопка на карточке отмены). Предмет
+    # стража от этого не меняется: судится наличие ПРИЗНАКА МАРШРУТА `answerable`, а не длина
+    # списка параметров. Само «подделка действительно построена» ниже — замок против того, чтобы
+    # рассинхрон литерала молча превратил проверку в зелёную пустышку; он и сработал.
+    noflag = src.replace("def send_inbox(text, answerable, buttons=None):",
+                         "def send_inbox(text, buttons=None):")
     ok(noflag != src, "подделка «дверь без признака» действительно построена")
     ok(any("answerable" in y for _w, y in ic._door_ast_findings(noflag)),
        "дверь без параметра «answerable» — страж флагует: признак обязан быть назван")
 
     # (в) маршрут инбокса зовут в обход двери.
-    second = src.replace("def send_card(text):",
+    second = src.replace("def send_card(text, buttons=None):",
                          "def send_now(text):\n    return _send_inbox_card(text)\n\n\n"
-                         "def send_card(text):")
+                         "def send_card(text, buttons=None):")
     ok(second != src, "подделка «второй вход в маршрут» действительно построена")
     ok(any("_send_inbox_card" in w for w, _y in ic._door_ast_findings(second)),
        "второй вход в маршрут инбокса — страж флагует")

@@ -44,7 +44,7 @@ EDITS = []     # (chat_id, mid, text)
 FAIL_HQ = {"on": False}
 
 
-def fake_send(token, text, chat_id=None, thread_id=None):
+def fake_send(token, text, chat_id=None, thread_id=None, buttons=None):
     chat = chat_id if chat_id else N.CHAT_ID
     SENT.append((chat, thread_id, text))
     if FAIL_HQ["on"] and chat == HQ:

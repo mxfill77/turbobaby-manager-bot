@@ -89,7 +89,7 @@ def sec1():
 
     sent = []
 
-    def fake_send(token, text, chat_id=None, thread_id=None):
+    def fake_send(token, text, chat_id=None, thread_id=None, buttons=None):
         sent.append((chat_id, thread_id, text))
         return True, 4242
 
