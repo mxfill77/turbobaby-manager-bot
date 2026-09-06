@@ -204,13 +204,17 @@ def _make_handler(method, path, body=b"", headers=None,
                   app_secret="test_secret",
                   our_phone="",
                   db=None,
-                  d360_path_secret=""):
+                  d360_path_secret="",
+                  pull_secret=""):
     h = _FakeHandler(method, path, body, headers)
     _FakeHandler.verify_token     = verify_token
     _FakeHandler.app_secret       = app_secret
     _FakeHandler.our_phone        = our_phone
     _FakeHandler.db               = db
     _FakeHandler.d360_path_secret = d360_path_secret
+    # Сбрасывается КАЖДЫЙ раз намеренно: атрибуты живут на классе, и секрет, забытый прошлым
+    # тестом, открыл бы дверь следующему — тест «неверный секрет → 404» врал бы зелёным.
+    _FakeHandler.pull_secret      = pull_secret
     return h
 
 
@@ -913,6 +917,288 @@ def test_normalize_d360_v1_empty():
     ok(len(events) == 0, "d360 empty payload → 0 events")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Bind — слушаем loopback, наружу только через Caddy
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_bind_default_is_loopback():
+    ok(wh.bind_host(None) == "127.0.0.1", "переменной нет → 127.0.0.1")
+    ok(wh.bind_host("") == "127.0.0.1", "пусто → 127.0.0.1")
+    ok(wh.bind_host("   ") == "127.0.0.1", "пробелы → 127.0.0.1 (опечатка не публикует порт)")
+
+
+def test_bind_explicit_is_honoured():
+    """Явно названный адрес уважается — иначе ручки отката не было бы вовсе."""
+    ok(wh.bind_host("0.0.0.0") == "0.0.0.0", "явный 0.0.0.0 → 0.0.0.0")
+    ok(wh.bind_host(" 10.0.0.5 ") == "10.0.0.5", "адрес с пробелами по краям очищается")
+
+
+def test_make_server_binds_loopback():
+    """Живой сокет: сервер без WA_BIND_HOST поднимается на петле, а не на всех интерфейсах."""
+    fd, dbp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    env = {"verify_token": "t", "app_secret": "", "phone_id": "", "port": 0,
+           "queue_db": dbp, "d360_path_secret": "", "pull_secret": ""}
+    srv = wh.make_server(env)
+    try:
+        ok(srv.server_address[0] == "127.0.0.1",
+           "make_server слушает 127.0.0.1, а не 0.0.0.0 (адрес=" + str(srv.server_address[0]) + ")")
+    finally:
+        srv.server_close()
+        os.remove(dbp)
+
+
+def test_no_hardcoded_wildcard_bind():
+    """Регресс: адрес всех интерфейсов не вшит в код — он приходит только из окружения."""
+    src = open("/root/turbobaby-manager-bot/wa_webhook.py", encoding="utf-8").read()
+    ok('ThreadingHTTPServer(("0.0.0.0"' not in src,
+       "жёстко вшитого 0.0.0.0 в make_server больше нет")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. Очередь для ПК — pull / ack
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PULL_SECRET = "a1b2c3d4e5f60718"          # фиксированный тестовый секрет
+
+
+def _seed(db, n, source="meta", start=1):
+    evs = [{"channel": "wa", "from": "6681000000" + str(i % 10), "name": "Кли",
+            "type": "text", "text": "msg" + str(i), "media_id": None,
+            "ts": 1700000000 + i, "echo": False, "history": False,
+            "wamid": "wamid.seed%d.%d" % (start, i), "raw": {"i": i}}
+           for i in range(start, start + n)]
+    return db.enqueue(evs, source=source)
+
+
+def _pull_http(db, secret_in_path, configured=_PULL_SECRET):
+    h = _make_handler("GET", "/wa-queue/pull/" + secret_in_path, db=db,
+                      pull_secret=configured)
+    _dispatch(h)
+    return h
+
+
+def _ack_http(db, ids, secret_in_path=_PULL_SECRET, configured=_PULL_SECRET):
+    body = json.dumps({"ids": ids}).encode()
+    h = _make_handler("POST", "/wa-queue/ack/" + secret_in_path, body=body,
+                      headers={"Content-Length": str(len(body))},
+                      db=db, pull_secret=configured)
+    _dispatch(h)
+    return h
+
+
+def test_pull_returns_rows_and_fields():
+    db = _tmp_db()
+    _seed(db, 3)
+    h = _pull_http(db, _PULL_SECRET)
+    ok(h._resp_code == 200, "верный секрет → 200")
+    data = json.loads(h._resp_body.decode())
+    ok(data["ok"] is True and data["count"] == 3, "отдано 3 записи")
+    row = data["items"][0]
+    for field in ("id", "from", "name", "type", "text", "ts", "source"):
+        ok(field in row, "в записи есть поле " + field)
+    ok(row["source"] == "meta", "источник записан: meta")
+
+
+def test_pull_limit_20():
+    db = _tmp_db()
+    _seed(db, 25)
+    data = json.loads(_pull_http(db, _PULL_SECRET)._resp_body.decode())
+    ok(data["count"] == 20, "за раз отдаётся не больше 20 (отдано " + str(data["count"]) + ")")
+
+
+def test_pull_wrong_secret_404_and_nothing_leased():
+    db = _tmp_db()
+    _seed(db, 2)
+    h = _pull_http(db, "0000000000000000")
+    ok(h._resp_code == 404, "неверный секрет → 404")
+    ok(b"Not found" in h._resp_body, "тело как у неизвестного URL — эндпоинт себя не выдаёт")
+    # и главное: отказ не пометил записи выданными
+    data = json.loads(_pull_http(db, _PULL_SECRET)._resp_body.decode())
+    ok(data["count"] == 2, "после отказа записи по-прежнему доступны (аренда не ставилась)")
+
+
+def test_pull_no_secret_configured_404():
+    db = _tmp_db()
+    _seed(db, 1)
+    h = _pull_http(db, "anything", configured="")
+    ok(h._resp_code == 404, "секрет не настроен → 404 всегда (fail-closed)")
+    h2 = _pull_http(db, "", configured="")
+    ok(h2._resp_code == 404, "пустой секрет в пути тоже 404")
+
+
+def test_ack_wrong_secret_404():
+    db = _tmp_db()
+    _seed(db, 1)
+    h = _ack_http(db, [1], secret_in_path="deadbeefdeadbeef")
+    ok(h._resp_code == 404, "ack с неверным секретом → 404")
+    ok(db.pull()[0]["id"] == 1, "и запись НЕ помечена обработанной")
+
+
+def test_pull_ack_then_not_returned():
+    db = _tmp_db()
+    _seed(db, 2)
+    items = json.loads(_pull_http(db, _PULL_SECRET)._resp_body.decode())["items"]
+    ids = [i["id"] for i in items]
+    h = _ack_http(db, ids)
+    ok(h._resp_code == 200, "ack → 200")
+    ok(json.loads(h._resp_body.decode())["acked"] == 2, "подтверждено 2 записи")
+    later = db.pull(now=int(time.time()) + 10_000)
+    ok(len(later) == 0, "подтверждённые не выдаются больше НИКОГДА, даже после аренды")
+
+
+def test_unacked_reappear_after_lease():
+    db = _tmp_db()
+    _seed(db, 2)
+    t0 = 1_700_000_000
+    first = db.pull(now=t0)
+    ok(len(first) == 2, "первая выдача: 2")
+    ok(len(db.pull(now=t0 + 60)) == 0,
+       "через минуту без ack — НЕ выдаются повторно (аренда держит)")
+    ok(len(db.pull(now=t0 + wh.LEASE_SECS - 1)) == 0, "за секунду до конца аренды — молчим")
+    again = db.pull(now=t0 + wh.LEASE_SECS + 1)
+    ok(len(again) == 2, "через 5 минут без ack — снова доступны (ПК умер, кто-то должен забрать)")
+
+
+def test_ack_partial_leaves_rest():
+    db = _tmp_db()
+    _seed(db, 3)
+    t0 = 1_700_000_000
+    items = db.pull(now=t0)
+    db.ack([items[0]["id"]], now=t0)
+    back = db.pull(now=t0 + wh.LEASE_SECS + 1)
+    ok(len(back) == 2, "подтверждена одна — возвращаются ровно две остальные")
+    ok(items[0]["id"] not in [b["id"] for b in back], "подтверждённой среди них нет")
+
+
+def test_ack_is_idempotent_and_junk_safe():
+    db = _tmp_db()
+    _seed(db, 1)
+    t0 = 1_700_000_000
+    i = db.pull(now=t0)[0]["id"]
+    ok(db.ack([i], now=t0) == 1, "первый ack меняет строку")
+    ok(db.ack([i], now=t0) == 0, "повторный ack ничего не меняет и не падает")
+    ok(db.ack([99999], now=t0) == 0, "ack несуществующего id безвреден")
+    ok(db.ack(["мусор", None, {}], now=t0) == 0, "мусорные id игнорируются без исключения")
+    ok(db.ack([], now=t0) == 0, "пустой список — ноль")
+
+
+def test_ack_bad_body():
+    db = _tmp_db()
+    _seed(db, 1)
+    body = b"{not json"
+    h = _make_handler("POST", "/wa-queue/ack/" + _PULL_SECRET, body=body,
+                      headers={"Content-Length": str(len(body))},
+                      db=db, pull_secret=_PULL_SECRET)
+    _dispatch(h)
+    ok(h._resp_code == 400, "нечитаемый JSON → 400 (секрет-то верный, врать про 404 незачем)")
+
+    body2 = json.dumps({"ids": "1,2"}).encode()
+    h2 = _make_handler("POST", "/wa-queue/ack/" + _PULL_SECRET, body=body2,
+                       headers={"Content-Length": str(len(body2))},
+                       db=db, pull_secret=_PULL_SECRET)
+    _dispatch(h2)
+    ok(h2._resp_code == 400, "ids не список → 400")
+    ok(db.pull()[0]["id"] == 1, "и ничего не подтверждено")
+
+
+def test_pull_deletes_nothing():
+    db = _tmp_db()
+    _seed(db, 4)
+    with db._conn() as c:
+        before = c.execute("SELECT COUNT(*) FROM wa_inbox").fetchone()[0]
+    t0 = 1_700_000_000
+    items = db.pull(now=t0)
+    db.ack([i["id"] for i in items], now=t0)
+    db.pull(now=t0 + 10_000)
+    with db._conn() as c:
+        after = c.execute("SELECT COUNT(*) FROM wa_inbox").fetchone()[0]
+    ok(before == after == 4, "ни одна строка не удалена: было %d, стало %d" % (before, after))
+
+    # Страж судит ДЕЙСТВИЕ, а не слово: разбираем модуль и смотрим SQL, который реально уходит
+    # в execute/executemany. Наивный поиск подстроки «DELETE» краснел бы на комментарии,
+    # который как раз и объясняет, почему удаления здесь нет, — тот самый класс «красное встаёт
+    # на слово», закрытый в этом репозитории для гарда (40c8425).
+    import ast as _ast
+    src = open("/root/turbobaby-manager-bot/wa_webhook.py", encoding="utf-8").read()
+    destructive = []
+    for node in _ast.walk(_ast.parse(src)):
+        if not isinstance(node, _ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, _ast.Attribute) and fn.attr in ("execute", "executemany")):
+            continue
+        if node.args and isinstance(node.args[0], _ast.Constant) \
+                and isinstance(node.args[0].value, str):
+            for stmt in node.args[0].value.split(";"):
+                head = stmt.strip().upper().split()[:1]
+                if head and head[0] in ("DELETE", "DROP", "TRUNCATE"):
+                    destructive.append(stmt.strip()[:40])
+    ok(not destructive,
+       "ни один исполняемый SQL не удаляет и не роняет: " + (str(destructive) or "таких нет"))
+
+
+def test_pull_marks_source_d360():
+    db = _tmp_db()
+    _seed(db, 1, source="d360")
+    data = json.loads(_pull_http(db, _PULL_SECRET)._resp_body.decode())
+    ok(data["items"][0]["source"] == "d360", "источник второй двери записан: d360")
+
+
+def test_pull_concurrent_no_double_handout():
+    """Две выдачи подряд не отдают одну строку дважды — иначе ПК ответил бы клиенту дважды."""
+    db = _tmp_db()
+    _seed(db, 30)
+    t0 = 1_700_000_000
+    a = [i["id"] for i in db.pull(now=t0)]
+    b = [i["id"] for i in db.pull(now=t0)]
+    ok(len(a) == 20 and len(b) == 10, "первая выдача 20, вторая — оставшиеся 10")
+    ok(not (set(a) & set(b)), "пересечения между выдачами нет ни одной строки")
+
+
+def test_legacy_rows_get_empty_source():
+    """Строки, лежавшие до миграции, получают source='' — и это НЕ выдаётся за 'meta'."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    # таблица СТАРОЙ формы, без новых колонок
+    with sqlite3.connect(path) as c:
+        c.execute("""CREATE TABLE wa_inbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts_queued INTEGER NOT NULL,
+            channel TEXT NOT NULL DEFAULT 'wa', from_number TEXT, name TEXT, msg_type TEXT,
+            text TEXT, media_id TEXT, ts_msg INTEGER, echo INTEGER NOT NULL DEFAULT 0,
+            history INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+            raw TEXT, wamid TEXT)""")
+        c.execute("""INSERT INTO wa_inbox (ts_queued, from_number, msg_type, text, wamid)
+                     VALUES (1700000000,'66811112222','text','старая строка','wamid.old')""")
+        c.commit()
+    db = wh.WAQueueDB(path)          # миграция ALTER TABLE происходит здесь
+    items = db.pull()
+    ok(len(items) == 1, "старая строка пережила миграцию и выдаётся")
+    ok(items[0]["source"] == "", "у неё источник пуст — не записан, а не угадан")
+    ok(items[0]["text"] == "старая строка", "её содержимое цело")
+    os.remove(path)
+
+
+def test_queue_paths_are_404_for_unknown_verbs():
+    db = _tmp_db()
+    h = _make_handler("GET", "/wa-queue/drop/" + _PULL_SECRET, db=db, pull_secret=_PULL_SECRET)
+    _dispatch(h)
+    ok(h._resp_code == 404, "неизвестный глагол очереди → 404")
+    h2 = _make_handler("GET", "/wa-queue/pull", db=db, pull_secret=_PULL_SECRET)
+    _dispatch(h2)
+    ok(h2._resp_code == 404, "путь без секрета → 404")
+
+
+def test_webhook_paths_still_work_next_to_queue():
+    """Регресс: новые маршруты не увели у вебхука его собственные."""
+    h = _make_handler("GET",
+        "/wa-webhook?hub.mode=subscribe&hub.verify_token=test_verify_token&hub.challenge=STILL",
+        pull_secret=_PULL_SECRET)
+    _dispatch(h)
+    ok(h._resp_code == 200 and b"STILL" in h._resp_body,
+       "рукопожатие Meta работает как работало")
+
+
 # ─── runner ───────────────────────────────────────────────────────────────────
 
 def _run_all():
@@ -959,6 +1245,28 @@ def _run_all():
         test_normalize_d360_v1_image,
         test_normalize_d360_v1_status,
         test_normalize_d360_v1_empty,
+        # 10. Bind — loopback
+        test_bind_default_is_loopback,
+        test_bind_explicit_is_honoured,
+        test_make_server_binds_loopback,
+        test_no_hardcoded_wildcard_bind,
+        # 11. Очередь для ПК — pull/ack
+        test_pull_returns_rows_and_fields,
+        test_pull_limit_20,
+        test_pull_wrong_secret_404_and_nothing_leased,
+        test_pull_no_secret_configured_404,
+        test_ack_wrong_secret_404,
+        test_pull_ack_then_not_returned,
+        test_unacked_reappear_after_lease,
+        test_ack_partial_leaves_rest,
+        test_ack_is_idempotent_and_junk_safe,
+        test_ack_bad_body,
+        test_pull_deletes_nothing,
+        test_pull_marks_source_d360,
+        test_pull_concurrent_no_double_handout,
+        test_legacy_rows_get_empty_source,
+        test_queue_paths_are_404_for_unknown_verbs,
+        test_webhook_paths_still_work_next_to_queue,
     ]
     for t in tests:
         try:

@@ -364,8 +364,16 @@ try:
     res.append(ok(isinstance(d.get("dirty_ok"), bool) and isinstance(d.get("dirty"), list),
                   "(13) замок «диск сверен с origin» отвечает: dirty_ok=%s, расхождений %d"
                   % (d.get("dirty_ok"), len(d.get("dirty") or []))))
-    res.append(ok(set(d.get("closures") or {}) == {"orchestrator-daemon", "splinter"},
+    # Предмет проверки — ТОЖДЕСТВО двух списков, как и говорит её название, а не то, что в них
+    # ровно два имени. Литерал `{"orchestrator-daemon", "splinter"}` замораживал СНИМОК списка:
+    # 06.09.2026 владелец внёс в наблюдаемые `wa-webhook`, и проверка покраснела на согласованном
+    # изменении, вместо того чтобы стеречь рассогласование. Теперь она сверяет О3 с самим
+    # `prod_drift.WATCHED` и краснеет в ОБЕ стороны — если списки разойдутся хоть на одно имя.
+    import prod_drift as _PD
+    res.append(ok(set(d.get("closures") or {}) == {u for u, _ in _PD.WATCHED},
                   "(13) потребители те же, что у детектора дрейфа: %s" % sorted(d.get("closures") or {})))
+    res.append(ok("wa-webhook" in {u for u, _ in _PD.WATCHED},
+                  "(13) `wa-webhook` среди наблюдаемых (решение владельца 06.09.2026)"))
     res.append(ok(all(isinstance(v, dict) and "alive" in v for v in (d.get("units") or {}).values()),
                   "(13) про каждого потребителя сказано, наблюдается ли он"))
 except Exception as e:                                                   # noqa: BLE001

@@ -15,18 +15,28 @@ Environment (.env):
   WA_APP_SECRET       — app secret for HMAC-SHA256 signature verification (required)
   WA_PHONE_NUMBER_ID  — our WA phone-number-id (used for echo detection)
   WA_WEBHOOK_PORT     — HTTP listen port (default: 8765)
+  WA_BIND_HOST        — listen address (default: 127.0.0.1 — loopback only, see below)
   WA_QUEUE_DB         — path to SQLite queue file (default: wa_queue.db next to this file)
   WA_360_SANDBOX_KEY  — 360dialog sandbox API key (D360-API-KEY header)
   WA_D360_PATH_SECRET — random hex secret embedded in the 360dialog webhook path
+  WA_PULL_SECRET      — random hex secret in the PC pull/ack path (absent → those doors 404)
 
 Endpoints:
   GET  /wa-webhook                            — Meta hub.verify-token handshake
   POST /wa-webhook                            — Meta Cloud API v2 (HMAC-verified)
   POST /wa-webhook/d360/<WA_D360_PATH_SECRET> — 360dialog v1 (auth by path secret, no HMAC)
+  GET  /wa-queue/pull/<WA_PULL_SECRET>        — PC takes up to 20 undelivered rows (leases them)
+  POST /wa-queue/ack/<WA_PULL_SECRET>         — PC confirms it processed the given ids
+
+BIND IS LOOPBACK BY DEFAULT (06.09.2026). TLS and the outside world are Caddy's job; the
+webhook itself has no reason to be reachable on a public interface. Direction of doubt is
+INWARD: an empty/blank WA_BIND_HOST falls back to 127.0.0.1, never to 0.0.0.0 — a typo in
+.env must not silently publish the port.
 
 Queue schema (wa_inbox table in wa_queue.db):
   id, ts_queued, channel, from_number, name, msg_type, text, media_id,
-  ts_msg, echo, history, status, raw (JSON), wamid
+  ts_msg, echo, history, status, raw (JSON), wamid,
+  source, delivered_at, acked_at   ← added 06.09.2026 for the PC pull/ack doors
 
 Usage (standalone service):
   venv/bin/python3 wa_webhook.py
@@ -69,10 +79,26 @@ def _env():
         "app_secret":       os.environ.get("WA_APP_SECRET", ""),
         "phone_id":         os.environ.get("WA_PHONE_NUMBER_ID", ""),
         "port":             int(os.environ.get("WA_WEBHOOK_PORT", "8765")),
+        "bind_host":        bind_host(os.environ.get("WA_BIND_HOST")),
         "queue_db":         os.environ.get("WA_QUEUE_DB", os.path.join(ROOT, "wa_queue.db")),
         "d360_key":         os.environ.get("WA_360_SANDBOX_KEY", ""),
         "d360_path_secret": os.environ.get("WA_D360_PATH_SECRET", ""),
+        "pull_secret":      os.environ.get("WA_PULL_SECRET", ""),
     }
+
+
+DEFAULT_BIND = "127.0.0.1"
+
+
+def bind_host(raw) -> str:
+    """Resolve the listen address. Unset / blank / whitespace → loopback.
+
+    Deliberately NOT a passthrough: the only way to publish this port is to name a host
+    explicitly. A missing or empty variable is the commonest accident, and its cost here is
+    an open port on the public interface — so that case resolves inward, not outward.
+    """
+    host = (raw or "").strip()
+    return host or DEFAULT_BIND
 
 
 # ─── SQLite queue ──────────────────────────────────────────────────────────────────────
@@ -100,6 +126,22 @@ CREATE INDEX IF NOT EXISTS idx_wa_status ON wa_inbox(status, ts_queued);
 # UNIQUE on wamid deduplicates retried deliveries; NULL wamid (status updates w/o id) not deduplicated.
 _WAMID_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_wamid ON wa_inbox(wamid)"
 
+# Columns added after the table already existed in production (06.09.2026). Adding them is
+# the only migration this file performs: ALTER TABLE ADD COLUMN never touches existing rows,
+# so a live wa_queue.db keeps every byte it had. Pre-migration rows get source='' — that is
+# read as "not recorded", NOT guessed into 'meta' or 'd360'.
+_ADDED_COLUMNS = (
+    ("source",       "TEXT"),
+    ("delivered_at", "INTEGER"),
+    ("acked_at",     "INTEGER"),
+)
+
+_PULL_INDEX = "CREATE INDEX IF NOT EXISTS idx_wa_pull ON wa_inbox(acked_at, delivered_at, id)"
+
+# How long a pulled row stays leased to the PC before it becomes available again.
+LEASE_SECS = 300     # 5 minutes — PC took it and went silent → someone must get it again
+PULL_LIMIT = 20      # rows handed out per pull
+
 
 class WAQueueDB:
     """Thread-safe SQLite queue for incoming WA events."""
@@ -122,9 +164,14 @@ class WAQueueDB:
                 conn.execute(_WAMID_INDEX)
             except sqlite3.OperationalError:
                 pass  # index already exists
+            have = {r[1] for r in conn.execute("PRAGMA table_info(wa_inbox)")}
+            for col, decl in _ADDED_COLUMNS:
+                if col not in have:
+                    conn.execute("ALTER TABLE wa_inbox ADD COLUMN " + col + " " + decl)
+            conn.execute(_PULL_INDEX)
             conn.commit()
 
-    def enqueue(self, events: list) -> int:
+    def enqueue(self, events: list, source: str = "") -> int:
         """Insert normalised events. Returns number actually inserted (dupes skipped)."""
         now = int(time.time())
         inserted = 0
@@ -135,8 +182,8 @@ class WAQueueDB:
                         conn.execute(
                             """INSERT OR IGNORE INTO wa_inbox
                                (ts_queued, channel, from_number, name, msg_type, text, media_id,
-                                ts_msg, echo, history, status, raw, wamid)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?)""",
+                                ts_msg, echo, history, status, raw, wamid, source)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?)""",
                             (
                                 now,
                                 ev.get("channel", "wa"),
@@ -150,6 +197,7 @@ class WAQueueDB:
                                 1 if ev.get("history") else 0,
                                 json.dumps(ev.get("raw"), ensure_ascii=False),
                                 ev.get("wamid"),
+                                ev.get("source") or source or "",
                             ),
                         )
                         inserted += conn.execute("SELECT changes()").fetchone()[0]
@@ -164,6 +212,85 @@ class WAQueueDB:
             return conn.execute(
                 "SELECT COUNT(*) FROM wa_inbox WHERE status='new'"
             ).fetchone()[0]
+
+    # ── PC pull/ack doors (06.09.2026) ────────────────────────────────────────
+    #
+    # NOTHING IS EVER DELETED HERE. A row's whole life is three timestamps: it arrives
+    # (ts_queued), it is handed to the PC (delivered_at), the PC says it dealt with it
+    # (acked_at). Both later columns only ever go from NULL to a number; no branch in this
+    # class issues DELETE. Losing a client's message because a lease bookkeeping bug ate the
+    # row would be the one unrecoverable failure of a transit queue, so the queue is
+    # append-and-stamp only, and it grows — that is the deliberate trade.
+    #
+    # LEASE, NOT CLAIM. delivered_at is a *lease*: if the PC takes rows and dies, after
+    # LEASE_SECS they become available again. Handing the same row out twice is a nuisance
+    # (the PC dedupes by id); handing it out never is a lost client.
+
+    def pull(self, limit: int = PULL_LIMIT, lease_secs: int = LEASE_SECS, now: int = None) -> list:
+        """Hand out up to `limit` rows the PC has not acked and whose lease has expired.
+
+        Selecting and stamping happen under one lock and one transaction, so two concurrent
+        pulls cannot be handed the same row.
+        """
+        now = int(now if now is not None else time.time())
+        cutoff = now - int(lease_secs)
+        with self._lock:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    """SELECT id, from_number, name, msg_type, text, ts_msg, source
+                         FROM wa_inbox
+                        WHERE acked_at IS NULL
+                          AND (delivered_at IS NULL OR delivered_at < ?)
+                        ORDER BY id
+                        LIMIT ?""",
+                    (cutoff, int(limit)),
+                ).fetchall()
+                items = [
+                    {
+                        "id":     r[0],
+                        "from":   r[1] or "",
+                        "name":   r[2] or "",
+                        "type":   r[3] or "",
+                        "text":   r[4],
+                        "ts":     r[5] or 0,
+                        "source": r[6] or "",
+                    }
+                    for r in rows
+                ]
+                if items:
+                    conn.executemany(
+                        "UPDATE wa_inbox SET delivered_at=? WHERE id=?",
+                        [(now, it["id"]) for it in items],
+                    )
+                conn.commit()
+        return items
+
+    def ack(self, ids, now: int = None) -> int:
+        """Mark the given ids as processed. Returns how many rows actually changed.
+
+        Idempotent: an id already acked, or an id that does not exist, changes nothing and is
+        not an error — the PC may retry an ack whose response it never saw.
+        """
+        now = int(now if now is not None else time.time())
+        clean = []
+        for i in (ids or []):
+            try:
+                clean.append(int(i))
+            except (TypeError, ValueError):
+                continue          # junk id is ignored, it cannot ack anything
+        if not clean:
+            return 0
+        changed = 0
+        with self._lock:
+            with self._conn() as conn:
+                for i in clean:
+                    conn.execute(
+                        "UPDATE wa_inbox SET acked_at=? WHERE id=? AND acked_at IS NULL",
+                        (now, i),
+                    )
+                    changed += conn.execute("SELECT changes()").fetchone()[0]
+                conn.commit()
+        return changed
 
 
 # ─── normalisation ────────────────────────────────────────────────────────────────────
@@ -358,6 +485,21 @@ def normalize_d360_v1_payload(payload: dict) -> list:
 
 # ─── HMAC signature verification ─────────────────────────────────────────────────────
 
+def path_secret_ok(configured: str, given: str) -> bool:
+    """Is the secret embedded in the URL path the one we configured?
+
+    FAIL-CLOSED: no secret configured → False, always. A door whose key was never set is a
+    door that does not open — otherwise forgetting the variable would publish the queue.
+    That is why nothing here needs `.env` to be writable to be safe: the doors stay 404
+    until the owner puts a real value in, and 404 is the correct state until then.
+
+    Compared with compare_digest so the answer's timing says nothing about the secret.
+    """
+    if not configured or not given:
+        return False
+    return hmac.compare_digest(str(configured), str(given))
+
+
 def verify_signature(body: bytes, signature_header: str, app_secret: str) -> bool:
     """Return True if X-Hub-Signature-256 header matches body HMAC.
 
@@ -392,6 +534,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
     our_phone:        str = ""
     db:               WAQueueDB = None
     d360_path_secret: str = ""
+    pull_secret:      str = ""
 
     # Socket r/w timeout per request — a slow/stalled client closes the connection
     # rather than holding the thread indefinitely (incident 15.07: TCP open, HTTP hung).
@@ -408,9 +551,15 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(enc)
 
-    # GET /wa-webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+    def _send_json(self, code: int, obj: dict):
+        self._send(code, json.dumps(obj, ensure_ascii=False), "application/json")
+
+    # GET dispatcher — routes by path
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/wa-queue/pull/"):
+            self._do_pull(parsed.path)
+            return
         if parsed.path != "/wa-webhook":
             self._send(404, "Not found")
             return
@@ -434,8 +583,63 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             self._do_meta_post()
         elif path.startswith("/wa-webhook/d360/"):
             self._do_d360_post(path)
+        elif path.startswith("/wa-queue/ack/"):
+            self._do_ack(path)
         else:
             self._send(404, "Not found")
+
+    # ── PC pull/ack doors ─────────────────────────────────────────────────────
+    #
+    # Wrong secret answers exactly like an unknown URL — 404 with the same body. A 401 would
+    # confirm the endpoint exists and turn a blind guess into a target list; the d360 door
+    # above answers the same way for the same reason.
+
+    def _pull_secret_from(self, path: str, verb: str) -> str:
+        """Return the secret segment of /wa-queue/<verb>/<secret>, or '' if malformed."""
+        parts = path.split("/")
+        # ['', 'wa-queue', verb, secret]
+        return parts[3] if len(parts) > 3 and parts[2] == verb else ""
+
+    # GET /wa-queue/pull/<secret>
+    def _do_pull(self, path: str):
+        if not path_secret_ok(self.pull_secret, self._pull_secret_from(path, "pull")):
+            self._send(404, "Not found")
+            return
+        try:
+            items = self.db.pull() if self.db else []
+        except Exception as e:
+            log.error("WA pull: %s", e, exc_info=True)
+            self._send_json(500, {"ok": False, "error": "pull_failed"})
+            return
+        # Count only — the payload is client correspondence and does not belong in our log.
+        log.info("WA pull: %d rows leased to PC", len(items))
+        self._send_json(200, {"ok": True, "count": len(items), "items": items})
+
+    # POST /wa-queue/ack/<secret>  body: {"ids": [1,2,3]}
+    def _do_ack(self, path: str):
+        if not path_secret_ok(self.pull_secret, self._pull_secret_from(path, "ack")):
+            self._send(404, "Not found")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            log.warning("WA ack: JSON parse error: %s", e)
+            self._send_json(400, {"ok": False, "error": "bad_json"})
+            return
+        ids = payload.get("ids")
+        if not isinstance(ids, list):
+            self._send_json(400, {"ok": False, "error": "ids_must_be_list"})
+            return
+        try:
+            n = self.db.ack(ids) if self.db else 0
+        except Exception as e:
+            log.error("WA ack: %s", e, exc_info=True)
+            self._send_json(500, {"ok": False, "error": "ack_failed"})
+            return
+        log.info("WA ack: %d of %d ids marked processed", n, len(ids))
+        self._send_json(200, {"ok": True, "acked": n})
 
     # POST /wa-webhook — Meta Cloud API v2, HMAC-verified
     def _do_meta_post(self):
@@ -468,7 +672,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         try:
             events = normalize_wa_payload(payload, our_phone_number=self.our_phone)
             if events:
-                n = self.db.enqueue(events) if self.db else 0
+                n = self.db.enqueue(events, source="meta") if self.db else 0
                 log.info("WA POST: %d events, %d enqueued (dupes skipped)", len(events), n)
             else:
                 log.debug("WA POST: payload contained 0 normalised events")
@@ -481,7 +685,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         # Wrong secret → 404 (not 401 — don't reveal endpoint existence)
         parts = path.split("/")
         secret_in_path = parts[3] if len(parts) > 3 else ""
-        if not self.d360_path_secret or secret_in_path != self.d360_path_secret:
+        if not path_secret_ok(self.d360_path_secret, secret_in_path):
             self._send(404, "Not found")
             return
 
@@ -504,7 +708,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         try:
             events = normalize_d360_v1_payload(payload)
             if events:
-                n = self.db.enqueue(events) if self.db else 0
+                n = self.db.enqueue(events, source="d360") if self.db else 0
                 log.info("D360 POST: %d events, %d enqueued", len(events), n)
             else:
                 log.debug("D360 POST: payload contained 0 events")
@@ -530,8 +734,9 @@ def make_server(env: dict) -> ThreadingHTTPServer:
     _Handler.our_phone        = env["phone_id"]
     _Handler.db               = db
     _Handler.d360_path_secret = env.get("d360_path_secret", "")
+    _Handler.pull_secret      = env.get("pull_secret", "")
 
-    server = ThreadingHTTPServer(("0.0.0.0", env["port"]), _Handler)
+    server = ThreadingHTTPServer((bind_host(env.get("bind_host")), env["port"]), _Handler)
     server.daemon_threads = True
     return server
 
@@ -546,8 +751,9 @@ def main():
 
     server = make_server(env)
     log.info(
-        "WA webhook listening on port %d  db=%s",
-        env["port"], env["queue_db"],
+        "WA webhook listening on %s:%d  db=%s  pull=%s",
+        server.server_address[0], env["port"], env["queue_db"],
+        "on" if env.get("pull_secret") else "OFF (WA_PULL_SECRET not set → pull/ack answer 404)",
     )
     try:
         server.serve_forever()
