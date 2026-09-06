@@ -160,6 +160,8 @@ function doGet(e) {
      return handleReadDoc_(e);
    case 'list_brain':
      return handleListBrain_(e);
+   case 'list_brain_folder':
+     return handleListBrainFolder_(e);
 
       // --- Зоны доставки (read-only) ---
       case 'delivery_zones_get':

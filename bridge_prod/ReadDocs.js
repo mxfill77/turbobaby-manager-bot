@@ -6,6 +6,7 @@
  *                           манифест в Script Properties + KB_index. Запускать ИЗ РЕДАКТОРА.
  *   - handleReadDoc_(e)   — endpoint read_doc  (по id или name через манифест).
  *   - handleListBrain_(e) — endpoint list_brain (отдаёт весь манифест).
+ *   - handleListBrainFolder_(e) — endpoint list_brain_folder (дети папки Brain: имена и id).
  *
  * Регистрация в роутере: добавить ТОЛЬКО два case в switch(action) внутри doGet (Bridge.gs).
  * Больше в Bridge.gs ничего не трогать.
@@ -275,6 +276,78 @@ function handleListBrain_(e) {
     return jsonOut_({ ok: true, manifest: getBrainManifest_() });
   } catch (err) {
     return jsonOut_({ ok: false, error: 'manifest_failed', message: String(err) });
+  }
+}
+
+/**
+ * handleListBrainFolder_(e) — endpoint list_brain_folder: ДЕТИ папки Brain, имена и id.
+ *
+ * Зачем: list_brain отдаёт МАНИФЕСТ (зарегистрированные ключи), а не содержимое папки —
+ * документ, положенный в Brain со стороны, в манифесте не появляется, и его id взять
+ * было неоткуда. Этот экшен закрывает ровно эту дыру: перечисление детей папки.
+ *
+ * Адрес папки берётся ОТТУДА ЖЕ, ОТКУДА ЕГО БЕРЁТ МАНИФЕСТ — manifest.folder_id
+ * (та же дорога, что у read_doc / createBrainPlain_ / архиватора), а не числом в коде.
+ *
+ * ТОЛЬКО ЧТЕНИЕ: ничего не создаёт, не переименовывает, не перемещает, не удаляет и
+ * манифеста не касается.
+ *
+ * Параметры (все необязательные):
+ *   prefix   — вернуть только детей, чьё имя НАЧИНАЕТСЯ с этой строки;
+ *   limit    — потолок отдаваемых файлов (по умолчанию 500, максимум 1000).
+ *
+ * Ответ: { ok, folder_id, count, files:[{name,id,mime}], folders_count, folders:[{name,id}],
+ *          prefix, scanned, truncated }.
+ * truncated:true значит «упёрлись в limit» — список НЕ полон, и судить по нему нельзя.
+ */
+function handleListBrainFolder_(e) {
+  if (!brainTokenOk_(e)) return jsonOut_({ ok: false, error: 'unauthorized', message: 'Неверный токен' });
+  try {
+    var p = (e && e.parameter) ? e.parameter : {};
+    var manifest = getBrainManifest_();
+    var folderId = manifest.folder_id;
+    if (!folderId) {
+      return jsonOut_({ ok: false, error: 'no_folder',
+        message: 'В манифесте нет folder_id — сначала setupBrain' });
+    }
+
+    var prefix = String(p.prefix == null ? '' : p.prefix);
+    var limit = parseInt(p.limit, 10);
+    if (!(limit > 0)) limit = 500;
+    if (limit > 1000) limit = 1000;
+
+    var folder = DriveApp.getFolderById(folderId);
+
+    var files = [];
+    var scanned = 0;
+    var truncated = false;
+    var it = folder.getFiles();
+    while (it.hasNext()) {
+      var f = it.next();
+      scanned++;
+      var nm = f.getName();
+      if (prefix && nm.indexOf(prefix) !== 0) continue;
+      if (files.length >= limit) { truncated = true; break; }
+      files.push({ name: nm, id: f.getId(), mime: f.getMimeType() });
+    }
+
+    var folders = [];
+    var itf = folder.getFolders();
+    while (itf.hasNext()) {
+      var sub = itf.next();
+      var sname = sub.getName();
+      if (prefix && sname.indexOf(prefix) !== 0) continue;
+      folders.push({ name: sname, id: sub.getId() });
+    }
+
+    files.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+    folders.sort(function (a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+
+    return jsonOut_({ ok: true, folder_id: folderId, count: files.length, files: files,
+                      folders_count: folders.length, folders: folders,
+                      prefix: prefix || null, scanned: scanned, truncated: truncated });
+  } catch (err) {
+    return jsonOut_({ ok: false, error: 'folder_list_failed', message: String(err) });
   }
 }
 
