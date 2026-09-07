@@ -16,12 +16,19 @@ res = []
 import orchestrator_daemon as OD
 import devbot as DB
 
-# (1) таймауты: dev-метка → 45 мин, остальное → 10 мин
-print("(1) выбор таймаута по метке from:")
+# (1) таймауты по РАБОТЕ: быстрая «задача:» → 10 мин, всё остальное → 45 мин
+print("(1) выбор таймаута по РАБОТЕ (не по метке from):")
 res.append(ok(OD.TASK_TIMEOUT == 600 and OD.TASK_TIMEOUT_DEV == 2700, "константы 600/2700"))
-res.append(ok(OD._task_timeout({"from": "Filipp-328-dev"}) == 2700, "from=*-dev → 2700с (45 мин)"))
-res.append(ok(OD._task_timeout({"from": "Filipp-328"}) == 600, "from=Filipp-328 → 600с"))
-res.append(ok(OD._task_timeout({}) == 600, "без from → 600с (безопасный дефолт)"))
+res.append(ok(OD._task_timeout({"task_text": "тз: правка и тесты"}) == 2700,
+              "работа не объявила себя быстрой → 2700с (45 мин)"))
+res.append(ok(OD._task_timeout({"from": "Filipp-328"}) == 2700,
+              "имя потолком не распоряжается: from=Filipp-328 без быстрого маркера → 2700с"))
+res.append(ok(OD._task_timeout({"from": "Filipp-shtab"}) == 2700,
+              "ящик Штаба (from=Filipp-shtab) → 2700с — ряд 172 умирал здесь на 600с"))
+res.append(ok(OD._task_timeout({"task_text": "задача: короткая"}) == 600,
+              "работа ОБЪЯВИЛА себя быстрой («задача:») → 600с"))
+res.append(ok(OD._task_timeout({}) == 2700,
+              "пустой ряд → дев-потолок (медиана законной работы 742с отменила дефолт 600с)"))
 
 # (2) преамбула v3: git push И restart сам (Q2), настоящее красное op=other + дисциплина
 print("(2) преамбула v3:")

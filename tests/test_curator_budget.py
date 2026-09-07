@@ -277,12 +277,12 @@ res.append(ok(ran[0][2] == OD.TASK_TIMEOUT_DEV,
 res.append(ok(len(consults) == 1 and consults[0][0] == "[куратор цели 500, шаг 1] дожать хвост",
               "терминал followup-задачи курируется (вторая глубина возможна)"))
 
-# (11) таймаут по метке from
+# (11) таймаут по РАБОТЕ (метка from потолком больше не распоряжается)
 print("(11) _task_timeout:")
 res.append(ok(OD._task_timeout({"from": "Filipp-curator"}) == OD.TASK_TIMEOUT_DEV,
               "Filipp-curator → TASK_TIMEOUT_DEV"))
-res.append(ok(OD._task_timeout({"from": "Filipp-328"}) == OD.TASK_TIMEOUT,
-              "Filipp-328 → быстрый таймаут (не задет)"))
+res.append(ok(OD._task_timeout({"task_text": "задача: короткая"}) == OD.TASK_TIMEOUT,
+              "работа, объявившая себя быстрой → TASK_TIMEOUT (имя мерилом быть перестало)"))
 
 # (12) regex-гварды
 print("(12) regex-гварды:")
