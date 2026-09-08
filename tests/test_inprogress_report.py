@@ -1,5 +1,6 @@
 """Мок выноса heartbeat/зависания в 328 (шаг D, devbot.report_results): «🔄 в работе» один раз,
 «⚠️ зависла» один раз — с порогом PER-ЗАДАЧА (_stall_threshold_sec = штатный потолок + люфт).
+Потолок с 08.09 выбирает РАБОТА, а не имя отправителя: зеркало orchestrator_daemon._task_timeout.
 Урок задачи 287 (13.07.2026): «долго работает» ≠ «умерла» — долгое «тз:» (до 45 мин) молчит до
 потолка; тревога один раз после потолка; done после тревоги → только штатный рапорт, без «отбоя».
 Сеть/бот замоканы."""
@@ -173,16 +174,27 @@ def test_pc_lane_cap():
     assert len(stalled) == 1 and "ПК" in stalled[0], f"за потолком pc — одна тревога с pc-хинтом: {SENDS}"
 
 
-# G5: классификация потолков — куратор/дек = дев-потолок, быстрая = 600, мусорный env не валит
+# G5: классификация потолков ПО РАБОТЕ — зеркало orchestrator_daemon._task_timeout (правка 08.09):
+#     10 минут получает только работа, объявившая себя быстрой («задача:»); всё прочее — дев-потолок.
+#     Имя отправителя порогом не распоряжается ни в одном ряду; мусорный env порог не валит.
 def test_threshold_classification():
     dev = DB._stall_threshold_sec({"from": DB.QUEUE_FROM_DEV})
     assert DB._stall_threshold_sec({"from": DB.QUEUE_FROM_CURATOR}) == dev, "куратор = дев-потолок (как у демона)"
     assert DB._stall_threshold_sec({"from": DB.QUEUE_FROM_DEC}) == dev, "декомпозер = дев-потолок"
-    assert DB._stall_threshold_sec({"from": DB.QUEUE_FROM}) == 600 + DB.STALL_GRACE_SEC
+    # ЯЩИК ШТАБА и ТЕМА 328 — ровно те два ряда, на которых зеркало расходилось с исполнителем
+    # и рождало ложную карточку «зависла» на работающем задании (заход 200, 08.09).
+    assert DB._stall_threshold_sec({"from": "Filipp-shtab", "task_text": "ЗАДАНИЕ ШТАБА ИЗ ЯЩИКА"}) == dev, \
+        "ящик Штаба → дев-потолок, как у демона"
+    assert DB._stall_threshold_sec({"from": DB.QUEUE_FROM, "task_text": "разбери и почини"}) == dev, \
+        "тема 328 без суффикса → дев-потолок, как у демона"
+    assert DB._stall_threshold_sec({}) == dev, "пустой ряд → дев-потолок (безопасное умолчание)"
+    fast = {"from": DB.QUEUE_FROM, "task_text": "задача: короткая"}
+    assert DB._stall_threshold_sec(fast) == 600 + DB.STALL_GRACE_SEC, \
+        "работа ОБЪЯВИЛА себя быстрой → TASK_TIMEOUT + люфт"
     old = os.environ.get("TASK_TIMEOUT")
     os.environ["TASK_TIMEOUT"] = "мусор"
     try:
-        assert DB._stall_threshold_sec({"from": DB.QUEUE_FROM}) == 600 + DB.STALL_GRACE_SEC, \
+        assert DB._stall_threshold_sec(fast) == 600 + DB.STALL_GRACE_SEC, \
             "мусорный env → дефолт, порог не падает"
     finally:
         os.environ["TASK_TIMEOUT"] = old if old is not None else "600"
