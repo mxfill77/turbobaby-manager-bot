@@ -38,6 +38,12 @@ Queue schema (wa_inbox table in wa_queue.db):
   ts_msg, echo, history, status, raw (JSON), wamid,
   source, delivered_at, acked_at   ← added 06.09.2026 for the PC pull/ack doors
 
+FOUR KINDS SHARE ONE TABLE, and the pull output says which is which (07.09.2026):
+  inbound (client wrote us) · echo (our own outbound bounced back) · history (backfill sync) ·
+  receipt (sent/delivered/read/failed — msg_type='status'). An unrecognised row is `unknown`
+  and is NEVER silently read as inbound. The rule itself is `wa_kind.py`; the pull door only
+  carries its verdict plus the raw discriminator columns.
+
 Usage (standalone service):
   venv/bin/python3 wa_webhook.py
 """
@@ -53,6 +59,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+import wa_kind          # чистое решение «поля строки → вид записи»; импортов у него ноль
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -231,13 +239,25 @@ class WAQueueDB:
 
         Selecting and stamping happen under one lock and one transaction, so two concurrent
         pulls cannot be handed the same row.
+
+        РАЗЛИЧИТЕЛЬ ВИДА ЕДЕТ ЯВНО (07.09.2026). До этой правки выдача несла `id, from, name,
+        type, text, ts, source` — и ни одного поля, которым виды записи РАЗЛИЧАЮТСЯ, хотя в
+        таблице они лежат с самого начала (`echo`, `history`, `msg_type`) и сервер сам судит по
+        ним окно суток. ПК не мог отличить входящее клиента от эха менеджера, от истории и от
+        квитанции доставки, то есть карточка менеджеру была невыполнима по построению.
+
+        ПРИБАВКА, А НЕ ЗАМЕНА: прежние семь ключей остаются на своих местах и с прежними
+        значениями — старый потребитель не ломается. `type` сохранён легаси-псевдонимом
+        `msg_type`: оба берутся из ОДНОГО элемента строки, разойтись им негде, а каноническим
+        именем служит то, что стоит в таблице.
         """
         now = int(now if now is not None else time.time())
         cutoff = now - int(lease_secs)
         with self._lock:
             with self._conn() as conn:
                 rows = conn.execute(
-                    """SELECT id, from_number, name, msg_type, text, ts_msg, source
+                    """SELECT id, from_number, name, msg_type, text, ts_msg, source,
+                              echo, history
                          FROM wa_inbox
                         WHERE acked_at IS NULL
                           AND (delivered_at IS NULL OR delivered_at < ?)
@@ -245,18 +265,26 @@ class WAQueueDB:
                         LIMIT ?""",
                     (cutoff, int(limit)),
                 ).fetchall()
-                items = [
-                    {
-                        "id":     r[0],
-                        "from":   r[1] or "",
-                        "name":   r[2] or "",
-                        "type":   r[3] or "",
-                        "text":   r[4],
-                        "ts":     r[5] or 0,
-                        "source": r[6] or "",
-                    }
-                    for r in rows
-                ]
+                items = []
+                for r in rows:
+                    kind = wa_kind.kind_of(r[3], r[7], r[8])
+                    items.append({
+                        # ── прежние семь ключей, байт-в-байт как были ──
+                        "id":       r[0],
+                        "from":     r[1] or "",
+                        "name":     r[2] or "",
+                        "type":     r[3] or "",
+                        "text":     r[4],
+                        "ts":       r[5] or 0,
+                        "source":   r[6] or "",
+                        # ── различитель: имена те же, что в таблице ──
+                        "msg_type": r[3] or "",
+                        "echo":     r[7],
+                        "history":  r[8],
+                        # ── вывод сервера: чем запись является и что с ней делать ──
+                        "kind":        kind,
+                        "disposition": wa_kind.disposition_of(kind),
+                    })
                 if items:
                     conn.executemany(
                         "UPDATE wa_inbox SET delivered_at=? WHERE id=?",
