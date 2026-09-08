@@ -145,7 +145,7 @@ def _poll_queue_sync(pb):
     by = {st: [] for st in _REPORT_STATUSES}
     for it in r.get("items", []):
         st = str(it.get("status") or "")
-        if st in by and str(it.get("from")) in QUEUE_FROMS:
+        if st in by and _is_our_source(it):
             by[st].append(it)
     return by
 
@@ -198,7 +198,55 @@ QUEUE_FROMS_PC = (QUEUE_FROM_PC, QUEUE_FROM_PC_DEV, QUEUE_FROM_PC_DEC,
                   QUEUE_FROM_PCLOC_DEC,
                   QUEUE_FROM_REVIZOR)    # метки полосы pc (карточки → тема PC-дев)
 QUEUE_FROMS = (QUEUE_FROM, QUEUE_FROM_DEV, QUEUE_FROM_DEC,
-               QUEUE_FROM_CURATOR, QUEUE_FROM_OWNER) + QUEUE_FROMS_PC  # фильтр отчётов: все наши
+               QUEUE_FROM_CURATOR, QUEUE_FROM_OWNER) + QUEUE_FROMS_PC  # ИМЕНОВАННЫЕ метки: те,
+                                        # у кого в devbot есть своя роль (постановка, тема, дедуп).
+                                        # ФИЛЬТРОМ ОТЧЁТОВ этот список больше НЕ является — см.
+                                        # _is_our_source ниже. Полнота его не требуется и не
+                                        # достигается: метку заводит производитель, а не мы.
+
+# === ЧЕЙ РЯД, А НЕ КАК ЕГО ЗОВУТ (фикс класса 08.09.2026, повод — ряд 172 ящика Штаба) ===
+# КЛАСС: «задание умирает молча». Отчёт доезжал до владельца, только если метка отправителя
+# СОВПАДАЛА с одним из имён закрытого списка. Список ведётся руками, метку заводит производитель —
+# поэтому каждый НОВЫЙ источник очереди молча терял свои done/failed/needs_approval, и лечился
+# постфактум дописыванием ещё одного имени. Это уже ЧЕТВЁРТЫЙ раз: Filipp-pcloc-dec (682a881),
+# Filipp-curator, Filipp-revizor (карточка 244 висела needs_approval трое суток), Filipp — и
+# каждый раз чинили ОДНОГО отправителя, оставляя болезнь всем следующим.
+#
+# ЗАМЕР (живой снимок очереди 08.09.2026, все статусы, обе полосы, 203 ряда): меток ВОСЕМЬ, из них
+# списку НЕ известны ЧЕТЫРЕ — Filipp-shtab 91 · Filipp-review-claim 63 · Filipp-recon 6 ·
+# Filipp-recon-ask 5, то есть 165 рядов (81 %) были невидимы для отчёта. Среди них 8 failed ящика
+# Штаба (повод захода) и, что хуже, ПЯТЬ needs_approval Filipp-recon-ask — открытые вопросы,
+# которые владелец не видел НИ РАЗУ (тот же исход, что у карточки 244, только впятеро).
+# Дописать сюда «Filipp-shtab» значило бы вылечить 1 источник из 4 и оставить 74 ряда немыми.
+#
+# ПОЭТОМУ СМЕНЁН ПРИЗНАК, А НЕ СПИСОК ИМЁН — ровно тем же ходом, что порог «зависла» 08.09
+# (`_stall_threshold_sec`, коммит 5b4b03e): судим, ЧЕЙ это ряд, а не как его назвали.
+#
+# ЗАБОР ЧЕСТЕРТОНА НЕ СНЯТ, И ОН НАСТОЯЩИЙ: очередь — общая таблица, и в неё пишет ЧУЖАЯ
+# подсистема — pc_agent/userbot темы 205 (метка вида `pc_agent-205`, голден D2
+# `tests/test_inprogress_report.py`). Её ряды в 328 выносить нельзя, и они по-прежнему не
+# выносятся. Различитель взят из живых данных: ВСЕ наши производители метят ряд именем владельца
+# (`Filipp` или `Filipp-<что-то>`), чужой — своим (`pc_agent-…`). Поэтому «полный отчёт по факту
+# наличия ряда в очереди» отвергнут: он снял бы этот забор.
+#
+# НАПРАВЛЕНИЕ ОШИБКИ ОБРАТНО ГАРДУ И НАМЕРЕННО: гард решает, исполнится ли команда, а здесь
+# решается судьба ОТЧЁТА — ничего не исполняется. Новая метка НАШЕЙ стороны становится видимой
+# сама, без правки кода (лишняя карточка); чужая метка молчит, как молчала. Пустое/битое `from`
+# нашим не считается — поведение прежнее.
+#
+# МЕТКА НЕ ПОТЕРЯЛА РАБОТУ, У НЕЁ ОСТАЛАСЬ СВОЯ: она решает ТЕМУ карточки (QUEUE_FROMS_PC →
+# тема PC-дев, иначе 328) и роли постановки. Незнакомая метка нашей стороны получает тему 328 —
+# то есть ряд ящика Штаба отчитывается там же, где темы 328, как и требует разбор 172.
+_OUR_SOURCE = "Filipp"                  # имя владельца = подпись НАШЕЙ стороны очереди
+
+
+def _is_our_source(it):
+    """Ряд очереди поставлен НАШЕЙ стороной? (единственный гейт видимости отчётов; разбор выше)
+    Наш — `Filipp` (ручные пробы владельца) и любой `Filipp-<метка>`: 328/dev/dec, куратор,
+    полоса pc, ревизор, ящик Штаба, заявки ревью и разведки, а также всякий будущий источник.
+    Чужой — производитель с иной подписью (`pc_agent-205` темы 205) и ряд без метки."""
+    f = str((it or {}).get("from") or "").strip()
+    return f == _OUR_SOURCE or f.startswith(_OUR_SOURCE + "-")
 _TASK_PREFIXES = ("задача:", "оркестратор:", "task:")
 _DEV_PREFIXES = ("тз:", "dev:", "tz:")  # дев-режим: произвольное ТЗ через headless CC, до 45 мин
 _DEC_PREFIXES = ("декомпозируй:", "разбей:", "decompose:")  # крупное ТЗ → план шагов → по одному
@@ -372,7 +420,7 @@ def _drain_claim_events(path=None):
         except Exception:
             continue                    # битая строка журнала не должна валить опрос
         if isinstance(ev, dict) and ev.get("id") is not None \
-                and str(ev.get("from")) in QUEUE_FROMS:
+                and _is_our_source(ev):
             out.append(ev)
     return out
 
@@ -1667,7 +1715,7 @@ def _queue_open_count(by):
     n = 0
     for st in _OPEN_STATUSES:
         for it in by.get(st, []) or []:
-            if str(it.get("from") or "") not in QUEUE_FROMS:
+            if not _is_our_source(it):
                 continue
             # Карточка ревизора, целиком уехавшая сводкой в ленту, владельца НЕ ждёт: вопроса
             # ей никто не задавал. Иначе «ждёт тебя 0» не наступило бы никогда — сводная
@@ -2450,16 +2498,16 @@ def _build_banner(qid, task_text, task_from, by, curator_wait=True):
         if not _curator_verdict_exists(qid, task_text, frm, by):
             return _CURATOR_THINKING
 
-    # Считаем активные задачи обеих полос из QUEUE_FROMS
+    # Считаем активные задачи обеих полос (гейт видимости — _is_our_source, не список имён)
     active_vps, active_pc = [], []
     for st in ("new", "in_progress", "approved"):
         for it in by.get(st, []):
-            if str(it.get("from") or "") not in QUEUE_FROMS:
+            if not _is_our_source(it):
                 continue
             (active_pc if _is_pc_item(it) else active_vps).append(it)
 
     n_approval = sum(1 for it in by.get("needs_approval", [])
-                     if str(it.get("from") or "") in QUEUE_FROMS)
+                     if _is_our_source(it))
     if n_approval > 0:
         return f"✋ Ждёт тебя: {n_approval} конвертов"
 
@@ -2692,7 +2740,7 @@ def _system_summary(items, goals, cowork_fn=None):
     chain_ids = {c["pid"] for c in chains}
     singles, waits = [], []
     for it in items:
-        if str(it.get("from") or "") not in QUEUE_FROMS:
+        if not _is_our_source(it):
             continue
         st = str(it.get("status") or "")
         txt = str(it.get("task_text") or "")
