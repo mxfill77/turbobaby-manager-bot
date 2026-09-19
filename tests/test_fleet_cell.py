@@ -285,7 +285,16 @@ def test_bridge_client_wiring():
 #     строкой (доска, дайджест, сводка /o3board). На мосту без разметки скан честно объявит
 #     ноль просрочек и ноль «не измерено» при N непроверенных клеток — регресс
 #     `tests/test_overdue_cells.py` §4 держит именно эту ветку.
-FLEET_CELLS_CONSUMERS = frozenset({"splinter.py"})
+#   park_read.py — читатель парка отдельной точкой входа (20.09.2026, мост @84 разметку знает:
+#     `cellState_` живёт в `bridge_prod/ReadFleet.js`, живой прогон вернул её по 38 байкам).
+#     ЧТО ДЕЛАЕТ С `unreadable`: отдаёт исход НЕИЗВЕСТНО с причиной «не прочитано» и НИКОГДА
+#     не выдаёт его ни за «в норме», ни за «пусто» — причина о НАС и причина о ЛИСТЕ лежат в
+#     разных корзинах `unknown_registers_by_why`. Замок держит `tests/test_park_read.py`:
+#     `test_unread_run_has_no_norm_at_all` (непрочитанный источник не даёт нормы НИ ОДНОМУ
+#     байку) и `test_two_unknowns_are_counted_separately` (числом: 152 «не прочитано» против
+#     46 «пусто» на живом парке). Читатель вдобавок умеет спросить мост БЕЗ разметки
+#     (`--no-cells`) — это и есть его способ предъявить ветку `unreadable` живьём.
+FLEET_CELLS_CONSUMERS = frozenset({"splinter.py", "park_read.py"})
 
 
 def test_python_consumers_ask_no_markup():
