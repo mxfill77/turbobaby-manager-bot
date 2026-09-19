@@ -1882,6 +1882,36 @@ def check_ask_ledger_pure(world, run):
         run.flag(f"ask_ledger.py:{where}", why)
 
 
+@register("LIMIT_SLOT_PURE")
+def check_limit_slot_pure(world, run):
+    """ИНВАРИАНТ 12ш: LIMIT_SLOT_PURE.
+
+    Решение «это лимит поставщика и под каким слотом повторять» (limit_slot.py, 20.09.2026)
+    стоит перед единственным местом, где заход повторяется, и умеет ровно одно — НАЗВАТЬ, что
+    делать. Инструментов у него быть не должно НИКАКИХ: импортов НОЛЬ. Получи он окружение сам —
+    и «под каким слотом шли» перестало бы зависеть от того запуска, который его спросил (а слот
+    берётся ИМЕННО из окружения запуска); получи он процесс — решение о повторе само бы этот
+    повтор и совершало, мимо рук и мимо потолка «ровно один раз»; получи он печать — значение
+    токена обрело бы дорогу наружу, а запрет на это прямой и безусловный.
+    Руки живут отдельно, в `orchestrator_daemon._run_task_impl`/`run_task`, и их проверяет
+    tests/test_limit_slot.py.
+    FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет."""
+    path = os.path.join(REPO, "limit_slot.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("limit_slot.py", f"решение о лимите не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("limit_slot.py", f"решение о лимите не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"limit_slot.py:{where}", why)
+
+
 @register("HINT_DEDUP_PURE")
 def check_hint_dedup_pure(world, run):
     """ИНВАРИАНТ 12ц: HINT_DEDUP_PURE.

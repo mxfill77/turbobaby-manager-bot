@@ -54,6 +54,7 @@ import result_judge_facts  # РУКИ СУДЬИ (только чтение): о
 import shadow_rule        # ТЕНЕВОЙ ПРОГОН ПРАВИЛА ЗЕЛЁНОГО: считаем рядом, вердикт НЕ трогаем
 import prod_gate          # ПРАВО НА ПРОД ТРЕБУЕТ ПОЛНОГО ГЕЙТА: чистое решение (см. _run_task_impl)
 import ask_ledger         # ОДИН ОБЪЕКТ — ОДИН ВОПРОС: дедуп между дверьми одобрения (см. _ask_dedup_check)
+import limit_slot         # ЛИМИТ ПОСТАВЩИКА: машинные поля конверта + повтор под вторым слотом токена
 
 
 def _is_fixture(text: str) -> bool:
@@ -82,6 +83,7 @@ HEARTBEAT_SEC = 45       # как часто фон-поток бьёт updated,
 TASK_TIMEOUT = _env_int("TASK_TIMEOUT", 600)        # быстрая «задача:» (10 мин)
 TASK_TIMEOUT_DEV = _env_int("TASK_TIMEOUT_DEV", 2700)  # дев-ТЗ «тз:» (45 мин) — правка+тесты+гейт+отчёт
 TIMEOUT_MARK = "⏱"       # маркер таймаут/сирота-диагнозов: думатель самопочинки их НЕ чинит
+LIMIT_MARK = "🚦"        # маркер «отказ ПОСТАВЩИКА по лимиту» — чужая сторона, не наш провал
 # Сирота in_progress (инцидент 07.07, задача 138): claim долетел сервер-сайд при потерянном ответе
 # (404/timeout Bridge) → демон задачу «пропустил», а подобрать некому — висела бы вечно. Реапер:
 # in_progress полосы vps с updated старше ORPHAN_TTL → честный failed (см. process_orphans).
@@ -1469,11 +1471,15 @@ def _task_timeout(task):
     return TASK_TIMEOUT if _RE_FAST_TASK.match(str(task.get("task_text") or "")) else TASK_TIMEOUT_DEV
 
 
-def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None, _mctx=None):
+def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None, _mctx=None,
+                   _slot=None):
     """Исполнить задачу через claude -p (headless). Возврат: (status, result_text).
     status ∈ done|failed|needs_approval|requeue (needs_approval — красная зона, самодекларация
     claude через маркер; requeue — гибель от ЧУЖОГО планового рестарта, вернуть задачу в new).
-    preamble: None → боевая APPROVAL_PREAMBLE; планировщик декомпозиции передаёт PLANNER_PREAMBLE."""
+    preamble: None → боевая APPROVAL_PREAMBLE; планировщик декомпозиции передаёт PLANNER_PREAMBLE.
+    _slot: имя слота токена ("A"/"B") для ПОВТОРА после лимита поставщика; None → окружение демона
+    как было. Параметр добавлен ПОСЛЕДНИМ и со значением по умолчанию — шесть сьютов мокают эту
+    функцию лямбдами фиксированной формы, и позиционные вызовы обязаны остаться прежними."""
     log.info("ИСПОЛНЕНИЕ id=%s через claude -p (timeout=%ss)", task_id, task_timeout)
     child_env = dict(os.environ)
     child_env.setdefault("HOME", "/root")
@@ -1553,6 +1559,20 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
     # CC_GUARD_TOKEN (замок происхождения 31.07.2026) — одноразовый токен ЭТОГО прогона: хук
     # кладёт его в маркер, демон сверяет. Маркер без токена/с чужим — карточку всё равно даёт
     # (реальный блок терять нельзя), но помечается как несверенный и прав на класс не несёт.
+    # ПОВТОР ПОД ДРУГИМ СЛОТОМ (20.09.2026): значение второго слота подставляется в ту самую
+    # переменную, под которой заход и идёт. Значение НЕ печатается и НЕ логируется ни здесь, ни
+    # где-либо ещё — в журнал уходит только ИМЯ слота. Пустой слот подставлять нельзя: это
+    # обнулило бы рабочее окружение, то есть поменяло бы лимит на отсутствие доступа.
+    if _slot:
+        _slot_var = limit_slot.VAR_SLOT.get(_slot)
+        _slot_val = child_env.get(_slot_var) if _slot_var else None
+        if _slot_val:
+            child_env[limit_slot.VAR_ACTIVE] = _slot_val
+            log.info("id=%s повтор под слотом токена %s (значение не печатается)", task_id, _slot)
+        else:
+            log.warning("id=%s повтор под слотом %s НЕ состоялся: слот пуст — идём как есть",
+                        task_id, _slot)
+
     task_id_str = str(task_id)
     child_env["CC_TASK_ID"] = task_id_str
     _guard_token = _guard_token_new()
@@ -1564,7 +1584,11 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
     # старт claude задачи по CLOCK_MONOTONIC — опора 5-го признака (свой/чужой плановый рестарт)
     t0_mono = time.monotonic()
     try:
-        proc = _POPEN(cmd, cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        # stdin=DEVNULL (20.09.2026, замер 19.09): без явного перенаправления claude -p наследует
+        # stdin демона, печатает предупреждение про stdin и ЖДЁТ три секунды на КАЖДОМ вызове.
+        # Ввода у headless-захода нет по построению (промпт идёт аргументом) — пустой ввод честен.
+        proc = _POPEN(cmd, cwd=REPO, stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                       text=True, env=child_env)
     except Exception as e:
         log.error("id=%s ошибка запуска claude -p: %s", task_id, e)
@@ -1640,6 +1664,7 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
     except Exception:
         pass
     if _mctx is not None:
+        _mctx["parsed"] = _parsed        # конверт целиком: его поля судит limit_slot, а не текст
         _mctx["model"] = ",".join(models_ran) if models_ran else model
         _ti, _to = task_metrics.extract_tokens(_parsed)
         _mctx["tokens_in"], _mctx["tokens_out"] = _ti, _to
@@ -1699,6 +1724,19 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
                 "ПОСЛЕДНИМ действием, работа к этому моменту сделана. Итоги — в cc_log (RESULT "
                 "задачи) и git log. Это НЕ сбой.")
         log.warning("id=%s claude -p exit=%s", task_id, proc.returncode)
+        # ЛИМИТ ПОСТАВЩИКА СУДИТСЯ МАШИННЫМ ПОЛЕМ (20.09.2026, повод — ряд 113 от 19.09): решение
+        # принимает чистый `limit_slot` по полям КОНВЕРТА (`is_error`, `api_error_status`), а не по
+        # английскому тексту, которым живёт `status_truth.classify_exec`. Код выхода основанием не
+        # делается — в `limit_slot.envelope` его нет даже в сигнатуре. Вердикт кладётся в контекст,
+        # а ПОВТОР ставит обёртка `run_task`: здесь мы внутри heartbeat'а и guard-монитора этого
+        # прогона, и второй заход обязан начаться со своими.
+        _lim = limit_slot.plan(_parsed, child_env, retried=bool(_slot))
+        if _mctx is not None:
+            _mctx["limit"] = _lim
+        if _lim["action"] != limit_slot.ACT_NONE:
+            log.warning("id=%s ЛИМИТ ПОСТАВЩИКА: %s → %s (слот=%s, следующий=%s)",
+                        task_id, _lim["why"], _lim["action"],
+                        _lim["slot"] or "неизвестен", _lim["next"] or "нет")
         # КОД ПРИЧИНЫ ставим ЗДЕСЬ, где известны сырые out/err/rc, — а не разбором готовой
         # карточки потом: причину знает тот, кто её видел (класс «судим по действию»).
         _set_fail_code(_mctx, status_truth.classify_exec(out, err, proc.returncode))
@@ -1706,6 +1744,23 @@ def _run_task_impl(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None,
         return "failed", _with_phrase_note(_fail_card(out, err, proc.returncode), _phrase_note)
     log.info("id=%s claude -p exit=0 (вывод %d симв)", task_id, len(out))
     return "done", _with_phrase_note(out or "(claude -p вернул пустой вывод)", _phrase_note)
+
+
+def _feed_limit_note(task_id, lim, reset):
+    """Заметка в ленту 829 об исходе НЕИЗВЕСТНО по лимиту поставщика: без кнопок, без номера,
+    без слова «да» — на неё не отвечают (доктрина третьего состояния 03.08.2026). ВРЕМЯ СБРОСА
+    называется прямо, потому что это единственное, что владельцу тут вообще можно сделать —
+    подождать. FAIL-SAFE: любой сбой отправки НИКОГДА не меняет исход задачи."""
+    try:
+        import notify                            # лениво, как у соседних заметок ленты (1286, 6259)
+        notify.send_feed(
+            f"🚦 лимит поставщика · задача {task_id} · оба слота токена исчерпаны\n"
+            f"{lim.get('why')}\n"
+            f"время сброса: {reset or 'поставщиком не названо'}\n"
+            f"исход НЕИЗВЕСТНО (чужая сторона) — рестарта и правок не делаю, "
+            f"это решение владельца")
+    except Exception as e:                       # noqa: BLE001 — лента не вправе ломать задачу
+        log.warning("id=%s заметка о лимите не ушла в ленту: %s", task_id, e)
 
 
 def _set_fail_code(mctx, code):
@@ -1733,13 +1788,46 @@ def run_task(task_id, task_text, task_timeout=TASK_TIMEOUT, preamble=None):
     _start = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     _expect_busy(task_id, task_timeout)   # ярус 2: заход идёт — это продукт, а не остановка
     status, result = _run_task_impl(task_id, task_text, task_timeout, preamble, _mctx)
+    # ПОВТОР ПОСЛЕ ЛИМИТА ПОСТАВЩИКА — РОВНО ОДИН И ТОЛЬКО ОТСЮДА (20.09.2026). Место выбрано
+    # так, что второго повтора не бывает ПО УСТРОЙСТВУ: ветка живёт в обёртке, которую заход
+    # проходит один раз, а сам повтор идёт с `_slot=…`, и `limit_slot.plan(retried=True)` внутри
+    # него отвечает ACT_UNKNOWN вместо ACT_RETRY. Рекурсии нет, счётчика нет — нечему сбиться.
+    _attempts = 1
+    _lim = _mctx.get("limit") or {}
+    if _lim.get("action") == limit_slot.ACT_RETRY:
+        log.warning("id=%s лимит поставщика под слотом %s — ПОВТОР под слотом %s (ровно один)",
+                    task_id, _lim.get("slot"), _lim.get("next"))
+        _expect_busy(task_id, task_timeout)   # второй заход — своё окно доверия яруса 2
+        _attempts = 2
+        status, result = _run_task_impl(task_id, task_text, task_timeout, preamble, _mctx,
+                                        _slot=_lim.get("next"))
+        _lim = _mctx.get("limit") or {}
+    # ИСХОД НЕИЗВЕСТНО, ЧУЖАЯ СТОРОНА: лимит доказан, а идти больше некуда. Провалом это не
+    # называется — о НАШЕЙ работе такой заход не говорит ничего; в тело едет время сброса, если
+    # поставщик его назвал, и оно же уходит в ленту строкой ниже.
+    if _lim.get("action") == limit_slot.ACT_UNKNOWN:
+        _reset = limit_slot.reset_at(_mctx.get("parsed"))
+        # Код причины берём ГОТОВЫЙ из словаря, общего с полосой ПК (`status_truth.FAIL_CODES` —
+        # зеркало, и замок «ровно пять кодов, ни одного своего» держит тест ПК-происхождения).
+        # Своего кода тут не заводим: лимит поставщика ЕСТЬ отказ модели, а то, что он ЧУЖОЙ и
+        # лечится ожиданием, говорит маркер 🚦 и тело — им и не нужен шестой код в общем словаре.
+        _set_fail_code(_mctx, "model_refusal")
+        result = cap_result(
+            f"{LIMIT_MARK} НЕИЗВЕСТНО — ЧУЖАЯ СТОРОНА: поставщик отказал по лимиту, и второго "
+            f"слота токена не осталось. О нашей работе этот заход не говорит НИЧЕГО: она не "
+            f"начиналась. Это НЕ провал контура.\n"
+            f"Машинное основание: {_lim.get('why')}\n"
+            f"Время сброса: {_reset or 'поставщиком не названо'}\n"
+            f"Что делать: поставить задачу заново после сброса — правок не требуется.")
+        _feed_limit_note(task_id, _lim, _reset)
+        status = "failed"   # у моста терминалов ровно два (done|failed); маркер выше говорит, ЧЕЙ это исход
     try:
         _is_planner = preamble is not None and preamble.startswith(PLANNER_PREAMBLE)
         _model = _mctx.get("model") or (ORCH_MODEL if _is_planner else EXECUTOR_MODEL)
         log.info(task_metrics.metrics_line(
             task=task_id, lane="vps", model=_model, effort=EXECUTOR_EFFORT, start_iso=_start,
             end_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-            dur_s=time.monotonic() - _t0, outcome=status, attempts=1,
+            dur_s=time.monotonic() - _t0, outcome=status, attempts=_attempts,
             selfheals=task_metrics.selfheal_count(task_text),
             tokens_in=_mctx.get("tokens_in"), tokens_out=_mctx.get("tokens_out"),
             task_text=task_text,
@@ -2026,8 +2114,10 @@ def _thinker_exec(prompt, timeout, tag):
     # своим таймаутом, иначе «задача 45 мин, следом думатель 3 мин» снова читалось бы остановкой.
     _expect_busy(tag, timeout)
     try:
+        # stdin=DEVNULL — тот же замер 19.09, что у исполнителя: иначе три секунды ожидания
+        # на каждом вызове думателя, а думатель зовётся после КАЖДОГО done-шага цепи.
         proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
-                              timeout=timeout, env=child_env)
+                              stdin=subprocess.DEVNULL, timeout=timeout, env=child_env)
     except Exception as e:
         log.warning("%s: думатель не отработал (%s) — fail-safe", tag, e)
         return None
