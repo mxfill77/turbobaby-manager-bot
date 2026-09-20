@@ -32,7 +32,15 @@
 одометра (Bot Data «обслуживание») штамп есть, и он называется отдельным полем — разница между
 «знаем, когда подтвердили» и «не знаем никогда» не должна пропадать в общей строке.
 
-ПРАВИЛА НЕ СВОИ. Текущий пробег даёт живой `splinter._odo_current` (единый источник правды,
+ОТКУДА ПРОБЕГ — СКАЗАНО ВСЛУХ (20.09.2026). У каждого байка есть поле `current_km_source` с
+тремя словами: «свой одометр» · «подстановка максимума регистров» · «неизвестно». Разница не
+косметическая: на подстановке «текущий пробег» — это max(I/J/K/L), одометр НА МОМЕНТ ЗАМЕНЫ, и
+НАИБОЛЬШИЙ РЕГИСТР ПО ПОСТРОЕНИЮ НЕ МОЖЕТ БЫТЬ ПРОСРОЧЕН. Поэтому «в норме» на подставленном
+пробеге не бывает вовсе — это третий исход с причиной «пробег подставлен»; просрочка остаётся
+просрочкой, но объявляется НИЖНЕЙ границей. Сам фоллбэк НЕ убран: он честен, его надо называть.
+Разбор: `docs/artifacts/2026-09-20-68u-OTKUDAPROBEG-2009.md`, основание — 68q SVERKADVUH.
+
+ПРАВИЛА НЕ СВОИ. Текущий пробег даёт живой `splinter._odo_current_src` (единый источник правды,
 класс-фикс 4957), тождество байка — `splinter._same_bike`, интервалы — `splinter._service_interval`
 (книга знаний с фоллбэком). Своей копии ни одного из этих правил здесь нет: две копии разошлись
 бы молча, и читатель показывал бы не то, что видит бот. Суждение «норма/просрочка/НЕИЗВЕСТНО» —
@@ -75,6 +83,12 @@ HIDDEN = env_out.HIDDEN    # маркер тоже готовый: двух ра
 
 _NO_STAMP = ("у клеток Лист1 (кол. I/J/K/L) штампа времени НЕТ ВОВСЕ: когда менялся регистр — "
              "из клетки не следует. Возраст регистра равен возрасту ЭТОГО снимка и не меньше")
+
+_SRC_NOTE = ("поле current_km_source у каждого байка называет, ОТКУДА взят текущий пробег: "
+             "«свой одометр» — подтверждённое число Bot Data «обслуживание»; «подстановка "
+             "максимума регистров» — max(I/J/K/L), то есть одометр НА МОМЕНТ ЗАМЕНЫ, а не "
+             "сегодняшний (на нём «в норме» не бывает: наибольший регистр по построению не "
+             "просрочен, а просрочка — НИЖНЯЯ граница); «неизвестно» — числа нет вовсе")
 
 
 class Refused(Exception):
@@ -283,10 +297,10 @@ def read_park(client, gate, query, cells=True):
     for row in targets:
         name = row.get("name") or ""
         mine = [r for r in svc if splinter._same_bike(r.get("bike"), name)]
-        cur = splinter._odo_current(client, name, recs=mine, fleet_row=row)
+        cur, cur_src = splinter._odo_current_src(client, name, recs=mine, fleet_row=row)
         intervals = {park_verdict.kind_of(f): splinter._service_interval(
             park_verdict.kind_of(f), name, client) for f in park_verdict.REGISTERS}
-        b = park_verdict.bike(name, _bike_cells(row), cur, intervals)
+        b = park_verdict.bike(name, _bike_cells(row), cur, intervals, cur_src=cur_src)
         b["odometer_confirmed_utc"] = _odo_stamp(mine) or "штампа нет — число не подтверждалось"
         bikes.append(b)
 
@@ -296,6 +310,7 @@ def read_park(client, gate, query, cells=True):
         "registers_have_no_timestamp": _NO_STAMP,
         "odometer_timestamp_note": ("у СВОЕГО одометра (Bot Data «обслуживание») штамп ЕСТЬ — "
                                     "поле odometer_confirmed_utc у каждого байка"),
+        "current_km_source_note": _SRC_NOTE,
         "service_list_problem": snapshot_note,
         # ── ЧТО СПРАШИВАЛИ ──
         "query": query,

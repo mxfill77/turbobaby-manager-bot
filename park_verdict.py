@@ -59,8 +59,18 @@ WHY_NEGATIVE = "отрицательное число"  # пробег наза�
 WHY_NO_INTERVAL = "интервал не задан"  # вид у этого байка не трекается (gear на мото)
 WHY_NO_ODO = "пробег неизвестен"     # мерить не от чего
 
+WHY_ODO_SUBSTITUTED = "пробег подставлен"   # мерили РЕГИСТРОМ, а не одометром
+WHY_ODO_SOURCE_UNNAMED = "происхождение пробега не названо"   # число есть, откуда — молчат
+
 WHYS = (WHY_UNREAD, WHY_EMPTY, WHY_TEXT, WHY_ZERO, WHY_NEGATIVE,
-        WHY_NO_INTERVAL, WHY_NO_ODO)
+        WHY_NO_INTERVAL, WHY_NO_ODO, WHY_ODO_SUBSTITUTED, WHY_ODO_SOURCE_UNNAMED)
+
+# ── ОТКУДА ВЗЯТ ТЕКУЩИЙ ПРОБЕГ. Три слова, и четвёртого нет (20.09.2026, класс 68u). ──
+# Имя поля названо тем, что оно меряет: `current_km_source` — происхождение `current_km`.
+SRC_OWN = "свой одометр"                        # Bot Data «обслуживание».current_km
+SRC_FALLBACK = "подстановка максимума регистров"  # max(I/J/K/L) — одометр НА МОМЕНТ ЗАМЕНЫ
+SRC_UNKNOWN = "неизвестно"                      # числа нет вовсе либо о нём промолчали
+SOURCES = (SRC_OWN, SRC_FALLBACK, SRC_UNKNOWN)
 
 # Четыре регистра ТО — СПИСОК ГОТОВЫЙ, из контракта клетки (кол. I/J/K/L Лист1).
 REGISTERS = fleet_cell.SERVICE_FIELDS
@@ -84,7 +94,8 @@ def _int_or_none(x):
         return None
 
 
-def _unknown(field, why, detail="", last_km=None, interval=None):
+def _unknown(field, why, detail="", last_km=None, interval=None, cur_src=SRC_UNKNOWN,
+             due_at_km=None, remaining_km_upper_bound=None):
     return {
         "register": field,
         "kind": kind_of(field),
@@ -93,68 +104,120 @@ def _unknown(field, why, detail="", last_km=None, interval=None):
         "detail": str(detail or ""),
         "last_km": last_km,
         "interval": interval,
-        "due_at_km": None,
+        "due_at_km": due_at_km,
         "remaining_km": None,
         "overdue_km": None,
+        # Откуда взят пробег, которым мерили (или не мерили) этот регистр.
+        "current_km_source": str(cur_src or ""),
+        # Заполняется ТОЛЬКО на подставленном пробеге: вычитание состоялось и дало неотрицательное
+        # число, но остатком оно не является — подставленный пробег НЕ БОЛЬШЕ настоящего, значит
+        # настоящий остаток НЕ БОЛЬШЕ этого числа. Верхняя граница, а не остаток.
+        "remaining_km_upper_bound": remaining_km_upper_bound,
+        "overdue_km_is_lower_bound": False,
     }
 
 
-def register(field, cell, cur_km, interval):
+def register(field, cell, cur_km, interval, cur_src=SRC_UNKNOWN):
     """Исход ОДНОГО регистра.
 
     `field`    — поле строки парка (`oil_last_km` …), из `REGISTERS`;
     `cell`     — `ScanResult` от `fleet_cell.read` (исход клетки, а не голое число);
     `cur_km`   — текущий пробег байка (число либо None/'' — «не знаем»);
-    `interval` — интервал вида для этого байка (число либо None — «вид не трекается»).
+    `interval` — интервал вида для этого байка (число либо None — «вид не трекается»);
+    `cur_src`  — ОТКУДА взят `cur_km`: слово из `SOURCES`. Не назвали — `SRC_UNKNOWN`.
 
     Порядок разбора — ИСТОЧНИК → ПРАВИЛО → МИР: сперва «что вообще лежало в клетке», потом «чем
     это мерить», потом «от чего отсчитывать». Первое недостающее и называется причиной: чинить
-    всё равно придётся его."""
+    всё равно придётся его.
+
+    ЧЕТВЁРТЫЙ ШАГ — ЧЕМ МЕРИЛИ (20.09.2026). Вычитание может состояться и на числе, которое
+    пробегом не является: при отсутствии своего одометра читатель подставляет `max(I/J/K/L)` —
+    одометр НА МОМЕНТ ЗАМЕНЫ (`splinter._odo_current_src`, ветка 2). У такого числа есть
+    измеренное свойство: НАИБОЛЬШИЙ РЕГИСТР ПО ПОСТРОЕНИЮ НЕ МОЖЕТ БЫТЬ ПРОСРОЧЕН, и «в норме»
+    на нём — тавтология подстановки, а не факт о байке (перепись 38 байков: у всех 29 без штампа
+    одометра `current_km` == `max(I..L)` ТОЧНО — `docs/artifacts/2026-09-20-68q-SVERKADVUH-2009.md`).
+    Поэтому:
+      • «в норме» достижимо РОВНО ОДНИМ путём и теперь требует НАЗВАННОГО своего одометра;
+      • просрочка на подставленном пробеге ОСТАЁТСЯ просрочкой — подставленный пробег не больше
+        настоящего, значит настоящий перепробег не меньше посчитанного: это НИЖНЯЯ ГРАНИЦА,
+        и она объявляется полем `overdue_km_is_lower_bound`;
+      • «было бы в норме» становится третьим исходом с причиной «пробег подставлен».
+    Фоллбэк при этом НЕ убран: он честен (реальное показание одометра), его надо НАЗЫВАТЬ."""
     # (1) ИСТОЧНИК: что лежало в клетке. Исходы берутся готовыми у contract'а клетки.
     outcome = getattr(cell, "outcome", None)
     detail = getattr(cell, "detail", "") or ""
     if outcome is None:
-        return _unknown(field, WHY_UNREAD, "исход клетки не получен — контракт клетки не звали")
+        return _unknown(field, WHY_UNREAD, "исход клетки не получен — контракт клетки не звали",
+                        cur_src=cur_src)
     if outcome == scan_result.OUTCOME_UNREADABLE:
-        return _unknown(field, WHY_UNREAD, detail)
+        return _unknown(field, WHY_UNREAD, detail, cur_src=cur_src)
     if outcome == scan_result.OUTCOME_EMPTY:
-        return _unknown(field, WHY_EMPTY, detail)
+        return _unknown(field, WHY_EMPTY, detail, cur_src=cur_src)
     if outcome != scan_result.OUTCOME_OK:
         # Осмотр БЫЛ, содержимое ЕСТЬ, числом оно не стало (`mismatch` контракта клетки).
-        return _unknown(field, WHY_TEXT, detail)
+        return _unknown(field, WHY_TEXT, detail, cur_src=cur_src)
 
     last = _int_or_none(getattr(cell, "payload", None))
     if last is None:
-        return _unknown(field, WHY_TEXT, "разобранное значение клетки не целое число")
+        return _unknown(field, WHY_TEXT, "разобранное значение клетки не целое число",
+                        cur_src=cur_src)
     if last == 0:
-        return _unknown(field, WHY_ZERO, detail, last_km=last, interval=_int_or_none(interval))
+        return _unknown(field, WHY_ZERO, detail, last_km=last, interval=_int_or_none(interval),
+                        cur_src=cur_src)
     if last < 0:
         return _unknown(field, WHY_NEGATIVE, detail, last_km=last,
-                        interval=_int_or_none(interval))
+                        interval=_int_or_none(interval), cur_src=cur_src)
 
     # (2) ПРАВИЛО: чем мерить.
     iv = _int_or_none(interval)
     if iv is None or iv <= 0:
-        return _unknown(field, WHY_NO_INTERVAL, detail, last_km=last, interval=iv)
+        return _unknown(field, WHY_NO_INTERVAL, detail, last_km=last, interval=iv,
+                        cur_src=cur_src)
 
     # (3) МИР: от чего отсчитывать.
     cur = _int_or_none(cur_km)
     if cur is None or cur <= 0:
-        return _unknown(field, WHY_NO_ODO, detail, last_km=last, interval=iv)
+        return _unknown(field, WHY_NO_ODO, detail, last_km=last, interval=iv, cur_src=cur_src)
 
     due = last + iv
     remaining = due - cur
+    src = str(cur_src or "")
+
+    # (4) ЧЕМ МЕРИЛИ: пробег или подстановка. Громкое (просрочка) переживает подстановку — тихое нет.
+    if remaining < 0:
+        return {
+            "register": field,
+            "kind": kind_of(field),
+            "outcome": OVERDUE,
+            "why": "",
+            "detail": detail,
+            "last_km": last,
+            "interval": iv,
+            "due_at_km": due,
+            "remaining_km": None,
+            "overdue_km": -remaining,
+            "current_km_source": src,
+            "remaining_km_upper_bound": None,
+            "overdue_km_is_lower_bound": src != SRC_OWN,
+        }
+    if src != SRC_OWN:
+        why = WHY_ODO_SUBSTITUTED if src == SRC_FALLBACK else WHY_ODO_SOURCE_UNNAMED
+        return _unknown(field, why, detail, last_km=last, interval=iv, cur_src=src,
+                        due_at_km=due, remaining_km_upper_bound=remaining)
     return {
         "register": field,
         "kind": kind_of(field),
-        "outcome": IN_NORM if remaining >= 0 else OVERDUE,
+        "outcome": IN_NORM,
         "why": "",
         "detail": detail,
         "last_km": last,
         "interval": iv,
         "due_at_km": due,
-        "remaining_km": remaining if remaining >= 0 else None,
-        "overdue_km": None if remaining >= 0 else -remaining,
+        "remaining_km": remaining,
+        "overdue_km": None,
+        "current_km_source": src,
+        "remaining_km_upper_bound": None,
+        "overdue_km_is_lower_bound": False,
     }
 
 
@@ -167,11 +230,12 @@ def loudest(outcomes):
     return UNKNOWN
 
 
-def bike(name, cells, cur_km, intervals):
+def bike(name, cells, cur_km, intervals, cur_src=SRC_UNKNOWN):
     """Исход БАЙКА: четыре регистра + сводное слово.
 
     `cells`     — {поле: ScanResult} по всем `REGISTERS`;
-    `intervals` — {вид: интервал или None}.
+    `intervals` — {вид: интервал или None};
+    `cur_src`   — откуда взят `cur_km` (слово из `SOURCES`); не назвали — `SRC_UNKNOWN`.
 
     Регистра нет в `cells` вовсе → он НЕИЗВЕСТЕН с причиной «не прочитано»: отсутствие ответа
     ответом не считается (тот же знаменатель у нуля, что у `scan_result`)."""
@@ -179,13 +243,17 @@ def bike(name, cells, cur_km, intervals):
     for field in REGISTERS:
         cell = (cells or {}).get(field)
         if cell is None:
-            regs.append(_unknown(field, WHY_UNREAD, "строка парка не несёт этой клетки"))
+            regs.append(_unknown(field, WHY_UNREAD, "строка парка не несёт этой клетки",
+                                 cur_src=cur_src))
             continue
         regs.append(register(field, cell, cur_km,
-                             (intervals or {}).get(kind_of(field))))
+                             (intervals or {}).get(kind_of(field)), cur_src=cur_src))
     return {
         "bike": str(name or ""),
         "current_km": _int_or_none(cur_km),
+        # ОТКУДА этот пробег — рядом с ним самим, а не в сноске: «в норме» на подставленном
+        # числе и «в норме» на своём одометре — разные утверждения о байке.
+        "current_km_source": str(cur_src or ""),
         "outcome": loudest(r["outcome"] for r in regs),
         "registers": regs,
         "unknown_by_why": tally(regs),
@@ -203,15 +271,21 @@ def tally(registers):
 
 
 def park_tally(bikes):
-    """Сводка по парку: сколько байков видно и у скольких исход какой."""
+    """Сводка по парку: сколько байков видно, у скольких исход какой и чем мерили пробег."""
     by = {o: 0 for o in OUTCOMES}
     whys = {}
+    srcs = {s: 0 for s in SOURCES}
     for b in bikes or ():
         by[b.get("outcome", UNKNOWN)] = by.get(b.get("outcome", UNKNOWN), 0) + 1
+        s = b.get("current_km_source") or SRC_UNKNOWN
+        srcs[s] = srcs.get(s, 0) + 1
         for why, n in (b.get("unknown_by_why") or {}).items():
             whys[why] = whys.get(why, 0) + n
     return {
         "bikes_seen": len(bikes or ()),
         "by_outcome": by,
+        # Чем мерили пробег у скольких байков. Без этой строки «в норме: 2» читается как факт о
+        # парке, а не как «двоим повезло иметь свой одометр».
+        "by_current_km_source": srcs,
         "unknown_registers_by_why": {w: whys[w] for w in WHYS if w in whys},
     }

@@ -18,6 +18,12 @@
      docs/artifacts/2026-08-08-park-overdue-35-of-38-census.md (12 ложных просрочек из 35).
   6. ВОЗРАСТ ПЕРЕД СОДЕРЖИМЫМ: первый ключ ответа — время снятия, и отдельной строкой сказано,
      что у клеток листа штампа нет вовсе.
+  7. ОТКУДА ПРОБЕГ — НАЗВАНО, И ВЕРДИКТ ЭТО ЗНАЕТ (20.09.2026, раздел 9). Поле
+     `current_km_source` с тремя словами; «в норме» на подставленном пробеге НЕ БЫВАЕТ вовсе
+     (наибольший регистр по построению не просрочен — 68q SVERKADVUH); просрочка на нём
+     остаётся просрочкой, но НИЖНЕЙ границей; байк СО СВОИМ одометром меткой подстановки не
+     метится. Дверь `_odo_current` и правило `_odo_current_src` дают одно и то же число —
+     двух копий правила нет.
 
 СЕТИ В ТЕСТАХ НЕТ. Мост — фикстура; единственный подпроцесс (голден 2) ходит на 127.0.0.1:9,
 где соединение отвергается сразу: наружу не уходит ничего, а ветка отказа при этом настоящая.
@@ -585,6 +591,142 @@ def test_outcomes_vocabulary_is_taken_ready():
         assert f"scan_result.{name}" in src, f"исход {name} не взят у scan_result"
     assert '"unreadable"' not in src and '"empty"' not in src, \
         "исход клетки продублирован литералом вместо вокабуляра"
+
+
+# ── (9) ОТКУДА ПРОБЕГ ─────────────────────────────────────────────────────────────────────────
+# Класс 68u, основание — docs/artifacts/2026-09-20-68q-SVERKADVUH-2009.md: при отсутствии своего
+# одометра читатель подставляет max(I/J/K/L) — одометр НА МОМЕНТ ЗАМЕНЫ. У подстановки измеренное
+# свойство: НАИБОЛЬШИЙ РЕГИСТР ПО ПОСТРОЕНИЮ НЕ МОЖЕТ БЫТЬ ПРОСРОЧЕН (29 байков из 38, 29/29
+# точно). Значит «в норме» на подставленном пробеге — тавтология подстановки, а не факт о байке.
+_SVC_NONE = []          # своего одометра нет вовсе → работает фоллбэк Лист1
+
+
+def test_source_vocabulary_is_three_words_and_no_fourth():
+    """Три слова происхождения, и четвёртого нет — ни в словаре, ни в живой выдаче."""
+    assert len(park_verdict.SOURCES) == 3, park_verdict.SOURCES
+    assert park_verdict.SOURCES == (park_verdict.SRC_OWN, park_verdict.SRC_FALLBACK,
+                                    park_verdict.SRC_UNKNOWN)
+    seen = set()
+    for svc in (None, _SVC_NONE):
+        out, _ = _run(svc=svc)
+        seen |= {b["current_km_source"] for b in out["bikes"]}
+        for b in out["bikes"]:
+            seen |= {r["current_km_source"] for r in b["registers"]}
+    assert seen <= set(park_verdict.SOURCES), f"появилось четвёртое слово: {seen}"
+
+
+def test_own_odometer_bike_is_not_marked_substituted():
+    """ВТОРАЯ СТОРОНА ТЕСТА: у байка СО СВОИМ одометром метки подстановки нет, и «в норме» живо."""
+    out, _ = _run()                       # фикстура даёт свой одометр 41000 каждому байку
+    for b in out["bikes"]:
+        assert b["current_km_source"] == park_verdict.SRC_OWN, b
+    good = _by_name(out, "5960")
+    assert good["outcome"] == park_verdict.IN_NORM, good
+    oil = _reg(good, "oil")
+    assert oil["remaining_km"] == 3000 and oil["overdue_km_is_lower_bound"] is False, oil
+    assert out["summary"]["by_current_km_source"][park_verdict.SRC_OWN] == len(out["bikes"])
+    assert out["summary"]["by_current_km_source"][park_verdict.SRC_FALLBACK] == 0
+
+
+def test_substituted_mileage_is_named_so():
+    """Своего одометра нет → пробег НАЗВАН подстановкой, а не выдан за одометр."""
+    out, _ = _run(svc=_SVC_NONE)
+    good = _by_name(out, "5960")
+    assert good["current_km"] == 40000, good          # max(I,J,K,L) = 40000
+    assert good["current_km_source"] == park_verdict.SRC_FALLBACK, good
+    assert out["summary"]["by_current_km_source"][park_verdict.SRC_FALLBACK] == len(out["bikes"])
+
+
+def test_substituted_mileage_is_never_in_norm():
+    """ГЛАВНЫЙ ЗАМОК: на подставленном пробеге «в норме» не возвращается НИ ОДНИМ регистром."""
+    out, _ = _run(svc=_SVC_NONE)
+    assert out["summary"]["by_outcome"][park_verdict.IN_NORM] == 0, out["summary"]
+    good = _by_name(out, "5960")
+    assert good["outcome"] == park_verdict.UNKNOWN, good
+    for r in good["registers"]:
+        assert r["outcome"] == park_verdict.UNKNOWN, r
+        assert r["why"] == park_verdict.WHY_ODO_SUBSTITUTED, r
+
+
+def test_substituted_norm_says_upper_bound_not_remaining():
+    """Число не выброшено, но названо тем, что оно есть: ВЕРХНЯЯ граница остатка, не остаток."""
+    out, _ = _run(svc=_SVC_NONE)
+    oil = _reg(_by_name(out, "5960"), "oil")
+    assert oil["due_at_km"] == 44000, oil             # 40000 + 4000, факт о листе
+    assert oil["remaining_km"] is None, "остаток посчитан от подставленного числа — это не остаток"
+    assert oil["remaining_km_upper_bound"] == 4000, oil
+
+
+def test_overdue_on_substituted_mileage_stays_overdue_as_lower_bound():
+    """Просрочка переживает подстановку: подставленный пробег НЕ БОЛЬШЕ настоящего."""
+    out, _ = _run(svc=_SVC_NONE)
+    late = _by_name(out, "4444")
+    assert late["outcome"] == park_verdict.OVERDUE, late
+    oil = _reg(late, "oil")
+    assert oil["overdue_km"] == 26000, oil            # 40000 - (10000 + 4000)
+    assert oil["overdue_km_is_lower_bound"] is True, oil
+    assert oil["current_km_source"] == park_verdict.SRC_FALLBACK, oil
+
+
+def test_overdue_on_own_odometer_is_not_a_lower_bound():
+    """А на СВОЁМ одометре та же просрочка — число, а не граница."""
+    out, _ = _run()
+    oil = _reg(_by_name(out, "4444"), "oil")
+    assert oil["outcome"] == park_verdict.OVERDUE and oil["overdue_km"] == 27000, oil
+    assert oil["overdue_km_is_lower_bound"] is False, oil
+
+
+def test_no_mileage_at_all_is_unknown_source():
+    """Ни своего одометра, ни регистров → происхождение «неизвестно», а не тихая подстановка."""
+    blind = [_row("NMAX 155 BLIND 7777", EMPTY, EMPTY, EMPTY, EMPTY)]
+    out, _ = _run(rows=blind, svc=_SVC_NONE)
+    b = out["bikes"][0]
+    assert b["current_km"] is None, b
+    assert b["current_km_source"] == park_verdict.SRC_UNKNOWN, b
+    assert b["outcome"] == park_verdict.UNKNOWN, b
+
+
+def test_odo_current_is_a_door_to_one_rule_not_a_second_copy():
+    """Дверь и правило дают ОДНО И ТО ЖЕ число на всех трёх ветках — копии правила нет."""
+    import splinter as S
+    own = [{"bike": "X", "current_km": 41000, "updated_at": "2026-09-19T10:00:00Z"}]
+    cases = [
+        (own, {}, "41000", park_verdict.SRC_OWN),
+        ([], {"oil_last_km": 20400, "gear_last_km": 20400}, "20400", park_verdict.SRC_FALLBACK),
+        ([], {}, "", park_verdict.SRC_UNKNOWN),
+    ]
+    for recs, row, km, src in cases:
+        pair = S._odo_current_src(None, "X", recs=recs, fleet_row=row)
+        assert pair == (km, src), pair
+        assert S._odo_current(None, "X", recs=recs, fleet_row=row) == pair[0], pair
+
+
+def test_fallback_is_not_removed_it_is_named():
+    """Фоллбэк НЕ выпилен: число он по-прежнему даёт — просто больше не молча."""
+    import splinter as S
+    km, src = S._odo_current_src(None, "X", recs=[],
+                                fleet_row={"oil_last_km": 29300, "gear_last_km": 0})
+    assert km == "29300" and src == park_verdict.SRC_FALLBACK, (km, src)
+
+
+def test_source_is_counted_in_the_park_summary():
+    """Сводка парка считает и происхождение: сумма по источникам = числу байков."""
+    for svc in (None, _SVC_NONE):
+        out, _ = _run(svc=svc)
+        s = out["summary"]["by_current_km_source"]
+        assert set(s) == set(park_verdict.SOURCES), s
+        assert sum(s.values()) == out["summary"]["bikes_seen"], s
+
+
+def test_source_note_is_in_the_answer_before_the_content():
+    """Поле объяснено в самой выдаче, а не только в коде: читателю ответа код недоступен."""
+    out, _ = _run()
+    note = out["current_km_source_note"]
+    for word in park_verdict.SOURCES:
+        assert word in note, note
+    keys = list(out)
+    assert keys.index("current_km_source_note") < keys.index("bikes"), keys
+
 
 
 if __name__ == "__main__":

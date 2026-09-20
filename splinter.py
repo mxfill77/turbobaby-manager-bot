@@ -40,6 +40,7 @@ import odo_lower
 import batch_odo     # работы на другом пробеге: третий исход карточки подтверждения работ       # понижение пробега: расхождение ЧИСЛОМ + причина + письменное пояснение
 import reply_floor     # пол ответа: бот не молчит и не отказывает глухо (правила владельца 23.08)
 import work_intent     # приём работ: вопрос о работе — не заявка на неё (повод 22.08, ADV 350 372)
+import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
@@ -2381,7 +2382,24 @@ def _odo_known_fresh(bridge, bike, recs=None, now_ts=None):
 
 
 def _odo_current(bridge, bike, recs=None, fleet_row=None):
-    """ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ по ТЕКУЩЕМУ пробегу байка (класс-фикс 4957, корень 4).
+    """ТЕКУЩИЙ ПРОБЕГ ОДНИМ ЧИСЛОМ — ДВЕРЬ, А НЕ ПРАВИЛО (20.09.2026).
+
+    Правило целиком переехало в `_odo_current_src`: то же число плюс СЛОВО, откуда оно взято.
+    Подпись и возврат здесь не менялись ни на символ, и это не вежливость: их читают семь мест
+    (`splinter.py` — карточка, партия, потолок, история; `park_read.py:286`; голдены
+    `test_odo_fresh.py`, `test_batch_odo_path.py`), а второе значение нужно ровно одному.
+    Двух копий правила нет — есть одно правило и эта дверь."""
+    return _odo_current_src(bridge, bike, recs=recs, fleet_row=fleet_row)[0]
+
+
+def _odo_current_src(bridge, bike, recs=None, fleet_row=None):
+    """ТО ЖЕ ЧИСЛО ПЛЮС ЕГО ПРОИСХОЖДЕНИЕ: `(км строкой, слово из park_verdict.SOURCES)`.
+
+    Происхождение называется ГОТОВЫМ словарём [[park_verdict]], а не литералом здесь: судит
+    подстановку он, и два словаря об одном разошлись бы молча. Три ветки — три слова:
+    свой одометр · подстановка максимума регистров · неизвестно (тогда и число пустое).
+
+    ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ по ТЕКУЩЕМУ пробегу байка (класс-фикс 4957, корень 4).
 
     ИСТОЧНИК = СВОЙ одометр бота: Bot Data «обслуживание».current_km. Туда — и только туда — кладёт
     подтверждённое человеком число _odo_store (см. _odo_confirmed). Из строк байка берём САМУЮ
@@ -2408,11 +2426,16 @@ def _odo_current(bridge, bike, recs=None, fleet_row=None):
             rows = []
     km, _at = _odo_own_freshest(rows)
     if km:
-        return km
+        return km, park_verdict.SRC_OWN
     fb = fleet_row if fleet_row is not None else (bridge.find_bike(bike) or {})
     last = [_odo_km_int((fb or {}).get(f"{k}_last_km")) for k in _MAND_KINDS]
     last = [x for x in last if x and x > 0]
-    return str(max(last)) if last else ""
+    if last:
+        # ПОДСТАНОВКА, А НЕ ПРОБЕГ, и наружу она уходит НАЗВАННОЙ. max(I/J/K/L) — честное
+        # показание одометра, но НА МОМЕНТ ЗАМЕНЫ: оно не больше сегодняшнего, а наибольший
+        # регистр по построению не может быть просрочен (68q: 29 байков из 38 — 29/29 точно).
+        return str(max(last)), park_verdict.SRC_FALLBACK
+    return "", park_verdict.SRC_UNKNOWN
 
 
 def _info_card_budget():
