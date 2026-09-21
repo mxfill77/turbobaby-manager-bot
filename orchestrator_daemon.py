@@ -4641,23 +4641,31 @@ def _convert_deliver_approved(tid, task, what):
     дело, но перезапускать наугад мы не станем."""
     text = str(task.get("task_text") or "")
     sha = deliver_card.sha_of(text)
+    # КАРТОЧКА ТЕПЕРЬ НА ОПЕРАЦИЮ: коммитов в ней сколько угодно, и все они лежат в строке
+    # очереди (`shas_of` читает и старую форму с одним коммитом — карточка, висящая с прошлой
+    # редакции, разбирается ровно как раньше).
+    shas = deliver_card.shas_of(text)
     units = deliver_card.units_of(text)
     ans = {}
     try:
-        if sha:
-            ans = _curator_state_answers([sha])
+        if shas:
+            ans = _curator_state_answers(shas)
     except Exception as e:                                           # noqa: BLE001
-        log.warning("доставка: второе окно прибора по коммиту %s не сработало (%s) — ответ "
-                    "владельца исполняется, как исполнялся", sha, e)
-    a = ans.get(sha) or {}
-    if a.get("ok") is True:
+        log.warning("доставка: второе окно прибора по коммитам %s не сработало (%s) — ответ "
+                    "владельца исполняется, как исполнялся", ", ".join(shas), e)
+    # ВТОРОЕ ОКНО СНИМАЕТ ВОПРОС, ТОЛЬКО ЕСЛИ ОБОГНАЛИ ВСЮ РАБОТУ КАРТОЧКИ. Доехала часть —
+    # перезапуск по-прежнему нужен остальным, и «да» исполняется: замок в ту же сторону, что был
+    # (сомнение → делаем то, о чём просил владелец).
+    done = [s for s in shas if (ans.get(s) or {}).get("ok") is True]
+    if shas and len(done) == len(shas):
+        a = ans.get(shas[0]) or {}
         bc.complete_task(tid, "done", cap_result(
-            f"🔍 карточка доставки коммита {sha} (✅ принято): задача НЕ ставилась — прибор О3 "
-            f"подтверждает, что коммит доехал до прода, ПОКА карточка ждала ответа ({a.get('state')}). "
-            f"Вопрос снят ПО ФАКТУ, а не по времени: второй перезапуск владелец не просил. "
-            f"Считаешь иначе — «тз:» в 328."))
-        log.info("доставка: карточка %s одобрена, но коммит %s уже доставлен (%s) — задачи нет",
-                 tid, sha, a.get("state"))
+            f"🔍 карточка доставки (✅ принято): задача НЕ ставилась — прибор О3 подтверждает, что "
+            f"ВСЕ коммиты карточки ({', '.join(shas)}) доехали до прода, ПОКА она ждала ответа "
+            f"({a.get('state')}). Вопрос снят ПО ФАКТУ, а не по времени: второй перезапуск "
+            f"владелец не просил. Считаешь иначе — «тз:» в 328."))
+        log.info("доставка: карточка %s одобрена, но все её коммиты (%s) уже доставлены — "
+                 "задачи нет", tid, ", ".join(shas))
         return
     if not sha or not units:
         bc.complete_task(tid, "failed", cap_result(
@@ -4668,7 +4676,11 @@ def _convert_deliver_approved(tid, task, what):
                     "(text=%.80s)", tid, text)
         return
     off = {"sha": sha, "units": units,
+           "commits": [{"sha": s} for s in shas],
            "subject": str(what or "").splitlines()[0][:70] if what else ""}
+    if done:                              # часть обогнали — задача об этом знает и не удивится
+        log.info("доставка: карточка %s — %d из %d коммитов уже доехали, перезапуск нужен "
+                 "остальным", tid, len(done), len(shas))
     nid = _enqueue_convert_verified(tid, cap_result(deliver_card.tz(tid, off)))
     if nid is None:
         bc.complete_task(tid, "failed", cap_result(
@@ -6513,12 +6525,18 @@ def _deliver_mark(sha, now):
         log.warning("доставка: состояние не сохранено (%s) — возможен повтор вопроса", e)
 
 
-def _deliver_open_shas():
-    """Коммиты, карточки которых уже висят в needs_approval → ScanResult (payload = множество).
+def _deliver_open_units():
+    """ПРОЦЕССЫ, по которым карточка доставки уже висит в needs_approval → ScanResult
+    (payload = множество имён юнитов).
 
-    Второй рубеж дедупа, и знаменатель ему нужен по той же причине, что памяти на диске: «в
-    очереди таких карточек нет» и «очередь не прочиталась» — разные вещи. Не прочиталось —
-    карточку НЕ ставим вовсе: дубль вопроса владельцу хуже, чем вопрос на четверть часа позже."""
+    ГЛАВНЫЙ РУБЕЖ ДЕДУПА ПОСЛЕ 22.09.2026, и ключ у него — ОПЕРАЦИЯ, а не коммит. Прежде здесь
+    читались ШАПКИ коммитов, и открытая карточка о `ef20207` не мешала выписать вторую о
+    `fe66881` — хотя лечит их ОДИН перезапуск splinter (живой случай 21.09: карточки 15 и 16 с
+    разницей 15 минут, до этого 149 и 150 20.09).
+
+    Знаменатель нужен по той же причине, что памяти на диске: «таких карточек нет» и «очередь не
+    прочиталась» — разные вещи. Не прочиталось — карточку НЕ ставим вовсе: дубль вопроса
+    владельцу хуже, чем вопрос на четверть часа позже."""
     subj = "открытых карточек доставки в очереди"
     try:
         r = bc.get_pending("needs_approval")
@@ -6528,8 +6546,12 @@ def _deliver_open_shas():
         return scan_result.ScanResult.unreadable(
             subj, detail=f"мост не ответил: {r.get('error') or 'без поля error'}")
     rows = list(r.get("items", []))
-    out = {sha for sha in (deliver_card.sha_of(str((it or {}).get("task_text") or ""))
-                           for it in rows) if sha}
+    out = set()
+    for it in rows:
+        text = str((it or {}).get("task_text") or "")
+        if not deliver_card.sha_of(text):
+            continue                          # чужая строка: карточкой доставки не является
+        out.update(deliver_card.units_of(text))
     return scan_result.ScanResult(scanned=len(rows), parsed=len(rows), subject=subj, payload=out)
 
 
@@ -6552,6 +6574,10 @@ def _maybe_deliver_ask(now=None):
         notes = expectations.verdict(facts, expectations.config(os.environ))
         watched = {u for u, _e in prod_drift.WATCHED}
         offers = [o for o in (deliver_card.offer(n, watched) for n in notes) if o]
+        # СКЛЕЙКА В ОПЕРАЦИЮ (22.09.2026): прибор даёт заметку на КАЖДЫЙ недоставленный коммит,
+        # а лечит их всех ОДИН перезапуск. Дальше по ветке идёт предложение НА ПРОЦЕСС, внутри
+        # которого перечислены все коммиты этого перезапуска.
+        offers = deliver_card.fold(offers)
     except Exception as e:                                           # noqa: BLE001
         log.warning("доставка: замер пропущен (%s)", e)
         return []
@@ -6562,29 +6588,48 @@ def _maybe_deliver_ask(now=None):
         log.warning("доставка: %s — вопрос не задаём (дубль владельцу хуже задержки)", mem.say())
         return []
     asked = dict(mem.payload or {})
-    today = [ts for ts in asked.values() if now - ts < 86400.0]
+    # ПОТОЛОК СЧИТАЕТ ВОПРОСЫ, А НЕ КОММИТЫ (22.09.2026). Память по-прежнему ведётся по коммитам
+    # (иначе «есть ли тут что-то новое» не спросить), но одна карточка метит ВСЕ свои коммиты
+    # ОДНИМ И ТЕМ ЖЕ временем — поэтому число РАЗНЫХ отметок и есть число заданных вопросов.
+    # Считать записи значило бы, что склеенная карточка на три коммита съедает суточный потолок
+    # целиком, то есть склейка молча превратилась бы в глушилку.
+    today = {ts for ts in asked.values() if now - ts < 86400.0}
     if DELIVER_DAY_CAP > 0 and len(today) >= DELIVER_DAY_CAP:
         log.info("доставка: за сутки уже %d вопросов (потолок %d) — молчу, недоставку видно в О3",
                  len(today), DELIVER_DAY_CAP)
         return []
-    seen = _deliver_open_shas()
+    seen = _deliver_open_units()
     if seen.outcome == scan_result.OUTCOME_UNREADABLE:
         log.warning("доставка: %s — вопрос не задаём", seen.say())
         return []
-    open_shas = set(seen.payload or ())
+    open_units = set(seen.payload or ())
     said = []
     for off in offers:
         sha = off["sha"]
-        if sha in asked or sha in open_shas:
+        shas = [c["sha"] for c in deliver_card.commits_of(off)]
+        # ПОКА ПО ЭТОМУ ПРОЦЕССУ ВОПРОС ОТКРЫТ — ВТОРОГО НЕТ. Новый коммит в то же окно ничего
+        # не покупает: открытая карточка уже просит тот самый перезапуск, и он поднимет дерево
+        # целиком. Карточка закрылась (ответ, истечение) — выписка снова открыта, и следующая
+        # назовёт ВСЕ накопленные коммиты.
+        if any(u in open_units for u in off["units"]):
+            log.info("ДОСТАВКА: по %s карточка уже открыта — второй вопрос о том же "
+                     "перезапуске не ставим (коммитов накоплено %d)",
+                     ", ".join(off["units"]), len(shas))
+            continue
+        # ПАМЯТЬ НА ДИСКЕ — про КОММИТЫ, и снимает вопрос, только если НИ ОДНОГО нового в нём
+        # нет: иначе закрытая отказом карточка навсегда похоронила бы и ту работу, что легла
+        # после неё.
+        if shas and all(s in asked for s in shas):
             continue
         # ДЕДУП МЕЖДУ ДВЕРЬМИ (22.08.2026): оба рубежа выше — ПАМЯТЬ ЭТОЙ ЖЕ ДВЕРИ, и о вопросе
         # соседней двери они не знают ничего. Живой случай 14.08: куратор спросил о b5478ce в
         # 18:02, эта дверь спросила о нём же в 22:09 — владельцу две карточки об одном объекте.
         # `continue`, а не `break`: снятый вопрос не должен съедать прогон у настоящего.
         dedup = _ask_dedup_check(DOOR_DELIVERY,
-                                 ["service:" + u for u in (off.get("units") or ())], [sha])
+                                 ["service:" + u for u in (off.get("units") or ())], shas)
         if dedup:
-            log.info("ДОСТАВКА: карточка по коммиту %s НЕ ставится — %s", sha, dedup)
+            log.info("ДОСТАВКА: карточка по перезапуску %s НЕ ставится — %s",
+                     ", ".join(off["units"]), dedup)
             continue
         try:
             r = bc.enqueue_task(f"Filipp-328{DEC_FROM_SUFFIX}", deliver_card.row_text(off))
@@ -6599,12 +6644,14 @@ def _maybe_deliver_ask(now=None):
                 log.warning("доставка: карточка %s не доведена в needs_approval (%s)",
                             sid, rr.get("error"))
                 continue
-            _deliver_mark(sha, now)
+            for s in (shas or [sha]):
+                _deliver_mark(s, now)         # ОДНО время на всю карточку: это ОДИН вопрос
             _ask_dedup_note(DOOR_DELIVERY,
-                            ["service:" + u for u in (off.get("units") or ())], [sha], sid)
+                            ["service:" + u for u in (off.get("units") or ())], shas, sid)
             said.append(sid)
-            log.info("ДОСТАВКА: коммит %s не доехал до %s → карточка %s владельцу (✅ = задача "
-                     "гейт+перезапуск, ❌ = ничего)", sha, ", ".join(off["units"]), sid)
+            log.info("ДОСТАВКА: перезапуск %s доставит %d коммит(ов) (%s) → карточка %s владельцу "
+                     "(✅ = задача гейт+перезапуск, ❌ = ничего)",
+                     ", ".join(off["units"]), len(shas), ", ".join(shas), sid)
             # ЖИВОЙ СЧЁТ СЕРИИ (§8г): карточка доставки — ВМЕШАТЕЛЬСТВО владельца, и по рамке
             # его сорт решает ОПЕРАЦИЯ, а не ответ. Прежде эта дверь счёт не звала вовсе:
             # карточки 565 (`b5478ce`) и 566 (`baf5d30`) от 14.08 не попали ни в состояние, ни в

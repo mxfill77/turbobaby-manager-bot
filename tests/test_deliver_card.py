@@ -326,8 +326,14 @@ res.append(ok(said7 == [] and "enqueue_task" not in fb7.calls,
 print("\n(7) потолок вопросов в сутки")
 reset_state()
 now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+# ЕДИНИЦА ПОТОЛКА — ВОПРОС, А НЕ КОММИТ (22.09.2026, склейка карточки в операцию). Память
+# по-прежнему ведётся по коммитам, но одна карточка метит все свои коммиты ОДНИМ временем,
+# поэтому потолок считает РАЗНЫЕ отметки. Фикстура догнана до этой единицы: три отметки с
+# разным временем = три заданных вопроса. Предмет проверки не изменён — «потолок достигнут →
+# молчим»; прежняя форма (три коммита с ОДНИМ временем) теперь означает ОДИН вопрос, и это
+# проверяется отдельно в `tests/test_deliver_one_card.py` секция (7).
 for i in range(OD.DELIVER_DAY_CAP):
-    OD._deliver_mark("dead%d" % i, now)
+    OD._deliver_mark("dead%d" % i, now - i)
 OD._deliver_next = 0.0
 said4, fb4 = ask(Facts())
 res.append(ok(said4 == [] and "enqueue_task" not in fb4.calls,
