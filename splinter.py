@@ -1618,6 +1618,24 @@ def msg_balance_set(wallet, parts):
     )
 
 
+def msg_balance_set_unverified(wallet, bal):
+    """ТРЕТИЙ ИСХОД ФИКСАЦИИ: число, ОТ КОТОРОГО считается поправка, не сверено — строки в кассу нет.
+
+    Слова о «не сверено» берутся ГОТОВЫМИ у `_balance_block` (принятая форма 13.08.2026, с датой и
+    на обоих языках) — второго способа сказать то же самое здесь не заводится. Своё в сообщении
+    ровно одно, и это то, чего у соседей нет: фиксация НЕ СДЕЛАНА, в кассу не ушло ни строки, и
+    что делать дальше. Молчание было бы хуже — Пым решит, что баланс принят, и не повторит."""
+    return _bilingual(
+        wallet,
+        [*_balance_block("ยอดคงเหลือ", bal, "th"), "",
+         "ยังไม่ได้ตั้งยอด — ไม่ได้บันทึกลงบัญชีสักรายการครับ",
+         f"{PYM_HANDLE} รบกวนสั่งตั้งยอดอีกครั้งเมื่อตารางตอบนะครับ 🙏"],
+        [*_balance_block("Баланс", bal), "",
+         "Баланс НЕ зафиксировал — в кассу не записал ни строки.",
+         "Повтори фиксацию, когда таблица ответит 🙏"],
+    )
+
+
 def msg_undo(amount, description, bal, wallet: str = "Money Cashflow"):
     sign = "+" if (amount or 0) >= 0 else "-"
     a = _fmt(abs(amount or 0))
@@ -3356,8 +3374,32 @@ async def _handle_money(msg, context, bridge, claude):
     elif ptype == "balance_set":
         # Установить/зафиксировать баланс кошелька (стартовый или правка) — приоритет владельцу
         target = parsed.get("balance", {}) or {}
-        cur_bal = wallet_cache.get_balance_with_fallback(
-            wallet, bridge.get_balance(group=wallet).get("balance", {}))
+        # ПОПРАВКА СЧИТАЕТСЯ ТОЛЬКО ОТ СВЕРЕННОГО ЧИСЛА (21.09.2026). Здесь ноль не печатается
+        # человеку, а ПИШЕТСЯ ДЕНЬГАМИ: `adj = цель − текущее`, и текущее по умолчанию ноль
+        # (`cur_bal.get(cur, 0)`). Молчащий мост при пустом кэше давал `adj = цель` — строку
+        # «фиксация» на ВСЮ сумму, которой никто не заказывал.
+        # РАЗЛИЧИТЬ «МОСТ МОЛЧИТ» И «КОШЕЛЁК ПУСТ» МОЖНО: `ok` лежит в ответе моста и терялся
+        # ПРЯМО ЗДЕСЬ, в `.get("balance", {})`, ДО судьи — старой двери оставалась истинность
+        # словаря, и та же ошибка шла в ОБЕ стороны (пустой кошелёк брал чужое число из кэша).
+        # Теперь ответ идёт судье ЦЕЛИКОМ. Обращение к мосту по-прежнему РОВНО одно.
+        if _cash_fact_on():
+            bal_v = wallet_cache.answer(wallet, bridge.get_balance(group=wallet))
+        else:
+            bal_v = balance_fact.Balance(
+                balance_fact.STATE_FRESH,
+                wallet_cache.get_balance_with_fallback(
+                    wallet, bridge.get_balance(group=wallet).get("balance", {})))
+        wanted = {c: target.get(c) for c in ("THB", "EUR", "PASSPORT")
+                  if target.get(c) is not None}
+        if wanted and not bal_v.fresh:
+            # ТРЕТИЙ ИСХОД: не считаю и не пишу — зову человека. Ни одной строки в кассу, и якорь
+            # в кэш НЕ кладём: фиксации не было, а якорь утверждал бы обратное.
+            log.warning(f"  → фиксация баланса «{wallet}» НЕ СДЕЛАНА: {bal_v.say()}")
+            await _send(context, chat_id=chat_id,
+                        text=msg_balance_set_unverified(wallet, bal_v))
+            _entry_counts[chat_id] = 0
+            return
+        cur_bal = bal_v.value
         parts = []
         for cur in ("THB", "EUR", "PASSPORT"):
             tgt = target.get(cur)
