@@ -192,7 +192,13 @@ def test_negative_looks_like_client_but_is_not():
     db.enqueue(wh.normalize_wa_payload(
         _msg_payload(CLIENT, "Привет, байк свободен", now, "wamid.real1"), OUR), source="meta")
 
-    got = {it["text"] or it["msg_type"]: it for it in db.pull()}
+    # ОБЕ выдачи судятся ОДНИМИ часами. Бесхозный `db.pull()` штампует аренду РЕАЛЬНЫМ
+    # `time.time()`, а вторая выдача меряется от `now`, снятого ДО пяти записей в базу:
+    # `cutoff = now - LEASE_SECS`, поэтому строки возвращаются лишь при `delivered_at < now+1`,
+    # то есть только если первая выдача попала в ТУ ЖЕ целую секунду. Пересекли границу секунды
+    # (а под нагрузкой это обычное дело) — и строк не видно. Идиома взята у соседнего сьюта
+    # `test_wa_webhook.test_unacked_reappear_after_lease`, где обе выдачи получают явное время.
+    got = {it["text"] or it["msg_type"]: it for it in db.pull(now=now)}
     by_wamid = {it["id"]: it for it in db.pull(now=now + wh.LEASE_SECS + 1)}
     ok(len(by_wamid) == 5, "все пять записей доехали до выдачи (ни одна не отсеяна)")
 
@@ -454,6 +460,22 @@ def test_end_to_end_over_http():
             post(_msg_payload(CLIENT, "Привет, есть байк?", now, "e2e.real")),
         ]
         ok(sent == [200] * 5, "все пять событий приняты дверью вебхука (" + str(sent) + ")")
+
+        # «Принято» и «записано» — РАЗНЫЕ моменты, и это устройство двери, а не случайность:
+        # `_do_meta_post` отвечает 200 и делает flush ДО нормализации и записи (Meta повторяет
+        # запрос при ответе дольше ~5с), а сама запись идёт в потоке этого запроса уже после.
+        # Значит 200 барьером записи не является, и ждать её надо ЯВНО, а не надеяться на
+        # планировщик: под нагрузкой соседей поток записи не успевает, и забор видит меньше
+        # пяти. ОЖИДАНИЕ НЕ ОСЛАБЛЕНО — ниже по-прежнему требуется РОВНО пять; барьер лишь
+        # даёт записи состояться, а не состоялась за отведённое время → тест краснеет, как и
+        # краснел.
+        import sqlite3 as _sq
+        _deadline = time.time() + 10.0
+        while time.time() < _deadline:
+            with _sq.connect(dbpath) as _c:
+                if _c.execute("SELECT COUNT(*) FROM wa_inbox").fetchone()[0] >= 5:
+                    break
+            time.sleep(0.01)
 
         with urllib.request.urlopen(
                 "http://127.0.0.1:%d/wa-queue/pull/%s" % (port, pull_secret), timeout=5) as r:
