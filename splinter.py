@@ -26,6 +26,13 @@ import fleet_cell      # контракт клетки Лист1: значени
 import card_deadline   # общий дедлайн сборки карточки «Инфо» + слова о непрочитанном
 import write_fact      # синк зеркала по ПЕРЕЧИТАННОМУ факту, а не по флагу расписки
 import balance_fact    # §касса: свежий баланс / «не сверено» + дата / нечего сказать; факт проводки
+# §касса: сумма НАЗВАНА числом или её нет вовсе; ноль не от хранилища — не деньги.
+# ПОД ПСЕВДОНИМОМ НАМЕРЕННО: в `_record_transaction` уже живёт ЛОКАЛЬНАЯ `money_amount`
+# (сумма денежного движения), и голый импорт того же имени делает модуль недостижимым внутри
+# всей функции — Python видит присваивание и считает имя локальным на всём её протяжении
+# (`UnboundLocalError` ДО первой строки, а не в месте присваивания). Переименовать локальную
+# значило бы тронуть три строки денежного пути ради имени; псевдоним не трогает ни одной.
+import money_amount as money_amt
 import service_receipt # квитанция ТО: ОБЕ половины (тайская+русская) из ОДНОГО исхода записи
 import odo_ceiling     # верхняя граница пробега при записи ТО: обе двери под одним гейтом
 import undo_last       # отмена последней записи ТО: объект из расписки моста → карточка владельцу
@@ -1458,6 +1465,18 @@ def _cash_fact_on():
     return str(os.getenv("CASH_FACT", "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _money_amount_on():
+    """Ручка отката класса «ноль не от хранилища не становится деньгами» (21.09.2026):
+    `MONEY_AMOUNT=0` + рестарт splinter → путь кассы БАЙТ-В-БАЙТ прежний, вместе с самим дефектом
+    (строка на 0 в листе, «Записал +0 ฿», «Отменил −0 ฿»).
+
+    Ручка ОТДЕЛЬНАЯ от `CASH_FACT` намеренно: тот класс про ответ ХРАНИЛИЩА (свеж ли баланс),
+    этот — про сумму от РАЗБОРА, до всякого хранилища. Свести их в одну значило бы, что откат
+    одного молча гасит другой. Читается на КАЖДЫЙ ответ, а не при импорте: иначе тест не смог бы
+    доказать откат, не поднимая процесс заново."""
+    return str(os.getenv("MONEY_AMOUNT", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
 # ── §касса: ЧИСЛО ИЗ КЭША НЕ ВЫГЛЯДИТ КАК СВЕЖИЙ БАЛАНС (13.08.2026) ───────────────────────────
 # Группа двуязычная, и решение «ждать или считать наличные руками» принимает Пым — значит слово
 # «не сверено» обязано стоять на ОБОИХ языках и РЯДОМ С ЧИСЛОМ, а не только в метке блока: число
@@ -1636,10 +1655,90 @@ def msg_balance_set_unverified(wallet, bal):
     )
 
 
-def msg_undo(amount, description, bal, wallet: str = "Money Cashflow"):
+# ── §касса: НОЛЬ НЕ ОТ ХРАНИЛИЩА НЕ СТАНОВИТСЯ ДЕНЬГАМИ (21.09.2026) ───────────────────────────
+# Сумма движения приходит от РАЗБОРА, а не из листа, и подставляется ноль в двух разных местах
+# (`money_amount`): наш `.get("amount", 0)` — когда поля нет, и мостовой `Number(x) || 0` — когда
+# поле есть, но числом не является. Ниже — то, что человек слышит вместо «Записал +0 ฿».
+_AMOUNT_UNSAID_LINE = {
+    "ru": "• {what}: {why}",
+    "th": "• {what}: {why}",
+}
+_AMOUNT_WHY = {
+    "ru": {"absent": "суммы в сообщении не нашёл", "unparsed": "сумму не разобрал ({raw})"},
+    "th": {"absent": "ไม่พบจำนวนเงินในข้อความ", "unparsed": "อ่านจำนวนเงินไม่ออก ({raw})"},
+}
+
+
+def _amount_why(v, lang):
+    """Причина словами человека. Сырое значение ПОКАЗЫВАЕМ: без него «не разобрал» неотличимо
+    от «не нашёл», а чинит это человек — ему и решать, опечатка там или пропуск."""
+    kind = "absent" if v.state == money_amt.STATE_ABSENT else "unparsed"
+    return _AMOUNT_WHY[lang][kind].format(raw=str(v.raw)[:40])
+
+
+def _amount_unsaid_lines(unsaid, lang):
+    return [_AMOUNT_UNSAID_LINE[lang].format(what=v.where or "движение", why=_amount_why(v, lang))
+            for v in unsaid]
+
+
+def msg_amount_unsaid(wallet, unsaid):
+    """ТРЕТИЙ ИСХОД ЗАПИСИ: ни у одного движения суммы нет — в лист не ушло НИ СТРОКИ.
+
+    Молчание было бы хуже: Пым решит, что записано, и не повторит; а ноль в листе хуже обоих —
+    он выглядит настоящей проводкой и портит баланс молча. Поэтому говорим ровно три вещи: не
+    записал, почему именно, и что сделать."""
+    return _bilingual(
+        wallet,
+        ["❌ ยังไม่ได้บันทึก — ไม่มีจำนวนเงิน",
+         *_amount_unsaid_lines(unsaid, "th"), "",
+         f"{PYM_HANDLE} รบกวนเขียนจำนวนเงินเป็นตัวเลขอีกครั้งนะครับ 🙏"],
+        ["❌ НЕ записал — суммы нет.",
+         *_amount_unsaid_lines(unsaid, "ru"), "",
+         "В таблицу не ушло ни строки. Напиши сумму цифрой и повтори 🙏"],
+    )
+
+
+def note_amount_unsaid(unsaid):
+    """Хвост к подтверждению, когда сумму не назвало ЧАСТЬ движений (или перенос).
+
+    Отдельной строкой, а не вместо подтверждения: записанное записано, и об этом сказать надо;
+    незаписанное молча пропасть не вправе."""
+    if not unsaid:
+        return ""
+    ru = "; ".join(f"{v.where or 'движение'} — {_amount_why(v, 'ru')}" for v in unsaid)
+    return f"\n❌ НЕ записал (суммы нет): {ru}"
+
+
+def msg_undo_unknown(wallet):
+    """ТРЕТИЙ ИСХОД ОТМЕНЫ: мост не ответил. «Нечего отменять» здесь было бы утверждением О
+    ХРАНИЛИЩЕ, которого никто не делал: по полю `voided` пустой ОТВЕТ и пустой ЛИСТ неотличимы,
+    а решения у них противоположные — во втором случае повтор безвреден, в первом он снимет
+    ВТОРУЮ запись."""
+    return _bilingual(
+        wallet,
+        ["⚠️ ไม่ทราบว่ายกเลิกสำเร็จหรือไม่ — ตารางไม่ตอบ",
+         f"{PYM_HANDLE} กรุณาตรวจตารางก่อนสั่งยกเลิกซ้ำนะครับ 🙏"],
+        ["⚠️ Отменил ли последнюю запись — НЕ ЗНАЮ, таблица не ответила.",
+         "Проверь таблицу, прежде чем отменять ещё раз: повтор вслепую снимет ВТОРУЮ запись 🙏"],
+    )
+
+
+def msg_undo(amount, description, bal, wallet: str = "Money Cashflow", amt=None):
+    """Отмена последней записи. `amt` — вердикт суммы (`money_amount.Amount`) или None.
+
+    Сумма названа (или вердикта не спрашивали) → строка БАЙТ-В-БАЙТ прежняя. Не названа →
+    говорим это словами, а не печатаем «−0 ฿»: ноль здесь не сумма отмены, а её отсутствие."""
+    desc = f" ({description})" if description else ""
+    if amt is not None and not amt.said:
+        return _bilingual(
+            wallet,
+            ["ยกเลิกรายการล่าสุดแล้ว — แต่ตารางไม่ได้บอกจำนวนเงิน",
+             *_balance_block("ยอดคงเหลือ", bal, "th")],
+            [f"Отменил последнюю запись — но сумму таблица не назвала{desc}",
+             *_balance_block("Баланс", bal)],
+        )
     sign = "+" if (amount or 0) >= 0 else "-"
     a = _fmt(abs(amount or 0))
-    desc = f" ({description})" if description else ""
     return _bilingual(
         wallet,
         [f"ยกเลิกรายการล่าสุดแล้ว:  {sign}{a} ฿", *_balance_block("ยอดคงเหลือ", bal, "th")],
@@ -1672,6 +1771,22 @@ def msg_balance_match(cur, bal):
         f"🐀 Splinter\n"
         f"✅ ยอดตรงกัน:  {_fmt(bal)} {cur}\n"
         f"✅ Баланс сходится:  {_fmt(bal)} {cur}"
+    )
+
+
+def msg_balance_mismatch_unnamed(cur, pym_bal, unsaid):
+    """Мост сказал «не сходится», а ЧИСЛА не дал. Печатать «разница 0 ฿» нельзя: это читается
+    как «расхождение ровно на ноль», то есть как сходится, — ровно наоборот сказанному."""
+    why_ru = "; ".join(f"{v.where or 'число'} — {_amount_why(v, 'ru')}" for v in unsaid)
+    return (
+        f"🐀 Splinter\n"
+        f"⚠️ ยอดไม่ตรงกัน / Баланс не сходится:\n"
+        f"   บันทึก / записано:  {_fmt(pym_bal)} {cur}\n"
+        f"   ⚠️ ส่วนต่าง / разница: ตารางไม่ได้บอก / таблица числа не назвала\n"
+        f"\n"
+        f"🇹🇭 {PYM_HANDLE} ยอดไม่ตรงแต่ผมบอกส่วนต่างไม่ได้ ช่วยตรวจตารางหน่อยครับ 🙏\n"
+        f"🇷🇺 {PYM_HANDLE}, расхождение есть, но назвать его не могу — глянь таблицу 🙏\n"
+        f"   ({why_ru})"
     )
 
 
@@ -3366,10 +3481,25 @@ async def _handle_money(msg, context, bridge, claude):
         if res.get("match"):
             await _send(context, chat_id=chat_id, text=msg_balance_match("฿", res.get("bot_balance")))
         elif res.get("match") is False:
-            await _send(context, 
-                chat_id=chat_id,
-                text=msg_balance_mismatch("฿", res.get("bot_balance"), pym_thb, res.get("diff", 0)),
-            )
+            # ВЕТВЬ В5: «РАЗНИЦА 0» ЧИТАЕТСЯ КАК «СХОДИТСЯ» — ровно наоборот сказанному.
+            # `res.get("diff", 0)` подставлял ноль, когда мост числа не дал, и расхождение
+            # объявлялось нулевым; `bot_balance` без числа печатался как «у меня: None ฿».
+            miss = []
+            if _money_amount_on():
+                miss = [v for v in (money_amt.verdict(res, field="diff", where="разница"),
+                                    money_amt.verdict(res, field="bot_balance",
+                                                         where="мой баланс"))
+                        if not v.said]
+            if miss:
+                log.warning(f"  → сверка «{wallet}»: расхождение НЕ НАЗЫВАЮ — "
+                            + " | ".join(v.say() for v in miss))
+                await _send(context, chat_id=chat_id,
+                            text=msg_balance_mismatch_unnamed("฿", pym_thb, miss))
+            else:
+                await _send(context,
+                    chat_id=chat_id,
+                    text=msg_balance_mismatch("฿", res.get("bot_balance"), pym_thb, res.get("diff", 0)),
+                )
 
     elif ptype == "balance_set":
         # Установить/зафиксировать баланс кошелька (стартовый или правка) — приоритет владельцу
@@ -3444,10 +3574,28 @@ async def _handle_money(msg, context, bridge, claude):
         # Отмена последней записи ИМЕННО этого кошелька
         res = bridge.void_last(group=wallet)
         log.info(f"  → undo: {res}")
-        if res.get("voided"):
-            await _send(context, 
+        # ВЕТВЬ В4: ОТМЕНА НЕ НАЗЫВАЕТ ЧИСЛА, КОТОРОГО ЕЙ НЕ ДАЛИ (21.09.2026). Здесь ноль
+        # подставлялся ТРИЖДЫ и каждый раз молча: `res.get("amount", 0)` → «−0 ฿»,
+        # `res.get("balance", {})` → голый dict, который `_bal_verdict` объявляет СВЕЖИМ, то есть
+        # «Баланс: 0 ฿» со словом сверенного числа, и наконец сам `res.get("voided")` — на пустом
+        # ответе он ложен, и молчание моста звучало как «Нечего отменять», то есть как
+        # утверждение О ХРАНИЛИЩЕ, которого никто не делал.
+        if _money_amount_on() and not (isinstance(res, dict) and res.get("ok")):
+            log.warning(f"  → касса «{wallet}»: исход ОТМЕНЫ НЕИЗВЕСТЕН — мост не ответил "
+                        f"({(res or {}).get('error') if isinstance(res, dict) else res!r})")
+            await _send(context, chat_id=chat_id, text=msg_undo_unknown(wallet))
+        elif res.get("voided"):
+            # Баланс судит ТОТ ЖЕ вердикт, что у остальной кассы: ответ `void_last` несёт `ok` и
+            # пересчитанный `balance`, форма та же — второго судьи о том же смысле не заводим.
+            uv = money_amt.verdict(res, where=f"отмена в «{wallet}»") if _money_amount_on() else None
+            ubal = (wallet_cache.answer(wallet, res) if _money_amount_on()
+                    else res.get("balance", {}))
+            if uv is not None and not uv.said:
+                log.warning(f"  → касса «{wallet}»: отмена прошла, но {uv.say()}")
+            await _send(context,
                 chat_id=chat_id,
-                text=msg_undo(res.get("amount", 0), res.get("description", ""), res.get("balance", {}), wallet=wallet),
+                text=msg_undo(res.get("amount", 0), res.get("description", ""), ubal,
+                              wallet=wallet, amt=uv),
             )
         else:
             await _send(context,
@@ -3591,6 +3739,34 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
     chat_id = msg.chat_id
     text = msg.text or msg.caption or ""
     moves = parsed.get("moves") or []
+    # ВЕТВЬ В2: НОЛЬ НЕ ОТ ХРАНИЛИЩА НЕ СТАНОВИТСЯ СТРОКОЙ В ЛИСТЕ (21.09.2026). Сумма движения
+    # приходит от РАЗБОРА, и хранилище о ней не спрашивают ВООБЩЕ — значит заметить подстановку
+    # ниже по пути некому. Подставлялась она в двух местах: наш `.get("amount", 0)` (ключа нет) и
+    # мостовой `Number(p.amount) || 0` (ключ есть, значение `null`/строка — наш `.get` пропускает
+    # его мимо себя). В обоих случаях в живой лист ложилась настоящая строка на 0, мост отвечал
+    # `{ok:true, saved:true}`, а человек слышал «Записал +0 ฿».
+    # СУДИТСЯ ПОДСТАНОВКА, А НЕ ЗНАЧЕНИЕ: ноль, который НАЗВАЛИ, — число, и он проходит.
+    unsaid = []
+    if _money_amount_on() and moves:
+        said = []
+        for i, mv in enumerate(moves):
+            v = money_amt.verdict(mv, where=f"движение {i + 1} из {len(moves)}")
+            if v.said:
+                said.append(mv)
+                continue
+            unsaid.append(v)
+            # СЛЕД: свежий ноль обязан быть виден. Строка называет ПРИЧИНУ и МЕСТО подстановки —
+            # по ним видно, чей это ноль (наш или мостовой) и что чинить, если он вернётся.
+            log.warning(f"  → касса: движение НЕ ПИШЕТСЯ — {v.say()} "
+                        f"(кошелёк «{wallet}», валюта {mv.get('currency') or 'THB'})")
+        moves = said
+    if unsaid and not moves:
+        # ТРЕТИЙ ИСХОД: писать нечего вовсе — ни строки в лист, ни переноса, ни якоря в кэш.
+        # Молчать нельзя: человек решит, что записано, и не повторит.
+        log.warning(f"  → касса «{wallet}»: НЕ ЗАПИСАНО НИ ОДНОГО движения — суммы не названы "
+                    f"({len(unsaid)} шт.)")
+        await _send(context, chat_id=chat_id, text=msg_amount_unsaid(wallet, unsaid))
+        return
     # deposit-ПРИХОД (deposit=passport/cash на плюсовом движении) → пробуем привязать к брони.
     # Возвраты депозита (минус) не трогаем — на возврате бронь уже «Завершена», подсказка спамила бы.
     dep_move = next((m for m in moves if m.get("deposit") and (m.get("amount") or 0) > 0), None)
@@ -3666,6 +3842,18 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
 
     # === Перенос в мелкую кассу === (только денежное движение, паспорт не переносим)
     is_transfer = parsed.get("transfer_to_pettycash") and money_move and chat_id != PETTYCASH_CHAT_ID
+    # ВЕТВЬ В3 — САМАЯ ТЯЖЁЛАЯ: ноль приходит ИЗ ВЕТКИ ЗАПАСНОГО ЗНАЧЕНИЯ (`money_move.get(
+    # "amount", 0)` выше и `abs(money_amount or 0)` ниже) и уходит дальше КАК ДЕНЬГИ — второй
+    # строкой в ДРУГОЙ кошелёк и сообщением «Пополнение +0 ฿» в ДРУГУЮ группу, где о причине
+    # никто не узнает вовсе. Ворота стоят ОТДЕЛЬНО от ворот В2 намеренно: перенос — своя запись в
+    # своём листе, и он не вправе держаться на том, что соседние ворота кого-то отфильтровали
+    # выше по функции. Уберут фильтр В2 — эти ворота удержат перенос сами.
+    if is_transfer and _money_amount_on():
+        tv = money_amt.verdict(money_move, where=f"перенос в «{PETTYCASH_LABEL}»")
+        if not tv.said:
+            log.warning(f"  → касса: ПЕРЕНОС НЕ СДЕЛАН — {tv.say()}")
+            unsaid.append(tv)
+            is_transfer = False
     if is_transfer:
         plus = abs(money_amount or 0)
         bridge.add_transaction(
@@ -3696,6 +3884,10 @@ async def _record_transaction(context, bridge, claude, msg, parsed, wallet, rece
     elif dep_move:
         link_note = "\n⚠️ депозит: бронь по байку не определил — уточни бронь"
         log.info(f"  → депозит {dep_move.get('bike') or '—'}: бронь не определена (0/несколько)")
+    # ЧАСТИЧНЫЙ ОТКАЗ НАЗЫВАЕТ СЕБЯ В ТОМ ЖЕ СООБЩЕНИИ (приём `_HUMAN_MISSING`, 05.08.2026):
+    # записанное записано и об этом сказать надо, но незаписанное молча пропасть не вправе —
+    # иначе человек прочтёт подтверждение как полное. Пусто → хвост пустой, текст байт-в-байт.
+    link_note += note_amount_unsaid(unsaid)
     # Показываем факт ТОГО движения, которое и названо в подтверждении.
     disp_tx = tx_facts.get(id(display_move)) if display_move is not None else None
     _entry_counts[chat_id] = _entry_counts.get(chat_id, 0) + 1
