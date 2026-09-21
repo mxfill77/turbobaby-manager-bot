@@ -1733,6 +1733,38 @@ def check_works_ledger_pure(world, run):
         run.flag(f"works_ledger.py:{where}", why)
 
 
+# --------------------------------------------------------------------------------------------
+#  ИНВАРИАНТ 12ч: WORKS_PERSIST_PURE
+#  Журнал принятых работ (works_persist.py, 21.09.2026) отвечает на один вопрос: какие названные
+#  человеком работы мы ПРИНЯЛИ и чем каждая кончилась. Он обязан быть слеп к миру ровно потому,
+#  ради чего написан: появись у него файл или часы — он мог бы «вспомнить» приём, которого не
+#  было, или состарить позицию своим временем вместо времени рук; появись мост — он спросил бы
+#  судьбу записи САМ, и «записано» снова зависело бы от того, КАК спросили, а не от того, что
+#  вернул `_write_info_works`. ИМПОРТОВ НОЛЬ: состояние, «сейчас» и срок годности приносят руки
+#  (`splinter._wl_*`).
+#  FAIL-CLOSED: файла нет / не парсится → ФЛАГ: недоказанная чистота доверия не имеет.
+# --------------------------------------------------------------------------------------------
+_WORKS_PERSIST_PATH = None      # подменяется САМОТЕСТОМ; None → боевой works_persist.py в репо
+
+
+@register("WORKS_PERSIST_PURE")
+def check_works_persist_pure(world, run):
+    path = _WORKS_PERSIST_PATH or os.path.join(REPO, "works_persist.py")
+    try:
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:
+        run.flag("works_persist.py", f"журнал принятых работ не читается ({e}) — чистота не доказана")
+        return
+    try:
+        findings = _duty_ast_findings(src, allowed=frozenset())
+    except SyntaxError as e:
+        run.flag("works_persist.py", f"журнал принятых работ не разбирается ({e}) — чистота не доказана")
+        return
+    for where, why in findings:
+        run.flag(f"works_persist.py:{where}", why)
+
+
 @register("EXPECT_JOURNAL_PURE")
 def check_expect_journal_pure(world, run):
     path = _EXPECT_JOURNAL_PATH or os.path.join(REPO, "expect_journal.py")

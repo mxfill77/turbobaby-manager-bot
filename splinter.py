@@ -33,6 +33,7 @@ import undo_exec       # ответ двери отмены → слова че�
 import work_name       # история обслуживания: слова механика — человеку, ярлык вида — расчётам
 import card_works      # «в работе»: ОДИН список на обе половины; доказанно записанное уходит
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
+import works_persist   # журнал принятых работ на диске: переживает рестарт и истечение TTL буфера
 import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
 import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 15 мест
 import odo_fresh       # срок годности подтверждённого пробега: не спрашиваем число, которое знаем
@@ -2684,6 +2685,189 @@ def _pw_slot(w):
     return _re_pl.sub(r"\s+", " ", str(w or "").strip().lower())
 
 
+# ============================================================================================
+#  ЖУРНАЛ ПРИНЯТЫХ РАБОТ НА ДИСКЕ — РУКИ (решение живёт в works_persist.py, импортов там ноль)
+# ============================================================================================
+#  ЗАЧЕМ. Буфер `_PENDING_WORKS` живёт в ПАМЯТИ ПРОЦЕССА, и принятая работа уходила в никуда
+#  ДВУМЯ дорогами, обе молча: смерть splinter (≈2 рестарта в сутки) и истечение трёх часов.
+#  Правило владельца писать работу без пробега ЗАПРЕЩАЕТ («ОБЯЗАТЕЛЬНЫЕ ПОЛЯ РАБОТЫ 23.08.2026»),
+#  и оно здесь не нарушается: журнал в историю байка не пишет НИ ОДНОЙ строки. Он делает ровно
+#  то, чего требует соседний раздел того же узла («НИ ОДНА названная работа не теряется») —
+#  кладёт ФАКТ ПРИЁМА туда, где его найдут после рестарта.
+#
+#  ГДЕ ЛЕЖИТ ПАМЯТЬ — РЕШАЕТСЯ НА КАЖДОМ ЗОВЕ, А НЕ НА ИМПОРТЕ, и прогон тестов в боевое
+#  состояние не пишет НИКОГДА. Класс известен репозиторию дословно: в боевом `wallet_cache.json`
+#  жила фикстура `tests/test_deposit_link.py`, а в боевой памяти замка подсказок — реальные
+#  имена байков из легаси-фикстур. Признак прогона судим ТЕМИ ЖЕ четырьмя именами, которыми это
+#  делает гард (`gate.py` ставит их подпроцессам сам) — список берётся ГОТОВЫМ у замка подсказок,
+#  второго списка о том же смысле здесь не заводится.
+#
+#  FAIL-SAFE ВЕЗДЕ В СТОРОНУ ПРЕЖНЕГО ПОВЕДЕНИЯ: файл не прочитан / не записан / решение упало →
+#  журнала просто нет, а буфер и запись работают как работали. Журнал не решает НИЧЕГО: он умеет
+#  только помнить, и ни одна ветка записи в историю его не спрашивает.
+_WL_STATE_SAID = False          # путь памяти называем в журнале ОДИН раз — чтобы прод было чем сверить
+
+
+def _wl_enabled() -> bool:
+    """Ручка отката: WORKS_PERSIST=0 в .env + рестарт splinter → журнала нет, путь прежний."""
+    return str(os.getenv(works_persist.FLAG_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _wl_path():
+    """Файл журнала. Явная подмена сильнее всего; признак прогона тестов уводит во временный
+    файл СВОЙ НА ПРОЦЕСС (общее имя утекало бы из одного прогона гейта в следующий)."""
+    global _WL_STATE_SAID
+    p = os.getenv("WORKS_PERSIST_STATE")
+    if not p:
+        p = (f"/tmp/works_persist_state_test_{os.getpid()}.json"
+             if any(os.getenv(m) for m in _HINT_TEST_MARKS)
+             else os.path.join(os.path.dirname(os.path.abspath(__file__)), "works_persist_state.json"))
+    if not _WL_STATE_SAID:
+        _WL_STATE_SAID = True
+        log.info(f"  🧾 журнал принятых работ: память в {p}")
+    return p
+
+
+def _wl_load():
+    """Журнал с диска → ПАРА «состояние · прочитано ли». Контракт, а не голое пустое: «файл не
+    прочитан» и «журнал пуст» — РАЗНЫЕ миры, и перепутать их тут стоит дороже всего (см. ветку
+    исключения ниже). Кэша в памяти процесса нет намеренно — журнал обязан быть правдой диска, а
+    не нашей копией правды: копия пережила бы ровно столько же, сколько буфер, то есть ничего."""
+    try:
+        with open(_wl_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data, True
+        log.warning("  → журнал принятых работ не того вида — не читаю и НЕ переписываю")
+        return works_persist.empty(), False
+    except FileNotFoundError:
+        # Файла нет — это ЧЕСТНО ПУСТОЙ журнал, а не непрочитанный: терять тут нечего.
+        return works_persist.empty(), True
+    except Exception as e:
+        # НЕ ПРОЧИТАН ≠ ПУСТ. Отдай мы сюда пустой журнал молча — первая же запись ЗАТЁРЛА бы
+        # файл, в котором лежат принятые работы, то есть механизм убил бы ровно то, что хранит.
+        # Поэтому наверх идёт ПАРА «что получилось · прочитано ли», и писать по ней запрещено.
+        log.error(f"  ⚠️ журнал принятых работ НЕ прочитан ({e}) — писать в него не буду, "
+                  f"чтобы не затереть принятые работы")
+        return works_persist.empty(), False
+
+
+def _wl_save(state):
+    """Запись журнала АТОМАРНО (временный файл → `os.replace`): оборванная на полуслове запись
+    оставила бы вместо журнала огрызок, то есть сама стала бы потерей принятых работ.
+
+    НИЧЕГО НЕ ВОЗВРАЩАЕТ, и это контракт, а не небрежность (зеркало `_ask_ledger_save`, храповик
+    слепых читателей): булев ответ «не сохранилось» наверху всё равно никем не читается, а
+    отданное из ветки промаха пустое неотличимо от честного «сохранять было нечего». Провал назван
+    там, где он виден человеку, — строкой журнала, и назван ГРОМКО: это принятая работа живого
+    байка."""
+    try:
+        path = _wl_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(works_persist.prune(state), f, ensure_ascii=False, default=str)
+        os.replace(tmp, path)
+    except Exception as e:                                           # noqa: BLE001
+        log.error(f"  ⚠️ журнал принятых работ НЕ записался ({e}) — "
+                  f"приём работ помнит только память процесса, до рестарта")
+
+
+def _wl_accept(chat_id, topic_id, bike, works):
+    """Работы приняты, пробега нет → строка в журнал на диске (переживает рестарт)."""
+    if not _wl_enabled() or not works:
+        return
+    try:
+        cur, read = _wl_load()
+        if not read:
+            return                      # не прочитали → не пишем: затирать принятое нельзя
+        state, added = works_persist.accept(cur, chat_id=chat_id, topic_id=topic_id,
+                                            bike=bike, pairs=[(w, _pw_slot(w)) for w in works],
+                                            now=_time.time())
+        if added:
+            _wl_save(state)
+            log.info(f"  🧾 в журнал принятых работ добавлено {added} (тема {topic_id}); "
+                     f"пробега нет — в историю байка НЕ пишем (правило обязательных полей)")
+    except Exception:
+        log.exception("  → журнал принятых работ: приём не записан (буфер работает как прежде)")
+
+
+def _wl_settle(chat_id, topic_id, written, km):
+    """РЕАЛЬНО записанные работы снимаются с ожидания. Списку верим ровно потому, что его
+    отдаёт `_write_info_works`: там только `ok+saved` либо `duplicate`, отказ туда не попадает."""
+    if not _wl_enabled() or not written:
+        return
+    try:
+        cur, read = _wl_load()
+        if not read:
+            return
+        state, done = works_persist.settle(cur, chat_id=chat_id, topic_id=topic_id,
+                                           slots=[_pw_slot(w) for w in written],
+                                           km=km, now=_time.time())
+        if done:
+            _wl_save(state)
+    except Exception:
+        log.exception("  → журнал принятых работ: снятие записанного сбоило")
+
+
+def _wl_lose(chat_id, topic_id, works, why, outcome=works_persist.LOST_OTHER):
+    """Позиция не легла по названной причине → помечаем потерей, но из журнала НЕ убираем.
+
+    Исход называем ЯВНО: «пробег не пришёл» и «мост не принял» лечат разные люди."""
+    if not _wl_enabled() or not works:
+        return
+    try:
+        cur, read = _wl_load()
+        if not read:
+            return
+        state, hit = works_persist.lose(cur, chat_id=chat_id, topic_id=topic_id,
+                                        slots=[_pw_slot(w) for w in works],
+                                        why=why, now=_time.time(), outcome=outcome)
+        if hit:
+            _wl_save(state)
+    except Exception:
+        log.exception("  → журнал принятых работ: пометка потери сбоила")
+
+
+def _wl_tick(*, ttl=None):
+    """Срок вышел → открытая позиция становится ПОТЕРЕЙ и ОСТАЁТСЯ в журнале вместе с возрастом.
+
+    Зовётся при старте процесса и при каждом приёме/записи — своего таймера у журнала нет, и это
+    намеренно: механизм обязан работать от тех же событий, что и буфер, иначе у него завелась бы
+    вторая жизнь, за которой некому следить. Возвращает человеческую строку об открытых позициях
+    («» — открытых нет), чтобы потеря была ВИДНА, а не только записана."""
+    if not _wl_enabled():
+        return ""
+    try:
+        now = _time.time()
+        cur, read = _wl_load()
+        if not read:
+            # НЕ ПРОЧИТАН — и это говорится вслух: «открытых нет» здесь было бы ложью того же
+            # рода, что «доставлено» вместо «неизвестно» у О3.
+            log.error("  ⚠️ журнал принятых работ не прочитан — о принятых работах сказать НЕЧЕГО")
+            return ""
+        state, hit = works_persist.expire(cur, now=now,
+                                          ttl=_PENDING_WORKS_TTL if ttl is None else ttl)
+        if hit:
+            _wl_save(state)
+        line = works_persist.report(state, now=now)
+        if line:
+            # ERROR, а не INFO: это не рутина, а принятая и НЕ записанная работа живого байка.
+            log.error(f"  ⚠️ журнал принятых работ: {line}")
+        return line
+    except Exception:
+        log.exception("  → журнал принятых работ: сверка сроков сбоила")
+        return ""
+
+
+def works_persist_startup_report():
+    """ПУБЛИЧНАЯ дверь для старта процесса (`bot.on_startup`): что осталось в журнале.
+
+    После рестарта буфер `_PENDING_WORKS` пуст ПО УСТРОЙСТВУ, а журнал — нет; именно здесь
+    принятая вчера и не записанная работа перестаёт быть тишиной. Ничего не отправляет и ничего
+    не пишет в историю байка: возвращает строку, звать её или нет — дело вызывающего."""
+    return _wl_tick()
+
+
 def _pw_add(chat_id, topic_id, works, bike, msg_id_base):
     """ДОПИСАТЬ работы в буфер темы (а не заместить его). Возвращает актуальный перечень буфера.
 
@@ -2710,6 +2894,11 @@ def _pw_add(chat_id, topic_id, works, bike, msg_id_base):
                            "msg_id_base": msg_id_base or cur.get("msg_id_base", ""), "ts": now}
     if again:
         log.info(f"  → инфо-работы: те же слова уже в буфере, не дублирую: {again} (тема {topic_id})")
+    # ЖУРНАЛ НА ДИСКЕ — рядом с буфером, а не вместо него: буфер остаётся рабочим механизмом
+    # записи, журнал только ПОМНИТ факт приёма. Кладём ВЕСЬ перечень темы, а не одну партию:
+    # дедуп открытых позиций живёт в решении, и повтор строки не заводит.
+    _wl_accept(chat_id, topic_id, bike, names)
+    _wl_tick()
     return names
 
 
@@ -2742,7 +2931,12 @@ def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_da
                                                  for w in stale])
         if lost_out is not None:
             lost_out.extend((w, "no_km", "") for w in stale)
+        # Протухшая позиция из буфера УХОДИТ, а из журнала НЕТ: у неё меняется исход. Ровно этим
+        # сведения о приёме переживают истечение трёх часов.
+        _wl_lose(chat_id, topic_id, stale, f"пробег так и не пришёл за {_PENDING_WORKS_TTL//3600}ч",
+                 outcome=works_persist.LOST_NO_KM)
     if not fresh:
+        _wl_tick()
         return []
     _failed = []
     written = _write_info_works(bridge, group_name, topic_id, bike or pend_bike,
@@ -2750,6 +2944,12 @@ def _flush_pending_works(bridge, chat_id, topic_id, group_name, bike, km, msg_da
                                 failed_out=_failed)
     if lost_out is not None:
         lost_out.extend((w, "write_failed", str(why or "")) for w, why in _failed)
+    # Снимаем с ожидания ТОЛЬКО реально записанное (`written` — там `ok+saved` либо `duplicate`),
+    # отказ помечаем потерей с причиной моста. Позиция, о которой мост промолчал, остаётся открытой.
+    _wl_settle(chat_id, topic_id, written, km)
+    if _failed:
+        _wl_lose(chat_id, topic_id, [w for w, _why in _failed], "мост не принял запись")
+    _wl_tick()
     return written
 
 
@@ -2778,6 +2978,9 @@ def _km_door(bridge, chat_id, topic_id, bike, km, *, source, msg_date="", lost_o
                                  [(w, "писать было некуда — буфер не выгружен") for w in peek])
             if lost_out is not None:
                 lost_out.extend((w, "no_bridge", "") for w in peek)
+            # Буфер НЕ трогаем (работы ещё могут лечь), но в журнале причина названа: «писать
+            # было некуда» — открытая потеря, а не тишина.
+            _wl_lose(chat_id, topic_id, peek, "писать было некуда — буфер не выгружен")
             return [], [(w, "no_bridge", "") for w in peek]
         return [], []
     lost = [] if lost_out is None else lost_out

@@ -64,6 +64,8 @@ ask_ledger.json
 hint_dedup_state.json
 # метки кнопок ТО: переживают перезапуск splinter (рантайм-состояние, не код; 25.08.2026)
 svc_tokens.json
+# журнал принятых работ без пробега: переживает рестарт splinter (рантайм-состояние; 21.09.2026)
+works_persist_state.json
 _pcport185
 # scratch / throwaway
 _*.py
