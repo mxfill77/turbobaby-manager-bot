@@ -2117,9 +2117,35 @@ def _hb(s):
     return html.escape(str(s))
 
 
-def _mand_line(kind, last, interval, cur):
+_ODO_WHY_LABEL = {                    # почему пробег НЕ ИЗМЕРЕН → (🇹🇭, 🇷🇺). Ключи и русские слова — ГОТОВЫЕ, из park_verdict.
+    park_verdict.WHY_ODO_SUBSTITUTED: ("เลขไมล์เป็นค่าแทน", park_verdict.WHY_ODO_SUBSTITUTED),
+    park_verdict.WHY_ODO_SOURCE_UNNAMED: ("ไม่ได้ระบุที่มาของเลขไมล์", park_verdict.WHY_ODO_SOURCE_UNNAMED),
+}
+
+
+def _mand_line(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN):
     """Строка обязательного вида ТО (HTML, БЕЗ отступа — компактно): (th, ru) ИЛИ None (gear на мото). ОДИН
-    статус-маркер; важное (просрочено/не делалось/остаток) — <b>. Данные те же — только формат."""
+    статус-маркер; важное (просрочено/не делалось/остаток) — <b>. Данные те же — только формат.
+
+    ЧИСЛО ПРИХОДИТ ВМЕСТЕ С ПРОИСХОЖДЕНИЕМ (21.09.2026, класс 69v). `cur_src` — слово из
+    `park_verdict.SOURCES`: чем меряли. Прежде его здесь не было вовсе, и строка не могла отличить
+    измеренный пробег от подставленного — а подставляется `max(I/J/K/L)`, показание приборки НА
+    ДЕНЬ ЗАМЕНЫ. У регистра-МАКСИМУМА остаток при этом равен полному интервалу по построению
+    (`rem = last + iv − last`), то есть зелёная галочка загоралась ВСЕГДА и утверждала, что байк
+    проехал с последней замены ровно ноль километров. Замер 69u по живому парку: 69 галочек, из
+    них 56 на подставленном пробеге, у 41 остаток равен интервалу РОВНО; живой случай PHUKET 372 —
+    карточка обещала «ещё 4000 км» при настоящем остатке 1293 (расхождение с приборкой 2707 км).
+
+    ТРИ ИСХОДА ВМЕСТО ДВУХ, и порядок тот же, что у судьи (`park_verdict.register`, шаг 4):
+      • ГРОМКОЕ ПЕРЕЖИВАЕТ ПОДСТАНОВКУ: `rem < 0` — просрочка и на подставленном числе, потому что
+        подставленный пробег НЕ БОЛЬШЕ настоящего → настоящий перепробег НЕ МЕНЬШЕ посчитанного.
+        Смягчать её нечем, поэтому она не прячется, а называется НИЖНЕЙ ГРАНИЦЕЙ;
+      • ТИХОЕ НЕ ПЕРЕЖИВАЕТ: `rem >= 0` на неизмеренном пробеге — это не «в норме», а «не измерено»,
+        с причиной СВОИМИ СЛОВАМИ и с ВЕРХНЕЙ границей остатка (настоящий остаток не больше);
+      • свой одометр — как было, БАЙТ-В-БАЙТ: ✅/пора сейчас/просрочено тем же текстом.
+    Условие «а своим ли одометром мерили» и имя причины берутся у `park_verdict` готовыми
+    (`measured`, `why_unmeasured`) — своей копии правила здесь нет. Слова экрана — из 69c
+    (`docs/artifacts/2026-09-20-69c-EKRANBAIKA-2009.md`), не выдуманы заново."""
     if interval is None:
         return None
     th_lbl, ru_lbl = _MAND_LABEL.get(kind, (str(kind), str(kind)))
@@ -2136,14 +2162,27 @@ def _mand_line(kind, last, interval, cur):
     except (ValueError, TypeError):
         return (f"{th_lbl} — เปลี่ยน {last_i} · ครบ {nxt} กม.",
                 f"{ru_lbl} — замена {last_i} · срок {nxt} км")
+    # ГРОМКОЕ ПЕРЕЖИВАЕТ ПОДСТАНОВКУ — но называется границей, а не фактом (см. шапку).
+    if rem < 0:
+        if park_verdict.measured(cur_src):
+            return (f"{th_lbl} — ⚠️ <b>เกินกำหนด {abs(rem)} กม.</b>",
+                    f"{ru_lbl} — ⚠️ <b>просрочено на {abs(rem)} км</b>")
+        return (f"{th_lbl} — ⚠️ <b>เกินอย่างน้อย {abs(rem)} กม.</b> "
+                f"(เลขไมล์เป็นค่าแทน จึงเป็นขั้นต่ำ)",
+                f"{ru_lbl} — ⚠️ <b>просрочено не меньше чем на {abs(rem)} км</b> "
+                f"(пробег подставлен, это нижняя граница)")
+    # ТИХОЕ НЕ ПЕРЕЖИВАЕТ: галочки на неизмеренном пробеге не бывает — бывает названная неизвестность.
+    if not park_verdict.measured(cur_src):
+        why_th, why_ru = _ODO_WHY_LABEL.get(
+            park_verdict.why_unmeasured(cur_src),
+            (park_verdict.WHY_ODO_SOURCE_UNNAMED, park_verdict.WHY_ODO_SOURCE_UNNAMED))
+        return (f"{th_lbl} — ❓ <b>ยังไม่ได้วัด</b>: {why_th} · เหลืออีกไม่เกิน {rem} กม.",
+                f"{ru_lbl} — ❓ <b>не измерено</b>: {why_ru} · остаток не больше {rem} км")
     if rem > 0:
         return (f"{th_lbl} — ✅ อีก <b>{rem}</b> กม. (ครบ {nxt})",
                 f"{ru_lbl} — ✅ ещё <b>{rem}</b> км (срок {nxt})")
-    if rem == 0:
-        return (f"{th_lbl} — ⚠️ <b>ครบกำหนดแล้ว</b> (ครบ {nxt})",
-                f"{ru_lbl} — ⚠️ <b>пора сейчас</b> (срок {nxt})")
-    return (f"{th_lbl} — ⚠️ <b>เกินกำหนด {abs(rem)} กม.</b>",
-            f"{ru_lbl} — ⚠️ <b>просрочено на {abs(rem)} км</b>")
+    return (f"{th_lbl} — ⚠️ <b>ครบกำหนดแล้ว</b> (ครบ {nxt})",
+            f"{ru_lbl} — ⚠️ <b>пора сейчас</b> (срок {nxt})")
 
 
 def _km_ago(cur, km, th):
@@ -2173,7 +2212,8 @@ def _km_ago(cur, km, th):
     return f"{d} กม.ที่แล้ว" if th else f"{d} км назад"
 
 
-def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_last=None, unread=None):
+def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_last=None, unread=None,
+                  cur_km_source=park_verdict.SRC_UNKNOWN):
     """КАРТОЧКА байка (HTML) — аккуратная двуязычная справка (фикс вёрстки 30.06).
 
     `unread` — ТРЕТИЙ ИСХОД сборки (13.08.2026): None → карточка полная и её вид БАЙТ-В-БАЙТ
@@ -2222,7 +2262,7 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
             m = by_kind.get(kind)
             if not m:
                 continue
-            line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km)
+            line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km, cur_km_source)
             if line:
                 to_th.append(line[0]); to_ru.append(line[1])
 
@@ -2484,7 +2524,11 @@ def _build_bike_card_body(bridge, chat_id, topic_id, bike, _cb=None):
     # подтверждённое число теперь попадает в сам источник (_odo_store); рендер такой строки
     # МОЛЧИТ — _km_ago не даёт метки вовсе (фикс 31.07.2026: прежнее «мягкое» «на текущем пробеге»
     # было ложью — в карточке 4957 стояло «38982 км (на текущем пробеге)» при шапке 37000).
-    cur_km = _odo_current(bridge, bike, recs=recs, fleet_row=fb)
+    # ЧИСЛО БЕРЁТСЯ НАЗВАННЫМ (21.09.2026, класс 69v): не дверь `_odo_current`, выбрасывающая слово
+    # «откуда», а само правило `_odo_current_src`. Без источника строка ТО не может отличить
+    # измеренный пробег от подставленного и ставит зелёную галочку на обоих (замер 69u: 56 из 69).
+    # Прочие пять читателей двери не тронуты — у них свои заходы.
+    cur_km, cur_km_source = _odo_current_src(bridge, bike, recs=recs, fleet_row=fb)
     # ПЛАНОВОЕ ТО — 4 ОБЯЗАТЕЛЬНЫХ вида из Лист1 (cols I/J/K/L = *_last_km), интервал из книги знаний.
     # Показываем ВСЕГДА (где нет записи → «не делалось»); gear на мото → interval None → скрыт в рендере.
     mand = [{"kind": k, "last": fb.get(f"{k}_last_km"), "interval": _service_interval(k, canon, bridge)}
@@ -2552,7 +2596,7 @@ def _build_bike_card_body(bridge, chat_id, topic_id, bike, _cb=None):
             log.warning(f"  → карточка {canon}: источники не прочитаны {_missing} "
                         f"(бюджет {_cb.budget} с, дедлайн исчерпан: {_cb.deadline_hit})")
     return msg_bike_card(canon, cur_km, mand, rental, service, sp_open=sp_open, sp_last=sp_last,
-                         unread=unread)
+                         unread=unread, cur_km_source=cur_km_source)
 
 
 async def _send_bike_card(context, bridge, chat_id, topic_id, bike):

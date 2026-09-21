@@ -72,6 +72,29 @@ SRC_FALLBACK = "подстановка максимума регистров"  #
 SRC_UNKNOWN = "неизвестно"                      # числа нет вовсе либо о нём промолчали
 SOURCES = (SRC_OWN, SRC_FALLBACK, SRC_UNKNOWN)
 
+
+def measured(cur_src):
+    """ИЗМЕРЕН ЛИ пробег, которым меряют регистр: True РОВНО у своего одометра.
+
+    Имя названо тем, что предикат меряет. Не `ok`, не `valid`, не `known`: подстановка тоже
+    известна и тоже честна (это реальное показание приборки НА ДЕНЬ ЗАМЕНЫ) — она просто не
+    измерение СЕГОДНЯШНЕГО пробега, а «известно» про неё сказать можно.
+
+    Предикат один на двух судей — этот модуль и строку вида ТО в карточке
+    (`splinter._mand_line`). Две копии условия «а своим ли одометром мерили» разошлись бы молча,
+    и разошлись бы ровно там, где цена ошибки — зелёная галочка на числе, которое пробегом не
+    является (замер 69u: 56 галочек парка из 69 стоя́ли на подстановке)."""
+    return str(cur_src or "") == SRC_OWN
+
+
+def why_unmeasured(cur_src):
+    """ПОЧЕМУ пробег не измерен — ГОТОВОЕ слово из `WHYS`, а не новая фраза в месте показа.
+    Измеренному пробегу причины нет вовсе → ''. Второй судья (карточка) берёт причину отсюда."""
+    src = str(cur_src or "")
+    if measured(src):
+        return ""
+    return WHY_ODO_SUBSTITUTED if src == SRC_FALLBACK else WHY_ODO_SOURCE_UNNAMED
+
 # Четыре регистра ТО — СПИСОК ГОТОВЫЙ, из контракта клетки (кол. I/J/K/L Лист1).
 REGISTERS = fleet_cell.SERVICE_FIELDS
 
@@ -198,11 +221,10 @@ def register(field, cell, cur_km, interval, cur_src=SRC_UNKNOWN):
             "overdue_km": -remaining,
             "current_km_source": src,
             "remaining_km_upper_bound": None,
-            "overdue_km_is_lower_bound": src != SRC_OWN,
+            "overdue_km_is_lower_bound": not measured(src),
         }
-    if src != SRC_OWN:
-        why = WHY_ODO_SUBSTITUTED if src == SRC_FALLBACK else WHY_ODO_SOURCE_UNNAMED
-        return _unknown(field, why, detail, last_km=last, interval=iv, cur_src=src,
+    if not measured(src):
+        return _unknown(field, why_unmeasured(src), detail, last_km=last, interval=iv, cur_src=src,
                         due_at_km=due, remaining_km_upper_bound=remaining)
     return {
         "register": field,

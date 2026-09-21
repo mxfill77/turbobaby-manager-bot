@@ -1,19 +1,25 @@
 """Карточка: ПЛАНОВОЕ ТО — 4 обязательных вида ВСЕГДА (масло/редуктор/ABS/возд.фильтр), статусы
 ✅ ещё / ⚠️ просрочено / ⚠️ пора сейчас / ❗ не делалось; gear только скутер; СТИЛЬ: <b>жирный</b> на важном,
-эмодзи минимум, тонкие ───── разделители, parse_mode=HTML."""
+эмодзи минимум, тонкие ───── разделители, parse_mode=HTML.
+
+СТАТУСЫ НИЖЕ — ГОЛДЕНЫ ЗДОРОВОГО ПУТИ, и с 21.09 они НАЗЫВАЮТ источник пробега
+(`park_verdict.SRC_OWN`): у `_mand_line` умолчание закрытое — не назвали, откуда число,
+значит зелёной галочки нет (класс 69v, свой тест `tests/test_card_odo_source.py`).
+Сами ожидаемые строки не менялись ни символом — на своём одометре вид прежний."""
 import os, sys, re
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 import splinter as S
+import park_verdict
 
 def ok(c, l): print(("  PASS " if c else "  FAIL ") + l); return c
 res = []
 
 # (1) _mand_line — статусы + HTML-жирный на важном (граничные включительно)
 print("(1) _mand_line (HTML):")
-res.append(ok(S._mand_line("oil", 24094, 4000, "27000")[1] == "Масло — ✅ ещё <b>1094</b> км (срок 28094)", ">0 → ✅ ещё <b>N</b> км"))
-res.append(ok(S._mand_line("oil", 24094, 4000, "29275")[1] == "Масло — ⚠️ <b>просрочено на 1181 км</b>", "<0 → ⚠️ <b>просрочено на N</b>"))
-res.append(ok(S._mand_line("oil", 24094, 4000, "28094")[1] == "Масло — ⚠️ <b>пора сейчас</b> (срок 28094)", "==0 → ⚠️ <b>пора сейчас</b> (граница)"))
+res.append(ok(S._mand_line("oil", 24094, 4000, "27000", park_verdict.SRC_OWN)[1] == "Масло — ✅ ещё <b>1094</b> км (срок 28094)", ">0 → ✅ ещё <b>N</b> км"))
+res.append(ok(S._mand_line("oil", 24094, 4000, "29275", park_verdict.SRC_OWN)[1] == "Масло — ⚠️ <b>просрочено на 1181 км</b>", "<0 → ⚠️ <b>просрочено на N</b>"))
+res.append(ok(S._mand_line("oil", 24094, 4000, "28094", park_verdict.SRC_OWN)[1] == "Масло — ⚠️ <b>пора сейчас</b> (срок 28094)", "==0 → ⚠️ <b>пора сейчас</b> (граница)"))
 res.append(ok(S._mand_line("abs", 0, 10000, "29275")[1] == "ABS — ❗ <b>не делалось</b>", "last 0 → ❗ <b>не делалось</b>"))
 res.append(ok(S._mand_line("airfilter", None, 20000, "29275")[1] == "Возд. фильтр — ❗ <b>не делалось</b>", "last None → ❗ не делалось"))
 res.append(ok(S._mand_line("gear", 17000, None, "29275") is None, "gear interval None (мото) → None (скрыт)"))
@@ -34,7 +40,8 @@ mand = [
     {"kind": "airfilter", "last": 0, "interval": 20000},     # нет записи → не делалось
 ]
 m = S.msg_bike_card("NMAX 155 4255", "29275", mand,
-                    {"state": "В аренде", "client": "Gamza", "expired": True, "end": "17.06.2026"})
+                    {"state": "В аренде", "client": "Gamza", "expired": True, "end": "17.06.2026"},
+                    cur_km_source=park_verdict.SRC_OWN)
 print("\n(3) карточка — 4 вида + стиль (RU):")
 res.append(ok("🐀 <b>NMAX 155 4255</b>" in m and "<b>пробег 29275 км</b>" in m, "имя байка и пробег — <b>жирные</b>"))
 res.append(ok("Масло — ⚠️ <b>просрочено на 1181 км</b>" in m, "масло просрочено (жирным)"))
@@ -52,7 +59,8 @@ mand_moto = [
     {"kind": "abs", "last": 0, "interval": 10000},
     {"kind": "airfilter", "last": 0, "interval": 20000},
 ]
-m2 = S.msg_bike_card("NINJA 400 6334", "31000", mand_moto, {"state": "дома", "client": ""})
+m2 = S.msg_bike_card("NINJA 400 6334", "31000", mand_moto, {"state": "дома", "client": ""},
+                     cur_km_source=park_verdict.SRC_OWN)
 print("(4) мото — gear скрыт:")
 res.append(ok("Редуктор" not in m2 and "น้ำมันเกียร์" not in m2, "gear НЕ показан на мото (не применимо)"))
 res.append(ok("Масло — ✅ ещё <b>4000</b> км" in m2, "масло мото считается (30000+5000-31000=4000)"))
