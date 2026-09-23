@@ -109,10 +109,23 @@ _SPOKE = _ctxvars.ContextVar("splinter_spoke", default=0)
 #: Тот же довод, что у `_SPOKE` выше и у `_CARD_BUDGET` в `bridge_client`.
 _PHOTO_KIND = _ctxvars.ContextVar("splinter_photo_kind", default="")
 
+#: ЧТО ПОНЯЛ РАЗБОРЩИК ТЕКСТА ЭТОГО обновления — второй свидетель пола (24.09.2026). Пол стоит
+#: снаружи `_handle_servicing` и о тексте не знал ничего: «Are you OK?», «Yes» и тег человека
+#: получали «не понял», хотя разборщик сам назвал их болтовнёй. Значения — `reply_floor.PARSE_*`.
+#: Сбрасывается в `handle` на каждое сообщение: PTB без параллельной обработки исполняет
+#: обновления в ОДНОЙ задаче, и без сброса вердикт прошлого сообщения доехал бы до следующего.
+_PARSE_SEEN = _ctxvars.ContextVar("splinter_parse_seen", default="")
+
 
 def _never_silent_on():
     """Ручка отката пола ответа. `NEVER_SILENT=0` → ветка мертва ДО сбора фактов."""
     return str(_os_env("NEVER_SILENT", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _floor_quiet_on():
+    """Ручка «пол говорит по делу» (24.09.2026). `FLOOR_QUIET=0` → пол говорит на всё, как
+    говорил с 23.08, байт-в-байт: решение `reply_floor.should_speak` не спрашивается вовсе."""
+    return str(_os_env("FLOOR_QUIET", "1")).strip() not in ("0", "", "нет", "no", "off")
 
 
 def _work_intent_on():
@@ -9068,6 +9081,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             return
         if _card_bike:
             log.info(f"  → карточка {_card_bike} подавлена троттлом (<{_CARD_COOLDOWN}s)")
+            _PARSE_SEEN.set(reply_floor.PARSE_STATUS)   # понят и отвечен недавно — полу молчать
             return
 
     # Разбираем текст (если есть) на событие
@@ -9075,6 +9089,12 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     if text.strip():
         parsed = _parse_json(claude.quick(SERVICING_SYSTEM, text, max_tokens=300, model="MAIN",
                                  tag="servicing", expect_json=True))
+        # Свидетель для пола ответа (24.09.2026): что сказал разборщик. Только ЗНАНИЕ для пола —
+        # ни одна ветка записи ниже его не читает; упал — пусто, и пол идёт прежним путём.
+        try:
+            _PARSE_SEEN.set(reply_floor.parse_seen(parsed))
+        except Exception:
+            pass
 
     # Разбираем фото через vision (топливо/пробег/повреждения). На альбом — каждое фото,
     # затем агрегируем в ОДИН вердикт (один ответ вместо дубля на каждое фото).
@@ -10084,7 +10104,9 @@ async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
 
     Что именно сказать, решает `reply_floor.fallback`; здесь только руки. Ответ уходит В ТУ ЖЕ
     тему, откуда пришло сообщение, — иначе «бот ответил» было бы правдой не для того человека.
-    Сам пол молчит РОВНО в двух случаях: ручка выключена и мы уже говорили; всё прочее — речь."""
+    Сам пол молчит в трёх случаях: ручка выключена · мы уже говорили · сообщение ПОНЯТО как
+    не-запись (болтовня, событие, снимок без приборки — `reply_floor.should_speak`, 24.09.2026,
+    ручка `FLOOR_QUIET`); всё прочее — речь."""
     if not _never_silent_on():
         return False
     if _SPOKE.get() != spoke_before:
@@ -10098,6 +10120,31 @@ async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
         _pk = _PHOTO_KIND.get()
     except Exception:
         _pk = ""                      # свидетеля нет → «вид не узнан», а не «это приборка»
+    # ПО ДЕЛУ, А НЕ НА ВСЁ (24.09.2026). Решает `reply_floor.should_speak`, здесь только факты;
+    # молчание — лишь при положительном знании «не запись», любой сбой решения = речь, как была.
+    if _floor_quiet_on():
+        try:
+            _addr = _addressed_bot(msg, context)
+        except Exception:
+            _addr = False
+        try:
+            _seen = _PARSE_SEEN.get()
+        except Exception:
+            _seen = ""
+        try:
+            _q = reply_floor.should_speak({
+                "crashed": bool(crashed),
+                "addressed": bool(_addr),
+                "photo": bool(getattr(msg, "photo", None)),
+                "photo_kind": _pk,
+                "parse": _seen,
+                "text": getattr(msg, "text", None) or getattr(msg, "caption", None) or "",
+            })
+        except Exception:
+            _q = {"speak": True, "why": "решение упало (fail-safe: говорим, как говорили)"}
+        if not _q.get("speak", True):
+            log.info(f"  → ПОЛ ОТВЕТА: молчу по делу ({_q.get('why')}) — тема={topic_id}")
+            return False
     say = reply_floor.fallback({
         "bike": bike,
         "crashed": bool(crashed),
@@ -10147,6 +10194,7 @@ async def handle(update, context, bridge, claude, album_msgs=None):
     # ПОЛ ОТВЕТА (правило владельца 23.08 «никогда не молчать»). Снимок свидетеля ДО разбора;
     # после разбора он либо вырос (мы говорили), либо нет — и тогда говорим сами.
     _spoke_before = _SPOKE.get()
+    _PARSE_SEEN.set(reply_floor.PARSE_UNKNOWN)   # вердикт прошлого сообщения сюда не доезжает
     _crashed = False
     try:
         if mode == "money":
