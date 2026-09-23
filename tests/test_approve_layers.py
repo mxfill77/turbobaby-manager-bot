@@ -126,7 +126,8 @@ res.append(ok(len(decl) == 1, "объявление фолбэка ровно о
 # именно мёртвый литерал, иначе страж запрещал бы живую запасную модель.
 res.append(ok(bool(decl) and "claude-opus-4-8[1m]" not in decl[0],
               "мёртвой модели в объявлении нет: %s" % (decl[0][:88] if decl else "нет строки")))
-res.append(ok(bool(decl) and 'or "claude-opus-4-8"' in decl[0], "дефолт фолбэка = claude-opus-4-8"))
+# 23.09.2026 решение владельца: запасная всех голов — claude-opus-5 (claude-opus-4-8 снят с лестницы).
+res.append(ok(bool(decl) and 'or "claude-opus-5"' in decl[0], "дефолт фолбэка = claude-opus-5"))
 
 print("(6) баннер печатает модель, запасную и усилия")
 i = src.find("ДЕМОН СТАРТ")

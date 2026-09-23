@@ -182,15 +182,19 @@ CLAUDE_BIN = "/usr/bin/claude"
 # Файл в корне репо (git-истина): в .claude/ headless писать не может (гейт движка).
 # Fail-closed: файла нет → CLI падает с ошибкой → честный failed, а не тихая потеря забора.
 HEADLESS_SETTINGS = os.path.join(REPO, "headless_settings.json")
-# КОНДУКТОР МОДЕЛИ (06.07.2026; голова сменена 30.07.2026): headless-исполнитель по умолчанию —
-# claude-opus-5, фолбэк — claude-opus-4-8. Вынесено в env, НЕ хардкод:
+# КОНДУКТОР МОДЕЛИ (06.07.2026; голова сменена 30.07.2026 и 24.09.2026): headless-исполнитель по
+# умолчанию — claude-opus-5-5, фолбэк — claude-opus-5 (решение владельца 23.09.2026: основная всех
+# голов обеих полос claude-opus-5-5, запасная claude-opus-5; claude-opus-4-8 с лестницы снят).
+# ДЕФОЛТЫ НИЖЕ ЖИВУЮ ПАРУ НЕ МЕНЯЮТ: её задают строки ORCH_MODEL / ORCH_MODEL_FALLBACK серверного
+# .env, а код доходит до процесса только рестартом orchestrator-daemon (самообновления у демона нет).
+# Правка дефолтов = пара на случай, когда строки в .env нет. Вынесено в env, НЕ хардкод:
 # смена модели в будущем = правка .env (ORCH_MODEL / ORCH_MODEL_FALLBACK), без правки кода.
 # Фолбэк исполняет САМ CLI флагом --fallback-model В РАМКАХ ОДНОГО вызова при
 # overload/недоступности/лимите/неверном имени primary → задача НЕ исполняется дважды
 # (проверено 06.07: невалидная primary + --fallback-model=opus → CLI сам берёт opus, exit 0,
 # modelUsage=opus). Хардкода без фолбэка нет: упёршись в лимит основной, автоматика не встаёт.
-ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "claude-opus-5").strip() or "claude-opus-5"
-ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-opus-4-8").strip() or "claude-opus-4-8"
+ORCH_MODEL = (os.environ.get("ORCH_MODEL") or "claude-opus-5-5").strip() or "claude-opus-5-5"
+ORCH_MODEL_FALLBACK = (os.environ.get("ORCH_MODEL_FALLBACK") or "claude-opus-5").strip() or "claude-opus-5"
 # УСКОРЕНИЕ ЦЕПЕЙ ч.1 (13.07.2026): модель ИСПОЛНИТЕЛЯ headless-задач — отдельный флаг
 # EXECUTOR_MODEL (.env). Шаги цепей в основном механические по готовой спеке — быстрый
 # исполнитель ускоряет цепь; ДУМАНЬЕ (планировщик декомпозиции, самопочинка, адаптация

@@ -21,18 +21,23 @@ res = []
 
 import orchestrator_daemon as OD
 
-# (1) модель вынесена в env: основная claude-opus-5 → фолбэк claude-opus-4-8 (состояние 30.07.2026)
+# (1) модель вынесена в env: основная claude-opus-5-5 → фолбэк claude-opus-5 (решение владельца
+# 23.09.2026; прежняя пара 30.07.2026 — claude-opus-5 → claude-opus-4-8)
 print("(1) конфиг модели из env:")
+# ВЕТКА pk-golovy-55-2409 (24.09.2026, с ПК): литералы ниже уже на НОВОЙ паре, а строки боевого
+# .env — ещё на прежней. Ветка вливается В ОДНОМ ЗАХОДЕ со сменой двух строк .env
+# (ORCH_MODEL=claude-opus-5-5, ORCH_MODEL_FALLBACK=claude-opus-5); влил без них — гейт красный,
+# и это правильно: он и есть напоминание про .env.
 # NB: два литерала ниже ЗЕРКАЛЯТ боевой .env (ORCH_MODEL / ORCH_MODEL_FALLBACK); при смене
 # модели правятся вместе с конфигом — иначе гейт краснеет и отгрузка встаёт ВСЕМУ репозиторию.
 # Так и вышло 24→25.07.2026: правку .env не догнали гейтом в том же заходе, push стоял 13 часов.
 # Поэтому ниже к литералу добавлена проверка СВОЙСТВА (полный идентификатор ≠ короткий алиас):
 # она переживает смену модели, а литерал остаётся якорем «конфиг и тест сверены глазами».
-res.append(ok(OD.ORCH_MODEL == "claude-opus-5", "ORCH_MODEL из .env = claude-opus-5"))
-# ЗЕРКАЛО .env: 30.07.2026 прежняя голова снята с работы — запасной стал claude-opus-4-8,
+res.append(ok(OD.ORCH_MODEL == "claude-opus-5-5", "ORCH_MODEL из .env = claude-opus-5-5"))
+# ЗЕРКАЛО .env: 23.09.2026 claude-opus-4-8 снят с лестницы — запасной стал claude-opus-5,
 # полным идентификатором (короткий алиас API не принимает, 404 not_found_error).
-res.append(ok(OD.ORCH_MODEL_FALLBACK == "claude-opus-4-8",
-              "ORCH_MODEL_FALLBACK = claude-opus-4-8"))
+res.append(ok(OD.ORCH_MODEL_FALLBACK == "claude-opus-5",
+              "ORCH_MODEL_FALLBACK = claude-opus-5"))
 res.append(ok(OD.ORCH_MODEL_FALLBACK.startswith("claude-"),
               "фолбэк — ПОЛНЫЙ идентификатор модели (короткий алиас даёт 404)"))
 res.append(ok(OD.ORCH_MODEL != OD.ORCH_MODEL_FALLBACK, "основная и фолбэк — разные модели"))
