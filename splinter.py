@@ -48,6 +48,7 @@ import odo_lower
 import batch_odo     # работы на другом пробеге: третий исход карточки подтверждения работ       # понижение пробега: расхождение ЧИСЛОМ + причина + письменное пояснение
 import reply_floor     # пол ответа: бот не молчит и не отказывает глухо (правила владельца 23.08)
 import work_intent     # приём работ: вопрос о работе — не заявка на неё (повод 22.08, ADV 350 372)
+import caption_intent  # подпись к фото: короткое указание — заявка, а не совет помыть (24.09, XADV 2478)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
@@ -132,6 +133,12 @@ def _work_intent_on():
     """Ручка отката гейта намерения. `WORK_INTENT=0` → ветка мертва ДО разбора слов:
     заявка заводится ровно так, как заводилась до 30.08, и переспроса не бывает вовсе."""
     return str(_os_env("WORK_INTENT", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _caption_intake_on():
+    """Ручка «подпись к фото — заявка» (24.09.2026). `CAPTION_INTAKE=0` → путь байт-в-байт
+    прежний: подпись не судится, в строку событий не пишется, совет C идёт, как шёл."""
+    return str(_os_env("CAPTION_INTAKE", "1")).strip() not in ("0", "", "нет", "no", "off")
 
 
 def _os_env(name, default=""):
@@ -8305,6 +8312,46 @@ async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declar
     log.info(f"  → ТО фаза1: заявка {bike} declared={declared}")
 
 
+async def _caption_zayavka(context, bridge, msg, *, text, vis, cap, bike, chat_id, topic_id,
+                           group_name, notes, sender, has_photo=True):
+    """ПОДПИСЬ-УКАЗАНИЕ → ЗАЯВКА (24.09.2026, задание Штаба 0031-73d). Решение — `caption_intent`,
+    здесь руки. Дверь ТА ЖЕ, что у фазы 1: строка событий `intake` (`add_event`) и открытая заявка
+    (`service_pending_upsert`, Bot Data «то_заявки»); новых листов и колонок нет. Работа ложится
+    дословно в note заявки (`WORKS:{…}`), вид — существующим классификатором `_declared_kinds`.
+    Открытая заявка по байку уже есть → работа ДОПИСЫВАЕТСЯ в неё, статус не трогается (дверь —
+    merge). Мост заявку не принял → исключение: пол скажет «заход упал», ложного «заявка есть» нет."""
+    obj = caption_intent.object_of(text, vis)
+    work = caption_intent.work_label(cap.get("act"), obj[0])
+    kinds = _declared_kinds(work, [work], {}) or ["other"]
+    try:
+        _ev = bridge.add_event(msg_date=(str(msg.date.date()) if msg.date else ""),
+                               group=group_name + (f" / тема {topic_id}" if topic_id else ""),
+                               bike=bike, event_type="intake", notes=notes[:200],
+                               photos=1 if has_photo else 0, sender=sender,
+                               msg_id=f"{chat_id}:{msg.message_id}")
+        log.info(f"  → add_event (подпись-заявка): ok={(_ev or {}).get('ok')} "
+                 f"saved={(_ev or {}).get('saved')} error={(_ev or {}).get('error')}")
+    except Exception:
+        log.exception("  → add_event (подпись-заявка) упал")
+    sp = _sp_open(bridge, chat_id, topic_id, bike)
+    note = _sp_note_set_works((sp or {}).get("note"), [work])
+    if sp:
+        declared = _sp_merge_done(_sp_split(sp.get("declared")), kinds)
+        r = bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                          bike=bike, declared=_sp_join(declared), note=note)
+    else:
+        declared = kinds
+        r = bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                          bike=bike, declared=_sp_join(declared), status="заявлено",
+                                          note=note)
+    if not (r or {}).get("ok"):
+        raise RuntimeError(f"заявка по подписи не легла: service_pending_upsert → {r}")
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=caption_intent.confirm_text(bike, cap.get("act"), obj))
+    log.info(f"  → подпись-заявка: {bike} работа={work!r} declared={declared} "
+             f"{'дописана в открытую' if sp else 'новая'}")
+
+
 def _sp_ask_ok(chat_id, topic_id):
     """E4(a): троттл переспросов фазы-2 — не чаще раза в _SP_ASK_THROTTLE_SEC на тему (не дёргать на каждое сообщение)."""
     key = (chat_id, topic_id)
@@ -9157,6 +9204,17 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     elif vis.get("dirt"):
         notes = (notes + " | грязный").strip()[:200]
 
+    # === ПОДПИСЬ К ФОТО (24.09.2026, задание Штаба 0031-73d, ручка CAPTION_INTAKE) ===
+    # Живой случай 24.09 07:09 UTC, XADV 750 GREY 2478: «Need to change» под фото колеса разборщик
+    # не понял (`type=None works=[]`), строка событий легла без подписи, ветка C ответила «помыть».
+    # Решение — `caption_intent` (чистое); здесь только руки. Подпись ложится в `notes` строки
+    # событий с пометкой «подпись:» — поля для неё у строки нет, а новых колонок не заводим.
+    _cap = None
+    if has_photo and text.strip() and _caption_intake_on():
+        _cap = caption_intent.verdict(text)
+        notes = caption_intent.note_with_caption(notes, text)
+        log.info(f"  → подпись: {_cap['state']} ({_cap['why']}) слов={_cap['n']}")
+
     _u_sp = getattr(msg, "from_user", None)
     _sender = ("@" + _u_sp.username) if (_u_sp and getattr(_u_sp, "username", None)) else ""
 
@@ -9197,6 +9255,18 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     if not _intent_claim:
         log.info(f"  → намерение: {_intent['state']} ({_intent['why']}) "
                  f"клауза={_intent['clause']!r} works={works}")
+
+    # === ПОДПИСЬ-УКАЗАНИЕ → ЗАЯВКА (24.09.2026) — раньше фазы 1: вердикт модели по короткой
+    # подписи не нужен и не надёжен (живой разбор «Need to change» не дал ничего), а подтверждение
+    # у этого пути своё — одна строка «заявка: байк — что». Возврат выигрывает (деньги и закрытие
+    # важнее), и снимок с пробегом или чек сюда не идут: у них свои ветки записи числа.
+    if (_cap and _cap["state"] == caption_intent.DIRECTIVE and bike and not _ret_ctx
+            and not vis.get("mileage")
+            and str(vis.get("kind") or "").strip().lower() not in ("dashboard", "receipt")):
+        await _caption_zayavka(context, bridge, msg, text=text, vis=vis, cap=_cap, bike=bike,
+                               chat_id=chat_id, topic_id=topic_id, group_name=group_name,
+                               notes=notes, sender=_sender, has_photo=has_photo)
+        return
 
     _sp_declared = _declared_kinds(text, works, vis)
     _sp_is_intake = (parsed.get("event_type") == "intake") and not _is_oil_done_marker(text, vis)
@@ -9492,7 +9562,12 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
                     or bool(vis.get("mileage"))
                     or _svc_question_open(chat_id, topic_id))
     # HANDOVER: байк выдаётся клиенту — совет «помыть/воск/чехол» (стоянка) неуместен → гасим.
-    if vis.get("dirt") and not _service_ctx and not _ho_ctx:
+    # ПОДПИСЬ С СЕРВИСНЫМ СМЫСЛОМ (24.09.2026) — это сервис-контекст: указание («need to change»)
+    # или отчёт о сделанном («changed tire»), и совет «помыть» был бы ответом не на то. Подпись
+    # без такого смысла («стоит на парковке», болтовня, тег, «ок») и фото без подписи — как было:
+    # совет про чехол на стоянке там по делу (`tests/test_handover.py`).
+    _cap_service = _cap is not None and _cap["state"] in (caption_intent.DIRECTIVE, caption_intent.DONE)
+    if vis.get("dirt") and not _service_ctx and not _ho_ctx and not _cap_service:
         # ЗАМОК ПОВТОРОВ (вид C). Состояние = вердикт vision о грязи. Пока байк числится
         # грязным, состояние не меняется — совет «помыть» второй раз за сутки ничего не
         # сообщает; помыли (dirt отпал) — ветка не срабатывает вовсе, замок тут ни при чём.
