@@ -621,7 +621,7 @@ VISION_BIKE_SYSTEM_POS = VISION_BIKE_SYSTEM.replace(
     '  disassembled: true если байк РАЗОБРАН или стоит в ремонте (снят пластик, колесо, узлы;\n'
     '     открыт мотор; на подставке без деталей); иначе false\n')
 
-VISION_RECEIPT_SYSTEM ="""На фото — чек/квитанция ИЛИ купюры (наличные).
+VISION_RECEIPT_SYSTEM = """На фото — чек/квитанция ИЛИ купюры (наличные).
 Верни СТРОГО JSON:
   amount: сумма числом или null
   currency: "THB" | "EUR" | "USD" | "USDT" | null  — какая валюта на фото (฿/บาท=THB, €=EUR,
