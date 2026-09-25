@@ -49,6 +49,7 @@ import batch_odo     # работы на другом пробеге: трети
 import reply_floor     # пол ответа: бот не молчит и не отказывает глухо (правила владельца 23.08)
 import work_intent     # приём работ: вопрос о работе — не заявка на неё (повод 22.08, ADV 350 372)
 import caption_intent  # подпись к фото: короткое указание — заявка, а не совет помыть (24.09, XADV 2478)
+import bike_position   # положение байка: совет C и фраза о депозите в J — только на возврате (25.09)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
@@ -139,6 +140,23 @@ def _caption_intake_on():
     """Ручка «подпись к фото — заявка» (24.09.2026). `CAPTION_INTAKE=0` → путь байт-в-байт
     прежний: подпись не судится, в строку событий не пишется, совет C идёт, как шёл."""
     return str(_os_env("CAPTION_INTAKE", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _bike_position_on():
+    """Ручка «положение байка» (25.09.2026, задание Штаба 0033-74b). `BIKE_POSITION=0` → путь
+    байт-в-байт прежний: снимок разбирается прежним промптом, положение не считается, мойка не
+    пишется, совет C и тревога J — как были. Решение — `bike_position.position`, руки — `_pos_*`."""
+    return str(_os_env("BIKE_POSITION", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _pos_service_h():
+    """N — окно «сервис в теме недавно», часы. Ручка `POS_SERVICE_H`, умолчание — из замера
+    (`bike_position.SERVICE_H_DEFAULT`, середина пустого промежутка сессий)."""
+    try:
+        v = float(_os_env("POS_SERVICE_H", "") or bike_position.SERVICE_H_DEFAULT)
+    except (TypeError, ValueError):
+        v = bike_position.SERVICE_H_DEFAULT
+    return v if v >= 0 else bike_position.SERVICE_H_DEFAULT
 
 
 def _os_env(name, default=""):
@@ -594,7 +612,16 @@ VISION_BIKE_SYSTEM = """На фото — мотобайк, его прибор�
 ВАЖНО: техника здесь — мотобайк/скутер. В notes и damage НИКОГДА не называй её «автомобиль/машина» — только «байк/мотоцикл/скутер».
 Если не разобрать — ставь null. Лучше null, чем выдумка. Верни ТОЛЬКО JSON."""
 
-VISION_RECEIPT_SYSTEM = """На фото — чек/квитанция ИЛИ купюры (наличные).
+#: Тот же промпт + ОДНО поле «байк разобран» (25.09.2026, положение байка: разобранный байк на
+#: снимке — признак ремонта, живой случай 21.09 VULCAN 650 S 5065). В модель идёт ТОЛЬКО при
+#: `BIKE_POSITION=1`; выключенная ручка шлёт `VISION_BIKE_SYSTEM` байт-в-байт.
+VISION_BIKE_SYSTEM_POS = VISION_BIKE_SYSTEM.replace(
+    '  kind: "dashboard" | "wheel" | "bike" | "receipt" | "other"\n',
+    '  kind: "dashboard" | "wheel" | "bike" | "receipt" | "other"\n'
+    '  disassembled: true если байк РАЗОБРАН или стоит в ремонте (снят пластик, колесо, узлы;\n'
+    '     открыт мотор; на подставке без деталей); иначе false\n')
+
+VISION_RECEIPT_SYSTEM ="""На фото — чек/квитанция ИЛИ купюры (наличные).
 Верни СТРОГО JSON:
   amount: сумма числом или null
   currency: "THB" | "EUR" | "USD" | "USDT" | null  — какая валюта на фото (฿/บาท=THB, €=EUR,
@@ -823,10 +850,14 @@ def _hint_save():
         log.warning(f"  → память замка подсказок не записалась: {e}")
 
 
-async def _hint_send(context, *, kind, bike, state, chat_id, topic_id, text, **kw):
+async def _hint_send(context, *, kind, bike, state, chat_id, topic_id, text, repeat_h=None, **kw):
     """ЕДИНАЯ ДВЕРЬ ПОДСКАЗКИ. Спрашивает замок ДО отправки, запоминает факт ПОСЛЕ неё —
     упавшая отправка подсказку не тратит. Возвращает то же, что `_send`, либо `HINT_SKIPPED`,
-    если повтор подавлен (место отправки обязано это учесть: подавлено = сообщения НЕТ)."""
+    если повтор подавлен (место отправки обязано это учесть: подавлено = сообщения НЕТ).
+
+    `repeat_h` — право на повтор того же состояния для ЭТОГО места, часы; не задано — общее
+    `HINT_REPEAT_H`. Совет C по положению байка (25.09.2026) ставит бесконечность: «один раз за
+    цикл возврата» — повтор того же цикла не нужен, сколько бы часов ни прошло."""
     global _HINT_SEEN
     if not _hint_enabled():
         # Ручка отката гасит ветку ДО чтения памяти: ни файла, ни решения — путь байт-в-байт
@@ -834,13 +865,14 @@ async def _hint_send(context, *, kind, bike, state, chat_id, topic_id, text, **k
         return await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id, **kw)
     seen = _hint_load()
     now = _time.time()
+    _rh = _hint_repeat_h() if repeat_h is None else repeat_h
     v = hint_dedup.verdict(kind, bike, state, seen.get(hint_dedup.key(chat_id, topic_id, bike, kind)),
                            now, chat_id=chat_id, topic_id=topic_id,
-                           repeat_h=_hint_repeat_h())     # выключенная ветка ушла выше, до памяти
+                           repeat_h=_rh)                  # выключенная ветка ушла выше, до памяти
     if not v["send"]:
         _age = f"{v['age_h']:.1f}ч" if v.get("age_h") is not None else "?"
         log.info(f"  🔁 подсказка {kind} ПОДАВЛЕНА (замок повторов): {v['why']}, прошло {_age} "
-                 f"< {_hint_repeat_h():.0f}ч · байк={bike or '—'} тема={topic_id or '—'}")
+                 f"< {_rh:.0f}ч · байк={bike or '—'} тема={topic_id or '—'}")
         return HINT_SKIPPED
     sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id, **kw)
     if v["key"]:
@@ -7389,6 +7421,10 @@ def _aggregate_album_vis(vis_list):
     if dmgs:
         agg["damage"] = "; ".join(dict.fromkeys(dmgs))[:200]
     agg["dirt"] = any(v.get("dirt") for v in vis_list)
+    # РАЗОБРАННЫЙ БАЙК (25.09.2026, положение байка): хоть на одном снимке — признак ремонта. Поле
+    # спрашивается только при `BIKE_POSITION=1`; без него ключа нет вовсе, и альбом прежний.
+    if any(v.get("disassembled") is True for v in vis_list):
+        agg["disassembled"] = True
     notes = [str(v.get("notes")) for v in vis_list if v.get("notes")]
     if notes:
         agg["notes"] = " | ".join(dict.fromkeys(notes))[:200]
@@ -9092,6 +9128,157 @@ async def scheduled_service_pending_reminder(context, bridge):
             log.exception(f"  → висяк-напоминание {bike} упало")
 
 
+# === ПОЛОЖЕНИЕ БАЙКА — РУКИ (25.09.2026, задание Штаба 0033-74b, ручка BIKE_POSITION) ===========
+# Решение — чистое `bike_position.position`; здесь только факты. Источники — те, что Splinter уже
+# читает (правило задания: новых чтений таблиц не заводим): контекст сообщения, память темы, свои
+# строки «событий» (`read_events`, как карточка «Инфо»), открытая заявка (`service_pending_get`, как
+# `_sp_open`), статус парка (`find_bike`, как `_is_return_context`), CRM «клиенты» (`_call("clients",
+# filter="all")`, как `_closing_resolve_booking`). Писать в таблицы положение не умеет: его след —
+# сегмент в `notes` строки событий, которую сообщение пишет и так, и строка мойки.
+
+#: Память «в этой теме недавно говорили о работах»: (чат, тема) → [секунды]. Свои строки работ в
+#: «событиях» есть не всегда (работы без пробега живут в буфере, сервис-слова без разбора не пишутся
+#: вовсе) — поэтому память процесса. Рестарт её стирает: тогда решает то, что лежит в таблицах.
+_POS_SVC_MARKS = {}
+_POS_SVC_KEEP = 8
+
+
+def _pos_mark_service(chat_id, topic_id, now=None):
+    lst = _POS_SVC_MARKS.setdefault((chat_id, topic_id), [])
+    lst.append(float(now if now is not None else _time.time()))
+    del lst[:-_POS_SVC_KEEP]
+
+
+def _pos_msg_facts(text, parsed, vis, works, chat_id, topic_id, has_photo):
+    """Признаки положения, видные в САМОМ сообщении — без единого обращения к мосту."""
+    cap_state = ""
+    if has_photo and (text or "").strip():
+        try:
+            cap_state = caption_intent.verdict(text)["state"]
+        except Exception:
+            cap_state = ""
+    et = str((parsed or {}).get("event_type") or "").strip().lower()
+    service = bool(works or et in ("repair", "intake")
+                   or cap_state in (caption_intent.DIRECTIVE, caption_intent.DONE)
+                   or str((vis or {}).get("kind") or "").strip().lower() == "receipt"
+                   or bike_position.service_said(text)
+                   or _svc_question_open(chat_id, topic_id))
+    return {"wash": bike_position.wash_said(text), "service": service,
+            "disassembled": (vis or {}).get("disassembled") is True}
+
+
+def _pos_write_wash(bridge, msg, text, bike, group_name, topic_id, has_photo):
+    """Мойка — строкой «событий» с видом `wash`. Ключ свой (`…:wash`): строка самого сообщения, если
+    она будет, остаётся отдельной, а повтор того же сообщения мост схлопнет по ключу."""
+    _u = getattr(msg, "from_user", None)
+    sender = ("@" + _u.username) if (_u and getattr(_u, "username", None)) else ""
+    q = " ".join(str(text or "").split())[:60]
+    r = bridge.add_event(msg_date=(str(msg.date.date()) if msg.date else ""),
+                         group=group_name + (f" / тема {topic_id}" if topic_id else ""),
+                         bike=bike, event_type="wash", notes=f"мойка: «{q}»"[:200],
+                         photos=1 if has_photo else 0, sender=sender,
+                         msg_id=f"{msg.chat_id}:{msg.message_id}:wash")
+    log.info(f"  → мойка {bike}: событие wash ok={(r or {}).get('ok')} "
+             f"duplicate={(r or {}).get('duplicate')} error={(r or {}).get('error')}")
+    return r
+
+
+def _pos_events(bridge, bike):
+    """Свои строки «событий» байка (возврат, выдача, мойка, работы) или None — не прочитано."""
+    try:
+        r = bridge.read_events(bike, limit=30)
+    except Exception:
+        log.exception("  → положение: read_events упал")
+        return None
+    if not isinstance(r, dict) or not r.get("ok"):
+        return None
+    return bike_position.events_from_items(r.get("items") or [])
+
+
+def _pos_open_request(bridge, chat_id, topic_id, bike):
+    """Открыта ли заявка на ТО по теме: True / False / None (не прочитано)."""
+    try:
+        r = bridge.service_pending_get(chat_id, topic_id or "", bike or "")
+    except Exception:
+        log.exception("  → положение: service_pending_get упал")
+        return None
+    if not isinstance(r, dict):
+        return None
+    if r.get("ok"):
+        it = r.get("item") or {}
+        return bool(it) and str(it.get("status") or "") not in ("закрыто", "")
+    return False if r.get("error") == "not_found" else None
+
+
+def _pos_fleet_status(bridge, bike):
+    """Статус байка в парке (Лист1 B: «ДОМА» / «В аренде» / «В ремонте» …) или None."""
+    try:
+        fb = bridge.find_bike(bike)
+    except Exception:
+        log.exception("  → положение: find_bike упал")
+        return None
+    if not isinstance(fb, dict) or not fb.get("name"):
+        return None
+    return str(fb.get("status") or "")
+
+
+def _pos_rentals(bridge, bike):
+    """Строки CRM «клиенты» этого байка — ТЕМ ЖЕ чтением, что `_closing_resolve_booking`; None —
+    не прочитано (это не «аренд нет»)."""
+    try:
+        cl = bridge._call("clients", filter="all")
+    except Exception:
+        log.exception("  → положение: чтение CRM упало")
+        return None
+    if not isinstance(cl, dict) or not cl.get("ok"):
+        return None
+    data = cl.get("data")
+    rows = data.get("clients") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return None
+    want = plateFromName_(bike)
+    mine = [c for c in rows if want and plateFromName_(str(c.get("bike", ""))) == want]
+    return bike_position.rentals_from_rows(mine)
+
+
+def _pos_resolve(bridge, chat_id, topic_id, bike, msgf):
+    """Положение байка на этот момент. Источники спрашиваются ЛЕНИВО, по порядку силы: решило
+    сообщение или память темы — к мосту не ходим вовсе; дальше свои события, заявка и парк, CRM —
+    последним. Возврат из сообщения читает только события и CRM (цикл и мойка после него)."""
+    f = {"now": _time.time(), "service_h": _pos_service_h(),
+         "msg_wash": bool(msgf.get("wash")), "msg_return": bool(msgf.get("return")),
+         "msg_handover": bool(msgf.get("handover")), "msg_service": bool(msgf.get("service")),
+         "msg_disassembled": bool(msgf.get("disassembled")),
+         "svc_marks": list(_POS_SVC_MARKS.get((chat_id, topic_id)) or []),
+         "open_request": None, "fleet_status": None, "rentals": None, "events": None}
+    p = bike_position.position(f)
+    if p["state"] in (bike_position.WASHED, bike_position.ISSUE, bike_position.REPAIR):
+        return p
+    f["events"] = _pos_events(bridge, bike)
+    if not f["msg_return"]:
+        p = bike_position.position(f)
+        if p["state"] == bike_position.REPAIR:
+            return p
+        f["open_request"] = _pos_open_request(bridge, chat_id, topic_id, bike)
+        f["fleet_status"] = _pos_fleet_status(bridge, bike)
+        p = bike_position.position(f)
+        if p["state"] == bike_position.REPAIR:
+            return p
+    f["rentals"] = _pos_rentals(bridge, bike)
+    return bike_position.position(f)
+
+
+def _pos_note(notes, seg):
+    """Сегмент положения — в конец `notes` так, чтобы потолок 200 резал ПРЕЖНИЙ хвост, а не сам
+    сегмент: след возврата потом читается как свой источник, обрезанным он был бы ничем."""
+    seg = str(seg or "")
+    base = str(notes or "").strip()
+    room = 200 - len(seg) - 3
+    if room <= 0:
+        return seg[:200]
+    return ((base[:room] + " | ") if base else "") + seg
+
+
 async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения).
     photo_msgs — пачка сообщений-фото (альбом склеен по media_group_id; для одиночного = [msg]).
@@ -9156,14 +9343,17 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             # Фото-байк (ТО/приёмка) — НЕ деньги (Поправка Б штаба): upstream упал → vision() сам
             # логирует «upstream down (graceful '')» и отдаёт '' → лог БЕЗ пуша, разбор деградирует
             # штатно (raise_on_upstream не включаем — громкий пуш только на ДЕНЬГАХ).
-            v = _parse_json(claude.vision(VISION_BIKE_SYSTEM, img, max_tokens=400))
+            _pos_vis = _bike_position_on()   # 25.09: промпт с полем «разобран» — только при ручке
+            v = _parse_json(claude.vision(VISION_BIKE_SYSTEM_POS if _pos_vis else VISION_BIKE_SYSTEM,
+                                          img, max_tokens=400))
             # ВИД СНИМКА В ЖУРНАЛ (30.08.2026). Разбор возвращал `kind` всегда, а строка его не
             # печатала — и замер «сколько раз просили переснять приборку там, где приборки не
             # было» задним числом упирался в потолок: слепой к цифрам снимок приборки и снимок
             # шлемов дают одинаковые пять `None`. Теперь вид виден, и следующий замер точен.
             log.info(f"  → vision: fuel={v.get('fuel')} mileage={v.get('mileage')} "
                      f"conf={v.get('mileage_confidence')} tire={v.get('tire')} "
-                     f"damage={v.get('damage')} kind={v.get('kind')}")
+                     f"damage={v.get('damage')} kind={v.get('kind')}"
+                     + (f" dirt={v.get('dirt')} disassembled={v.get('disassembled')}" if _pos_vis else ""))
             # Копим разбор в буфер недавних фото ЭТОЙ ТЕМЫ (для вопросов "проверь фото резины/пробега")
             _remember_recent_photo(chat_id, v, pm, topic_id=topic_id)
             vis_list.append(v)
@@ -9186,6 +9376,26 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # «молчание на текст-работ» был невидим в splinter.log). Пишем ДО любых ранних return.
     log.info(f"  → parse: type={parsed.get('type')} event_type={parsed.get('event_type')} "
              f"mileage={parsed.get('mileage')} works={works}")
+
+    # === ПОЛОЖЕНИЕ БАЙКА: признаки САМОГО сообщения (25.09.2026, ручка BIKE_POSITION) ===
+    # Стоит ДО раннего выхода: текст «помыл» или сервис-слова без разбора тоже должны оставить след
+    # (строку мойки и память темы), иначе следующий снимок той же темы о них не узнал бы.
+    _pos_on = _bike_position_on()
+    _pos_msg = {}
+    if _pos_on:
+        try:
+            _pos_msg = _pos_msg_facts(text, parsed, vis, works, chat_id, topic_id, has_photo)
+            if _pos_msg.get("service") or _pos_msg.get("disassembled"):
+                _pos_mark_service(chat_id, topic_id)
+            if _pos_msg.get("wash"):
+                _wb = parsed.get("bike") or bike_from_topic(chat_id, topic_id) or ""
+                if _wb and (_pos_write_wash(bridge, msg, text, _wb, group_name, topic_id,
+                                            has_photo) or {}).get("ok"):
+                    # мойка записана строкой событий — полу ответа молчать, как на любое событие
+                    _PARSE_SEEN.set(reply_floor.PARSE_EVENT)
+        except Exception:
+            log.exception("  → положение: признаки сообщения не собраны (fail-safe: как без них)")
+            _pos_msg = {}
 
     # Если ни текст-событие, ни работы, ни осмысленное фото — выходим.
     is_event = parsed.get("type") == "event"
@@ -9291,6 +9501,25 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     if non_oil_works:
         event_type = "repair"   # для force/_service_ctx ниже (перечень в notes НЕ лепим)
     info_works = [w for w in works if _classify_work(w) == "info"]
+
+    # === ПОЛОЖЕНИЕ БАЙКА НА МОМЕНТ СООБЩЕНИЯ (25.09.2026, слово владельца) ===
+    # Считается только там, где от него что-то зависит: грязь (совет C), повреждение (фраза о
+    # депозите в тревоге J), возврат (его след в строке событий). Грязь и положение ложатся в
+    # строку событий при любом исходе — молчащий совет оставляет след, а не пустоту.
+    _pos = None
+    if _pos_on and bike and (vis.get("dirt") or vis.get("damage") or _ret_ctx):
+        try:
+            _pmf = dict(_pos_msg or {})
+            _pmf["return"] = bool(_ret_ctx)
+            _pmf["handover"] = bool(_ho_ctx)
+            _pmf["service"] = bool(_pmf.get("service") or event_type == "repair")
+            _pos = _pos_resolve(bridge, chat_id, topic_id, bike, _pmf)
+            notes = _pos_note(notes, bike_position.note(_pos))
+            log.info(f"  → положение {bike}: {_pos['state']} ({_pos['why']})"
+                     + (f" цикл={_pos['cycle']}" if _pos.get("cycle") else ""))
+        except Exception:
+            log.exception("  → положение: не посчитано (fail-safe: совет C молчит, фраза о депозите снята)")
+            _pos = None
     # ОДНО ПРАВИЛО ЗАПИСИ (класс-фикс 4957): в «события» идёт только ЧЕЛОВЕЧЕСКОЕ число.
     # Раньше здесь стоял сырой vis.mileage — и ветка инфо-работ писала OCR мимо подтверждения
     # («колодки — 38982 км», splinter.log 29.07 09:32:16), пока ветка обычного события уже была
@@ -9452,6 +9681,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         # RU — основа (с конкретикой повреждения + депозит), TH = точный перевод этого RU (вариант 1).
         _ru_dmg = (f"⚠️ {PYM_HANDLE}, на фото повреждения: {vis['damage']} — глянь. "
                    f"Если это возврат — посмотри по депозиту 🙏")
+        if _pos_on and not bike_position.deposit_phrase(_pos):
+            # ПОЛОЖЕНИЕ (25.09.2026): «если это возврат — посмотри по депозиту» звучит ТОЛЬКО на
+            # возврате. В ремонте, в аренде, перед выдачей и при неизвестном — тревога без неё
+            # (живой случай 21.09 05:04: депозит на колодки, чью замену бот сам принял 10 мин назад).
+            _ru_dmg = f"⚠️ {PYM_HANDLE}, на фото повреждения: {vis['damage']} — глянь 🙏"
         # ЗАМОК ПОВТОРОВ (вид J). Состояние = ЧТО назвал vision: другое повреждение — другое
         # состояние, подсказка уходит снова; тот же скол, снятый второй раз, — повтор.
         await _hint_send(context, kind="J", bike=bike, state=("damage", vis["damage"]),
@@ -9567,7 +9801,21 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # без такого смысла («стоит на парковке», болтовня, тег, «ок») и фото без подписи — как было:
     # совет про чехол на стоянке там по делу (`tests/test_handover.py`).
     _cap_service = _cap is not None and _cap["state"] in (caption_intent.DIRECTIVE, caption_intent.DONE)
-    if vis.get("dirt") and not _service_ctx and not _ho_ctx and not _cap_service:
+    if _pos_on:
+        # СОВЕТ C ПО ПОЛОЖЕНИЮ (25.09.2026, слово владельца): только ВОЗВРАТ и не помыт, ОДИН раз за
+        # цикл возврата по байку. Замок повторов судит ЦИКЛ, а не «грязно», и без права на повтор по
+        # времени: тот же цикл — повтор, сколько бы часов ни прошло. Молчит — идём дальше, как шли
+        # раньше при несработавшем условии C.
+        if vis.get("dirt"):
+            if bike_position.may_advise_wash(_pos):
+                await _hint_send(context, kind="C", bike=bike, state=bike_position.hint_state(_pos),
+                                 chat_id=chat_id, topic_id=topic_id, text=msg_dirty_care(bike),
+                                 repeat_h=float("inf"))
+                return
+            log.info(f"  → совет C молчит: положение "
+                     f"{(_pos or {}).get('state', bike_position.UNKNOWN)} "
+                     f"({(_pos or {}).get('why', 'не посчитано')}) · байк={bike or '—'}")
+    elif vis.get("dirt") and not _service_ctx and not _ho_ctx and not _cap_service:
         # ЗАМОК ПОВТОРОВ (вид C). Состояние = вердикт vision о грязи. Пока байк числится
         # грязным, состояние не меняется — совет «помыть» второй раз за сутки ничего не
         # сообщает; помыли (dirt отпал) — ветка не срабатывает вовсе, замок тут ни при чём.

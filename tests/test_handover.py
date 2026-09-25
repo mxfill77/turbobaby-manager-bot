@@ -64,9 +64,16 @@ def test_handover_suppresses_dirt():
     assert not any("помыть" in s or "чехл" in s for s in SENDS), f"на выдаче совет ухода должен молчать: {SENDS}"
 
 def test_dirt_fires_without_handover():
+    # Предмет — прежнее правило C (по картинке, вне выдачи): ручка положения байка (25.09.2026)
+    # выключена на время случая. С включённой совет звучит только на возврате — близнецы в
+    # tests/test_bike_position.py (там «стоит на парковке» без возврата — молчание).
     reset(); b = FakeBridge(status="ДОМА")
-    run(S._handle_servicing(Msg("стоит на парковке", photo=True), Ctx(), b,
-                            FakeClaude({"type": "none"}, vis={"dirt": True})))
+    prev_pos = os.environ.get("BIKE_POSITION"); os.environ["BIKE_POSITION"] = "0"
+    try:
+        run(S._handle_servicing(Msg("стоит на парковке", photo=True), Ctx(), b,
+                                FakeClaude({"type": "none"}, vis={"dirt": True})))
+    finally:
+        os.environ["BIKE_POSITION"] = prev_pos if prev_pos is not None else "1"
     assert any("помыть" in s or "чехл" in s for s in SENDS), "вне выдачи грязь-совет должен сработать"
 
 # ---- ЧИСТАЯ выдача (байк ДОМА, без handback-сигнала) НЕ заводит closing ----

@@ -301,12 +301,20 @@ def test_album_before_the_fix_was_one_word_not_nine():
 
 def test_dirty_advice_repeat_does_not_turn_into_a_floor_word():
     """Живой случай 23.09: совет «помыть» подавлен замком повторов → пол говорил «вижу байк
-    целиком, напиши о чём». Теперь: совет один раз, повтор — тишина."""
+    целиком, напиши о чём». Теперь: совет один раз, повтор — тишина.
+    Предмет — прежнее правило C (по картинке): ручка положения байка (25.09.2026) выключена на
+    время случая. С включённой совет зависит от положения — близнецы в `tests/test_bike_position.py`
+    (там же: молчащий совет не превращается в слово пола)."""
     _fresh_hints()
     v = {"kind": "bike", "dirt": True}
     own = TOPIC + 101        # своя тема: открытый вопрос о пробеге соседнего случая глушит совет
-    first, _, _ = _run(_Msg(photo=True, mid=801, topic=own), _Claude(vision=[v]))
-    second, _, _ = _run(_Msg(photo=True, mid=802, topic=own), _Claude(vision=[v]))
+    prev_pos = os.environ.get("BIKE_POSITION")
+    os.environ["BIKE_POSITION"] = "0"
+    try:
+        first, _, _ = _run(_Msg(photo=True, mid=801, topic=own), _Claude(vision=[v]))
+        second, _, _ = _run(_Msg(photo=True, mid=802, topic=own), _Claude(vision=[v]))
+    finally:
+        os.environ["BIKE_POSITION"] = prev_pos if prev_pos is not None else "1"
     assert len(first) == 1 and "🧽" in first[0]["text"], _texts(first)
     assert second == [], _texts(second)
 

@@ -142,10 +142,14 @@ class _Claude:
         return v if isinstance(v, str) else json.dumps(v)
 
 
-def _run(msg, claude, *, album=None, knob="1", bridge=None, bike=BIKE):
-    """Прогнать ЖИВОЙ `splinter.handle`. Возврат (отправленное, вызовы моста, разборщик)."""
+def _run(msg, claude, *, album=None, knob="1", bridge=None, bike=BIKE, position="1"):
+    """Прогнать ЖИВОЙ `splinter.handle`. Возврат (отправленное, вызовы моста, разборщик).
+    `position` — ручка `BIKE_POSITION` (25.09.2026): случаи, чей предмет — прежнее правило «совет C
+    по картинке», гоняются с `position="0"`; новое правило судит `tests/test_bike_position.py`."""
     prev = os.environ.get("CAPTION_INTAKE")
+    prev_pos = os.environ.get("BIKE_POSITION")
     os.environ["CAPTION_INTAKE"] = knob
+    os.environ["BIKE_POSITION"] = position
     ctx, br = _Ctx(), (bridge or _Bridge())
     saved = (S.bike_from_topic, S._download_photo)
     S.bike_from_topic = lambda *a, **k: bike          # тема = байк, без обращения к миру
@@ -159,6 +163,7 @@ def _run(msg, claude, *, album=None, knob="1", bridge=None, bike=BIKE):
     finally:
         S.bike_from_topic, S._download_photo = saved
         os.environ["CAPTION_INTAKE"] = prev if prev is not None else "1"
+        os.environ["BIKE_POSITION"] = prev_pos if prev_pos is not None else "1"
     return ctx.bot.sent, br.calls, claude
 
 
@@ -386,18 +391,22 @@ def test_directive_as_plain_text_without_photo_is_not_this_path():
 
 
 def test_dirty_photo_without_caption_still_gets_c():
-    on, _, _ = _run(_Msg(photo=True), _Claude(None, vision=[{"kind": "bike", "dirt": True}]))
-    off, _, _ = _run(_Msg(photo=True), _Claude(None, vision=[{"kind": "bike", "dirt": True}]), knob="0")
+    # Предмет — прежнее правило C (по картинке): ручка положения выключена. С 25.09 при включённой
+    # совет зависит от положения байка — близнец в `tests/test_bike_position.py`.
+    on, _, _ = _run(_Msg(photo=True), _Claude(None, vision=[{"kind": "bike", "dirt": True}]), position="0")
+    off, _, _ = _run(_Msg(photo=True), _Claude(None, vision=[{"kind": "bike", "dirt": True}]), knob="0",
+                     position="0")
     assert len(on) == 1 and "🧽" in on[0]["text"], _texts(on)
     assert _texts(on) == _texts(off)
 
 
 def test_dirty_photo_with_neutral_caption_still_gets_c():
     """Подпись без сервисного смысла — не сервис-контекст: совет про мойку и чехол на стоянке
-    по делу (близнец `test_handover.test_dirt_fires_without_handover`)."""
+    по делу (близнец `test_handover.test_dirt_fires_without_handover`). Предмет — прежнее правило
+    C, ручка положения выключена; на возврате то же проверяет `tests/test_bike_position.py`."""
     for cap in ("ok", "👍", "@someone_else", "стоит на парковке", "nice weather today"):
         sent, _, _ = _run(_Msg(photo=True, caption=cap),
-                          _Claude(CHAT, vision=[{"kind": "bike", "dirt": True}]))
+                          _Claude(CHAT, vision=[{"kind": "bike", "dirt": True}]), position="0")
         assert len(sent) == 1 and "🧽" in sent[0]["text"], (cap, _texts(sent))
 
 
@@ -423,9 +432,10 @@ def test_directive_on_dashboard_with_mileage_keeps_its_own_path():
 #  (4) РУЧКА ОТКАТА
 # ============================================================================================
 def test_knob_off_returns_the_old_path_on_12105():
-    """`CAPTION_INTAKE=0` → как было 24.09 07:09: совет C, заявки нет, подписи в строке нет."""
+    """`CAPTION_INTAKE=0` → как было 24.09 07:09: совет C, заявки нет, подписи в строке нет.
+    «Как было 24.09» — это и без положения байка (25.09): обе ручки выключены."""
     sent, calls, _ = _run(_Msg(photo=True, caption="Need to change"),
-                          _Claude(None, vision=[V12105]), knob="0")
+                          _Claude(None, vision=[V12105]), knob="0", position="0")
     assert _texts(sent) == [S.msg_dirty_care(BIKE)], _texts(sent)
     assert not _zayavki(calls)
     rows = _event_rows(calls)
