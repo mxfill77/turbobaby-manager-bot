@@ -48,6 +48,7 @@ import odo_lower
 import batch_odo     # работы на другом пробеге: третий исход карточки подтверждения работ       # понижение пробега: расхождение ЧИСЛОМ + причина + письменное пояснение
 import reply_floor     # пол ответа: бот не молчит и не отказывает глухо (правила владельца 23.08)
 import work_intent     # приём работ: вопрос о работе — не заявка на неё (повод 22.08, ADV 350 372)
+import addressee       # пол: ответ на сообщение бота с другим адресатом — не обращение (26.09)
 import caption_intent  # подпись к фото: короткое указание — заявка, а не совет помыть (24.09, XADV 2478)
 import bike_position   # положение байка: совет C и фраза о депозите в J — только на возврате (25.09)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
@@ -128,6 +129,15 @@ def _floor_quiet_on():
     """Ручка «пол говорит по делу» (24.09.2026). `FLOOR_QUIET=0` → пол говорит на всё, как
     говорил с 23.08, байт-в-байт: решение `reply_floor.should_speak` не спрашивается вовсе."""
     return str(_os_env("FLOOR_QUIET", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _talk_stage_on():
+    """Ручка «в теме байка Splinter молчит, когда люди говорят между собой» (26.09.2026, задание
+    Штаба 0041-74j). `TALK_STAGE=0` → путь байт-в-байт прежний (744619b): согласие читается как
+    отписка, ответ на сообщение бота — обращение при любом адресате, «масло» — моторное по
+    подстроке, пол на замечание говорит «не понял». Решения — `work_intent` (исход AGREE),
+    `addressee.other`, `reply_floor.should_speak`; руки — здесь."""
+    return str(_os_env("TALK_STAGE", "1")).strip() not in ("0", "", "нет", "no", "off")
 
 
 def _work_intent_on():
@@ -1390,6 +1400,38 @@ def _addressed_bot(msg, context) -> bool:
     return False
 
 
+def _floor_addressee(msg, context):
+    """Для ПОЛА (26.09.2026): (обратились ли к боту, другой адресат — строкой или ""). Не бросает.
+
+    Тег бота — прямое обращение всегда. Ответ на СЛУЖЕБНОЕ сообщение создания темы ответом не
+    является (Telegram кладёт его в `reply_to_message` каждому сообщению темы). Ответ на
+    сообщение бота — обращение, если в тексте нет ДРУГОГО адресата (`addressee.other`). Прочие
+    места (`_is_explicit_status_query` рядом) судят прежним `_addressed_bot` — их не трогаем."""
+    if _bot_mentioned(msg, context):
+        return True, ""
+    r = getattr(msg, "reply_to_message", None)
+    if r is None or getattr(r, "forum_topic_created", None):
+        return False, ""
+    if not _addressed_bot(msg, context):
+        return False, ""
+    try:
+        uname = (context.bot.username or "")
+    except Exception:
+        uname = ""
+    human = False
+    try:
+        for ent in (getattr(msg, "entities", None) or getattr(msg, "caption_entities", None) or []):
+            u = getattr(ent, "user", None)
+            if str(getattr(ent, "type", "")).endswith("text_mention") and u is not None \
+                    and not getattr(u, "is_bot", False):
+                human = True
+    except Exception:
+        human = False
+    text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+    return True, addressee.other(text, bot_names=(uname, "turbobaby_manager_bot"),
+                                 mentions_human=human)
+
+
 # Анти-спам карточки байка (пакет Б): не слать ту же карточку чаще раза в окно на тему.
 _CARD_LAST = {}            # (chat_id, topic_id) -> ts последней отправленной карточки
 _CARD_COOLDOWN = 180       # сек
@@ -1900,6 +1942,39 @@ def _is_oil_context(text, vis):
     """True если речь/фото про замену масла (по словам в тексте/подписи и vis.notes)."""
     blob = ((text or "") + " " + str((vis or {}).get("notes", ""))).lower()
     return any(kw in blob for kw in _OIL_KEYWORDS)
+
+
+#: НЕ МОТОРНОЕ масло (26.09.2026): вилка, амортизатор, тормоз — узел рядом со словом масла. Такое
+#: масло запись ТО Oil не запускает. Судится СОСЕДСТВО (узел сразу при масле), а не «слово где-то в
+#: тексте»: «колодки тормозные и масло» — моторное масло рядом с колодками, не тормозное.
+_NON_MOTOR_OIL_RE = (
+    r"масл\w*\s+(?:(?:в|во|для|из|у)\s+)?(?:передн\w*\s+|задн\w*\s+)?(?:вилк|амортиз|тормоз|перьев)"
+    r"|(?:вилочн|амортизаторн|тормозн)\w*\s+масл"
+    r"|(?:fork|shock|brake|suspension)\s+oil|oil\s+(?:in|for|of)\s+(?:the\s+)?(?:fork|shock|brake)"
+    r"|น้ำมัน\s*(?:โช๊ค|โช้ค|โช็ค|โช้ก|ช็อค|เบรก|เบรค)"
+)
+_NON_MOTOR_NODES = ("вилк", "fork", "амортиз", "shock", "โช๊ค", "โช้ค", "โช็ค", "ช็อค",
+                    "тормоз", "brake", "เบรก", "เบรค")
+
+
+def _oil_motor_words():
+    """Словарь МОТОРНОГО масла — словарь фикса A (`_SP_TEXT_KINDS`, три языка). Один источник."""
+    return dict(_SP_TEXT_KINDS).get("oil", ())
+
+
+def _oil_motor_explicit(text, vis):
+    """Моторное масло названо ЯВНО (словарь фикса A) в тексте или заметке снимка? Узел не-моторного
+    масла без моторного слова — нет. Слово «масло» само по себе — нет (правило Штаба 26.09)."""
+    blob = ((text or "") + " " + str((vis or {}).get("notes", ""))).lower()
+    return any(kw in blob for kw in _oil_motor_words())
+
+
+def _oil_non_motor(s):
+    """Масло здесь НЕ моторное (вилка/амортизатор/тормоз при масле) и моторное не названо?"""
+    low = str(s or "").lower()
+    if any(kw in low for kw in _oil_motor_words()):
+        return False
+    return bool(_re_pl.search(_NON_MOTOR_OIL_RE, low))
 
 
 # Слова «замена ВЫПОЛНЕНА» (прошедшее время/факт) — НЕ будущее «надо заменить».
@@ -5067,6 +5142,10 @@ def _classify_work(w):
         return "gear"               # ЗАМЕНА МАСЛА редуктора → кол.J (узел + предмет, оба)
     if "вилк" in s or "fork" in s:
         return "info"               # масло вилки — столбца нет → события
+    if (_talk_stage_on() and any(k in s for k in ("масл", "oil", "น้ำมัน"))
+            and any(k in s for k in _NON_MOTOR_NODES)
+            and not any(k in s for k in _oil_motor_words())):
+        return "info"               # 26.09.2026: масло амортизатора/тормоза — не моторное, события
     if any(k in s for k in ("масл", "oil", "น้ำมัน")):
         return "oil"                # моторное масло → кол.I
     return "info"                   # колодки/цепь/прочее → события
@@ -8067,6 +8146,8 @@ def _declared_kinds(text, works, vis, strict_oil=False):
     _oil_repl = any(v in blob for v in ("замен", "помен", "сменил", "залил", "เปลี่ยน"))
     # strict (факт/done): нужен и глагол замены; intake/заявка: достаточно явного слова масла.
     _oil_ok = bool(_oil_word) and (_oil_repl if strict_oil else True)
+    if _oil_ok and _talk_stage_on() and _oil_non_motor(blob):
+        _oil_ok = False    # 26.09.2026: масло вилки/амортизатора/тормоза — не ТО Oil (кол.I)
     if _oil_ok and "oil" not in out:
         add("oil")
     return out
@@ -9454,13 +9535,23 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # и держим на ОБЕИХ дверях заявки (фаза 1 ниже и группа B дальше) — двум определениям
     # намерения разойтись негде. Решение чистое (`work_intent`), руки здесь.
     _intent = {"state": work_intent.CLAIM, "why": "гейт намерения выключен", "clause": "", "n": 0}
+    _talk = _talk_stage_on()
     if _work_intent_on() and works:
         try:
-            _intent = work_intent.verdict(text, works)
+            _intent = work_intent.verdict(text, works, plan=_talk)
         except Exception:
             # FAIL-SAFE В СТОРОНУ ПРЕЖНЕГО ПУТИ: разбор упал → заявка заводится, как заводилась.
             log.exception("  → намерение: разбор слов упал (fail-safe: считаем утверждением)")
             _intent = {"state": work_intent.CLAIM, "why": "разбор упал", "clause": "", "n": 0}
+    if _talk and _intent["state"] == work_intent.AGREE:
+        # СОГЛАСИЕ — НЕ ФАКТ РАБОТ (26.09.2026, правило Штаба). 26.09 09:51 согласие владельца на
+        # цену дало «принял работы: подшипники, пришли пробег» и строку журнала принятых работ.
+        # Ход за людьми: ни «принял работы», ни просьбы пробега, ни записи — только след в журнале
+        # процесса. Пол тоже молчит: свидетель разбора называет это разговором людей.
+        log.info(f"  → намерение: СОГЛАСИЕ/ПЛАН ({_intent['why']}) клауза={_intent['clause']!r} "
+                 f"works={works} — не факт работ: не отвечаю и ничего не записываю ({bike or '?'})")
+        _PARSE_SEEN.set(reply_floor.PARSE_PEOPLE)
+        return
     _intent_claim = (_intent["state"] == work_intent.CLAIM)
     if not _intent_claim:
         log.info(f"  → намерение: {_intent['state']} ({_intent['why']}) "
@@ -9777,7 +9868,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # (damage уже отработан выше и сделал return — повреждение приоритетнее.)
     # Ничего в ТО не пишем, число не выдумываем. Анти-спам: буфер high-пробега + троттлинг.
     no_clear_km = (not mileage) or str(vis.get("mileage_confidence", "")) == "low"
-    if _is_oil_context(text, vis) and no_clear_km and _should_ask_odometer(chat_id, topic_id):
+    # A1 СУДИТ МОТОРНОЕ МАСЛО, А НЕ ПОДСТРОКУ (26.09.2026): «масло» само по себе не моторное —
+    # 26.09 05:29 диагноз мастера со словом масла родил «масло + фото пробега». При ручке
+    # `TALK_STAGE` дверь открывает только явное моторное (словарь фикса A, три языка).
+    _a1_oil = (_oil_motor_explicit(text, vis) if _talk_stage_on() else _is_oil_context(text, vis))
+    if _a1_oil and no_clear_km and _should_ask_odometer(chat_id, topic_id):
         # ЗАМОК ПОВТОРОВ (вид A1). Состояние = «просим одометр под масло, чёткого пробега нет».
         # Пришёл пробег — ветка не срабатывает вовсе; не пришёл — просить второй раз за сутки
         # нечего. Кулдаун 10 мин (`_should_ask_odometer`) НЕ тронут и стоит выше.
@@ -10445,11 +10540,19 @@ async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
         _pk = ""                      # свидетеля нет → «вид не узнан», а не «это приборка»
     # ПО ДЕЛУ, А НЕ НА ВСЁ (24.09.2026). Решает `reply_floor.should_speak`, здесь только факты;
     # молчание — лишь при положительном знании «не запись», любой сбой решения = речь, как была.
+    _talk = _talk_stage_on()
+    _seen = ""
     if _floor_quiet_on():
+        _other = ""
         try:
-            _addr = _addressed_bot(msg, context)
+            if _talk:
+                # РАЗГОВОР ЛЮДЕЙ (26.09.2026): ответ на сообщение бота с другим адресатом
+                # обращением к боту не считается; прямое обращение — как было.
+                _addr, _other = _floor_addressee(msg, context)
+            else:
+                _addr = _addressed_bot(msg, context)
         except Exception:
-            _addr = False
+            _addr, _other = False, ""
         try:
             _seen = _PARSE_SEEN.get()
         except Exception:
@@ -10458,6 +10561,7 @@ async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
             _q = reply_floor.should_speak({
                 "crashed": bool(crashed),
                 "addressed": bool(_addr),
+                "other": _other,
                 "photo": bool(getattr(msg, "photo", None)),
                 "photo_kind": _pk,
                 "parse": _seen,
@@ -10468,12 +10572,15 @@ async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
         if not _q.get("speak", True):
             log.info(f"  → ПОЛ ОТВЕТА: молчу по делу ({_q.get('why')}) — тема={topic_id}")
             return False
-    say = reply_floor.fallback({
+    _ff = {
         "bike": bike,
         "crashed": bool(crashed),
         "photo": bool(getattr(msg, "photo", None)),
         "photo_kind": _pk,
-    })
+    }
+    if _talk and _seen:
+        _ff["parse"] = _seen          # событие → правда «понял как замечание», а не «не понял»
+    say = reply_floor.fallback(_ff)
     log.info(f"  → ПОЛ ОТВЕТА: заход промолчал (исход {say['state']}, упал={bool(crashed)}, "
              f"вид снимка={_pk or '—'}) — отвечаю сам, тема={topic_id}")
     try:
