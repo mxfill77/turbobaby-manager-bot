@@ -399,6 +399,14 @@ def test_non_motor_oil_is_not_oil_kind():
     assert S._oil_motor_explicit("น้ำมันเครื่องดำ", {})
 
 
+def test_declared_kinds_skip_non_motor_oil():
+    """Свободный текст «заменил масло в амортизаторах» вида oil (кол.I) не даёт; моторное — даёт."""
+    assert "oil" not in S._declared_kinds("заменил масло в амортизаторах", [], {}, strict_oil=True)
+    assert "oil" not in S._declared_kinds("залил тормозное масло", [], {}, strict_oil=True)
+    assert "oil" in S._declared_kinds("заменил моторное масло", [], {}, strict_oil=True)
+    assert "oil" in S._declared_kinds("заменил масло", [], {}, strict_oil=True)
+
+
 def test_addressee_keeps_its_single_import():
     src = open(os.path.join(ROOT, "addressee.py"), encoding="utf-8").read()
     mods = set()
