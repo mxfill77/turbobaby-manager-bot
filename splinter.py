@@ -2460,17 +2460,17 @@ _ODO_WHY_LABEL = {                    # почему пробег НЕ ИЗМЕ�
 }
 
 
-def _mand_line(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN, last_date=None, today=None):
+def _mand_line_due(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN, last_date=None, today=None):
     """Строка вида ТО со СРОКОМ «км или полгода, что раньше» (27.09.2026, 0054-74w, `service_due`).
 
-    Ручка `SERVICE_DUE=0` → `_mand_line_km` байт-в-байт. Иначе поверх строки километража:
+    Ручка `SERVICE_DUE=0` → `_mand_line` байт-в-байт. Иначе поверх строки километража:
       • первая проверка (подшипники без записи): пробег дошёл до 20000 → «пора», нет → «ещё N км
         до первой проверки», пробег не прочитан → «не измерено»;
       • полгода от даты последней замены прошли → «пора по сроку», даже при малом пробеге (км
         просрочку не смягчаем: громкая строка остаётся громкой);
       • даты нет → «по времени: не измерено», а НЕ «просрочено»."""
     if interval is None or not _service_due_on():
-        return _mand_line_km(kind, last, interval, cur, cur_src)
+        return _mand_line(kind, last, interval, cur, cur_src)
     v = service_due.verdict(kind, last, interval, cur, last_date=last_date, today=today)
     th_lbl, ru_lbl = _MAND_LABEL.get(kind, (str(kind), str(kind)))
     if v["first"]:
@@ -2483,7 +2483,7 @@ def _mand_line(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN, last
                     f"{ru_lbl} — ещё <b>{v['rem']}</b> км до первой проверки ({nxt})")
         return (f"{th_lbl} — ⚠️ <b>ถึงเวลาเปลี่ยน/ตรวจแล้ว</b> (ครั้งแรกที่ {nxt} กม., ยังไม่มีบันทึก)",
                 f"{ru_lbl} — ⚠️ <b>пора: к замене</b> (первая проверка на {nxt} км, записи нет)")
-    base = _mand_line_km(kind, last, interval, cur, cur_src)
+    base = _mand_line(kind, last, interval, cur, cur_src)
     if base is None or v["km"] == service_due.KM_NEVER or today is None:
         return base          # «сегодня» не принесли — ось времени не судит (прямые вызовы прежние)
     tth, tru = service_due.time_words(v)
@@ -2493,7 +2493,7 @@ def _mand_line(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN, last
     return (f"{base[0]} · {tth}", f"{base[1]} · {tru}")
 
 
-def _mand_line_km(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN):
+def _mand_line(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN):
     """Строка обязательного вида ТО (HTML, БЕЗ отступа — компактно): (th, ru) ИЛИ None (gear на мото). ОДИН
     статус-маркер; важное (просрочено/не делалось/остаток) — <b>. Данные те же — только формат.
 
@@ -2632,7 +2632,7 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
             m = by_kind.get(kind)
             if not m:
                 continue
-            line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km, cur_km_source,
+            line = _mand_line_due(kind, m.get("last"), m.get("interval"), cur_km, cur_km_source,
                               last_date=m.get("date"), today=m.get("today"))
             if line:
                 to_th.append(line[0]); to_ru.append(line[1])

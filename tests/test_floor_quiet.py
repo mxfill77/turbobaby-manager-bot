@@ -31,6 +31,7 @@ os.environ["NEVER_SILENT"] = "1"        # боевые дефолты ЯВНО: 
 os.environ["FLOOR_QUIET"] = "1"
 os.environ["WORK_INTENT"] = "1"
 os.environ["ACT_GATE"] = "0"   # 27.09 (0055-74x): предмет сьюта — прежнее определение двери; ворота судит tests/test_act_gate.py
+os.environ["RECEIPT_READ"] = "0"   # 27.09 (0054-74w): снимок чека здесь — «названный снимок, пол молчит»; чек теперь говорит сам, судит tests/test_chastb.py
 _TMP = tempfile.mkdtemp(prefix="tb_floor_quiet_")
 os.environ["HINT_DEDUP_STATE"] = os.path.join(_TMP, "hint.json")
 os.environ["WORKS_PERSIST_STATE"] = os.path.join(_TMP, "works.json")

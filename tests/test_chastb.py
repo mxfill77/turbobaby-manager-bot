@@ -289,7 +289,7 @@ def test_mand_line_without_today_is_byte_for_byte_old():
     for args in (("oil", 19000, 4000, 19500, park_verdict.SRC_OWN),
                  ("airfilter", 0, 20000, 30000, park_verdict.SRC_OWN),
                  ("abs", 5000, 10000, 16000, park_verdict.SRC_FALLBACK)):
-        assert S._mand_line(*args) == S._mand_line_km(*args), args
+        assert S._mand_line_due(*args) == S._mand_line(*args), args
 
 
 def test_pure_imports():
