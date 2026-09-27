@@ -2,6 +2,7 @@
 import os, sys, json, asyncio, datetime
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL","http://x"); os.environ.setdefault("BRIDGE_TOKEN","x")
+import os as _os_ag; _os_ag.environ["ACT_GATE"] = "0"   # 27.09 (0055-74x): предмет сьюта — прежнее определение двери; ворота судит tests/test_act_gate.py
 import splinter as S
 
 CHAT=-1002751134848; TOPIC=77

@@ -9,6 +9,7 @@ os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_T
 # при этом остаётся предметом проверки и не тронут). Изоляция принудительная — иначе флаг
 # приезжает из боевого .env процесса. Приём тот же, что у CURATOR / PLAN_ADAPT / CARD_DUTY.
 os.environ["HINTS_DEDUP"] = "0"
+import os as _os_ag; _os_ag.environ["ACT_GATE"] = "0"   # 27.09 (0055-74x): предмет сьюта — прежнее определение двери; ворота судит tests/test_act_gate.py
 import splinter as S
 
 CHAT = -1002751134848

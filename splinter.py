@@ -4741,6 +4741,7 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
             _cur = []
             if prev:
                 _cur.append(int(prev[0]))
+            bridge = bridge if bridge is not None else _ACT_BRIDGE.get(None)
             if bridge is not None and bike:
                 _c2 = _odo_current(bridge, bike)
                 if _c2 not in (None, ""):
@@ -4871,7 +4872,7 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     oil_hint = pend[3] if len(pend) > 3 else False   # подсказка «был маркер замены»
     t = (text or "").strip().lower()
     m = _re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", ""))
-    if t in _CONFIRM_YES and _act_gate_on() and not (_is_trusted(msg) or _is_owner(msg)):
+    if t in _CONFIRM_YES and _act_gate_on() and not _act_trusted(msg):
         # «ДА» НА ПРОБЕГ — ТОЛЬКО ОТ ДОВЕРЕННОГО (27.09.2026, #91 SPLINTERCHEK2709): «да» любого
         # записывало число, прочитанное зрением без контекста. Вопрос остаётся висеть.
         _u = getattr(getattr(msg, "from_user", None), "username", "") or "?"
@@ -9430,6 +9431,17 @@ def _pos_note(notes, seg):
 # Решение — чистое `act_gate.verdict`; здесь лента темы, адресат, вопрос с кнопками и повтор двери
 # по «да». Лента и ожидания живут в ПАМЯТИ процесса (рестарт их снимает — кнопка тогда честно
 # говорит «устарело», а не действует по догадке).
+_ACT_BRIDGE = _ctxvars.ContextVar("splinter_act_bridge")   # мост для сверки показания (только чтение)
+
+
+def _act_trusted(msg):
+    """Доверенный автор (Пым/владелец). Сообщение без автора — не доверенный. Не бросает."""
+    try:
+        return bool(getattr(msg, "from_user", None)) and (_is_trusted(msg) or _is_owner(msg))
+    except Exception:
+        return False
+
+
 _TOPIC_FEED = {}           # (chat_id, topic_id) -> [ {ts, author, tags, works} ] — последние 20
 _TOPIC_FEED_MAX = 20
 _ACT_GATE_PENDING = {}     # n -> {msg, photo_msgs, claude, door, bike, author, ts}
@@ -9547,6 +9559,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
     photo_msgs — пачка сообщений-фото (альбом склеен по media_group_id; для одиночного = [msg]).
     Альбом разбираем по каждому фото, но СЛИВАЕМ в один вердикт → один ответ."""
     text = msg.text or msg.caption or ""
+    if _act_gate_on():
+        _ACT_BRIDGE.set(bridge)       # сверка показания вверх читает свой одометр (только чтение)
     if photo_msgs is None:
         photo_msgs = [msg] if msg.photo else []
     has_photo = bool(photo_msgs)
@@ -9763,7 +9777,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
         if parsed.get("mileage") and not _ret_ctx:
             # Возврат выигрывает (деньги и лист закрытия): его число судит своя ветка приёмки.
             _agv = act_gate.verdict({"door": act_gate.DOOR_TEXT_KM, "to_bot": _ag_to_bot,
-                                     "to_human": _ag_other, "trusted": _is_trusted(msg),
+                                     "to_human": _ag_other, "trusted": _act_trusted(msg),
                                      "text": text, "km": parsed.get("mileage"), "bike": bike})
             if _agv["act"] == act_gate.ASK:
                 await _act_gate_ask(context, msg, photo_msgs, claude, door=act_gate.DOOR_TEXT_KM,
@@ -9978,8 +9992,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
         # Пробег с ФОТО приборки → СНАЧАЛА подтверждаем цифру (vision врёт на LCD) + сторож B,
         # затем _after_mileage решит: спросить кнопками или просто квитанция.
         await _ask_mileage_confirm(context, chat_id, topic_id, bike,
-                                   str(vis.get("mileage")), oil_hint=oil_hint,
-                                   bridge=(bridge if _act_gate_on() else None))
+                                   str(vis.get("mileage")), oil_hint=oil_hint)
     elif mileage and _conf_ok:
         # Пробег из ТЕКСТА (человек ввёл руками) — доверяем числу, сразу решаем (спросить/квитанция).
         try:
