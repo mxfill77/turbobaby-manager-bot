@@ -29,6 +29,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # дерево, которое судим
 sys.path.insert(0, ROOT)
+os.environ["ACT_GATE"] = "0"   # 27.09 (0055-74x): предмет сьюта — прежнее определение двери; ворота судит tests/test_act_gate.py
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["NEVER_SILENT"] = "1"        # боевые дефолты ЯВНО: сьют не зависит от файла настроек

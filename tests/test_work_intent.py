@@ -33,6 +33,7 @@ sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
 os.environ["WORK_INTENT"] = "1"          # боевой дефолт ЯВНО: сьют не зависит от .env машины
+os.environ["ACT_GATE"] = "0"   # 27.09 (0055-74x): предмет сьюта — прежнее определение двери; ворота судит tests/test_act_gate.py
 os.environ["NEVER_SILENT"] = "1"
 # Память замка подсказок — во ВРЕМЕННЫЙ файл: боевое состояние прогоном не трогается.
 os.environ["HINT_DEDUP_STATE"] = os.path.join(tempfile.mkdtemp(prefix="tb_intent_"), "seen.json")

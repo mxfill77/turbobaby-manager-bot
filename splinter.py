@@ -51,6 +51,7 @@ import work_intent     # приём работ: вопрос о работе —
 import addressee       # пол: ответ на сообщение бота с другим адресатом — не обращение (26.09)
 import caption_intent  # подпись к фото: короткое указание — заявка, а не совет помыть (24.09, XADV 2478)
 import bike_position   # положение байка: совет C и фраза о депозите в J — только на возврате (25.09)
+import act_gate        # одно место перед действием: адресат, лента темы, переспрос до «да» (27.09)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
@@ -157,6 +158,13 @@ def _bike_position_on():
     байт-в-байт прежний: снимок разбирается прежним промптом, положение не считается, мойка не
     пишется, совет C и тревога J — как были. Решение — `bike_position.position`, руки — `_pos_*`."""
     return str(_os_env("BIKE_POSITION", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _act_gate_on():
+    """Ручка «одно место перед действием» (27.09.2026, правило владельца, задание Штаба 0055-74x).
+    `ACT_GATE=0` → путь байт-в-байт 09587d9: двери действуют по одному сообщению, J зовёт Пыма
+    зашитым тегом, «да» на пробег принимается от любого. Решение — `act_gate`, руки — `_act_gate_*`."""
+    return str(_os_env("ACT_GATE", "1")).strip() not in ("0", "", "нет", "no", "off")
 
 
 def _pos_service_h():
@@ -4708,7 +4716,7 @@ async def _batch_odo_commit(context, bridge, chat_id, topic_id, pend, who):
     return written, failed
 
 
-async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hint=False):
+async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hint=False, bridge=None):
     """Спросить подтверждение распознанного с фото пробега + поставить pending/awaiting.
     Фикс B (сторож пробега): если распознанное число МЕНЬШЕ последнего известного по теме —
     это ошибка vision (одометр не убывает). Тогда вместо «верно?» шлём флаг и НЕ пишем в ТО
@@ -4724,6 +4732,43 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
         prev = last_mileage_in_topic(chat_id, topic_id, exclude_km=new_km)
         if prev and new_km < prev[0]:
             floor = prev[0]
+
+    # ПОКАЗАНИЕ СВЕРЯЕТСЯ С ПОСЛЕДНИМ В ОБЕ СТОРОНЫ (27.09.2026, #91 SPLINTERCHEK2709). Вниз его
+    # держал floor, вверх — никто на этой двери: 198864 при байке на 19 тысячах ушло «верно?» с
+    # кнопкой. Неправдоподобное число называется расхождением и вероятным числом, кнопки «Да» нет.
+    if _act_gate_on() and new_km is not None and floor is None:
+        try:
+            _cur = []
+            if prev:
+                _cur.append(int(prev[0]))
+            if bridge is not None and bike:
+                _c2 = _odo_current(bridge, bike)
+                if _c2 not in (None, ""):
+                    _cur.append(int(str(_c2).replace(" ", "").replace(",", "")))
+            _lim = _odo_ceiling_limit()
+            if _cur and _lim:
+                _cv = odo_ceiling.verdict(new_km, max(_cur), _lim)
+                if _cv["state"] == odo_ceiling.STATE_ASK:
+                    _cand = act_gate.odo_candidate(new_km, _cv["cur"], _lim)
+                    log.warning(f"  🔒 показание с фото {new_km} против последнего {_cv['cur']}: "
+                                f"+{_cv['gap']} км > {_lim} — вероятно {_cand or '?'} ({bike or '?'})")
+                    if _cand:
+                        _PENDING_MILEAGE[(chat_id, topic_id)] = (str(_cand), bike or "", None,
+                                                                 bool(oil_hint), _time.time())
+                        mark_awaiting(chat_id, topic_id)
+                    _p_ru = (f" Вероятно {_cand} км? «Да» — от Пыма или владельца, или пришли верное число"
+                             if _cand else " Пришли верное число или чёткое фото одометра")
+                    _p_th = (f" น่าจะเป็น {_cand} กม.? หรือส่งเลขที่ถูกต้อง" if _cand
+                             else " ส่งเลขที่ถูกต้องหรือรูปเลขไมล์ชัดๆ")
+                    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                                text=(f"🐀 Splinter\n"
+                                      f"🇹🇭 อ่านได้ {mileage} กม. แต่ล่าสุด {_cv['cur']} กม. "
+                                      f"ต่างกัน {_cv['gap']} กม. — ไม่น่าเป็นไปได้.{_p_th} 🙏\n"
+                                      f"🇷🇺 📟 Вижу {mileage} км, а последний известный {_cv['cur']} км: "
+                                      f"разница {_cv['gap']} км неправдоподобна.{_p_ru} 🙏"))
+                    return
+        except Exception:
+            log.exception("  → сверка показания вверх не удалась (fail-safe: вопрос «верно?», как был)")
 
     # ts (5-й элемент) — предел жизни вопроса, класс-фикс 4957 корень 5.
     _PENDING_MILEAGE[(chat_id, topic_id)] = (str(mileage), bike or "", floor, bool(oil_hint),
@@ -4826,6 +4871,16 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     oil_hint = pend[3] if len(pend) > 3 else False   # подсказка «был маркер замены»
     t = (text or "").strip().lower()
     m = _re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", ""))
+    if t in _CONFIRM_YES and _act_gate_on() and not (_is_trusted(msg) or _is_owner(msg)):
+        # «ДА» НА ПРОБЕГ — ТОЛЬКО ОТ ДОВЕРЕННОГО (27.09.2026, #91 SPLINTERCHEK2709): «да» любого
+        # записывало число, прочитанное зрением без контекста. Вопрос остаётся висеть.
+        _u = getattr(getattr(msg, "from_user", None), "username", "") or "?"
+        log.info(f"  → «да» на пробег {mileage} от @{_u} не принят: не доверенный (вопрос висит)")
+        await _send(context, chat_id=msg.chat_id, message_thread_id=key[1],
+                    text=("🐀 Splinter\n"
+                          f"🇹🇭 เลขไมล์ {mileage} ต้องให้ Pym หรือเจ้าของยืนยันครับ 🙏\n"
+                          f"🇷🇺 Пробег {mileage} подтверждает Пым или владелец — нужно их «да» 🙏"))
+        return True
     if t in _CONFIRM_YES:
         num = mileage
     elif m:
@@ -6150,6 +6205,10 @@ async def handle_service_button(update, context, bridge) -> None:
         # правит живую таблицу без второго вопроса, — и право на это даёт сама карточка.
         await _svc_undo_run(q, context, bridge, token)
         return
+    if action in ("agy", "agm", "agn"):
+        # ВОРОТА (27.09): ответ на «верно ли понял?» — своя память (`_ACT_GATE_PENDING`).
+        await _act_gate_button(q, context, bridge, action, token)
+        return
 
     # МЕТКА СВЕРЯЕТСЯ С МЕСТОМ НАЖАТИЯ (25.08.2026). Адрес операции — чат, тема, байк, пробег —
     # берётся ИЗ МЕТКИ и раньше не сверялся ни с чем: угаданный (или воскресший после рестарта)
@@ -6209,6 +6268,13 @@ async def handle_service_button(update, context, bridge) -> None:
     if action == "mok":
         # [✅ Да] на подтверждение распознанного пробега — эквивалент текстового «да».
         # Сторож B сохранён: если число < floor — не принимаем, шлём msg_mileage_drop.
+        if _act_gate_on() and not (_is_trusted_user(q.from_user) or is_owner_user(q.from_user)):
+            # «ДА» НА ПРОБЕГ — ТОЛЬКО ОТ ДОВЕРЕННОГО (27.09.2026, #91): кнопка живёт.
+            await _btn_answer(q, "Пробег подтверждает Пым или владелец / ให้ Pym หรือเจ้าของยืนยัน",
+                              show_alert=True)
+            log.info(f"  → кнопка «Да» на пробег от @{getattr(q.from_user, 'username', '?')} "
+                     f"не принята: не доверенный (кнопка живёт)")
+            return
         await _btn_answer(q)
         mileage = data.get("mileage", "")
         floor = data.get("floor")
@@ -9360,7 +9426,123 @@ def _pos_note(notes, seg):
     return ((base[:room] + " | ") if base else "") + seg
 
 
-async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
+# === ОДНО МЕСТО ПЕРЕД ДЕЙСТВИЕМ — РУКИ (27.09.2026, правило владельца, задание Штаба 0055-74x) ===
+# Решение — чистое `act_gate.verdict`; здесь лента темы, адресат, вопрос с кнопками и повтор двери
+# по «да». Лента и ожидания живут в ПАМЯТИ процесса (рестарт их снимает — кнопка тогда честно
+# говорит «устарело», а не действует по догадке).
+_TOPIC_FEED = {}           # (chat_id, topic_id) -> [ {ts, author, tags, works} ] — последние 20
+_TOPIC_FEED_MAX = 20
+_ACT_GATE_PENDING = {}     # n -> {msg, photo_msgs, claude, door, bike, author, ts}
+_ACT_GATE_SEQ = [0]
+_ACT_GATE_TTL = 6 * 3600
+
+
+def _act_feed_note(msg, text, works):
+    """Запись ленты темы: кто, кого отметил, какие работы названы (сырой текст + разборщик)."""
+    try:
+        key = (msg.chat_id, getattr(msg, "message_thread_id", None))
+        u = getattr(msg, "from_user", None)
+        uname = (getattr(u, "username", "") or "").lower()
+        tags = addressee.human_tags(text, bot_names=("turbobaby_manager_bot",))
+        ww = act_gate.work_words(text)
+        for w in works or []:
+            if w not in ww:
+                ww.append(str(w))
+        rec = {"ts": _time.time(), "author": uname, "tags": tags, "works": ww}
+        feed = _TOPIC_FEED.setdefault(key, [])
+        feed.append(rec)
+        horizon = _time.time() - _pos_service_h() * 3600
+        _TOPIC_FEED[key] = [r for r in feed if r["ts"] >= horizon][-_TOPIC_FEED_MAX:]
+    except Exception:
+        log.exception("  → лента темы: запись не удалась (fail-safe: без записи)")
+
+
+def _act_addressee(msg, context):
+    """(к боту ли, другой адресат строкой или ""). Тег бота или ответ боту без другого адресата —
+    к боту; тег/упоминание человека — к человеку. Ответ на сообщение человека адресатом не
+    считается (отчёт механика ответом на поручение — ясный факт работы). Не бросает."""
+    try:
+        to_bot, other = _floor_addressee(msg, context)
+        if to_bot and not other:
+            return True, ""
+        if other:
+            return False, other
+        text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+        try:
+            uname = context.bot.username or ""
+        except Exception:
+            uname = ""
+        tags = addressee.human_tags(text, bot_names=(uname, "turbobaby_manager_bot"))
+        if tags:
+            return False, "тег человека @" + tags[0]
+        for ent in (getattr(msg, "entities", None) or getattr(msg, "caption_entities", None) or []):
+            u = getattr(ent, "user", None)
+            if str(getattr(ent, "type", "")).endswith("text_mention") and u is not None \
+                    and not getattr(u, "is_bot", False):
+                return False, "упоминание человека"
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+async def _act_gate_ask(context, msg, photo_msgs, claude, *, door, v, bike):
+    """Одно сообщение RU+TH: что видно, верно ли понято, кто берёт. Кнопки → повтор двери."""
+    _ACT_GATE_SEQ[0] += 1
+    n = _ACT_GATE_SEQ[0]
+    now = _time.time()
+    for k in [k for k, p in _ACT_GATE_PENDING.items() if now - p["ts"] > _ACT_GATE_TTL]:
+        _ACT_GATE_PENDING.pop(k, None)
+    _ACT_GATE_PENDING[n] = {"msg": msg, "photo_msgs": photo_msgs, "claude": claude, "door": door,
+                            "bike": bike, "ts": now,
+                            "author": (getattr(getattr(msg, "from_user", None), "username", "")
+                                       or "").lower()}
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ถูก / Верно", callback_data=f"svc:agy:{n}"),
+         InlineKeyboardButton("🙋 ผมรับ / Беру я", callback_data=f"svc:agm:{n}")],
+        [InlineKeyboardButton("❌ ไม่ใช่ / Не так", callback_data=f"svc:agn:{n}")],
+    ])
+    log.info(f"  → ВОРОТА [{door}] {bike or '?'}: ask ({v['why']}) — действие ждёт «да», метка {n}")
+    _PARSE_SEEN.set(reply_floor.PARSE_STATUS)     # спросили по делу — полу молчать
+    await _send(context, chat_id=msg.chat_id, message_thread_id=getattr(msg, "message_thread_id", None),
+                text=(f"🐀 Splinter\n🇹🇭 {v['see_th']} ถูกต้องไหมครับ? ใครรับงาน?\n"
+                      f"🇷🇺 {v['see_ru']} Кто берёт?"),
+                reply_markup=kb)
+
+
+async def _act_gate_button(q, context, bridge, action, n):
+    """Кнопки ворот: agy/agm — «верно» (agm: берёт нажавший) → повтор двери мимо ворот; agn — ничего."""
+    p = _ACT_GATE_PENDING.get(n)
+    if not p or _time.time() - p["ts"] > _ACT_GATE_TTL:
+        _ACT_GATE_PENDING.pop(n, None)
+        await _btn_answer(q, "Устарело — пришли сообщение ещё раз / หมดอายุ ส่งใหม่นะครับ",
+                          show_alert=True)
+        return
+    u = getattr(q, "from_user", None)
+    uname = (getattr(u, "username", "") or "").lower()
+    trusted = bool(uname and uname in TRUSTED_AUTHORS) or is_owner_user(u)
+    # Число пробегом делает только доверенный; прочее — доверенный или автор сообщения.
+    if not trusted and (p["door"] == act_gate.DOOR_TEXT_KM or uname != p["author"]):
+        await _btn_answer(q, "Подтверждает Пым или владелец / ให้พี่ป๋อมหรือเจ้าของยืนยัน",
+                          show_alert=True)
+        log.info(f"  → ворота метка {n}: «{action}» от @{uname or '?'} не принят (не доверенный)")
+        return
+    _ACT_GATE_PENDING.pop(n, None)
+    await _btn_answer(q)
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if action == "agn":
+        log.info(f"  → ворота метка {n} [{p['door']}]: «не так» от @{uname or '?'} — ничего не делаю")
+        return
+    if action == "agm":
+        log.info(f"  → ворота метка {n} [{p['door']}]: берёт @{uname or '?'}")
+    log.info(f"  → ворота метка {n} [{p['door']}]: «верно» от @{uname or '?'} — дверь действует")
+    await _handle_servicing(p["msg"], context, bridge, p["claude"], p["photo_msgs"],
+                            _gate_ok=p["door"])
+
+
+async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate_ok=None):
     """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения).
     photo_msgs — пачка сообщений-фото (альбом склеен по media_group_id; для одиночного = [msg]).
     Альбом разбираем по каждому фото, но СЛИВАЕМ в один вердикт → один ответ."""
@@ -9452,6 +9634,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
     # Работы из разбора — отдельно от type (техник может перечислить работы, а parse вернуть
     # type≠"event": так и было в кейсе NINJA 6334 09.06 — works был, но в события не записалось и молчали).
     works = [str(w).strip() for w in (parsed.get("works") or []) if w and str(w).strip()]
+    # ЛЕНТА ТЕМЫ (27.09): что сказано в теме — кто, кого отметил, какие работы. Пишется ДО любых
+    # ранних выходов и на повторе по «да» не пишется второй раз.
+    if _act_gate_on() and not _gate_ok and text.strip():
+        _act_feed_note(msg, text, works)
 
     # Диагностика parse (закрываем пробел: раньше результат разбора в лог НЕ писался — кейс
     # «молчание на текст-работ» был невидим в splinter.log). Пишем ДО любых ранних return.
@@ -9557,6 +9743,34 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         log.info(f"  → намерение: {_intent['state']} ({_intent['why']}) "
                  f"клауза={_intent['clause']!r} works={works}")
 
+    # === ВОРОТА: ОДНО МЕСТО ПЕРЕД ДЕЙСТВИЕМ (27.09.2026, правило владельца, ручка ACT_GATE) ===
+    # Стоит ПОСЛЕ всех чтений (разбор, зрение, намерение, возврат/выдача) и ДО первой пишущей двери
+    # (подпись-заявка, фаза 1, инфо-работы, строка событий с км, заявка+I, пробег из текста).
+    # Поручение человеку и число из текста без явной формы — вопрос с кнопками, действие после «да».
+    _ag_to_bot, _ag_other = False, ""
+    if _act_gate_on() and not _gate_ok:
+        _ag_to_bot, _ag_other = _act_addressee(msg, context)
+        if works and not _ret_ctx and _intent_claim:
+            # Вопрос и сомнение (QUESTION/UNCLEAR) ворота не судят: их дверь K сама только
+            # переспрашивает и ничего не пишет.
+            _agv = act_gate.verdict({"door": act_gate.DOOR_WORKS, "to_bot": _ag_to_bot,
+                                     "to_human": _ag_other, "text": text, "works": works,
+                                     "bike": bike})
+            if _agv["act"] == act_gate.ASK:
+                await _act_gate_ask(context, msg, photo_msgs, claude, door=act_gate.DOOR_WORKS,
+                                    v=_agv, bike=bike)
+                return
+        if parsed.get("mileage") and not _ret_ctx:
+            # Возврат выигрывает (деньги и лист закрытия): его число судит своя ветка приёмки.
+            _agv = act_gate.verdict({"door": act_gate.DOOR_TEXT_KM, "to_bot": _ag_to_bot,
+                                     "to_human": _ag_other, "trusted": _is_trusted(msg),
+                                     "text": text, "km": parsed.get("mileage"), "bike": bike})
+            if _agv["act"] == act_gate.ASK:
+                await _act_gate_ask(context, msg, photo_msgs, claude, door=act_gate.DOOR_TEXT_KM,
+                                    v=_agv, bike=bike)
+                return
+            log.info(f"  → ворота [text_km] {bike or '?'}: do ({_agv['why']})")
+
     # === ПОДПИСЬ-УКАЗАНИЕ → ЗАЯВКА (24.09.2026) — раньше фазы 1: вердикт модели по короткой
     # подписи не нужен и не надёжен (живой разбор «Need to change» не дал ничего), а подтверждение
     # у этого пути своё — одна строка «заявка: байк — что». Возврат выигрывает (деньги и закрытие
@@ -9611,6 +9825,30 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         except Exception:
             log.exception("  → положение: не посчитано (fail-safe: совет C молчит, фраза о депозите снята)")
             _pos = None
+    # === ВОРОТА: ФОТО ДЕТАЛИ В СЕРВИСНОМ ПОЛОЖЕНИИ — НЕ ПОВРЕЖДЕНИЕ ПРИ ПРИЁМЕ (27.09.2026) ===
+    # Стоит ДО строки событий: иначе ложное «повреждения: …» ложится в `notes` раньше вопроса.
+    if _act_gate_on() and vis.get("damage") and bike:
+        if _gate_ok == act_gate.DOOR_DAMAGE:
+            _dmg = str(vis.get("damage"))
+            vis = dict(vis)
+            vis["damage"] = None
+            notes = notes.replace(f" | повреждения: {_dmg}", "").replace(f"повреждения: {_dmg}", "")
+            notes = (notes + " | деталь по работе (подтверждено)").strip(" |")[:200]
+            log.info(f"  → ворота [damage] {bike}: «верно» — деталь по работе, тревоги нет")
+        elif not _gate_ok:
+            _au = (getattr(getattr(msg, "from_user", None), "username", "") or "").lower()
+            _asg = act_gate.assignment_for(_TOPIC_FEED.get((chat_id, topic_id)), _au,
+                                           _time.time(), _pos_service_h() * 3600)
+            _agv = act_gate.verdict({
+                "door": act_gate.DOOR_DAMAGE, "to_bot": _ag_to_bot, "bike": bike,
+                "service": bool((_pos or {}).get("state") == bike_position.REPAIR
+                                or (_pos_msg or {}).get("service")),
+                "disassembled": bool(vis.get("disassembled")), "assignment": _asg})
+            if _agv["act"] == act_gate.ASK:
+                await _act_gate_ask(context, msg, photo_msgs, claude, door=act_gate.DOOR_DAMAGE,
+                                    v=_agv, bike=bike)
+                return
+            log.info(f"  → ворота [damage] {bike}: do ({_agv['why']})")
     # ОДНО ПРАВИЛО ЗАПИСИ (класс-фикс 4957): в «события» идёт только ЧЕЛОВЕЧЕСКОЕ число.
     # Раньше здесь стоял сырой vis.mileage — и ветка инфо-работ писала OCR мимо подтверждения
     # («колодки — 38982 км», splinter.log 29.07 09:32:16), пока ветка обычного события уже была
@@ -9740,7 +9978,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
         # Пробег с ФОТО приборки → СНАЧАЛА подтверждаем цифру (vision врёт на LCD) + сторож B,
         # затем _after_mileage решит: спросить кнопками или просто квитанция.
         await _ask_mileage_confirm(context, chat_id, topic_id, bike,
-                                   str(vis.get("mileage")), oil_hint=oil_hint)
+                                   str(vis.get("mileage")), oil_hint=oil_hint,
+                                   bridge=(bridge if _act_gate_on() else None))
     elif mileage and _conf_ok:
         # Пробег из ТЕКСТА (человек ввёл руками) — доверяем числу, сразу решаем (спросить/квитанция).
         try:
@@ -9777,6 +10016,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None):
             # возврате. В ремонте, в аренде, перед выдачей и при неизвестном — тревога без неё
             # (живой случай 21.09 05:04: депозит на колодки, чью замену бот сам принял 10 мин назад).
             _ru_dmg = f"⚠️ {PYM_HANDLE}, на фото повреждения: {vis['damage']} — глянь 🙏"
+        if _act_gate_on():
+            # ЗАШИТЫЙ АДРЕСАТ СНЯТ (27.09): кто смотрит — решают люди темы, а не строка кода.
+            _ru_dmg = (f"⚠️ На фото повреждения: {vis['damage']}. Кто глянет?"
+                       + (" Если это возврат — посмотри по депозиту 🙏"
+                          if (not _pos_on or bike_position.deposit_phrase(_pos)) else " 🙏"))
         # ЗАМОК ПОВТОРОВ (вид J). Состояние = ЧТО назвал vision: другое повреждение — другое
         # состояние, подсказка уходит снова; тот же скол, снятый второй раз, — повтор.
         await _hint_send(context, kind="J", bike=bike, state=("damage", vis["damage"]),
