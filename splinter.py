@@ -52,6 +52,8 @@ import addressee       # пол: ответ на сообщение бота с 
 import caption_intent  # подпись к фото: короткое указание — заявка, а не совет помыть (24.09, XADV 2478)
 import bike_position   # положение байка: совет C и фраза о депозите в J — только на возврате (25.09)
 import act_gate        # одно место перед действием: адресат, лента темы, переспрос до «да» (27.09)
+import receipt_read    # чек в теме обслуживания: итог и работы → одно «верно?», сумма только названа (27.09)
+import service_due     # срок замены: км или полгода, что раньше; подшипники — первая проверка на 20000 (27.09)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
@@ -165,6 +167,18 @@ def _act_gate_on():
     `ACT_GATE=0` → путь байт-в-байт 09587d9: двери действуют по одному сообщению, J зовёт Пыма
     зашитым тегом, «да» на пробег принимается от любого. Решение — `act_gate`, руки — `_act_gate_*`."""
     return str(_os_env("ACT_GATE", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _receipt_read_on():
+    """Ручка «чек в теме обслуживания читается» (27.09.2026, 0054-74w). `RECEIPT_READ=0` → путь
+    0772f84 байт-в-байт: чек читается только промптом байка. Решение — `receipt_read`, руки — `_receipt_*`."""
+    return str(_os_env("RECEIPT_READ", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _service_due_on():
+    """Ручка «срок замены — км или полгода; подшипники — обязательный вид» (27.09.2026, 0054-74w).
+    `SERVICE_DUE=0` → строки планового ТО байт-в-байт 0772f84, подшипников в карточке нет."""
+    return str(_os_env("SERVICE_DUE", "1")).strip() not in ("0", "", "нет", "no", "off")
 
 
 def _pos_service_h():
@@ -2377,8 +2391,62 @@ _MAND_LABEL = {                       # kind → (🇹🇭-метка, 🇷🇺-
     "gear":      ("น้ำมันเกียร์",  "Редуктор"),
     "abs":       ("น้ำมัน ABS",   "ABS"),
     "airfilter": ("ไส้กรองอากาศ",  "Возд. фильтр"),
+    "bearings":  ("ลูกปืนล้อและคอ", "Подшипники колёс и руля"),
 }
+# Обязательные виды БЕЗ колонки Лист1 (27.09.2026, 0054-74w): регистр — строка Bot Data «обслуживание»
+# того же вида (`last_service_km`), интервал — книга знаний с фоллбэком кода, как у воздушного фильтра.
+# Колонки в живой таблице нет намеренно — её правка описана в артефакте SPLINTERCHASTB2709, не применена.
+_MAND_EXTRA = ("bearings",)
+_BEARING_STEMS = ("подшип", "bearing", "ลูกปืน")
+_BEARING_WHERE = ("колес", "колёс", "руле", "руля", "рулев", "wheel", "steer", "ล้อ", "คอ")
 _SEP_LINE = "─────"                   # сдержанный тонкий разделитель секций
+
+
+def _is_bearings_work(w):
+    """Подшипники колёс/рулевой: стем подшипника И уточнитель места (подшипник вариатора — не этот вид)."""
+    s = str(w or "").lower()
+    return any(k in s for k in _BEARING_STEMS) and any(k in s for k in _BEARING_WHERE)
+
+
+def _dt_now_local_date():
+    """Сегодня по Пхукету (UTC+7) — «сегодня» для оси времени срока."""
+    from datetime import datetime as _d, timedelta as _td
+    return (_d.utcnow() + _td(hours=7)).date()
+
+
+def _mand_kind_of_work(w):
+    """Вид планового ТО по словам работы: подшипники — своим признаком, прочее — `_classify_work`."""
+    if _is_bearings_work(w):
+        return "bearings"
+    k = _classify_work(w)
+    return k if k in _MAND_KINDS else ""
+
+
+def _mand_last_dates(items):
+    """{вид: дата последней замены} из строк «события» (newest-first): первая строка «работа — N км»,
+    чья работа опознана видом. Нет строки — вида в словаре нет (ось времени скажет «не измерено»)."""
+    out = {}
+    for it in items or []:
+        m = _re_pl.match(_SVC_HIST_RE, str(it.get("notes") or "").strip(), _re_pl.IGNORECASE)
+        if not m:
+            continue
+        k = _mand_kind_of_work(m.group(1))
+        d = service_due.parse_date(it.get("msg_date") or it.get("recorded_at"))
+        if k and d and k not in out:
+            out[k] = d
+    return out
+
+
+def _mand_extra_last(recs, kind):
+    """Последняя замена вида без колонки Лист1 — `last_service_km` его строки «обслуживание»."""
+    best = None
+    for r in recs or []:
+        if str(r.get("service_type") or "").strip().lower() != kind:
+            continue
+        v = _odo_km_int(r.get("last_service_km"))
+        if v and (best is None or v > best):
+            best = v
+    return best
 
 
 def _hb(s):
@@ -2392,7 +2460,40 @@ _ODO_WHY_LABEL = {                    # почему пробег НЕ ИЗМЕ�
 }
 
 
-def _mand_line(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN):
+def _mand_line(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN, last_date=None, today=None):
+    """Строка вида ТО со СРОКОМ «км или полгода, что раньше» (27.09.2026, 0054-74w, `service_due`).
+
+    Ручка `SERVICE_DUE=0` → `_mand_line_km` байт-в-байт. Иначе поверх строки километража:
+      • первая проверка (подшипники без записи): пробег дошёл до 20000 → «пора», нет → «ещё N км
+        до первой проверки», пробег не прочитан → «не измерено»;
+      • полгода от даты последней замены прошли → «пора по сроку», даже при малом пробеге (км
+        просрочку не смягчаем: громкая строка остаётся громкой);
+      • даты нет → «по времени: не измерено», а НЕ «просрочено»."""
+    if interval is None or not _service_due_on():
+        return _mand_line_km(kind, last, interval, cur, cur_src)
+    v = service_due.verdict(kind, last, interval, cur, last_date=last_date, today=today)
+    th_lbl, ru_lbl = _MAND_LABEL.get(kind, (str(kind), str(kind)))
+    if v["first"]:
+        nxt = v["nxt"]
+        if v["km"] == service_due.KM_UNKNOWN:
+            return (f"{th_lbl} — ❓ <b>ยังไม่ได้วัด</b>: ไม่รู้เลขไมล์ · ตรวจครั้งแรกที่ {nxt} กม.",
+                    f"{ru_lbl} — ❓ <b>не измерено</b>: пробег не прочитан · первая проверка на {nxt} км")
+        if v["km"] == service_due.KM_FIRST:
+            return (f"{th_lbl} — อีก <b>{v['rem']}</b> กม. ถึงตรวจครั้งแรก ({nxt})",
+                    f"{ru_lbl} — ещё <b>{v['rem']}</b> км до первой проверки ({nxt})")
+        return (f"{th_lbl} — ⚠️ <b>ถึงเวลาเปลี่ยน/ตรวจแล้ว</b> (ครั้งแรกที่ {nxt} กม., ยังไม่มีบันทึก)",
+                f"{ru_lbl} — ⚠️ <b>пора: к замене</b> (первая проверка на {nxt} км, записи нет)")
+    base = _mand_line_km(kind, last, interval, cur, cur_src)
+    if base is None or v["km"] == service_due.KM_NEVER or today is None:
+        return base          # «сегодня» не принесли — ось времени не судит (прямые вызовы прежние)
+    tth, tru = service_due.time_words(v)
+    if v["time"] == service_due.T_OVER and v["km"] not in (service_due.KM_OVER, service_due.KM_NOW):
+        return (f"{th_lbl} — ⚠️ <b>ถึงเวลาเปลี่ยนตามเวลา</b>: {tth}",
+                f"{ru_lbl} — ⚠️ <b>пора по сроку: к замене</b>, {tru}")
+    return (f"{base[0]} · {tth}", f"{base[1]} · {tru}")
+
+
+def _mand_line_km(kind, last, interval, cur, cur_src=park_verdict.SRC_UNKNOWN):
     """Строка обязательного вида ТО (HTML, БЕЗ отступа — компактно): (th, ru) ИЛИ None (gear на мото). ОДИН
     статус-маркер; важное (просрочено/не делалось/остаток) — <b>. Данные те же — только формат.
 
@@ -2527,11 +2628,12 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
         # вчера. Поэтому вместо четырёх выдуманных строк — одна честная.
         to_th, to_ru = [_UNREAD_TH], [_UNREAD_RU]
     else:
-        for kind in _MAND_KINDS:
+        for kind in _MAND_KINDS + _MAND_EXTRA:
             m = by_kind.get(kind)
             if not m:
                 continue
-            line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km, cur_km_source)
+            line = _mand_line(kind, m.get("last"), m.get("interval"), cur_km, cur_km_source,
+                              last_date=m.get("date"), today=m.get("today"))
             if line:
                 to_th.append(line[0]); to_ru.append(line[1])
 
@@ -2802,6 +2904,20 @@ def _build_bike_card_body(bridge, chat_id, topic_id, bike, _cb=None):
     # Показываем ВСЕГДА (где нет записи → «не делалось»); gear на мото → interval None → скрыт в рендере.
     mand = [{"kind": k, "last": fb.get(f"{k}_last_km"), "interval": _service_interval(k, canon, bridge)}
             for k in _MAND_KINDS]
+    if _service_due_on():
+        # СРОК «км или полгода» (27.09.2026, 0054-74w): дата последней замены — из истории «события»
+        # (уже прочитана выше), подшипники — регистр строки «обслуживание». Даты нет → «не измерено».
+        try:
+            _dates = _mand_last_dates(ev.get("items", []) if isinstance(ev, dict) else [])
+        except Exception:
+            _dates = {}
+        _today = _dt_now_local_date()
+        for m in mand:
+            m["date"], m["today"] = _dates.get(m["kind"]), _today
+        for k in _MAND_EXTRA:
+            mand.append({"kind": k, "last": _mand_extra_last(recs, k),
+                         "interval": _service_interval(k, canon, bridge),
+                         "date": _dates.get(k), "today": _today})
     rental = None
     if fb.get("status"):
         _end = (fb.get("current_rental") or {}).get("end_date", "")
@@ -2914,6 +3030,18 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
         # это ПОТЕРЯ, и она называется вслух (сводка + WARNING), а не молчит.
         if _ok and not _dup:
             written.append(w); mids.append(mid)
+            if km and _service_due_on() and _is_bearings_work(w):
+                # РЕГИСТР ПОДШИПНИКОВ (27.09.2026, 0054-74w): как у воздушного фильтра, но в своей
+                # таблице бота — строка «обслуживание» вида bearings. current_km = тот же пробег
+                # работы (подтверждённое число этого сообщения), интервал — книга/фоллбэк 20000.
+                try:
+                    _iv = _service_interval("bearings", bike, bridge) or 20000
+                    rb = bridge.service_upsert(bike=bike, topic_id=topic_id, service_type="bearings",
+                                               current_km=km, last_service_km=km, interval_km=_iv,
+                                               note=f"замена {_dt_now_local_date().isoformat()}") or {}
+                    log.info(f"  → подшипники: регистр «обслуживание» {bike} = {km} ok={rb.get('ok')}")
+                except Exception:
+                    log.exception("  → подшипники: регистр не записан (история легла)")
         elif _dup:
             written.append(w)
             log.warning(f"  → инфо-работа «{note}» уже была в истории (ключ {mid}) — новой строки нет")
@@ -5453,6 +5581,7 @@ _SVC_INTERVALS_FALLBACK = {
     "gear": {"scooter": 4000, "moto": None},
     "abs": 10000,
     "airfilter": 20000,
+    "bearings": 20000,          # 27.09.2026 (0054-74w): подшипники колёс и руля — как воздушный фильтр
     "oilfilter": {"ref": 20000},
     "scooter_keywords": ["nmax", "xmax", "adv", "forza", "pcx", "click"],
     "moto_default": 5000,
@@ -6209,6 +6338,10 @@ async def handle_service_button(update, context, bridge) -> None:
     if action in ("agy", "agm", "agn"):
         # ВОРОТА (27.09): ответ на «верно ли понял?» — своя память (`_ACT_GATE_PENDING`).
         await _act_gate_button(q, context, bridge, action, token)
+        return
+    if action in ("rcy", "rcn"):
+        # ЧЕК (27.09.2026, 0054-74w): «Верно»/«Не так» — своя память (`_RECEIPT_PENDING`).
+        await _receipt_button(q, context, bridge, action, token)
         return
 
     # МЕТКА СВЕРЯЕТСЯ С МЕСТОМ НАЖАТИЯ (25.08.2026). Адрес операции — чат, тема, байк, пробег —
@@ -9554,6 +9687,92 @@ async def _act_gate_button(q, context, bridge, action, n):
                             _gate_ok=p["door"])
 
 
+_RECEIPT_PENDING = {}      # n -> {bike, chat_id, topic_id, group, msg_id, msg_date, works, shop, date, ts}
+_RECEIPT_SEQ = [0]
+
+
+async def _receipt_ask(context, msg, rec):
+    """ЧЕК → ОДНО сообщение RU+TH (27.09.2026, 0054-74w): что видно (итог, работы), сомнение словами,
+    «верно?». Кнопки только у прочитанного чека; работы пишутся по «Верно» доверенного
+    (`_receipt_button`), сумма не пишется НИКУДА. Решение — `receipt_read.verdict`."""
+    chat_id = msg.chat_id
+    topic_id = getattr(msg, "message_thread_id", None)
+    bike = bike_from_topic(chat_id, topic_id) or ""
+    v = receipt_read.verdict(rec, bike)
+    th, ru = receipt_read.message(v, bike)
+    kb = None
+    if v["state"] != receipt_read.UNREADABLE and v["works"]:
+        _RECEIPT_SEQ[0] += 1
+        n = _RECEIPT_SEQ[0]
+        now = _time.time()
+        for k in [k for k, p in _RECEIPT_PENDING.items() if now - p["ts"] > _ACT_GATE_TTL]:
+            _RECEIPT_PENDING.pop(k, None)
+        _md = getattr(msg, "date", None)
+        _RECEIPT_PENDING[n] = {"bike": bike, "chat_id": chat_id, "topic_id": topic_id,
+                               "group": group_label(chat_id), "msg_id": getattr(msg, "message_id", ""),
+                               "msg_date": (_md.strftime("%Y-%m-%d %H:%M") if hasattr(_md, "strftime") else ""),
+                               "works": list(v["works"]), "shop": (rec or {}).get("shop", ""),
+                               "date": (rec or {}).get("date", ""), "ts": now}
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ ถูก / Верно", callback_data=f"svc:rcy:{n}"),
+            InlineKeyboardButton("❌ ไม่ใช่ / Не так", callback_data=f"svc:rcn:{n}")]])
+        log.info(f"  → ЧЕК {bike or '?'}: {v['state']} работ={len(v['works'])} "
+                 f"сомнений={len(v['why'])} — ждёт «Верно», метка {n}")
+    else:
+        log.info(f"  → ЧЕК {bike or '?'}: {v['state']} — не читается, спрашиваю ровнее")
+    _PARSE_SEEN.set(reply_floor.PARSE_STATUS)     # спросили по делу — полу молчать
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=f"🐀 Splinter\n🇹🇭 {th}\n🇷🇺 {ru}", reply_markup=kb)
+
+
+async def _receipt_button(q, context, bridge, action, n):
+    """Кнопки чека: rcy — «Верно» (ТОЛЬКО Пым/владелец) → работы строками «события» без суммы;
+    rcn — ничего не пишем. «Верно» не доверенного не пишет и метку не гасит."""
+    p = _RECEIPT_PENDING.get(n)
+    if not p or _time.time() - p["ts"] > _ACT_GATE_TTL:
+        _RECEIPT_PENDING.pop(n, None)
+        await _btn_answer(q, "Устарело — пришли чек ещё раз / หมดอายุ ส่งใหม่นะครับ", show_alert=True)
+        return
+    u = getattr(q, "from_user", None)
+    uname = (getattr(u, "username", "") or "").lower()
+    trusted = bool(uname and uname in TRUSTED_AUTHORS) or is_owner_user(u)
+    if not trusted:
+        await _btn_answer(q, "Подтверждает Пым или владелец / ให้พี่ป๋อมหรือเจ้าของยืนยัน",
+                          show_alert=True)
+        log.info(f"  → чек метка {n}: «{action}» от @{uname or '?'} не принят (не доверенный)")
+        return
+    _RECEIPT_PENDING.pop(n, None)
+    await _btn_answer(q)
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if action == "rcn":
+        log.info(f"  → чек метка {n}: «не так» от @{uname or '?'} — ничего не пишу")
+        await _send(context, chat_id=p["chat_id"], message_thread_id=p["topic_id"],
+                    text="🐀 Splinter\n🇹🇭 เข้าใจครับ ไม่บันทึกใบเสร็จนี้\n🇷🇺 Понял, чек не записываю.")
+        return
+    grp = p["group"] + (f" / тема {p['topic_id']}" if p["topic_id"] else "")
+    done = []
+    for i, w in enumerate(p["works"]):
+        try:
+            r = bridge.add_event(msg_date=p["msg_date"], group=grp, bike=p["bike"], event_type="repair",
+                                 fuel="", mileage="", photos=0,
+                                 notes=receipt_read.event_note(w, p["shop"], p["date"]),
+                                 msg_id=f"receipt:{p['chat_id']}:{p['msg_id']}:{i}") or {}
+        except Exception:
+            log.exception(f"  → чек: работа «{w}» не записана")
+            r = {}
+        if r.get("ok"):
+            done.append(w)
+    log.info(f"  → чек метка {n}: «верно» от @{uname or '?'} — записано работ {len(done)}/{len(p['works'])}")
+    ws = "; ".join(done) if done else "—"
+    await _send(context, chat_id=p["chat_id"], message_thread_id=p["topic_id"],
+                text=(f"🐀 Splinter\n🇹🇭 บันทึกงานจากใบเสร็จแล้ว {len(done)} รายการ ยอดเงินไม่บันทึก\n"
+                      f"🇷🇺 Записал работы по чеку ({len(done)} из {len(p['works'])}): {ws}. "
+                      f"Сумму никуда не записывал."))
+
+
 async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate_ok=None):
     """Обслуживание байков — события + vision на фото (топливо/пробег/повреждения).
     photo_msgs — пачка сообщений-фото (альбом склеен по media_group_id; для одиночного = [msg]).
@@ -9610,6 +9829,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
     # Разбираем фото через vision (топливо/пробег/повреждения). На альбом — каждое фото,
     # затем агрегируем в ОДИН вердикт (один ответ вместо дубля на каждое фото).
     vis = {}
+    _receipts = []
     if has_photo:
         vis_list = []
         for pm in photo_msgs:
@@ -9631,6 +9851,19 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
                      f"conf={v.get('mileage_confidence')} tire={v.get('tire')} "
                      f"damage={v.get('damage')} kind={v.get('kind')}"
                      + (f" dirt={v.get('dirt')} disassembled={v.get('disassembled')}" if _pos_vis else ""))
+            if (_receipt_read_on() and _gate_ok is None
+                    and str(v.get("kind") or "").strip().lower() == "receipt"):
+                # ЧЕК ЧИТАЕТСЯ СВОИМ ПРОМПТОМ (27.09.2026, 0054-74w): итог и строки работ. Заметка
+                # зрения байка по снимку чека гасится — содержимое чека больше не работает молча
+                # (27.09 оно зажгло «масло заменено»); чек говорит только своим сообщением ниже.
+                try:
+                    _rec = receipt_read.parse(_parse_json(claude.vision(
+                        receipt_read.VISION_SERVICE_RECEIPT_SYSTEM, img, max_tokens=600)))
+                except Exception:
+                    log.exception("  → чек: чтение упало (вопрос скажет «не читается»)")
+                    _rec = None
+                _receipts.append(_rec)
+                v = dict(v, notes="")
             # Копим разбор в буфер недавних фото ЭТОЙ ТЕМЫ (для вопросов "проверь фото резины/пробега")
             _remember_recent_photo(chat_id, v, pm, topic_id=topic_id)
             vis_list.append(v)
@@ -9644,6 +9877,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
         if len(vis_list) > 1:
             log.info(f"  → альбом: склеил {len(vis_list)} фото → mileage={vis.get('mileage')} "
                      f"conf={vis.get('mileage_confidence')} damage={vis.get('damage')} dirt={vis.get('dirt')}")
+        for _rec in _receipts:
+            try:
+                await _receipt_ask(context, msg, _rec)
+            except Exception:
+                log.exception("  → чек: вопрос не отправлен")
 
     # Работы из разбора — отдельно от type (техник может перечислить работы, а parse вернуть
     # type≠"event": так и было в кейсе NINJA 6334 09.06 — works был, но в события не записалось и молчали).
