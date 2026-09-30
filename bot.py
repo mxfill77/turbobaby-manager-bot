@@ -798,6 +798,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception("devbot handle_command error")
         return
 
+    # «TurboBaby · Агенты» — режим agents ПАССИВНЫЙ (0076-75s.3009): строка приёма и выход, ДО леджера
+    # и роутинга — ни мозга, ни инструментов, ни ответа (даже на тег владельца).
+    if splinter.is_agents_group(msg.chat_id):
+        splinter.agents_passive_intake(msg, "текст")
+        return
+
     # §12 ЛЕДЖЕР ТРАТ API: владельческая команда пополнения/запроса остатка (в любом чате —
     # это глобальный ресурс, не касса группы). Ловим ДО операционного роутинга; API-маркер в
     # команде исключает клэш с наличным балансом кошелька.
@@ -983,6 +989,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await manager_reply(msg, context)
 
 
+def _voice_foreign_group(msg) -> bool:
+    """Голосовое из группы вне карты Splinter и не из HQ. Чат без типа с отрицательным id
+    считается группой (личка в Telegram — всегда положительный id): сомнение → замок."""
+    chat_id = msg.chat_id
+    if chat_id == GROUP_CHAT_ID or splinter.is_splinter_group(chat_id):
+        return False
+    ctype = getattr(getattr(msg, "chat", None), "type", None)
+    return ctype in ("group", "supergroup", "channel") or (ctype != "private" and chat_id < 0)
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка голосовых сообщений через Claude (он умеет принимать аудио)."""
     msg = update.message
@@ -994,6 +1010,20 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = msg.chat_id
+
+    # «TurboBaby · Агенты» — пассивно (0076-75s.3009): строка приёма, аудио не скачиваем.
+    if splinter.is_agents_group(chat_id):
+        splinter.agents_passive_intake(msg, "голос")
+        return
+
+    # ЗАМОК ГОЛОСОВЫХ (0076-75s.3009, AGENTGROUP3009 §6 шаг 0): группа вне карты Splinter и не HQ —
+    # выход ДО скачивания, Whisper и мозга. Раньше голос из любой незнакомой группы шёл в полный
+    # мозг HQ с пишущими инструментами без проверки автора. В строке только id группы, без текста.
+    if _voice_foreign_group(msg):
+        log.info(f"ЗАМОК ГОЛОСОВЫХ: группа {chat_id} вне карты и не HQ — голосовое не скачано, "
+                 f"Whisper и мозг не званы")
+        return
+
     user_id = msg.from_user.id if msg.from_user else None
     user_name = (msg.from_user.first_name or USER_NAME) if msg.from_user else "User"
 
@@ -1280,6 +1310,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not splinter.is_splinter_group(msg.chat_id):
         return
+    if splinter.is_agents_group(msg.chat_id):
+        # Пассивно (0076-75s.3009): подпись с тегом не открывает мозг, альбом не копим.
+        splinter.agents_passive_intake(msg, "фото")
+        return
     mgid = getattr(msg, "media_group_id", None)
     if mgid:
         # Альбом — не обрабатываем сразу: копим фото и пере-взводим дебаунс-таймер.
@@ -1383,6 +1417,8 @@ async def on_forum_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg or not splinter.is_splinter_group(msg.chat_id):
         return
+    if splinter.is_agents_group(msg.chat_id):
+        return                        # пассивно: темы «Агентов» — не байки, в memory.db не пишем
     thread = getattr(msg, "message_thread_id", None)
     name = splinter._remember_topic_name(msg.chat_id, thread, msg)
     if name:
