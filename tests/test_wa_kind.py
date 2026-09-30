@@ -19,7 +19,9 @@ import json
 import time
 import tempfile
 
-sys.path.insert(0, "/root/turbobaby-manager-bot")
+# Корень дерева, в котором лежит ЭТОТ файл, а не вшитый путь живого сервера (01.10.2026).
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 os.environ.setdefault("WA_VERIFY_TOKEN",    "test_verify_token")
 os.environ.setdefault("WA_APP_SECRET",      "test_secret")
@@ -390,7 +392,7 @@ def test_window_door_and_kind_agree_on_the_same_axes():
 def test_decision_module_has_no_imports():
     """Чистота решения: ни базы, ни сети, ни часов (страж WA_KIND_PURE — в гейте)."""
     import ast
-    src = open("/root/turbobaby-manager-bot/wa_kind.py", encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "wa_kind.py"), encoding="utf-8").read()
     imports = [n for n in ast.walk(ast.parse(src))
                if isinstance(n, (ast.Import, ast.ImportFrom))]
     ok(not imports, "импортов ноль (нашли " + str(len(imports)) + ")")
@@ -399,7 +401,7 @@ def test_decision_module_has_no_imports():
 def test_pull_still_deletes_nothing():
     """Прибавка полей не завела удаления: строка живёт тремя метками, как жила."""
     import ast
-    src = open("/root/turbobaby-manager-bot/wa_webhook.py", encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "wa_webhook.py"), encoding="utf-8").read()
     bad = []
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \

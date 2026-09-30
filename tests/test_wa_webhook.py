@@ -20,7 +20,10 @@ import sqlite3
 import tempfile
 import threading
 
-sys.path.insert(0, "/root/turbobaby-manager-bot")
+# Корень дерева, в котором лежит ЭТОТ файл, а не вшитый путь живого сервера: иначе прогон в клоне
+# молча проверял бы боевой код, а не правку рядом с тестом (01.10.2026).
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 # Мок .env до импорта модуля
 os.environ.setdefault("WA_VERIFY_TOKEN",   "test_verify_token")
@@ -950,7 +953,7 @@ def test_make_server_binds_loopback():
 
 def test_no_hardcoded_wildcard_bind():
     """Регресс: адрес всех интерфейсов не вшит в код — он приходит только из окружения."""
-    src = open("/root/turbobaby-manager-bot/wa_webhook.py", encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "wa_webhook.py"), encoding="utf-8").read()
     ok('ThreadingHTTPServer(("0.0.0.0"' not in src,
        "жёстко вшитого 0.0.0.0 в make_server больше нет")
 
@@ -1120,7 +1123,7 @@ def test_pull_deletes_nothing():
     # который как раз и объясняет, почему удаления здесь нет, — тот самый класс «красное встаёт
     # на слово», закрытый в этом репозитории для гарда (40c8425).
     import ast as _ast
-    src = open("/root/turbobaby-manager-bot/wa_webhook.py", encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "wa_webhook.py"), encoding="utf-8").read()
     destructive = []
     for node in _ast.walk(_ast.parse(src)):
         if not isinstance(node, _ast.Call):
