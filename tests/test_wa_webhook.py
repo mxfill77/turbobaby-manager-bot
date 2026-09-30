@@ -1202,6 +1202,244 @@ def test_webhook_paths_still_work_next_to_queue():
        "рукопожатие Meta работает как работало")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. 360dialog Cloud API (COEX) — вход d360 принимает тело Meta (01.10.2026)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Образцы собраны по структуре документации Meta для вебхуков Cloud API: messages (входящее и
+# статус), smb_message_echoes (эхо сообщения, отправленного с телефона) и history (досинхрон).
+# Номера, wamid, id и тексты выдуманы. Каждый случай — своя временная база (TMPDIR прогона).
+
+import logging
+import re
+
+_BIZ  = "66600000000"      # наш деловой номер (выдуманный)
+_CLI  = "66800000001"      # клиент (выдуманный)
+_CLI2 = "66800000002"      # второй клиент (выдуманный)
+
+
+def _cloud(field, value):
+    value = dict(value)
+    value.setdefault("messaging_product", "whatsapp")
+    value.setdefault("metadata", {"display_phone_number": _BIZ,
+                                  "phone_number_id": "100000000000001"})
+    return {"object": "whatsapp_business_account",
+            "entry": [{"id": "200000000000001",
+                       "changes": [{"value": value, "field": field}]}]}
+
+
+def _cloud_inbound_text():
+    return _cloud("messages", {
+        "contacts": [{"profile": {"name": "Cloud Client"}, "wa_id": _CLI}],
+        "messages": [{"from": _CLI, "id": "wamid.cloud.in001",
+                      "timestamp": str(int(time.time())),
+                      "text": {"body": "Is the scooter free?"}, "type": "text"}],
+    })
+
+
+def _cloud_status(status_val="delivered"):
+    return _cloud("messages", {
+        "statuses": [{"id": "wamid.cloud.out001", "status": status_val,
+                      "timestamp": str(int(time.time())), "recipient_id": _CLI,
+                      "conversation": {"id": "conv001", "origin": {"type": "service"}},
+                      "pricing": {"billable": True, "pricing_model": "CBP",
+                                  "category": "service"}}],
+    })
+
+
+def _cloud_smb_echo():
+    return _cloud("smb_message_echoes", {
+        "message_echoes": [{"from": _BIZ, "to": _CLI, "id": "wamid.cloud.echo001",
+                            "timestamp": str(int(time.time())), "type": "text",
+                            "text": {"body": "Yes, free from tomorrow"}}],
+    })
+
+
+def _cloud_history():
+    old = int(time.time()) - 5 * 86400
+    return _cloud("history", {
+        "history": [{
+            "metadata": {"phase": 0, "chunk_order": 1, "progress": 100},
+            "threads": [
+                {"id": _CLI, "messages": [
+                    {"from": _CLI, "id": "wamid.cloud.h001", "timestamp": str(old),
+                     "type": "text", "text": {"body": "old question"},
+                     "history_context": {"status": "READ"}},
+                    {"from": _BIZ, "to": _CLI, "id": "wamid.cloud.h002",
+                     "timestamp": str(old + 60), "type": "text",
+                     "text": {"body": "old answer"},
+                     "history_context": {"status": "DELIVERED"}},
+                ]},
+                {"id": _CLI2, "messages": [
+                    {"from": _CLI2, "id": "wamid.cloud.h003", "timestamp": str(old + 120),
+                     "type": "image", "image": {"id": "MEDIAH003", "mime_type": "image/jpeg"},
+                     "history_context": {"status": "READ"}},
+                ]},
+            ],
+        }],
+    })
+
+
+def _d360_post(db, payload, secret=_D360_SECRET):
+    body = json.dumps(payload).encode()
+    h = _make_handler("POST", "/wa-webhook/d360/" + secret, body,
+                      headers={"Content-Length": str(len(body))},
+                      app_secret="", db=db, d360_path_secret=_D360_SECRET)
+    _dispatch(h)
+    return h
+
+
+def _pulled(db):
+    """Строки очереди так, как их выдаёт забор ПК (роды — решение wa_kind на сервере)."""
+    return db.pull(limit=100)
+
+
+class _LogCap(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _logged(fn):
+    cap = _LogCap()
+    wh.log.addHandler(cap)
+    try:
+        fn()
+    finally:
+        wh.log.removeHandler(cap)
+    return cap.records
+
+
+def test_d360_format_of():
+    ok(wh.d360_format_of(_cloud_inbound_text()) == "cloud", "форма: object+entry → cloud")
+    ok(wh.d360_format_of(_make_d360_text_payload()) == "v1", "форма: плоские messages → v1")
+    ok(wh.d360_format_of(_make_d360_status_payload()) == "v1", "форма: плоские statuses → v1")
+    ok(wh.d360_format_of({"entry": []}) == "other", "форма: entry без object → other")
+    ok(wh.d360_format_of({}) == "other", "форма: пустой dict → other")
+    ok(wh.d360_format_of([1, 2]) == "other", "форма: список → other")
+
+
+def test_d360_cloud_inbound_text():
+    db = _tmp_db()
+    h = _d360_post(db, _cloud_inbound_text())
+    items = _pulled(db)
+    ok(h._resp_code == 200, "cloud входящее → 200")
+    ok([it["kind"] for it in items] == ["inbound"],
+       "cloud входящее → 1 строка рода inbound: " + str([it["kind"] for it in items]))
+    it = items[0] if items else {}
+    ok(it.get("from") == _CLI and it.get("name") == "Cloud Client"
+       and it.get("text") == "Is the scooter free?" and it.get("source") == "d360"
+       and it.get("disposition") == "card",
+       "cloud входящее: номер клиента, имя, текст, источник d360, распоряжение card")
+
+
+def test_d360_cloud_status():
+    db = _tmp_db()
+    h = _d360_post(db, _cloud_status("delivered"))
+    items = _pulled(db)
+    ok(h._resp_code == 200, "cloud статус → 200")
+    ok([it["kind"] for it in items] == ["receipt"],
+       "cloud статус → 1 строка рода receipt: " + str([it["kind"] for it in items]))
+    ok(items and items[0]["text"] == "delivered" and items[0]["disposition"] == "drop",
+       "cloud статус: слово состояния delivered, распоряжение drop")
+
+
+def test_d360_cloud_smb_echo():
+    db = _tmp_db()
+    h = _d360_post(db, _cloud_smb_echo())
+    items = _pulled(db)
+    ok(h._resp_code == 200, "cloud эхо с телефона → 200")
+    ok([it["kind"] for it in items] == ["echo"],
+       "smb_message_echoes → 1 строка рода echo: " + str([it["kind"] for it in items]))
+    it = items[0] if items else {}
+    ok(it.get("from") == _CLI and it.get("echo") == 1 and it.get("history") == 0
+       and it.get("text") == "Yes, free from tomorrow" and it.get("disposition") == "context",
+       "эхо: адрес — номер КЛИЕНТА (to), echo=1, текст менеджера, распоряжение context")
+
+
+def test_d360_cloud_history():
+    db = _tmp_db()
+    h = _d360_post(db, _cloud_history())
+    items = _pulled(db)
+    ok(h._resp_code == 200, "cloud история → 200")
+    ok(len(items) == 3, "history: 2 нити, 3 сообщения → 3 строки (" + str(len(items)) + ")")
+    ok([it["kind"] for it in items] == ["history", "echo", "history"],
+       "history: роды по порядку history·echo·history: " + str([it["kind"] for it in items]))
+    ok([it["from"] for it in items] == [_CLI, _CLI, _CLI2],
+       "history: адрес каждой строки — клиент своей нити (наша реплика тоже под клиентом)")
+    ok(all(it["history"] == 1 for it in items) and [it["echo"] for it in items] == [0, 1, 0],
+       "history: history=1 у всех, echo=1 только у нашей реплики")
+    ok(all(it["disposition"] == "context" for it in items),
+       "history: ни одной карточки — всё в контекст")
+
+
+def test_d360_v1_still_v1_path():
+    """Плоский v1 идёт прежним разбором; разбор Cloud API для него не зовётся."""
+    calls = {"cloud": 0, "v1": 0}
+    orig_cloud, orig_v1 = wh.normalize_wa_payload, wh.normalize_d360_v1_payload
+
+    def _cloud_spy(*a, **kw):
+        calls["cloud"] += 1
+        return orig_cloud(*a, **kw)
+
+    def _v1_spy(*a, **kw):
+        calls["v1"] += 1
+        return orig_v1(*a, **kw)
+
+    wh.normalize_wa_payload, wh.normalize_d360_v1_payload = _cloud_spy, _v1_spy
+    try:
+        db = _tmp_db()
+        h = _d360_post(db, _make_d360_text_payload(wamid="d360.v1path"))
+        items = _pulled(db)
+        ok(h._resp_code == 200 and [it["kind"] for it in items] == ["inbound"],
+           "v1 → 200 и 1 строка inbound, как до правки")
+        ok(calls == {"cloud": 0, "v1": 1}, "v1: разбор v1 позван 1 раз, Cloud API — 0: " + str(calls))
+        calls.update(cloud=0, v1=0)
+        _d360_post(_tmp_db(), _cloud_inbound_text())
+        ok(calls == {"cloud": 1, "v1": 0}, "cloud: разбор Cloud API 1 раз, v1 — 0: " + str(calls))
+    finally:
+        wh.normalize_wa_payload, wh.normalize_d360_v1_payload = orig_cloud, orig_v1
+
+
+def test_d360_cloud_wrong_secret_404_nothing_queued():
+    """ОТРИЦАТЕЛЬНЫЙ: тело Cloud API под неверным секретом пути — 404, в очереди 0."""
+    db = _tmp_db()
+    h = _d360_post(db, _cloud_inbound_text(), secret="wrong_secret_cloud")
+    ok(h._resp_code == 404, "cloud под неверным секретом → 404")
+    ok(db.count_pending() == 0 and _pulled(db) == [], "cloud под неверным секретом → в очереди 0")
+
+
+def test_d360_nonempty_zero_events_warns():
+    """ОТРИЦАТЕЛЬНЫЙ: непустое тело без событий — 0 в очереди и строка WARNING без текста и номеров."""
+    bodies = [
+        ("cloud account_update",
+         _cloud("account_update", {"phone_number": _CLI, "event": "VERIFIED_ACCOUNT"}),
+         "account_update"),
+        ("cloud history отказ",
+         _cloud("history", {"history": [{"errors": [{"code": 2593109,
+                                                    "title": "declined by " + _CLI}]}]}),
+         "history"),
+        ("v1 пустые messages", {"messages": [], "contacts": [{"wa_id": _CLI}]}, "messages"),
+        ("незнакомая форма", {"hello": "private text " + _CLI, "n": 66800000001}, "hello"),
+    ]
+    for label, payload, marker in bodies:
+        db = _tmp_db()
+        box = {}
+        recs = _logged(lambda: box.setdefault("h", _d360_post(db, payload)))
+        warns = [r for r in recs if r.levelno == logging.WARNING]
+        text = " | ".join(r.getMessage() for r in warns)
+        ok(box["h"]._resp_code == 200 and db.count_pending() == 0,
+           label + ": 200 и в очереди 0")
+        ok(len(warns) == 1 and marker in text,
+           label + ": ровно 1 WARNING с видом тела (" + marker + "): " + text[:160])
+        ok(_CLI not in text and "private" not in text and "declined" not in text
+           and not re.search(r"\d{5,}", text),
+           label + ": в строке журнала нет текста и номеров")
+
+
 # ─── runner ───────────────────────────────────────────────────────────────────
 
 def _run_all():
@@ -1270,6 +1508,15 @@ def _run_all():
         test_legacy_rows_get_empty_source,
         test_queue_paths_are_404_for_unknown_verbs,
         test_webhook_paths_still_work_next_to_queue,
+        # 12. 360dialog Cloud API (COEX)
+        test_d360_format_of,
+        test_d360_cloud_inbound_text,
+        test_d360_cloud_status,
+        test_d360_cloud_smb_echo,
+        test_d360_cloud_history,
+        test_d360_v1_still_v1_path,
+        test_d360_cloud_wrong_secret_404_nothing_queued,
+        test_d360_nonempty_zero_events_warns,
     ]
     for t in tests:
         try:

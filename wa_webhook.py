@@ -24,7 +24,8 @@ Environment (.env):
 Endpoints:
   GET  /wa-webhook                            — Meta hub.verify-token handshake
   POST /wa-webhook                            — Meta Cloud API v2 (HMAC-verified)
-  POST /wa-webhook/d360/<WA_D360_PATH_SECRET> — 360dialog v1 (auth by path secret, no HMAC)
+  POST /wa-webhook/d360/<WA_D360_PATH_SECRET> — 360dialog: Cloud API (object/entry) or flat v1
+                                                (auth by path secret, no HMAC)
   GET  /wa-queue/pull/<WA_PULL_SECRET>        — PC takes up to 20 undelivered rows (leases them)
   POST /wa-queue/ack/<WA_PULL_SECRET>         — PC confirms it processed the given ids
 
@@ -55,6 +56,7 @@ import hashlib
 import json
 import sqlite3
 import logging
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -329,12 +331,55 @@ _MEDIA_TYPES = {"image", "audio", "video", "document", "sticker", "voice"}
 # Messages older than this many seconds from now are classified as history-sync
 _HISTORY_THRESHOLD_SECS = 86400  # 24 hours
 
+# Поля change, которые несут сообщения. `messages` — обычный поток Cloud API. Два других Meta шлёт
+# номеру в режиме Coexistence (WhatsApp Business app и Cloud API на одном номере — так подключён
+# канал 360dialog 30.09.2026): эхо того, что менеджер написал С ТЕЛЕФОНА, и досинхрон старой
+# переписки. До 01.10.2026 оба отбрасывались как «не messages» — молча, без строки журнала.
+_FIELD_MESSAGES = "messages"
+_FIELD_ECHOES   = "smb_message_echoes"
+_FIELD_HISTORY  = "history"
+
+
+def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -> dict:
+    """Одно сообщение Cloud API → событие очереди. `number` — чья это переписка (клиент)."""
+    msg_type = msg.get("type", "")
+    text = None
+    media_id = None
+    if msg_type == "text":
+        text = (msg.get("text") or {}).get("body")
+    elif msg_type in _MEDIA_TYPES:
+        media_id = (msg.get(msg_type) or {}).get("id")
+    elif msg_type == "location":
+        loc = msg.get("location") or {}
+        text = f"{loc.get('latitude')},{loc.get('longitude')}"
+    elif msg_type == "interactive":
+        intr = msg.get("interactive") or {}
+        kind = intr.get("type", "")
+        if kind == "button_reply":
+            text = (intr.get("button_reply") or {}).get("title")
+        elif kind == "list_reply":
+            text = (intr.get("list_reply") or {}).get("title")
+    return {
+        "channel":  "wa",
+        "from":     number,
+        "name":     name,
+        "type":     msg_type,
+        "text":     text,
+        "media_id": media_id,
+        "ts":       int(msg.get("timestamp") or 0),
+        "echo":     echo,
+        "history":  history,
+        "wamid":    msg.get("id"),
+        "raw":      msg,
+    }
+
 
 def normalize_wa_payload(payload: dict, our_phone_number: str = "") -> list:
     """Extract and normalise a WA Cloud API webhook payload.
 
     Returns a list of normalised event dicts (one per message or status entry).
-    Incoming messages, status updates, and history-sync events all flow through here.
+    Incoming messages, status updates, and history-sync events all flow through here,
+    including the Coexistence fields `smb_message_echoes` and `history` (01.10.2026).
 
     Each output dict has:
       channel, from, name, type, text, media_id, ts, echo, history, wamid, raw
@@ -344,7 +389,8 @@ def normalize_wa_payload(payload: dict, our_phone_number: str = "") -> list:
 
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
-            if change.get("field") != "messages":
+            field = change.get("field")
+            if field not in (_FIELD_MESSAGES, _FIELD_ECHOES, _FIELD_HISTORY):
                 continue
             value = change.get("value", {})
             metadata = value.get("metadata", {})
@@ -357,52 +403,57 @@ def normalize_wa_payload(payload: dict, our_phone_number: str = "") -> list:
                 if isinstance(c, dict) and c.get("wa_id")
             }
 
+            # ── эхо Coexistence: менеджер написал клиенту с телефона ────────────
+            # `from` у такого сообщения — НАШ номер, клиент — в `to`. В строку кладём КЛИЕНТА:
+            # ПК адресует контекст по `from` (wa_bridge.number_of → append_context), и эхо под
+            # нашим номером легло бы не в ту переписку. Сырое сообщение целиком — в raw.
+            if field == _FIELD_ECHOES:
+                for msg in value.get("message_echoes", []):
+                    if not isinstance(msg, dict):
+                        continue
+                    client = msg.get("to") or msg.get("from", "")
+                    ts = int(msg.get("timestamp") or 0)
+                    events.append(_cloud_event(
+                        msg, client, contacts.get(client, ""), echo=True,
+                        history=ts > 0 and (now - ts) > _HISTORY_THRESHOLD_SECS))
+                continue
+
+            # ── досинхрон Coexistence: history[] → threads[] → messages[] ────────
+            # `id` нити — номер клиента, поэтому `from`, чужой для нити, значит «написали мы»
+            # (эхо). История — каждая строка, без порога по времени: так её назвал сам Meta.
+            if field == _FIELD_HISTORY:
+                for chunk in value.get("history", []):
+                    if not isinstance(chunk, dict):
+                        continue
+                    for thread in chunk.get("threads", []):
+                        if not isinstance(thread, dict):
+                            continue
+                        client = thread.get("id") or ""
+                        for msg in thread.get("messages", []):
+                            if not isinstance(msg, dict):
+                                continue
+                            sender = msg.get("from", "")
+                            if client:
+                                ours = sender != client
+                            else:
+                                ours = bool(our_display and sender == our_display)
+                            number = client or sender
+                            events.append(_cloud_event(
+                                msg, number, contacts.get(number, ""), echo=ours, history=True))
+                continue
+
             # ── incoming messages ──────────────────────────────────────────
             for msg in value.get("messages", []):
                 if not isinstance(msg, dict):
                     continue
-
                 sender = msg.get("from", "")
-                msg_type = msg.get("type", "")
                 ts = int(msg.get("timestamp") or 0)
-                wamid = msg.get("id")
-
-                text = None
-                media_id = None
-                if msg_type == "text":
-                    text = (msg.get("text") or {}).get("body")
-                elif msg_type in _MEDIA_TYPES:
-                    media_id = (msg.get(msg_type) or {}).get("id")
-                elif msg_type == "location":
-                    loc = msg.get("location") or {}
-                    text = f"{loc.get('latitude')},{loc.get('longitude')}"
-                elif msg_type == "interactive":
-                    intr = msg.get("interactive") or {}
-                    kind = intr.get("type", "")
-                    if kind == "button_reply":
-                        text = (intr.get("button_reply") or {}).get("title")
-                    elif kind == "list_reply":
-                        text = (intr.get("list_reply") or {}).get("title")
-
-                # echo: message sent FROM our own business phone (bounced back)
-                echo = bool(our_display and sender == our_display)
-
-                # history-sync: timestamp significantly in the past
-                history = ts > 0 and (now - ts) > _HISTORY_THRESHOLD_SECS
-
-                events.append({
-                    "channel":  "wa",
-                    "from":     sender,
-                    "name":     contacts.get(sender, ""),
-                    "type":     msg_type,
-                    "text":     text,
-                    "media_id": media_id,
-                    "ts":       ts,
-                    "echo":     echo,
-                    "history":  history,
-                    "wamid":    wamid,
-                    "raw":      msg,
-                })
+                events.append(_cloud_event(
+                    msg, sender, contacts.get(sender, ""),
+                    # echo: message sent FROM our own business phone (bounced back)
+                    echo=bool(our_display and sender == our_display),
+                    # history-sync: timestamp significantly in the past
+                    history=ts > 0 and (now - ts) > _HISTORY_THRESHOLD_SECS))
 
             # ── status updates (delivery/read receipts for our outbound msgs) ──
             for status in value.get("statuses", []):
@@ -509,6 +560,61 @@ def normalize_d360_v1_payload(payload: dict) -> list:
         })
 
     return events
+
+
+# ─── 360dialog: какая форма тела пришла (01.10.2026) ──────────────────────────────────
+#
+# Песочница 360dialog шлёт плоский v1, а боевой канал (Cloud API, режим COEX, подключён 30.09.2026)
+# — тело Meta как есть: {"object": …, "entry": [{"changes": [...]}]}. До 01.10 вход разбирал только
+# v1, и тело Cloud API давало 0 событий, ответ 200 и строку DEBUG при журнале на INFO — поток
+# пропадал молча. Теперь форму решает НАЛИЧИЕ ключей верхнего уровня, а третья форма и любой
+# нулевой разбор оставляют строку WARNING с видом тела.
+
+D360_FMT_CLOUD = "cloud"     # Cloud API: object + entry
+D360_FMT_V1    = "v1"        # плоский on-premise v1: messages/statuses сверху
+D360_FMT_OTHER = "other"     # ни то ни другое — разбирать нечем, но и глотать молча нельзя
+
+_SHAPE_MAX_KEYS = 12
+
+
+def d360_format_of(payload) -> str:
+    """Форма тела на входе 360dialog: `cloud` · `v1` · `other`. Содержимое не читается."""
+    if not isinstance(payload, dict):
+        return D360_FMT_OTHER
+    if "object" in payload and "entry" in payload:
+        return D360_FMT_CLOUD
+    if "messages" in payload or "statuses" in payload:
+        return D360_FMT_V1
+    return D360_FMT_OTHER
+
+
+def _shape_names(names) -> str:
+    """Имена ключей для журнала: цифры маской (номер в имени ключа не утечёт), длина срезана."""
+    clean = sorted({re.sub(r"\d", "#", str(n))[:32] for n in names})
+    more = ",…" if len(clean) > _SHAPE_MAX_KEYS else ""
+    return "[" + ",".join(clean[:_SHAPE_MAX_KEYS]) + more + "]"
+
+
+def payload_shape(payload) -> str:
+    """Вид тела для журнала — только устройство, НИ ОДНОГО значения: ни текста, ни номеров.
+
+    Для Cloud API ещё поля change и ключи их value (`history`, `account_update`, `errors`, …):
+    по ним видно, ЧТО пришло и почему событий ноль, не заглядывая в переписку.
+    """
+    if isinstance(payload, list):
+        return "list"
+    if not isinstance(payload, dict):
+        return type(payload).__name__
+    shape = "keys=" + _shape_names(payload)
+    entries = payload.get("entry")
+    if isinstance(entries, list):
+        changes = [ch for e in entries if isinstance(e, dict)
+                   for ch in (e.get("changes") if isinstance(e.get("changes"), list) else [])
+                   if isinstance(ch, dict)]
+        values = [k for ch in changes if isinstance(ch.get("value"), dict) for k in ch["value"]]
+        shape += " fields=" + _shape_names(ch.get("field") for ch in changes)
+        shape += " value_keys=" + _shape_names(values)
+    return shape
 
 
 # ─── HMAC signature verification ─────────────────────────────────────────────────────
@@ -707,7 +813,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         except Exception as e:
             log.error("WA POST: processing error: %s", e, exc_info=True)
 
-    # POST /wa-webhook/d360/<secret> — 360dialog v1, auth by path secret (no HMAC)
+    # POST /wa-webhook/d360/<secret> — 360dialog Cloud API or v1, auth by path secret (no HMAC)
     def _do_d360_post(self, path: str):
         # Extract secret from path: /wa-webhook/d360/<secret>
         # Wrong secret → 404 (not 401 — don't reveal endpoint existence)
@@ -734,12 +840,21 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             pass
 
         try:
-            events = normalize_d360_v1_payload(payload)
+            fmt = d360_format_of(payload)
+            if fmt == D360_FMT_CLOUD:
+                events = normalize_wa_payload(payload, our_phone_number=self.our_phone)
+            elif fmt == D360_FMT_V1:
+                events = normalize_d360_v1_payload(payload)
+            else:
+                log.warning("D360 POST: unknown body form, 0 events, nothing enqueued (%s)",
+                            payload_shape(payload))
+                return
             if events:
                 n = self.db.enqueue(events, source="d360") if self.db else 0
-                log.info("D360 POST: %d events, %d enqueued", len(events), n)
+                log.info("D360 POST: %d events, %d enqueued (form=%s)", len(events), n, fmt)
             else:
-                log.debug("D360 POST: payload contained 0 events")
+                log.warning("D360 POST: %s body gave 0 events, nothing enqueued (%s)",
+                            fmt, payload_shape(payload))
         except Exception as e:
             log.error("D360 POST: processing error: %s", e, exc_info=True)
 
