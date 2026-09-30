@@ -290,9 +290,11 @@ GROUPS = {
     -1002445921469: "delivery",    # Delivery cooperation
     -1003966216195: "attendance",  # Отметка сотрудников / การลงเวลาเข้า
     -1003997419806: "intake",      # TurboBaby — Входящие брони (клиентский контур, RU)
+    -1003999596406: "agents",      # TurboBaby · Агенты — внутренний агент (этап 3), пока ПАССИВНО
 }
 
 INTAKE_CHAT = -1003997419806      # группа «Входящие брони» (язык RU, без тайского)
+AGENTS_CHAT = -1003999596406      # группа «TurboBaby · Агенты» (0076-75s.3009)
 
 # Стабильные имена кошельков/групп (chat_id → метка для учёта).
 # ВАЖНО: баланс считается по этой метке, не по TG-названию (оно может меняться).
@@ -303,11 +305,27 @@ GROUP_NAMES = {
     -1002445921469: "Delivery",
     -1003966216195: "Отметка",
     -1003997419806: "Входящие брони",
+    -1003999596406: "TurboBaby · Агенты",
 }
 
 
 def group_label(chat_id):
     return GROUP_NAMES.get(chat_id, str(chat_id))
+
+
+def is_agents_group(chat_id) -> bool:
+    return GROUPS.get(chat_id) == "agents"
+
+
+def agents_passive_intake(msg, kind: str) -> None:
+    """Режим «agents» ПАССИВНЫЙ (0076-75s.3009, шаг 1 пакета AGENTGROUP3009 §6): только строка
+    приёма — user id, ник, вид сообщения. Ни мозга, ни инструментов, ни ответа, ни «печатает».
+    Текста сообщения в строке нет. Id отправителей — сырьё списка главных (AGENTGROUP3009 §2)."""
+    u = getattr(msg, "from_user", None)
+    uid = getattr(u, "id", None) if u else None
+    nick = (getattr(u, "username", None) or "—") if u else "—"
+    log.info(f"Splinter [agents] приём {getattr(msg, 'chat_id', None)} uid={uid} @{nick} "
+             f"вид={kind} — пассивно: мозг, инструменты и ответ не званы")
 
 
 # === Темы чужого контура в HQ — Splinter ПОЛНОСТЬЮ игнорирует ===
@@ -10859,6 +10877,10 @@ async def handle(update, context, bridge, claude, album_msgs=None):
         return
     mode = GROUPS.get(msg.chat_id)
     if not mode:
+        return
+    if mode == "agents":
+        # Пассивный режим: строка приёма и выход — до «печатает», разбора и пола ответа.
+        agents_passive_intake(msg, "фото" if (album_msgs or msg.photo) else ("текст" if msg.text else "прочее"))
         return
     # Пачка фото: альбом (album_msgs) ИЛИ одиночное фото ([msg]) ИЛИ нет фото ([]).
     photo_msgs = album_msgs if album_msgs else ([msg] if msg.photo else [])
