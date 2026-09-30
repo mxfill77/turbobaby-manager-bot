@@ -85,3 +85,7 @@ _allow_new_settings.json
 _claspsplit_build.py
 # 01.10.2026: сырой архив входа 360dialog (wa_webhook.RAW_ARCHIVE_NAME), рядом с wa_queue.db
 wa_d360_raw.jsonl
+# 01.10.2026: служба показа WA→TG (wa_tg_mirror.py): своё состояние и скачанные медиа клиентов
+wa_tg_mirror.db
+wa_tg_mirror.db-journal
+wa_media/

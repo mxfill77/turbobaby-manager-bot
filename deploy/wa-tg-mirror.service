@@ -1,0 +1,19 @@
+[Unit]
+Description=TurboBaby WA → Telegram mirror: client media to disk always; show in forum group only under WA_TG_MIRROR_SHOW
+# Reads wa_queue.db READ-ONLY (mode=ro); own state wa_tg_mirror.db and wa_media/ next to it.
+# Show flag WA_TG_MIRROR_SHOW is off by default: zero Telegram calls, start line «показ выключен».
+After=network.target wa-webhook.service
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/turbobaby-manager-bot
+ExecStart=/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/wa_tg_mirror.py
+Restart=always
+RestartSec=15
+User=root
+StandardOutput=append:/root/turbobaby-manager-bot/wa_tg_mirror.log
+StandardError=append:/root/turbobaby-manager-bot/wa_tg_mirror.log
+
+[Install]
+WantedBy=multi-user.target
