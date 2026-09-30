@@ -83,3 +83,5 @@ tests/test_orchestrator_model.py.bak-execmodel-20260713
 tests/test_proc_gate.py.bak
 _allow_new_settings.json
 _claspsplit_build.py
+# 01.10.2026: сырой архив входа 360dialog (wa_webhook.RAW_ARCHIVE_NAME), рядом с wa_queue.db
+wa_d360_raw.jsonl

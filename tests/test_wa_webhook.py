@@ -208,8 +208,17 @@ def _make_handler(method, path, body=b"", headers=None,
                   our_phone="",
                   db=None,
                   d360_path_secret="",
-                  pull_secret=""):
+                  pull_secret="",
+                  raw_archive="",
+                  raw_archive_max=None,
+                  raw_archive_floor=None):
     h = _FakeHandler(method, path, body, headers)
+    # Архив тоже сбрасывается каждый раз: путь, оставленный прошлым тестом, писал бы чужие тела.
+    _FakeHandler.raw_archive       = raw_archive
+    _FakeHandler.raw_archive_max   = (wh.RAW_ARCHIVE_MAX_BYTES if raw_archive_max is None
+                                      else raw_archive_max)
+    _FakeHandler.raw_archive_floor = (wh.RAW_ARCHIVE_FREE_FLOOR if raw_archive_floor is None
+                                      else raw_archive_floor)
     _FakeHandler.verify_token     = verify_token
     _FakeHandler.app_secret       = app_secret
     _FakeHandler.our_phone        = our_phone
@@ -1280,11 +1289,11 @@ def _cloud_history():
     })
 
 
-def _d360_post(db, payload, secret=_D360_SECRET):
-    body = json.dumps(payload).encode()
+def _d360_post(db, payload, secret=_D360_SECRET, raw_body=None, **kw):
+    body = raw_body if raw_body is not None else json.dumps(payload).encode()
     h = _make_handler("POST", "/wa-webhook/d360/" + secret, body,
                       headers={"Content-Length": str(len(body))},
-                      app_secret="", db=db, d360_path_secret=_D360_SECRET)
+                      app_secret="", db=db, d360_path_secret=_D360_SECRET, **kw)
     _dispatch(h)
     return h
 
@@ -1440,6 +1449,272 @@ def test_d360_nonempty_zero_events_warns():
            label + ": в строке журнала нет текста и номеров")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. Разовая выгрузка Coexistence: дополнение по wamid, заглушка медиа, контакты,
+#     сырой архив, строка журнала истории (01.10.2026)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Образцы — по структуре документации Meta: history с metadata{phase, chunk_order, progress},
+# media_placeholder и потом тот же wamid с медиа; smb_app_state_sync{state_sync[{type, contact,
+# action, metadata{timestamp}}]}. Номера, wamid, id и тексты выдуманы.
+
+import stat as _stat
+
+_PH_WAMID = "wamid.cloud.ph001"
+
+
+def _row(db, wamid):
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        r = conn.execute("SELECT * FROM wa_inbox WHERE wamid=?", (wamid,)).fetchone()
+        return dict(r) if r else None
+    finally:
+        conn.close()
+
+
+def _rows_count(db, table="wa_inbox"):
+    conn = sqlite3.connect(db.db_path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _contacts(db):
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM wa_contacts ORDER BY number")]
+    finally:
+        conn.close()
+
+
+def _hist_body(messages, phase=0, chunk=2, progress=40, client=_CLI):
+    return _cloud("history", {"history": [{
+        "metadata": {"phase": phase, "chunk_order": chunk, "progress": progress},
+        "threads": [{"id": client, "messages": messages}],
+    }]})
+
+
+def _hist_placeholder():
+    old = int(time.time()) - 20 * 86400
+    return _hist_body([
+        {"from": _CLI, "id": "wamid.cloud.pht01", "timestamp": str(old), "type": "text",
+         "text": {"body": "photo of the bike please"}},
+        {"from": _BIZ, "to": _CLI, "id": _PH_WAMID, "timestamp": str(old + 60),
+         "type": "media_placeholder"},
+    ])
+
+
+def _hist_media_for_placeholder():
+    old = int(time.time()) - 20 * 86400
+    return _hist_body([
+        {"from": _BIZ, "to": _CLI, "id": _PH_WAMID, "timestamp": str(old + 60), "type": "image",
+         "image": {"id": "MEDIAPH001", "mime_type": "image/jpeg", "caption": "PCX 160 front"}},
+    ], phase=0, chunk=3, progress=45)
+
+
+def _state_sync(number, name, action, ts):
+    contact = {"phone_number": number}
+    if name:
+        contact["full_name"] = name
+        contact["first_name"] = name.split()[0]
+    return _cloud("smb_app_state_sync", {"state_sync": [
+        {"type": "contact", "contact": contact, "action": action,
+         "metadata": {"timestamp": str(ts)}}]})
+
+
+def test_d360_placeholder_marked_no_file():
+    """П.2: media_placeholder истории — строка с пометкой «медиа без файла»."""
+    db = _tmp_db()
+    h = _d360_post(db, _hist_placeholder())
+    r = _row(db, _PH_WAMID) or {}
+    ok(h._resp_code == 200 and _rows_count(db) == 2, "история с заглушкой → 200, 2 строки")
+    ok(r.get("msg_type") == "media_placeholder" and r.get("media_note") == "no_file"
+       and r.get("media_id") is None and r.get("history") == 1,
+       "заглушка: msg_type=media_placeholder, media_note=no_file, media_id пуст, history=1: "
+       + str({k: r.get(k) for k in ("msg_type", "media_note", "media_id", "history")}))
+
+
+def test_d360_media_fields_stored():
+    """П.3: живое медиа кладёт id, mime и подпись в свои колонки (до 01.10 — только id)."""
+    db = _tmp_db()
+    kinds = {
+        "image":    {"id": "M-IMG", "mime_type": "image/jpeg", "caption": "cap img"},
+        "video":    {"id": "M-VID", "mime_type": "video/mp4", "caption": "cap vid"},
+        "document": {"id": "M-DOC", "mime_type": "application/pdf", "caption": "cap doc",
+                     "filename": "contract.pdf"},
+        "audio":    {"id": "M-AUD", "mime_type": "audio/ogg; codecs=opus", "voice": True},
+        "sticker":  {"id": "M-STK", "mime_type": "image/webp", "animated": False},
+    }
+    msgs = [{"from": _CLI, "id": "wamid.media." + t, "timestamp": str(int(time.time())),
+             "type": t, t: obj} for t, obj in kinds.items()]
+    _d360_post(db, _cloud("messages", {"messages": msgs}))
+    good = 0
+    for t, obj in kinds.items():
+        r = _row(db, "wamid.media." + t) or {}
+        if (r.get("msg_type") == t and r.get("media_id") == obj["id"]
+                and r.get("mime") == obj["mime_type"] and r.get("caption") == obj.get("caption")):
+            good += 1
+    ok(good == 5, "медиа 5 типов: id, mime и подпись в колонках (" + str(good) + "/5)")
+
+
+def test_d360_repeat_wamid_enriches():
+    """П.1: повтор того же wamid с медиа дополняет строку заглушки, а не теряется."""
+    db = _tmp_db()
+    _d360_post(db, _hist_placeholder())
+    recs = _logged(lambda: _d360_post(db, _hist_media_for_placeholder()))
+    r = _row(db, _PH_WAMID) or {}
+    ok(_rows_count(db) == 2, "повтор wamid → строк по-прежнему 2 (" + str(_rows_count(db)) + ")")
+    ok(r.get("msg_type") == "image" and r.get("media_id") == "MEDIAPH001"
+       and r.get("mime") == "image/jpeg" and r.get("caption") == "PCX 160 front",
+       "повтор дополнил: тип image, id медиа, mime, подпись")
+    ok(r.get("media_note") == "file_late" and isinstance(r.get("enriched_at"), int),
+       "пометка no_file → file_late, enriched_at поставлен")
+    ok(r.get("echo") == 1 and r.get("from_number") == _CLI and r.get("history") == 1,
+       "род и адрес строки повтор не менял (echo=1, адрес — клиент, history=1)")
+    info = " | ".join(x.getMessage() for x in recs if x.levelno == logging.INFO)
+    ok("0 enqueued" in info and "1 enriched" in info,
+       "строка журнала: 0 вставлено, 1 дополнено: " + info[:200])
+    # текст: строка без текста, повтор с текстом → дополнена; второй повтор с другим текстом — нет
+    db2 = _tmp_db()
+    base = {"channel": "wa", "from": _CLI, "type": "text", "text": None, "ts": 1,
+            "wamid": "wamid.txt.1", "raw": {}}
+    db2.enqueue([base])
+    st = db2.enqueue_stats([dict(base, text="late text", name="Late Name")])
+    st2 = db2.enqueue_stats([dict(base, text="other text")])
+    r2 = _row(db2, "wamid.txt.1") or {}
+    ok(st == {"inserted": 0, "enriched": 1} and st2 == {"inserted": 0, "enriched": 0}
+       and r2.get("text") == "late text" and r2.get("name") == "Late Name",
+       "текст и имя дописаны в пустое; непустое повтор не перетирает: " + str((st, st2)))
+
+
+def test_d360_empty_repeat_changes_nothing():
+    """ОТРИЦАТЕЛЬНЫЙ: пустой повтор (и квитанции) строку не меняют — как до 01.10."""
+    db = _tmp_db()
+    _d360_post(db, _cloud_inbound_text())
+    before = _row(db, "wamid.cloud.in001")
+    _d360_post(db, _cloud_inbound_text())                         # точный повтор
+    empty = _cloud("messages", {"messages": [{"from": _CLI, "id": "wamid.cloud.in001",
+                                              "timestamp": "1", "type": ""}]})
+    _d360_post(db, empty)                                          # повтор без содержимого
+    after = _row(db, "wamid.cloud.in001")
+    ok(before is not None and before == after and after.get("enriched_at") is None,
+       "точный и пустой повтор: строка байт-в-байт та же, enriched_at пуст")
+    ok(_rows_count(db) == 1, "и строка одна")
+    db2 = _tmp_db()
+    _d360_post(db2, _cloud_status("sent"))
+    s_before = _row(db2, "wamid.cloud.out001")
+    _d360_post(db2, _cloud_status("delivered"))
+    _d360_post(db2, _cloud_status("read"))
+    s_after = _row(db2, "wamid.cloud.out001")
+    ok(s_before == s_after and s_after.get("text") == "sent",
+       "квитанции sent→delivered→read: строка не менялась (как до правки)")
+    # заглушка поверх готового медиа не откатывает его назад
+    db3 = _tmp_db()
+    _d360_post(db3, _hist_media_for_placeholder())
+    m_before = _row(db3, _PH_WAMID)
+    _d360_post(db3, _hist_placeholder())
+    m_after = _row(db3, _PH_WAMID)
+    ok(m_before == m_after and m_after.get("msg_type") == "image",
+       "заглушка после медиа: строка медиа не тронута")
+
+
+def test_d360_state_sync_contacts():
+    """П.3 задания: smb_app_state_sync → wa_contacts; повтор номера — обновление."""
+    db = _tmp_db()
+    t0 = int(time.time()) - 1000
+    recs = _logged(lambda: _d360_post(db, _state_sync(_CLI, "Anna Test", "add", t0)))
+    c = _contacts(db)
+    ok(len(c) == 1 and c[0]["number"] == _CLI and c[0]["name"] == "Anna Test"
+       and c[0]["action"] == "add" and c[0]["ts"] == t0,
+       "контакт лёг: номер, имя, действие add, время")
+    ok(not [x for x in recs if x.levelno == logging.WARNING],
+       "тело контактов больше не WARNING «0 событий»")
+    _d360_post(db, _state_sync(_CLI, "Anna Renamed", "edit", t0 + 10))
+    c = _contacts(db)
+    ok(len(c) == 1 and c[0]["name"] == "Anna Renamed" and c[0]["action"] == "edit"
+       and c[0]["ts"] == t0 + 10, "повтор номера → та же строка обновлена (1 строка)")
+    _d360_post(db, _state_sync(_CLI, "", "remove", t0 + 20))
+    c = _contacts(db)
+    ok(len(c) == 1 and c[0]["action"] == "remove" and c[0]["name"] == "Anna Renamed",
+       "remove без имени: действие remove, имя сохранено")
+    _d360_post(db, _state_sync(_CLI, "Stale Name", "add", t0 - 500))
+    c = _contacts(db)
+    ok(c[0]["name"] == "Anna Renamed" and c[0]["action"] == "remove",
+       "более старое событие не затирает новое")
+    ok(_rows_count(db) == 0, "в очередь сообщений контакты не легли (0 строк wa_inbox)")
+
+
+def test_d360_raw_archive():
+    """П.4: каждое тело входа d360 — строка JSONL рядом с базой, права 600; потолок — WARNING."""
+    tmpd = tempfile.mkdtemp(prefix="wa_raw_")
+    db = wh.WAQueueDB(os.path.join(tmpd, "wa_queue.db"))
+    path = wh.raw_archive_path(db.db_path)
+    ok(os.path.dirname(path) == tmpd and path.endswith("wa_d360_raw.jsonl"),
+       "архив лежит рядом с базой: wa_d360_raw.jsonl")
+    b1 = json.dumps(_hist_placeholder()).encode()
+    b2 = b"{not json"
+    _d360_post(db, None, raw_body=b1, raw_archive=path)
+    _d360_post(db, None, raw_body=b2, raw_archive=path)
+    _d360_post(db, None, raw_body=b1, secret="wrong_secret_raw", raw_archive=path)
+    lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
+    got = [json.loads(x) for x in lines]
+    ok(len(got) == 2, "2 тела под верным секретом → 2 строки (чужой секрет не пишется): "
+       + str(len(got)))
+    ok(len(got) == 2 and got[0]["body"].encode() == b1 and got[1]["body"].encode() == b2
+       and got[0]["len"] == len(b1), "тело лежит как пришло, включая не-JSON")
+    mode = _stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else None
+    ok(mode == 0o600, "права файла 600: " + (oct(mode) if mode is not None else "нет файла"))
+    size = os.path.getsize(path) if os.path.exists(path) else -1
+    db_rows = _rows_count(db)
+    recs = _logged(lambda: _d360_post(db, _cloud_inbound_text(), raw_archive=path,
+                                      raw_archive_max=size + 10))
+    warns = [x.getMessage() for x in recs if x.levelno == logging.WARNING]
+    ok(os.path.getsize(path) == size and len(warns) == 1 and "CEILING" in warns[0],
+       "потолок: тело не дописано, ровно 1 WARNING: " + " | ".join(warns)[:160])
+    ok(_rows_count(db) == db_rows + 1, "потолок архива очередь не останавливает (+1 строка)")
+    recs = _logged(lambda: _d360_post(db, _cloud_inbound_text(), raw_archive=path,
+                                      raw_archive_floor=10 ** 18))
+    warns = [x.getMessage() for x in recs if x.levelno == logging.WARNING]
+    ok(len(warns) == 1 and "CEILING" in warns[0], "нижняя граница свободного места → WARNING")
+    srv_env = {"verify_token": "t", "app_secret": "", "phone_id": "", "port": 0,
+               "bind_host": "127.0.0.1", "queue_db": os.path.join(tmpd, "q2.db")}
+    srv = wh.make_server(srv_env)
+    try:
+        ok(srv.RequestHandlerClass.raw_archive == os.path.join(tmpd, "wa_d360_raw.jsonl"),
+           "make_server включает архив рядом с базой очереди")
+    finally:
+        srv.server_close()
+
+
+def test_d360_history_log_line():
+    """П.5: на каждое тело истории — строка из чисел: фаза, кусок, прогресс, счёт."""
+    db = _tmp_db()
+    recs = _logged(lambda: _d360_post(db, _hist_placeholder()))
+    lines = [x.getMessage() for x in recs if x.getMessage().startswith("D360 history:")]
+    ok(len(lines) == 1, "одна строка истории на тело: " + str(len(lines)))
+    line = lines[0] if lines else ""
+    ok("phase=0 chunk=2 progress=40 messages=2 placeholders=1 errors=0 inserted=2 enriched=0"
+       in line, "числа: " + line)
+    recs = _logged(lambda: _d360_post(db, _hist_media_for_placeholder()))
+    lines = [x.getMessage() for x in recs if x.getMessage().startswith("D360 history:")]
+    ok(lines and "chunk=3 progress=45 messages=1 placeholders=0 errors=0 inserted=0 enriched=1"
+       in lines[0], "повтор медиа: enriched=1: " + (lines[0] if lines else ""))
+    recs = _logged(lambda: _d360_post(_tmp_db(), _cloud("history", {"history": [
+        {"errors": [{"code": 2593109, "title": "declined by " + _CLI}]}]})))
+    lines = [x.getMessage() for x in recs if x.getMessage().startswith("D360 history:")]
+    ok(lines and "errors=1" in lines[0] and "phase=?" in lines[0],
+       "отказ выгрузки тоже даёт строку: errors=1: " + (lines[0] if lines else ""))
+    allt = " | ".join(x.getMessage() for x in recs) + " | " + line
+    ok(_CLI not in allt and "photo" not in allt and "declined" not in allt
+       and not re.search(r"\d{5,}", allt), "в строках истории нет номеров и текста")
+    recs = _logged(lambda: _d360_post(_tmp_db(), _cloud_inbound_text()))
+    ok(not [x for x in recs if x.getMessage().startswith("D360 history:")],
+       "не история → строки истории нет")
+
+
 # ─── runner ───────────────────────────────────────────────────────────────────
 
 def _run_all():
@@ -1517,6 +1792,14 @@ def _run_all():
         test_d360_v1_still_v1_path,
         test_d360_cloud_wrong_secret_404_nothing_queued,
         test_d360_nonempty_zero_events_warns,
+        # 13. Разовая выгрузка Coexistence (01.10.2026)
+        test_d360_placeholder_marked_no_file,
+        test_d360_media_fields_stored,
+        test_d360_repeat_wamid_enriches,
+        test_d360_empty_repeat_changes_nothing,
+        test_d360_state_sync_contacts,
+        test_d360_raw_archive,
+        test_d360_history_log_line,
     ]
     for t in tests:
         try:

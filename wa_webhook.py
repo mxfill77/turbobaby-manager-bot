@@ -38,6 +38,17 @@ Queue schema (wa_inbox table in wa_queue.db):
   id, ts_queued, channel, from_number, name, msg_type, text, media_id,
   ts_msg, echo, history, status, raw (JSON), wamid,
   source, delivered_at, acked_at   ← added 06.09.2026 for the PC pull/ack doors
+  mime, caption, media_note, enriched_at   ← added 01.10.2026 (history import, see below)
+
+HISTORY IMPORT IS ONE-SHOT (01.10.2026). Coexistence sends the last 180 days once; what the
+receiver drops is not sent again. So on the d360 door:
+  * a repeat of a known wamid that carries what the row lacks (media id, type, caption, text)
+    FILLS the row instead of being ignored — media of a history message arrives first as
+    `media_placeholder` (row marked media_note='no_file') and later under the same wamid;
+  * `smb_app_state_sync` contacts go to table wa_contacts (number, name, action, ts), upsert;
+  * every body that passed the path secret is appended raw to wa_d360_raw.jsonl next to the
+    queue db (mode 600, size ceiling below; hitting it is a WARNING, never silence);
+  * every `history` body leaves one INFO line of numbers: phase, chunk, progress, counts.
 
 FOUR KINDS SHARE ONE TABLE, and the pull output says which is which (07.09.2026):
   inbound (client wrote us) · echo (our own outbound bounced back) · history (backfill sync) ·
@@ -144,9 +155,70 @@ _ADDED_COLUMNS = (
     ("source",       "TEXT"),
     ("delivered_at", "INTEGER"),
     ("acked_at",     "INTEGER"),
+    # 01.10.2026 — разовая выгрузка истории: что было в сообщении кроме текста, и след дополнения
+    ("mime",         "TEXT"),
+    ("caption",      "TEXT"),
+    ("media_note",   "TEXT"),       # 'no_file' — заглушка без файла · 'file_late' — файл догнал
+    ("enriched_at",  "INTEGER"),    # когда повтор того же wamid дополнил строку
 )
 
 _PULL_INDEX = "CREATE INDEX IF NOT EXISTS idx_wa_pull ON wa_inbox(acked_at, delivered_at, id)"
+
+# Контакты телефона бизнеса (Coexistence `smb_app_state_sync`). Повтор номера — обновление, а не
+# вторая строка; более старое событие не затирает более новое.
+_CONTACTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wa_contacts (
+    number   TEXT PRIMARY KEY,
+    name     TEXT,
+    action   TEXT,
+    ts       INTEGER,
+    ts_seen  INTEGER NOT NULL,
+    source   TEXT,
+    raw      TEXT
+)
+"""
+
+MEDIA_PLACEHOLDER    = "media_placeholder"   # тип сообщения истории: медиа было, файла нет
+MEDIA_NOTE_NO_FILE   = "no_file"
+MEDIA_NOTE_FILE_LATE = "file_late"
+
+# Что повтор того же wamid вправе дописать в строку: колонка ← ключ события. Только пустое.
+_ENRICH_FIELDS = (
+    ("text",     "text"),
+    ("media_id", "media_id"),
+    ("mime",     "mime"),
+    ("caption",  "caption"),
+    ("name",     "name"),
+)
+_ENRICH_COLS = ("msg_type", "text", "media_id", "mime", "caption", "name", "media_note")
+
+
+def _blank(v) -> bool:
+    return v is None or v == ""
+
+
+def _enrichment(row: dict, ev: dict) -> dict:
+    """Что событие несёт СВЕРХ строки с тем же wamid. Пусто → строку не трогаем (как до 01.10).
+
+    Пишется только в пустое: непустое поле строки повтор не перетирает никогда. Квитанции
+    (`status`) не дополняются и сами ничего не дополняют: их повтор (sent → delivered → read)
+    остаётся тем, чем был, — первым словом состояния.
+    """
+    old_type = row.get("msg_type") or ""
+    new_type = ev.get("type") or ""
+    if "status" in (old_type, new_type):
+        return {}
+    upd = {}
+    if (new_type and new_type != old_type and new_type != MEDIA_PLACEHOLDER
+            and old_type in ("", MEDIA_PLACEHOLDER)):
+        upd["msg_type"] = new_type
+    for col, key in _ENRICH_FIELDS:
+        val = ev.get(key)
+        if not _blank(val) and _blank(row.get(col)):
+            upd[col] = val
+    if upd.get("media_id") and row.get("media_note") == MEDIA_NOTE_NO_FILE:
+        upd["media_note"] = MEDIA_NOTE_FILE_LATE
+    return upd
 
 # How long a pulled row stays leased to the PC before it becomes available again.
 LEASE_SECS = 300     # 5 minutes — PC took it and went silent → someone must get it again
@@ -179,12 +251,23 @@ class WAQueueDB:
                 if col not in have:
                     conn.execute("ALTER TABLE wa_inbox ADD COLUMN " + col + " " + decl)
             conn.execute(_PULL_INDEX)
+            conn.execute(_CONTACTS_SCHEMA)
             conn.commit()
 
     def enqueue(self, events: list, source: str = "") -> int:
         """Insert normalised events. Returns number actually inserted (dupes skipped)."""
+        return self.enqueue_stats(events, source=source)["inserted"]
+
+    def enqueue_stats(self, events: list, source: str = "") -> dict:
+        """Insert normalised events → {"inserted": n, "enriched": m}.
+
+        A repeat of a known wamid is no longer simply ignored (01.10.2026): if it carries what
+        the stored row lacks (`_enrichment`), the row is filled and stamped `enriched_at`. A
+        repeat carrying nothing new changes nothing — the old dedup, byte for byte.
+        """
         now = int(time.time())
         inserted = 0
+        enriched = 0
         with self._lock:
             with self._conn() as conn:
                 for ev in events:
@@ -192,8 +275,9 @@ class WAQueueDB:
                         conn.execute(
                             """INSERT OR IGNORE INTO wa_inbox
                                (ts_queued, channel, from_number, name, msg_type, text, media_id,
-                                ts_msg, echo, history, status, raw, wamid, source)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?)""",
+                                ts_msg, echo, history, status, raw, wamid, source,
+                                mime, caption, media_note)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?,?,?)""",
                             (
                                 now,
                                 ev.get("channel", "wa"),
@@ -208,13 +292,67 @@ class WAQueueDB:
                                 json.dumps(ev.get("raw"), ensure_ascii=False),
                                 ev.get("wamid"),
                                 ev.get("source") or source or "",
+                                ev.get("mime"),
+                                ev.get("caption"),
+                                ev.get("media_note"),
                             ),
                         )
-                        inserted += conn.execute("SELECT changes()").fetchone()[0]
+                        if conn.execute("SELECT changes()").fetchone()[0]:
+                            inserted += 1
+                            continue
+                        wamid = ev.get("wamid")
+                        if not wamid:
+                            continue
+                        row = conn.execute(
+                            "SELECT " + ", ".join(_ENRICH_COLS) + " FROM wa_inbox WHERE wamid=?",
+                            (wamid,)).fetchone()
+                        if row is None:
+                            continue
+                        upd = _enrichment(dict(zip(_ENRICH_COLS, row)), ev)
+                        if upd:
+                            conn.execute(
+                                "UPDATE wa_inbox SET " + ", ".join(c + "=?" for c in upd)
+                                + ", enriched_at=? WHERE wamid=?",
+                                (*upd.values(), now, wamid))
+                            enriched += 1
                     except Exception as e:
                         log.warning("wa_queue enqueue error: %s", e)
                 conn.commit()
-        return inserted
+        return {"inserted": inserted, "enriched": enriched}
+
+    def upsert_contacts(self, contacts: list, source: str = "") -> int:
+        """Contacts of the business phone → wa_contacts. Returns rows inserted or updated.
+
+        Repeat of a number is an UPDATE of that row. An event older than the stored one does
+        not overwrite it; an event without a name (e.g. `remove`) keeps the name we had.
+        """
+        now = int(time.time())
+        changed = 0
+        with self._lock:
+            with self._conn() as conn:
+                for c in contacts:
+                    try:
+                        conn.execute(
+                            """INSERT INTO wa_contacts (number, name, action, ts, ts_seen, source, raw)
+                               VALUES (?,?,?,?,?,?,?)
+                               ON CONFLICT(number) DO UPDATE SET
+                                 name    = CASE WHEN excluded.name <> '' THEN excluded.name
+                                                ELSE wa_contacts.name END,
+                                 action  = excluded.action,
+                                 ts      = excluded.ts,
+                                 ts_seen = excluded.ts_seen,
+                                 source  = excluded.source,
+                                 raw     = excluded.raw
+                               WHERE excluded.ts >= COALESCE(wa_contacts.ts, 0)""",
+                            (c["number"], c.get("name") or "", c.get("action") or "",
+                             int(c.get("ts") or 0), now, source or "",
+                             json.dumps(c.get("raw"), ensure_ascii=False)),
+                        )
+                        changed += conn.execute("SELECT changes()").fetchone()[0]
+                    except Exception as e:
+                        log.warning("wa_contacts upsert error: %s", e)
+                conn.commit()
+        return changed
 
     def count_pending(self) -> int:
         """Count rows with status='new' (pending for PC)."""
@@ -345,10 +483,14 @@ def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -
     msg_type = msg.get("type", "")
     text = None
     media_id = None
+    mime = caption = media_note = None
     if msg_type == "text":
         text = (msg.get("text") or {}).get("body")
     elif msg_type in _MEDIA_TYPES:
-        media_id = (msg.get(msg_type) or {}).get("id")
+        media_id, mime, caption = _media_fields(msg, msg_type)
+    elif msg_type == MEDIA_PLACEHOLDER:
+        # история: медиа было, файла в этом теле нет; id придёт позже под тем же wamid
+        media_note = MEDIA_NOTE_NO_FILE
     elif msg_type == "location":
         loc = msg.get("location") or {}
         text = f"{loc.get('latitude')},{loc.get('longitude')}"
@@ -360,18 +502,29 @@ def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -
         elif kind == "list_reply":
             text = (intr.get("list_reply") or {}).get("title")
     return {
-        "channel":  "wa",
-        "from":     number,
-        "name":     name,
-        "type":     msg_type,
-        "text":     text,
-        "media_id": media_id,
-        "ts":       int(msg.get("timestamp") or 0),
-        "echo":     echo,
-        "history":  history,
-        "wamid":    msg.get("id"),
-        "raw":      msg,
+        "channel":    "wa",
+        "from":       number,
+        "name":       name,
+        "type":       msg_type,
+        "text":       text,
+        "media_id":   media_id,
+        "mime":       mime,
+        "caption":    caption,
+        "media_note": media_note,
+        "ts":         int(msg.get("timestamp") or 0),
+        "echo":       echo,
+        "history":    history,
+        "wamid":      msg.get("id"),
+        "raw":        msg,
     }
+
+
+def _media_fields(msg: dict, msg_type: str):
+    """id, mime и подпись медиа из объекта под именем типа. Не dict → всё пусто."""
+    media = msg.get(msg_type)
+    if not isinstance(media, dict):
+        return None, None, None
+    return media.get("id"), media.get("mime_type"), media.get("caption")
 
 
 def normalize_wa_payload(payload: dict, our_phone_number: str = "") -> list:
@@ -509,10 +662,11 @@ def normalize_d360_v1_payload(payload: dict) -> list:
 
         text     = None
         media_id = None
+        mime = caption = None
         if msg_type == "text":
             text = (msg.get("text") or {}).get("body")
         elif msg_type in _MEDIA_TYPES:
-            media_id = (msg.get(msg_type) or {}).get("id")
+            media_id, mime, caption = _media_fields(msg, msg_type)
         elif msg_type == "location":
             loc  = msg.get("location") or {}
             text = f"{loc.get('latitude')},{loc.get('longitude')}"
@@ -533,6 +687,8 @@ def normalize_d360_v1_payload(payload: dict) -> list:
             "type":     msg_type,
             "text":     text,
             "media_id": media_id,
+            "mime":     mime,
+            "caption":  caption,
             "ts":       ts,
             "echo":     False,   # sandbox: messages are always from real users
             "history":  history,
@@ -617,6 +773,156 @@ def payload_shape(payload) -> str:
     return shape
 
 
+# ─── разовая выгрузка Coexistence: контакты, счёт истории, сырой архив (01.10.2026) ─────
+#
+# Выгрузка истории за 180 дней приходит ОДИН раз; что вход потерял, повторно не придёт. Поэтому
+# три вещи ниже: контакты телефона бизнеса кладутся в таблицу (а не в WARNING), каждое тело
+# истории оставляет строку из чисел (фаза, кусок, прогресс, счёт), а каждое тело, прошедшее
+# секрет пути, ложится как есть в JSONL рядом с базой — из него можно разобрать заново то, что
+# разбор сегодняшнего дня не понял.
+
+_FIELD_STATE_SYNC = "smb_app_state_sync"
+
+
+def _changes_of(payload, field: str) -> list:
+    """value всех change с данным полем. Кривые узлы пропускаются, а не роняют разбор."""
+    out = []
+    if not isinstance(payload, dict):
+        return out
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            if (isinstance(change, dict) and change.get("field") == field
+                    and isinstance(change.get("value"), dict)):
+                out.append(change["value"])
+    return out
+
+
+def _to_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def contacts_of(payload) -> list:
+    """`smb_app_state_sync` → [{number, name, action, ts, raw}]. Без номера — не контакт."""
+    out = []
+    for value in _changes_of(payload, _FIELD_STATE_SYNC):
+        for item in value.get("state_sync") or []:
+            if not isinstance(item, dict) or (item.get("type") or "contact") != "contact":
+                continue
+            c = item.get("contact") if isinstance(item.get("contact"), dict) else {}
+            number = str(c.get("phone_number") or c.get("wa_id") or "").strip()
+            if not number:
+                continue
+            meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            out.append({
+                "number": number,
+                "name":   c.get("full_name") or c.get("first_name") or "",
+                "action": item.get("action") or "",
+                "ts":     _to_int(meta.get("timestamp") or item.get("timestamp")) or 0,
+                "raw":    item,
+            })
+    return out
+
+
+def history_summary(payload):
+    """Тело `history` → числа для журнала; не история → None. Ни одного значения переписки.
+
+    chunks — (phase, chunk_order, progress) каждого куска, отсутствующее — None;
+    messages — сообщений в нитях; placeholders — из них `media_placeholder`; errors — кусков
+    с отказом (`errors`).
+    """
+    values = _changes_of(payload, _FIELD_HISTORY)
+    if not values:
+        return None
+    chunks, messages, placeholders, errors = [], 0, 0, 0
+    for value in values:
+        for chunk in value.get("history") or []:
+            if not isinstance(chunk, dict):
+                continue
+            meta = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+            chunks.append((_to_int(meta.get("phase")), _to_int(meta.get("chunk_order")),
+                           _to_int(meta.get("progress"))))
+            if chunk.get("errors"):
+                errors += 1
+            for thread in chunk.get("threads") or []:
+                if not isinstance(thread, dict):
+                    continue
+                for msg in thread.get("messages") or []:
+                    if isinstance(msg, dict):
+                        messages += 1
+                        if msg.get("type") == MEDIA_PLACEHOLDER:
+                            placeholders += 1
+    return {"chunks": chunks, "messages": messages, "placeholders": placeholders,
+            "errors": errors}
+
+
+def _nums(values) -> str:
+    return ",".join("?" if v is None else str(int(v)) for v in values) or "?"
+
+
+# Сырой архив входа d360. Потолок назван от свободного места корня сервера на 01.10.2026
+# (22 875 267 072 байт свободно из 39 964 635 136): архив не больше 2 GiB (≈9% свободного), и
+# запись не опускает свободное место ниже 5 GiB. Выгрузка текста за 180 дней — порядок десятков
+# мегабайт, потолок — страховка диска, а не ожидаемый размер. Сработал — WARNING на каждое тело.
+RAW_ARCHIVE_NAME       = "wa_d360_raw.jsonl"
+RAW_ARCHIVE_MAX_BYTES  = 2 * 1024 ** 3
+RAW_ARCHIVE_FREE_FLOOR = 5 * 1024 ** 3
+
+_raw_archive_lock = threading.Lock()
+
+
+def raw_archive_path(queue_db: str) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(queue_db)), RAW_ARCHIVE_NAME)
+
+
+def _free_bytes(path: str):
+    if not hasattr(os, "statvfs"):
+        return None
+    st = os.statvfs(os.path.dirname(os.path.abspath(path)))
+    return st.f_bavail * st.f_frsize
+
+
+def archive_raw(path: str, body: bytes, max_bytes: int = RAW_ARCHIVE_MAX_BYTES,
+                free_floor: int = RAW_ARCHIVE_FREE_FLOOR) -> str:
+    """Тело входа как есть → строка JSONL {"ts", "len", "body"}, файл с правами 600.
+
+    Исход: `written` · `cap` (потолок, WARNING) · `error` (WARNING) · `off` (пути нет). Сбой
+    архива очередь не останавливает: разбор и запись строк идут дальше.
+    """
+    if not path:
+        return "off"
+    try:
+        line = (json.dumps({"ts": int(time.time()), "len": len(body),
+                            "body": body.decode("utf-8", "replace")},
+                           ensure_ascii=False) + "\n").encode("utf-8")
+        with _raw_archive_lock:
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            free = _free_bytes(path)
+            if size + len(line) > max_bytes or (free is not None and free - len(line) < free_floor):
+                log.warning("D360 raw archive: CEILING, body of %d bytes NOT archived "
+                            "(size=%d cap=%d free=%s floor=%d)",
+                            len(body), size, max_bytes, free, free_floor)
+                return "cap"
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(fd, 0o600)
+                view = memoryview(line)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+        return "written"
+    except Exception as e:
+        log.warning("D360 raw archive: write failed, body of %d bytes NOT archived: %s",
+                    len(body), type(e).__name__)
+        return "error"
+
+
 # ─── HMAC signature verification ─────────────────────────────────────────────────────
 
 def path_secret_ok(configured: str, given: str) -> bool:
@@ -669,6 +975,9 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
     db:               WAQueueDB = None
     d360_path_secret: str = ""
     pull_secret:      str = ""
+    raw_archive:      str = ""                       # '' → архива нет (make_server ставит путь)
+    raw_archive_max:  int = RAW_ARCHIVE_MAX_BYTES
+    raw_archive_floor: int = RAW_ARCHIVE_FREE_FLOOR
 
     # Socket r/w timeout per request — a slow/stalled client closes the connection
     # rather than holding the thread indefinitely (incident 15.07: TCP open, HTTP hung).
@@ -826,6 +1135,9 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
 
+        # Сначала сырой архив — до разбора, чтобы и тело, которое разбор не поймёт, осталось.
+        archive_raw(self.raw_archive, body, self.raw_archive_max, self.raw_archive_floor)
+
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception as e:
@@ -841,18 +1153,34 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
 
         try:
             fmt = d360_format_of(payload)
+            contacts = []
             if fmt == D360_FMT_CLOUD:
                 events = normalize_wa_payload(payload, our_phone_number=self.our_phone)
+                contacts = contacts_of(payload)
             elif fmt == D360_FMT_V1:
                 events = normalize_d360_v1_payload(payload)
             else:
                 log.warning("D360 POST: unknown body form, 0 events, nothing enqueued (%s)",
                             payload_shape(payload))
                 return
+            stats = {"inserted": 0, "enriched": 0}
             if events:
-                n = self.db.enqueue(events, source="d360") if self.db else 0
-                log.info("D360 POST: %d events, %d enqueued (form=%s)", len(events), n, fmt)
-            else:
+                if self.db:
+                    stats = self.db.enqueue_stats(events, source="d360")
+                log.info("D360 POST: %d events, %d enqueued (form=%s), %d enriched",
+                         len(events), stats["inserted"], fmt, stats["enriched"])
+            if contacts:
+                n = self.db.upsert_contacts(contacts, source="d360") if self.db else 0
+                log.info("D360 POST: %d contacts, %d stored (form=%s)", len(contacts), n, fmt)
+            hist = history_summary(payload) if fmt == D360_FMT_CLOUD else None
+            if hist is not None:
+                ch = hist["chunks"]
+                log.info("D360 history: phase=%s chunk=%s progress=%s messages=%d "
+                         "placeholders=%d errors=%d inserted=%d enriched=%d",
+                         _nums(c[0] for c in ch), _nums(c[1] for c in ch),
+                         _nums(c[2] for c in ch), hist["messages"], hist["placeholders"],
+                         hist["errors"], stats["inserted"], stats["enriched"])
+            if not events and not contacts:
                 log.warning("D360 POST: %s body gave 0 events, nothing enqueued (%s)",
                             fmt, payload_shape(payload))
         except Exception as e:
@@ -878,8 +1206,9 @@ def make_server(env: dict) -> ThreadingHTTPServer:
     _Handler.db               = db
     _Handler.d360_path_secret = env.get("d360_path_secret", "")
     _Handler.pull_secret      = env.get("pull_secret", "")
+    _Handler.raw_archive      = raw_archive_path(env["queue_db"])
 
-    server = ThreadingHTTPServer((bind_host(env.get("bind_host")), env["port"]), _Handler)
+    server =ThreadingHTTPServer((bind_host(env.get("bind_host")), env["port"]), _Handler)
     server.daemon_threads = True
     return server
 
@@ -898,6 +1227,9 @@ def main():
         server.server_address[0], env["port"], env["queue_db"],
         "on" if env.get("pull_secret") else "OFF (WA_PULL_SECRET not set → pull/ack answer 404)",
     )
+    log.info("D360 raw archive: %s  cap=%d  free_floor=%d",
+             server.RequestHandlerClass.raw_archive, RAW_ARCHIVE_MAX_BYTES,
+             RAW_ARCHIVE_FREE_FLOOR)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
