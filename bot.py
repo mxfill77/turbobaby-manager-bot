@@ -238,6 +238,7 @@ async def on_audit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_service_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Кнопки [После замены]/[Просто пробег] по фото пробега → splinter.handle_service_button.
     [После замены] пишет ТО Oil в Лист1 ТОЛЬКО доверенным (Пым/владелец)."""
+    splinter.feed_button(update)       # лента темы (SPLTOPICFEED0110): кто нажал что; fail-safe
     await splinter.handle_service_button(update, context, bridge)
 
 
@@ -622,7 +623,10 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
 
     memory.save_message(chat_id, None, "Bot", "assistant", answer, topic_id=_topic)
     for chunk in chunk_text(answer, 4000):
-        await msg.reply_text(chunk, parse_mode=None)
+        _sent_ans = await msg.reply_text(chunk, parse_mode=None)
+        # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): ответ мозга — тоже событие темы (только обслуживание)
+        splinter.feed_bot_sent(chat_id, _topic, _sent_ans, chunk,
+                               reply_to=getattr(msg, "message_id", None), source="мозг")
 
     # Окно «бот ждёт ответа без тега»:
     # пришедшее сообщение мы уже обработали → снимаем старый флаг,
@@ -834,6 +838,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Иначе гейт вступления (фикс 07:51) работает как обычно — pending не трогает его.
         _tid_sv = getattr(msg, "message_thread_id", None)
         if splinter.GROUPS.get(chat_id) == "servicing":
+            # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): КАЖДОЕ сообщение группы обслуживания — в память
+            # темы на сервере ДО любых перехватов (первый взявший сообщение — последний, кто его видит).
+            # Fail-safe внутри: сбой ленты = строка журнала, сообщение идёт дальше прежним путём.
+            splinter.feed_incoming(msg, "text")
             # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» в этой теме (дедуп, O(1) после первого раза)
             await splinter.ensure_info_pin(context, chat_id, _tid_sv)
             # 0'') ОТВЕТ РЕПЛАЕМ НА ВОПРОС О ПРОБЕГЕ (01.10.2026, SPLODOREPLY0110): реплай на само
@@ -965,6 +973,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                 except Exception:
                     pass
+                # ЛЕНТА ТЕМЫ → МОЗГ (01.10.2026, SPLTOPICFEED0110): что было в теме, что бот спросил и
+                # с каким id, что открыто, что легло, на что это сообщение — реплай. Выключатель
+                # `TOPIC_FEED_CONTEXT=0` → None, note прежний байт в байт.
+                _feed_ctx = splinter.topic_context(chat_id, _tid, bridge=bridge, bike=_bike_topic,
+                                                   reply_to=splinter._tfeed.reply_to_of(msg))
+                if _feed_ctx:
+                    note += "\n\n" + _feed_ctx
                 # Инструкция по надзору за важным
                 note += (
                     f"\n\n## НАДЗОР ЗА ВАЖНЫМ\n"
@@ -1381,6 +1396,9 @@ async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):
     if splinter.GROUPS.get(msg.chat_id) == "servicing":
         _spk_ph = (msg.from_user.username or "").lower() if msg.from_user else ""
         log.info(f"  → photo servicing @{_spk_ph}: cap={cap[:60]!r}")
+        # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): каждое фото пачки — событие ДО маршрута. Fail-safe.
+        for _u_ph in updates:
+            splinter.feed_incoming(_u_ph.message, "photo")
         # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» и в фото-пути обслуживания
         await splinter.ensure_info_pin(context, msg.chat_id, _tid)
         _addressed = _servicing_caption_to_brain(msg, context, cap)
@@ -1393,7 +1411,14 @@ async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):
     if _addressed:
         # У фото нет msg.text — передаём подпись (или нейтральный запрос) мозгу ПАРАМЕТРОМ.
         # Message в PTB immutable: msg.text=... бросает AttributeError (был краш в горячем пути фото).
-        await manager_reply(msg, context, context_note="Владелец/Пым прислал фото.", bilingual=True,
+        _note_ph = "Владелец/Пым прислал фото."
+        if splinter.GROUPS.get(msg.chat_id) == "servicing":
+            # ЛЕНТА ТЕМЫ → МОЗГ (SPLTOPICFEED0110); выключатель → None и note прежний байт в байт
+            _feed_ctx_ph = splinter.topic_context(msg.chat_id, _tid, bridge=bridge,
+                                                  reply_to=splinter._tfeed.reply_to_of(msg))
+            if _feed_ctx_ph:
+                _note_ph += "\n\n" + _feed_ctx_ph
+        await manager_reply(msg, context, context_note=_note_ph, bilingual=True,
                             user_text=cap or "Фото в теме — проверь, что на нём (пробег/чек/состояние).")
         return
     photo_msgs = [u.message for u in updates]

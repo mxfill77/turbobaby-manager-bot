@@ -92,3 +92,6 @@ wa_d360_raw.jsonl
 wa_tg_mirror.db
 wa_tg_mirror.db-journal
 wa_media/
+
+# лента темы обслуживания (SPLTOPICFEED0110) — рантайм-состояние
+topic_feed/
