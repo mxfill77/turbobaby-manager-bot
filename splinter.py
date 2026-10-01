@@ -53,6 +53,7 @@ import caption_intent  # подпись к фото: короткое указа
 import bike_position   # положение байка: совет C и фраза о депозите в J — только на возврате (25.09)
 import act_gate        # одно место перед действием: адресат, лента темы, переспрос до «да» (27.09)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
+import topic_feed as _tfeed   # лента темы обслуживания на диске + контекст мозгу (01.10, SPLTOPICFEED0110)
 import contextvars as _ctxvars   # свидетель «мы уже говорили» — по задаче, а не глобально
 # §12: типизированный upstream-down (громкий провал API-пути). В проде импортируется РЕАЛЬНЫЙ класс
 # из claude_client (тот же, что бросает quick()/vision()) → except его ловит. Часть тестов подменяет
@@ -112,6 +113,10 @@ _SPOKE = _ctxvars.ContextVar("splinter_spoke", default=0)
 #: а глобаль отдала бы полу вид снимка СОСЕДНЕГО сообщения — ту же ложь с другой стороны.
 #: Тот же довод, что у `_SPOKE` выше и у `_CARD_BUDGET` в `bridge_client`.
 _PHOTO_KIND = _ctxvars.ContextVar("splinter_photo_kind", default="")
+
+#: Отправка идёт через `_hint_send` — событие ленты пишет он (как «вопрос бота» с видом подсказки),
+#: а `_send` второй строки не пишет (01.10.2026, SPLTOPICFEED0110). ContextVar по тому же доводу.
+_FEED_VIA_HINT = _ctxvars.ContextVar("splinter_feed_via_hint", default=False)
 
 #: ЧТО ПОНЯЛ РАЗБОРЩИК ТЕКСТА ЭТОГО обновления — второй свидетель пола (24.09.2026). Пол стоит
 #: снаружи `_handle_servicing` и о тексте не знал ничего: «Are you OK?», «Yes» и тег человека
@@ -209,6 +214,10 @@ async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=Tru
     if parse_mode is not None:
         kw["parse_mode"] = parse_mode
     sent = await context.bot.send_message(**kw)
+    # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): своё сообщение бота в теме обслуживания — с id.
+    # Через `_hint_send` строку пишет он сам (с видом подсказки). Не бросает.
+    if not _FEED_VIA_HINT.get():
+        feed_bot_sent(chat_id, message_thread_id, sent, text)
     # СВИДЕТЕЛЬ РЕЧИ (правило владельца 23.08 «никогда не молчать»). `_send` — ЕДИНСТВЕННАЯ дверь
     # к `send_message` во всём модуле, поэтому счётчик здесь и есть полный ответ на вопрос
     # «сказали ли мы хоть слово». Отметка ставится ПОСЛЕ удачной отправки: упавшая отправка речью
@@ -898,7 +907,7 @@ async def _hint_send(context, *, kind, bike, state, chat_id, topic_id, text, rep
     if not _hint_enabled():
         # Ручка отката гасит ветку ДО чтения памяти: ни файла, ни решения — путь байт-в-байт
         # прежний. Это же и держит прогон тестов подальше от боевого состояния.
-        return await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id, **kw)
+        return await _hint_send_fed(context, kind, bike, chat_id, topic_id, text, kw)
     seen = _hint_load()
     now = _time.time()
     _rh = _hint_repeat_h() if repeat_h is None else repeat_h
@@ -910,12 +919,24 @@ async def _hint_send(context, *, kind, bike, state, chat_id, topic_id, text, rep
         log.info(f"  🔁 подсказка {kind} ПОДАВЛЕНА (замок повторов): {v['why']}, прошло {_age} "
                  f"< {_rh:.0f}ч · байк={bike or '—'} тема={topic_id or '—'}")
         return HINT_SKIPPED
-    sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id, **kw)
+    sent = await _hint_send_fed(context, kind, bike, chat_id, topic_id, text, kw)
     if v["key"]:
         seen[v["key"]] = {"fp": v["fp"], "ts": now}
         _HINT_SEEN = hint_dedup.prune(seen, now)
         _hint_save()
     log.info(f"  ✅ подсказка {kind} отправлена ({v['why']}) · байк={bike or '—'}")
+    return sent
+
+
+async def _hint_send_fed(context, kind, bike, chat_id, topic_id, text, kw):
+    """Отправка подсказки + событие ленты «вопрос бота» с id и видом (01.10.2026, SPLTOPICFEED0110).
+    Пишется ЗДЕСЬ, а не в `_send`: так строка есть и тогда, когда `_send` подменён, и у неё есть вид."""
+    tok = _FEED_VIA_HINT.set(True)
+    try:
+        sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=topic_id, **kw)
+    finally:
+        _FEED_VIA_HINT.reset(tok)
+    feed_bot_sent(chat_id, topic_id, sent, text, kind="bot_ask", hint=kind, bike=bike)
     return sent
 
 
@@ -941,6 +962,251 @@ def is_awaiting(chat_id, topic_id=None) -> bool:
 
 def clear_awaiting(chat_id, topic_id=None):
     _AWAITING_REPLY.pop((chat_id, topic_id), None)
+
+
+# === ЛЕНТА ТЕМЫ ОБСЛУЖИВАНИЯ + КОНТЕКСТ МОЗГУ (01.10.2026, задание Штаба 0091-76h, SPLTOPICFEED0110) ===
+# Хранилище и поля — в шапке `topic_feed.py`. Здесь — места записи и сборка контекста:
+#   вход bot.py (каждое сообщение группы обслуживания, ДО перехватов) → `feed_incoming`;
+#   кнопки `svc:*` → `feed_button`; свои сообщения `_send` / вопросы `_hint_send` → `feed_bot_sent`;
+#   разбор фото (когда готов) → событие `vision` в `_handle_servicing`;
+#   `_odo_confirmed` и запись ТО фазы 2 (`_sp_write_done`) → `feed_record` (что легло).
+# Пишется ТОЛЬКО группа обслуживания. Ни одна функция не бросает: сбой ленты = строка журнала.
+
+def _feed_servicing(chat_id) -> bool:
+    try:
+        return GROUPS.get(chat_id) == "servicing"
+    except Exception:
+        return False
+
+
+def _feed_role(user) -> str:
+    if user is None:
+        return "staff"
+    if getattr(user, "is_bot", False):
+        return "bot"
+    u = (getattr(user, "username", None) or "").lower()
+    if u in PYM_USERNAMES:
+        return "pym"
+    if u in OWNER_USERNAMES:
+        return "owner"
+    return "staff"
+
+
+def feed_incoming(msg, kind=None) -> bool:
+    """Входящее сообщение группы обслуживания → лента (текст / фото с подписью). Не бросает."""
+    try:
+        if msg is None or not _feed_servicing(msg.chat_id):
+            return False
+        if kind is None:
+            kind = "photo" if getattr(msg, "photo", None) else "text"
+        text = getattr(msg, "text", None) if kind == "text" else getattr(msg, "caption", None)
+        return _tfeed.append(msg.chat_id, getattr(msg, "message_thread_id", None), kind,
+                             mid=getattr(msg, "message_id", None), ts=_tfeed.msg_ts(msg),
+                             role=_feed_role(getattr(msg, "from_user", None)),
+                             reply_to=_tfeed.reply_to_of(msg), text=text or "",
+                             album=getattr(msg, "media_group_id", None))
+    except Exception as e:
+        log.warning(f"  🧵 лента темы: вход не записан ({e}) — сообщение идёт дальше")
+        return False
+
+
+def feed_button(update) -> bool:
+    """Нажатие кнопки `svc:*` → лента: кто, какое действие (без метки), под каким сообщением."""
+    try:
+        q = getattr(update, "callback_query", None)
+        m = getattr(q, "message", None)
+        if q is None or m is None or not _feed_servicing(m.chat_id):
+            return False
+        action = ":".join(str(q.data or "").split(":")[:2])
+        return _tfeed.append(m.chat_id, getattr(m, "message_thread_id", None), "button",
+                             mid=getattr(m, "message_id", None),
+                             role=_feed_role(getattr(q, "from_user", None)),
+                             reply_to=getattr(m, "message_id", None), text=action)
+    except Exception as e:
+        log.warning(f"  🧵 лента темы: кнопка не записана ({e})")
+        return False
+
+
+def feed_bot_sent(chat_id, topic_id, sent, text, *, kind=None, hint=None, reply_to=None,
+                  source=None, bike=None) -> bool:
+    """Своё сообщение бота в теме обслуживания (с id из ответа Telegram). Подавленный повтор
+    подсказки (`HINT_SKIPPED`) сообщением не является и не пишется. Не бросает."""
+    try:
+        if sent is HINT_SKIPPED or not _feed_servicing(chat_id):
+            return False
+        if kind is None:
+            kind = "bot_ask" if "?" in str(text or "") else "bot_msg"
+        return _tfeed.append(chat_id, topic_id, kind, mid=getattr(sent, "message_id", None),
+                             role="bot", reply_to=reply_to, text=text or "", hint=hint,
+                             source=source, bike=bike)
+    except Exception as e:
+        log.warning(f"  🧵 лента темы: сообщение бота не записано ({e})")
+        return False
+
+
+def feed_vision(chat_id, topic_id, photo_msgs, vis, n) -> bool:
+    """Разбор зрения фото (одиночного или альбома) → ОДНО событие `vision` с id первого фото."""
+    try:
+        if not _feed_servicing(chat_id) or not isinstance(vis, dict):
+            return False
+        mid = getattr((photo_msgs or [None])[0], "message_id", None)
+        return _tfeed.append(chat_id, topic_id, "vision", mid=mid, role="bot",
+                             mileage=(str(vis.get("mileage")) if vis.get("mileage") else None),
+                             conf=vis.get("mileage_confidence") or None,
+                             photo_kind=vis.get("kind") or None, n=int(n or 0),
+                             damage=(str(vis.get("damage"))[:120] if vis.get("damage") else None))
+    except Exception as e:
+        log.warning(f"  🧵 лента темы: разбор фото не записан ({e})")
+        return False
+
+
+def feed_record(chat_id, topic_id, what, **fields) -> bool:
+    """Что легло в учёт (пробег, работы ТО). Не бросает."""
+    try:
+        if not _feed_servicing(chat_id):
+            return False
+        return _tfeed.append(chat_id, topic_id, "record", role="bot", what=what, **fields)
+    except Exception as e:
+        log.warning(f"  🧵 лента темы: запись учёта не отмечена ({e})")
+        return False
+
+
+def _ctx_age(ts, now):
+    try:
+        h = (now - float(ts)) / 3600.0
+        return f"{h:.1f} ч назад"
+    except Exception:
+        return "возраст неизвестен"
+
+
+def _ctx_brief(v):
+    """Короткая сводка значения словаря ожиданий: только числа/короткие строки, без объектов."""
+    if isinstance(v, dict):
+        bits = []
+        for k, x in v.items():
+            if k in ("msg", "photo_msgs", "claude", "ts", "at"):
+                continue
+            if isinstance(x, (int, float, str, bool)) and len(str(x)) <= 80:
+                bits.append(f"{k}={x}")
+            elif isinstance(x, (list, tuple)) and len(x) <= 8:
+                bits.append(f"{k}={','.join(str(i)[:40] for i in x)}")
+        return " ".join(bits)
+    if isinstance(v, (list, tuple)):
+        return " ".join(str(i)[:60] for i in v if not isinstance(i, float))
+    return str(v)[:80]
+
+
+def _ctx_ts(v):
+    if isinstance(v, dict):
+        return v.get("ts") or v.get("at")
+    if isinstance(v, (list, tuple)) and v and isinstance(v[-1], (int, float)):
+        return v[-1]
+    if isinstance(v, (int, float)):
+        return v
+    return None
+
+
+def topic_open_questions(chat_id, topic_id, now=None) -> list:
+    """Открытые вопросы/ожидания темы: файл вопроса о пробеге (0088) + словари памяти процесса."""
+    now = _time.time() if now is None else now
+    out = []
+    key = (chat_id, topic_id)
+    try:
+        _mileage_q_load()
+        q = _MILEAGE_Q.get(_mileage_q_key(chat_id, topic_id))
+        if q:
+            out.append(f"вопрос о пробеге «Вижу {q.get('mileage')} км. Верно?» — сообщение бота "
+                       f"#{q.get('msg_id')}, задан {_ctx_age(q.get('ts'), now)}, ответа не было "
+                       f"(хранится на диске; реплай на #{q.get('msg_id')} числом или да/нет = ответ на него)")
+    except Exception as e:
+        log.warning(f"  🧵 контекст: файл вопроса о пробеге не прочитан ({e})")
+    tables = (("вопрос о пробеге (память)", "_PENDING_MILEAGE"),
+              ("мягкий гейт убывания пробега", "_SOFT_ODO_PENDING"),
+              ("вопрос о причине понижения пробега", "_ODO_LOWER_PENDING"),
+              ("вопрос о партии работ на другом пробеге", "_BATCH_ODO_PENDING"),
+              ("переспрос правки пробега", "_PENDING_CORRECTION"),
+              ("работы ждут пробега", "_PENDING_WORKS"),
+              ("бот ждёт ответа без тега (10 мин)", "_AWAITING_REPLY"))
+    for label, name in tables:
+        try:
+            d = globals().get(name) or {}
+            if key in d:
+                v = d[key]
+                out.append(f"{label}: {_ctx_brief(v)} · {_ctx_age(_ctx_ts(v), now)}".replace(":  ·", ": ·"))
+        except Exception:
+            continue
+    try:
+        for n, v in list((globals().get("_ACT_GATE_PENDING") or {}).items()):
+            m = v.get("msg") if isinstance(v, dict) else None
+            if m is not None and m.chat_id == chat_id and getattr(m, "message_thread_id", None) == topic_id:
+                out.append(f"вопрос-ворота действия №{n}: {_ctx_brief(v)} · {_ctx_age(_ctx_ts(v), now)}")
+    except Exception:
+        pass
+    return out
+
+
+def _ctx_last_confirmed_km(chat_id, topic_id, events):
+    for ev in reversed(events):
+        if ev.get("kind") == "record" and ev.get("km") is not None:
+            return ev.get("km"), ev.get("ts")
+    v = (globals().get("_LAST_RECORDED_KM") or {}).get((chat_id, topic_id))
+    if v:
+        return v[0], v[1]
+    return None, None
+
+
+def topic_context(chat_id, topic_id, *, reply_to=None, bridge=None, now=None, bike=None) -> str:
+    """Контекст темы для мозга: байк; открытые вопросы; ТО-заявка; последний подтверждённый пробег;
+    на что это сообщение — реплай; последние 30 событий ленты за 7 суток. Предел объёма —
+    `TOPIC_CONTEXT_MAX` символов (по умолчанию 6000): режутся самые старые события. Выключатель —
+    `TOPIC_FEED_CONTEXT=0` → None (контекст мозга прежний байт в байт). Не бросает: сбой → None
+    («контекст не собран»; пустая строка выдала бы промах за ответ — храповик `blind_readers.py`)."""
+    try:
+        if not _tfeed.context_enabled():
+            return None
+        now = _time.time() if now is None else now
+        try:
+            cap = int(os.getenv("TOPIC_CONTEXT_MAX", "6000"))
+        except ValueError:
+            cap = 6000
+        events = _tfeed.read(chat_id, topic_id, days=7, limit=30, now=now)
+        feed_ok = events is not None
+        events = events or []
+        bike = bike if bike is not None else bike_from_topic(chat_id, topic_id)
+        head = [(f"## ЛЕНТА ЭТОЙ ТЕМЫ (память темы на сервере, последние {len(events)} событий за 7 суток)"
+                 if feed_ok else
+                 "## ЛЕНТА ЭТОЙ ТЕМЫ: НЕ ПРОЧИТАНА (сбой хранилища) — событий не знаю, не «их нет»"),
+                f"Байк темы: {bike or 'неизвестен'}"]
+        opens = topic_open_questions(chat_id, topic_id, now=now)
+        head.append("Открытые вопросы и ожидания: " + ("нет" if not opens else ""))
+        head += [f"- {o}" for o in opens]
+        sp = None
+        if bridge is not None and bike:
+            sp = _sp_open(bridge, chat_id, topic_id, bike)
+        head.append(f"ТО-заявка: {_ctx_brief(sp) if sp else 'открытой нет (или мост не ответил)'}")
+        km, km_ts = _ctx_last_confirmed_km(chat_id, topic_id, events)
+        head.append(f"Последний подтверждённый пробег: {km} км, {_ctx_age(km_ts, now)}" if km is not None
+                    else "Последний подтверждённый пробег: в ленте нет")
+        if reply_to is not None:
+            target = _tfeed.find(chat_id, topic_id, reply_to)
+            if target:
+                head.append(f"ЭТО СООБЩЕНИЕ — РЕПЛАЙ на #{reply_to}: {_tfeed.render_event(target)}")
+            else:
+                head.append(f"ЭТО СООБЩЕНИЕ — РЕПЛАЙ на #{reply_to} (в ленте его нет)")
+        head.append("События (Пхукет, старые сверху; #id — сообщение, ↩#id — реплай на него):")
+        lines = [_tfeed.render_event(ev) for ev in events]
+        tail = ("Опирайся на ленту: не переспрашивай то, на что уже ответили; если сообщение — ответ "
+                "на открытый вопрос, считай его ответом на этот вопрос.")
+        while True:
+            txt = "\n".join(head + lines + [tail])
+            if len(txt) <= cap or not lines:
+                break
+            lines = lines[1:]
+        log.info(f"  🧵 контекст темы → мозг: событий {len(lines)}, открытых {len(opens)}, символов {len(txt)}")
+        return txt
+    except Exception as e:
+        log.warning(f"  🧵 контекст темы не собран ({e}) — мозг получает прежний контекст")
+        return None
 
 # Кэш названий форум-тем: {(chat_id, topic_id): "название темы"}
 # В названии темы записан байк (по договорённости Филиппа).
@@ -3491,6 +3757,10 @@ def _odo_confirmed(bridge, chat_id, topic_id, bike, km, *, questioned_km=None,
     # без bridge писать некуда — буфер там НЕ трогается (забрали бы работы в пустоту).
     written, _ = _km_door(bridge, chat_id, topic_id, bike, km, source=source or "confirm",
                           msg_date=msg_date)
+    # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): подтверждённый пробег лёг — событие учёта. Не бросает.
+    feed_record(chat_id, topic_id, "пробег подтверждён", km=str(km),
+                questioned_km=(str(questioned_km) if questioned_km is not None else None),
+                done=list(written or []), source=source or "confirm", bike=bike)
     if written:
         try:
             acc = _summary_acc(chat_id, topic_id)
@@ -9270,6 +9540,9 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                                          note=f"written={','.join(written)} by {confirmed_by}")
         except Exception:
             log.exception("  → service_pending_close упал")
+    # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): что легло в ТО по «да». Не бросает.
+    feed_record(chat_id, topic_id, "ТО записано", km=str(odo_int), done=list(written),
+                failed=[k for k, _e in failed], source=f"фаза 2 {confirmed_by or ''}".strip(), bike=bike)
     return written, failed
 
 
@@ -9844,6 +10117,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
         if len(vis_list) > 1:
             log.info(f"  → альбом: склеил {len(vis_list)} фото → mileage={vis.get('mileage')} "
                      f"conf={vis.get('mileage_confidence')} damage={vis.get('damage')} dirt={vis.get('dirt')}")
+        # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): разбор зрения — ОТДЕЛЬНЫМ событием, когда готов,
+        # с id первого фото (альбом — одним событием). Не бросает.
+        if vis_list:
+            feed_vision(chat_id, topic_id, photo_msgs, vis, len(vis_list))
 
     # Работы из разбора — отдельно от type (техник может перечислить работы, а parse вернуть
     # type≠"event": так и было в кейсе NINJA 6334 09.06 — works был, но в события не записалось и молчали).
