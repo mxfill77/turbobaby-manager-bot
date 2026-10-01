@@ -517,7 +517,21 @@ def snapshot(now=None, st=None, cfg=None):
         "pc": pc_facts(st, now, cfg) if q.get("ok") else
               dict((st.get("pc") or {}) if isinstance(st.get("pc"), dict) else {},
                    ok=False, err="мост не ответил в этом прогоне — журнал ПК не читался"),
+        # О9: показ WhatsApp в Telegram — юнит, флаг, базы ТОЛЬКО на чтение. Откат (порог 0) —
+        # ни одного обращения к миру.
+        "wa_mirror": wa_mirror_facts(now) if float(cfg.get("wa_mirror") or 0) > 0 else None,
     }
+
+
+def wa_mirror_facts(now):
+    """Факты О9 (`expect_wa_mirror`). Сбор упал → факт «не прочитано», а не молчание: судья
+    скажет НЕИЗВЕСТНО с адресом, и эпизод не закроется сам."""
+    try:
+        import expect_wa_mirror
+        return expect_wa_mirror.facts(now)
+    except Exception as e:                                           # noqa: BLE001
+        return {"unit": {"active": None, "err": "сбор фактов упал: %s" % type(e).__name__,
+                         "addr": "expect_wa_mirror.facts"}}
 
 
 # ═══════════════════════════════ СОСТОЯНИЕ: ОДИН ЭПИЗОД — ОДНО СООБЩЕНИЕ ═══════════════════
@@ -930,7 +944,9 @@ _KEEP_V = ("kind", "key", "id", "sha", "dt", "limit", "free", "age", "pc_task_id
            # О8: длина череды и ДОСЛОВНЫЙ ответ внешней системы. Второе — не украшение строки:
            # к закрытию эпизода вердикта уже нет, а именно этим текстом владелец (и Штаб,
            # читающий журнал) отличит перегрузку от кончившегося способа оплаты.
-           "run", "err")
+           "run", "err",
+           # О9: причина словами и адрес незнания — к закрытию вердикта уже нет.
+           "why", "addr")
 
 
 def _trim_v(v):
@@ -1009,6 +1025,10 @@ def close_detail(key, facts):
                 if isinstance(r, dict) and not r.get("ext"):
                     return "полоса снова выполнила заход: «%s»" % str(r.get("line"))[:150]
             return ""                    # своих слов не нашлось — чужие не подставляем
+        if str(key).startswith("o9"):
+            _st, info = expectations.wa_mirror_state(facts, expectations.config(os.environ),
+                                                     float((facts or {}).get("now") or 0.0))
+            return "показ сейчас: %s" % expectations.wa_mirror_line(_st, info)
         if str(key).startswith("o5"):
             dt = ((facts or {}).get("bridge") or {}).get("dt")
             return "проба прошла за %s" % expectations._secs(dt) if dt is not None else ""
@@ -1071,6 +1091,15 @@ def run(dry=False, now=None):
            # Своими списками, а не внутри `closed`/`notes`: это РАЗНЫЕ события, и слить их значило
            # бы потерять счёт того, сколько эпизодов кончилось не выздоровлением.
            "dropped": [], "raised": []}
+    # О9 называет исход КАЖДЫЙ прогон — и «в порядке», и «удержание»: строка таймера в журнале
+    # systemd отвечает на «точно стоит отслеживание?» без чтения кода.
+    if facts.get("wa_mirror") is not None:
+        try:
+            out["wa_mirror"] = expectations.wa_mirror_line(
+                *expectations.wa_mirror_state(facts, cfg, now))
+        except Exception as e:                                       # noqa: BLE001
+            out["wa_mirror"] = "НЕИЗВЕСТНО: судья упал (%s), expectations.wa_mirror_state" % (
+                type(e).__name__)
     brain = _to_brain()
     frozen = _frozen_client()
     owner_defer = _owner_defer()

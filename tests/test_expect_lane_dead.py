@@ -393,8 +393,8 @@ res.append(ok(E.pc_state(f, C, NOW)[0] == E.PC_ALIVE,
               "(15) О4 «подаёт признак жизни» — полоса ПИШЕТ, и это верно"))
 res.append(ok(sorted(x["kind"] for x in E.verdict(f, C)) == ["o8_lane_dead"],
               "(15) беду видит РОВНО О8 — дыра закрыта, дубля нет"))
-res.append(ok(len(E.KINDS) == 12 and "o8_lane_dead" in E.KINDS,
-              "(15) видов стало 12, новый назван поимённо"))
+res.append(ok(len(E.KINDS) == 14 and "o8_lane_dead" in E.KINDS,
+              "(15) видов стало 14 (О9 добавлен 01.10), О8 назван поимённо"))
 res.append(ok(all(k in E.NOTE_HEAD for k in E.KINDS)
               and all(k in J.SHORT and k in J.WHAT for k in E.KINDS),
               "(15) у каждого вида есть заголовок заметки и имя в журнале мозга"))

@@ -147,7 +147,13 @@ PC_KINDS = {"o4_pc_silent", "o6_pc_task", "o7_child_down", "o7_pulse_lost"}
 # У О8 (18.08.2026) ветка тоже СВОЯ, и предмет у неё не машина ПК, а ВНЕШНИЙ ДОСТУП, без которого
 # не работает ни одна полоса: `CONTOUR_FREEZE` его не касается, поэтому вес тяжёлый безусловно.
 LANE_KINDS = {"o8_lane_dead"}
-res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | PC_KINDS | LANE_KINDS == set(E.KINDS),
+# У О9 (01.10.2026) ветки СВОИ: ОТКАЗ показа WhatsApp — обещание клиентам (тяжёлое), НЕИЗВЕСТНО —
+# отсутствие сведений о показе (лёгкое), тот же довод, что у двух видов О7.
+WA_KINDS = {"o9_wa_mirror", "o9_wa_unknown"}
+res.append(ok(J.heavy({"kind": "o9_wa_mirror"}, None, True)[0] is True
+              and J.heavy({"kind": "o9_wa_unknown"}, None, True)[0] is False,
+              "(3e) оба веса О9 названы ЯВНО: ОТКАЗ тяжёлый, НЕИЗВЕСТНО лёгкое"))
+res.append(ok(set(J.INFRA_KINDS) | set(J.NAMED_KINDS) | PC_KINDS | LANE_KINDS | WA_KINDS == set(E.KINDS),
               "(3e) все сегодняшние виды названы явно — «неизвестный вид» это про БУДУЩИЕ"))
 res.append(ok(J.heavy({"kind": "o7_child_down", "child": "moderation_bot"}, None, True)[0] is True
               and J.heavy({"kind": "o7_pulse_lost"}, None, True)[0] is False,

@@ -570,6 +570,11 @@ BRIDGE_MIN_ENV, BRIDGE_MIN_DEFAULT = "EXPECT_BRIDGE_MIN", 60.0
 # Живые 156 и 174 с, с которых начался разбор, при 240 тревоги не дают — и правильно: они внутри
 # сплошного тела распределения опроса очереди. Откат/переопределение — EXPECT_BRIDGE_SLOW_SEC.
 BRIDGE_SLOW_ENV, BRIDGE_SLOW_DEFAULT = "EXPECT_BRIDGE_SLOW_SEC", 240.0
+# О9 (01.10.2026): живая строка wa_inbox показана в своей теме не позже 10 минут — ровно обещание
+# самой службы показа (`wa_tg_mirror.ALARM_AFTER` = 600 с), только судит его внешний прибор.
+# Период таймера тоже 10 мин, поэтому худший случай обнаружения — 20 мин от прихода строки.
+# Откат — EXPECT_WA_MIRROR_MIN=0: ветка мертва ДО чтения фактов.
+WA_MIRROR_MIN_ENV, WA_MIRROR_MIN_DEFAULT = "EXPECT_WA_MIRROR_MIN", 10.0
 
 VPS_LANE = "vps"
 OPEN_STATUSES = ("new", "in_progress", "needs_approval", "approved")
@@ -579,7 +584,7 @@ STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")   # зе
 
 KINDS = ("o1_new_vps", "o2_daemon", "o2_splinter", "o3_undelivered", "o3_unknown",
          "o4_pc_silent", "o5_bridge_down", "o5_bridge_slow", "o6_pc_task",
-         "o7_child_down", "o7_pulse_lost", "o8_lane_dead")
+         "o7_child_down", "o7_pulse_lost", "o8_lane_dead", "o9_wa_mirror", "o9_wa_unknown")
 
 
 def limit_env(name, default, env=None, scale=60.0):
@@ -620,6 +625,7 @@ def config(env=None):
         "bridge": limit_env(BRIDGE_MIN_ENV, BRIDGE_MIN_DEFAULT, env),
         # СЕКУНДЫ: длительность одного вызова, а не возраст факта — отсюда scale=1.
         "bridge_slow": limit_env(BRIDGE_SLOW_ENV, BRIDGE_SLOW_DEFAULT, env, scale=1.0),
+        "wa_mirror": limit_env(WA_MIRROR_MIN_ENV, WA_MIRROR_MIN_DEFAULT, env),
     }
 
 
@@ -2194,6 +2200,123 @@ def _o5(facts, cfg, now):
     return out
 
 
+# ═══════════ О9: ПОКАЗ WhatsApp В TELEGRAM СУДИТСЯ ПО РЕЗУЛЬТАТУ (01.10.2026) ═════════════════
+# Предмет — обещание службы показа клиентам и владельцу, а не жизнь её процесса: «процесс жив» и
+# «строка показана» — разные слова. Факты собирают руки (`expect_wa_mirror.facts`): юнит, флаг
+# порядком службы, точка включения, живые и не показанные строки после неё. Строка «СТОИТ» из
+# журнала службы — только пояснение в заметке, решение по ней не выносится.
+WAM_OK, WAM_HOLD, WAM_FAIL, WAM_UNKNOWN = "в порядке", "удержание", "ОТКАЗ", "НЕИЗВЕСТНО"
+
+
+def _wam_part(f, name):
+    part = f.get(name)
+    return part if isinstance(part, dict) else {}
+
+
+def wa_mirror_state(facts, cfg, now):
+    """→ (исход, info). Исходы: в порядке · удержание (показ выключен) · ОТКАЗ · НЕИЗВЕСТНО.
+    info: why — словами; what — ключ эпизода; addr — где не удалось узнать (у НЕИЗВЕСТНО)."""
+    limit = float((cfg or {}).get("wa_mirror") or 0.0)
+    f = (facts or {}).get("wa_mirror")
+    if not isinstance(f, dict):
+        return WAM_UNKNOWN, {"what": "facts", "why": "фактов о показе нет",
+                             "addr": "expect_wa_mirror.facts", "limit": limit}
+    hint = f.get("hint") if isinstance(f.get("hint"), dict) else {}
+    u = _wam_part(f, "unit")
+    if u.get("active") is None:
+        return WAM_UNKNOWN, {"what": "unit", "limit": limit,
+                             "why": "состояние юнита не прочитано (%s)" % (u.get("err") or "?"),
+                             "addr": u.get("addr") or "юнит wa-tg-mirror (руки О9)"}
+    # Юнит не активен — ОТКАЗ при ЛЮБОМ флаге: медиа клиентов служба качает всегда, пока ссылка
+    # жива, и выключенный показ эту обязанность не снимает. Свежая сводка в журнале не оправдание.
+    if not u.get("active"):
+        return WAM_FAIL, {"what": "unit", "limit": limit, "hint": hint,
+                          "why": "юнит wa-tg-mirror не активен (%s) — медиа клиентов не качаются "
+                                 "при любом флаге" % (u.get("state") or "?")}
+    fl = _wam_part(f, "flag")
+    if fl.get("on") is None:
+        return WAM_UNKNOWN, {"what": "flag", "limit": limit,
+                             "why": "флаг показа не узнать (%s)" % (fl.get("err") or "?"),
+                             "addr": fl.get("addr") or "?"}
+    if not fl.get("on"):
+        return WAM_HOLD, {"limit": limit,
+                          "why": "показ выключен (флаг: %s)" % (fl.get("src") or "?")}
+    st = _wam_part(f, "state")
+    if st.get("err") or not st:
+        return WAM_UNKNOWN, {"what": "state", "limit": limit,
+                             "why": "база показанного не открывается (%s)" % (st.get("err") or "фактов нет"),
+                             "addr": st.get("addr") or "wa_tg_mirror.db"}
+    start = st.get("start_id")
+    if start is None:
+        try:
+            up = now - float(u.get("since"))
+        except (TypeError, ValueError):
+            return WAM_UNKNOWN, {"what": "since", "limit": limit,
+                                 "why": "время входа юнита в active не прочитано",
+                                 "addr": u.get("addr") or "юнит wa-tg-mirror (руки О9)"}
+        if up > limit:
+            return WAM_FAIL, {"what": "nostart", "age": up, "limit": limit, "hint": hint,
+                              "why": "показ не стартовал: флаг включён, юнит активен %s, точки "
+                                     "включения нет" % human_age(up)}
+        return WAM_OK, {"age": up, "limit": limit,
+                        "why": "показ включается: юнит активен %s, точки включения ещё нет"
+                               % human_age(up)}
+    q = _wam_part(f, "queue")
+    if q.get("err") or not q:
+        return WAM_UNKNOWN, {"what": "queue", "limit": limit,
+                             "why": "очередь не открывается (%s)" % (q.get("err") or "фактов нет"),
+                             "addr": q.get("addr") or "wa_queue.db"}
+    pend = []
+    for p in q.get("pending") or []:
+        try:
+            pend.append((int(p[0]), float(p[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    late = sorted((i, t) for i, t in pend if now - t > limit)
+    info = {"start_id": int(start), "live": q.get("live"), "pending": len(pend),
+            "late": len(late), "limit": limit}
+    if late:
+        age = now - min(t for _, t in late)
+        info.update(what="late", ids=[i for i, _ in late][:8], age=age, hint=hint,
+                    why="просрочено %d живых строк после точки включения (id > %d): старшая ждёт "
+                        "показа %s при пороге %s" % (len(late), int(start), human_age(age),
+                                                     human_age(limit)))
+        return WAM_FAIL, info
+    info["why"] = ("живых строк после точки включения %s, ждут показа %d, просрочено 0"
+                   % (q.get("live"), len(pend)))
+    return WAM_OK, info
+
+
+def wa_mirror_line(state, info):
+    """Одна строка итога О9 — в вывод прогона каждый раз, включая «в порядке» и «удержание»."""
+    info = info or {}
+    if state == WAM_HOLD:
+        return "удержание: %s" % info.get("why")
+    if state == WAM_UNKNOWN:
+        return "НЕИЗВЕСТНО: %s, %s" % (info.get("why"), info.get("addr"))
+    return "%s: %s" % (state, info.get("why"))
+
+
+def _o9(facts, cfg, now):
+    """О9 — показ WhatsApp в Telegram не выполняет обещания (ОТКАЗ) либо судить его нечем."""
+    if float((cfg or {}).get("wa_mirror") or 0.0) <= 0:
+        return []                                     # откат: ветка мертва ДО чтения фактов
+    if "wa_mirror" not in (facts or {}):
+        return []                                     # руки этого источника не собирали
+    state, info = wa_mirror_state(facts, cfg, now)
+    if state == WAM_FAIL:
+        return [{"kind": "o9_wa_mirror", "key": "o9|%s" % info.get("what"),
+                 "why": info.get("why"), "age": info.get("age"), "limit": info.get("limit"),
+                 "late": info.get("late"), "ids": info.get("ids"), "hint": info.get("hint"),
+                 # Прибор не чинит: задача-эскалация не вернула бы показ ни одной строкой.
+                 "can_task": False}]
+    if state == WAM_UNKNOWN:
+        return [{"kind": "o9_wa_unknown", "key": "o9u|%s" % info.get("what"),
+                 "why": info.get("why"), "addr": info.get("addr"), "limit": info.get("limit"),
+                 "can_task": False}]
+    return []
+
+
 def verdict(facts, cfg=None):
     """ФАКТЫ → список нарушений. Ни одного обращения к миру: ни ФС, ни сети, ни времени — всё
     приходит в `facts`. Пустой список = вердикта нет (НЕ «всё хорошо»: сказать так слой не умеет).
@@ -2210,7 +2333,7 @@ def verdict(facts, cfg=None):
     if now <= 0:
         return []
     out = []
-    for fn in (_o1, _o2_daemon, _o2_splinter, _o3, _o4, _o5, _o6, _o7, _o8):
+    for fn in (_o1, _o2_daemon, _o2_splinter, _o3, _o4, _o5, _o6, _o7, _o8, _o9):
         try:
             out.extend(fn(facts, cfg, now) or [])
         except Exception:                                            # noqa: BLE001
@@ -2240,6 +2363,8 @@ def closures(facts, cfg, open_keys):
     ch_st, ch_info = children_state(facts, cfg, now) if now > 0 else (CH_UNKNOWN, {})
     br_st, br_info = bridge_state(facts, cfg, now) if now > 0 else (BRIDGE_UNKNOWN, {})
     runs_st = lane_runs_state(facts, cfg, now)[0] if now > 0 else RUNS_UNKNOWN
+    wam_st = (wa_mirror_state(facts, cfg, now)[0]
+              if now > 0 and "wa_mirror" in (facts or {}) else WAM_UNKNOWN)
     out = []
     for key in (open_keys or []):
         key = str(key)
@@ -2279,6 +2404,10 @@ def closures(facts, cfg, open_keys):
             # Строка вернулась, но живость подтверждена не у всех (третий исход по СОДЕРЖАНИЮ) —
             # предмет этого эпизода всё равно закрыт: публикация идёт, и она снова в пределах срока.
             out.append(key)
+        elif kind in ("o9", "o9u") and wam_st != WAM_UNKNOWN:
+            # Показ ДОКАЗАННО судим в этом прогоне, и этого ключа в вердикте нет. «Судить нечем»
+            # эпизод не закрывает: молчание источника не есть выздоровление (замок О6/О7).
+            out.append(key)
     return out
 
 
@@ -2317,6 +2446,9 @@ NOTE_HEAD = {
     "o7_pulse_lost": "🔔 полоса ПК перестала говорить о детях — сказать о них нечего",
     # О8 говорит про СПОСОБНОСТЬ работать, а не про одну задачу: предмет — череда, а не случай.
     "o8_lane_dead": "🔔 полоса ПК не может выполнить ни одного захода",
+    # О9 говорит про ОБЕЩАНИЕ клиентам (строка показана за 10 минут), а не про процесс.
+    "o9_wa_mirror": "🔔 показ WhatsApp клиентов в Telegram не выполняет обещание",
+    "o9_wa_unknown": "🔔 не знаю, идёт ли показ WhatsApp в Telegram",
 }
 CLOSE_HEAD = "🔔 ожидание снова выполняется"
 # Строка, которой заканчивается КАЖДАЯ заметка: граница владельца названа в самом сообщении.
@@ -2482,6 +2614,23 @@ def render(v, lane="VPS"):
             "мост ответил, но «ответил» тут не значит «здоров»: у клиента две вложенные "
             "лестницы повторов без общего дедлайна — объявленный бюджет вызова потолком не является",
         ]
+    elif kind == "o9_wa_mirror":
+        parts.append("ОТКАЗ: %s" % (v.get("why") or "причина не названа"))
+        if v.get("ids"):
+            parts.append("строки wa_inbox: %s" % ", ".join(str(i) for i in (v.get("ids") or [])[:8]))
+        h = v.get("hint") if isinstance(v.get("hint"), dict) else {}
+        if h.get("stoit") or h.get("show"):
+            # ПОЯСНЕНИЕ, А НЕ РЕШЕНИЕ: решено по wa_inbox против таблицы показанного.
+            parts.append("журнал службы (пояснение): %s" % "; ".join(
+                s for s in ("сводка %s «показ=%s»" % (h.get("ts") or "?", h.get("show"))
+                            if h.get("show") else "",
+                            "%s «СТОИТ — %s»" % (h.get("stoit_ts") or "?", h.get("stoit"))
+                            if h.get("stoit") else "") if s))
+        parts.append("судит внешний прибор слоя ожиданий; бот показа для этой заметки не используется")
+    elif kind == "o9_wa_unknown":
+        parts += ["НЕИЗВЕСТНО: %s" % (v.get("why") or "причина не названа"),
+                  "адрес: %s" % (v.get("addr") or "?"),
+                  "это не «показ в порядке» и не «показ стоит» — судить нечем"]
     else:
         parts.append("нарушение ожидания")
     parts.append(TAIL)
@@ -2588,7 +2737,9 @@ def render_close(v_key, lane="VPS", detail=""):
             "o7": "источник снова называет ребёнка %s живым" % rest,
             "o7l": "полоса ПК снова говорит о детях",
             "o5": "мост снова отвечает",
-            "o5s": "мост снова укладывается в отведённое время"}.get(head,
+            "o5s": "мост снова укладывается в отведённое время",
+            "o9": "показ WhatsApp снова выполняет обещание (%s)" % rest,
+            "o9u": "о показе WhatsApp снова есть факты (%s)" % rest}.get(head,
                                                                      "ожидание снова выполняется")
     parts = [CLOSE_HEAD, str(lane or "VPS"), what]
     if detail:
