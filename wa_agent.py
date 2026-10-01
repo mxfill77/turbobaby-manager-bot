@@ -94,7 +94,57 @@ CREATE TABLE IF NOT EXISTS drafts (
 CREATE UNIQUE INDEX IF NOT EXISTS one_live_draft ON drafts(number)
     WHERE state IN ('pending', 'claimed', 'sending');
 CREATE INDEX IF NOT EXISTS drafts_wamid ON drafts(wamid);
+CREATE TABLE IF NOT EXISTS relay (
+    msg_id  INTEGER PRIMARY KEY,                  -- сообщение человека в теме показа (id Telegram)
+    number  TEXT    NOT NULL,
+    state   TEXT    NOT NULL,                     -- sending ДО двери, потом sent | not_sent | unsure
+    reason  TEXT,
+    wamid   TEXT,
+    who     TEXT,
+    ts      REAL    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relay_edits (
+    msg_id  INTEGER PRIMARY KEY,                  -- на правку этого сообщения темы ответ уже дан
+    ts      REAL
+);
+CREATE TABLE IF NOT EXISTS outbox (
+    wamid   TEXT PRIMARY KEY,                     -- ушедшее клиенту через API (эхом не возвращается)
+    number  TEXT NOT NULL,
+    ts      REAL NOT NULL,
+    text    TEXT NOT NULL,
+    via     TEXT NOT NULL                         -- «тема» | «агент»
+);
+CREATE INDEX IF NOT EXISTS outbox_number ON outbox(number);
 """
+
+# «Тема клиента → WhatsApp» (WARELAYTEXT0210): текст человека из темы форума показа уходит клиенту.
+# Ключ — id сообщения Telegram (`relay`); ушедшее через API — в `outbox`: история агента видит его
+# видом «мы» (wa_history.read_sent), эхо с тем же wamid паузы не ставит (`_our_wamid`).
+VIA_TOPIC, VIA_AGENT = "тема", "агент"
+RELAY_DUP = "dup"
+W_CLOSED = "не отправлено: окно 24 ч закрыто — напишите клиенту с телефона"
+W_WIN_UNKNOWN = ("не отправлено: окно 24 ч неизвестно — входящих клиента у нас не записано; "
+                 "напишите клиенту с телефона")
+W_DOOR_OFF = "не отправлено: отправка выключена (WA_SEND)"
+W_DOOR_ERR = "не отправлено: ошибка двери — %s"
+W_UNSURE = "не знаю, дошло ли — второй раз не шлю; проверьте переписку в телефоне"
+
+
+def relay_words(state, res):
+    """Исход двери → слова для темы. Окно закрыто, окно неизвестно, дверь выключена, ошибка двери —
+    разные слова: человек по строке видит, что делать."""
+    if state == SENT:
+        return "отправлено"
+    if state == UNSURE:
+        return W_UNSURE
+    reason = str((res or {}).get("reason") or "")
+    if (res or {}).get("door_off") or "WA_SEND" in reason:
+        return W_DOOR_OFF
+    if (res or {}).get("window") == "closed":
+        return W_CLOSED
+    if reason.startswith("окно неизвестно"):
+        return W_WIN_UNKNOWN
+    return W_DOOR_ERR % (reason[:150] or "причина не названа")
 
 # «Нужен человек» (WAAGENTMODEL0210): причины кода и модели — JSON-список слов в drafts.handoff.
 # Черновик с причинами «Отправить» не шлёт, пока человек не нажал «Исправить» (версия > 1).
@@ -144,8 +194,12 @@ class Telegram:
     def card_done(self, draft_id, card_id, words):
         raise NotImplementedError
 
-    def ask_pause(self, number, pause_no):
+    def ask_pause(self, number, pause_no, via=None):
         raise NotImplementedError
+
+    def agent_sent(self, number, text, who):
+        """Ушедшее по «Отправить» — строкой в тему клиента (WARELAYTEXT0210). Рук нет — ничего."""
+        return None
 
 
 class Door:
@@ -197,6 +251,11 @@ class Core:
                              "WHERE state=?", (PENDING, CLAIMED)).rowcount
         if n1 or n2:
             self.log("старт: sending→unsure %d, claimed→pending %d" % (n1, n2))
+        n3 = self.db.execute("UPDATE relay SET state=?, reason=? WHERE state=?",
+                             (UNSURE, "рестарт посреди отправки из темы — могло уйти, не повторяем",
+                              SENDING)).rowcount
+        if n3:
+            self.log("старт: из темы sending→unsure %d" % n3)
 
     def _queue(self):
         return sqlite3.connect("file:%s?mode=ro" % self.queue_path, uri=True, timeout=5)
@@ -219,8 +278,16 @@ class Core:
                                (number,) + LIVE).fetchone()
 
     def _our_wamid(self, wamid):
-        return bool(wamid) and self.db.execute(
-            "SELECT 1 FROM drafts WHERE wamid=?", (wamid,)).fetchone() is not None
+        """Эхо нашей отправки через API (черновик или текст из темы) — не ответ с телефона."""
+        return bool(wamid) and (
+            self.db.execute("SELECT 1 FROM drafts WHERE wamid=?", (wamid,)).fetchone() is not None
+            or self.db.execute("SELECT 1 FROM outbox WHERE wamid=?", (wamid,)).fetchone() is not None)
+
+    def _sent_out(self, wamid, number, text, via, now):
+        """Ушедшее через API → `outbox`: история агента (видом «мы») и опознание эха."""
+        if wamid:
+            self.db.execute("INSERT OR IGNORE INTO outbox(wamid, number, ts, text, via) VALUES(?,?,?,?,?)",
+                            (wamid, number, now, text, via))
 
     def _close(self, draft_id, state, words, now, from_states=(PENDING,)):
         """Снять черновик условно: только из названных состояний. True — снят этим вызовом."""
@@ -254,14 +321,63 @@ class Core:
 
     # ── пауза ─────────────────────────────────────────────────────────────────────────────
 
-    def _pause(self, number, row_id, now):
-        """Человек ответил с телефона: клиент на паузе. Вопрос в группу — один на паузу."""
+    def _pause(self, number, row_id, now, via=None):
+        """Человек ответил с телефона (или написал в теме, via): клиент на паузе. Вопрос в группу —
+        один на паузу."""
         n = self.db.execute("UPDATE clients SET paused=1, pause_no=pause_no+1, paused_at=?, "
                             "pause_row=? WHERE number=? AND paused=0", (now, row_id, number)).rowcount
         if n == 1:
             no = self.db.execute("SELECT pause_no FROM clients WHERE number=?", (number,)).fetchone()[0]
-            self.log("клиент на паузе (строка эха %d, пауза %d)" % (row_id, no))
-            self._tg("ask_pause", number, no)
+            if via:
+                self.log("клиент на паузе (%s, пауза %d)" % (via, no))
+                self._tg("ask_pause", number, no, via)
+            else:
+                self.log("клиент на паузе (строка эха %d, пауза %d)" % (row_id, no))
+                self._tg("ask_pause", number, no)
+
+    def human_wrote(self, number, now):
+        """Человек написал клиенту в теме показа — вмешательство (запись 30.09.2026-7 п.4): ждущий
+        черновик снят, входящие до этого закрыты, клиент на паузе до «Продолжить»."""
+        self._client(number)
+        self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
+        live = self._live_draft(number)
+        if live and live[1] == PENDING:
+            self._close(live[0], SUPERSEDED, "снят: человек написал клиенту в теме %s" % _hm(now), now)
+        self._pause(number, None, now, via="написал в теме")
+
+    def relay(self, msg_id, number, text, who, now=None):
+        """Текст человека из темы клиента → клиенту в WhatsApp (WARELAYTEXT0210). Ключ — id сообщения
+        Telegram: одно сообщение темы — не больше одной отправки; `sending` пишется ДО двери, рестарт
+        не повторяет (`_startup`). → {"outcome": sent|not_sent|unknown|dup, "words", "wamid"}."""
+        now = self.clock() if now is None else now
+        mid = int(msg_id)
+        if self.db.execute("INSERT OR IGNORE INTO relay(msg_id, number, state, who, ts) VALUES(?,?,?,?,?)",
+                           (mid, number, SENDING, who, now)).rowcount != 1:
+            row = self.db.execute("SELECT state FROM relay WHERE msg_id=?", (mid,)).fetchone()
+            self.log("тема: сообщение %d уже разобрано (%s) — второй раз не шлём" % (mid, row[0] if row else "?"))
+            return {"outcome": RELAY_DUP, "words": "", "wamid": None}
+        self.human_wrote(number, now)
+        if not self._door_open():
+            res = {"outcome": "not_sent", "reason": "отправка выключена (WA_SEND)", "door_off": True}
+        else:
+            try:
+                res = self.door.send_text(number, text) or {}
+            except Exception as e:                                   # noqa: BLE001
+                res = {"outcome": "unknown", "reason": "дверь упала: %s" % type(e).__name__}
+        state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
+        wamid = res.get("wamid") if state == SENT else None
+        self.db.execute("UPDATE relay SET state=?, reason=?, wamid=? WHERE msg_id=? AND state=?",
+                        (state, str(res.get("reason") or "")[:300], wamid, mid, SENDING))
+        if state == SENT:
+            self._sent_out(wamid, number, text, VIA_TOPIC, now)
+        self.log("тема: сообщение %d → %s" % (mid, state))
+        return {"outcome": {SENT: "sent", NOT_SENT: "not_sent"}.get(state, "unknown"),
+                "words": relay_words(state, res), "wamid": wamid}
+
+    def edit_once(self, msg_id):
+        """Правка сообщения темы клиенту не уходит; ответ об этом — один на сообщение. True — ответить."""
+        return self.db.execute("INSERT OR IGNORE INTO relay_edits(msg_id, ts) VALUES(?,?)",
+                               (int(msg_id), self.clock())).rowcount == 1
 
     def resume(self, number, pause_no, who, now=None):
         """«Продолжить». Снимает ровно свою паузу; второй нажавший получает «уже продолжено»."""
@@ -464,6 +580,11 @@ class Core:
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
         self.log("черновик %d: дверь → %s" % (draft_id, state))
         self._tg("card_done", draft_id, self._card(draft_id), "%s: %s, %s" % (state, who, _hm(now)))
+        if state == SENT:
+            # ушедшее агентом: история агента и строка в теме клиента (WARELAYTEXT0210)
+            self._sent_out(wamid, number, text, VIA_AGENT, now)
+            if hasattr(self.tg, "agent_sent"):
+                self._tg("agent_sent", number, text, who)
         return {"ok": state == SENT, "state": state, "words": state}
 
     def revise(self, draft_id, text, who, now=None, ver=None):

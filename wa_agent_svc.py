@@ -12,7 +12,9 @@
                     адаптер не собрался (нет ключа, моста) — выключен, словами в старте.
   WA_AGENT_CARDS  — карточки и нажатия в «Агентах».
   WA_AGENT_REACT  — реакции из тем показа наружу клиенту.
-  WA_SEND         — дверь. Выключена — «Отправить» отвечает «отправка выключена» ДО двери
+  WA_AGENT_RELAY  — текст человека из темы клиента → клиенту в WhatsApp; «Отправить» — строкой в теме
+                    (WARELAYTEXT0210). Дверь та же — WA_SEND.
+  WA_SEND        — дверь. Выключена — «Отправить» отвечает «отправка выключена» ДО двери
                     (`Core.press` спрашивает `SendDoor.is_open`), черновик ждёт.
 Все выключены — ни одного вызова Telegram и двери: такт ядра читает только очередь (mode=ro).
 
@@ -35,7 +37,8 @@ import wa_send
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SUMMARY_EVERY = 300                       # сводка числами раз в 5 минут
 F_DRAFTS, F_CARDS, F_REACT, F_SEND = "WA_AGENT_DRAFTS", "WA_AGENT_CARDS", "WA_AGENT_REACT", "WA_SEND"
-FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_SEND)
+F_RELAY = "WA_AGENT_RELAY"                # тема клиента → WhatsApp (WARELAYTEXT0210)
+FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
 log = logging.getLogger("wa_agent")
@@ -100,7 +103,7 @@ def make_model(env, line=None, bridge=None, call=None):
         env["queue_db"], call, read_doc=lambda n: bridge._call("read_doc", name=n), fleet=bridge.fleet,
         door=bridge.quote_price, archive_db=env.get("archive_db") or "",
         manifest=env.get("archive_manifest") or "", media_dir=env.get("archive_media") or "",
-        log=line or (lambda s: log.info("%s", s)))
+        agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)))
     return model, ""
 
 
@@ -114,7 +117,7 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     drafts = flags[F_DRAFTS] and model is not None
     tg = wa_agent_tg.Tg(env.get("tg_token"), enabled=flags[F_CARDS], show_chat=env.get("show_chat"),
                         mirror_db=env.get("mirror_db"), http=http, clock=clock, log=line,
-                        react=flags[F_REACT], react_send=react_send)
+                        react=flags[F_REACT], react_send=react_send, relay=flags[F_RELAY])
     door = SendDoor(env["queue_db"], environ=environ, send=send)
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                          log=line, drafts=drafts)
@@ -125,6 +128,8 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
         F_CARDS: ("вкл" if tg.enabled else "выкл") + ("" if tg.enabled or not flags[F_CARDS]
                                                       else " (флаг 1, ключа бота нет)"),
         F_REACT: ("вкл" if tg.react else "выкл") + ("" if tg.react or not flags[F_REACT]
+                                                    else " (флаг 1, ключа бота нет)"),
+        F_RELAY: ("вкл" if tg.relay else "выкл") + ("" if tg.relay or not flags[F_RELAY]
                                                     else " (флаг 1, ключа бота нет)"),
         F_SEND: "вкл" if door.is_open() else "выкл",
     }
@@ -150,10 +155,11 @@ def summary(core, tg, words, stats):
     cards = db.execute("SELECT COUNT(*) FROM tg_cards").fetchone()[0]
     paused = db.execute("SELECT COUNT(*) FROM clients WHERE paused=1").fetchone()[0]
     reacts = dict(db.execute("SELECT outcome, COUNT(*) FROM tg_react_out GROUP BY outcome").fetchall())
-    return ("сводка: %s · черновики %s · карточек %d · на паузе %d · реакций наружу %s · опросов ok=%d "
-            "сбой=%d 409=%d · тактов %d упало %d"
+    relays = dict(db.execute("SELECT state, COUNT(*) FROM relay GROUP BY state").fetchall())
+    return ("сводка: %s · черновики %s · карточек %d · на паузе %d · реакций наружу %s · из тем %s · "
+            "опросов ok=%d сбой=%d 409=%d · тактов %d упало %d"
             % (" ".join("%s=%s" % (k, words[k].split(" ")[0]) for k in FLAGS), _pairs(core.counts()),
-               cards, paused, _pairs(reacts), tg.polls["ok"], tg.polls["fail"], tg.polls["conflict"],
+               cards, paused, _pairs(reacts), _pairs(relays), tg.polls["ok"], tg.polls["fail"], tg.polls["conflict"],
                stats.get("ticks", 0), stats.get("tick_fail", 0)))
 
 

@@ -250,8 +250,9 @@ class ModelAdapter(wa_agent.Model):
     `fleet`; door(unit, ds, de) → ответ двери цены. Все — снаружи (в тестах подделки)."""
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
-                 manifest="", media_dir="", no_price_models=(), clock=time.time, log=None):
+                 manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db=""):
         self.queue_db, self.call = queue_db, call
+        self.agent_db = agent_db                          # outbox: ушедшее через API (WARELAYTEXT0210)
         self.fleet, self.door = fleet, door
         self.archive_db, self.manifest, self.media_dir = archive_db, manifest, media_dir
         self.no_price_models = tuple(no_price_models)
@@ -262,7 +263,8 @@ class ModelAdapter(wa_agent.Model):
 
     def _history(self, number, upto_id):
         items, missing = wa_history.read_history(number, self.queue_db, self.archive_db, self.manifest,
-                                                 self.media_dir, trig=int(upto_id) + 1)
+                                                 self.media_dir, trig=int(upto_id) + 1,
+                                                 sent_db=self.agent_db or None)
         return items, missing
 
     @staticmethod

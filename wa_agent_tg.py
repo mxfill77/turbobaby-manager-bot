@@ -35,6 +35,15 @@
 реакция на сообщение: держится последняя из реакций людей группы; снял последний — снятие. Одно
 изменение — одна отправка: то, что уже уходило на это сообщение (любым исходом), второй раз не шлётся.
 Выключатель `WA_AGENT_REACT` по умолчанию выключен — реакции не читаются и не отправляются.
+
+ТЕМА КЛИЕНТА → WHATSAPP (WARELAYTEXT0210). Текст человека в теме клиента форума показа уходит клиенту
+(`Core.relay`, дверь `wa_send.send_text`: WA_SEND, ключ, окно 24 ч). Читатель тот же: `allowed_updates`
++ message, edited_message. Тема → номер — `topics` базы показа (mode=ro); общая тема и тема без номера
+наружу не идут; бот (и «от имени группы») — тоже. Исход в теме: отправлено — реакция бота 👌 на
+сообщение человека; не отправлено — ответ с причиной словами; неизвестно — «не знаю, дошло ли», без
+повтора. Правка — не уходит, одна строка в ответ. Удаление сообщения Bot API боту не присылает.
+«Отправить» по черновику — строкой «мы · агент, отправил <имя>: текст» в теме клиента.
+Выключатель `WA_AGENT_RELAY` по умолчанию выключен — сообщения тем не читаются и не отправляются.
 """
 
 import json
@@ -58,6 +67,15 @@ ALLOWED_UPDATES = ["callback_query", "message"]
 REACT_FLAG = "WA_AGENT_REACT"
 REACT_UPDATE = "message_reaction"
 REACT_KINDS = (wa_kind.KIND_INBOUND, wa_kind.KIND_ECHO)   # на что реакция уходит клиенту
+RELAY_FLAG = "WA_AGENT_RELAY"     # тема клиента → WhatsApp (WARELAYTEXT0210), по умолчанию выключен
+RELAY_UPDATES = ["message", "edited_message"]
+RELAY_SENT_EMOJI = "👌"           # отправлено — реакция бота из набора Telegram на сообщение человека
+RELAY_EDIT_WORDS = ("правка в WhatsApp не передаётся — клиент видит первый текст; "
+                    "поправку напишите новым сообщением")
+RELAY_MEDIA_WORDS = "из темы клиенту уходит только текст — это сообщение в WhatsApp не передано"
+RELAY_MEDIA = ("photo", "video", "document", "audio", "voice", "video_note", "sticker", "animation",
+               "contact", "location", "venue", "poll")
+AGENT_LINE = "мы · агент, отправил %s: %s"
 POLL_RETRY_SEC = 1                 # getUpdates не удался — следующий опрос не раньше
 CONFLICT_PAUSE = 30                # 409 (второй читатель) — следующий опрос не раньше; такт идёт
 
@@ -165,10 +183,11 @@ def wa_emoji(tg) -> str:
 
 class Tg(wa_agent.Telegram):
     def __init__(self, token, enabled=False, chat_id=AGENTS_CHAT, show_chat=None, mirror_db=None,
-                 http=None, clock=time.time, log=None, react=False, react_send=None):
+                 http=None, clock=time.time, log=None, react=False, react_send=None, relay=False):
         self.token = token or ""
         self.enabled = bool(enabled) and bool(self.token)
         self.react = bool(react) and bool(self.token)
+        self.relay = bool(relay) and bool(self.token)
         self.react_send = react_send
         self.chat = int(chat_id)
         self.show_chat = show_chat
@@ -189,8 +208,8 @@ class Tg(wa_agent.Telegram):
 
     @property
     def reading(self):
-        """Читатель обновлений нужен, если включены карточки или реакции."""
-        return self.enabled or self.react
+        """Читатель обновлений нужен, если включены карточки, реакции или тема → WhatsApp."""
+        return self.enabled or self.react or self.relay
 
     # ── вызов Bot API ─────────────────────────────────────────────────────────────────────
 
@@ -285,12 +304,14 @@ class Tg(wa_agent.Telegram):
         self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
                                      "text": body + "\n\n— " + words})
 
-    def ask_pause(self, number, pause_no):
+    def ask_pause(self, number, pause_no, via=None):
         if not self.enabled:
             return
         cid = self.cid(number)
-        body = ("⏸ %s\nОтветили с телефона — агент на паузе с этим клиентом (пауза %d). "
-                "Черновиков не будет до «Продолжить». Когда продолжать?" % (self._head(number), pause_no))
+        body = ("⏸ %s\n%s — агент на паузе с этим клиентом (пауза %d). "
+                "Черновиков не будет до «Продолжить». Когда продолжать?"
+                % (self._head(number), "Человек написал клиенту в теме" if via else "Ответили с телефона",
+                   pause_no))
         kb = {"inline_keyboard": [[{"text": "▶️ Продолжить",
                                     "callback_data": "wa:go:%d:%d" % (cid, pause_no)}]]}
         ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": body, "reply_markup": kb})
@@ -313,7 +334,11 @@ class Tg(wa_agent.Telegram):
         """Один getUpdates. → число разобранных обновлений или None (вызов не удался)."""
         if not self.reading:
             return 0
-        allowed = (ALLOWED_UPDATES if self.enabled else []) + ([REACT_UPDATE] if self.react else [])
+        allowed = []
+        for name in ((ALLOWED_UPDATES if self.enabled else []) + (RELAY_UPDATES if self.relay else [])
+                     + ([REACT_UPDATE] if self.react else [])):
+            if name not in allowed:
+                allowed.append(name)
         ok, res = self.api("getUpdates", {"offset": self.offset(), "timeout": int(max(0, timeout)),
                                           "allowed_updates": allowed}, timeout=int(timeout) + 15, quiet=(409,))
         if not ok:
@@ -350,8 +375,13 @@ class Tg(wa_agent.Telegram):
                 if self.enabled:
                     self.on_press(u["callback_query"])
             elif "message" in u:
-                if self.enabled:
+                if self._is_show(u["message"]):
+                    self.on_topic(u["message"])
+                elif self.enabled:
                     self.on_message(u["message"])
+            elif "edited_message" in u:
+                if self._is_show(u["edited_message"]):
+                    self.on_topic_edit(u["edited_message"])
             elif REACT_UPDATE in u:
                 self.on_reaction(u[REACT_UPDATE], uid)
         except Exception as e:                                       # noqa: BLE001
@@ -434,6 +464,110 @@ class Tg(wa_agent.Telegram):
         self.api("sendMessage", {"chat_id": self.chat, "text": words,
                                  "reply_parameters": {"message_id": int(msg.get("message_id") or 0),
                                                       "allow_sending_without_reply": True}})
+
+    # ── тема клиента → WhatsApp (WARELAYTEXT0210) ─────────────────────────────────────────
+
+    def _is_show(self, msg):
+        return bool(self.show_chat) and str(((msg or {}).get("chat") or {}).get("id")) == str(self.show_chat)
+
+    def _topics(self, where, arg):
+        """Строки topics базы показа (только mode=ro) → (строки | None, почему)."""
+        if not (self.mirror_db and os.path.exists(self.mirror_db)):
+            return None, "базы показа нет"
+        try:
+            conn = self._ro(self.mirror_db)
+            try:
+                return conn.execute("SELECT number, thread_id FROM topics WHERE " + where, (arg,)).fetchall(), ""
+            finally:
+                conn.close()
+        except Exception as e:                                       # noqa: BLE001
+            return None, "база показа не прочитана: %s" % type(e).__name__
+
+    def _topic_number(self, msg):
+        """Сообщение форума показа → (номер клиента, тема) · (None, почему). Общая тема и тема без
+        номера наружу не идут."""
+        thread = msg.get("message_thread_id") if msg.get("is_topic_message") else None
+        if not thread:
+            return None, "общая тема форума"
+        rows, why = self._topics("thread_id=?", int(thread))
+        if rows is None:
+            return None, why
+        nums = {r[0] for r in rows if r[0]}
+        if len(nums) != 1:
+            return None, "у темы %s %s" % (thread, "нет номера клиента" if not nums else "больше одного номера")
+        return nums.pop(), int(thread)
+
+    def _human(self, msg):
+        frm = msg.get("from") or {}
+        return bool(frm) and not frm.get("is_bot")
+
+    def _topic_reply(self, thread, mid, words):
+        return self.api("sendMessage", {"chat_id": self.show_chat, "message_thread_id": int(thread),
+                                        "text": str(words)[:TG_TEXT_MAX],
+                                        "reply_parameters": {"message_id": int(mid),
+                                                             "allow_sending_without_reply": True}})
+
+    def on_topic(self, msg):
+        """Сообщение в форуме показа. Текст человека в теме клиента → `Core.relay` → клиенту в WhatsApp;
+        исход — в теме: отправлено — реакция бота, иначе — ответ словами. → исход или None (наружу ничего)."""
+        mid = int(msg.get("message_id") or 0)
+        if not self.relay:
+            self.log("тема: сообщение %d — %s выключен, наружу ничего" % (mid, RELAY_FLAG))
+            return None
+        if not self._human(msg):
+            self.log("тема: сообщение %d — написал не человек (бот или от имени группы), наружу ничего" % mid)
+            return None
+        number, thread = self._topic_number(msg)
+        if not number:
+            self.log("тема: сообщение %d — %s, наружу ничего" % (mid, thread))
+            return None
+        text = msg.get("text")
+        if not isinstance(text, str) or not text.strip():
+            if any(k in msg for k in RELAY_MEDIA):
+                self.log("тема: сообщение %d — не текст, наружу ничего, ответ словами" % mid)
+                self._topic_reply(thread, mid, RELAY_MEDIA_WORDS)
+            return None
+        res = self.core.relay(mid, number, text, who_of(msg.get("from")))
+        out = res.get("outcome")
+        if out == wa_agent.RELAY_DUP:
+            return None
+        if out == "sent":
+            self.api("setMessageReaction", {"chat_id": self.show_chat, "message_id": mid,
+                                            "reaction": [{"type": "emoji", "emoji": RELAY_SENT_EMOJI}]})
+        else:
+            self._topic_reply(thread, mid, res.get("words"))
+        return out
+
+    def on_topic_edit(self, msg):
+        """Правка сообщения в теме клиента: клиенту не уходит; одна строка в ответ на сообщение."""
+        mid = int(msg.get("message_id") or 0)
+        if not self.relay or not self._human(msg):
+            return None
+        number, thread = self._topic_number(msg)
+        if not number:
+            return None
+        if not self.core.edit_once(mid):
+            self.log("тема: правка сообщения %d — ответ уже дан" % mid)
+            return None
+        self.log("тема: правка сообщения %d — в WhatsApp не передаётся, ответ словами" % mid)
+        self._topic_reply(thread, mid, RELAY_EDIT_WORDS)
+        return True
+
+    def agent_sent(self, number, text, who):
+        """Ушедшее агентом по «Отправить» — одной строкой в тему клиента. → id сообщения или None."""
+        if not self.relay:
+            return None
+        rows, why = self._topics("number=?", number)
+        thread = rows[0][1] if rows else None
+        if not thread:
+            self.log("тема: строки «отправил агент» нет — %s" % (why or "у клиента нет темы"))
+            return None
+        line = AGENT_LINE % (str(who or "").split(" (id ")[0] or "—", text)
+        if len(line) > TG_TEXT_MAX:
+            line = line[:TG_TEXT_MAX - 1] + "…"
+        ok, res = self.api("sendMessage", {"chat_id": self.show_chat, "message_thread_id": int(thread),
+                                           "text": line})
+        return int(res.get("message_id")) if ok else None
 
     # ── реакции наружу (WAREACTOUT0110) ───────────────────────────────────────────────────
 

@@ -231,9 +231,45 @@ def queue_rows(queue_db, num):
     return [r for r in rows if is_utterance(r)]
 
 
-def read_history(num, queue_db, archive_db, manifest="", media_dir="", trig=None, media_of=None):
+def read_sent(agent_db, num):
+    """Ушедшее клиенту через API — `outbox` базы агента wa_agent.db (текст из темы и «Отправить»,
+    WARELAYTEXT0210) → (записи [(wamid, ts, text)], причина «чего нет» | ""). Только mode=ro."""
+    if not agent_db or not os.path.exists(agent_db):
+        return [], "базы агента нет"
+    try:
+        conn = _ro(agent_db)
+    except sqlite3.Error as e:
+        return [], "база агента не читается (%s)" % type(e).__name__
+    try:
+        return conn.execute("SELECT wamid, ts, text FROM outbox WHERE number=? ORDER BY ts",
+                            (num,)).fetchall(), ""
+    except sqlite3.Error as e:
+        return [], "база агента не читается (%s)" % type(e).__name__
+    finally:
+        conn.close()
+
+
+def with_sent(items, sent):
+    """Ушедшее через API — в историю видом «мы», ровно один раз: запись не идёт, если та же реплика
+    уже в истории — эхом очереди (тот же wamid) или записью архива (тот же key_id)."""
+    have = {it["key"] for it in items}
+    have_k = {it["key"][2:].rsplit(":", 1)[0] for it in items if it["key"].startswith("a:")}
+    out = list(items)
+    for wamid, ts, text in sent or ():
+        if not wamid or wamid in have or (parse_wamid(wamid)[1] or "\0") in have_k:
+            continue
+        have.add(wamid)
+        out.append({"key": wamid, "ts": int(ts or 0), "who": "мы", "text": text or "", "word": None,
+                    "file": None})
+    out.sort(key=lambda it: (it["ts"], it["key"]))
+    return out
+
+
+def read_history(num, queue_db, archive_db, manifest="", media_dir="", trig=None, media_of=None,
+                 sent_db=None):
     """История номера (агент) → (элементы по времени, чего нет). Номер без истории — ([], …), не
-    ошибка; очередь, архив или опись не читаются — причина в списке, а не исключение."""
+    ошибка; очередь, архив или опись не читаются — причина в списке, а не исключение. sent_db — база
+    агента: ушедшее через API (эхом не возвращается) идёт видом «мы» (`with_sent`)."""
     missing = []
     try:
         rows = queue_rows(queue_db, num) if queue_db and os.path.exists(queue_db) else None
@@ -248,7 +284,13 @@ def read_history(num, queue_db, archive_db, manifest="", media_dir="", trig=None
     man, why_m = read_manifest(manifest, media_dir)
     if man is None:
         missing.append(why_m)
-    return merge(arch, rows or [], trig, man or {}, media_of), missing
+    items = merge(arch, rows or [], trig, man or {}, media_of)
+    if sent_db is not None:
+        sent, why_s = read_sent(sent_db, num)
+        if why_s:
+            missing.append(why_s)
+        items = with_sent(items, sent)
+    return items, missing
 
 
 # ── представление ──────────────────────────────────────────────────────────────────────────
