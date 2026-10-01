@@ -8,7 +8,8 @@
 
 ВЫКЛЮЧАТЕЛИ — все по умолчанию ВЫКЛЮЧЕНЫ (включает только явное 1/true/yes/on):
   WA_AGENT_DRAFTS — модель и черновики. Выключен — модель не зовётся, курсор идёт за очередью
-                    (`Core.follow`). Включён без адаптера модели — всё равно выключен, словами в старте.
+                    (`Core.follow`). Включён — `main` собирает адаптер `wa_agent_model` (WAAGENTMODEL0210);
+                    адаптер не собрался (нет ключа, моста) — выключен, словами в старте.
   WA_AGENT_CARDS  — карточки и нажатия в «Агентах».
   WA_AGENT_REACT  — реакции из тем показа наружу клиенту.
   WA_SEND         — дверь. Выключена — «Отправить» отвечает «отправка выключена» ДО двери
@@ -52,6 +53,8 @@ def env_of():
     base = os.path.dirname(os.path.abspath(env["queue_db"]))
     return {"queue_db": env["queue_db"], "mirror_db": env["state_db"],
             "tg_token": env["tg_token"], "show_chat": env["tg_chat"],
+            "archive_db": env.get("archive_db"), "archive_manifest": env.get("archive_manifest"),
+            "archive_media": env.get("archive_media"),
             "agent_db": os.environ.get("WA_AGENT_DB", os.path.join(base, "wa_agent.db")),
             "log_path": os.environ.get("WA_AGENT_LOG", os.path.join(ROOT, "wa_agent.log"))}
 
@@ -79,6 +82,26 @@ class NoModel(wa_agent.Model):
 
     def draft(self, number, upto_id):
         return None
+
+
+def make_model(env, line=None, bridge=None, call=None):
+    """Адаптер модели (WAAGENTMODEL0210): история — очередь и архив службы показа, знания, парк и цена —
+    мост (только чтение), плательщик — платный ключ тем же путём, что у Splinter. → (модель | None, почему).
+    Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели."""
+    import wa_agent_model
+    try:
+        if bridge is None:
+            import bridge_client
+            bridge = bridge_client.BridgeClient()
+        call = call or wa_agent_model.paid_call(env_file=os.path.join(ROOT, ".env"))
+    except Exception as e:                                           # noqa: BLE001
+        return None, "адаптер не собран: %s" % type(e).__name__
+    model = wa_agent_model.ModelAdapter(
+        env["queue_db"], call, read_doc=lambda n: bridge._call("read_doc", name=n), fleet=bridge.fleet,
+        door=bridge.quote_price, archive_db=env.get("archive_db") or "",
+        manifest=env.get("archive_manifest") or "", media_dir=env.get("archive_media") or "",
+        log=line or (lambda s: log.info("%s", s)))
+    return model, ""
 
 
 def build(env, environ=None, model=None, http=None, send=None, react_send=None, clock=time.time,
@@ -157,8 +180,13 @@ def main():
     env = env_of()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                         handlers=[logging.FileHandler(env["log_path"], encoding="utf-8")])
-    core, tg, _flags, words = build(env)
+    model, why = None, ""
+    if flags_of(os.environ)[F_DRAFTS]:
+        model, why = make_model(env)
+    core, tg, _flags, words = build(env, model=model)
     log.info("%s", start_line(env, words))
+    if why:
+        log.info("wa-agent: WA_AGENT_DRAFTS=1, но %s — черновиков нет", why)
     stop = []
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
     stats = serve(core, tg, words, lambda: bool(stop))

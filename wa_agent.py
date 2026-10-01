@@ -34,6 +34,7 @@ superseded и пауза; новое входящее → stale), пишет `se
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
 """
 
+import json
 import sqlite3
 import time
 
@@ -95,11 +96,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_live_draft ON drafts(number)
 CREATE INDEX IF NOT EXISTS drafts_wamid ON drafts(wamid);
 """
 
+# «Нужен человек» (WAAGENTMODEL0210): причины кода и модели — JSON-список слов в drafts.handoff.
+# Черновик с причинами «Отправить» не шлёт, пока человек не нажал «Исправить» (версия > 1).
+HANDOFF_LOCK_WORDS = "нужен человек — сначала «Исправить»: «Отправить» откроется на исправленной версии"
+
+
+def handoff_of(raw):
+    """drafts.handoff → [слова] (пусто/битое — [])."""
+    try:
+        val = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        return []
+    return [str(x) for x in val if str(x).strip()] if isinstance(val, list) else []
+
+
+def draft_out(out):
+    """Ответ Model.draft → (текст | None, [причины]). Строка — прежний контракт без причин."""
+    if isinstance(out, dict):
+        hand = out.get("handoff") or []
+        hand = [str(h).strip() for h in hand if str(h).strip()] if isinstance(hand, list) else []
+        return out.get("text"), hand
+    return out, []
+
 
 # ═══ интерфейсы рук (подделки — в тестах; настоящие — шаги 3–4 плана) ═══════════════════
 
 class Model:
-    """draft(number, upto_id) → текст черновика или None (модель не дала текста)."""
+    """draft(number, upto_id) → текст черновика или None (модель не дала текста), либо словарь
+    {text, handoff[слова причин «нужен человек»], …} (адаптер модели, WAAGENTMODEL0210)."""
 
     def draft(self, number, upto_id):
         raise NotImplementedError
@@ -148,6 +172,8 @@ class Core:
         self.log = log or (lambda line: None)
         self.db = sqlite3.connect(db_path, timeout=10, isolation_level=None)
         self.db.executescript(_SCHEMA)
+        if "handoff" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
+            self.db.execute("ALTER TABLE drafts ADD COLUMN handoff TEXT")
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -316,21 +342,23 @@ class Core:
             if self._live_draft(number):
                 continue
             try:
-                text = self.model.draft(number, upto)
+                text, hand = draft_out(self.model.draft(number, upto))
             except Exception as e:                                   # noqa: BLE001
                 self.log("модель упала: %s" % type(e).__name__)
-                text = None
-            if not (text or "").strip():
+                text, hand = None, []
+            if not isinstance(text, str) or not text.strip():
                 self.db.execute("UPDATE clients SET next_try=? WHERE number=?",
                                 (now + MODEL_RETRY_SEC, number))
                 continue
             # пока думала модель, клиент мог написать ещё или человек ответить — не пишем
             if self._fresh(number, upto):
                 continue
-            cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at) "
-                                  "VALUES(?,?,1,?,?,?)", (number, PENDING, text, upto, now))
+            cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, handoff) "
+                                  "VALUES(?,?,1,?,?,?,?)", (number, PENDING, text, upto, now,
+                                                            json.dumps(hand, ensure_ascii=False) if hand else None))
             did = cur.lastrowid
-            self.log("черновик %d (до строки %d, %d симв.)" % (did, upto, len(text)))
+            self.log("черновик %d (до строки %d, %d симв.%s)" % (
+                did, upto, len(text), ", нужен человек: причин %d" % len(hand) if hand else ""))
             card = self._tg("card", did, 1, number, text)
             if card is not None:
                 self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, did))
@@ -374,6 +402,10 @@ class Core:
         target = CLAIMED if action == ACT_SEND else DECLINED
         if action not in (ACT_SEND, ACT_DECLINE):
             return {"ok": False, "state": None, "words": "неизвестное действие"}
+        if action == ACT_SEND and self.send_locked(draft_id, ver):
+            # «нужен человек»: ДО захвата и до двери — черновик ждёт правки, кнопки живы
+            self.log("черновик %d: «Отправить» заперто — нужен человек, ждём «Исправить»" % draft_id)
+            return {"ok": False, "state": PENDING, "words": HANDOFF_LOCK_WORDS}
         if action == ACT_SEND and not self._door_open():
             # дверь выключена (WA_SEND): ДО захвата — черновик остаётся pending, кнопки живы
             row = self.db.execute("SELECT state, ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
@@ -453,6 +485,18 @@ class Core:
     def _card(self, draft_id):
         row = self.db.execute("SELECT card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
         return row[0] if row else None
+
+    def handoff(self, draft_id):
+        row = self.db.execute("SELECT handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        return handoff_of(row[0]) if row else []
+
+    def send_locked(self, draft_id, ver):
+        """«Отправить» заперто: черновик ждёт с этой версией, у него есть причины «нужен человек»,
+        и человек его ещё не исправлял (версия 1 — текст модели; «Исправить» даёт версию +1)."""
+        row = self.db.execute("SELECT state, ver, handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or row[0] != PENDING or row[1] != int(ver):
+            return False
+        return bool(handoff_of(row[2])) and row[1] == 1
 
     def _door_open(self):
         """Дверь без `is_open` — открыта (прежний контракт); `is_open` упал — закрыта."""

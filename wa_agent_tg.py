@@ -250,13 +250,23 @@ class Tg(wa_agent.Telegram):
     def card(self, draft_id, ver, number, text):
         if not self.enabled:
             return None
-        body = "📝 Черновик №%d · версия %d\n%s\n\n%s" % (draft_id, ver, self._head(number), text)
+        # «нужен человек» (WAAGENTMODEL0210): пометка с причинами; на версии модели «Отправить» нет —
+        # оно появляется на исправленной версии (замок в ядре тот же: Core.send_locked)
+        probe = getattr(self.core, "handoff", None)
+        hand = probe(draft_id) if probe else []
+        mark = ""
+        if hand:
+            mark = "🙋 НУЖЕН ЧЕЛОВЕК: " + "; ".join(hand) + "\n" + (
+                "«Отправить» — после «Исправить» (ответьте реплаем своим текстом)\n" if ver == 1
+                else "исправлено человеком — «Отправить» открыто\n")
+        body = "📝 Черновик №%d · версия %d\n%s\n%s\n%s" % (draft_id, ver, self._head(number), mark, text)
         if len(body) > TG_TEXT_MAX:
             body = body[:TG_TEXT_MAX - 60] + "\n… (показ обрезан; «Отправить» шлёт текст целиком)"
-        kb = {"inline_keyboard": [[
-            {"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)},
-            {"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
-            {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]]}
+        row = [{"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
+               {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]
+        if not (hand and ver == 1):
+            row.insert(0, {"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)})
+        kb = {"inline_keyboard": [row]}
         ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": body, "reply_markup": kb})
         if not ok:
             return None

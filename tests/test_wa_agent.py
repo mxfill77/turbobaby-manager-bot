@@ -363,7 +363,8 @@ def test_no_network_in_core():
             names |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom):
             names.add((node.module or "").split(".")[0])
-    assert names == {"sqlite3", "time", "wa_kind"}, names
+    # json — stdlib без сети: причины «нужен человек» в drafts.handoff (WAAGENTMODEL0210)
+    assert names == {"json", "sqlite3", "time", "wa_kind"}, names
 
 
 def test_queue_read_only():
