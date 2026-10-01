@@ -212,7 +212,8 @@ def edits(http, since=0):
 
 
 def strike_ok(text, ent, old):
-    return (ent == [{"type": "strikethrough", "offset": 0, "length": M.utf16_len(old)}]
+    """Длина считается здесь же, независимо от службы: единицы UTF-16 (эмодзи вне BMP — две)."""
+    return (ent == [{"type": "strikethrough", "offset": 0, "length": len(old.encode("utf-16-le")) // 2}]
             and text.startswith(old + "\n"))
 
 
@@ -237,8 +238,10 @@ mark = "🗑 удалено с телефона " + M.pk_hm(NOW0 + 60)
 ok(len(e) == 1 and e[0]["message_id"] == mid_c1, "editMessageText ровно один, на id цели: %s" % [x.get("message_id") for x in e])
 ok(e and e[0]["text"] == sent_text[0] + "\n" + mark,
    "прежний текст оставлен дословно, ниже «🗑 удалено с телефона ЧЧ:ММ»: %r" % (e[0]["text"][-40:] if e else None))
-ok(e and strike_ok(e[0]["text"], e[0].get("entities"), sent_text[0]),
-   "прежний текст зачёркнут (strikethrough, длина в UTF-16 с эмодзи: %d)" % M.utf16_len(sent_text[0]))
+ok(e and strike_ok(e[0]["text"], e[0].get("entities"), sent_text[0])
+   and len(sent_text[0].encode("utf-16-le")) // 2 != len(sent_text[0]),
+   "прежний текст зачёркнут (strikethrough, длина в UTF-16 с эмодзи: %d, символов %d)"
+   % (len(sent_text[0].encode("utf-16-le")) // 2, len(sent_text[0])))
 ok(not [p for p in http.calls("sendMessage", n0) if "удал" in p.get("text", "")],
    "отдельной строки об удалении нет")
 ok(m._is_shown("msg:wamid.V1") and m._is_shown("rev:wamid.C1"), "ключ строки и «цель помечена» записаны")
