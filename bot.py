@@ -240,6 +240,13 @@ async def on_service_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     [После замены] пишет ТО Oil в Лист1 ТОЛЬКО доверенным (Пым/владелец)."""
     splinter.feed_button(update)       # лента темы (SPLTOPICFEED0110): кто нажал что; fail-safe
     await splinter.handle_service_button(update, context, bridge)
+    # SPLLIVEMODE0110: человек отклонил кнопку решателя → пауза темы. Флаг выкл. → no-op; fail-safe.
+    await splinter.decider_note_button(update, context)
+
+
+async def on_decider_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка «▶️ Продолжить» в «Агентах» (SPLLIVEMODE0110): нажатие человека снимает паузу решателя темы."""
+    await splinter.handle_decider_button(update, context)
 
 
 async def on_devbot_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -848,6 +855,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             splinter.decider_shadow(msg, bridge=bridge, claude=claude)
             # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» в этой теме (дедуп, O(1) после первого раза)
             await splinter.ensure_info_pin(context, chat_id, _tid_sv)
+            # РЕШАТЕЛЬ В БОЮ (01.10.2026, SPLLIVEMODE0110): флаг `TOPIC_DECIDER_LIVE` (по умолчанию выкл. →
+            # строка не делает ничего). Сообщение НЕ к Splinter решается до перехватов; взял → перехваты
+            # молчат. Обращение к Splinter, пауза темы, сбой модели → прежний путь ниже. Fail-safe внутри.
+            #     Реплай на сообщение САМОГО решателя — ему (иначе поправку человека он бы не увидел).
+            if (splinter.decider_live_on()
+                    and (splinter.decider_reply_to_own(msg) or not _owner_addresses_bot(msg, context))
+                    and await splinter.decider_live(msg, context, bridge, claude)):
+                return
             # 0'') ОТВЕТ РЕПЛАЕМ НА ВОПРОС О ПРОБЕГЕ (01.10.2026, SPLODOREPLY0110): реплай на само
             #     сообщение-вопрос оживляет вопрос в любом возрасте и после перезапуска. Стоит ДО 0'):
             #     иначе 0') снял бы вопрос как протухший и назвал ответ устаревшим. Fail-safe внутри.
@@ -1516,6 +1531,7 @@ def main():
     # Кнопки карточек аудита (👍/✏️/👎) в группе «Аудит»
     app.add_handler(CallbackQueryHandler(on_audit_button, pattern=r"^aud:"))
     app.add_handler(CallbackQueryHandler(on_service_button, pattern=r"^svc:"))
+    app.add_handler(CallbackQueryHandler(on_decider_button, pattern=r"^dlv:"))   # пауза решателя (SPLLIVEMODE0110)
     app.add_handler(CallbackQueryHandler(on_devbot_button, pattern=r"^(approve|reject|check|next):"))
     app.add_handler(CallbackQueryHandler(on_delivery_button, pattern=r"^delivery:"))   # табло выдачи (слой 1 O3)
     app.add_handler(CallbackQueryHandler(on_o3_button, pattern=r"^o3:"))   # board→конструктор наряда→доставки (O3 ступень-1)

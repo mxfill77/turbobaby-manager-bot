@@ -1250,6 +1250,9 @@ def decider_open_kinds(chat_id, topic_id) -> dict:
                 out.setdefault("подтверждение", f"ворота №{n}")
     except Exception:
         pass
+    # SPLLIVEMODE0110: вопросы, заданные решателем В БОЮ (пусто, пока боевой режим не задал ни одного)
+    for k, v in _dlive_asks(chat_id, topic_id).items():
+        out.setdefault(k, v)
     return out
 
 
@@ -1308,7 +1311,7 @@ async def decider_run(snap, bridge, claude):
 def decider_shadow(msg, bridge=None, claude=None, kind="text"):
     """Вход тени. Флаг выключен → None сразу (ни снимка, ни модели, ни строки). Иначе — снимок
     сейчас и фоновая задача; прежний путь её не ждёт. Не бросает."""
-    if not _tdec.enabled():
+    if not _tdec.enabled() or _tdec.live_enabled():     # боевой режим заменяет тень (один вызов модели)
         return None
     try:
         if msg is None or claude is None or not _feed_servicing(msg.chat_id):
@@ -1324,6 +1327,279 @@ def decider_shadow(msg, bridge=None, claude=None, kind="text"):
     except Exception as e:
         log.warning(f"  🧠 решатель (тень): не запущен ({type(e).__name__}: {e}) — путь прежний")
         return None
+
+
+# ===================== РЕШАТЕЛЬ В БОЮ (01.10.2026, задание Штаба 0099-76p, SPLLIVEMODE0110) ==========
+# Флаг `TOPIC_DECIDER_LIVE` (по умолчанию выкл. → `decider_live` сразу False, путь равен 05efc4b).
+# Включён: сообщение темы, не обращённое к Splinter, решается ДО перехватов (с таймаутом); решение
+# исполняется через ПРЕЖНИЕ двери (`_odo_confirmed` для доверенного пробега, вопрос L с кнопкой «Да»
+# для чужого пробега, `sp_confirm_from_brain` для работ ТО), перехваты на этом сообщении молчат.
+# Сбой модели / таймаут / ответ не по схеме / «ответить» → прежний путь и строка журнала с причиной.
+# ПАУЗА (правило владельца 30.09.2026-7, п.4): человек отклонил кнопку решателя или поправил его ответом
+# → тема на паузе (там прежний путь), одно сообщение в «Агенты» с кнопкой «Продолжить»; нажатие снимает.
+# Состояние (паузы, вопросы решателя, зовы, mid его сообщений) — на диске, переживает перезапуск.
+_DLIVE = {"pauses": {}, "asks": {}, "calls": {}, "mids": {}}
+_DLIVE_LOADED = [False]
+_DLIVE_ASK_TTL = 3 * 3600
+_DLIVE_MIDS_KEEP = 60
+
+
+def _dlive_path():
+    return os.getenv("DECIDER_LIVE_STATE") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "decider_live_state.json")
+
+
+def _dlive_load():
+    if _DLIVE_LOADED[0]:
+        return
+    _DLIVE_LOADED[0] = True
+    try:
+        with open(_dlive_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        for k in _DLIVE:
+            if isinstance(d.get(k), dict):
+                _DLIVE[k].update(d[k])
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"  🧠 решатель (бой): состояние не прочитано ({type(e).__name__}) — начинаю с пустого")
+
+
+def _dlive_save():
+    try:
+        p = _dlive_path()
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(_DLIVE, f, ensure_ascii=False)
+        os.replace(p + ".tmp", p)
+    except Exception as e:
+        log.warning(f"  🧠 решатель (бой): состояние не записано ({type(e).__name__})")
+
+
+def _dkey(chat_id, topic_id):
+    return f"{chat_id}:{topic_id}"
+
+
+def _dlive_asks(chat_id, topic_id, now=None) -> dict:
+    """Открытые вопросы решателя по видам (вид → mid вопроса), не старше срока вопроса L."""
+    _dlive_load()
+    now = now or _time.time()
+    return {k: v.get("mid") for k, v in (_DLIVE["asks"].get(_dkey(chat_id, topic_id)) or {}).items()
+            if isinstance(v, dict) and now - float(v.get("ts") or 0) <= _DLIVE_ASK_TTL}
+
+
+def _dlive_mids(chat_id, topic_id) -> set:
+    _dlive_load()
+    return {int(m) for m in (_DLIVE["mids"].get(_dkey(chat_id, topic_id)) or []) if m is not None}
+
+
+def _dlive_mark(chat_id, topic_id, mid):
+    """Запомнить mid сообщения решателя — по нему узнаётся реплай/кнопка человека на решателя."""
+    if mid is None:
+        return
+    lst = _DLIVE["mids"].setdefault(_dkey(chat_id, topic_id), [])
+    lst.append(int(mid))
+    del lst[:-_DLIVE_MIDS_KEEP]
+    _dlive_save()
+
+
+def decider_live_on() -> bool:
+    return _tdec.live_enabled()
+
+
+def decider_reply_to_own(msg) -> bool:
+    """Сообщение — реплай на сообщение решателя (его вопрос, зов или вопрос L его двери)."""
+    try:
+        rt = _tfeed.reply_to_of(msg)
+        return rt is not None and int(rt) in _dlive_mids(msg.chat_id, getattr(msg, "message_thread_id", None))
+    except Exception:
+        return False
+
+
+def decider_paused(chat_id, topic_id):
+    _dlive_load()
+    return _DLIVE["pauses"].get(_dkey(chat_id, topic_id))
+
+
+async def _decider_live_decide(snap, bridge, claude):
+    """Мост (только чтение) и модель с таймаутом → (действие, причина_сбоя)."""
+    import asyncio as _aio
+    facts, user, tmo = snap["facts"], snap["user"], _tdec.live_timeout()
+    try:
+        if bridge is not None and snap.get("bike"):
+            sp = await _aio.wait_for(_aio.to_thread(_sp_open, bridge, snap["chat"], snap["topic"], snap["bike"]), tmo)
+            user = user.replace(_CTX_SP_UNASKED, f"ТО-заявка: {_ctx_brief(sp) if sp else 'открытой нет'}")
+            cur = await _aio.wait_for(_aio.to_thread(_odo_current, bridge, snap["bike"]), tmo)
+            facts["cur_km"] = odo_ceiling.km(cur)
+    except Exception as e:
+        log.warning(f"  🧠 решатель (бой): мост не прочитан ({type(e).__name__}) — решаю без него")
+    try:
+        raw = await _aio.wait_for(_aio.to_thread(
+            claude.quick, _tdec.LIVE_SYSTEM, user, max_tokens=400,
+            model=os.getenv("TOPIC_DECIDER_MODEL") or None, tag="decider_live", expect_json=True), tmo)
+    except _aio.TimeoutError:
+        return None, f"таймаут модели {tmo:g} с"
+    except Exception as e:
+        return None, f"модель не ответила ({type(e).__name__})"
+    return _tdec.parse_checked(raw)
+
+
+async def decider_pause(context, chat_id, topic_id, why, on_mid) -> bool:
+    """Тема на паузу (на диск) + ОДНО сообщение в «Агенты» с кнопкой «Продолжить». Уже на паузе → False."""
+    _dlive_load()
+    k = _dkey(chat_id, topic_id)
+    if k in _DLIVE["pauses"]:
+        return False
+    _DLIVE["pauses"][k] = {"why": why, "on": on_mid, "ts": _time.time()}
+    _dlive_save()
+    log.warning(f"  ⏸ решатель (бой): тема {k} на паузе — {why} (#{on_mid}); в ней прежний путь")
+    _tfeed.append(chat_id, topic_id, "decision", role="bot", reply_to=on_mid, text="", on=on_mid,
+                  live=True, pause=why)
+    bike = bike_from_topic(chat_id, topic_id) or "?"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("▶️ Продолжить", callback_data=f"dlv:go:{chat_id}:{topic_id}")]])
+    try:
+        await context.bot.send_message(
+            chat_id=AGENTS_CHAT, reply_markup=kb,
+            text=(f"⏸ Splinter: решатель темы обслуживания «{bike}» на паузе — {why} (сообщение #{on_mid}). "
+                  f"В теме работает прежний путь. Когда продолжать — нажмите «Продолжить»."))
+    except Exception as e:
+        log.warning(f"  ⏸ решатель (бой): сообщение в «Агенты» не ушло ({type(e).__name__}) — пауза стоит")
+    return True
+
+
+async def handle_decider_button(update, context) -> None:
+    """Кнопка «Продолжить» (`dlv:go:<чат>:<тема>`) в «Агентах»: нажатие человека снимает паузу темы."""
+    q = update.callback_query
+    try:
+        _, act, chat_s, topic_s = (q.data or "").split(":", 3)
+    except ValueError:
+        await q.answer()
+        return
+    u = getattr(q, "from_user", None)
+    if act != "go" or u is None or getattr(u, "is_bot", False):
+        await q.answer()
+        return
+    _dlive_load()
+    k = f"{chat_s}:{topic_s}"
+    p = _DLIVE["pauses"].pop(k, None)
+    _dlive_save()
+    log.info(f"  ▶️ решатель (бой): пауза темы {k} {'снята' if p else 'уже снята'} — нажал uid={getattr(u, 'id', None)}")
+    try:
+        chat_i = int(chat_s)
+        topic_i = None if topic_s == "None" else int(topic_s)
+        if p:
+            _tfeed.append(chat_i, topic_i, "decision", role="bot", text="", live=True, resume=True,
+                          by=getattr(u, "id", None))
+    except Exception:
+        pass
+    await q.answer("Продолжаю" if p else "Паузы уже нет")
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def decider_note_button(update, context) -> None:
+    """После прежней кнопки `svc:*`: человек ОТКЛОНИЛ кнопку решателя → пауза темы. Флаг выкл. → no-op."""
+    if not _tdec.live_enabled():
+        return
+    try:
+        q = update.callback_query
+        parts = (q.data or "").split(":", 2)
+        m = q.message
+        chat_id, topic_id = m.chat_id, getattr(m, "message_thread_id", None)
+        u = getattr(q, "from_user", None)
+        why = _tdec.pause_reason({"вид": "кнопка", "действие": parts[1] if len(parts) > 1 else "",
+                                  "на": m.message_id, "человек": u is not None and not getattr(u, "is_bot", False)},
+                                 _dlive_mids(chat_id, topic_id))
+        if why:
+            await decider_pause(context, chat_id, topic_id, why, m.message_id)
+    except Exception as e:
+        log.warning(f"  ⏸ решатель (бой): кнопка не разобрана ({type(e).__name__})")
+
+
+async def _decider_execute(msg, context, bridge, snap, v) -> str:
+    """Исполнить итог правил через ПРЕЖНИЕ двери. Возврат — имя двери (для журнала)."""
+    it, chat_id, topic_id, bike = v["итог"], snap["chat"], snap["topic"], snap["bike"]
+    a, k, now = it.get("действие"), _dkey(snap["chat"], snap["topic"]), _time.time()
+    if a == "записать":
+        door = v.get("дверь") or ""
+        if not _tdec._is_mileage(it.get("что")):                         # работа ТО — всегда кнопка Пыма (E2b)
+            await sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, it.get("что"), it.get("км"))
+            return "кнопка Пыма (ТО-заявка)"
+        if door == _tdec.DOOR_ODO:                                       # доверенный пробег — как сейчас
+            _odo_confirmed(bridge, chat_id, topic_id, bike, it.get("км"),
+                           sender=snap["facts"].get("role") or "?", source=f"решатель #{it.get('источник')}")
+            _PENDING_MILEAGE.pop((chat_id, topic_id), None)
+            _mileage_q_forget(chat_id, topic_id, "решатель записал пробег")
+            (_DLIVE["asks"].get(k) or {}).pop("пробег", None)
+            _dlive_save()
+            return _tdec.DOOR_ODO
+        await _ask_mileage_confirm(context, chat_id, topic_id, bike, str(it.get("км")), bridge=bridge)
+        _dlive_mark(chat_id, topic_id, (_MILEAGE_Q.get(_mileage_q_key(chat_id, topic_id)) or {}).get("msg_id"))
+        return "кнопка Пыма (вопрос L)"
+    if a == "спросить":
+        q = str(it.get("вопрос") or "")[:400]
+        sent = await msg.reply_text(f"🐀 Splinter\n{q}")
+        smid = getattr(sent, "message_id", None)
+        _DLIVE["asks"].setdefault(k, {})[_tdec.ask_kind(it.get("ждём_что"))] = {"mid": smid, "ts": now}
+        _dlive_mark(chat_id, topic_id, smid)
+        _tfeed.append(chat_id, topic_id, "bot_ask", mid=smid, role="bot", reply_to=snap["facts"].get("mid"),
+                      text=q[:300])
+        return "вопрос реплаем"
+    if a == "позвать":
+        last = (_DLIVE["calls"].get(k) or {}).get("ts")
+        if not _tdec.call_allowed(last, now, _tdec.call_window()):
+            return "зов (уже был в окне — без повтора)"
+        why = str(it.get("зачем") or "")[:160]
+        sent = await msg.reply_text(f"🐀 Splinter\n🙋 {PYM_HANDLE}: {why}")
+        smid = getattr(sent, "message_id", None)
+        _DLIVE["calls"][k] = {"ts": now, "mid": smid}
+        _dlive_mark(chat_id, topic_id, smid)
+        return "зов Пыма"
+    return ""
+
+
+async def decider_live(msg, context, bridge, claude, kind="text") -> bool:
+    """Вход боевого режима. True — решатель взял сообщение (перехваты молчат); False — прежний путь
+    (флаг выкл., тема на паузе, сбой/таймаут/не JSON, «ответить», поправка → пауза). Не бросает."""
+    if not _tdec.live_enabled():
+        return False
+    mid = getattr(msg, "message_id", None)
+    try:
+        if msg is None or claude is None or not _feed_servicing(msg.chat_id):
+            return False
+        if getattr(getattr(msg, "from_user", None), "is_bot", False):
+            return False
+        chat_id, topic_id = msg.chat_id, getattr(msg, "message_thread_id", None)
+        p = decider_paused(chat_id, topic_id)
+        if p:
+            log.info(f"  🧠 решатель (бой): #{mid} → тема на паузе — прежний путь")
+            return False
+        snap = decider_snapshot(msg, kind)
+        dec, why = await _decider_live_decide(snap, bridge, claude)
+        if why:
+            log.warning(f"  🧠 решатель (бой): #{mid} → прежний путь: {why}")
+            _tfeed.append(chat_id, topic_id, "decision", role="bot", reply_to=mid, text="", on=mid,
+                          input_kind=kind, live=True, fallback=why)
+            return False
+        pw = _tdec.pause_reason({"вид": "реплай", "на": snap["facts"].get("reply_to"), "человек": True,
+                                 "поправка": dec.get("поправка") is True}, _dlive_mids(chat_id, topic_id))
+        if pw:
+            await decider_pause(context, chat_id, topic_id, pw, mid)
+            return False
+        v = _tdec.rules(dec, snap["facts"])
+        v["модель"] = dec.get("действие")
+        if v["итог"].get("действие") not in _tdec.LIVE_ACTIONS:
+            log.info(f"  🧠 решатель (бой): #{mid} → {v['итог'].get('действие')} в бою не исполняется — прежний путь")
+            return False
+        door = await _decider_execute(msg, context, bridge, snap, v)
+        log.info(_tdec.live_say(v, mid, door))
+        _tfeed.append(chat_id, topic_id, "decision", role="bot", reply_to=mid, text="", on=mid,
+                      input_kind=kind, live=True, model=dec, final=v["итог"], rule=v["правило"], door=door)
+        return True
+    except Exception as e:
+        log.warning(f"  🧠 решатель (бой): #{mid} сбой ({type(e).__name__}) — прежний путь")
+        return False
 
 # Кэш названий форум-тем: {(chat_id, topic_id): "название темы"}
 # В названии темы записан байк (по договорённости Филиппа).
@@ -10240,6 +10516,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
             feed_vision(chat_id, topic_id, photo_msgs, vis, len(vis_list))
             # РЕШАТЕЛЬ В ТЕНИ (SPLDECIDER0110): фото решается, когда разбор уже в ленте. Флаг выкл. → no-op.
             decider_shadow((photo_msgs or [msg])[0], bridge=bridge, claude=claude, kind="photo")
+            # РЕШАТЕЛЬ В БОЮ (SPLLIVEMODE0110): фото — после разбора, одно решение на альбом (по первому
+            # фото). Взял → прежний разбор дальше молчит. Флаг выкл. / сбой / пауза → прежний путь.
+            if decider_live_on() and await decider_live((photo_msgs or [msg])[0], context, bridge, claude,
+                                                        kind="photo"):
+                return
 
     # Работы из разбора — отдельно от type (техник может перечислить работы, а parse вернуть
     # type≠"event": так и было в кейсе NINJA 6334 09.06 — works был, но в события не записалось и молчали).
