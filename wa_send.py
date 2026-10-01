@@ -19,6 +19,11 @@
                        человеку, которое не отзывается.
   WA_360_API_KEY     — ключ 360dialog, заголовок `D360-API-KEY`. Пусто либо заполнитель
                        («PLACEHOLDER» и родня) → отказ ДО обращения к сети.
+                       С 01.10.2026 (WAREACTOUT0110) — ОДНО правило для двери и показа
+                       (`api_key`): WA_360_API_KEY, иначе WA_D360_API_KEY — первое годное имя.
+
+РЕАКЦИЯ (01.10.2026, WAREACTOUT0110). `send_reaction` идёт ТЕМ ЖЕ путём, что текст: ручка
+WA_SEND, ключ, окно 24 ч, три исхода. Пустой эмодзи — снятие реакции (так говорит API Meta).
 
 ЗНАЧЕНИЕ КЛЮЧА НЕ ПОКАЗЫВАЕТСЯ НИГДЕ. Ни в отказе, ни в журнале, ни в исключении не печатается
 ни одного его символа — наружу уходит только «ключ не годен» и почему (пусто / заполнитель).
@@ -126,6 +131,26 @@ def key_usable(key) -> tuple:
         if mark in up:
             return False, "в WA_360_API_KEY стоит заполнитель, а не ключ — боевой ещё не заведён"
     return True, "ключ задан"
+
+
+KEY_NAMES = ("WA_360_API_KEY", "WA_D360_API_KEY")
+
+
+def api_key(env=None) -> tuple:
+    """Ключ 360dialog по ОДНОМУ правилу для двери и показа → (ключ или '', имя или '', причина).
+
+    У одного ключа два имени (WAAGENTLIVE0110, находка 1): дверь читала WA_360_API_KEY, показ —
+    WA_D360_API_KEY. Правило: WA_360_API_KEY, иначе WA_D360_API_KEY; пустое имя и заполнитель
+    пропускаются, берётся первое ГОДНОЕ. ЗНАЧЕНИЕ В ПРИЧИНУ НЕ ПОПАДАЕТ НИКОГДА — только имена.
+    """
+    env = env if env is not None else os.environ
+    seen = []
+    for name in KEY_NAMES:
+        key = str(env.get(name) or "").strip()
+        if key_usable(key)[0]:
+            return key, name, "ключ задан (%s)" % name
+        seen.append("%s — %s" % (name, "заполнитель" if key else "пуст"))
+    return "", "", "ключ 360dialog не годен ни под одним именем (%s)" % ", ".join(seen)
 
 
 def window_state(last_inbound_ts, now, window_secs: float = WINDOW_SECS) -> tuple:
@@ -299,6 +324,36 @@ def build_payload(to: str, text: str) -> dict:
     }
 
 
+def build_reaction(to: str, wamid: str, emoji: str) -> dict:
+    """Реакция на сообщение `wamid`; пустой эмодзи — снятие."""
+    return {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": str(to),
+        "type": "reaction",
+        "reaction": {"message_id": str(wamid), "emoji": emoji or ""},
+    }
+
+
+def _out(outcome, reason, window=WINDOW_UNKNOWN, wamid=None, attempts=0):
+    return {"outcome": outcome, "reason": reason, "wamid": wamid,
+            "window": window, "attempts": attempts, "verify": outcome == UNKNOWN}
+
+
+def send_reaction(to, wamid, emoji, now=None, db_path=None, env=None, transport=None,
+                  sleep=time.sleep, budget=SEND_BUDGET_SEC, clock=time.monotonic):
+    """Поставить (или снять — пустой `emoji`) реакцию на сообщение `wamid` у клиента `to`.
+
+    Путь тот же, что у текста (`_door`): WA_SEND, ключ по `api_key`, окно 24 ч, три исхода.
+    НИКОГДА не бросает. Ответ — тот же словарь, что у `send_text`.
+    """
+    if not str(to or "").strip():
+        return _out(NOT_SENT, "номер получателя не назван")
+    if not str(wamid or "").strip():
+        return _out(NOT_SENT, "не назван wamid сообщения, на которое реакция")
+    return _door(to, build_reaction(to, wamid, emoji), now, db_path, env, transport, sleep, budget, clock)
+
+
 def send_text(to, text, now=None, db_path=None, env=None, transport=None,
               sleep=time.sleep, budget=SEND_BUDGET_SEC, clock=time.monotonic):
     """Отправить текст клиенту. Возвращает словарь-исход, НИКОГДА не бросает.
@@ -311,27 +366,27 @@ def send_text(to, text, now=None, db_path=None, env=None, transport=None,
       attempts сколько раз обращались к сети (0 — если до сети не дошло)
       verify   True, когда исход unknown: ПЕРЕД любым повтором надо выяснить, ушло ли
     """
+    if not str(to or "").strip():
+        return _out(NOT_SENT, "номер получателя не назван")
+    if not str(text or "").strip():
+        return _out(NOT_SENT, "пустой текст не отправляем")
+    return _door(to, build_payload(to, text), now, db_path, env, transport, sleep, budget, clock)
+
+
+def _door(to, payload, now, db_path, env, transport, sleep, budget, clock):
+    """Общий путь текста и реакции: ручка → ключ → окно 24 ч → отправка под общим дедлайном."""
     env = env if env is not None else os.environ
     now = time.time() if now is None else float(now)
     post = transport or _post
-
-    def out(outcome, reason, window=WINDOW_UNKNOWN, wamid=None, attempts=0):
-        return {"outcome": outcome, "reason": reason, "wamid": wamid,
-                "window": window, "attempts": attempts, "verify": outcome == UNKNOWN}
-
-    if not str(to or "").strip():
-        return out(NOT_SENT, "номер получателя не назван")
-    if not str(text or "").strip():
-        return out(NOT_SENT, "пустой текст не отправляем")
+    out = _out
 
     # ── ручка двери ──
     if not send_enabled(env):
         return out(NOT_SENT, "дверь отправки выключена (WA_SEND не равен 1) — не отправлено")
 
-    # ── ключ ──
-    key = env.get("WA_360_API_KEY") or ""
-    key_ok, key_why = key_usable(key)
-    if not key_ok:
+    # ── ключ: одно правило для двери и показа ──
+    key, _name, key_why = api_key(env)
+    if not key:
         return out(NOT_SENT, key_why + " — не отправлено")
 
     # ── окно 24 часа: судим ДО сети ──
@@ -358,7 +413,6 @@ def send_text(to, text, now=None, db_path=None, env=None, transport=None,
 
     # ── отправка под общим дедлайном ──
     url = API_BASE + SEND_PATH
-    payload = build_payload(to, text)
     # ДЕДЛАЙН ЖИВЁТ НА СВОИХ ЧАСАХ, а не на `now`. `now` — семантическое «сейчас» для окна
     # 24 часа, и тест вправе подать его фальшивым; смешать их значило бы, что подставленное
     # время мгновенно съедает бюджет и отправка не случается никогда. Часы монотонные:
