@@ -218,11 +218,12 @@ def test_door_off_and_door_error_words():
     assert [m["text"] for m in w3.show_msgs()] == [A.W_WIN_UNKNOWN], w3.show_msgs()
 
 
-def test_media_not_relayed_words():
+def test_kind_without_pair_words():
+    # медиа уходят с WARELAYMEDIA0210 (tests/test_wa_relay_media.py); вид без пары — ответ словами
     w = RW(ON)
-    w.http.updates = [[w.topic(text=None, photo=[{"file_id": "x"}])]]
+    w.http.updates = [[w.topic(text=None, contact={"phone_number": "000", "first_name": "x"})]]
     w.serve(10)
-    assert w.sends == [] and [m["text"] for m in w.show_msgs()] == [G.RELAY_MEDIA_WORDS], w.show_msgs()
+    assert w.sends == [] and [m["text"] for m in w.show_msgs()] == [G.RELAY_NO_PAIR % "контакт"], w.show_msgs()
 
 
 def test_journal_no_client_text_or_number():

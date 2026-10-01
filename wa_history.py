@@ -231,9 +231,13 @@ def queue_rows(queue_db, num):
     return [r for r in rows if is_utterance(r)]
 
 
+SENT_WORD = dict(MEDIA_WORD, location="геоточка")   # вид медиа в outbox → слово (WARELAYMEDIA0210)
+
+
 def read_sent(agent_db, num):
     """Ушедшее клиенту через API — `outbox` базы агента wa_agent.db (текст из темы и «Отправить»,
-    WARELAYTEXT0210) → (записи [(wamid, ts, text)], причина «чего нет» | ""). Только mode=ro."""
+    WARELAYTEXT0210; медиа из темы — видом и подписью, WARELAYMEDIA0210) → (записи
+    [(wamid, ts, text, kind | None)], причина «чего нет» | ""). Колонки kind ещё нет — NULL. Только mode=ro."""
     if not agent_db or not os.path.exists(agent_db):
         return [], "базы агента нет"
     try:
@@ -241,8 +245,9 @@ def read_sent(agent_db, num):
     except sqlite3.Error as e:
         return [], "база агента не читается (%s)" % type(e).__name__
     try:
-        return conn.execute("SELECT wamid, ts, text FROM outbox WHERE number=? ORDER BY ts",
-                            (num,)).fetchall(), ""
+        have = {r[1] for r in conn.execute("PRAGMA table_info(outbox)")}
+        return conn.execute("SELECT wamid, ts, text, %s FROM outbox WHERE number=? ORDER BY ts"
+                            % ("kind" if "kind" in have else "NULL"), (num,)).fetchall(), ""
     except sqlite3.Error as e:
         return [], "база агента не читается (%s)" % type(e).__name__
     finally:
@@ -255,12 +260,14 @@ def with_sent(items, sent):
     have = {it["key"] for it in items}
     have_k = {it["key"][2:].rsplit(":", 1)[0] for it in items if it["key"].startswith("a:")}
     out = list(items)
-    for wamid, ts, text in sent or ():
+    for rec in sent or ():
+        wamid, ts, text = rec[0], rec[1], rec[2]
+        kind = rec[3] if len(rec) > 3 else None
         if not wamid or wamid in have or (parse_wamid(wamid)[1] or "\0") in have_k:
             continue
         have.add(wamid)
-        out.append({"key": wamid, "ts": int(ts or 0), "who": "мы", "text": text or "", "word": None,
-                    "file": None})
+        out.append({"key": wamid, "ts": int(ts or 0), "who": "мы", "text": text or "",
+                    "word": SENT_WORD.get(kind) if kind else None, "file": None})
     out.sort(key=lambda it: (it["ts"], it["key"]))
     return out
 

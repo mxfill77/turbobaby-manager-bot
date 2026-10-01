@@ -13,7 +13,7 @@
   WA_AGENT_CARDS  — карточки и нажатия в «Агентах».
   WA_AGENT_REACT  — реакции из тем показа наружу клиенту.
   WA_AGENT_RELAY  — текст человека из темы клиента → клиенту в WhatsApp; «Отправить» — строкой в теме
-                    (WARELAYTEXT0210). Дверь та же — WA_SEND.
+                    (WARELAYTEXT0210); медиа из темы своим видом (WARELAYMEDIA0210). Дверь та же — WA_SEND.
   WA_SEND        — дверь. Выключена — «Отправить» отвечает «отправка выключена» ДО двери
                     (`Core.press` спрашивает `SendDoor.is_open`), черновик ждёт.
 Все выключены — ни одного вызова Telegram и двери: такт ядра читает только очередь (mode=ro).
@@ -66,10 +66,11 @@ class SendDoor(wa_agent.Door):
     """Дверь текста: `wa_send.send_text` с очередью службы (окно 24 ч, ключ, три исхода — там).
     `is_open` — ручка WA_SEND тем же правилом, что у двери (`wa_send.send_enabled`)."""
 
-    def __init__(self, queue_path, environ=None, send=None):
+    def __init__(self, queue_path, environ=None, send=None, send_media=None):
         self.queue_path = queue_path
         self.environ = environ if environ is not None else os.environ
         self.send = send or wa_send.send_text
+        self.media = send_media or wa_send.send_media
 
     def is_open(self):
         return wa_send.send_enabled(self.environ)
@@ -78,6 +79,12 @@ class SendDoor(wa_agent.Door):
         if not self.is_open():
             return {"outcome": wa_send.NOT_SENT, "reason": DOOR_OFF_WORDS, "wamid": None}
         return self.send(to, text, db_path=self.queue_path)
+
+    def send_media(self, to, media):
+        """Медиа из темы (WARELAYMEDIA0210): `wa_send.send_media` с очередью службы — тот же путь."""
+        if not self.is_open():
+            return {"outcome": wa_send.NOT_SENT, "reason": DOOR_OFF_WORDS, "wamid": None}
+        return self.media(to, media, db_path=self.queue_path)
 
 
 class NoModel(wa_agent.Model):
@@ -108,7 +115,7 @@ def make_model(env, line=None, bridge=None, call=None):
 
 
 def build(env, environ=None, model=None, http=None, send=None, react_send=None, clock=time.time,
-          line=None):
+          line=None, send_media=None):
     """Собрать ядро и руки. model=None — адаптера нет, черновики выключены при любом WA_AGENT_DRAFTS.
     → (core, tg, flags, words): flags — запрошенные, words — действующие состояния словами."""
     environ = environ if environ is not None else os.environ
@@ -118,7 +125,7 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     tg = wa_agent_tg.Tg(env.get("tg_token"), enabled=flags[F_CARDS], show_chat=env.get("show_chat"),
                         mirror_db=env.get("mirror_db"), http=http, clock=clock, log=line,
                         react=flags[F_REACT], react_send=react_send, relay=flags[F_RELAY])
-    door = SendDoor(env["queue_db"], environ=environ, send=send)
+    door = SendDoor(env["queue_db"], environ=environ, send=send, send_media=send_media)
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                          log=line, drafts=drafts)
     tg.bind(core)

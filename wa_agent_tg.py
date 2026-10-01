@@ -44,6 +44,15 @@
 повтора. Правка — не уходит, одна строка в ответ. Удаление сообщения Bot API боту не присылает.
 «Отправить» по черновику — строкой «мы · агент, отправил <имя>: текст» в теме клиента.
 Выключатель `WA_AGENT_RELAY` по умолчанию выключен — сообщения тем не читаются и не отправляются.
+
+МЕДИА ИЗ ТЕМЫ → WHATSAPP (WARELAYMEDIA0210). Фото, видео (и гиф, и кружок), документ, голосовое, аудио,
+статичный стикер и место из темы клиента уходят клиенту своим видом (`media_of` → `Core.relay(media=…)` →
+`wa_send.send_media`): файл берётся `getFile` и скачивается В ПАМЯТЬ (`Tg.download`, на диск не ложится),
+дверь грузит его в 360dialog и шлёт. Голосовое Telegram (OGG/Opus) — аудио WhatsApp. Предел — меньший из
+Bot API (20 МБ) и WhatsApp по виду; больше — ответ в теме с размером и пределом, наружу ничего. Альбом —
+это отдельные сообщения Telegram: каждый файл — своим сообщением со своим ключом, подпись — та, что у
+файла (у альбома Telegram держит её на первом). Вид без пары (контакт, опрос, живая геоточка,
+анимированный стикер, …) — ответ в теме, что он в WhatsApp не отправляется. Исход — как у текста.
 """
 
 import json
@@ -72,9 +81,15 @@ RELAY_UPDATES = ["message", "edited_message"]
 RELAY_SENT_EMOJI = "👌"           # отправлено — реакция бота из набора Telegram на сообщение человека
 RELAY_EDIT_WORDS = ("правка в WhatsApp не передаётся — клиент видит первый текст; "
                     "поправку напишите новым сообщением")
-RELAY_MEDIA_WORDS = "из темы клиенту уходит только текст — это сообщение в WhatsApp не передано"
-RELAY_MEDIA = ("photo", "video", "document", "audio", "voice", "video_note", "sticker", "animation",
-               "contact", "location", "venue", "poll")
+# Медиа из темы (WARELAYMEDIA0210)
+TG_GET_MAX = 20 * 1024 * 1024      # Bot API getFile: боту отдаётся файл до 20 МБ
+TG_FILE_TIMEOUT = 120
+RELAY_NO_PAIR = "не отправлено: %s в WhatsApp из темы не отправляется — наружу ничего"
+RELAY_NO_CAPTION = "ушло без подписи: у %s в WhatsApp подписи нет — напишите её отдельным сообщением"
+NO_CAPTION_GEN = {"voice": "голосового", "audio": "аудио", "sticker": "стикера"}
+NO_PAIR = (("contact", "контакт"), ("poll", "опрос"), ("dice", "кубик"), ("game", "игра"),
+           ("story", "история"), ("paid_media", "платное медиа"), ("invoice", "счёт"),
+           ("giveaway", "розыгрыш"), ("checklist", "список задач"))
 AGENT_LINE = "мы · агент, отправил %s: %s"
 POLL_RETRY_SEC = 1                 # getUpdates не удался — следующий опрос не раньше
 CONFLICT_PAUSE = 30                # 409 (второй читатель) — следующий опрос не раньше; такт идёт
@@ -174,6 +189,63 @@ def tg_standard(reactions):
         else:
             other.append(str((r or {}).get("type") or "?"))
     return emoji, other
+
+
+def media_of(msg):
+    """Сообщение темы → (медиа для `wa_send.send_media` | None, вид без пары словами | None).
+    Медиа: kind — вид WhatsApp, label — что прислал человек (голосовое уходит аудио), file_id, size
+    (по описанию Telegram), mime, filename, caption, fetch_max; у места — координаты, название, адрес.
+    (None, None) — служебное сообщение без вложения: молча."""
+    cap = msg.get("caption") or ""
+
+    def f(kind, obj, mime, label=None, filename=""):
+        return {"kind": kind, "label": label or kind, "file_id": obj.get("file_id"),
+                "size": int(obj.get("file_size") or 0), "mime": str(mime or "").lower(),
+                "filename": filename, "caption": cap, "fetch_max": TG_GET_MAX}, None
+
+    if msg.get("photo"):
+        sizes = [x for x in msg["photo"] if isinstance(x, dict) and x.get("file_id")]
+        lim = min(TG_GET_MAX, wa_send.MEDIA_MAX["image"])
+        fit = [x for x in sizes if int(x.get("file_size") or 0) <= lim]
+        if not sizes:
+            return None, "фото без файла"
+        return f("image", (fit or sizes)[-1], "image/jpeg")          # Bot API: размеры по возрастанию
+    if msg.get("animation"):
+        a = msg["animation"]
+        return f("video", a, a.get("mime_type") or "video/mp4")
+    if msg.get("video"):
+        v = msg["video"]
+        return f("video", v, v.get("mime_type") or "video/mp4")
+    if msg.get("video_note"):
+        return f("video", msg["video_note"], "video/mp4")
+    if msg.get("voice"):
+        v = msg["voice"]
+        return f("audio", v, v.get("mime_type") or "audio/ogg", label="voice")
+    if msg.get("audio"):
+        a = msg["audio"]
+        return f("audio", a, a.get("mime_type") or "", filename=a.get("file_name") or "")
+    if msg.get("document"):
+        d = msg["document"]
+        mime = str(d.get("mime_type") or "").lower()
+        kind = next((k for k in ("document", "image", "video", "audio") if mime in wa_send.MEDIA_MIMES[k]),
+                    "document")
+        return f(kind, d, mime, filename=d.get("file_name") or "")
+    if msg.get("sticker"):
+        st = msg["sticker"]
+        if st.get("is_animated") or st.get("is_video"):
+            return None, "анимированный стикер"
+        return f("sticker", st, "image/webp")
+    if msg.get("location"):
+        loc, venue = msg["location"], msg.get("venue") or {}
+        if loc.get("live_period") and not venue:
+            return None, "живая геоточка"
+        return {"kind": "location", "label": "location", "latitude": loc.get("latitude"),
+                "longitude": loc.get("longitude"), "name": venue.get("title") or "",
+                "address": venue.get("address") or ""}, None
+    for key, word in NO_PAIR:
+        if msg.get(key):
+            return None, word
+    return None, None
 
 
 def wa_emoji(tg) -> str:
@@ -501,6 +573,24 @@ class Tg(wa_agent.Telegram):
         frm = msg.get("from") or {}
         return bool(frm) and not frm.get("is_bot")
 
+    def download(self, file_id, cap):
+        """Файл Telegram → (bytes | None, почему): `getFile`, затем скачивание В ПАМЯТЬ — на диск не
+        пишется ни байта. Ключ бота живёт только в адресе запроса и в журнал не идёт."""
+        ok, res = self.api("getFile", {"file_id": file_id})
+        if not ok:
+            return None, "getFile не удался (%s)" % res
+        path = (res or {}).get("file_path")
+        if not path:
+            return None, "getFile без пути файла"
+        size = int((res or {}).get("file_size") or 0)
+        if cap and size > cap:
+            return None, "файл %s больше предела %s" % (wa_send.fmt_size(size), wa_send.fmt_size(cap))
+        status, body = self.http("GET", TG_BASE + "/file/bot" + self.token + "/" + path, {}, None,
+                                 TG_FILE_TIMEOUT)
+        if status != 200:
+            return None, "скачивание: HTTP %s" % status
+        return bytes(body or b""), ""
+
     def _topic_reply(self, thread, mid, words):
         return self.api("sendMessage", {"chat_id": self.show_chat, "message_thread_id": int(thread),
                                         "text": str(words)[:TG_TEXT_MAX],
@@ -522,18 +612,28 @@ class Tg(wa_agent.Telegram):
             self.log("тема: сообщение %d — %s, наружу ничего" % (mid, thread))
             return None
         text = msg.get("text")
+        media = None
         if not isinstance(text, str) or not text.strip():
-            if any(k in msg for k in RELAY_MEDIA):
-                self.log("тема: сообщение %d — не текст, наружу ничего, ответ словами" % mid)
-                self._topic_reply(thread, mid, RELAY_MEDIA_WORDS)
-            return None
-        res = self.core.relay(mid, number, text, who_of(msg.get("from")))
+            media, no_pair = media_of(msg)
+            if media is None:
+                if no_pair:
+                    self.log("тема: сообщение %d — %s в WhatsApp не отправляется, ответ словами" % (mid, no_pair))
+                    self._topic_reply(thread, mid, RELAY_NO_PAIR % no_pair)
+                return None
+            if media.get("file_id"):
+                media["fetch"] = lambda cap, fid=media["file_id"]: self.download(fid, cap)
+            res = self.core.relay(mid, number, None, who_of(msg.get("from")), media=media)
+        else:
+            res = self.core.relay(mid, number, text, who_of(msg.get("from")))
         out = res.get("outcome")
         if out == wa_agent.RELAY_DUP:
             return None
         if out == "sent":
             self.api("setMessageReaction", {"chat_id": self.show_chat, "message_id": mid,
                                             "reaction": [{"type": "emoji", "emoji": RELAY_SENT_EMOJI}]})
+            if res.get("dropped_caption"):
+                self._topic_reply(thread, mid, RELAY_NO_CAPTION % NO_CAPTION_GEN.get(
+                    (media or {}).get("label"), "этого вида"))
         else:
             self._topic_reply(thread, mid, res.get("words"))
         return out
@@ -545,6 +645,9 @@ class Tg(wa_agent.Telegram):
             return None
         number, thread = self._topic_number(msg)
         if not number:
+            return None
+        if msg.get("location"):
+            self.log("тема: сообщение %d — геоточка обновилась, в WhatsApp не передаётся" % mid)
             return None
         if not self.core.edit_once(mid):
             self.log("тема: правка сообщения %d — ответ уже дан" % mid)

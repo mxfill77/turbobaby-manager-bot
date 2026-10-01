@@ -128,6 +128,9 @@ W_WIN_UNKNOWN = ("не отправлено: окно 24 ч неизвестно
 W_DOOR_OFF = "не отправлено: отправка выключена (WA_SEND)"
 W_DOOR_ERR = "не отправлено: ошибка двери — %s"
 W_UNSURE = "не знаю, дошло ли — второй раз не шлю; проверьте переписку в телефоне"
+# Медиа из темы (WARELAYMEDIA0210): отказ, который человек исправит сам (вид, формат, размер, подпись,
+# файл не получен), — словами двери `topic_words`; клиенту в этих случаях не ушло ничего.
+W_TOPIC = "не отправлено: %s — наружу ничего"
 
 
 def relay_words(state, res):
@@ -140,6 +143,8 @@ def relay_words(state, res):
     reason = str((res or {}).get("reason") or "")
     if (res or {}).get("door_off") or "WA_SEND" in reason:
         return W_DOOR_OFF
+    if (res or {}).get("topic_words"):
+        return W_TOPIC % str(res["topic_words"])[:300]
     if (res or {}).get("window") == "closed":
         return W_CLOSED
     if reason.startswith("окно неизвестно"):
@@ -209,6 +214,19 @@ class Door:
     def send_text(self, to, text):
         raise NotImplementedError
 
+    def send_media(self, to, media):
+        """Медиа из темы (WARELAYMEDIA0210) — контракт `wa_send.send_media`. Двери без медиа — отказ."""
+        return {"outcome": "not_sent", "reason": "дверь не умеет медиа", "wamid": None}
+
+
+def media_text(media):
+    """Медиа → текст записи `outbox`: подпись; у геоточки — название, адрес или координаты."""
+    m = media or {}
+    if m.get("kind") == "location":
+        return " · ".join(str(x) for x in (m.get("name"), m.get("address")) if x) or \
+            "%s, %s" % (m.get("latitude"), m.get("longitude"))
+    return str(m.get("caption") or "")
+
 
 # ═══ ядро ════════════════════════════════════════════════════════════════════════════════
 
@@ -234,6 +252,8 @@ class Core:
         self.db.executescript(_SCHEMA)
         if "handoff" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
             self.db.execute("ALTER TABLE drafts ADD COLUMN handoff TEXT")
+        if "kind" not in {r[1] for r in self.db.execute("PRAGMA table_info(outbox)")}:
+            self.db.execute("ALTER TABLE outbox ADD COLUMN kind TEXT")   # вид медиа; NULL — текст
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -283,11 +303,12 @@ class Core:
             self.db.execute("SELECT 1 FROM drafts WHERE wamid=?", (wamid,)).fetchone() is not None
             or self.db.execute("SELECT 1 FROM outbox WHERE wamid=?", (wamid,)).fetchone() is not None)
 
-    def _sent_out(self, wamid, number, text, via, now):
-        """Ушедшее через API → `outbox`: история агента (видом «мы») и опознание эха."""
+    def _sent_out(self, wamid, number, text, via, now, kind=None):
+        """Ушедшее через API → `outbox`: история агента (видом «мы», медиа — видом и подписью) и
+        опознание эха."""
         if wamid:
-            self.db.execute("INSERT OR IGNORE INTO outbox(wamid, number, ts, text, via) VALUES(?,?,?,?,?)",
-                            (wamid, number, now, text, via))
+            self.db.execute("INSERT OR IGNORE INTO outbox(wamid, number, ts, text, via, kind) "
+                            "VALUES(?,?,?,?,?,?)", (wamid, number, now, text, via, kind))
 
     def _close(self, draft_id, state, words, now, from_states=(PENDING,)):
         """Снять черновик условно: только из названных состояний. True — снят этим вызовом."""
@@ -345,10 +366,12 @@ class Core:
             self._close(live[0], SUPERSEDED, "снят: человек написал клиенту в теме %s" % _hm(now), now)
         self._pause(number, None, now, via="написал в теме")
 
-    def relay(self, msg_id, number, text, who, now=None):
+    def relay(self, msg_id, number, text, who, now=None, media=None):
         """Текст человека из темы клиента → клиенту в WhatsApp (WARELAYTEXT0210). Ключ — id сообщения
         Telegram: одно сообщение темы — не больше одной отправки; `sending` пишется ДО двери, рестарт
-        не повторяет (`_startup`). → {"outcome": sent|not_sent|unknown|dup, "words", "wamid"}."""
+        не повторяет (`_startup`). → {"outcome": sent|not_sent|unknown|dup, "words", "wamid"}.
+        media (WARELAYMEDIA0210) — медиа этого сообщения (`wa_send.send_media`): тот же ключ, та же
+        пауза, тот же исход; в `outbox` — вид и подпись. Сверх: dropped_caption — подпись не ушла."""
         now = self.clock() if now is None else now
         mid = int(msg_id)
         if self.db.execute("INSERT OR IGNORE INTO relay(msg_id, number, state, who, ts) VALUES(?,?,?,?,?)",
@@ -361,18 +384,24 @@ class Core:
             res = {"outcome": "not_sent", "reason": "отправка выключена (WA_SEND)", "door_off": True}
         else:
             try:
-                res = self.door.send_text(number, text) or {}
+                if media is not None:
+                    res = self.door.send_media(number, media) or {}
+                else:
+                    res = self.door.send_text(number, text) or {}
             except Exception as e:                                   # noqa: BLE001
                 res = {"outcome": "unknown", "reason": "дверь упала: %s" % type(e).__name__}
         state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
         wamid = res.get("wamid") if state == SENT else None
         self.db.execute("UPDATE relay SET state=?, reason=?, wamid=? WHERE msg_id=? AND state=?",
                         (state, str(res.get("reason") or "")[:300], wamid, mid, SENDING))
+        kind = ((media or {}).get("label") or (media or {}).get("kind")) if media is not None else None
         if state == SENT:
-            self._sent_out(wamid, number, text, VIA_TOPIC, now)
-        self.log("тема: сообщение %d → %s" % (mid, state))
+            self._sent_out(wamid, number, media_text(media) if media is not None else text, VIA_TOPIC, now,
+                           kind=kind)
+        self.log("тема: сообщение %d%s → %s" % (mid, " (%s)" % kind if kind else "", state))
         return {"outcome": {SENT: "sent", NOT_SENT: "not_sent"}.get(state, "unknown"),
-                "words": relay_words(state, res), "wamid": wamid}
+                "words": relay_words(state, res), "wamid": wamid,
+                "dropped_caption": state == SENT and bool(res.get("dropped_caption"))}
 
     def edit_once(self, msg_id):
         """Правка сообщения темы клиенту не уходит; ответ об этом — один на сообщение. True — ответить."""
