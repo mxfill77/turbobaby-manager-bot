@@ -310,6 +310,8 @@ def test_door_checks_before_network():
                        env={"WA_SEND": "0", "WA_360_API_KEY": KEY},
                        transport=lambda *a: calls.append(a), upload=lambda *a: calls.append(a))
     assert res["outcome"] == W.NOT_SENT and calls == [], (res, calls)                   # ручка выключена
+    off = W.send_media(NUM, dict(ok, mime="application/zip"), env={"WA_SEND": "0", "WA_360_API_KEY": KEY})
+    assert "WA_SEND" in off["reason"] and "topic_words" not in off, off   # выключенная дверь файл не судит
     body, ctype = W.multipart([("messaging_product", "whatsapp"), ("type", "audio/ogg")], "v.ogg", OGG, "audio/ogg")
     bnd = ctype.split("boundary=", 1)[1]
     assert ctype.startswith("multipart/form-data; boundary=") and body.endswith(("--%s--\r\n" % bnd).encode())
