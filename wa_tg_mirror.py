@@ -35,7 +35,6 @@
 Usage (standalone service): venv/bin/python3 wa_tg_mirror.py
 """
 
-import base64
 import hashlib
 import json
 import logging
@@ -52,7 +51,11 @@ import urllib.request
 import uuid
 from collections import deque
 
+import wa_history
 import wa_kind
+# склейка истории и её строки живут в wa_history (WAHISTMOD0110) — её же зовёт агент
+from wa_history import (PHUKET_OFFSET, SERIES_GAP, MEDIA_PLACEHOLDER, head_text, item_line,
+                        parse_wamid, pk_date, pk_full, who_of)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("wa_tg_mirror")
@@ -68,8 +71,7 @@ TG_PER_MIN     = 20            # потолок вызовов Telegram в ск�
 TG_TEXT_MAX    = 4000
 TG_CAPTION_MAX = 1000
 TG_FILE_MAX    = 50 * 1024 * 1024
-PHUKET_OFFSET  = 7 * 3600
-WARN_EVERY     = 3600          # WARNING «показ стоит» — не чаще раза в час
+WARN_EVERY    = 3600          # WARNING «показ стоит» — не чаще раза в час
 RECHECK_EVERY  = 300           # стоящий показ перепроверяется раз в 5 минут
 ALARM_AFTER    = 600           # живая строка без показа дольше 10 минут — тревога
 SUMMARY_EVERY  = 300           # сводка числами раз в 5 минут
@@ -81,21 +83,12 @@ CAP_MAX        = 4 * 1024 ** 3     # … но не больше 4 GiB
 
 ARCHIVE_DIR    = "/root/wa_archive"   # архив копии телефона: wa_archive.db, media/, media_manifest.jsonl
 TAIL_N         = 15            # последних сообщений предыстории — текстом в тему
-SERIES_GAP     = 30 * 86400    # перерыв больше 30 дней — новая серия обращений
 FIRST_WINDOW   = 86400         # первое включение: темы и по живым строкам за 24 ч до него
 
 PLACEHOLDER_TEXT = "файл Meta не отдаёт"
-MEDIA_PLACEHOLDER = "media_placeholder"
 _KEY_FORM = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
-_MEDIA_WORD = {"image": "фото", "video": "видео", "audio": "аудио", "voice": "голосовое",
-               "document": "документ", "sticker": "стикер"}
-# виды архива (build_archive.py → messages.kind): медиа — со словом «на сервере / файла нет»
-_ARCH_MEDIA = {"image": "фото", "video": "видео", "audio": "аудио", "document": "документ",
-               "sticker": "стикер", "gif": "гиф", "view_once_image": "одноразовое фото",
-               "view_once_video": "одноразовое видео"}
-_ARCH_OTHER = {"location": "геоточка", "live_location": "геоточка", "contact": "контакт",
-               "contacts": "контакты", "deleted": "удалено", "waiting": "ожидает"}
+_MEDIA_WORD = wa_history.MEDIA_WORD
 _EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "video/mp4": ".mp4",
         "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac",
         "application/pdf": ".pdf", "video/3gpp": ".3gp"}
@@ -107,8 +100,7 @@ S_SENDING, S_SHOWN, S_UNSURE = "sending", "shown", "unsure"
 # ступени темы
 T_HEAD, T_HIST, T_TAIL, T_FILES, T_LIVE = "head", "hist", "tail", "files", "live"
 
-_QCOLS = ("id", "ts_queued", "from_number", "name", "msg_type", "text", "media_id", "mime",
-          "caption", "media_note", "ts_msg", "echo", "history", "wamid", "react_to")
+_QCOLS = wa_history.QCOLS
 
 # Реакции (WAREACTNAME0110). Бот ставит ОДНУ реакцию на сообщение и только из набора Telegram
 # (ReactionTypeEmoji); вне набора, цель не показана отдельным сообщением или чат реакцию не
@@ -181,76 +173,8 @@ def pk_time(ts) -> str:
     return time.strftime("%d.%m %H:%M", time.gmtime(int(ts or 0) + PHUKET_OFFSET))
 
 
-def pk_full(ts) -> str:
-    return time.strftime("%d.%m.%Y %H:%M", time.gmtime(int(ts or 0) + PHUKET_OFFSET))
-
-
-def pk_date(ts) -> str:
-    return time.strftime("%d.%m.%Y", time.gmtime(int(ts or 0) + PHUKET_OFFSET))
-
-
-def parse_wamid(w):
-    """wamid → (номер, key_id). После «wamid.» — base64, внутри строки с длиной за байтом 0x18:
-    номер и key_id (WAARCHIVE0110 П3: 5 347 из 5 347). Не раскрылся → (None, None)."""
-    if not w or not str(w).startswith("wamid."):
-        return None, None
-    b64 = str(w)[6:]
-    try:
-        raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
-    except Exception:
-        return None, None
-    strs, i = [], 0
-    while i < len(raw) - 1:
-        if raw[i] == 0x18:
-            n = raw[i + 1]
-            s = raw[i + 2:i + 2 + n]
-            if len(s) == n and n >= 5 and all(32 < c < 127 for c in s):
-                strs.append(s.decode())
-                i += 2 + n
-                continue
-        i += 1
-    num = next((s for s in strs if s.isdigit()), None)
-    return num, next((s for s in strs if s != num), None)
-
-
-def item_line(it) -> str:
-    """Строка предыстории: «ДД.ММ.ГГГГ ЧЧ:ММ клиент|мы: …»; медиа — «[вид — на сервере|файла нет]»."""
-    body = it["text"] or ""
-    if it["word"]:
-        body = "[%s — %s]" % (it["word"], "на сервере" if it["file"] else "файла нет") \
-            + (" " + body if body else "")
-    return "%s %s: %s" % (pk_full(it["ts"]), it["who"], body or "[пусто]")
-
-
-def head_text(items, missing) -> str:
-    """Шапка темы по предыстории; missing — чего нет (архив, опись), чтобы пустое не читалось «не писал»."""
-    if items:
-        ts = sorted(it["ts"] for it in items)
-        series = 1 + sum(1 for a, b in zip(ts, ts[1:]) if b - a > SERIES_GAP)
-        s = ("писал раньше: с %s, %d сообщений (клиент %d / мы %d), серий обращений %d "
-             "(перерыв больше 30 дней), последнее %s"
-             % (pk_date(ts[0]), len(items), sum(1 for it in items if it["who"] == "клиент"),
-                sum(1 for it in items if it["who"] == "мы"), series, pk_date(ts[-1])))
-    else:
-        s = "раньше не писал"
-    if missing:
-        s += "\n⚠️ предыстория неполная: " + "; ".join(missing)
-    return s
-
-
 def history_txt(items) -> bytes:
     return ("\n".join(item_line(it) for it in items) + "\n").encode("utf-8")
-
-
-def who_of(row) -> str:
-    kind = wa_kind.kind_of(row["msg_type"], row["echo"], row["history"])
-    if kind == wa_kind.KIND_REACTION:
-        return "мы" if int(row["echo"] or 0) else "клиент"
-    if kind == wa_kind.KIND_ECHO:
-        return "мы"
-    if kind in (wa_kind.KIND_INBOUND, wa_kind.KIND_HISTORY):
-        return "клиент"
-    return "?"
 
 
 def body_of(row) -> str:
@@ -287,8 +211,7 @@ def batch_lines(items, limit=TG_TEXT_MAX):
     return out
 
 
-def _row_key(row) -> str:
-    return row["wamid"] or ("row:%d" % row["id"])
+_row_key = wa_history.row_key
 
 
 def _is_live(row) -> bool:
@@ -446,18 +369,9 @@ class Mirror:
         sig = (fst.st_mtime, fst.st_size)
         if self._man_sig == sig:
             return self._man, ""
-        out, mdir = {}, self.env.get("archive_media") or ""
-        try:
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    rec = json.loads(line)
-                    fpath = os.path.join(mdir, os.path.basename(rec["server_file"]))
-                    for k in rec.get("msg_keys") or ():
-                        out[k] = (fpath, int(rec.get("size") or 0), rec.get("mime") or "")
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            return None, "опись медиа архива не читается (%s)" % type(e).__name__
+        out, why = wa_history.read_manifest(path, self.env.get("archive_media") or "")
+        if out is None:
+            return None, why
         self._man, self._man_sig = out, sig
         return out, ""
 
@@ -473,44 +387,12 @@ class Mirror:
         if man is None:
             self._warn_hourly("manifest", "предыстория: %s — файлы архива в темы не пойдут", why_m)
 
-    def _arch_item(self, a, man):
-        ts, from_me, kind, text, caption, transcript, media_file, key_id = a
-        word = _ARCH_MEDIA.get(kind) or (kind if media_file else None)
-        f = None
-        if word:
-            hit = man.get("%s|%d" % (key_id, int(from_me)))
-            if hit and os.path.exists(hit[0]):
-                f = hit
-            text = caption or ""
-            if transcript:
-                text += (" " if text else "") + "(расшифровка: %s)" % transcript
-        elif kind in _ARCH_OTHER:
-            text = "[%s]" % _ARCH_OTHER[kind] + (" " + text if text else "")
-        elif not text:
-            text = "[%s]" % kind
-        return {"key": "a:%s:%d" % (key_id, int(from_me)), "ts": int(ts),
-                "who": "мы" if int(from_me) else "клиент", "text": text, "word": word, "file": f}
-
-    def _queue_item(self, r):
-        t = r["msg_type"] or ""
-        word, f, text = None, None, r["text"] or ""
-        if t == MEDIA_PLACEHOLDER:
-            word, text = "медиа", ""
-        elif t in _MEDIA_WORD:
-            word, text = _MEDIA_WORD[t], r["caption"] or ""
-            md = self._media_of(_row_key(r))
-            if md and md[0] == M_OK and md[1] and os.path.exists(md[1]):
-                f = (md[1], md[2] or 0, md[3] or "")
-        elif not text:
-            text = "[" + (t or "?") + "]"
-        return {"key": _row_key(r), "ts": int(r["ts_msg"] or r["ts_queued"] or 0), "who": who_of(r),
-                "text": text, "word": word, "file": f}
-
     def prehistory(self, num, rows, trig):
         """Предыстория номера → (items по времени, чего нет). items = архив + строки очереди ДО
         темы (id < trig) без пары в архиве. Пара — номер и key_id из wamid (номер — from_number:
         у эха номер внутри wamid другой). Архивная запись, чья пара — строка темы (id ≥ trig),
-        сюда не идёт: её покажет «новое». Дублей нет ни одной дорогой."""
+        сюда не идёт: её покажет «новое». Дублей нет ни одной дорогой. Склейка — wa_history.merge
+        (её же зовёт агент); здесь — архив своим соединением, опись с кешем и «чего нет»."""
         missing, arch = [], []
         conn, why = self._archive()
         if conn is None:
@@ -519,8 +401,7 @@ class Mirror:
                               why)
         else:
             try:
-                arch = conn.execute("SELECT ts, from_me, kind, text, caption, transcript, media_file, "
-                                    "key_id FROM messages WHERE number=? ORDER BY ts, id", (num,)).fetchall()
+                arch = wa_history.archive_select(conn, num)
             except sqlite3.Error as e:
                 missing.append("архив не читается (%s)" % type(e).__name__)
             finally:
@@ -529,19 +410,7 @@ class Mirror:
         if man is None:
             missing.append(why_m)
             man = {}
-        arch_keys = {a[7] for a in arch}
-        taken, items = set(), []
-        for r in rows:
-            k = parse_wamid(r["wamid"])[1]
-            paired = k is not None and k in arch_keys
-            if r["id"] >= trig:
-                if paired:
-                    taken.add(k)
-            elif not paired:
-                items.append(self._queue_item(r))
-        items += [self._arch_item(a, man) for a in arch if a[7] not in taken]
-        items.sort(key=lambda it: (it["ts"], it["key"]))
-        return items, missing
+        return wa_history.merge(arch, rows, trig, man, self._media_of), missing
 
     # ── 1. медиа ─────────────────────────────────────────────────────────────────────────
     def media_step(self):
