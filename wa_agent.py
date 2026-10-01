@@ -17,6 +17,10 @@
      msg_type не status, wamid не наш) — ответ человека с телефона: ждущий черновик `superseded`,
      клиент на ПАУЗЕ, в группу ОДИН вопрос «когда продолжать» на одну паузу (правило владельца
      30.09.2026-7 п.4). Пауза снимается только нажатием «Продолжить» (`Core.resume`).
+     Исключение — автоприветствие WhatsApp Business (WAGREETECHO0210, вариант В3 WAAUTOGREET0210):
+     эхо, у которого отпечаток текста равен настройке службы И которое пришло не позже GREET_SEC
+     после «первого» входящего. Паузы нет, черновик жив, done_upto не трогается — первый вопрос
+     клиента остаётся открытым (запись владельца 02.10.2026-1 п.3). Строка — в таблицу `autogreet`.
      На первом старте курсор встаёт на MAX(id): переписка до службы черновиков не даёт.
   2. ЧЕРНОВИК. Клиент не на паузе, ждущих сообщений больше, чем закрыто прежним решением, живого
      черновика нет, со времени последнего сообщения прошло `quiet` (60–90 с — клиенты пишут
@@ -34,6 +38,7 @@ superseded и пауза; новое входящее → stale), пишет `se
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
 """
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -57,6 +62,29 @@ MODEL_RETRY_SEC = 300                         # модель не дала те�
 
 # исход двери → состояние черновика; всё незнакомое — unsure (могло уйти, не повторяем)
 _DOOR_STATE = {"sent": SENT, "not_sent": NOT_SENT, "unknown": UNSURE}
+
+# ── автоприветствие WhatsApp Business (WAGREETECHO0210) ─────────────────────────────────
+# Поля, отличающего автоответ от эха человека, в событии нет (WAAUTOGREET0210 §2) — только текст и
+# время, и нужны ОБА: отпечаток текста равен настройке И ≤ GREET_SEC после «первого» входящего.
+# Замер по всей очереди: приветствий ≤ 10 с — 119 из 128, чужих эхо ≤ 10 с после «первого» — 0 из
+# 2 448 (самое быстрое — 12 с). Любая ошибка уходит в паузу, то есть в прежнее поведение.
+GREET_SEC = 10                                # эхо не позже 10 с после «первого» входящего
+GREET_SILENCE = 14 * 86400                    # «первое»: до него 14 суток тишины в обе стороны
+GREET_FP_MIN = 10                             # отпечаток в настройке — sha256 или его начало от 10 знаков
+
+
+def greet_fps(raw):
+    """Настройка службы (WA_AGENT_GREET_SHA256) → (отпечатки, слова). Значение — hex sha256 текста
+    приветствия или его начало от GREET_FP_MIN знаков, несколько — через запятую; текста в настройке
+    нет. Пусто — признака нет; хоть одно значение битое — признака нет целиком: любое эхо ставит
+    паузу, как до WAGREETECHO0210."""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return (), "настройки нет — любое эхо ставит паузу"
+    out = [p for p in s.replace(" ", ",").split(",") if p]
+    if not out or any(not GREET_FP_MIN <= len(p) <= 64 or p.strip("0123456789abcdef") for p in out):
+        return (), "настройка битая — признака нет, любое эхо ставит паузу"
+    return tuple(out), "отпечаток %s" % ", ".join(p[:10] for p in out)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -115,6 +143,15 @@ CREATE TABLE IF NOT EXISTS outbox (
     via     TEXT NOT NULL                         -- «тема» | «агент»
 );
 CREATE INDEX IF NOT EXISTS outbox_number ON outbox(number);
+CREATE TABLE IF NOT EXISTS autogreet (
+    row_id  INTEGER PRIMARY KEY,                  -- строка очереди: эхо-автоприветствие (паузы не было)
+    number  TEXT    NOT NULL,
+    wamid   TEXT,
+    ts_msg  REAL,                                 -- время сообщения: место строки в истории агента
+    after   REAL,                                 -- секунд после «первого» входящего
+    ts      REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS autogreet_number ON autogreet(number);
 """
 
 # «Тема клиента → WhatsApp» (WARELAYTEXT0210): текст человека из темы форума показа уходит клиенту.
@@ -236,8 +273,10 @@ def _hm(ts):
 
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
-                 clock=time.time, log=None, drafts=True):
+                 clock=time.time, log=None, drafts=True, greet=()):
         quiet = int(quiet)
+        # отпечатки текста автоприветствия (`greet_fps`); пусто — признака нет, любое эхо — пауза
+        self.greet = tuple(greet or ())
         if not QUIET_MIN <= quiet <= QUIET_MAX:
             raise ValueError("пауза черновика %d с вне %d–%d с" % (quiet, QUIET_MIN, QUIET_MAX))
         self.quiet = quiet
@@ -453,16 +492,16 @@ class Core:
                 self._set_cursor(top)
                 self.log("курсор встал на %d (первый старт)" % top)
                 return 0
-            rows = q.execute("SELECT id, from_number, msg_type, echo, history, wamid, ts_queued "
+            rows = q.execute("SELECT id, from_number, msg_type, echo, history, wamid, ts_queued, text, ts_msg "
                              "FROM wa_inbox WHERE id > ? ORDER BY id LIMIT ?",
                              (cur, SCAN_LIMIT)).fetchall()
-        for rid, number, msg_type, echo, history, wamid, ts_q in rows:
+        for rid, number, msg_type, echo, history, wamid, ts_q, text, ts_m in rows:
             kind = self._live_kind(msg_type, echo, history)
             if kind and number:
                 if kind == wa_kind.KIND_INBOUND:
                     self._on_inbound(number, rid, ts_q, now)
                 elif not self._our_wamid(wamid):
-                    self._on_echo(number, rid, now)
+                    self._on_echo(number, rid, now, text=text, ts_msg=ts_m, wamid=wamid)
             cur = rid
         self._set_cursor(cur)
         return len(rows)
@@ -475,7 +514,58 @@ class Core:
         if live and live[1] == PENDING:
             self._close(live[0], STALE, "снят: клиент написал ещё (строка %d)" % rid, now)
 
-    def _on_echo(self, number, rid, now):
+    def _after_first(self, number, rid, ts_msg):
+        """Секунд от «первого» входящего клиента до эха, если оно было не раньше GREET_SEC до эха; иначе
+        None. «Первое» — живое входящее, перед которым у номера GREET_SILENCE ни одной строки в обе
+        стороны (история тоже; квитанции не в счёт). Время — ts_msg: на нём стоит замер."""
+        try:
+            t = float(ts_msg)
+        except (TypeError, ValueError):
+            return None
+        q = self._queue()                     # закрываем сами: `with` у sqlite3 соединение не закрывает
+        try:
+            cands = q.execute("SELECT id, msg_type, echo, history, ts_msg FROM wa_inbox WHERE from_number=? "
+                              "AND id < ? AND ts_msg >= ? AND ts_msg <= ? ORDER BY id",
+                              (number, rid, t - GREET_SEC, t)).fetchall()
+            for cid, msg_type, echo, history, c_ts in cands:
+                if self._live_kind(msg_type, echo, history) != wa_kind.KIND_INBOUND:
+                    continue
+                before = q.execute("SELECT COUNT(*) FROM wa_inbox WHERE from_number=? AND id<>? "
+                                   "AND (msg_type IS NULL OR msg_type<>?) AND ts_msg>=? AND ts_msg<?",
+                                   (number, cid, wa_kind.RECEIPT_TYPE, c_ts - GREET_SILENCE, c_ts)).fetchone()[0]
+                if before == 0:
+                    return t - c_ts
+        finally:
+            q.close()
+        return None
+
+    def _greet(self, number, rid, text, ts_msg):
+        """Эхо — автоприветствие? → (секунд после «первого» входящего | None, слова для журнала).
+        Нужны ОБА признака. Время меряется всегда: сменили текст приветствия — журнал покажет
+        «отпечаток не совпал; 3 с после первого входящего», а не молчание."""
+        after = self._after_first(number, rid, ts_msg)
+        t_words = ("первого входящего за %d с до эха нет" % GREET_SEC if after is None
+                   else "%d с после первого входящего" % after)
+        if not self.greet:
+            return None, "отпечатка приветствия в настройке нет; " + t_words
+        h = hashlib.sha256(text.encode("utf-8")).hexdigest() if isinstance(text, str) and text else ""
+        if not h or not any(h.startswith(g) for g in self.greet):
+            return None, "отпечаток не совпал; " + t_words
+        return after, "отпечаток совпал; " + t_words
+
+    def _greeted(self, rid):
+        return self.db.execute("SELECT 1 FROM autogreet WHERE row_id=?", (rid,)).fetchone() is not None
+
+    def _on_echo(self, number, rid, now, text=None, ts_msg=None, wamid=None):
+        after, words = self._greet(number, rid, text, ts_msg)
+        if after is not None:
+            # автоприветствие — не ответ человека: паузы нет, черновик жив, done_upto не трогаем
+            self.db.execute("INSERT OR IGNORE INTO autogreet(row_id, number, wamid, ts_msg, after, ts) "
+                            "VALUES(?,?,?,?,?,?)", (rid, number, wamid, ts_msg, after, now))
+            self.log("эхо строки %d: автоприветствие (%s) — паузы нет, черновик жив, первый вопрос открыт"
+                     % (rid, words))
+            return
+        self.log("эхо строки %d: не автоприветствие (%s) — пауза" % (rid, words))
         self._client(number)
         # человек ответил на всё, что было до его эха: эти входящие закрыты
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
@@ -517,7 +607,9 @@ class Core:
         return made
 
     def _fresh(self, number, after_id):
-        """Что пришло в очередь по клиенту после after_id: (kind, id) первой живой строки или None."""
+        """Что пришло в очередь по клиенту после after_id: (kind, id) первой живой строки или None.
+        Эхо, которое скан признал автоприветствием (`autogreet`), — не новое: оно идёт следом за
+        «первым» входящим, и без этого черновик на первый вопрос не родился бы никогда."""
         with self._queue() as q:
             rows = q.execute("SELECT id, msg_type, echo, history, wamid FROM wa_inbox "
                              "WHERE from_number=? AND id > ? ORDER BY id", (number, after_id)).fetchall()
@@ -525,7 +617,7 @@ class Core:
             kind = self._live_kind(msg_type, echo, history)
             if kind == wa_kind.KIND_INBOUND:
                 return kind, rid
-            if kind == wa_kind.KIND_ECHO and not self._our_wamid(wamid):
+            if kind == wa_kind.KIND_ECHO and not self._our_wamid(wamid) and not self._greeted(rid):
                 return kind, rid
         return None
 

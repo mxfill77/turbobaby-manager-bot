@@ -19,6 +19,10 @@
   WA_AGENT_WATCH — ожидание «клиент без ответа» (`wa_watch.Watch`, WAUNANSWERED0210): последнее
                     сообщение клиента без нашего ответа дольше порога — одно сообщение в «Агенты».
                     Читателя getUpdates не заводит; от черновиков, пауз и двери не зависит.
+НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
+  sha256 текста или его начало от 10 знаков, несколько — через запятую; самого текста нет нигде. Эхо с
+  этим отпечатком И не позже 10 с после «первого» входящего паузы не ставит, первый вопрос не закрывает.
+  Нет или битая — признака нет, любое эхо ставит паузу, как раньше; исход — строкой на старте.
 Все выключены — ни одного вызова Telegram и двери: такт ядра читает только очередь (mode=ro).
 
 ЦИКЛ — `wa_agent_tg.run`, один поток; читатель `getUpdates` у бота показа ОДИН — эта служба. Второй
@@ -43,6 +47,7 @@ SUMMARY_EVERY = 300                       # сводка числами раз �
 F_DRAFTS, F_CARDS, F_REACT, F_SEND = "WA_AGENT_DRAFTS", "WA_AGENT_CARDS", "WA_AGENT_REACT", "WA_SEND"
 F_RELAY = "WA_AGENT_RELAY"                # тема клиента → WhatsApp (WARELAYTEXT0210)
 F_WATCH = "WA_AGENT_WATCH"                # ожидание «клиент без ответа» (WAUNANSWERED0210)
+F_GREET = "WA_AGENT_GREET_SHA256"         # отпечаток текста автоприветствия (WAGREETECHO0210)
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
@@ -131,8 +136,11 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
                         mirror_db=env.get("mirror_db"), http=http, clock=clock, log=line,
                         react=flags[F_REACT], react_send=react_send, relay=flags[F_RELAY], watch=flags[F_WATCH])
     door = SendDoor(env["queue_db"], environ=environ, send=send, send_media=send_media)
+    # автоприветствие (WAGREETECHO0210): настройка — отпечаток, не текст; нет или битая — любое эхо — пауза
+    greet, greet_words = wa_agent.greet_fps(environ.get(F_GREET))
+    line("автоприветствие (%s): %s" % (F_GREET, greet_words))
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
-                         log=line, drafts=drafts)
+                         log=line, drafts=drafts, greet=greet)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram
     core.watch = wa_watch.Watch(core.db, env["queue_db"], tg.watch_alarm, head=tg._head, clock=clock,

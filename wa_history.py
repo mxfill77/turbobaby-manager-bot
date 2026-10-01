@@ -272,11 +272,64 @@ def with_sent(items, sent):
     return out
 
 
+GREET_WORDS = "автоприветствие"        # эхо-автоприветствие в истории агента (WAGREETECHO0210)
+
+
+def read_greets(agent_db, num):
+    """Эхо-автоприветствия номера — таблица `autogreet` базы агента (ядро признало, паузы не было) →
+    (записи [(row_id, wamid, ts_msg)], причина «чего нет» | ""). Таблицы ещё нет — ([], ""). Только mode=ro."""
+    if not agent_db or not os.path.exists(agent_db):
+        return [], "базы агента нет"
+    try:
+        conn = _ro(agent_db)
+    except sqlite3.Error as e:
+        return [], "база агента не читается (%s)" % type(e).__name__
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='autogreet'").fetchone():
+            return [], ""
+        return conn.execute("SELECT row_id, wamid, ts_msg FROM autogreet WHERE number=? ORDER BY row_id",
+                            (num,)).fetchall(), ""
+    except sqlite3.Error as e:
+        return [], "база агента не читается (%s)" % type(e).__name__
+    finally:
+        conn.close()
+
+
+def with_greets(items, greets):
+    """Автоприветствие — в истории агента строкой «мы · автоприветствие», текст приветствия не идёт.
+    Та же реплика очереди (wamid) или архива (key_id) помечается, а не задваивается; строка новее
+    черновика (её срезал trig) добавляется — клиент её уже видел. Помеченное (`auto`) адаптер
+    модели не считает нашим ответом: вопрос клиента до приветствия остаётся «сейчас»."""
+    marks = {}
+    for rid, wamid, ts in greets or ():
+        key = wamid or ("row:%d" % int(rid))
+        marks[key] = key
+        k = parse_wamid(wamid)[1] if wamid else None
+        if k:
+            marks["a:%s:1" % k] = key
+    out, seen = [], set()
+    for it in items:
+        key = marks.get(it["key"])
+        if key:
+            seen.add(key)
+            it = dict(it, who="мы", text=GREET_WORDS, word=None, file=None, auto=True)
+        out.append(it)
+    for rid, wamid, ts in greets or ():
+        key = wamid or ("row:%d" % int(rid))
+        if key not in seen:
+            seen.add(key)
+            out.append({"key": key, "ts": int(ts or 0), "who": "мы", "text": GREET_WORDS, "word": None,
+                        "file": None, "auto": True})
+    out.sort(key=lambda it: (it["ts"], it["key"]))
+    return out
+
+
 def read_history(num, queue_db, archive_db, manifest="", media_dir="", trig=None, media_of=None,
                  sent_db=None):
     """История номера (агент) → (элементы по времени, чего нет). Номер без истории — ([], …), не
     ошибка; очередь, архив или опись не читаются — причина в списке, а не исключение. sent_db — база
-    агента: ушедшее через API (эхом не возвращается) идёт видом «мы» (`with_sent`)."""
+    агента: ушедшее через API (эхом не возвращается) идёт видом «мы» (`with_sent`), автоприветствие —
+    строкой «мы · автоприветствие» (`with_greets`, WAGREETECHO0210)."""
     missing = []
     try:
         rows = queue_rows(queue_db, num) if queue_db and os.path.exists(queue_db) else None
@@ -297,6 +350,10 @@ def read_history(num, queue_db, archive_db, manifest="", media_dir="", trig=None
         if why_s:
             missing.append(why_s)
         items = with_sent(items, sent)
+        greets, why_g = read_greets(sent_db, num)
+        if why_g and why_g not in missing:
+            missing.append(why_g)
+        items = with_greets(items, greets)
     return items, missing
 
 
@@ -328,7 +385,10 @@ def head_text(items, missing) -> str:
 
 
 def model_line(it) -> str:
-    """Строка для модели: «ДД.ММ.ГГГГ ЧЧ:ММ · клиент|мы: текст»; медиа — словом: «[фото] подпись»."""
+    """Строка для модели: «ДД.ММ.ГГГГ ЧЧ:ММ · клиент|мы: текст»; медиа — словом: «[фото] подпись»;
+    автоприветствие — «ДД.ММ.ГГГГ ЧЧ:ММ · мы · автоприветствие» (WAGREETECHO0210)."""
+    if it.get("auto"):
+        return "%s · мы · %s" % (pk_full(it["ts"]), GREET_WORDS)
     body = it["text"] or ""
     if it["word"]:
         body = "[%s]" % it["word"] + (" " + body if body else "")

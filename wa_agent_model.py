@@ -269,9 +269,12 @@ class ModelAdapter(wa_agent.Model):
 
     @staticmethod
     def _tail(items):
-        """То, что клиент спрашивает сейчас: его реплики после нашей последней."""
+        """То, что клиент спрашивает сейчас: его реплики после нашей последней. Автоприветствие
+        (`auto`, WAGREETECHO0210) нашим ответом не считается — первый вопрос до него остаётся «сейчас»."""
         tail = []
         for it in reversed(items):
+            if it.get("auto"):
+                continue
             if it["who"] == "мы":
                 break
             if it["who"] == "клиент":
