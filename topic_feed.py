@@ -33,6 +33,9 @@ import time as _time
 log = logging.getLogger("splinter")
 
 KINDS = ("text", "photo", "button", "bot_ask", "bot_msg", "record", "vision")
+# Решения решателя в тени (0094-76k, SPLDECIDER0110). Читатель по умолчанию их ПРОПУСКАЕТ: контекст
+# мозга и окно последних событий одинаковы с тенью и без неё; видеть их — `read(..., shadow=True)`.
+SHADOW_KINDS = ("decision",)
 ROLES = ("staff", "pym", "owner", "bot")
 TEXT_MAX = 300
 _TEST_MARKS = ("PRETOOL_NOPUSH", "PRETOOL_TEST_RUN", "ORCH_TEST_MODE", "PYTEST_CURRENT_TEST")
@@ -115,10 +118,11 @@ def append(chat, topic, kind, *, mid=None, ts=None, role="", reply_to=None, text
         return None
 
 
-def read(chat, topic, *, days=7, limit=30, now=None):
+def read(chat, topic, *, days=7, limit=30, now=None, shadow=False):
     """Последние `limit` событий темы не старше `days` суток, по времени. Не бросает.
     Файла нет → `[]` (в теме ещё не было событий — это ответ). Сбой чтения → `None` («не знаю»):
-    контекст скажет «лента не прочитана», а не «событий 0»."""
+    контекст скажет «лента не прочитана», а не «событий 0». События тени (`SHADOW_KINDS`) — только
+    при `shadow=True`."""
     try:
         p = path_for(chat, topic)
         now = _time.time() if now is None else now
@@ -135,6 +139,8 @@ def read(chat, topic, *, days=7, limit=30, now=None):
                         continue
                     if ev.get("chat") != int(chat) or ev.get("topic") != _norm_topic(topic):
                         continue          # чужая тема в чужом файле не появится, но проверяем поле
+                    if not shadow and ev.get("kind") in SHADOW_KINDS:
+                        continue          # решение тени — не событие темы: мозг его не видит
                     out.append(ev)
         out.sort(key=lambda e: float(e.get("ts") or 0))
         return out[-limit:] if limit else out

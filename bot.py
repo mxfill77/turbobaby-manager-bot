@@ -842,6 +842,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # темы на сервере ДО любых перехватов (первый взявший сообщение — последний, кто его видит).
             # Fail-safe внутри: сбой ленты = строка журнала, сообщение идёт дальше прежним путём.
             splinter.feed_incoming(msg, "text")
+            # РЕШАТЕЛЬ В ТЕНИ (01.10.2026, SPLDECIDER0110): снимок темы ДО перехватов, решение — фоновой
+            # задачей, итог — только строка журнала и событие ленты `decision`; действует прежний код.
+            # Выключатель `TOPIC_DECIDER_SHADOW` (по умолчанию выкл. → ни одного вызова). Fail-safe внутри.
+            splinter.decider_shadow(msg, bridge=bridge, claude=claude)
             # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» в этой теме (дедуп, O(1) после первого раза)
             await splinter.ensure_info_pin(context, chat_id, _tid_sv)
             # 0'') ОТВЕТ РЕПЛАЕМ НА ВОПРОС О ПРОБЕГЕ (01.10.2026, SPLODOREPLY0110): реплай на само

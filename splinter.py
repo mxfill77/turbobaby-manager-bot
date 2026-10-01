@@ -1208,6 +1208,123 @@ def topic_context(chat_id, topic_id, *, reply_to=None, bridge=None, now=None, bi
         log.warning(f"  🧵 контекст темы не собран ({e}) — мозг получает прежний контекст")
         return None
 
+
+# ===================== РЕШАТЕЛЬ ТЕМЫ В ТЕНИ (01.10.2026, задание Штаба 0094-76k, SPLDECIDER0110) ==========
+# На каждое входящее темы обслуживания модель выбирает ОДНО действие по `topic_context`, правила кодом
+# (`topic_decider.rules`) проверяют его против гейтов. ТЕНЬ: решение — строка журнала и событие ленты
+# `decision`; ничего не пишется в учёт и не шлётся в чат, действует прежний код. Выключатель
+# `TOPIC_DECIDER_SHADOW` (по умолчанию выкл. → `decider_shadow` возвращает None, не сделав ни одного
+# вызова). Снимок темы берётся СИНХРОННО в момент входа (до перехватов), модель и мост (только чтение)
+# зовутся фоновой задачей в потоке — прежний путь их не ждёт.
+import topic_decider as _tdec
+
+_DECIDER_TASKS = set()       # ссылки на фоновые задачи тени (иначе сборщик мусора может их снять)
+_DECIDER_OPEN_KINDS = (("_PENDING_MILEAGE", "пробег"), ("_SOFT_ODO_PENDING", "пробег"),
+                       ("_ODO_LOWER_PENDING", "пробег"), ("_BATCH_ODO_PENDING", "пробег"),
+                       ("_PENDING_CORRECTION", "пробег"), ("_PENDING_WORKS", "пробег"))
+_CTX_SP_UNASKED = "ТО-заявка: открытой нет (или мост не ответил)"
+
+
+def decider_open_kinds(chat_id, topic_id) -> dict:
+    """Открытые вопросы темы ПО ВИДАМ: вид → id сообщения-вопроса (или где он живёт). Источники —
+    те же, что у `topic_open_questions`: файл вопроса о пробеге (0088) и словари памяти процесса."""
+    out = {}
+    try:
+        _mileage_q_load()
+        q = _MILEAGE_Q.get(_mileage_q_key(chat_id, topic_id))
+        if q:
+            out["пробег"] = q.get("msg_id")
+    except Exception:
+        pass
+    key = (chat_id, topic_id)
+    for name, kind in _DECIDER_OPEN_KINDS:
+        try:
+            if kind not in out and key in (globals().get(name) or {}):
+                out[kind] = name
+        except Exception:
+            continue
+    try:
+        for n, v in list((globals().get("_ACT_GATE_PENDING") or {}).items()):
+            m = v.get("msg") if isinstance(v, dict) else None
+            if m is not None and m.chat_id == chat_id and getattr(m, "message_thread_id", None) == topic_id:
+                out.setdefault("подтверждение", f"ворота №{n}")
+    except Exception:
+        pass
+    return out
+
+
+def decider_snapshot(msg, kind="text") -> dict:
+    """Снимок темы на момент входа: контекст (без моста — он в фоне), факты для правил кодом."""
+    chat_id, topic_id = msg.chat_id, getattr(msg, "message_thread_id", None)
+    now = max(_time.time(), _tfeed.msg_ts(msg) or 0)
+    bike = bike_from_topic(chat_id, topic_id)
+    reply_to = _tfeed.reply_to_of(msg)
+    ctx = topic_context(chat_id, topic_id, reply_to=reply_to, bridge=None, now=now, bike=bike)
+    events = _tfeed.read(chat_id, topic_id, days=7, limit=30, now=now) or []
+    known = {}
+    for ev in events:
+        if ev.get("mid") is not None and ev.get("kind") != "vision":
+            known[int(ev["mid"])] = ev.get("role")
+    last_km, _ = _ctx_last_confirmed_km(chat_id, topic_id, events)
+    facts = {"mid": getattr(msg, "message_id", None), "reply_to": reply_to,
+             "role": _feed_role(getattr(msg, "from_user", None)), "trusted": _act_trusted(msg),
+             "known": known, "last_km": odo_ceiling.km(last_km), "cur_km": None,
+             "ceiling": _odo_ceiling_limit(), "open_kinds": decider_open_kinds(chat_id, topic_id)}
+    text = (getattr(msg, "text", None) if kind == "text" else getattr(msg, "caption", None)) or ""
+    return {"chat": chat_id, "topic": topic_id, "bike": bike, "kind": kind, "facts": facts,
+            "user": _tdec.user_prompt(ctx, facts, kind, len(text))}
+
+
+async def decider_run(snap, bridge, claude):
+    """Фон: ТО-заявка и текущий пробег (мост, только чтение) → модель → разбор → правила кодом →
+    строка журнала + событие ленты `decision`. Ничего не пишет в учёт и не шлёт в чат. Не бросает."""
+    import asyncio as _aio
+    facts, user, mid = snap["facts"], snap["user"], snap["facts"].get("mid")
+    try:
+        if bridge is not None and snap.get("bike"):
+            sp = await _aio.to_thread(_sp_open, bridge, snap["chat"], snap["topic"], snap["bike"])
+            user = user.replace(_CTX_SP_UNASKED, f"ТО-заявка: {_ctx_brief(sp) if sp else 'открытой нет'}")
+            cur = await _aio.to_thread(_odo_current, bridge, snap["bike"])
+            facts["cur_km"] = odo_ceiling.km(cur)
+    except Exception as e:
+        log.warning(f"  🧠 решатель (тень): мост не прочитан ({type(e).__name__}) — решаю без него")
+    raw = None
+    try:
+        raw = await _aio.to_thread(claude.quick, _tdec.SYSTEM, user, max_tokens=400,
+                                   model=os.getenv("TOPIC_DECIDER_MODEL") or None, tag="decider",
+                                   expect_json=True)
+    except Exception as e:
+        log.warning(f"  🧠 решатель (тень): модель не ответила ({type(e).__name__})")
+    dec = _tdec.parse(raw)
+    v = _tdec.rules(dec, facts)
+    v["модель"] = dec.get("действие")
+    log.info(_tdec.say(v, mid))
+    _tfeed.append(snap["chat"], snap["topic"], "decision", role="bot", reply_to=mid, text="",
+                  on=mid, input_kind=snap["kind"], model=dec, final=v["итог"], rule=v["правило"],
+                  door=v["дверь"], parsed=(raw is not None and dec != _tdec.NOT_UNDERSTOOD))
+    return v
+
+
+def decider_shadow(msg, bridge=None, claude=None, kind="text"):
+    """Вход тени. Флаг выключен → None сразу (ни снимка, ни модели, ни строки). Иначе — снимок
+    сейчас и фоновая задача; прежний путь её не ждёт. Не бросает."""
+    if not _tdec.enabled():
+        return None
+    try:
+        if msg is None or claude is None or not _feed_servicing(msg.chat_id):
+            return None
+        if getattr(getattr(msg, "from_user", None), "is_bot", False):
+            return None
+        snap = decider_snapshot(msg, kind)
+        import asyncio as _aio
+        t = _aio.get_running_loop().create_task(decider_run(snap, bridge, claude))
+        _DECIDER_TASKS.add(t)
+        t.add_done_callback(_DECIDER_TASKS.discard)
+        return t
+    except Exception as e:
+        log.warning(f"  🧠 решатель (тень): не запущен ({type(e).__name__}: {e}) — путь прежний")
+        return None
+
 # Кэш названий форум-тем: {(chat_id, topic_id): "название темы"}
 # В названии темы записан байк (по договорённости Филиппа).
 # ВНИМАНИЕ: кэш в памяти, стирается рестартом → персистится в memory.db (таблица topic_bike),
@@ -10121,6 +10238,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
         # с id первого фото (альбом — одним событием). Не бросает.
         if vis_list:
             feed_vision(chat_id, topic_id, photo_msgs, vis, len(vis_list))
+            # РЕШАТЕЛЬ В ТЕНИ (SPLDECIDER0110): фото решается, когда разбор уже в ленте. Флаг выкл. → no-op.
+            decider_shadow((photo_msgs or [msg])[0], bridge=bridge, claude=claude, kind="photo")
 
     # Работы из разбора — отдельно от type (техник может перечислить работы, а parse вернуть
     # type≠"event": так и было в кейсе NINJA 6334 09.06 — works был, но в события не записалось и молчали).
