@@ -58,6 +58,8 @@ ALLOWED_UPDATES = ["callback_query", "message"]
 REACT_FLAG = "WA_AGENT_REACT"
 REACT_UPDATE = "message_reaction"
 REACT_KINDS = (wa_kind.KIND_INBOUND, wa_kind.KIND_ECHO)   # на что реакция уходит клиенту
+POLL_RETRY_SEC = 1                 # getUpdates не удался — следующий опрос не раньше
+CONFLICT_PAUSE = 30                # 409 (второй читатель) — следующий опрос не раньше; такт идёт
 
 # Сведение Telegram → WhatsApp. Набор реакций Telegram — обычные эмодзи Unicode, WhatsApp принимает
 # любое эмодзи, поэтому каждое из набора уходит как есть; семь записаны в Telegram без U+FE0F
@@ -176,6 +178,8 @@ class Tg(wa_agent.Telegram):
         self.log = log or (lambda line: None)
         self.core = None
         self.db = None
+        self.polls = {"ok": 0, "fail": 0, "conflict": 0}   # числа для сводки службы
+        self.conflict = False                               # идёт серия 409
 
     def bind(self, core):
         """Своя база — база ядра (offset в её meta, свои таблицы tg_*)."""
@@ -190,8 +194,9 @@ class Tg(wa_agent.Telegram):
 
     # ── вызов Bot API ─────────────────────────────────────────────────────────────────────
 
-    def api(self, method, params, timeout=30):
-        """→ (True, result) · (False, код|описание) · (None, 'net'). Выключено — сети нет вовсе."""
+    def api(self, method, params, timeout=30, quiet=()):
+        """→ (True, result) · (False, код|описание) · (None, 'net'). Выключено — сети нет вовсе.
+        quiet — коды, которые вызывающий пишет в журнал сам (409 опроса — одной строкой на серию)."""
         if not self.reading:
             return False, "выключено"
         status, body = self.http("POST", TG_BASE + "/bot" + self.token + "/" + method,
@@ -206,7 +211,8 @@ class Tg(wa_agent.Telegram):
         if status is None:
             self.log("telegram: %s без ответа" % method)
             return None, "net"
-        self.log("telegram: %s HTTP %s %s" % (method, status, str(data.get("description") or "")[:120]))
+        if status not in quiet:
+            self.log("telegram: %s HTTP %s %s" % (method, status, str(data.get("description") or "")[:120]))
         return False, status
 
     # ── клиент: короткий id, имя, тема ────────────────────────────────────────────────────
@@ -299,15 +305,29 @@ class Tg(wa_agent.Telegram):
             return 0
         allowed = (ALLOWED_UPDATES if self.enabled else []) + ([REACT_UPDATE] if self.react else [])
         ok, res = self.api("getUpdates", {"offset": self.offset(), "timeout": int(max(0, timeout)),
-                                          "allowed_updates": allowed}, timeout=int(timeout) + 15)
+                                          "allowed_updates": allowed}, timeout=int(timeout) + 15, quiet=(409,))
         if not ok:
             if res == 409:
-                self.log("getUpdates: 409 — у бота второй читатель, разбор стоит")
+                self.polls["conflict"] += 1
+                if not self.conflict:
+                    self.log("getUpdates: 409 — у бота второй читатель, разбор стоит; опрос раз в %d с, "
+                             "такт ядра идёт, число 409 — в сводке" % CONFLICT_PAUSE)
+                self.conflict = True
+            else:
+                self.polls["fail"] += 1
             return None
+        if self.conflict:
+            self.log("getUpdates: 409 прошёл — читатель снова один (409 за серию: %d)" % self.polls["conflict"])
+            self.conflict = False
+        self.polls["ok"] += 1
         n = 0
         for u in res or []:
             n += self.handle(u)
         return n
+
+    def poll_pause(self):
+        """Сколько ждать до следующего опроса после неудачного: серия 409 — CONFLICT_PAUSE."""
+        return CONFLICT_PAUSE if self.conflict else POLL_RETRY_SEC
 
     def handle(self, u):
         """Одно обновление. Ниже offset — уже разобрано, пропуск. → 1 разобрано, 0 пропущено."""
@@ -509,27 +529,36 @@ class Tg(wa_agent.Telegram):
         return outcome
 
 
-def run(core, tg, should_stop, clock=time.time, sleep=time.sleep, tick_secs=TICK_SECS, log=None):
+def run(core, tg, should_stop, clock=time.time, sleep=time.sleep, tick_secs=TICK_SECS, log=None,
+        on_turn=None, stats=None):
     """Главный цикл: getUpdates и такт ядра в ОДНОМ потоке. Длинный опрос не дольше остатка до
-    такта, поэтому такт идёт раз в tick_secs. Падение такта — строка журнала, не смерть цикла."""
+    такта, поэтому такт идёт раз в tick_secs. Падение такта — строка журнала, не смерть цикла.
+    Неудачный опрос откладывает СЛЕДУЮЩИЙ опрос (`tg.poll_pause`: 409 — 30 с), а не такт.
+    on_turn(now) — раз за оборот (сводка службы); stats — счётчики тактов для неё."""
     log = log or (lambda line: None)
+    stats = stats if stats is not None else {}
     next_tick = clock()
+    poll_after = 0.0
     while not should_stop():
         now = clock()
-        if tg.reading:
+        if tg.reading and now >= poll_after:
             if tg.poll(timeout=max(0, int(next_tick - now))) is None:
-                sleep(1)
+                poll_after = clock() + getattr(tg, "poll_pause", lambda: POLL_RETRY_SEC)()
         now = clock()
         if now >= next_tick:
+            stats["ticks"] = stats.get("ticks", 0) + 1
             try:
                 core.tick(now)
             except Exception as e:                                   # noqa: BLE001
+                stats["tick_fail"] = stats.get("tick_fail", 0) + 1
                 log("такт упал: %s" % type(e).__name__)
             next_tick = now + tick_secs
-        elif not tg.reading:
-            sleep(max(0.0, next_tick - now))
+        elif not tg.reading or now < poll_after:
+            sleep(max(0.0, (next_tick if not tg.reading else min(next_tick, poll_after)) - now))
+        if on_turn is not None:
+            on_turn(clock())
 
 
 if __name__ == "__main__":
-    raise SystemExit("wa_agent_tg: руки Telegram (WAAGENTTG0110) — модели и юнита ещё нет; "
-                     "запуск службы — шаги 4–5 плана WAAGENTLIVE0110 §7")
+    raise SystemExit("wa_agent_tg: руки Telegram (WAAGENTTG0110) — служба запускается wa_agent_svc.py "
+                     "(WAAGENTSVC0210)")

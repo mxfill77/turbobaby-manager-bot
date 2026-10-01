@@ -1,0 +1,22 @@
+[Unit]
+Description=TurboBaby WA agent: drafts → cards in «Агенты» → one press = one message; reactions from show topics to WhatsApp. All switches off by default
+# Assembly: wa_agent_svc.py = wa_agent.Core + wa_agent_tg.Tg + wa_send door (WAAGENTSVC0210).
+# Reads wa_queue.db and wa_tg_mirror.db READ-ONLY (mode=ro); own state wa_agent.db next to the queue.
+# The ONLY getUpdates reader of the show bot (WA_TG_BOT_TOKEN): a second reader gets 409.
+# Switches WA_AGENT_DRAFTS, WA_AGENT_CARDS, WA_AGENT_REACT, WA_SEND are off by default (.env, not here):
+# all off — zero Telegram calls and zero door calls. Log: wa_agent.log, numbers summary every 5 minutes.
+After=network.target wa-webhook.service wa-tg-mirror.service
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/turbobaby-manager-bot
+ExecStart=/root/turbobaby-manager-bot/venv/bin/python3 /root/turbobaby-manager-bot/wa_agent_svc.py
+Restart=always
+RestartSec=15
+User=root
+StandardOutput=append:/root/turbobaby-manager-bot/wa_agent.log
+StandardError=append:/root/turbobaby-manager-bot/wa_agent.log
+
+[Install]
+WantedBy=multi-user.target

@@ -134,11 +134,14 @@ def _hm(ts):
 
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
-                 clock=time.time, log=None):
+                 clock=time.time, log=None, drafts=True):
         quiet = int(quiet)
         if not QUIET_MIN <= quiet <= QUIET_MAX:
             raise ValueError("пауза черновика %d с вне %d–%d с" % (quiet, QUIET_MIN, QUIET_MAX))
         self.quiet = quiet
+        # WA_AGENT_DRAFTS (WAAGENTSVC0210): выключен — модель не зовётся, черновиков и пауз нет,
+        # курсор идёт за очередью (`follow`). Решает служба; ядро по умолчанию прежнее.
+        self.drafts = bool(drafts)
         self.queue_path = queue_path
         self.model, self.tg, self.door = model, tg, door
         self.clock = clock
@@ -246,8 +249,23 @@ class Core:
 
     def tick(self, now=None):
         now = self.clock() if now is None else now
+        if not self.drafts:
+            self.follow()
+            return []
         self.scan(now)
         return self.make_drafts(now)
+
+    def follow(self):
+        """Черновики выключены: курсор встаёт на MAX(id) без разбора строк, ждущие входящие закрыты
+        без черновика. Включение не поднимет черновиков на переписку выключенного времени — то же
+        правило, что у первого старта. Живой черновик не трогается: его «Отправить» перепроверит
+        очередь (`press` → `_fresh`)."""
+        with self._queue() as q:
+            top = q.execute("SELECT COALESCE(MAX(id), 0) FROM wa_inbox").fetchone()[0]
+        if self._cursor() != top:
+            self._set_cursor(top)
+        self.db.execute("UPDATE clients SET done_upto=last_in_id WHERE done_upto < last_in_id")
+        return top
 
     def scan(self, now):
         """Новые строки очереди после курсора. Первый старт — курсор на MAX(id), без разбора."""
@@ -356,6 +374,14 @@ class Core:
         target = CLAIMED if action == ACT_SEND else DECLINED
         if action not in (ACT_SEND, ACT_DECLINE):
             return {"ok": False, "state": None, "words": "неизвестное действие"}
+        if action == ACT_SEND and not self._door_open():
+            # дверь выключена (WA_SEND): ДО захвата — черновик остаётся pending, кнопки живы
+            row = self.db.execute("SELECT state, ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
+            if row and row[0] == PENDING and row[1] == int(ver):
+                self.log("черновик %d: «Отправить» — отправка выключена, черновик ждёт" % draft_id)
+                return {"ok": False, "state": PENDING,
+                        "words": "отправка выключена — черновик ждёт, кнопки живы"}
+            return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
         n = self.db.execute("UPDATE drafts SET state=?, decided_by=?, decided_at=? "
                             "WHERE id=? AND state='pending' AND ver=?",
                             (target, who, now, draft_id, int(ver))).rowcount
@@ -428,10 +454,21 @@ class Core:
         row = self.db.execute("SELECT card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
         return row[0] if row else None
 
+    def _door_open(self):
+        """Дверь без `is_open` — открыта (прежний контракт); `is_open` упал — закрыта."""
+        probe = getattr(self.door, "is_open", None)
+        if probe is None:
+            return True
+        try:
+            return bool(probe())
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дверь: is_open упал: %s — считаем выключенной" % type(e).__name__)
+            return False
+
     def counts(self):
         return dict(self.db.execute("SELECT state, COUNT(*) FROM drafts GROUP BY state").fetchall())
 
 
 if __name__ == "__main__":
-    raise SystemExit("wa_agent: ядро без рук (WAAGENTCORE0110) — Telegram в wa_agent_tg.py (WAAGENTTG0110), "
-                     "службы и модели ещё нет; запуск — шаги 4–5 плана WAAGENTLIVE0110 §7")
+    raise SystemExit("wa_agent: ядро без рук (WAAGENTCORE0110) — служба собирается в wa_agent_svc.py "
+                     "(WAAGENTSVC0210), Telegram в wa_agent_tg.py (WAAGENTTG0110)")
