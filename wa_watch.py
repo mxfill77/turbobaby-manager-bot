@@ -18,7 +18,9 @@
                «Отправить») и `tg_react_out` (наша реакция из темы, исход двери sent).
   способ     — раз в `every` с: последнее живое входящее каждого номера за сутки; ответ — что угодно
                наше ПОСЛЕ него, кроме автоответа (отпечаток текста приветствия ИЛИ эхо ≤ 10 с после
-               «первого» входящего — до него 14 суток тишины, WAAUTOGREET0210).
+               «первого» входящего — до него 14 суток тишины, WAAUTOGREET0210). Отпечаток — та же
+               настройка WA_AGENT_GREET_SHA256 и то же правило, что у ядра (`wa_agent.greet_fps`,
+               `wa_agent.greet_hit`; WACHAINFIX0210); настройки нет — автоответ ловит одно время.
   отрицание  — ответили с телефона, по «Отправить», из темы или реакцией — тишина; повтор такта и
                рестарт — та же одна тревога (ключ «номер + строка входящего» в базе ДО Telegram).
 Не знаю, наш ли ответ (флаг строки не разобран) — не ответ: молчание источника ответом не считается.
@@ -36,6 +38,7 @@ import hashlib
 import sqlite3
 import time
 
+import wa_agent
 import wa_kind
 
 WATCH_SEC = 2130                     # порог: p90 ответа за 30 суток (WAUNANSWERED0210 п.2)
@@ -43,7 +46,6 @@ EVERY = 60                           # оборот ожидания не чащ
 WINDOW = 86400                       # входящее старше суток тревоги не даёт
 AUTO_SEC = 10                        # эхо ≤ 10 с после «первого» входящего — автоответ
 SILENCE = 14 * 86400                 # «первое» входящее: до него 14 суток тишины в обе стороны
-GREET_FP = ("614e20ee29",)           # sha256[:10] текста автоприветствия (WAAUTOGREET0210)
 TRIES = 3                            # отказ Telegram с кодом — попыток всего
 TZ_SEC = 7 * 3600                    # Пхукет — для времени в сообщении
 SENDING, SENT, FAIL, UNSURE = "sending", "sent", "fail", "unsure"
@@ -77,10 +79,11 @@ def _local_hm(ts):
 
 class Watch:
     """db — соединение базы агента (общая с ядром); queue_path — очередь (только mode=ro);
-    send(number, text) → (True, message_id) · (False, код) · (None, 'net'); head(number) → «имя\\nтема: ссылка»."""
+    send(number, text) → (True, message_id) · (False, код) · (None, 'net'); head(number) → «имя\\nтема: ссылка»;
+    greet — отпечатки приветствия из настройки службы (`wa_agent.greet_fps`), пусто — только время."""
 
     def __init__(self, db, queue_path, send, head=None, threshold=WATCH_SEC, every=EVERY, clock=time.time,
-                 log=None, greet=GREET_FP):
+                 log=None, greet=()):
         self.db, self.queue_path, self.send = db, queue_path, send
         self.head = head or (lambda number: "без имени")
         self.threshold, self.every = int(threshold), int(every)
@@ -104,7 +107,7 @@ class Watch:
 
     def _auto(self, q, number, echo_text, echo_ts, in_id, in_ts):
         """Эхо — автоответ: отпечаток текста приветствия ИЛИ ≤ AUTO_SEC после «первого» входящего."""
-        if fp(echo_text) in self.greet:
+        if wa_agent.greet_hit(echo_text, self.greet):
             return True
         if echo_ts is None or in_ts is None or not 0 <= echo_ts - in_ts <= AUTO_SEC:
             return False
@@ -135,7 +138,8 @@ class Watch:
         if self.last is not None and now - self.last < self.every:
             return []
         self.last = now
-        with self._queue() as q:
+        q = self._queue()                     # закрываем сами: `with` у sqlite3 соединение не закрывает
+        try:
             start = self._from()
             if start is None:
                 top = q.execute("SELECT COALESCE(MAX(id), 0) FROM wa_inbox").fetchone()[0]
@@ -168,6 +172,8 @@ class Watch:
                     continue
                 if self._alarm(number, in_id, in_ts, now):
                     fired.append(in_id)
+        finally:
+            q.close()
         return fired
 
     def _alarm(self, number, in_id, in_ts, now):

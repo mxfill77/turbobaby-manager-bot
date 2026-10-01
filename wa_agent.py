@@ -86,6 +86,15 @@ def greet_fps(raw):
         return (), "настройка битая — признака нет, любое эхо ставит паузу"
     return tuple(out), "отпечаток %s" % ", ".join(p[:10] for p in out)
 
+
+def greet_hit(text, fps):
+    """Отпечаток текста эха совпал с настройкой: sha256 текста начинается с одного из `greet_fps`.
+    Одно правило для ядра и ожидания `wa_watch` (WACHAINFIX0210). Отпечатков нет — не совпал."""
+    if not fps or not isinstance(text, str) or not text:
+        return False
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return any(h.startswith(g) for g in fps)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -476,8 +485,11 @@ class Core:
         без черновика. Включение не поднимет черновиков на переписку выключенного времени — то же
         правило, что у первого старта. Живой черновик не трогается: его «Отправить» перепроверит
         очередь (`press` → `_fresh`)."""
-        with self._queue() as q:
+        q = self._queue()
+        try:
             top = q.execute("SELECT COALESCE(MAX(id), 0) FROM wa_inbox").fetchone()[0]
+        finally:
+            q.close()
         if self._cursor() != top:
             self._set_cursor(top)
         self.db.execute("UPDATE clients SET done_upto=last_in_id WHERE done_upto < last_in_id")
@@ -486,7 +498,8 @@ class Core:
     def scan(self, now):
         """Новые строки очереди после курсора. Первый старт — курсор на MAX(id), без разбора."""
         cur = self._cursor()
-        with self._queue() as q:
+        q = self._queue()                     # закрываем сами: `with` у sqlite3 соединение не закрывает
+        try:
             if cur is None:
                 top = q.execute("SELECT COALESCE(MAX(id), 0) FROM wa_inbox").fetchone()[0]
                 self._set_cursor(top)
@@ -495,6 +508,8 @@ class Core:
             rows = q.execute("SELECT id, from_number, msg_type, echo, history, wamid, ts_queued, text, ts_msg "
                              "FROM wa_inbox WHERE id > ? ORDER BY id LIMIT ?",
                              (cur, SCAN_LIMIT)).fetchall()
+        finally:
+            q.close()
         for rid, number, msg_type, echo, history, wamid, ts_q, text, ts_m in rows:
             kind = self._live_kind(msg_type, echo, history)
             if kind and number:
@@ -548,8 +563,7 @@ class Core:
                    else "%d с после первого входящего" % after)
         if not self.greet:
             return None, "отпечатка приветствия в настройке нет; " + t_words
-        h = hashlib.sha256(text.encode("utf-8")).hexdigest() if isinstance(text, str) and text else ""
-        if not h or not any(h.startswith(g) for g in self.greet):
+        if not greet_hit(text, self.greet):
             return None, "отпечаток не совпал; " + t_words
         return after, "отпечаток совпал; " + t_words
 
@@ -610,9 +624,12 @@ class Core:
         """Что пришло в очередь по клиенту после after_id: (kind, id) первой живой строки или None.
         Эхо, которое скан признал автоприветствием (`autogreet`), — не новое: оно идёт следом за
         «первым» входящим, и без этого черновик на первый вопрос не родился бы никогда."""
-        with self._queue() as q:
+        q = self._queue()
+        try:
             rows = q.execute("SELECT id, msg_type, echo, history, wamid FROM wa_inbox "
                              "WHERE from_number=? AND id > ? ORDER BY id", (number, after_id)).fetchall()
+        finally:
+            q.close()
         for rid, msg_type, echo, history, wamid in rows:
             kind = self._live_kind(msg_type, echo, history)
             if kind == wa_kind.KIND_INBOUND:

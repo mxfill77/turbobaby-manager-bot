@@ -23,6 +23,8 @@
   sha256 текста или его начало от 10 знаков, несколько — через запятую; самого текста нет нигде. Эхо с
   этим отпечатком И не позже 10 с после «первого» входящего паузы не ставит, первый вопрос не закрывает.
   Нет или битая — признака нет, любое эхо ставит паузу, как раньше; исход — строкой на старте.
+  Ожидание `wa_watch` берёт отпечаток отсюда же (WACHAINFIX0210); нет настройки — автоответ там ловит одно
+  время (≤ 10 с после «первого» входящего).
 Все выключены — ни одного вызова Telegram и двери: такт ядра читает только очередь (mode=ro).
 
 ЦИКЛ — `wa_agent_tg.run`, один поток; читатель `getUpdates` у бота показа ОДИН — эта служба. Второй
@@ -142,9 +144,10 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                          log=line, drafts=drafts, greet=greet)
     tg.bind(core)
-    # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram
+    # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
+    # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210)
     core.watch = wa_watch.Watch(core.db, env["queue_db"], tg.watch_alarm, head=tg._head, clock=clock,
-                                log=line) if tg.watch else None
+                                log=line, greet=greet) if tg.watch else None
     words = {
         F_DRAFTS: ("вкл" if drafts else "выкл") + ("" if drafts or not flags[F_DRAFTS]
                                                    else " (флаг 1, адаптера модели нет)"),

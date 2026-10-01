@@ -309,7 +309,8 @@ def last_inbound_ts(number, db_path=None):
     if not os.path.exists(path):
         return ScanResult.unreadable("входящих", detail="очереди нет по пути " + os.path.basename(path))
     try:
-        with sqlite3.connect(path, timeout=5) as conn:
+        conn = sqlite3.connect(path, timeout=5)  # закрываем сами: `with` у sqlite3 соединение не закрывает
+        try:
             row = conn.execute(
                 """SELECT COUNT(*), MAX(COALESCE(NULLIF(ts_msg, 0), ts_queued))
                      FROM wa_inbox
@@ -317,6 +318,8 @@ def last_inbound_ts(number, db_path=None):
                       AND msg_type <> 'reaction'""",
                 (str(number),),
             ).fetchone()
+        finally:
+            conn.close()
     except Exception as e:
         return ScanResult.unreadable("входящих", detail="очередь не читается: " + type(e).__name__)
     seen = int((row or [0])[0] or 0)
