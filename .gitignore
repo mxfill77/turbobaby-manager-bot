@@ -66,6 +66,9 @@ hint_dedup_state.json
 svc_tokens.json
 # журнал принятых работ без пробега: переживает рестарт splinter (рантайм-состояние; 21.09.2026)
 works_persist_state.json
+# открытый вопрос о пробеге + id сообщения: реплай узнаётся после рестарта splinter (рантайм-состояние; 01.10.2026)
+mileage_question_state.json
+mileage_question_state.json.tmp
 _pcport185
 # scratch / throwaway
 _*.py
