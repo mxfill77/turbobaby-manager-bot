@@ -25,6 +25,16 @@
 
 ВЫКЛЮЧАТЕЛЬ. `WA_AGENT_CARDS` по умолчанию выключен: адаптер не делает ни одного вызова Telegram
 (ни карточек, ни `getUpdates`), ядро тактует как без рук.
+
+РЕАКЦИИ НАРУЖУ (WAREACTOUT0110). Человек ставит или снимает реакцию на сообщении темы форума показа —
+та же реакция уходит клиенту в WhatsApp на то же сообщение. Читатель тот же (второй читатель бота
+получил бы 409): `allowed_updates` + `message_reaction`, бот — админ форума показа. Сообщение темы
+сводится к wamid по базе показа (`shown.msg_id`, ключ один в сообщении, только mode=ro) и виду строки
+очереди (только сообщение клиента или наше, только mode=ro); wamid нет — наружу ничего, строка журнала.
+Реакция уходит дверью `wa_send.send_reaction` (WA_SEND, ключ, окно 24 ч). У бизнеса в WhatsApp ОДНА
+реакция на сообщение: держится последняя из реакций людей группы; снял последний — снятие. Одно
+изменение — одна отправка: то, что уже уходило на это сообщение (любым исходом), второй раз не шлётся.
+Выключатель `WA_AGENT_REACT` по умолчанию выключен — реакции не читаются и не отправляются.
 """
 
 import json
@@ -35,6 +45,8 @@ import urllib.error
 import urllib.request
 
 import wa_agent
+import wa_kind
+import wa_send
 
 AGENTS_CHAT = -1003999596406       # «TurboBaby · Агенты»
 FLAG_NAME = "WA_AGENT_CARDS"
@@ -43,6 +55,24 @@ TICK_SECS = 5
 TG_TEXT_MAX = 4000
 ANSWER_MAX = 190                   # answerCallbackQuery: до 200 символов
 ALLOWED_UPDATES = ["callback_query", "message"]
+REACT_FLAG = "WA_AGENT_REACT"
+REACT_UPDATE = "message_reaction"
+REACT_KINDS = (wa_kind.KIND_INBOUND, wa_kind.KIND_ECHO)   # на что реакция уходит клиенту
+
+# Сведение Telegram → WhatsApp. Набор реакций Telegram — обычные эмодзи Unicode, WhatsApp принимает
+# любое эмодзи, поэтому каждое из набора уходит как есть; семь записаны в Telegram без U+FE0F
+# (текстовое начертание по умолчанию) — клиенту уходит полная форма, иначе он увидит значок шрифта.
+# Вне набора у Telegram только custom_emoji (премиум) и paid (звёзды): в WhatsApp их нет — не шлём,
+# строка журнала; для итога сообщения такая реакция человека — «нет реакции».
+WA_FULL_FORM = {
+    "❤": "❤️",                                   # ❤
+    "❤‍\U0001F525": "❤️‍\U0001F525",   # ❤‍🔥
+    "\U0001F54A": "\U0001F54A️",                           # 🕊
+    "✍": "✍️",                                   # ✍
+    "☃": "☃️",                                   # ☃
+    "\U0001F937‍♂": "\U0001F937‍♂️",   # 🤷‍♂
+    "\U0001F937‍♀": "\U0001F937‍♀️",   # 🤷‍♀
+}
 
 ACTIONS = {"send": wa_agent.ACT_SEND, "no": wa_agent.ACT_DECLINE}
 
@@ -63,6 +93,20 @@ CREATE TABLE IF NOT EXISTS tg_pauses (
     msg_id    INTEGER,
     body      TEXT,
     PRIMARY KEY (cid, pause_no)
+);
+CREATE TABLE IF NOT EXISTS tg_reacts (
+    msg_id    INTEGER NOT NULL,                      -- сообщение темы форума показа
+    who       TEXT    NOT NULL,                      -- человек группы (u<id> / chat<id> анонимно)
+    emoji     TEXT    NOT NULL,                      -- его реакция из набора Telegram
+    seq       INTEGER NOT NULL,                      -- update_id: последняя побеждает
+    PRIMARY KEY (msg_id, who)
+);
+CREATE TABLE IF NOT EXISTS tg_react_out (
+    msg_id    INTEGER PRIMARY KEY,                   -- что уже уходило клиенту на это сообщение
+    wamid     TEXT,
+    emoji     TEXT,                                  -- '' — снятие
+    outcome   TEXT,                                  -- sending до двери, потом исход двери
+    ts        REAL
 );
 """
 
@@ -100,11 +144,30 @@ def who_of(user):
     return "%s (id %s)" % (name or "без имени", (user or {}).get("id"))
 
 
+def tg_standard(reactions):
+    """new_reaction → (эмодзи из набора Telegram или '', [виды вне набора]). У человека-премиума
+    реакций до трёх — берётся последняя обычная: у бизнеса в WhatsApp реакция одна."""
+    emoji, other = "", []
+    for r in reactions or []:
+        if (r or {}).get("type") == "emoji" and r.get("emoji"):
+            emoji = r["emoji"]
+        else:
+            other.append(str((r or {}).get("type") or "?"))
+    return emoji, other
+
+
+def wa_emoji(tg) -> str:
+    """Эмодзи реакции Telegram → эмодзи для WhatsApp (полная форма); '' остаётся '' — снятие."""
+    return WA_FULL_FORM.get(tg, tg or "")
+
+
 class Tg(wa_agent.Telegram):
     def __init__(self, token, enabled=False, chat_id=AGENTS_CHAT, show_chat=None, mirror_db=None,
-                 http=None, clock=time.time, log=None):
+                 http=None, clock=time.time, log=None, react=False, react_send=None):
         self.token = token or ""
         self.enabled = bool(enabled) and bool(self.token)
+        self.react = bool(react) and bool(self.token)
+        self.react_send = react_send
         self.chat = int(chat_id)
         self.show_chat = show_chat
         self.mirror_db = mirror_db
@@ -120,11 +183,16 @@ class Tg(wa_agent.Telegram):
         self.db.executescript(_SCHEMA)
         return self
 
+    @property
+    def reading(self):
+        """Читатель обновлений нужен, если включены карточки или реакции."""
+        return self.enabled or self.react
+
     # ── вызов Bot API ─────────────────────────────────────────────────────────────────────
 
     def api(self, method, params, timeout=30):
         """→ (True, result) · (False, код|описание) · (None, 'net'). Выключено — сети нет вовсе."""
-        if not self.enabled:
+        if not self.reading:
             return False, "выключено"
         status, body = self.http("POST", TG_BASE + "/bot" + self.token + "/" + method,
                                  {"Content-Type": "application/json"},
@@ -227,10 +295,11 @@ class Tg(wa_agent.Telegram):
 
     def poll(self, timeout=0):
         """Один getUpdates. → число разобранных обновлений или None (вызов не удался)."""
-        if not self.enabled:
+        if not self.reading:
             return 0
+        allowed = (ALLOWED_UPDATES if self.enabled else []) + ([REACT_UPDATE] if self.react else [])
         ok, res = self.api("getUpdates", {"offset": self.offset(), "timeout": int(max(0, timeout)),
-                                          "allowed_updates": ALLOWED_UPDATES}, timeout=int(timeout) + 15)
+                                          "allowed_updates": allowed}, timeout=int(timeout) + 15)
         if not ok:
             if res == 409:
                 self.log("getUpdates: 409 — у бота второй читатель, разбор стоит")
@@ -248,9 +317,13 @@ class Tg(wa_agent.Telegram):
             return 0
         try:
             if "callback_query" in u:
-                self.on_press(u["callback_query"])
+                if self.enabled:
+                    self.on_press(u["callback_query"])
             elif "message" in u:
-                self.on_message(u["message"])
+                if self.enabled:
+                    self.on_message(u["message"])
+            elif REACT_UPDATE in u:
+                self.on_reaction(u[REACT_UPDATE], uid)
         except Exception as e:                                       # noqa: BLE001
             self.log("обновление %d упало: %s" % (uid, type(e).__name__))
         self._set_offset(uid + 1)
@@ -332,6 +405,109 @@ class Tg(wa_agent.Telegram):
                                  "reply_parameters": {"message_id": int(msg.get("message_id") or 0),
                                                       "allow_sending_without_reply": True}})
 
+    # ── реакции наружу (WAREACTOUT0110) ───────────────────────────────────────────────────
+
+    def _ro(self, path):
+        return sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+
+    def _react_target(self, mid):
+        """Сообщение темы → (wamid, номер, '') либо (None, None, почему). Только mode=ro."""
+        if not mid:
+            return None, None, "нет id сообщения"
+        if not (self.mirror_db and os.path.exists(self.mirror_db)):
+            return None, None, "базы показа нет"
+        try:
+            conn = self._ro(self.mirror_db)
+            try:
+                rows = conn.execute("SELECT key, number FROM shown WHERE msg_id=? AND state='shown' "
+                                    "AND solo=1", (int(mid),)).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:                                       # noqa: BLE001
+            return None, None, "база показа не прочитана: %s" % type(e).__name__
+        pairs = set()
+        for key, number in rows:
+            pre, _, wamid = str(key).partition(":")
+            if pre in ("msg", "file") and wamid and not wamid.startswith("row:"):
+                pairs.add((wamid, number))
+        if not pairs:
+            return None, None, "в показе у сообщения нет ключа с wamid (не из показа или показано до 40b158b)"
+        if len(pairs) > 1:
+            return None, None, "у сообщения больше одного wamid"
+        wamid, number = pairs.pop()
+        qpath = getattr(self.core, "queue_path", None)
+        try:
+            conn = self._ro(qpath)
+            try:
+                row = conn.execute("SELECT msg_type, echo, history FROM wa_inbox WHERE wamid=? "
+                                   "ORDER BY id LIMIT 1", (wamid,)).fetchone()
+            finally:
+                conn.close()
+        except Exception as e:                                       # noqa: BLE001
+            return None, None, "очередь не прочитана: %s" % type(e).__name__
+        if not row:
+            return None, None, "строки цели в очереди нет"
+        kind = wa_kind.kind_of(row[0], row[1], row[2])
+        if kind not in REACT_KINDS:
+            return None, None, "цель — не сообщение клиента и не наше (вид %s)" % kind
+        return wamid, number, ""
+
+    def _send_reaction(self, number, wamid, emoji):
+        if self.react_send:
+            return self.react_send(number, wamid, emoji)
+        return wa_send.send_reaction(number, wamid, emoji, db_path=getattr(self.core, "queue_path", None))
+
+    def on_reaction(self, mr, seq=0):
+        """Реакция человека в группе показа → та же реакция клиенту. → исход двери или None."""
+        chat = (mr.get("chat") or {}).get("id")
+        mid = mr.get("message_id")
+        if str(chat) != str(self.show_chat or ""):
+            self.log("реакция: чужой чат %s — пропуск" % chat)
+            return None
+        if not self.react:
+            self.log("реакция: сообщение темы %s — %s выключен, наружу ничего" % (mid, REACT_FLAG))
+            return None
+        user = mr.get("user") or {}
+        actor = (mr.get("actor_chat") or {}).get("id")
+        if user.get("is_bot") or (not user and str(actor) != str(chat)):
+            self.log("реакция: сообщение темы %s — поставил не человек группы, пропуск" % mid)
+            return None
+        who = ("u%s" % user.get("id")) if user else ("chat%s" % actor)
+        emoji, other = tg_standard(mr.get("new_reaction"))
+        if other:
+            self.log("реакция: сообщение темы %s — вид %s в WhatsApp не существует, не отправляется"
+                     % (mid, ",".join(other)))
+        wamid, number, why = self._react_target(mid)
+        if not wamid:
+            self.log("реакция: сообщение темы %s — wamid нет (%s), наружу ничего" % (mid, why))
+            return None
+        if emoji:
+            self.db.execute("INSERT OR REPLACE INTO tg_reacts(msg_id, who, emoji, seq) VALUES(?,?,?,?)",
+                            (int(mid), who, emoji, int(seq)))
+        else:
+            self.db.execute("DELETE FROM tg_reacts WHERE msg_id=? AND who=?", (int(mid), who))
+        row = self.db.execute("SELECT emoji FROM tg_reacts WHERE msg_id=? ORDER BY seq DESC LIMIT 1",
+                              (int(mid),)).fetchone()
+        want = row[0] if row else ""
+        last = self.db.execute("SELECT emoji, outcome FROM tg_react_out WHERE msg_id=?",
+                               (int(mid),)).fetchone()
+        if (last[0] if last else "") == want:
+            self.log("реакция: сообщение темы %s — это уже уходило клиенту (%s), второй раз не шлём"
+                     % (mid, last[1] if last else "снимать нечего"))
+            return None
+        # sending ДО двери: обрыв посреди вызова повтора не даёт
+        self.db.execute("INSERT OR REPLACE INTO tg_react_out(msg_id, wamid, emoji, outcome, ts) "
+                        "VALUES(?,?,?,?,?)", (int(mid), wamid, want, "sending", self.clock()))
+        try:
+            res = self._send_reaction(number, wamid, wa_emoji(want)) or {}
+        except Exception as e:                                       # noqa: BLE001
+            res = {"outcome": wa_send.UNKNOWN, "reason": "дверь упала: %s" % type(e).__name__}
+        outcome = str(res.get("outcome") or wa_send.UNKNOWN)
+        self.db.execute("UPDATE tg_react_out SET outcome=? WHERE msg_id=?", (outcome, int(mid)))
+        self.log("реакция: сообщение темы %s · %s → %s · %s" % (mid, "реакция" if want else "снятие",
+                                                               outcome, str(res.get("reason") or "")[:120]))
+        return outcome
+
 
 def run(core, tg, should_stop, clock=time.time, sleep=time.sleep, tick_secs=TICK_SECS, log=None):
     """Главный цикл: getUpdates и такт ядра в ОДНОМ потоке. Длинный опрос не дольше остатка до
@@ -340,7 +516,7 @@ def run(core, tg, should_stop, clock=time.time, sleep=time.sleep, tick_secs=TICK
     next_tick = clock()
     while not should_stop():
         now = clock()
-        if tg.enabled:
+        if tg.reading:
             if tg.poll(timeout=max(0, int(next_tick - now))) is None:
                 sleep(1)
         now = clock()
@@ -350,7 +526,7 @@ def run(core, tg, should_stop, clock=time.time, sleep=time.sleep, tick_secs=TICK
             except Exception as e:                                   # noqa: BLE001
                 log("такт упал: %s" % type(e).__name__)
             next_tick = now + tick_secs
-        elif not tg.enabled:
+        elif not tg.reading:
             sleep(max(0.0, next_tick - now))
 
 

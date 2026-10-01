@@ -53,6 +53,7 @@ import uuid
 from collections import deque
 
 import wa_kind
+import wa_send
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("wa_tg_mirror")
@@ -146,7 +147,8 @@ def _env():
         "queue_db":  qdb,
         "state_db":  os.environ.get("WA_TG_MIRROR_DB", os.path.join(base, "wa_tg_mirror.db")),
         "media_dir": os.environ.get("WA_MEDIA_DIR", os.path.join(base, "wa_media")),
-        "d360_key":  (os.environ.get("WA_D360_API_KEY") or "").strip(),
+        # одно правило с дверью (WAREACTOUT0110): WA_360_API_KEY, иначе WA_D360_API_KEY
+        "d360_key":  wa_send.api_key(os.environ)[0],
         "tg_token":  (os.environ.get("WA_TG_BOT_TOKEN") or "").strip(),
         "tg_chat":   (os.environ.get("WA_TG_CHAT_ID") or "").strip(),
         "show":      _flag_on(os.environ.get(FLAG_NAME)),
