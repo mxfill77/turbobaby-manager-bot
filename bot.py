@@ -836,6 +836,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if splinter.GROUPS.get(chat_id) == "servicing":
             # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» в этой теме (дедуп, O(1) после первого раза)
             await splinter.ensure_info_pin(context, chat_id, _tid_sv)
+            # 0'') ОТВЕТ РЕПЛАЕМ НА ВОПРОС О ПРОБЕГЕ (01.10.2026, SPLODOREPLY0110): реплай на само
+            #     сообщение-вопрос оживляет вопрос в любом возрасте и после перезапуска. Стоит ДО 0'):
+            #     иначе 0') снял бы вопрос как протухший и назвал ответ устаревшим. Fail-safe внутри.
+            try:
+                splinter.revive_mileage_question_by_reply(msg)
+            except Exception:
+                log.exception("revive_mileage_question_by_reply error")
             # 0') ПРЕДЕЛ ЖИЗНИ ВОПРОСА О ПРОБЕГЕ (класс-фикс 4957, корень 5): протухший вопрос
             #     снимаем ДО любого разбора — иначе он и ответ человека съедает молча (31.07 07:29 UTC),
             #     и держит уступку голого числа в handle_service_result. Fail-safe внутри: сбой → поток как был.
