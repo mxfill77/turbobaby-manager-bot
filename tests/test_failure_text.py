@@ -337,8 +337,15 @@ res.append(ok(E.lane_err("claude exit=1: API Error: 529 Overloaded.") == "529 Ov
               "`lane_err` отвечает ровно как прежде"))
 res.append(ok(E.lane_err("claude -p упал (exit=1): API Error: 529.") == "",
               "и НЕ выучил зачин чужой поверхности — О8 судит ровно то, что судил"))
-res.append(ok(len(E.KINDS) == 12 and "o8_lane_dead" in E.KINDS,
-              "видов ожиданий по-прежнему 12 — новых заход не завёл"))
+# Рост 12 → 14 обоснован ПОИМЁННО (REDFIX8DC0110): О9 «показ WhatsApp в Telegram» завёл 01.10 ровно
+# два вида — `o9_wa_mirror` (ОТКАЗ) и `o9_wa_unknown` (НЕИЗВЕСТНО), задание 0090-76g, WAMIRRWATCH0110.
+# Замок сверяет МНОЖЕСТВО, а не число: любой следующий вид по-прежнему роняет эту строку.
+KINDS_12 = {"o1_new_vps", "o2_daemon", "o2_splinter", "o3_undelivered", "o3_unknown",
+            "o4_pc_silent", "o5_bridge_down", "o5_bridge_slow", "o6_pc_task",
+            "o7_child_down", "o7_pulse_lost", "o8_lane_dead"}
+KINDS_O9 = {"o9_wa_mirror", "o9_wa_unknown"}
+res.append(ok(len(E.KINDS) == 14 and set(E.KINDS) == KINDS_12 | KINDS_O9,
+              "видов ожиданий 14 = прежние 12 + два вида О9 (0090) — новых этот заход не завёл"))
 res.append(ok((E.LANE_RUN_ENV, E.LANE_RUN_DEFAULT) == ("EXPECT_LANE_RUN", 2.0),
               "порог О8 и его ручка прежние"))
 src_ft = open(os.path.join(ROOT, "failure_text.py"), encoding="utf-8").read()

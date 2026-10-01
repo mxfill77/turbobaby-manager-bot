@@ -46,7 +46,8 @@ PID = 4242
 
 
 def world(rows=(), shown=(), start=None, flag_proc=None, flag_file=None, active=True,
-          since_ago=3600.0, log_text="", state_broken=False, queue_broken=False, sysctl_rc=0):
+          since_ago=3600.0, log_text="", state_broken=False, queue_broken=False, sysctl_rc=0,
+          no_log=False):
     """Выдуманный мир: очередь, база показанного, файл ключей, /proc процесса, журнал, systemctl."""
     d = tempfile.mkdtemp(prefix="w_", dir=BASE)
     qp = os.path.join(d, "wa_queue.db")
@@ -90,8 +91,9 @@ def world(rows=(), shown=(), start=None, flag_proc=None, flag_file=None, active=
         env += ("%s=%s\0" % (M.FLAG_NAME, flag_proc)).encode()
     with open(os.path.join(pdir, "environ"), "wb") as fh:
         fh.write(env)
-    with open(os.path.join(d, "wa_tg_mirror.log"), "w", encoding="utf-8") as fh:
-        fh.write(log_text)
+    if not no_log:
+        with open(os.path.join(d, "wa_tg_mirror.log"), "w", encoding="utf-8") as fh:
+            fh.write(log_text)
 
     class _P:
         def __init__(self, out, rc):
@@ -200,6 +202,27 @@ res.append(ok(EX.wa_mirror_line(s_e, i_e).startswith("НЕИЗВЕСТНО: ") a
               in EX.wa_mirror_line(s_e, i_e), "(д) строка итога несёт адрес"))
 res.append(ok(not EJ.heavy(ve[0])[0] and EJ.heavy(va[0])[0],
               "(д) НЕИЗВЕСТНО владельцу не адресовано (вес лёгкий), ОТКАЗ — тяжёлый"))
+
+# ═══ (д2) хвост журнала не прочитан → «не знаю» с адресом, а не пустое (REDFIX8DC0110) ═══════════
+# Слепой читатель `_tail` (храповик 72 → 73 на 8dc61b4) отдавал «» и при пустом журнале, и при
+# непрочитанном: пояснение тревоги молча пропадало. Пустой и непрочитанный — разные факты.
+print("\n(д2) журнал службы не прочитан — пояснение «не знаю» с адресом")
+fg, dg = world(active=False, flag_proc="1", no_log=True)
+fg0, dg0 = world(active=False, flag_proc="1", log_text="")
+log_g = os.path.join(dg, "wa_tg_mirror.log")
+res.append(ok(EWM._tail(log_g) is None and EWM._tail(os.path.join(dg0, "wa_tg_mirror.log")) == "",
+              "(д2) _tail: файла нет → None, пустой файл → «» (промах отличим от пустоты)"))
+hg = fg["wa_mirror"].get("hint") or {}
+res.append(ok("не прочитан" in str(hg.get("err")) and hg.get("addr") == log_g,
+              "(д2) факты: hint = «не прочитан» + адрес журнала: %s" % hg))
+res.append(ok((fg0["wa_mirror"].get("hint") or {}) == {},
+              "(д2) пустой журнал → пояснения нет, ошибки нет (это не промах)"))
+vg = o9(fg)
+res.append(ok(st(fg)[0] == EX.WAM_FAIL and vg and vg[0]["key"] == "o9|unit",
+              "(д2) решение от пояснения не зависит: юнит не активен → ОТКАЗ o9|unit"))
+tg = EX.render(vg[0]) if vg else ""
+res.append(ok("НЕ ЗНАЮ" in tg and log_g in tg and "НЕ ЗНАЮ" not in EX.render(o9(fg0)[0]),
+              "(д2) заметка называет «НЕ ЗНАЮ» с адресом; при пустом журнале — нет"))
 
 # ═══ закрытие и откат ═════════════════════════════════════════════════════════════════════════
 print("\n(е) закрытие только по доказанному факту; откат порогом 0")

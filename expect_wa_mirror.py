@@ -198,6 +198,9 @@ def log_hint(text):
 
 
 def _tail(path, nbytes=LOG_TAIL):
+    """Хвост журнала службы → текст. ПРОМАХ ЧТЕНИЯ → None, а не «» (REDFIX8DC0110): пустой журнал
+    и непрочитанный — разные факты, «» выдало бы «службе нечего пояснить» там, где пояснить нечем.
+    Причину называет `hint_facts` — адрес у него."""
     try:
         with open(path, "rb") as fh:
             fh.seek(0, 2)
@@ -205,7 +208,16 @@ def _tail(path, nbytes=LOG_TAIL):
             fh.seek(max(0, size - nbytes))
             return fh.read().decode("utf-8", "replace")
     except OSError:
-        return ""
+        return None
+
+
+def hint_facts(path):
+    """Пояснение из журнала службы; промах чтения → {"err", "addr"} — «не знаю» с причиной."""
+    text = _tail(path)
+    if text is None:
+        why = "файла нет" if not os.path.exists(path) else "файл есть, чтение не удалось"
+        return {"err": "хвост журнала службы не прочитан: %s" % why, "addr": path}
+    return log_hint(text)
 
 
 # ─────────────────────────────── сбор ─────────────────────────────────────────────────────
@@ -213,7 +225,7 @@ def facts(now=None, root=None, run=None, proc="/proc", probe=False):
     """Факты О9. Не активен или не прочитан юнит — флаг и базы не нужны: судья решит без них."""
     p = paths(root)
     u = unit_facts(run)
-    out = {"unit": u, "hint": log_hint(_tail(p["log"]))}
+    out = {"unit": u, "hint": hint_facts(p["log"])}
     if not u.get("active") and not probe:
         return out
     pv = proc_flag(u.get("pid"), proc)

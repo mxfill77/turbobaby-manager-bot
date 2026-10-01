@@ -2626,6 +2626,10 @@ def render(v, lane="VPS"):
                             if h.get("show") else "",
                             "%s «СТОИТ — %s»" % (h.get("stoit_ts") or "?", h.get("stoit"))
                             if h.get("stoit") else "") if s))
+        elif h.get("err"):
+            # Пояснения нет, и это НЕ «журнал молчит»: хвост не прочитан — названо с адресом.
+            parts.append("журнал службы (пояснение): НЕ ЗНАЮ — %s (%s)" % (h.get("err"),
+                                                                        h.get("addr") or "?"))
         parts.append("судит внешний прибор слоя ожиданий; бот показа для этой заметки не используется")
     elif kind == "o9_wa_unknown":
         parts += ["НЕИЗВЕСТНО: %s" % (v.get("why") or "причина не названа"),

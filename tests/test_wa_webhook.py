@@ -1656,9 +1656,15 @@ def test_d360_raw_archive():
        "архив лежит рядом с базой: wa_d360_raw.jsonl")
     b1 = json.dumps(_hist_placeholder()).encode()
     b2 = b"{not json"
-    _d360_post(db, None, raw_body=b1, raw_archive=path)
-    _d360_post(db, None, raw_body=b2, raw_archive=path)
-    _d360_post(db, None, raw_body=b1, secret="wrong_secret_raw", raw_archive=path)
+    # Пол свободного места — ЯВНО 0 в ветках записи (REDFIX8DC0110): на сервере /tmp — tmpfs ~3.8 ГБ,
+    # меньше пола по умолчанию 5 ГиБ, и тест молча судил свободное место машины, а не архив. Ветка
+    # пола проверяется отдельно ниже (raw_archive_floor=10**18), пол по умолчанию сверен строкой.
+    ok(wh.RAW_ARCHIVE_FREE_FLOOR == 5 * 1024 ** 3 and wh.WAWebhookHandler.raw_archive_floor
+       == wh.RAW_ARCHIVE_FREE_FLOOR, "пол свободного места по умолчанию прежний: 5 ГиБ")
+    _d360_post(db, None, raw_body=b1, raw_archive=path, raw_archive_floor=0)
+    _d360_post(db, None, raw_body=b2, raw_archive=path, raw_archive_floor=0)
+    _d360_post(db, None, raw_body=b1, secret="wrong_secret_raw", raw_archive=path,
+               raw_archive_floor=0)
     lines = open(path, encoding="utf-8").read().splitlines() if os.path.exists(path) else []
     got = [json.loads(x) for x in lines]
     ok(len(got) == 2, "2 тела под верным секретом → 2 строки (чужой секрет не пишется): "
@@ -1670,7 +1676,7 @@ def test_d360_raw_archive():
     size = os.path.getsize(path) if os.path.exists(path) else -1
     db_rows = _rows_count(db)
     recs = _logged(lambda: _d360_post(db, _cloud_inbound_text(), raw_archive=path,
-                                      raw_archive_max=size + 10))
+                                      raw_archive_max=size + 10, raw_archive_floor=0))
     warns = [x.getMessage() for x in recs if x.levelno == logging.WARNING]
     ok(os.path.getsize(path) == size and len(warns) == 1 and "CEILING" in warns[0],
        "потолок: тело не дописано, ровно 1 WARNING: " + " | ".join(warns)[:160])
