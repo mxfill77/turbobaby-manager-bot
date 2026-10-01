@@ -94,7 +94,7 @@ def test_four_kinds_by_fields():
     ok(wk.kind_of("text", 1, 0) == wk.KIND_ECHO, "наше исходящее вернулось → echo")
     ok(wk.kind_of("text", 0, 1) == wk.KIND_HISTORY, "досинхрон старой переписки → history")
     ok(wk.kind_of("status", 0, 0) == wk.KIND_RECEIPT, "квитанция доставки → receipt")
-    ok(len(set(wk.KINDS)) == 5, "видов ровно пять, и все разные")
+    ok(len(set(wk.KINDS)) == 6, "видов ровно шесть (с 01.10 и reaction), и все разные")
 
 
 def test_receipt_decided_by_one_field_not_by_text():
@@ -131,11 +131,19 @@ def test_echo_beats_history():
        "эхо И история сразу → echo (ось «чьё» главнее; обе величины едут сырыми)")
 
 
+def test_reaction_is_own_kind():
+    """01.10.2026 (WAREACTNAME0110): реакция — свой вид, у клиента и с телефона; карточки не даёт."""
+    for echo in (0, 1):
+        ok(wk.kind_of("reaction", echo, 0) == wk.KIND_REACTION, "reaction echo=%d → reaction" % echo)
+    ok(wk.disposition_of(wk.KIND_REACTION) == wk.DISP_DROP, "реакция: drop — ни карточки, ни контекста")
+    ok(wk.kind_of("reaction", None, 0) == wk.KIND_UNKNOWN, "неразобранный флаг сильнее вида: unknown")
+
+
 # ═══ (2) ТРЕТИЙ ИСХОД: неопознанное НЕ становится входящим ════════════════════════════
 
 def test_unknown_type_is_not_inbound():
     """Пункт 3: молчаливое приведение к входящему дало бы карточку там, где её быть не должно."""
-    for t in ("reaction", "order", "button", "system", "жжж"):
+    for t in ("order", "button", "system", "жжж"):
         got = wk.kind_of(t, 0, 0)
         ok(got == wk.KIND_UNKNOWN, "незнакомый тип «" + t + "» → unknown, а не inbound (" + got + ")")
 
@@ -189,7 +197,7 @@ def test_negative_looks_like_client_but_is_not():
         _status_payload(CLIENT, "delivered", now, "wamid.rcpt1"), OUR), source="meta")
     # (г) неопознанный вид от живого клиента
     db.enqueue(wh.normalize_wa_payload(
-        _msg_payload(CLIENT, None, now, "wamid.unk1", mtype="reaction"), OUR), source="meta")
+        _msg_payload(CLIENT, None, now, "wamid.unk1", mtype="order"), OUR), source="meta")
     # (д) КОНТРОЛЬ: настоящее входящее — иначе «отделяет» могло бы значить «отвергает всё»
     db.enqueue(wh.normalize_wa_payload(
         _msg_payload(CLIENT, "Привет, байк свободен", now, "wamid.real1"), OUR), source="meta")
@@ -310,7 +318,8 @@ def test_row_with_unrecognised_type_is_unknown_not_inbound():
     """Строка живой формы с неопознанным типом НЕ становится входящим молча.
 
     Это ветка третьего исхода, ДОСТИЖИМАЯ из самой таблицы: WhatsApp волен прислать род, о
-    котором нормализация не знает (`reaction`, `order`, `button`), — и он ляжет в очередь.
+    котором нормализация не знает (`order`, `button`; `reaction` с 01.10 — свой вид), — и он
+    ляжет в очередь.
     """
     db = _tmp_db()
     now = int(time.time())
@@ -320,7 +329,7 @@ def test_row_with_unrecognised_type_is_unknown_not_inbound():
             "INSERT INTO wa_inbox (ts_queued, channel, from_number, name, msg_type, text,"
             " ts_msg, echo, history, status, raw, wamid)"
             " VALUES (?,?,?,?,?,?,?,0,0,'new','{}',?)",
-            (now, "wa", CLIENT, "Ivan", "reaction", None, now, "wamid.unk2"),
+            (now, "wa", CLIENT, "Ivan", "order", None, now, "wamid.unk2"),
         )
         conn.commit()
     it = db.pull()[0]
@@ -458,7 +467,7 @@ def test_end_to_end_over_http():
             post(_msg_payload(OUR, "Байк свободен", now, "e2e.echo")),
             post(_msg_payload(CLIENT, "Здравствуйте", now - 3 * 86400, "e2e.hist")),
             post(_status_payload(CLIENT, "delivered", now, "e2e.rcpt")),
-            post(_msg_payload(CLIENT, None, now, "e2e.unk", mtype="reaction")),
+            post(_msg_payload(CLIENT, None, now, "e2e.unk", mtype="order")),
             post(_msg_payload(CLIENT, "Привет, есть байк?", now, "e2e.real")),
         ]
         ok(sent == [200] * 5, "все пять событий приняты дверью вебхука (" + str(sent) + ")")
@@ -492,8 +501,8 @@ def test_end_to_end_over_http():
         ok(by_type["status"]["kind"] == wk.KIND_RECEIPT
            and by_type["status"]["disposition"] == wk.DISP_DROP,
            "квитанция не считается входящим: receipt / drop")
-        ok(by_type["reaction"]["kind"] == wk.KIND_UNKNOWN
-           and by_type["reaction"]["disposition"] != wk.DISP_CARD,
+        ok(by_type["order"]["kind"] == wk.KIND_UNKNOWN
+           and by_type["order"]["disposition"] != wk.DISP_CARD,
            "неопознанное не становится входящим: unknown, карточки нет")
 
         cards = [i for i in items if i["disposition"] == wk.DISP_CARD]
@@ -514,6 +523,7 @@ def _run_all():
         test_receipt_survives_junk_neighbours,
         test_receipt_gives_neither_card_nor_context,
         test_echo_beats_history,
+        test_reaction_is_own_kind,
         test_unknown_type_is_not_inbound,
         test_empty_type_is_unknown,
         test_unreadable_flag_is_unknown,

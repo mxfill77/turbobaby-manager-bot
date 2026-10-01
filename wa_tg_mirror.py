@@ -22,6 +22,10 @@
    нет — тема открывается с тем, что есть, шапка это называет, журнал — раз в час. Первое
    включение открывает темы и по живым строкам за 24 ч до него; тревога — только для новых.
    Дальше каждое живое сообщение — в свою тему; квитанции не показываются.
+   Реакция (клиента или наша с телефона, WAREACTNAME0110) — не строкой, а реакцией бота на
+   сообщение темы, показанное из строки с wamid цели (id сообщения темы хранится у ключа показа);
+   вне набора Telegram или цель не показана отдельным сообщением — короткая строка; снятие — снять.
+   Имя темы догоняет имя клиента: появилось или сменилось — editForumTopic один раз на смену.
    Темп — не больше 20 вызовов в минуту; 429 — ждать retry_after. wamid дважды не показывается:
    ключ ставится ДО вызова, так что обрыв посреди вызова даёт «не повторять», а не дубль.
 
@@ -104,7 +108,25 @@ S_SENDING, S_SHOWN, S_UNSURE = "sending", "shown", "unsure"
 T_HEAD, T_HIST, T_TAIL, T_FILES, T_LIVE = "head", "hist", "tail", "files", "live"
 
 _QCOLS = ("id", "ts_queued", "from_number", "name", "msg_type", "text", "media_id", "mime",
-          "caption", "media_note", "ts_msg", "echo", "history", "wamid")
+          "caption", "media_note", "ts_msg", "echo", "history", "wamid", "react_to")
+
+# Реакции (WAREACTNAME0110). Бот ставит ОДНУ реакцию на сообщение и только из набора Telegram
+# (ReactionTypeEmoji); вне набора, цель не показана отдельным сообщением или чат реакцию не
+# принял (400) — короткая строка в теме. Сравнение — без U+FE0F и без оттенка кожи: «❤️» и «👍🏽»
+# WhatsApp ставятся как «❤» и «👍» (оттенок теряется — Telegram его не держит).
+TG_REACTIONS = frozenset(
+    "👍 👎 ❤ 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 "
+    "🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 "
+    "😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡".split())
+SIDE_TG = "tg"                 # строка reacts с тем, что бот СЕЙЧАС держит на сообщении темы
+NO_NAME = "без имени"
+RENAME_EVERY = 60              # имена тем сверяются не чаще раза в минуту
+
+
+def tg_emoji(e) -> str:
+    """Эмодзи WhatsApp → эмодзи реакции Telegram или '' (вне набора / пусто)."""
+    s = "".join(ch for ch in (e or "") if ch != "️" and not 0x1F3FB <= ord(ch) <= 0x1F3FF)
+    return s if s in TG_REACTIONS else ""
 
 
 def _flag_on(raw) -> bool:
@@ -222,6 +244,8 @@ def history_txt(items) -> bytes:
 
 def who_of(row) -> str:
     kind = wa_kind.kind_of(row["msg_type"], row["echo"], row["history"])
+    if kind == wa_kind.KIND_REACTION:
+        return "мы" if int(row["echo"] or 0) else "клиент"
     if kind == wa_kind.KIND_ECHO:
         return "мы"
     if kind in (wa_kind.KIND_INBOUND, wa_kind.KIND_HISTORY):
@@ -278,6 +302,10 @@ def _is_receipt(row) -> bool:
     return wa_kind.kind_of(row["msg_type"], row["echo"], row["history"]) == wa_kind.KIND_RECEIPT
 
 
+def _is_reaction(row) -> bool:
+    return wa_kind.kind_of(row["msg_type"], row["echo"], row["history"]) == wa_kind.KIND_REACTION
+
+
 _STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS media (key TEXT PRIMARY KEY, row_id INTEGER, state TEXT, path TEXT,
     size INTEGER, mime TEXT, code TEXT, tries INTEGER NOT NULL DEFAULT 0,
@@ -286,8 +314,13 @@ CREATE TABLE IF NOT EXISTS shown (key TEXT PRIMARY KEY, number TEXT, state TEXT,
 CREATE TABLE IF NOT EXISTS topics (number TEXT PRIMARY KEY, thread_id INTEGER, trigger_id INTEGER,
     stage TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS alarmed (row_id INTEGER PRIMARY KEY, ts REAL);
-CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS reacts (target TEXT, side TEXT, emoji TEXT, row_id INTEGER,
+    PRIMARY KEY (target, side))
 """
+# 01.10.2026 (WAREACTNAME0110): id сообщения темы у показанного ключа (solo — ключ один в
+# сообщении, на него можно ставить реакцию) и имя, под которым тема сейчас названа. Только ADD.
+_STATE_ADDED = (("shown", "msg_id", "INTEGER"), ("shown", "solo", "INTEGER"), ("topics", "name", "TEXT"))
 
 
 class Mirror:
@@ -307,6 +340,7 @@ class Mirror:
         self.cap = int(min(CAP_MAX, CAP_SHARE * self.disk_free(self.media_dir)))
         self._init_state(env["state_db"])
         self.sent = deque()
+        self.names_checked = None
         self.ready = False
         self.ready_checked = None
         self.block_reason = ""
@@ -324,6 +358,9 @@ class Mirror:
         for stmt in _STATE_SCHEMA.strip().split(";"):
             if stmt.strip():
                 self.st.execute(stmt)
+        for table, col, decl in _STATE_ADDED:
+            if col not in {r[1] for r in self.st.execute("PRAGMA table_info(%s)" % table)}:
+                self.st.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, decl))
         # обрыв посреди вызова: показано ли — неизвестно; повтор дал бы дубль → не повторяем
         n = self.st.execute("UPDATE shown SET state=? WHERE state=?", (S_UNSURE, S_SENDING)).rowcount
         self.st.commit()
@@ -356,10 +393,29 @@ class Mirror:
     def _rows(self, where, args=()):
         conn = self._q()
         try:
-            return conn.execute("SELECT " + ", ".join(_QCOLS) + " FROM wa_inbox WHERE " + where,
+            # колонки, которых в очереди ещё нет (вход не перезапущен после правки), читаются NULL
+            have = {r[1] for r in conn.execute("PRAGMA table_info(wa_inbox)")}
+            cols = [c if c in have else "NULL AS " + c for c in _QCOLS]
+            return conn.execute("SELECT " + ", ".join(cols) + " FROM wa_inbox WHERE " + where,
                                 args).fetchall()
         finally:
             conn.close()
+
+    def _react_fields(self, row):
+        """Строка реакции → (эмодзи, wamid цели). Строка легла до правки входа (react_to нет) —
+        оба берутся из тела сообщения в той же строке (raw). Не раскрылось → ('', None)."""
+        if row["react_to"]:
+            return row["text"] or "", row["react_to"]
+        conn = self._q()
+        try:
+            raw = conn.execute("SELECT raw FROM wa_inbox WHERE id=?", (row["id"],)).fetchone()
+        finally:
+            conn.close()
+        try:
+            r = (json.loads(raw[0] or "null") or {}).get("reaction") or {}
+            return r.get("emoji") or "", r.get("message_id") or None
+        except (TypeError, ValueError, AttributeError):
+            return "", None
 
     # ── архив копии телефона: только чтение; нет или не читается — причина, а не падение ────
     def _archive(self):
@@ -684,11 +740,13 @@ class Mirror:
     def _is_shown(self, key) -> bool:
         return self.st.execute("SELECT 1 FROM shown WHERE key=?", (key,)).fetchone() is not None
 
-    def _mark(self, keys, number, state):
+    def _mark(self, keys, number, state, result=None):
+        """result — ответ Telegram: его message_id запоминается у ключа (на него ставится реакция)."""
         now = self.clock()
+        mid = result.get("message_id") if isinstance(result, dict) else None
         for k in keys:
-            self.st.execute("INSERT OR REPLACE INTO shown(key, number, state, ts) VALUES (?,?,?,?)",
-                            (k, number, state, now))
+            self.st.execute("INSERT OR REPLACE INTO shown(key, number, state, ts, msg_id, solo) "
+                            "VALUES (?,?,?,?,?,?)", (k, number, state, now, mid, int(len(keys) == 1)))
         self.st.commit()
 
     def _unmark(self, keys):
@@ -699,9 +757,9 @@ class Mirror:
     def _deliver(self, keys, number, method, params, files=None) -> bool:
         """Ключи ставятся ДО вызова: обрыв процесса посреди вызова повтора не даёт."""
         self._mark(keys, number, S_SENDING)
-        ok, _ = self.tg(method, params, files)
+        ok, res = self.tg(method, params, files)
         if ok:
-            self._mark(keys, number, S_SHOWN)
+            self._mark(keys, number, S_SHOWN, res)
             self.counts["shown"] += 1
             return True
         if ok is None:
@@ -743,7 +801,7 @@ class Mirror:
                 name = (r[0] if r else "") or ""
         finally:
             conn.close()
-        return ((name.strip() or "без имени") + " · +" + number.lstrip("+"))[:128]
+        return ((name.strip() or NO_NAME) + " · +" + number.lstrip("+"))[:128]
 
     def show_step(self):
         if not self.show:
@@ -757,25 +815,54 @@ class Mirror:
         for row in self._rows("id >= ? ORDER BY id", (open_from,)):
             num = row["from_number"] or ""
             if num and num not in topics and _is_live(row):
-                thread = self._open_topic(num)
+                name = self._topic_name(num)
+                thread = self._open_topic(name)
                 if thread is None:
                     return
                 topics[num] = (thread, row["id"], T_HEAD)
-                self.st.execute("INSERT INTO topics(number, thread_id, trigger_id, stage, ts) "
-                                "VALUES (?,?,?,?,?)", (num, thread, row["id"], T_HEAD, self.clock()))
+                self.st.execute("INSERT INTO topics(number, thread_id, trigger_id, stage, ts, name) "
+                                "VALUES (?,?,?,?,?,?)", (num, thread, row["id"], T_HEAD, self.clock(), name))
                 self.st.commit()
                 log.info("показ: тема открыта thread=%d по строке=%d", thread, row["id"])
         for num, (thread, trig, stage) in topics.items():
             if not self.ready:
                 return
             self._advance(num, thread, trig, stage)
+        self.rename_step()
 
-    def _open_topic(self, number):
-        ok, res = self.tg("createForumTopic", {"chat_id": self.env["tg_chat"],
-                                               "name": self._topic_name(number)})
+    def _open_topic(self, name):
+        ok, res = self.tg("createForumTopic", {"chat_id": self.env["tg_chat"], "name": name})
         if not ok:
             return None
         return int(res.get("message_thread_id"))
+
+    def rename_step(self):
+        """Имя темы догоняет имя клиента: появилось или сменилось — editForumTopic ОДИН раз на смену.
+        Имени нет — тему не трогаем (прежнее имя «без имени» не затирает). Тема, открытая до
+        правки (имя не записано), сверяется один раз: 400 «не изменено» — тоже «записано»."""
+        now = self.clock()
+        if self.names_checked is not None and now - self.names_checked < RENAME_EVERY:
+            return
+        self.names_checked = now
+        for num, thread, stored in self.st.execute("SELECT number, thread_id, name FROM topics").fetchall():
+            if not self.ready:
+                return
+            name = self._topic_name(num)
+            if name == stored:
+                continue
+            if name.startswith(NO_NAME + " · "):
+                if stored is None:
+                    self._topic_named(num, name)
+                continue
+            ok, res = self.tg("editForumTopic", {"chat_id": self.env["tg_chat"],
+                                                 "message_thread_id": thread, "name": name})
+            if ok or (ok is False and res == 400):
+                self._topic_named(num, name)
+                log.info("показ: имя темы thread=%d %s", thread, "переименована" if ok else "уже то (400)")
+
+    def _topic_named(self, number, name):
+        self.st.execute("UPDATE topics SET name=? WHERE number=?", (name, number))
+        self.st.commit()
 
     def _stage(self, number, stage):
         self.st.execute("UPDATE topics SET stage=? WHERE number=?", (stage, number))
@@ -784,7 +871,8 @@ class Mirror:
     def _advance(self, num, thread, trig, stage):
         rows = [r for r in self._rows("from_number=? ORDER BY id", (num,)) if not _is_receipt(r)]
         if stage != T_LIVE:
-            items, missing = self.prehistory(num, rows, trig)
+            # реакции — не реплики: в предысторию не идут, живые ставятся на своё сообщение ниже
+            items, missing = self.prehistory(num, [r for r in rows if not _is_reaction(r)], trig)
             tail = items[-TAIL_N:]
         if stage == T_HEAD:                                   # шапка: писал ли раньше, чего нет
             if not self._is_shown("head:" + num):
@@ -836,8 +924,82 @@ class Mirror:
                 key = "msg:" + _row_key(r)
                 if self._is_shown(key):
                     continue
-                if not self._show_one(num, thread, r, key):
+                if _is_reaction(r):
+                    if int(r["history"] or 0):
+                        continue                              # досинхрон: не живое
+                    if not self._react_one(num, thread, r, key):
+                        return
+                elif not self._show_one(num, thread, r, key):
                     return
+
+    def _target_msg(self, target):
+        """wamid цели → id сообщения темы, где она показана ОДНА (текстом или файлом) · None."""
+        for k in ("msg:" + target, "file:" + target):
+            r = self.st.execute("SELECT msg_id FROM shown WHERE key=? AND state=? AND solo=1 "
+                                "AND msg_id IS NOT NULL", (k, S_SHOWN)).fetchone()
+            if r:
+                return int(r[0])
+        return None
+
+    def _react_one(self, num, thread, r, key) -> bool:
+        """Реакция → реакция бота на сообщение темы с её целью; иначе — короткая строка.
+        Одна реакция бота на сообщение: держится последняя непустая из сторон «клиент»/«мы»;
+        снятие одной стороны возвращает реакцию другой. Ключ строки — как у всех ("msg:"+wamid),
+        поэтому повтор тела и рестарт второй раз её не ставят."""
+        emoji, target = self._react_fields(r)
+        who = who_of(r)
+        mid = prev = None
+        if target:
+            prev = self.st.execute("SELECT emoji FROM reacts WHERE target=? AND side=?",
+                                   (target, who)).fetchone()
+            self.st.execute("INSERT OR REPLACE INTO reacts(target, side, emoji, row_id) VALUES (?,?,?,?)",
+                            (target, who, emoji, r["id"]))
+            self.st.commit()
+            mid = self._target_msg(target)
+        line = None
+        self._mark([key], num, S_SENDING)
+        if mid is not None:
+            cur = self.st.execute("SELECT emoji FROM reacts WHERE target=? AND side<>? AND emoji<>'' "
+                                  "ORDER BY row_id DESC LIMIT 1", (target, SIDE_TG)).fetchone()
+            want = tg_emoji(cur[0]) if cur else ""
+            held = self.st.execute("SELECT emoji FROM reacts WHERE target=? AND side=?",
+                                   (target, SIDE_TG)).fetchone()
+            if want != (held[0] if held else ""):
+                ok, res = self.tg("setMessageReaction", {
+                    "chat_id": self.env["tg_chat"], "message_id": mid,
+                    "reaction": [{"type": "emoji", "emoji": want}] if want else []})
+                if ok is None:
+                    self._mark([key], num, S_UNSURE)
+                    return False
+                if ok:
+                    self.st.execute("INSERT OR REPLACE INTO reacts(target, side, emoji, row_id) "
+                                    "VALUES (?,?,?,?)", (target, SIDE_TG, want, r["id"]))
+                    self.st.commit()
+                elif res == 400:
+                    line = True                               # чат не принял — строкой
+                else:
+                    self._unmark([key])
+                    return False
+            if emoji and not tg_emoji(emoji):
+                line = True                                   # вне набора Telegram — строкой
+            elif not emoji and prev and prev[0] and not tg_emoji(prev[0]):
+                line = True                                   # снята реакция, показанная строкой
+        else:
+            line = True                                       # цель не показана отдельным сообщением
+        if not line:
+            self._mark([key], num, S_SHOWN)
+            self.counts["shown"] += 1
+            return True
+        self._unmark([key])
+        tgt = self._rows("wamid=?", (target,)) if target else []
+        what, pre = (("реакция " + emoji, "на") if emoji else ("снял реакцию", "с"))
+        to = ("%s «%s»" % (pre, body_of(tgt[0])[:40])) if tgt else \
+            ("на сообщение" if emoji else "с сообщения") + " не из этой темы"
+        params = {"chat_id": self.env["tg_chat"], "message_thread_id": thread,
+                  "text": "%s %s: %s %s" % (pk_time(r["ts_msg"] or r["ts_queued"]), who, what, to)}
+        if mid is not None:
+            params["reply_parameters"] = {"message_id": mid, "allow_sending_without_reply": True}
+        return self._deliver([key], num, "sendMessage", params)
 
     def _show_one(self, num, thread, r, key) -> bool:
         head = "%s %s" % (pk_time(r["ts_msg"] or r["ts_queued"]), who_of(r))

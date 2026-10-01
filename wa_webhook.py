@@ -160,6 +160,8 @@ _ADDED_COLUMNS = (
     ("caption",      "TEXT"),
     ("media_note",   "TEXT"),       # 'no_file' — заглушка без файла · 'file_late' — файл догнал
     ("enriched_at",  "INTEGER"),    # когда повтор того же wamid дополнил строку
+    # 01.10.2026 (WAREACTNAME0110) — реакция: wamid сообщения-цели; эмодзи — в text, снятие — ''
+    ("react_to",     "TEXT"),
 )
 
 _PULL_INDEX = "CREATE INDEX IF NOT EXISTS idx_wa_pull ON wa_inbox(acked_at, delivered_at, id)"
@@ -189,8 +191,9 @@ _ENRICH_FIELDS = (
     ("mime",     "mime"),
     ("caption",  "caption"),
     ("name",     "name"),
+    ("react_to", "react_to"),
 )
-_ENRICH_COLS = ("msg_type", "text", "media_id", "mime", "caption", "name", "media_note")
+_ENRICH_COLS = ("msg_type", "text", "media_id", "mime", "caption", "name", "media_note", "react_to")
 
 
 def _blank(v) -> bool:
@@ -276,8 +279,8 @@ class WAQueueDB:
                             """INSERT OR IGNORE INTO wa_inbox
                                (ts_queued, channel, from_number, name, msg_type, text, media_id,
                                 ts_msg, echo, history, status, raw, wamid, source,
-                                mime, caption, media_note)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?,?,?)""",
+                                mime, caption, media_note, react_to)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?,?,?,?)""",
                             (
                                 now,
                                 ev.get("channel", "wa"),
@@ -295,6 +298,7 @@ class WAQueueDB:
                                 ev.get("mime"),
                                 ev.get("caption"),
                                 ev.get("media_note"),
+                                ev.get("react_to"),
                             ),
                         )
                         if conn.execute("SELECT changes()").fetchone()[0]:
@@ -483,7 +487,7 @@ def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -
     msg_type = msg.get("type", "")
     text = None
     media_id = None
-    mime = caption = media_note = None
+    mime = caption = media_note = react_to = None
     if msg_type == "text":
         text = (msg.get("text") or {}).get("body")
     elif msg_type in _MEDIA_TYPES:
@@ -501,6 +505,12 @@ def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -
             text = (intr.get("button_reply") or {}).get("title")
         elif kind == "list_reply":
             text = (intr.get("list_reply") or {}).get("title")
+    elif msg_type == wa_kind.REACTION_TYPE:
+        # реакция: эмодзи → text, wamid цели → react_to. Снятие реакции Meta шлёт тем же видом
+        # без эмодзи (пусто или ключа нет) — в строку ложится '' и это слово «снята».
+        r = msg.get("reaction") if isinstance(msg.get("reaction"), dict) else {}
+        text = r.get("emoji") or ""
+        react_to = r.get("message_id") or None
     return {
         "channel":    "wa",
         "from":       number,
@@ -511,6 +521,7 @@ def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -
         "mime":       mime,
         "caption":    caption,
         "media_note": media_note,
+        "react_to":   react_to,
         "ts":         int(msg.get("timestamp") or 0),
         "echo":       echo,
         "history":    history,

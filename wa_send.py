@@ -241,7 +241,7 @@ def last_inbound_ts(number, db_path=None):
     Исходы: `unreadable` — базы нет либо она не читается; `empty` — прочитали, входящих этого
     номера нет; `ok` — прочитали и метка есть. Только чтение. Эхо своих исходящих и квитанции
     статусов входящими не считаются: окно открывает сообщение КЛИЕНТА, а не наше о нём
-    представление.
+    представление. Реакция клиента (эмодзи на сообщение, 01.10.2026) окно тоже не открывает.
     """
     path = db_path or os.environ.get("WA_QUEUE_DB") or os.path.join(ROOT, "wa_queue.db")
     if not str(number or "").strip():
@@ -253,7 +253,8 @@ def last_inbound_ts(number, db_path=None):
             row = conn.execute(
                 """SELECT COUNT(*), MAX(COALESCE(NULLIF(ts_msg, 0), ts_queued))
                      FROM wa_inbox
-                    WHERE from_number = ? AND echo = 0 AND msg_type <> 'status'""",
+                    WHERE from_number = ? AND echo = 0 AND msg_type <> 'status'
+                      AND msg_type <> 'reaction'""",
                 (str(number),),
             ).fetchone()
     except Exception as e:
