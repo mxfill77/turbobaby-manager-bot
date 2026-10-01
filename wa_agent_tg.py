@@ -255,11 +255,13 @@ def wa_emoji(tg) -> str:
 
 class Tg(wa_agent.Telegram):
     def __init__(self, token, enabled=False, chat_id=AGENTS_CHAT, show_chat=None, mirror_db=None,
-                 http=None, clock=time.time, log=None, react=False, react_send=None, relay=False):
+                 http=None, clock=time.time, log=None, react=False, react_send=None, relay=False, watch=False):
         self.token = token or ""
         self.enabled = bool(enabled) and bool(self.token)
         self.react = bool(react) and bool(self.token)
         self.relay = bool(relay) and bool(self.token)
+        # ожидание «клиент без ответа» (WAUNANSWERED0210): только пишет в «Агенты», читателя не заводит
+        self.watch = bool(watch) and bool(token)
         self.react_send = react_send
         self.chat = int(chat_id)
         self.show_chat = show_chat
@@ -288,7 +290,7 @@ class Tg(wa_agent.Telegram):
     def api(self, method, params, timeout=30, quiet=()):
         """→ (True, result) · (False, код|описание) · (None, 'net'). Выключено — сети нет вовсе.
         quiet — коды, которые вызывающий пишет в журнал сам (409 опроса — одной строкой на серию)."""
-        if not self.reading:
+        if not (self.reading or self.watch):
             return False, "выключено"
         status, body = self.http("POST", TG_BASE + "/bot" + self.token + "/" + method,
                                  {"Content-Type": "application/json"},
@@ -391,6 +393,14 @@ class Tg(wa_agent.Telegram):
         self.db.execute("INSERT OR REPLACE INTO tg_pauses(cid, pause_no, msg_id, body) VALUES(?,?,?,?)",
                         (cid, int(pause_no), mid, body))
         self.log("вопрос паузы: клиент %d пауза %d → сообщение %s" % (cid, pause_no, mid))
+
+    def watch_alarm(self, number, text):
+        """Тревога ожидания «клиент без ответа» (WAUNANSWERED0210) — одно сообщение в «Агенты», без кнопок.
+        → (True, message_id) · (False, код | 'выключено') · (None, 'net')."""
+        if not self.watch:
+            return False, "выключено"
+        ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": str(text)[:TG_TEXT_MAX]})
+        return (True, int(res.get("message_id"))) if ok else (ok, res)
 
     # ── приём обновлений ──────────────────────────────────────────────────────────────────
 

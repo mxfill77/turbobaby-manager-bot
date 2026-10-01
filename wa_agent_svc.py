@@ -16,6 +16,9 @@
                     (WARELAYTEXT0210); медиа из темы своим видом (WARELAYMEDIA0210). Дверь та же — WA_SEND.
   WA_SEND        — дверь. Выключена — «Отправить» отвечает «отправка выключена» ДО двери
                     (`Core.press` спрашивает `SendDoor.is_open`), черновик ждёт.
+  WA_AGENT_WATCH — ожидание «клиент без ответа» (`wa_watch.Watch`, WAUNANSWERED0210): последнее
+                    сообщение клиента без нашего ответа дольше порога — одно сообщение в «Агенты».
+                    Читателя getUpdates не заводит; от черновиков, пауз и двери не зависит.
 Все выключены — ни одного вызова Telegram и двери: такт ядра читает только очередь (mode=ro).
 
 ЦИКЛ — `wa_agent_tg.run`, один поток; читатель `getUpdates` у бота показа ОДИН — эта служба. Второй
@@ -33,12 +36,14 @@ import time
 import wa_agent
 import wa_agent_tg
 import wa_send
+import wa_watch
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SUMMARY_EVERY = 300                       # сводка числами раз в 5 минут
 F_DRAFTS, F_CARDS, F_REACT, F_SEND = "WA_AGENT_DRAFTS", "WA_AGENT_CARDS", "WA_AGENT_REACT", "WA_SEND"
 F_RELAY = "WA_AGENT_RELAY"                # тема клиента → WhatsApp (WARELAYTEXT0210)
-FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND)
+F_WATCH = "WA_AGENT_WATCH"                # ожидание «клиент без ответа» (WAUNANSWERED0210)
+FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
 log = logging.getLogger("wa_agent")
@@ -124,11 +129,14 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     drafts = flags[F_DRAFTS] and model is not None
     tg = wa_agent_tg.Tg(env.get("tg_token"), enabled=flags[F_CARDS], show_chat=env.get("show_chat"),
                         mirror_db=env.get("mirror_db"), http=http, clock=clock, log=line,
-                        react=flags[F_REACT], react_send=react_send, relay=flags[F_RELAY])
+                        react=flags[F_REACT], react_send=react_send, relay=flags[F_RELAY], watch=flags[F_WATCH])
     door = SendDoor(env["queue_db"], environ=environ, send=send, send_media=send_media)
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                          log=line, drafts=drafts)
     tg.bind(core)
+    # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram
+    core.watch = wa_watch.Watch(core.db, env["queue_db"], tg.watch_alarm, head=tg._head, clock=clock,
+                                log=line) if tg.watch else None
     words = {
         F_DRAFTS: ("вкл" if drafts else "выкл") + ("" if drafts or not flags[F_DRAFTS]
                                                    else " (флаг 1, адаптера модели нет)"),
@@ -139,6 +147,8 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
         F_RELAY: ("вкл" if tg.relay else "выкл") + ("" if tg.relay or not flags[F_RELAY]
                                                     else " (флаг 1, ключа бота нет)"),
         F_SEND: "вкл" if door.is_open() else "выкл",
+        F_WATCH: ("вкл" if tg.watch else "выкл") + ("" if tg.watch or not flags[F_WATCH]
+                                                    else " (флаг 1, ключа бота нет)"),
     }
     return core, tg, flags, words
 
@@ -163,11 +173,13 @@ def summary(core, tg, words, stats):
     paused = db.execute("SELECT COUNT(*) FROM clients WHERE paused=1").fetchone()[0]
     reacts = dict(db.execute("SELECT outcome, COUNT(*) FROM tg_react_out GROUP BY outcome").fetchall())
     relays = dict(db.execute("SELECT state, COUNT(*) FROM relay GROUP BY state").fetchall())
+    watch = getattr(core, "watch", None)
     return ("сводка: %s · черновики %s · карточек %d · на паузе %d · реакций наружу %s · из тем %s · "
-            "опросов ok=%d сбой=%d 409=%d · тактов %d упало %d"
+            "опросов ok=%d сбой=%d 409=%d · тактов %d упало %d%s"
             % (" ".join("%s=%s" % (k, words[k].split(" ")[0]) for k in FLAGS), _pairs(core.counts()),
                cards, paused, _pairs(reacts), _pairs(relays), tg.polls["ok"], tg.polls["fail"], tg.polls["conflict"],
-               stats.get("ticks", 0), stats.get("tick_fail", 0)))
+               stats.get("ticks", 0), stats.get("tick_fail", 0),
+               " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else ""))
 
 
 def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every=SUMMARY_EVERY,
@@ -175,8 +187,14 @@ def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every
     """Цикл службы: `wa_agent_tg.run` + сводка раз в `every` секунд (первая — сразу)."""
     line = line or (lambda s: log.info("%s", s))
     stats, last = {}, [None]
+    watch = getattr(core, "watch", None)
 
     def on_turn(now):
+        if watch is not None:
+            try:
+                watch.tick(now)                                     # сам не чаще раза в wa_watch.EVERY
+            except Exception as e:                                   # noqa: BLE001
+                line("ожидание упало: %s" % type(e).__name__)
         if last[0] is None or now - last[0] >= every:
             last[0] = now
             try:
