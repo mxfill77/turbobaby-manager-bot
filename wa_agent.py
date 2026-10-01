@@ -334,12 +334,18 @@ class Core:
 
     # ── нажатие ───────────────────────────────────────────────────────────────────────────
 
-    def _decided(self, draft_id):
+    def _decided(self, draft_id, ver=None):
+        """Слова проигравшему. ver — версия нажатой кнопки: прежняя версия отвечает «устарело»."""
         row = self.db.execute("SELECT state, decided_by, decided_at, closed_at, ver FROM drafts "
                               "WHERE id=?", (draft_id,)).fetchone()
         if not row:
             return "черновика нет"
-        state, by, at, closed, ver = row
+        state, by, at, closed, ver_now = row
+        if ver is not None and int(ver) != ver_now:
+            return "устарело: версия %d, действует версия %d — %s" % (
+                int(ver), ver_now, "жмите кнопки новой карточки" if state == PENDING
+                else self._decided(draft_id))
+        ver = ver_now
         if by:
             return "уже решено: %s, %s — %s" % (by, _hm(at), state)
         return "уже решено: снят, %s — %s (версия %d)" % (_hm(closed), state, ver)
@@ -354,7 +360,7 @@ class Core:
                             "WHERE id=? AND state='pending' AND ver=?",
                             (target, who, now, draft_id, int(ver))).rowcount
         if n != 1:
-            return {"ok": False, "state": None, "words": self._decided(draft_id)}
+            return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
         number, upto, text = self.db.execute("SELECT number, upto_id, text FROM drafts WHERE id=?",
                                              (draft_id,)).fetchone()
         if action == ACT_DECLINE:
@@ -396,15 +402,26 @@ class Core:
         self._tg("card_done", draft_id, self._card(draft_id), "%s: %s, %s" % (state, who, _hm(now)))
         return {"ok": state == SENT, "state": state, "words": state}
 
-    def revise(self, draft_id, text, who, now=None):
-        """«Исправить»: текст человека, версия +1; кнопки прежней версии отвечают «уже решено»."""
+    def revise(self, draft_id, text, who, now=None, ver=None):
+        """«Исправить»: текст человека, версия +1; кнопки прежней версии отвечают «устарело».
+        ver — версия карточки, на которую ответили реплаем: правка прежней версии не принимается
+        (тот же замок, что у нажатия). Принята — прежняя карточка «устарело», новая карточка с
+        версией +1; «Отправить» на ней шлёт текст человека дословно."""
         now = self.clock() if now is None else now
         if not (text or "").strip():
             return False
-        n = self.db.execute("UPDATE drafts SET text=?, ver=ver+1 WHERE id=? AND state='pending'",
-                            (text, draft_id)).rowcount
+        q, args = "UPDATE drafts SET text=?, ver=ver+1 WHERE id=? AND state='pending'", (text, draft_id)
+        if ver is not None:
+            q, args = q + " AND ver=?", args + (int(ver),)
+        n = self.db.execute(q, args).rowcount
         if n == 1:
-            self.log("черновик %d исправлен (%s)" % (draft_id, who))
+            number, ver_now, old_card = self.db.execute(
+                "SELECT number, ver, card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
+            self.log("черновик %d исправлен → версия %d (%s)" % (draft_id, ver_now, who))
+            self._tg("card_done", draft_id, old_card,
+                     "устарело: исправлено — %s, %s, действует версия %d" % (who, _hm(now), ver_now))
+            card = self._tg("card", draft_id, ver_now, number, text)
+            self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, draft_id))
         return n == 1
 
     def _card(self, draft_id):
@@ -416,5 +433,5 @@ class Core:
 
 
 if __name__ == "__main__":
-    raise SystemExit("wa_agent: ядро без рук (WAAGENTCORE0110) — службы, Telegram и модели ещё нет; "
-                     "запуск — шаги 3–4 плана WAAGENTLIVE0110 §7")
+    raise SystemExit("wa_agent: ядро без рук (WAAGENTCORE0110) — Telegram в wa_agent_tg.py (WAAGENTTG0110), "
+                     "службы и модели ещё нет; запуск — шаги 4–5 плана WAAGENTLIVE0110 §7")
