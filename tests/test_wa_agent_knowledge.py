@@ -235,7 +235,8 @@ def test_mask_catches_samples():
 
 def test_mask_keeps_price_date_phone():
     text = ("Цена 11 241 ฿ за 27 суток, 416 ฿ в сутки, депозит 15 000 ฿, с 04.10.2026 по 31.10.2026 "
-            "(2026-10-04), звоните +66 81 234 5678, +66812345678 или 89161234567, байк CB 300R, PCX160, "
+            "(2026-10-04), звоните +66 81 234 5678, +66812345678 или 89161234567, номер для кода: 89161234567, "
+            "байк CB 300R, PCX160, "
             "в 10:00, ссылка https://maps.app.goo.gl/AbCdEf12345XyZ и www.turbobaby.example/bikes/pcx160")
     out, n = K.mask(text)
     assert out == text and n == 0, out

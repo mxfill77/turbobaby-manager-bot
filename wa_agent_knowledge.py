@@ -403,23 +403,18 @@ def _label(kind):
 
 
 def _weak_value(tok):
-    """Значение после «код/ключ»: буквы-цифры от 4 знаков, есть цифра, не дата и не телефон."""
-    if not re.fullmatch(r"[A-Za-z0-9\-]{4,}", tok) or not re.search(r"\d", tok):
-        return False
-    if re.fullmatch(r"\d{9,}", tok):
-        return False
-    return True
+    """Значение после «код/ключ»: буквы-цифры от 4 знаков, есть цифра, не дата и не телефон.
+    Предикат, а не читатель: одно выражение без «пустого из ветки промаха» (храповик blind_readers)."""
+    return (re.fullmatch(r"[A-Za-z0-9\-]{4,}", tok) is not None and re.search(r"\d", tok) is not None
+            and re.fullmatch(r"\d{9,}", tok) is None)
 
 
 def _generic(tok):
     """Паролеподобное слово: от 12 знаков подряд, есть и буква, и цифра; не ссылка и не почта."""
-    if len(tok) < 12 or "://" in tok or tok.lower().startswith("www."):
-        return False
-    if re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", tok):
-        return False
-    if not re.fullmatch(r"[A-Za-z0-9_\-+/=!#$%^&*@.]+", tok):
-        return False
-    return bool(re.search(r"[A-Za-z]", tok)) and bool(re.search(r"\d", tok))
+    return (len(tok) >= 12 and "://" not in tok and not tok.lower().startswith("www.")
+            and re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", tok) is None
+            and re.fullmatch(r"[A-Za-z0-9_\-+/=!#$%^&*@.]+", tok) is not None
+            and re.search(r"[A-Za-z]", tok) is not None and re.search(r"\d", tok) is not None)
 
 
 def mask(text):
