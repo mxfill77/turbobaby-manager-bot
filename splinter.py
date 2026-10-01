@@ -4071,6 +4071,171 @@ _PENDING_MILEAGE_TTL = 3 * 3600
 _CONFIRM_YES = {"да", "ага", "верно", "ок", "окей", "yes", "ใช่", "ถูก", "ถูกต้อง", "ถูกต้องครับ"}
 _CONFIRM_NO = {"нет", "не", "no", "ไม่", "ไม่ใช่"}
 
+# === ВОПРОС О ПРОБЕГЕ НА ДИСКЕ + ОТВЕТ РЕПЛАЕМ (01.10.2026, задание Штаба 0088-76e, SPLODOREPLY0110) ===
+# Живой случай: NMAX 155 BLACK 8952, тема 74. Вопрос «Вижу пробег 38872» ушёл 30.09 в 11:23 UTC,
+# в 18:23 UTC splinter перезапустился (память `_PENDING_MILEAGE` стёрта), а ответ Пыма «38972»
+# реплаем пришёл 01.10 в 06:08 UTC — через 18 ч 45 мин. Перехват его не взял (вопроса в памяти
+# нет, да и срок 3 ч вышел): число ушло в разговорный мозг, оттуда переспрос и лишняя карточка.
+# Реплай на сообщение-вопрос однозначен: человек отвечает ИМЕННО на этот вопрос. Поэтому срок
+# `_PENDING_MILEAGE_TTL` судит только ответ БЕЗ реплая — он прежний (корень 5: вопрос 46-часовой
+# давности не смеет съесть случайное сообщение). Реплай же оживляет вопрос в ЛЮБОМ возрасте и
+# после перезапуска: для этого вопрос лежит на диске вместе с id своего сообщения. Узнаётся ТОЛЬКО
+# ответ — число (правка) или да/нет; прочий текст реплаем вопрос не оживляет. Доверие к
+# отвечающему прежнее — его судит `handle_mileage_confirm`, куда оживлённый вопрос и попадает.
+# Отвеченный вопрос (текстом или кнопкой) с диска снимается: второй реплай не запишет то же
+# дважды. Новый вопрос в теме заменяет прежний — реплай на старый сообщение не узнаётся.
+# FAIL-SAFE: файл не прочитан/не записан → поведение прежнее. Откат: `MILEAGE_Q_PERSIST=0` + рестарт.
+_MILEAGE_Q = {}                 # "chat:topic" -> {chat, topic, msg_id, mileage, bike, oil_hint, ts}
+_MILEAGE_Q_LOADED = False       # память с диска поднимается один раз за процесс
+_MILEAGE_Q_SAID = False         # путь памяти называем в журнале ОДИН раз
+
+
+def _mileage_q_persist():
+    """Ручка отката: `MILEAGE_Q_PERSIST=0` + рестарт splinter → вопрос живёт только в памяти."""
+    return str(os.getenv("MILEAGE_Q_PERSIST", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _mileage_q_path():
+    """Файл памяти вопросов. Явная подмена сильнее всего; у прогона тестов — свой файл на процесс
+    (тот же приём, что у меток кнопок и замка подсказок)."""
+    global _MILEAGE_Q_SAID
+    p = os.getenv("MILEAGE_Q_STATE")
+    if not p:
+        p = (f"/tmp/mileage_q_test_{os.getpid()}.json"
+             if any(os.getenv(m) for m in _HINT_TEST_MARKS)
+             else os.path.join(os.path.dirname(os.path.abspath(__file__)), "mileage_question_state.json"))
+    if not _MILEAGE_Q_SAID:
+        _MILEAGE_Q_SAID = True
+        log.info(f"  📟 вопросы о пробеге: память в {p}")
+    return p
+
+
+def _mileage_q_key(chat_id, topic_id):
+    return f"{chat_id}:{topic_id}"
+
+
+def _mileage_q_load():
+    """Поднять вопросы с диска ОДИН раз за процесс. Любая беда → пустая память (поведение прежнее)."""
+    global _MILEAGE_Q_LOADED
+    if _MILEAGE_Q_LOADED or not _mileage_q_persist():
+        return
+    _MILEAGE_Q_LOADED = True
+    try:
+        with open(_mileage_q_path(), encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return
+        n = 0
+        for k, v in raw.items():
+            if isinstance(v, dict) and v.get("msg_id") is not None and str(k) not in _MILEAGE_Q:
+                _MILEAGE_Q[str(k)] = v
+                n += 1
+        log.info(f"  📟 вопросы о пробеге подняты с диска: {n}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning(f"  → память вопросов о пробеге не прочиталась ({e}) — реплай узнаётся только в процессе")
+
+
+def _mileage_q_save():
+    """Записать память вопросов (через временный файл: оборванная запись не бьёт прежнюю)."""
+    if not _mileage_q_persist():
+        return
+    try:
+        p = _mileage_q_path()
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(_MILEAGE_Q, f, ensure_ascii=False, default=str)
+        os.replace(p + ".tmp", p)
+    except Exception as e:
+        log.warning(f"  → память вопросов о пробеге не записалась: {e}")
+
+
+def _mileage_q_remember(chat_id, topic_id, sent, mileage, bike, oil_hint=False):
+    """Вопрос задан → запомнить его вместе с id сообщения. `sent` — то, что вернул `_send`/
+    `_hint_send`. Повтор подавлен замком (`HINT_SKIPPED`) → вопрос стоит прежним сообщением: тот же
+    вопрос (то же число) на диске остаётся как есть; иначе id неизвестен и запись снимается
+    (реплай не узнаётся — поведение прежнее). Не бросает."""
+    try:
+        _mileage_q_load()
+        k = _mileage_q_key(chat_id, topic_id)
+        old = _MILEAGE_Q.get(k)
+        if sent is HINT_SKIPPED and old and str(old.get("mileage")) == str(mileage):
+            return
+        mid = None if sent is HINT_SKIPPED else getattr(sent, "message_id", None)
+        if mid is None:
+            if _MILEAGE_Q.pop(k, None) is not None:
+                _mileage_q_save()
+            return
+        _MILEAGE_Q[k] = {"chat": chat_id, "topic": topic_id, "msg_id": int(mid),
+                         "mileage": str(mileage), "bike": bike or "", "oil_hint": bool(oil_hint),
+                         "ts": _time.time()}
+        _mileage_q_save()
+        log.info(f"  📟 вопрос о пробеге {mileage} ({bike or '?'}) запомнен: сообщение {mid}, тема {topic_id}")
+    except Exception:
+        log.exception("  → вопрос о пробеге не запомнился (реплай узнаётся только в пределах срока)")
+
+
+def _mileage_q_forget(chat_id, topic_id, why=""):
+    """Вопрос отвечен или заменён другим → снять с диска. Не бросает."""
+    try:
+        _mileage_q_load()
+        if _MILEAGE_Q.pop(_mileage_q_key(chat_id, topic_id), None) is not None:
+            _mileage_q_save()
+            log.info(f"  📟 вопрос о пробеге в теме {topic_id} снят с диска ({why or '—'})")
+    except Exception:
+        log.exception("  → вопрос о пробеге не снялся с диска")
+
+
+def _mileage_q_answer_shape(text):
+    """Текст — ответ на вопрос о пробеге в том же смысле, что у `handle_mileage_confirm`:
+    да / нет / число от 4 цифр."""
+    t = (text or "").strip().lower()
+    if t in _CONFIRM_YES or t in _CONFIRM_NO:
+        return True
+    return bool(_re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", "")))
+
+
+def revive_mileage_question_by_reply(msg) -> bool:
+    """Ответ РЕПЛАЕМ на сообщение-вопрос о пробеге → вопрос снова открыт (в памяти, свежей
+    меткой), в любом возрасте и после перезапуска. Дальше его берёт прежний перехват роутера
+    (`handle_mileage_confirm`) со всеми прежними правилами: доверие к «да», сторожа, B1.
+    Узнаётся ТОЛЬКО реплай в ТОМ ЖЕ чате и ТОЙ ЖЕ теме на ТО САМОЕ сообщение-вопрос, и только
+    текст-ответ (число / да / нет). Всё прочее → False, поток прежний. Не бросает."""
+    try:
+        r = getattr(msg, "reply_to_message", None)
+        # служебное сообщение создания темы Telegram кладёт в reply_to_message КАЖДОМУ сообщению
+        # темы — реплаем это не является
+        if r is None or getattr(r, "forum_topic_created", None):
+            return False
+        rid = getattr(r, "message_id", None)
+        if rid is None:
+            return False
+        chat_id = msg.chat_id
+        topic_id = getattr(msg, "message_thread_id", None)
+        rchat = getattr(getattr(r, "chat", None), "id", None)
+        if rchat is not None and rchat != chat_id:
+            return False
+        if not _mileage_q_answer_shape(getattr(msg, "text", None)):
+            return False
+        _mileage_q_load()
+        q = _MILEAGE_Q.get(_mileage_q_key(chat_id, topic_id))
+        if not q or str(q.get("msg_id")) != str(rid):
+            return False
+        if q.get("chat") != chat_id or q.get("topic") != topic_id:
+            return False
+        try:
+            age_h = (_time.time() - float(q.get("ts") or 0)) / 3600.0
+        except (TypeError, ValueError):
+            age_h = -1.0
+        _PENDING_MILEAGE[(chat_id, topic_id)] = (str(q.get("mileage") or ""), q.get("bike") or "", None,
+                                                 bool(q.get("oil_hint")), _time.time())
+        log.info(f"  📟 реплай на вопрос о пробеге {q.get('mileage')} (сообщение {rid}, возраст "
+                 f"{age_h:.1f} ч, тема {topic_id}) — вопрос открыт снова, ответ идёт в перехват")
+        return True
+    except Exception:
+        log.exception("  → реплай на вопрос о пробеге не разобран (поток прежний)")
+        return False
+
 # === Фикс _row22: текстовая КОРРЕКЦИЯ пробега после уже сделанной записи ===
 # Кейс: vision/«да» записали неверный пробег (напр. 39374 вместо 33974), человек поправляет
 # ТЕКСТОМ «не верно пробег 33974». Раньше это уходило в мозг (болтал, не переписывал), а правка
@@ -4482,6 +4647,7 @@ async def _odo_lower_commit(context, bridge, chat_id, topic_id, low, plan, who, 
     _ODO_LOWER_PENDING.pop((chat_id, topic_id), None)
     _SOFT_ODO_PENDING.pop((chat_id, topic_id), None)
     _PENDING_MILEAGE.pop((chat_id, topic_id), None)
+    _mileage_q_forget(chat_id, topic_id, why="понижение с пояснением")
     clear_awaiting(chat_id, topic_id)
     _odo_drop_record(bike)
 
@@ -4779,12 +4945,17 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
                              if _cand else " Пришли верное число или чёткое фото одометра")
                     _p_th = (f" น่าจะเป็น {_cand} กม.? หรือส่งเลขที่ถูกต้อง" if _cand
                              else " ส่งเลขที่ถูกต้องหรือรูปเลขไมล์ชัดๆ")
-                    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                                text=(f"🐀 Splinter\n"
-                                      f"🇹🇭 อ่านได้ {mileage} กม. แต่ล่าสุด {_cv['cur']} กม. "
-                                      f"ต่างกัน {_cv['gap']} กม. — ไม่น่าเป็นไปได้.{_p_th} 🙏\n"
-                                      f"🇷🇺 📟 Вижу {mileage} км, а последний известный {_cv['cur']} км: "
-                                      f"разница {_cv['gap']} км неправдоподобна.{_p_ru} 🙏"))
+                    _sent_c = await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                                          text=(f"🐀 Splinter\n"
+                                                f"🇹🇭 อ่านได้ {mileage} กม. แต่ล่าสุด {_cv['cur']} กม. "
+                                                f"ต่างกัน {_cv['gap']} กม. — ไม่น่าเป็นไปได้.{_p_th} 🙏\n"
+                                                f"🇷🇺 📟 Вижу {mileage} км, а последний известный {_cv['cur']} км: "
+                                                f"разница {_cv['gap']} км неправдоподобна.{_p_ru} 🙏"))
+                    # SPLODOREPLY0110: вопрос «вероятно N?» — тоже вопрос о пробеге, реплай на него узнаётся
+                    if _cand:
+                        _mileage_q_remember(chat_id, topic_id, _sent_c, _cand, bike, oil_hint)
+                    else:
+                        _mileage_q_forget(chat_id, topic_id, "новое показание без кандидата")
                     return
         except Exception:
             log.exception("  → сверка показания вверх не удалась (fail-safe: вопрос «верно?», как был)")
@@ -4795,6 +4966,9 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
     mark_awaiting(chat_id, topic_id)
 
     if floor is not None:
+        # SPLODOREPLY0110: вопрос о понижении живёт своим состоянием (не на диске) — прежний вопрос
+        # темы заменён, реплай на него узнаваться не должен.
+        _mileage_q_forget(chat_id, topic_id, "вопрос о понижении")
         # Мягкий гейт (задача 383): вместо жёсткого отказа — переспрос.
         delta = floor - new_km
         consec = _odo_is_consec(bike)
@@ -4857,6 +5031,9 @@ async def _ask_mileage_confirm(context, chat_id, topic_id, bike, mileage, oil_hi
     )
     if sent is not HINT_SKIPPED:
         _remember_cycle_msg(chat_id, topic_id, sent)   # ЧАСТЬ D: промежуточный вопрос → удалить на финале
+    # SPLODOREPLY0110: вопрос на диск вместе с id сообщения — реплай на него узнаётся в любом
+    # возрасте и после перезапуска (подавленный повтор `HINT_SKIPPED` функция разбирает сама)
+    _mileage_q_remember(chat_id, topic_id, sent, mileage, bike, oil_hint)
 
 
 async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
@@ -4907,6 +5084,7 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     elif t in _CONFIRM_NO:
         soft = _SOFT_ODO_PENDING.pop(key, None)
         _PENDING_MILEAGE.pop(key, None)
+        _mileage_q_forget(*key, why="ответ «нет»")
         clear_awaiting(*key)
         if soft and bridge:
             _odo_audit_write(bridge, key[0], key[1], soft.get("bike", ""),
@@ -4947,6 +5125,7 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
                 # Авторизовано: подтверждаем убывание
                 _SOFT_ODO_PENDING.pop(key, None)
                 _PENDING_MILEAGE.pop(key, None)
+                _mileage_q_forget(*key, why="понижение подтверждено")
                 clear_awaiting(*key)
                 _odo_drop_record(soft.get("bike") or bike)
                 u = getattr(msg, "from_user", None)
@@ -4971,6 +5150,7 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
                             message_thread_id=key[1])
                 return True
     _PENDING_MILEAGE.pop(key, None)
+    _mileage_q_forget(*key, why=f"ответ текстом: {num}")
     clear_awaiting(*key)
     # ЕДИНАЯ ТОЧКА подтверждения: откат строк с прежним числом (если человек поправил) + дозапись
     # отложенных инфо-работ ПОДТВЕРЖДЁННЫМ км. Стоит ДО B1 — заявка может увести нас в ранний
@@ -6313,6 +6493,7 @@ async def handle_service_button(update, context, bridge) -> None:
             pass
         _svc_drop(token)
         _PENDING_MILEAGE.pop(key, None)
+        _mileage_q_forget(*key, why="кнопка «Да»")
         clear_awaiting(*key)
         # ЕДИНАЯ ТОЧКА подтверждения (зеркало текстового пути): кнопка «Да» подтверждает ровно то
         # число, о котором спрашивали → откат не нужен, но отложенные инфо-работы дописываются.
@@ -6588,6 +6769,7 @@ async def handle_service_button(update, context, bridge) -> None:
         _svc_drop(token)
         _SOFT_ODO_PENDING.pop(key, None)
         _PENDING_MILEAGE.pop(key, None)
+        _mileage_q_forget(chat_id, topic_id, why="кнопка понижения")
         clear_awaiting(chat_id, topic_id)
         _odo_drop_record(bike)
         _odo_audit_write(bridge, chat_id, topic_id, bike, new_km, prev_km,
