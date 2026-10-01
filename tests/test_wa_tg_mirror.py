@@ -18,6 +18,7 @@ API 360dialog и Telegram, а любой чужой хост роняет тес
 Мутанты: WA_TG_MIRROR_SRC=<каталог> ставит копию модуля впереди дерева.
 """
 
+import base64
 import json
 import logging
 import os
@@ -135,6 +136,22 @@ class FakeHTTP:
         return [p["text"] for _, m, p in self.tg[since:] if m == "sendMessage"]
 
 
+def docs(http, since=0, fname=None):
+    """Тела файлов sendDocument (multipart) → [bytes]; fname — только файл с этим именем."""
+    out = []
+    for _, meth, p in http.tg[since:]:
+        if meth != "sendDocument":
+            continue
+        mm = re.search(rb'filename="([^"]*)"\r\nContent-Type: [^\r]*\r\n\r\n(.*)\r\n--[0-9a-f]+--\r\n$', p, re.S)
+        if mm and (fname is None or mm.group(1).decode() == fname):
+            out.append(mm.group(2))
+    return out
+
+
+def doc_text(http, since, fname):
+    return "\n".join(d.decode("utf-8") for d in docs(http, since, fname))
+
+
 TMP = tempfile.mkdtemp(prefix="wa_tg_mirror_test_")
 _seq = [0]
 
@@ -146,20 +163,61 @@ def world(show, token=True, chat=True):
     q = W.WAQueueDB(os.path.join(d, "wa_queue.db"))
     env = {"queue_db": q.db_path, "state_db": os.path.join(d, "wa_tg_mirror.db"),
            "media_dir": os.path.join(d, "wa_media"), "d360_key": KEY,
-           "tg_token": "123:fake" if token else "", "tg_chat": "-1001" if chat else "", "show": show}
+           "tg_token": "123:fake" if token else "", "tg_chat": "-1001" if chat else "", "show": show,
+           # архив по умолчанию — выдуманный и отсутствующий: боевой /root/wa_archive тест не читает
+           "archive_db": os.path.join(d, "arch", "wa_archive.db"),
+           "archive_media": os.path.join(d, "arch", "media"),
+           "archive_manifest": os.path.join(d, "arch", "media_manifest.jsonl")}
     return q, env
 
 
 _w = [0]
 
 
-def ev(number, text=None, echo=False, history=False, typ="text", media_id=None, ts=None, name=""):
+def ev(number, text=None, echo=False, history=False, typ="text", media_id=None, ts=None, name="",
+       wamid=None):
     _w[0] += 1
     return {"from": number, "name": name, "type": typ, "text": text, "media_id": media_id,
             "mime": "image/jpeg" if media_id else None,
             "media_note": "no_file" if typ == "media_placeholder" else None,
             "ts": ts if ts is not None else NOW0, "echo": echo, "history": history,
-            "wamid": "wamid.T%05d" % _w[0], "raw": {}}
+            "wamid": wamid or "wamid.T%05d" % _w[0], "raw": {}}
+
+
+def wamid_of(number, key_id):
+    """wamid живой формы: base64, внутри номер и key_id строками с длиной за байтом 0x18."""
+    raw = (b"\x1c\x18" + bytes([len(number)]) + number.encode() + b"\x15\x02\x00\x12\x18"
+           + bytes([len(key_id)]) + key_id.encode() + b"\x00")
+    return "wamid." + base64.b64encode(raw).decode()
+
+
+def make_archive(env, rows, files=None, manifest=True):
+    """Выдуманный архив схемы build_archive.py (нужные службе поля) + опись + файлы медиа.
+    rows: (номер, ts, from_me, kind, text, caption, transcript, media_file, key_id);
+    files: {key_id: (from_me, байты)} — ляжет в media/ под именем sha256 и в опись."""
+    import hashlib
+    import sqlite3
+    d = os.path.dirname(env["archive_db"])
+    os.makedirs(env["archive_media"], exist_ok=True)
+    db = sqlite3.connect(env["archive_db"])
+    db.executescript("""CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL,
+        ts INTEGER NOT NULL, from_me INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT, caption TEXT,
+        transcript TEXT, media_file TEXT, key_id TEXT NOT NULL, UNIQUE (number, key_id, from_me));
+        CREATE TABLE chats (number TEXT PRIMARY KEY, first_ts INTEGER, last_ts INTEGER, n_messages INTEGER);""")
+    db.executemany("INSERT INTO messages (number, ts, from_me, kind, text, caption, transcript, media_file, "
+                   "key_id) VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    db.commit()
+    db.close()
+    if manifest:
+        with open(env["archive_manifest"], "w", encoding="utf-8") as f:
+            for key_id, (from_me, data) in (files or {}).items():
+                sha = hashlib.sha256(data).hexdigest()
+                with open(os.path.join(env["archive_media"], sha + ".bin"), "wb") as g:
+                    g.write(data)
+                f.write(json.dumps({"sha256": sha, "ext": ".bin", "size": len(data), "mime": "image/jpeg",
+                                    "server_file": sha + ".bin", "msg_keys": ["%s|%d" % (key_id, from_me)]})
+                        + "\n")
+    return d
 
 
 def mirror(env, clock, http, free=10 ** 12):
@@ -296,17 +354,20 @@ meths = http.methods(k0)
 ok(meths[:1] == ["createForumTopic"], "первое живое входящее открыло тему")
 name = http.tg[k0][2]["name"]
 ok(name == "Анна · +" + A, "тема названа «имя · номер»")
-ok(meths[1:] == ["sendMessage", "sendMessage", "sendDocument", "sendMessage"],
-   "порядок: предыстория → провал → файлы → новое: %s" % meths[1:])
+ok(meths[1:] == ["sendMessage", "sendDocument", "sendMessage", "sendDocument", "sendMessage"],
+   "порядок: шапка → файл истории → последние текстом → их медиа → новое: %s" % meths[1:])
 texts = http.texts(k0) + ["", "", ""]
-hist = texts[0]
-pos = [hist.find(s) for s in ("старый вопрос", "старый ответ", M.PLACEHOLDER_TEXT)]
-ok(-1 not in pos and pos == sorted(pos), "предыстория по времени, заглушка — «%s»" % M.PLACEHOLDER_TEXT)
+hist = doc_text(http, k0, "history.txt")
+pos = [hist.find(s) for s in ("старый вопрос", "старый ответ", "[медиа — файла нет]", "[фото — на сервере]")]
+ok(-1 not in pos and pos == sorted(pos), "файл истории по времени; заглушка — «файла нет», скачанное — «на сервере»")
 ok("клиент: старый вопрос" in hist and "мы: старый ответ" in hist, "пометки «клиент» и «мы»")
-ok(M.pk_time(T0) in hist and M.pk_time(T0) == time.strftime("%d.%m %H:%M", time.gmtime(T0 + 7 * 3600)),
-   "время по Пхукету (UTC+7)")
-ok("delivered" not in hist and all("sent" not in t for t in texts), "квитанций в показе нет")
-ok(texts[1] == M.GAP_LINE, "вторым — строка провала 08.09–01.10")
+ok(M.pk_full(T0) in hist and M.pk_full(T0) == time.strftime("%d.%m.%Y %H:%M", time.gmtime(T0 + 7 * 3600)),
+   "время по Пхукету (UTC+7), ДД.ММ.ГГГГ ЧЧ:ММ")
+ok("delivered" not in hist and all("sent" not in t and "delivered" not in t for t in texts), "квитанций в показе нет")
+ok(texts[0].startswith("писал раньше: с %s, 4 сообщений (клиент 3 / мы 1), серий обращений 1" % M.pk_date(T0))
+   and "архива копии телефона нет" in texts[0], "шапка: с даты, N (клиент/мы), серии, и чего нет: %r" % texts[0][:60])
+ok("клиент: старый вопрос" in texts[1] and "мы: старый ответ" in texts[1], "последние сообщения — текстом")
+ok(not hasattr(M, "GAP_LINE") and not any("переписки на сервере нет" in t for t in texts), "строки о провале нет")
 ok("новый вопрос" in texts[2] and "клиент" in texts[2], "затем новое")
 threads = {p.get("message_thread_id") if isinstance(p, dict) else "file" for _, mm, p in http.tg[k0 + 1:]}
 ok(threads <= {501, "file"}, "всё в свою тему")
@@ -330,11 +391,12 @@ m.tick()
 q.enqueue([ev(C, "живое")])
 m.tick()
 batches = [t for t in http.texts() if "строка номер" in t]
-ok(len(batches) >= 4 and all(len(t) <= 4000 for t in batches),
-   "сводные сообщения ≤4000 знаков: %d шт., максимум %d" % (len(batches), max(map(len, batches), default=0)))
-joined = "\n".join(batches)
-nums = [int(x) for x in re.findall(r"строка номер (\d+)", joined)]
-ok(nums == list(range(300)), "все 300 прежних строк, по времени, без пропусков и повторов")
+ok(batches and all(len(t) <= 4000 for t in batches),
+   "текстовые сообщения ≤4000 знаков: %d шт., максимум %d" % (len(batches), max(map(len, batches), default=0)))
+nums = [int(x) for x in re.findall(r"строка номер (\d+)", "\n".join(batches))]
+ok(nums == list(range(285, 300)), "текстом — ровно последние 15, по времени: %s" % nums[:3])
+nums = [int(x) for x in re.findall(r"строка номер (\d+)", doc_text(http, 0, "history.txt"))]
+ok(nums == list(range(300)), "в файле истории все 300 прежних строк, по времени, без пропусков и повторов")
 ok(M.batch_lines([("k", "я" * 9000)]) and all(len(t) <= 4000 for _, t in M.batch_lines([("k", "я" * 9000)])),
    "длинная строка режется по 4000")
 
@@ -434,6 +496,186 @@ ok(src.count("urlopen(") == 1, "выход в сеть ровно один (http
 ok("mode=ro" in src and "sqlite3.connect(self.queue_db" not in src, "живая очередь открывается только mode=ro")
 ok(re.search(r"(INSERT|UPDATE|DELETE|ALTER|CREATE)[^\"\n]*wa_inbox", src) is None,
    "записи в очередь нет: ни одного INSERT/UPDATE/DELETE/ALTER/CREATE по wa_inbox")
+ok(len(re.findall(r"sqlite3\.connect\(", src)) == 3 and src.count("?mode=ro") == 2,
+   "архив, как и очередь, открывается только mode=ro; третья база — своя")
+
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n(9) предыстория из архива копии телефона")
+E, F, G = "66800000005", "66800000006", "66800000007"
+T1 = NOW0 - 400 * 86400
+T2 = T1 + 100 * 86400
+ARCH = [(E, T1, 0, "text", "архив первый", None, None, None, "KARCH00001"),
+        (E, T1 + 60, 1, "image", None, "подпись фото", None, "IMG-1.jpg", "KARCH00002"),
+        (E, T1 + 120, 0, "audio", None, None, None, "PTT-1.opus", "KARCH00003"),
+        (E, T2, 0, "text", "пара с очередью", None, None, None, "KPAIR00004"),
+        (E, T2 + 60, 1, "document", None, None, None, "DOC-1.pdf", "KBIG000005"),
+        (E, NOW0 - 60, 0, "text", "живое из архива", None, None, None, "KLIVE00006"),
+        (F, T1, 0, "text", "чужой номер", None, None, None, "KOTHER0008")]
+AFILES = {"KARCH00002": (1, b"IMG"), "KBIG000005": (1, b"D" * 20)}
+
+
+def arch_world(files=AFILES, manifest=True):
+    q, env = world(show=True)
+    make_archive(env, ARCH, files, manifest)
+    q.enqueue([ev(E, "пара с очередью", history=True, ts=T2, wamid=wamid_of(E, "KPAIR00004")),
+               ev(E, "только в очереди", history=True, ts=T2 + 120, wamid=wamid_of(E, "KQONLY0007")),
+               ev(E, "read", typ="status", echo=True, ts=T2 + 130)])
+    return q, env
+
+
+def run_arch(q, env, http=None, clk=None):
+    clk = clk or Clock(NOW0 + 5)
+    http = http or FakeHTTP(clk)
+    m = mirror(env, clk, http)
+    m.tick()                                    # первое включение
+    q.enqueue([ev(E, "живое из архива", wamid=wamid_of(E, "KLIVE00006"))])
+    m.tick()
+    return m, http, clk
+
+
+ok(M.parse_wamid(wamid_of(E, "KPAIR00004")) == (E, "KPAIR00004") and M.parse_wamid("wamid.T00001")[1] is None,
+   "wamid раскрывается в номер и key_id; выдуманный — без key_id")
+q, env = arch_world()
+old_max, M.TG_FILE_MAX = M.TG_FILE_MAX, 10
+try:
+    m, http, clk = run_arch(q, env)
+finally:
+    M.TG_FILE_MAX = old_max
+texts = http.texts()
+hist = doc_text(http, 0, "history.txt")
+hl = [ln for ln in hist.split("\n") if ln]
+ok(len(hl) == 6, "файл истории: архив (5, без записи живой строки) + очередь без пары (1) = %d строк" % len(hl))
+ok(hist.count("пара с очередью") == 1, "пара архив+очередь (номер и key_id) в файле истории один раз: %d"
+   % hist.count("пара с очередью"))
+ok(sum(t.count("пара с очередью") for t in texts) == 1, "и среди последних текстом — один раз")
+ok("живое из архива" not in hist and sum(t.count("живое из архива") for t in texts) == 1,
+   "архивная пара живой строки не уходит в историю; живое показано один раз — «новым»")
+ok("только в очереди" in hist and "чужой номер" not in hist, "строка очереди без пары — в истории; чужой номер — нет")
+pos = [hist.find(s) for s in ("архив первый", "подпись фото", "[аудио — файла нет]", "пара с очередью",
+                              "[документ — на сервере]", "только в очереди")]
+ok(-1 not in pos and pos == sorted(pos), "архив и очередь слиты по времени")
+ok("мы: [фото — на сервере] подпись фото" in hist and "клиент: [аудио — файла нет]" in hist,
+   "медиа: «на сервере» по описи, «файла нет» без файла")
+head = texts[0]
+ok(head == "писал раньше: с %s, 6 сообщений (клиент 4 / мы 2), серий обращений 2 (перерыв больше 30 дней), "
+   "последнее %s" % (M.pk_date(T1), M.pk_date(T2 + 120)), "шапка: %r" % head[:90])
+ok(docs(http, 0, "file.bin") == [b"IMG"], "медиа последних — файлом из архива (1 файл)")
+ok(any("[документ — файл 0 МБ на сервере, больше лимита Telegram]" in t for t in texts),
+   "файл больше лимита — строкой")
+ok(http.methods()[3:] == ["createForumTopic", "sendMessage", "sendDocument", "sendMessage", "sendDocument",
+                          "sendMessage", "sendMessage"], "порядок темы: %s" % http.methods()[3:])
+
+# без пары в архиве + ни одной строки — «раньше не писал»
+q, env = world(show=True)
+make_archive(env, ARCH, AFILES)
+clk = Clock(NOW0 + 5)
+http = FakeHTTP(clk)
+m = mirror(env, clk, http)
+m.tick()
+q.enqueue([ev(G, "впервые")])
+m.tick()
+ok(http.texts()[:1] == ["раньше не писал"] and not docs(http, 0, "history.txt"),
+   "нового клиента шапка зовёт «раньше не писал», файла истории нет")
+
+print("\n(9б) архива или описи нет")
+q, env = world(show=False)
+clk = Clock(NOW0 + 5)
+LOGS.lines.clear()
+m = mirror(env, clk, FakeHTTP(clk))
+m.tick()
+m.tick()
+ok(LOGS.count("WARNING", "архива копии телефона нет") == 1 and LOGS.count("WARNING", "описи медиа архива нет") == 1,
+   "нет архива и описи — WARNING раз в час, служба идёт")
+clk.t += 3600
+m.tick()
+ok(LOGS.count("WARNING", "архива копии телефона нет") == 2, "через час — снова")
+ok("архив: нет, опись медиа: нет" in M.start_line(m), "строка старта говорит, чего нет")
+q, env = arch_world(manifest=False)
+m, http, clk = run_arch(q, env)
+ok("описи медиа архива нет" in http.texts()[0] and "[фото — файла нет]" in doc_text(http, 0, "history.txt")
+   and not docs(http, 0, "file.bin"), "нет описи — тема открыта, шапка называет, файлов архива нет")
+q, env = world(show=True)
+os.makedirs(os.path.dirname(env["archive_db"]))
+open(env["archive_db"], "wb").write(b"not a database" * 100)
+clk = Clock(NOW0 + 5)
+http = FakeHTTP(clk)
+m = mirror(env, clk, http)
+m.tick()
+q.enqueue([ev(G, "привет")])
+m.tick()
+ok(http.texts()[:1] and "архив не читается" in http.texts()[0] and http.texts()[-1].endswith("привет"),
+   "битый архив — не падение: тема открыта, шапка называет причину")
+
+
+class Kill(BaseException):
+    pass
+
+
+class KillHTTP(FakeHTTP):
+    def __init__(self, clock, at):
+        super().__init__(clock)
+        self.at, self.n = at, 0
+
+    def __call__(self, method, url, headers, data, timeout):
+        if "/sendMessage" in url or "/sendDocument" in url:
+            self.n += 1
+            if self.n == self.at:
+                raise Kill()
+        return FakeHTTP.__call__(self, method, url, headers, data, timeout)
+
+
+print("\n(9в) рестарт посреди открытия темы")
+bad = []
+for at in range(1, 7):
+    q, env = arch_world()
+    clk = Clock(NOW0 + 5)
+    h1 = KillHTTP(clk, at)
+    try:
+        run_arch(q, env, http=h1, clk=clk)
+    except Kill:
+        pass
+    h2 = FakeHTTP(clk)
+    h2.thread = 900
+    m2 = mirror(env, clk, h2)
+    m2.tick()
+    m2.tick()
+    sent = [(meth, json.dumps(p, ensure_ascii=False, sort_keys=True) if isinstance(p, dict)
+             else re.sub(rb"[0-9a-f]{32}", b"", p)) for h in (h1, h2) for _, meth, p in h.tg
+            if meth in ("sendMessage", "sendDocument", "createForumTopic")]
+    stage = m2.st.execute("SELECT stage FROM topics").fetchall()
+    if len(sent) != len(set(map(str, sent))) or [x for x, _ in sent].count("createForumTopic") != 1 \
+            or stage != [("live",)]:
+        bad.append(at)
+ok(not bad, "обрыв на каждом из 6 вызовов темы: после рестарта дублей 0, тема одна, дошла до «нового» (сбой на %s)"
+   % bad)
+
+print("\n(9г) первое включение: 24 часа")
+q, env = world(show=True)
+q.enqueue([ev(F, "за 23 часа")])
+clk = Clock(time.time() + 23 * 3600)
+http = FakeHTTP(clk)
+http.fail_threads = True
+m = mirror(env, clk, http)
+m.tick()
+ok(http.methods().count("createForumTopic") == 1, "живая строка за 23 ч до включения открыла тему")
+clk.t += 700
+m.tick()
+ok(not [t for t in http.texts() if "отстал" in t], "по строке до включения тревоги нет")
+q.enqueue([ev(F, "после включения")])
+m.tick()
+al = [t for t in http.texts() if "отстал" in t]
+ok(len(al) == 1 and "1 живых" in al[0], "строка после включения, не показанная 10 минут, — тревога (одна)")
+http.fail_threads = False
+m.tick()
+ok(any(t.endswith("за 23 часа") for t in http.texts()), "строка до включения показана «новым» в своей теме")
+q, env = world(show=True)
+q.enqueue([ev(G, "за 25 часов")])
+clk = Clock(time.time() + 25 * 3600)
+http = FakeHTTP(clk)
+m = mirror(env, clk, http)
+m.tick()
+m.tick()
+ok(http.methods().count("createForumTopic") == 0, "строка старше 24 ч до включения тему не открывает")
 
 print("\nИтог: %d/%d PASS" % (sum(res), len(res)))
 fails = sum(1 for r in res if not r)

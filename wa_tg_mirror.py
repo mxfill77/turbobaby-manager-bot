@@ -14,19 +14,24 @@
 2. ПОКАЗ — ТОЛЬКО ФЛАГОМ `WA_TG_MIRROR_SHOW` (по умолчанию выключен). Выключен → ни одного
    вызова Telegram, строка старта «показ выключен». Включён, но нет ключа, группы, тем или прав —
    показ стоит, раз в час WARNING с причиной.
-   Тема «имя · номер» открывается по первому ЖИВОМУ входящему или эху клиента. В неё сначала вся
-   прежняя переписка сводными сообщениями до 4000 знаков, по времени, «клиент»/«мы», время
-   Пхукета; заглушка медиа — «файл Meta не отдаёт»; затем строка о провале 08.09–01.10; затем
-   файлы; затем новое. Дальше каждое живое сообщение — в свою тему; квитанции не показываются.
+   Тема «имя · номер» открывается по первому ЖИВОМУ входящему или эху клиента. Порядок в теме:
+   шапка («писал раньше: с …, N сообщений, серий обращений K, последнее …» или «раньше не писал»,
+   плюс чего нет); вся предыстория файлом .txt; последние TAIL_N сообщений текстом; их медиа
+   файлами; затем новое. Предыстория = архив копии телефона (WAARCHIVE0110) + строки очереди без
+   пары в архиве (пара — номер и key_id из wamid), по времени, без дублей. Архива или описи медиа
+   нет — тема открывается с тем, что есть, шапка это называет, журнал — раз в час. Первое
+   включение открывает темы и по живым строкам за 24 ч до него; тревога — только для новых.
+   Дальше каждое живое сообщение — в свою тему; квитанции не показываются.
    Темп — не больше 20 вызовов в минуту; 429 — ждать retry_after. wamid дважды не показывается:
    ключ ставится ДО вызова, так что обрыв посреди вызова даёт «не повторять», а не дубль.
 
-Живая wa_queue.db открывается ТОЛЬКО на чтение (mode=ro). Своё состояние — wa_tg_mirror.db рядом.
+Живая wa_queue.db и архив открываются ТОЛЬКО на чтение (mode=ro). Своё состояние — wa_tg_mirror.db рядом.
 В журнал не пишутся тексты, номера, имена и пути файлов клиентов — только id строк и числа.
 
 Usage (standalone service): venv/bin/python3 wa_tg_mirror.py
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -70,13 +75,23 @@ FREE_FLOOR     = 5 * 1024 ** 3     # после записи свободног�
 CAP_SHARE      = 0.20              # потолок каталога — 20% свободного места на старте …
 CAP_MAX        = 4 * 1024 ** 3     # … но не больше 4 GiB
 
-GAP_LINE         = "с 08.09 по 01.10 переписки на сервере нет — она в WhatsApp на телефоне"
+ARCHIVE_DIR    = "/root/wa_archive"   # архив копии телефона: wa_archive.db, media/, media_manifest.jsonl
+TAIL_N         = 15            # последних сообщений предыстории — текстом в тему
+SERIES_GAP     = 30 * 86400    # перерыв больше 30 дней — новая серия обращений
+FIRST_WINDOW   = 86400         # первое включение: темы и по живым строкам за 24 ч до него
+
 PLACEHOLDER_TEXT = "файл Meta не отдаёт"
 MEDIA_PLACEHOLDER = "media_placeholder"
 _KEY_FORM = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 _MEDIA_WORD = {"image": "фото", "video": "видео", "audio": "аудио", "voice": "голосовое",
                "document": "документ", "sticker": "стикер"}
+# виды архива (build_archive.py → messages.kind): медиа — со словом «на сервере / файла нет»
+_ARCH_MEDIA = {"image": "фото", "video": "видео", "audio": "аудио", "document": "документ",
+               "sticker": "стикер", "gif": "гиф", "view_once_image": "одноразовое фото",
+               "view_once_video": "одноразовое видео"}
+_ARCH_OTHER = {"location": "геоточка", "live_location": "геоточка", "contact": "контакт",
+               "contacts": "контакты", "deleted": "удалено", "waiting": "ожидает"}
 _EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "video/mp4": ".mp4",
         "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac",
         "application/pdf": ".pdf", "video/3gpp": ".3gp"}
@@ -86,7 +101,7 @@ M_OK, M_FAIL, M_RETRY, M_WAIT = "ok", "fail", "retry", "wait"
 # показ: ключ ставится ДО вызова (sending), после ответа — shown; обрыв → unsure, повтора нет
 S_SENDING, S_SHOWN, S_UNSURE = "sending", "shown", "unsure"
 # ступени темы
-T_BACKFILL, T_GAP, T_FILES, T_LIVE = "backfill", "gap", "files", "live"
+T_HEAD, T_HIST, T_TAIL, T_FILES, T_LIVE = "head", "hist", "tail", "files", "live"
 
 _QCOLS = ("id", "ts_queued", "from_number", "name", "msg_type", "text", "media_id", "mime",
           "caption", "media_note", "ts_msg", "echo", "history", "wamid")
@@ -113,6 +128,10 @@ def _env():
         "tg_token":  (os.environ.get("WA_TG_BOT_TOKEN") or "").strip(),
         "tg_chat":   (os.environ.get("WA_TG_CHAT_ID") or "").strip(),
         "show":      _flag_on(os.environ.get(FLAG_NAME)),
+        "archive_db":       os.environ.get("WA_ARCHIVE_DB", os.path.join(ARCHIVE_DIR, "wa_archive.db")),
+        "archive_media":    os.environ.get("WA_ARCHIVE_MEDIA_DIR", os.path.join(ARCHIVE_DIR, "media")),
+        "archive_manifest": os.environ.get("WA_ARCHIVE_MANIFEST",
+                                           os.path.join(ARCHIVE_DIR, "media_manifest.jsonl")),
     }
 
 
@@ -138,6 +157,67 @@ def http_request(method, url, headers=None, data=None, timeout=30):
 
 def pk_time(ts) -> str:
     return time.strftime("%d.%m %H:%M", time.gmtime(int(ts or 0) + PHUKET_OFFSET))
+
+
+def pk_full(ts) -> str:
+    return time.strftime("%d.%m.%Y %H:%M", time.gmtime(int(ts or 0) + PHUKET_OFFSET))
+
+
+def pk_date(ts) -> str:
+    return time.strftime("%d.%m.%Y", time.gmtime(int(ts or 0) + PHUKET_OFFSET))
+
+
+def parse_wamid(w):
+    """wamid → (номер, key_id). После «wamid.» — base64, внутри строки с длиной за байтом 0x18:
+    номер и key_id (WAARCHIVE0110 П3: 5 347 из 5 347). Не раскрылся → (None, None)."""
+    if not w or not str(w).startswith("wamid."):
+        return None, None
+    b64 = str(w)[6:]
+    try:
+        raw = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+    except Exception:
+        return None, None
+    strs, i = [], 0
+    while i < len(raw) - 1:
+        if raw[i] == 0x18:
+            n = raw[i + 1]
+            s = raw[i + 2:i + 2 + n]
+            if len(s) == n and n >= 5 and all(32 < c < 127 for c in s):
+                strs.append(s.decode())
+                i += 2 + n
+                continue
+        i += 1
+    num = next((s for s in strs if s.isdigit()), None)
+    return num, next((s for s in strs if s != num), None)
+
+
+def item_line(it) -> str:
+    """Строка предыстории: «ДД.ММ.ГГГГ ЧЧ:ММ клиент|мы: …»; медиа — «[вид — на сервере|файла нет]»."""
+    body = it["text"] or ""
+    if it["word"]:
+        body = "[%s — %s]" % (it["word"], "на сервере" if it["file"] else "файла нет") \
+            + (" " + body if body else "")
+    return "%s %s: %s" % (pk_full(it["ts"]), it["who"], body or "[пусто]")
+
+
+def head_text(items, missing) -> str:
+    """Шапка темы по предыстории; missing — чего нет (архив, опись), чтобы пустое не читалось «не писал»."""
+    if items:
+        ts = sorted(it["ts"] for it in items)
+        series = 1 + sum(1 for a, b in zip(ts, ts[1:]) if b - a > SERIES_GAP)
+        s = ("писал раньше: с %s, %d сообщений (клиент %d / мы %d), серий обращений %d "
+             "(перерыв больше 30 дней), последнее %s"
+             % (pk_date(ts[0]), len(items), sum(1 for it in items if it["who"] == "клиент"),
+                sum(1 for it in items if it["who"] == "мы"), series, pk_date(ts[-1])))
+    else:
+        s = "раньше не писал"
+    if missing:
+        s += "\n⚠️ предыстория неполная: " + "; ".join(missing)
+    return s
+
+
+def history_txt(items) -> bytes:
+    return ("\n".join(item_line(it) for it in items) + "\n").encode("utf-8")
 
 
 def who_of(row) -> str:
@@ -232,6 +312,7 @@ class Mirror:
         self.block_reason = ""
         self._warned = {}
         self.last_summary = None
+        self._man, self._man_sig = None, None
         self.counts = {"media_ok": 0, "media_fail": 0, "shown": 0, "tg_calls": 0}
 
     # ── своё состояние ──────────────────────────────────────────────────────────────────
@@ -279,6 +360,132 @@ class Mirror:
                                 args).fetchall()
         finally:
             conn.close()
+
+    # ── архив копии телефона: только чтение; нет или не читается — причина, а не падение ────
+    def _archive(self):
+        """→ (соединение mode=ro | None, причина)."""
+        path = self.env.get("archive_db") or ""
+        if not os.path.exists(path):
+            return None, "архива копии телефона нет"
+        conn = None
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path).replace("\\", "/"),
+                                   uri=True, timeout=10)
+            conn.execute("SELECT number, ts, from_me, kind, text, caption, transcript, media_file, "
+                         "key_id FROM messages LIMIT 0")
+            return conn, ""
+        except sqlite3.Error as e:
+            if conn is not None:
+                conn.close()
+            return None, "архив не читается (%s)" % type(e).__name__
+
+    def _manifest(self):
+        """Опись медиа архива → ({«key_id|from_me»: (путь, размер, mime)}, "") · (None, причина).
+        Перечитывается только при смене файла (mtime, размер)."""
+        path = self.env.get("archive_manifest") or ""
+        try:
+            fst = os.stat(path)
+        except OSError:
+            return None, "описи медиа архива нет"
+        sig = (fst.st_mtime, fst.st_size)
+        if self._man_sig == sig:
+            return self._man, ""
+        out, mdir = {}, self.env.get("archive_media") or ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    fpath = os.path.join(mdir, os.path.basename(rec["server_file"]))
+                    for k in rec.get("msg_keys") or ():
+                        out[k] = (fpath, int(rec.get("size") or 0), rec.get("mime") or "")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return None, "опись медиа архива не читается (%s)" % type(e).__name__
+        self._man, self._man_sig = out, sig
+        return out, ""
+
+    def archive_step(self):
+        """Каждый такт, при любом флаге: чего нет — WARNING раз в час (без путей файлов клиентов)."""
+        conn, why = self._archive()
+        if conn is not None:
+            conn.close()
+        else:
+            self._warn_hourly("archive", "предыстория: %s — темы откроются с тем, что есть, шапка назовёт",
+                              why)
+        man, why_m = self._manifest()
+        if man is None:
+            self._warn_hourly("manifest", "предыстория: %s — файлы архива в темы не пойдут", why_m)
+
+    def _arch_item(self, a, man):
+        ts, from_me, kind, text, caption, transcript, media_file, key_id = a
+        word = _ARCH_MEDIA.get(kind) or (kind if media_file else None)
+        f = None
+        if word:
+            hit = man.get("%s|%d" % (key_id, int(from_me)))
+            if hit and os.path.exists(hit[0]):
+                f = hit
+            text = caption or ""
+            if transcript:
+                text += (" " if text else "") + "(расшифровка: %s)" % transcript
+        elif kind in _ARCH_OTHER:
+            text = "[%s]" % _ARCH_OTHER[kind] + (" " + text if text else "")
+        elif not text:
+            text = "[%s]" % kind
+        return {"key": "a:%s:%d" % (key_id, int(from_me)), "ts": int(ts),
+                "who": "мы" if int(from_me) else "клиент", "text": text, "word": word, "file": f}
+
+    def _queue_item(self, r):
+        t = r["msg_type"] or ""
+        word, f, text = None, None, r["text"] or ""
+        if t == MEDIA_PLACEHOLDER:
+            word, text = "медиа", ""
+        elif t in _MEDIA_WORD:
+            word, text = _MEDIA_WORD[t], r["caption"] or ""
+            md = self._media_of(_row_key(r))
+            if md and md[0] == M_OK and md[1] and os.path.exists(md[1]):
+                f = (md[1], md[2] or 0, md[3] or "")
+        elif not text:
+            text = "[" + (t or "?") + "]"
+        return {"key": _row_key(r), "ts": int(r["ts_msg"] or r["ts_queued"] or 0), "who": who_of(r),
+                "text": text, "word": word, "file": f}
+
+    def prehistory(self, num, rows, trig):
+        """Предыстория номера → (items по времени, чего нет). items = архив + строки очереди ДО
+        темы (id < trig) без пары в архиве. Пара — номер и key_id из wamid (номер — from_number:
+        у эха номер внутри wamid другой). Архивная запись, чья пара — строка темы (id ≥ trig),
+        сюда не идёт: её покажет «новое». Дублей нет ни одной дорогой."""
+        missing, arch = [], []
+        conn, why = self._archive()
+        if conn is None:
+            missing.append(why)
+            self._warn_hourly("archive", "предыстория: %s — темы откроются с тем, что есть, шапка назовёт",
+                              why)
+        else:
+            try:
+                arch = conn.execute("SELECT ts, from_me, kind, text, caption, transcript, media_file, "
+                                    "key_id FROM messages WHERE number=? ORDER BY ts, id", (num,)).fetchall()
+            except sqlite3.Error as e:
+                missing.append("архив не читается (%s)" % type(e).__name__)
+            finally:
+                conn.close()
+        man, why_m = self._manifest()
+        if man is None:
+            missing.append(why_m)
+            man = {}
+        arch_keys = {a[7] for a in arch}
+        taken, items = set(), []
+        for r in rows:
+            k = parse_wamid(r["wamid"])[1]
+            paired = k is not None and k in arch_keys
+            if r["id"] >= trig:
+                if paired:
+                    taken.add(k)
+            elif not paired:
+                items.append(self._queue_item(r))
+        items += [self._arch_item(a, man) for a in arch if a[7] not in taken]
+        items.sort(key=lambda it: (it["ts"], it["key"]))
+        return items, missing
 
     # ── 1. медиа ─────────────────────────────────────────────────────────────────────────
     def media_step(self):
@@ -438,13 +645,18 @@ class Mirror:
         self.ready, self.block_reason = True, ""
         log.info("показ: готов — группа-форум, у бота право тем")
         if self._kv("show_start_id") is None:
+            # темы — и по живым строкам за 24 ч до включения; тревога — только для строк после него
             conn = self._q()
             try:
                 mx = conn.execute("SELECT COALESCE(MAX(id), 0) FROM wa_inbox").fetchone()[0]
+                lo = conn.execute("SELECT MIN(id) FROM wa_inbox WHERE ts_queued >= ?",
+                                  (int(now - FIRST_WINDOW),)).fetchone()[0]
             finally:
                 conn.close()
+            self._kv_set("open_from_id", lo if lo is not None else mx + 1)
             self._kv_set("show_start_id", mx)
-            log.info("показ: первое включение, живые строки считаются с id > %d", mx)
+            log.info("показ: первое включение — темы по живым строкам с id >= %s (24 ч до включения), "
+                     "тревога «старше 10 минут» — для id > %d", self._kv("open_from_id"), mx)
         return True
 
     def _probe(self) -> str:
@@ -503,15 +715,18 @@ class Mirror:
                              {"chat_id": self.env["tg_chat"], "message_thread_id": thread,
                               "text": text})
 
+    def _send_bytes(self, keys, number, thread, fname, data, mime, caption) -> bool:
+        return self._deliver(keys, number, "sendDocument",
+                             {"chat_id": self.env["tg_chat"], "message_thread_id": thread,
+                              "caption": caption[:TG_CAPTION_MAX]},
+                             {"document": (fname, data, mime or "application/octet-stream")})
+
     def _send_file(self, keys, number, thread, media, caption) -> bool:
         _state, path, _size, mime, _code = media
         with open(path, "rb") as f:
             data = f.read()
         ext = os.path.splitext(path)[1] or ".bin"
-        return self._deliver(keys, number, "sendDocument",
-                             {"chat_id": self.env["tg_chat"], "message_thread_id": thread,
-                              "caption": caption[:TG_CAPTION_MAX]},
-                             {"document": ("file" + ext, data, mime or "application/octet-stream")})
+        return self._send_bytes(keys, number, thread, "file" + ext, data, mime, caption)
 
     def _topic_name(self, number) -> str:
         name = ""
@@ -536,17 +751,18 @@ class Mirror:
         if not self._check_ready():
             return
         start = int(self._kv("show_start_id", "0"))
+        open_from = int(self._kv("open_from_id", str(start + 1)))
         topics = {n: (t, trig, stage) for n, t, trig, stage in
                   self.st.execute("SELECT number, thread_id, trigger_id, stage FROM topics")}
-        for row in self._rows("id > ? ORDER BY id", (start,)):
+        for row in self._rows("id >= ? ORDER BY id", (open_from,)):
             num = row["from_number"] or ""
             if num and num not in topics and _is_live(row):
                 thread = self._open_topic(num)
                 if thread is None:
                     return
-                topics[num] = (thread, row["id"], T_BACKFILL)
+                topics[num] = (thread, row["id"], T_HEAD)
                 self.st.execute("INSERT INTO topics(number, thread_id, trigger_id, stage, ts) "
-                                "VALUES (?,?,?,?,?)", (num, thread, row["id"], T_BACKFILL, self.clock()))
+                                "VALUES (?,?,?,?,?)", (num, thread, row["id"], T_HEAD, self.clock()))
                 self.st.commit()
                 log.info("показ: тема открыта thread=%d по строке=%d", thread, row["id"])
         for num, (thread, trig, stage) in topics.items():
@@ -567,26 +783,49 @@ class Mirror:
 
     def _advance(self, num, thread, trig, stage):
         rows = [r for r in self._rows("from_number=? ORDER BY id", (num,)) if not _is_receipt(r)]
-        prior = [r for r in rows if r["id"] < trig]
-        if stage == T_BACKFILL:
-            if not self._send_backfill(num, thread, prior):  # предыстория
-                return
-            stage = T_GAP
+        if stage != T_LIVE:
+            items, missing = self.prehistory(num, rows, trig)
+            tail = items[-TAIL_N:]
+        if stage == T_HEAD:                                   # шапка: писал ли раньше, чего нет
+            if not self._is_shown("head:" + num):
+                if not self._send_text(["head:" + num], num, thread, head_text(items, missing)):
+                    return
+            stage = T_HIST
             self._stage(num, stage)
-        if stage == T_GAP:
-            if not self._is_shown("gap:" + num):
-                if not self._send_text(["gap:" + num], num, thread, GAP_LINE):
+        if stage == T_HIST:                                   # вся предыстория — файлом .txt
+            if items and not self._is_shown("hist:" + num):
+                cap = "вся прежняя переписка: %d сообщений, %s — %s" % (
+                    len(items), pk_date(items[0]["ts"]), pk_date(items[-1]["ts"]))
+                if not self._send_bytes(["hist:" + num], num, thread, "history.txt",
+                                        history_txt(items), "text/plain", cap):
+                    return
+            stage = T_TAIL
+            self._stage(num, stage)
+        if stage == T_TAIL:                                   # последние TAIL_N — текстом
+            lines = [("msg:" + it["key"], item_line(it)) for it in tail
+                     if not self._is_shown("msg:" + it["key"])]
+            for keys, text in batch_lines(lines):
+                if not self._send_text(keys, num, thread, text):
                     return
             stage = T_FILES
             self._stage(num, stage)
-        if stage == T_FILES:
-            for r in sorted(prior, key=lambda r: (r["ts_msg"] or r["ts_queued"], r["id"])):
-                key = "file:" + _row_key(r)
-                media = self._media_of(_row_key(r))
-                if not media or media[0] != M_OK or (media[2] or 0) > TG_FILE_MAX or self._is_shown(key):
+        if stage == T_FILES:                                  # их медиа — файлами
+            for it in tail:
+                key = "file:" + it["key"]
+                if not it["file"] or self._is_shown(key):
                     continue
-                cap = "%s %s" % (pk_time(r["ts_msg"] or r["ts_queued"]), who_of(r))
-                if not self._send_file([key], num, thread, media, cap):
+                path, _size, mime = it["file"]
+                size = os.path.getsize(path)
+                cap = "%s %s" % (pk_full(it["ts"]), it["who"])
+                if size > TG_FILE_MAX:
+                    sent = self._send_text([key], num, thread, "%s: [%s — файл %d МБ на сервере, больше "
+                                           "лимита Telegram]" % (cap, it["word"], size // 2 ** 20))
+                else:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    sent = self._send_bytes([key], num, thread, "file" + (os.path.splitext(path)[1] or ".bin"),
+                                            data, mime, cap)
+                if not sent:
                     return
             stage = T_LIVE
             self._stage(num, stage)
@@ -599,15 +838,6 @@ class Mirror:
                     continue
                 if not self._show_one(num, thread, r, key):
                     return
-
-    def _send_backfill(self, num, thread, prior) -> bool:
-        items = [("msg:" + _row_key(r), line_of(r))
-                 for r in sorted(prior, key=lambda r: (r["ts_msg"] or r["ts_queued"], r["id"]))
-                 if not self._is_shown("msg:" + _row_key(r))]
-        for keys, text in batch_lines(items):
-            if not self._send_text(keys, num, thread, text):
-                return False
-        return True
 
     def _show_one(self, num, thread, r, key) -> bool:
         head = "%s %s" % (pk_time(r["ts_msg"] or r["ts_queued"]), who_of(r))
@@ -676,15 +906,17 @@ class Mirror:
             self._warn_hourly("no_queue", "очередь не найдена — жду")
             return
         self.media_step()
+        self.archive_step()
         self.show_step()
         self.watch_step()
 
 
 def start_line(m) -> str:
     return ("wa-tg-mirror: показ %s (флаг %s) · медиа всегда: каталог %s, потолок %d байт, пол "
-            "свободного %d · очередь только чтение: %s"
+            "свободного %d · очередь только чтение: %s · архив: %s, опись медиа: %s"
             % ("включён" if m.show else "выключен", FLAG_NAME, m.media_dir, m.cap, FREE_FLOOR,
-               m.queue_db))
+               m.queue_db, "есть" if os.path.exists(m.env.get("archive_db") or "") else "нет",
+               "есть" if os.path.exists(m.env.get("archive_manifest") or "") else "нет"))
 
 
 def main():
