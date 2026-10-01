@@ -12,7 +12,10 @@
     архивная пара тоже. trig=None — вся очередь история (агент);
   • дублей нет: строка очереди — один раз на wamid, запись архива — один раз на key_id и сторону;
   • квитанции и реакции — не реплики: `queue_rows` их отсекает (служба показа — сама, тем же wa_kind);
-  • порядок — по времени, при равном времени — по ключу.
+  • порядок — по времени, при равном времени — по ключу;
+  • вид без текста и без файла — русским словом (`kind_word`, WAMIRRRU0210): латиницы в скобках нет
+    ни в теме, ни в файле истории, ни в строке модели; вид вне словаря — «сообщение неизвестного вида»,
+    а его имя уходит вызывающему (служба показа пишет строку журнала — здесь журнала нет).
 
 Только чтение: очередь и архив открываются mode=ro, своего состояния нет, журнала нет, сети нет.
 Тексты, номера и имена клиентов наружу не идут — функции отдают их только вызывающему.
@@ -40,6 +43,30 @@ ARCH_MEDIA = {"image": "фото", "video": "видео", "audio": "аудио",
               "view_once_video": "одноразовое видео"}
 ARCH_OTHER = {"location": "геоточка", "live_location": "геоточка", "contact": "контакт",
               "contacts": "контакты", "deleted": "удалено", "waiting": "ожидает"}
+# Вид без текста и без файла (строка очереди — msg_type, запись архива — kind) → русское слово
+# (WAMIRRRU0210, владелец 01.10: «надо, чтобы всё было обычно»). До 02.10 такой вид показывался
+# своим именем в скобках: «[revoke]», «[unsupported]», «[edit]», «[code_99]».
+KIND_WORD = {
+    "text":          "пустое сообщение",
+    "unsupported":   "неподдерживаемое сообщение — смотреть в телефоне",
+    "revoke":        "сообщение удалено с телефона",
+    "edit":          "сообщение изменено",
+    "errors":        "сообщение не передано — смотреть в телефоне",
+    "contacts":      "контакт",
+    "contact":       "контакт",
+    "location":      "геоточка",
+    "live_location": "геоточка",
+    "interactive":   "ответ кнопкой",
+    "button":        "ответ кнопкой",
+    "order":         "заказ из каталога",
+    "system":        "служебное сообщение",
+    "reaction":      "реакция",
+    "status":        "квитанция",
+    "deleted":       "удалено",
+    "waiting":       "ожидает",
+}
+UNKNOWN_WORD = "сообщение неизвестного вида"
+FILE_WORD = "файл"             # медиа вида вне словаря медиа (архив: code_<N> с файлом)
 
 # колонки очереди wa_inbox, которые читают склейка и служба показа
 QCOLS = ("id", "ts_queued", "from_number", "name", "msg_type", "text", "media_id", "mime",
@@ -87,7 +114,20 @@ def who_of(row) -> str:
         return "мы"
     if kind in (wa_kind.KIND_INBOUND, wa_kind.KIND_HISTORY):
         return "клиент"
+    if row["echo"] in (0, 1):
+        return "мы" if row["echo"] else "клиент"     # вид не опознан, сторона записана (unsupported клиента)
     return "?"
+
+
+def kind_word(kind, unknown=None) -> str:
+    """Вид без текста → русское слово. Вне словаря — UNKNOWN_WORD, а имя вида — в unknown (set),
+    если вызывающий его дал: строку журнала пишет он."""
+    word = KIND_WORD.get(kind or "")
+    if word is None:
+        if unknown is not None:
+            unknown.add(kind or "")
+        word = UNKNOWN_WORD
+    return word
 
 
 def row_key(row) -> str:
@@ -104,10 +144,15 @@ def is_utterance(row) -> bool:
 # элемент: {"key", "ts", "who" (клиент|мы|?), "text", "word" (медиа словом | None),
 #           "file" ((путь, размер, mime) — файл на сервере | None)}
 
-def arch_item(a, man):
-    """Запись архива (ARCH_COLS) → элемент. man — опись медиа {«key_id|from_me»: (путь, размер, mime)}."""
+def arch_item(a, man, unknown=None):
+    """Запись архива (ARCH_COLS) → элемент. man — опись медиа {«key_id|from_me»: (путь, размер, mime)}.
+    unknown — set, куда ложатся имена видов вне словарей (строку журнала пишет вызывающий)."""
     ts, from_me, kind, text, caption, transcript, media_file, key_id = a
-    word = ARCH_MEDIA.get(kind) or (kind if media_file else None)
+    word = ARCH_MEDIA.get(kind)
+    if not word and media_file:
+        word = FILE_WORD                          # медиа неизвестного вида — «файл», имя вида — в журнал
+        if unknown is not None:
+            unknown.add(kind or "")
     f = None
     if word:
         hit = man.get("%s|%d" % (key_id, int(from_me)))
@@ -119,14 +164,15 @@ def arch_item(a, man):
     elif kind in ARCH_OTHER:
         text = "[%s]" % ARCH_OTHER[kind] + (" " + text if text else "")
     elif not text:
-        text = "[%s]" % kind
+        text = "[%s]" % kind_word(kind, unknown)
     return {"key": "a:%s:%d" % (key_id, int(from_me)), "ts": int(ts),
             "who": "мы" if int(from_me) else "клиент", "text": text, "word": word, "file": f}
 
 
-def queue_item(r, media_of=None):
+def queue_item(r, media_of=None, unknown=None):
     """Строка очереди → элемент. media_of(ключ) → (state, path, size, mime, code) | None — опись
-    скачанных файлов службы показа; нет её (агент) — файл неизвестен, слово медиа остаётся."""
+    скачанных файлов службы показа; нет её (агент) — файл неизвестен, слово медиа остаётся.
+    unknown — set для имён видов вне словаря (см. kind_word)."""
     t = r["msg_type"] or ""
     word, f, text = None, None, r["text"] or ""
     if t == MEDIA_PLACEHOLDER:
@@ -137,15 +183,16 @@ def queue_item(r, media_of=None):
         if md and md[0] == MEDIA_OK and md[1] and os.path.exists(md[1]):
             f = (md[1], md[2] or 0, md[3] or "")
     elif not text:
-        text = "[" + (t or "?") + "]"
+        text = "[%s]" % kind_word(t, unknown)
     return {"key": row_key(r), "ts": int(r["ts_msg"] or r["ts_queued"] or 0), "who": who_of(r),
             "text": text, "word": word, "file": f}
 
 
-def merge(arch, rows, trig=None, man=None, media_of=None):
+def merge(arch, rows, trig=None, man=None, media_of=None, unknown=None):
     """Склейка → элементы по времени. arch — записи архива номера (ARCH_COLS), rows — реплики
     очереди номера по id. Строка очереди с id ≥ trig — «новое»: не идёт сама и снимает свою
-    архивную пару; trig=None — вся очередь история. Дублей нет ни одной дорогой."""
+    архивную пару; trig=None — вся очередь история. Дублей нет ни одной дорогой. unknown — set,
+    куда ложатся имена видов вне словаря (служба показа пишет по ним строку журнала)."""
     man = man or {}
     arch_keys = {a[7] for a in arch}
     taken, seen, items = set(), set(), []
@@ -157,11 +204,11 @@ def merge(arch, rows, trig=None, man=None, media_of=None):
                 taken.add(k)
         elif not paired and row_key(r) not in seen:
             seen.add(row_key(r))
-            items.append(queue_item(r, media_of))
+            items.append(queue_item(r, media_of, unknown))
     for a in arch:
         if a[7] in taken:
             continue
-        it = arch_item(a, man)
+        it = arch_item(a, man, unknown)
         if it["key"] not in seen:
             seen.add(it["key"])
             items.append(it)
