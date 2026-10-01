@@ -247,6 +247,16 @@ def test_code_reason_alone_locks():
     assert w.door.sends == [], w.door.sends
 
 
+def test_broken_handoff_record_locks():
+    w = World()
+    w.ask("Спасибо!")
+    w.core.db.execute("UPDATE drafts SET handoff='{битое' WHERE id=1")
+    assert A.handoff_of("{битое") is None and A.handoff_of(None) == []
+    w.press("wa:send:1:1", 101)
+    assert w.door.sends == [] and w.answers()[-1] == A.HANDOFF_LOCK_WORDS[:G.ANSWER_MAX], w.answers()
+    assert w.core.handoff(1) == [A.UNREAD_REASON]
+
+
 def test_other_language_by_model_lang():
     rep = json.dumps({"text": "Hello!", "lang": "de", "handoff": [], "why": "x"})
     w = World(reply=rep)

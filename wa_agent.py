@@ -102,12 +102,18 @@ HANDOFF_LOCK_WORDS = "нужен человек — сначала «Испра�
 
 
 def handoff_of(raw):
-    """drafts.handoff → [слова] (пусто/битое — [])."""
+    """drafts.handoff → [слова]; NULL — [] (причин нет). Битая запись — None («не прочитано», не «причин
+    нет»): замок `send_locked` и карточка считают такой черновик черновиком с причинами."""
     try:
-        val = json.loads(raw) if raw else []
+        val = json.loads(raw or "[]")
     except (ValueError, TypeError):
-        return []
-    return [str(x) for x in val if str(x).strip()] if isinstance(val, list) else []
+        return None
+    if isinstance(val, list):
+        return [str(x) for x in val if str(x).strip()]
+    return None
+
+
+UNREAD_REASON = "причины не прочитаны — решает человек"
 
 
 def draft_out(out):
@@ -488,7 +494,8 @@ class Core:
 
     def handoff(self, draft_id):
         row = self.db.execute("SELECT handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
-        return handoff_of(row[0]) if row else []
+        hand = handoff_of(row[0]) if row else []
+        return [UNREAD_REASON] if hand is None else hand
 
     def send_locked(self, draft_id, ver):
         """«Отправить» заперто: черновик ждёт с этой версией, у него есть причины «нужен человек»,
@@ -496,7 +503,8 @@ class Core:
         row = self.db.execute("SELECT state, ver, handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
         if not row or row[0] != PENDING or row[1] != int(ver):
             return False
-        return bool(handoff_of(row[2])) and row[1] == 1
+        hand = handoff_of(row[2])
+        return (hand is None or bool(hand)) and row[1] == 1
 
     def _door_open(self):
         """Дверь без `is_open` — открыта (прежний контракт); `is_open` упал — закрыта."""
