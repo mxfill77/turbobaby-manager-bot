@@ -436,7 +436,7 @@ def test_main_passes_switch():
     saved = (SV.env_of, SV.make_model, SV.build, dict(os.environ))
     try:
         SV.env_of, SV.build = (lambda: env), build
-        SV.make_model = lambda e, line=None, bridge=None, call=None, lessons=False, book=False: \
+        SV.make_model = lambda e, line=None, bridge=None, call=None, lessons=False, book=False, cache=None: \
             seen.append(book) or (None, "")
         for flag in ("1", None):
             os.environ["WA_AGENT_DRAFTS"] = "1"

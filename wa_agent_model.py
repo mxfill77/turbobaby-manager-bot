@@ -35,6 +35,14 @@ ANTHROPIC_API_KEY из .env корня дерева, учёт трат `spend_le
 
 ЖУРНАЛ — только номер черновика у ядра, объёмы, токены, причины словами. Текстов, номеров и имён
 клиентов в журнале нет.
+
+КЭШ ПРОМПТА (WAAGENTCACHE0210) — выключатель службы WA_AGENT_CACHE: «1h»/«5m» — срок, 1/true/yes/on — 1h,
+прочее и пусто — выключен (запрос байт-в-байт прежний). Включён — неизменная часть идёт ВПЕРЕДИ одним
+системным префиксом: инструкция, затем снимки `faq` и `business_rules` БЕЗ возраста (меняются только со
+сменой узла) с отметкой `cache_control` на последнем блоке; возраст узлов, уроки, цена, факты, история и
+вопрос — после, в сообщении. Цена каждого вызова считается по usage (вход, запись в кэш 5 мин/1 ч, чтение
+из кэша, выход) — строкой журнала и итогом в сводку службы (`spend`). Множители — по документации Anthropic
+«Prompt caching»: запись 5 мин 1.25× цены входа, запись 1 ч 2×, чтение 0.1×.
 """
 
 import datetime
@@ -261,11 +269,108 @@ def parse_reply(raw):
             "handoff": hand[:8], "why": str(data.get("why") or "").strip()[:300]}
 
 
+# ── кэш промпта и цена по usage (WAAGENTCACHE0210) ─────────────────────────────────────
+
+CACHE_TTLS = ("5m", "1h")
+# Множители к цене входа модели — документация Anthropic «Prompt caching», раздел цен:
+# https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+CACHE_WRITE_X = {"5m": 1.25, "1h": 2.0}
+CACHE_READ_X = 0.1
+KNOW_HEAD = ("ЗНАНИЯ КОМПАНИИ — снимки узлов мозга (на них ссылается правило 5; возраст снимков — в сообщении, "
+             "блок «ВОЗРАСТ ЗНАНИЙ»):")
+
+
+def cache_ttl_of(value):
+    """Настройка WA_AGENT_CACHE → срок кэша | None (выключен). «5m»/«1h» — срок; 1/true/yes/on — «1h»
+    (выбор WAAGENTCACHE0210 §2: черновики реже раза в 5 минут); пусто и всё прочее — выключен."""
+    v = str(value or "").strip().lower()
+    if v in CACHE_TTLS:
+        return v
+    if v in ("1", "true", "yes", "on"):
+        return "1h"
+    return None
+
+
+def usage_of(u):
+    """usage ответа API → {in, cw, cw5, cw1h, cr, out} — целые; поля нет — 0. `in` — вход ПОСЛЕ кэша
+    (так его считает API), `cw` — запись в кэш, `cw5`/`cw1h` — она же по срокам, `cr` — чтение из кэша."""
+    def g(o, k):                                       # поля SDK — int | None; None и «нет поля» — 0
+        return max(0, int(getattr(o, k, 0) or 0)) if o is not None else 0
+    cc = getattr(u, "cache_creation", None)
+    return {"in": g(u, "input_tokens"), "cw": g(u, "cache_creation_input_tokens"),
+            "cw5": g(cc, "ephemeral_5m_input_tokens"), "cw1h": g(cc, "ephemeral_1h_input_tokens"),
+            "cr": g(u, "cache_read_input_tokens"), "out": g(u, "output_tokens")}
+
+
+def cost_of(model, use):
+    """Цена вызова по usage → {usd, usd_nocache, eq_in}. eq_in — вход в токенах по цене входа:
+    in + запись 5 мин × 1.25 + запись 1 ч × 2 + чтение × 0.1; запись без разбивки по сроку — по ДОРОГОМУ
+    (2×, учёт не занижает). usd_nocache — тот же вход целиком по цене входа (как без кэша). Цены модели —
+    `spend_ledger.cost_usd` (одна таблица с Splinter)."""
+    import spend_ledger
+    u = {k: int((use or {}).get(k) or 0) for k in ("in", "cw", "cw5", "cw1h", "cr", "out")}
+    rest = max(0, u["cw"] - u["cw5"] - u["cw1h"])
+    eq_in = (u["in"] + u["cw5"] * CACHE_WRITE_X["5m"] + (u["cw1h"] + rest) * CACHE_WRITE_X["1h"]
+             + u["cr"] * CACHE_READ_X)
+    per_in = spend_ledger.cost_usd(model, 1_000_000, 0) / 1_000_000.0          # $ за токен входа
+    return {"usd": per_in * eq_in + spend_ledger.cost_usd(model, 0, u["out"]),
+            "usd_nocache": spend_ledger.cost_usd(model, u["in"] + u["cw"] + u["cr"], u["out"]),
+            "eq_in": eq_in}
+
+
+def cost_words(use, cost):
+    """Строка журнала о цене вызова: только числа."""
+    return ("цена: вход %d · запись в кэш %d (5 мин %d, 1 ч %d) · чтение из кэша %d · выход %d → $%.4f "
+            "(без кэша $%.4f)" % (use["in"], use["cw"], use["cw5"], use["cw1h"], use["cr"], use["out"],
+                                  cost["usd"], cost["usd_nocache"]))
+
+
+def _by_name(nodes):
+    return sorted(nodes or (), key=lambda n: str(n.get("name")))            # как sorted(parts): business_rules, faq
+
+
+def node_stable(node, now=None):
+    """Узел → текст для префикса кэша: без возраста и без причины непрочтения (они меняются каждый вызов
+    и живут в блоке «ВОЗРАСТ ЗНАНИЙ»). Меняется только со сменой узла. Не прочитан — НЕИЗВЕСТНО словами."""
+    if K.node_age(node, now) is None:
+        return ("УЗЕЛ %s: НЕИЗВЕСТНО — не прочитан (причина — в блоке «ВОЗРАСТ ЗНАНИЙ»). Не отвечай по памяти о "
+                "том, что в нём; где нужен он — «уточню у коллег»." % node.get("name"))
+    return "УЗЕЛ %s (%d симв.):\n%s" % (node["name"], node["len"], node["text"])
+
+
+def knowledge_stable(nodes, now=None):
+    """Неизменная часть знаний — одним блоком: шапка и узлы по имени."""
+    return "\n\n".join([KNOW_HEAD] + [node_stable(n, now) for n in _by_name(nodes)])
+
+
+def ages_block(nodes, now=None):
+    """Переменная часть знаний — возраст снимков и причина непрочтения, в сообщение (после префикса)."""
+    out = []
+    for n in _by_name(nodes):
+        age = K.node_age(n, now)
+        out.append("%s — %s" % (n.get("name"), "снят %d мин назад" % int(age // 60) if age is not None else
+                                "НЕИЗВЕСТНО: не прочитан (%s)" % (n.get("why") or "причина не названа")))
+    return "ВОЗРАСТ ЗНАНИЙ: " + "; ".join(out)
+
+
+def system_chars(system):
+    return len(system) if isinstance(system, str) else sum(len(b.get("text") or "") for b in system)
+
+
+class _LedgerUsage:
+    """usage для `spend_ledger.meter`: вход — в токенах по цене входа (eq_in), чтобы учёт трат Splinter
+    видел запись и чтение кэша по их цене, а не только `input_tokens`. Без кэша eq_in = input_tokens."""
+
+    def __init__(self, eq_in, out):
+        self.input_tokens, self.output_tokens = int(round(eq_in)), int(out)
+
+
 # ── платный вызов (как у Splinter) ─────────────────────────────────────────────────────
 
 def paid_call(model_name=None, env_file=None):
     """→ call(system, user) → (текст, usage-словарь). Ключ — ANTHROPIC_API_KEY из .env дерева тем же
-    путём, что у Splinter; учёт трат — `spend_ledger.meter`. Значение ключа нигде не печатается."""
+    путём, что у Splinter; учёт трат — `spend_ledger.meter`. Значение ключа нигде не печатается.
+    system — строка (кэш выключен) или список блоков с `cache_control` (WAAGENTCACHE0210) — уходит как есть."""
     try:
         from dotenv import load_dotenv
         load_dotenv(env_file or os.path.join(ROOT, ".env"))
@@ -281,15 +386,17 @@ def paid_call(model_name=None, env_file=None):
     def call(system, user):
         resp = client.messages.create(model=name, max_tokens=MAX_TOKENS, system=system,
                                       messages=[{"role": "user", "content": user}])
+        u = getattr(resp, "usage", None)
+        use = usage_of(u)
+        model = getattr(resp, "model", name) or name
         try:
             import spend_ledger
-            spend_ledger.meter(name, getattr(resp, "usage", None))
+            spend_ledger.meter(name, _LedgerUsage(cost_of(model, use)["eq_in"], use["out"]) if u is not None
+                               else None)
         except Exception:                                            # noqa: BLE001
             pass
-        u = getattr(resp, "usage", None)
         text = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        return text, {"model": getattr(resp, "model", name),
-                      "in": getattr(u, "input_tokens", None), "out": getattr(u, "output_tokens", None)}
+        return text, dict(use, model=model)
     return call
 
 
@@ -303,8 +410,10 @@ class ModelAdapter(wa_agent.Model):
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
                  manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db="",
-                 lessons_db="", book=None):
+                 lessons_db="", book=None, cache=None):
         self.queue_db, self.call = queue_db, call
+        self.cache = cache if cache in CACHE_TTLS else None   # срок кэша промпта (WAAGENTCACHE0210); None — выкл
+        self.spend = {"calls": 0, "in": 0, "cw": 0, "cr": 0, "out": 0, "usd": 0.0, "usd_nocache": 0.0}
         self.book = book                                  # снимок броней `wa_book_read.Snapshot`; None — выкл
         self.agent_db = agent_db                          # outbox: ушедшее через API (WARELAYTEXT0210)
         self.lessons_db = lessons_db                      # уроки людей (WAAGENTLESSON0210); пусто — выкл
@@ -315,6 +424,34 @@ class ModelAdapter(wa_agent.Model):
         self.clock = clock
         self.log = log or (lambda line: None)
         self.last = None                                  # разбор последнего вызова (для проб и тестов)
+
+    def _system(self, text, nodes, now):
+        """Кэш выключен — строка инструкции, как раньше (узлы — в сообщении). Включён — префикс из двух
+        блоков: инструкция и знания без возраста; отметка кэша — на последнем (кэшируется всё до неё)."""
+        if not self.cache:
+            return text
+        return [{"type": "text", "text": text},
+                {"type": "text", "text": knowledge_stable(nodes, now),
+                 "cache_control": {"type": "ephemeral", "ttl": self.cache}}]
+
+    def _knowledge_blocks(self, parts, nodes, now):
+        """Блоки знаний для сообщения: кэш выключен — узлы с возрастом (как раньше); включён — только возраст."""
+        if self.cache:
+            return [ages_block(nodes, now)]
+        return [parts[k] for k in sorted(parts) if k.startswith("node:")]
+
+    def _spend(self, usage, what):
+        """usage вызова → строка журнала о цене и итог в `self.spend` (сводка службы). → цена."""
+        use = {k: int((usage or {}).get(k) or 0) for k in ("in", "cw", "cw5", "cw1h", "cr", "out")}
+        cost = cost_of((usage or {}).get("model") or DEFAULT_MODEL, use)
+        s = self.spend
+        s["calls"] += 1
+        for k in ("in", "cw", "cr", "out"):
+            s[k] += use[k]
+        s["usd"] += cost["usd"]
+        s["usd_nocache"] += cost["usd_nocache"]
+        self.log("%s %s" % (what, cost_words(use, cost)))
+        return cost
 
     def _history(self, number, upto_id):
         items, missing = wa_history.read_history(number, self.queue_db, self.archive_db, self.manifest,
@@ -425,9 +562,10 @@ class ModelAdapter(wa_agent.Model):
         if avail is not None or rental is not None:
             reasons = B.adjust_reasons(reasons, avail, rental, ask)
         nodes = self.knowledge.refresh(now)
-        parts = K.prompt_parts(price, reasons, [nodes[n] for n in K.NODES], now)
+        node_list = [nodes[n] for n in K.NODES]
+        parts = K.prompt_parts(price, reasons, node_list, now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
-        blocks += [parts[k] for k in sorted(parts) if k.startswith("node:")]
+        blocks += self._knowledge_blocks(parts, node_list, now)
         lessons = self._lessons()
         lesson_text, n_mask3 = K.mask(lessons_block(lessons))
         if lesson_text:
@@ -442,17 +580,18 @@ class ModelAdapter(wa_agent.Model):
                       ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
         blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + (ask or "[пусто]"))
         user = "\n\n".join(blocks)
-        system = SYSTEM_PROMPT if self.book is None else SYSTEM_PROMPT_BOOK
+        system = self._system(SYSTEM_PROMPT if self.book is None else SYSTEM_PROMPT_BOOK, node_list, now)
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
                 "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
                 "avail": avail, "rental": rental, "book_words": book_words,
-                "user_chars": len(user), "system_chars": len(system)}
+                "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache}
         return system, user, info
 
     def draft(self, number, upto_id):
         system, user, info = self.build(number, upto_id)
         raw, usage = self.call(system, user)
+        self._spend(usage, "черновик:")
         got = parse_reply(raw)
         self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got}
         tok = "токены in=%s out=%s" % ((usage or {}).get("in"), (usage or {}).get("out"))
@@ -486,9 +625,10 @@ class ModelAdapter(wa_agent.Model):
             hist = "… (старшая часть истории обрезана: %d симв.)\n" % cut + hist[-HISTORY_MAX:]
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
         nodes = self.knowledge.refresh(now)
-        parts = K.prompt_parts(None, [], [nodes[n] for n in K.NODES], now)
+        node_list = [nodes[n] for n in K.NODES]
+        parts = K.prompt_parts(None, [], node_list, now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
-        blocks += [parts[k] for k in sorted(parts) if k.startswith("node:")]
+        blocks += self._knowledge_blocks(parts, node_list, now)
         lesson_text, n_mask2 = K.mask(lessons_block(self._lessons()))
         if lesson_text:
             blocks.append(lesson_text)
@@ -496,14 +636,15 @@ class ModelAdapter(wa_agent.Model):
                       "молчит):\n" + (hist or "переписки раньше не было") +
                       ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
         user = "\n\n".join(blocks)
-        return FOLLOW_SYSTEM_PROMPT, user, {"history_items": len(items), "history_chars": len(hist),
-                                            "history_cut": cut, "masked": n_mask + n_mask2,
-                                            "missing": missing, "user_chars": len(user)}
+        return self._system(FOLLOW_SYSTEM_PROMPT, node_list, now), user, {
+            "history_items": len(items), "history_chars": len(hist), "history_cut": cut,
+            "masked": n_mask + n_mask2, "missing": missing, "user_chars": len(user), "cache": self.cache}
 
     def followup(self, number, upto_id):
         """Напоминание → текст | {skip: True, why} («не нужно») | None (не JSON, нет решения)."""
         system, user, info = self.build_followup(number, upto_id)
         raw, usage = self.call(system, user)
+        self._spend(usage, "напоминание:")
         got = parse_followup(raw)
         self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got}
         tok = "токены in=%s out=%s" % ((usage or {}).get("in"), (usage or {}).get("out"))
