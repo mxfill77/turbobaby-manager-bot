@@ -169,11 +169,11 @@ items, _ = hist(env)
 lines = [H.model_line(it) for it in items]
 ok(lines[0] == "%s · мы: [фото] подпись фото" % H.pk_full(T0), "модель: архивное фото словом с подписью: %r" % lines[0][17:])
 ok(lines[1].endswith("клиент: [аудио] (расшифровка: привет голосом)"), "голосовое архива — словом и расшифровкой")
-ok(lines[2].endswith("клиент: [геоточка] Раваи") and lines[3].endswith("клиент: [weird_kind]"),
-   "геоточка словом, неизвестный вид — именем вида")
+ok(lines[2].endswith("клиент: [геоточка] Раваи") and lines[3].endswith("клиент: [сообщение неизвестного вида]"),
+   "геоточка словом, неизвестный вид — «сообщение неизвестного вида» (WAMIRRRU0210: не именем)")
 ok(lines[4].endswith("клиент: [фото] фото очереди") and lines[5].endswith("клиент: [медиа]")
-   and lines[6].endswith("клиент: [голосовое]") and lines[7].endswith("клиент: [interactive]"),
-   "очередь: фото, заглушка, голосовое — словом; неизвестный тип — именем")
+   and lines[6].endswith("клиент: [голосовое]") and lines[7].endswith("клиент: [ответ кнопкой]"),
+   "очередь: фото, заглушка, голосовое — словом; вид без текста — русским словом (WAMIRRRU0210)")
 ok(" · " in lines[0] and all(ln.split(" · ")[0] == H.pk_full(it["ts"]) for ln, it in zip(lines, items)),
    "строка модели «ДД.ММ.ГГГГ ЧЧ:ММ · клиент|мы: текст»")
 ok(H.item_line(items[0]).endswith("мы: [фото — на сервере] подпись фото")
@@ -328,7 +328,7 @@ ok(not hasattr(M.Mirror, "_arch_item") and not hasattr(M.Mirror, "_queue_item")
    and M.who_of is H.who_of, "реализация одна: элементы, строки и wamid — только в wa_history")
 
 # ─────────────────────────────────────────────────────────────────────────────
-print("\n(8) до и после: новая склейка == дословная копия прежней (f8f65b3)")
+print("\n(8) до и после: новая склейка == дословная копия прежней (f8f65b3), латиница вида → русское слово")
 # Прежний код службы показа (wa_tg_mirror.py у f8f65b3: parse_wamid, _arch_item, _queue_item,
 # prehistory) — дословно, только self.* заменены параметрами. Оракул, а не реализация: не править.
 _O_MEDIA_WORD = {"image": "фото", "video": "видео", "audio": "аудио", "voice": "голосовое",
@@ -426,6 +426,24 @@ def o_prehistory(arch, rows, trig, man, media_of):
     return items
 
 
+# WAMIRRRU0210 (02.10): намеренные отличия от оракула — латиница вида в скобках стала русским словом,
+# сторона неопознанного вида — по echo вместо «?». Оракул не правится; его выдача переводится o_ru и только ею.
+_O_RU_TEXT = {"[weird]": "[сообщение неизвестного вида]", "[text]": "[пустое сообщение]",
+              "[interactive]": "[ответ кнопкой]"}
+_O_WORDS = set(_O_ARCH_MEDIA.values()) | set(_O_MEDIA_WORD.values()) | {"медиа"}
+
+
+def o_ru(it, rows_by_key):
+    it = dict(it)
+    if it["word"] is not None and it["word"] not in _O_WORDS:
+        it["word"] = "файл"                    # медиа вида вне словаря: было именем вида
+    it["text"] = _O_RU_TEXT.get(it["text"], it["text"])
+    r = rows_by_key.get(it["key"])
+    if it["who"] == "?" and r is not None and r["echo"] in (0, 1):
+        it["who"] = "мы" if r["echo"] else "клиент"   # неопознанный вид: сторона по echo, а не «?»
+    return it
+
+
 KINDS = ["text", "text", "text", "image", "audio", "document", "location", "deleted", "sticker", "weird"]
 QTYPES = ["text", "text", "text", "image", "voice", "media_placeholder", "status", "reaction", "interactive"]
 rnd = random.Random(20261001)
@@ -460,7 +478,8 @@ for w in range(120):
     media = {r["wamid"]: ("ok", mfile, 1, "image/jpeg", "") for r in rows if r["msg_type"] == "image"}
     ids = [r["id"] for r in rows]
     for trig in [None] + ([rnd.choice(ids)] if ids else []):
-        old = o_prehistory(arch_db, rows, (max(ids) + 1 if ids else 1) if trig is None else trig, man, media.get)
+        old = [o_ru(it, {H.row_key(r): r for r in rows}) for it in
+               o_prehistory(arch_db, rows, (max(ids) + 1 if ids else 1) if trig is None else trig, man, media.get)]
         new = H.merge(arch_db, rows, trig, man, media.get)
         worlds += 1
         n_items += len(new)

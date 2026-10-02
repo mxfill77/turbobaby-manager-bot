@@ -26,6 +26,10 @@
    сообщение темы, показанное из строки с wamid цели (id сообщения темы хранится у ключа показа);
    вне набора Telegram или цель не показана отдельным сообщением — короткая строка; снятие — снять.
    Имя темы догоняет имя клиента: появилось или сменилось — editForumTopic один раз на смену.
+   Все виды — по-русски (WAMIRRRU0210): вид без текста — словом (wa_history.kind_word), вид вне
+   словаря — «[сообщение неизвестного вида]» и строка журнала с именем вида. Удаление с телефона
+   (revoke) — пометка «🗑 удалено с телефона ЧЧ:ММ» на сообщении темы, где цель показана одна
+   (прежний текст остаётся зачёркнутым); иначе одна строка «🗑 удалено сообщение от ЧЧ:ММ».
    Темп — не больше 20 вызовов в минуту; 429 — ждать retry_after. wamid дважды не показывается:
    ключ ставится ДО вызова, так что обрыв посреди вызова даёт «не повторять», а не дубль.
 
@@ -115,6 +119,45 @@ SIDE_TG = "tg"                 # строка reacts с тем, что бот С
 NO_NAME = "без имени"
 RENAME_EVERY = 60              # имена тем сверяются не чаще раза в минуту
 
+# Удаление с телефона (WAMIRRRU0210): msg_type, поле тела с wamid удалённого и ключ «цель уже
+# помечена» — второй revoke той же цели (другой wamid, повтор досинхрона) правки не повторяет.
+REVOKE_TYPE = "revoke"
+REVOKE_KEY = "rev:"
+# Правка с телефона (WAPHONEEDIT0210): цель и новый текст — колонки очереди edit_to/edit_text.
+# Таблица edits — какая строка правки последней легла на цель и как (правкой или строкой): повтор
+# того же текста (досинхрон под другим wamid) второй правки не даёт, удаление зачёркивает НОВЫЙ текст.
+EDIT_TYPE = wa_history.EDIT_TYPE
+_UNKNOWN_LOGGED = set()        # имена неизвестных видов, по которым строка журнала уже была
+_KIND_FORM = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,39}$")
+
+
+def _kind_name(kind) -> str:
+    """Имя вида для журнала — только формы имени (буква, затем [A-Za-z0-9_.-], до 40); иное — длиной:
+    тексты, номера и имена клиентов в журнал не идут."""
+    s = str(kind or "")
+    if not s:
+        return "<пусто>"
+    return s if _KIND_FORM.match(s) else "<не имя вида, %d симв.>" % len(s)
+
+
+def note_unknown(kinds):
+    """Вид вне словаря показан словом «сообщение неизвестного вида» — строка журнала с именем вида,
+    одна на вид за жизнь процесса."""
+    for k in sorted(kinds):
+        if k not in _UNKNOWN_LOGGED:
+            _UNKNOWN_LOGGED.add(k)
+            log.warning("показ: вид сообщения %s неизвестен — показан словом «%s»",
+                        _kind_name(k), wa_history.UNKNOWN_WORD)
+
+
+def pk_hm(ts) -> str:
+    return time.strftime("%H:%M", time.gmtime(int(ts or 0) + PHUKET_OFFSET))
+
+
+def utf16_len(s) -> int:
+    """Длина в единицах UTF-16 — так Telegram меряет смещения разметки (entities)."""
+    return len(s.encode("utf-16-le")) // 2
+
 
 def tg_emoji(e) -> str:
     """Эмодзи WhatsApp → эмодзи реакции Telegram или '' (вне набора / пусто)."""
@@ -188,7 +231,10 @@ def body_of(row) -> str:
         return s + (" " + row["caption"] if row["caption"] else "")
     if row["text"]:
         return row["text"]
-    return "[" + (t or "?") + "]"
+    unknown = set()
+    word = wa_history.kind_word(t, unknown)
+    note_unknown(unknown)
+    return "[" + word + "]"
 
 
 def line_of(row) -> str:
@@ -241,7 +287,8 @@ CREATE TABLE IF NOT EXISTS topics (number TEXT PRIMARY KEY, thread_id INTEGER, t
 CREATE TABLE IF NOT EXISTS alarmed (row_id INTEGER PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS reacts (target TEXT, side TEXT, emoji TEXT, row_id INTEGER,
-    PRIMARY KEY (target, side))
+    PRIMARY KEY (target, side));
+CREATE TABLE IF NOT EXISTS edits (target TEXT PRIMARY KEY, row_id INTEGER, how TEXT, ts REAL)
 """
 # 01.10.2026 (WAREACTNAME0110): id сообщения темы у показанного ключа (solo — ключ один в
 # сообщении, на него можно ставить реакцию) и имя, под которым тема сейчас названа. Только ADD.
@@ -412,7 +459,10 @@ class Mirror:
         if man is None:
             missing.append(why_m)
             man = {}
-        return wa_history.merge(arch, rows, trig, man, self._media_of), missing
+        unknown = set()
+        items = wa_history.merge(arch, rows, trig, man, self._media_of, unknown)
+        note_unknown(unknown)
+        return items, missing
 
     # ── 1. медиа ─────────────────────────────────────────────────────────────────────────
     def media_step(self):
@@ -800,17 +850,217 @@ class Mirror:
                         continue                              # досинхрон: не живое
                     if not self._react_one(num, thread, r, key):
                         return
+                elif (r["msg_type"] or "") == REVOKE_TYPE:
+                    if not self._revoke_one(num, thread, r, key, trig):
+                        return
+                elif (r["msg_type"] or "") == EDIT_TYPE and wa_history.edit_of(r)[1]:
+                    if not self._edit_one(num, thread, r, key, trig):
+                        return
                 elif not self._show_one(num, thread, r, key):
                     return
 
+    def _target_where(self, target):
+        """wamid цели → («msg»|«file», id сообщения темы), где она показана ОДНА · (None, None)."""
+        for p in ("msg", "file"):
+            r = self.st.execute("SELECT msg_id FROM shown WHERE key=? AND state=? AND solo=1 "
+                                "AND msg_id IS NOT NULL", (p + ":" + target, S_SHOWN)).fetchone()
+            if r:
+                return p, int(r[0])
+        return None, None
+
     def _target_msg(self, target):
         """wamid цели → id сообщения темы, где она показана ОДНА (текстом или файлом) · None."""
-        for k in ("msg:" + target, "file:" + target):
-            r = self.st.execute("SELECT msg_id FROM shown WHERE key=? AND state=? AND solo=1 "
-                                "AND msg_id IS NOT NULL", (k, S_SHOWN)).fetchone()
-            if r:
-                return int(r[0])
-        return None
+        return self._target_where(target)[1]
+
+    def _revoke_target(self, row):
+        """Строка удаления → wamid удалённого (revoke.original_message_id тела в raw) · None."""
+        conn = self._q()
+        try:
+            raw = conn.execute("SELECT raw FROM wa_inbox WHERE id=?", (row["id"],)).fetchone()
+        finally:
+            conn.close()
+        try:
+            rv = (json.loads(raw[0] or "null") or {}).get("revoke") or {}
+            return rv.get("original_message_id") or None
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _target_ts(self, num, target, trows):
+        """Время удалённого: строка очереди, иначе запись архива номера по key_id · None."""
+        if trows:
+            return int(trows[0]["ts_msg"] or trows[0]["ts_queued"] or 0)
+        key_id = parse_wamid(target)[1] if target else None
+        if not key_id:
+            return None
+        conn, _why = self._archive()
+        if conn is None:
+            return None
+        try:
+            a = conn.execute("SELECT ts FROM messages WHERE number=? AND key_id=? ORDER BY ts LIMIT 1",
+                             (num, key_id)).fetchone()
+            return int(a[0]) if a else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def _shown_body(self, prefix, trow, trig, new=None):
+        """Что показано в теме по строке цели → («text»|«caption», текст) — теми же функциями, что
+        показывали: живая лента (id ≥ trig) — _live_view; хвост предыстории — item_line текстом,
+        файл хвоста — подпись «дата кто». new — текст правки: та же строка с новым текстом."""
+        if new is not None:
+            trow = wa_history.edited(trow, new)
+        if prefix == "file":
+            return "caption", "%s %s" % (pk_full(trow["ts_msg"] or trow["ts_queued"]), who_of(trow)) \
+                + (" · " + new if new is not None else "")
+        if trow["id"] >= trig:
+            how, _media, text = self._live_view(trow)
+            return ("caption" if how == "file" else "text"), text
+        return "text", item_line(wa_history.queue_item(trow, self._media_of))
+
+    def _revoke_one(self, num, thread, r, key, trig) -> bool:
+        """Удаление с телефона (revoke). Цель показана ОДНА и её id есть — правка этого сообщения:
+        прежний текст остаётся зачёркнутым, ниже «🗑 удалено с телефона ЧЧ:ММ» (сотрудник видит, ЧТО
+        удалено, — в переписке и файле истории оно всё равно лежит). Иначе (цель в пачке, показана
+        до хранения id, не показана, не из этой темы, правку чат не принял) — одна строка
+        «🗑 удалено сообщение от ЧЧ:ММ». Ключ строки — как у всех; цель — ещё и «rev:<wamid>»:
+        повтор тела, рестарт и второй revoke той же цели правку не повторяют."""
+        target = self._revoke_target(r)
+        when = pk_hm(r["ts_msg"] or r["ts_queued"])
+        if target and self._is_shown(REVOKE_KEY + target):
+            self._mark([key], num, S_SHOWN)               # цель уже помечена — второй правки нет
+            return True
+        trows = self._rows("wamid=?", (target,)) if target else []
+        prefix, mid = self._target_where(target) if (target and trows) else (None, None)
+        if mid is not None:
+            how, old = self._shown_now(prefix, trows[0], trig)
+            mark = "🗑 удалено с телефона " + when
+            cap = TG_CAPTION_MAX if how == "caption" else TG_TEXT_MAX
+            old = old[:cap - len(mark) - 1]
+            ent = [{"type": "strikethrough", "offset": 0, "length": utf16_len(old)}]
+            params = {"chat_id": self.env["tg_chat"], "message_id": mid}
+            if how == "caption":
+                method = "editMessageCaption"
+                params.update(caption=old + "\n" + mark, caption_entities=ent)
+            else:
+                method = "editMessageText"
+                params.update(text=old + "\n" + mark, entities=ent)
+            self._mark([key], num, S_SENDING)
+            ok, res = self.tg(method, params)
+            if ok:
+                self._mark([key, REVOKE_KEY + target], num, S_SHOWN)
+                self.counts["shown"] += 1
+                return True
+            if ok is None:
+                self._mark([key, REVOKE_KEY + target], num, S_UNSURE)
+                return False
+            self._unmark([key])
+            if res != 400:
+                return False                                  # повторим следующим тактом
+            # 400 — чат правку не принял: строкой, ответом на цель
+        ts = self._target_ts(num, target, trows)
+        if ts is None:
+            what = "🗑 удалено сообщение — какое, неизвестно"
+        else:
+            same_day = pk_date(ts) == pk_date(r["ts_msg"] or r["ts_queued"])
+            what = "🗑 удалено сообщение от " + (pk_hm(ts) if same_day else pk_time(ts))
+        params = {"chat_id": self.env["tg_chat"], "message_thread_id": thread,
+                  "text": "%s %s: %s" % (pk_time(r["ts_msg"] or r["ts_queued"]), who_of(r), what)}
+        reply = mid if mid is not None else self._any_msg(target)
+        if reply is not None:
+            params["reply_parameters"] = {"message_id": reply, "allow_sending_without_reply": True}
+        keys = [key, REVOKE_KEY + target] if target else [key]
+        return self._deliver(keys, num, "sendMessage", params)
+
+    # ── правка с телефона (WAPHONEEDIT0210) ────────────────────────────────────────────────
+    def _edit_last(self, target):
+        """Последняя правка, легшая на цель → (id строки правки, «edit»|«line») · None."""
+        return self.st.execute("SELECT row_id, how FROM edits WHERE target=?", (target,)).fetchone()
+
+    def _edit_set(self, target, row_id, how):
+        self.st.execute("INSERT OR REPLACE INTO edits(target, row_id, how, ts) VALUES (?,?,?,?)",
+                        (target, row_id, how, self.clock()))
+        self.st.commit()
+
+    def _edit_view(self, prefix, trow, trig, erow):
+        """Цель после правки erow → («text»|«caption», текст) — ровно то, что уходит в правку сообщения:
+        вид строки цели с новым текстом, ниже «✏️ изменено с телефона ЧЧ:ММ» (время правки, Пхукет)."""
+        how, body = self._shown_body(prefix, trow, trig, wa_history.edit_of(erow)[1])
+        mark = "✏️ изменено с телефона " + pk_hm(erow["ts_msg"] or erow["ts_queued"])
+        cap = TG_CAPTION_MAX if how == "caption" else TG_TEXT_MAX
+        return how, body[:cap - len(mark) - 1] + "\n" + mark
+
+    def _shown_now(self, prefix, trow, trig):
+        """Что сообщение цели показывает СЕЙЧАС: последняя правка легла правкой — её вид, иначе прежний."""
+        last = self._edit_last(trow["wamid"]) if trow["wamid"] else None
+        if last is not None and last[1] == "edit":
+            erow = self._rows("id=?", (last[0],))
+            if erow and wa_history.edit_of(erow[0])[1]:
+                return self._edit_view(prefix, trow, trig, erow[0])
+        return self._shown_body(prefix, trow, trig)
+
+    def _edit_one(self, num, thread, r, key, trig) -> bool:
+        """Правка с телефона с новым текстом. Цель показана ОДНА и её id есть — правка этого сообщения
+        темы: тот же вид строки с новым текстом, ниже «✏️ изменено с телефона ЧЧ:ММ» (текст —
+        editMessageText, файл — editMessageCaption). Иначе (цель в пачке, показана до хранения id, не
+        показана, не из этой темы, правку чат не принял) — одна строка «✏️ изменено сообщение от ЧЧ:ММ,
+        теперь: …» ответом на цель, если она показана хоть в пачке. Ключ строки — как у всех; тот же
+        текст на ту же цель ещё раз (досинхрон под другим wamid) второй правки и строки не даёт."""
+        target, new = wa_history.edit_of(r)
+        last = self._edit_last(target) if target else None
+        if last is not None:
+            prev = self._rows("id=?", (last[0],))
+            if prev and wa_history.edit_of(prev[0])[1] == new:
+                self._mark([key], num, S_SHOWN)               # этот текст уже лёг — второй правки нет
+                return True
+        trows = self._rows("wamid=?", (target,)) if target else []
+        prefix, mid = self._target_where(target) if (target and trows) else (None, None)
+        if mid is not None:
+            how, text = self._edit_view(prefix, trows[0], trig, r)
+            params = {"chat_id": self.env["tg_chat"], "message_id": mid}
+            if how == "caption":
+                method = "editMessageCaption"
+                params["caption"] = text
+            else:
+                method = "editMessageText"
+                params["text"] = text
+            self._mark([key], num, S_SENDING)
+            ok, res = self.tg(method, params)
+            if ok:
+                self._edit_set(target, r["id"], "edit")
+                self._mark([key], num, S_SHOWN)
+                self.counts["shown"] += 1
+                return True
+            if ok is None:
+                self._edit_set(target, r["id"], "edit")      # исход неизвестен — повтора нет
+                self._mark([key], num, S_UNSURE)
+                return False
+            self._unmark([key])
+            if res != 400:
+                return False                                  # повторим следующим тактом
+            # 400 — чат правку не принял: строкой, ответом на цель
+        at = r["ts_msg"] or r["ts_queued"]
+        ts = self._target_ts(num, target, trows)
+        what = "✏️ изменено сообщение" + ("" if ts is None else
+                                          " от " + (pk_hm(ts) if pk_date(ts) == pk_date(at) else pk_time(ts)))
+        params = {"chat_id": self.env["tg_chat"], "message_thread_id": thread,
+                  "text": ("%s %s: %s, теперь: %s" % (pk_time(at), who_of(r), what, new))[:TG_TEXT_MAX]}
+        reply = mid if mid is not None else self._any_msg(target)
+        if reply is not None:
+            params["reply_parameters"] = {"message_id": reply, "allow_sending_without_reply": True}
+        if not self._deliver([key], num, "sendMessage", params):
+            return False
+        if target:
+            self._edit_set(target, r["id"], "line")
+        return True
+
+    def _any_msg(self, target):
+        """id сообщения темы, где цель показана хоть в пачке (для ответа строкой) · None."""
+        if not target:
+            return None
+        r = self.st.execute("SELECT msg_id FROM shown WHERE key IN (?, ?) AND state=? AND msg_id IS NOT NULL",
+                            ("msg:" + target, "file:" + target, S_SHOWN)).fetchone()
+        return int(r[0]) if r else None
 
     def _react_one(self, num, thread, r, key) -> bool:
         """Реакция → реакция бота на сообщение темы с её целью; иначе — короткая строка.
@@ -872,24 +1122,34 @@ class Mirror:
             params["reply_parameters"] = {"message_id": mid, "allow_sending_without_reply": True}
         return self._deliver([key], num, "sendMessage", params)
 
-    def _show_one(self, num, thread, r, key) -> bool:
+    def _live_view(self, r):
+        """Живая строка → («file», опись файла, подпись) — показ файлом · («text», None, текст).
+        Ею же _revoke_one восстанавливает показанное, когда ставит пометку удаления."""
         head = "%s %s" % (pk_time(r["ts_msg"] or r["ts_queued"]), who_of(r))
+        if not r["media_id"]:
+            return "text", None, "%s: %s" % (head, body_of(r))
+        media = self._media_of(_row_key(r))
+        state = media[0] if media else None
+        if state == M_OK and (media[2] or 0) <= TG_FILE_MAX:
+            return "file", media, head + (" · " + r["caption"] if r["caption"] else "")
+        word = _MEDIA_WORD.get(r["msg_type"] or "") or wa_history.FILE_WORD
+        if state == M_OK:
+            note = "файл %d МБ на сервере, больше лимита Telegram" % ((media[2] or 0) // 2 ** 20)
+        else:
+            note = "файл не скачан" + (", код " + media[4] if media and media[4] else "")
+        return "text", None, "%s: [%s — %s]%s" % (head, word, note,
+                                                  (" " + r["caption"]) if r["caption"] else "")
+
+    def _show_one(self, num, thread, r, key) -> bool:
         if r["media_id"]:
             media = self._media_of(_row_key(r))
             state = media[0] if media else None
-            if state == M_OK and (media[2] or 0) <= TG_FILE_MAX:
-                cap = head + (" · " + r["caption"] if r["caption"] else "")
-                return self._send_file([key], num, thread, media, cap)
             if state in (None, M_RETRY) and self.clock() - (r["ts_queued"] or 0) < MEDIA_WAIT:
                 return False  # файл ещё качается — порядок темы важнее скорости
-            word = _MEDIA_WORD.get(r["msg_type"] or "", r["msg_type"] or "файл")
-            if state == M_OK:
-                note = "файл %d МБ на сервере, больше лимита Telegram" % ((media[2] or 0) // 2 ** 20)
-            else:
-                note = "файл не скачан" + (", код " + media[4] if media and media[4] else "")
-            text = "%s: [%s — %s]%s" % (head, word, note, (" " + r["caption"]) if r["caption"] else "")
-            return self._send_text([key], num, thread, text)
-        return self._send_text([key], num, thread, "%s: %s" % (head, body_of(r)))
+        how, media, text = self._live_view(r)
+        if how == "file":
+            return self._send_file([key], num, thread, media, text)
+        return self._send_text([key], num, thread, text)
 
     # ── 3. ожидание и сводка ─────────────────────────────────────────────────────────────
     def _overdue(self):

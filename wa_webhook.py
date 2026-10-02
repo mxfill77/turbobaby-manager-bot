@@ -162,6 +162,9 @@ _ADDED_COLUMNS = (
     ("enriched_at",  "INTEGER"),    # когда повтор того же wamid дополнил строку
     # 01.10.2026 (WAREACTNAME0110) — реакция: wamid сообщения-цели; эмодзи — в text, снятие — ''
     ("react_to",     "TEXT"),
+    # 02.10.2026 (WAPHONEEDIT0210) — правка сообщения: wamid цели и новый текст (подпись медиа — тоже он)
+    ("edit_to",      "TEXT"),
+    ("edit_text",    "TEXT"),
 )
 
 _PULL_INDEX = "CREATE INDEX IF NOT EXISTS idx_wa_pull ON wa_inbox(acked_at, delivered_at, id)"
@@ -192,8 +195,11 @@ _ENRICH_FIELDS = (
     ("caption",  "caption"),
     ("name",     "name"),
     ("react_to", "react_to"),
+    ("edit_to",  "edit_to"),
+    ("edit_text", "edit_text"),
 )
-_ENRICH_COLS = ("msg_type", "text", "media_id", "mime", "caption", "name", "media_note", "react_to")
+_ENRICH_COLS = ("msg_type", "text", "media_id", "mime", "caption", "name", "media_note", "react_to",
+                "edit_to", "edit_text")
 
 
 def _blank(v) -> bool:
@@ -279,8 +285,8 @@ class WAQueueDB:
                             """INSERT OR IGNORE INTO wa_inbox
                                (ts_queued, channel, from_number, name, msg_type, text, media_id,
                                 ts_msg, echo, history, status, raw, wamid, source,
-                                mime, caption, media_note, react_to)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?,?,?,?)""",
+                                mime, caption, media_note, react_to, edit_to, edit_text)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?,?,?,?,?,?)""",
                             (
                                 now,
                                 ev.get("channel", "wa"),
@@ -299,6 +305,8 @@ class WAQueueDB:
                                 ev.get("caption"),
                                 ev.get("media_note"),
                                 ev.get("react_to"),
+                                ev.get("edit_to"),
+                                ev.get("edit_text"),
                             ),
                         )
                         if conn.execute("SELECT changes()").fetchone()[0]:
@@ -487,8 +495,12 @@ def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -
     msg_type = msg.get("type", "")
     text = None
     media_id = None
-    mime = caption = media_note = react_to = None
-    if msg_type == "text":
+    mime = caption = media_note = react_to = edit_to = edit_text = None
+    if msg_type == EDIT_TYPE:
+        # правка с телефона: новый текст и wamid цели — в свои колонки; `text` остаётся пустым, чтобы
+        # правку не принял за новое сообщение ни один прежний читатель очереди
+        edit_to, edit_text = _edit_fields(msg)
+    elif msg_type == "text":
         text = (msg.get("text") or {}).get("body")
     elif msg_type in _MEDIA_TYPES:
         media_id, mime, caption = _media_fields(msg, msg_type)
@@ -522,12 +534,31 @@ def _cloud_event(msg: dict, number: str, name: str, echo: bool, history: bool) -
         "caption":    caption,
         "media_note": media_note,
         "react_to":   react_to,
+        "edit_to":    edit_to,
+        "edit_text":  edit_text,
         "ts":         int(msg.get("timestamp") or 0),
         "echo":       echo,
         "history":    history,
         "wamid":      msg.get("id"),
         "raw":        msg,
     }
+
+
+EDIT_TYPE = "edit"
+
+
+def _edit_fields(msg: dict):
+    """Правка → (wamid цели, новый текст). Живое тело (досинхрон, 98 из 98 на 02.10): `edit.original_message_id`
+    и `edit.message` вида `text` с `text.body`; правка подписи медиа — `edit.message.<вид>.caption`, как у
+    обычного медиа (`_media_fields`). Нет поля или не строка → None: правка покажется словом, как до 02.10."""
+    e = msg.get("edit") if isinstance(msg.get("edit"), dict) else {}
+    m = e.get("message") if isinstance(e.get("message"), dict) else {}
+    t = m.get("type") or ""
+    sub = m.get(t) if isinstance(m.get(t), dict) else {}
+    new = sub.get("body") if t == "text" else (sub.get("caption") if t in _MEDIA_TYPES else None)
+    target = e.get("original_message_id")
+    return (target if isinstance(target, str) and target else None,
+            new if isinstance(new, str) and new.strip() else None)
 
 
 def _media_fields(msg: dict, msg_type: str):
