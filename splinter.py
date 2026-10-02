@@ -1202,6 +1202,9 @@ def topic_context(chat_id, topic_id, *, reply_to=None, bridge=None, now=None, bi
             if len(txt) <= cap or not lines:
                 break
             lines = lines[1:]
+        rb = rules_prompt(now)              # правила владельца (SPLDELIVERYASK0210); выкл. → None, текст прежний
+        if rb:
+            txt = txt + "\n\n" + rb
         log.info(f"  🧵 контекст темы → мозг: событий {len(lines)}, открытых {len(opens)}, символов {len(txt)}")
         return txt
     except Exception as e:
@@ -1434,7 +1437,7 @@ async def _decider_live_decide(snap, bridge, claude):
         log.warning(f"  🧠 решатель (бой): мост не прочитан ({type(e).__name__}) — решаю без него")
     try:
         raw = await _aio.wait_for(_aio.to_thread(
-            claude.quick, _tdec.LIVE_SYSTEM, user, max_tokens=400,
+            claude.quick, _decider_live_system(), user, max_tokens=400,
             model=os.getenv("TOPIC_DECIDER_MODEL") or None, tag="decider_live", expect_json=True), tmo)
     except _aio.TimeoutError:
         return None, f"таймаут модели {tmo:g} с"
@@ -1539,6 +1542,18 @@ async def _decider_execute(msg, context, bridge, snap, v) -> str:
         return "кнопка Пыма (вопрос L)"
     if a == "спросить":
         q = str(it.get("вопрос") or "")[:400]
+        # ВОПРОС СОТРУДНИКАМ (SPLDELIVERYASK0210): при `SPLINTER_ASK_STAFF=1` и поле «вопрос_th» (или вопрос
+        # менеджерам) — через дверь `staff_ask_post`: пост в теме байка + просьба в Delivery / «Агенты».
+        if _sask.enabled() and (it.get("вопрос_th") or _sask.norm_kind(it.get("вид")) in _sask.KINDS_MANAGERS):
+            r = await staff_ask_post(context, kind=it.get("вид"), bike=bike, q_ru=q, q_th=it.get("вопрос_th"),
+                                     urgency=it.get("срочность"), topic_id=topic_id, servicing_chat=chat_id)
+            if r.get("posted"):
+                # открыт как вопрос решателя (правило «второй_вопрос», реплай на него — решателю), как прежний путь
+                _DLIVE["asks"].setdefault(k, {})[_tdec.ask_kind(it.get("ждём_что"))] = {"mid": r.get("mid"), "ts": now}
+                _dlive_mark(chat_id, topic_id, r.get("mid"))
+                return "вопрос сотрудникам: " + " + ".join(r["posted"])
+            if r.get("qid"):
+                return "вопрос сотрудникам уже открыт — без повтора"
         sent = await msg.reply_text(f"🐀 Splinter\n{q}")
         smid = getattr(sent, "message_id", None)
         _DLIVE["asks"].setdefault(k, {})[_tdec.ask_kind(it.get("ждём_что"))] = {"mid": smid, "ts": now}
@@ -1600,6 +1615,152 @@ async def decider_live(msg, context, bridge, claude, kind="text") -> bool:
     except Exception as e:
         log.warning(f"  🧠 решатель (бой): #{mid} сбой ({type(e).__name__}) — прежний путь")
         return False
+
+# ===================== ВОПРОС СОТРУДНИКАМ ОФИСА И СНИМОК ПРАВИЛ ВЛАДЕЛЬЦА (02.10.2026, задание Штаба 0119-77t,
+# SPLDELIVERYASK0210) ==========================================================================================
+# Решения — `staff_ask` (место по виду вопроса, тексты TH+RU, срок, «Агенты») и `rules_snap` (снимок узла
+# business_rules с возрастом); здесь руки: Telegram (`_send`), мост, тема байка. Оба выключателя по умолчанию
+# ВЫКЛЮЧЕНЫ: `SPLINTER_ASK_STAFF` — ни одного поста и ни одной записи в мозг; `SPLINTER_RULES_FEED` — узел не
+# читается, системный текст решателя и контекст мозга байт в байт прежние.
+import staff_ask as _sask
+import rules_snap as _rsnap
+
+SERVICING_CHAT = -1002751134848     # «การบำรุงรักษา / Обслуживание» — форум, тема = байк
+
+
+def rules_prompt(now=None):
+    """Выжимка правил владельца для промпта (решатель, мозг) или None. Не бросает."""
+    try:
+        return _rsnap.prompt_block(now)
+    except Exception as e:
+        log.warning(f"  📜 снимок правил не прочитан ({type(e).__name__}) — промпт прежний")
+        return None
+
+
+def _decider_live_system():
+    """Системный текст боя: прежний `LIVE_SYSTEM` + (по выключателям) поля вопроса сотрудникам и правила."""
+    s = _tdec.LIVE_SYSTEM
+    if _sask.enabled():
+        s += _tdec.LIVE_STAFF_ADD
+    rb = rules_prompt()
+    return s + "\n\n" + rb if rb else s
+
+
+def _bike_topic_id(chat_id, bike):
+    """Тема байка в форуме обслуживания по имени байка (кэш `_TOPIC_NAMES` из memory.db) или None."""
+    b = str(bike or "").strip().lower()
+    if not b:
+        return None
+    for (cid, tid), name in list(_TOPIC_NAMES.items()):
+        if int(cid) == int(chat_id) and str(name or "").strip().lower() == b:
+            return tid
+    return None
+
+
+def _sask_sender(context):
+    async def send(place, chat_id, text, thread_id, reply_to):
+        try:
+            sent = await _send(context, chat_id=chat_id, text=text, message_thread_id=thread_id,
+                               bilingual=place != _sask.PLACE_AGENTS, group=f"staff_ask:{place}")
+            return getattr(sent, "message_id", None)
+        except Exception as e:
+            log.warning(f"  🙋 вопрос сотрудникам: {place} не принял пост ({type(e).__name__})")
+            return None
+    return send
+
+
+async def staff_ask_post(context, *, kind, bike, q_ru, q_th="", urgency="", topic_id=None, servicing_chat=None):
+    """Дверь «спросить сотрудников офиса». Байк → пост в теме байка (TH+RU, @username из `THAI_HANDLES`) +
+    просьба со срочностью в Delivery; цена/бронь/сложность → «Агенты». Итог `staff_ask.ask`. Не бросает."""
+    if not _sask.enabled():
+        return {"posted": [], "qid": None, "why": "выключено (SPLINTER_ASK_STAFF)"}
+    try:
+        chat = servicing_chat or SERVICING_CHAT
+        tid = topic_id or _bike_topic_id(chat, bike)
+        r = await _sask.ask(_sask_sender(context), kind=kind, bike=bike, q_ru=q_ru, q_th=q_th, urgency=urgency,
+                            handles=list(THAI_HANDLES.values()), servicing_chat=chat, topic_id=tid,
+                            delivery_chat=DELIVERY_CHAT_ID, agents_chat=AGENTS_CHAT)
+        log.info(f"  🙋 вопрос сотрудникам: {r.get('qid') or '—'} → {' + '.join(r['posted']) or 'не задан'}"
+                 + (f" — {r['why']}" if r.get("why") else ""))
+        return r
+    except Exception as e:
+        log.warning(f"  🙋 вопрос сотрудникам: сбой ({type(e).__name__}) — не задан")
+        return {"posted": [], "qid": None, "why": f"сбой ({type(e).__name__})"}
+
+
+def _staff_brain_append(bridge, line):
+    """Строка ответа → конец узла мозга `staff_ask.doc_name()` (read_doc → + строка → write_doc → перечитать).
+    Метка `[staff_ask qid#mid]` уже в узле → (True, «уже в узле»). Возврат (ok, причина)."""
+    if bridge is None:
+        return False, "моста нет"
+    name = _sask.doc_name()
+    r = bridge._call("read_doc", name=name)
+    if not (isinstance(r, dict) and r.get("ok")):
+        return False, f"узел {name} не прочитан"
+    cur = r.get("text") or r.get("content") or ""
+    mark = line.split("]", 1)[0] + "]"
+    if mark in cur:
+        return True, "уже в узле"
+    w = bridge.write_doc((cur.rstrip("\n") + "\n" + line).lstrip("\n"), name=name)
+    if not (isinstance(w, dict) and w.get("ok")):
+        return False, "write_doc не ok"
+    back = bridge._call("read_doc", name=name)
+    if not (isinstance(back, dict) and mark in (back.get("text") or back.get("content") or "")):
+        return False, "обратное чтение не нашло строку"
+    return True, ""
+
+
+async def staff_ask_reply(msg, bridge=None) -> bool:
+    """Реплай человека на вопрос Splinter (тема байка / Delivery / «Агенты») → строка в мозг с источником.
+    Сообщение НЕ забирается — дальше идёт прежним путём. Выключено → False сразу. Не бросает."""
+    if not _sask.enabled():
+        return False
+    try:
+        rt = getattr(msg, "reply_to_message", None)
+        if rt is None:
+            return False
+        import asyncio as _aio
+        u = getattr(msg, "from_user", None)
+        d = getattr(msg, "date", None)
+        r = await _aio.to_thread(
+            _sask.on_reply, lambda line: _staff_brain_append(bridge, line), chat=msg.chat_id,
+            reply_to=getattr(rt, "message_id", None), mid=getattr(msg, "message_id", None),
+            user_id=getattr(u, "id", None), username=getattr(u, "username", None),
+            is_bot=bool(getattr(u, "is_bot", False)),
+            text=getattr(msg, "text", None) or getattr(msg, "caption", None) or "",
+            ts=d.timestamp() if hasattr(d, "timestamp") else None)
+        if r.get("qid"):
+            log.info(f"  🙋 ответ на вопрос {r['qid']}: {'в мозге' if r.get('recorded') else r.get('why')}")
+        return bool(r.get("recorded"))
+    except Exception as e:
+        log.warning(f"  🙋 ответ на вопрос сотрудникам не записан ({type(e).__name__})")
+        return False
+
+
+async def staff_ask_job(context, bridge=None):
+    """Такт (bot.py, раз в 5 мин): нет ответа к сроку → ОДИН вопрос в «Агенты». Выключено → ничего."""
+    if not _sask.enabled():
+        return
+    try:
+        n = await _sask.tick(_sask_sender(context), agents_chat=AGENTS_CHAT)
+        if n:
+            log.info(f"  🙋 вопрос сотрудникам: без ответа за срок — уточнено в «Агентах»: {n}")
+    except Exception as e:
+        log.warning(f"  🙋 такт вопросов сотрудникам упал ({type(e).__name__})")
+
+
+async def rules_snap_job(context, bridge=None):
+    """Такт (bot.py, раз в 30 мин): одно чтение узла business_rules в снимок. Выключено → ничего."""
+    if not _rsnap.enabled() or bridge is None:
+        return
+    try:
+        import asyncio as _aio
+        r = await _aio.to_thread(_rsnap.refresh, lambda: bridge._call("read_doc", name=_rsnap.DOC))
+        (log.info if r.get("ok") else log.warning)(
+            f"  📜 снимок правил: {'прочитан, ' + str(r.get('len')) + ' символов' if r.get('ok') else 'не обновлён — ' + r.get('why', '') + ', прежний на месте'}")
+    except Exception as e:
+        log.warning(f"  📜 такт снимка правил упал ({type(e).__name__})")
+
 
 # Кэш названий форум-тем: {(chat_id, topic_id): "название темы"}
 # В названии темы записан байк (по договорённости Филиппа).
