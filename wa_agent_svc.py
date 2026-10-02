@@ -54,7 +54,8 @@
 читатель даёт 409: строка журнала на серию, опрос раз в 30 с, такт идёт, служба не падает.
 
 ЖУРНАЛ — файл `wa_agent.log` (или WA_AGENT_LOG): только id, состояния и числа; сводка числами раз в
-5 минут. Текстов, номеров и имён клиентов в журнале нет.
+5 минут. Текстов, номеров и имён клиентов в журнале нет. При включённых черновиках сводка несёт очередь
+карточек и число ждущих черновиков без доставленной карточки (WADRAFTSAFE0210).
 """
 
 import logging
@@ -264,7 +265,19 @@ def summary(core, tg, words, stats):
                " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else "")
             + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else "")
             + (" · напоминаний %s" % _pairs(core.follow_counts()) if getattr(core, "followup", False) else "")
-            + (" · %s" % spend_words(spend) if isinstance(spend, dict) else ""))
+            + (" · %s" % spend_words(spend) if isinstance(spend, dict) else "")
+            + cards_words(core))
+
+
+def cards_words(core):
+    """Очередь карточек (WADRAFTSAFE0210): состояния и ждущие черновики без доставленной карточки. В сводке —
+    при включённых черновиках или если такие черновики есть; иначе пусто (выключено — строка прежняя)."""
+    if not hasattr(core, "undelivered"):
+        return ""
+    n = core.undelivered()
+    if not (getattr(core, "drafts", False) or n):
+        return ""
+    return " · карточки в «Агенты» %s · черновиков без доставленной карточки %d" % (_pairs(core.card_counts()), n)
 
 
 def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every=SUMMARY_EVERY,

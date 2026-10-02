@@ -204,7 +204,7 @@ def test_hm_phuket_unit():
 
 
 _TIME_CALLS = {"strftime", "gmtime", "localtime", "ctime", "asctime", "fromtimestamp", "utcfromtimestamp"}
-SITES = {"wa_agent": 15, "wa_agent_tg": 2, "wa_watch": 1}
+SITES = {"wa_agent": 17, "wa_agent_tg": 2, "wa_watch": 1}   # WADRAFTSAFE0210: +2 ядра — «снят до срока … ЧЧ:ММ»
 
 
 def _scan(mod):
@@ -233,8 +233,9 @@ def _scan(mod):
 
 
 def test_one_time_function_for_staff_words():
-    """Перечень мест: 18 мест времени в словах сотрудникам — все через ОДНУ `wa_agent.hm_phuket` (ядро 15:
-    карточки, ответы на нажатия, напоминания, уроки; руки Telegram 2: урок и «продолжено»; сторож 1). Иного
+    """Перечень мест: 20 мест времени в словах сотрудникам — все через ОДНУ `wa_agent.hm_phuket` (ядро 17:
+    карточки, ответы на нажатия, напоминания, уроки, снятие отложенного ответом с телефона и текстом из темы —
+    WADRAFTSAFE0210; руки Telegram 2: урок и «продолжено»; сторож 1). Иного
     времени словами в трёх модулях нет, «UTC» в строках кода нет."""
     for mod in (A, G, W):
         name = os.path.splitext(os.path.basename(mod.__file__))[0]

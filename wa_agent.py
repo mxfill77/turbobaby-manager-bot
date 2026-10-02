@@ -40,7 +40,20 @@ superseded и пауза; новое входящее → stale), пишет `se
 клиента + длина / PACE_CPS (не дольше PACE_TYPE_MAX), то есть модель и человек думали дольше набора — без
 добавки. Срок не настал — черновик `scheduled` со сроком в базе, на карточке «уйдёт в ЧЧ:ММ» и «Отменить»;
 отправку в срок делает такт (`send_due`) через тот же захват `sending` ДО двери. Рестарт срок не теряет и
-не дублирует. Клиент написал ещё — одобренное уходит в срок, новое — в следующий черновик.
+не дублирует. Клиент написал ещё — отложенное снимается и не уходит, черновик пересобирается (WADRAFTSAFE0210;
+до него одобренное уходило в срок и после нового сообщения клиента).
+
+ДОСТАВКА КАРТОЧЕК И АКТУАЛЬНОСТЬ (WADRAFTSAFE0210). У каждой карточки (черновик + версия) состояние на диске,
+таблица `card_out`: wait (ждёт доставки) → sending (`sendMessage` зван) → delivered (message_id, chat_id, время)
+→ decided (исход на карточке; правку, которую Telegram отказал, такт повторяет). Отказ Telegram — повтор с
+паузой CARD_RETRY, рестарт очередь продолжает; sending на старте → wait: карточка могла дойти, шлём снова —
+дубль карточки безопасен, кнопки несут черновик и версию, второе нажатие — «уже решено». Повторяются ТОЛЬКО
+карточки в Telegram, отправка клиенту — никогда. Черновик решён до доставки — карточка не шлётся, решена
+недоставленной; ждущие черновики без доставленной карточки — числом в сводке службы (`undelivered`).
+«Отправить» привязано к последнему сообщению клиента (`drafts.upto_id` против `clients.last_in_id` и очереди)
+и версии контекста (`clients.ctx`: +1 на живое входящее, ответ с телефона, текст из темы, «Продолжить»;
+`drafts.ctx` — на момент черновика). Устарело — ответ словами, наружу ничего, черновик пересобирается. Новое
+входящее снимает и ждущий, и отложенный черновик; ответ с телефона и текст из темы — тоже оба.
 
 УРОКИ ЛЮДЕЙ (WAAGENTLESSON0210, выключатель службы WA_AGENT_LESSONS, по умолчанию выключен — «Исправить»
 как раньше). Включён — принятое «Исправить» с новым текстом пишет в таблицу `lessons` своей базы КАНДИДАТА
@@ -88,6 +101,13 @@ PACE_FIRST_MIN, PACE_FIRST_MAX = 180, 300     # первый ответ бесе
 PACE_CPS = 1.75                               # знаков в секунду: медиана наших двух подряд, 10 933 пары
 PACE_TYPE_MAX = PACE_FIRST_MAX                # набор длинного текста не дольше окна первого ответа
 PACE_NEW_TALK = 4 * 3600                      # беседа новая: до сообщения клиента тишина в обе стороны > 4 ч
+
+# ── доставка карточек в «Агенты» (WADRAFTSAFE0210) ───────────────────────────────────────
+CARD_WAIT, CARD_SENDING, CARD_DELIVERED, CARD_DECIDED = "wait", "sending", "delivered", "decided"
+CARD_RETRY = (5, 15, 30, 60, 120, 300)        # пауза перед повтором, с: попытка N — элемент N, дальше последний
+EDIT_WAIT, EDIT_OK, EDIT_GAVE_UP = "wait", "ok", "gave_up"
+EDIT_MAX = 12                                 # правка исхода: попыток не больше (≈ 40 мин), дальше — строка журнала
+WROTE_WORDS = "клиент написал ещё (строка %d)"
 
 # ── пауза между последним сообщением клиента и черновиком ───────────────────────────────
 QUIET_MIN, QUIET_MAX, QUIET_DEFAULT = 60, 90, 75
@@ -270,6 +290,22 @@ CREATE TABLE IF NOT EXISTS followups (
     outcome     TEXT    NOT NULL,                     -- drafted | not_needed
     draft_id    INTEGER,
     PRIMARY KEY (number, anchor)
+);
+CREATE TABLE IF NOT EXISTS card_out (
+    draft_id     INTEGER NOT NULL,                    -- карточка = черновик + версия (WADRAFTSAFE0210)
+    ver          INTEGER NOT NULL,
+    state        TEXT    NOT NULL,                    -- wait → sending → delivered → decided
+    tries        INTEGER NOT NULL DEFAULT 0,          -- попыток доставки
+    next_at      REAL    NOT NULL DEFAULT 0,          -- следующая попытка (доставки или правки) не раньше
+    message_id   INTEGER,                             -- карточка в «Агентах»: есть — доставлена
+    chat_id      INTEGER,
+    delivered_at REAL,
+    decided_at   REAL,
+    words        TEXT,                                -- исход на карточке
+    edit         TEXT,                                -- правка исхода: wait | ok | gave_up; NULL — править нечего
+    edit_tries   INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL    NOT NULL,
+    PRIMARY KEY (draft_id, ver)
 );
 """
 
@@ -460,6 +496,11 @@ class Core:
             self.db.execute("ALTER TABLE drafts ADD COLUMN due_at REAL")  # срок отправки по ритму; NULL — сразу
         if "kind" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
             self.db.execute("ALTER TABLE drafts ADD COLUMN kind TEXT")    # «followup» — напоминание; NULL — ответ
+        # версия контекста (WADRAFTSAFE0210): у клиента — счётчик событий беседы, у черновика — на момент черновика
+        if "ctx" not in {r[1] for r in self.db.execute("PRAGMA table_info(clients)")}:
+            self.db.execute("ALTER TABLE clients ADD COLUMN ctx INTEGER NOT NULL DEFAULT 0")
+        if "ctx" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
+            self.db.execute("ALTER TABLE drafts ADD COLUMN ctx INTEGER")  # NULL — черновик старше версии контекста
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -483,6 +524,16 @@ class Core:
                               SENDING)).rowcount
         if n3:
             self.log("старт: из темы sending→unsure %d" % n3)
+        # карточки (WADRAFTSAFE0210): sending → wait — могла дойти, шлём снова (дубль безопасен: кнопки по
+        # черновику и версии); ждущие черновики, которых очередь не знает, — доставлена, если card_id есть
+        n4 = self.db.execute("UPDATE card_out SET state=?, next_at=0 WHERE state=?",
+                             (CARD_WAIT, CARD_SENDING)).rowcount
+        n5 = self.db.execute("INSERT OR IGNORE INTO card_out(draft_id, ver, state, message_id, delivered_at, "
+                             "created_at) SELECT id, ver, CASE WHEN card_id IS NULL THEN ? ELSE ? END, card_id, "
+                             "CASE WHEN card_id IS NULL THEN NULL ELSE created_at END, created_at FROM drafts "
+                             "WHERE state=?", (CARD_WAIT, CARD_DELIVERED, PENDING)).rowcount
+        if n4 or n5:
+            self.log("старт: карточка sending→wait %d, ждущих черновиков взято в очередь доставки %d" % (n4, n5))
 
     def _queue(self):
         return sqlite3.connect("file:%s?mode=ro" % self.queue_path, uri=True, timeout=5)
@@ -523,9 +574,8 @@ class Core:
             ",".join("?" * len(from_states))
         n = self.db.execute(q, (state, words, now, draft_id) + tuple(from_states)).rowcount
         if n == 1:
-            card = self.db.execute("SELECT card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
             self.log("черновик %d → %s" % (draft_id, state))
-            self._tg("card_done", draft_id, card[0] if card else None, words)
+            self._done(draft_id, words, now)
         return n == 1
 
     def _tg(self, method, *args):
@@ -534,6 +584,135 @@ class Core:
         except Exception as e:                                       # noqa: BLE001
             self.log("telegram %s упал: %s" % (method, type(e).__name__))
             return None
+
+    # ── доставка карточек (WADRAFTSAFE0210) ───────────────────────────────────────────────
+
+    def _card_new(self, draft_id, ver, now):
+        """Карточка версии ver — в очередь доставки и первая попытка сразу. → message_id | None."""
+        self.db.execute("INSERT OR IGNORE INTO card_out(draft_id, ver, state, created_at) VALUES(?,?,?,?)",
+                        (draft_id, int(ver), CARD_WAIT, now))
+        return self._card_try(draft_id, int(ver), now)
+
+    def _card_try(self, draft_id, ver, now):
+        """Одна попытка доставки. Черновик ждёт с этой версией — `sending` ДО вызова Telegram, потом доставлена
+        (message_id, chat_id, время) или снова ждёт с паузой CARD_RETRY. Черновик решён или исправлен до
+        доставки — карточка не шлётся, она решена недоставленной. → message_id | None."""
+        row = self.db.execute("SELECT number, state, ver, text FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or row[1] != PENDING or row[2] != ver:
+            self.db.execute("UPDATE card_out SET state=?, decided_at=?, words=? WHERE draft_id=? AND ver=? "
+                            "AND state IN (?,?)", (CARD_DECIDED, now, "решён до доставки: %s" % (
+                                row[1] if row and row[2] == ver else "версия сменилась" if row else "черновика нет"),
+                                draft_id, ver, CARD_WAIT, CARD_SENDING))
+            return None
+        if self.db.execute("UPDATE card_out SET state=?, tries=tries+1 WHERE draft_id=? AND ver=? AND state=?",
+                           (CARD_SENDING, draft_id, ver, CARD_WAIT)).rowcount != 1:
+            return None
+        mid = _int_or_none(self._tg("card", draft_id, ver, row[0], row[3]))
+        if mid is not None:
+            self.db.execute("UPDATE card_out SET state=?, message_id=?, chat_id=?, delivered_at=? WHERE draft_id=? "
+                            "AND ver=? AND state=?", (CARD_DELIVERED, mid, _int_or_none(getattr(self.tg, "chat", None)),
+                                                      now, draft_id, ver, CARD_SENDING))
+            self.db.execute("UPDATE drafts SET card_id=? WHERE id=? AND ver=?", (mid, draft_id, ver))
+            return mid
+        tries = self.db.execute("SELECT tries FROM card_out WHERE draft_id=? AND ver=?", (draft_id, ver)).fetchone()[0]
+        pause = CARD_RETRY[min(tries, len(CARD_RETRY)) - 1]
+        self.db.execute("UPDATE card_out SET state=?, next_at=? WHERE draft_id=? AND ver=? AND state=?",
+                        (CARD_WAIT, now + pause, draft_id, ver, CARD_SENDING))
+        self.log("карточка черновика %d версия %d не доставлена (попытка %d) — повтор через %d с"
+                 % (draft_id, ver, tries, pause))
+        return None
+
+    def _done(self, draft_id, words, now):
+        """Исход черновика — на карточку его текущей версии."""
+        row = self.db.execute("SELECT ver, card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if row:
+            self._card_close(draft_id, row[0], words, now, row[1])
+
+    def _card_close(self, draft_id, ver, words, now, card_id=None):
+        """Карточка решена: исход словами, кнопки сняты. Доставлена — правка `card_done` (Telegram отказал —
+        повтор в `deliver_cards`); не доставлена — решена недоставленной, править нечего. Карточка вне очереди
+        (запись старше неё) — прежний путь, один вызов без повтора."""
+        row = self.db.execute("SELECT message_id FROM card_out WHERE draft_id=? AND ver=?",
+                              (draft_id, int(ver))).fetchone()
+        if row is None:
+            self._tg("card_done", draft_id, card_id, words)
+            return
+        self.db.execute("UPDATE card_out SET state=?, decided_at=COALESCE(decided_at, ?), words=?, edit=?, "
+                        "edit_tries=0, next_at=0 WHERE draft_id=? AND ver=?",
+                        (CARD_DECIDED, now, words, EDIT_WAIT if row[0] else None, draft_id, int(ver)))
+        if row[0]:
+            self._card_edit(draft_id, int(ver), row[0], words, now)
+
+    def _card_edit(self, draft_id, ver, mid, words, now):
+        """Одна правка исхода. Telegram отказал (`card_done` → False) — повтор с паузой, не больше EDIT_MAX."""
+        if self._tg("card_done", draft_id, mid, words) is not False:
+            self.db.execute("UPDATE card_out SET edit=? WHERE draft_id=? AND ver=?", (EDIT_OK, draft_id, ver))
+            return True
+        self.db.execute("UPDATE card_out SET edit_tries=edit_tries+1 WHERE draft_id=? AND ver=?", (draft_id, ver))
+        n = self.db.execute("SELECT edit_tries FROM card_out WHERE draft_id=? AND ver=?", (draft_id, ver)).fetchone()[0]
+        if n >= EDIT_MAX:
+            self.db.execute("UPDATE card_out SET edit=? WHERE draft_id=? AND ver=?", (EDIT_GAVE_UP, draft_id, ver))
+            self.log("карточка черновика %d версия %d: исход не лёг за %d попыток — кнопки на ней живы, нажатие "
+                     "ответит «уже решено»" % (draft_id, ver, n))
+            return False
+        pause = CARD_RETRY[min(n, len(CARD_RETRY)) - 1]
+        self.db.execute("UPDATE card_out SET next_at=? WHERE draft_id=? AND ver=?", (now + pause, draft_id, ver))
+        self.log("карточка черновика %d версия %d: исход не лёг (попытка %d) — повтор через %d с"
+                 % (draft_id, ver, n, pause))
+        return False
+
+    def deliver_cards(self, now):
+        """Такт очереди карточек: ждущие доставки, чей срок настал, и правки исхода, которые Telegram отказал.
+        → число доставленных этим тактом."""
+        got = 0
+        for did, ver in self.db.execute("SELECT draft_id, ver FROM card_out WHERE state=? AND next_at<=? "
+                                        "ORDER BY next_at, draft_id", (CARD_WAIT, now)).fetchall():
+            if self._card_try(did, ver, now) is not None:
+                got += 1
+        for did, ver, mid, words in self.db.execute(
+                "SELECT draft_id, ver, message_id, words FROM card_out WHERE state=? AND edit=? AND next_at<=? "
+                "ORDER BY next_at, draft_id", (CARD_DECIDED, EDIT_WAIT, now)).fetchall():
+            self._card_edit(did, ver, mid, words, now)
+        return got
+
+    def card_counts(self):
+        return dict(self.db.execute("SELECT state, COUNT(*) FROM card_out GROUP BY state").fetchall())
+
+    def undelivered(self):
+        """Ждущие черновики без доставленной карточки своей версии — число для сводки службы."""
+        return self.db.execute("SELECT COUNT(*) FROM drafts d WHERE d.state=? AND NOT EXISTS (SELECT 1 FROM "
+                               "card_out c WHERE c.draft_id=d.id AND c.ver=d.ver AND c.message_id IS NOT NULL)",
+                               (PENDING,)).fetchone()[0]
+
+    # ── версия контекста (WADRAFTSAFE0210) ────────────────────────────────────────────────
+
+    def _bump(self, number):
+        """Событие беседы (живое входящее, ответ с телефона, текст из темы, «Продолжить») — версия контекста +1."""
+        self.db.execute("UPDATE clients SET ctx=ctx+1 WHERE number=?", (number,))
+
+    def _withdraw(self, number, state, words, now, before=None):
+        """Снять отложенные ритмом черновики клиента (scheduled) — одобряли ответ на прежнюю беседу.
+        before — снимать только отвечающие на строки раньше этой."""
+        q, args = "SELECT id FROM drafts WHERE number=? AND state=?", (number, SCHEDULED)
+        if before is not None:
+            q, args = q + " AND upto_id<?", args + (int(before),)
+        for (sid,) in self.db.execute(q, args).fetchall():
+            self._close(sid, state, words, now, from_states=(SCHEDULED,))
+
+    def _outdated(self, draft_id):
+        """«Отправить» привязано к последнему сообщению клиента и версии контекста: после черновика клиент
+        написал (`last_in_id` > `upto_id`) или контекст сменился (`clients.ctx` ≠ `drafts.ctx`) → слова;
+        иначе None. Черновик старше версии контекста (ctx NULL) сверяется только по сообщению."""
+        row = self.db.execute("SELECT d.upto_id, d.ctx, c.last_in_id, c.ctx FROM drafts d JOIN clients c "
+                              "ON c.number=d.number WHERE d.id=?", (draft_id,)).fetchone()
+        if not row:
+            return None
+        upto, dctx, last_in, cctx = row
+        if last_in > upto:
+            return WROTE_WORDS % last_in
+        if dctx is not None and dctx != cctx:
+            return "беседа сменилась после черновика (контекст %d → %d)" % (dctx, cctx)
+        return None
 
     # ── вид строки очереди ────────────────────────────────────────────────────────────────
 
@@ -567,10 +746,13 @@ class Core:
         """Человек написал клиенту в теме показа — вмешательство (запись 30.09.2026-7 п.4): ждущий
         черновик снят, входящие до этого закрыты, клиент на паузе до «Продолжить»."""
         self._client(number)
+        self._bump(number)
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
         live = self._live_draft(number)
         if live and live[1] == PENDING:
             self._close(live[0], SUPERSEDED, "снят: человек написал клиенту в теме %s" % hm_phuket(now), now)
+        self._withdraw(number, SUPERSEDED, "снят до срока: человек написал клиенту в теме %s — отложенное не уходит"
+                       % hm_phuket(now), now)
         self._pause(number, None, now, via="написал в теме")
 
     def relay(self, msg_id, number, text, who, now=None, media=None):
@@ -622,6 +804,7 @@ class Core:
                             "WHERE number=? AND paused=1 AND pause_no=?",
                             (who, now, number, int(pause_no))).rowcount
         if n == 1:
+            self._bump(number)
             self.log("пауза %s снята нажатием" % pause_no)
             return {"ok": True, "words": "продолжаем"}
         row = self.db.execute("SELECT resumed_by, resumed_at FROM clients WHERE number=?",
@@ -636,11 +819,13 @@ class Core:
         self.send_due(now)                    # отложенное уходит в срок и при выключенных черновиках
         if not self.drafts:
             self.follow()
+            self.deliver_cards(now)
             return []
         self.scan(now)
         made = self.make_drafts(now)
         if self.followup:
             made += self.make_followups(now)
+        self.deliver_cards(now)               # повтор карточек, которые Telegram не принял (WADRAFTSAFE0210)
         return made
 
     def follow(self):
@@ -688,10 +873,14 @@ class Core:
         self._client(number)
         self.db.execute("UPDATE clients SET last_in_id=MAX(last_in_id, ?), last_in_ts=MAX(last_in_ts, ?) "
                         "WHERE number=?", (rid, float(ts_q or now), number))
+        self._bump(number)
         live = self._live_draft(number)
         if live and live[1] == PENDING:
             self._close(live[0], STALE, FOLLOW_STALE_WORDS % rid if self.draft_kind(live[0]) == KIND_FOLLOW
-                        else "снят: клиент написал ещё (строка %d)" % rid, now)
+                        else "снят: " + WROTE_WORDS % rid + " — черновик пересобирается", now)
+        # отложенное ритмом — тоже (WADRAFTSAFE0210): одобряли ответ, а клиент уже написал дальше
+        self._withdraw(number, STALE, "снят до срока: " + WROTE_WORDS % rid + " — отложенное не уходит, черновик "
+                       "пересобирается", now, before=rid)
 
     def _after_first(self, number, rid, ts_msg):
         """Секунд от «первого» входящего клиента до эха, если оно было не раньше GREET_SEC до эха; иначе
@@ -745,19 +934,22 @@ class Core:
             return
         self.log("эхо строки %d: не автоприветствие (%s) — пауза" % (rid, words))
         self._client(number)
+        self._bump(number)
         # человек ответил на всё, что было до его эха: эти входящие закрыты
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
         live = self._live_draft(number)
         if live and live[1] == PENDING:
             self._close(live[0], SUPERSEDED, "снят: ответили с телефона %s" % hm_phuket(now), now)
+        self._withdraw(number, SUPERSEDED, "снят до срока: ответили с телефона %s — отложенное не уходит"
+                       % hm_phuket(now), now, before=rid)
         self._pause(number, rid, now)
 
     def make_drafts(self, now):
         made = []
-        due = self.db.execute("SELECT number, last_in_id FROM clients WHERE paused=0 "
+        due = self.db.execute("SELECT number, last_in_id, ctx FROM clients WHERE paused=0 "
                               "AND last_in_id > done_upto AND last_in_ts <= ? AND next_try <= ?",
                               (now - self.quiet, now)).fetchall()
-        for number, upto in due:
+        for number, upto, ctx in due:
             if self._live_draft(number):
                 continue
             try:
@@ -772,15 +964,14 @@ class Core:
             # пока думала модель, клиент мог написать ещё или человек ответить — не пишем
             if self._fresh(number, upto):
                 continue
-            cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, handoff) "
-                                  "VALUES(?,?,1,?,?,?,?)", (number, PENDING, text, upto, now,
-                                                            json.dumps(hand, ensure_ascii=False) if hand else None))
+            cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, handoff, ctx) "
+                                  "VALUES(?,?,1,?,?,?,?,?)", (number, PENDING, text, upto, now,
+                                                              json.dumps(hand, ensure_ascii=False) if hand else None,
+                                                              ctx))
             did = cur.lastrowid
             self.log("черновик %d (до строки %d, %d симв.%s)" % (
                 did, upto, len(text), ", нужен человек: причин %d" % len(hand) if hand else ""))
-            card = self._tg("card", did, 1, number, text)
-            if card is not None:
-                self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, did))
+            self._card_new(did, 1, now)       # не дошла — очередь доставки повторит (WADRAFTSAFE0210)
             made.append(did)
         return made
 
@@ -788,7 +979,8 @@ class Core:
         """Что пришло в очередь по клиенту после after_id: (kind, id) первой живой строки или None.
         Эхо, которое скан признал автоприветствием (`autogreet`), — не новое: оно идёт следом за
         «первым» входящим, и без этого черновик на первый вопрос не родился бы никогда.
-        inbound=False — только эхо: отложенному в срок новое входящее не помеха (WAHUMANPACE0210)."""
+        inbound=False — только эхо. Такт отложенного с WADRAFTSAFE0210 зовёт с входящими: новое сообщение
+        клиента снимает и отложенное (до него, WAHUMANPACE0210, отложенному в срок оно было не помеха)."""
         q = self._queue()
         try:
             rows = q.execute("SELECT id, msg_type, echo, history, wamid FROM wa_inbox "
@@ -837,8 +1029,7 @@ class Core:
             if n != 1:
                 return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
             self.log("черновик %d: отложенное отменено" % draft_id)
-            self._tg("card_done", draft_id, self._card(draft_id),
-                     "отменено до срока: %s, %s — клиенту ничего не ушло" % (who, hm_phuket(now)))
+            self._done(draft_id, "отменено до срока: %s, %s — клиенту ничего не ушло" % (who, hm_phuket(now)), now)
             return {"ok": True, "state": DECLINED, "words": "отменено — клиенту ничего не ушло"}
         if action == ACT_SEND and self.send_locked(draft_id, ver):
             # «нужен человек»: ДО захвата и до двери — черновик ждёт правки, кнопки живы
@@ -862,11 +1053,26 @@ class Core:
         if action == ACT_DECLINE:
             self.db.execute("UPDATE drafts SET closed_at=? WHERE id=?", (now, draft_id))
             self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
-            self._tg("card_done", draft_id, self._card(draft_id), "не нужно: %s, %s" % (who, hm_phuket(now)))
+            self._done(draft_id, "не нужно: %s, %s" % (who, hm_phuket(now)), now)
             return {"ok": True, "state": DECLINED, "words": "не отправляем"}
 
-        # ── победитель: перепроверка очереди ДО двери ──
-        fresh = self._fresh(number, upto)
+        # ── победитель: нажатие привязано к последнему сообщению клиента и версии контекста (WADRAFTSAFE0210) ──
+        old = self._outdated(draft_id)
+        if old:
+            self._close(draft_id, STALE, "устарело при нажатии: %s — ничего не отправлено, черновик пересобирается"
+                        % old, now, from_states=(CLAIMED,))
+            return {"ok": False, "state": STALE, "words": "устарело: %s — ничего не отправлено" % old}
+
+        # ── перепроверка очереди ДО двери; очередь не прочитана — захват назад, наружу ничего ──
+        try:
+            fresh = self._fresh(number, upto)
+        except Exception as e:                                       # noqa: BLE001
+            self.db.execute("UPDATE drafts SET state=?, decided_by=NULL, decided_at=NULL WHERE id=? AND state=?",
+                            (PENDING, draft_id, CLAIMED))
+            self.log("черновик %d: очередь не прочитана при нажатии (%s) — ничего не отправлено, черновик ждёт"
+                     % (draft_id, type(e).__name__))
+            return {"ok": False, "state": PENDING,
+                    "words": "очередь не прочитана — ничего не отправлено, черновик ждёт: нажмите ещё раз"}
         paused = self.db.execute("SELECT paused FROM clients WHERE number=?", (number,)).fetchone()
         if fresh or (paused and paused[0]):
             kind, rid = fresh or (wa_kind.KIND_ECHO, None)
@@ -915,7 +1121,7 @@ class Core:
                         (state, str(res.get("reason") or "")[:300], wamid, now, draft_id, SENDING))
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
         self.log("черновик %d: дверь → %s" % (draft_id, state))
-        self._tg("card_done", draft_id, self._card(draft_id), "%s: %s, %s" % (state, who, hm_phuket(now)))
+        self._done(draft_id, "%s: %s, %s" % (state, who, hm_phuket(now)), now)
         if state == SENT:
             # ушедшее агентом: история агента и строка в теме клиента (WARELAYTEXT0210)
             self._sent_out(wamid, number, text, VIA_AGENT, now)
@@ -928,16 +1134,27 @@ class Core:
     def send_due(self, now):
         """Отложенные, срок которых настал: по сроку, по одному, через тот же захват `sending`.
         Ответили с телефона после черновика или клиент на паузе (человек вмешался) — не шлём.
-        Новое сообщение клиента одобренное НЕ снимает: оно уходит в срок, новое — в следующий черновик."""
+        Клиент написал ещё (в очереди, даже не разобранное сканом, или по версии контекста) — тоже не шлём:
+        отложенное снято, черновик пересобирается (WADRAFTSAFE0210). Очередь не прочитана — ждёт такта."""
         rows = self.db.execute("SELECT id, number, upto_id, text, decided_by FROM drafts WHERE state=? "
                                "AND due_at<=? ORDER BY due_at, id", (SCHEDULED, now)).fetchall()
         out = []
         for did, number, upto, text, who in rows:
-            echo = self._fresh(number, upto, inbound=False)
+            try:
+                fresh = self._fresh(number, upto)
+            except Exception as e:                                   # noqa: BLE001
+                self.log("черновик %d: очередь не прочитана в срок (%s) — отложенное ждёт следующего такта"
+                         % (did, type(e).__name__))
+                continue
+            old = self._outdated(did)
             paused = self.db.execute("SELECT paused FROM clients WHERE number=?", (number,)).fetchone()
-            if echo or (paused and paused[0]):
+            if (fresh and fresh[0] == wa_kind.KIND_INBOUND) or (old and not fresh):
+                self._close(did, STALE, "снят в срок: %s — отложенное не уходит, черновик пересобирается" % (
+                    WROTE_WORDS % fresh[1] if fresh else old), now, from_states=(SCHEDULED,))
+                continue
+            if fresh or (paused and paused[0]):
                 self._close(did, SUPERSEDED, "снят в срок: %s — не отправлено" % (
-                    "ответили с телефона" if echo else "человек вмешался, клиент на паузе"), now,
+                    "ответили с телефона" if fresh else "человек вмешался, клиент на паузе"), now,
                     from_states=(SCHEDULED,))
                 continue
             res = self._deliver(did, number, upto, text, who or "—", now, SCHEDULED)
@@ -1051,10 +1268,10 @@ class Core:
         made = []
         # грубый отсев по часам сервера (last_in_ts — ts_queued): очередь читаем только у писавших за окно
         # с часом запаса; точное окно — `_follow_due`
-        rows = self.db.execute("SELECT number FROM clients WHERE paused=0 AND last_in_id > 0 "
+        rows = self.db.execute("SELECT number, ctx FROM clients WHERE paused=0 AND last_in_id > 0 "
                                "AND last_in_id <= done_upto AND next_try <= ? AND last_in_ts >= ?",
                                (now, now - FOLLOW_WINDOW - 3600)).fetchall()
-        for (number,) in rows:
+        for number, ctx in rows:
             if self._live_draft(number) or self.db.execute(
                     "SELECT 1 FROM drafts WHERE number=? AND state=?", (number, SCHEDULED)).fetchone():
                 continue
@@ -1079,14 +1296,13 @@ class Core:
                                 (number, anchor, now, FOLLOW_NOT_NEEDED))
                 self.log("напоминание: модель — не нужно, карточки нет (%s)" % why)
                 continue
-            did = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, kind) "
-                                  "VALUES(?,?,1,?,?,?,?)", (number, PENDING, val, top, now, KIND_FOLLOW)).lastrowid
+            did = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, kind, ctx) "
+                                  "VALUES(?,?,1,?,?,?,?,?)", (number, PENDING, val, top, now, KIND_FOLLOW,
+                                                              ctx)).lastrowid
             self.db.execute("INSERT OR IGNORE INTO followups(number, anchor, ts, outcome, draft_id) VALUES(?,?,?,?,?)",
                             (number, anchor, now, FOLLOW_DRAFTED, did))
             self.log("черновик %d: напоминание (%s, %d симв.)" % (did, why, len(val)))
-            card = self._tg("card", did, 1, number, val)
-            if card is not None:
-                self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, did))
+            self._card_new(did, 1, now)       # не дошла — очередь доставки повторит (WADRAFTSAFE0210)
             made.append(did)
         return made
 
@@ -1125,10 +1341,11 @@ class Core:
                 if lesson:
                     self.log("урок %d: кандидат (черновик %d, версия %d → %d, %s)" % (
                         lesson, draft_id, ver_now - 1, ver_now, who))
-            self._tg("card_done", draft_id, old_card,
-                     "устарело: исправлено — %s, %s, действует версия %d" % (who, hm_phuket(now), ver_now))
-            card = self._tg("card", draft_id, ver_now, number, text)
-            self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, draft_id))
+            self._card_close(draft_id, ver_now - 1, "устарело: исправлено — %s, %s, действует версия %d" % (
+                who, hm_phuket(now), ver_now), now, old_card)
+            # карточка новой версии — через очередь доставки: до доставки card_id пуст (WADRAFTSAFE0210)
+            self.db.execute("UPDATE drafts SET card_id=NULL WHERE id=?", (draft_id,))
+            self._card_new(draft_id, ver_now, now)
             if lesson:
                 self._tg("lesson_card", lesson)
         return n == 1

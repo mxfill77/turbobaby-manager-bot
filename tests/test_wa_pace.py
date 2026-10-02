@@ -219,22 +219,24 @@ def test_cancel_after_send_nothing_changes():
     assert not res["ok"] and w.drafts()[0][1] == A.SENT and len(w.door.sends) == 1, (res, w.drafts())
 
 
-def test_client_wrote_more_approved_goes_new_next():
+def test_client_wrote_more_scheduled_withdrawn_new_next():
+    """Правило WADRAFTSAFE0210 (прежде, WAHUMANPACE0210, одобренное уходило в срок и после нового сообщения):
+    клиент написал ещё — отложенное снято и не уходит, черновик пересобирается на всю беседу."""
     w = PaceWorld()
     did = draft_at(w)
     w.core.press(did, 1, A.ACT_SEND, "owner", now=T0 + 60)
     due = w.due(did)
     w.put(T0 + 100)                                               # клиент написал ещё до срока
     w.core.tick(T0 + 100 + w.quiet)
+    assert w.drafts()[0][1] == A.STALE, "отложенное не снято новым сообщением"
     new = w.drafts(A.PENDING)
     assert len(new) == 1 and new[0][0] != did, w.drafts()
-    assert w.drafts()[0][1] == A.SCHEDULED, "одобренное снято новым сообщением"
-    res = w.core.press(new[0][0], 1, A.ACT_SEND, "owner", now=T0 + 170)
-    assert res["state"] == A.SCHEDULED and w.due(new[0][0]) >= due, (res, w.due(new[0][0]), due)
     w.core.tick(due)
-    assert w.door.sends == [(NUM, "черновик 1")], w.door.sends
+    assert w.door.sends == [], "устаревшее отложенное ушло"
+    res = w.core.press(new[0][0], 1, A.ACT_SEND, "owner", now=T0 + 170)
+    assert res["state"] == A.SCHEDULED, res
     w.core.tick(w.due(new[0][0]))
-    assert w.door.sends == [(NUM, "черновик 1"), (NUM, "черновик 2")], w.door.sends
+    assert w.door.sends == [(NUM, "черновик 2")], w.door.sends
 
 
 def test_phone_reply_before_due_not_sent():
