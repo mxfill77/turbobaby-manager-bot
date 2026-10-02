@@ -50,6 +50,15 @@ superseded и пауза; новое входящее → stale), пишет `se
 WA_AGENT_LESSON_ADMINS, по умолчанию владелец); остальным — отказ словами. Откат по номеру убирает
 урок из промпта. Хранилище своё — с уроками и правилами Splinter не смешивается.
 
+НАПОМИНАНИЕ ПРИТИХШЕМУ (WAFOLLOWUP0210, выключатель службы WA_AGENT_FOLLOWUP, по умолчанию выключен). Включён —
+раз в FOLLOW_EVERY такт ищет клиентов, у которых последнее слово НАШЕ (ушедшее через API или эхо с телефона,
+автоприветствие не в счёт) и после него FOLLOW_QUIET тишины; окно 24 ч открыто (правило `wa_send.window_state`,
+с запасом FOLLOW_SPARE); живого и отложенного черновика нет; клиент не на паузе; напоминаний в беседе меньше
+FOLLOW_MAX. Тогда модель (`Model.followup`) пишет одно короткое напоминание — черновик вида «напоминание» с
+карточкой на «Отправить» — или говорит «не нужно»: карточки нет, строка журнала. Модель спрашивается ОДИН раз
+на наше последнее сообщение (`followups`). Клиент написал до нажатия — карточка «устарело». Ритм на
+напоминание не действует: тишина в нём уже есть.
+
 ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа (это
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
 """
@@ -105,6 +114,28 @@ LESSON_CANDIDATE, LESSON_ACTIVE, LESSON_ROLLED = "candidate", "active", "rolled_
 LESSON_OWNER_IDS = frozenset({504608015, 6879003264, 5466425480})
 LESSON_REASON_MAX = 500                       # причина урока, символов
 LESSON_OFF_WORDS = "уроки выключены (WA_AGENT_LESSONS)"
+
+# ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────────
+KIND_FOLLOW = "followup"                      # drafts.kind: черновик-напоминание; NULL — ответ на сообщение
+FOLLOW_QUIET = 15 * 60                        # тишина клиента после нашего последнего сообщения
+FOLLOW_MAX = 2                                # напоминаний на беседу (граница беседы — PACE_NEW_TALK)
+FOLLOW_EVERY = 60                             # поиск притихших — не чаще раза в минуту
+FOLLOW_WINDOW = 24 * 3600                     # окно 24 ч — то же число, что wa_send.WINDOW_SECS (тест сверяет)
+FOLLOW_SPARE = 30 * 60                        # до закрытия окна — не меньше этого: человеку нужно время нажать
+FOLLOW_NOT_NEEDED, FOLLOW_DRAFTED = "not_needed", "drafted"
+FOLLOW_STALE_WORDS = "устарело: клиент написал сам (строка %d) — напоминание не нужно"
+
+
+def follow_out(out):
+    """Ответ Model.followup → ("text", текст) | ("skip", почему) | ("fail", None). Строка — текст;
+    словарь {skip: True, why} — модель сказала «не нужно»; None, пусто и прочее — модель не дала ответа."""
+    if isinstance(out, dict):
+        if out.get("skip"):
+            return "skip", str(out.get("why") or "")[:200]
+        out = out.get("text")
+    if isinstance(out, str) and out.strip():
+        return "text", out
+    return "fail", None
 
 
 def lesson_admins_of(raw):
@@ -232,6 +263,14 @@ CREATE TABLE IF NOT EXISTS lessons (
     rolled_at   REAL,
     UNIQUE (draft_id, ver_to)
 );
+CREATE TABLE IF NOT EXISTS followups (
+    number      TEXT    NOT NULL,
+    anchor      REAL    NOT NULL,                     -- время нашего последнего сообщения: модель — раз на него
+    ts          REAL    NOT NULL,
+    outcome     TEXT    NOT NULL,                     -- drafted | not_needed
+    draft_id    INTEGER,
+    PRIMARY KEY (number, anchor)
+);
 """
 
 # «Тема клиента → WhatsApp» (WARELAYTEXT0210): текст человека из темы форума показа уходит клиенту.
@@ -306,6 +345,11 @@ class Model:
     def draft(self, number, upto_id):
         raise NotImplementedError
 
+    def followup(self, number, upto_id):
+        """Напоминание притихшему (WAFOLLOWUP0210) → текст | {skip: True, why} («не нужно») | None (модель
+        не дала ответа). Адаптера нет — None."""
+        return None
+
 
 class Telegram:
     """Группа согласования. Ничего не возвращает, кроме card → id сообщения карточки (или None)."""
@@ -376,8 +420,11 @@ def _int_or_none(x):
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
                  clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random,
-                 lessons=False, lesson_admins=None):
+                 lessons=False, lesson_admins=None, followup=False):
         quiet = int(quiet)
+        # WA_AGENT_FOLLOWUP (WAFOLLOWUP0210): выключен — притихших не ищем, модель о напоминании не зовётся
+        self.followup = bool(followup)
+        self._follow_last = None
         # WA_AGENT_LESSONS (WAAGENTLESSON0210): выключен — «Исправить» урока не пишет, перевода нет;
         # lesson_admins — id Telegram, кто вправе переводить и откатывать (по умолчанию владелец)
         self.lessons = bool(lessons)
@@ -405,6 +452,8 @@ class Core:
             self.db.execute("ALTER TABLE outbox ADD COLUMN kind TEXT")   # вид медиа; NULL — текст
         if "due_at" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
             self.db.execute("ALTER TABLE drafts ADD COLUMN due_at REAL")  # срок отправки по ритму; NULL — сразу
+        if "kind" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
+            self.db.execute("ALTER TABLE drafts ADD COLUMN kind TEXT")    # «followup» — напоминание; NULL — ответ
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -583,7 +632,10 @@ class Core:
             self.follow()
             return []
         self.scan(now)
-        return self.make_drafts(now)
+        made = self.make_drafts(now)
+        if self.followup:
+            made += self.make_followups(now)
+        return made
 
     def follow(self):
         """Черновики выключены: курсор встаёт на MAX(id) без разбора строк, ждущие входящие закрыты
@@ -632,7 +684,8 @@ class Core:
                         "WHERE number=?", (rid, float(ts_q or now), number))
         live = self._live_draft(number)
         if live and live[1] == PENDING:
-            self._close(live[0], STALE, "снят: клиент написал ещё (строка %d)" % rid, now)
+            self._close(live[0], STALE, FOLLOW_STALE_WORDS % rid if self.draft_kind(live[0]) == KIND_FOLLOW
+                        else "снят: клиент написал ещё (строка %d)" % rid, now)
 
     def _after_first(self, number, rid, ts_msg):
         """Секунд от «первого» входящего клиента до эха, если оно было не раньше GREET_SEC до эха; иначе
@@ -823,7 +876,9 @@ class Core:
                 "ответили с телефона" if state == SUPERSEDED else "клиент написал ещё")}
 
         # ── человеческий ритм (WAHUMANPACE0210): срок не настал — отправка ставится на срок ──
-        if self.pace:
+        # напоминание (WAFOLLOWUP0210) ритму не подлежит: тишина в нём уже есть, а отложенное ушло бы и
+        # после нового сообщения клиента (send_due снимает только по эху)
+        if self.pace and self.draft_kind(draft_id) != KIND_FOLLOW:
             due, why = self._pace_due(number, upto, text, now)
             self.log("черновик %d: ритм — %s" % (draft_id, why))
             if due is not None and due > now:
@@ -924,6 +979,113 @@ class Core:
         base = ins[-1] if later is None else max(ins[-1], float(later))
         return base + typing, "следующий: набор %d с, от %s до нажатия %d с" % (
             typing, "сообщения клиента" if later is None else "срока отложенного", now - base)
+
+    # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────
+
+    def draft_kind(self, draft_id):
+        """Вид черновика: KIND_FOLLOW — напоминание; None — ответ на сообщение клиента."""
+        row = self.db.execute("SELECT kind FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        return row[0] if row else None
+
+    def _follow_due(self, number, now):
+        """Пора ли напоминать → (якорь — время нашего последнего сообщения | None, верхний id строк клиента,
+        слова для журнала). Числами, без текста. Наше — живое эхо (кроме автоприветствия) и `outbox`;
+        клиента — живые входящие. Окно — правилом `wa_send.last_inbound_ts`/`window_state`: последнее
+        входящее (echo=0, не квитанция, не реакция) не старше FOLLOW_WINDOW − FOLLOW_SPARE."""
+        q = self._queue()
+        try:
+            rows = q.execute("SELECT id, msg_type, echo, history, wamid, COALESCE(NULLIF(ts_msg, 0), ts_queued) "
+                             "FROM wa_inbox WHERE from_number=? ORDER BY id", (number,)).fetchall()
+        finally:
+            q.close()
+        ins, outs, win, top = [], [], None, 0
+        for rid, msg_type, echo, history, wamid, ts in rows:
+            top = max(top, rid)
+            if ts is None:
+                continue
+            if not echo and msg_type is not None and msg_type not in ("status", "reaction"):
+                win = float(ts) if win is None else max(win, float(ts))
+            kind = self._live_kind(msg_type, echo, history)
+            if kind == wa_kind.KIND_INBOUND or (msg_type == "reaction" and not echo and not history):
+                ins.append(float(ts))         # реакция клиента окна не открывает, но тишину прерывает
+            elif kind == wa_kind.KIND_ECHO and not self._greeted(rid):
+                outs.append(float(ts))
+        outs += [float(r[0]) for r in self.db.execute("SELECT ts FROM outbox WHERE number=?", (number,))]
+        if win is None:
+            return None, top, "окно 24 ч неизвестно — входящих клиента нет"
+        if now - win > FOLLOW_WINDOW - FOLLOW_SPARE:
+            return None, top, "окно 24 ч закрыто или кончается"
+        if not outs:
+            return None, top, "нашего сообщения нет"
+        ours = max(outs)
+        if ins and max(ins) >= ours:
+            return None, top, "последнее слово за клиентом"
+        if now - ours < FOLLOW_QUIET:
+            return None, top, "тишины меньше %d с" % FOLLOW_QUIET
+        # беседа — события подряд без тишины дольше PACE_NEW_TALK (та же граница, что у ритма)
+        evs = sorted(t for t in ins + outs if t <= now)
+        start = evs[-1]
+        for t in reversed(evs[:-1]):
+            if start - t > PACE_NEW_TALK:
+                break
+            start = t
+        n = self.db.execute("SELECT COUNT(*) FROM drafts WHERE number=? AND kind=? AND created_at>=?",
+                            (number, KIND_FOLLOW, start)).fetchone()[0]
+        if n >= FOLLOW_MAX:
+            return None, top, "напоминаний в беседе уже %d из %d" % (n, FOLLOW_MAX)
+        return ours, top, "тишина %d с после нашего, окну осталось %d с, напоминание %d из %d" % (
+            now - ours, FOLLOW_WINDOW - (now - win), n + 1, FOLLOW_MAX)
+
+    def make_followups(self, now):
+        """Притихшие клиенты → черновик-напоминание с карточкой или «не нужно» (строка журнала). Модель —
+        один раз на наше последнее сообщение; не дала ответа — повтор не раньше MODEL_RETRY_SEC."""
+        if self._follow_last is not None and 0 <= now - self._follow_last < FOLLOW_EVERY:
+            return []
+        self._follow_last = now
+        made = []
+        # грубый отсев по часам сервера (last_in_ts — ts_queued): очередь читаем только у писавших за окно
+        # с часом запаса; точное окно — `_follow_due`
+        rows = self.db.execute("SELECT number FROM clients WHERE paused=0 AND last_in_id > 0 "
+                               "AND last_in_id <= done_upto AND next_try <= ? AND last_in_ts >= ?",
+                               (now, now - FOLLOW_WINDOW - 3600)).fetchall()
+        for (number,) in rows:
+            if self._live_draft(number) or self.db.execute(
+                    "SELECT 1 FROM drafts WHERE number=? AND state=?", (number, SCHEDULED)).fetchone():
+                continue
+            anchor, top, why = self._follow_due(number, now)
+            if anchor is None or self.db.execute("SELECT 1 FROM followups WHERE number=? AND anchor=?",
+                                                 (number, anchor)).fetchone():
+                continue
+            try:
+                kind, val = follow_out(self.model.followup(number, top))
+            except Exception as e:                                   # noqa: BLE001
+                self.log("напоминание: модель упала: %s" % type(e).__name__)
+                kind, val = "fail", None
+            if kind == "fail":
+                self.db.execute("UPDATE clients SET next_try=? WHERE number=?", (now + MODEL_RETRY_SEC, number))
+                self.log("напоминание: модель не дала ответа — повтор не раньше %d с" % MODEL_RETRY_SEC)
+                continue
+            # пока думала модель, клиент мог написать или человек ответить — не пишем
+            if self._fresh(number, top):
+                continue
+            if kind == "skip":
+                self.db.execute("INSERT OR IGNORE INTO followups(number, anchor, ts, outcome) VALUES(?,?,?,?)",
+                                (number, anchor, now, FOLLOW_NOT_NEEDED))
+                self.log("напоминание: модель — не нужно, карточки нет (%s)" % why)
+                continue
+            did = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, kind) "
+                                  "VALUES(?,?,1,?,?,?,?)", (number, PENDING, val, top, now, KIND_FOLLOW)).lastrowid
+            self.db.execute("INSERT OR IGNORE INTO followups(number, anchor, ts, outcome, draft_id) VALUES(?,?,?,?,?)",
+                            (number, anchor, now, FOLLOW_DRAFTED, did))
+            self.log("черновик %d: напоминание (%s, %d симв.)" % (did, why, len(val)))
+            card = self._tg("card", did, 1, number, val)
+            if card is not None:
+                self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, did))
+            made.append(did)
+        return made
+
+    def follow_counts(self):
+        return dict(self.db.execute("SELECT outcome, COUNT(*) FROM followups GROUP BY outcome").fetchall())
 
     def revise(self, draft_id, text, who, now=None, ver=None, who_id=None):
         """«Исправить»: текст человека, версия +1; кнопки прежней версии отвечают «устарело».

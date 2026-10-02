@@ -26,6 +26,9 @@
   WA_AGENT_LESSONS — уроки людей (WAAGENTLESSON0210): «Исправить» с другим текстом пишет кандидата урока,
                     «Сделать правилом» переводит его в действующие, действующие идут в промпт агента,
                     «Откатить №N» убирает. Выключен — «Исправить» как раньше, уроков в промпте нет.
+  WA_AGENT_FOLLOWUP — напоминание притихшему (WAFOLLOWUP0210): 15 мин тишины клиента после нашего сообщения,
+                    окно 24 ч открыто — черновик-напоминание модели на «Отправить» (не больше двух на беседу);
+                    модель вправе сказать «не нужно». Выключен — притихших не ищем. Работает только с черновиками.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -62,6 +65,7 @@ F_GREET = "WA_AGENT_GREET_SHA256"         # отпечаток текста ав
 F_PACE = "WA_AGENT_PACE"                  # человеческий ритм «Отправить» (WAHUMANPACE0210)
 F_LESSONS = "WA_AGENT_LESSONS"            # уроки людей из «Исправить» (WAAGENTLESSON0210)
 F_LESSON_ADMINS = "WA_AGENT_LESSON_ADMINS"  # кто переводит урок в действующие и откатывает; пусто — владелец
+F_FOLLOW = "WA_AGENT_FOLLOWUP"            # напоминание притихшему (WAFOLLOWUP0210)
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
@@ -165,8 +169,14 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     line("уроки (%s): %s · право перевода и отката: %s" % (
         F_LESSONS, "вкл — «Исправить» пишет кандидата урока" if lessons else "выкл — «Исправить» как раньше",
         admin_words))
+    # напоминание притихшему (WAFOLLOWUP0210): тем же правилом; без черновиков не работает (такт их не ищет)
+    follow = wa_agent_tg.flag_on(environ.get(F_FOLLOW))
+    line("напоминание (%s): %s" % (F_FOLLOW, ("вкл — 15 мин тишины после нашего: черновик-напоминание, "
+                                              "не больше %d на беседу" % wa_agent.FOLLOW_MAX) if follow
+                                   else "выкл — притихших не ищем"))
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
-                         log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins)
+                         log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
+                         followup=follow)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
     # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210)
@@ -215,7 +225,8 @@ def summary(core, tg, words, stats):
                cards, paused, _pairs(reacts), _pairs(relays), tg.polls["ok"], tg.polls["fail"], tg.polls["conflict"],
                stats.get("ticks", 0), stats.get("tick_fail", 0),
                " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else "")
-            + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else ""))
+            + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else "")
+            + (" · напоминаний %s" % _pairs(core.follow_counts()) if getattr(core, "followup", False) else ""))
 
 
 def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every=SUMMARY_EVERY,

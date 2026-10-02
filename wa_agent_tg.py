@@ -375,7 +375,14 @@ class Tg(wa_agent.Telegram):
         lesson = lesson(draft_id, ver) if lesson and ver > 1 else None
         if lesson:
             mark += "📚 урок №%d записан кандидатом — «Сделать правилом» под ним\n" % lesson
-        body = "📝 Черновик №%d · версия %d\n%s\n%s\n%s" % (draft_id, ver, self._head(number), mark, text)
+        # напоминание притихшему (WAFOLLOWUP0210): помечено — это не ответ на сообщение клиента
+        kind = getattr(self.core, "draft_kind", None)
+        follow = bool(kind) and kind(draft_id) == wa_agent.KIND_FOLLOW
+        if follow:
+            mark = ("🔔 НАПОМИНАНИЕ — клиент молчит после нашего ответа; написал сам до нажатия — карточка "
+                    "«устарело»\n") + mark
+        body = "%s №%d · версия %d\n%s\n%s\n%s" % ("🔔 Напоминание" if follow else "📝 Черновик", draft_id, ver,
+                                                   self._head(number), mark, text)
         if len(body) > TG_TEXT_MAX:
             body = body[:TG_TEXT_MAX - 60] + "\n… (показ обрезан; «Отправить» шлёт текст целиком)"
         row = [{"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},

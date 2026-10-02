@@ -18,6 +18,10 @@
     mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
     (`lessons_db` пуст — WA_AGENT_LESSONS выключен) — блока нет, как раньше.
 
+НАПОМИНАНИЕ ПРИТИХШЕМУ (WAFOLLOWUP0210) — `followup(number, upto_id)`: своя инструкция, история под маской, узлы
+знаний и действующие уроки; цен и «нужен человек» нет. Ответ — JSON {skip, text, lang, why}: skip=true —
+«не нужно» (ядро карточки не делает), текст — черновик напоминания, прочее — None (повтор позже).
+
 ОТВЕТ МОДЕЛИ — JSON {text, lang, handoff[], why}. Не JSON, нет текста — черновика нет, строка журнала
 (ядро повторит не раньше MODEL_RETRY_SEC). lang не ru/en — причина «язык». Итог `draft` — словарь
 {text, handoff[слова], lang, why} (ядро принимает и прежнюю строку); причины — кода и модели вместе.
@@ -410,3 +414,86 @@ class ModelAdapter(wa_agent.Model):
                  % (len(got["text"]), info["history_items"], info["history_chars"], info["masked"],
                     info["price_words"], len(words), tok))
         return {"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]}
+
+    # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────
+
+    def build_followup(self, number, upto_id, now=None):
+        """→ (system, user, сведения) для напоминания без вызова модели: история под маской, узлы знаний,
+        действующие уроки. Цены и «нужен человек» не идут — напоминание нового не обещает."""
+        now = self.clock() if now is None else now
+        items, missing = self._history(number, upto_id)
+        hist, _ = wa_history.model_view(items)
+        hist, n_mask = K.mask(hist)                       # маска до модели — как у черновика
+        cut = 0
+        if len(hist) > HISTORY_MAX:
+            cut = len(hist) - HISTORY_MAX
+            hist = "… (старшая часть истории обрезана: %d симв.)\n" % cut + hist[-HISTORY_MAX:]
+        today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
+        nodes = self.knowledge.refresh(now)
+        parts = K.prompt_parts(None, [], [nodes[n] for n in K.NODES], now)
+        blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
+        blocks += [parts[k] for k in sorted(parts) if k.startswith("node:")]
+        lesson_text, n_mask2 = K.mask(lessons_block(self._lessons()))
+        if lesson_text:
+            blocks.append(lesson_text)
+        blocks.append("ИСТОРИЯ ПЕРЕПИСКИ (вся, по времени; «мы» — наша сторона; последнее слово — наше, клиент "
+                      "молчит):\n" + (hist or "переписки раньше не было") +
+                      ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
+        user = "\n\n".join(blocks)
+        return FOLLOW_SYSTEM_PROMPT, user, {"history_items": len(items), "history_chars": len(hist),
+                                            "history_cut": cut, "masked": n_mask + n_mask2,
+                                            "missing": missing, "user_chars": len(user)}
+
+    def followup(self, number, upto_id):
+        """Напоминание → текст | {skip: True, why} («не нужно») | None (не JSON, нет решения)."""
+        system, user, info = self.build_followup(number, upto_id)
+        raw, usage = self.call(system, user)
+        got = parse_followup(raw)
+        self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got}
+        tok = "токены in=%s out=%s" % ((usage or {}).get("in"), (usage or {}).get("out"))
+        if got is None:
+            self.log("модель (напоминание): ответ не JSON или без решения — повтор позже (%s, %d симв.)"
+                     % (tok, len(raw or "")))
+            return None
+        if got.get("skip"):
+            self.log("модель (напоминание): не нужно (%s)" % tok)
+            return got
+        self.log("модель (напоминание): %d симв., история %d строк, маска %d (%s)"
+                 % (len(got["text"]), info["history_items"], info["masked"], tok))
+        return got["text"]
+
+
+FOLLOW_SYSTEM_PROMPT = """Ты — менеджер проката мотобайков TurboBaby на Пхукете. Клиент в WhatsApp притих: последнее сообщение в переписке — наше, и он молчит уже минут пятнадцать или дольше. Реши, нужно ли ему мягкое напоминание, и если нужно — напиши его ЧЕРНОВИК. Черновик читает сотрудник и сам решает, отправлять ли его.
+
+Напоминание НЕ нужно, если: разговор завершён (клиент поблагодарил, попрощался, сказал «ок», «подумаю», «вернусь позже», «напишу завтра»); мы уже напомнили и клиент так и не ответил; наше последнее сообщение — прощание или «спасибо»; ждём не клиента, а себя (мы обещали уточнить и вернуться); клиент отказался.
+
+Если нужно:
+1. ОДНО короткое вежливое сообщение, обычно одно предложение, по сути беседы: о том, на чём остановились (подобрать байк, даты, доставка, документы), без давления и без «вы ещё здесь?».
+2. На языке клиента: русский или английский.
+3. Ничего нового не обещай и не называй: ни цен, ни наличия, ни брони, ни скидок, ни сроков от имени людей. Не пересказывай историю.
+4. Метки «[скрыто: …]» — скрытые данные клиента; не упоминай их.
+
+Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
+{"skip": false, "text": "текст напоминания", "lang": "ru" или "en", "why": "одна строка для сотрудника"}
+или, если напоминание не нужно:
+{"skip": true, "text": "", "why": "одна строка для сотрудника: почему не нужно"}"""
+
+
+def parse_followup(raw):
+    """Ответ модели о напоминании → {skip: True, why} | {text, lang, why} | None (не JSON, нет решения)."""
+    s = str(raw or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s).strip()
+    try:
+        data = json.loads(s)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    why = str(data.get("why") or "").strip()[:300]
+    if data.get("skip") is True:
+        return {"skip": True, "why": why}
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return {"text": text.strip(), "lang": str(data.get("lang") or "").strip().lower()[:8], "why": why}
