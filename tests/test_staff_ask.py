@@ -217,6 +217,11 @@ def test_a1_bike_question_topic_and_delivery():
     check("A1 решатель: дверь вопроса сотрудникам, реплая прежнего пути нет",
           door.startswith("вопрос сотрудникам") and not m.replies and len(to(ctx2, SVC)) == 1
           and len(to(ctx2, DLV)) == 1, (door, m.replies, ctx2.bot.sent))
+    qm = to(ctx2, SVC)[0]["mid"] if to(ctx2, SVC) else None
+    check("A1 решатель: вопрос сотрудникам открыт как вопрос решателя (второй того же вида не задаётся)",
+          S._dlive_asks(SVC, TOPIC).get(topic_decider.ask_kind("работы")) == qm and qm is not None
+          and topic_decider.rules(dec, {"open_kinds": S._dlive_asks(SVC, TOPIC)})["правило"] == "второй_вопрос"
+          and qm in S._dlive_mids(SVC, TOPIC), (S._dlive_asks(SVC, TOPIC), qm))
     dtxt = to(ctx2, DLV)[0]["text"] if to(ctx2, DLV) else ""
     check("A2 срочный → «клиент сейчас интересуется» (и по-тайски)",
           "клиент сейчас интересуется" in dtxt and "ลูกค้ากำลังสนใจ" in dtxt and "для ясности" not in dtxt, dtxt)

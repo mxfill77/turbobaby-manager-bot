@@ -216,7 +216,8 @@ async def ask(send, *, kind, bike, q_ru, q_th, urgency=URG_CLARITY, handles=(), 
             posted.append(PLACE_DELIVERY)
     st["asks"][qid] = a
     save(st, path)
-    return {"posted": posted, "qid": qid, "why": ""}
+    main = a["posts"].get("question") or a["posts"].get("agents")
+    return {"posted": posted, "qid": qid, "why": "", "mid": main[1]}
 
 
 def _when(ts):

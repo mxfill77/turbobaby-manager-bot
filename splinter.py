@@ -1548,6 +1548,9 @@ async def _decider_execute(msg, context, bridge, snap, v) -> str:
             r = await staff_ask_post(context, kind=it.get("вид"), bike=bike, q_ru=q, q_th=it.get("вопрос_th"),
                                      urgency=it.get("срочность"), topic_id=topic_id, servicing_chat=chat_id)
             if r.get("posted"):
+                # открыт как вопрос решателя (правило «второй_вопрос», реплай на него — решателю), как прежний путь
+                _DLIVE["asks"].setdefault(k, {})[_tdec.ask_kind(it.get("ждём_что"))] = {"mid": r.get("mid"), "ts": now}
+                _dlive_mark(chat_id, topic_id, r.get("mid"))
                 return "вопрос сотрудникам: " + " + ".join(r["posted"])
             if r.get("qid"):
                 return "вопрос сотрудникам уже открыт — без повтора"
