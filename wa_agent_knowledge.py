@@ -316,11 +316,22 @@ _PAY_QUESTION = re.compile(r"\?|\bли\b|\bможно\b|\bнужн\w*|\bнадо
                            re.I)
 _NEG_BEFORE = re.compile(r"(?:\bне|\bnot|n't|\bnever)\s+(?:\S+\s+)?$", re.I)
 _LI_AFTER = re.compile(r"\s*ли\b", re.I)
+# WADRAFTFIX0310: документ под отрицанием фактом не считается — «нет чека», «без чека», no receipt; «чека нет».
+# «не» — только вплотную («не чек»): в «не оплатил, чек…» оно относится к оплате, а не к документу
+_PROOF_NEG_BEFORE = re.compile(r"(?:\bнет|\bбез|\bno|\bnot|n't|\bnever|\bwithout)\s+(?:\S+\s+)?$|\bне\s+$", re.I)
+_PROOF_NEG_AFTER = re.compile(r"\s*(?:(?:пока|ещё|еще|тоже|у\s+меня)\s+)?(?:нет|не)\b", re.I)
 
 
 def _claimed(s, m):
     """Признак оплаты заявлен как факт: перед ним нет отрицания, после него нет «ли»."""
     return _NEG_BEFORE.search(s[max(0, m.start() - 24):m.start()]) is None and _LI_AFTER.match(s, m.end()) is None
+
+
+def _proof_claimed(s, m):
+    """Документ оплаты (чек, скрин) назван как есть: перед ним нет отрицания («нет», «без», no), после него нет
+    «нет» (WADRAFTFIX0310)."""
+    return (_PROOF_NEG_BEFORE.search(s[max(0, m.start() - 24):m.start()]) is None
+            and _PROOF_NEG_AFTER.match(s, m.end()) is None)
 
 
 def payment_mode(text, trusted=True):
@@ -329,20 +340,27 @@ def payment_mode(text, trusted=True):
     факт из него не берётся, совершённая оплата становится неясной."""
     s = str(text or "")
     done = list(_PAY_DONE.finditer(s))
-    proof = _PAY_PROOF.search(s) is not None
-    fact = any(_claimed(s, m) for m in done) or (proof and _PAY_QUESTION.search(s) is None)
+    proofs = list(_PAY_PROOF.finditer(s))
+    fact = (any(_claimed(s, m) for m in done)
+            or (any(_proof_claimed(s, m) for m in proofs) and _PAY_QUESTION.search(s) is None))
     if fact:
         return MONEY_PAYMENT if trusted else MONEY_PAYMENT_UNCLEAR
-    return MONEY_PAYMENT_UNCLEAR if (done or proof) else MONEY_PAYMENT_ASK
+    return MONEY_PAYMENT_UNCLEAR if (done or proofs) else MONEY_PAYMENT_ASK
+
+
+# WADRAFTFIX0310: другие деньги рядом с депозитом — «верните» уже не только о депозите
+_OTHER_MONEY = re.compile(r"аренд|предоплат|аванс|\bден(?:ьг\w*|ег)\s+за\b|\brent\b|\bpre-?pa(?:y|id)\w*|"
+                          r"\bmoney\s+for\b", re.I)
 
 
 def money_labels(text, trusted=True):
     """Текст → [(ярлык, слова)] сработавших денежных ярлыков, в порядке MONEY_LABELS. Не пусто ровно тогда, когда
-    сработало выражение R_MONEY. Депозит назван и других денег нет — «верните» относится к депозиту; возврат с
-    оплатой без заявленного факта («верните предоплату») — это возврат, а не вопрос об оплате."""
+    сработало выражение R_MONEY. Депозит назван и других денег нет (оплаты, аренды, предоплаты, «денег за», rent —
+    WADRAFTFIX0310) — «верните» относится к депозиту; возврат с оплатой без заявленного факта («верните
+    предоплату») — это возврат, а не вопрос об оплате."""
     s = str(text or "")
     hit = {key for key, _words, rx in MONEY_LABELS if rx.search(s)}
-    if MONEY_DEPOSIT in hit and MONEY_PAYMENT not in hit:
+    if MONEY_DEPOSIT in hit and MONEY_PAYMENT not in hit and not _OTHER_MONEY.search(s):
         hit.discard(MONEY_REFUND)
     out = []
     for key, _words, _rx in MONEY_LABELS:
@@ -437,6 +455,12 @@ def merge_reasons(words, extra):
         cats.update(got)
         texts.add(_norm(h))
     return out
+
+
+def reason_first(words, word):
+    """Причина `word` — первой строкой всегда (WADRAFTFIX0310): уже стоящая (тот же текст без учёта регистра и
+    знаков) переносится вперёд, а не остаётся на своём месте; повторов нет."""
+    return [word] + [w for w in words or () if _norm(w) != _norm(word)]
 
 
 # ------------------------------- деньги в черновике модели (WAMONEYCHECK0310) -------------------------------
@@ -552,6 +576,14 @@ def node_stale(node, now=None):
     return age is not None and limit is not None and age > limit
 
 
+def node_failed_unread(node, now=None):
+    """Снимка нет, а чтение пробовали в этом вызове и оно не удалось (WADRAFTFIX0310): знаний узла в промпте нет
+    по сбою — та же причина, что у устаревшего. Чтение не настроено (`Knowledge` без read_doc) — не сбой, как
+    раньше: причины нет."""
+    return (node_age(node, now) is None and (node or {}).get("call") == CALL_FAILED
+            and bool((node or {}).get("configured")))
+
+
 # что было с узлом в ЭТОМ вызове `refresh` — для строки журнала (WAKNOWFRESH0310)
 CALL_READ, CALL_KEPT, CALL_FAILED = "прочитан", "не перечитывался", "не прочитан"
 
@@ -563,10 +595,14 @@ class Knowledge:
     текста и причина «знания устарели»; до предела модель видит прежний текст с его возрастом."""
 
     def __init__(self, read_doc, names=NODES, max_age=600, max_stale=None):
-        self.read_doc, self.names, self.max_age = read_doc, tuple(names), max_age
+        # read_doc None — чтение не настроено (WADRAFTFIX0310): отказ «моста нет», как раньше, но сбоем не считается
+        self.configured = read_doc is not None
+        self.read_doc = read_doc if read_doc is not None else (lambda n: {"ok": False, "error": "моста нет"})
+        self.names, self.max_age = tuple(names), max_age
         self.max_stale = 3 * max_age if max_stale is None else max_stale
         self.snap = {n: {"name": n, "read": False, "text": None, "len": 0, "taken_at": None,
-                         "why": "ещё не читался", "max_stale": self.max_stale, "call": None} for n in self.names}
+                         "why": "ещё не читался", "max_stale": self.max_stale, "call": None,
+                         "configured": self.configured} for n in self.names}
 
     def refresh(self, now=None):
         t = time.time() if now is None else now
@@ -577,19 +613,25 @@ class Knowledge:
                 continue
             got = read_node(n, self.read_doc, t)
             if got["read"]:
-                self.snap[n] = dict(got, max_stale=self.max_stale, call=CALL_READ)
+                self.snap[n] = dict(got, max_stale=self.max_stale, call=CALL_READ, configured=self.configured)
             else:
                 self.snap[n] = dict(self.snap[n], why=got["why"], call=CALL_FAILED)
         return self.snap
 
 
 def stale_reasons(nodes, now=None):
-    """Узлы этого вызова → [причина «знания устарели»] | []: одна на все устаревшие узлы."""
+    """Узлы этого вызова → [причина «знания устарели»] | []: одна на все узлы, чьих знаний в промпте нет по сбою —
+    снимок старше предела или снимка нет, а чтение не удалось (WADRAFTFIX0310)."""
     old = [n for n in nodes or () if node_stale(n, now)]
-    if not old:
+    none = [n for n in nodes or () if node_failed_unread(n, now)]
+    if not old and not none:
         return []
-    return [{"reason": R_STALE, "words": STALE_WORDS,
-             "why": "снимок старше %d мин: %s" % (old[0]["max_stale"] // 60, ", ".join(n["name"] for n in old))}]
+    why = []
+    if old:
+        why.append("снимок старше %d мин: %s" % (old[0]["max_stale"] // 60, ", ".join(n["name"] for n in old)))
+    if none:
+        why.append("снимка нет, чтение не удалось: %s" % ", ".join(n["name"] for n in none))
+    return [{"reason": R_STALE, "words": STALE_WORDS, "why": "; ".join(why)}]
 
 
 def node_block(node, now=None):

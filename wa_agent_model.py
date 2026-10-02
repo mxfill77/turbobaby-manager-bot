@@ -444,7 +444,7 @@ class ModelAdapter(wa_agent.Model):
         self.fleet, self.door = fleet, door
         self.archive_db, self.manifest, self.media_dir = archive_db, manifest, media_dir
         self.no_price_models = tuple(no_price_models)
-        self.knowledge = K.Knowledge(read_doc or (lambda n: {"ok": False, "error": "моста нет"}))
+        self.knowledge = K.Knowledge(read_doc)              # None — чтение не настроено (WADRAFTFIX0310)
         self.clock = clock
         self.log = log or (lambda line: None)
         self.last = None                                  # разбор последнего вызова (для проб и тестов)
@@ -566,9 +566,13 @@ class ModelAdapter(wa_agent.Model):
         self.log(words)
         return avail, rental, words
 
+    def _now(self, now):
+        """Время суждения: заданное вызывающим — как есть; иначе часы адаптера в этот момент (WADRAFTFIX0310)."""
+        return self.clock() if now is None else now
+
     def build(self, number, upto_id, now=None):
         """→ (system, user, сведения) без вызова модели (пробы и тесты меряют то, что уйдёт)."""
-        now = self.clock() if now is None else now
+        fixed, now = now, self._now(now)
         items, missing = self._history(number, upto_id)
         hist, _ = wa_history.model_view(items)
         hist, n_mask = K.mask(hist)
@@ -585,7 +589,10 @@ class ModelAdapter(wa_agent.Model):
         avail, rental, book_words = self._book(number, ask, today, now)
         if avail is not None or rental is not None:
             reasons = B.adjust_reasons(reasons, avail, rental, ask)
-        nodes = self.knowledge.refresh(now)
+        # после ожиданий (история, парк и дверь цены, брони, чтение узлов) время снимается заново (WADRAFTFIX0310):
+        # возраст, причина, журнал, блоки знаний и префикс кэша судятся по нему, а не по началу вызова
+        nodes = self.knowledge.refresh(self._now(fixed))
+        now = self._now(fixed)
         node_list = [nodes[n] for n in K.NODES]
         self.log(knowledge_line(node_list, now))           # на каждый вызов, без текста узлов (WAKNOWFRESH0310)
         # узел старше предела: его текста в промпте нет — черновик пишет человек; причина первой из причин кода
@@ -635,8 +642,7 @@ class ModelAdapter(wa_agent.Model):
         # причин). Текст ответа не правится. В журнал — только числа: текст черновика туда не идёт.
         claims = K.money_claims(got["text"], info["price"])
         if claims:
-            if K.MONEY_CLAIM_WORDS not in words:
-                words.insert(0, K.MONEY_CLAIM_WORDS)
+            words = K.reason_first(words, K.MONEY_CLAIM_WORDS)   # уже стоящая — вперёд (WADRAFTFIX0310)
             self.log("модель: денежных утверждений без опоры %d (процентов %d, сумм %d) — причина «нужен человек»"
                      % (len(claims), sum(1 for c in claims if c[0] == "процент"),
                         sum(1 for c in claims if c[0] == "сумма")))
@@ -650,7 +656,7 @@ class ModelAdapter(wa_agent.Model):
     def build_followup(self, number, upto_id, now=None):
         """→ (system, user, сведения) для напоминания без вызова модели: история под маской, узлы знаний,
         действующие уроки. Цены и «нужен человек» не идут — напоминание нового не обещает."""
-        now = self.clock() if now is None else now
+        fixed, now = now, self._now(now)
         items, missing = self._history(number, upto_id)
         hist, _ = wa_history.model_view(items)
         hist, n_mask = K.mask(hist)                       # маска до модели — как у черновика
@@ -659,7 +665,8 @@ class ModelAdapter(wa_agent.Model):
             cut = len(hist) - HISTORY_MAX
             hist = "… (старшая часть истории обрезана: %d симв.)\n" % cut + hist[-HISTORY_MAX:]
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
-        nodes = self.knowledge.refresh(now)
+        nodes = self.knowledge.refresh(self._now(fixed))
+        now = self._now(fixed)                            # после чтения узлов — заново, как у черновика
         node_list = [nodes[n] for n in K.NODES]
         self.log(knowledge_line(node_list, now))
         parts = K.prompt_parts(None, [], node_list, now)

@@ -162,7 +162,8 @@ def test_journal_never_read_unknown():
     assert know_lines(w) == ["знания: business_rules — не прочитан (мост не отвечает (TimeoutError)), снимка нет — "
                              "НЕИЗВЕСТНО; faq — не прочитан (мост не отвечает (TimeoutError)), снимка нет — "
                              "НЕИЗВЕСТНО"], know_lines(w)
-    assert "УЗЕЛ faq: НЕИЗВЕСТНО — не прочитан" in prompt and hand == [], hand     # как раньше: причины нет
+    # WADRAFTFIX0310 (п.3): чтение пробовали и оно не удалось — та же причина, что у устаревшего (было: причины нет)
+    assert "УЗЕЛ faq: НЕИЗВЕСТНО — не прочитан" in prompt and hand == [STALE], hand
 
 
 def test_cache_prefix_no_text_when_stale():
