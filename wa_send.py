@@ -19,6 +19,19 @@
                        человеку, которое не отзывается.
   WA_360_API_KEY     — ключ 360dialog, заголовок `D360-API-KEY`. Пусто либо заполнитель
                        («PLACEHOLDER» и родня) → отказ ДО обращения к сети.
+                       С 01.10.2026 (WAREACTOUT0110) — ОДНО правило для двери и показа
+                       (`api_key`): WA_360_API_KEY, иначе WA_D360_API_KEY — первое годное имя.
+
+РЕАКЦИЯ (01.10.2026, WAREACTOUT0110). `send_reaction` идёт ТЕМ ЖЕ путём, что текст: ручка
+WA_SEND, ключ, окно 24 ч, три исхода. Пустой эмодзи — снятие реакции (так говорит API Meta).
+
+МЕДИА (02.10.2026, WARELAYMEDIA0210). `send_media` — фото, видео, документ, аудио (и голосовое),
+стикер и место ТЕМ ЖЕ путём: ручка WA_SEND, проверка вида, формата, подписи и размера (до сети),
+ключ, окно 24 ч — и только потом файл. Файл берёт вызывающий (`fetch`, байты в памяти), дверь
+загружает его в 360dialog (`POST /media`, multipart из памяти — на диск не ложится ни байта) и
+шлёт сообщение своего вида с id медиа. Загрузка клиенту не видна: любой её провал — `not_sent`
+(повтор загрузки безвреден — лишний файл в 360dialog, не второе сообщение). Исход ОТПРАВКИ —
+прежние три. Пределы и форматы — `MEDIA_MAX`, `MEDIA_MIMES` (Meta, «Supported media types»).
 
 ЗНАЧЕНИЕ КЛЮЧА НЕ ПОКАЗЫВАЕТСЯ НИГДЕ. Ни в отказе, ни в журнале, ни в исключении не печатается
 ни одного его символа — наружу уходит только «ключ не годен» и почему (пусто / заполнитель).
@@ -103,6 +116,33 @@ BACKOFF_BASE = 1.0           # паузы 1 с, 2 с — растут вдвое
 
 RETRY_STATUSES = frozenset((429, 500, 502, 503, 504))
 
+# ── медиа (WARELAYMEDIA0210) ─────────────────────────────────────────────────────────────
+# Пределы и форматы WhatsApp Cloud API по видам — документация Meta «Supported media types»
+# (developers.facebook.com/docs/whatsapp/cloud-api/reference/media#supported-media-types).
+# МБ здесь — 1024², ровно как у предела Bot API в wa_agent_tg; спор на краю решит отказ сервера
+# (4xx → not_sent словами API), второго сообщения он не даёт.
+MEDIA_PATH = "/media"
+MB = 1024 * 1024
+MEDIA_MAX = {"image": 5 * MB, "video": 16 * MB, "audio": 16 * MB, "document": 100 * MB,
+             "sticker": 100 * 1024}                    # стикер — статичный webp; анимированный не шлём
+MEDIA_MIMES = {
+    "image": ("image/jpeg", "image/png"),
+    "video": ("video/mp4", "video/3gpp"),
+    "audio": ("audio/aac", "audio/amr", "audio/mpeg", "audio/mp4", "audio/ogg"),
+    "document": ("text/plain", "application/pdf", "application/msword", "application/vnd.ms-excel",
+                 "application/vnd.ms-powerpoint",
+                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                 "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    "sticker": ("image/webp",),
+}
+CAPTION_KINDS = ("image", "video", "document")         # у аудио и стикера подписи в WhatsApp нет
+CAPTION_MAX = 1024
+KIND_WORD = {"image": "фото", "video": "видео", "audio": "аудио", "voice": "голосовое",
+             "document": "документ", "sticker": "стикер", "location": "геоточка"}
+MEDIA_BUDGET_SEC = 180.0     # потолок на загрузку и отправку вместе
+UPLOAD_LEG_SEC = 90.0        # плечо одной загрузки, урезается остатком бюджета
+
 # Значения, которыми ключ объявляет себя ненастоящим. Сверяется в верхнем регистре, по
 # ВХОЖДЕНИЮ: «PLACEHOLDER», «wa-placeholder-key» и «TODO_SET_ME» одинаково не ключи.
 _PLACEHOLDERS = ("PLACEHOLDER", "CHANGEME", "CHANGE_ME", "TODO", "XXXXX", "YOUR_KEY", "DUMMY")
@@ -126,6 +166,26 @@ def key_usable(key) -> tuple:
         if mark in up:
             return False, "в WA_360_API_KEY стоит заполнитель, а не ключ — боевой ещё не заведён"
     return True, "ключ задан"
+
+
+KEY_NAMES = ("WA_360_API_KEY", "WA_D360_API_KEY")
+
+
+def api_key(env=None) -> tuple:
+    """Ключ 360dialog по ОДНОМУ правилу для двери и показа → (ключ или '', имя или '', причина).
+
+    У одного ключа два имени (WAAGENTLIVE0110, находка 1): дверь читала WA_360_API_KEY, показ —
+    WA_D360_API_KEY. Правило: WA_360_API_KEY, иначе WA_D360_API_KEY; пустое имя и заполнитель
+    пропускаются, берётся первое ГОДНОЕ. ЗНАЧЕНИЕ В ПРИЧИНУ НЕ ПОПАДАЕТ НИКОГДА — только имена.
+    """
+    env = env if env is not None else os.environ
+    seen = []
+    for name in KEY_NAMES:
+        key = str(env.get(name) or "").strip()
+        if key_usable(key)[0]:
+            return key, name, "ключ задан (%s)" % name
+        seen.append("%s — %s" % (name, "заполнитель" if key else "пуст"))
+    return "", "", "ключ 360dialog не годен ни под одним именем (%s)" % ", ".join(seen)
 
 
 def window_state(last_inbound_ts, now, window_secs: float = WINDOW_SECS) -> tuple:
@@ -249,7 +309,8 @@ def last_inbound_ts(number, db_path=None):
     if not os.path.exists(path):
         return ScanResult.unreadable("входящих", detail="очереди нет по пути " + os.path.basename(path))
     try:
-        with sqlite3.connect(path, timeout=5) as conn:
+        conn = sqlite3.connect(path, timeout=5)  # закрываем сами: `with` у sqlite3 соединение не закрывает
+        try:
             row = conn.execute(
                 """SELECT COUNT(*), MAX(COALESCE(NULLIF(ts_msg, 0), ts_queued))
                      FROM wa_inbox
@@ -257,6 +318,8 @@ def last_inbound_ts(number, db_path=None):
                       AND msg_type <> 'reaction'""",
                 (str(number),),
             ).fetchone()
+        finally:
+            conn.close()
     except Exception as e:
         return ScanResult.unreadable("входящих", detail="очередь не читается: " + type(e).__name__)
     seen = int((row or [0])[0] or 0)
@@ -268,14 +331,21 @@ def last_inbound_ts(number, db_path=None):
 
 
 def _post(url, payload: dict, key: str, timeout: float):
-    """Один POST. Возвращает (status, body_text, err). Сеть трогается ТОЛЬКО здесь.
+    """Один POST. Возвращает (status, body_text, err). Сеть — только через `_open`.
 
-    Это единственный шов, который тесты подменяют, — поэтому ни один тест не выходит наружу.
+    Это шов, который тесты подменяют (у загрузки медиа свой — `_post_media`), — поэтому ни один
+    тест не выходит наружу.
     """
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header(KEY_HEADER, key)
+    return _open(req, timeout)
+
+
+def _open(req, timeout):
+    """ЕДИНСТВЕННЫЙ выход двери в сеть — у текста, реакции и загрузки медиа (WARELAYMEDIA0210) один.
+    → (status, body_text, err). Тесты подменяют швы над ним (`transport`, `upload`)."""
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace"), None
@@ -299,6 +369,36 @@ def build_payload(to: str, text: str) -> dict:
     }
 
 
+def build_reaction(to: str, wamid: str, emoji: str) -> dict:
+    """Реакция на сообщение `wamid`; пустой эмодзи — снятие."""
+    return {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": str(to),
+        "type": "reaction",
+        "reaction": {"message_id": str(wamid), "emoji": emoji or ""},
+    }
+
+
+def _out(outcome, reason, window=WINDOW_UNKNOWN, wamid=None, attempts=0):
+    return {"outcome": outcome, "reason": reason, "wamid": wamid,
+            "window": window, "attempts": attempts, "verify": outcome == UNKNOWN}
+
+
+def send_reaction(to, wamid, emoji, now=None, db_path=None, env=None, transport=None,
+                  sleep=time.sleep, budget=SEND_BUDGET_SEC, clock=time.monotonic):
+    """Поставить (или снять — пустой `emoji`) реакцию на сообщение `wamid` у клиента `to`.
+
+    Путь тот же, что у текста (`_door`): WA_SEND, ключ по `api_key`, окно 24 ч, три исхода.
+    НИКОГДА не бросает. Ответ — тот же словарь, что у `send_text`.
+    """
+    if not str(to or "").strip():
+        return _out(NOT_SENT, "номер получателя не назван")
+    if not str(wamid or "").strip():
+        return _out(NOT_SENT, "не назван wamid сообщения, на которое реакция")
+    return _door(to, build_reaction(to, wamid, emoji), now, db_path, env, transport, sleep, budget, clock)
+
+
 def send_text(to, text, now=None, db_path=None, env=None, transport=None,
               sleep=time.sleep, budget=SEND_BUDGET_SEC, clock=time.monotonic):
     """Отправить текст клиенту. Возвращает словарь-исход, НИКОГДА не бросает.
@@ -311,27 +411,24 @@ def send_text(to, text, now=None, db_path=None, env=None, transport=None,
       attempts сколько раз обращались к сети (0 — если до сети не дошло)
       verify   True, когда исход unknown: ПЕРЕД любым повтором надо выяснить, ушло ли
     """
-    env = env if env is not None else os.environ
-    now = time.time() if now is None else float(now)
-    post = transport or _post
-
-    def out(outcome, reason, window=WINDOW_UNKNOWN, wamid=None, attempts=0):
-        return {"outcome": outcome, "reason": reason, "wamid": wamid,
-                "window": window, "attempts": attempts, "verify": outcome == UNKNOWN}
-
     if not str(to or "").strip():
-        return out(NOT_SENT, "номер получателя не назван")
+        return _out(NOT_SENT, "номер получателя не назван")
     if not str(text or "").strip():
-        return out(NOT_SENT, "пустой текст не отправляем")
+        return _out(NOT_SENT, "пустой текст не отправляем")
+    return _door(to, build_payload(to, text), now, db_path, env, transport, sleep, budget, clock)
+
+
+def _gate(to, now, db_path, env):
+    """Ворота текста, реакции и медиа: ручка → ключ → окно 24 ч. → (ключ, окно) либо словарь-отказ."""
+    out = _out
 
     # ── ручка двери ──
     if not send_enabled(env):
         return out(NOT_SENT, "дверь отправки выключена (WA_SEND не равен 1) — не отправлено")
 
-    # ── ключ ──
-    key = env.get("WA_360_API_KEY") or ""
-    key_ok, key_why = key_usable(key)
-    if not key_ok:
+    # ── ключ: одно правило для двери и показа ──
+    key, _name, key_why = api_key(env)
+    if not key:
         return out(NOT_SENT, key_why + " — не отправлено")
 
     # ── окно 24 часа: судим ДО сети ──
@@ -355,15 +452,28 @@ def send_text(to, text, now=None, db_path=None, env=None, transport=None,
         return out(NOT_SENT,
                    "окно неизвестно: %s — не отправлено (это НЕ «окно закрыто», это отсутствие "
                    "записи у нас)" % info.get("why", "причина не названа"), window=state)
+    return key, state
 
-    # ── отправка под общим дедлайном ──
-    url = API_BASE + SEND_PATH
-    payload = build_payload(to, text)
+
+def _door(to, payload, now, db_path, env, transport, sleep, budget, clock):
+    """Общий путь текста и реакции: ручка → ключ → окно 24 ч → отправка под общим дедлайном."""
+    env = env if env is not None else os.environ
+    now = time.time() if now is None else float(now)
+    gate = _gate(to, now, db_path, env)
+    if isinstance(gate, dict):
+        return gate
+    key, state = gate
     # ДЕДЛАЙН ЖИВЁТ НА СВОИХ ЧАСАХ, а не на `now`. `now` — семантическое «сейчас» для окна
     # 24 часа, и тест вправе подать его фальшивым; смешать их значило бы, что подставленное
     # время мгновенно съедает бюджет и отправка не случается никогда. Часы монотонные:
     # перевод системного времени не должен ни продлевать, ни обрывать отправку.
-    deadline = clock() + float(budget)
+    return _send_loop(transport or _post, payload, key, state, clock() + float(budget), sleep, clock)
+
+
+def _send_loop(post, payload, key, state, deadline, sleep, clock):
+    """Отправка сообщения под общим дедлайном: повтор только 429, 5xx и молчания транспорта."""
+    out = _out
+    url = API_BASE + SEND_PATH
     attempts = 0
     last = out(UNKNOWN, "ни одной попытки не состоялось", window=state)
 
@@ -393,3 +503,210 @@ def send_text(to, text, now=None, db_path=None, env=None, transport=None,
             return last
 
     return last
+
+
+# ═══ медиа (WARELAYMEDIA0210) ══════════════════════════════════════════════════════════════
+
+def fmt_size(n) -> str:
+    """Байты → «23.4 МБ» / «96 КБ» (1024²; так же считает предел)."""
+    n = float(n or 0)
+    if n >= MB:
+        return ("%.1f" % (n / MB)).rstrip("0").rstrip(".") + " МБ"
+    return "%d КБ" % max(1, round(n / 1024))
+
+
+def media_limit(kind, fetch_max=None) -> tuple:
+    """Предел файла вида `kind` → (байты, чей предел словами). Меньший из WhatsApp и того, что
+    вызывающий может достать (Bot API отдаёт боту файл до 20 МБ)."""
+    wa = MEDIA_MAX[kind]
+    if fetch_max and int(fetch_max) < wa:
+        return int(fetch_max), "Telegram отдаёт боту файл до %s" % fmt_size(fetch_max)
+    return wa, "%s в WhatsApp" % KIND_WORD.get(kind, kind)
+
+
+def media_check(media) -> str:
+    """Чистая проверка медиа ДО сети → '' (годно) либо слова отказа для человека."""
+    m = media or {}
+    kind = m.get("kind")
+    if kind == "location":
+        try:
+            lat, lon = float(m.get("latitude")), float(m.get("longitude"))
+        except (TypeError, ValueError):
+            return "у геоточки нет координат"
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return "координаты геоточки вне допустимого"
+        return ""
+    if kind not in MEDIA_MAX:
+        return "вид «%s» в WhatsApp не отправляется" % (kind or "?")
+    mime = str(m.get("mime") or "").split(";")[0].strip().lower()
+    if mime not in MEDIA_MIMES[kind]:
+        return "формат %s WhatsApp как %s не принимает" % (mime or "без типа", KIND_WORD.get(kind, kind))
+    caption = str(m.get("caption") or "")
+    if kind in CAPTION_KINDS and len(caption) > CAPTION_MAX:
+        return "подпись %d симв. длиннее предела WhatsApp %d — сократите" % (len(caption), CAPTION_MAX)
+    limit, whose = media_limit(kind, m.get("fetch_max"))
+    size = int(m.get("size") or 0)
+    if size > limit:
+        return "файл %s больше предела %s (%s)" % (fmt_size(size), fmt_size(limit), whose)
+    return ""
+
+
+def build_media(to, kind, media_id, caption="", filename=""):
+    """Сообщение вида `kind` с загруженным медиа; подпись — только у фото, видео и документа."""
+    body = {"id": str(media_id)}
+    if caption and kind in CAPTION_KINDS:
+        body["caption"] = caption
+    if kind == "document" and filename:
+        body["filename"] = filename
+    return {"messaging_product": "whatsapp", "recipient_type": "individual", "to": str(to),
+            "type": kind, kind: body}
+
+
+def build_location(to, lat, lon, name="", address=""):
+    loc = {"latitude": float(lat), "longitude": float(lon)}
+    if name:
+        loc["name"] = name
+    if address:
+        loc["address"] = address
+    return {"messaging_product": "whatsapp", "recipient_type": "individual", "to": str(to),
+            "type": "location", "location": loc}
+
+
+def multipart(fields, fname, data, mime):
+    """multipart/form-data В ПАМЯТИ → (тело bytes, Content-Type). Файл — последней частью."""
+    bnd = "wa" + os.urandom(12).hex()
+    parts = []
+    for name, value in fields:
+        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                      % (bnd, name, value)).encode("utf-8"))
+    parts.append(("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+                  "Content-Type: %s\r\n\r\n" % (bnd, fname.replace('"', "_"), mime)).encode("utf-8"))
+    parts.append(bytes(data))
+    parts.append(("\r\n--%s--\r\n" % bnd).encode("utf-8"))
+    return b"".join(parts), "multipart/form-data; boundary=" + bnd
+
+
+def _post_media(url, fields, file, key, timeout):
+    """Одна загрузка файла (`POST /media`, multipart из памяти). → (status, body_text, err).
+    Второй шов двери (сеть — тот же `_open`); тесты подменяют его, как `_post`."""
+    fname, data, mime = file
+    body, ctype = multipart(fields, fname, data, mime)
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", ctype)
+    req.add_header(KEY_HEADER, key)
+    return _open(req, timeout)
+
+
+def classify_upload(status, body_text, err=None) -> tuple:
+    """Ответ загрузки → (id медиа | None, причина, повторять ли). Клиент загрузки не видит, поэтому
+    исходов два: id есть — шлём дальше; иначе — не загружено (повтор безвреден, если не отказ)."""
+    if err:
+        return None, "транспорт молчит (%s)" % err, True
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return None, "код ответа не прочитан", True
+    if 200 <= code < 300:
+        try:
+            data = json.loads(body_text or "")
+        except (TypeError, ValueError):
+            data = None
+        mid = data.get("id") if isinstance(data, dict) else None
+        if mid:
+            return str(mid), "загружено", False
+        return None, "код %d, но id медиа в ответе нет" % code, False
+    if code in RETRY_STATUSES:
+        return None, "сервер ответил %d%s" % (code, _api_error(body_text)), True
+    return None, "сервер отказал %d%s" % (code, _api_error(body_text)), False
+
+
+def send_media(to, media, now=None, db_path=None, env=None, transport=None, upload=None,
+               sleep=time.sleep, budget=MEDIA_BUDGET_SEC, clock=time.monotonic):
+    """Отправить клиенту медиа своего вида. Возвращает словарь-исход `send_text`, НИКОГДА не бросает.
+
+    media: kind (image|video|audio|document|sticker|location), mime, size (байты по описанию
+    источника, если известны), caption, filename, fetch_max (сколько источник может отдать),
+    fetch(предел) → (bytes | None, почему) — файл в ПАМЯТИ; у места — latitude, longitude, name, address.
+
+    Порядок: ручка → проверка вида/формата/подписи/размера → ключ → окно 24 ч → файл (`fetch`) →
+    загрузка (`POST /media`) → отправка (`POST /messages`). Всё до отправки — `not_sent`: клиенту
+    не ушло ничего. Отказ, который человек исправит сам, несёт `topic_words` — слова для темы.
+    Сверх полей `send_text`: uploads (сколько загрузок), dropped_caption (подпись у вида без подписи)."""
+    env = env if env is not None else os.environ
+    now = time.time() if now is None else float(now)
+    m = media or {}
+    kind = m.get("kind")
+    if not str(to or "").strip():
+        return _out(NOT_SENT, "номер получателя не назван")
+    if not send_enabled(env):
+        return _out(NOT_SENT, "дверь отправки выключена (WA_SEND не равен 1) — не отправлено")
+    bad = media_check(m)
+    if bad:
+        res = _out(NOT_SENT, bad + " — не отправлено")
+        res["topic_words"] = bad
+        return res
+    gate = _gate(to, now, db_path, env)
+    if isinstance(gate, dict):
+        return gate
+    key, state = gate
+    deadline = clock() + float(budget)
+    post = transport or _post
+
+    if kind == "location":
+        payload = build_location(to, m["latitude"], m["longitude"], m.get("name") or "",
+                                 m.get("address") or "")
+        res = _send_loop(post, payload, key, state, deadline, sleep, clock)
+        res["uploads"] = 0
+        return res
+
+    # ── файл: из источника в память ──
+    limit, whose = media_limit(kind, m.get("fetch_max"))
+    try:
+        data, why = (m.get("fetch") or (lambda cap: (None, "источника файла нет")))(limit)
+    except Exception as e:                                            # noqa: BLE001
+        data, why = None, "источник упал: %s" % type(e).__name__
+    if data is None:
+        res = _out(NOT_SENT, "файл не получен: %s — не отправлено" % why, window=state)
+        res["topic_words"] = "файл из Telegram не получен (%s)" % why
+        return res
+    if len(data) > limit:
+        words = "файл %s больше предела %s (%s)" % (fmt_size(len(data)), fmt_size(limit), whose)
+        res = _out(NOT_SENT, words + " — не отправлено", window=state)
+        res["topic_words"] = words
+        return res
+
+    # ── загрузка в 360dialog: повтор безвреден, но под тем же дедлайном ──
+    mime = str(m.get("mime") or "").split(";")[0].strip().lower()
+    fname = m.get("filename") or ("file." + mime.rsplit("/", 1)[-1])
+    up = upload or _post_media
+    media_id, why, uploads = None, "ни одной попытки загрузки не состоялось", 0
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        pause = backoff_delay(attempt)
+        if pause and clock() + pause >= deadline:
+            break
+        if pause:
+            sleep(pause)
+        left = deadline - clock()
+        if left <= 0:
+            break
+        uploads += 1
+        try:
+            status, body, err = up(API_BASE + MEDIA_PATH,
+                                   [("messaging_product", "whatsapp"), ("type", mime)],
+                                   (fname, data, mime), key, min(UPLOAD_LEG_SEC, left))
+        except Exception as e:                                        # noqa: BLE001
+            status, body, err = None, "", type(e).__name__
+        media_id, why, retry = classify_upload(status, body, err)
+        if media_id or not retry:
+            break
+    if not media_id:
+        res = _out(NOT_SENT, "файл в 360dialog не загружен: %s — не отправлено" % why, window=state)
+        res["uploads"] = uploads
+        return res
+
+    caption = str(m.get("caption") or "")
+    res = _send_loop(post, build_media(to, kind, media_id, caption, m.get("filename") or ""),
+                     key, state, deadline, sleep, clock)
+    res["uploads"] = uploads
+    res["dropped_caption"] = bool(caption.strip()) and kind not in CAPTION_KINDS
+    return res

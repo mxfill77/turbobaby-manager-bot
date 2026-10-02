@@ -24,7 +24,9 @@ import sqlite3
 import tempfile
 import time
 
-REPO = "/root/turbobaby-manager-bot"
+# корень дерева — от файла теста: проверяется дверь СВОЕГО дерева (ветки, клона), а не живая
+# (WARELAYMEDIA0210 §7 п.5, WACHAINFIX0210)
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 os.environ["PRETOOL_NOPUSH"] = "1"
 
