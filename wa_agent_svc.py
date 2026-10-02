@@ -19,6 +19,9 @@
   WA_AGENT_WATCH — ожидание «клиент без ответа» (`wa_watch.Watch`, WAUNANSWERED0210): последнее
                     сообщение клиента без нашего ответа дольше порога — одно сообщение в «Агенты».
                     Читателя getUpdates не заводит; от черновиков, пауз и двери не зависит.
+                    Порог — настройка WA_AGENT_WATCH_SEC (секунды, по умолчанию 600 = 10 мин), тихие часы —
+                    WA_AGENT_WATCH_QUIET «ЧЧ-ЧЧ» по Пхукету (по умолчанию выкл): тревога этих часов придёт в их
+                    конце одной сводкой. Битая настройка — умолчание и строка журнала (WAWATCHTEN0210).
   WA_AGENT_PACE  — человеческий ритм «Отправить» (WAHUMANPACE0210): первый ответ беседы — не раньше 3–5 мин
                     после сообщения клиента, следующий — по длине текста; раньше срока — «уйдёт в ЧЧ:ММ» и
                     «Отменить». Выключен — «Отправить» шлёт сразу. Текст человека из темы ритм не касается.
@@ -201,9 +204,14 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
                          followup=follow)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
-    # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210)
+    # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210); порог и тихие часы — настройки
+    # (WAWATCHTEN0210): битая — умолчание (порог 600 с, тихих часов нет) и строка журнала со словом «битая»
+    watch_sec, sec_words, _ = wa_watch.threshold_of(environ.get(wa_watch.F_SEC))
+    quiet, quiet_words, _ = wa_watch.quiet_of(environ.get(wa_watch.F_QUIET))
+    line("ожидание: порог (%s): %s · тихие часы (%s): %s" % (wa_watch.F_SEC, sec_words, wa_watch.F_QUIET,
+                                                           quiet_words))
     core.watch = wa_watch.Watch(core.db, env["queue_db"], tg.watch_alarm, head=tg._head, clock=clock,
-                                log=line, greet=greet) if tg.watch else None
+                                log=line, greet=greet, threshold=watch_sec, quiet=quiet) if tg.watch else None
     words = {
         F_DRAFTS: ("вкл" if drafts else "выкл") + ("" if drafts or not flags[F_DRAFTS]
                                                    else " (флаг 1, адаптера модели нет)"),
