@@ -589,8 +589,11 @@ class ModelAdapter(wa_agent.Model):
         avail, rental, book_words = self._book(number, ask, today, now)
         if avail is not None or rental is not None:
             reasons = B.adjust_reasons(reasons, avail, rental, ask)
-        # после ожиданий (история, парк и дверь цены, брони, чтение узлов) время снимается заново (WADRAFTFIX0310):
-        # возраст, причина, журнал, блоки знаний и префикс кэша судятся по нему, а не по началу вызова
+        # уроки — SQLite с ожиданием до 5 с: читаются до снятия времени, как и остальное (WATIMEFIX0310)
+        lessons = self._lessons()
+        # после ожиданий (история, парк и дверь цены, брони, уроки, чтение узлов) время снимается заново
+        # (WADRAFTFIX0310): возраст, причина, журнал, блоки знаний и префикс кэша судятся по нему, а не по началу
+        # вызова. Дальше до вызова модели блокирующих чтений нет (WATIMEFIX0310)
         nodes = self.knowledge.refresh(self._now(fixed))
         now = self._now(fixed)
         node_list = [nodes[n] for n in K.NODES]
@@ -600,7 +603,6 @@ class ModelAdapter(wa_agent.Model):
         parts = K.prompt_parts(price, reasons, node_list, now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
         blocks += self._knowledge_blocks(parts, node_list, now)
-        lessons = self._lessons()
         lesson_text, n_mask3 = K.mask(lessons_block(lessons))
         if lesson_text:
             blocks.append(lesson_text)
@@ -665,14 +667,15 @@ class ModelAdapter(wa_agent.Model):
             cut = len(hist) - HISTORY_MAX
             hist = "… (старшая часть истории обрезана: %d симв.)\n" % cut + hist[-HISTORY_MAX:]
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
+        lessons = self._lessons()                         # до снятия времени, как у черновика (WATIMEFIX0310)
         nodes = self.knowledge.refresh(self._now(fixed))
-        now = self._now(fixed)                            # после чтения узлов — заново, как у черновика
+        now = self._now(fixed)                            # после уроков и чтения узлов — заново, как у черновика
         node_list = [nodes[n] for n in K.NODES]
         self.log(knowledge_line(node_list, now))
         parts = K.prompt_parts(None, [], node_list, now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
         blocks += self._knowledge_blocks(parts, node_list, now)
-        lesson_text, n_mask2 = K.mask(lessons_block(self._lessons()))
+        lesson_text, n_mask2 = K.mask(lessons_block(lessons))
         if lesson_text:
             blocks.append(lesson_text)
         blocks.append("ИСТОРИЯ ПЕРЕПИСКИ (вся, по времени; «мы» — наша сторона; последнее слово — наше, клиент "
