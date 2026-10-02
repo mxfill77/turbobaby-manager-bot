@@ -185,6 +185,33 @@ def bikes_of(reply):
     return bikes or None
 
 
+def model_key(name):
+    """Имя юнита → модель для слов клиента: слова до первого с цифрой включительно. Живые имена парка — вида
+    «PCX 160CC WHITE PHUKET 3011»: снятие одного номера (`wa_agent_model.model_of_name`) оставляет цвет и город, и
+    модель в словах клиента не находится никогда (замер 02.10: 38 «моделей» на 38 юнитов)."""
+    toks = str(name or "").split()
+    for i, t in enumerate(toks):
+        if re.search(r"\d", t):
+            return " ".join(toks[:i + 1])
+    return " ".join(toks)
+
+
+def _nocc(s):
+    return re.sub("cc", "", re.sub(r"[^a-z0-9]", "", str(s or "").lower()))
+
+
+def find_model(text, bikes):
+    """Модель из парка, названная в словах клиента (самое длинное совпадение ключа без «CC») | None."""
+    t = _nocc(text)
+    best = None
+    for b in bikes or ():
+        m = model_key((b or {}).get("name"))
+        k = _nocc(m)
+        if len(k) >= 3 and k in t and (best is None or len(k) > len(_nocc(best))):
+            best = m
+    return best
+
+
 def local_now(now):
     """Эпоха → «сейчас» Пхукета без зоны (в той же зоне, что даты двери)."""
     return datetime.datetime.fromtimestamp(now + PHUKET_OFFSET, datetime.timezone.utc).replace(tzinfo=None)
@@ -282,7 +309,7 @@ def free_bikes(model, units, ds, de, rows, age, why, now_local, door):
     if rows is None:
         return _avail_unknown(res, "таблица броней не прочитана (%s)" % (why or "причина не названа"))
     if not model or not units:
-        return _avail_unknown(res, "модели нет в парке")
+        return _avail_unknown(res, "модель не названа точно или её нет в парке")
     if ds is None or de is None or de <= ds:
         return _avail_unknown(res, "срок не разобран")
     free = []

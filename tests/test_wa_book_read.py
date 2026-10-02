@@ -186,8 +186,28 @@ def test_avail_model_not_in_fleet_unknown():
     w, br = world([])
     w.ask("Есть ли свободная Vespa 150 с 5 по 12 ноября?")
     a = w.adapter.last["info"]["avail"]
-    assert a["outcome"] == B.UNKNOWN and a["why"] == "модели нет в парке" and br.doors == [], a
+    assert a["outcome"] == B.UNKNOWN and a["why"] == "модель не названа точно или её нет в парке" and br.doors == [], a
     assert B.W_AVAIL_UNKNOWN in hand(w)
+
+
+def test_live_fleet_name_format():
+    """Имена живого парка вида «PCX 160CC WHITE PHUKET 3011» (как FLEET_NAMES test_suggest): + модель находится по
+    словам клиента, юниты — все цвета, и адаптер даёт факт; − чужая модель не цепляется (XADV ≠ ADV, Forza нет)."""
+    live = [{"name": n} for n in ("PCX 160CC WHITE PHUKET 3011", "PCX 160CC BLACK PHUKET 3012",
+                                  "ADV 350CC BLACK PHUKET 5849", "XADV 750CC GREY PHUKET 4290",
+                                  "MT-03 BLUE PHUKET 7788", "CB 300CC R 9011")]
+    assert B.find_model(ASK_FREE, live) == "PCX 160CC"
+    assert WM.units_of("PCX 160CC", live) == ["PCX 160CC WHITE PHUKET 3011", "PCX 160CC BLACK PHUKET 3012"]
+    assert B.find_model("is XADV 750 free 5-12 Nov?", live) == "XADV 750CC"
+    assert B.find_model("ADV 350 available?", live) == "ADV 350CC"
+    assert B.find_model("MT-03 есть?", live) == "MT-03" and B.find_model("CB 300R свободен?", live) == "CB 300CC"
+    assert B.find_model("Есть ли свободный Forza 350?", live) is None
+    assert B.model_key("PCX 160 1234") == "PCX 160"
+    w, br = world([])
+    w.adapter.book = B.Snapshot(lambda: br.clients(filter="all"), lambda: {"ok": True, "data": {"bikes": live}})
+    _s, user, info = built(w, ASK_FREE)
+    assert info["avail"]["outcome"] == B.FREE and info["avail"]["units"] == 2, info["avail"]
+    assert br.doors == [("PCX 160CC WHITE PHUKET 3011", "2026-11-05", "2026-11-12")], br.doors
 
 
 def test_avail_overdue_unit_unchecked():

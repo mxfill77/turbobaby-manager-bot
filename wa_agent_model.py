@@ -389,7 +389,7 @@ class ModelAdapter(wa_agent.Model):
         now_local = B.local_now(now)
         avail = rental = None
         if want_avail:
-            model = find_model(ask, bikes) if bikes else None
+            model = B.find_model(ask, bikes) if bikes else None     # ключ модели — живые имена парка
             units = units_of(model, bikes) if model else []
             avail = B.free_bikes(model, units, dates[0], dates[1], rows, age, why, now_local, self.door)
         if want_end:
