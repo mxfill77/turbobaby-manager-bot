@@ -98,3 +98,8 @@ topic_feed/
 # решатель темы в бою (SPLLIVEMODE0110): паузы, вопросы, зовы, mid его сообщений — состояние, не код
 decider_live_state.json
 decider_live_state.json.tmp
+# вопрос сотрудникам и снимок правил (SPLDELIVERYASK0210) — состояние, не код
+staff_ask_state.json
+staff_ask_state.json.tmp
+business_rules_snap.json
+business_rules_snap.json.tmp

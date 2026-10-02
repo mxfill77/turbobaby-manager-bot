@@ -813,6 +813,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # и роутинга — ни мозга, ни инструментов, ни ответа (даже на тег владельца).
     if splinter.is_agents_group(msg.chat_id):
         splinter.agents_passive_intake(msg, "текст")
+        # Реплай на СВОЙ вопрос Splinter (SPLDELIVERYASK0210) → строка в мозг; группа остаётся пассивной.
+        # `SPLINTER_ASK_STAFF` выкл. (по умолчанию) → строка не делает ничего.
+        await splinter.staff_ask_reply(msg, bridge)
         return
 
     # §12 ЛЕДЖЕР ТРАТ API: владельческая команда пополнения/запроса остатка (в любом чате —
@@ -841,6 +844,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Операционные группы
     if splinter.is_splinter_group(chat_id):
+        # ОТВЕТ НА ВОПРОС СОТРУДНИКАМ (02.10.2026, SPLDELIVERYASK0210): реплай на вопрос Splinter в теме байка или
+        # в Delivery → строка в мозг с источником; сообщение идёт дальше прежним путём. `SPLINTER_ASK_STAFF`
+        # выкл. (по умолчанию) → строка не делает ничего. Fail-safe внутри.
+        await splinter.staff_ask_reply(msg, bridge)
         # Фикс B: перехват ответа на подтверждение пробега — ТОЛЬКО если для темы открыт pending.
         # Иначе гейт вступления (фикс 07:51) работает как обычно — pending не трогает его.
         _tid_sv = getattr(msg, "message_thread_id", None)
@@ -1605,6 +1612,13 @@ def main():
         name="service_pending_reminder",
     )
     log.info("Scheduled service-pending (ТО заявки) reminder every 1h")
+
+    # ВОПРОС СОТРУДНИКАМ и СНИМОК ПРАВИЛ (02.10.2026, SPLDELIVERYASK0210): такты стоят всегда, но при
+    # выключенных `SPLINTER_ASK_STAFF` / `SPLINTER_RULES_FEED` (по умолчанию) выходят первой строкой.
+    app.job_queue.run_repeating(functools.partial(splinter.staff_ask_job, bridge=bridge),
+                                interval=300, first=120, name="staff_ask_tick")
+    app.job_queue.run_repeating(functools.partial(splinter.rules_snap_job, bridge=bridge),
+                                interval=splinter._rsnap.REFRESH_S, first=60, name="rules_snap")
 
     log.info("Bot polling started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
