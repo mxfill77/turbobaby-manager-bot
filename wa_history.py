@@ -15,7 +15,9 @@
   • порядок — по времени, при равном времени — по ключу;
   • вид без текста и без файла — русским словом (`kind_word`, WAMIRRRU0210): латиницы в скобках нет
     ни в теме, ни в файле истории, ни в строке модели; вид вне словаря — «сообщение неизвестного вида»,
-    а его имя уходит вызывающему (служба показа пишет строку журнала — здесь журнала нет).
+    а его имя уходит вызывающему (служба показа пишет строку журнала — здесь журнала нет);
+  • правка с телефона (WAPHONEEDIT0210, `apply_edits`): цель в истории есть — у неё последний текст
+    с пометкой «(изменено)», правка строкой не идёт; цели нет — правка своей строкой с пометкой.
 
 Только чтение: очередь и архив открываются mode=ro, своего состояния нет, журнала нет, сети нет.
 Тексты, номера и имена клиентов наружу не идут — функции отдают их только вызывающему.
@@ -70,7 +72,12 @@ FILE_WORD = "файл"             # медиа вида вне словаря �
 
 # колонки очереди wa_inbox, которые читают склейка и служба показа
 QCOLS = ("id", "ts_queued", "from_number", "name", "msg_type", "text", "media_id", "mime",
-         "caption", "media_note", "ts_msg", "echo", "history", "wamid", "react_to")
+         "caption", "media_note", "ts_msg", "echo", "history", "wamid", "react_to", "edit_to", "edit_text")
+
+# Правка с телефона (WAPHONEEDIT0210): строка вида edit несёт wamid цели (edit_to) и новый текст
+# (edit_text). В истории у цели — последний текст с пометкой; сама правка строкой тогда не идёт.
+EDIT_TYPE = "edit"
+EDIT_MARK = "(изменено)"
 ARCH_COLS = "ts, from_me, kind, text, caption, transcript, media_file, key_id"
 
 
@@ -134,6 +141,32 @@ def row_key(row) -> str:
     return row["wamid"] or ("row:%d" % row["id"])
 
 
+def col(row, name):
+    """Колонка строки или None: строка из очереди до правки входа (или словарь теста) её не несёт."""
+    try:
+        return row[name]
+    except (KeyError, IndexError):
+        return None
+
+
+def edit_of(row):
+    """Строка очереди → (wamid цели, новый текст) для правки · (None, None) — не правка или полей нет."""
+    if (row["msg_type"] or "") != EDIT_TYPE:
+        return None, None
+    return col(row, "edit_to") or None, col(row, "edit_text") or None
+
+
+def edited(row, new):
+    """Копия строки цели с новым текстом: у медиа — подпись, у прочих — текст. Её показывают те же
+    функции, что показали цель (тема, хвост, файл истории), поэтому вид строки не расходится."""
+    d = {k: row[k] for k in row.keys()}
+    if (d.get("msg_type") or "") in MEDIA_WORD or d.get("msg_type") == MEDIA_PLACEHOLDER:
+        d["caption"] = new
+    else:
+        d["text"] = new
+    return d
+
+
 def is_utterance(row) -> bool:
     """Реплика — всё, кроме квитанции и реакции (они в историю не идут)."""
     return wa_kind.kind_of(row["msg_type"], row["echo"], row["history"]) not in (
@@ -195,14 +228,17 @@ def merge(arch, rows, trig=None, man=None, media_of=None, unknown=None):
     куда ложатся имена видов вне словаря (служба показа пишет по ним строку журнала)."""
     man = man or {}
     arch_keys = {a[7] for a in arch}
-    taken, seen, items = set(), set(), []
+    taken, seen, items, edits = set(), set(), [], []
     for r in rows:
         k = parse_wamid(r["wamid"])[1]
         paired = k is not None and k in arch_keys
         if trig is not None and r["id"] >= trig:
             if paired:
                 taken.add(k)
-        elif not paired and row_key(r) not in seen:
+            continue
+        if (r["msg_type"] or "") == EDIT_TYPE:
+            edits.append((r, k if paired else None))
+        if not paired and row_key(r) not in seen:
             seen.add(row_key(r))
             items.append(queue_item(r, media_of, unknown))
     for a in arch:
@@ -212,8 +248,42 @@ def merge(arch, rows, trig=None, man=None, media_of=None, unknown=None):
         if it["key"] not in seen:
             seen.add(it["key"])
             items.append(it)
+    if edits:
+        items = apply_edits(items, edits)
     items.sort(key=lambda it: (it["ts"], it["key"]))
     return items
+
+
+def apply_edits(items, edits):
+    """Правки истории (WAPHONEEDIT0210). Цель есть в истории и новый текст есть — у цели последний
+    текст (по времени правки, затем по id) с пометкой «(изменено)», а сама правка строкой не идёт.
+    Иначе правка остаётся своей строкой: новым текстом с пометкой; без нового текста — словом, как до
+    02.10; запись архива, парная правке (живой досинхрон: 98 из 98 — текстом правки), — с пометкой."""
+    by_key = {it["key"]: it for it in items}
+    by_kid = {}
+    for it in items:
+        if it["key"].startswith("a:"):
+            by_kid.setdefault(it["key"][2:].rsplit(":", 1)[0], it)
+    last, drop = {}, set()
+    for r, pk in edits:
+        target, new = edit_of(r)
+        own = by_key.get(row_key(r)) or (by_kid.get(pk) if pk else None)
+        tit = (by_key.get(target) or by_kid.get(parse_wamid(target)[1] or "")) if target else None
+        if tit is not None and new and tit is not own:
+            stamp = (int(r["ts_msg"] or r["ts_queued"] or 0), r["id"])
+            if tit["key"] not in last or stamp > last[tit["key"]][0]:
+                last[tit["key"]] = (stamp, new)
+            if own is not None:
+                drop.add(own["key"])
+        elif own is not None:
+            if own["key"] == row_key(r):
+                if new:
+                    own["text"] = new + " " + EDIT_MARK
+            elif not (own["text"] or "").endswith(EDIT_MARK):
+                own["text"] = ((own["text"] or "") + " " + EDIT_MARK).strip()
+    for key, (_stamp, new) in last.items():
+        by_key[key]["text"] = new + " " + EDIT_MARK
+    return [it for it in items if it["key"] not in drop]
 
 
 # ── чтение: только mode=ro ─────────────────────────────────────────────────────────────────
