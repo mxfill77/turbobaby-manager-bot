@@ -12,7 +12,9 @@
 текст черновика, кнопки `wa:send|fix|no:<черновик>:<версия>`. `card_done` — `editMessageText`
 без клавиатуры (кнопки сняты). `card_wait` — «уйдёт в ЧЧ:ММ» и кнопка `wa:cancel:…` (ритм, WAHUMANPACE0210).
 `card` → message_id или None (не доставлена), `card_done` → True/False/None: очередь доставки и повтор — у
-ядра (`card_out`, WADRAFTSAFE0210), руки только говорят, лёг ли вызов. Вопрос паузы — кнопка `wa:go:<id клиента>:<пауза>`: в
+ядра (`card_out`, WADRAFTSAFE0210), руки только говорят, лёг ли вызов. Ответа на `sendMessage` нет (сеть,
+таймаут) — `card` поднимает `wa_agent.AnswerLost`: карточка могла лечь, ядро считает «неизвестно», а не отказ
+(WACARDDONEFIX0210). Контракт `card_done` прежний — сеть без ответа там False. Вопрос паузы — кнопка `wa:go:<id клиента>:<пауза>`: в
 `callback_data` номера телефона нет, id клиента — короткий номер строки своей таблицы.
 
 «ИСПРАВИТЬ». Кнопка только подсказывает; правка — РЕПЛАЙ человека на карточку: `Core.revise` с
@@ -393,6 +395,10 @@ class Tg(wa_agent.Telegram):
             row.insert(0, {"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)})
         kb = {"inline_keyboard": [row]}
         ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": body, "reply_markup": kb})
+        if ok is None:
+            # ответа нет (сеть, таймаут) — карточка могла лечь: это не отказ (WACARDDONEFIX0210), ядро считает
+            # «неизвестно» и повторяет — возможна вторая карточка
+            raise wa_agent.AnswerLost("sendMessage: ответа нет")
         if not ok:
             return None
         mid = int(res.get("message_id"))

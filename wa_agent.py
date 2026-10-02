@@ -50,6 +50,11 @@ superseded и пауза; новое входящее → stale), пишет `se
 дубль карточки безопасен, кнопки несут черновик и версию, второе нажатие — «уже решено». Повторяются ТОЛЬКО
 карточки в Telegram, отправка клиенту — никогда. Черновик решён до доставки — карточка не шлётся, решена
 недоставленной; ждущие черновики без доставленной карточки — числом в сводке службы (`undelivered`).
+Исход вызова рук — три слова (WACARDDONEFIX0210): подтверждено · отказ · НЕИЗВЕСТНО. Руки упали (исключение,
+таймаут, ответ Telegram потерян) — вызов мог лечь: отправка карточки — повтор как при отказе, но в `card_out.lost`
+и в сводке отдельно («возможна вторая карточка», единственность не обещается); правка исхода засчитывается
+ТОЛЬКО на True рук, исключение — повтор в тех же пределах EDIT_MAX и итог `unconfirmed` («не подтверждено»), а не
+`ok`. Прочие вызовы рук (`_tg`) исключение по-прежнему глотают в None.
 «Отправить» привязано к последнему сообщению клиента (`drafts.upto_id` против `clients.last_in_id` и очереди)
 и версии контекста (`clients.ctx`: +1 на живое входящее, ответ с телефона, текст из темы, «Продолжить»;
 `drafts.ctx` — на момент черновика). Устарело — ответ словами, наружу ничего, черновик пересобирается. Новое
@@ -106,6 +111,7 @@ PACE_NEW_TALK = 4 * 3600                      # беседа новая: до с
 CARD_WAIT, CARD_SENDING, CARD_DELIVERED, CARD_DECIDED = "wait", "sending", "delivered", "decided"
 CARD_RETRY = (5, 15, 30, 60, 120, 300)        # пауза перед повтором, с: попытка N — элемент N, дальше последний
 EDIT_WAIT, EDIT_OK, EDIT_GAVE_UP = "wait", "ok", "gave_up"
+EDIT_UNCONFIRMED = "unconfirmed"              # предел вышел, и хоть один ответ был неизвестен: могла лечь (WACARDDONEFIX0210)
 EDIT_MAX = 12                                 # правка исхода: попыток не больше (≈ 40 мин), дальше — строка журнала
 WROTE_WORDS = "клиент написал ещё (строка %d)"
 
@@ -302,9 +308,11 @@ CREATE TABLE IF NOT EXISTS card_out (
     delivered_at REAL,
     decided_at   REAL,
     words        TEXT,                                -- исход на карточке
-    edit         TEXT,                                -- правка исхода: wait | ok | gave_up; NULL — править нечего
+    edit         TEXT,                                -- правка исхода: wait | ok | gave_up | unconfirmed; NULL — нечего
     edit_tries   INTEGER NOT NULL DEFAULT 0,
     created_at   REAL    NOT NULL,
+    lost         INTEGER NOT NULL DEFAULT 0,          -- попыток отправки с неизвестным ответом (WACARDDONEFIX0210)
+    edit_unk     INTEGER NOT NULL DEFAULT 0,          -- попыток правки с неизвестным ответом
     PRIMARY KEY (draft_id, ver)
 );
 """
@@ -387,8 +395,15 @@ class Model:
         return None
 
 
+class AnswerLost(Exception):
+    """Вызов Telegram ушёл, ответа нет (сеть, таймаут): сообщение могло лечь. Руки поднимают его там, где «не знаю»
+    нельзя сказать отказом (отправка карточки, WACARDDONEFIX0210); ядро считает такой исход «неизвестно»."""
+
+
 class Telegram:
-    """Группа согласования. Ничего не возвращает, кроме card → id сообщения карточки (или None)."""
+    """Группа согласования. Ничего не возвращает, кроме card → id сообщения карточки (или None — отказ) и
+    card_done → True (легла) · False (отказ) · None (править нечего). Исключение рук — исход НЕИЗВЕСТЕН: вызов мог
+    лечь (WACARDDONEFIX0210)."""
 
     def card(self, draft_id, ver, number, text):
         raise NotImplementedError
@@ -501,6 +516,10 @@ class Core:
             self.db.execute("ALTER TABLE clients ADD COLUMN ctx INTEGER NOT NULL DEFAULT 0")
         if "ctx" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
             self.db.execute("ALTER TABLE drafts ADD COLUMN ctx INTEGER")  # NULL — черновик старше версии контекста
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(card_out)")}
+        for col in ("lost", "edit_unk"):                                  # очередь старше WACARDDONEFIX0210
+            if col not in have:
+                self.db.execute("ALTER TABLE card_out ADD COLUMN %s INTEGER NOT NULL DEFAULT 0" % col)
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -525,15 +544,17 @@ class Core:
         if n3:
             self.log("старт: из темы sending→unsure %d" % n3)
         # карточки (WADRAFTSAFE0210): sending → wait — могла дойти, шлём снова (дубль безопасен: кнопки по
-        # черновику и версии); ждущие черновики, которых очередь не знает, — доставлена, если card_id есть
-        n4 = self.db.execute("UPDATE card_out SET state=?, next_at=0 WHERE state=?",
+        # черновику и версии); ждущие черновики, которых очередь не знает, — доставлена, если card_id есть.
+        # Ответ на ту попытку неизвестен — в `lost`, как исключение рук (WACARDDONEFIX0210)
+        n4 = self.db.execute("UPDATE card_out SET state=?, next_at=0, lost=lost+1 WHERE state=?",
                              (CARD_WAIT, CARD_SENDING)).rowcount
         n5 = self.db.execute("INSERT OR IGNORE INTO card_out(draft_id, ver, state, message_id, delivered_at, "
                              "created_at) SELECT id, ver, CASE WHEN card_id IS NULL THEN ? ELSE ? END, card_id, "
                              "CASE WHEN card_id IS NULL THEN NULL ELSE created_at END, created_at FROM drafts "
                              "WHERE state=?", (CARD_WAIT, CARD_DELIVERED, PENDING)).rowcount
         if n4 or n5:
-            self.log("старт: карточка sending→wait %d, ждущих черновиков взято в очередь доставки %d" % (n4, n5))
+            self.log("старт: карточка sending→wait %d (ответ неизвестен — возможна вторая карточка), ждущих "
+                     "черновиков взято в очередь доставки %d" % (n4, n5))
 
     def _queue(self):
         return sqlite3.connect("file:%s?mode=ro" % self.queue_path, uri=True, timeout=5)
@@ -579,11 +600,18 @@ class Core:
         return n == 1
 
     def _tg(self, method, *args):
+        """Вызов рук без исключений наружу: упали — строка журнала и None. Так зовутся все руки, кроме отправки
+        карточки и правки её исхода: тем исход нужен тремя словами (`_tg_out`)."""
+        return self._tg_out(method, *args)[1]
+
+    def _tg_out(self, method, *args):
+        """→ (True, ответ рук) · (None, None): руки упали (исключение, таймаут, ответ потерян) — исход НЕИЗВЕСТЕН,
+        вызов мог лечь (WACARDDONEFIX0210). None рук «по контракту» и None от падения здесь различимы."""
         try:
-            return getattr(self.tg, method)(*args)
+            return True, getattr(self.tg, method)(*args)
         except Exception as e:                                       # noqa: BLE001
             self.log("telegram %s упал: %s" % (method, type(e).__name__))
-            return None
+            return None, None
 
     # ── доставка карточек (WADRAFTSAFE0210) ───────────────────────────────────────────────
 
@@ -596,7 +624,9 @@ class Core:
     def _card_try(self, draft_id, ver, now):
         """Одна попытка доставки. Черновик ждёт с этой версией — `sending` ДО вызова Telegram, потом доставлена
         (message_id, chat_id, время) или снова ждёт с паузой CARD_RETRY. Черновик решён или исправлен до
-        доставки — карточка не шлётся, она решена недоставленной. → message_id | None."""
+        доставки — карточка не шлётся, она решена недоставленной. → message_id | None.
+        Руки упали после вызова (WACARDDONEFIX0210) — НЕ отказ: ответ неизвестен, карточка могла лечь. Повтор тот
+        же, но попытка ложится в `lost` и в сводку: возможна вторая карточка, единственность не обещается."""
         row = self.db.execute("SELECT number, state, ver, text FROM drafts WHERE id=?", (draft_id,)).fetchone()
         if not row or row[1] != PENDING or row[2] != ver:
             self.db.execute("UPDATE card_out SET state=?, decided_at=?, words=? WHERE draft_id=? AND ver=? "
@@ -607,7 +637,8 @@ class Core:
         if self.db.execute("UPDATE card_out SET state=?, tries=tries+1 WHERE draft_id=? AND ver=? AND state=?",
                            (CARD_SENDING, draft_id, ver, CARD_WAIT)).rowcount != 1:
             return None
-        mid = _int_or_none(self._tg("card", draft_id, ver, row[0], row[3]))
+        got, res = self._tg_out("card", draft_id, ver, row[0], row[3])
+        mid = _int_or_none(res)
         if mid is not None:
             self.db.execute("UPDATE card_out SET state=?, message_id=?, chat_id=?, delivered_at=? WHERE draft_id=? "
                             "AND ver=? AND state=?", (CARD_DELIVERED, mid, _int_or_none(getattr(self.tg, "chat", None)),
@@ -616,10 +647,15 @@ class Core:
             return mid
         tries = self.db.execute("SELECT tries FROM card_out WHERE draft_id=? AND ver=?", (draft_id, ver)).fetchone()[0]
         pause = CARD_RETRY[min(tries, len(CARD_RETRY)) - 1]
-        self.db.execute("UPDATE card_out SET state=?, next_at=? WHERE draft_id=? AND ver=? AND state=?",
-                        (CARD_WAIT, now + pause, draft_id, ver, CARD_SENDING))
-        self.log("карточка черновика %d версия %d не доставлена (попытка %d) — повтор через %d с"
-                 % (draft_id, ver, tries, pause))
+        lost = 0 if got else 1
+        self.db.execute("UPDATE card_out SET state=?, next_at=?, lost=lost+? WHERE draft_id=? AND ver=? AND state=?",
+                        (CARD_WAIT, now + pause, lost, draft_id, ver, CARD_SENDING))
+        if lost:
+            self.log("карточка черновика %d версия %d: ответ Telegram неизвестен (попытка %d) — могла лечь; повтор "
+                     "через %d с, возможна вторая карточка" % (draft_id, ver, tries, pause))
+        else:
+            self.log("карточка черновика %d версия %d не доставлена (попытка %d) — повтор через %d с"
+                     % (draft_id, ver, tries, pause))
         return None
 
     def _done(self, draft_id, words, now):
@@ -629,8 +665,8 @@ class Core:
             self._card_close(draft_id, row[0], words, now, row[1])
 
     def _card_close(self, draft_id, ver, words, now, card_id=None):
-        """Карточка решена: исход словами, кнопки сняты. Доставлена — правка `card_done` (Telegram отказал —
-        повтор в `deliver_cards`); не доставлена — решена недоставленной, править нечего. Карточка вне очереди
+        """Карточка решена: исход словами, кнопки сняты. Доставлена — правка `card_done` (Telegram отказал или ответ
+        неизвестен — повтор в `deliver_cards`); не доставлена — решена недоставленной, править нечего. Карточка вне очереди
         (запись старше неё) — прежний путь, один вызов без повтора."""
         row = self.db.execute("SELECT message_id FROM card_out WHERE draft_id=? AND ver=?",
                               (draft_id, int(ver))).fetchone()
@@ -638,32 +674,45 @@ class Core:
             self._tg("card_done", draft_id, card_id, words)
             return
         self.db.execute("UPDATE card_out SET state=?, decided_at=COALESCE(decided_at, ?), words=?, edit=?, "
-                        "edit_tries=0, next_at=0 WHERE draft_id=? AND ver=?",
+                        "edit_tries=0, edit_unk=0, next_at=0 WHERE draft_id=? AND ver=?",
                         (CARD_DECIDED, now, words, EDIT_WAIT if row[0] else None, draft_id, int(ver)))
         if row[0]:
             self._card_edit(draft_id, int(ver), row[0], words, now)
 
     def _card_edit(self, draft_id, ver, mid, words, now):
-        """Одна правка исхода. Telegram отказал (`card_done` → False) — повтор с паузой, не больше EDIT_MAX."""
-        if self._tg("card_done", draft_id, mid, words) is not False:
+        """Одна правка исхода, три исхода (WACARDDONEFIX0210). `card_done` → True — легла (ok); None по контракту —
+        править нечего (ok, как раньше); False — Telegram отказал. Руки упали (исключение, таймаут) — ответ
+        НЕИЗВЕСТЕН, правка могла лечь: не ok. Отказ и «неизвестно» — повтор с паузой, вместе не больше EDIT_MAX;
+        за пределом — gave_up, если все ответы были отказами, и unconfirmed, если хоть один был неизвестен."""
+        got, res = self._tg_out("card_done", draft_id, mid, words)
+        if got and res is not False:
             self.db.execute("UPDATE card_out SET edit=? WHERE draft_id=? AND ver=?", (EDIT_OK, draft_id, ver))
             return True
-        self.db.execute("UPDATE card_out SET edit_tries=edit_tries+1 WHERE draft_id=? AND ver=?", (draft_id, ver))
-        n = self.db.execute("SELECT edit_tries FROM card_out WHERE draft_id=? AND ver=?", (draft_id, ver)).fetchone()[0]
+        unk = 0 if got else 1
+        self.db.execute("UPDATE card_out SET edit_tries=edit_tries+1, edit_unk=edit_unk+? WHERE draft_id=? AND ver=?",
+                        (unk, draft_id, ver))
+        n, u = self.db.execute("SELECT edit_tries, edit_unk FROM card_out WHERE draft_id=? AND ver=?",
+                               (draft_id, ver)).fetchone()
         if n >= EDIT_MAX:
-            self.db.execute("UPDATE card_out SET edit=? WHERE draft_id=? AND ver=?", (EDIT_GAVE_UP, draft_id, ver))
-            self.log("карточка черновика %d версия %d: исход не лёг за %d попыток — кнопки на ней живы, нажатие "
-                     "ответит «уже решено»" % (draft_id, ver, n))
+            self.db.execute("UPDATE card_out SET edit=? WHERE draft_id=? AND ver=?",
+                            (EDIT_UNCONFIRMED if u else EDIT_GAVE_UP, draft_id, ver))
+            if u:
+                self.log("карточка черновика %d версия %d: исход не подтверждён за %d попыток (ответ Telegram "
+                         "неизвестен %d раз) — мог лечь; не лёг — кнопки живы, нажатие ответит «уже решено»"
+                         % (draft_id, ver, n, u))
+            else:
+                self.log("карточка черновика %d версия %d: исход не лёг за %d попыток — кнопки на ней живы, нажатие "
+                         "ответит «уже решено»" % (draft_id, ver, n))
             return False
         pause = CARD_RETRY[min(n, len(CARD_RETRY)) - 1]
         self.db.execute("UPDATE card_out SET next_at=? WHERE draft_id=? AND ver=?", (now + pause, draft_id, ver))
-        self.log("карточка черновика %d версия %d: исход не лёг (попытка %d) — повтор через %d с"
-                 % (draft_id, ver, n, pause))
+        self.log("карточка черновика %d версия %d: исход %s (попытка %d) — повтор через %d с"
+                 % (draft_id, ver, "не подтверждён — ответ Telegram неизвестен" if unk else "не лёг", n, pause))
         return False
 
     def deliver_cards(self, now):
-        """Такт очереди карточек: ждущие доставки, чей срок настал, и правки исхода, которые Telegram отказал.
-        → число доставленных этим тактом."""
+        """Такт очереди карточек: ждущие доставки, чей срок настал, и правки исхода, которые Telegram отказал или
+        чей ответ неизвестен (WACARDDONEFIX0210). → число доставленных этим тактом."""
         got = 0
         for did, ver in self.db.execute("SELECT draft_id, ver FROM card_out WHERE state=? AND next_at<=? "
                                         "ORDER BY next_at, draft_id", (CARD_WAIT, now)).fetchall():
@@ -683,6 +732,14 @@ class Core:
         return self.db.execute("SELECT COUNT(*) FROM drafts d WHERE d.state=? AND NOT EXISTS (SELECT 1 FROM "
                                "card_out c WHERE c.draft_id=d.id AND c.ver=d.ver AND c.message_id IS NOT NULL)",
                                (PENDING,)).fetchone()[0]
+
+    def card_unknown(self):
+        """«Неизвестно» отдельно (WACARDDONEFIX0210) → (карточек, у которых ответ на отправку терялся — возможна
+        вторая карточка; правок исхода без подтверждения с неизвестным ответом — повтор идёт или unconfirmed)."""
+        lost = self.db.execute("SELECT COUNT(*) FROM card_out WHERE lost>0").fetchone()[0]
+        unk = self.db.execute("SELECT COUNT(*) FROM card_out WHERE edit_unk>0 AND edit IN (?,?)",
+                              (EDIT_WAIT, EDIT_UNCONFIRMED)).fetchone()[0]
+        return lost, unk
 
     # ── версия контекста (WADRAFTSAFE0210) ────────────────────────────────────────────────
 
