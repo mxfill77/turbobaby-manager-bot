@@ -19,10 +19,29 @@
   WA_AGENT_WATCH — ожидание «клиент без ответа» (`wa_watch.Watch`, WAUNANSWERED0210): последнее
                     сообщение клиента без нашего ответа дольше порога — одно сообщение в «Агенты».
                     Читателя getUpdates не заводит; от черновиков, пауз и двери не зависит.
+                    Порог — настройка WA_AGENT_WATCH_SEC (секунды, по умолчанию 600 = 10 мин), тихие часы —
+                    WA_AGENT_WATCH_QUIET «ЧЧ-ЧЧ» по Пхукету (по умолчанию выкл): тревога этих часов придёт в их
+                    конце одной сводкой. Битая настройка — умолчание и строка журнала (WAWATCHTEN0210).
   WA_AGENT_PACE  — человеческий ритм «Отправить» (WAHUMANPACE0210): первый ответ беседы — не раньше 3–5 мин
                     после сообщения клиента, следующий — по длине текста; раньше срока — «уйдёт в ЧЧ:ММ» и
                     «Отменить». Выключен — «Отправить» шлёт сразу. Текст человека из темы ритм не касается.
                     Отложенное до выключения уходит в срок и при выключенном.
+  WA_AGENT_LESSONS — уроки людей (WAAGENTLESSON0210): «Исправить» с другим текстом пишет кандидата урока,
+                    «Сделать правилом» переводит его в действующие, действующие идут в промпт агента,
+                    «Откатить №N» убирает. Выключен — «Исправить» как раньше, уроков в промпте нет.
+  WA_AGENT_FOLLOWUP — напоминание притихшему (WAFOLLOWUP0210): 15 мин тишины клиента после нашего сообщения,
+                    окно 24 ч открыто — черновик-напоминание модели на «Отправить» (не больше двух на беседу);
+                    модель вправе сказать «не нужно». Выключен — притихших не ищем. Работает только с черновиками.
+  WA_AGENT_BOOK_READ — брони ТОЛЬКО на чтение (WABOOKTOOLS0210, `wa_book_read`): на явный вопрос «свободен ли байк
+                    на даты» или «когда кончается аренда» адаптер кодом до модели читает снимок `clients`+`fleet` моста
+                    (GET, в памяти 10 мин) и даёт факт с возрастом; нет факта — «нужен человек». Выключен — таблица
+                    броней не читается, промпт прежний. Работает только с черновиками.
+  WA_AGENT_CACHE — кэш промпта (WAAGENTCACHE0210, `wa_agent_model`): «1h»/«5m» — срок, 1/true/yes/on — «1h»; инструкция
+                    и снимки узлов знаний без возраста идут впереди одним префиксом с отметкой кэша, остальное — после.
+                    Выключен (пусто или иное значение) — запрос модели прежний. Цена вызова по usage пишется всегда:
+                    строкой журнала и итогом в сводку. Работает только с черновиками.
+НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
+  Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
   sha256 текста или его начало от 10 знаков, несколько — через запятую; самого текста нет нигде. Эхо с
   этим отпечатком И не позже 10 с после «первого» входящего паузы не ставит, первый вопрос не закрывает.
@@ -35,7 +54,9 @@
 читатель даёт 409: строка журнала на серию, опрос раз в 30 с, такт идёт, служба не падает.
 
 ЖУРНАЛ — файл `wa_agent.log` (или WA_AGENT_LOG): только id, состояния и числа; сводка числами раз в
-5 минут. Текстов, номеров и имён клиентов в журнале нет.
+5 минут. Текстов, номеров и имён клиентов в журнале нет. При включённых черновиках сводка несёт очередь
+карточек и число ждущих черновиков без доставленной карточки (WADRAFTSAFE0210). Ответ Telegram неизвестен —
+отдельным полем: отправка карточки (возможна вторая карточка) и правка исхода (не подтверждена) (WACARDDONEFIX0210).
 """
 
 import logging
@@ -55,6 +76,11 @@ F_RELAY = "WA_AGENT_RELAY"                # тема клиента → WhatsApp
 F_WATCH = "WA_AGENT_WATCH"                # ожидание «клиент без ответа» (WAUNANSWERED0210)
 F_GREET = "WA_AGENT_GREET_SHA256"         # отпечаток текста автоприветствия (WAGREETECHO0210)
 F_PACE = "WA_AGENT_PACE"                  # человеческий ритм «Отправить» (WAHUMANPACE0210)
+F_LESSONS = "WA_AGENT_LESSONS"            # уроки людей из «Исправить» (WAAGENTLESSON0210)
+F_LESSON_ADMINS = "WA_AGENT_LESSON_ADMINS"  # кто переводит урок в действующие и откатывает; пусто — владелец
+F_FOLLOW = "WA_AGENT_FOLLOWUP"            # напоминание притихшему (WAFOLLOWUP0210)
+F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чтение: наличие и конец аренды (WABOOKTOOLS0210)
+F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
@@ -111,11 +137,15 @@ class NoModel(wa_agent.Model):
         return None
 
 
-def make_model(env, line=None, bridge=None, call=None):
+def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False, cache=None):
     """Адаптер модели (WAAGENTMODEL0210): история — очередь и архив службы показа, знания, парк и цена —
     мост (только чтение), плательщик — платный ключ тем же путём, что у Splinter. → (модель | None, почему).
-    Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели."""
+    Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели.
+    lessons — WA_AGENT_LESSONS: включён — действующие уроки из базы агента идут в промпт (WAAGENTLESSON0210).
+    book — WA_AGENT_BOOK_READ: включён — снимок броней `clients`(filter=all)+`fleet` моста, GET (WABOOKTOOLS0210).
+    cache — срок кэша промпта «1h»/«5m» или None (WA_AGENT_CACHE, WAAGENTCACHE0210)."""
     import wa_agent_model
+    import wa_book_read
     try:
         if bridge is None:
             import bridge_client
@@ -127,7 +157,10 @@ def make_model(env, line=None, bridge=None, call=None):
         env["queue_db"], call, read_doc=lambda n: bridge._call("read_doc", name=n), fleet=bridge.fleet,
         door=bridge.quote_price, archive_db=env.get("archive_db") or "",
         manifest=env.get("archive_manifest") or "", media_dir=env.get("archive_media") or "",
-        agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)))
+        agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)),
+        lessons_db=(env.get("agent_db") or "") if lessons else "",
+        book=wa_book_read.Snapshot(lambda: bridge.clients(filter="all"), bridge.fleet) if book else None,
+        cache=cache)
     return model, ""
 
 
@@ -150,13 +183,37 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     pace = wa_agent_tg.flag_on(environ.get(F_PACE))
     line("ритм (%s): %s" % (F_PACE, "вкл — «Отправить» до срока ставит отправку на срок" if pace
                             else "выкл — «Отправить» шлёт сразу"))
+    # уроки людей (WAAGENTLESSON0210): выключены — «Исправить» как раньше; право перевода — список или владелец
+    lessons = wa_agent_tg.flag_on(environ.get(F_LESSONS))
+    admins, admin_words = wa_agent.lesson_admins_of(environ.get(F_LESSON_ADMINS))
+    line("уроки (%s): %s · право перевода и отката: %s" % (
+        F_LESSONS, "вкл — «Исправить» пишет кандидата урока" if lessons else "выкл — «Исправить» как раньше",
+        admin_words))
+    # напоминание притихшему (WAFOLLOWUP0210): тем же правилом; без черновиков не работает (такт их не ищет)
+    follow = wa_agent_tg.flag_on(environ.get(F_FOLLOW))
+    line("напоминание (%s): %s" % (F_FOLLOW, ("вкл — 15 мин тишины после нашего: черновик-напоминание, "
+                                              "не больше %d на беседу" % wa_agent.FOLLOW_MAX) if follow
+                                   else "выкл — притихших не ищем"))
+    # брони на чтение (WABOOKTOOLS0210): снимок собирает make_model; здесь — только строка старта
+    line("брони (%s): %s" % (F_BOOK, "вкл — наличие и конец аренды из таблицы броней, только чтение"
+                             if wa_agent_tg.flag_on(environ.get(F_BOOK)) else "выкл — таблица броней не читается"))
+    # кэш промпта (WAAGENTCACHE0210): срок несёт адаптер, его собрал make_model; здесь — только строка старта
+    ttl = getattr(model, "cache", None)
+    line("кэш промпта (%s): %s" % (F_CACHE, "вкл, срок %s — инструкция и узлы знаний впереди с отметкой кэша" % ttl
+                                   if ttl else "выкл — запрос модели как раньше"))
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
-                         log=line, drafts=drafts, greet=greet, pace=pace)
+                         log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
+                         followup=follow)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
-    # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210)
+    # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210); порог и тихие часы — настройки
+    # (WAWATCHTEN0210): битая — умолчание (порог 600 с, тихих часов нет) и строка журнала со словом «битая»
+    watch_sec, sec_words, _ = wa_watch.threshold_of(environ.get(wa_watch.F_SEC))
+    quiet, quiet_words, _ = wa_watch.quiet_of(environ.get(wa_watch.F_QUIET))
+    line("ожидание: порог (%s): %s · тихие часы (%s): %s" % (wa_watch.F_SEC, sec_words, wa_watch.F_QUIET,
+                                                           quiet_words))
     core.watch = wa_watch.Watch(core.db, env["queue_db"], tg.watch_alarm, head=tg._head, clock=clock,
-                                log=line, greet=greet) if tg.watch else None
+                                log=line, greet=greet, threshold=watch_sec, quiet=quiet) if tg.watch else None
     words = {
         F_DRAFTS: ("вкл" if drafts else "выкл") + ("" if drafts or not flags[F_DRAFTS]
                                                    else " (флаг 1, адаптера модели нет)"),
@@ -186,8 +243,15 @@ def _pairs(d):
     return " ".join("%s=%d" % (k, d[k]) for k in sorted(d)) or "0"
 
 
+def spend_words(s):
+    """Итог трат адаптера модели (WAAGENTCACHE0210) — только числа."""
+    return ("модель: вызовов %d · вход %d · запись в кэш %d · чтение из кэша %d · выход %d · $%.4f (без кэша $%.4f)"
+            % (s["calls"], s["in"], s["cw"], s["cr"], s["out"], s["usd"], s["usd_nocache"]))
+
+
 def summary(core, tg, words, stats):
-    """Сводка ЧИСЛАМИ: состояния черновиков, карточки, паузы, реакции наружу, опросы, такты."""
+    """Сводка ЧИСЛАМИ: состояния черновиков, карточки, паузы, реакции наружу, опросы, такты; траты модели."""
+    spend = getattr(getattr(core, "model", None), "spend", None)
     db = core.db
     cards = db.execute("SELECT COUNT(*) FROM tg_cards").fetchone()[0]
     paused = db.execute("SELECT COUNT(*) FROM clients WHERE paused=1").fetchone()[0]
@@ -199,7 +263,29 @@ def summary(core, tg, words, stats):
             % (" ".join("%s=%s" % (k, words[k].split(" ")[0]) for k in FLAGS), _pairs(core.counts()),
                cards, paused, _pairs(reacts), _pairs(relays), tg.polls["ok"], tg.polls["fail"], tg.polls["conflict"],
                stats.get("ticks", 0), stats.get("tick_fail", 0),
-               " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else ""))
+               " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else "")
+            + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else "")
+            + (" · напоминаний %s" % _pairs(core.follow_counts()) if getattr(core, "followup", False) else "")
+            + (" · %s" % spend_words(spend) if isinstance(spend, dict) else "")
+            + cards_words(core))
+
+
+def cards_words(core):
+    """Очередь карточек (WADRAFTSAFE0210): состояния и ждущие черновики без доставленной карточки. В сводке —
+    при включённых черновиках или если такие черновики есть; иначе пусто (выключено — строка прежняя).
+    «Неизвестно» отдельно (WACARDDONEFIX0210): карточки, у которых ответ Telegram на отправку терялся, — возможна
+    вторая карточка, единственность не обещается; правки исхода без подтверждения. Нет таких — поля нет."""
+    if not hasattr(core, "undelivered"):
+        return ""
+    n = core.undelivered()
+    lost, unk = core.card_unknown() if hasattr(core, "card_unknown") else (0, 0)
+    if not (getattr(core, "drafts", False) or n or lost or unk):
+        return ""
+    words = " · карточки в «Агенты» %s · черновиков без доставленной карточки %d" % (_pairs(core.card_counts()), n)
+    if lost or unk:
+        words += (" · ответ Telegram неизвестен: отправка карточки %d — возможна вторая карточка, единственность "
+                  "не обещается; правка исхода не подтверждена %d" % (lost, unk))
+    return words
 
 
 def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every=SUMMARY_EVERY,
@@ -233,7 +319,10 @@ def main():
                         handlers=[logging.FileHandler(env["log_path"], encoding="utf-8")])
     model, why = None, ""
     if flags_of(os.environ)[F_DRAFTS]:
-        model, why = make_model(env)
+        import wa_agent_model
+        model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)),
+                                book=wa_agent_tg.flag_on(os.environ.get(F_BOOK)),
+                                cache=wa_agent_model.cache_ttl_of(os.environ.get(F_CACHE)))
     core, tg, _flags, words = build(env, model=model)
     log.info("%s", start_line(env, words))
     if why:

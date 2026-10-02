@@ -214,7 +214,7 @@ def test_two_presses_one_send():
     r2 = other.press(did, 1, A.ACT_SEND, "mike")
     assert r1["ok"] and r2["ok"] is False, (r1, r2)
     assert len(w.door.sends) == 1, ("двойная отправка", len(w.door.sends))
-    assert "owner" in r2["words"] and A.SENT in r2["words"] and "UTC" in r2["words"], r2
+    assert "owner" in r2["words"] and A.SENT in r2["words"] and "UTC" not in r2["words"], r2   # время — по Пхукету
 
 
 def test_repeat_update_one_send():
