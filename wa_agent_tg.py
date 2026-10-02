@@ -45,6 +45,13 @@
 «Отправить» по черновику — строкой «мы · агент, отправил <имя>: текст» в теме клиента.
 Выключатель `WA_AGENT_RELAY` по умолчанию выключен — сообщения тем не читаются и не отправляются.
 
+УРОКИ ЛЮДЕЙ (WAAGENTLESSON0210). Принятое «Исправить» при включённых уроках — на новой карточке строка
+«📚 урок №N записан кандидатом», ниже отдельным сообщением урок: было/стало, автор, источник и кнопка
+«📚 Сделать правилом» `wa:rule:<урок>:0`. Реплай на сообщение кандидата — причина урока. Право перевода и
+отката — у ядра (`Core.lesson_admin`, id Telegram нажавшего); остальным — отказ словами ядра. Действующий
+урок получает кнопку «↩️ Откатить №N» `wa:unrule:<урок>:0`; откат по номеру — и текстом «откатить №N» в
+группе. В журнал — номер урока, кто и исход; было/стало и причины в журнале нет.
+
 МЕДИА ИЗ ТЕМЫ → WHATSAPP (WARELAYMEDIA0210). Фото, видео (и гиф, и кружок), документ, голосовое, аудио,
 статичный стикер и место из темы клиента уходят клиенту своим видом (`media_of` → `Core.relay(media=…)` →
 `wa_send.send_media`): файл берётся `getFile` и скачивается В ПАМЯТЬ (`Tg.download`, на диск не ложится),
@@ -57,6 +64,7 @@ Bot API (20 МБ) и WhatsApp по виду; больше — ответ в те
 
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.error
@@ -112,6 +120,10 @@ WA_FULL_FORM = {
 ACTIONS = {"send": wa_agent.ACT_SEND, "no": wa_agent.ACT_DECLINE,
            "cancel": wa_agent.ACT_CANCEL}         # «Отменить» отложенного по ритму (WAHUMANPACE0210)
 
+# уроки людей (WAAGENTLESSON0210)
+LESSON_TEXT_MAX = 1500                            # было/стало в сообщении урока, символов
+RX_ROLLBACK = re.compile(r"(?i)^\s*откатить\s+(?:урок\s+)?№?\s*(\d+)\s*$")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tg_clients (
     cid     INTEGER PRIMARY KEY AUTOINCREMENT,      -- короткий id клиента для callback_data
@@ -136,6 +148,11 @@ CREATE TABLE IF NOT EXISTS tg_reacts (
     emoji     TEXT    NOT NULL,                      -- его реакция из набора Telegram
     seq       INTEGER NOT NULL,                      -- update_id: последняя побеждает
     PRIMARY KEY (msg_id, who)
+);
+CREATE TABLE IF NOT EXISTS tg_lessons (
+    lesson_id INTEGER PRIMARY KEY,                   -- номер урока (lessons.id ядра)
+    msg_id    INTEGER,                               -- сообщение урока в группе
+    body      TEXT
 );
 CREATE TABLE IF NOT EXISTS tg_react_out (
     msg_id    INTEGER PRIMARY KEY,                   -- что уже уходило клиенту на это сообщение
@@ -353,6 +370,11 @@ class Tg(wa_agent.Telegram):
             mark = "🙋 НУЖЕН ЧЕЛОВЕК: " + "; ".join(hand) + "\n" + (
                 "«Отправить» — после «Исправить» (ответьте реплаем своим текстом)\n" if ver == 1
                 else "исправлено человеком — «Отправить» открыто\n")
+        # урок людей (WAAGENTLESSON0210): эта версия — правка, записанная кандидатом урока
+        lesson = getattr(self.core, "lesson_of", None)
+        lesson = lesson(draft_id, ver) if lesson and ver > 1 else None
+        if lesson:
+            mark += "📚 урок №%d записан кандидатом — «Сделать правилом» под ним\n" % lesson
         body = "📝 Черновик №%d · версия %d\n%s\n%s\n%s" % (draft_id, ver, self._head(number), mark, text)
         if len(body) > TG_TEXT_MAX:
             body = body[:TG_TEXT_MAX - 60] + "\n… (показ обрезан; «Отправить» шлёт текст целиком)"
@@ -389,6 +411,83 @@ class Tg(wa_agent.Telegram):
         kb = {"inline_keyboard": [[{"text": "↩️ Отменить", "callback_data": "wa:cancel:%d:%d" % (draft_id, ver)}]]}
         self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
                                      "text": body + "\n\n— ⏳ " + words, "reply_markup": kb})
+
+    # ── уроки людей (WAAGENTLESSON0210) ───────────────────────────────────────────────────
+
+    def _lesson_body(self, lesson_id):
+        row = self.db.execute("SELECT state, author, ts, draft_id, ver_from, ver_to, was_text, now_text, reason "
+                              "FROM lessons WHERE id=?", (int(lesson_id),)).fetchone()
+        if not row:
+            return None, None
+        state, author, ts, did, v1, v2, was, now, reason = row
+
+        def cut(s):
+            s = str(s or "")
+            return s if len(s) <= LESSON_TEXT_MAX else s[:LESSON_TEXT_MAX] + " … (обрезано в показе)"
+        return state, ("📚 Урок №%d · %s\nисправил: %s, %s · черновик №%d, версия %d → %d\nбыло: %s\nстало: %s\n"
+                       "причина: %s\nВ промпт агента идёт только действующее правило; перевод — «Сделать "
+                       "правилом» (владелец или список WA_AGENT_LESSON_ADMINS)."
+                       % (int(lesson_id), {"candidate": "кандидат", "active": "действующее правило",
+                                           "rolled_back": "откатан"}.get(state, state),
+                          author, wa_agent._hm(ts), did, v1, v2, cut(was), cut(now),
+                          cut(reason) if reason else "— (ответьте реплаем на это сообщение — запишу причиной)"))
+
+    @staticmethod
+    def _lesson_kb(lesson_id, state):
+        if state == wa_agent.LESSON_CANDIDATE:
+            return {"inline_keyboard": [[{"text": "📚 Сделать правилом",
+                                          "callback_data": "wa:rule:%d:0" % int(lesson_id)}]]}
+        if state == wa_agent.LESSON_ACTIVE:
+            return {"inline_keyboard": [[{"text": "↩️ Откатить №%d" % int(lesson_id),
+                                          "callback_data": "wa:unrule:%d:0" % int(lesson_id)}]]}
+        return None
+
+    def lesson_card(self, lesson_id):
+        """Кандидат урока — отдельное сообщение в «Агенты» с кнопкой «Сделать правилом»."""
+        if not self.enabled:
+            return None
+        state, body = self._lesson_body(lesson_id)
+        if body is None:
+            return None
+        ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": body[:TG_TEXT_MAX],
+                                           "reply_markup": self._lesson_kb(lesson_id, state)})
+        mid = int(res.get("message_id")) if ok else None
+        self.db.execute("INSERT OR REPLACE INTO tg_lessons(lesson_id, msg_id, body) VALUES(?,?,?)",
+                        (int(lesson_id), mid, body))
+        self.log("урок %d: сообщение кандидата → %s" % (int(lesson_id), mid))
+        return mid
+
+    def lesson_done(self, lesson_id, words, state):
+        """Перевод или откат: сообщение урока получает исход; у действующего — кнопка «Откатить №N»."""
+        if not self.enabled:
+            return
+        row = self.db.execute("SELECT msg_id FROM tg_lessons WHERE lesson_id=?", (int(lesson_id),)).fetchone()
+        if not row or not row[0]:
+            return
+        _state, body = self._lesson_body(lesson_id)
+        params = {"chat_id": self.chat, "message_id": int(row[0]),
+                  "text": (body or "📚 Урок №%d" % int(lesson_id))[:TG_TEXT_MAX - 200] + "\n\n— " + words}
+        kb = self._lesson_kb(lesson_id, state)
+        if kb:
+            params["reply_markup"] = kb
+        self.api("editMessageText", params)
+
+    def _lesson_show(self, lesson_id):
+        """Сообщение кандидата заново (причина записана): тело из базы, кнопка по состоянию."""
+        row = self.db.execute("SELECT msg_id FROM tg_lessons WHERE lesson_id=?", (int(lesson_id),)).fetchone()
+        state, body = self._lesson_body(lesson_id)
+        if not row or not row[0] or body is None:
+            return
+        params = {"chat_id": self.chat, "message_id": int(row[0]), "text": body[:TG_TEXT_MAX]}
+        kb = self._lesson_kb(lesson_id, state)
+        if kb:
+            params["reply_markup"] = kb
+        self.api("editMessageText", params)
+
+    def _say(self, msg, words):
+        self.api("sendMessage", {"chat_id": self.chat, "text": words,
+                                 "reply_parameters": {"message_id": int(msg.get("message_id") or 0),
+                                                      "allow_sending_without_reply": True}})
 
     def ask_pause(self, number, pause_no, via=None):
         if not self.enabled:
@@ -504,6 +603,12 @@ class Tg(wa_agent.Telegram):
         act, a, b = parts[1], int(parts[2]), int(parts[3])
         if act == "go":
             return self._on_resume(cq, a, b, who)
+        if act in ("rule", "unrule"):
+            # уроки (WAAGENTLESSON0210): право решает ядро по id нажавшего
+            fn = self.core.lesson_promote if act == "rule" else self.core.lesson_rollback
+            res = fn(a, who, frm.get("id"))
+            self.log("урок %d: %s → %s" % (a, act, res.get("state") or "нет"))
+            return self.answer(cq.get("id"), res.get("words"))
         if act == "fix":
             row = self.db.execute("SELECT state, ver FROM drafts WHERE id=?", (a,)).fetchone()
             if row and row[0] == wa_agent.PENDING and row[1] == b:
@@ -540,24 +645,44 @@ class Tg(wa_agent.Telegram):
             self.log("сообщение из чужого чата %s — пропуск" % chat)
             return
         reply = (msg.get("reply_to_message") or {}).get("message_id")
+        frm = msg.get("from") or {}
+        who = who_of(frm)
+        if not frm.get("is_bot") and self._on_lesson_text(msg, reply, who, frm):
+            return
         card = self.db.execute("SELECT draft_id, ver FROM tg_cards WHERE card_id=?",
                                (reply,)).fetchone() if reply else None
         if not card:
             return
-        frm = msg.get("from") or {}
-        who = who_of(frm)
         if frm.get("is_bot"):
             self.log("отказ: правку прислал бот %s (черновик %d)" % (who, card[0]))
             return
         did, ver = card
         text = msg.get("text") or ""
         self.log("правка: от %s · черновик %d версия %d" % (who, did, ver))
-        if self.core.revise(did, text, who, ver=ver):
+        if self.core.revise(did, text, who, ver=ver, who_id=frm.get("id")):
             return
         words = "не принято: " + (self.core._decided(did, ver) if text.strip() else "нужен текст сообщения")
-        self.api("sendMessage", {"chat_id": self.chat, "text": words,
-                                 "reply_parameters": {"message_id": int(msg.get("message_id") or 0),
-                                                      "allow_sending_without_reply": True}})
+        self._say(msg, words)
+
+    def _on_lesson_text(self, msg, reply, who, frm):
+        """Уроки (WAAGENTLESSON0210): «откатить №N» текстом и реплай-причина на сообщение кандидата.
+        → True — сообщение разобрано здесь."""
+        text = msg.get("text") or ""
+        m = RX_ROLLBACK.match(text)
+        row = None if m or not reply else self.db.execute(
+            "SELECT lesson_id FROM tg_lessons WHERE msg_id=?", (reply,)).fetchone()
+        if m:
+            res = self.core.lesson_rollback(int(m.group(1)), who, frm.get("id"))
+            self.log("урок %s: «откатить» текстом от %s → %s" % (m.group(1), who, res.get("state") or "нет"))
+            self._say(msg, res.get("words"))
+        elif row and self.core.lesson_reason(row[0], text, who):
+            self._lesson_show(row[0])
+            self._say(msg, "причина урока №%d записана" % row[0])
+        elif row:
+            self._say(msg, "не принято: причину пишут только кандидату, текстом — %s"
+                      % self.core._lesson_decided(row[0]))
+        # разобрано здесь — «откатить №N» или реплай на сообщение урока; прочее — карточкам
+        return bool(m or row)
 
     # ── тема клиента → WhatsApp (WARELAYTEXT0210) ─────────────────────────────────────────
 

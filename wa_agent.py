@@ -42,6 +42,14 @@ superseded и пауза; новое входящее → stale), пишет `se
 отправку в срок делает такт (`send_due`) через тот же захват `sending` ДО двери. Рестарт срок не теряет и
 не дублирует. Клиент написал ещё — одобренное уходит в срок, новое — в следующий черновик.
 
+УРОКИ ЛЮДЕЙ (WAAGENTLESSON0210, выключатель службы WA_AGENT_LESSONS, по умолчанию выключен — «Исправить»
+как раньше). Включён — принятое «Исправить» с новым текстом пишет в таблицу `lessons` своей базы КАНДИДАТА
+урока: номер, автор, время, источник (черновик, версии), было/стало, причина (реплай на сообщение урока,
+пока он кандидат) или пусто. В промпт агента идут ТОЛЬКО действующие (`active_lessons`); перевод
+кандидата в действующие — отдельной кнопкой и только тем, кто в праве (`lesson_admins_of`: настройка
+WA_AGENT_LESSON_ADMINS, по умолчанию владелец); остальным — отказ словами. Откат по номеру убирает
+урок из промпта. Хранилище своё — с уроками и правилами Splinter не смешивается.
+
 ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа (это
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
 """
@@ -88,6 +96,34 @@ _DOOR_STATE = {"sent": SENT, "not_sent": NOT_SENT, "unknown": UNSURE}
 GREET_SEC = 10                                # эхо не позже 10 с после «первого» входящего
 GREET_SILENCE = 14 * 86400                    # «первое»: до него 14 суток тишины в обе стороны
 GREET_FP_MIN = 10                             # отпечаток в настройке — sha256 или его начало от 10 знаков
+
+
+# ── уроки людей (WAAGENTLESSON0210) ───────────────────────────────────────────────────────
+LESSON_CANDIDATE, LESSON_ACTIVE, LESSON_ROLLED = "candidate", "active", "rolled_back"
+# владелец по умолчанию — те же три аккаунта, что `splinter.OWNER_IDS` (тест сверяет литерал по тексту
+# splinter.py, без импорта: Splinter тянет python-telegram-bot)
+LESSON_OWNER_IDS = frozenset({504608015, 6879003264, 5466425480})
+LESSON_REASON_MAX = 500                       # причина урока, символов
+LESSON_OFF_WORDS = "уроки выключены (WA_AGENT_LESSONS)"
+
+
+def lesson_admins_of(raw):
+    """Настройка службы WA_AGENT_LESSON_ADMINS → (id Telegram, слова). Значение — id через запятую;
+    пусто — владелец; хоть одно значение не число — владелец (битая настройка права не расширяет)."""
+    s = str(raw or "").strip()
+    if not s:
+        return LESSON_OWNER_IDS, "владелец (WA_AGENT_LESSON_ADMINS не задан)"
+    out = [p for p in s.replace(" ", ",").split(",") if p]
+    if not out or any(not p.isdigit() for p in out):
+        return LESSON_OWNER_IDS, "настройка WA_AGENT_LESSON_ADMINS битая — только владелец"
+    return frozenset(int(p) for p in out), "список WA_AGENT_LESSON_ADMINS (%d id)" % len(set(out))
+
+
+def active_lessons(db):
+    """Действующие уроки → [(номер, было, стало, причина)] по номеру. Одно правило для ядра и адаптера
+    модели: кандидат и откатанный в промпт не идут."""
+    return db.execute("SELECT id, was_text, now_text, reason FROM lessons WHERE state=? ORDER BY id",
+                      (LESSON_ACTIVE,)).fetchall()
 
 
 def greet_fps(raw):
@@ -178,6 +214,24 @@ CREATE TABLE IF NOT EXISTS autogreet (
     ts      REAL    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS autogreet_number ON autogreet(number);
+CREATE TABLE IF NOT EXISTS lessons (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,    -- номер урока
+    state       TEXT    NOT NULL,                     -- candidate | active | rolled_back
+    author      TEXT    NOT NULL,                     -- кто исправил: имя (id N)
+    author_id   INTEGER,
+    ts          REAL    NOT NULL,
+    draft_id    INTEGER NOT NULL,                     -- источник: черновик и его версии
+    ver_from    INTEGER NOT NULL,
+    ver_to      INTEGER NOT NULL,
+    was_text    TEXT    NOT NULL,                     -- было
+    now_text    TEXT    NOT NULL,                     -- стало
+    reason      TEXT,                                 -- причина или NULL
+    decided_by  TEXT,                                 -- перевод в действующие: кто, когда
+    decided_at  REAL,
+    rolled_by   TEXT,                                 -- откат: кто, когда
+    rolled_at   REAL,
+    UNIQUE (draft_id, ver_to)
+);
 """
 
 # «Тема клиента → WhatsApp» (WARELAYTEXT0210): текст человека из темы форума показа уходит клиенту.
@@ -274,6 +328,16 @@ class Telegram:
         Рук нет — ничего."""
         return None
 
+    def lesson_card(self, lesson_id):
+        """Кандидат урока (WAAGENTLESSON0210): сообщение с было/стало и кнопкой «Сделать правилом».
+        Рук нет — ничего."""
+        return None
+
+    def lesson_done(self, lesson_id, words, state):
+        """Урок переведён или откатан: сообщение урока получает исход; у действующего — «Откатить».
+        Рук нет — ничего."""
+        return None
+
 
 class Door:
     """send_text(to, text) → {"outcome": sent|not_sent|unknown, "reason": str, "wamid": str|None}.
@@ -302,10 +366,22 @@ def _hm(ts):
     return time.strftime("%H:%M", time.gmtime(float(ts))) + " UTC" if ts else "—"
 
 
+def _int_or_none(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
-                 clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random):
+                 clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random,
+                 lessons=False, lesson_admins=None):
         quiet = int(quiet)
+        # WA_AGENT_LESSONS (WAAGENTLESSON0210): выключен — «Исправить» урока не пишет, перевода нет;
+        # lesson_admins — id Telegram, кто вправе переводить и откатывать (по умолчанию владелец)
+        self.lessons = bool(lessons)
+        self.lesson_admins = frozenset(LESSON_OWNER_IDS if lesson_admins is None else lesson_admins)
         # WA_AGENT_PACE (WAHUMANPACE0210): выключен — «Отправить» шлёт сразу; rand — доля окна первого ответа
         self.pace = bool(pace)
         self.rand = rand
@@ -849,27 +925,125 @@ class Core:
         return base + typing, "следующий: набор %d с, от %s до нажатия %d с" % (
             typing, "сообщения клиента" if later is None else "срока отложенного", now - base)
 
-    def revise(self, draft_id, text, who, now=None, ver=None):
+    def revise(self, draft_id, text, who, now=None, ver=None, who_id=None):
         """«Исправить»: текст человека, версия +1; кнопки прежней версии отвечают «устарело».
         ver — версия карточки, на которую ответили реплаем: правка прежней версии не принимается
         (тот же замок, что у нажатия). Принята — прежняя карточка «устарело», новая карточка с
-        версией +1; «Отправить» на ней шлёт текст человека дословно."""
+        версией +1; «Отправить» на ней шлёт текст человека дословно.
+        Уроки включены и текст другой — кандидат урока (было → стало) пишется ДО новой карточки:
+        карточка показывает «урок №N записан кандидатом», под ней — сообщение урока (WAAGENTLESSON0210)."""
         now = self.clock() if now is None else now
         if not (text or "").strip():
             return False
+        old = self.db.execute("SELECT text, ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
         q, args = "UPDATE drafts SET text=?, ver=ver+1 WHERE id=? AND state='pending'", (text, draft_id)
         if ver is not None:
             q, args = q + " AND ver=?", args + (int(ver),)
+        elif old:
+            q, args = q + " AND ver=?", args + (old[1],)
         n = self.db.execute(q, args).rowcount
         if n == 1:
             number, ver_now, old_card = self.db.execute(
                 "SELECT number, ver, card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
             self.log("черновик %d исправлен → версия %d (%s)" % (draft_id, ver_now, who))
+            lesson = None
+            if self.lessons and old and old[0] != text:
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO lessons(state, author, author_id, ts, draft_id, ver_from, ver_to, "
+                    "was_text, now_text) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (LESSON_CANDIDATE, who, _int_or_none(who_id), now, draft_id, ver_now - 1, ver_now,
+                     old[0], text))
+                lesson = cur.lastrowid if cur.rowcount == 1 else None
+                if lesson:
+                    self.log("урок %d: кандидат (черновик %d, версия %d → %d, %s)" % (
+                        lesson, draft_id, ver_now - 1, ver_now, who))
             self._tg("card_done", draft_id, old_card,
                      "устарело: исправлено — %s, %s, действует версия %d" % (who, _hm(now), ver_now))
             card = self._tg("card", draft_id, ver_now, number, text)
             self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, draft_id))
+            if lesson:
+                self._tg("lesson_card", lesson)
         return n == 1
+
+    # ── уроки людей (WAAGENTLESSON0210) ───────────────────────────────────────────────────
+
+    def lesson_of(self, draft_id, ver):
+        """Номер урока, записанного правкой, давшей эту версию черновика; нет — None."""
+        row = self.db.execute("SELECT id FROM lessons WHERE draft_id=? AND ver_to=?",
+                              (draft_id, int(ver))).fetchone()
+        return row[0] if row else None
+
+    def lesson_admin(self, who_id):
+        """Вправе ли переводить и откатывать уроки: id Telegram в списке. Нет id — не вправе."""
+        uid = _int_or_none(who_id)
+        return uid is not None and uid in self.lesson_admins
+
+    def _lesson_decided(self, lesson_id):
+        row = self.db.execute("SELECT state, decided_by, decided_at, rolled_by, rolled_at FROM lessons "
+                              "WHERE id=?", (int(lesson_id),)).fetchone()
+        if not row:
+            return "урока №%d нет" % int(lesson_id)
+        state, by, at, rby, rat = row
+        if state == LESSON_ACTIVE:
+            return "уже решено: урок №%d — действующее правило: %s, %s" % (int(lesson_id), by, _hm(at))
+        if state == LESSON_ROLLED:
+            return "уже решено: урок №%d откатан: %s, %s" % (int(lesson_id), rby, _hm(rat))
+        return "урок №%d — кандидат" % int(lesson_id)
+
+    def _lesson_deny(self, lesson_id, what):
+        return "отказ: %s вправе только владелец или список WA_AGENT_LESSON_ADMINS — урок №%d не тронут" % (
+            what, int(lesson_id))
+
+    def lesson_promote(self, lesson_id, who, who_id, now=None):
+        """«Сделать правилом»: кандидат → действующий, только тем, кто в праве. → {"ok", "state", "words"}."""
+        now = self.clock() if now is None else now
+        if not self.lessons:
+            return {"ok": False, "state": None, "words": "%s — урок №%d не переведён" % (
+                LESSON_OFF_WORDS, int(lesson_id))}
+        if not self.lesson_admin(who_id):
+            self.log("урок %d: «Сделать правилом» — отказ, нет права: %s" % (int(lesson_id), who))
+            return {"ok": False, "state": None, "words": self._lesson_deny(lesson_id, "сделать правилом")}
+        n = self.db.execute("UPDATE lessons SET state=?, decided_by=?, decided_at=? WHERE id=? AND state=?",
+                            (LESSON_ACTIVE, who, now, int(lesson_id), LESSON_CANDIDATE)).rowcount
+        if n != 1:
+            return {"ok": False, "state": None, "words": self._lesson_decided(lesson_id)}
+        self.log("урок %d → действующий (%s)" % (int(lesson_id), who))
+        self._tg("lesson_done", int(lesson_id), "✅ действующее правило — %s, %s" % (who, _hm(now)),
+                 LESSON_ACTIVE)
+        return {"ok": True, "state": LESSON_ACTIVE,
+                "words": "урок №%d — действующее правило: идёт в промпт агента" % int(lesson_id)}
+
+    def lesson_rollback(self, lesson_id, who, who_id, now=None):
+        """«Откатить №N»: действующий (или кандидат) → откатан, только тем, кто в праве. Из промпта уходит
+        со следующего черновика. Откат работает и при выключенных уроках — это шаг в безопасную сторону."""
+        now = self.clock() if now is None else now
+        if not self.lesson_admin(who_id):
+            self.log("урок %d: откат — отказ, нет права: %s" % (int(lesson_id), who))
+            return {"ok": False, "state": None, "words": self._lesson_deny(lesson_id, "откатить урок")}
+        n = self.db.execute("UPDATE lessons SET state=?, rolled_by=?, rolled_at=? WHERE id=? AND state IN (?,?)",
+                            (LESSON_ROLLED, who, now, int(lesson_id), LESSON_ACTIVE, LESSON_CANDIDATE)).rowcount
+        if n != 1:
+            return {"ok": False, "state": None, "words": self._lesson_decided(lesson_id)}
+        self.log("урок %d → откатан (%s)" % (int(lesson_id), who))
+        self._tg("lesson_done", int(lesson_id), "↩️ откатан — %s, %s; в промпт агента не идёт" % (who, _hm(now)),
+                 LESSON_ROLLED)
+        return {"ok": True, "state": LESSON_ROLLED,
+                "words": "урок №%d откатан — в промпт агента не идёт" % int(lesson_id)}
+
+    def lesson_reason(self, lesson_id, text, who):
+        """Причина урока — реплай на сообщение урока, пока он кандидат: действующий меняет только
+        перевод и откат, иначе правка причины обходила бы право перевода. → True — записана."""
+        text = (text or "").strip()[:LESSON_REASON_MAX]
+        if not text:
+            return False
+        n = self.db.execute("UPDATE lessons SET reason=? WHERE id=? AND state=?",
+                            (text, int(lesson_id), LESSON_CANDIDATE)).rowcount
+        if n == 1:
+            self.log("урок %d: причина записана (%s, %d симв.)" % (int(lesson_id), who, len(text)))
+        return n == 1
+
+    def lesson_counts(self):
+        return dict(self.db.execute("SELECT state, COUNT(*) FROM lessons GROUP BY state").fetchall())
 
     def _card(self, draft_id):
         row = self.db.execute("SELECT card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()

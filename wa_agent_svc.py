@@ -23,6 +23,11 @@
                     после сообщения клиента, следующий — по длине текста; раньше срока — «уйдёт в ЧЧ:ММ» и
                     «Отменить». Выключен — «Отправить» шлёт сразу. Текст человека из темы ритм не касается.
                     Отложенное до выключения уходит в срок и при выключенном.
+  WA_AGENT_LESSONS — уроки людей (WAAGENTLESSON0210): «Исправить» с другим текстом пишет кандидата урока,
+                    «Сделать правилом» переводит его в действующие, действующие идут в промпт агента,
+                    «Откатить №N» убирает. Выключен — «Исправить» как раньше, уроков в промпте нет.
+НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
+  Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
   sha256 текста или его начало от 10 знаков, несколько — через запятую; самого текста нет нигде. Эхо с
   этим отпечатком И не позже 10 с после «первого» входящего паузы не ставит, первый вопрос не закрывает.
@@ -55,6 +60,8 @@ F_RELAY = "WA_AGENT_RELAY"                # тема клиента → WhatsApp
 F_WATCH = "WA_AGENT_WATCH"                # ожидание «клиент без ответа» (WAUNANSWERED0210)
 F_GREET = "WA_AGENT_GREET_SHA256"         # отпечаток текста автоприветствия (WAGREETECHO0210)
 F_PACE = "WA_AGENT_PACE"                  # человеческий ритм «Отправить» (WAHUMANPACE0210)
+F_LESSONS = "WA_AGENT_LESSONS"            # уроки людей из «Исправить» (WAAGENTLESSON0210)
+F_LESSON_ADMINS = "WA_AGENT_LESSON_ADMINS"  # кто переводит урок в действующие и откатывает; пусто — владелец
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
@@ -111,10 +118,11 @@ class NoModel(wa_agent.Model):
         return None
 
 
-def make_model(env, line=None, bridge=None, call=None):
+def make_model(env, line=None, bridge=None, call=None, lessons=False):
     """Адаптер модели (WAAGENTMODEL0210): история — очередь и архив службы показа, знания, парк и цена —
     мост (только чтение), плательщик — платный ключ тем же путём, что у Splinter. → (модель | None, почему).
-    Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели."""
+    Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели.
+    lessons — WA_AGENT_LESSONS: включён — действующие уроки из базы агента идут в промпт (WAAGENTLESSON0210)."""
     import wa_agent_model
     try:
         if bridge is None:
@@ -127,7 +135,8 @@ def make_model(env, line=None, bridge=None, call=None):
         env["queue_db"], call, read_doc=lambda n: bridge._call("read_doc", name=n), fleet=bridge.fleet,
         door=bridge.quote_price, archive_db=env.get("archive_db") or "",
         manifest=env.get("archive_manifest") or "", media_dir=env.get("archive_media") or "",
-        agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)))
+        agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)),
+        lessons_db=(env.get("agent_db") or "") if lessons else "")
     return model, ""
 
 
@@ -150,8 +159,14 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     pace = wa_agent_tg.flag_on(environ.get(F_PACE))
     line("ритм (%s): %s" % (F_PACE, "вкл — «Отправить» до срока ставит отправку на срок" if pace
                             else "выкл — «Отправить» шлёт сразу"))
+    # уроки людей (WAAGENTLESSON0210): выключены — «Исправить» как раньше; право перевода — список или владелец
+    lessons = wa_agent_tg.flag_on(environ.get(F_LESSONS))
+    admins, admin_words = wa_agent.lesson_admins_of(environ.get(F_LESSON_ADMINS))
+    line("уроки (%s): %s · право перевода и отката: %s" % (
+        F_LESSONS, "вкл — «Исправить» пишет кандидата урока" if lessons else "выкл — «Исправить» как раньше",
+        admin_words))
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
-                         log=line, drafts=drafts, greet=greet, pace=pace)
+                         log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
     # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210)
@@ -199,7 +214,8 @@ def summary(core, tg, words, stats):
             % (" ".join("%s=%s" % (k, words[k].split(" ")[0]) for k in FLAGS), _pairs(core.counts()),
                cards, paused, _pairs(reacts), _pairs(relays), tg.polls["ok"], tg.polls["fail"], tg.polls["conflict"],
                stats.get("ticks", 0), stats.get("tick_fail", 0),
-               " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else ""))
+               " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else "")
+            + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else ""))
 
 
 def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every=SUMMARY_EVERY,
@@ -233,7 +249,7 @@ def main():
                         handlers=[logging.FileHandler(env["log_path"], encoding="utf-8")])
     model, why = None, ""
     if flags_of(os.environ)[F_DRAFTS]:
-        model, why = make_model(env)
+        model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)))
     core, tg, _flags, words = build(env, model=model)
     log.info("%s", start_line(env, words))
     if why:

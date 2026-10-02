@@ -13,7 +13,10 @@
     НЕИЗВЕСТНО словами, а не пусто;
   • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене И в его словах есть
     модель из парка И обе даты. Без дат или модели дверь цены не зовётся;
-  • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас.
+  • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас;
+  • уроки людей (WAAGENTLESSON0210) — ТОЛЬКО действующие (`wa_agent.active_lessons`, своя база агента
+    mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
+    (`lessons_db` пуст — WA_AGENT_LESSONS выключен) — блока нет, как раньше.
 
 ОТВЕТ МОДЕЛИ — JSON {text, lang, handoff[], why}. Не JSON, нет текста — черновика нет, строка журнала
 (ядро повторит не раньше MODEL_RETRY_SEC). lang не ru/en — причина «язык». Итог `draft` — словарь
@@ -30,6 +33,7 @@ import datetime
 import json
 import os
 import re
+import sqlite3
 import time
 
 import wa_agent
@@ -41,6 +45,32 @@ DEFAULT_MODEL = "claude-sonnet-4-5"          # как CLAUDE_MODEL Splinter по
 MAX_TOKENS = 700
 HISTORY_MAX = 60000                           # символов истории; старше — обрезается с головы, словами
 TAIL_MAX = 4000
+LESSON_ITEM_MAX = 600                         # было/стало/причина одного урока в промпте, символов
+LESSONS_MAX = 8000                            # блок уроков целиком; не помещается — старшие уходят, словами
+LESSONS_HEAD = ("УРОКИ ЛЮДЕЙ — действующие правила (поправки сотрудников к прежним черновикам, утверждены "
+                "владельцем), по номерам. В похожем случае пиши так, как «стало», и следуй причине. Имён, "
+                "номеров, дат и сумм из примеров не переноси — это переписка другого клиента; правила выше "
+                "(цены, наличие, брони, «нужен человек») уроки не отменяют.")
+
+
+def lessons_block(rows):
+    """[(номер, было, стало, причина)] → текст блока или '' (уроков нет). Новые важнее: не помещается
+    в LESSONS_MAX — уходят старшие номера, словами."""
+    def cut(s):
+        s = " ".join(str(s or "").split())
+        return s if len(s) <= LESSON_ITEM_MAX else s[:LESSON_ITEM_MAX] + "…"
+    items = ["№%d: было «%s» → стало «%s»%s" % (n, cut(was), cut(now), "; причина: %s" % cut(why) if why else "")
+             for n, was, now, why in rows]
+    keep, size = [], len(LESSONS_HEAD)
+    for it in reversed(items):
+        if size + len(it) + 1 > LESSONS_MAX:
+            break
+        keep.insert(0, it)
+        size += len(it) + 1
+    if not keep:
+        return ""
+    drop = len(items) - len(keep)
+    return "\n".join([LESSONS_HEAD] + (["(старших уроков не поместилось: %d)" % drop] if drop else []) + keep)
 
 SYSTEM_PROMPT = """Ты — менеджер проката мотобайков TurboBaby на Пхукете и пишешь ЧЕРНОВИК ответа клиенту в WhatsApp. Черновик читает сотрудник и сам решает, отправлять ли его.
 
@@ -250,9 +280,11 @@ class ModelAdapter(wa_agent.Model):
     `fleet`; door(unit, ds, de) → ответ двери цены. Все — снаружи (в тестах подделки)."""
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
-                 manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db=""):
+                 manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db="",
+                 lessons_db=""):
         self.queue_db, self.call = queue_db, call
         self.agent_db = agent_db                          # outbox: ушедшее через API (WARELAYTEXT0210)
+        self.lessons_db = lessons_db                      # уроки людей (WAAGENTLESSON0210); пусто — выкл
         self.fleet, self.door = fleet, door
         self.archive_db, self.manifest, self.media_dir = archive_db, manifest, media_dir
         self.no_price_models = tuple(no_price_models)
@@ -280,6 +312,21 @@ class ModelAdapter(wa_agent.Model):
             if it["who"] == "клиент":
                 tail.append(it)
         return list(reversed(tail))
+
+    def _lessons(self):
+        """Действующие уроки из базы агента (mode=ro). Выключено — []; не прочитано — [] и строка журнала:
+        без уроков агент пишет как раньше, а не выдумывает правила."""
+        if not self.lessons_db:
+            return []
+        try:
+            db = sqlite3.connect("file:%s?mode=ro" % self.lessons_db, uri=True, timeout=5)
+            try:
+                return wa_agent.active_lessons(db)
+            finally:
+                db.close()
+        except Exception as e:                                       # noqa: BLE001
+            self.log("уроки не прочитаны: %s — блока уроков нет" % type(e).__name__)
+            return []
 
     def _price(self, ask, today):
         """Цена — только на вопрос о цене с моделью и обеими датами. → (исход quote | None, слова)."""
@@ -324,6 +371,10 @@ class ModelAdapter(wa_agent.Model):
         parts = K.prompt_parts(price, reasons, [nodes[n] for n in K.NODES], now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
         blocks += [parts[k] for k in sorted(parts) if k.startswith("node:")]
+        lessons = self._lessons()
+        lesson_text, n_mask3 = K.mask(lessons_block(lessons))
+        if lesson_text:
+            blocks.append(lesson_text)
         if "price" in parts:
             blocks.append(parts["price"])
         if "handoff" in parts:
@@ -334,7 +385,7 @@ class ModelAdapter(wa_agent.Model):
         blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + (ask or "[пусто]"))
         user = "\n\n".join(blocks)
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
-                "masked": n_mask + n_mask2, "missing": missing, "price": price, "price_words": price_words,
+                "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
                 "user_chars": len(user), "system_chars": len(SYSTEM_PROMPT)}
         return SYSTEM_PROMPT, user, info
