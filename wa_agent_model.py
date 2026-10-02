@@ -594,6 +594,16 @@ class ModelAdapter(wa_agent.Model):
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
         words = K.merge_reasons(words, got["handoff"])      # дедуп по категории (WACARDCOMPACT0310)
+        # деньги в тексте черновика (WAMONEYCHECK0310): процент предоплаты, депозита или скидки и сумма в батах не из
+        # блока «ЦЕНА» этого вызова — причина «нужен человек» ПЕРВОЙ строкой (на карточке видна при любом числе
+        # причин). Текст ответа не правится. В журнал — только числа: текст черновика туда не идёт.
+        claims = K.money_claims(got["text"], info["price"])
+        if claims:
+            if K.MONEY_CLAIM_WORDS not in words:
+                words.insert(0, K.MONEY_CLAIM_WORDS)
+            self.log("модель: денежных утверждений без опоры %d (процентов %d, сумм %d) — причина «нужен человек»"
+                     % (len(claims), sum(1 for c in claims if c[0] == "процент"),
+                        sum(1 for c in claims if c[0] == "сумма")))
         self.log("модель: черновик %d симв., история %d строк / %d симв., маска %d, %s, причин %d (%s)"
                  % (len(got["text"]), info["history_items"], info["history_chars"], info["masked"],
                     info["price_words"], len(words), tok))

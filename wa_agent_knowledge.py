@@ -387,11 +387,15 @@ def handoff(text, price=None):
 # по своим словам, причины модели — теми же выражениями, что поднимают «нужен человек». Не узнана —
 # категорий нет: карточка показывает слова как есть, дедуп — по тексту. Цена человеком — одна категория.
 CAT_PRICE = "price"
+# WAMONEYCHECK0310: причина по ТЕКСТУ ЧЕРНОВИКА модели, а не по сообщению клиента — см. `money_claims` ниже
+R_MONEY_CLAIM = "money_claim"
+MONEY_CLAIM_WORDS = "денежное утверждение без опоры"
 _WORD_CATS = dict(
     [(REASON_WORDS[R_AVAILABILITY], R_AVAILABILITY), (REASON_WORDS[R_SEASON_CROSS], CAT_PRICE),
      (REASON_WORDS[R_NO_PRICE_MODEL], CAT_PRICE), (REASON_WORDS[R_LONG_TERM], CAT_PRICE),
      (REASON_WORDS[R_DISCOUNT], R_DISCOUNT), (REASON_WORDS[R_DOOR_NO_PRICE], CAT_PRICE),
-     (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE)]
+     (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE),
+     (MONEY_CLAIM_WORDS, R_MONEY_CLAIM)]
     + [(words, key) for key, words in MONEY_WORDS.items()])
 _RULES = dict(_TEXT_RULES)
 _KEYWORD_CATS = ((R_AVAILABILITY, _RULES[R_AVAILABILITY]), (R_DISCOUNT, _RULES[R_DISCOUNT]))
@@ -429,6 +433,79 @@ def merge_reasons(words, extra):
         out.append(h)
         cats.update(got)
         texts.add(_norm(h))
+    return out
+
+
+# ------------------------------- деньги в черновике модели (WAMONEYCHECK0310) -------------------------------
+
+# Черновик проверяется ПОСЛЕ модели: правило 4 промпта просит цену только из блока «ЦЕНА», но исполнение его не
+# проверял никто. Утверждение без опоры — (а) процент в одном предложении со словом предоплаты, депозита или скидки:
+# опоры у процента нет ни в одном блоке вызова, его решает человек; (б) сумма в батах, которой нет среди сумм блока
+# «ЦЕНА» этого вызова (ставка, итог, депозит двери). Нашлось — причина MONEY_CLAIM_WORDS; текст ответа не правится.
+# Число без валюты («PCX 160», «7 суток») суммой не считается.
+_CLAIM_PCT = re.compile(r"(?<![\d.,])\d{1,3}(?:[.,]\d+)?\s*(?:%|процент\w*|percent\b|per\s+cent\b)", re.I)
+_CLAIM_PCT_WORDS = re.compile(
+    r"предоплат|предоплач|аванс|депозит|залог|скидк|скидоч|"
+    r"pre-?pay|prepaid|advance|down\s*payment|upfront|up-front|deposit|discount|(?<![-\w])off\b", re.I)
+_SENTENCE = re.compile(r"\n+|[.!?;…]+(?=\s|$)")
+_SP = " " + chr(0xA0) + chr(0x202F)            # пробел, неразрывный и узкий неразрывный — разделители тысяч
+_THB_GROUPED = r"\d{1,3}(?:[" + _SP + r",.]\d{3})+"
+_THB_NUM = _THB_GROUPED + r"(?!\d)|\d+(?:[.,]\d+)?"
+_CLAIM_THB = re.compile(
+    # «฿ 2 800», «THB 2,800», «฿3k»
+    r"(?:฿|\bthb\b|\bbaht\b)\s*(?P<pn>" + _THB_NUM + r")(?P<pm>[kк](?![a-zа-яё]))?"
+    # «2 800 ฿», «2800 бат», «2.8k baht», «1 500–2 800 ฿», «от 1 500 до 2 800 бат»
+    r"|(?<![\d.,])(?:(?P<rn>" + _THB_NUM + r")(?:[-–]|\s+(?:до|to)\s+))?(?P<sn>" + _THB_NUM + r")"
+    r"(?:\s*(?P<sm>k|к|тыс(?:\.|яч\w*)?)(?![a-zа-яё]))?\s*(?:฿|бат(?:а|ов|ы)?\b|thb\b|baht\w*)", re.I)
+
+
+def _thb_value(num, mult):
+    """Число суммы и множитель → int | None. Разделители тысяч (пробел, запятая, точка по три цифры) снимаются;
+    дробь — только с множителем («2,8k» = 2800)."""
+    num = str(num or "").strip()
+    if not num:
+        return None
+    if mult:
+        try:
+            return int(round(float(re.sub("[" + _SP + "]", "", num).replace(",", ".")) * 1000))
+        except ValueError:
+            return None
+    if re.fullmatch(_THB_GROUPED, num):
+        return int(re.sub(r"\D", "", num))
+    if re.fullmatch(r"\d+", num):
+        return int(num)
+    return None                                    # «2.5 бат» без множителя — не сумма аренды, судить нечем
+
+
+def thb_amounts(text):
+    """Текст → [сумма в батах, …] по порядку появления: «2 800 ฿», «2800 бат», «THB 2,800», «2.8k baht»;
+    у диапазона — обе границы. Число без валюты суммой не считается."""
+    out = []
+    for m in _CLAIM_THB.finditer(str(text or "")):
+        if m.group("pn") is not None:
+            pairs = [(m.group("pn"), m.group("pm"))]
+        else:
+            pairs = [(m.group("rn"), m.group("sm")), (m.group("sn"), m.group("sm"))]
+        for num, mult in pairs:
+            v = _thb_value(num, mult)
+            if v is not None:
+                out.append(v)
+    return out
+
+
+def money_claims(text, price=None):
+    """Текст черновика модели (+ исход цены этого вызова) → [(вид, что)] денежных утверждений без опоры:
+    ('процент', «30%») — процент в одном предложении со словом предоплаты, депозита или скидки;
+    ('сумма', 3500) — сумма в батах, которой нет среди сумм блока «ЦЕНА» (`price["line"]`). Пусто — опора есть
+    или денег в тексте нет."""
+    s = str(text or "")
+    out = []
+    for sent in _SENTENCE.split(s):
+        if _CLAIM_PCT_WORDS.search(sent):
+            out += [("процент", m.group(0).strip()) for m in _CLAIM_PCT.finditer(sent)]
+    line = price.get("line") if isinstance(price, dict) else None
+    known = set(thb_amounts(line))
+    out += [("сумма", v) for v in thb_amounts(s) if v not in known]
     return out
 
 
