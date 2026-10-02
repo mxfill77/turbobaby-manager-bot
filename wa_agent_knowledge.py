@@ -390,12 +390,15 @@ CAT_PRICE = "price"
 # WAMONEYCHECK0310: причина по ТЕКСТУ ЧЕРНОВИКА модели, а не по сообщению клиента — см. `money_claims` ниже
 R_MONEY_CLAIM = "money_claim"
 MONEY_CLAIM_WORDS = "денежное утверждение без опоры"
+# WAKNOWFRESH0310: причина по СНИМКУ ЗНАНИЙ — узел старше предела, его текста в промпте нет (см. `node_stale`)
+R_STALE = "stale_knowledge"
+STALE_WORDS = "знания устарели"
 _WORD_CATS = dict(
     [(REASON_WORDS[R_AVAILABILITY], R_AVAILABILITY), (REASON_WORDS[R_SEASON_CROSS], CAT_PRICE),
      (REASON_WORDS[R_NO_PRICE_MODEL], CAT_PRICE), (REASON_WORDS[R_LONG_TERM], CAT_PRICE),
      (REASON_WORDS[R_DISCOUNT], R_DISCOUNT), (REASON_WORDS[R_DOOR_NO_PRICE], CAT_PRICE),
      (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE),
-     (MONEY_CLAIM_WORDS, R_MONEY_CLAIM)]
+     (MONEY_CLAIM_WORDS, R_MONEY_CLAIM), (STALE_WORDS, R_STALE)]
     + [(words, key) for key, words in MONEY_WORDS.items()])
 _RULES = dict(_TEXT_RULES)
 _KEYWORD_CATS = ((R_AVAILABILITY, _RULES[R_AVAILABILITY]), (R_DISCOUNT, _RULES[R_DISCOUNT]))
@@ -542,35 +545,63 @@ def node_age(node, now=None):
     return max(0.0, (time.time() if now is None else now) - node["taken_at"])
 
 
+def node_stale(node, now=None):
+    """Снимок старше своего предела `max_stale` (WAKNOWFRESH0310): его текст модели не подаётся. Предела в узле
+    нет (узел не из `Knowledge`) — не устарел, как раньше."""
+    age, limit = node_age(node, now), (node or {}).get("max_stale")
+    return age is not None and limit is not None and age > limit
+
+
+# что было с узлом в ЭТОМ вызове `refresh` — для строки журнала (WAKNOWFRESH0310)
+CALL_READ, CALL_KEPT, CALL_FAILED = "прочитан", "не перечитывался", "не прочитан"
+
+
 class Knowledge:
     """Снимки узлов с возрастом. Перечитывает не чаще `max_age` секунд. Неудачное чтение НЕ
-    затирает прежний снимок и НЕ освежает его: возраст честно растёт, причина пишется рядом."""
+    затирает прежний снимок и НЕ освежает его: возраст честно растёт, причина пишется рядом.
+    Предел — `max_stale` (по умолчанию 3 × `max_age`, WAKNOWFRESH0310): снимок старше — НЕИЗВЕСТНО вместо
+    текста и причина «знания устарели»; до предела модель видит прежний текст с его возрастом."""
 
-    def __init__(self, read_doc, names=NODES, max_age=600):
+    def __init__(self, read_doc, names=NODES, max_age=600, max_stale=None):
         self.read_doc, self.names, self.max_age = read_doc, tuple(names), max_age
+        self.max_stale = 3 * max_age if max_stale is None else max_stale
         self.snap = {n: {"name": n, "read": False, "text": None, "len": 0, "taken_at": None,
-                         "why": "ещё не читался"} for n in self.names}
+                         "why": "ещё не читался", "max_stale": self.max_stale, "call": None} for n in self.names}
 
     def refresh(self, now=None):
         t = time.time() if now is None else now
         for n in self.names:
             age = node_age(self.snap[n], t)
             if age is not None and age < self.max_age:
+                self.snap[n] = dict(self.snap[n], call=CALL_KEPT)
                 continue
             got = read_node(n, self.read_doc, t)
             if got["read"]:
-                self.snap[n] = got
+                self.snap[n] = dict(got, max_stale=self.max_stale, call=CALL_READ)
             else:
-                self.snap[n] = dict(self.snap[n], why=got["why"])
+                self.snap[n] = dict(self.snap[n], why=got["why"], call=CALL_FAILED)
         return self.snap
 
 
+def stale_reasons(nodes, now=None):
+    """Узлы этого вызова → [причина «знания устарели»] | []: одна на все устаревшие узлы."""
+    old = [n for n in nodes or () if node_stale(n, now)]
+    if not old:
+        return []
+    return [{"reason": R_STALE, "words": STALE_WORDS,
+             "why": "снимок старше %d мин: %s" % (old[0]["max_stale"] // 60, ", ".join(n["name"] for n in old))}]
+
+
 def node_block(node, now=None):
-    """Узел → текст для промпта. Не прочитан — НЕИЗВЕСТНО словами, а не пусто."""
+    """Узел → текст для промпта. Не прочитан или снимок старше предела — НЕИЗВЕСТНО словами, без текста."""
     age = node_age(node, now)
     if age is None:
         return ("УЗЕЛ %s: НЕИЗВЕСТНО — не прочитан (%s). Не отвечай по памяти о том, что в нём; "
                 "где нужен он — «уточню у коллег»." % (node.get("name"), node.get("why") or "причина не названа"))
+    if node_stale(node, now):
+        return ("УЗЕЛ %s: НЕИЗВЕСТНО: снимок старше %d мин, %s. Не отвечай по памяти о том, что в нём; "
+                "где нужен он — «уточню у коллег»." % (node["name"], node["max_stale"] // 60,
+                                                       node.get("why") or "не освежён"))
     return "УЗЕЛ %s (снят %d мин назад, %d симв.):\n%s" % (
         node["name"], int(age // 60), node["len"], node["text"])
 

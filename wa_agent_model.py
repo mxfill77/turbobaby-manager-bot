@@ -10,7 +10,8 @@
   • МАСКА ДО МОДЕЛИ — `wa_agent_knowledge.mask` на всё, что пишет клиент или мы: пароли, ключи, коды,
     карты уходят меткой «[скрыто: …]»;
   • снимки узлов `faq` и `business_rules` с возрастом (`wa_agent_knowledge.Knowledge`); не прочитан —
-    НЕИЗВЕСТНО словами, а не пусто;
+    НЕИЗВЕСТНО словами, а не пусто. Снимок старше предела (`max_stale`, 3 × `max_age` = 30 мин, WAKNOWFRESH0310)
+    — тоже НЕИЗВЕСТНО, без текста, и причина «знания устарели» первой из причин кода;
   • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене И в его словах есть
     модель из парка И обе даты. Без дат или модели дверь цены не зовётся. Модель ищется по ключу живых имён
     парка (`wa_book_read.find_model`, WADRAFTFIX0210), дверь цены на вопрос — не больше одного раза;
@@ -35,7 +36,8 @@
 ANTHROPIC_API_KEY из .env корня дерева, учёт трат `spend_ledger.meter`). Значение ключа не печатается.
 
 ЖУРНАЛ — только номер черновика у ядра, объёмы, токены, причины словами. Текстов, номеров и имён
-клиентов в журнале нет.
+клиентов в журнале нет. Знания — строкой «знания: …» на каждый вызов (WAKNOWFRESH0310): имя узла, прочитан ли
+сейчас, длина, sha16 и возраст снимка; текста узлов в журнале нет.
 
 КЭШ ПРОМПТА (WAAGENTCACHE0210) — выключатель службы WA_AGENT_CACHE: «1h»/«5m» — срок, 1/true/yes/on — 1h,
 прочее и пусто — выключен (запрос байт-в-байт прежний). Включён — неизменная часть идёт ВПЕРЕДИ одним
@@ -47,6 +49,7 @@ ANTHROPIC_API_KEY из .env корня дерева, учёт трат `spend_le
 """
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -326,6 +329,9 @@ def node_stable(node, now=None):
     if K.node_age(node, now) is None:
         return ("УЗЕЛ %s: НЕИЗВЕСТНО — не прочитан (причина — в блоке «ВОЗРАСТ ЗНАНИЙ»). Не отвечай по памяти о "
                 "том, что в нём; где нужен он — «уточню у коллег»." % node.get("name"))
+    if K.node_stale(node, now):                       # старше предела — без текста (WAKNOWFRESH0310)
+        return ("УЗЕЛ %s: НЕИЗВЕСТНО: снимок старше %d мин (причина — в блоке «ВОЗРАСТ ЗНАНИЙ»). Не отвечай по "
+                "памяти о том, что в нём; где нужен он — «уточню у коллег»." % (node["name"], node["max_stale"] // 60))
     return "УЗЕЛ %s (%d симв.):\n%s" % (node["name"], node["len"], node["text"])
 
 
@@ -339,9 +345,36 @@ def ages_block(nodes, now=None):
     out = []
     for n in _by_name(nodes):
         age = K.node_age(n, now)
+        if K.node_stale(n, now):
+            out.append("%s — НЕИЗВЕСТНО: снимок старше %d мин, %s" % (n["name"], n["max_stale"] // 60,
+                                                                    n.get("why") or "не освежён"))
+            continue
         out.append("%s — %s" % (n.get("name"), "снят %d мин назад" % int(age // 60) if age is not None else
                                 "НЕИЗВЕСТНО: не прочитан (%s)" % (n.get("why") or "причина не названа")))
     return "ВОЗРАСТ ЗНАНИЙ: " + "; ".join(out)
+
+
+def sha16(text):
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:16]
+
+
+def knowledge_line(nodes, now=None):
+    """Узлы этого вызова → строка журнала (WAKNOWFRESH0310): имя, прочитан ли сейчас, длина, sha16 и возраст
+    снимка — без текста узла. Снимка нет или он старше предела — НЕИЗВЕСТНО словами."""
+    out = []
+    for n in _by_name(nodes):
+        s = "%s — %s" % (n.get("name"), n.get("call") or "не читался")
+        if n.get("call") == K.CALL_FAILED:
+            s += " (%s)" % str(n.get("why") or "причина не названа")[:120]
+        age = K.node_age(n, now)
+        if age is None:
+            out.append(s + ", снимка нет — НЕИЗВЕСТНО")
+            continue
+        s += ", снимок %d симв., sha16 %s, возраст %d с" % (n["len"], sha16(n["text"]), int(age))
+        if K.node_stale(n, now):
+            s += " > предела %d с — НЕИЗВЕСТНО, текста в промпте нет" % n["max_stale"]
+        out.append(s)
+    return "знания: " + "; ".join(out)
 
 
 def system_chars(system):
@@ -554,6 +587,9 @@ class ModelAdapter(wa_agent.Model):
             reasons = B.adjust_reasons(reasons, avail, rental, ask)
         nodes = self.knowledge.refresh(now)
         node_list = [nodes[n] for n in K.NODES]
+        self.log(knowledge_line(node_list, now))           # на каждый вызов, без текста узлов (WAKNOWFRESH0310)
+        # узел старше предела: его текста в промпте нет — черновик пишет человек; причина первой из причин кода
+        reasons = K.stale_reasons(node_list, now) + reasons
         parts = K.prompt_parts(price, reasons, node_list, now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
         blocks += self._knowledge_blocks(parts, node_list, now)
@@ -625,6 +661,7 @@ class ModelAdapter(wa_agent.Model):
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
         nodes = self.knowledge.refresh(now)
         node_list = [nodes[n] for n in K.NODES]
+        self.log(knowledge_line(node_list, now))
         parts = K.prompt_parts(None, [], node_list, now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
         blocks += self._knowledge_blocks(parts, node_list, now)
