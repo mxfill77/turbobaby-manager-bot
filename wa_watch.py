@@ -47,7 +47,6 @@ WINDOW = 86400                       # входящее старше суток 
 AUTO_SEC = 10                        # эхо ≤ 10 с после «первого» входящего — автоответ
 SILENCE = 14 * 86400                 # «первое» входящее: до него 14 суток тишины в обе стороны
 TRIES = 3                            # отказ Telegram с кодом — попыток всего
-TZ_SEC = 7 * 3600                    # Пхукет — для времени в сообщении
 SENDING, SENT, FAIL, UNSURE = "sending", "sent", "fail", "unsure"
 
 _SCHEMA = """
@@ -71,10 +70,6 @@ def fp(text):
 def wait_words(sec):
     m = int(sec // 60)
     return "%d мин" % m if m < 120 else "%d ч %02d мин" % (m // 60, m % 60)
-
-
-def _local_hm(ts):
-    return time.strftime("%H:%M", time.gmtime(float(ts) + TZ_SEC))
 
 
 class Watch:
@@ -189,7 +184,7 @@ class Watch:
                 "ответа нет: ни с телефона, ни из темы, ни по «Отправить», ни реакцией%s.\n"
                 "Порог %s — так долго мы не отвечали лишь в 1 беседе из 10 за 30 суток. "
                 "Следующее напоминание по этому клиенту — только после его нового сообщения."
-                % (wait_words(now - in_ts), self.head(number), _local_hm(in_ts),
+                % (wait_words(now - in_ts), self.head(number), wa_agent.hm_phuket(in_ts),
                    "; агент на паузе — черновика не будет до «Продолжить»" if paused and paused[0] else "",
                    wait_words(self.threshold)))
         try:

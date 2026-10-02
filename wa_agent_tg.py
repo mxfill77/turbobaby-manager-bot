@@ -436,7 +436,7 @@ class Tg(wa_agent.Telegram):
                        "правилом» (владелец или список WA_AGENT_LESSON_ADMINS)."
                        % (int(lesson_id), {"candidate": "кандидат", "active": "действующее правило",
                                            "rolled_back": "откатан"}.get(state, state),
-                          author, wa_agent._hm(ts), did, v1, v2, cut(was), cut(now),
+                          author, wa_agent.hm_phuket(ts), did, v1, v2, cut(was), cut(now),
                           cut(reason) if reason else "— (ответьте реплаем на это сообщение — запишу причиной)"))
 
     @staticmethod
@@ -642,7 +642,7 @@ class Tg(wa_agent.Telegram):
             if row and row[0]:
                 self.api("editMessageText", {"chat_id": self.chat, "message_id": int(row[0]),
                                              "text": (row[1] or "")[:TG_TEXT_MAX - 200] + "\n\n— продолжено: %s, %s"
-                                             % (who, wa_agent._hm(self.clock()))})
+                                             % (who, wa_agent.hm_phuket(self.clock()))})
         return self.answer(cq.get("id"), res["words"])
 
     def on_message(self, msg):

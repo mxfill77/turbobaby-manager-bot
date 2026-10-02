@@ -406,8 +406,14 @@ def media_text(media):
 
 # ═══ ядро ════════════════════════════════════════════════════════════════════════════════
 
-def _hm(ts):
-    return time.strftime("%H:%M", time.gmtime(float(ts))) + " UTC" if ts else "—"
+PHUKET_OFFSET = 7 * 3600                  # Пхукет, UTC+7 круглый год; тест сверяет с wa_history.PHUKET_OFFSET
+
+
+def hm_phuket(ts):
+    """«ЧЧ:ММ» по Пхукету — ОДНА функция времени для слов, которые видят сотрудники: карточки, ответы на нажатия,
+    сторож, напоминания, уроки (WADRAFTFIX0210; офис живёт по Пхукету, прежде здесь было UTC). Журнал службы
+    пишет своё время сам и сюда не ходит."""
+    return time.strftime("%H:%M", time.gmtime(float(ts) + PHUKET_OFFSET)) if ts else "—"
 
 
 def _int_or_none(x):
@@ -564,7 +570,7 @@ class Core:
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
         live = self._live_draft(number)
         if live and live[1] == PENDING:
-            self._close(live[0], SUPERSEDED, "снят: человек написал клиенту в теме %s" % _hm(now), now)
+            self._close(live[0], SUPERSEDED, "снят: человек написал клиенту в теме %s" % hm_phuket(now), now)
         self._pause(number, None, now, via="написал в теме")
 
     def relay(self, msg_id, number, text, who, now=None, media=None):
@@ -621,7 +627,7 @@ class Core:
         row = self.db.execute("SELECT resumed_by, resumed_at FROM clients WHERE number=?",
                               (number,)).fetchone()
         by, at = (row or (None, None))
-        return {"ok": False, "words": "уже продолжено: %s, %s" % (by or "—", _hm(at))}
+        return {"ok": False, "words": "уже продолжено: %s, %s" % (by or "—", hm_phuket(at))}
 
     # ── такт ──────────────────────────────────────────────────────────────────────────────
 
@@ -743,7 +749,7 @@ class Core:
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
         live = self._live_draft(number)
         if live and live[1] == PENDING:
-            self._close(live[0], SUPERSEDED, "снят: ответили с телефона %s" % _hm(now), now)
+            self._close(live[0], SUPERSEDED, "снят: ответили с телефона %s" % hm_phuket(now), now)
         self._pause(number, rid, now)
 
     def make_drafts(self, now):
@@ -812,8 +818,8 @@ class Core:
                 else self._decided(draft_id))
         ver = ver_now
         if by:
-            return "уже решено: %s, %s — %s" % (by, _hm(at), state)
-        return "уже решено: снят, %s — %s (версия %d)" % (_hm(closed), state, ver)
+            return "уже решено: %s, %s — %s" % (by, hm_phuket(at), state)
+        return "уже решено: снят, %s — %s (версия %d)" % (hm_phuket(closed), state, ver)
 
     def press(self, draft_id, ver, action, who, now=None):
         """Нажатие кнопки карточки. → {"ok": bool, "state": …, "words": …}."""
@@ -832,7 +838,7 @@ class Core:
                 return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
             self.log("черновик %d: отложенное отменено" % draft_id)
             self._tg("card_done", draft_id, self._card(draft_id),
-                     "отменено до срока: %s, %s — клиенту ничего не ушло" % (who, _hm(now)))
+                     "отменено до срока: %s, %s — клиенту ничего не ушло" % (who, hm_phuket(now)))
             return {"ok": True, "state": DECLINED, "words": "отменено — клиенту ничего не ушло"}
         if action == ACT_SEND and self.send_locked(draft_id, ver):
             # «нужен человек»: ДО захвата и до двери — черновик ждёт правки, кнопки живы
@@ -856,7 +862,7 @@ class Core:
         if action == ACT_DECLINE:
             self.db.execute("UPDATE drafts SET closed_at=? WHERE id=?", (now, draft_id))
             self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
-            self._tg("card_done", draft_id, self._card(draft_id), "не нужно: %s, %s" % (who, _hm(now)))
+            self._tg("card_done", draft_id, self._card(draft_id), "не нужно: %s, %s" % (who, hm_phuket(now)))
             return {"ok": True, "state": DECLINED, "words": "не отправляем"}
 
         # ── победитель: перепроверка очереди ДО двери ──
@@ -887,8 +893,8 @@ class Core:
                     return {"ok": False, "state": None, "words": self._decided(draft_id)}
                 # входящие до черновика закрыты решением: новый черновик — только на новое сообщение
                 self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
-                words = "уйдёт в %s" % _hm(due)
-                self._tg("card_wait", draft_id, self._card(draft_id), "%s — нажал %s, %s" % (words, who, _hm(now)),
+                words = "уйдёт в %s" % hm_phuket(due)
+                self._tg("card_wait", draft_id, self._card(draft_id), "%s — нажал %s, %s" % (words, who, hm_phuket(now)),
                          int(ver))
                 return {"ok": True, "state": SCHEDULED, "words": words}
         return self._deliver(draft_id, number, upto, text, who, now, CLAIMED)
@@ -909,7 +915,7 @@ class Core:
                         (state, str(res.get("reason") or "")[:300], wamid, now, draft_id, SENDING))
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
         self.log("черновик %d: дверь → %s" % (draft_id, state))
-        self._tg("card_done", draft_id, self._card(draft_id), "%s: %s, %s" % (state, who, _hm(now)))
+        self._tg("card_done", draft_id, self._card(draft_id), "%s: %s, %s" % (state, who, hm_phuket(now)))
         if state == SENT:
             # ушедшее агентом: история агента и строка в теме клиента (WARELAYTEXT0210)
             self._sent_out(wamid, number, text, VIA_AGENT, now)
@@ -1120,7 +1126,7 @@ class Core:
                     self.log("урок %d: кандидат (черновик %d, версия %d → %d, %s)" % (
                         lesson, draft_id, ver_now - 1, ver_now, who))
             self._tg("card_done", draft_id, old_card,
-                     "устарело: исправлено — %s, %s, действует версия %d" % (who, _hm(now), ver_now))
+                     "устарело: исправлено — %s, %s, действует версия %d" % (who, hm_phuket(now), ver_now))
             card = self._tg("card", draft_id, ver_now, number, text)
             self.db.execute("UPDATE drafts SET card_id=? WHERE id=?", (card, draft_id))
             if lesson:
@@ -1147,9 +1153,9 @@ class Core:
             return "урока №%d нет" % int(lesson_id)
         state, by, at, rby, rat = row
         if state == LESSON_ACTIVE:
-            return "уже решено: урок №%d — действующее правило: %s, %s" % (int(lesson_id), by, _hm(at))
+            return "уже решено: урок №%d — действующее правило: %s, %s" % (int(lesson_id), by, hm_phuket(at))
         if state == LESSON_ROLLED:
-            return "уже решено: урок №%d откатан: %s, %s" % (int(lesson_id), rby, _hm(rat))
+            return "уже решено: урок №%d откатан: %s, %s" % (int(lesson_id), rby, hm_phuket(rat))
         return "урок №%d — кандидат" % int(lesson_id)
 
     def _lesson_deny(self, lesson_id, what):
@@ -1170,7 +1176,7 @@ class Core:
         if n != 1:
             return {"ok": False, "state": None, "words": self._lesson_decided(lesson_id)}
         self.log("урок %d → действующий (%s)" % (int(lesson_id), who))
-        self._tg("lesson_done", int(lesson_id), "✅ действующее правило — %s, %s" % (who, _hm(now)),
+        self._tg("lesson_done", int(lesson_id), "✅ действующее правило — %s, %s" % (who, hm_phuket(now)),
                  LESSON_ACTIVE)
         return {"ok": True, "state": LESSON_ACTIVE,
                 "words": "урок №%d — действующее правило: идёт в промпт агента" % int(lesson_id)}
@@ -1187,7 +1193,7 @@ class Core:
         if n != 1:
             return {"ok": False, "state": None, "words": self._lesson_decided(lesson_id)}
         self.log("урок %d → откатан (%s)" % (int(lesson_id), who))
-        self._tg("lesson_done", int(lesson_id), "↩️ откатан — %s, %s; в промпт агента не идёт" % (who, _hm(now)),
+        self._tg("lesson_done", int(lesson_id), "↩️ откатан — %s, %s; в промпт агента не идёт" % (who, hm_phuket(now)),
                  LESSON_ROLLED)
         return {"ok": True, "state": LESSON_ROLLED,
                 "words": "урок №%d откатан — в промпт агента не идёт" % int(lesson_id)}

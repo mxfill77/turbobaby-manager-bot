@@ -12,7 +12,8 @@
   • снимки узлов `faq` и `business_rules` с возрастом (`wa_agent_knowledge.Knowledge`); не прочитан —
     НЕИЗВЕСТНО словами, а не пусто;
   • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене И в его словах есть
-    модель из парка И обе даты. Без дат или модели дверь цены не зовётся;
+    модель из парка И обе даты. Без дат или модели дверь цены не зовётся. Модель ищется по ключу живых имён
+    парка (`wa_book_read.find_model`, WADRAFTFIX0210), дверь цены на вопрос — не больше одного раза;
   • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас;
   • уроки людей (WAAGENTLESSON0210) — ТОЛЬКО действующие (`wa_agent.active_lessons`, своя база агента
     mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
@@ -220,19 +221,9 @@ def fleet_bikes(reply):
     return bikes if isinstance(bikes, list) else None
 
 
-def find_model(text, bikes):
-    """Модель из парка, названная в словах клиента (самое длинное совпадение) | None."""
-    t1, t2 = _alnum(text), _nocc(text)
-    best = None
-    for b in bikes or ():
-        m = model_of_name((b or {}).get("name"))
-        k1, k2 = _alnum(m), _nocc(m)
-        if len(k2) < 3:
-            continue
-        if (k1 and k1 in t1) or (k2 and k2 in t2):
-            if best is None or len(k1) > len(_alnum(best)):
-                best = m
-    return best
+# Модель в словах клиента — `wa_book_read.find_model` (ключ живых имён парка) и для цены, и для наличия
+# (WADRAFTFIX0210). Прежний поиск брал имя юнита без номерного знака: на живых именах вида
+# «XMAX 300CC NEW BLUE PHUKET 1234» это цвет и город, и модель не находилась никогда (замер 02.10: 0 из 13).
 
 
 def units_of(model, bikes):
@@ -504,7 +495,7 @@ class ModelAdapter(wa_agent.Model):
             self.log("парк не прочитан: %s" % type(e).__name__)
         if bikes is None:
             return K.quote("?", dates[0], dates[1], self.door, lambda m: None), "парк не прочитан"
-        model = find_model(ask, bikes)
+        model = B.find_model(ask, bikes)                            # ключ модели — живые имена парка
         if not model:
             return None, "о цене спрашивают без модели из парка — дверь не звана"
         res = K.quote(model, dates[0], dates[1], self.door, lambda m: units_of(m, bikes),
