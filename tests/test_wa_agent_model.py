@@ -225,7 +225,8 @@ def test_handoff_mark_send_locked_until_fix():
     assert len(d) == 1 and json.loads(d[0][4]) and "жалоба" in json.loads(d[0][4]), d
     card = w.http.of("sendMessage")[0]
     assert "🙋 НУЖЕН ЧЕЛОВЕК" in card["text"] and "жалоба" in card["text"], card["text"]
-    assert K.REASON_WORDS[K.R_MONEY] in card["text"], card["text"]          # причина кода
+    # причина кода — сработавший ярлык денег, а не весь перечень (WACARDCOMPACT0310)
+    assert "повреждения и штрафы" in card["text"] and K.REASON_WORDS[K.R_MONEY] not in card["text"], card["text"]
     assert buttons(card) == ["wa:fix:1:1", "wa:no:1:1"], buttons(card)
     w.press("wa:send:1:1", 101)                                              # старая/подделанная кнопка
     assert w.door.sends == [] and w.answers()[-1] == A.HANDOFF_LOCK_WORDS[:G.ANSWER_MAX], w.answers()

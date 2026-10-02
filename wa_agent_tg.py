@@ -17,6 +17,13 @@
 (WACARDDONEFIX0210). Контракт `card_done` прежний — сеть без ответа там False. Вопрос паузы — кнопка `wa:go:<id клиента>:<пауза>`: в
 `callback_data` номера телефона нет, id клиента — короткий номер строки своей таблицы.
 
+КОМПАКТНАЯ КАРТОЧКА (WACARDCOMPACT0310). Сверху — полный ответ клиенту, он не режется; ниже — до трёх
+действий сотрудника по сработавшим категориям «нужен человек», состояние «Отправить» (дверь закрыта — на
+любой версии «отправка выключена — ответьте клиенту сами»), подсказка про реплай; в самом низу — подробности
+(тема, полный список оснований). Не влезает — первыми режутся подробности с числом скрытых знаков; не
+влезает сам ответ — он уходит отдельным сообщением перед карточкой (`tg_card_parts`, реплай на него — та же
+правка). «why» модели на карточке не показывается.
+
 «ИСПРАВИТЬ». Кнопка только подсказывает; правка — РЕПЛАЙ человека на карточку: `Core.revise` с
 версией карточки, новая карточка версии +1, «Отправить» на ней шлёт текст человека дословно.
 Реплай на прежнюю версию — «устарело».
@@ -75,6 +82,7 @@ import urllib.error
 import urllib.request
 
 import wa_agent
+import wa_agent_knowledge as K
 import wa_kind
 import wa_send
 
@@ -124,8 +132,35 @@ WA_FULL_FORM = {
 ACTIONS = {"send": wa_agent.ACT_SEND, "no": wa_agent.ACT_DECLINE,
            "cancel": wa_agent.ACT_CANCEL}         # «Отменить» отложенного по ритму (WAHUMANPACE0210)
 
+# компактная карточка (WACARDCOMPACT0310)
+CARD_ROOM = TG_TEXT_MAX - 200       # card_done/card_wait дописывают исход к телу и режут его по этой границе
+ACTIONS_MAX = 3
+REASON_SHOW_MAX = 120               # причина без категории — строкой действия, не длиннее
+CARD_ACTIONS = {
+    K.R_AVAILABILITY: "наличие и брони: проверьте и решите сами — агент не решает",
+    K.CAT_PRICE: "цена: посчитайте сами — агент числа не назвал",
+    K.R_DISCOUNT: "скидка: решите сами — агент её не обещает",
+    K.MONEY_DAMAGE: "повреждения и штрафы: разберите сами",
+    K.MONEY_DEPOSIT: "депозит: сверьте сумму и условия возврата",
+    K.MONEY_DISPUTE: "спор: ответьте клиенту сами",
+    K.MONEY_PAYMENT: "оплата: проверьте поступление",
+    K.R_MONEY: "деньги (повреждения, штрафы, депозит, спор или оплата): разберите сами",
+    K.R_LANGUAGE: "язык: проверьте, что ответ на языке клиента",
+}
+W_HAND = "🙋 НУЖЕН ЧЕЛОВЕК — сделайте:"
+W_DOOR_CLOSED = "⛔ отправка выключена — ответьте клиенту сами"
+W_SEND_LOCKED = "«Отправить» — на исправленной версии"
+W_SEND_OPEN = "исправлено человеком — «Отправить» открыто"
+W_HINT = "✏️ ответьте на карточку полным готовым текстом для клиента — он целиком станет новой версией"
+W_FOLLOW = "🔔 НАПОМИНАНИЕ — клиент молчит после нашего ответа; написал сам до нажатия — карточка «устарело»"
+DETAILS_SEP = "\n\n── подробности ──\n"
+W_DETAILS_CUT = "…\n(скрыто знаков подробностей: %d)"
+W_DETAILS_HIDDEN = "\n\n(подробности скрыты: %d знаков)"
+W_ANSWER_LEAD = " · ответ клиенту целиком, карточка — следующим сообщением:\n\n"
+W_ANSWER_ABOVE = "\n↑ ответ клиенту — сообщением выше (%d знаков)\n\n"
+
 # уроки людей (WAAGENTLESSON0210)
-LESSON_TEXT_MAX = 1500                            # было/стало в сообщении урока, символов
+LESSON_TEXT_MAX = 1500                           # было/стало в сообщении урока, символов
 RX_ROLLBACK = re.compile(r"(?i)^\s*откатить\s+(?:урок\s+)?№?\s*(\d+)\s*$")
 
 _SCHEMA = """
@@ -138,6 +173,11 @@ CREATE TABLE IF NOT EXISTS tg_cards (
     draft_id  INTEGER NOT NULL,
     ver       INTEGER NOT NULL,
     body      TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_card_parts (
+    msg_id    INTEGER PRIMARY KEY,                   -- ответ клиенту отдельным сообщением (WACARDCOMPACT0310)
+    draft_id  INTEGER NOT NULL,
+    ver       INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tg_pauses (
     cid       INTEGER NOT NULL,
@@ -275,6 +315,82 @@ def wa_emoji(tg) -> str:
     return WA_FULL_FORM.get(tg, tg or "")
 
 
+# ── компактная карточка (WACARDCOMPACT0310): чистые функции ───────────────────────────────
+
+def card_actions(hand):
+    """Причины «нужен человек» → [действия сотрудника] по категориям, без повторов, в порядке причин.
+    Причина без категории — её слова как есть (не длиннее REASON_SHOW_MAX)."""
+    acts, seen = [], set()
+    for w in hand or ():
+        for cat in K.word_categories(w) or [None]:
+            key = cat or "text:" + K._norm(w)
+            if key in seen:
+                continue
+            seen.add(key)
+            words = str(w).strip()
+            acts.append(CARD_ACTIONS.get(cat) or (words if len(words) <= REASON_SHOW_MAX
+                                                  else words[:REASON_SHOW_MAX - 1] + "…"))
+    return acts
+
+
+def card_notes(hand, ver, door_open, follow=False, lesson=None):
+    """Строки под ответом: напоминание, до ACTIONS_MAX действий, «Отправить», урок, подсказка про реплай."""
+    lines = [W_FOLLOW] if follow else []
+    acts = card_actions(hand)
+    if acts:
+        lines.append(W_HAND)
+        lines += ["• " + a for a in acts[:ACTIONS_MAX]]
+        if len(acts) > ACTIONS_MAX:
+            lines.append("• ещё %d — в подробностях" % (len(acts) - ACTIONS_MAX))
+    if not door_open:
+        lines.append(W_DOOR_CLOSED)                  # на любой версии: пока дверь закрыта, клиенту не уйдёт
+    elif hand and ver == 1:
+        lines.append(W_SEND_LOCKED)
+    elif hand:
+        lines.append(W_SEND_OPEN)
+    if lesson:
+        lines.append("📚 урок №%d записан кандидатом — «Сделать правилом» под ним" % lesson)
+    lines.append(W_HINT)
+    return "\n".join(lines)
+
+
+def card_details(hand, link):
+    """Подробности — режутся первыми: тема клиента и ПОЛНЫЙ список оснований."""
+    lines = ["тема: " + link if link else "темы в показе нет"]
+    if hand:
+        lines.append("основания (%d): %s" % (len(hand), "; ".join(str(w) for w in hand)))
+    return "\n".join(lines)
+
+
+def fit_details(head, details, room=CARD_ROOM):
+    """head + подробности в room знаков: целиком · урезанные с числом скрытых · скрытые с числом · None
+    (не влезает и head — ответ пойдёт отдельным сообщением)."""
+    full = head + (DETAILS_SEP + details if details else "")
+    if len(full) <= room:
+        return full
+    keep = room - len(head) - len(DETAILS_SEP) - len(W_DETAILS_CUT % len(details))
+    if keep >= 1:
+        return head + DETAILS_SEP + details[:keep] + W_DETAILS_CUT % (len(details) - keep)
+    hidden = head + W_DETAILS_HIDDEN % len(details)
+    return hidden if len(hidden) <= room else None
+
+
+def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX):
+    """→ [тексты сообщений]; последнее — карточка с кнопками. Ответ клиенту не режется НИКОГДА: не влезает
+    карточка — режутся подробности; не влезает сам ответ — он уходит отдельно (длиннее сообщения —
+    подряд несколькими), карточка — следующим сообщением."""
+    one = fit_details(top + "\n\n" + answer + "\n\n" + notes, details, room)
+    if one is not None:
+        return [one]
+    first = top + W_ANSWER_LEAD
+    parts, rest = [first + answer[:msg_max - len(first)]], answer[msg_max - len(first):]
+    while rest:
+        parts.append(rest[:msg_max])
+        rest = rest[msg_max:]
+    card_head = top + W_ANSWER_ABOVE % len(answer) + notes
+    return parts + [fit_details(card_head, details, room) or card_head[:room]]
+
+
 class Tg(wa_agent.Telegram):
     def __init__(self, token, enabled=False, chat_id=AGENTS_CHAT, show_chat=None, mirror_db=None,
                  http=None, clock=time.time, log=None, react=False, react_send=None, relay=False, watch=False):
@@ -367,44 +483,50 @@ class Tg(wa_agent.Telegram):
             return None
         # «нужен человек» (WAAGENTMODEL0210): пометка с причинами; на версии модели «Отправить» нет —
         # оно появляется на исправленной версии (замок в ядре тот же: Core.send_locked)
+        # «нужен человек» (WAAGENTMODEL0210): причины; на версии модели «Отправить» нет — оно появляется на
+        # исправленной версии (замок в ядре тот же: Core.send_locked)
         probe = getattr(self.core, "handoff", None)
         hand = probe(draft_id) if probe else []
-        mark = ""
-        if hand:
-            mark = "🙋 НУЖЕН ЧЕЛОВЕК: " + "; ".join(hand) + "\n" + (
-                "«Отправить» — после «Исправить» (ответьте реплаем своим текстом)\n" if ver == 1
-                else "исправлено человеком — «Отправить» открыто\n")
         # урок людей (WAAGENTLESSON0210): эта версия — правка, записанная кандидатом урока
         lesson = getattr(self.core, "lesson_of", None)
         lesson = lesson(draft_id, ver) if lesson and ver > 1 else None
-        if lesson:
-            mark += "📚 урок №%d записан кандидатом — «Сделать правилом» под ним\n" % lesson
         # напоминание притихшему (WAFOLLOWUP0210): помечено — это не ответ на сообщение клиента
         kind = getattr(self.core, "draft_kind", None)
         follow = bool(kind) and kind(draft_id) == wa_agent.KIND_FOLLOW
-        if follow:
-            mark = ("🔔 НАПОМИНАНИЕ — клиент молчит после нашего ответа; написал сам до нажатия — карточка "
-                    "«устарело»\n") + mark
-        body = "%s №%d · версия %d\n%s\n%s\n%s" % ("🔔 Напоминание" if follow else "📝 Черновик", draft_id, ver,
-                                                   self._head(number), mark, text)
-        if len(body) > TG_TEXT_MAX:
-            body = body[:TG_TEXT_MAX - 60] + "\n… (показ обрезан; «Отправить» шлёт текст целиком)"
+        # дверь отправки (WA_SEND): та же проба, что у нажатия «Отправить»; пробы нет — открыта
+        door = getattr(self.core, "_door_open", None)
+        door_open = door() if door else True
+        name, link = self._topic(number)
+        top = "%s №%d · версия %d · %s" % ("🔔 Напоминание" if follow else "📝 Черновик", draft_id, ver, name)
+        texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson),
+                           card_details(hand, link))
         row = [{"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
                {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]
         if not (hand and ver == 1):
             row.insert(0, {"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)})
         kb = {"inline_keyboard": [row]}
-        ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": body, "reply_markup": kb})
-        if ok is None:
-            # ответа нет (сеть, таймаут) — карточка могла лечь: это не отказ (WACARDDONEFIX0210), ядро считает
-            # «неизвестно» и повторяет — возможна вторая карточка
-            raise wa_agent.AnswerLost("sendMessage: ответа нет")
-        if not ok:
-            return None
-        mid = int(res.get("message_id"))
-        self.db.execute("INSERT OR REPLACE INTO tg_cards(card_id, draft_id, ver, body) VALUES(?,?,?,?)",
-                        (mid, draft_id, ver, body))
-        self.log("карточка: черновик %d версия %d → сообщение %d" % (draft_id, ver, mid))
+        mid = None
+        for i, body in enumerate(texts):
+            card = i == len(texts) - 1
+            params = {"chat_id": self.chat, "text": body}
+            if card:
+                params["reply_markup"] = kb
+            ok, res = self.api("sendMessage", params)
+            if ok is None:
+                # ответа нет (сеть, таймаут) — карточка могла лечь: это не отказ (WACARDDONEFIX0210), ядро считает
+                # «неизвестно» и повторяет — возможна вторая карточка
+                raise wa_agent.AnswerLost("sendMessage: ответа нет")
+            if not ok:
+                return None
+            mid = int(res.get("message_id"))
+            if card:
+                self.db.execute("INSERT OR REPLACE INTO tg_cards(card_id, draft_id, ver, body) VALUES(?,?,?,?)",
+                                (mid, draft_id, ver, body))
+            else:
+                self.db.execute("INSERT OR REPLACE INTO tg_card_parts(msg_id, draft_id, ver) VALUES(?,?,?)",
+                                (mid, draft_id, ver))
+        self.log("карточка: черновик %d версия %d → сообщение %d%s" % (
+            draft_id, ver, mid, " (ответ отдельно: сообщений %d)" % (len(texts) - 1) if len(texts) > 1 else ""))
         return mid
 
     def card_done(self, draft_id, card_id, words):
@@ -668,6 +790,9 @@ class Tg(wa_agent.Telegram):
             return
         card = self.db.execute("SELECT draft_id, ver FROM tg_cards WHERE card_id=?",
                                (reply,)).fetchone() if reply else None
+        if not card and reply:
+            # реплай на ответ клиенту, ушедший отдельным сообщением перед карточкой (WACARDCOMPACT0310)
+            card = self.db.execute("SELECT draft_id, ver FROM tg_card_parts WHERE msg_id=?", (reply,)).fetchone()
         if not card:
             return
         if frm.get("is_bot"):

@@ -278,8 +278,32 @@ def lang_of(text):
     return "en"
 
 
+# R_MONEY — один ключ «нужен человек», и поднимает его то же выражение выше (не меняется). На карточку и в
+# промпт идёт СРАБОТАВШИЙ ярлык (WACARDCOMPACT0310): вопрос о депозите — «депозит», а не весь перечень денег.
+# Альтернативы четырёх ярлыков вместе РАВНЫ альтернативам выражения R_MONEY (тест сверяет множества).
+# «верните»/refund — к депозиту: в аренде байка возврат денег — это возврат депозита.
+MONEY_DAMAGE, MONEY_DEPOSIT, MONEY_DISPUTE, MONEY_PAYMENT = "damage_fines", "deposit", "dispute", "payment"
+MONEY_LABELS = (
+    (MONEY_DAMAGE, "повреждения и штрафы", re.compile(
+        r"поврежд|царап|вмятин|разбил|сломал|авари|\bдтп|\bупал|штраф|"
+        r"damage|scratch|\bdent|crash|accident|\bbroke|\bfined\b|penalt", re.I)),
+    (MONEY_DEPOSIT, "депозит", re.compile(r"депозит|залог|верн[иуё]те|refund|deposit", re.I)),
+    (MONEY_DISPUTE, "спор", re.compile(r"\bспор(?!т)|оспор|претенз|жалоб|dispute|complain", re.I)),
+    (MONEY_PAYMENT, "оплата", re.compile(
+        r"оплат|оплач|переве[лд]|перевёл|перевод(?!чик)|\bчек\b|\bpaid\b|payment|\bpay\b|transfer|receipt|"
+        r"invoice", re.I)),
+)
+
+
+def money_labels(text):
+    """Текст → [(ярлык, слова)] сработавших денежных ярлыков, в порядке MONEY_LABELS."""
+    s = str(text or "")
+    return [(key, words) for key, words, rx in MONEY_LABELS if rx.search(s)]
+
+
 def handoff(text, price=None):
-    """Текст клиента (+ исход цены) → [{reason, words, why}] без повторов, в порядке REASONS."""
+    """Текст клиента (+ исход цены) → [{reason, words, why}] в порядке REASONS, ключи без повторов, кроме
+    R_MONEY: у него строка на каждый сработавший ярлык (`label`, WACARDCOMPACT0310)."""
     found = {}
     s = str(text or "")
     for reason, rx in _TEXT_RULES:
@@ -290,7 +314,60 @@ def handoff(text, price=None):
         found[R_LANGUAGE] = "язык сообщения"
     if isinstance(price, dict) and price.get("outcome") == PRICE_HUMAN and price.get("reason"):
         found.setdefault(price["reason"], price.get("why") or "")
-    return [{"reason": r, "words": w, "why": found[r]} for r, w in REASONS if r in found]
+    out = []
+    for r, w in REASONS:
+        if r not in found:
+            continue
+        labels = money_labels(s) if r == R_MONEY else []
+        if labels:
+            out += [{"reason": r, "label": key, "words": words, "why": found[r]} for key, words in labels]
+        else:
+            out.append({"reason": r, "words": w, "why": found[r]})
+    return out
+
+
+# ------------------------------- категории причин (карточка, дедуп) -------------------------------
+
+# WACARDCOMPACT0310: слова причины → категории → действия сотрудника на карточке. Причины кода узнаются
+# по своим словам, причины модели — теми же выражениями, что поднимают «нужен человек». Не узнана —
+# категорий нет: карточка показывает слова как есть, дедуп — по тексту. Цена человеком — одна категория.
+CAT_PRICE = "price"
+_WORD_CATS = dict(
+    [(REASON_WORDS[R_AVAILABILITY], R_AVAILABILITY), (REASON_WORDS[R_SEASON_CROSS], CAT_PRICE),
+     (REASON_WORDS[R_NO_PRICE_MODEL], CAT_PRICE), (REASON_WORDS[R_LONG_TERM], CAT_PRICE),
+     (REASON_WORDS[R_DISCOUNT], R_DISCOUNT), (REASON_WORDS[R_DOOR_NO_PRICE], CAT_PRICE),
+     (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE)]
+    + [(words, key) for key, words, _rx in MONEY_LABELS])
+_RULES = dict(_TEXT_RULES)
+_KEYWORD_CATS = ((R_AVAILABILITY, _RULES[R_AVAILABILITY]), (R_DISCOUNT, _RULES[R_DISCOUNT])) + tuple(
+    (key, rx) for key, _words, rx in MONEY_LABELS)
+
+
+def word_categories(word):
+    """Слова причины → [категории] (слова кода — ровно одна; причина модели — все сработавшие) | []."""
+    w = str(word or "").strip()
+    if w in _WORD_CATS:
+        return [_WORD_CATS[w]]
+    return [cat for cat, rx in _KEYWORD_CATS if rx.search(w)]
+
+
+def merge_reasons(words, extra):
+    """Причины кода + причины модели → список без повторов ПО КАТЕГОРИИ (WACARDCOMPACT0310): причина модели
+    отпадает, только если все её категории уже названы; без категории — по тексту (регистр и знаки не
+    различаются). Непустое пустым не становится: при пустом списке первая причина модели остаётся всегда."""
+    out = [str(w) for w in words or ()]
+    cats, texts = set(), set()
+    for w in out:
+        cats.update(word_categories(w))
+        texts.add(_norm(w))
+    for h in extra or ():
+        got = word_categories(h)
+        if (got and set(got) <= cats) or _norm(h) in texts:
+            continue
+        out.append(h)
+        cats.update(got)
+        texts.add(_norm(h))
+    return out
 
 
 # ------------------------------- узлы мозга -------------------------------

@@ -593,9 +593,7 @@ class ModelAdapter(wa_agent.Model):
         words = [r["words"] for r in info["code_reasons"]]
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
-        for h in got["handoff"]:
-            if h not in words:
-                words.append(h)
+        words = K.merge_reasons(words, got["handoff"])      # дедуп по категории (WACARDCOMPACT0310)
         self.log("модель: черновик %d симв., история %d строк / %d симв., маска %d, %s, причин %d (%s)"
                  % (len(got["text"]), info["history_items"], info["history_chars"], info["masked"],
                     info["price_words"], len(words), tok))
