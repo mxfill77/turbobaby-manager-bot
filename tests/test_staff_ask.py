@@ -188,8 +188,10 @@ def test_a1_bike_question_topic_and_delivery():
     txt = t[0]["text"] if t else ""
     check("A1 пост: тайский и русский, вопрос на обоих", "🇹🇭" in txt and "🇷🇺" in txt and Q_TH in txt and Q_RU in txt
           and txt.index("🇹🇭") < txt.index("🇷🇺"), txt)
-    check("A1 пост: обращение @username из THAI_HANDLES, имени нет",
-          all(h in txt for h in S.THAI_HANDLES.values()) and "Пым" not in txt and "тайц" not in txt.lower(), txt)
+    th_part, ru_part = (txt.split("🇷🇺", 1) + [""])[:2]
+    check("A1 пост: обращение @username из THAI_HANDLES в обеих половинах, имени нет",
+          all(h in th_part and h in ru_part for h in S.THAI_HANDLES.values())
+          and "Пым" not in txt and "тайц" not in txt.lower(), txt)
     check("A1 пост: вежливо, без давления (ครับ / «когда будет минутка»)",
           "ครับ" in txt and "когда будет минутка" in txt and "срочно!" not in txt.lower(), txt)
     check("A1 Delivery: одна просьба, без вопроса целиком, со ссылкой на пост темы",
@@ -241,6 +243,12 @@ def test_a3_reply_to_brain_with_source():
         check("A3 прежнее содержимое узла сохранено", br.doc.startswith("ОТВЕТЫ СОТРУДНИКОВ ОФИСА"), br.doc[:60])
         run(S.staff_ask_reply(m, br))
         check("A3 повтор того же реплая — второй записи нет", len(br.writes) == 1, len(br.writes))
+        calls = []
+        r2 = staff_ask.on_reply(lambda line: (calls.append(line), (True, ""))[1], chat=SVC, reply_to=qmid,
+                                mid=m.message_id, user_id=4242, username="staff_fixture", is_bot=False,
+                                text="да, готов, бак полный", ts=ts)
+        check("A3 повтор реплая — модуль не зовёт мозг вовсе (не только узел отказал)",
+              not calls and not r2["recorded"] and "уже записан" in r2["why"], (calls, r2))
         m2 = Msg(DLV, "посмотрю после обеда", reply_to=dmid, uname="staff_two", uid=5151)
         run(S.staff_ask_reply(m2, br))
         check("A3 реплай на просьбу в Delivery → запись с местом Delivery",
