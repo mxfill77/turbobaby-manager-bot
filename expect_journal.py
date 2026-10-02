@@ -79,6 +79,7 @@ SHORT = {
     "o5_bridge_down": "О5", "o5_bridge_slow": "О5", "o6_pc_task": "О6",
     "o7_child_down": "О7", "o7_pulse_lost": "О7", "o8_lane_dead": "О8",
     "o9_wa_mirror": "О9", "o9_wa_unknown": "О9",
+    "o10_wa_inbound": "О10", "o10_wa_unknown": "О10",
 }
 WHAT = {
     "o1_new_vps": "строка очереди не взята при свободном исполнителе",
@@ -95,6 +96,8 @@ WHAT = {
     "o8_lane_dead": "полоса ПК не может выполнить ни одного захода (череда внешних отказов)",
     "o9_wa_mirror": "показ WhatsApp клиентов в Telegram не выполняет обещание (10 минут)",
     "o9_wa_unknown": "идёт ли показ WhatsApp в Telegram — неизвестно",
+    "o10_wa_inbound": "WhatsApp не присылает нам сообщения клиентов (адрес вебхука или номер у 360dialog)",
+    "o10_wa_unknown": "присылает ли WhatsApp нам сообщения клиентов — неизвестно",
 }
 
 
@@ -193,6 +196,12 @@ def heavy(v, facts=None, frozen_client=True):
         # Тот же довод, что у О7 «строки нет»: предмет — ОТСУТСТВИЕ сведений о показе, а не факт
         # о нём. В мозг уходит всё; владельцу решать по незнанию нечего.
         return False, "предмет — отсутствие сведений о показе, а не факт о нём: решать нечего"
+    if kind == "o10_wa_inbound":
+        # ПРЕДМЕТ — ВХОД КЛИЕНТОВ: пока это так, ни одно сообщение WhatsApp до нас не дойдёт.
+        # Доказано положительным ответом 360dialog, чинится только владельцем (настройка канала).
+        return True, "назван клиентский контур: вход WhatsApp клиентов"
+    if kind == "o10_wa_unknown":
+        return False, "предмет — отсутствие ответа 360dialog о входе, а не факт о нём: решать нечего"
     if kind in ("o4_pc_silent", "o6_pc_task"):
         # ОДИН ПРЕДМЕТ — ОДИН ВЕС: и «следа нет», и «взяла и молчит» суть наблюдения о МАШИНЕ ПК,
         # а она несёт клиентский контур. Развести их весами значило бы дать одному решению
@@ -315,6 +324,12 @@ def number(v):
             return NO_NUMBER
         return "%s (порог %s)" % (str(v.get("why"))[:200], _age(v.get("limit")))
     if kind == "o9_wa_unknown":
+        if not v.get("why"):
+            return NO_NUMBER
+        return "%s · адрес %s" % (str(v.get("why"))[:160], str(v.get("addr") or "?")[:80])
+    if kind == "o10_wa_inbound":
+        return str(v.get("why"))[:200] if v.get("why") else NO_NUMBER
+    if kind == "o10_wa_unknown":
         if not v.get("why"):
             return NO_NUMBER
         return "%s · адрес %s" % (str(v.get("why"))[:160], str(v.get("addr") or "?")[:80])

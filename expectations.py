@@ -575,6 +575,14 @@ BRIDGE_SLOW_ENV, BRIDGE_SLOW_DEFAULT = "EXPECT_BRIDGE_SLOW_SEC", 240.0
 # Период таймера тоже 10 мин, поэтому худший случай обнаружения — 20 мин от прихода строки.
 # Откат — EXPECT_WA_MIRROR_MIN=0: ветка мертва ДО чтения фактов.
 WA_MIRROR_MIN_ENV, WA_MIRROR_MIN_DEFAULT = "EXPECT_WA_MIRROR_MIN", 10.0
+# О10 (02.10.2026): вход WhatsApp — у 360dialog адрес вебхука НАШ и номер подключён. Не счёт и не
+# порог времени: выключатель (1 — спрашивать каждый такт, 0 — ветка мертва ДО обращения к миру).
+WA_INBOUND_ENV, WA_INBOUND_DEFAULT = "EXPECT_WA_INBOUND", 1.0
+# Отсрочка О10 — НОЛЬ: ОТКАЗ выносится только по ПОЛОЖИТЕЛЬНОМУ ответу 360dialog («адрес не наш»,
+# «номер BLOCKED»), а это настройка, которая сама не мигает. Всё, что мигает (транспорт, 5xx,
+# незнакомая форма), уходит в НЕИЗВЕСТНО — лёгкое, владельцу не идёт. Отсрочка слоя (60 мин)
+# держала бы мёртвый вход час после того, как это уже доказано.
+WA_INBOUND_DEFER_SEC = 0.0
 
 VPS_LANE = "vps"
 OPEN_STATUSES = ("new", "in_progress", "needs_approval", "approved")
@@ -584,7 +592,8 @@ STEP_RE = re.compile(r"^\[шаг (\d+)/(\d+) родитель (\d+)\]")   # зе
 
 KINDS = ("o1_new_vps", "o2_daemon", "o2_splinter", "o3_undelivered", "o3_unknown",
          "o4_pc_silent", "o5_bridge_down", "o5_bridge_slow", "o6_pc_task",
-         "o7_child_down", "o7_pulse_lost", "o8_lane_dead", "o9_wa_mirror", "o9_wa_unknown")
+         "o7_child_down", "o7_pulse_lost", "o8_lane_dead", "o9_wa_mirror", "o9_wa_unknown",
+         "o10_wa_inbound", "o10_wa_unknown")
 
 
 def limit_env(name, default, env=None, scale=60.0):
@@ -626,6 +635,8 @@ def config(env=None):
         # СЕКУНДЫ: длительность одного вызова, а не возраст факта — отсюда scale=1.
         "bridge_slow": limit_env(BRIDGE_SLOW_ENV, BRIDGE_SLOW_DEFAULT, env, scale=1.0),
         "wa_mirror": limit_env(WA_MIRROR_MIN_ENV, WA_MIRROR_MIN_DEFAULT, env),
+        # ВЫКЛЮЧАТЕЛЬ, а не время: scale=1, 0 — откат.
+        "wa_inbound": limit_env(WA_INBOUND_ENV, WA_INBOUND_DEFAULT, env, scale=1.0),
     }
 
 
@@ -2317,6 +2328,93 @@ def _o9(facts, cfg, now):
     return []
 
 
+# ═══════════ О10: ВХОД WhatsApp — 360dialog ШЛЁТ НАМ, И НОМЕР ПОДКЛЮЧЁН (02.10.2026) ════════════
+# Без подсчётов: тишину клиентов и мёртвый вход по числу сообщений не отличить. Предмет — две
+# настройки у 360dialog, от которых доставка зависит целиком: адрес вебхука и состояние номера.
+# Факты собирают руки (`expect_wa_inbound.facts`) — два GET за такт, значения ключа и адреса в
+# факты не попадают (только совпадение частей и отпечатки).
+# ПРЕДЕЛ ПРИБОРА: 360dialog говорит «адрес наш, номер подключён», а доставка всё равно стоит (их
+# очередь, сеть до нас, наш вход) — прибор молчит. Это не О10, а поток событий.
+WAI_OK, WAI_FAIL, WAI_UNKNOWN = "в порядке", "ОТКАЗ", "НЕИЗВЕСТНО"
+
+
+def wa_inbound_state(facts, cfg, now):
+    """→ (исход, info). ОТКАЗ любой части сильнее НЕИЗВЕСТНО другой; «в порядке» — только когда обе
+    части доказаны. info: why — словами; what — ключ эпизода; addr — где не удалось узнать."""
+    f = (facts or {}).get("wa_inbound")
+    if not isinstance(f, dict):
+        return WAI_UNKNOWN, {"what": "facts", "why": "фактов о входе нет",
+                             "addr": "expect_wa_inbound.facts"}
+    k = _wam_part(f, "keys")
+    if k.get("err"):
+        return WAI_UNKNOWN, {"what": "keys", "why": k.get("err"), "addr": k.get("addr") or "?"}
+    if not k.get("key"):
+        return WAI_UNKNOWN, {"what": "keys", "why": "ключ канала WA_D360_API_KEY не задан — "
+                                                    "спросить 360dialog нечем",
+                             "addr": k.get("addr") or "?"}
+    h, n = _wam_part(f, "hook"), _wam_part(f, "number")
+    fails, unknown = [], []
+    if h.get("err") or not h:
+        unknown.append(("hook", "адрес вебхука не прочитан: %s" % (h.get("err") or "фактов нет"),
+                        h.get("addr") or "GET /v1/configs/webhook"))
+    elif not h.get("set"):
+        fails.append(("hook", "у 360dialog адрес вебхука пуст — события не отправляются никуда"))
+    elif not h.get("match"):
+        part = ("хост не наш" if not h.get("host_ok") else
+                "путь не наш" if not h.get("path_ok") else "секрет пути не наш")
+        fails.append(("hook", "адрес вебхука у 360dialog не наш: %s (отпечаток их %s, наш %s)"
+                      % (part, h.get("fp_their") or "?", h.get("fp_our") or "?")))
+    if n.get("err") or not n:
+        unknown.append(("number", "состояние номера не прочитано: %s" % (n.get("err") or "фактов нет"),
+                        n.get("addr") or "GET /health_status"))
+    else:
+        s = str(n.get("state") or "")
+        if s in ("BLOCKED",):
+            errs = "; ".join(n.get("errors") or []) or "причина не названа"
+            fails.append(("number", "номер не подключён: 360dialog называет его %s (%s)" % (s, errs)))
+        elif s not in ("AVAILABLE", "LIMITED"):
+            unknown.append(("number", "состояние номера незнакомо: «%s»" % (s or "пусто")[:40],
+                            n.get("addr") or "GET /health_status"))
+    if fails:
+        what, why = fails[0]
+        return WAI_FAIL, {"what": what, "why": "; ".join(w for _, w in fails),
+                          "parts": [w for w, _ in fails]}
+    if unknown:
+        what, why, addr = unknown[0]
+        return WAI_UNKNOWN, {"what": what, "why": "; ".join(w for _, w, _ in unknown),
+                             "addr": addr}
+    return WAI_OK, {"why": "адрес вебхука у 360dialog наш (отпечаток %s), номер %s"
+                           % (h.get("fp_our") or "?", n.get("state"))}
+
+
+def wa_inbound_line(state, info):
+    """Одна строка итога О10 — в вывод прогона каждый раз, включая «в порядке»."""
+    info = info or {}
+    if state == WAI_UNKNOWN:
+        return "НЕИЗВЕСТНО: %s, %s" % (info.get("why"), info.get("addr"))
+    return "%s: %s" % (state, info.get("why"))
+
+
+def _o10(facts, cfg, now):
+    """О10 — вход WhatsApp: 360dialog шлёт не нам или номер не подключён (ОТКАЗ) либо не узнать."""
+    if float((cfg or {}).get("wa_inbound") or 0.0) <= 0:
+        return []                                     # откат: ветка мертва ДО чтения фактов
+    if "wa_inbound" not in (facts or {}):
+        return []                                     # руки этого источника не собирали
+    state, info = wa_inbound_state(facts, cfg, now)
+    if state == WAI_FAIL:
+        # ОДИН ЭПИЗОД НА ВХОД, а не на часть: «адрес не наш» и «номер BLOCKED» — одна новость
+        # владельцу («WhatsApp к нам не приходит»), причины названы обе в одной строке.
+        return [{"kind": "o10_wa_inbound", "key": "o10|in", "why": info.get("why"),
+                 # ПОТОЛОК отсрочки слоя (рука берёт min): см. WA_INBOUND_DEFER_SEC.
+                 "parts": info.get("parts"), "defer_max": WA_INBOUND_DEFER_SEC,
+                 "can_task": False}]
+    if state == WAI_UNKNOWN:
+        return [{"kind": "o10_wa_unknown", "key": "o10u|%s" % info.get("what"),
+                 "why": info.get("why"), "addr": info.get("addr"), "can_task": False}]
+    return []
+
+
 def verdict(facts, cfg=None):
     """ФАКТЫ → список нарушений. Ни одного обращения к миру: ни ФС, ни сети, ни времени — всё
     приходит в `facts`. Пустой список = вердикта нет (НЕ «всё хорошо»: сказать так слой не умеет).
@@ -2333,7 +2431,7 @@ def verdict(facts, cfg=None):
     if now <= 0:
         return []
     out = []
-    for fn in (_o1, _o2_daemon, _o2_splinter, _o3, _o4, _o5, _o6, _o7, _o8, _o9):
+    for fn in (_o1, _o2_daemon, _o2_splinter, _o3, _o4, _o5, _o6, _o7, _o8, _o9, _o10):
         try:
             out.extend(fn(facts, cfg, now) or [])
         except Exception:                                            # noqa: BLE001
@@ -2365,6 +2463,8 @@ def closures(facts, cfg, open_keys):
     runs_st = lane_runs_state(facts, cfg, now)[0] if now > 0 else RUNS_UNKNOWN
     wam_st = (wa_mirror_state(facts, cfg, now)[0]
               if now > 0 and "wa_mirror" in (facts or {}) else WAM_UNKNOWN)
+    wai_st = (wa_inbound_state(facts, cfg, now)[0]
+              if now > 0 and "wa_inbound" in (facts or {}) else WAI_UNKNOWN)
     out = []
     for key in (open_keys or []):
         key = str(key)
@@ -2408,6 +2508,12 @@ def closures(facts, cfg, open_keys):
             # Показ ДОКАЗАННО судим в этом прогоне, и этого ключа в вердикте нет. «Судить нечем»
             # эпизод не закрывает: молчание источника не есть выздоровление (замок О6/О7).
             out.append(key)
+        elif kind == "o10" and wai_st == WAI_OK:
+            # Вход закрыт только ДОКАЗАННЫМ «адрес наш и номер подключён». «360dialog не ответил»
+            # ОТКАЗ не закрывает: молчание источника не есть выздоровление.
+            out.append(key)
+        elif kind == "o10u" and wai_st != WAI_UNKNOWN:
+            out.append(key)                          # о входе снова есть факты
     return out
 
 
@@ -2449,6 +2555,9 @@ NOTE_HEAD = {
     # О9 говорит про ОБЕЩАНИЕ клиентам (строка показана за 10 минут), а не про процесс.
     "o9_wa_mirror": "🔔 показ WhatsApp клиентов в Telegram не выполняет обещание",
     "o9_wa_unknown": "🔔 не знаю, идёт ли показ WhatsApp в Telegram",
+    # О10 говорит про ВХОД: сообщения клиентов WhatsApp к нам не придут, пока это так.
+    "o10_wa_inbound": "🔔 WhatsApp не присылает нам сообщения клиентов",
+    "o10_wa_unknown": "🔔 не знаю, присылает ли WhatsApp нам сообщения клиентов",
 }
 CLOSE_HEAD = "🔔 ожидание снова выполняется"
 # Строка, которой заканчивается КАЖДАЯ заметка: граница владельца названа в самом сообщении.
@@ -2635,6 +2744,13 @@ def render(v, lane="VPS"):
         parts += ["НЕИЗВЕСТНО: %s" % (v.get("why") or "причина не названа"),
                   "адрес: %s" % (v.get("addr") or "?"),
                   "это не «показ в порядке» и не «показ стоит» — судить нечем"]
+    elif kind == "o10_wa_inbound":
+        parts += ["ОТКАЗ: %s" % (v.get("why") or "причина не названа"),
+                  "спрошено у 360dialog прямо сейчас, без подсчётов; ключ и адрес в заметку не идут"]
+    elif kind == "o10_wa_unknown":
+        parts += ["НЕИЗВЕСТНО: %s" % (v.get("why") or "причина не названа"),
+                  "адрес: %s" % (v.get("addr") or "?"),
+                  "это не «вход в порядке» и не «вход стоит» — 360dialog не дал ответа"]
     else:
         parts.append("нарушение ожидания")
     parts.append(TAIL)
@@ -2743,7 +2859,9 @@ def render_close(v_key, lane="VPS", detail=""):
             "o5": "мост снова отвечает",
             "o5s": "мост снова укладывается в отведённое время",
             "o9": "показ WhatsApp снова выполняет обещание (%s)" % rest,
-            "o9u": "о показе WhatsApp снова есть факты (%s)" % rest}.get(head,
+            "o9u": "о показе WhatsApp снова есть факты (%s)" % rest,
+            "o10": "360dialog снова шлёт нам: адрес вебхука наш, номер подключён",
+            "o10u": "о входе WhatsApp снова есть факты (%s)" % rest}.get(head,
                                                                      "ожидание снова выполняется")
     parts = [CLOSE_HEAD, str(lane or "VPS"), what]
     if detail:
