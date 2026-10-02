@@ -520,7 +520,19 @@ def snapshot(now=None, st=None, cfg=None):
         # О9: показ WhatsApp в Telegram — юнит, флаг, базы ТОЛЬКО на чтение. Откат (порог 0) —
         # ни одного обращения к миру.
         "wa_mirror": wa_mirror_facts(now) if float(cfg.get("wa_mirror") or 0) > 0 else None,
+        # О10: вход WhatsApp — два GET чтения к 360dialog. Откат (EXPECT_WA_INBOUND=0) — ни одного.
+        "wa_inbound": wa_inbound_facts(now) if float(cfg.get("wa_inbound") or 0) > 0 else None,
     }
+
+
+def wa_inbound_facts(now):
+    """Факты О10 (`expect_wa_inbound`). Сбор упал → «не прочитано», а не молчание."""
+    try:
+        import expect_wa_inbound
+        return expect_wa_inbound.facts(now)
+    except Exception as e:                                           # noqa: BLE001
+        return {"keys": {"err": "сбор фактов упал: %s" % type(e).__name__,
+                         "addr": "expect_wa_inbound.facts"}}
 
 
 def wa_mirror_facts(now):
@@ -1025,6 +1037,10 @@ def close_detail(key, facts):
                 if isinstance(r, dict) and not r.get("ext"):
                     return "полоса снова выполнила заход: «%s»" % str(r.get("line"))[:150]
             return ""                    # своих слов не нашлось — чужие не подставляем
+        if str(key).startswith("o10"):
+            _st, info = expectations.wa_inbound_state(facts, expectations.config(os.environ),
+                                                      float((facts or {}).get("now") or 0.0))
+            return "вход сейчас: %s" % expectations.wa_inbound_line(_st, info)
         if str(key).startswith("o9"):
             _st, info = expectations.wa_mirror_state(facts, expectations.config(os.environ),
                                                      float((facts or {}).get("now") or 0.0))
@@ -1099,6 +1115,14 @@ def run(dry=False, now=None):
                 *expectations.wa_mirror_state(facts, cfg, now))
         except Exception as e:                                       # noqa: BLE001
             out["wa_mirror"] = "НЕИЗВЕСТНО: судья упал (%s), expectations.wa_mirror_state" % (
+                type(e).__name__)
+    # О10 — так же: строка исхода входа в каждом прогоне, значений ключа и адреса в ней нет.
+    if facts.get("wa_inbound") is not None:
+        try:
+            out["wa_inbound"] = expectations.wa_inbound_line(
+                *expectations.wa_inbound_state(facts, cfg, now))
+        except Exception as e:                                       # noqa: BLE001
+            out["wa_inbound"] = "НЕИЗВЕСТНО: судья упал (%s), expectations.wa_inbound_state" % (
                 type(e).__name__)
     brain = _to_brain()
     frozen = _frozen_client()
@@ -1236,6 +1260,10 @@ def run(dry=False, now=None):
         # Отсрочка адреса и отсрочка самого О3 (окно правки) складываются по СИЛЬНЕЙШЕЙ: обе
         # говорят «рано», и уступить надо той, что говорит это дольше.
         defer = max(owner_defer if brain else 0.0, float(v.get("defer") or 0.0))
+        if v.get("defer_max") is not None:
+            # ПОТОЛОК, объявленный самим вердиктом (О10, 02.10): ОТКАЗ вынесен по положительному
+            # ответу внешней системы, а не по мигающему факту, — ждать отсрочку слоя незачем.
+            defer = min(defer, float(v.get("defer_max") or 0.0))
         if not rec.get("noted"):                           # ВЛАДЕЛЬЦУ ЕЩЁ НЕ СКАЗАНО
             if brain:
                 addr, addr_why = expect_journal.address(v, facts, held, defer, frozen)

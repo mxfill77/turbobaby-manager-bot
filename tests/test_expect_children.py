@@ -508,7 +508,7 @@ res.append(ok(E.pc_task_state(facts(LIVE, NOW), C, NOW)[0] == E.PCT_MOVING,
               "(17) О6: взятая задача закрыта → «движется»"))
 res.append(ok(E.bridge_state(facts(LIVE, NOW), C, NOW)[0] == E.BRIDGE_OK,
               "(17) О5: проба прошла → «отвечает»"))
-res.append(ok(len(E.KINDS) == 14 and "o7_child_down" in E.KINDS
+res.append(ok(len(E.KINDS) == 16 and "o7_child_down" in E.KINDS
               and "o7_pulse_lost" in E.KINDS,
               "(17) видов стало 14 (О8 18.08, О9 01.10), оба вида О7 названы поимённо"))
 res.append(ok(all(k in E.NOTE_HEAD for k in E.KINDS),

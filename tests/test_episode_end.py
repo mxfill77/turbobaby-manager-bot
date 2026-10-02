@@ -333,9 +333,9 @@ print("\n(12) соседи: вердикт и закрытие по выздор
 KINDS_12 = {"o1_new_vps", "o2_daemon", "o2_splinter", "o3_undelivered", "o3_unknown",
             "o4_pc_silent", "o5_bridge_down", "o5_bridge_slow", "o6_pc_task",
             "o7_child_down", "o7_pulse_lost", "o8_lane_dead"}
-KINDS_O9 = {"o9_wa_mirror", "o9_wa_unknown"}
-res.append(ok(len(E.KINDS) == 14 and set(E.KINDS) == KINDS_12 | KINDS_O9,
-              "(12) видов ожиданий 14 = прежние 12 + два вида О9 (0090), новых этот модуль не завёл"))
+KINDS_O9 = {"o9_wa_mirror", "o9_wa_unknown", "o10_wa_inbound", "o10_wa_unknown"}  # + О10 (0114, 02.10)
+res.append(ok(len(E.KINDS) == 16 and set(E.KINDS) == KINDS_12 | KINDS_O9,
+              "(12) видов ожиданий 16 = прежние 12 + два вида О9 (0090) + два О10 (0114), новых этот модуль не завёл"))
 FRESH = dict(pc_facts(ts=NOW - HOUR), now=NOW)
 res.append(ok(E.children_state(FRESH, CFG, NOW)[0] == E.CH_UNKNOWN,
               "(12) children_state отвечает как отвечал (третий исход при неизвестном ребёнке)"))
