@@ -19,6 +19,10 @@
   WA_AGENT_WATCH — ожидание «клиент без ответа» (`wa_watch.Watch`, WAUNANSWERED0210): последнее
                     сообщение клиента без нашего ответа дольше порога — одно сообщение в «Агенты».
                     Читателя getUpdates не заводит; от черновиков, пауз и двери не зависит.
+  WA_AGENT_PACE  — человеческий ритм «Отправить» (WAHUMANPACE0210): первый ответ беседы — не раньше 3–5 мин
+                    после сообщения клиента, следующий — по длине текста; раньше срока — «уйдёт в ЧЧ:ММ» и
+                    «Отменить». Выключен — «Отправить» шлёт сразу. Текст человека из темы ритм не касается.
+                    Отложенное до выключения уходит в срок и при выключенном.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
   sha256 текста или его начало от 10 знаков, несколько — через запятую; самого текста нет нигде. Эхо с
   этим отпечатком И не позже 10 с после «первого» входящего паузы не ставит, первый вопрос не закрывает.
@@ -50,6 +54,7 @@ F_DRAFTS, F_CARDS, F_REACT, F_SEND = "WA_AGENT_DRAFTS", "WA_AGENT_CARDS", "WA_AG
 F_RELAY = "WA_AGENT_RELAY"                # тема клиента → WhatsApp (WARELAYTEXT0210)
 F_WATCH = "WA_AGENT_WATCH"                # ожидание «клиент без ответа» (WAUNANSWERED0210)
 F_GREET = "WA_AGENT_GREET_SHA256"         # отпечаток текста автоприветствия (WAGREETECHO0210)
+F_PACE = "WA_AGENT_PACE"                  # человеческий ритм «Отправить» (WAHUMANPACE0210)
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
@@ -141,8 +146,12 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     # автоприветствие (WAGREETECHO0210): настройка — отпечаток, не текст; нет или битая — любое эхо — пауза
     greet, greet_words = wa_agent.greet_fps(environ.get(F_GREET))
     line("автоприветствие (%s): %s" % (F_GREET, greet_words))
+    # ритм (WAHUMANPACE0210): тем же правилом, что выключатели; выключен — «Отправить» шлёт сразу
+    pace = wa_agent_tg.flag_on(environ.get(F_PACE))
+    line("ритм (%s): %s" % (F_PACE, "вкл — «Отправить» до срока ставит отправку на срок" if pace
+                            else "выкл — «Отправить» шлёт сразу"))
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
-                         log=line, drafts=drafts, greet=greet)
+                         log=line, drafts=drafts, greet=greet, pace=pace)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
     # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210)

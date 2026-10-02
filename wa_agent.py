@@ -34,12 +34,21 @@ superseded и пауза; новое входящее → stale), пишет `se
 старте службы `sending` → `unsure` (сообщение могло уйти) — тот же замок, что `_init_state`
 службы показа. `claimed` на старте → `pending`: дверь ещё не звали, отправки не было.
 
+ЧЕЛОВЕЧЕСКИЙ РИТМ (WAHUMANPACE0210, выключатель службы WA_AGENT_PACE, по умолчанию выключен — «Отправить»
+шлёт сразу, как раньше). Включён — после захвата и перепроверки очереди ядро считает срок (`_pace_due`):
+первый ответ беседы — сообщение клиента + случайно PACE_FIRST_MIN–PACE_FIRST_MAX; следующий — сообщение
+клиента + длина / PACE_CPS (не дольше PACE_TYPE_MAX), то есть модель и человек думали дольше набора — без
+добавки. Срок не настал — черновик `scheduled` со сроком в базе, на карточке «уйдёт в ЧЧ:ММ» и «Отменить»;
+отправку в срок делает такт (`send_due`) через тот же захват `sending` ДО двери. Рестарт срок не теряет и
+не дублирует. Клиент написал ещё — одобренное уходит в срок, новое — в следующий черновик.
+
 ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа (это
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
 """
 
 import hashlib
 import json
+import random
 import sqlite3
 import time
 
@@ -49,11 +58,19 @@ import wa_kind
 PENDING, CLAIMED, SENDING = "pending", "claimed", "sending"
 SENT, NOT_SENT, UNSURE = "sent", "not_sent", "unsure"
 SUPERSEDED, STALE, DECLINED = "superseded", "stale", "declined"
-STATES = (PENDING, CLAIMED, SENDING, SENT, NOT_SENT, UNSURE, SUPERSEDED, STALE, DECLINED)
+SCHEDULED = "scheduled"                       # «Отправить» нажато до срока ритма: ждёт срока (WAHUMANPACE0210)
+STATES = (PENDING, CLAIMED, SENDING, SENT, NOT_SENT, UNSURE, SUPERSEDED, STALE, DECLINED, SCHEDULED)
 LIVE = (PENDING, CLAIMED, SENDING)            # «живой» черновик: у клиента не больше одного
+# scheduled — не «живой»: клиент написал ещё — следующий черновик родится, одобренное уйдёт в срок
 
 # ── действия кнопок ─────────────────────────────────────────────────────────────────────
-ACT_SEND, ACT_DECLINE = "send", "decline"
+ACT_SEND, ACT_DECLINE, ACT_CANCEL = "send", "decline", "cancel"
+
+# ── человеческий ритм (WAHUMANPACE0210) — числа замера по архиву копии телефона и очереди ──
+PACE_FIRST_MIN, PACE_FIRST_MAX = 180, 300     # первый ответ беседы: сообщение клиента + случайно 3–5 мин
+PACE_CPS = 1.75                               # знаков в секунду: медиана наших двух подряд, 10 933 пары
+PACE_TYPE_MAX = PACE_FIRST_MAX                # набор длинного текста не дольше окна первого ответа
+PACE_NEW_TALK = 4 * 3600                      # беседа новая: до сообщения клиента тишина в обе стороны > 4 ч
 
 # ── пауза между последним сообщением клиента и черновиком ───────────────────────────────
 QUIET_MIN, QUIET_MAX, QUIET_DEFAULT = 60, 90, 75
@@ -252,6 +269,11 @@ class Telegram:
         """Ушедшее по «Отправить» — строкой в тему клиента (WARELAYTEXT0210). Рук нет — ничего."""
         return None
 
+    def card_wait(self, draft_id, card_id, words, ver):
+        """«Отправить» до срока ритма (WAHUMANPACE0210): на карточке «уйдёт в ЧЧ:ММ» и кнопка «Отменить».
+        Рук нет — ничего."""
+        return None
+
 
 class Door:
     """send_text(to, text) → {"outcome": sent|not_sent|unknown, "reason": str, "wamid": str|None}.
@@ -282,8 +304,11 @@ def _hm(ts):
 
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
-                 clock=time.time, log=None, drafts=True, greet=()):
+                 clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random):
         quiet = int(quiet)
+        # WA_AGENT_PACE (WAHUMANPACE0210): выключен — «Отправить» шлёт сразу; rand — доля окна первого ответа
+        self.pace = bool(pace)
+        self.rand = rand
         # отпечатки текста автоприветствия (`greet_fps`); пусто — признака нет, любое эхо — пауза
         self.greet = tuple(greet or ())
         if not QUIET_MIN <= quiet <= QUIET_MAX:
@@ -302,13 +327,16 @@ class Core:
             self.db.execute("ALTER TABLE drafts ADD COLUMN handoff TEXT")
         if "kind" not in {r[1] for r in self.db.execute("PRAGMA table_info(outbox)")}:
             self.db.execute("ALTER TABLE outbox ADD COLUMN kind TEXT")   # вид медиа; NULL — текст
+        if "due_at" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
+            self.db.execute("ALTER TABLE drafts ADD COLUMN due_at REAL")  # срок отправки по ритму; NULL — сразу
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
 
     def _startup(self):
         """sending → unsure (могло уйти — не повторяем); claimed → pending (двери не звали).
-        Входящие под unsure закрыты: новый черновик на них звал бы ко второй отправке."""
+        Входящие под unsure закрыты: новый черновик на них звал бы ко второй отправке.
+        scheduled не трогаем: срок в базе, такт отправит его один раз (WAHUMANPACE0210)."""
         self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, (SELECT MAX(upto_id) FROM drafts "
                         "WHERE drafts.number=clients.number AND state=?)) WHERE number IN "
                         "(SELECT number FROM drafts WHERE state=?)", (SENDING, SENDING))
@@ -474,6 +502,7 @@ class Core:
 
     def tick(self, now=None):
         now = self.clock() if now is None else now
+        self.send_due(now)                    # отложенное уходит в срок и при выключенных черновиках
         if not self.drafts:
             self.follow()
             return []
@@ -620,10 +649,11 @@ class Core:
             made.append(did)
         return made
 
-    def _fresh(self, number, after_id):
+    def _fresh(self, number, after_id, inbound=True):
         """Что пришло в очередь по клиенту после after_id: (kind, id) первой живой строки или None.
         Эхо, которое скан признал автоприветствием (`autogreet`), — не новое: оно идёт следом за
-        «первым» входящим, и без этого черновик на первый вопрос не родился бы никогда."""
+        «первым» входящим, и без этого черновик на первый вопрос не родился бы никогда.
+        inbound=False — только эхо: отложенному в срок новое входящее не помеха (WAHUMANPACE0210)."""
         q = self._queue()
         try:
             rows = q.execute("SELECT id, msg_type, echo, history, wamid FROM wa_inbox "
@@ -632,7 +662,7 @@ class Core:
             q.close()
         for rid, msg_type, echo, history, wamid in rows:
             kind = self._live_kind(msg_type, echo, history)
-            if kind == wa_kind.KIND_INBOUND:
+            if kind == wa_kind.KIND_INBOUND and inbound:
                 return kind, rid
             if kind == wa_kind.KIND_ECHO and not self._our_wamid(wamid) and not self._greeted(rid):
                 return kind, rid
@@ -660,8 +690,21 @@ class Core:
         """Нажатие кнопки карточки. → {"ok": bool, "state": …, "words": …}."""
         now = self.clock() if now is None else now
         target = CLAIMED if action == ACT_SEND else DECLINED
-        if action not in (ACT_SEND, ACT_DECLINE):
+        if action not in (ACT_SEND, ACT_DECLINE, ACT_CANCEL):
             return {"ok": False, "state": None, "words": "неизвестное действие"}
+        if action == ACT_CANCEL:
+            # «Отменить» отложенного (WAHUMANPACE0210): тот же условный захват, что у такта отправки —
+            # кто первым сменил scheduled, тот и решил; клиенту не уходит ничего
+            n = self.db.execute("UPDATE drafts SET state=?, decided_by=?, decided_at=?, closed_at=?, reason=? "
+                                "WHERE id=? AND state=? AND ver=?",
+                                (DECLINED, who, now, now, "отменено до срока", draft_id, SCHEDULED,
+                                 int(ver))).rowcount
+            if n != 1:
+                return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
+            self.log("черновик %d: отложенное отменено" % draft_id)
+            self._tg("card_done", draft_id, self._card(draft_id),
+                     "отменено до срока: %s, %s — клиенту ничего не ушло" % (who, _hm(now)))
+            return {"ok": True, "state": DECLINED, "words": "отменено — клиенту ничего не ушло"}
         if action == ACT_SEND and self.send_locked(draft_id, ver):
             # «нужен человек»: ДО захвата и до двери — черновик ждёт правки, кнопки живы
             self.log("черновик %d: «Отправить» заперто — нужен человек, ждём «Исправить»" % draft_id)
@@ -703,9 +746,27 @@ class Core:
             return {"ok": False, "state": state, "words": "не отправлено: " + (
                 "ответили с телефона" if state == SUPERSEDED else "клиент написал ещё")}
 
+        # ── человеческий ритм (WAHUMANPACE0210): срок не настал — отправка ставится на срок ──
+        if self.pace:
+            due, why = self._pace_due(number, upto, text, now)
+            self.log("черновик %d: ритм — %s" % (draft_id, why))
+            if due is not None and due > now:
+                if self.db.execute("UPDATE drafts SET state=?, due_at=? WHERE id=? AND state=?",
+                                   (SCHEDULED, due, draft_id, CLAIMED)).rowcount != 1:
+                    return {"ok": False, "state": None, "words": self._decided(draft_id)}
+                # входящие до черновика закрыты решением: новый черновик — только на новое сообщение
+                self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
+                words = "уйдёт в %s" % _hm(due)
+                self._tg("card_wait", draft_id, self._card(draft_id), "%s — нажал %s, %s" % (words, who, _hm(now)),
+                         int(ver))
+                return {"ok": True, "state": SCHEDULED, "words": words}
+        return self._deliver(draft_id, number, upto, text, who, now, CLAIMED)
+
+    def _deliver(self, draft_id, number, upto, text, who, now, from_state):
+        """Дверь для захваченного черновика: «Отправить» (claimed) или срок ритма (scheduled)."""
         # ── sending ДО двери: рестарт после этой строки повтора не даст ──
         if self.db.execute("UPDATE drafts SET state=? WHERE id=? AND state=?",
-                           (SENDING, draft_id, CLAIMED)).rowcount != 1:
+                           (SENDING, draft_id, from_state)).rowcount != 1:
             return {"ok": False, "state": None, "words": self._decided(draft_id)}
         try:
             res = self.door.send_text(number, text) or {}
@@ -724,6 +785,69 @@ class Core:
             if hasattr(self.tg, "agent_sent"):
                 self._tg("agent_sent", number, text, who)
         return {"ok": state == SENT, "state": state, "words": state}
+
+    # ── человеческий ритм (WAHUMANPACE0210) ───────────────────────────────────────────────
+
+    def send_due(self, now):
+        """Отложенные, срок которых настал: по сроку, по одному, через тот же захват `sending`.
+        Ответили с телефона после черновика или клиент на паузе (человек вмешался) — не шлём.
+        Новое сообщение клиента одобренное НЕ снимает: оно уходит в срок, новое — в следующий черновик."""
+        rows = self.db.execute("SELECT id, number, upto_id, text, decided_by FROM drafts WHERE state=? "
+                               "AND due_at<=? ORDER BY due_at, id", (SCHEDULED, now)).fetchall()
+        out = []
+        for did, number, upto, text, who in rows:
+            echo = self._fresh(number, upto, inbound=False)
+            paused = self.db.execute("SELECT paused FROM clients WHERE number=?", (number,)).fetchone()
+            if echo or (paused and paused[0]):
+                self._close(did, SUPERSEDED, "снят в срок: %s — не отправлено" % (
+                    "ответили с телефона" if echo else "человек вмешался, клиент на паузе"), now,
+                    from_states=(SCHEDULED,))
+                continue
+            res = self._deliver(did, number, upto, text, who or "—", now, SCHEDULED)
+            self.log("черновик %d: срок ритма настал → %s" % (did, res.get("state")))
+            out.append((did, res.get("state")))
+        return out
+
+    def _pace_due(self, number, upto, text, now):
+        """Срок отправки по ритму → (срок | None — судить нечем, слова для журнала). Числами, без текста.
+        Срок прошёл — решает `press`: уходит сразу.
+        Наше — живое эхо с телефона (кроме автоприветствия), ушедшее через API (`outbox`) и отложенное
+        этого клиента; клиента — живые входящие до строки черновика. Беседа новая, если до первого
+        неотвеченного сообщения клиента тишина в обе стороны дольше PACE_NEW_TALK."""
+        q = self._queue()
+        try:
+            rows = q.execute("SELECT id, msg_type, echo, history, wamid, COALESCE(ts_msg, ts_queued) FROM wa_inbox "
+                             "WHERE from_number=? AND id<=? ORDER BY id", (number, upto)).fetchall()
+        finally:
+            q.close()
+        ins, outs = [], []
+        for rid, msg_type, echo, history, wamid, ts in rows:
+            kind = self._live_kind(msg_type, echo, history)
+            if ts is None or kind is None:
+                continue
+            if kind == wa_kind.KIND_INBOUND:
+                ins.append(float(ts))
+            elif not self._greeted(rid):
+                outs.append(float(ts))
+        outs += [float(r[0]) for r in self.db.execute("SELECT ts FROM outbox WHERE number=?", (number,))]
+        if not ins:
+            return None, "входящих клиента до черновика в очереди нет — сразу"
+        past = [t for t in outs if t <= now]
+        unanswered = [t for t in ins if not past or t > max(past)]
+        # у клиента уже есть отложенное: этот ответ — следующий за ним и его не обгоняет
+        later = self.db.execute("SELECT MAX(due_at) FROM drafts WHERE number=? AND state=?",
+                                (number, SCHEDULED)).fetchone()[0]
+        if later is None and unanswered:
+            first = unanswered[0]
+            before = [t for t in ins + outs if t < first]
+            if not before or first - max(before) > PACE_NEW_TALK:
+                due = first + PACE_FIRST_MIN + self.rand() * (PACE_FIRST_MAX - PACE_FIRST_MIN)
+                return due, "первый ответ беседы: срок %d с после сообщения клиента, нажато через %d с" % (
+                    due - first, now - first)
+        typing = min(len(text or "") / PACE_CPS, PACE_TYPE_MAX)
+        base = ins[-1] if later is None else max(ins[-1], float(later))
+        return base + typing, "следующий: набор %d с, от %s до нажатия %d с" % (
+            typing, "сообщения клиента" if later is None else "срока отложенного", now - base)
 
     def revise(self, draft_id, text, who, now=None, ver=None):
         """«Исправить»: текст человека, версия +1; кнопки прежней версии отвечают «устарело».

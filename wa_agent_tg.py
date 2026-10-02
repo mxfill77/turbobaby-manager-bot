@@ -10,7 +10,7 @@
 
 КАРТОЧКА. `sendMessage` в -1003999596406: «имя · +номер», ссылка на тему клиента в форуме показа,
 текст черновика, кнопки `wa:send|fix|no:<черновик>:<версия>`. `card_done` — `editMessageText`
-без клавиатуры (кнопки сняты). Вопрос паузы — кнопка `wa:go:<id клиента>:<пауза>`: в
+без клавиатуры (кнопки сняты). `card_wait` — «уйдёт в ЧЧ:ММ» и кнопка `wa:cancel:…` (ритм, WAHUMANPACE0210). Вопрос паузы — кнопка `wa:go:<id клиента>:<пауза>`: в
 `callback_data` номера телефона нет, id клиента — короткий номер строки своей таблицы.
 
 «ИСПРАВИТЬ». Кнопка только подсказывает; правка — РЕПЛАЙ человека на карточку: `Core.revise` с
@@ -109,7 +109,8 @@ WA_FULL_FORM = {
     "\U0001F937‍♀": "\U0001F937‍♀️",   # 🤷‍♀
 }
 
-ACTIONS = {"send": wa_agent.ACT_SEND, "no": wa_agent.ACT_DECLINE}
+ACTIONS = {"send": wa_agent.ACT_SEND, "no": wa_agent.ACT_DECLINE,
+           "cancel": wa_agent.ACT_CANCEL}         # «Отменить» отложенного по ритму (WAHUMANPACE0210)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tg_clients (
@@ -377,6 +378,17 @@ class Tg(wa_agent.Telegram):
         body = (row[0] if row else "📝 Черновик №%d" % draft_id)[:TG_TEXT_MAX - 200]
         self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
                                      "text": body + "\n\n— " + words})
+
+    def card_wait(self, draft_id, card_id, words, ver):
+        """«Отправить» до срока ритма (WAHUMANPACE0210): «уйдёт в ЧЧ:ММ» и одна кнопка «Отменить»
+        `wa:cancel:<черновик>:<версия>`. В срок `card_done` снимет её вместе с исходом."""
+        if not self.enabled or not card_id:
+            return
+        row = self.db.execute("SELECT body FROM tg_cards WHERE card_id=?", (int(card_id),)).fetchone()
+        body = (row[0] if row else "📝 Черновик №%d" % draft_id)[:TG_TEXT_MAX - 200]
+        kb = {"inline_keyboard": [[{"text": "↩️ Отменить", "callback_data": "wa:cancel:%d:%d" % (draft_id, ver)}]]}
+        self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
+                                     "text": body + "\n\n— ⏳ " + words, "reply_markup": kb})
 
     def ask_pause(self, number, pause_no, via=None):
         if not self.enabled:

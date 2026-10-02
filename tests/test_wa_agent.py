@@ -365,7 +365,7 @@ def test_no_network_in_core():
             names.add((node.module or "").split(".")[0])
     # json — stdlib без сети: причины «нужен человек» в drafts.handoff (WAAGENTMODEL0210)
     # hashlib — stdlib без сети: отпечаток текста автоприветствия (WAGREETECHO0210)
-    assert names == {"hashlib", "json", "sqlite3", "time", "wa_kind"}, names
+    assert names == {"hashlib", "json", "random", "sqlite3", "time", "wa_kind"}, names
 
 
 def test_queue_read_only():
