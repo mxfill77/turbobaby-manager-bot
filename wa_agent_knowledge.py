@@ -280,25 +280,80 @@ def lang_of(text):
 
 # R_MONEY — один ключ «нужен человек», и поднимает его то же выражение выше (не меняется). На карточку и в
 # промпт идёт СРАБОТАВШИЙ ярлык (WACARDCOMPACT0310): вопрос о депозите — «депозит», а не весь перечень денег.
-# Альтернативы четырёх ярлыков вместе РАВНЫ альтернативам выражения R_MONEY (тест сверяет множества).
-# «верните»/refund — к депозиту: в аренде байка возврат денег — это возврат депозита.
+# Альтернативы пяти групп слов вместе РАВНЫ альтернативам выражения R_MONEY (тест сверяет множества).
+# WACARDMONEY0310: ярлык не утверждает факта, которого в сообщении нет.
+# - «верните»/refund — свой ярлык «возврат денег»: что возвращать (депозит, предоплату, аренду), решает человек.
+#   К депозиту — только когда депозит назван (депозит, залог, deposit) и других денег рядом нет.
+# - Оплата — по смыслу сообщения: клиент заявил совершённую оплату (оплатил, перевёл, чек, скрин) — MONEY_PAYMENT;
+#   признака факта нет (вопрос, упоминание) — «вопрос об оплате»; признак есть, но неясен (отрицание, «ли»,
+#   чек в вопросе) — нейтральное «оплата». Причина МОДЕЛИ факта не заявляет никогда: её слова — пересказ, а не
+#   сообщение клиента, поэтому её «оплатил» даёт нейтральное «оплата».
 MONEY_DAMAGE, MONEY_DEPOSIT, MONEY_DISPUTE, MONEY_PAYMENT = "damage_fines", "deposit", "dispute", "payment"
-MONEY_LABELS = (
+MONEY_REFUND, MONEY_PAYMENT_ASK, MONEY_PAYMENT_UNCLEAR = "refund", "payment_ask", "payment_unclear"
+MONEY_LABELS = (                                # группы слов; группа оплаты уточняется `payment_mode`
     (MONEY_DAMAGE, "повреждения и штрафы", re.compile(
         r"поврежд|царап|вмятин|разбил|сломал|авари|\bдтп|\bупал|штраф|"
         r"damage|scratch|\bdent|crash|accident|\bbroke|\bfined\b|penalt", re.I)),
-    (MONEY_DEPOSIT, "депозит", re.compile(r"депозит|залог|верн[иуё]те|refund|deposit", re.I)),
+    (MONEY_DEPOSIT, "депозит", re.compile(r"депозит|залог|deposit", re.I)),
+    (MONEY_REFUND, "возврат денег", re.compile(r"верн[иуё]те|refund", re.I)),
     (MONEY_DISPUTE, "спор", re.compile(r"\bспор(?!т)|оспор|претенз|жалоб|dispute|complain", re.I)),
-    (MONEY_PAYMENT, "оплата", re.compile(
+    (MONEY_PAYMENT, "оплата со слов клиента — поступление не проверено", re.compile(
         r"оплат|оплач|переве[лд]|перевёл|перевод(?!чик)|\bчек\b|\bpaid\b|payment|\bpay\b|transfer|receipt|"
         r"invoice", re.I)),
 )
+MONEY_WORDS = dict([(key, words) for key, words, _rx in MONEY_LABELS]
+                   + [(MONEY_PAYMENT_ASK, "вопрос об оплате"), (MONEY_PAYMENT_UNCLEAR, "оплата")])
+
+_PAY_DONE = re.compile(
+    r"оплатил[аи]?\b|оплачен[аоы]?\b|заплатил[аи]?\b|перев[её]л[аи]?\b|скинул[аи]?\b|закинул[аи]?\b|"
+    r"внес(?:ла|ли)?\b|внёс\b|отправил[аи]?\s+(?:вам\s+)?(?:деньги|оплату|перевод|сумму|предоплату)|"
+    r"оплата\s+прошла|прошла\s+оплата|деньги\s+(?:ушли|отправлен)|"
+    r"\b(?:i|we|i've|we've|i\s+have|we\s+have|already|just)\s+(?:already\s+|just\s+)?"
+    r"(?:paid|sent|transferred|made\s+(?:the\s+)?payment)\b|"
+    r"payment\s+(?:is\s+|was\s+|has\s+been\s+)?(?:done|sent|made|completed)\b", re.I)
+_PAY_PROOF = re.compile(r"\bчек(?:а|и|ом|у)?\b|\bскрин\w*|квитанц\w*|\breceipt\b|\bscreenshot\b|\bproof\b", re.I)
+_PAY_QUESTION = re.compile(r"\?|\bли\b|\bможно\b|\bнужн\w*|\bнадо\b|\bкак\b|\bкуда\b|\bcan\b|\bhow\b|\bdo\s+you\b",
+                           re.I)
+_NEG_BEFORE = re.compile(r"(?:\bне|\bnot|n't|\bnever)\s+(?:\S+\s+)?$", re.I)
+_LI_AFTER = re.compile(r"\s*ли\b", re.I)
 
 
-def money_labels(text):
-    """Текст → [(ярлык, слова)] сработавших денежных ярлыков, в порядке MONEY_LABELS."""
+def _claimed(s, m):
+    """Признак оплаты заявлен как факт: перед ним нет отрицания, после него нет «ли»."""
+    return _NEG_BEFORE.search(s[max(0, m.start() - 24):m.start()]) is None and _LI_AFTER.match(s, m.end()) is None
+
+
+def payment_mode(text, trusted=True):
+    """Текст с денежным словом оплаты → MONEY_PAYMENT (заявлена совершённой) | MONEY_PAYMENT_ASK (признака факта
+    нет: вопрос или упоминание) | MONEY_PAYMENT_UNCLEAR (признак есть, но неясен). trusted=False — пересказ модели:
+    факт из него не берётся, совершённая оплата становится неясной."""
     s = str(text or "")
-    return [(key, words) for key, words, rx in MONEY_LABELS if rx.search(s)]
+    done = list(_PAY_DONE.finditer(s))
+    proof = _PAY_PROOF.search(s) is not None
+    fact = any(_claimed(s, m) for m in done) or (proof and _PAY_QUESTION.search(s) is None)
+    if fact:
+        return MONEY_PAYMENT if trusted else MONEY_PAYMENT_UNCLEAR
+    return MONEY_PAYMENT_UNCLEAR if (done or proof) else MONEY_PAYMENT_ASK
+
+
+def money_labels(text, trusted=True):
+    """Текст → [(ярлык, слова)] сработавших денежных ярлыков, в порядке MONEY_LABELS. Не пусто ровно тогда, когда
+    сработало выражение R_MONEY. Депозит назван и других денег нет — «верните» относится к депозиту; возврат с
+    оплатой без заявленного факта («верните предоплату») — это возврат, а не вопрос об оплате."""
+    s = str(text or "")
+    hit = {key for key, _words, rx in MONEY_LABELS if rx.search(s)}
+    if MONEY_DEPOSIT in hit and MONEY_PAYMENT not in hit:
+        hit.discard(MONEY_REFUND)
+    out = []
+    for key, _words, _rx in MONEY_LABELS:
+        if key not in hit:
+            continue
+        if key == MONEY_PAYMENT:
+            key = payment_mode(s, trusted)
+            if MONEY_REFUND in hit and key != MONEY_PAYMENT:
+                continue
+        out.append((key, MONEY_WORDS[key]))
+    return out
 
 
 def handoff(text, price=None):
@@ -337,24 +392,31 @@ _WORD_CATS = dict(
      (REASON_WORDS[R_NO_PRICE_MODEL], CAT_PRICE), (REASON_WORDS[R_LONG_TERM], CAT_PRICE),
      (REASON_WORDS[R_DISCOUNT], R_DISCOUNT), (REASON_WORDS[R_DOOR_NO_PRICE], CAT_PRICE),
      (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE)]
-    + [(words, key) for key, words, _rx in MONEY_LABELS])
+    + [(words, key) for key, words in MONEY_WORDS.items()])
 _RULES = dict(_TEXT_RULES)
-_KEYWORD_CATS = ((R_AVAILABILITY, _RULES[R_AVAILABILITY]), (R_DISCOUNT, _RULES[R_DISCOUNT])) + tuple(
-    (key, rx) for key, _words, rx in MONEY_LABELS)
+_KEYWORD_CATS = ((R_AVAILABILITY, _RULES[R_AVAILABILITY]), (R_DISCOUNT, _RULES[R_DISCOUNT]))
+# три смысла оплаты — одна семья для дедупа: оплату по сообщению клиента уже назвал код — пересказ модели лишний
+_FAMILY = {MONEY_PAYMENT_ASK: MONEY_PAYMENT, MONEY_PAYMENT_UNCLEAR: MONEY_PAYMENT}
 
 
 def word_categories(word):
-    """Слова причины → [категории] (слова кода — ровно одна; причина модели — все сработавшие) | []."""
+    """Слова причины → [категории] (слова кода — ровно одна; причина модели — все сработавшие) | [].
+    Причина модели — пересказ: деньги в ней узнаются без доверия к факту оплаты (WACARDMONEY0310)."""
     w = str(word or "").strip()
     if w in _WORD_CATS:
         return [_WORD_CATS[w]]
-    return [cat for cat, rx in _KEYWORD_CATS if rx.search(w)]
+    return [cat for cat, rx in _KEYWORD_CATS if rx.search(w)] + [key for key, _ in money_labels(w, trusted=False)]
+
+
+def _families(cats):
+    return {_FAMILY.get(c, c) for c in cats}
 
 
 def merge_reasons(words, extra):
     """Причины кода + причины модели → список без повторов ПО КАТЕГОРИИ (WACARDCOMPACT0310): причина модели
-    отпадает, только если все её категории уже названы; без категории — по тексту (регистр и знаки не
-    различаются). Непустое пустым не становится: при пустом списке первая причина модели остаётся всегда."""
+    отпадает, только если все её категории уже названы (смыслы оплаты — одна семья, WACARDMONEY0310); без
+    категории — по тексту (регистр и знаки не различаются). Непустое пустым не становится: при пустом списке
+    первая причина модели остаётся всегда."""
     out = [str(w) for w in words or ()]
     cats, texts = set(), set()
     for w in out:
@@ -362,7 +424,7 @@ def merge_reasons(words, extra):
         texts.add(_norm(w))
     for h in extra or ():
         got = word_categories(h)
-        if (got and set(got) <= cats) or _norm(h) in texts:
+        if (got and _families(got) <= _families(cats)) or _norm(h) in texts:
             continue
         out.append(h)
         cats.update(got)

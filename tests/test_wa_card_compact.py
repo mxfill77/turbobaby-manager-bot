@@ -175,7 +175,8 @@ def test_thanks_with_payment_word_no_damage():
     t = card(w.draft(q))["text"]
     low = t.lower()
     assert "поврежд" not in low and "штраф" not in low, t
-    assert actions(t) == [G.CARD_ACTIONS[K.MONEY_PAYMENT]], actions(t)
+    # факта оплаты в благодарности нет — «вопрос об оплате», а не «проверьте поступление» (WACARDMONEY0310)
+    assert actions(t) == [G.CARD_ACTIONS[K.MONEY_PAYMENT_ASK]], actions(t)
 
 
 def test_booking_negation_no_confirm_action():
