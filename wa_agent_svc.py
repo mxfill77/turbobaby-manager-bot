@@ -29,6 +29,10 @@
   WA_AGENT_FOLLOWUP — напоминание притихшему (WAFOLLOWUP0210): 15 мин тишины клиента после нашего сообщения,
                     окно 24 ч открыто — черновик-напоминание модели на «Отправить» (не больше двух на беседу);
                     модель вправе сказать «не нужно». Выключен — притихших не ищем. Работает только с черновиками.
+  WA_AGENT_BOOK_READ — брони ТОЛЬКО на чтение (WABOOKTOOLS0210, `wa_book_read`): на явный вопрос «свободен ли байк
+                    на даты» или «когда кончается аренда» адаптер кодом до модели читает снимок `clients`+`fleet` моста
+                    (GET, в памяти 10 мин) и даёт факт с возрастом; нет факта — «нужен человек». Выключен — таблица
+                    броней не читается, промпт прежний. Работает только с черновиками.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -66,6 +70,7 @@ F_PACE = "WA_AGENT_PACE"                  # человеческий ритм «
 F_LESSONS = "WA_AGENT_LESSONS"            # уроки людей из «Исправить» (WAAGENTLESSON0210)
 F_LESSON_ADMINS = "WA_AGENT_LESSON_ADMINS"  # кто переводит урок в действующие и откатывает; пусто — владелец
 F_FOLLOW = "WA_AGENT_FOLLOWUP"            # напоминание притихшему (WAFOLLOWUP0210)
+F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чтение: наличие и конец аренды (WABOOKTOOLS0210)
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
@@ -122,12 +127,14 @@ class NoModel(wa_agent.Model):
         return None
 
 
-def make_model(env, line=None, bridge=None, call=None, lessons=False):
+def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False):
     """Адаптер модели (WAAGENTMODEL0210): история — очередь и архив службы показа, знания, парк и цена —
     мост (только чтение), плательщик — платный ключ тем же путём, что у Splinter. → (модель | None, почему).
     Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели.
-    lessons — WA_AGENT_LESSONS: включён — действующие уроки из базы агента идут в промпт (WAAGENTLESSON0210)."""
+    lessons — WA_AGENT_LESSONS: включён — действующие уроки из базы агента идут в промпт (WAAGENTLESSON0210).
+    book — WA_AGENT_BOOK_READ: включён — снимок броней `clients`(filter=all)+`fleet` моста, GET (WABOOKTOOLS0210)."""
     import wa_agent_model
+    import wa_book_read
     try:
         if bridge is None:
             import bridge_client
@@ -140,7 +147,8 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False):
         door=bridge.quote_price, archive_db=env.get("archive_db") or "",
         manifest=env.get("archive_manifest") or "", media_dir=env.get("archive_media") or "",
         agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)),
-        lessons_db=(env.get("agent_db") or "") if lessons else "")
+        lessons_db=(env.get("agent_db") or "") if lessons else "",
+        book=wa_book_read.Snapshot(lambda: bridge.clients(filter="all"), bridge.fleet) if book else None)
     return model, ""
 
 
@@ -174,6 +182,9 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     line("напоминание (%s): %s" % (F_FOLLOW, ("вкл — 15 мин тишины после нашего: черновик-напоминание, "
                                               "не больше %d на беседу" % wa_agent.FOLLOW_MAX) if follow
                                    else "выкл — притихших не ищем"))
+    # брони на чтение (WABOOKTOOLS0210): снимок собирает make_model; здесь — только строка старта
+    line("брони (%s): %s" % (F_BOOK, "вкл — наличие и конец аренды из таблицы броней, только чтение"
+                             if wa_agent_tg.flag_on(environ.get(F_BOOK)) else "выкл — таблица броней не читается"))
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                          log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
                          followup=follow)
@@ -260,7 +271,8 @@ def main():
                         handlers=[logging.FileHandler(env["log_path"], encoding="utf-8")])
     model, why = None, ""
     if flags_of(os.environ)[F_DRAFTS]:
-        model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)))
+        model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)),
+                                book=wa_agent_tg.flag_on(os.environ.get(F_BOOK)))
     core, tg, _flags, words = build(env, model=model)
     log.info("%s", start_line(env, words))
     if why:

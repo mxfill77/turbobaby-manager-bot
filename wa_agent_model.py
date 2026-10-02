@@ -16,7 +16,11 @@
   • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас;
   • уроки людей (WAAGENTLESSON0210) — ТОЛЬКО действующие (`wa_agent.active_lessons`, своя база агента
     mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
-    (`lessons_db` пуст — WA_AGENT_LESSONS выключен) — блока нет, как раньше.
+    (`lessons_db` пуст — WA_AGENT_LESSONS выключен) — блока нет, как раньше;
+  • брони ТОЛЬКО на чтение (WABOOKTOOLS0210, `wa_book_read`) — тем же путём, что цена: кодом ДО модели и только
+    на явный вопрос. «Свободен ли байк» — слово наличия, модель из парка и обе даты → блок «НАЛИЧИЕ»; «когда
+    кончается аренда» → блок «АРЕНДА КЛИЕНТА» по номеру WhatsApp; у обоих возраст снимка. Нет факта — причина
+    «нужен человек». Снимка нет (`book` пуст — WA_AGENT_BOOK_READ выключен) — промпт байт-в-байт прежний.
 
 НАПОМИНАНИЕ ПРИТИХШЕМУ (WAFOLLOWUP0210) — `followup(number, upto_id)`: своя инструкция, история под маской, узлы
 знаний и действующие уроки; цен и «нужен человек» нет. Ответ — JSON {skip, text, lang, why}: skip=true —
@@ -42,6 +46,7 @@ import time
 
 import wa_agent
 import wa_agent_knowledge as K
+import wa_book_read as B
 import wa_history
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -91,6 +96,19 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 
 Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
 {"text": "текст ответа клиенту", "lang": "ru" или "en" (язык клиента; иной — его код), "handoff": ["причина словами", …] или [], "why": "одна строка для сотрудника: что спросил клиент и почему такой ответ"}"""
+
+# Брони на чтение (WABOOKTOOLS0210): при включённом снимке правила 4 и 7 говорят о блоках «НАЛИЧИЕ» и «АРЕНДА
+# КЛИЕНТА»; без снимка — SYSTEM_PROMPT байт-в-байт прежний. Замена — строго по одному вхождению.
+_RULE4_OLD = "Наличие и брони ты не видишь — не обещай «есть» и «забронировано»."
+_RULE4_BOOK = ("Наличие байка на даты называй ТОЛЬКО из блока «НАЛИЧИЕ» и только так, как он разрешает; блока нет "
+               "или там НЕИЗВЕСТНО — наличие ты не видишь: не обещай «есть» и «свободен». Конец аренды клиента — "
+               "ТОЛЬКО из блока «АРЕНДА КЛИЕНТА»; блока нет или там НЕИЗВЕСТНО — не говори «у вас нет аренды», скажи, "
+               "что уточнишь у менеджера. Бронь ты не делаешь: «забронировано» не обещай — её оформляет человек.")
+_RULE7_OLD = "(наличие и брони, скидка,"
+_RULE7_BOOK = "(бронь, наличие без факта в блоке «НАЛИЧИЕ», конец аренды без факта, скидка,"
+if SYSTEM_PROMPT.count(_RULE4_OLD) != 1 or SYSTEM_PROMPT.count(_RULE7_OLD) != 1:
+    raise RuntimeError("SYSTEM_PROMPT: правила 4/7 для броней не найдены ровно по одному разу")
+SYSTEM_PROMPT_BOOK = SYSTEM_PROMPT.replace(_RULE4_OLD, _RULE4_BOOK).replace(_RULE7_OLD, _RULE7_BOOK)
 
 
 # ── даты и модель в словах клиента ─────────────────────────────────────────────────────
@@ -285,8 +303,9 @@ class ModelAdapter(wa_agent.Model):
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
                  manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db="",
-                 lessons_db=""):
+                 lessons_db="", book=None):
         self.queue_db, self.call = queue_db, call
+        self.book = book                                  # снимок броней `wa_book_read.Snapshot`; None — выкл
         self.agent_db = agent_db                          # outbox: ушедшее через API (WARELAYTEXT0210)
         self.lessons_db = lessons_db                      # уроки людей (WAAGENTLESSON0210); пусто — выкл
         self.fleet, self.door = fleet, door
@@ -355,6 +374,37 @@ class ModelAdapter(wa_agent.Model):
                       self.no_price_models)
         return res, "цена: %s" % res["outcome"]
 
+    def _book(self, number, ask, today, now):
+        """Брони на чтение (WABOOKTOOLS0210) — кодом ДО модели и только на явный вопрос: о свободном байке
+        (слово наличия и обе даты) или о конце аренды. → (наличие | None, аренда | None, слова для журнала).
+        Не спросили — снимок не читается вовсе."""
+        if self.book is None:
+            return None, None, "брони выключены"
+        asked = B.avail_ask(ask)
+        dates = find_dates(ask, today) if asked else []
+        want_avail, want_end = len(dates) >= 2, B.rental_end_ask(ask)
+        if not want_avail and not want_end:
+            return None, None, ("о наличии без двух дат — таблица не звана" if asked else "о бронях не спрашивают")
+        rows, bikes, age, why = self.book.get(now)
+        now_local = B.local_now(now)
+        avail = rental = None
+        if want_avail:
+            model = find_model(ask, bikes) if bikes else None
+            units = units_of(model, bikes) if model else []
+            avail = B.free_bikes(model, units, dates[0], dates[1], rows, age, why, now_local, self.door)
+        if want_end:
+            rental = B.rental_end(number, rows, age, why, now_local, model_of_name)
+        words = "брони: снимок %s, чтений %d" % ("нет" if age is None else "%d мин" % (age // 60), self.book.reads)
+        if avail is not None:
+            words += " · наличие %s (юнитов %d: свободно %d, занято %d, не проверено %d; дверь %d)" % (
+                avail["outcome"], avail["units"], avail["free"], avail["busy"], avail["unchecked"],
+                avail["door_calls"])
+        if rental is not None:
+            words += " · аренда %s (найдено %d, срок истёк %d)" % (rental["outcome"], len(rental["rentals"]),
+                                                                  rental["expired"])
+        self.log(words)
+        return avail, rental, words
+
     def build(self, number, upto_id, now=None):
         """→ (system, user, сведения) без вызова модели (пробы и тесты меряют то, что уйдёт)."""
         now = self.clock() if now is None else now
@@ -371,6 +421,9 @@ class ModelAdapter(wa_agent.Model):
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
         price, price_words = self._price(ask, today)
         reasons = K.handoff(ask, price)
+        avail, rental, book_words = self._book(number, ask, today, now)
+        if avail is not None or rental is not None:
+            reasons = B.adjust_reasons(reasons, avail, rental, ask)
         nodes = self.knowledge.refresh(now)
         parts = K.prompt_parts(price, reasons, [nodes[n] for n in K.NODES], now)
         blocks = ["СЕГОДНЯ: %s (Пхукет)" % today.strftime("%d.%m.%Y")]
@@ -381,6 +434,7 @@ class ModelAdapter(wa_agent.Model):
             blocks.append(lesson_text)
         if "price" in parts:
             blocks.append(parts["price"])
+        blocks += [fact["line"] for fact in (avail, rental) if fact is not None]
         if "handoff" in parts:
             blocks.append(parts["handoff"])
         blocks.append("ИСТОРИЯ ПЕРЕПИСКИ (вся, по времени; «мы» — наша сторона):\n" +
@@ -388,11 +442,13 @@ class ModelAdapter(wa_agent.Model):
                       ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
         blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + (ask or "[пусто]"))
         user = "\n\n".join(blocks)
+        system = SYSTEM_PROMPT if self.book is None else SYSTEM_PROMPT_BOOK
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
                 "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
-                "user_chars": len(user), "system_chars": len(SYSTEM_PROMPT)}
-        return SYSTEM_PROMPT, user, info
+                "avail": avail, "rental": rental, "book_words": book_words,
+                "user_chars": len(user), "system_chars": len(system)}
+        return system, user, info
 
     def draft(self, number, upto_id):
         system, user, info = self.build(number, upto_id)
