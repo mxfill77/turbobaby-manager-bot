@@ -1049,6 +1049,38 @@ class BridgeClient:
     def tx_summary(self, period: str = "today") -> dict:
         return self._post("tx_summary", period=period)
 
+    def tx_find(self, bike: str = "", booking_id: str = "", date_from: str = "",
+                date_to: str = "", limit: Optional[int] = None) -> dict:
+        """Поиск проводок кассы (лист «транзакции» Bot Data) — ТОЛЬКО ЧТЕНИЕ, GET (`_call`):
+        полный повтор безопасен, токен-замок записи и чёрный ящик боевых записей не участвуют.
+
+        Фильтры (хотя бы один, иначе мост ответит `no_filter`): `bike` — как пишется в кассе
+        («Nmax 6908») или голый номер, сравнение ПО НОМЕРУ; `booking_id` — точно, col N;
+        `date_from`/`date_to` — включительно, YYYY-MM-DD или DD.MM.YYYY, день = msg_date (пуст →
+        день recorded_at). `limit` — по умолчанию 50, потолок 200 (`TX_FIND_LIMIT_MAX` моста).
+
+        → {ok, filter, limit, limit_max, checked:{span_from, span_to, rows_scanned, rows_in_span,
+        undated, voided, matched, returned, truncated, …}, total:{валюта: сумма},
+        items:[{row, date, date_src, recorded_at, amount, currency, category, bike, deposit,
+        description, raw, msg_id, link, status, booking_id, group, sender}]}. Отменённые (status
+        void) не отдаются, их число — `checked.voided`. Пустой `items` при `ok` — «просмотрено
+        `rows_scanned` строк за срок span_from…span_to, не найдено», а не «не смотрели».
+
+        В мост уходят ТОЛЬКО названные фильтры. Мост без двери (до выкладки) отвечает
+        `unknown_action` — это «касса не просмотрена», а не «проводок нет»."""
+        params = {}
+        if str(bike or "").strip():
+            params["bike"] = str(bike).strip()
+        if str(booking_id or "").strip():
+            params["booking_id"] = str(booking_id).strip()
+        if str(date_from or "").strip():
+            params["date_from"] = str(date_from).strip()
+        if str(date_to or "").strip():
+            params["date_to"] = str(date_to).strip()
+        if limit is not None:
+            params["limit"] = int(limit)
+        return self._call("tx_find", **params)
+
     def void_last(self, group: str = "") -> dict:
         """Отменить последнюю активную запись (группы group, если задана)."""
         return self._post("void_last", group=group)
