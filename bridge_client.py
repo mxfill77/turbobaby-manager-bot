@@ -1081,6 +1081,57 @@ class BridgeClient:
             params["limit"] = int(limit)
         return self._call("tx_find", **params)
 
+    def contract_find(self, phone: str = "", name: str = "", bike: str = "", date_from: str = "",
+                      date_to: str = "", limit: Optional[int] = None) -> dict:
+        """Договоры аренды из реестра подписей TB e-Sign — ТОЛЬКО ЧТЕНИЕ, GET (`_call`).
+
+        Фильтры (хотя бы один из phone/name/bike, иначе мост ответит `no_filter`): `phone` —
+        сравнение по последним 9 цифрам (колонки «Телефон» и «Ник»); `name` — слова имени в любом
+        порядке; `bike` — по номеру, как у `tx_find`; `date_from`/`date_to` — включительно по «Дата
+        договора». `limit` — по умолчанию 20, потолок 100.
+
+        → {ok, outcome, pick, items:[{row, doc_id, client, contract_date, date_src, status, signed,
+        signed_at, bike, phone, pdf_id, matched_on}], checked:{rows_scanned, span_from, span_to,
+        matched, signed, returned, truncated, …}}. `outcome`: `one` — ровно один подписанный, он в
+        `pick`; `ambiguous` — подписанных несколько, выбрать нельзя (неизвестно, а не первый);
+        `none_signed` — договоры есть, подписанного нет; `none` — не найдено среди `rows_scanned`.
+        Подписанным считается РОВНО статус «ПОДПИСАН». Мост без двери (до выкладки) отвечает
+        `unknown_action` — это «реестр не просмотрен», а не «договоров нет»."""
+        params = {}
+        for key, val in (("phone", phone), ("name", name), ("bike", bike),
+                         ("date_from", date_from), ("date_to", date_to)):
+            if str(val or "").strip():
+                params[key] = str(val).strip()
+        if limit is not None:
+            params["limit"] = int(limit)
+        return self._call("contract_find", **params)
+
+    def contract_pdf(self, file_id: str) -> dict:
+        """Подписанный PDF договора по id файла Drive — ТОЛЬКО ЧТЕНИЕ, GET (`_call`).
+
+        Мост отдаёт файл, только если id стоит в колонке «PDF (подписанный)» реестра, строка
+        «ПОДПИСАН» и файл лежит в папке подписанных; иначе `ok: false` с причиной (`not_in_registry`,
+        `not_signed`, `not_in_signed_folder`, `not_pdf`, `too_large`, …).
+
+        → {ok, id, name, mime, size, sha256, content_b64, row, client, contract_date, signed_at,
+        verified}. `verified` ставит КЛИЕНТ: содержимое декодировано, длина и sha256 сошлись с тем,
+        что назвал мост. Не сошлись → `ok: false, error: "pdf_mismatch"`, файл прикладывать нельзя."""
+        import base64
+        import hashlib
+        res = self._call("contract_pdf", id=str(file_id or "").strip())
+        if not (isinstance(res, dict) and res.get("ok") and "content_b64" in res):
+            return res
+        try:
+            raw = base64.b64decode(res.get("content_b64") or "", validate=True)
+        except Exception as e:   # noqa: BLE001 — битое содержимое = отказ, а не исключение наружу
+            return dict(res, ok=False, error="pdf_mismatch", verified=False, message=f"base64: {e}")
+        same = (len(raw) == res.get("size")
+                and hashlib.sha256(raw).hexdigest() == str(res.get("sha256") or "").lower())
+        if not same:
+            return dict(res, ok=False, error="pdf_mismatch", verified=False,
+                        message="длина или sha256 содержимого не сошлись с ответом моста")
+        return dict(res, verified=True)
+
     def void_last(self, group: str = "") -> dict:
         """Отменить последнюю активную запись (группы group, если задана)."""
         return self._post("void_last", group=group)
