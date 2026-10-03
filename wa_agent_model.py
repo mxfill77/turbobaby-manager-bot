@@ -434,8 +434,12 @@ class ModelAdapter(wa_agent.Model):
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
                  manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db="",
-                 lessons_db="", book=None, cache=None):
+                 lessons_db="", book=None, cache=None, tools=None, fresh=None):
         self.queue_db, self.call = queue_db, call
+        # инструменты чтения (AGENTLOOPA0310, флаг WA_AGENT_TOOLS): None — выкл, черновик одним вызовом, как в 9c4aac6;
+        # dict дверей моста (cash/contract/contract_pdf) — модель сама выбирает, что прочитать (`wa_agent_tools`)
+        self.tools = tools
+        self.fresh = fresh                                # fresh(number, upto_id) → новое входящее посреди сверки
         self.cache = cache if cache in CACHE_TTLS else None   # срок кэша промпта (WAAGENTCACHE0210); None — выкл
         self.spend = {"calls": 0, "in": 0, "cw": 0, "cr": 0, "out": 0, "usd": 0.0, "usd_nocache": 0.0}
         self.book = book                                  # снимок броней `wa_book_read.Snapshot`; None — выкл
@@ -625,6 +629,8 @@ class ModelAdapter(wa_agent.Model):
         return system, user, info
 
     def draft(self, number, upto_id):
+        if self.tools is not None:
+            return self._draft_tools(number, upto_id)
         system, user, info = self.build(number, upto_id)
         raw, usage = self.call(system, user)
         self._spend(usage, "черновик:")
@@ -651,6 +657,75 @@ class ModelAdapter(wa_agent.Model):
         self.log("модель: черновик %d симв., история %d строк / %d симв., маска %d, %s, причин %d (%s)"
                  % (len(got["text"]), info["history_items"], info["history_chars"], info["masked"],
                     info["price_words"], len(words), tok))
+        return {"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]}
+
+    # ── черновик со сверкой (AGENTLOOPA0310, Т4а) ─────────────────────────────────────────
+
+    def _tool_doors(self, number, upto_id):
+        """Двери адаптера (переписка, аренда, правила) + двери моста из `self.tools`. Все — только чтение."""
+        def history():
+            items, _missing = self._history(number, upto_id)
+            return items
+
+        def rental():
+            if self.book is None:
+                return {"ok": False, "error": "брони выключены"}
+            rows, _bikes, _age, why = self.book.get(self.clock())
+            if rows is None:
+                return {"ok": False, "error": why or "снимок броней не прочитан"}
+            digits = re.sub(r"\D", "", str(number or ""))
+            key = digits[-B.KEY_DIGITS:] if len(digits) >= B.KEY_DIGITS else None
+            hits = [r for r in rows if key and B.is_active(r) and key in B.phone_keys(r.get("contacts"))]
+            return {"ok": True, "rows": hits}
+
+        def rules():
+            return self.knowledge.snap.get("business_rules")
+
+        doors = {"history": history, "rental": rental, "rules": rules}
+        doors.update({k: v for k, v in (self.tools or {}).items() if k in ("cash", "contract", "contract_pdf")})
+        return doors
+
+    def _draft_tools(self, number, upto_id):
+        """Сверка: модель вызывает инструменты (≤ T.MAX_CALLS вызовов, ≤ T.MAX_SEC с), код принимает факты, считает
+        суммы и судит денежные роли. Предел превышен — обычный черновик одним вызовом без фактов и причина «сверка не
+        завершена» первой. Новое входящее посреди сверки — черновика нет (служба повторит позже)."""
+        import wa_agent_tools as T
+        system, user, info = self.build(number, upto_id)
+        out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
+                    fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
+                    spend=lambda u: self._spend(u, "сверка:"))
+        jr = out["journal"]
+        if out["state"] == T.ABORTED:
+            for line in jr.lines():
+                self.log(line)
+            self.log("сверка прервана: новое входящее — черновика нет")
+            self.last = {"info": info, "tools": out}
+            return None
+        reasons, raw, usage = [], out["raw"], out["usage"]
+        if out["state"] == T.OVER:
+            raw, usage = self.call(system, user)                # тот же один вызов, что и без флага
+            self._spend(usage, "черновик:")
+            reasons = [T.INCOMPLETE_WORDS]
+            out["results"] = []                                 # факты незавершённой сверки не опора
+        got = parse_reply(raw)
+        words_t, figures = T.judge(got["text"] if got else "", info["price"], out["results"], jr)
+        for line in jr.lines():
+            self.log(line)
+        self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got, "tools": out, "figures": figures}
+        if got is None:
+            self.log("модель: ответ не JSON или без текста — черновика нет (сверка %s, вызовов %d)"
+                     % (out["state"], out["calls"]))
+            return None
+        words = [r["words"] for r in info["code_reasons"]]
+        if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
+            words.append(K.REASON_WORDS[K.R_LANGUAGE])
+        words = K.merge_reasons(words, got["handoff"])
+        for w in reversed(words_t):                             # причины кода о деньгах — вперёд
+            words = K.reason_first(words, w)
+        for w in reversed(reasons):                             # «сверка не завершена» — самой первой
+            words = K.reason_first(words, w)
+        self.log("модель: черновик %d симв. со сверкой (%s, вызовов %d, %.1f с), причин %d"
+                 % (len(got["text"]), out["state"], out["calls"], out["sec"], len(words)))
         return {"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]}
 
     # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────
