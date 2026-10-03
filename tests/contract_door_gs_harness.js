@@ -385,6 +385,154 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   check('route.help-lists', Array.isArray(b4.actions) && b4.actions.indexOf('contract_find') >= 0 && b4.actions.indexOf('contract_pdf') >= 0, J(b4.actions));
 }
 
+// ── 18. CONTRACTFIX0410: неизвестный день строки не даёт уверенного единственного ответа ──
+// Свой синтетический реестр (подменой листа, как в секции 14): прежние случаи 1–17 судят прежний
+// реестр и не тронуты. Номер строки = индекс + 1 (шапка — строка 1).
+{
+  const ROWS2 = [
+    HEADERS.slice(),
+    /* 2 */ rowOf({ 'ID документа': 'F-001', 'Клиент': 'Petr Kotov', 'Дата договора': '2026-09-10', 'Статус': 'ПОДПИСАН',
+      'PDF (подписанный)': VIEW(PDF_A), 'Телефон': '+66 81 555 0001', 'Байк': 'PCX 1111' }),
+    /* 3 */ rowOf({ 'ID документа': 'F-002', 'Клиент': 'Petr Kotov', 'Статус': 'ПОДПИСАН',
+      'PDF (подписанный)': VIEW(PDF_B), 'Телефон': '+66 81 555 0001', 'Байк': 'PCX 2222' }),
+    /* 4 */ rowOf({ 'ID документа': 'F-003', 'Клиент': 'Sara Vale', 'Дата договора': '31.02.2026', 'Документ создан': '2026-09-12 10:00',
+      'Статус': 'ПОДПИСАН', 'PDF (подписанный)': VIEW(PDF_C), 'Телефон': '+66 81 555 0002', 'Байк': 'Vario 3333' }),
+    /* 5 */ rowOf({ 'ID документа': 'F-004', 'Клиент': 'Tom Reed', 'Дата договора': 'по договорённости', 'Документ создан': '2026-09-14 09:00',
+      'Статус': 'ПОДПИСАН', 'PDF (подписанный)': VIEW(PDF_R), 'Телефон': '+66 81 555 0003', 'Байк': 'Vario 4444' }),
+    /* 6 */ rowOf({ 'ID документа': 'F-005', 'Клиент': 'Nina Ross', 'Документ создан': '2026-09-16 11:00', 'Статус': 'ПОДПИСАН',
+      'Подписан': '2026-09-16 12:30', 'PDF (подписанный)': VIEW(PDF_X), 'Телефон': '+66 81 555 0004', 'Байк': 'Click 5555' }),
+    /* 7 */ rowOf({ 'ID документа': 'F-006', 'Клиент': 'Oleg Lane', 'Дата договора': '2026-09-18', 'Статус': 'ПОДПИСАН',
+      'PDF (подписанный)': VIEW(PDF_N), 'Телефон': '+66 81 555 0005', 'Байк': 'ADV 6666' }),
+    /* 8 */ rowOf({ 'ID документа': 'F-007', 'Клиент': 'Oleg Lane', 'Статус': 'ОТПРАВЛЕН',
+      'Телефон': '+66 81 555 0005', 'Байк': 'ADV 6667' }),
+    /* 9 */ rowOf({ 'ID документа': 'F-008', 'Клиент': 'Ira Moss', 'Статус': 'ПОДПИСАН',
+      'PDF (подписанный)': VIEW(PDF_T), 'Телефон': '+66 81 555 0006', 'Байк': 'NMAX 7771' }),
+    /* 10 */ rowOf({ 'ID документа': 'F-009', 'Клиент': 'Leo Park', 'Дата договора': '2026-02-29', 'Статус': 'ПОДПИСАН',
+      'Телефон': '+66 81 555 0007', 'Байк': 'NMAX 7772' }),
+    /* 11 */ rowOf({ 'ID документа': 'F-010', 'Клиент': 'Max Hill', 'Дата договора': '29.02.2028', 'Статус': 'ПОДПИСАН',
+      'Телефон': '+66 81 555 0008', 'Байк': 'NMAX 7773' }),
+    /* 12 */ rowOf({ 'ID документа': 'F-011', 'Клиент': 'Kate Bell', 'Дата договора': '2026-09-05', 'Статус': 'ПОДПИСАН',
+      'Телефон': '+66 81 555 0009', 'Байк': 'PCX 8881' }),
+    /* 13 */ rowOf({ 'ID документа': 'F-012', 'Клиент': 'Kate Bell', 'Дата договора': '2026-09-06', 'Статус': 'ПОДПИСАН',
+      'Телефон': '+66 81 555 0009', 'Байк': 'PCX 8882' }),
+    /* 14 */ rowOf({ 'ID документа': 'F-013', 'Клиент': 'Kate Bell', 'Статус': 'ПОДПИСАН',
+      'Телефон': '+66 81 555 0009', 'Байк': 'PCX 8883' }),
+  ];
+  const SEPT = { date_from: '2026-09-01', date_to: '2026-09-30' };
+  const keep = SHEETS;
+  const sheet2 = makeSheet(ROWS2, ROWS2.map(() => []), ROWS2.map(() => []));
+  SHEETS = { 'Реестр': sheet2 };
+  const urows = r => (r && r.undated_items ? r.undated_items.map(x => x.row) : null);
+  const ubyRow = (r, n) => (r && r.undated_items || []).find(x => x.row === n) || {};
+
+  // контрпример П3 (Codex TB-CHECK-0410-0025 п.1): первый подписанный в сроке, второй без обеих дат
+  const ce = safe(() => contractFind(Object.assign({ phone: '0815550001' }, SEPT)));
+  check('fix.counterexample-incomplete', ce.ok === true && ce.outcome === 'incomplete' && ce.pick === null,
+    J([ce.outcome, ce.pick]));
+  check('fix.counterexample-not-one', ['one', 'none', 'none_signed'].indexOf(ce.outcome) < 0, ce.outcome);
+  check('fix.counterexample-reason', ce.reason && ce.reason.code === 'undated_signed' && J(ce.reason.rows) === J([3])
+    && typeof ce.reason.message === 'string' && ce.reason.message.length > 0, J(ce.reason));
+  check('fix.counterexample-counts', ce.checked && ce.checked.undated === 1 && ce.checked.undated_signed === 1
+    && ce.checked.date_unparsed === 0 && ce.checked.complete === false && ce.checked.matched === 1, J(ce.checked));
+  check('fix.counterexample-rows', J(rowsOf(ce)) === J([2]) && J(urows(ce)) === J([3]), J([rowsOf(ce), urows(ce)]));
+  check('fix.counterexample-undated-record', ubyRow(ce, 3).contract_date === null && ubyRow(ce, 3).date_src === 'none'
+    && ubyRow(ce, 3).contract_date_raw === '' && ubyRow(ce, 3).pdf_id === PDF_B && ubyRow(ce, 3).signed === true, J(ubyRow(ce, 3)));
+
+  // П1: 31.02.2026 — не дата; без срока строка остаётся в ответе с честным «день неизвестен»
+  const sv = safe(() => contractFind({ name: 'Sara Vale' }));
+  check('fix.feb31-unparsed', byRow(sv, 4).contract_date === null && byRow(sv, 4).date_src === 'unparsed'
+    && byRow(sv, 4).contract_date_raw === '31.02.2026', J(byRow(sv, 4)));
+  check('fix.feb31-counted', sv.checked && sv.checked.date_unparsed === 1 && sv.checked.undated === 0
+    && sv.checked.complete === true && sv.outcome === 'one', J([sv.outcome, sv.checked]));
+  // и created рядом НЕ подставлен, хотя он верная дата
+  check('fix.feb31-created-not-used', byRow(sv, 4).created_raw === '2026-09-12 10:00' && byRow(sv, 4).date_src !== 'created', J(byRow(sv, 4)));
+  const svt = safe(() => contractFind(Object.assign({ name: 'Sara Vale' }, SEPT)));
+  check('fix.feb31-term-incomplete', svt.outcome === 'incomplete' && J(urows(svt)) === J([4]) && J(rowsOf(svt)) === J([])
+    && svt.checked.date_unparsed === 1, J([svt.outcome, svt.checked]));
+
+  // П2: непустая неразобранная дата договора при верном created — created НЕ подставлен
+  const tr = safe(() => contractFind(Object.assign({ name: 'Tom Reed' }, SEPT)));
+  check('fix.unparsed-no-created', J(rowsOf(tr)) === J([]) && ubyRow(tr, 5).date_src === 'unparsed'
+    && ubyRow(tr, 5).contract_date === null && ubyRow(tr, 5).contract_date_raw === 'по договорённости'
+    && ubyRow(tr, 5).created_raw === '2026-09-14 09:00', J([rowsOf(tr), ubyRow(tr, 5)]));
+  check('fix.unparsed-no-created-outcome', tr.outcome === 'incomplete' && tr.pick === null && tr.reason
+    && J(tr.reason.rows) === J([5]), J([tr.outcome, tr.reason]));
+
+  // пустая ячейка даты договора при верном created — created подставлен, источник назван
+  const nr = safe(() => contractFind(Object.assign({ name: 'Nina Ross' }, SEPT)));
+  check('fix.empty-uses-created', J(rowsOf(nr)) === J([6]) && byRow(nr, 6).date_src === 'created'
+    && byRow(nr, 6).contract_date === '2026-09-16' && byRow(nr, 6).contract_date_raw === ''
+    && byRow(nr, 6).created_raw === '2026-09-16 11:00' && nr.outcome === 'one' && nr.checked.complete === true, J(nr.items));
+
+  // П4: pick — полная запись (поля как в items) плюс pdf_ready
+  const ITEM_KEYS = ['row', 'doc_id', 'client', 'contract_date', 'contract_date_raw', 'created_raw', 'date_src', 'status',
+    'signed', 'signed_at', 'bike', 'phone', 'pdf_id', 'matched_on'];
+  const it6 = byRow(nr, 6);
+  check('fix.pick-full-record', nr.pick && ITEM_KEYS.every(k => J(nr.pick[k]) === J(it6[k])) && nr.pick.pdf_ready === true
+    && J(Object.keys(nr.pick).sort()) === J(ITEM_KEYS.concat(['pdf_ready']).sort()), J(nr.pick));
+  check('fix.items-keys', J(Object.keys(it6).sort()) === J(ITEM_KEYS.slice().sort()), J(Object.keys(it6)));
+  check('fix.pick-values', nr.pick && nr.pick.client === 'Nina Ross' && nr.pick.signed_at === '2026-09-16 12:30'
+    && nr.pick.bike === 'Click 5555' && nr.pick.status === 'ПОДПИСАН' && nr.pick.pdf_id === PDF_X, J(nr.pick));
+
+  // неподписанный без дня в сроке не мешает one (но ответ помечен неполным)
+  const ol = safe(() => contractFind(Object.assign({ phone: '0815550005' }, SEPT)));
+  check('fix.unsigned-undated-keeps-one', ol.outcome === 'one' && ol.pick && ol.pick.row === 7 && ol.reason === null, J([ol.outcome, ol.pick]));
+  check('fix.unsigned-undated-counted', ol.checked.undated === 1 && ol.checked.undated_signed === 0 && ol.checked.complete === false
+    && J(urows(ol)) === J([8]), J(ol.checked));
+
+  // без срока неизвестный день строку не исключает
+  const im = safe(() => contractFind({ name: 'Ira Moss' }));
+  check('fix.no-term-keeps-undated', im.outcome === 'one' && J(rowsOf(im)) === J([9]) && byRow(im, 9).contract_date === null
+    && byRow(im, 9).date_src === 'none' && im.pick && im.pick.row === 9, J([im.outcome, im.items]));
+  check('fix.no-term-complete', im.checked.undated === 0 && im.checked.complete === true && J(urows(im)) === J([]), J(im.checked));
+  const imt = safe(() => contractFind(Object.assign({ name: 'Ira Moss' }, SEPT)));
+  check('fix.term-same-row-incomplete', imt.outcome === 'incomplete' && J(urows(imt)) === J([9]), J([imt.outcome, imt.checked]));
+
+  // календарь: 2026-02-29 — нет такого дня; 29.02.2028 — високосный, день есть
+  const lp = safe(() => contractFind({ name: 'Leo Park' }));
+  check('fix.iso-feb29-nonleap-unparsed', byRow(lp, 10).date_src === 'unparsed' && byRow(lp, 10).contract_date === null
+    && byRow(lp, 10).contract_date_raw === '2026-02-29', J(byRow(lp, 10)));
+  const mh = safe(() => contractFind({ name: 'Max Hill' }));
+  check('fix.leap-day-valid', byRow(mh, 11).contract_date === '2028-02-29' && byRow(mh, 11).date_src === 'contract_date', J(byRow(mh, 11)));
+
+  // в сроке подписанных два — ambiguous верен при любом неизвестном; ответ всё равно неполон
+  const kb = safe(() => contractFind(Object.assign({ name: 'Kate Bell' }, SEPT)));
+  check('fix.ambiguous-over-incomplete', kb.outcome === 'ambiguous' && kb.pick === null && kb.reason === null
+    && kb.checked.undated_signed === 1 && kb.checked.complete === false, J([kb.outcome, kb.checked]));
+
+  // span реестра — только из верных дней (31.02 и 29.02.2026 в него не входят)
+  check('fix.span-valid-days-only', ce.checked.span_from === '2026-09-01' && ce.checked.span_to === '2026-09-30'
+    && sv.checked.span_from === '2026-09-05' && sv.checked.span_to === '2028-02-29', J([sv.checked.span_from, sv.checked.span_to]));
+
+  // маршрут GET отдаёт новый исход и причину как есть
+  const rt = safe(() => JSON.parse(doGet({ parameter: { token: 'tok-test', action: 'contract_find', phone: '0815550001',
+    date_from: '2026-09-01', date_to: '2026-09-30' } }).getContent()));
+  check('fix.route-incomplete', rt.action === 'contract_find' && rt.outcome === 'incomplete' && rt.pick === null
+    && rt.reason && rt.reason.code === 'undated_signed' && rt.checked.complete === false, J(rt).slice(0, 300));
+
+  // реестр прочитан не целиком → checked.complete = false и названо, ЧТО не прочитано
+  const wrap = (sh, over) => Object.assign({}, sh, { getRange(...a) { return Object.assign({}, sh.getRange(...a), over(a)); } });
+  SHEETS = { 'Реестр': wrap(sheet2, () => ({ getRichTextValues() { throw new Error('rich недоступен'); } })) };
+  const ur = safe(() => contractFind({ name: 'Nina Ross' }));
+  check('fix.unread-rich', ur.ok === true && J(ur.checked.unread) === J(['pdf_rich_text']) && ur.checked.complete === false
+    && ur.outcome === 'one', J(ur.checked));
+  SHEETS = { 'Реестр': wrap(sheet2, () => ({ getFormulas() { throw new Error('формулы недоступны'); } })) };
+  const uf = safe(() => contractFind({ name: 'Nina Ross' }));
+  check('fix.unread-formulas', J(uf.checked.unread) === J(['pdf_formulas']) && uf.checked.complete === false, J(uf.checked));
+  SHEETS = { 'Реестр': wrap(sheet2, a => (a[0] === 2 && a[1] === 1
+    ? { getValues() { return sheet2.getRange(...a).getValues().slice(0, -1); } } : {})) };
+  const us = safe(() => contractFind({ name: 'Nina Ross' }));
+  check('fix.unread-rows-short', us.checked && (us.checked.unread || []).indexOf('rows_short') >= 0 && us.checked.complete === false, J(us.checked));
+  SHEETS = keep;
+
+  // прежний реестр: полный ответ помечен полным; Date-ячейка даты договора — исходное значение названо
+  const ok2 = safe(() => contractFind({ phone: '0812345678', date_from: '2026-09-15', date_to: '2026-09-30' }));
+  check('fix.complete-normal', ok2.checked.complete === true && J(ok2.checked.unread) === J([]) && ok2.checked.undated === 0
+    && ok2.reason === null && J(ok2.undated_items) === '[]', J(ok2.checked));
+  check('fix.raw-date-object', ok2.pick && ok2.pick.contract_date_raw === '2026-09-20 00:00' && ok2.pick.date_src === 'contract_date', J(ok2.pick));
+  check('fix.readonly-no-writes', WRITES.n === 0, J(WRITES.what));
+}
+
 const failed = cases.filter(c => !c.pass);
 console.log(JSON.stringify({ cases, failed: failed.length }, null, 1));
 process.exit(failed.length ? 1 : 0);
