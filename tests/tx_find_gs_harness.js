@@ -271,6 +271,137 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   check('route.help-lists', Array.isArray(b4.actions) && b4.actions.indexOf('tx_find') >= 0, J(b4.actions));
 }
 
+// ══ НЕРАЗОБРАННОЕ НЕ СТАНОВИТСЯ ФАКТОМ (TXFINDFIX0310) — свой лист, прежние случаи выше не тронуты ══
+// Сумма строкой и день в иной форме — рука человека или старые строки (писатель кладёт сумму
+// числом, msg_date — как пришло). recorded_at 02.10 03:00Z = 10:00 по Бангкоку, тоже 02.10.
+const REC2 = '2026-10-02T03:00:00.000Z';
+const fx = (rec, md, amt, bike, extra) => {
+  const e = extra || {};
+  return [rec, md, 'Money Cashflow', '@pym', amt, e.cur || 'THB', 'rental', bike, '', bike + ' ' + amt,
+          bike + ' ' + amt, e.st || 'recorded', CHAT + ':' + (e.mid || 900) + ':m0', e.bk || ''];
+};
+const ROWS2 = [
+  HEADERS.slice(),
+  /*  2 */ fx(REC2, '2026-10-01', '8,000', 'Nmax 7001', { bk: 'bk-fix', mid: 901 }),
+  /*  3 */ fx(REC2, '2026-10-01', '8 000', 'Nmax 7002', { mid: 902 }),
+  /*  4 */ fx(REC2, '2026-10-01', 0, 'Nmax 7003', { mid: 903 }),
+  /*  5 */ fx(REC2, '2026-10-01', '', 'Nmax 7004', { mid: 904 }),
+  /*  6 */ fx(REC2, '01.10.2026', 3000, 'ADV 7005', { mid: 905 }),
+  /*  7 */ fx(REC2, 'вчера вечером', 1500, 'ADV 7006', { mid: 906 }),
+  /*  8 */ fx(REC2, '2026-10-01', '8,5', 'Nmax 7007', { bk: 'bk-fix', mid: 907 }),
+  /*  9 */ fx(REC2, '31.09.2026', 700, 'ADV 7008', { mid: 908 }),
+  /* 10 */ fx(REC2, 'вчера вечером', 900, 'ADV 7009', { st: 'void', mid: 910 }),
+  /* 11 */ fx(REC2, '2026-10-01', 1000, 'Nmax 7010', { bk: 'bk-fix', mid: 911 }),
+  /* 12 */ fx(REC2, '2026-10-03', 500, 'Nmax 7001', { mid: 912 }),
+  /* 13 */ fx(REC2, '2026-10-01', '8.000', 'Nmax 7011', { mid: 913 }),
+  /* 14 */ fx(REC2, '2026-10-01', '-300', 'Nmax 7012', { mid: 914 }),
+  /* 15 */ fx(REC2, '2026-10-01', '1,234,567.50', 'Nmax 7013', { mid: 915 }),
+  /* 16 */ fx(REC2, '2026-10-01', '80,00', 'Nmax 7014', { mid: 916 }),
+  /* 17 */ fx(REC2, '2026-10-01', '8000 THB', 'Nmax 7015', { mid: 917 }),
+  /* 18 */ fx(REC2, '2026-10-01', '8\u00A0000', 'Nmax 7016', { mid: 918 }),
+  /* 19 */ fx(REC2, '2026-10-01', '8000', 'Nmax 7017', { mid: 919 }),
+];
+const txSheet2 = makeSheet(ROWS2);
+const onSheet2 = fn => { const keep = SHEETS; SHEETS = { 'транзакции': txSheet2 }; try { return safe(fn); } finally { SHEETS = keep; } };
+const one = r => (r && r.items && r.items.length === 1 ? r.items[0] : {});
+
+// ── 14. сумма: строка однозначной формы разбирается; прочее — null + исходник + флаг, не 0 ──
+{
+  const a = onSheet2(() => txFind({ bike: '7001', date_to: '2026-10-01' }));
+  check('amount.comma-string', one(a).amount === 8000 && one(a).amount_raw === '8,000' && one(a).amount_unparsed === false
+        && a.total.THB === 8000 && a.total_complete === true && a.checked.amount_unparsed === 0, J([one(a), a.total, a.total_complete]));
+  const b = onSheet2(() => txFind({ bike: '7002' }));
+  check('amount.space-string', one(b).amount === 8000 && one(b).amount_raw === '8 000' && b.total.THB === 8000, J([one(b), b.total]));
+  const nb = onSheet2(() => txFind({ bike: '7016' }));
+  check('amount.nbsp-string', one(nb).amount === 8000 && nb.total_complete === true, J(one(nb)));
+  const pl = onSheet2(() => txFind({ bike: '7017' }));
+  check('amount.plain-string', one(pl).amount === 8000 && one(pl).amount_unparsed === false, J(one(pl)));
+  const z = onSheet2(() => txFind({ bike: '7003' }));
+  check('amount.real-zero', one(z).amount === 0 && one(z).amount_unparsed === false && one(z).amount_raw === '0'
+        && z.total.THB === 0 && z.total_complete === true && z.checked.amount_unparsed === 0, J([one(z), z.total]));
+  const e = onSheet2(() => txFind({ bike: '7004' }));
+  check('amount.empty-unparsed', one(e).amount === null && one(e).amount_raw === '' && one(e).amount_unparsed === true
+        && !('THB' in e.total) && e.total_complete === false && e.checked.amount_unparsed === 1 && e.checked.complete === false,
+        J([one(e), e.total, e.total_complete, e.checked]));
+  const neg = onSheet2(() => txFind({ bike: '7012' }));
+  check('amount.sign', one(neg).amount === -300 && neg.total.THB === -300, J(one(neg)));
+  const big = onSheet2(() => txFind({ bike: '7013' }));
+  check('amount.groups-fraction', one(big).amount === 1234567.5 && big.total.THB === 1234567.5, J(one(big)));
+  const bad = {};
+  for (const [pl2, raw] of [['7007', '8,5'], ['7011', '8.000'], ['7014', '80,00'], ['7015', '8000 THB']]) {
+    const r = onSheet2(() => txFind({ bike: pl2 }));
+    bad[raw] = [one(r).amount, one(r).amount_raw, one(r).amount_unparsed, r.total_complete, J(r.total)];
+  }
+  check('amount.ambiguous-unparsed', Object.keys(bad).every(k => bad[k][0] === null && bad[k][1] === k && bad[k][2] === true
+        && bad[k][3] === false && bad[k][4] === '{}'), J(bad));
+  const mix = onSheet2(() => txFind({ booking_id: 'bk-fix' }));
+  check('amount.mix-total', J(rowsOf(mix)) === J([11, 8, 2]) && mix.total.THB === 9000 && mix.total_complete === false
+        && mix.checked.amount_unparsed === 1 && mix.checked.matched === 3 && mix.checked.complete === false,
+        J([rowsOf(mix), mix.total, mix.total_complete, mix.checked]));
+  check('amount.unparsed-still-returned', (mix.items || []).some(x => x.row === 8 && x.amount === null && x.amount_raw === '8,5'),
+        J(mix.items && mix.items.map(x => [x.row, x.amount, x.amount_raw])));
+}
+
+// ── 15. день: DD.MM.YYYY понимается; непустая неразобранная msg_date НЕ подменяется днём записи ──
+{
+  const d1 = onSheet2(() => txFind({ date_from: '2026-10-01', date_to: '2026-10-01', bike: '7005' }));
+  check('date.ddmmyyyy-cell', J(rowsOf(d1)) === J([6]) && one(d1).date === '2026-10-01' && one(d1).date_src === 'msg_date'
+        && one(d1).msg_date_raw === '01.10.2026' && d1.checked.complete === true, J([one(d1), d1.checked]));
+  const d2 = onSheet2(() => txFind({ date_from: '2026-10-02', date_to: '2026-10-02', bike: '7005' }));
+  check('date.ddmmyyyy-not-recorded-day', d2.ok === true && J(d2.items) === '[]', J(rowsOf(d2)));
+  const g = onSheet2(() => txFind({ date_from: '2026-10-02', date_to: '2026-10-02' }));
+  check('date.garbage-not-in-record-day', g.ok === true && !(g.items || []).some(x => x.row === 7 || x.row === 9),
+        J(rowsOf(g)));
+  check('date.garbage-counted', g.checked && g.checked.undated === 2 && g.checked.date_unparsed === 2 && g.checked.complete === false
+        && g.total_complete === false, J([g.checked, g.total_complete]));
+  const gb = onSheet2(() => txFind({ bike: '7006' }));
+  check('date.garbage-no-span', one(gb).row === 7 && one(gb).date === null && one(gb).date_src === 'unparsed'
+        && one(gb).msg_date_raw === 'вчера вечером' && one(gb).recorded_at === REC2
+        && gb.checked.date_unparsed === 1 && gb.checked.complete === false && gb.total_complete === true && gb.total.THB === 1500,
+        J([one(gb), gb.checked]));
+  const cal = onSheet2(() => txFind({ bike: '7008' }));
+  check('date.calendar-check', one(cal).date === null && one(cal).date_src === 'unparsed' && one(cal).msg_date_raw === '31.09.2026',
+        J(one(cal)));
+  const s1 = onSheet2(() => txFind({ date_from: '2026-10-01', date_to: '2026-10-01' }));
+  check('date.span-day1', !(s1.items || []).some(x => x.row === 7 || x.row === 9) && (s1.items || []).some(x => x.row === 6)
+        && s1.checked.undated === 2, J([rowsOf(s1), s1.checked]));
+}
+
+// ── 16. полнота: обрезка, строки без дня в сроке, только СВОИ (байк/бронь, не отменённые) ──
+{
+  const c = onSheet2(() => txFind({ bike: '7001' }));
+  check('complete.clean', J(rowsOf(c)) === J([12, 2]) && c.checked.complete === true && c.total_complete === true
+        && c.total.THB === 8500, J([c.checked, c.total]));
+  const t = onSheet2(() => txFind({ bike: '7001', limit: 1 }));
+  check('complete.truncated', t.checked.truncated === true && t.checked.complete === false && t.total_complete === true
+        && t.total.THB === 8500, J([t.checked, t.total_complete]));
+  const own = onSheet2(() => txFind({ bike: '7001', date_from: '2026-10-01', date_to: '2026-10-03' }));
+  check('complete.foreign-undated-ignored', own.checked.undated === 0 && own.checked.complete === true && own.total_complete === true,
+        J(own.checked));
+  const v = onSheet2(() => txFind({ bike: '7009', date_from: '2026-10-02', date_to: '2026-10-02' }));
+  check('complete.void-undated-ignored', v.checked.undated === 0 && v.checked.date_unparsed === 0 && v.checked.complete === true
+        && J(v.items) === '[]', J(v.checked));
+  const v2 = onSheet2(() => txFind({ bike: '7009' }));
+  check('complete.void-still-void', J(v2.items) === '[]' && v2.checked.voided === 1 && v2.checked.date_unparsed === 0, J(v2.checked));
+  const fields = onSheet2(() => txFind({ bike: '7001' }));
+  const need = ['amount_raw', 'amount_unparsed', 'msg_date_raw'];
+  check('complete.fields', (fields.items || []).every(x => need.every(k => k in x)) && 'total_complete' in fields
+        && ['amount_unparsed', 'date_unparsed', 'complete'].every(k => k in fields.checked), J(fields.items && fields.items[0]));
+}
+
+// ── 17. маршрут GET доносит новые поля; лист по-прежнему не тронут ──
+{
+  const keep = SHEETS; SHEETS = { 'транзакции': txSheet2 };
+  const out = safe(() => doGet({ parameter: { token: 'tok-test', action: 'tx_find', booking_id: 'bk-fix' } }));
+  SHEETS = keep;
+  const body = safe(() => JSON.parse(out.getContent()));
+  const it8 = (body.items || []).find(x => x.row === 8) || {};
+  check('fix.route-fields', body.ok === true && body.total_complete === false && body.checked && body.checked.complete === false
+        && body.checked.amount_unparsed === 1 && it8.amount === null && it8.amount_raw === '8,5' && it8.amount_unparsed === true,
+        J(body).slice(0, 400));
+  check('fix.readonly', WRITES.n === 0, J(WRITES.what));
+}
+
 const failed = cases.filter(c => !c.pass);
 console.log(JSON.stringify({ cases, failed: failed.length }, null, 1));
 process.exit(failed.length ? 1 : 0);

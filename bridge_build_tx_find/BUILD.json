@@ -6,7 +6,7 @@
   "Bridge.js": "0489756aa0af93a27de364e7abf44f9ecc1a5c3ccd0d075627858b52cf9a44d8"
  },
  "build_sha256": {
-  "BotData.js": "57ba519ffc0d616ea739178c535b1003897ac8b07f304ee3f29922305cfde5cd",
+  "BotData.js": "7ee6f1564e1df08cfbf600773ca065e4c39d38d8eb8d21eb13483d5a30a83a76",
   "Bridge.js": "7eb0b52d24aba339ef94b11f1496f35e1415aefc344ad1bc2637659ac7fc547d"
  },
  "changed": [
@@ -26,6 +26,7 @@
   "base_sha256 здесь совпадает с bridge_prod/ (стережёт tests/test_tx_find.py::test_build_passport)",
   "после выкладки свести зеркало bridge_prod/ (bridge_deploy.py шаг [7/7] делает это сам)"
  ],
+ "поправка": "TXFINDFIX0310 (03.10.2026): неразобранное не становится фактом — сумма-строка неоднозначной формы даёт amount=null + amount_raw + amount_unparsed и не идёт в total (total_complete=false); msg_date 'DD.MM.YYYY' понимается; непустая неразобранная msg_date днём записи не подменяется (date=null, date_src 'unparsed', msg_date_raw); checked.amount_unparsed/date_unparsed/complete. build_sha256 BotData.js пересчитан по файлу (было 57ba519f…).",
  "почему_отдельный_каталог": "bridge_build/ — след выложенной сборки двери отмены ТО (@83), его судит tests/test_undo_door.py; перестройка там потребовала бы удалить ReadFleet.js/ServiceUndo.js из каталога, а удаление в этом заходе запрещено. bridge_deploy.py принимает каталог аргументом, поэтому сборка живёт рядом.",
  "тема": "дверь tx_find — read-only поиск проводок кассы по байку, брони и сроку (К1 проекта AGENTASKSPL0310, 03.10.2026)",
  "что_это": "КАТАЛОГ СБОРКИ ЗАХОДА. Здесь лежит НЕ прод, а то, что заход предлагает выложить. Истина о проде — bridge_prod/ (зеркало под паспортом MIRROR.json)."

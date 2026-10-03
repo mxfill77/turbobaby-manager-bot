@@ -1056,15 +1056,25 @@ class BridgeClient:
 
         Фильтры (хотя бы один, иначе мост ответит `no_filter`): `bike` — как пишется в кассе
         («Nmax 6908») или голый номер, сравнение ПО НОМЕРУ; `booking_id` — точно, col N;
-        `date_from`/`date_to` — включительно, YYYY-MM-DD или DD.MM.YYYY, день = msg_date (пуст →
+        `date_from`/`date_to` — включительно, YYYY-MM-DD или DD.MM.YYYY, день = msg_date (ПУСТ →
         день recorded_at). `limit` — по умолчанию 50, потолок 200 (`TX_FIND_LIMIT_MAX` моста).
 
         → {ok, filter, limit, limit_max, checked:{span_from, span_to, rows_scanned, rows_in_span,
-        undated, voided, matched, returned, truncated, …}, total:{валюта: сумма},
-        items:[{row, date, date_src, recorded_at, amount, currency, category, bike, deposit,
+        undated, voided, matched, returned, truncated, amount_unparsed, date_unparsed, complete,
+        …}, total:{валюта: сумма}, total_complete, items:[{row, date, date_src, msg_date_raw,
+        recorded_at, amount, amount_raw, amount_unparsed, currency, category, bike, deposit,
         description, raw, msg_id, link, status, booking_id, group, sender}]}. Отменённые (status
         void) не отдаются, их число — `checked.voided`. Пустой `items` при `ok` — «просмотрено
         `rows_scanned` строк за срок span_from…span_to, не найдено», а не «не смотрели».
+
+        НЕРАЗОБРАННОЕ НЕ СТАНОВИТСЯ ФАКТОМ (TXFINDFIX0310): сумма-строка неоднозначной формы →
+        `amount=None`, исходник в `amount_raw`, `amount_unparsed=True`, в `total` она НЕ входит и
+        `total_complete=False` (счёт — `checked.amount_unparsed`); непустая неразобранная msg_date
+        днём записи НЕ подменяется → `date=None`, `date_src='unparsed'`, исходник в `msg_date_raw`,
+        при сроке строка не отдаётся и считается в `undated` и `checked.date_unparsed`.
+        `checked.complete=False` — выдача обрезана, или есть строки без дня при сроке, или есть
+        неразобранное: отвечать клиенту о деньгах «всё сходится» по такому ответу нельзя.
+        Метод отдаёт ответ моста целиком, ни одного поля не отбрасывает и не пересчитывает.
 
         В мост уходят ТОЛЬКО названные фильтры. Мост без двери (до выкладки) отвечает
         `unknown_action` — это «касса не просмотрена», а не «проводок нет»."""

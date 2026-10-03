@@ -1463,10 +1463,23 @@ function getTxSummary(period) {
  *                отказ bad_bike, а не «все строки».
  *   booking_id — точное совпадение с col N.
  *   date_from, date_to — включительно, 'YYYY-MM-DD' или 'DD.MM.YYYY'; день строки = msg_date
- *                (день сообщения кассы), а если он пуст — день recorded_at (поле date_src говорит,
+ *                (день сообщения кассы), а если он ПУСТ — день recorded_at (поле date_src говорит,
  *                какой взят). Строка без дня при названном сроке не отдаётся и считается в undated.
  *   limit      — по умолчанию TX_FIND_LIMIT_DEFAULT, потолок TX_FIND_LIMIT_MAX.
  *   Хотя бы один фильтр обязателен (no_filter) — дверь не выгрузка кассы.
+ *
+ * НЕРАЗОБРАННОЕ НЕ ПРЕВРАЩАЕТСЯ В ФАКТ (TXFINDFIX0310). Писатель addTransaction кладёт сумму
+ * числом, а msg_date — как пришло (splinter шлёт 'YYYY-MM-DD'), поэтому строка в ячейке суммы и
+ * день в иной форме — рука человека или старые строки. Агент отвечает клиенту о деньгах по кассе:
+ *   сумма  — число из ячейки как есть (настоящий 0 — это 0); строка — только однозначная форма
+ *            (txFindAmount_); иначе amount=null, amount_raw — исходник, amount_unparsed=true, в
+ *            total строка НЕ идёт, total_complete=false, счёт — checked.amount_unparsed;
+ *   день   — msg_date понимается в формах txFindDay_; НЕПУСТАЯ, но не разобранная msg_date днём
+ *            записи НЕ подменяется: date=null, date_src 'unparsed', msg_date_raw — исходник; при
+ *            названном сроке строка не отдаётся и считается в undated и checked.date_unparsed.
+ *   checked.complete=false, если выдача обрезана, или при названном сроке есть строки без дня
+ *   (undated), или есть неразобранные суммы или дни. undated и date_unparsed считаются среди строк,
+ *   прошедших фильтры байка и брони и не отменённых: чужая строка без дня полноту не портит.
  *
  * ОТМЕНЁННЫЕ НЕ ОТДАЮТСЯ: отменённой считается РОВНО то, что не считает баланс (computeBalance_:
  * status 'void' без учёта регистра), — иначе дверь и баланс разошлись бы в том, что считать
@@ -1495,14 +1508,16 @@ function txFindTz_() {
 }
 
 /** День ячейки листа → 'YYYY-MM-DD' или ''. Лист отдаёт и Date (Sheets сам парсит '2026-10-03'),
- *  и строку 'YYYY-MM-DD', и ISO-строку recorded_at (UTC, toISOString). */
+ *  и строку 'YYYY-MM-DD' или 'DD.MM.YYYY' (проверка календаря — та же, что у границы срока,
+ *  txFindParamDay_), и ISO-строку recorded_at (UTC, toISOString). */
 function txFindDay_(v, tz) {
   if (v === '' || v === null || v === undefined) return '';
   if (Object.prototype.toString.call(v) === '[object Date]') {
     return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, tz, 'yyyy-MM-dd');
   }
   var s = String(v).trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  var day = txFindParamDay_(s);
+  if (day) return day;
   if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
     var d = new Date(s);
     return isNaN(d.getTime()) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
@@ -1525,6 +1540,32 @@ function txFindParamDay_(v) {
   var t = new Date(Date.UTC(y, mo - 1, d));
   if (t.getUTCFullYear() !== y || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== d) return null;
   return y + '-' + (mo < 10 ? '0' : '') + mo + '-' + (d < 10 ? '0' : '') + d;
+}
+
+/** Пустая ли ячейка дня: только пусто и пробелы. Непустое, но не разобранное — НЕ пусто. */
+function txFindBlank_(v) {
+  return v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
+}
+
+/** Ячейка → текст исходника: Date — ISO UTC (как recorded_at), пусто → '', прочее — как есть. */
+function txFindCellText_(v) {
+  if (v === null || v === undefined) return '';
+  if (Object.prototype.toString.call(v) === '[object Date]') return isNaN(v.getTime()) ? '' : v.toISOString();
+  return String(v);
+}
+
+/** Однозначная строка суммы: знак по желанию; тысячи — запятыми ЛИБО пробелами между тройками;
+ *  дробь — точкой, 1–2 знака. «8,5» (запятая-дробь?), «8.000» (8 или 8000?), «8000 THB» — нет. */
+var TX_FIND_AMOUNT_RE_ = /^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+|\d{1,3}(?:[ \u00A0\u202F]\d{3})+)(?:\.\d{1,2})?$/;
+
+/** Сумма ячейки → { amount, raw, unparsed }. Число — как есть (0 остаётся 0); строка — только
+ *  однозначная форма; всё прочее, включая пустую ячейку, — amount null: в 0 молча не превращаем. */
+function txFindAmount_(v) {
+  var raw = txFindCellText_(v);
+  if (typeof v === 'number' && isFinite(v)) return { amount: v, raw: raw, unparsed: false };
+  var s = typeof v === 'string' ? v.trim() : '';
+  if (s && TX_FIND_AMOUNT_RE_.test(s)) return { amount: Number(s.replace(/[, \u00A0\u202F]/g, '')), raw: raw, unparsed: false };
+  return { amount: null, raw: raw, unparsed: true };
 }
 
 /** Ссылка на сообщение кассы из msg_id вида '<chat>:<message>:m<i>' / ':topup'
@@ -1568,39 +1609,50 @@ function txFind(payload) {
   var tz = txFindTz_();
   var spanAsked = !!(from || to);
   var first = '', lastDay = '', undated = 0, inSpan = 0, voided = 0, matched = 0;
+  var amountUnparsed = 0, dateUnparsed = 0;
   var total = {};
   var items = [];
 
   for (var i = data.length - 1; i >= 0; i--) {            // снизу вверх = newest-first
     var r = data[i];
     var day = txFindDay_(r[MD], tz), src = 'msg_date';
-    if (!day) { day = txFindDay_(r[REC], tz); src = day ? 'recorded_at' : ''; }
+    if (!day) {                                           // к дню записи — ТОЛЬКО при пустой msg_date
+      if (txFindBlank_(r[MD])) { day = txFindDay_(r[REC], tz); src = day ? 'recorded_at' : ''; }
+      else src = 'unparsed';
+    }
     if (day) {
       if (!first || day < first) first = day;
       if (!lastDay || day > lastDay) lastDay = day;
     }
-    if (spanAsked) {
-      if (!day) { undated++; continue; }
+    if (spanAsked && day) {
       if (from && day < from) continue;
       if (to && day > to) continue;
     }
-    inSpan++;
+    if (!spanAsked || day) inSpan++;
     if (plate && plateOf_(String(r[BIKE] || '')) !== plate) continue;
     if (booking && String(r[BKG] === undefined || r[BKG] === null ? '' : r[BKG]).trim() !== booking) continue;
+    if (spanAsked && !day) {                              // срок назван, а день строки неизвестен
+      if (String(r[ST]).toLowerCase() !== 'void') {       // отменённая денег не меняет
+        undated++;
+        if (src === 'unparsed') dateUnparsed++;           // не отдаётся: в срок ли она — не знаем
+      }
+      continue;
+    }
     if (String(r[ST]).toLowerCase() === 'void') { voided++; continue; }   // как computeBalance_
     matched++;
-    var amount = Number(r[AMT]) || 0;
+    if (src === 'unparsed') dateUnparsed++;               // отдаётся с date=null
+    var amt = txFindAmount_(r[AMT]);
     var cur = String(r[CUR] || 'THB').toUpperCase();
-    total[cur] = Math.round(((total[cur] || 0) + amount) * 100) / 100;
+    if (amt.unparsed) amountUnparsed++;                   // в total НЕ идёт
+    else total[cur] = Math.round(((total[cur] || 0) + amt.amount) * 100) / 100;
     if (items.length >= limit) continue;                  // считаем дальше, но не отдаём
-    var rec = r[REC];
-    var recS = Object.prototype.toString.call(rec) === '[object Date]'
-      ? (isNaN(rec.getTime()) ? '' : rec.toISOString()) : String(rec === null || rec === undefined ? '' : rec);
     var msgId = String(r[MID] === null || r[MID] === undefined ? '' : r[MID]);
     items.push({
       row: i + 2,                                         // строка листа: +1 шапка, +1 счёт с единицы
-      date: day, date_src: src, recorded_at: recS,
-      amount: amount, currency: cur, category: String(r[CAT] || ''),
+      date: src === 'unparsed' ? null : day, date_src: src, msg_date_raw: txFindCellText_(r[MD]),
+      recorded_at: txFindCellText_(r[REC]),
+      amount: amt.amount, amount_raw: amt.raw, amount_unparsed: amt.unparsed, currency: cur,
+      category: String(r[CAT] || ''),
       bike: String(r[BIKE] || ''), deposit: String(r[DEP] || ''),
       description: String(r[DESC] || ''), raw: String(r[RAW] === null || r[RAW] === undefined ? '' : r[RAW]),
       msg_id: msgId, link: txFindLink_(msgId),
@@ -1609,6 +1661,7 @@ function txFind(payload) {
     });
   }
 
+  var spanHoles = spanAsked && undated > 0;               // в срок ли эти строки — не знаем
   return {
     ok: true, filter: filter, limit: limit, limit_max: TX_FIND_LIMIT_MAX,
     checked: {
@@ -1617,8 +1670,11 @@ function txFind(payload) {
       rows_scanned: data.length, undated: undated, rows_in_span: inSpan,
       voided: voided, matched: matched, returned: items.length,
       truncated: matched > items.length,
+      amount_unparsed: amountUnparsed, date_unparsed: dateUnparsed,
+      complete: !spanHoles && matched === items.length && amountUnparsed === 0 && dateUnparsed === 0,
     },
     total: total,
+    total_complete: amountUnparsed === 0 && !spanHoles,   // сумма ВСЕХ строк запроса, а не части
     items: items,
   };
 }

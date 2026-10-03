@@ -65,7 +65,7 @@ def test_harness_all_green():
     res = json.loads(out)
     failed = [c for c in res["cases"] if not c["pass"]]
     assert not failed, json.dumps(failed, ensure_ascii=False, indent=1)
-    assert len(res["cases"]) >= 40, len(res["cases"])
+    assert len(res["cases"]) >= 72, len(res["cases"])
 
 
 def test_harness_covers_key_cases():
@@ -74,7 +74,14 @@ def test_harness_covers_key_cases():
     for need in ("bike.rows", "bike.plate-not-string", "booking.rows", "span.rows",
                  "span.inclusive-ends", "void.not-returned", "raw.note-arrives", "link.m-form",
                  "link.topup-form", "empty.rows-scanned", "empty.named-span", "limit.cut",
-                 "nosheet.error", "readonly.no-writes", "route.get-ok", "route.params-pass"):
+                 "nosheet.error", "readonly.no-writes", "route.get-ok", "route.params-pass",
+                 # TXFINDFIX0310: неразобранное не становится фактом
+                 "amount.comma-string", "amount.space-string", "amount.real-zero",
+                 "amount.empty-unparsed", "amount.ambiguous-unparsed", "amount.mix-total",
+                 "date.ddmmyyyy-cell", "date.ddmmyyyy-not-recorded-day",
+                 "date.garbage-not-in-record-day", "date.garbage-counted", "date.garbage-no-span",
+                 "complete.truncated", "complete.foreign-undated-ignored", "fix.route-fields",
+                 "fix.readonly"):
         assert need in names, f"нет кейса {need}: {sorted(names)}"
 
 
@@ -162,7 +169,34 @@ def test_client_method_is_get():
     assert f.calls == [("tx_find", {})], f.calls   # отказ no_filter выносит мост, клиент не гадает
 
 
+def test_client_keeps_new_fields():
+    """TXFINDFIX0310: клиент отдаёт ответ моста целиком — поля неразобранного не теряются."""
+    cls, meth, red = _client_method()
+    mod = ast.Module(body=[meth], type_ignores=[])
+    ns = {"Optional": __import__("typing").Optional}
+    exec(compile(mod, CLIENT, "exec"), ns)
+    answer = {
+        "ok": True, "total": {"THB": 9000}, "total_complete": False,
+        "checked": {"undated": 1, "amount_unparsed": 1, "date_unparsed": 1, "complete": False},
+        "items": [{"row": 8, "amount": None, "amount_raw": "8,5", "amount_unparsed": True,
+                   "date": None, "date_src": "unparsed", "msg_date_raw": "вчера вечером"}],
+    }
+    snapshot = json.dumps(answer, ensure_ascii=False, sort_keys=True)
+
+    class Fake:
+        def _call(self, action, **params):
+            return answer
+
+    got = ns["tx_find"](Fake(), booking_id="bk-fix")
+    assert json.dumps(got, ensure_ascii=False, sort_keys=True) == snapshot, got
+    doc = ast.get_docstring(meth) or ""
+    for field in ("amount_raw", "amount_unparsed", "msg_date_raw", "total_complete",
+                  "date_unparsed", "complete", "unparsed"):
+        assert field in doc, f"контракт метода не называет {field}"
+
+
 # мутант = (имя, файл, было, стало); каждый обязан покраснить харнесс
+_BS = chr(92)   # обратная косая: escape невидимых пробелов в исходнике видимы, мутант их называет так же
 MUTANTS = [
     ("void-returned", "BotData.js",
      "if (String(r[ST]).toLowerCase() === 'void') { voided++; continue; }",
@@ -197,11 +231,42 @@ MUTANTS = [
      "txFind({ bike: params.bike, booking_id: params.booking_id,",
      "txFind({ bike: params.bike, booking_id: '',"),
     ("route-missing", "Bridge.js", "case 'tx_find':", "case 'tx_find_x':"),
+    # TXFINDFIX0310: новые ветки — неразобранное не становится фактом
+    ("amount-unparsed-to-zero", "BotData.js",
+     "return { amount: null, raw: raw, unparsed: true };",
+     "return { amount: 0, raw: raw, unparsed: false };"),
+    ("amount-comma-fraction", "BotData.js",
+     r"(?:\.\d{1,2})?$/;", r"(?:[.,]\d{1,2})?$/;"),
+    ("amount-nbsp-dropped", "BotData.js",
+     "(?:[ " + _BS + "u00A0" + _BS + "u202F]" + _BS + "d{3})+", "(?:[ ]" + _BS + "d{3})+"),
+    ("amount-zero-not-number", "BotData.js",
+     "if (typeof v === 'number' && isFinite(v))", "if (typeof v === 'number' && v)"),
+    ("unparsed-in-total", "BotData.js",
+     "else total[cur] = Math.round(((total[cur] || 0) + amt.amount) * 100) / 100;",
+     "total[cur] = Math.round(((total[cur] || 0) + (amt.amount || 0)) * 100) / 100;"),
+    ("garbage-date-to-recorded", "BotData.js",
+     "if (txFindBlank_(r[MD])) { day = txFindDay_(r[REC], tz);",
+     "if (true) { day = txFindDay_(r[REC], tz);"),
+    ("ddmmyyyy-cell-not-parsed", "BotData.js",
+     "var day = txFindParamDay_(s);\n  if (day) return day;",
+     "var day = /^\\d{4}-\\d{2}-\\d{2}$/.test(s) ? s : '';\n  if (day) return day;"),
+    ("complete-ignores-truncated", "BotData.js",
+     "complete: !spanHoles && matched === items.length &&", "complete: !spanHoles && true &&"),
+    ("total-complete-ignores-undated", "BotData.js",
+     "total_complete: amountUnparsed === 0 && !spanHoles,", "total_complete: amountUnparsed === 0,"),
+    ("undated-counts-void", "BotData.js",
+     "if (String(r[ST]).toLowerCase() !== 'void') {", "if (true) {"),
+    ("unparsed-date-shown-as-empty", "BotData.js",
+     "date: src === 'unparsed' ? null : day,", "date: day,"),
+    ("returned-unparsed-date-not-counted", "BotData.js",
+     "matched++;\n    if (src === 'unparsed') dateUnparsed++;", "matched++;\n    if (false) dateUnparsed++;"),
 ]
+NEW_MUTANTS_FROM = 14   # первые 14 — двери 83ee219, дальше — ветки TXFINDFIX0310
 
 
 def test_mutants_killed():
     assert len(MUTANTS) >= 6
+    assert len(MUTANTS) - NEW_MUTANTS_FROM >= 6, "у веток TXFINDFIX0310 меньше шести мутантов"
     alive = []
     for name, fname, old, new in MUTANTS:
         src = _read(os.path.join(BUILD, fname))
