@@ -324,10 +324,11 @@ def main():
     model, why = None, ""
     if flags_of(os.environ)[F_DRAFTS]:
         import wa_agent_model
+        # WA_AGENT_TOOLS выкл — вызов той же формы, что в 9c4aac6 (без ключа tools)
+        more = {"tools": True} if wa_agent_tg.flag_on(os.environ.get(F_TOOLS)) else {}
         model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)),
                                 book=wa_agent_tg.flag_on(os.environ.get(F_BOOK)),
-                                cache=wa_agent_model.cache_ttl_of(os.environ.get(F_CACHE)),
-                                tools=wa_agent_tg.flag_on(os.environ.get(F_TOOLS)))
+                                cache=wa_agent_model.cache_ttl_of(os.environ.get(F_CACHE)), **more)
     core, tg, _flags, words = build(env, model=model)
     if model is not None and getattr(model, "tools", None) is not None:
         # новое входящее посреди сверки обрывает её (AGENTLOOPA0310): тот же признак, что ядро судит после модели
