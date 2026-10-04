@@ -43,6 +43,14 @@ calc и pay_confirmed видят только отсеянное. Оплата �
 кассы оплаты — этой аренды, и второй источник — той же аренды (договор, привязанный к ней кодом, либо её строка листа
 «клиенты» вместе с той же суммой в переписке).
 
+Деньги одной аренды (T4BFACTS0410, Т4б шаг 2): сумма кода, опора чисел ответа и сумма, которую текст называет полученной
+оплатой, — только строки кассы аренды обращения (`cash_split`); прочая наличность — «не привязано», в сумму и в опору не
+входит. Аренды обращения нет — сумма берётся, только если вся наличность и все аренды опоры называют одну и ту же аренду
+(она единственная в поле зрения); подтверждения оплаты без аренды обращения по-прежнему нет. Версия факта — по НАЧАЛУ
+запроса (`at` ставит `_read` до вызова двери), а не по приходу ответа (`read_order`): новейшее прочтение ключа снято
+(отказ, неизвестность, неполнота того же запроса или его новый ответ без этой строки) — факт не подтверждён, и старая
+версия из другого запроса не возвращается.
+
 Общий предел (AGENTDEDUP0410): дедлайн t0 + MAX_SEC на ВСЮ сверку, включая запасной вызов. Сверка не начинает вызовов
 (модели и дверей, включая аренду, которую код читает сам) после t0 + MAX_SEC − FALLBACK_SEC; остаток — запасному
 обычному вызову. Запасной вызов начинается только до дедлайна; после дедлайна вызовов нет — черновика нет, служба
@@ -75,6 +83,7 @@ ROLE_WORDS = "денежная роль не сходится с кассой"
 SUMS_WORDS = "суммы расходятся"
 UNREAD_WORDS = "реестр прочитан не целиком, мог скрыть другой подписанный"
 CONTRACT_WORDS = "договор не этого клиента или не этой аренды"
+UNBOUND_WORDS = "не привязано"   # наличность не аренды обращения: в сумму и в опору не входит (T4BFACTS0410)
 
 # роли денег по category кассы (splinter: rental|salary|advance|fuel|taxi|topup|other; deposit — passport|cash|null)
 R_RENT, R_DEPOSIT, R_REFUND, R_OTHER = "оплата аренды", "залог", "возврат", "прочее"
@@ -420,20 +429,38 @@ def stale(r, since):
     return (since is not None and isinstance(at, (int, float)) and not isinstance(at, bool) and at < since)
 
 
+def read_order(results):
+    """Порядок прочтений — по НАЧАЛУ запроса (T4BFACTS0410): `at` ставит `_read` ДО вызова двери, а ответ запроса,
+    начатого раньше, может прийти позже ответа запроса, начатого после него. Равное время — порядок списка; время
+    неизвестно хоть у одного ответа — порядок списка целиком (сравнить начала нечем; прежнее поведение)."""
+    ats = [r.get("at") for r in results]
+    if all(isinstance(a, (int, float)) and not isinstance(a, bool) for a in ats):
+        return sorted(range(len(results)), key=lambda i: (ats[i], i))
+    return list(range(len(results)))
+
+
 def sift(results, since=None):
-    """Результаты → (опора, снятое). Опора — каждый факт ОДИН раз, в версии ПОСЛЕДНЕГО прочтения:
-    из каждого запроса берётся только последний ответ (позднее «не факт» того же запроса снимает прежний FACT);
-    ответ, прочитанный раньше последнего входящего (`since`), устарел. Снятое — слова для журнала."""
+    """Результаты → (опора, снятое). Опора — каждый факт ОДИН раз, в версии НОВЕЙШЕГО по началу прочтения
+    (T4BFACTS0410; было — по приходу ответа): из каждого запроса берётся только последний начатый ответ (позднее
+    «не факт» того же запроса снимает прежний FACT); ключ, чьё новейшее прочтение снято (отказ, неизвестность, неполнота
+    того же запроса или его новый ответ без этой строки), не подтверждён — старая версия из другого запроса не
+    возвращается; ответ, прочитанный раньше последнего входящего (`since`), устарел. Снятое — слова для журнала."""
+    order = read_order(results)
+    rank = {i: n for n, i in enumerate(order)}
     last = {}
-    for i, r in enumerate(results):
-        last[r.get("req") or "#%d" % i] = i
-    facts, dropped = {}, []
-    for i, r in enumerate(results):
+    for i in order:
+        last[results[i].get("req") or "#%d" % i] = i
+    facts, dropped, born, gone = {}, [], {}, {}
+    for i in order:
+        r = results[i]
         if r["outcome"] != FACT:
             continue
         j = last[r.get("req") or "#%d" % i]
         if j != i:
             dropped.append("%s: факт снят — тот же запрос прочитан позже (%s)" % (r["tool"], results[j]["outcome"]))
+            kept = {fact_key(g) for g in results[j]["facts"]} if results[j]["outcome"] == FACT else set()
+            for key in {fact_key(g) for g in r["facts"]} - kept:       # ключ снят с началом запроса j
+                gone[key] = max(gone.get(key, -1), rank[j])
             continue
         if stale(r, since):
             dropped.append("%s: факт устарел — прочитан раньше последнего входящего" % r["tool"])
@@ -443,6 +470,10 @@ def sift(results, since=None):
             if k in facts:
                 dropped.append("%s: повтор факта — взята последняя версия" % r["tool"])
             facts[k] = f
+            born[k] = rank[i]
+    for k in [k for k in facts if gone.get(k, -1) > born.get(k, -1)]:
+        dropped.append("%s: факт снят — новейшее прочтение того же ключа не подтверждено" % facts[k].get("kind"))
+        del facts[k]
     return list(facts.values()), dropped
 
 
@@ -451,18 +482,19 @@ def accepted(results, since=None):
 
 
 def calc(facts):
-    """Суммы по ролям и валютам — только из принятых строк кассы, каждая строка ОДИН раз (последняя версия);
-    разность с ценой аренды, если она названа."""
+    """Суммы по ролям и валютам — только строки кассы АРЕНДЫ ОБРАЩЕНИЯ (T4BFACTS0410, `cash_split`), каждая строка
+    ОДИН раз (последняя версия); прочая наличность — «не привязано» (`unbound`), в сумму не входит; разность с ценой
+    аренды, если она названа."""
     uniq = {}
     for f in facts:
         uniq[fact_key(f)] = f
     facts = list(uniq.values())
+    bound, unbound = cash_split(facts)
     sums = {}
-    for f in facts:
-        if f["kind"] == "cash":
-            key = "%s %s" % (f["role"], f["currency"])
-            sums[key] = sums.get(key, 0) + f["amount"]
-    out = {"sums": sums, "diffs": []}
+    for f in bound:
+        key = "%s %s" % (f["role"], f["currency"])
+        sums[key] = sums.get(key, 0) + f["amount"]
+    out = {"sums": sums, "diffs": [], "unbound": [dict(_fact_ref(f), why=UNBOUND_WORDS) for f in unbound]}
     for f in facts:
         if f["kind"] == "rental" and f.get("price") is not None:
             paid = sums.get("%s %s" % (R_RENT, f["currency"]))
@@ -492,6 +524,27 @@ def cash_of_rental(f, bk, facts):
     return bool(pc) and pc == pr and None not in (d, ds, de) and ds <= d <= de
 
 
+def _rental_id(f):
+    """Чью аренду называет факт: booking_id; без него — номер байка ("" — не назван)."""
+    if f.get("booking_id"):
+        return ("booking", str(f["booking_id"]))
+    return ("bike", plate_of(f.get("bike")))
+
+
+def cash_split(facts):
+    """Строки кассы → (аренды обращения, «не привязано») (T4BFACTS0410). Аренда обращения есть (`rental_of`) — её строки
+    (`cash_of_rental`), прочие не привязаны. Её нет — привязывать не к чему: наличность считается одной аренды, только если
+    все строки кассы и все аренды и договоры опоры называют одну и ту же аренду (`_rental_id`); иначе не привязано всё."""
+    cash = [f for f in facts if f["kind"] == "cash"]
+    bk = rental_of(facts)
+    if bk is not None:
+        bound = [f for f in cash if cash_of_rental(f, bk, facts)]
+    else:
+        named = {_rental_id(f) for f in facts if f["kind"] in ("cash", "rental", "contract")}
+        bound = cash if len(named) == 1 else []
+    return bound, [f for f in cash if not any(f is g for g in bound)]
+
+
 def pay_confirmed(facts):
     """Оплата подтверждена, только если аренда обращения одна, в кассе есть строка оплаты ЭТОЙ аренды И второй
     независимый источник ТОЙ ЖЕ аренды: договор, привязанный к ней кодом, либо её строка листа «клиенты» вместе с той
@@ -511,7 +564,10 @@ def pay_confirmed(facts):
 
 def known_amounts(price, facts, figures):
     out = set(K.thb_amounts(price.get("line") if isinstance(price, dict) else None))
+    loose = {id(f) for f in cash_split(facts)[1]}       # «не привязано» — не опора чисел ответа (T4BFACTS0410)
     for f in facts:
+        if id(f) in loose:
+            continue
         for k in ("amount", "price"):
             if isinstance(f.get(k), (int, float)) and not isinstance(f.get(k), bool):
                 out.add(abs(int(round(f[k]))))
@@ -559,14 +615,48 @@ _CHANGE_OK = re.compile(r"в\s+конце|с\s+возврат\w*\s+залог|в
                         r"at\s+the\s+end|with\s+the\s+deposit", re.I)
 
 
+def pay_claimed(text):
+    """Суммы, которые текст называет полученной оплатой (T4BFACTS0410): числа предложений с подтверждением оплаты —
+    в батах и голые, как в `money_claims` (имя модели, дни, км, проценты суммами не считаются)."""
+    out = set()
+    for sent in K._SENTENCE.split(str(text or "")):
+        if not _PAY_CLAIM.search(sent):
+            continue
+        out.update(abs(int(round(v))) for v in K.thb_amounts(sent))
+        for m in _BARE.finditer(sent):
+            if not _MODEL_BEFORE.search(sent[:m.start()]):
+                out.add(int(re.sub(r"\D", "", m.group(1))))
+    return out
+
+
+def pay_backing(facts):
+    """Чем подтверждается сумма полученной оплаты (T4BFACTS0410): деньги АРЕНДЫ ОБРАЩЕНИЯ — её строки кассы и их итоги,
+    разность с её ценой, сама цена. Строки других аренд и «не привязано» опорой подтверждения не бывают."""
+    bk = rental_of(facts)
+    rows = cash_split(facts)[0]
+    figures = calc(facts)
+    out = {abs(int(round(f["amount"]))) for f in rows}
+    out.update(abs(int(round(v))) for v in list(figures["sums"].values()) + [d["value"] for d in figures["diffs"]])
+    out.update(abs(int(round(f["price"]))) for f in facts if f["kind"] == "rental" and bk is not None
+               and str(f.get("booking_id") or "") == bk and isinstance(f.get("price"), (int, float)))
+    return out
+
+
 def money_roles(text, facts):
     """Денежные роли текста против принятых фактов → [(слова причины, что)]: оплата аренды ≠ залог, записанный
-    возврат запрещает «вернём», сдача — «в конце, с возвратом залога»."""
+    возврат запрещает «вернём», сдача — «в конце, с возвратом залога». Сумма подтверждения и залог — деньгами аренды
+    обращения (T4BFACTS0410): чужая оплата подтверждением не бывает."""
     s = str(text or "")
     out = []
+    bound = cash_split(facts)[0]
     if _PAY_CLAIM.search(s) and not pay_confirmed(facts):
         out.append((PAY_WORDS, "текст подтверждает оплату без кассы и второго источника"))
-    if _DEP_CLAIM.search(s) and not any(f["kind"] == "cash" and f["role"] == R_DEPOSIT for f in facts):
+    elif _PAY_CLAIM.search(s):
+        alien = sorted(pay_claimed(s) - pay_backing(facts))
+        if alien:
+            out.append((PAY_WORDS, "текст подтверждает оплату %s, у аренды обращения %s такой суммы нет"
+                        % (", ".join(str(v) for v in alien), rental_of(facts))))
+    if _DEP_CLAIM.search(s) and not any(f["kind"] == "cash" and f["role"] == R_DEPOSIT for f in bound):
         out.append((ROLE_WORDS, "текст говорит о залоге, в кассе строки залога нет (оплата аренды ≠ залог)"))
     if _REFUND_PROMISE.search(s) and any(f["kind"] == "cash" and f["role"] == R_REFUND for f in facts):
         out.append((ROLE_WORDS, "возврат уже записан в кассе — «вернём» запрещено"))
@@ -596,6 +686,7 @@ class Journal:
 
     def __init__(self, number_tail=""):
         self.calls, self.facts, self.conflicts, self.refusals = [], [], [], []
+        self.unbound = []                                 # наличность не аренды обращения (T4BFACTS0410)
         self.number_tail = number_tail
 
     def call(self, i, tool, args, res, sec):
@@ -611,6 +702,8 @@ class Journal:
         out += ["  вызов %(n)d %(tool)s %(in)s → %(outcome)s · %(source)s · %(sec)sс · %(reason)s" % c
                 for c in self.calls]
         out += ["  факт %s" % json.dumps(_fact_ref(f), ensure_ascii=False) for f in self.facts]
+        out += ["  %s, в сумму не входит: %s" % (UNBOUND_WORDS, json.dumps(u, ensure_ascii=False))
+                for u in self.unbound]
         out += ["  конфликт %s" % c for c in self.conflicts]
         out += ["  отказ %s" % r for r in self.refusals]
         return out
@@ -717,6 +810,7 @@ def judge(text, price, results, jr, since=None):
     facts, dropped = sift(results, since)
     figures = calc(facts)
     jr.facts = facts
+    jr.unbound = [{k: v for k, v in u.items() if k != "why"} for u in figures["unbound"]]
     jr.refusals.extend(d for d in dropped if d not in jr.refusals)
     jr.conflicts = conflicts(facts, figures)
     words = []
