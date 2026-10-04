@@ -315,6 +315,15 @@ CREATE TABLE IF NOT EXISTS card_out (
     edit_unk     INTEGER NOT NULL DEFAULT 0,          -- попыток правки с неизвестным ответом
     PRIMARY KEY (draft_id, ver)
 );
+CREATE TABLE IF NOT EXISTS draft_tr (
+    draft_id    INTEGER NOT NULL,                     -- перевод для сотрудника (WACARDQ0410): черновик и ВЕРСИЯ
+    ver         INTEGER NOT NULL,
+    a_sha       TEXT    NOT NULL,                     -- отпечаток текста этой версии: перевод привязан к нему
+    q_ru        TEXT,                                 -- перевод вопроса клиента
+    a_ru        TEXT,                                 -- перевод ответа этой версии
+    ts          REAL    NOT NULL,
+    PRIMARY KEY (draft_id, ver)
+);
 """
 
 # «Тема клиента → WhatsApp» (WARELAYTEXT0210): текст человека из темы форума показа уходит клиенту.
@@ -378,6 +387,37 @@ def draft_out(out):
         hand = [str(h).strip() for h in hand if str(h).strip()] if isinstance(hand, list) else []
         return out.get("text"), hand
     return out, []
+
+
+# ── вопрос клиента и перевод на карточке (WACARDQ0410) ───────────────────────────────────
+# Вопрос — блок последних реплик клиента, ушедший в модель (под маской), — хранится у черновика; язык вопроса —
+# вердикт КОДА адаптера. Перевод для сотрудника хранится С ВЕРСИЕЙ и отпечатком её текста (`draft_tr`): у версии
+# человека (правка) перевода нет — карточка говорит, к какой версии он. Клиенту уходит только drafts.text.
+
+def text_sha(text):
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def draft_card(out):
+    """Ответ Model.draft → поля карточки {question, q_lang, q_ru, a_ru} | None (прежний контракт: строка, словарь
+    без вопроса). Не строка — пусто; переводы режет адаптер, здесь только типы."""
+    if not isinstance(out, dict) or not isinstance(out.get("question"), str):
+        return None
+
+    def s(key):
+        v = out.get(key)
+        return v.strip() if isinstance(v, str) else ""
+    return {"question": out["question"], "q_lang": s("q_lang"), "q_ru": s("q_ru"), "a_ru": s("text_ru")}
+
+
+def tr_pick(rows, ver, text):
+    """Переводы черновика [(ver, a_sha, q_ru, a_ru)] → (q_ru, a_ru, None) для ЭТОЙ версии с ЭТИМ текстом, иначе
+    (None, None, версия, к которой перевод есть | None — перевода нет вовсе)."""
+    for r_ver, a_sha, q_ru, a_ru in rows:
+        if r_ver == int(ver) and a_sha == text_sha(text):
+            return q_ru or "", a_ru or "", None
+    other = sorted(r[0] for r in rows)
+    return None, None, (other[0] if other else None)
 
 
 # ═══ интерфейсы рук (подделки — в тестах; настоящие — шаги 3–4 плана) ═══════════════════
@@ -516,6 +556,10 @@ class Core:
             self.db.execute("ALTER TABLE clients ADD COLUMN ctx INTEGER NOT NULL DEFAULT 0")
         if "ctx" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
             self.db.execute("ALTER TABLE drafts ADD COLUMN ctx INTEGER")  # NULL — черновик старше версии контекста
+        # вопрос клиента и язык вопроса (WACARDQ0410); NULL — черновик старше или напоминание: карточка прежняя
+        for col in ("question", "q_lang"):
+            if col not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
+                self.db.execute("ALTER TABLE drafts ADD COLUMN %s TEXT" % col)
         have = {r[1] for r in self.db.execute("PRAGMA table_info(card_out)")}
         for col in ("lost", "edit_unk"):                                  # очередь старше WACARDDONEFIX0210
             if col not in have:
@@ -1010,10 +1054,12 @@ class Core:
             if self._live_draft(number):
                 continue
             try:
-                text, hand = draft_out(self.model.draft(number, upto))
+                out = self.model.draft(number, upto)
+                text, hand = draft_out(out)
+                card = draft_card(out)                               # вопрос и перевод для карточки (WACARDQ0410)
             except Exception as e:                                   # noqa: BLE001
                 self.log("модель упала: %s" % type(e).__name__)
-                text, hand = None, []
+                text, hand, card = None, [], None
             if not isinstance(text, str) or not text.strip():
                 self.db.execute("UPDATE clients SET next_try=? WHERE number=?",
                                 (now + MODEL_RETRY_SEC, number))
@@ -1021,13 +1067,22 @@ class Core:
             # пока думала модель, клиент мог написать ещё или человек ответить — не пишем
             if self._fresh(number, upto):
                 continue
-            cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, handoff, ctx) "
-                                  "VALUES(?,?,1,?,?,?,?,?)", (number, PENDING, text, upto, now,
-                                                              json.dumps(hand, ensure_ascii=False) if hand else None,
-                                                              ctx))
+            cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, handoff, ctx, "
+                                  "question, q_lang) VALUES(?,?,1,?,?,?,?,?,?,?)",
+                                  (number, PENDING, text, upto, now,
+                                   json.dumps(hand, ensure_ascii=False) if hand else None, ctx,
+                                   card["question"] if card else None, card["q_lang"] if card else None))
             did = cur.lastrowid
             self.log("черновик %d (до строки %d, %d симв.%s)" % (
                 did, upto, len(text), ", нужен человек: причин %d" % len(hand) if hand else ""))
+            if card and (card["q_ru"] or card["a_ru"]):
+                # перевод — к версии 1 и её тексту; у правки человека его нет (WACARDQ0410)
+                self.db.execute("INSERT OR REPLACE INTO draft_tr(draft_id, ver, a_sha, q_ru, a_ru, ts) "
+                                "VALUES(?,1,?,?,?,?)", (did, text_sha(text), card["q_ru"], card["a_ru"], now))
+            if card:
+                self.log("черновик %d: вопрос %d симв., язык вопроса %s, перевод %s" % (
+                    did, len(card["question"]), card["q_lang"] or "—",
+                    "есть" if (card["q_ru"] or card["a_ru"]) else "нет"))
             self._card_new(did, 1, now)       # не дошла — очередь доставки повторит (WADRAFTSAFE0210)
             made.append(did)
         return made
@@ -1490,6 +1545,17 @@ class Core:
     def _card(self, draft_id):
         row = self.db.execute("SELECT card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
         return row[0] if row else None
+
+    def card_extra(self, draft_id, ver, text):
+        """Вопрос и перевод для карточки версии ver с текстом text (WACARDQ0410) → None (вопроса нет: черновик старше
+        или напоминание — карточка прежняя) | {question, q_lang, q_ru, a_ru, tr_ver}: переводы — только этой версии
+        с этим текстом; tr_ver — версия, к которой перевод есть, если он не к этой."""
+        row = self.db.execute("SELECT question, q_lang FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or row[0] is None:
+            return None
+        rows = self.db.execute("SELECT ver, a_sha, q_ru, a_ru FROM draft_tr WHERE draft_id=?", (draft_id,)).fetchall()
+        q_ru, a_ru, tr_ver = tr_pick(rows, ver, text)
+        return {"question": row[0], "q_lang": row[1] or None, "q_ru": q_ru, "a_ru": a_ru, "tr_ver": tr_ver}
 
     def handoff(self, draft_id):
         row = self.db.execute("SELECT handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()

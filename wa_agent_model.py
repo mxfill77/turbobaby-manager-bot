@@ -32,6 +32,11 @@
 (ядро повторит не раньше MODEL_RETRY_SEC). lang не ru/en — причина «язык». Итог `draft` — словарь
 {text, handoff[слова], lang, why} (ядро принимает и прежнюю строку); причины — кода и модели вместе.
 
+КАРТОЧКА СОТРУДНИКА (WACARDQ0410) — итог `draft` несёт ещё {question, q_lang, q_ru, text_ru}: вопрос — блок последних
+реплик клиента ровно в том виде, что ушёл в модель (под маской); язык вопроса — кодом (`question_lang` → `K.lang_of`);
+не русский — тем же вызовом два перевода на русский (блок `TR_BLOCK` в сообщении), русский — переводов нет. Клиенту
+уходит только text.
+
 ПЛАТЕЛЬЩИК — платный ключ API тем же путём, что у Splinter (`claude_client.ClaudeClient`:
 ANTHROPIC_API_KEY из .env корня дерева, учёт трат `spend_ledger.meter`). Значение ключа не печатается.
 
@@ -63,7 +68,9 @@ import wa_history
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = "claude-sonnet-4-5"          # как CLAUDE_MODEL Splinter по умолчанию (claude_client)
-MAX_TOKENS = 700
+# WACARDQ0410: при вопросе не по-русски тот же ответ несёт ещё два перевода (вопроса до TR_Q_MAX знаков и ответа);
+# при 700 длинный вопрос обрывал бы JSON — черновика не было бы вовсе. Цена — по фактическим токенам, не по пределу
+MAX_TOKENS = 1500
 HISTORY_MAX = 60000                           # символов истории; старше — обрезается с головы, словами
 TAIL_MAX = 4000
 LESSON_ITEM_MAX = 600                         # было/стало/причина одного урока в промпте, символов
@@ -122,6 +129,29 @@ _RULE7_BOOK = "(бронь, наличие без факта в блоке «Н�
 if SYSTEM_PROMPT.count(_RULE4_OLD) != 1 or SYSTEM_PROMPT.count(_RULE7_OLD) != 1:
     raise RuntimeError("SYSTEM_PROMPT: правила 4/7 для броней не найдены ровно по одному разу")
 SYSTEM_PROMPT_BOOK = SYSTEM_PROMPT.replace(_RULE4_OLD, _RULE4_BOOK).replace(_RULE7_OLD, _RULE7_BOOK)
+
+# ── вопрос клиента и перевод для сотрудника на карточке (WACARDQ0410) ───────────────────
+# Вопрос на карточке — ровно то, что ушло в модель последним блоком (хвост реплик клиента после нашей последней,
+# под той же маской), а не пересказ модели. Язык вопроса судит КОД (`K.lang_of`), поле lang модели — нет. Не русский —
+# в сообщение (не в инструкцию: префикс кэша прежний) идёт блок с просьбой двух переводов тем же вызовом; русский или
+# букв нет — блока нет, промпт байт-в-байт прежний. Переводы видит только сотрудник: клиенту уходит одно поле text.
+TR_Q_MAX = 800                                # перевод вопроса — не длиннее, знаков (просьба модели и обрезка кода)
+TR_A_MAX = 3000                               # перевод ответа — не длиннее, знаков (обрезка кода)
+TR_BLOCK = ("ПЕРЕВОД ДЛЯ СОТРУДНИКА (код определил: клиент пишет не по-русски). В тот же JSON добавь ещё два поля: "
+            "\"q_ru\" — перевод на русский того, о чём клиент спрашивает в последнем блоке (не длиннее %d знаков; "
+            "длинное сократи, сохранив смысл), и \"text_ru\" — перевод на русский твоего ответа из поля \"text\". "
+            "Переводы видит только сотрудник; клиенту уходит одно поле \"text\" на языке клиента." % TR_Q_MAX)
+_LABEL = re.compile(r"\[[^\[\]\n]{1,40}\]")   # метки маски «[скрыто: …]» и медиа «[фото]» — не слова клиента
+
+
+def question_lang(question):
+    """Язык вопроса клиента — кодом: `K.lang_of` по словам клиента без наших меток. → 'ru' | 'en' | 'other' | None."""
+    return K.lang_of(_LABEL.sub(" ", str(question or "")))
+
+
+def need_translation(lang):
+    """Перевод нужен, если язык вопроса не русский; букв нет (None) — переводить нечего."""
+    return lang not in ("ru", None)
 
 
 # ── даты и модель в словах клиента ─────────────────────────────────────────────────────
@@ -474,8 +504,23 @@ def parse_reply(raw):
         return None
     hand = data.get("handoff")
     hand = [str(h).strip() for h in hand if str(h).strip()] if isinstance(hand, list) else []
+
+    def tr(key, cap):                                 # перевод для сотрудника (WACARDQ0410): не строка — нет перевода
+        v = data.get(key)
+        return v.strip()[:cap] if isinstance(v, str) else ""
     return {"text": text.strip(), "lang": str(data.get("lang") or "").strip().lower()[:8],
-            "handoff": hand[:8], "why": str(data.get("why") or "").strip()[:300]}
+            "handoff": hand[:8], "why": str(data.get("why") or "").strip()[:300],
+            "q_ru": tr("q_ru", TR_Q_MAX), "text_ru": tr("text_ru", TR_A_MAX)}
+
+
+def card_fields(info, got):
+    """Поля карточки сотрудника (WACARDQ0410): вопрос — из блока последних реплик клиента, что ушёл в модель (под
+    маской); язык — кодом; переводы — только при не русском вопросе. Клиенту из этого не уходит ничего."""
+    question = info["question"]
+    lang = info["q_lang"]
+    keep = need_translation(lang)
+    return {"question": question, "q_lang": lang or "",
+            "q_ru": got.get("q_ru", "") if keep else "", "text_ru": got.get("text_ru", "") if keep else ""}
 
 
 # ── кэш промпта и цена по usage (WAAGENTCACHE0210) ─────────────────────────────────────
@@ -845,10 +890,14 @@ class ModelAdapter(wa_agent.Model):
         blocks += [fact["line"] for fact in (avail, rental) if fact is not None]
         if "handoff" in parts:
             blocks.append(parts["handoff"])
+        question = ask or "[пусто]"                     # ровно то, что уйдёт последним блоком (WACARDQ0410)
+        q_lang = question_lang(question)
+        if need_translation(q_lang):
+            blocks.append(TR_BLOCK)
         blocks.append("ИСТОРИЯ ПЕРЕПИСКИ (вся, по времени; «мы» — наша сторона):\n" +
                       (hist or "переписки раньше не было") +
                       ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
-        blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + (ask or "[пусто]"))
+        blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + question)
         user = "\n\n".join(blocks)
         system = self._system(SYSTEM_PROMPT if self.book is None else SYSTEM_PROMPT_BOOK, node_list, now)
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
@@ -856,6 +905,7 @@ class ModelAdapter(wa_agent.Model):
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
                 "avail": avail, "rental": rental, "book_words": book_words, "today": today, "terms": terms,
                 "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache,
+                "question": question, "q_lang": q_lang,           # карточка сотрудника (WACARDQ0410)
                 # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
                 "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
         return system, user, info
@@ -901,7 +951,8 @@ class ModelAdapter(wa_agent.Model):
         self.log("модель: черновик %d симв., история %d строк / %d симв., маска %d, %s, причин %d (%s)"
                  % (len(got["text"]), info["history_items"], info["history_chars"], info["masked"],
                     info["price_words"], len(words), tok))
-        return {"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]}
+        return dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]},
+                    **card_fields(info, got))
 
     # ── черновик со сверкой (AGENTLOOPA0310, Т4а) ─────────────────────────────────────────
 
@@ -980,7 +1031,8 @@ class ModelAdapter(wa_agent.Model):
             words = K.reason_first(words, w)
         self.log("модель: черновик %d симв. со сверкой (%s, вызовов %d, %.1f с), причин %d"
                  % (len(got["text"]), out["state"], out["calls"], out["sec"], len(words)))
-        return {"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]}
+        return dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]},
+                    **card_fields(info, got))
 
     # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────
 

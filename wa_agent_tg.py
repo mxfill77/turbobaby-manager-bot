@@ -24,6 +24,12 @@
 влезает сам ответ — он уходит отдельным сообщением перед карточкой (`tg_card_parts`, реплай на него — та же
 правка). «why» модели на карточке не показывается.
 
+ВОПРОС И ПЕРЕВОД (WACARDQ0410). Над ответом — вопрос клиента: блок его последних реплик, ушедший в модель (под
+маской; `Core.card_extra`). Язык вопроса не русский (вердикт кода) — под ответом перевод вопроса и ответа на русский с
+пометкой «перевод для сотрудника, клиенту не уходит»; перевода нет — «перевода нет: модель не дала»; у версии человека —
+«перевод — к версии 1». Резка по порядку: подробности, переводы, вопрос (с числом скрытых знаков); ответ — никогда.
+«Отправить» шлёт только текст ответа. Вопроса у ядра нет (черновик старше, напоминание) — карточка прежняя.
+
 «ИСПРАВИТЬ». Кнопка только подсказывает; правка — РЕПЛАЙ человека на карточку: `Core.revise` с
 версией карточки, новая карточка версии +1, «Отправить» на ней шлёт текст человека дословно.
 Реплай на прежнюю версию — «устарело».
@@ -164,6 +170,21 @@ W_DETAILS_CUT = "…\n(скрыто знаков подробностей: %d)"
 W_DETAILS_HIDDEN = "\n\n(подробности скрыты: %d знаков)"
 W_ANSWER_LEAD = " · ответ клиенту целиком, карточка — следующим сообщением:\n\n"
 W_ANSWER_ABOVE = "\n↑ ответ клиенту — сообщением выше (%d знаков)\n\n"
+
+# вопрос клиента и перевод для сотрудника (WACARDQ0410)
+W_Q_HEAD = "❓ клиент спрашивает:"
+W_A_HEAD = "✉️ ответ клиенту:"
+W_A_LEAD_Q = "✉️ ответ клиенту целиком, карточка — следующим сообщением:\n\n"
+W_Q_CUT = "…\n(скрыто знаков вопроса: %d)"
+W_Q_HIDDEN = "(вопрос не поместился: %d знаков)"
+W_TR_HEAD = "🔤 перевод для сотрудника, клиенту не уходит:"
+W_TR_Q, W_TR_A = "вопрос: ", "ответ: "
+W_TR_EMPTY = "— (модель не дала)"
+W_TR_NONE = "🔤 перевода нет: модель не дала"
+W_TR_VER = "🔤 перевод — к версии %d; у этой версии (текст человека) перевода нет"
+W_TR_CUT = "…\n(скрыто знаков перевода: %d)"
+W_TR_HIDDEN = "(перевод не поместился: %d знаков)"
+Q_SPLIT_MAX = 1000                  # вопрос над ответом, ушедшим отдельным сообщением, — не длиннее, знаков
 
 # уроки людей (WAAGENTLESSON0210)
 LESSON_TEXT_MAX = 1500                           # было/стало в сообщении урока, символов
@@ -381,20 +402,82 @@ def fit_details(head, details, room=CARD_ROOM):
     return hidden if len(hidden) <= room else None
 
 
-def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX):
+def card_trans(extra):
+    """Поля карточки ядра (`Core.card_extra`) → (строка блока перевода | "", тело | ""). Вопрос русский или букв нет —
+    ("", ""): перевода не бывает. Перевод этой версии — заголовок с пометкой и оба перевода; перевод есть, но к другой
+    версии — «перевод — к версии N»; перевода нет — «перевода нет: модель не дала» (WACARDQ0410)."""
+    if not extra or extra.get("q_lang") in (None, "", "ru"):
+        return "", ""
+    q_ru, a_ru = extra.get("q_ru"), extra.get("a_ru")
+    if q_ru or a_ru:
+        return W_TR_HEAD, W_TR_Q + (q_ru or W_TR_EMPTY) + "\n" + W_TR_A + (a_ru or W_TR_EMPTY)
+    if extra.get("tr_ver"):
+        return W_TR_VER % int(extra["tr_ver"]), ""
+    return W_TR_NONE, ""
+
+
+def _cut(body, over, cut_word, hidden_word):
+    """Тело короче на over знаков с числом скрытых | «не поместился» с числом знаков вместо тела."""
+    keep = len(body) - over - len(cut_word % len(body))
+    if keep >= 1:
+        return body[:keep] + cut_word % (len(body) - keep)
+    return hidden_word % len(body)
+
+
+def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX, question="", trans=("", "")):
     """→ [тексты сообщений]; последнее — карточка с кнопками. Ответ клиенту не режется НИКОГДА: не влезает
     карточка — режутся подробности; не влезает сам ответ — он уходит отдельно (длиннее сообщения —
-    подряд несколькими), карточка — следующим сообщением."""
-    one = fit_details(top + "\n\n" + answer + "\n\n" + notes, details, room)
+    подряд несколькими), карточка — следующим сообщением.
+    question — вопрос клиента над ответом, trans — (строка, тело) перевода под ответом (WACARDQ0410); вопроса нет —
+    карточка байт-в-байт прежняя. Резка по порядку: подробности, переводы, вопрос; ответ — нет."""
+    if not question:
+        one = fit_details(top + "\n\n" + answer + "\n\n" + notes, details, room)
+        if one is not None:
+            return [one]
+        first = top + W_ANSWER_LEAD
+        parts, rest = [first + answer[:msg_max - len(first)]], answer[msg_max - len(first):]
+        while rest:
+            parts.append(rest[:msg_max])
+            rest = rest[msg_max:]
+        card_head = top + W_ANSWER_ABOVE % len(answer) + notes
+        return parts + [fit_details(card_head, details, room) or card_head[:room]]
+    th, tb_full = trans or ("", "")
+
+    def tr_part(tb):
+        return th + ("\n" + tb if tb else "")
+
+    def head(qb, tb):
+        return "\n\n".join([top, W_Q_HEAD + "\n" + qb, W_A_HEAD + "\n" + answer] + ([tr_part(tb)] if th else [])
+                           + [notes])
+
+    one = fit_details(head(question, tb_full), details, room)
     if one is not None:
         return [one]
-    first = top + W_ANSWER_LEAD
+    hid = W_DETAILS_HIDDEN % len(details) if details else ""
+    tb = tb_full
+    if tb:                                          # подробности уже скрыты — режутся переводы
+        tb = _cut(tb, len(head(question, tb)) + len(hid) - room, W_TR_CUT, W_TR_HIDDEN)
+        if len(head(question, tb)) + len(hid) <= room:
+            return [head(question, tb) + hid]
+    qb = _cut(question, len(head(question, tb)) + len(hid) - room, W_Q_CUT, W_Q_HIDDEN)   # затем вопрос
+    if len(head(qb, tb)) + len(hid) <= room:
+        return [head(qb, tb) + hid]
+    # не влезает сам ответ — он отдельно; вопрос над ним, в первом сообщении
+    qs = question if len(question) <= Q_SPLIT_MAX else _cut(question, len(question) - Q_SPLIT_MAX, W_Q_CUT,
+                                                            W_Q_HIDDEN)
+    first = top + "\n\n" + W_Q_HEAD + "\n" + qs + "\n\n" + W_A_LEAD_Q
     parts, rest = [first + answer[:msg_max - len(first)]], answer[msg_max - len(first):]
     while rest:
         parts.append(rest[:msg_max])
         rest = rest[msg_max:]
-    card_head = top + W_ANSWER_ABOVE % len(answer) + notes
-    return parts + [fit_details(card_head, details, room) or card_head[:room]]
+
+    def card_head(tb):
+        return top + W_ANSWER_ABOVE % len(answer) + ((tr_part(tb) + "\n\n") if th else "") + notes
+    card = fit_details(card_head(tb_full), details, room)
+    if card is None and tb_full:
+        card = card_head(_cut(tb_full, len(card_head(tb_full)) + len(hid) - room, W_TR_CUT, W_TR_HIDDEN)) + hid
+        card = card if len(card) <= room else None
+    return parts + [card or card_head("")[:room]]
 
 
 class Tg(wa_agent.Telegram):
@@ -504,8 +587,12 @@ class Tg(wa_agent.Telegram):
         door_open = door() if door else True
         name, link = self._topic(number)
         top = "%s №%d · версия %d · %s" % ("🔔 Напоминание" if follow else "📝 Черновик", draft_id, ver, name)
+        # вопрос клиента над ответом и перевод для сотрудника (WACARDQ0410); нет у ядра — карточка прежняя
+        extra = getattr(self.core, "card_extra", None)
+        extra = extra(draft_id, ver, str(text or "")) if extra else None
         texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson),
-                           card_details(hand, link))
+                           card_details(hand, link), question=(extra or {}).get("question") or "",
+                           trans=card_trans(extra))
         row = [{"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
                {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]
         if not (hand and ver == 1):
