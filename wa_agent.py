@@ -21,6 +21,9 @@
      эхо, у которого отпечаток текста равен настройке службы И которое пришло не позже GREET_SEC
      после «первого» входящего. Паузы нет, черновик жив, done_upto не трогается — первый вопрос
      клиента остаётся открытым (запись владельца 02.10.2026-1 п.3). Строка — в таблицу `autogreet`.
+     Фото, видео, документ с телефона (WAPAUSEMEDIA0410, решение владельца 05.10.2026): паузы нет — ни
+     вопроса «когда продолжать», ни ожидания «Продолжить»; ждущий черновик, done_upto и версия контекста — как
+     у всякого эха. Что ставит паузу, решает `wa_kind.echo_pauses` (голосовое, стикер и прочее — пауза).
      На первом старте курсор встаёт на MAX(id): переписка до службы черновиков не даёт.
   2. ЧЕРНОВИК. Клиент не на паузе, ждущих сообщений больше, чем закрыто прежним решением, живого
      черновика нет, со времени последнего сообщения прошло `quiet` (60–90 с — клиенты пишут
@@ -29,7 +32,7 @@
 
 НАЖАТИЕ (`Core.press`). Захват — условный UPDATE `state='pending' AND ver=?`, решает rowcount;
 проигравший получает «уже решено: кто, когда, исход». Победитель перепроверяет очередь (эхо →
-superseded и пауза; новое входящее → stale), пишет `sending` и ТОЛЬКО ПОТОМ зовёт дверь, затем
+superseded и пауза, у фото/видео/документа — без паузы; новое входящее → stale), пишет `sending` и ТОЛЬКО ПОТОМ зовёт дверь, затем
 исход: sent (с wamid) · not_sent · unsure. Повтора нет нигде: `unknown` двери = `unsure`, а на
 старте службы `sending` → `unsure` (сообщение могло уйти) — тот же замок, что `_init_state`
 службы показа. `claimed` на старте → `pending`: дверь ещё не звали, отправки не было.
@@ -1114,7 +1117,7 @@ class Core:
                 if kind == wa_kind.KIND_INBOUND:
                     self._on_inbound(number, rid, ts_q, now)
                 elif not self._our_wamid(wamid):
-                    self._on_echo(number, rid, now, text=text, ts_msg=ts_m, wamid=wamid)
+                    self._on_echo(number, rid, now, text=text, ts_msg=ts_m, wamid=wamid, msg_type=msg_type)
             cur = rid
         self._set_cursor(cur)
         return len(rows)
@@ -1173,7 +1176,7 @@ class Core:
     def _greeted(self, rid):
         return self.db.execute("SELECT 1 FROM autogreet WHERE row_id=?", (rid,)).fetchone() is not None
 
-    def _on_echo(self, number, rid, now, text=None, ts_msg=None, wamid=None):
+    def _on_echo(self, number, rid, now, text=None, ts_msg=None, wamid=None, msg_type=None):
         after, words = self._greet(number, rid, text, ts_msg)
         if after is not None:
             # автоприветствие — не ответ человека: паузы нет, черновик жив, done_upto не трогаем
@@ -1182,7 +1185,10 @@ class Core:
             self.log("эхо строки %d: автоприветствие (%s) — паузы нет, черновик жив, первый вопрос открыт"
                      % (rid, words))
             return
-        self.log("эхо строки %d: не автоприветствие (%s) — пауза" % (rid, words))
+        # фото, видео, документ с телефона — ответ человека, но паузы не ставит (WAPAUSEMEDIA0410)
+        pause = wa_kind.echo_pauses(msg_type)
+        self.log("эхо строки %d: не автоприветствие (%s) — %s" % (
+            rid, words, "пауза" if pause else "вид %s, паузы нет (WAPAUSEMEDIA0410)" % wa_kind._type(msg_type)))
         self._client(number)
         self._bump(number)
         # человек ответил на всё, что было до его эха: эти входящие закрыты
@@ -1192,7 +1198,8 @@ class Core:
             self._close(live[0], SUPERSEDED, "снят: ответили с телефона %s" % hm_phuket(now), now)
         self._withdraw(number, SUPERSEDED, "снят до срока: ответили с телефона %s — отложенное не уходит"
                        % hm_phuket(now), now, before=rid)
-        self._pause(number, rid, now)
+        if pause:
+            self._pause(number, rid, now)
 
     def make_drafts(self, now):
         made = []
@@ -1254,6 +1261,21 @@ class Core:
                 return kind, rid
             if kind == wa_kind.KIND_ECHO and not self._our_wamid(wamid) and not self._greeted(rid):
                 return kind, rid
+        return None
+
+    def _pausing_echo(self, number, after_id):
+        """id первого эха с телефона после after_id, которое ставит паузу (`wa_kind.echo_pauses`), или None.
+        Те же признаки «ответ человека», что у `_fresh`; фото, видео, документ паузы не дают (WAPAUSEMEDIA0410)."""
+        q = self._queue()
+        try:
+            rows = q.execute("SELECT id, msg_type, echo, history, wamid FROM wa_inbox "
+                             "WHERE from_number=? AND id > ? ORDER BY id", (number, after_id)).fetchall()
+        finally:
+            q.close()
+        for rid, msg_type, echo, history, wamid in rows:
+            if (self._live_kind(msg_type, echo, history) == wa_kind.KIND_ECHO and wa_kind.echo_pauses(msg_type)
+                    and not self._our_wamid(wamid) and not self._greeted(rid)):
+                return rid
         return None
 
     # ── нажатие ───────────────────────────────────────────────────────────────────────────
@@ -1344,7 +1366,14 @@ class Core:
             if state == SUPERSEDED and rid is not None:
                 self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?",
                                 (number,))
-                self._pause(number, rid, now)
+                # черновик снят любым эхом с телефона; пауза — только если среди них есть ставящее её
+                try:
+                    prid = self._pausing_echo(number, upto)
+                except Exception as e:                               # noqa: BLE001
+                    prid = rid                # очередь не прочитана — как до WAPAUSEMEDIA0410: пауза
+                    self.log("черновик %d: вид эха не прочитан (%s) — пауза, как прежде" % (draft_id, type(e).__name__))
+                if prid is not None:
+                    self._pause(number, prid, now)
             return {"ok": False, "state": state, "words": "не отправлено: " + (
                 "ответили с телефона" if state == SUPERSEDED else "клиент написал ещё")}
 
