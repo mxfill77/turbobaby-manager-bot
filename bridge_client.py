@@ -1098,15 +1098,29 @@ class BridgeClient:
         Фильтры (хотя бы один из phone/name/bike, иначе мост ответит `no_filter`): `phone` —
         сравнение по последним 9 цифрам (колонки «Телефон» и «Ник»); `name` — слова имени в любом
         порядке; `bike` — по номеру, как у `tx_find`; `date_from`/`date_to` — включительно по «Дата
-        договора». `limit` — по умолчанию 20, потолок 100.
+        договора»; «Документ создан» берётся ТОЛЬКО при ПУСТОЙ ячейке даты договора. `limit` — по
+        умолчанию 20, потолок 100.
 
-        → {ok, outcome, pick, items:[{row, doc_id, client, contract_date, date_src, status, signed,
-        signed_at, bike, phone, pdf_id, matched_on}], checked:{rows_scanned, span_from, span_to,
-        matched, signed, returned, truncated, …}}. `outcome`: `one` — ровно один подписанный, он в
-        `pick`; `ambiguous` — подписанных несколько, выбрать нельзя (неизвестно, а не первый);
-        `none_signed` — договоры есть, подписанного нет; `none` — не найдено среди `rows_scanned`.
-        Подписанным считается РОВНО статус «ПОДПИСАН». Мост без двери (до выкладки) отвечает
-        `unknown_action` — это «реестр не просмотрен», а не «договоров нет»."""
+        → {ok, outcome, pick, reason, items:[запись], undated_items:[запись], checked:{rows_scanned,
+        span_from, span_to, matched, signed, returned, truncated, undated, undated_signed,
+        date_unparsed, unread, complete}}. Запись: {row, doc_id, client, contract_date (день или
+        None — неизвестен), contract_date_raw, created_raw, date_src (contract_date | created |
+        unparsed | none), status, signed, signed_at, bike, phone, pdf_id, matched_on}; `pick` — та же
+        полная запись выбранного договора плюс `pdf_ready`.
+
+        `outcome`: `one` — ровно один подписанный, он в `pick`; `ambiguous` — подписанных в сроке
+        несколько, выбрать нельзя (неизвестно, а не первый); `incomplete` — при сроке есть подходящий
+        ПОДПИСАННЫЙ без известного дня (дата пуста или не дата, «31.02.2026» — не дата): в сроке ли он,
+        неизвестно, поэтому `pick` нет, причина в `reason` ({code: "undated_signed", rows, message}),
+        договор не прикладывать — нужен человек; `none_signed` — договоры есть, подписанного нет;
+        `none` — не найдено среди `rows_scanned`.
+
+        ПОЛНОТА: `checked.complete` = False, если при сроке есть строки с неизвестным днём
+        (`undated`, они в `undated_items`) или реестр прочитан не целиком (`unread` называет, что не
+        прочитано). Ответ с `complete` = False — не «нет других договоров», а «смотрел не всё».
+        Без срока неизвестный день строку не исключает. Подписанным считается РОВНО статус
+        «ПОДПИСАН». Мост без двери (до выкладки) отвечает `unknown_action` — это «реестр не
+        просмотрен», а не «договоров нет»."""
         params = {}
         for key, val in (("phone", phone), ("name", name), ("bike", bike),
                          ("date_from", date_from), ("date_to", date_to)):

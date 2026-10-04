@@ -12,7 +12,12 @@ GET (`_call`), в мост уходят только названные филь
 
 Методы клиента проверяются разбором исходника (ast) и исполнением ИХ ЖЕ текста на подставном
 `self`: импорт bridge_client тянет `fcntl` и сеть, а у методов зависимостей нет — так тест идёт
-одинаково на сервере и на ПК."""
+одинаково на сервере и на ПК.
+
+CONTRACTFIX0410 (04.10.2026): неизвестный день строки не даёт уверенного единственного ответа —
+секция 18 харнесса (контрпример Codex TB-CHECK-0410-0025 п.1 → incomplete; 31.02.2026 → unparsed;
+created только при пустой дате договора; pick — полная запись), мутант на каждое правило, docstring
+клиента называет incomplete и полноту."""
 import ast
 import base64
 import difflib
@@ -67,7 +72,7 @@ def test_harness_all_green():
     res = json.loads(out)
     failed = [c for c in res["cases"] if not c["pass"]]
     assert not failed, json.dumps(failed, ensure_ascii=False, indent=1)
-    assert len(res["cases"]) >= 60, len(res["cases"])
+    assert len(res["cases"]) >= 100, len(res["cases"])
 
 
 def test_harness_covers_key_cases():
@@ -79,7 +84,12 @@ def test_harness_covers_key_cases():
                  "pdf.sha256", "foreign.not-in-registry", "foreign.drive-not-touched",
                  "foreign.wrong-folder", "empty.rows-scanned", "empty.named-span",
                  "headers.by-name", "config.no-registry", "readonly.no-writes",
-                 "route.find", "route.pdf", "route.token"):
+                 "route.find", "route.pdf", "route.token",
+                 # CONTRACTFIX0410 — отрицательные случаи неизвестного дня
+                 "fix.counterexample-incomplete", "fix.counterexample-not-one", "fix.feb31-unparsed",
+                 "fix.unparsed-no-created", "fix.empty-uses-created", "fix.pick-full-record",
+                 "fix.unsigned-undated-keeps-one", "fix.no-term-keeps-undated", "fix.unread-rich",
+                 "fix.ambiguous-over-incomplete", "fix.route-incomplete", "fix.readonly-no-writes"):
         assert need in names, f"нет кейса {need}: {sorted(names)}"
 
 
@@ -184,6 +194,28 @@ def test_client_methods_are_get():
     assert out == {"ok": False, "error": "not_in_registry"}, out   # отказ моста — как есть
 
 
+def test_client_find_doc_names_incomplete():
+    """CONTRACTFIX0410: docstring contract_find называет исход incomplete, его причину, полноту
+    ответа и полную запись pick — агент читает контракт отсюда, а не из кода моста."""
+    meths, _, ns = _client_methods()
+    doc = ast.get_docstring(meths["contract_find"]) or ""
+    for need in ("`incomplete`", "undated_signed", "`reason`", "checked.complete", "`unread`",
+                 "`undated`", "undated_items", "date_unparsed", "contract_date_raw", "unparsed",
+                 "pdf_ready", "полная запись", "ПУСТОЙ ячейке", "31.02.2026"):
+        assert need in doc, f"docstring contract_find не называет {need!r}"
+    for old in ("one", "ambiguous", "none_signed", "none"):
+        assert f"`{old}`" in doc, f"прежний исход {old} пропал из docstring"
+    # исход incomplete клиент не прячет и не переписывает: ответ моста — как есть
+    reply = {"ok": True, "outcome": "incomplete", "pick": None,
+             "reason": {"code": "undated_signed", "rows": [3], "message": "m"},
+             "checked": {"complete": False, "undated": 1, "undated_signed": 1}}
+    f = _Fake(reply)
+    out = ns["contract_find"](f, phone="0815550001", date_from="2026-09-01", date_to="2026-09-30")
+    assert out is reply and out["outcome"] == "incomplete" and out["pick"] is None, out
+    assert f.calls == [("contract_find", {"phone": "0815550001", "date_from": "2026-09-01",
+                                          "date_to": "2026-09-30"})], f.calls
+
+
 def test_client_pdf_verified():
     """Клиент декодирует содержимое и сверяет длину и sha256 с ответом моста."""
     _, _, ns = _client_methods()
@@ -240,12 +272,52 @@ MUTANTS = [
      "pdfIds[i] = esignFileId_(link) || esignFileId_(", "pdfIds[i] = esignFileId_("),
     ("no-filter-allowed", "ContractDoor.js",
      "if (!phone && !qWords.length && !plate) return", "if (false) return"),
+    # CONTRACTFIX0410: «было» двух прежних мутантов сдвинуто вслед за кодом (подстановка created
+    # переехала в esignRowDate_, запись строки — в rec), суть мутации та же
     ("created-fallback-dropped", "ContractDoor.js",
-     "if (!day && c.created !== undefined) {", "if (false) {"),
+     "} else if (createdRaw) {", "} else if (false) {"),
     ("row-off-by-one", "ContractDoor.js",
-     "matched.push({\n      row: i + 2,", "matched.push({\n      row: i + 1,"),
+     "var rec = {\n      row: i + 2,", "var rec = {\n      row: i + 1,"),
     ("route-find-missing", "Bridge.js", "case 'contract_find':", "case 'contract_find_x':"),
     ("route-pdf-drops-id", "Bridge.js", "contractPdf({ id: params.id })", "contractPdf({ id: '' })"),
+    # ── CONTRACTFIX0410: по мутанту на каждое правило ──
+    # П1: день только при верной календарной дате
+    ("fix-calendar-dropped", "ContractDoor.js",
+     "return esignCalendar_(+y, +mo, +d) ? y + '-' + mo + '-' + d : '';", "return y + '-' + mo + '-' + d;"),
+    # П2: created только при ПУСТОЙ дате договора (мутант = прежнее поведение: при неразобранной — тоже)
+    ("fix-created-on-unparsed", "ContractDoor.js",
+     "  if (raw) {\n    var d = esignDay_(r[c.contract_date], tz);",
+     "  if (raw && esignDay_(r[c.contract_date], tz)) {\n    var d = esignDay_(r[c.contract_date], tz);"),
+    ("fix-unparsed-called-none", "ContractDoor.js",
+     "out.src = d ? 'contract_date' : 'unparsed';", "out.src = d ? 'contract_date' : 'none';"),
+    ("fix-raw-dropped", "ContractDoor.js",
+     "contract_date_raw: dt.raw,", "contract_date_raw: day || '',"),
+    # П3: при сроке неизвестный день не выпадает молча; подписанный среди них → incomplete
+    ("fix-undated-dropped", "ContractDoor.js",
+     "if (!day) { aside.push(rec); continue; }", "if (!day) { continue; }"),
+    ("fix-undated-signed-ignored", "ContractDoor.js",
+     "if (asideSigned.length && signed.length <= 1) {", "if (false) {"),
+    ("fix-incomplete-over-ambiguous", "ContractDoor.js",
+     "if (asideSigned.length && signed.length <= 1) {", "if (asideSigned.length) {"),
+    ("fix-unsigned-undated-blocks", "ContractDoor.js",
+     "var asideSigned = aside.filter(function (x) { return x.signed; });", "var asideSigned = aside.slice();"),
+    ("fix-no-term-drops-undated", "ContractDoor.js",
+     "    if (from || to) {\n      // день неизвестен", "    if (true) {\n      // день неизвестен"),
+    ("fix-unparsed-not-counted", "ContractDoor.js",
+     "if (dt.src === 'unparsed') unparsed++;", "if (false) unparsed++;"),
+    # полнота: строки без дня и непрочитанный реестр
+    ("fix-complete-ignores-undated", "ContractDoor.js",
+     "complete: !aside.length && !unread.length,", "complete: !unread.length,"),
+    ("fix-unread-rich-hidden", "ContractDoor.js",
+     "catch (e) { rich = null; unread.push('pdf_rich_text'); }", "catch (e) { rich = null; }"),
+    ("fix-unread-formulas-hidden", "ContractDoor.js",
+     "catch (e) { frm = null; unread.push('pdf_formulas'); }", "catch (e) { frm = null; }"),
+    ("fix-rows-short-hidden", "ContractDoor.js",
+     "if (data.length < n) unread.push('rows_short');", ""),
+    # П4: pick — полная запись плюс pdf_ready (мутант = прежний тонкий pick)
+    ("fix-pick-thin", "ContractDoor.js",
+     "pick = Object.assign({}, signed[0], { pdf_ready: !!signed[0].pdf_id });",
+     "pick = { row: signed[0].row, doc_id: signed[0].doc_id, pdf_id: signed[0].pdf_id, pdf_ready: !!signed[0].pdf_id };"),
 ]
 
 
