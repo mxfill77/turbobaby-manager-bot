@@ -1450,6 +1450,237 @@ function getTxSummary(period) {
 
 
 /**
+ * READ-ONLY ПОИСК ПРОВОДОК КАССЫ — дверь tx_find (К1 проекта AGENTASKSPL0310, 03.10.2026).
+ *
+ * ЗАЧЕМ. Сводка getTxSummary отдаёт date/sender/amount/currency/category/bike/description и
+ * НЕ отдаёт ни raw (там пометки вида «сдача 210 клиенту»), ни msg_id (ссылка на сообщение кассы),
+ * ни status, ни booking_id, отменённые не отсекает, а срок меряет моментом ЗАПИСИ ботом. Оплату
+ * клиента по ней не подтвердить. Эта дверь ищет по байку, брони и сроку и отдаёт строку целиком.
+ *
+ * payload: { bike, booking_id, date_from, date_to, limit }
+ *   bike       — как пишется в кассе («Nmax 6908») или голый номер («6908»); сравнение ПО НОМЕРУ
+ *                (plateOf_, тот же резолв, что у readEvents). Байк назван, а номера в нём нет →
+ *                отказ bad_bike, а не «все строки».
+ *   booking_id — точное совпадение с col N.
+ *   date_from, date_to — включительно, 'YYYY-MM-DD' или 'DD.MM.YYYY'; день строки = msg_date
+ *                (день сообщения кассы), а если он ПУСТ — день recorded_at (поле date_src говорит,
+ *                какой взят). Строка без дня при названном сроке не отдаётся и считается в undated.
+ *   limit      — по умолчанию TX_FIND_LIMIT_DEFAULT, потолок TX_FIND_LIMIT_MAX.
+ *   Хотя бы один фильтр обязателен (no_filter) — дверь не выгрузка кассы.
+ *
+ * НЕРАЗОБРАННОЕ НЕ ПРЕВРАЩАЕТСЯ В ФАКТ (TXFINDFIX0310). Писатель addTransaction кладёт сумму
+ * числом, а msg_date — как пришло (splinter шлёт 'YYYY-MM-DD'), поэтому строка в ячейке суммы и
+ * день в иной форме — рука человека или старые строки. Агент отвечает клиенту о деньгах по кассе:
+ *   сумма  — число из ячейки как есть (настоящий 0 — это 0); строка — только однозначная форма
+ *            (txFindAmount_); иначе amount=null, amount_raw — исходник, amount_unparsed=true, в
+ *            total строка НЕ идёт, total_complete=false, счёт — checked.amount_unparsed;
+ *   день   — msg_date понимается в формах txFindDay_; НЕПУСТАЯ, но не разобранная msg_date днём
+ *            записи НЕ подменяется: date=null, date_src 'unparsed', msg_date_raw — исходник; при
+ *            названном сроке строка не отдаётся и считается в undated и checked.date_unparsed.
+ *   checked.complete=false, если выдача обрезана, или при названном сроке есть строки без дня
+ *   (undated), или есть неразобранные суммы или дни. undated и date_unparsed считаются среди строк,
+ *   прошедших фильтры байка и брони и не отменённых: чужая строка без дня полноту не портит.
+ *
+ * ОТМЕНЁННЫЕ НЕ ОТДАЮТСЯ: отменённой считается РОВНО то, что не считает баланс (computeBalance_:
+ * status 'void' без учёта регистра), — иначе дверь и баланс разошлись бы в том, что считать
+ * деньгами. Отсеянные названы числом checked.voided.
+ *
+ * «НЕ НАЙДЕНО» ОТЛИЧИМО ОТ «НЕ СМОТРЕЛИ»: ответ всегда несёт checked — просмотренный срок
+ * (span_from/span_to: названный, а где не назван — крайние дни листа) и rows_scanned (сколько строк
+ * листа прочитано). Листа нет → ok:false no_tx_sheet, а не пустой список.
+ *
+ * Только чтение: ни одной записи в лист, лист не создаётся (getBotTab_ здесь не зовётся — он
+ * создаёт недостающую вкладку). Новые строки — снизу, поэтому выдача newest-first.
+ */
+var TX_FIND_LIMIT_DEFAULT = 50;
+var TX_FIND_LIMIT_MAX = 200;
+
+/** Лист транзакций БЕЗ создания: нет ID таблицы → null, нет вкладки → null. */
+function txFindSheet_() {
+  var id = PropertiesService.getScriptProperties().getProperty('BOT_DATA_SHEET_ID');
+  if (!id) return null;
+  return SpreadsheetApp.openById(id).getSheetByName(BOTDATA.TABS.TX);
+}
+
+/** Часовой пояс для дней: пояс скрипта (appsscript.json — Asia/Bangkok). */
+function txFindTz_() {
+  try { return Session.getScriptTimeZone() || 'Asia/Bangkok'; } catch (e) { return 'Asia/Bangkok'; }
+}
+
+/** День ячейки листа → 'YYYY-MM-DD' или ''. Лист отдаёт и Date (Sheets сам парсит '2026-10-03'),
+ *  и строку 'YYYY-MM-DD' или 'DD.MM.YYYY' (проверка календаря — та же, что у границы срока,
+ *  txFindParamDay_), и ISO-строку recorded_at (UTC, toISOString). */
+function txFindDay_(v, tz) {
+  if (v === '' || v === null || v === undefined) return '';
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, tz, 'yyyy-MM-dd');
+  }
+  var s = String(v).trim();
+  var day = txFindParamDay_(s);
+  if (day) return day;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) {
+    var d = new Date(s);
+    return isNaN(d.getTime()) ? '' : Utilities.formatDate(d, tz, 'yyyy-MM-dd');
+  }
+  return '';
+}
+
+/** Граница срока из запроса → 'YYYY-MM-DD' | '' (не названа) | null (не разобрана). */
+function txFindParamDay_(v) {
+  var s = String(v === undefined || v === null ? '' : v).trim();
+  if (!s) return '';
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s) || null;
+  var y, mo, d;
+  if (m) { y = +m[1]; mo = +m[2]; d = +m[3]; }
+  else {
+    m = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec(s);
+    if (!m) return null;
+    y = +m[3]; mo = +m[2]; d = +m[1];
+  }
+  var t = new Date(Date.UTC(y, mo - 1, d));
+  if (t.getUTCFullYear() !== y || t.getUTCMonth() !== mo - 1 || t.getUTCDate() !== d) return null;
+  return y + '-' + (mo < 10 ? '0' : '') + mo + '-' + (d < 10 ? '0' : '') + d;
+}
+
+/** Пустая ли ячейка дня: только пусто и пробелы. Непустое, но не разобранное — НЕ пусто. */
+function txFindBlank_(v) {
+  return v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
+}
+
+/** Ячейка → текст исходника: Date — ISO UTC (как recorded_at), пусто → '', прочее — как есть. */
+function txFindCellText_(v) {
+  if (v === null || v === undefined) return '';
+  if (Object.prototype.toString.call(v) === '[object Date]') return isNaN(v.getTime()) ? '' : v.toISOString();
+  return String(v);
+}
+
+/** Однозначная строка суммы: знак по желанию; тысячи — запятыми ЛИБО пробелами между тройками;
+ *  дробь — точкой, 1–2 знака. «8,5» (запятая-дробь?), «8.000» (8 или 8000?), «8000 THB» — нет. */
+var TX_FIND_AMOUNT_RE_ = /^[+-]?(?:\d+|\d{1,3}(?:,\d{3})+|\d{1,3}(?:[ \u00A0\u202F]\d{3})+)(?:\.\d{1,2})?$/;
+
+/** Сумма ячейки → { amount, raw, unparsed }. Число — как есть (0 остаётся 0); строка — только
+ *  однозначная форма; всё прочее, включая пустую ячейку, — amount null: в 0 молча не превращаем. */
+function txFindAmount_(v) {
+  var raw = txFindCellText_(v);
+  if (typeof v === 'number' && isFinite(v)) return { amount: v, raw: raw, unparsed: false };
+  var s = typeof v === 'string' ? v.trim() : '';
+  if (s && TX_FIND_AMOUNT_RE_.test(s)) return { amount: Number(s.replace(/[, \u00A0\u202F]/g, '')), raw: raw, unparsed: false };
+  return { amount: null, raw: raw, unparsed: true };
+}
+
+/** Ссылка на сообщение кассы из msg_id вида '<chat>:<message>:m<i>' / ':topup'
+ *  (splinter.py пишет f"{chat_id}:{msg.message_id}:m{i}"). Только супергруппа (-100…): ссылка
+ *  t.me/c/<id без -100>/<message> открывается участникам группы. Иначе ''. */
+function txFindLink_(msgId) {
+  var m = /^-100(\d+):(\d+)(?::|$)/.exec(String(msgId || '').trim());
+  return m ? 'https://t.me/c/' + m[1] + '/' + m[2] : '';
+}
+
+function txFind(payload) {
+  var p = payload || {};
+  var bikeIn = String(p.bike === undefined || p.bike === null ? '' : p.bike).trim();
+  var plate = bikeIn ? plateOf_(bikeIn) : '';
+  var booking = String(p.booking_id === undefined || p.booking_id === null ? '' : p.booking_id).trim();
+  var from = txFindParamDay_(p.date_from);
+  var to = txFindParamDay_(p.date_to);
+  var lim = Math.floor(Number(p.limit));
+  var limit = Math.min(lim > 0 ? lim : TX_FIND_LIMIT_DEFAULT, TX_FIND_LIMIT_MAX);
+  var filter = { bike: bikeIn, plate: plate, booking_id: booking,
+                 date_from: from || '', date_to: to || '' };
+
+  if (bikeIn && !plate) return { ok: false, error: 'bad_bike', filter: filter,
+    message: 'в названии байка нет номера (нужно «Nmax 6908» или «6908»)' };
+  if (from === null || to === null) return { ok: false, error: 'bad_date', filter: filter,
+    message: 'срок: YYYY-MM-DD или DD.MM.YYYY' };
+  if (from && to && from > to) return { ok: false, error: 'bad_span', filter: filter,
+    message: 'date_from позже date_to' };
+  if (!plate && !booking && !from && !to) return { ok: false, error: 'no_filter', filter: filter,
+    message: 'нужен хотя бы один фильтр: bike, booking_id, date_from, date_to' };
+
+  var tab = txFindSheet_();
+  if (!tab) return { ok: false, error: 'no_tx_sheet', filter: filter,
+    message: 'лист транзакций Bot Data не найден — касса НЕ просмотрена' };
+
+  var last = tab.getLastRow();
+  var data = last >= 2 ? tab.getRange(2, 1, last - 1, BOTDATA.TX_HEADERS.length).getValues() : [];
+  // TX_HEADERS: recorded_at,msg_date,group,sender,amount,currency,category,bike,deposit,description,raw,status,msg_id,booking_id
+  var REC = 0, MD = 1, GRP = 2, SND = 3, AMT = 4, CUR = 5, CAT = 6, BIKE = 7, DEP = 8,
+      DESC = 9, RAW = 10, ST = 11, MID = 12, BKG = 13;
+  var tz = txFindTz_();
+  var spanAsked = !!(from || to);
+  var first = '', lastDay = '', undated = 0, inSpan = 0, voided = 0, matched = 0;
+  var amountUnparsed = 0, dateUnparsed = 0;
+  var total = {};
+  var items = [];
+
+  for (var i = data.length - 1; i >= 0; i--) {            // снизу вверх = newest-first
+    var r = data[i];
+    var day = txFindDay_(r[MD], tz), src = 'msg_date';
+    if (!day) {                                           // к дню записи — ТОЛЬКО при пустой msg_date
+      if (txFindBlank_(r[MD])) { day = txFindDay_(r[REC], tz); src = day ? 'recorded_at' : ''; }
+      else src = 'unparsed';
+    }
+    if (day) {
+      if (!first || day < first) first = day;
+      if (!lastDay || day > lastDay) lastDay = day;
+    }
+    if (spanAsked && day) {
+      if (from && day < from) continue;
+      if (to && day > to) continue;
+    }
+    if (!spanAsked || day) inSpan++;
+    if (plate && plateOf_(String(r[BIKE] || '')) !== plate) continue;
+    if (booking && String(r[BKG] === undefined || r[BKG] === null ? '' : r[BKG]).trim() !== booking) continue;
+    if (spanAsked && !day) {                              // срок назван, а день строки неизвестен
+      if (String(r[ST]).toLowerCase() !== 'void') {       // отменённая денег не меняет
+        undated++;
+        if (src === 'unparsed') dateUnparsed++;           // не отдаётся: в срок ли она — не знаем
+      }
+      continue;
+    }
+    if (String(r[ST]).toLowerCase() === 'void') { voided++; continue; }   // как computeBalance_
+    matched++;
+    if (src === 'unparsed') dateUnparsed++;               // отдаётся с date=null
+    var amt = txFindAmount_(r[AMT]);
+    var cur = String(r[CUR] || 'THB').toUpperCase();
+    if (amt.unparsed) amountUnparsed++;                   // в total НЕ идёт
+    else total[cur] = Math.round(((total[cur] || 0) + amt.amount) * 100) / 100;
+    if (items.length >= limit) continue;                  // считаем дальше, но не отдаём
+    var msgId = String(r[MID] === null || r[MID] === undefined ? '' : r[MID]);
+    items.push({
+      row: i + 2,                                         // строка листа: +1 шапка, +1 счёт с единицы
+      date: src === 'unparsed' ? null : day, date_src: src, msg_date_raw: txFindCellText_(r[MD]),
+      recorded_at: txFindCellText_(r[REC]),
+      amount: amt.amount, amount_raw: amt.raw, amount_unparsed: amt.unparsed, currency: cur,
+      category: String(r[CAT] || ''),
+      bike: String(r[BIKE] || ''), deposit: String(r[DEP] || ''),
+      description: String(r[DESC] || ''), raw: String(r[RAW] === null || r[RAW] === undefined ? '' : r[RAW]),
+      msg_id: msgId, link: txFindLink_(msgId),
+      status: String(r[ST] || ''), booking_id: String(r[BKG] === null || r[BKG] === undefined ? '' : r[BKG]),
+      group: String(r[GRP] || ''), sender: String(r[SND] || ''),
+    });
+  }
+
+  var spanHoles = spanAsked && undated > 0;               // в срок ли эти строки — не знаем
+  return {
+    ok: true, filter: filter, limit: limit, limit_max: TX_FIND_LIMIT_MAX,
+    checked: {
+      span_from: from || first, span_to: to || lastDay,
+      sheet_first: first, sheet_last: lastDay,
+      rows_scanned: data.length, undated: undated, rows_in_span: inSpan,
+      voided: voided, matched: matched, returned: items.length,
+      truncated: matched > items.length,
+      amount_unparsed: amountUnparsed, date_unparsed: dateUnparsed,
+      complete: !spanHoles && matched === items.length && amountUnparsed === 0 && dateUnparsed === 0,
+    },
+    total: total,
+    total_complete: amountUnparsed === 0 && !spanHoles,   // сумма ВСЕХ строк запроса, а не части
+    items: items,
+  };
+}
+
+
+/**
  * РУЧНОЙ ТЕСТ записи. Run → testBotData.
  */
 function testBotData() {

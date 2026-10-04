@@ -71,10 +71,26 @@ function doGet(e) {
         return jsonResponse(Object.assign({ action: 'read_events' },
           readEvents({ bike: params.bike || '', limit: params.limit })));
 
+      // --- Поиск проводок кассы (read-only лист «транзакции»; байк / бронь / срок, без отменённых) ---
+      case 'tx_find':
+        return jsonResponse(Object.assign({ action: 'tx_find' },
+          txFind({ bike: params.bike, booking_id: params.booking_id,
+                   date_from: params.date_from, date_to: params.date_to, limit: params.limit })));
+
       // --- Очередь оркестратора: задачи по статусу (деф. new), newest-first (дешёвый опрос демоном) ---
       case 'get_pending':
         return jsonResponse(Object.assign({ action: 'get_pending' },
           getPending_({ status: params.status, lane: params.lane })));
+
+      // --- Договоры TB e-Sign: поиск в реестре подписей (read-only, ContractDoor.js) ---
+      case 'contract_find':
+        return jsonResponse(Object.assign({ action: 'contract_find' },
+          contractFind({ phone: params.phone, name: params.name, bike: params.bike,
+                         date_from: params.date_from, date_to: params.date_to, limit: params.limit })));
+
+      // --- Договоры TB e-Sign: подписанный PDF по id (только из реестра и папки подписанных) ---
+      case 'contract_pdf':
+        return jsonResponse(Object.assign({ action: 'contract_pdf' }, contractPdf({ id: params.id })));
 
       // --- Расчёт цены аренды (read-only, ничего не пишет) ---
       case 'quote_price':
@@ -142,7 +158,7 @@ function doGet(e) {
           version: CONFIG.VERSION,
           actions: [
             'ping', 'fleet', 'clients', 'anomalies',
-            'client_history', 'finance', 'returns_soon', 'daily_pulse', 'get_pending'
+            'client_history', 'finance', 'returns_soon', 'daily_pulse', 'get_pending', 'tx_find', 'contract_find', 'contract_pdf'
           ],
           examples: {
             ping: '?token=XXX&action=ping',
