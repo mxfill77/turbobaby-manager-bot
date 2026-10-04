@@ -183,6 +183,9 @@ for (const f of ['Config.js', 'BotData.js', 'Bridge.js', 'ContractDoor.js'])
   vm.runInThisContext(srcText(f), { filename: srcOf(f) });
 
 const cases = [];
+// `--snap` (AGENTFIX0410): ответы contractFind этих же сценариев — опора сквозного контракта адаптера агента
+// (tests/test_agent_contract_bind.py). Снимается то, что вернул код двери, без правок и без выдуманных полей.
+const SNAP = {};
 function check(name, cond, detail) { cases.push({ name, pass: !!cond, detail: detail === undefined ? '' : String(detail) }); }
 function safe(fn) { try { return fn(); } catch (e) { return { ok: false, error: 'THROWN', message: String(e && e.message) }; } }
 const rowsOf = r => (r && r.items ? r.items.map(x => x.row) : null);
@@ -199,6 +202,7 @@ const byRow = (r, n) => (r && r.items || []).find(x => x.row === n) || {};
   check('phone.formatted', J(rowsOf(r2)) === J([3, 2]), J(rowsOf(r2)));
   const r3 = safe(() => contractFind({ phone: '089-765-4321' }));
   check('phone.via-nick', J(rowsOf(r3)) === J([6]) && J(r3.items[0].matched_on) === J(['nick']), J(r3.items));
+  SNAP.one_nick = r3;
   check('phone.filter-echo', r.filter && r.filter.phone_last9 === '812345678', J(r.filter));
   check('phone.bad', safe(() => contractFind({ phone: '12345' })).error === 'bad_phone', '');
 }
@@ -430,6 +434,7 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   check('fix.counterexample-incomplete', ce.ok === true && ce.outcome === 'incomplete' && ce.pick === null,
     J([ce.outcome, ce.pick]));
   check('fix.counterexample-not-one', ['one', 'none', 'none_signed'].indexOf(ce.outcome) < 0, ce.outcome);
+  SNAP.incomplete = ce;
   check('fix.counterexample-reason', ce.reason && ce.reason.code === 'undated_signed' && J(ce.reason.rows) === J([3])
     && typeof ce.reason.message === 'string' && ce.reason.message.length > 0, J(ce.reason));
   check('fix.counterexample-counts', ce.checked && ce.checked.undated === 1 && ce.checked.undated_signed === 1
@@ -460,6 +465,7 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
 
   // пустая ячейка даты договора при верном created — created подставлен, источник назван
   const nr = safe(() => contractFind(Object.assign({ name: 'Nina Ross' }, SEPT)));
+  SNAP.one_complete = nr;
   check('fix.empty-uses-created', J(rowsOf(nr)) === J([6]) && byRow(nr, 6).date_src === 'created'
     && byRow(nr, 6).contract_date === '2026-09-16' && byRow(nr, 6).contract_date_raw === ''
     && byRow(nr, 6).created_raw === '2026-09-16 11:00' && nr.outcome === 'one' && nr.checked.complete === true, J(nr.items));
@@ -476,6 +482,7 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
 
   // неподписанный без дня в сроке не мешает one (но ответ помечен неполным)
   const ol = safe(() => contractFind(Object.assign({ phone: '0815550005' }, SEPT)));
+  SNAP.one_unsigned_undated = ol;
   check('fix.unsigned-undated-keeps-one', ol.outcome === 'one' && ol.pick && ol.pick.row === 7 && ol.reason === null, J([ol.outcome, ol.pick]));
   check('fix.unsigned-undated-counted', ol.checked.undated === 1 && ol.checked.undated_signed === 0 && ol.checked.complete === false
     && J(urows(ol)) === J([8]), J(ol.checked));
@@ -497,6 +504,7 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
 
   // в сроке подписанных два — ambiguous верен при любом неизвестном; ответ всё равно неполон
   const kb = safe(() => contractFind(Object.assign({ name: 'Kate Bell' }, SEPT)));
+  SNAP.ambiguous = kb;
   check('fix.ambiguous-over-incomplete', kb.outcome === 'ambiguous' && kb.pick === null && kb.reason === null
     && kb.checked.undated_signed === 1 && kb.checked.complete === false, J([kb.outcome, kb.checked]));
 
@@ -522,11 +530,13 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   SHEETS = { 'Реестр': wrap(sheet2, a => (a[0] === 2 && a[1] === 1
     ? { getValues() { return sheet2.getRange(...a).getValues().slice(0, -1); } } : {})) };
   const us = safe(() => contractFind({ name: 'Nina Ross' }));
+  SNAP.one_rows_short = us;
   check('fix.unread-rows-short', us.checked && (us.checked.unread || []).indexOf('rows_short') >= 0 && us.checked.complete === false, J(us.checked));
   SHEETS = keep;
 
   // прежний реестр: полный ответ помечен полным; Date-ячейка даты договора — исходное значение названо
   const ok2 = safe(() => contractFind({ phone: '0812345678', date_from: '2026-09-15', date_to: '2026-09-30' }));
+  SNAP.one_other_client = ok2;
   check('fix.complete-normal', ok2.checked.complete === true && J(ok2.checked.unread) === J([]) && ok2.checked.undated === 0
     && ok2.reason === null && J(ok2.undated_items) === '[]', J(ok2.checked));
   check('fix.raw-date-object', ok2.pick && ok2.pick.contract_date_raw === '2026-09-20 00:00' && ok2.pick.date_src === 'contract_date', J(ok2.pick));
@@ -534,5 +544,21 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
 }
 
 const failed = cases.filter(c => !c.pass);
+if (process.argv.includes('--snap')) {
+  // ещё три ответа того же реестра: соседняя неподписанная строка при одном подписанном; реестр прочитан не целиком
+  // при подписанном договоре с годным PDF; сами PDF (contractPdf) двух договоров
+  const base = SHEETS['Реестр'];
+  SNAP.one_partial_neighbor = safe(() => contractFind({ phone: '+447700900123' }));
+  SHEETS = { 'Реестр': Object.assign({}, base, { getRange(...a) {
+    const rg = base.getRange(...a);
+    return a[0] === 2 && a[1] === 1 ? Object.assign({}, rg, { getValues() { return rg.getValues().slice(0, -1); } }) : rg;
+  } }) };
+  SNAP.one_rows_short_ivan = safe(() => contractFind({ phone: '0812345678', date_from: '2026-09-15', date_to: '2026-09-30' }));
+  SHEETS = { 'Реестр': base };
+  SNAP.pdf_b = safe(() => contractPdf({ id: PDF_B }));
+  SNAP.pdf_c = safe(() => contractPdf({ id: PDF_C }));
+  console.log(JSON.stringify({ snaps: SNAP, failed: failed.length }));
+  process.exit(0);
+}
 console.log(JSON.stringify({ cases, failed: failed.length }, null, 1));
 process.exit(failed.length ? 1 : 0);

@@ -21,6 +21,14 @@
 строки без дня) — выборка неполная, суммы и даты «не проверено», оплату такая выборка не подтверждает. Общий
 `total` двери не читается вовсе: оплату и залог он не подтверждает.
 
+Договор (AGENTFIX0410, Т4а ч.1): факт — только ответ двери `one` с подписанным `pick`, пустым `checked.unread` и
+`checked.undated_signed` = 0 (неподписанные строки без дня допустимы); `unread` непуст — «реестр прочитан не целиком,
+мог скрыть другой подписанный», `incomplete` двери и ответ без полей полноты (дверь до CONTRACTFIX0410) — INCOMPLETE.
+Привязка — кодом, а не аргументами модели: телефон договора (или ник, сверенный дверью по номеру обращения) совпадает
+с номером обращения по последним 9 цифрам; номер байка договора — с байком аренды из `rental` (аренду код читает сам);
+дата договора — внутри срока аренды, оба дня включительно. Не совпало — CONFLICT с причиной; не проверить или аренды
+нет — не факт. PDF — факт только для `pdf_id` принятого договора.
+
 Ожидание и другие клиенты: черновики служба делает по одному за такт (`wa_agent.Core.make_drafts`), поэтому сверка
 одного клиента держит остальных не дольше MAX_SEC (+ один обычный вызов при превышении). Новое входящее посреди
 сверки (`fresh()`) обрывает её сразу: черновика нет, служба повторит позже — как и сегодня после модели.
@@ -31,13 +39,15 @@ import re
 import time
 
 import wa_agent_knowledge as K
+import wa_book_read as B
 
 MAX_CALLS = 8                 # вызовов модели на один черновик
 MAX_SEC = 90.0                # секунд на сверку одного черновика
 
 FACT, EMPTY, REFUSED, TIMEOUT = "fact", "empty", "refused", "timeout"
 CANCELLED, AMBIGUOUS, UNKNOWN, INCOMPLETE = "cancelled", "ambiguous", "unknown", "incomplete"
-OUTCOMES = (FACT, EMPTY, REFUSED, TIMEOUT, CANCELLED, AMBIGUOUS, UNKNOWN, INCOMPLETE)
+CONFLICT = "conflict"         # ответ двери есть, но не этого клиента / не этой аренды (AGENTFIX0410)
+OUTCOMES = (FACT, EMPTY, REFUSED, TIMEOUT, CANCELLED, AMBIGUOUS, UNKNOWN, INCOMPLETE, CONFLICT)
 
 DONE, OVER, ABORTED = "done", "over", "aborted"        # исход сверки
 
@@ -47,6 +57,8 @@ INCOMPLETE_WORDS = "сверка не завершена"
 PAY_WORDS = "оплата не подтверждена сверкой"
 ROLE_WORDS = "денежная роль не сходится с кассой"
 SUMS_WORDS = "суммы расходятся"
+UNREAD_WORDS = "реестр прочитан не целиком, мог скрыть другой подписанный"
+CONTRACT_WORDS = "договор не этого клиента или не этой аренды"
 
 # роли денег по category кассы (splinter: rental|salary|advance|fuel|taxi|topup|other; deposit — passport|cash|null)
 R_RENT, R_DEPOSIT, R_REFUND, R_OTHER = "оплата аренды", "залог", "возврат", "прочее"
@@ -124,7 +136,79 @@ def cash_result(resp, at=None):
     return result("cash", FACT, src, ref="строк %s" % rows, at=at, window=window, reason="; ".join(bad), facts=facts)
 
 
-def contract_result(resp, at=None):
+_CC = frozenset(("125", "150", "155", "300", "350", "400", "500", "650", "700", "750", "900"))   # = plateOf_ моста
+_ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def plate_of(text):
+    """Номер байка — как plateOf_ моста (BotData.js): последнее число от 3 цифр, не кубатура. Нет — ""."""
+    nums = [n for n in re.findall(r"\d{3,}", str(text or "").lower()) if n not in _CC]
+    return nums[-1] if nums else ""
+
+
+def last9(value):
+    d = re.sub(r"\D", "", str(value or ""))
+    return d[-9:] if len(d) >= 9 else ""
+
+
+def contract_phones(cell):
+    """Последние 9 цифр каждого номера ячейки «Телефон» — как esignPhones_ двери (делители , ; / | и перевод строки)."""
+    return [p for p in (last9(piece) for piece in re.split(r"[,;/|\n]+", str(cell or ""))) if p]
+
+
+def _tail(key):
+    return "…" + key[-4:] if key else "—"
+
+
+def bind_contract(fact, resp, number, rental, ref="", at=None):
+    """Принятый по полноте договор → FACT, только если он этого номера и этой аренды. Сверяет код:
+    номер — телефон договора (или ник, который дверь сверила с ЭТИМ номером: `matched_on` nick и
+    `filter.phone_last9` = номер обращения), байк — номером с байком аренды, дата — в сроке аренды включительно.
+    Расхождение — CONFLICT с причиной; не проверить (поля пусты, аренды нет или она не одна) — UNKNOWN."""
+    src = "реестр подписей TB e-Sign (contract_find)"
+    key = last9(number)
+    if not key:
+        return result("contract", UNKNOWN, src, ref, at, reason="номер обращения не назван — договор не к чему привязать")
+    flt = resp.get("filter") if isinstance(resp.get("filter"), dict) else {}
+    on = fact.get("matched_on") if isinstance(fact.get("matched_on"), list) else []
+    phones = contract_phones(fact.get("phone"))
+    if key in phones:
+        by = "телефон"
+    elif "nick" in on and str(flt.get("phone_last9") or "") == key:
+        by = "ник"
+    elif phones or "nick" in on:
+        return result("contract", CONFLICT, src, ref, at, reason="договор другого номера: %s %s, обращение %s" % (
+            "ник" if not phones else "телефон", _tail(phones[0] if phones else str(flt.get("phone_last9") or "")),
+            _tail(key)))
+    else:
+        return result("contract", UNKNOWN, src, ref, at, reason="телефон договора пуст, ник не сверен — номер не проверен")
+    if not isinstance(rental, dict) or rental.get("outcome") != FACT or len(rental.get("facts") or []) != 1:
+        return result("contract", UNKNOWN, src, ref, at, reason="аренда обращения не установлена (rental: %s) — "
+                      "договор не к чему привязать" % ((rental or {}).get("outcome") if isinstance(rental, dict) else "—"))
+    rent = rental["facts"][0]
+    pc, pr = plate_of(fact.get("bike")), plate_of(rent.get("bike"))
+    if not pc or not pr:
+        return result("contract", UNKNOWN, src, ref, at, reason="номер байка не разобран (договор %s, аренда %s)"
+                      % (pc or "—", pr or "—"))
+    if pc != pr:
+        return result("contract", CONFLICT, src, ref, at, reason="байк договора %s, байк аренды %s" % (pc, pr))
+    cd = str(fact.get("contract_date") or "")
+    ds, de = B.day_of(rent.get("date_start")), B.day_of(rent.get("date_end"))
+    if not _ISO_DAY.match(cd) or ds is None or de is None:
+        return result("contract", UNKNOWN, src, ref, at, reason="день договора или срок аренды неизвестен (%s; %s…%s)"
+                      % (cd or "—", ds or "—", de or "—"))
+    if not ds.isoformat() <= cd <= de.isoformat():
+        return result("contract", CONFLICT, src, ref, at, reason="дата договора %s вне срока аренды %s…%s"
+                      % (cd, ds.isoformat(), de.isoformat()))
+    bound = dict(fact, booking_id=rent.get("booking_id"), bound_by=by)
+    return result("contract", FACT, src, ref, at, version=str(fact.get("signed_at") or ""),
+                  window="%s…%s" % (ds.isoformat(), de.isoformat()),
+                  reason="привязан: номер по полю «%s», байк %s, дата %s в сроке аренды" % (by, pc, cd), facts=[bound])
+
+
+def contract_result(resp, at=None, number="", rental=None):
+    """Ответ contract_find → результат. Факт — только `one` + подписанный pick + пустой `unread` + `undated_signed` = 0,
+    и только после привязки к номеру и аренде обращения (`bind_contract`)."""
     src = "реестр подписей TB e-Sign (contract_find)"
     if not (isinstance(resp, dict) and resp.get("ok")):
         return _refusal("contract", resp, src, at)
@@ -133,23 +217,42 @@ def contract_result(resp, at=None):
     ref = "строк %s" % checked.get("rows_scanned")
     if out == "ambiguous":
         return result("contract", AMBIGUOUS, src, ref, at, reason="подписанных несколько — выбрать нельзя")
+    if out == "incomplete":
+        why = (resp.get("reason") or {}).get("message") if isinstance(resp.get("reason"), dict) else ""
+        return result("contract", INCOMPLETE, src, ref, at,
+                      reason="дверь: ответ неполон — %s" % (why or "подписанный без известного дня"))
     if out in ("none", "none_signed"):
         return result("contract", EMPTY, src, ref, at,
                       reason="подписанного нет" if out == "none_signed" else "договор не найден")
     pick = resp.get("pick") if isinstance(resp.get("pick"), dict) else None
     if out != "one" or not pick or pick.get("signed") is not True:
         return result("contract", UNKNOWN, src, ref, at, reason="исход двери не разобран: %s" % out)
-    return result("contract", FACT, src, ref, at, version=str(pick.get("signed_at") or ""), facts=[{
-        "kind": "contract", "row": pick.get("row"), "doc_id": pick.get("doc_id"), "bike": pick.get("bike"),
-        "contract_date": pick.get("contract_date"), "signed_at": pick.get("signed_at"), "pdf_id": pick.get("pdf_id")}])
+    unread, undated_signed = checked.get("unread"), checked.get("undated_signed")
+    if (not isinstance(unread, list) or not isinstance(undated_signed, int) or isinstance(undated_signed, bool)):
+        return result("contract", INCOMPLETE, src, ref, at,
+                      reason="нет полей полноты unread/undated_signed — дверь до CONTRACTFIX0410, ответ не судим")
+    if unread:
+        return result("contract", INCOMPLETE, src, ref, at,
+                      reason="%s (не прочитано: %s)" % (UNREAD_WORDS, ", ".join(str(u) for u in unread)))
+    if undated_signed != 0:
+        return result("contract", INCOMPLETE, src, ref, at,
+                      reason="подписанных без известного дня %d — выбрать один нельзя" % undated_signed)
+    fact = {"kind": "contract", "row": pick.get("row"), "doc_id": pick.get("doc_id"), "bike": pick.get("bike"),
+            "contract_date": pick.get("contract_date"), "signed_at": pick.get("signed_at"),
+            "pdf_id": pick.get("pdf_id"), "phone": pick.get("phone"), "matched_on": pick.get("matched_on")}
+    return bind_contract(fact, resp, number, rental, ref, at)
 
 
-def pdf_result(resp, at=None):
+def pdf_result(resp, at=None, allowed=()):
+    """PDF — факт только для `pdf_id` ПРИНЯТОГО договора (`allowed`): чужой файл к ответу не прикладывается."""
     src = "подписанный PDF (contract_pdf)"
     if not (isinstance(resp, dict) and resp.get("ok")):
         return _refusal("contract_pdf", resp, src, at)
     if resp.get("verified") is not True:
         return result("contract_pdf", REFUSED, src, at=at, reason="длина и sha256 не сверены клиентом")
+    if not resp.get("id") or resp.get("id") not in set(allowed or ()):
+        return result("contract_pdf", REFUSED, src, ref=str(resp.get("id") or ""), at=at,
+                      reason="PDF не принятого договора этой аренды — не прикладывается")
     return result("contract_pdf", FACT, src, ref=str(resp.get("id") or ""), at=at, facts=[{   # без content_b64
         "kind": "pdf", "id": resp.get("id"), "name": resp.get("name"), "size": resp.get("size"),
         "sha256": resp.get("sha256"), "row": resp.get("row")}])
@@ -216,8 +319,10 @@ def masked(args):
     return out
 
 
-def call_tool(tool, args, doors, clock=time.time):
-    """Имя + вход → результат по контракту. Двери нет · исключение · таймаут — не факт, а исход со словами."""
+def call_tool(tool, args, doors, clock=time.time, ctx=None):
+    """Имя + вход → результат по контракту. Двери нет · исключение · таймаут — не факт, а исход со словами.
+    `ctx` (AGENTFIX0410) — что знает КОД, а не модель: {"number": номер обращения, "rental": () → результат аренды,
+    "results": принятые до сих пор}. Без ctx договор и PDF фактом не бывают (привязать не к чему)."""
     at = clock()
     door = (doors or {}).get(tool)
     if tool not in TOOLS:
@@ -232,9 +337,27 @@ def call_tool(tool, args, doors, clock=time.time):
         if "timeout" in type(e).__name__.lower():
             return result(tool, TIMEOUT, at=at, reason="таймаут двери")
         return result(tool, REFUSED, at=at, reason="дверь упала: %s" % type(e).__name__)
-    parse = {"cash": cash_result, "contract": contract_result, "contract_pdf": pdf_result,
-             "rental": rental_result, "history": history_result, "rules": rules_result}[tool]
+    ctx = ctx or {}
+    if tool == "contract":
+        rental = ctx["rental"]() if callable(ctx.get("rental")) else None
+        return contract_result(raw, at, number=ctx.get("number") or "", rental=rental)
+    if tool == "contract_pdf":
+        allowed = {f.get("pdf_id") for f in accepted(ctx.get("results") or []) if f.get("kind") == "contract"}
+        return pdf_result(raw, at, allowed={a for a in allowed if a})
+    parse = {"cash": cash_result, "rental": rental_result, "history": history_result, "rules": rules_result}[tool]
     return parse(raw, at)
+
+
+def bind_ctx(number, doors, results, clock=time.time):
+    """Контекст привязки одной сверки: номер обращения и аренда, которую код читает САМ (дверь rental без аргументов
+    модели), один раз на сверку."""
+    memo = {}
+
+    def rental():
+        if "r" not in memo:
+            memo["r"] = call_tool("rental", {}, doors, clock)
+        return memo["r"]
+    return {"number": number, "rental": rental, "results": results}
 
 
 # ------------------------------- код считает -------------------------------
@@ -343,7 +466,8 @@ def conflicts(facts, figures):
     for d in figures["diffs"]:
         if d["value"] != 0:
             out.append("%s: %s %s" % (d["what"], d["value"], d["currency"]))
-    bikes = {str(f.get("bike") or "").strip().lower() for f in facts if f["kind"] in ("rental", "contract")}
+    bikes = {plate_of(f.get("bike")) or str(f.get("bike") or "").strip().lower()      # по номеру, как дверь
+             for f in facts if f["kind"] in ("rental", "contract")}
     bikes.discard("")
     if len(bikes) > 1:
         out.append("байк аренды и договора расходится")
@@ -428,6 +552,7 @@ def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend
     t0 = clock()
     jr = Journal(re.sub(r"\D", "", str(number))[-4:])
     results, calls = [], 0
+    ctx = bind_ctx(number, doors, results, clock)
     head = (TOOLS_BLOCK % max_calls) + "\n\n" + user
     while True:
         if fresh is not None and fresh():
@@ -450,7 +575,7 @@ def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend
                     "calls": calls, "sec": clock() - t0}
         _, tool, args = turn
         t1 = clock()
-        res = call_tool(tool, args, doors, clock)
+        res = call_tool(tool, args, doors, clock, ctx)
         results.append(res)
         jr.call(len(results), tool, args, res, clock() - t1)
 
@@ -468,6 +593,11 @@ def judge(text, price, results, jr):
         if w not in words:
             words.append(w)
         jr.conflicts.append(why)
+    for r in results:                                     # договор не этого клиента / не этой аренды (AGENTFIX0410)
+        if r["outcome"] == CONFLICT:
+            jr.conflicts.append("%s: %s" % (r["tool"], r["reason"]))
+            if CONTRACT_WORDS not in words:
+                words.append(CONTRACT_WORDS)
     if jr.conflicts and any(c.startswith("цена аренды") or "расходится" in c for c in jr.conflicts):
         words.append(SUMS_WORDS)
     return words, figures

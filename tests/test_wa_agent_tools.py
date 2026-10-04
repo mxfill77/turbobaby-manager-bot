@@ -2,7 +2,8 @@
 """AGENTLOOPA0310 (Т4а): агент WhatsApp с инструментами чтения и журналом — флаг WA_AGENT_TOOLS.
 
 Всё на подменах: модели, моста, Telegram, WhatsApp, сети и SQLite здесь нет. Двери — функции с ответами живого формата
-(`bridge_client.tx_find` @83ee219, `contract_find`/`contract_pdf` @bb0aa86). Голден флага выкл — дерево 9c4aac6 через
+(`bridge_client.tx_find` @83ee219, `contract_find`/`contract_pdf` @bb0aa86; ответ договора с AGENTFIX0410 снимается
+харнессом двери f8276398 — `contract_door_snaps`). Голден флага выкл — дерево 9c4aac6 через
 `git show` (нет git — проверка названа пропущенной, а не зелёной)."""
 
 import json
@@ -71,10 +72,14 @@ def tx(items, complete=True, truncated=False, ok=True):
     return {"ok": ok, "checked": checked, "total": {"THB": 999999}, "items": list(items)}
 
 
-CONTRACT_ONE = {"ok": True, "outcome": "one", "checked": {"rows_scanned": 40},
-                "pick": {"row": 7, "doc_id": "TB-0007", "client": "Иван Петров", "contract_date": "2026-09-30",
-                         "status": "ПОДПИСАН", "signed": True, "signed_at": "2026-09-30 12:00", "bike": BIKE,
-                         "phone": "+66 81 234 5678", "pdf_id": "pdf-7"}}
+import contract_door_snaps as S   # noqa: E402
+
+# ответ двери договоров — снят харнессом f8276398 (AGENTFIX0410), а не написан руками: Ivan Petrov, D-002, ADV 8004,
+# 2026-09-20, телефон 66812345678 (последние 9 = NUMBER)
+CONTRACT_ONE = S.snap("one_other_client")
+# аренда, к которой этот договор привязывается кодом: тот же номер, тот же байк, дата договора в сроке
+RENTAL_IVAN = {"status": "В аренде", "contacts": "+66 81 234 5678", "bike": "ADV 750 8004", "booking_id": "bk-2",
+               "date_start": "2026-09-20 10:00", "date_end": "2026-10-05 10:00"}
 
 
 class Book:
@@ -115,7 +120,8 @@ def reasons(out):
 def test_paid_confirmed_by_cash_and_contract():
     s = Script({"tool": "cash", "args": {"bike": BIKE}}, {"tool": "contract", "args": {"phone": NUMBER}},
                final("Оплата 4900 бат получена, спасибо!"))
-    a = adapter(s, {"cash": lambda **kw: tx([tx_item()]), "contract": lambda **kw: CONTRACT_ONE})
+    a = adapter(s, {"cash": lambda **kw: tx([tx_item()]), "contract": lambda **kw: CONTRACT_ONE},
+                book=Book([RENTAL_IVAN]))
     out = a.draft(NUMBER, 5)
     assert T.PAY_WORDS not in reasons(out), reasons(out)
     assert K.MONEY_CLAIM_WORDS not in reasons(out), reasons(out)        # 4900 — опора из факта кассы
@@ -283,7 +289,7 @@ def test_unknown_tool_refused():
 
 def test_pdf_content_never_kept():
     r = T.pdf_result({"ok": True, "verified": True, "id": "pdf-7", "name": "TB-0007.pdf", "size": 3,
-                      "sha256": "ab", "content_b64": "QUJD", "row": 7})
+                      "sha256": "ab", "content_b64": "QUJD", "row": 7}, allowed={"pdf-7"})
     assert r["outcome"] == T.FACT and "content_b64" not in json.dumps(r)
 
 
@@ -362,11 +368,12 @@ def test_journal_no_pii_no_model_text():
     LOG.clear()
     s = Script({"tool": "contract", "args": {"phone": "+66 81 234 5678", "name": "Иван Петров"}},
                final("СЕКРЕТНЫЙ-ТЕКСТ-МОДЕЛИ"))
-    a = adapter(s, {"contract": lambda **kw: CONTRACT_ONE})
+    a = adapter(s, {"contract": lambda **kw: CONTRACT_ONE}, book=Book([RENTAL_IVAN]))
     a.draft(NUMBER, 5)
     blob = "\n".join(LOG)
     assert "вызов 1 contract" in blob and "→ fact" in blob and "реестр подписей" in blob
     assert "5678" in blob and "234 5678" not in blob and "Иван" not in blob and "Петров" not in blob
+    assert "Ivan" not in blob and "Petrov" not in blob and "66812345678" not in blob
     assert "СЕКРЕТНЫЙ-ТЕКСТ-МОДЕЛИ" not in blob
     assert "факт {" in blob and "+66" not in blob
 
