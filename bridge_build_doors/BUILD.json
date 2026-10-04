@@ -1,0 +1,46 @@
+{
+ "added": [
+  "ContractDoor.js"
+ ],
+ "base_prod_version": 84,
+ "base_sha256": {
+  "BotData.js": "c92d414eed9643ab4e09c9e6f136336ed58a4cb72ed53b7c59ab320cc90273e7",
+  "Bridge.js": "0489756aa0af93a27de364e7abf44f9ecc1a5c3ccd0d075627858b52cf9a44d8"
+ },
+ "build_sha256": {
+  "BotData.js": "7ee6f1564e1df08cfbf600773ca065e4c39d38d8eb8d21eb13483d5a30a83a76",
+  "Bridge.js": "d788e4a36cd91c37f8e32b6c3b03ca43b517a7f25244a0efa54588f0cda080b6",
+  "ContractDoor.js": "c0f367a2d6134a103cd1d0af9bea03997eb25936c5a8627a37ef8e413a4b6cc3"
+ },
+ "changed": [
+  "BotData.js",
+  "Bridge.js"
+ ],
+ "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
+ "база": "bridge_prod/ (зеркало задеплоенной версии @84, паспорт MIRROR.json)",
+ "выкладке_подлежат": [
+  "BotData.js",
+  "Bridge.js",
+  "ContractDoor.js"
+ ],
+ "выложено": "НЕТ. Сборка НЕ выложена: clasp push/redeploy — красная зона владельца и в этот заход не входили. До выкладки прод-мост на tx_find/contract_find/contract_pdf отвечает unknown_action.",
+ "до_первого_вызова": [
+  "Script Properties проекта моста: ESIGN_REGISTRY_ID = id таблицы «Договоры — реестр подписей (TB e-Sign)»; ESIGN_SIGNED_FOLDER_ID = id папки подписанных PDF. Не заданы — дверь отвечает no_registry_config / no_signed_folder_config",
+  "у аккаунта, от имени которого развёрнут мост (executeAs USER_DEPLOYING), должен быть доступ на чтение к реестру и к папке подписанных — отсюда это не проверялось"
+ ],
+ "заменяет": "выкладку bridge_build_tx_find/ и bridge_build_contract/ по отдельности: обе правят Bridge.js, и вторая выкладка стёрла бы маршрут первой. Выкладывать ТОЛЬКО этот каталог.",
+ "источники": {
+  "BotData.js": "bridge_build_tx_find/BotData.js ветки tx-find-0310 @ 920212395334aa6fd63efeb5b4f87df6fb1acf8f — побайтно",
+  "Bridge.js": "зеркало @84 + вставка маршрута tx_find (из bridge_build_tx_find/Bridge.js) + вставка маршрутов contract_find/contract_pdf (из bridge_build_contract/Bridge.js); строка help называет обе двери",
+  "ContractDoor.js": "bridge_build_contract/ContractDoor.js ветки contract-door-0310 @ f8276398f4fb4ce3fd5bdba73dde3c5a49360591 — побайтно"
+ },
+ "не_каталог_выкладки": "настроек проекта (.clasp.json) здесь НЕТ намеренно: из репозитория залить прод нельзя. Выкладка собирает свой каталог вне репо и СНАЧАЛА снимает свежий отпечаток прода (deploy/bridge_prod_diff.py).",
+ "перед_выкладкой": [
+  "deploy/bridge_prod_diff.py — прод не ушёл вперёд с @84?",
+  "base_sha256 здесь совпадает с bridge_prod/ (стережёт tests/test_bridge_doors.py::test_build_passport)",
+  "после выкладки свести зеркало bridge_prod/ (bridge_deploy.py шаг [7/7] делает это сам)"
+ ],
+ "почему_отдельный_каталог": "bridge_build/ — след выложенной сборки двери отмены ТО (@83), его судит tests/test_undo_door.py; bridge_build_tx_find/ и bridge_build_contract/ — сборки дверей по отдельности, их судят свои тесты. bridge_deploy.py принимает каталог аргументом, поэтому общая сборка живёт рядом.",
+ "тема": "ОБЕ двери моста одной сборкой к выкладке одним clasp (BRIDGEBOTH0410, 04.10.2026): tx_find — read-only поиск проводок кассы (правка TXFINDFIX0310) и contract_find/contract_pdf — договоры TB e-Sign (правка CONTRACTFIX0410). Агент отвечает о деньгах и прикладывает договор.",
+ "что_это": "КАТАЛОГ СБОРКИ ЗАХОДА. Здесь лежит НЕ прод, а то, что заход предлагает выложить. Истина о проде — bridge_prod/ (зеркало под паспортом MIRROR.json)."
+}
