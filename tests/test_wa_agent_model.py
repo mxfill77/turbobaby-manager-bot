@@ -66,8 +66,10 @@ class FakeBridge:
 
     def door(self, unit, ds, de):
         self.doors.append((unit, ds, de))
+        # живой формат двери (QuotePrice.js): скидка за срок — только словами в text (WAPRICECTX0410)
         return {"ok": True, "days": 7, "day_price": 400, "total": 2800, "deposit": 3000,
-                "season": {"label": "P3"}, "model": "PCX 160"}
+                "season": {"label": "P3"}, "model": "PCX 160",
+                "text": "PCX 160 | дней: 7, стоимость: 2800 (скидка за срок 0%, 400 в день), депозит: 3000 бат"}
 
 
 class FakeHttp:

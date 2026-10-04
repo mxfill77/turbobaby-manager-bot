@@ -12,9 +12,11 @@
   • снимки узлов `faq` и `business_rules` с возрастом (`wa_agent_knowledge.Knowledge`); не прочитан —
     НЕИЗВЕСТНО словами, а не пусто. Снимок старше предела (`max_stale`, 3 × `max_age` = 30 мин, WAKNOWFRESH0310)
     — тоже НЕИЗВЕСТНО, без текста, и причина «знания устарели» первой из причин кода;
-  • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене И в его словах есть
-    модель из парка И обе даты. Без дат или модели дверь цены не зовётся. Модель ищется по ключу живых имён
-    парка (`wa_book_read.find_model`, WADRAFTFIX0210), дверь цены на вопрос — не больше одного раза;
+  • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене. Модель и обе даты в его
+    словах — одна дверь. Модели или дат нет — пары «модель + срок» из последних сообщений диалога, наших и клиента
+    (WAPRICECTX0410): до трёх, каждая — своя дверь с прежними воротами; срок числом суток — от начала из переписки,
+    начала нет — числа нет, агент спрашивает даты. Модель ищется по ключу живых имён парка (`wa_book_read`,
+    WADRAFTFIX0210). Скидка за срок — в строке цены всегда, и 0%; дверь её не назвала — «неизвестна» и причина;
   • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас;
   • уроки людей (WAAGENTLESSON0210) — ТОЛЬКО действующие (`wa_agent.active_lessons`, своя база агента
     mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
@@ -113,6 +115,7 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 8. На «спасибо», «ок» и подобное — короткий вежливый ответ без новых вопросов и предложений.
 9. Метки «[скрыто: …]» — это скрытые данные клиента; не проси их повторить и не упоминай.
 10. Число суток аренды называй ТОЛЬКО из блоков «СРОКИ» и «ЦЕНА» — там его посчитал код: дата возврата минус дата выдачи («с 5 по 7» — двое суток, не трое). Блоков нет — числа суток не называй. Клиент назвал другое число суток на те же даты — мягко поправь числом из «СРОКИ».
+11. В ответе о цене скидку за срок называй ВСЕГДА — числом из блока «ЦЕНА», и когда она 0% («скидка за срок 0%»). В блоке «скидка за срок неизвестна» — скажи, что скидку за срок уточнит коллега, числа скидки не называй. Блок «ЦЕНА» с несколькими вариантами — назови цену каждого варианта (модель и срок), не выбирай за клиента. Другой скидки сверх этой не обещай (правило 6).
 
 Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
 {"text": "текст ответа клиенту", "lang": "ru" или "en" (язык клиента; иной — его код), "handoff": ["причина словами", …] или [], "why": "одна строка для сотрудника: что спросил клиент и почему такой ответ"}"""
@@ -422,8 +425,9 @@ def days_claims(text, today, known=(), price=None):
     Поправка клиента («вы написали 3 дня, но с 5 по 7 — двое суток») причиной не становится: верное число названо."""
     s = str(text or "")
     out, free, every, ref = [], [], [], set(known or ())
-    if isinstance(price, dict) and isinstance(price.get("days"), int):
-        ref.add(price["days"])
+    for q in K.quotes_of(price):                          # каждый вариант цены (WAPRICECTX0410)
+        if isinstance(q.get("days"), int):
+            ref.add(q["days"])
     for sent in K._SENTENCE.split(s):
         ranges, counts = find_ranges(sent, today), day_counts(sent)
         ref.update(r["days"] for r in ranges)
@@ -484,6 +488,127 @@ def units_of(model, bikes):
         return strict
     mk = _nocc(model)
     return [b.get("name") for b in bikes if mk and mk in _nocc(b.get("name"))]
+
+
+# ── вопрос о цене без модели или дат — варианты из переписки (WAPRICECTX0410) ───────────────
+# Повод — владелец 05.10, черновик №11: «сколько будет стоить?» относилось и к ADV 350 на 5 дней из НАШЕГО ответа, а
+# цена бралась только из слов клиента «сейчас». Вопрос о цене без модели или без двух дат дополняется последними
+# сообщениями диалога (наши и клиента, новые первыми): пары «модель + срок», без повторов, не больше PAIRS_MAX, каждая —
+# свой `K.quote` с прежними воротами (срок до месяца, один сезон, модель с ценой и в парке). Срок числом суток
+# («на 5 дней») — от начала, названного в переписке (самая новая дата); начала нет — числа нет, агент спрашивает даты.
+
+CTX_MSGS = 6                                   # сообщений диалога до вопроса, где ищутся модель и срок
+PAIRS_MAX = 3                                  # вариантов «модель + срок» на вопрос; дверь цены — не чаще
+NO_START_LINE = ("%s на %d сут.: цена НЕИЗВЕСТНА — дата начала аренды в переписке не названа. Числа цены не "
+                 "называть; спроси у клиента даты (с какого по какое число).")
+
+
+def _norm_map(text):
+    """Текст → (строка как у `B._nocc`: строчные латиница и цифры без «cc»; [место каждого её знака в тексте])."""
+    keep = [(c, i) for i, c in enumerate(str(text or "").lower()) if "a" <= c <= "z" or "0" <= c <= "9"]
+    out, i = [], 0
+    while i < len(keep):                       # «cc» снимается слева направо без перекрытий — как re.sub("cc", "")
+        if keep[i][0] == "c" and i + 1 < len(keep) and keep[i + 1][0] == "c":
+            i += 2
+            continue
+        out.append(keep[i])
+        i += 1
+    return "".join(c for c, _ in out), [p for _, p in out]
+
+
+def find_models(text, bikes):
+    """Модели из парка в тексте → [(место в тексте, модель)] по порядку, каждая один раз. Ключ — как у
+    `B.find_model` (живые имена парка без «CC»); совпадение внутри более длинного ключа — не своё."""
+    t, pos = _norm_map(text)
+    keys = {}
+    for b in bikes or ():
+        m = B.model_key((b or {}).get("name"))
+        k = B._nocc(m)
+        if len(k) >= 3:
+            keys.setdefault(k, m)
+    hits = []
+    for k, m in keys.items():
+        at = t.find(k)
+        while at >= 0:
+            hits.append((at, at + len(k), m))
+            at = t.find(k, at + 1)
+    hits = [h for h in hits if not any(o[0] <= h[0] and h[1] <= o[1] and o[1] - o[0] > h[1] - h[0] for o in hits)]
+    out, seen = [], set()
+    for a, _b, m in sorted(hits):
+        if m not in seen:
+            seen.add(m)
+            out.append((pos[a], m))
+    return out
+
+
+def _terms(text, today):
+    """Сроки сообщения → [{a, ds, de, days}]: диапазоны дат; их нет — числа суток («на 5 дней») без дат. Диапазон без
+    месяца («с 5 по 7») — срока нет: ни дат, ни уверенности в числе."""
+    rs = find_ranges(text, today)
+    full = [r for r in rs if r["ds"] is not None]
+    if full:
+        return [{"a": r["a"], "ds": r["ds"], "de": r["de"], "days": r["days"]} for r in full]
+    if rs:
+        return []
+    return [{"a": a, "ds": None, "de": None, "days": n} for a, _b, n in day_counts(text) if 0 < n <= TERM_MAX_DAYS]
+
+
+def context_start(msgs, today):
+    """Начало срока из переписки (сообщения новые первыми): самый новый диапазон дат — его начало; диапазонов нет —
+    первая дата самого нового сообщения с датой; дат нет — None."""
+    for text in msgs:
+        full = [r for r in find_ranges(text, today) if r["ds"] is not None]
+        if full:
+            return full[0]["ds"]
+    for text in msgs:
+        dates = find_dates(text, today)
+        if dates:
+            return dates[0]
+    return None
+
+
+def _pair_up(models, terms):
+    """Модели и сроки одного сообщения → [(модель, срок)]: одна модель — со всеми сроками, один срок — со всеми
+    моделями; иначе каждой модели — ближайший срок по месту в тексте (поровну — тот, что после модели)."""
+    if not models or not terms:
+        return []
+    if len(models) == 1:
+        return [(models[0][1], t) for t in terms]
+    if len(terms) == 1:
+        return [(m, terms[0]) for _p, m in models]
+    return [(m, min(terms, key=lambda t: (abs(t["a"] - p), t["a"] < p))) for p, m in models]
+
+
+def price_pairs(ask, ctx, today, bikes):
+    """Вопрос о цене + сообщения диалога до него (новые первыми) → ([(модель, {ds, de, days})], отброшено сверх
+    PAIRS_MAX). Модели и сроки вопроса — первыми, недостающее — из самого нового сообщения, где оно есть; в вопросе нет
+    ни модели, ни срока — пары каждого сообщения (недостающее так же). Срок числом суток — от `context_start`; начала нет —
+    ds и de None (цены нет, агент спрашивает даты)."""
+    msgs = [str(ask or "")] + [str(c or "") for c in list(ctx or ())[:CTX_MSGS]]
+    parsed = [(find_models(t, bikes), _terms(t, today)) for t in msgs]
+    a_models, a_terms = parsed[0]
+    dates = find_dates(msgs[0], today)
+    if not a_terms and len(dates) >= 2 and dates[1] > dates[0]:      # две даты вопроса — срок, как раньше
+        a_terms = [{"a": 0, "ds": dates[0], "de": dates[1], "days": term_days(dates[0], dates[1])}]
+    fill_m = next((ms for ms, _ts in parsed if ms), [])
+    fill_t = a_terms or next((ts for _ms, ts in parsed if ts), [])
+    if a_models or a_terms:
+        raw = _pair_up(a_models or fill_m, fill_t)
+    else:
+        raw = []
+        for ms, ts in parsed[1:]:
+            if ms or ts:
+                raw += _pair_up(ms or fill_m, ts or fill_t)
+    start = context_start(msgs, today)
+    pairs, seen = [], set()
+    for m, t in raw:
+        if t["ds"] is None and start is not None:
+            t = dict(t, ds=start, de=start + datetime.timedelta(days=t["days"]))
+        key = (m, t["ds"], t["de"], t["days"])
+        if key not in seen:
+            seen.add(key)
+            pairs.append((m, t))
+    return pairs[:PAIRS_MAX], max(0, len(pairs) - PAIRS_MAX)
 
 
 # ── ответ модели ───────────────────────────────────────────────────────────────────────
@@ -791,12 +916,14 @@ class ModelAdapter(wa_agent.Model):
             self.log("уроки не прочитаны: %s — блока уроков нет" % type(e).__name__)
             return []
 
-    def _price(self, ask, today):
-        """Цена — только на вопрос о цене с моделью и обеими датами. → (исход quote | None, слова)."""
+    def _price(self, ask, today, ctx=()):
+        """Цена — только на вопрос о цене. Одна модель и обе даты в вопросе — одна дверь, как раньше; модели или дат
+        нет (или моделей несколько) — варианты «модель + срок» из вопроса и переписки `ctx` (сообщения до вопроса, новые
+        первыми; `price_pairs`, WAPRICECTX0410), каждый — свой `K.quote`. → (исход | None, слова)."""
         if not _PRICE_ASK.search(ask):
             return None, "о цене не спрашивают"
         dates = find_dates(ask, today)
-        if len(dates) < 2:
+        if len(dates) < 2 and not ctx:
             return None, "о цене спрашивают без дат — дверь не звана"
         if self.fleet is None or self.door is None:
             return None, "двери цены нет"
@@ -806,13 +933,46 @@ class ModelAdapter(wa_agent.Model):
             bikes = None
             self.log("парк не прочитан: %s" % type(e).__name__)
         if bikes is None:
+            if len(dates) < 2:                                       # моделей переписки не найти — как без дат
+                return None, "о цене спрашивают без дат, парк не прочитан — дверь не звана"
             return K.quote("?", dates[0], dates[1], self.door, lambda m: None), "парк не прочитан"
-        model = B.find_model(ask, bikes)                            # ключ модели — живые имена парка
-        if not model:
-            return None, "о цене спрашивают без модели из парка — дверь не звана"
-        res = K.quote(model, dates[0], dates[1], self.door, lambda m: units_of(m, bikes),
-                      self.no_price_models)
-        return res, "цена: %s" % res["outcome"]
+        if len(dates) >= 2 and len(find_models(ask, bikes)) <= 1:
+            model = B.find_model(ask, bikes)                        # ключ модели — живые имена парка
+            if model:
+                res = K.quote(model, dates[0], dates[1], self.door, lambda m: units_of(m, bikes),
+                              self.no_price_models)
+                return res, "цена: %s" % res["outcome"]
+        pairs, dropped = price_pairs(ask, ctx, today, bikes)
+        if not pairs:
+            return None, ("о цене спрашивают без модели из парка — дверь не звана" if len(dates) >= 2 else
+                          "о цене спрашивают без дат — дверь не звана")
+        got = [self._quote_pair(m, t, bikes) for m, t in pairs]
+        n = {o: sum(1 for r in got if r["outcome"] == o) for o in (K.PRICE_NUMBER, K.PRICE_HUMAN, K.PRICE_UNKNOWN)}
+        return K.price_set(got, dropped), "цена по переписке: вариантов %d (число %d, человек %d, неизвестно %d)%s" % (
+            len(got), n[K.PRICE_NUMBER], n[K.PRICE_HUMAN], n[K.PRICE_UNKNOWN],
+            ", сверх предела %d" % dropped if dropped else "")
+
+    def _quote_pair(self, model, term, bikes):
+        """Пара «модель + срок» → исход `K.quote` (прежние ворота). Начала срока нет — дверь не зовётся: цена
+        неизвестна, агент спрашивает даты."""
+        if term["ds"] is None:
+            res = K.quote(model, None, None, self.door, lambda m: None)
+            res.update(days=term["days"], why="дата начала не названа", line=NO_START_LINE % (model, term["days"]))
+            return res
+        return K.quote(model, term["ds"], term["de"], self.door, lambda m: units_of(m, bikes), self.no_price_models)
+
+    @staticmethod
+    def _context(items, tail):
+        """Сообщения диалога ДО вопроса клиента (наши и клиента, без автоприветствия) под маской, новые первыми, не
+        больше CTX_MSGS: в них ищутся модель и срок вопроса о цене (WAPRICECTX0410)."""
+        skip, out = {id(it) for it in tail}, []
+        for it in reversed(items):
+            if it.get("auto") or id(it) in skip or not it.get("text"):
+                continue
+            out.append(K.mask(it["text"])[0])
+            if len(out) >= CTX_MSGS:
+                break
+        return out
 
     def _book(self, number, ask, today, now):
         """Брони на чтение (WABOOKTOOLS0210) — кодом ДО модели и только на явный вопрос: о свободном байке
@@ -864,7 +1024,8 @@ class ModelAdapter(wa_agent.Model):
         ask, n_mask2 = K.mask(ask_raw[-TAIL_MAX:])
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
         terms = client_terms(items, today)              # сутки каждому диапазону дат клиента — кодом (WADAYS0410)
-        price, price_words = self._price(ask, today)
+        ctx = self._context(items, tail)                # переписка до вопроса: модель и срок цены (WAPRICECTX0410)
+        price, price_words = self._price(ask, today, ctx)
         reasons = K.handoff(ask, price)
         avail, rental, book_words = self._book(number, ask, today, now)
         if avail is not None or rental is not None:
@@ -1015,7 +1176,10 @@ class ModelAdapter(wa_agent.Model):
             reasons = [T.INCOMPLETE_WORDS]
             out["results"] = []                                 # факты незавершённой сверки не опора
         got = parse_reply(raw)
-        words_t, figures = T.judge(got["text"] if got else "", info["price"], out["results"], jr,
+        # процент скидки за срок, названной дверью, — с опорой (WAPRICECTX0410): судья сверки процент судит без
+        # исхода цены, поэтому названная дверью скидка снимается из текста до суда; прочее — как было
+        said = K.without_known_discount(got["text"], info["price"]) if got else ""
+        words_t, figures = T.judge(said, info["price"], out["results"], jr,
                                    since=info.get("last_in"))
         for line in jr.lines():
             self.log(line)
