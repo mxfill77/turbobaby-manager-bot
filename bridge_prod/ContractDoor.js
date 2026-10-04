@@ -4,11 +4,16 @@
  * contract_find — подписанные договоры аренды из реестра подписей «Договоры — реестр подписей
  *   (TB e-Sign)», лист «Реестр», по телефону (последние 9 цифр), имени, байку и сроку.
  * contract_pdf  — подписанный PDF по id файла: только если id стоит в колонке «PDF (подписанный)»
- *   реестра, строка подписана и файл лежит в папке подписанных.
+ *   реестра, строка подписана и файл лежит в папке подписанных — САМ или в её подпапках не глубже
+ *   ESIGN.SIGNED_FOLDER_LEVELS уровней: e-Sign раскладывает PDF по «Подписанные/ГГГГ/ММ»
+ *   (ESIGNDOOR0410, 04.10.2026).
  *
- * Адреса реестра и папки в коде НЕ лежат: их берёт Script Properties проекта
- * (ESIGN_REGISTRY_ID, ESIGN_SIGNED_FOLDER_ID — тот же приём, что BOT_DATA_SHEET_ID в BotData.js).
- * Свойство не задано → названный отказ, а не пустой ответ.
+ * Адреса реестра и папки в коде НЕ лежат. Свойство Script Properties проекта задано
+ * (ESIGN_REGISTRY_ID, ESIGN_SIGNED_FOLDER_ID — тот же приём, что BOT_DATA_SHEET_ID в BotData.js) —
+ * берётся ТОЛЬКО оно, поиска нет. Не задано — поиск по имени (ESIGNDOOR0410): ЕДИНСТВЕННАЯ таблица
+ * «Договоры — реестр подписей (TB e-Sign)» вне корзины и ЕДИНСТВЕННАЯ папка «Подписанные» в папке
+ * реестра. Найдено 0 или больше 1 → названный отказ с числом найденного, первый попавшийся не
+ * берётся. Найденное в свойства НЕ пишется. Откуда адрес — в ответе (config: property | search).
  *
  * Колонки ищутся ПО ИМЕНИ заголовка (строка 1), а не по позиции: код TB e-Sign живёт вне проекта,
  * порядок колонок отсюда не проверить. Нужной колонки нет → отказ no_column с перечнем.
@@ -25,6 +30,12 @@
 var ESIGN = {
   REGISTRY_PROP: 'ESIGN_REGISTRY_ID',
   SIGNED_FOLDER_PROP: 'ESIGN_SIGNED_FOLDER_ID',
+  // поиск адресов по имени, когда свойство не задано (ESIGNDOOR0410)
+  REGISTRY_NAME: 'Договоры — реестр подписей (TB e-Sign)',
+  REGISTRY_MIME: 'application/vnd.google-apps.spreadsheet',
+  SIGNED_FOLDER_NAME: 'Подписанные',
+  // папка подписанных — среди предков PDF не дальше этого: ММ (1) → ГГГГ (2) → «Подписанные» (3)
+  SIGNED_FOLDER_LEVELS: 3,
   SHEET: 'Реестр',
   SIGNED_STATUS: 'ПОДПИСАН',
   FIND_LIMIT_DEFAULT: 20,
@@ -156,17 +167,114 @@ function esignIsSigned_(status) {
   return esignNorm_(status).toUpperCase() === ESIGN.SIGNED_STATUS;
 }
 
+/** Итератор Drive → массив (без дублей по id). */
+function esignList_(it) {
+  var out = [], seen = {};
+  while (it.hasNext()) {
+    var x = it.next(), xid = x.getId();
+    if (!seen[xid]) { seen[xid] = true; out.push(x); }
+  }
+  return out;
+}
+
 /**
- * Открыть реестр. → { ok, data, pdfIds, col, headers, unread } или { ok:false, error, … }.
+ * Адрес реестра (ESIGNDOOR0410). Свойство ESIGN_REGISTRY_ID задано → только оно, Drive не ищется.
+ * Не задано → поиск по имени: ЕДИНСТВЕННАЯ таблица ESIGN.REGISTRY_NAME вне корзины.
+ * Найдено 0 → no_registry_config, больше 1 → registry_ambiguous (первую не берём), сбой поиска →
+ * registry_lookup_failed; у отказа source:'search' и found. Найденное в свойства НЕ пишется.
+ * → { ok:true, id, source:'property'|'search' } или отказ.
+ */
+function esignRegistryAddr_() {
+  var id = PropertiesService.getScriptProperties().getProperty(ESIGN.REGISTRY_PROP);
+  if (id) return { ok: true, id: id, source: 'property' };
+  var found;
+  try {
+    found = esignList_(DriveApp.getFilesByName(ESIGN.REGISTRY_NAME)).filter(function (f) {
+      return !f.isTrashed() && String(f.getMimeType()) === ESIGN.REGISTRY_MIME;
+    });
+  } catch (e) {
+    return { ok: false, error: 'registry_lookup_failed', source: 'search',
+      message: 'Script Property ' + ESIGN.REGISTRY_PROP + ' не задан, поиск «' + ESIGN.REGISTRY_NAME +
+        '» сорвался: ' + String(e && e.message || e) };
+  }
+  if (found.length !== 1) return { ok: false, error: found.length ? 'registry_ambiguous' : 'no_registry_config',
+    source: 'search', found: found.length,
+    message: 'Script Property ' + ESIGN.REGISTRY_PROP + ' не задан; таблиц «' + ESIGN.REGISTRY_NAME +
+      '» вне корзины найдено ' + found.length + ' — нужна ровно одна, реестр не открывался' };
+  return { ok: true, id: found[0].getId(), source: 'search' };
+}
+
+/**
+ * Адрес папки подписанных (ESIGNDOOR0410). Свойство ESIGN_SIGNED_FOLDER_ID задано → только оно.
+ * Не задано → ЕДИНСТВЕННАЯ папка ESIGN.SIGNED_FOLDER_NAME вне корзины в папке реестра (regAddr —
+ * адрес реестра из esignRegistryAddr_). Найдено 0 → no_signed_folder_config, больше 1 →
+ * signed_folder_ambiguous, сбой чтения → signed_folder_lookup_failed; у отказа source и found.
+ */
+function esignSignedFolderAddr_(regAddr) {
+  var id = PropertiesService.getScriptProperties().getProperty(ESIGN.SIGNED_FOLDER_PROP);
+  if (id) return { ok: true, id: id, source: 'property' };
+  if (!regAddr.ok) return regAddr;   // реестр неизвестен — искать папку негде, причина — его отказ
+  var found = [], seen = {};
+  try {
+    esignList_(DriveApp.getFileById(regAddr.id).getParents()).forEach(function (dir) {
+      esignList_(dir.getFoldersByName(ESIGN.SIGNED_FOLDER_NAME)).forEach(function (f) {
+        if (!f.isTrashed() && !seen[f.getId()]) { seen[f.getId()] = true; found.push(f); }
+      });
+    });
+  } catch (e) {
+    return { ok: false, error: 'signed_folder_lookup_failed', source: 'search',
+      message: 'Script Property ' + ESIGN.SIGNED_FOLDER_PROP + ' не задан, папка реестра не прочитана: ' +
+        String(e && e.message || e) };
+  }
+  if (found.length !== 1) return { ok: false, error: found.length ? 'signed_folder_ambiguous' : 'no_signed_folder_config',
+    source: 'search', found: found.length,
+    message: 'Script Property ' + ESIGN.SIGNED_FOLDER_PROP + ' не задан; папок «' + ESIGN.SIGNED_FOLDER_NAME +
+      '» в папке реестра найдено ' + found.length + ' — нужна ровно одна' };
+  return { ok: true, id: found[0].getId(), source: 'search' };
+}
+
+/**
+ * Файл лежит в папке подписанных или в её подпапках не глубже ESIGN.SIGNED_FOLDER_LEVELS
+ * (ESIGNDOOR0410): обход предков по уровням, 1 — непосредственные родители (ММ), 2 — ГГГГ,
+ * 3 — «Подписанные». → { ok:true, level } | { ok:false, error:'not_in_signed_folder', levels_checked,
+ * levels_max } | { ok:false, error:'parents_unreadable', level } — родителей прочитать не удалось:
+ * «не в папке» не утверждаем и PDF не отдаём.
+ */
+function esignInSignedFolder_(file, folderId) {
+  var max = ESIGN.SIGNED_FOLDER_LEVELS, level = 0, seen = {};
+  var front = [file];
+  while (front.length && level < max) {
+    level++;
+    var next = [];
+    try {
+      for (var i = 0; i < front.length; i++) {
+        var ps = esignList_(front[i].getParents());
+        for (var k = 0; k < ps.length; k++) {
+          var pid = ps[k].getId();
+          if (pid === folderId) return { ok: true, level: level };
+          if (!seen[pid]) { seen[pid] = true; next.push(ps[k]); }
+        }
+      }
+    } catch (e) {
+      return { ok: false, error: 'parents_unreadable', level: level,
+        message: 'родители файла на уровне ' + level + ' не прочитаны: ' + String(e && e.message || e) };
+    }
+    front = next;
+  }
+  return { ok: false, error: 'not_in_signed_folder', levels_checked: level, levels_max: max,
+    message: 'папки подписанных нет среди предков файла на ' + level + ' уровн. (предел ' + max + ')' };
+}
+
+/**
+ * Открыть реестр по адресу (esignRegistryAddr_). → { ok, data, pdfIds, col, headers, unread }
+ * или { ok:false, error, … }.
  * pdfIds[i] — id файла из колонки PDF строки i: значение, ссылка богатого текста, формула.
  * unread — что прочитать НЕ удалось (реестр прочитан не целиком): 'rows_short' — строк меньше,
  * чем в листе; 'pdf_rich_text' / 'pdf_formulas' — ссылки PDF богатым текстом / формулой не читались.
  */
-function esignRegistry_() {
-  var props = PropertiesService.getScriptProperties();
-  var id = props.getProperty(ESIGN.REGISTRY_PROP);
-  if (!id) return { ok: false, error: 'no_registry_config',
-    message: 'Script Property ' + ESIGN.REGISTRY_PROP + ' не задан — реестр не открывался' };
+function esignRegistry_(addr) {
+  if (!addr.ok) return addr;
+  var id = addr.id;
   var ss;
   try { ss = SpreadsheetApp.openById(id); }
   catch (e) { return { ok: false, error: 'registry_unreadable', message: String(e && e.message || e) }; }
@@ -200,7 +308,7 @@ function esignRegistry_() {
       pdfIds[i] = esignFileId_(link) || esignFileId_(frm && frm[i] ? frm[i][0] : '');
     }
   }
-  return { ok: true, data: data, pdfIds: pdfIds, col: col, headers: headers, unread: unread };
+  return { ok: true, data: data, pdfIds: pdfIds, col: col, headers: headers, unread: unread, source: addr.source };
 }
 
 
@@ -214,7 +322,8 @@ function esignRegistry_() {
  *   даты договора (источник дня — date_src, исходные значения — contract_date_raw / created_raw).
  * Нужен хотя бы один из phone/name/bike, иначе no_filter: реестр целиком дверь не выгружает.
  * → { ok, outcome: one|ambiguous|incomplete|none_signed|none, pick, reason, items[], undated_items[],
- *     checked{…, undated, undated_signed, date_unparsed, unread[], complete}, filter, limit, limit_max }
+ *     checked{…, undated, undated_signed, date_unparsed, unread[], complete}, filter, limit, limit_max,
+ *     config:{ registry: property|search } }  — откуда адрес реестра (ESIGNDOOR0410)
  *
  * Запись договора (items, undated_items, pick): row, doc_id, client, contract_date ('YYYY-MM-DD' или
  * null — день неизвестен), contract_date_raw, created_raw, date_src (contract_date|created|unparsed|
@@ -255,7 +364,7 @@ function contractFind(payload) {
   if (!(limit > 0)) limit = ESIGN.FIND_LIMIT_DEFAULT;
   if (limit > ESIGN.FIND_LIMIT_MAX) limit = ESIGN.FIND_LIMIT_MAX;
 
-  var reg = esignRegistry_();
+  var reg = esignRegistry_(esignRegistryAddr_());
   if (!reg.ok) return reg;
   var tz = esignTz_(), c = reg.col, data = reg.data;
   var matched = [], aside = [], unparsed = 0, minDay = '', maxDay = '';
@@ -343,6 +452,7 @@ function contractFind(payload) {
     filter: { phone_last9: phone, name: nameIn, bike: bikeIn, plate: plate, date_from: from || '', date_to: to || '' },
     limit: limit,
     limit_max: ESIGN.FIND_LIMIT_MAX,
+    config: { registry: reg.source },
   };
 }
 
@@ -354,16 +464,19 @@ function esignHex_(bytes) {
 /**
  * READ-ONLY: подписанный PDF по id файла Drive.
  * Отдаёт файл, только если: id стоит в колонке «PDF (подписанный)» реестра · строка «ПОДПИСАН» ·
- * файл не в корзине · лежит в папке подписанных (ESIGN_SIGNED_FOLDER_ID) · это PDF · не больше потолка.
- * Иначе — отказ с причиной. payload: { id } → { ok, id, name, mime, size, sha256, content_b64, row, … }
+ * файл не в корзине · папка подписанных среди его предков не дальше ESIGN.SIGNED_FOLDER_LEVELS
+ * (ESIGNDOOR0410) · это PDF · не больше потолка. Иначе — отказ с причиной; родители не прочитаны →
+ * parents_unreadable, PDF не отдаётся.
+ * payload: { id } → { ok, id, name, mime, size, sha256, content_b64, row, …, folder_level,
+ *   config:{ registry, signed_folder } } — уровень папки и откуда адреса (property | search).
  */
 function contractPdf(payload) {
   var id = String((payload || {}).id || '').trim();
   if (!/^[-\w]{25,}$/.test(id)) return { ok: false, error: 'bad_id', message: 'id файла Drive — от 25 знаков [A-Za-z0-9_-]' };
-  var folderId = PropertiesService.getScriptProperties().getProperty(ESIGN.SIGNED_FOLDER_PROP);
-  if (!folderId) return { ok: false, error: 'no_signed_folder_config',
-    message: 'Script Property ' + ESIGN.SIGNED_FOLDER_PROP + ' не задан — папка подписанных не известна' };
-  var reg = esignRegistry_();
+  var regAddr = esignRegistryAddr_();
+  var dirAddr = esignSignedFolderAddr_(regAddr);
+  if (!dirAddr.ok) return dirAddr;
+  var reg = esignRegistry_(regAddr);
   if (!reg.ok) return reg;
   var rows = [];
   for (var i = 0; i < reg.pdfIds.length; i++) if (reg.pdfIds[i] === id) rows.push(i);
@@ -379,9 +492,8 @@ function contractPdf(payload) {
   try { file = DriveApp.getFileById(id); }
   catch (e) { return { ok: false, error: 'file_unreadable', message: String(e && e.message || e) }; }
   if (file.isTrashed()) return { ok: false, error: 'trashed', message: 'файл в корзине' };
-  var inFolder = false, parents = file.getParents();
-  while (parents.hasNext()) { if (parents.next().getId() === folderId) { inFolder = true; break; } }
-  if (!inFolder) return { ok: false, error: 'not_in_signed_folder', message: 'файл лежит не в папке подписанных' };
+  var inDir = esignInSignedFolder_(file, dirAddr.id);
+  if (!inDir.ok) return inDir;
   var mime = String(file.getMimeType() || '');
   if (mime !== 'application/pdf') return { ok: false, error: 'not_pdf', mime: mime };
   var size = file.getSize();
@@ -399,5 +511,7 @@ function contractPdf(payload) {
     client: String(reg.data[ri][c.client] || ''),
     contract_date: esignDay_(reg.data[ri][c.contract_date], tz),
     signed_at: esignStamp_(reg.data[ri][c.signed_at], tz),
+    folder_level: inDir.level,
+    config: { registry: regAddr.source, signed_folder: dirAddr.source },
   };
 }
