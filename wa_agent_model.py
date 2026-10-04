@@ -505,19 +505,23 @@ def parse_reply(raw):
     hand = data.get("handoff")
     hand = [str(h).strip() for h in hand if str(h).strip()] if isinstance(hand, list) else []
 
-    def tr(key, cap):                                 # перевод для сотрудника (WACARDQ0410): не строка — нет перевода
+    out = {"text": text.strip(), "lang": str(data.get("lang") or "").strip().lower()[:8],
+           "handoff": hand[:8], "why": str(data.get("why") or "").strip()[:300]}
+    for key, cap in (("q_ru", TR_Q_MAX), ("text_ru", TR_A_MAX)):   # перевод для сотрудника (WACARDQ0410) — если дан
         v = data.get(key)
-        return v.strip()[:cap] if isinstance(v, str) else ""
-    return {"text": text.strip(), "lang": str(data.get("lang") or "").strip().lower()[:8],
-            "handoff": hand[:8], "why": str(data.get("why") or "").strip()[:300],
-            "q_ru": tr("q_ru", TR_Q_MAX), "text_ru": tr("text_ru", TR_A_MAX)}
+        if isinstance(v, str) and v.strip():
+            out[key] = v.strip()[:cap]
+    return out
 
 
 def card_fields(info, got):
     """Поля карточки сотрудника (WACARDQ0410): вопрос — из блока последних реплик клиента, что ушёл в модель (под
-    маской); язык — кодом; переводы — только при не русском вопросе. Клиенту из этого не уходит ничего."""
-    question = info["question"]
-    lang = info["q_lang"]
+    маской); язык — кодом; переводы — только при не русском вопросе. Клиенту из этого не уходит ничего.
+    Вопроса в сведениях нет (сборка без него) — полей нет: карточка прежняя."""
+    question = info.get("question")
+    if question is None:
+        return {}
+    lang = info.get("q_lang")
     keep = need_translation(lang)
     return {"question": question, "q_lang": lang or "",
             "q_ru": got.get("q_ru", "") if keep else "", "text_ru": got.get("text_ru", "") if keep else ""}

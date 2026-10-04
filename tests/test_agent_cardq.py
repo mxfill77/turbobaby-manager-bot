@@ -252,10 +252,10 @@ MUTANTS = [
      "        try:\n"
      "            res = self.door.send_text(number, (self.db.execute(\"SELECT body FROM tg_cards WHERE draft_id=? \"\n"
      "                \"ORDER BY card_id DESC\", (draft_id,)).fetchone() or [text])[0]) or {}\n"),
-    ("язык по полю модели", "M", "    lang = info[\"q_lang\"]\n", "    lang = got.get(\"lang\") or None\n"),
+    ("язык по полю модели", "M", "    lang = info.get(\"q_lang\")\n", "    lang = got.get(\"lang\") or None\n"),
     ("перевод на версии 2", "A", "        if r_ver == int(ver) and a_sha == text_sha(text):\n", "        if True:\n"),
-    ("вопрос из текста модели", "M", "    question = info[\"question\"]\n",
-     "    question = got.get(\"why\") or info[\"question\"]\n"),
+    ("вопрос из текста модели", "M", "    question = info.get(\"question\")\n",
+     "    question = got.get(\"why\") or info.get(\"question\")\n"),
 ]
 
 
