@@ -12,12 +12,15 @@
      (config); в свойства не пишет.
 
 Покрытие: синтаксис; паспорт против зеркала @85 (18 файлов побайтно, ContractDoor.js — база @85 и свой
-sha256; база сверяется и с git-историей зеркала, поэтому замок переживает выкладку); службы Apps Script
-те же, что у двери @85; в двери нет пишущих вызовов; новый харнесс tests/esign_door_gs_harness.js
-зелёный; ПЕРЕКРЁСТНО — старый харнесс дверей tests/contract_door_gs_harness.js (102 случая) зелёный на
-новой сборке и на сборке @85 (дополненные моки дверь @85 не замечает), а новый харнесс на двери @85
-красный ровно на новых ветках (32 из 36); МУТАНТЫ — пять, у двух по два варианта (реестр и папка),
-каждый ловится СВОИМ случаем, число упавших печатается."""
+sha256; база сверяется и с git-историей зеркала, поэтому замок переживает выкладку); выложенная сборка
+сверяется с зеркалом ПО БАЙТАМ его файлов, а не только паспортами (подмену байтов при нетронутых
+MIRROR.json и BUILD.json паспорта не видят — отрицательный тест портит по байту каждый .js копии
+зеркала @86); службы Apps Script те же, что у двери @85; в двери нет пишущих вызовов; новый харнесс
+tests/esign_door_gs_harness.js зелёный; ПЕРЕКРЁСТНО — старый харнесс дверей
+tests/contract_door_gs_harness.js (102 случая) зелёный на новой сборке и на двери @85 из git-истории
+зеркала (коммит MIRROR_85, с проверкой, что это правда @85: рабочий каталог зеркала с 04.10 описывает
+@86), а новый харнесс на двери @85 красный ровно на новых ветках (32 из 36); МУТАНТЫ — пять, у двух по
+два варианта (реестр и папка), каждый ловится СВОИМ случаем, число упавших печатается."""
 import hashlib
 import json
 import os
@@ -33,6 +36,7 @@ H_OLD = os.path.join(ROOT, "tests", "contract_door_gs_harness.js")
 DOOR = "ContractDoor.js"
 LOADED = ("Config.js", "BotData.js", "Bridge.js", DOOR)   # что харнессы грузят в node
 MIRROR_85 = "c72f57ea71872665765a86291cdbe293c7093a2d"     # коммит, которым зеркало сведено к проду @85
+MIRROR_86 = "3c9466fecb0acb98732d5595903560ada76ad738"     # коммит, которым зеркало сведено к выкладке @86
 
 _cache = {}
 
@@ -50,10 +54,10 @@ def _sha(path):
     return hashlib.sha256(_bytes(path)).hexdigest()
 
 
-def _git_blob(path):
-    """Файл зеркала @85 из git-истории (база сборки), не с диска: зеркало сдвинется после выкладки."""
-    proc = subprocess.run(["git", "-C", ROOT, "show", f"{MIRROR_85}:bridge_prod/{path}"], capture_output=True, timeout=30)
-    assert proc.returncode == 0, f"нет блоба {MIRROR_85}:{path} — базу не сверить: {proc.stderr[-300:]}"
+def _git_blob(path, commit=MIRROR_85):
+    """Файл зеркала из git-истории (по умолчанию @85 — база сборки), не с диска: зеркало сдвигается выкладками."""
+    proc = subprocess.run(["git", "-C", ROOT, "show", f"{commit}:bridge_prod/{path}"], capture_output=True, timeout=30)
+    assert proc.returncode == 0, f"нет блоба {commit}:{path} — базу не сверить: {proc.stderr[-300:]}"
     return proc.stdout
 
 
@@ -80,6 +84,31 @@ def failed_names(res):
 
 def files_of(where):
     return {n: _read(os.path.join(where, n)) for n in LOADED}
+
+
+def files_85():
+    """То, что грузят харнессы, — с двери @85 из git-истории зеркала (коммит MIRROR_85), не с диска:
+    рабочий каталог зеркала с выкладки 04.10 описывает @86, и проверка «на @85» тихо гоняла бы новую сборку."""
+    return {n: _git_blob(n).decode("utf-8") for n in LOADED}
+
+
+def mirror_bytes(where, names):
+    """Фактические байты файлов зеркала {имя: bytes, None — файла нет}: сверку выложенного судят они."""
+    return {n: _bytes(os.path.join(where, n)) if os.path.isfile(os.path.join(where, n)) else None for n in names}
+
+
+def delivered_mismatch(p, mirror, files):
+    """(б) зеркало описывает ТУ выкладку → [имя, …], где прод разошёлся с построенным. Цепочка: паспорт
+    сборки == паспорт зеркала == sha256 фактических байт файла зеркала; одних паспортов мало — подмену
+    байтов при нетронутых MIRROR.json и BUILD.json они не видят."""
+    bad = []
+    for name in sorted(p["build_sha256"]):
+        want = mirror["files_sha256"].get(name)
+        if p["build_sha256"][name] != want:                  # паспорт сборки против паспорта зеркала
+            bad.append(name)
+        elif files.get(name) is None or hashlib.sha256(files[name]).hexdigest() != want:   # байты против паспорта
+            bad.append(name)
+    return bad
 
 
 def test_build_js_syntax():
@@ -119,9 +148,29 @@ def test_build_passport():
             assert _bytes(os.path.join(BUILD, name)) == _bytes(os.path.join(MIRROR, name)), name
         return
     assert isinstance(delivered, int) and mirror["prod_version"] >= delivered, (delivered, mirror["prod_version"])
-    if mirror["prod_version"] == delivered:                  # (б) зеркало описывает ТУ выкладку
-        for name in names:
-            assert p["build_sha256"][name] == mirror["files_sha256"][name], f"{name}: в проде не то, что построено"
+    if mirror["prod_version"] == delivered:                  # (б) зеркало описывает ТУ выкладку — по байтам
+        bad = delivered_mismatch(p, mirror, mirror_bytes(MIRROR, names))
+        assert not bad, f"{bad}: в проде не то, что построено (байты файлов зеркала против паспортов)"
+
+
+def test_delivered_bytes_catch_js_corruption():
+    """Отрицательный: копия зеркала @86 (коммит MIRROR_86, им выкладка сведена) с ОДНИМ испорченным байтом
+    .js при нетронутых MIRROR.json и BUILD.json краснеет ровно на этом файле — по каждому .js; паспорта при
+    этом сходятся, их одних подмена не видна. Близнец без порчи сходится. Порча — в памяти, диск не трогается."""
+    p = json.loads(_read(os.path.join(BUILD, "BUILD.json")))
+    mirror = json.loads(_git_blob("MIRROR.json", MIRROR_86).decode("utf-8"))
+    assert mirror["prod_version"] == p["delivered_as_version"] == 86, (mirror["prod_version"], p["delivered_as_version"])
+    names = sorted(p["build_sha256"])
+    clean = {n: _git_blob(n, MIRROR_86) for n in names}
+    assert delivered_mismatch(p, mirror, clean) == [], "копия зеркала без порчи разошлась с паспортами"
+    js = [n for n in names if n.endswith(".js")]
+    assert len(js) == 18, js
+    for name in js:
+        spoiled = bytearray(clean[name])
+        spoiled[len(spoiled) // 2] ^= 0x01
+        files = dict(clean, **{name: bytes(spoiled)})
+        assert all(p["build_sha256"][n] == mirror["files_sha256"][n] for n in names)   # паспорта сходятся
+        assert delivered_mismatch(p, mirror, files) == [name], f"{name}: порча байта не замечена"
 
 
 _SERVICES = re.compile(r"\b(DriveApp|SpreadsheetApp|PropertiesService|Utilities|Session|UrlFetchApp|MailApp|"
@@ -167,9 +216,16 @@ def test_new_harness_green():
 
 def test_old_harness_on_new_build_and_on_85():
     """Старый харнесс дверей (102 случая, проверки не тронуты, моки дополнены) — зелёный и на новой
-    сборке, и на сборке @85: дополненные моки дверь @85 не замечает."""
-    for label, where in (("новая сборка", BUILD), ("зеркало @85", MIRROR)):
-        code, res, err = run(H_OLD, files_of(where))
+    сборке, и на двери @85: дополненные моки дверь @85 не замечает. @85 — из git (MIRROR_85), и перед
+    прогоном сверено, что это правда @85, а не та же новая сборка."""
+    runs = (("новая сборка", files_of(BUILD)), ("зеркало @85", files_85()))
+    old, base = dict(runs)["зеркало @85"], _base_meta()
+    for name in LOADED:                                      # прогон «@85» гоняет ровно файлы паспорта @85
+        assert hashlib.sha256(old[name].encode("utf-8")).hexdigest() == base["files_sha256"][name], \
+            f"{name}: прогон «@85» не на файлах зеркала @85"
+    assert old[DOOR] != dict(runs)["новая сборка"][DOOR], "дверь «@85» равна новой — перекрёстная проверка выродилась"
+    for label, files in runs:
+        code, res, err = run(H_OLD, files)
         assert code == 0 and res["failed"] == 0, f"{label}: {failed_names(res)} {err[-1500:]}"
         assert len(res["cases"]) == 102, (label, len(res["cases"]))
 
