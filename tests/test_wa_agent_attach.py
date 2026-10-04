@@ -302,7 +302,9 @@ def test_window_closed():
 
 # ── 3. «неизвестно» и «Дослать PDF» ───────────────────────────────────────────────────────
 
-def test_unsure_with_delivery_status():
+def test_foreign_status_stays_unknown():
+    """WAPARTFIX0410 п.5: посторонний статус после неизвестной PDF-попытки — НЕ доставка: PDF неизвестно, wamid
+    чужого сообщения не присваивается, в outbox не пишется; дослать кнопкой нельзя (улика дубля) — и с разрешением."""
     door = FakeDoor(media="unknown")
     w = World(door=door)
     did = w.draft()
@@ -311,8 +313,75 @@ def test_unsure_with_delivery_status():
     w.put(T0 + 205, "status", wamid="wamid.T1", word="delivered")       # статус ТЕКСТА — не наша часть
     w.put(T0 + 206, "status", wamid="wamid.X9", word="delivered")       # неизвестный wamid после попытки
     got = w.core.press(did, 1, X.ACT_PDF, "Пым", T0 + 300)
-    assert got["state"] == A.SENT and "дослать нельзя" in got["words"] and len(door.media) == 1, got
-    assert w.part(did)[:3] == (A.SENT, 1, "wamid.X9")
+    assert got["state"] == A.UNSURE and "доставлен" not in got["words"] and "неизвестно" in got["words"], got
+    assert w.part(did)[:3] == (A.UNSURE, 1, None), w.part(did)
+    assert w.q("SELECT COUNT(*) FROM outbox WHERE wamid='wamid.X9'")[0][0] == 0
+    risk = w.core.press(did, 1, X.ACT_PDF_RISK, "Пым", T0 + 310)
+    assert not risk["ok"] and len(door.media) == 1 and w.part(did)[0] == A.UNSURE, risk
+
+
+def test_no_wamid_never_confirmed():
+    """Без wamid попытки исход — «неизвестно», какие бы статусы ни лежали."""
+    w = World()
+    w.put(T0 + 5, "status", wamid="wamid.X9", word="read")
+    assert w.core.delivery_check(NUM, None)[0] == X.D_UNKNOWN
+    assert w.core.delivery_check(NUM, "")[0] == X.D_UNKNOWN
+
+
+def test_own_sent_status_is_accepted_not_delivered():
+    """sent по СВОЕМУ wamid — «принято WhatsApp», не доставка; delivered/read по своему wamid — доставка;
+    чужой delivered своей части не доставляет."""
+    w = World()
+    did = w.draft()
+    assert w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)["ok"]
+    assert w.core.parts(did)["delivery"][0] == X.D_UNKNOWN              # статусов ещё нет
+    w.put(T0 + 205, "status", wamid="wamid.X9", word="delivered")       # чужой
+    assert w.core.parts(did)["delivery"][0] == X.D_UNKNOWN
+    w.put(T0 + 206, "status", wamid="wamid.P1", word="sent")
+    got = w.core.parts(did)["delivery"]
+    assert got[0] == X.D_ACCEPTED and "принято WhatsApp" in got[1] and "доставлен" not in got[1], got
+    w2 = World()
+    d2 = w2.draft()
+    w2.core.press(d2, 1, A.ACT_SEND, "Даня", T0 + 200)
+    w2.put(T0 + 206, "status", wamid="wamid.P1", word="read")
+    assert w2.core.parts(d2)["delivery"][0] == X.D_DELIVERED
+
+
+def test_unsure_part_own_wamid_sent_status():
+    """«Неизвестно» с wamid попытки и статусом sent по нему → PDF sent «принято WhatsApp», дослать нельзя."""
+    door = FakeDoor(media="unknown")
+    w = World(door=door)
+    did = w.draft()
+    w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
+    w.core.db.execute("UPDATE pdf_parts SET wamid='wamid.P7' WHERE draft_id=?", (did,))
+    w.put(T0 + 205, "status", wamid="wamid.P7", word="sent")
+    got = w.core.press(did, 1, X.ACT_PDF, "Пым", T0 + 300)
+    assert got["state"] == A.SENT and got["delivery"] == X.D_ACCEPTED and "принято WhatsApp" in got["words"], got
+    assert "доставлен (" not in got["words"] and len(door.media) == 1
+
+
+def test_concurrent_same_attempt_one_capture():
+    """WAPARTFIX0410 п.4: два нажатия «Дослать PDF» одной попытки. Второе прочитало часть ДО первого и захватывает
+    ПОСЛЕ него — сравнение с ожидаемым номером попытки даёт «уже решено», второй двери нет."""
+    door = FakeDoor(media="not_sent")
+    w = World(door=door)
+    did = w.draft()
+    w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)                 # попытка 1 не ушла
+    assert len(door.media) == 1
+    core, real, runs = w.core, w.core._attach, []
+
+    def attach_then_first_wins(draft_id):
+        if not runs:
+            runs.append(1)
+            core._attach = real
+            runs.append(core.press(did, 1, X.ACT_PDF, "Пым", T0 + 300))   # первое нажатие проходит целиком
+        return real(draft_id)
+
+    core._attach = attach_then_first_wins
+    second = core.press(did, 1, X.ACT_PDF, "Даня", T0 + 300)            # прочитало попытку 1 до первого
+    assert len(door.media) == 2, "дверь звалась %d раз — захват одной попытки дважды" % len(door.media)
+    assert not second["ok"] and "уже решено" in second["words"], second
+    assert w.part(did)[:2] == (A.NOT_SENT, 2)
 
 
 def test_unsure_without_status_needs_permit():
@@ -327,6 +396,22 @@ def test_unsure_without_status_needs_permit():
     ok = w.core.press(did, 1, X.ACT_PDF_RISK, "Пым", T0 + 310)
     assert ok["ok"] and len(door.media) == 2 and w.part(did)[:2] == (A.SENT, 2)
     assert w.q("SELECT permit FROM pdf_parts WHERE draft_id=?", (did,))[0][0] == 1
+
+
+def test_unsure_live_path_no_wamid_human_decides():
+    """ПРЕДЕЛ (WAPARTFIX0410, дозаход): дверь вернула «неизвестно» без id сообщения — у попытки wamid нет и не будет,
+    подтвердить её статусом нечем. Доставка: «неизвестно, нет wamid»; решает человек — повтор только явным
+    разрешением с риском дубля, сама система PDF не досылает и доставленным не называет."""
+    door = FakeDoor(media="unknown")
+    w = World(door=door)
+    did = w.draft()
+    w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
+    assert w.part(did)[:3] == (A.UNSURE, 1, None), w.part(did)
+    d = w.core.parts(did)["delivery"]
+    assert d[0] == X.D_UNKNOWN and "нет wamid" in d[1], d
+    got = w.core.press(did, 1, X.ACT_PDF, "Пым", T0 + 300)
+    assert got["state"] == A.UNSURE and got.get("need_permit") and len(door.media) == 1, got
+    assert w.part(did)[:3] == (A.UNSURE, 1, None), w.part(did)
 
 
 def test_status_unreadable_no_resend():

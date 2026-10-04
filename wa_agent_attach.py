@@ -17,10 +17,16 @@
 или неизвестен — дверь PDF не звали, файл без текста не уходит. sha256 байтов при отправке не равен sha256 сверки —
 PDF not_sent с причиной. Повтора нет: unsure двери и рестарт посреди части — «неизвестно».
 
-«ДОСЛАТЬ PDF». Текст sent, PDF not_sent — свой захват по номеру попытки (второе нажатие — «уже решено»). PDF
-«неизвестно» — сначала сверка доставки по статусам провайдера (`wa_inbox`, msg_type='status', наши wamid
-исключены): подтверждена — PDF sent, дослать нельзя; не подтверждена — дослать только отдельным явным разрешением
-этого повтора, со словами о риске дубля; статусы не прочитаны — дослать нельзя.
+«ДОСЛАТЬ PDF». Текст sent, PDF not_sent — захват сравнением-и-записью с ОЖИДАЕМЫМ номером попытки (кнопка несёт
+его; устаревший номер и второе нажатие — «уже решено»). PDF «неизвестно» — сначала статусы провайдера.
+
+ПРАВДА О ДОСТАВКЕ (WAPARTFIX0410). Подтверждает PDF только статус с wamid ЭТОЙ попытки (`delivery_check`): delivered
+или read — доставлен; sent — «принято WhatsApp», это ещё не доставка; у попытки нет wamid — исход остаётся
+«неизвестно», чужим статусом он не подтверждается никогда. Статус неизвестного нам сообщения после попытки
+(`_foreign_after`) — не подтверждение, а улика возможного дубля: PDF «неизвестно», дослать кнопкой нельзя. Чужих
+статусов нет — дослать только отдельным явным разрешением повтора, со словами о риске дубля; статусы не прочитаны —
+дослать нельзя. ПРЕДЕЛ: попытка «неизвестно» wamid не получает никогда (дверь не назвала id сообщения) — без wamid
+подтверждения нет, доставленной система её не назовёт; решает человек.
 
 «ПЕРЕСОБРАТЬ СО СВЕРКОЙ». Ждущий черновик superseded тем же захватом (state+ver), новый проход Т4а даёт новый черновик
 со своей карточкой. При флаге вкл. черновик без сверки (нет строки `attach`) не уходит: «Отправить» снимает его stale.
@@ -42,8 +48,11 @@ ACT_PDF_RISK = "pdf_risk"         # «Дослать PDF — риск дубля
 
 P_WAIT, P_CLAIMED = "wait", "claimed"
 PDF_MIME = "application/pdf"
-STATUS_OK = ("sent", "delivered", "read")      # статус провайдера, подтверждающий, что сообщение у WhatsApp
+STATUS_DELIVERED = ("delivered", "read")       # доставка — только эти статусы
+STATUS_ACCEPTED = "sent"                       # «принято WhatsApp» — у WhatsApp, но клиенту ещё не доставлено
+STATUS_ANY = (STATUS_ACCEPTED,) + STATUS_DELIVERED
 STATUS_SKEW = 120                              # часы провайдера и наши: статус раньше попытки на столько — ещё её
+D_DELIVERED, D_ACCEPTED, D_UNKNOWN = "delivered", "accepted", "unknown"
 
 W_NO_CHECK = ("устарело: черновик без сверки — при WA_AGENT_ATTACH не уходит; ничего не отправлено, "
               "черновик пересобирается")
@@ -51,6 +60,8 @@ W_TEXT_NOT = "текст не ушёл — дверь PDF не звали"
 W_TEXT_UNSURE = "текст: неизвестно — PDF не шлём, файл без текста не уходит"
 W_RISK = ("доставка PDF статусами провайдера не подтверждена — повтор может дать клиенту ВТОРОЙ такой же PDF; "
           "дослать можно только отдельной кнопкой «Дослать PDF — риск дубля»")
+W_FOREIGN = ("после попытки есть статус сообщения, которого мы не знаем (%d) — возможно, это PDF; доставкой его не "
+             "считаем: PDF — неизвестно; дослать кнопкой нельзя, повтор может дать дубль — проверьте переписку")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS attach (
@@ -324,7 +335,7 @@ class AttachCore(A.Core):
             self._plog(draft_id, "pdf", 1, who, now, A.NOT_SENT, reason=why)
             pstate, preason = A.NOT_SENT, why
         else:
-            pstate, preason = self._send_pdf(draft_id, number, who, now, 1, (P_WAIT,), meta)
+            pstate, preason = self._send_pdf(draft_id, number, who, now, 1, (P_WAIT,), meta, prev=1)
         words = parts_words(tstate, pstate, preason)
         self._done(draft_id, "%s — %s, %s" % (words, who, A.hm_phuket(now)), now)
         return dict(res, words=words, parts={"text": tstate, "pdf": pstate})
@@ -335,12 +346,14 @@ class AttachCore(A.Core):
 
     # ── часть PDF ─────────────────────────────────────────────────────────────────────────
 
-    def _send_pdf(self, draft_id, number, who, now, attempt, from_states, meta, permit=False):
-        """Захват части → байты из contract_pdf и сверка sha256 → sending ДО двери → дверь → исход. → (state, reason)."""
+    def _send_pdf(self, draft_id, number, who, now, attempt, from_states, meta, permit=False, prev=None):
+        """Захват части → байты из contract_pdf и сверка sha256 → sending ДО двери → дверь → исход. → (state, reason).
+        Захват — сравнение-и-запись: состояние из `from_states` И номер попытки равен ожидаемому `prev` (номер на кнопке).
+        Номер уже сменился (другое нажатие решило раньше) — строк 0, «уже решено», двери нет."""
         file_id, name, size, sha, _row, _why = meta
         q = "UPDATE pdf_parts SET state=?, attempt=?, who=?, at=?, permit=?, reason=NULL WHERE draft_id=? " \
-            "AND state IN (%s)" % ",".join("?" * len(from_states))
-        if self.db.execute(q, (P_CLAIMED, int(attempt), who, now, int(bool(permit)), draft_id)
+            "AND attempt=? AND state IN (%s)" % ",".join("?" * len(from_states))
+        if self.db.execute(q, (P_CLAIMED, int(attempt), who, now, int(bool(permit)), draft_id, int(prev))
                            + tuple(from_states)).rowcount != 1:
             return None, "уже решено"
 
@@ -385,9 +398,32 @@ class AttachCore(A.Core):
         self._plog(draft_id, "pdf", attempt, who, now, state, wamid, now_sha, reason)
         return state, reason
 
-    def delivery_check(self, number, since):
-        """Статусы провайдера после попытки → ("confirmed", wamid) · ("not_confirmed", None) · ("unknown", почему).
-        Наши известные wamid (черновики, outbox, PDF) — чужая часть, не эта."""
+    def delivery_check(self, number, wamid):
+        """Статусы провайдера по ТОЧНОМУ wamid попытки → (исход, слова). Исходы: delivered (delivered/read) ·
+        accepted (только sent: «принято WhatsApp», не доставка) · unknown (wamid нет, статуса нет, не прочитано).
+        Без wamid попытки подтверждать нечем: чужой статус этой попытке не принадлежит никогда."""
+        if not wamid:
+            return D_UNKNOWN, "у попытки нет wamid — статусом её не подтвердить"
+        try:
+            q = self._queue()
+            try:
+                rows = q.execute("SELECT text FROM wa_inbox WHERE wamid=? AND from_number=? AND msg_type='status'",
+                                 (wamid, number)).fetchall()
+            finally:
+                q.close()
+        except Exception as e:                                       # noqa: BLE001
+            return D_UNKNOWN, "статусы провайдера не прочитаны (%s)" % type(e).__name__
+        words = {str(w or "").strip().lower() for (w,) in rows}
+        hit = [w for w in STATUS_DELIVERED if w in words]
+        if hit:
+            return D_DELIVERED, "доставлен (статус %s по wamid попытки)" % hit[-1]
+        if STATUS_ACCEPTED in words:
+            return D_ACCEPTED, "принято WhatsApp (статус sent по wamid попытки) — доставка не подтверждена"
+        return D_UNKNOWN, "статуса по wamid попытки нет"
+
+    def _foreign_after(self, number, since):
+        """Статусы НЕИЗВЕСТНЫХ нам сообщений этого номера после попытки → список wamid; None — не прочитаны.
+        Наши wamid (черновики, outbox, PDF) — не они. Это не подтверждение доставки, а улика возможного дубля."""
         try:
             q = self._queue()
             try:
@@ -396,16 +432,17 @@ class AttachCore(A.Core):
                                  (number, float(since or 0) - STATUS_SKEW)).fetchall()
             finally:
                 q.close()
-        except Exception as e:                                       # noqa: BLE001
-            return "unknown", "статусы провайдера не прочитаны (%s)" % type(e).__name__
+        except Exception:                                            # noqa: BLE001
+            return None
+        out = []
         for wamid, word in rows:
-            if not wamid or str(word or "").strip().lower() not in STATUS_OK:
+            if not wamid or str(word or "").strip().lower() not in STATUS_ANY:
                 continue
             if self._our_wamid(wamid) or self.db.execute("SELECT 1 FROM pdf_parts WHERE wamid=?",
                                                          (wamid,)).fetchone():
                 continue
-            return "confirmed", wamid
-        return "not_confirmed", None
+            out.append(wamid)
+        return out
 
     def press_pdf(self, draft_id, attempt, who, now=None, permit=False):
         """«Дослать PDF» (attempt — номер попытки на кнопке). → {"ok", "state", "words"}."""
@@ -423,25 +460,32 @@ class AttachCore(A.Core):
             return {"ok": False, "state": pstate, "words": "дослать нельзя: %s" % (
                 W_TEXT_UNSURE if tstate == A.UNSURE else W_TEXT_NOT)}
         if pstate == A.UNSURE:
-            verdict, extra = self.delivery_check(number, psend)
-            if verdict == "unknown":
-                self.log("черновик %d: «Дослать PDF» — %s, дослать нельзя" % (draft_id, extra))
-                return {"ok": False, "state": A.UNSURE, "words": "%s — дослать нельзя, PDF: неизвестно" % extra}
-            if verdict == "confirmed":
-                n = self.db.execute("UPDATE pdf_parts SET state=?, wamid=?, reason=? WHERE draft_id=? AND state=? "
-                                    "AND attempt=?", (A.SENT, extra, "доставка подтверждена статусом провайдера",
-                                                      draft_id, A.UNSURE, patt)).rowcount
+            verdict, extra = self.delivery_check(number, _wamid)
+            if verdict in (D_DELIVERED, D_ACCEPTED):
+                # статус ТОЧНОГО wamid этой попытки: WhatsApp сообщение взял — PDF sent, повтор был бы дублем
+                n = self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE draft_id=? AND state=? "
+                                    "AND attempt=?", (A.SENT, extra, draft_id, A.UNSURE, patt)).rowcount
                 if n != 1:
                     return {"ok": False, "state": None, "words": "уже решено"}
-                self._sent_out(extra, number, "", A.VIA_AGENT, now, kind="document")
-                self._plog(draft_id, "pdf", patt, who, now, A.SENT, extra, reason="сверка статусов: доставлено")
-                words = parts_words(A.SENT, A.SENT) + " (подтверждено статусом провайдера) — дослать нельзя"
+                self._sent_out(_wamid, number, "", A.VIA_AGENT, now, kind="document")
+                self._plog(draft_id, "pdf", patt, who, now, A.SENT, _wamid, reason="сверка статусов: %s" % verdict)
+                words = parts_words(A.SENT, A.SENT) + " (%s) — дослать нельзя" % extra
                 self._done(draft_id, "%s — %s, %s" % (words, who, A.hm_phuket(now)), now)
-                return {"ok": False, "state": A.SENT, "words": words}
+                return {"ok": False, "state": A.SENT, "words": words, "delivery": verdict}
+            foreign = self._foreign_after(number, psend)
+            if foreign is None:
+                why = "статусы провайдера не прочитаны"
+                self.log("черновик %d: «Дослать PDF» — %s, дослать нельзя" % (draft_id, why))
+                return {"ok": False, "state": A.UNSURE, "words": "%s — дослать нельзя, PDF: неизвестно" % why}
+            if foreign:
+                self.log("черновик %d: «Дослать PDF» — после попытки статусы неизвестных сообщений: %d, "
+                         "PDF неизвестно, дослать нельзя" % (draft_id, len(foreign)))
+                return {"ok": False, "state": A.UNSURE, "words": W_FOREIGN % len(foreign), "delivery": D_UNKNOWN}
             if not permit:
                 self.log("черновик %d: «Дослать PDF» — доставка не подтверждена, нужен явный повтор" % draft_id)
                 return {"ok": False, "state": A.UNSURE, "words": W_RISK, "need_permit": True}
-        pstate2, why = self._send_pdf(draft_id, number, who, now, patt + 1, (pstate,), meta, permit=permit)
+        pstate2, why = self._send_pdf(draft_id, number, who, now, patt + 1, (pstate,), meta, permit=permit,
+                                      prev=int(attempt))
         if pstate2 is None:
             return {"ok": False, "state": None, "words": "уже решено: PDF — повтор уже идёт"}
         words = parts_words(A.SENT, pstate2, why)
@@ -454,8 +498,13 @@ class AttachCore(A.Core):
         row = self.db.execute("SELECT state FROM drafts WHERE id=?", (draft_id,)).fetchone()
         part = self._part(draft_id) if self.attach else None
         t = row[0] if row else None
-        return {"text": t, "pdf": part[0] if part else None,
-                "words": parts_words(t, part[0] if part else None, part[5] if part else "")}
+        out = {"text": t, "pdf": part[0] if part else None,
+               "words": parts_words(t, part[0] if part else None, part[5] if part else "")}
+        if part:
+            # «ушёл» — дверь приняла; доставку говорит ТОЛЬКО статус wamid этой попытки (sent — «принято WhatsApp»)
+            num = self.db.execute("SELECT number FROM drafts WHERE id=?", (draft_id,)).fetchone()
+            out["delivery"] = self.delivery_check(num[0] if num else None, part[4])
+        return out
 
 
 def make_core(env, *args, pdf_fetch=None, **kw):
