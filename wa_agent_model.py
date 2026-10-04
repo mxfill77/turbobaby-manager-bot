@@ -105,6 +105,7 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 7. Если вопрос требует решения человека (наличие и брони, скидка, срок через границу сезонов, срок от месяца, повреждения, штрафы, депозит, споры, оплаты, жалоба, иной язык, что-то, чего нет в знаниях и что нельзя сказать уклончиво) — всё равно напиши вежливый короткий черновик, но перечисли причины в handoff. Причины из блока «НУЖЕН ЧЕЛОВЕК» перенеси в handoff обязательно.
 8. На «спасибо», «ок» и подобное — короткий вежливый ответ без новых вопросов и предложений.
 9. Метки «[скрыто: …]» — это скрытые данные клиента; не проси их повторить и не упоминай.
+10. Число суток аренды называй ТОЛЬКО из блоков «СРОКИ» и «ЦЕНА» — там его посчитал код: дата возврата минус дата выдачи («с 5 по 7» — двое суток, не трое). Блоков нет — числа суток не называй. Клиент назвал другое число суток на те же даты — мягко поправь числом из «СРОКИ».
 
 Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
 {"text": "текст ответа клиенту", "lang": "ru" или "en" (язык клиента; иной — его код), "handoff": ["причина словами", …] или [], "why": "одна строка для сотрудника: что спросил клиент и почему такой ответ"}"""
@@ -195,6 +196,220 @@ def find_dates(text, today):
     for _, d in hits:
         if not out or out[-1] != d:
             out.append(d)
+    return out
+
+
+# ── сутки по датам (WADAYS0410) ────────────────────────────────────────────────────────
+# «С 5 по 7» — двое суток: дата возврата минус дата выдачи, как у двери цены (`K.quote`, QuotePrice.js). Код считает
+# сутки каждому диапазону дат клиента (блок «СРОКИ») и сверяет число суток у диапазона в черновике модели.
+
+TERMS_MAX = 6                                  # диапазонов в блоке «СРОКИ»: новые важнее
+TERM_MAX_DAYS = 400                            # длиннее — не срок аренды, а неразобранная пара чисел
+TERMS_HEAD = "СРОКИ (сутки посчитал код: дата возврата минус дата выдачи; «с 5 по 7» — двое суток): "
+_SEP = r"\s*(?:-|–|—|по|до|to|till|until)\s*"
+_ORD = r"(?:st|nd|rd|th)?"
+_NOT_TIME = r"(?![.:/]\d)(?!\s*(?:час|ч\b|утр|вечер|ноч|мин|am\b|pm\b|h\b|o'?clock))"
+_RANGES = (                                    # (вид, выражение); место, занятое первым, следующие не трогают
+    ("iso", re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})" + _SEP + r"(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")),
+    ("num", re.compile(r"(?<![\d.])(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?" + _SEP
+                       + r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?!\d)")),
+    ("dm_dm", re.compile(r"(?i)(?<!\d)(\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MON + _SEP + r"(\d{1,2})" + _ORD
+                         + r"\s+(?:of\s+)?" + _MON)),
+    ("md_md", re.compile(r"(?i)\b" + _MON + r"\s+(\d{1,2})" + _ORD + _SEP + _MON + r"\s+(\d{1,2})" + _ORD
+                         + r"(?!\d)")),
+    ("d_dm", _RX_RANGE_WORD),
+    ("dm_d", re.compile(r"(?i)(?<!\d)(\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MON + _SEP + r"(\d{1,2})" + _ORD
+                        + r"(?!\d)" + _NOT_TIME)),
+    ("md_d", re.compile(r"(?i)\b" + _MON + r"\s+(\d{1,2})" + _ORD + _SEP + r"(\d{1,2})" + _ORD + r"(?!\d)"
+                        + _NOT_TIME)),
+    ("bare", re.compile(r"(?i)(?<!\w)с\s+(\d{1,2})\s+по\s+(\d{1,2})(?!\d)" + _NOT_TIME)),
+)
+
+
+def term_days(ds, de):
+    """Сутки аренды: дата возврата минус дата выдачи («с 5 по 7» — двое), как `K.quote` и дверь цены."""
+    return (de - ds).days
+
+
+def _span(today, d1, m1, y1, d2, m2, y2):
+    """Пара дат диапазона → (выдача, возврат) | None. Год не назван — возврат ближайший будущий (как `_mk`), выдача —
+    последняя такая дата не позже возврата: «с 30 сентября по 2 октября» — двое суток при любом «сегодня»."""
+    def yr(y):
+        y = int(y)
+        return y + 2000 if y < 100 else y
+    try:
+        if y2 is not None:
+            de = datetime.date(yr(y2), int(m2), int(d2))
+        elif y1 is not None:
+            de = datetime.date(yr(y1), int(m2), int(d2))
+        else:
+            de = _mk(today, d2, m2)
+        if de is None:
+            return None
+        if y1 is not None:
+            ds = datetime.date(yr(y1), int(m1), int(d1))
+            if y2 is None and de < ds:
+                de = datetime.date(de.year + 1, int(m2), int(d2))
+        else:
+            ds = datetime.date(de.year, int(m1), int(d1))
+            if ds > de:
+                ds = datetime.date(de.year - 1, int(m1), int(d1))
+    except (ValueError, TypeError, AttributeError):      # не дата · «сегодня» не задано — не диапазон
+        return None
+    return (ds, de) if ds < de else None
+
+
+def _range_of(kind, g, today):
+    """Совпадение выражения диапазона → {ds, de, days, label} | None (не диапазон)."""
+    if kind == "bare":                         # «с 5 по 7» без месяца: дат нет, сутки — разность чисел одного месяца
+        d1, d2 = int(g[0]), int(g[1])
+        if not 1 <= d1 < d2 <= 31:
+            return None
+        return {"ds": None, "de": None, "days": term_days(datetime.date(2001, 1, d1), datetime.date(2001, 1, d2)),
+                "label": "с %d по %d (месяц не назван)" % (d1, d2)}
+    y1 = y2 = None
+    if kind == "iso":
+        y1, m1, d1, y2, m2, d2 = g
+    elif kind == "num":
+        d1, m1, y1, d2, m2, y2 = g
+    elif kind == "dm_dm":
+        d1, w1, d2, w2 = g
+        m1, m2 = _mon(w1), _mon(w2)
+    elif kind == "md_md":
+        w1, d1, w2, d2 = g
+        m1, m2 = _mon(w1), _mon(w2)
+    elif kind == "d_dm":
+        d1, d2, w = g
+        m1 = m2 = _mon(w)
+    elif kind == "dm_d":
+        d1, w, d2 = g
+        m1 = m2 = _mon(w)
+    else:                                      # md_d
+        w, d1, d2 = g
+        m1 = m2 = _mon(w)
+    if m1 is None or m2 is None:
+        return None
+    span = _span(today, d1, m1, y1, d2, m2, y2)
+    if span is None:
+        return None
+    days = term_days(*span)
+    if days > TERM_MAX_DAYS:
+        return None
+    return {"ds": span[0], "de": span[1], "days": days,
+            "label": "с %s по %s" % (span[0].strftime("%d.%m"), span[1].strftime("%d.%m"))}
+
+
+def find_ranges(text, today):
+    """Диапазоны дат в тексте по порядку появления → [{a, b, ds, de, days, label}]. Сутки — `term_days`."""
+    s = str(text or "")
+    taken, out = [], []
+    for kind, rx in _RANGES:
+        for m in rx.finditer(s):
+            a, b = m.span()
+            if any(x < b and a < y for x, y in taken):
+                continue
+            got = _range_of(kind, m.groups(), today)
+            if got is not None:
+                taken.append((a, b))
+                out.append(dict(got, a=a, b=b))
+    return sorted(out, key=lambda r: r["a"])
+
+
+def client_terms(items, today):
+    """История → диапазоны дат из слов КЛИЕНТА, без повторов, не больше TERMS_MAX (новые важнее)."""
+    seen, out = set(), []
+    for it in items or ():
+        if it.get("who") != "клиент" or not it.get("text"):
+            continue
+        for r in find_ranges(it["text"], today):
+            key = (r["label"], r["days"])
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+    return out[-TERMS_MAX:]
+
+
+def terms_line(ranges):
+    """Диапазоны → блок «СРОКИ» | '' (дат нет — блока нет)."""
+    if not ranges:
+        return ""
+    return TERMS_HEAD + "; ".join("%s — %d сут." % (r["label"], r["days"]) for r in ranges)
+
+
+_CNT_WORDS = {
+    "один": 1, "одни": 1, "одних": 1, "одна": 1, "два": 2, "две": 2, "двух": 2, "двое": 2, "три": 3, "трое": 3,
+    "трёх": 3, "трех": 3, "четыре": 4, "четверо": 4, "четырёх": 4, "четырех": 4, "пять": 5, "пятеро": 5, "пяти": 5,
+    "шесть": 6, "шестеро": 6, "шести": 6, "семь": 7, "семеро": 7, "семи": 7, "восемь": 8, "восьми": 8,
+    "девять": 9, "девяти": 9, "десять": 10, "десяти": 10,
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_RX_COUNT = re.compile(
+    r"(?i)(?<![\w.,])(\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)) + r")"
+    r"(?:-?(?:х|ти|ми|ух|ёх|ех))?(?:\s+|\s*-\s*)"
+    r"(?:сут(?:ки|ок|ка|кам|ках)|дн(?:я|ей|ям)|день|ноч(?:ь|и|ей)|days?|nights?)\b")
+# число суток — не срок аренды: «через 2 дня», «от 3 суток», «минимальный срок 3 дня», «за 1 день до выдачи»
+_CNT_SKIP_BEFORE = re.compile(
+    r"(?i)(?<!\w)(?:через|спустя|в\s+течение|кажд\w+|минимум|минимальн\w*(?:\s+\w+){0,2}|не\s+(?:менее|меньше|более|больше)|"
+    r"более|больше|менее|меньше|от|до|within|in|after|every|at\s+least|minimum|min|from|up\s+to|more\s+than|"
+    r"less\s+than)\s*$")
+_CNT_SKIP_AFTER = re.compile(r"(?i)\s+(?:до|before|назад|ago|после|after)\b")
+
+
+def day_counts(text):
+    """Текст → [(начало, конец, число суток)] по порядку: «3 суток», «двое суток», «3-х дней», «2 nights», «2-day»."""
+    s = str(text or "")
+    out = []
+    for m in _RX_COUNT.finditer(s):
+        w = m.group(1).lower()
+        n = int(w) if w.isdigit() else _CNT_WORDS.get(w)
+        if n is None or _CNT_SKIP_BEFORE.search(s[max(0, m.start() - 40):m.start()]) \
+                or _CNT_SKIP_AFTER.match(s, m.end()):
+            continue
+        out.append((m.start(), m.end(), n))
+    return out
+
+
+_RX_LEADS = re.compile(r"(?i)\s*(?:\(|с|from|на|for|:)?\s*")
+
+
+def _owner_of(ranges, a, b, sent):
+    """Чей это срок: число сразу вводит диапазон («на 3 дня с 5 по 7», «3 суток (с 5 по 7)») — его; иначе —
+    ближайший диапазон ПЕРЕД числом («5–7 октября — 3 суток, 5–8 — …»); перед числом нет — первый после."""
+    after = [r for r in ranges if r["a"] >= b]
+    if after and _RX_LEADS.fullmatch(sent[b:after[0]["a"]]):
+        return after[0]
+    before = [r for r in ranges if r["b"] <= a]
+    if before:
+        return before[-1]
+    return after[0] if after else ranges[0]
+
+
+def days_claims(text, today, known=(), price=None):
+    """Текст черновика → [(что, названо, по датам)] — число суток без опоры на даты:
+    (а) у диапазона дат в одном предложении названо число суток, и ни одно из них не равно разности дат;
+    (б) число суток без диапазона рядом, когда сутки известны (блок «СРОКИ», «ЦЕНА», диапазоны самого черновика),
+        и ни одно число суток черновика не совпало ни с одним известным. Пусто — сверять нечего или всё верно.
+    Поправка клиента («вы написали 3 дня, но с 5 по 7 — двое суток») причиной не становится: верное число названо."""
+    s = str(text or "")
+    out, free, every, ref = [], [], [], set(known or ())
+    if isinstance(price, dict) and isinstance(price.get("days"), int):
+        ref.add(price["days"])
+    for sent in K._SENTENCE.split(s):
+        ranges, counts = find_ranges(sent, today), day_counts(sent)
+        ref.update(r["days"] for r in ranges)
+        every += [n for _a, _b, n in counts]
+        if not ranges:
+            free += [n for _a, _b, n in counts]
+            continue
+        near = {}
+        for a, b, n in counts:                 # число — диапазону своего предложения (`_owner_of`)
+            r = _owner_of(ranges, a, b, sent)
+            near.setdefault(r["a"], (r, []))[1].append(n)
+        for r, ns in near.values():
+            if r["days"] not in ns:
+                out += [(r["label"], n, r["days"]) for n in ns]
+    if ref and free and not any(n in ref for n in every):
+        out += [("сутки без дат рядом", n, "/".join(str(x) for x in sorted(ref))) for n in free if n not in ref]
     return out
 
 
@@ -599,6 +814,7 @@ class ModelAdapter(wa_agent.Model):
         ask_raw = "\n".join(it["text"] or ("[%s]" % it["word"] if it["word"] else "") for it in tail)
         ask, n_mask2 = K.mask(ask_raw[-TAIL_MAX:])
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
+        terms = client_terms(items, today)              # сутки каждому диапазону дат клиента — кодом (WADAYS0410)
         price, price_words = self._price(ask, today)
         reasons = K.handoff(ask, price)
         avail, rental, book_words = self._book(number, ask, today, now)
@@ -621,6 +837,9 @@ class ModelAdapter(wa_agent.Model):
         lesson_text, n_mask3 = K.mask(lessons_block(lessons))
         if lesson_text:
             blocks.append(lesson_text)
+        terms_text = terms_line(terms)
+        if terms_text:
+            blocks.append(terms_text)
         if "price" in parts:
             blocks.append(parts["price"])
         blocks += [fact["line"] for fact in (avail, rental) if fact is not None]
@@ -635,11 +854,22 @@ class ModelAdapter(wa_agent.Model):
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
                 "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
-                "avail": avail, "rental": rental, "book_words": book_words,
+                "avail": avail, "rental": rental, "book_words": book_words, "today": today, "terms": terms,
                 "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache,
                 # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
                 "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
         return system, user, info
+
+    def _days_check(self, text, info, words):
+        """Сверка суток черновика (WADAYS0410): у диапазона дат число суток не равно разности — причина «нужен
+        человек» первой строкой, «Отправить» на версии 1 закрыто (тот же замок, что у денег без опоры). Текст
+        не правится; в журнал — только числа."""
+        bad = days_claims(text, info.get("today"), [r["days"] for r in info.get("terms") or ()], info.get("price"))
+        if not bad:
+            return words
+        self.log("модель: сутки не по датам %d (названо %s, по датам %s) — причина «нужен человек»"
+                 % (len(bad), ",".join(str(n) for _w, n, _r in bad), ",".join(str(r) for _w, _n, r in bad)))
+        return K.reason_first(words, K.DAYS_CLAIM_WORDS)
 
     def draft(self, number, upto_id):
         if self.tools is not None:
@@ -658,6 +888,7 @@ class ModelAdapter(wa_agent.Model):
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
         words = K.merge_reasons(words, got["handoff"])      # дедуп по категории (WACARDCOMPACT0310)
+        words = self._days_check(got["text"], info, words)   # сутки у дат не по разности — причина (WADAYS0410)
         # деньги в тексте черновика (WAMONEYCHECK0310): процент предоплаты, депозита или скидки и сумма в батах не из
         # блока «ЦЕНА» этого вызова — причина «нужен человек» ПЕРВОЙ строкой (на карточке видна при любом числе
         # причин). Текст ответа не правится. В журнал — только числа: текст черновика туда не идёт.
@@ -742,6 +973,7 @@ class ModelAdapter(wa_agent.Model):
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
         words = K.merge_reasons(words, got["handoff"])
+        words = self._days_check(got["text"], info, words)      # сутки у дат (WADAYS0410)
         for w in reversed(words_t):                             # причины кода о деньгах — вперёд
             words = K.reason_first(words, w)
         for w in reversed(reasons):                             # «сверка не завершена» — самой первой

@@ -411,12 +411,15 @@ MONEY_CLAIM_WORDS = "денежное утверждение без опоры"
 # WAKNOWFRESH0310: причина по СНИМКУ ЗНАНИЙ — узел старше предела, его текста в промпте нет (см. `node_stale`)
 R_STALE = "stale_knowledge"
 STALE_WORDS = "знания устарели"
+# WADAYS0410: причина по ТЕКСТУ ЧЕРНОВИКА — число суток у диапазона дат не равно разности дат (`wa_agent_model.days_claims`)
+R_DAYS_CLAIM = "days_claim"
+DAYS_CLAIM_WORDS = "срок: агент посчитал сутки не так — проверьте"
 _WORD_CATS = dict(
     [(REASON_WORDS[R_AVAILABILITY], R_AVAILABILITY), (REASON_WORDS[R_SEASON_CROSS], CAT_PRICE),
      (REASON_WORDS[R_NO_PRICE_MODEL], CAT_PRICE), (REASON_WORDS[R_LONG_TERM], CAT_PRICE),
      (REASON_WORDS[R_DISCOUNT], R_DISCOUNT), (REASON_WORDS[R_DOOR_NO_PRICE], CAT_PRICE),
      (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE),
-     (MONEY_CLAIM_WORDS, R_MONEY_CLAIM), (STALE_WORDS, R_STALE)]
+     (MONEY_CLAIM_WORDS, R_MONEY_CLAIM), (STALE_WORDS, R_STALE), (DAYS_CLAIM_WORDS, R_DAYS_CLAIM)]
     + [(words, key) for key, words in MONEY_WORDS.items()])
 _RULES = dict(_TEXT_RULES)
 _KEYWORD_CATS = ((R_AVAILABILITY, _RULES[R_AVAILABILITY]), (R_DISCOUNT, _RULES[R_DISCOUNT]))
