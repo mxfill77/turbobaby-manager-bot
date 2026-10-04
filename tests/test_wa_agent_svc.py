@@ -164,9 +164,12 @@ def test_e2e_inbound_draft_card_press_one_send():
     w.put(T0 - 200)                                          # вход клиента
     w.http.updates = [[], [], [w.press("wa:send:1:1")], [w.press("wa:send:1:1")]]
     w.serve(60)
-    cards = w.http.of("sendMessage")
+    # WAMIRROR0410: ушедшее — ещё одной строкой в теме клиента (форум показа), карточка в «Агентах» одна
+    cards = [p for p in w.http.of("sendMessage") if p.get("chat_id") == CHAT]
     assert w.model.calls == 1, w.model.calls
     assert len(cards) == 1 and "черновик модели" in cards[0]["text"], cards
+    shows = [p for p in w.http.of("sendMessage") if str(p.get("chat_id")) == SHOW]
+    assert len(shows) == 1 and shows[0]["text"].endswith("\nчерновик модели"), shows
     assert w.sends == [(NUM, "черновик модели")], w.sends               # одна отправка
     assert w.draft_state() == (A.SENT,), w.draft_state()
     assert w.answers()[0] == "sent" and w.answers()[1].startswith("уже решено"), w.answers()

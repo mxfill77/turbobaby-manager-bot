@@ -59,8 +59,12 @@
 наружу не идут; бот (и «от имени группы») — тоже. Исход в теме: отправлено — реакция бота 👌 на
 сообщение человека; не отправлено — ответ с причиной словами; неизвестно — «не знаю, дошло ли», без
 повтора. Правка — не уходит, одна строка в ответ. Удаление сообщения Bot API боту не присылает.
-«Отправить» по черновику — строкой «мы · агент, отправил <имя>: текст» в теме клиента.
 Выключатель `WA_AGENT_RELAY` по умолчанию выключен — сообщения тем не читаются и не отправляются.
+
+СТРОКА ПОКАЗА УШЕДШЕГО АГЕНТОМ (WAMIRROR0410). «Отправить» по черновику — строкой в теме клиента (`agent_line`):
+время, «агент», кто подтвердил, № черновика, версия, часть, текст; «неизвестно» — «исход неизвестен, проверьте
+телефон». Флаг relay её больше не решает; строку собирает и хранит ядро (`Core.show_agent`, ключ «wamid|часть»).
+Строку пишет бот — в WhatsApp она не уходит: из темы наружу идёт только сообщение человека (`on_topic`).
 
 УРОКИ ЛЮДЕЙ (WAAGENTLESSON0210). Принятое «Исправить» при включённых уроках — на новой карточке строка
 «📚 урок №N записан кандидатом», ниже отдельным сообщением урок: было/стало, автор, источник и кнопка
@@ -116,7 +120,6 @@ NO_CAPTION_GEN = {"voice": "голосового", "audio": "аудио", "stick
 NO_PAIR = (("contact", "контакт"), ("poll", "опрос"), ("dice", "кубик"), ("game", "игра"),
            ("story", "история"), ("paid_media", "платное медиа"), ("invoice", "счёт"),
            ("giveaway", "розыгрыш"), ("checklist", "список задач"))
-AGENT_LINE = "мы · агент, отправил %s: %s"
 POLL_RETRY_SEC = 1                 # getUpdates не удался — следующий опрос не раньше
 CONFLICT_PAUSE = 30                # 409 (второй читатель) — следующий опрос не раньше; такт идёт
 
@@ -1038,21 +1041,28 @@ class Tg(wa_agent.Telegram):
         self._topic_reply(thread, mid, RELAY_EDIT_WORDS)
         return True
 
-    def agent_sent(self, number, text, who):
-        """Ушедшее агентом по «Отправить» — одной строкой в тему клиента. → id сообщения или None."""
-        if not self.relay:
+    def agent_line(self, number, line):
+        """Строка показа ушедшего агентом (WAMIRROR0410) — в тему клиента. Флаг relay её НЕ решает: до правки строка
+        жила только при WA_AGENT_RELAY и при выключенном молча не ложилась. Строку собирает и хранит ядро
+        (`Core.show_agent`, ключ «wamid|часть»), руки только кладут её. → id сообщения темы · None — темы нет или
+        Telegram отказал (ядро повторит тем же ключом) · AnswerLost — ответа нет (сеть): строка могла лечь."""
+        if not self.show_chat:
+            self.log("тема: строки показа нет — форум показа не задан")
             return None
         rows, why = self._topics("number=?", number)
         thread = rows[0][1] if rows else None
         if not thread:
-            self.log("тема: строки «отправил агент» нет — %s" % (why or "у клиента нет темы"))
+            self.log("тема: строки показа нет — %s" % (why or "у клиента нет темы"))
             return None
-        line = AGENT_LINE % (str(who or "").split(" (id ")[0] or "—", text)
-        if len(line) > TG_TEXT_MAX:
-            line = line[:TG_TEXT_MAX - 1] + "…"
-        ok, res = self.api("sendMessage", {"chat_id": self.show_chat, "message_thread_id": int(thread),
-                                           "text": line})
-        return int(res.get("message_id")) if ok else None
+        text = str(line or "")
+        if len(text) > TG_TEXT_MAX:
+            text = text[:TG_TEXT_MAX - 1] + "…"
+        ok, res = self.api("sendMessage", {"chat_id": self.show_chat, "message_thread_id": int(thread), "text": text})
+        if ok is None:
+            raise wa_agent.AnswerLost("sendMessage: ответа нет")
+        if not ok:
+            return None
+        return int(res.get("message_id"))
 
     # ── реакции наружу (WAREACTOUT0110) ───────────────────────────────────────────────────
 

@@ -25,6 +25,10 @@
    Реакция (клиента или наша с телефона, WAREACTNAME0110) — не строкой, а реакцией бота на
    сообщение темы, показанное из строки с wamid цели (id сообщения темы хранится у ключа показа);
    вне набора Telegram или цель не показана отдельным сообщением — короткая строка; снятие — снять.
+   Цель — НАШЕ сообщение через API (WAMIRROR0410): эха у него нет, в очереди по его wamid лежит только
+   квитанция, и текстом цели квитанция не бывает никогда. Реакция ставится на строку показа ушедшего
+   агентом (`agent_show` базы агента, mode=ro); строки нет — короткая строка с текстом ушедшей версии по
+   wamid (`outbox`/`drafts` базы агента); не найдено — «на наше сообщение».
    Имя темы догоняет имя клиента: появилось или сменилось — editForumTopic один раз на смену.
    Все виды — по-русски (WAMIRRRU0210): вид без текста — словом (wa_history.kind_word), вид вне
    словаря — «[сообщение неизвестного вида]» и строка журнала с именем вида. Удаление с телефона
@@ -187,6 +191,9 @@ def _env():
         "tg_token":  (os.environ.get("WA_TG_BOT_TOKEN") or "").strip(),
         "tg_chat":   (os.environ.get("WA_TG_CHAT_ID") or "").strip(),
         "show":      _flag_on(os.environ.get(FLAG_NAME)),
+        # база агента (WAMIRROR0410): тот же путь, что у службы wa-agent; только mode=ro — строка показа и текст
+        # ушедшего через API для реакции клиента на наше сообщение
+        "agent_db":  os.environ.get("WA_AGENT_DB", os.path.join(base, "wa_agent.db")),
         "archive_db":       os.environ.get("WA_ARCHIVE_DB", os.path.join(ARCHIVE_DIR, "wa_archive.db")),
         "archive_media":    os.environ.get("WA_ARCHIVE_MEDIA_DIR", os.path.join(ARCHIVE_DIR, "media")),
         "archive_manifest": os.environ.get("WA_ARCHIVE_MANIFEST",
@@ -1062,6 +1069,41 @@ class Mirror:
                             ("msg:" + target, "file:" + target, S_SHOWN)).fetchone()
         return int(r[0]) if r else None
 
+    def _agent_target(self, target):
+        """wamid цели в базе агента (WAMIRROR0410, только mode=ro) → (id строки показа в теме | None, текст ушедшей
+        версии | None, наше ли это сообщение). Базы, таблицы или строки нет — (None, None, False)."""
+        path = self.env.get("agent_db")
+        if not target or not path or not os.path.exists(path):
+            return None, None, False
+        mid, text, ours = None, None, False
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path).replace("\\", "/"), uri=True, timeout=5)
+            try:
+                have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if "agent_show" in have:
+                    row = conn.execute("SELECT msg_id, chat_id FROM agent_show WHERE wamid=? AND state='shown' "
+                                       "AND msg_id IS NOT NULL ORDER BY shown_at LIMIT 1", (target,)).fetchone()
+                    if row and (row[1] is None or str(row[1]) == str(self.env.get("tg_chat"))):
+                        mid, ours = int(row[0]), True
+                if "outbox" in have:
+                    cols = {c[1] for c in conn.execute("PRAGMA table_info(outbox)")}
+                    row = conn.execute("SELECT text, %s FROM outbox WHERE wamid=?" % (
+                        "kind" if "kind" in cols else "NULL"), (target,)).fetchone()
+                    if row:
+                        ours = True
+                        word = _MEDIA_WORD.get(row[1] or "") or ("документ" if row[1] == "document" else None)
+                        text = row[0] or ("[%s]" % word if word else None)
+                if not text and "drafts" in have:
+                    row = conn.execute("SELECT text FROM drafts WHERE wamid=?", (target,)).fetchone()
+                    if row:
+                        ours, text = True, row[0] or None
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            self._warn_hourly("agent_db", "база агента не прочитана (%s) — реакция на наше сообщение без текста",
+                              type(e).__name__)
+        return mid, text, ours
+
     def _react_one(self, num, thread, r, key) -> bool:
         """Реакция → реакция бота на сообщение темы с её целью; иначе — короткая строка.
         Одна реакция бота на сообщение: держится последняя непустая из сторон «клиент»/«мы»;
@@ -1077,6 +1119,12 @@ class Mirror:
                             (target, who, emoji, r["id"]))
             self.st.commit()
             mid = self._target_msg(target)
+        a_mid = a_text = None
+        ours = False
+        if target and mid is None:
+            # цель не показана зеркалом — возможно, наше сообщение через API (WAMIRROR0410): строка показа агента
+            a_mid, a_text, ours = self._agent_target(target)
+            mid = a_mid
         line = None
         self._mark([key], num, S_SENDING)
         if mid is not None:
@@ -1112,10 +1160,19 @@ class Mirror:
             self.counts["shown"] += 1
             return True
         self._unmark([key])
-        tgt = self._rows("wamid=?", (target,)) if target else []
+        rows = self._rows("wamid=?", (target,)) if target else []
+        # квитанция текстом цели не бывает (WAMIRROR0410): по wamid нашего API-сообщения в очереди лежит только она
+        tgt = [x for x in rows if not _is_receipt(x)]
+        ours = ours or len(tgt) < len(rows)
         what, pre = (("реакция " + emoji, "на") if emoji else ("снял реакцию", "с"))
-        to = ("%s «%s»" % (pre, body_of(tgt[0])[:40])) if tgt else \
-            ("на сообщение" if emoji else "с сообщения") + " не из этой темы"
+        if tgt:
+            to = "%s «%s»" % (pre, body_of(tgt[0])[:40])
+        elif a_text:
+            to = "%s «%s»" % (pre, a_text[:40])
+        elif ours:
+            to = "на наше сообщение" if emoji else "с нашего сообщения"
+        else:
+            to = ("на сообщение" if emoji else "с сообщения") + " не из этой темы"
         params = {"chat_id": self.env["tg_chat"], "message_thread_id": thread,
                   "text": "%s %s: %s %s" % (pk_time(r["ts_msg"] or r["ts_queued"]), who, what, to)}
         if mid is not None:

@@ -496,8 +496,9 @@ ok(src.count("urlopen(") == 1, "выход в сеть ровно один (http
 ok("mode=ro" in src and "sqlite3.connect(self.queue_db" not in src, "живая очередь открывается только mode=ro")
 ok(re.search(r"(INSERT|UPDATE|DELETE|ALTER|CREATE)[^\"\n]*wa_inbox", src) is None,
    "записи в очередь нет: ни одного INSERT/UPDATE/DELETE/ALTER/CREATE по wa_inbox")
-ok(len(re.findall(r"sqlite3\.connect\(", src)) == 3 and src.count("?mode=ro") == 2,
-   "архив, как и очередь, открывается только mode=ro; третья база — своя")
+# WAMIRROR0410: четвёртое соединение — база агента (строка показа и текст ушедшего), тоже только mode=ro
+ok(len(re.findall(r"sqlite3\.connect\(", src)) == 4 and src.count("?mode=ro") == 3,
+   "архив, очередь и база агента открываются только mode=ro; четвёртая база — своя")
 
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n(9) предыстория из архива копии телефона")
