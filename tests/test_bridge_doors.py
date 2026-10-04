@@ -7,7 +7,11 @@ contract_pdf (CONTRACTFIX0410). Выкладывается ОДНИМ clasp вм
 сборкам своих дверей; разница Bridge.js с каждой сборкой — только блок другой двери и строка help;
 харнесс tx_find и харнесс договоров на ЭТОЙ сборке (исходники подаются через stdin, сами харнессы
 не тронуты) — все случаи зелёные; харнесс маршрутизатора — обе двери и help; МУТАНТЫ — каждый
-ловится, и число упавших случаев называется."""
+ловится, и число упавших случаев называется.
+
+ESIGNDOOR0410 (04.10.2026): сборка выложена как @85 (BRIDGEDEPLOY0410) — паспорт объявляет
+delivered_as_version, живое зеркало описывает @85, а база (@84) судится по git-истории зеркала
+(MIRROR_84): разница Bridge.js «от базы» и мутант «BotData базы» прежние, по прежней базе."""
 import difflib
 import hashlib
 import json
@@ -25,6 +29,9 @@ H_CT = os.path.join(ROOT, "tests", "contract_door_gs_harness.js")
 H_RT = os.path.join(ROOT, "tests", "bridge_doors_router_harness.js")
 FILES = ("BotData.js", "Bridge.js", "ContractDoor.js")
 CONTRACT_DOOR_BEFORE_FIX = "bb0aa862e7da7ca413c463bc04e0992d663ed398"   # дверь договоров до CONTRACTFIX0410
+# База сборки — зеркало @84. Сборка выложена как @85 (BRIDGEDEPLOY0410), живое зеркало описывает @85,
+# поэтому базу после выкладки судим по git-истории: этим коммитом зеркало @84 введено в git.
+MIRROR_84 = "c89c7f4314c23db6c7ccc306ec5941ed2c832aa1"
 
 _cache = {}
 
@@ -45,6 +52,28 @@ def _sha(path):
 def doors():
     """Исходники сборки для подачи в харнессы через stdin."""
     return {n: _read(os.path.join(BUILD, n)) for n in FILES}
+
+
+def _passport():
+    return json.loads(_read(os.path.join(BUILD, "BUILD.json")))
+
+
+def _base_blob(name):
+    """Файл зеркала @84 (база сборки) из git-истории."""
+    proc = subprocess.run(["git", "-C", ROOT, "show", f"{MIRROR_84}:bridge_prod/{name}"], capture_output=True,
+                          timeout=30)
+    assert proc.returncode == 0, f"нет блоба {MIRROR_84}:{name} — базу не сверить: {proc.stderr[-300:]}"
+    return proc.stdout
+
+
+def _base_text(name):
+    """База сборки: до выкладки — живое зеркало; после — зеркало @84 из git, сверенное с паспортом."""
+    passport = _passport()
+    if passport.get("delivered_as_version") is None:
+        return _read(os.path.join(MIRROR, name))
+    raw = _base_blob(name)
+    assert hashlib.sha256(raw).hexdigest() == passport["base_sha256"][name], f"{name}: git-база ≠ паспорт"
+    return raw.decode("utf-8")
 
 
 def run(harness, override):
@@ -69,25 +98,46 @@ def test_build_js_syntax():
 
 
 def test_build_passport():
-    """База = зеркало @N пофайлово, содержимое = паспорт, к выкладке ровно три файла, настроек нет."""
-    passport = json.loads(_read(os.path.join(BUILD, "BUILD.json")))
+    """Три состояния каталога сборки (образец tests/test_undo_door.py):
+    (а) не выложена — база = живое зеркало @84 пофайлово, нового файла в зеркале нет;
+    (б) выложена, и зеркало описывает ТУ версию — каждый файл сборки побайтно в зеркале (сильнее (а));
+    (в) прод ушёл дальше выкладки — сборка не тронута по байтам (сверяется всегда).
+    Во (б)/(в) база сверяется с зеркалом @84 из git-истории (MIRROR_84) — замок базы не снят.
+    Сборка выложена как @85 04.10.2026 (BRIDGEDEPLOY0410), объявлено ESIGNDOOR0410."""
+    passport = _passport()
     mirror = json.loads(_read(os.path.join(MIRROR, "MIRROR.json")))
-    assert passport["base_prod_version"] == mirror["prod_version"] == 84, \
-        f"зеркало @{mirror['prod_version']}, сборка @{passport['base_prod_version']} — пересобрать"
-    assert "delivered_as_version" not in passport
+    assert passport["base_prod_version"] == 84, passport["base_prod_version"]
     assert passport["changed"] == ["BotData.js", "Bridge.js"]
     assert passport["added"] == ["ContractDoor.js"]
     assert passport["выкладке_подлежат"] == sorted(FILES)
-    assert not os.path.exists(os.path.join(MIRROR, "ContractDoor.js")), "новый файл уже в зеркале?"
-    for name in passport["changed"]:
-        assert passport["base_sha256"][name] == mirror["files_sha256"][name] == _sha(os.path.join(MIRROR, name)), \
-            f"{name}: база сборки разошлась с зеркалом"
     for name in FILES:
         assert passport["build_sha256"][name] == _sha(os.path.join(BUILD, name)), \
             f"{name}: файл сборки разошёлся со своим паспортом"
     assert sorted(os.listdir(BUILD)) == sorted(list(FILES) + ["BUILD.json"]), os.listdir(BUILD)
     assert not os.path.exists(os.path.join(BUILD, ".clasp.json"))
     assert passport["script_id"] == mirror["script_id"]
+
+    delivered = passport.get("delivered_as_version")
+    if delivered is None:                                            # (а)
+        assert mirror["prod_version"] == 84, \
+            f"зеркало @{mirror['prod_version']}, сборка @{passport['base_prod_version']} — пересобрать"
+        assert not os.path.exists(os.path.join(MIRROR, "ContractDoor.js")), "новый файл уже в зеркале?"
+        for name in passport["changed"]:
+            assert passport["base_sha256"][name] == mirror["files_sha256"][name] == _sha(os.path.join(MIRROR, name)), \
+                f"{name}: база сборки разошлась с зеркалом"
+        return
+    base = json.loads(_base_blob("MIRROR.json").decode("utf-8"))
+    assert base["prod_version"] == 84 and base["script_id"] == passport["script_id"], base["prod_version"]
+    assert "ContractDoor.js" not in base["files_sha256"], "новый файл уже был в базе?"
+    for name in passport["changed"]:
+        assert passport["base_sha256"][name] == base["files_sha256"][name] \
+            == hashlib.sha256(_base_blob(name)).hexdigest(), f"{name}: база сборки разошлась с зеркалом @84"
+    assert delivered == 85 and isinstance(mirror["prod_version"], int) and mirror["prod_version"] >= delivered, \
+        f"сборка выложена как @{delivered}, зеркало @{mirror['prod_version']} — зеркало отстало от прода"
+    if mirror["prod_version"] == delivered:                          # (б)
+        for name in FILES:
+            assert passport["build_sha256"][name] == mirror["files_sha256"][name] == _sha(os.path.join(MIRROR, name)), \
+                f"{name}: в проде не то, что построено"
 
 
 def test_door_files_equal_their_builds():
@@ -97,8 +147,12 @@ def test_door_files_equal_their_builds():
 
 
 def _diff(old_path, new_path):
-    old = _read(old_path).splitlines()
-    new = _read(new_path).splitlines()
+    return _diff_text(_read(old_path), _read(new_path))
+
+
+def _diff_text(old_text, new_text):
+    old = old_text.splitlines()
+    new = new_text.splitlines()
     inserted, replaced = [], []
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old, b=new, autojunk=False).get_opcodes():
         if tag == "equal":
@@ -124,7 +178,7 @@ def test_bridge_only_other_door_and_help():
     assert [x for x in ins if x.strip().startswith("case ")] == ["      case 'tx_find':"], ins
     assert len(ins) == 6 and "contract" not in "\n".join(ins), ins
     assert len(rep) == 1 and rep[0][0].replace("'get_pending', 'contract_find', 'contract_pdf'", full) == rep[0][1], rep
-    ins, rep = _diff(os.path.join(MIRROR, "Bridge.js"), doors_js)    # от зеркала — только вставки и help
+    ins, rep = _diff_text(_base_text("Bridge.js"), _read(doors_js))  # от базы @84 — только вставки и help
     assert len(ins) == 16 and len(rep) == 1 and rep[0][0].replace("'get_pending'", full) == rep[0][1], (ins, rep)
 
 
@@ -166,7 +220,7 @@ def mutants():
         ("no-route-tx_find", {"Bridge.js": bridge.replace("case 'tx_find':", "case 'tx_find_x':")}),
         ("no-route-contracts", {"Bridge.js": bridge.replace("case 'contract_find':", "case 'contract_find_x':")
                                 .replace("case 'contract_pdf':", "case 'contract_pdf_x':")}),
-        ("botdata-of-base", {"BotData.js": _read(os.path.join(MIRROR, "BotData.js"))}),
+        ("botdata-of-base", {"BotData.js": _base_text("BotData.js")}),
         ("contractdoor-bb0aa862", {"ContractDoor.js": _contract_door_before_fix()}),
         ("no-contractdoor", {"ContractDoor.js": ""}),
     ]

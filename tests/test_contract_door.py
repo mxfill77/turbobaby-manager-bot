@@ -32,6 +32,9 @@ BUILD = os.path.join(ROOT, "bridge_build_contract")
 MIRROR = os.path.join(ROOT, "bridge_prod")
 HARNESS = os.path.join(ROOT, "tests", "contract_door_gs_harness.js")
 CLIENT = os.path.join(ROOT, "bridge_client.py")
+# База сборки — зеркало @84; сборка выложена как @85 в составе bridge_build_doors/ (BRIDGEDEPLOY0410),
+# после выкладки базу судим по git-истории: этим коммитом зеркало @84 введено в git.
+MIRROR_84 = "c89c7f4314c23db6c7ccc306ec5941ed2c832aa1"
 
 _cache = {}
 
@@ -44,6 +47,28 @@ def _sha(path):
 def _read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
+
+
+def _passport():
+    return json.loads(_read(os.path.join(BUILD, "BUILD.json")))
+
+
+def _base_blob(name):
+    """Файл зеркала @84 (база сборки) из git-истории."""
+    proc = subprocess.run(["git", "-C", ROOT, "show", f"{MIRROR_84}:bridge_prod/{name}"], capture_output=True,
+                          timeout=30)
+    assert proc.returncode == 0, f"нет блоба {MIRROR_84}:{name} — базу не сверить: {proc.stderr[-300:]}"
+    return proc.stdout
+
+
+def _base_text(name):
+    """База сборки: до выкладки — живое зеркало; после — зеркало @84 из git, сверенное с паспортом."""
+    passport = _passport()
+    if passport.get("delivered_as_version") is None:
+        return _read(os.path.join(MIRROR, name))
+    raw = _base_blob(name)
+    assert hashlib.sha256(raw).hexdigest() == passport["base_sha256"][name], f"{name}: git-база ≠ паспорт"
+    return raw.decode("utf-8")
 
 
 def run_harness(override=None):
@@ -94,19 +119,16 @@ def test_harness_covers_key_cases():
 
 
 def test_build_passport():
-    """База сборки = зеркало пофайлово, содержимое = паспорт, настроек проекта нет."""
-    passport = json.loads(_read(os.path.join(BUILD, "BUILD.json")))
+    """Содержимое = паспорт, настроек проекта нет. Три состояния (образец tests/test_undo_door.py):
+    (а) не выложена — база = живое зеркало пофайлово, нового файла в зеркале нет;
+    (б) выложена в составе общей сборки (delivered_via), и зеркало описывает ТУ версию — дверь
+        побайтно в проде, Bridge.js прода = Bridge.js общей сборки (её разницу с этой стережёт
+        tests/test_bridge_doors.py); (в) прод ушёл дальше — сборка не тронута по байтам.
+    Во (б)/(в) база сверяется с зеркалом @84 из git-истории (MIRROR_84) — замок базы не снят."""
+    passport = _passport()
     mirror = json.loads(_read(os.path.join(MIRROR, "MIRROR.json")))
-    assert passport["base_prod_version"] == mirror["prod_version"], \
-        f"зеркало ушло на @{mirror['prod_version']}, сборка на @{passport['base_prod_version']} — пересобрать"
-    assert "delivered_as_version" not in passport
     assert passport["changed"] == ["Bridge.js"]
     assert passport["added"] == ["ContractDoor.js"]
-    assert not os.path.exists(os.path.join(MIRROR, "ContractDoor.js")), "новый файл уже в зеркале?"
-    for name in passport["changed"]:
-        base = passport["base_sha256"][name]
-        assert base == mirror["files_sha256"][name] == _sha(os.path.join(MIRROR, name)), \
-            f"{name}: база сборки разошлась с зеркалом"
     for name in passport["changed"] + passport["added"]:
         assert passport["build_sha256"][name] == _sha(os.path.join(BUILD, name)), \
             f"{name}: файл сборки разошёлся со своим паспортом"
@@ -114,10 +136,38 @@ def test_build_passport():
     assert on_disk == sorted(passport["changed"] + passport["added"] + ["BUILD.json"]), on_disk
     assert not os.path.exists(os.path.join(BUILD, ".clasp.json"))
 
+    delivered = passport.get("delivered_as_version")
+    if delivered is None:                                            # (а)
+        assert passport["base_prod_version"] == mirror["prod_version"], \
+            f"зеркало ушло на @{mirror['prod_version']}, сборка на @{passport['base_prod_version']} — пересобрать"
+        assert not os.path.exists(os.path.join(MIRROR, "ContractDoor.js")), "новый файл уже в зеркале?"
+        for name in passport["changed"]:
+            base = passport["base_sha256"][name]
+            assert base == mirror["files_sha256"][name] == _sha(os.path.join(MIRROR, name)), \
+                f"{name}: база сборки разошлась с зеркалом"
+        return
+    via = passport["delivered_via"]
+    doors = json.loads(_read(os.path.join(ROOT, via, "BUILD.json")))
+    assert via == "bridge_build_doors" and doors.get("delivered_as_version") == delivered, (via, delivered)
+    base = json.loads(_base_blob("MIRROR.json").decode("utf-8"))
+    assert passport["base_prod_version"] == base["prod_version"] == 84, base["prod_version"]
+    assert "ContractDoor.js" not in base["files_sha256"], "новый файл уже был в базе?"
+    for name in passport["changed"]:
+        assert passport["base_sha256"][name] == base["files_sha256"][name] \
+            == hashlib.sha256(_base_blob(name)).hexdigest(), f"{name}: база сборки разошлась с зеркалом @84"
+    assert isinstance(mirror["prod_version"], int) and mirror["prod_version"] >= delivered, \
+        f"сборка выложена как @{delivered}, зеркало @{mirror['prod_version']} — зеркало отстало от прода"
+    if mirror["prod_version"] == delivered:                          # (б)
+        assert passport["build_sha256"]["ContractDoor.js"] == mirror["files_sha256"]["ContractDoor.js"] \
+            == _sha(os.path.join(MIRROR, "ContractDoor.js")), "дверь в проде не та, что построена"
+        assert mirror["files_sha256"]["Bridge.js"] == doors["build_sha256"]["Bridge.js"], \
+            "Bridge.js прода не тот, что в общей сборке"
+
 
 def test_build_only_adds_to_mirror():
-    """Bridge.js сборки: только вставки и одна правка строки help, где прежний список сохранён."""
-    old = _read(os.path.join(MIRROR, "Bridge.js")).splitlines()
+    """Bridge.js сборки: только вставки и одна правка строки help, где прежний список сохранён.
+    Сравнивается с БАЗОЙ сборки (после выкладки — зеркало @84 из git, см. _base_text)."""
+    old = _base_text("Bridge.js").splitlines()
     new = _read(os.path.join(BUILD, "Bridge.js")).splitlines()
     sm = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
     replaced = 0

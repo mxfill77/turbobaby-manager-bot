@@ -13,13 +13,15 @@
   "BotData.js",
   "Bridge.js"
  ],
+ "delivered_as_version": 85,
+ "delivered_via": "bridge_build_doors",
  "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
  "база": "bridge_prod/ (зеркало задеплоенной версии @84, паспорт MIRROR.json)",
  "выкладке_подлежат": [
   "BotData.js",
   "Bridge.js"
  ],
- "выложено": "НЕТ. Сборка НЕ выложена: clasp push/redeploy — красная зона владельца и в этот заход не входили. Прод-мост на дверь tx_find отвечает unknown_action.",
+ "выложено": "ДА, как @85, в составе общей сборки bridge_build_doors/ (BRIDGEDEPLOY0410, 04.10.2026 10:25:53 UTC, одним clasp вместо двух сборок по очереди): BotData.js этой сборки лежит в зеркале @85 побайтно, Bridge.js прода — общий (маршруты обеих дверей). Объявлено ESIGNDOOR0410 (04.10.2026). До выкладки строка была «НЕТ».",
  "не_каталог_выкладки": "настроек проекта (.clasp.json) здесь НЕТ намеренно: из репозитория залить прод нельзя. Выкладка собирает свой каталог вне репо и СНАЧАЛА снимает свежий отпечаток прода (deploy/bridge_prod_diff.py).",
  "перед_выкладкой": [
   "deploy/bridge_prod_diff.py — прод не ушёл вперёд с @84?",

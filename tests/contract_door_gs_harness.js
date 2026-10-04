@@ -117,6 +117,17 @@ let SHEETS = { 'Реестр': makeSheet(ROWS, RICH, FORMULAS) };
 const PROPS = { BRIDGE_TOKEN: 'tok-test', ESIGN_REGISTRY_ID: REG_ID, ESIGN_SIGNED_FOLDER_ID: SIGNED_DIR };
 const OPENED = { reg: 0 };
 
+// ── мок папок Drive (ESIGNDOOR0410, 04.10.2026): у папки есть свои предки и поиск подпапок по имени.
+// В этом мире все папки — вершины (предков нет), реестр лежит в своей папке, и «Подписанных» рядом с
+// ним нет; поиск таблицы по имени ничего не находит — реестр известен только свойством. Дверь @85 эти
+// методы не зовёт; новая дверь обходит предков файла и ищет адреса, когда свойства не заданы.
+const REG_DIR = 'dirRegistry00000000000000003';
+function iterOf(list) { let i = 0; return { hasNext: () => i < list.length, next: () => list[i++] }; }
+function folderOf(id) {
+  return { getId: () => id, isTrashed: () => false, getParents: () => iterOf([]), getFoldersByName: () => iterOf([]),
+    createFolder() { wrote('createFolder'); }, setTrashed() { wrote('setTrashed'); } };
+}
+
 // ── мок Drive: байты PDF несут значения ≥128 (в Apps Script это отрицательные Byte) ──
 function bytesOf(text) { return Array.from(Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.from([0xE2, 0xE3, 0xCF, 0xD3]), Buffer.from(text)])); }
 const signedArr = u => u.map(b => (b > 127 ? b - 256 : b));
@@ -126,8 +137,7 @@ function makeFile(id, o) {
   return {
     getId: () => id, getName: () => o.name || (id + '.pdf'), getMimeType: () => o.mime || 'application/pdf',
     getSize: () => (o.size !== undefined ? o.size : u.length), isTrashed: () => !!o.trashed,
-    getParents() { const ps = (o.parents || [SIGNED_DIR]).map(p => ({ getId: () => p })); let i = 0;
-      return { hasNext: () => i < ps.length, next: () => ps[i++] }; },
+    getParents() { return iterOf((o.parents || [SIGNED_DIR]).map(folderOf)); },
     getBlob() { if (o.size && o.size > 1e6) throw new Error('getBlob на файле сверх потолка'); return { getBytes: () => signedArr(u.slice()) }; },
     setTrashed() { wrote('setTrashed'); }, moveTo() { wrote('moveTo'); }, setName() { wrote('setName'); },
     setContent() { wrote('setContent'); }, addEditor() { wrote('addEditor'); },
@@ -144,6 +154,8 @@ const FILES = {
   [PDF_T]: makeFile(PDF_T, { text: 'trashed', trashed: true }),
   [PDF_L]: makeFile(PDF_L, { text: 'big', size: 20 * 1024 * 1024 }),
   [FOREIGN]: makeFile(FOREIGN, { text: 'foreign but in signed folder' }),
+  // сам реестр — тоже файл Drive (таблица в своей папке); в колонке PDF его нет
+  [REG_ID]: makeFile(REG_ID, { mime: 'application/vnd.google-apps.spreadsheet', parents: [REG_DIR] }),
 };
 
 global.SpreadsheetApp = { openById(id) {
@@ -152,7 +164,8 @@ global.SpreadsheetApp = { openById(id) {
   return { getSheetByName: n => SHEETS[n] || null, insertSheet() { wrote('insertSheet'); } };
 } };
 global.DriveApp = { getFileById(id) { DRIVE_GETS.n++; DRIVE_GETS.ids.push(id); if (!FILES[id]) throw new Error('File not found: ' + id); return FILES[id]; },
-  createFile() { wrote('createFile'); } };
+  getFilesByName: () => iterOf([]), getFolderById: id => folderOf(id),
+  createFile() { wrote('createFile'); }, createFolder() { wrote('createFolder'); } };
 global.PropertiesService = { getScriptProperties: () => ({ getProperty: k => (k in PROPS ? PROPS[k] : null), setProperty: () => wrote('setProperty') }) };
 global.Session = { getScriptTimeZone: () => 'Asia/Bangkok' };
 global.Utilities = {

@@ -16,6 +16,7 @@
   "BotData.js",
   "Bridge.js"
  ],
+ "delivered_as_version": 85,
  "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
  "база": "bridge_prod/ (зеркало задеплоенной версии @84, паспорт MIRROR.json)",
  "выкладке_подлежат": [
@@ -23,7 +24,7 @@
   "Bridge.js",
   "ContractDoor.js"
  ],
- "выложено": "НЕТ. Сборка НЕ выложена: clasp push/redeploy — красная зона владельца и в этот заход не входили. До выкладки прод-мост на tx_find/contract_find/contract_pdf отвечает unknown_action.",
+ "выложено": "ДА, как @85: 04.10.2026 с ПК одним clasp push (19 файлов) → развёртывание «ПРОД» на @85 в 10:25:53 UTC (BRIDGEDEPLOY0410); зеркало bridge_prod/ сведено к @85 коммитом c72f57ea71872665765a86291cdbe293c7093a2d, три файла сборки в нём побайтно. Объявлено ESIGNDOOR0410 (04.10.2026). До выкладки строка была «НЕТ».",
  "до_первого_вызова": [
   "Script Properties проекта моста: ESIGN_REGISTRY_ID = id таблицы «Договоры — реестр подписей (TB e-Sign)»; ESIGN_SIGNED_FOLDER_ID = id папки подписанных PDF. Не заданы — дверь отвечает no_registry_config / no_signed_folder_config",
   "у аккаунта, от имени которого развёрнут мост (executeAs USER_DEPLOYING), должен быть доступ на чтение к реестру и к папке подписанных — отсюда это не проверялось"
