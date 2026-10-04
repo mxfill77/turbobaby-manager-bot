@@ -30,8 +30,23 @@
 нет — не факт. PDF — факт только для `pdf_id` принятого договора.
 
 Ожидание и другие клиенты: черновики служба делает по одному за такт (`wa_agent.Core.make_drafts`), поэтому сверка
-одного клиента держит остальных не дольше MAX_SEC (+ один обычный вызов при превышении). Новое входящее посреди
-сверки (`fresh()`) обрывает её сразу: черновика нет, служба повторит позже — как и сегодня после модели.
+одного клиента держит остальных не дольше MAX_SEC. Новое входящее посреди сверки (`fresh()`) обрывает её сразу:
+черновика нет, служба повторит позже — как и сегодня после модели.
+
+Опора (AGENTDEDUP0410, Т4а ч.2) — каждый факт ОДИН раз и в ПОСЛЕДНЕЙ версии (`sift`):
+  * ответ запроса — последний: тот же инструмент с теми же аргументами прочитан снова — прежний ответ не опора; позднее
+    не-FACT того же запроса (отказ, таймаут, неполнота) снимает прежний FACT;
+  * идентичность факта (`fact_key`): касса — источник + row + msg_id|link; договор — row + doc_id; аренда — booking_id;
+    PDF — id. Одна строка, прочитанная двумя запросами, считается один раз, версия — последнего прочтения;
+  * свежесть: ответ, прочитанный раньше последнего входящего клиента (`since`), устарел и не опора.
+calc и pay_confirmed видят только отсеянное. Оплата подтверждена, только если аренда обращения одна (`rental_of`), строка
+кассы оплаты — этой аренды, и второй источник — той же аренды (договор, привязанный к ней кодом, либо её строка листа
+«клиенты» вместе с той же суммой в переписке).
+
+Общий предел (AGENTDEDUP0410): дедлайн t0 + MAX_SEC на ВСЮ сверку, включая запасной вызов. Сверка не начинает вызовов
+(модели и дверей, включая аренду, которую код читает сам) после t0 + MAX_SEC − FALLBACK_SEC; остаток — запасному
+обычному вызову. Запасной вызов начинается только до дедлайна; после дедлайна вызовов нет — черновика нет, служба
+повторит (`MODEL_RETRY_SEC`). Уже идущий синхронный вызов этот код не обрывает — его держит собственный таймаут двери.
 """
 
 import json
@@ -42,7 +57,8 @@ import wa_agent_knowledge as K
 import wa_book_read as B
 
 MAX_CALLS = 8                 # вызовов модели на один черновик
-MAX_SEC = 90.0                # секунд на сверку одного черновика
+MAX_SEC = 90.0                # секунд на сверку одного черновика — ВКЛЮЧАЯ запасной вызов (AGENTDEDUP0410)
+FALLBACK_SEC = 30.0           # остаток предела, который сверка не тратит: он — запасному обычному вызову
 
 FACT, EMPTY, REFUSED, TIMEOUT = "fact", "empty", "refused", "timeout"
 CANCELLED, AMBIGUOUS, UNKNOWN, INCOMPLETE = "cancelled", "ambiguous", "unknown", "incomplete"
@@ -119,7 +135,8 @@ def cash_result(resp, at=None):
                 or not isinstance(amount, (int, float)) or isinstance(amount, bool) or not it.get("currency")):
             bad.append("строка %s без источника, связи с арендой или суммы" % it.get("row"))
             continue
-        facts.append({"kind": "cash", "row": it.get("row"), "msg_id": it.get("msg_id"), "link": it.get("link"),
+        facts.append({"kind": "cash", "src": "tx_find", "row": it.get("row"), "msg_id": it.get("msg_id"),
+                      "link": it.get("link"),
                       "at": when, "booking_id": it.get("booking_id"), "bike": it.get("bike"), "amount": amount,
                       "currency": str(it.get("currency")).upper(), "role": role_of(it),
                       "category": it.get("category")})
@@ -319,7 +336,22 @@ def masked(args):
     return out
 
 
+def request_key(tool, args):
+    """Тождество ЗАПРОСА (AGENTDEDUP0410): инструмент + аргументы без пустых, пробелы и регистр сведены. Тот же запрос,
+    прочитанный снова, заменяет прежний ответ — и позднее «не факт» снимает прежний факт."""
+    norm = sorted((str(k), re.sub(r"\s+", " ", str(v)).strip().lower()) for k, v in (args or {}).items()
+                  if v is not None and str(v).strip() != "")
+    return "%s %s" % (tool, json.dumps(norm, ensure_ascii=False))
+
+
 def call_tool(tool, args, doors, clock=time.time, ctx=None):
+    """Имя + вход → результат по контракту, с тождеством запроса `req` (AGENTDEDUP0410)."""
+    res = _read(tool, args, doors, clock, ctx)
+    res["req"] = request_key(tool, args)
+    return res
+
+
+def _read(tool, args, doors, clock=time.time, ctx=None):
     """Имя + вход → результат по контракту. Двери нет · исключение · таймаут — не факт, а исход со словами.
     `ctx` (AGENTFIX0410) — что знает КОД, а не модель: {"number": номер обращения, "rental": () → результат аренды,
     "results": принятые до сих пор}. Без ctx договор и PDF фактом не бывают (привязать не к чему)."""
@@ -348,13 +380,16 @@ def call_tool(tool, args, doors, clock=time.time, ctx=None):
     return parse(raw, at)
 
 
-def bind_ctx(number, doors, results, clock=time.time):
+def bind_ctx(number, doors, results, clock=time.time, may_call=None):
     """Контекст привязки одной сверки: номер обращения и аренда, которую код читает САМ (дверь rental без аргументов
-    модели), один раз на сверку."""
+    модели), один раз на сверку. `may_call()` (AGENTDEDUP0410) — есть ли время на новый вызов двери: нет — аренда
+    не читается, исход TIMEOUT «предел сверки»."""
     memo = {}
 
     def rental():
         if "r" not in memo:
+            if may_call is not None and not may_call():
+                return result("rental", TIMEOUT, at=clock(), reason="предел сверки — аренда не прочитана")
             memo["r"] = call_tool("rental", {}, doors, clock)
         return memo["r"]
     return {"number": number, "rental": rental, "results": results}
@@ -362,12 +397,66 @@ def bind_ctx(number, doors, results, clock=time.time):
 
 # ------------------------------- код считает -------------------------------
 
-def accepted(results):
-    return [f for r in results if r["outcome"] == FACT for f in r["facts"]]
+def fact_key(f):
+    """Тождество факта (AGENTDEDUP0410): касса — источник + row + msg_id|link; договор — row + doc_id; аренда —
+    booking_id (без него — байк и срок); PDF — id; переписка и правила — одна на сверку."""
+    k = f.get("kind")
+    if k == "cash":
+        return ("cash", str(f.get("src") or "tx_find"), str(f.get("row")), str(f.get("msg_id") or f.get("link") or ""))
+    if k == "contract":
+        return ("contract", str(f.get("row")), str(f.get("doc_id") or ""))
+    if k == "rental":
+        if f.get("booking_id"):
+            return ("rental", str(f["booking_id"]))
+        return ("rental", "", str(f.get("bike") or ""), str(f.get("date_start") or ""), str(f.get("date_end") or ""))
+    if k == "pdf":
+        return ("pdf", str(f.get("id") or ""))
+    return (str(k),)
+
+
+def stale(r, since):
+    """Ответ прочитан раньше последнего входящего клиента — устарел (AGENTDEDUP0410). Время неизвестно — не судим."""
+    at = r.get("at")
+    return (since is not None and isinstance(at, (int, float)) and not isinstance(at, bool) and at < since)
+
+
+def sift(results, since=None):
+    """Результаты → (опора, снятое). Опора — каждый факт ОДИН раз, в версии ПОСЛЕДНЕГО прочтения:
+    из каждого запроса берётся только последний ответ (позднее «не факт» того же запроса снимает прежний FACT);
+    ответ, прочитанный раньше последнего входящего (`since`), устарел. Снятое — слова для журнала."""
+    last = {}
+    for i, r in enumerate(results):
+        last[r.get("req") or "#%d" % i] = i
+    facts, dropped = {}, []
+    for i, r in enumerate(results):
+        if r["outcome"] != FACT:
+            continue
+        j = last[r.get("req") or "#%d" % i]
+        if j != i:
+            dropped.append("%s: факт снят — тот же запрос прочитан позже (%s)" % (r["tool"], results[j]["outcome"]))
+            continue
+        if stale(r, since):
+            dropped.append("%s: факт устарел — прочитан раньше последнего входящего" % r["tool"])
+            continue
+        for f in r["facts"]:
+            k = fact_key(f)
+            if k in facts:
+                dropped.append("%s: повтор факта — взята последняя версия" % r["tool"])
+            facts[k] = f
+    return list(facts.values()), dropped
+
+
+def accepted(results, since=None):
+    return sift(results, since)[0]
 
 
 def calc(facts):
-    """Суммы по ролям и валютам — только из принятых строк кассы; разность с ценой аренды, если она названа."""
+    """Суммы по ролям и валютам — только из принятых строк кассы, каждая строка ОДИН раз (последняя версия);
+    разность с ценой аренды, если она названа."""
+    uniq = {}
+    for f in facts:
+        uniq[fact_key(f)] = f
+    facts = list(uniq.values())
     sums = {}
     for f in facts:
         if f["kind"] == "cash":
@@ -383,16 +472,41 @@ def calc(facts):
     return out
 
 
+def rental_of(facts):
+    """Аренда обращения (AGENTDEDUP0410): booking_id строк листа «клиенты» и договоров, привязанных к аренде кодом.
+    Ровно одна — она; ни одной или несколько — None: оплату не к чему привязать."""
+    ids = {str(f["booking_id"]) for f in facts if f["kind"] in ("rental", "contract") and f.get("booking_id")}
+    return ids.pop() if len(ids) == 1 else None
+
+
+def cash_of_rental(f, bk, facts):
+    """Строка кассы — этой аренды: её booking_id; без booking_id — байк номером и день внутри срока аренды bk."""
+    if f.get("booking_id"):
+        return str(f["booking_id"]) == bk
+    rent = [r for r in facts if r["kind"] == "rental" and str(r.get("booking_id") or "") == bk]
+    if len(rent) != 1:
+        return False
+    r = rent[0]
+    pc, pr = plate_of(f.get("bike")), plate_of(r.get("bike"))
+    d, ds, de = B.day_of(str(f.get("at") or "")[:10]), B.day_of(r.get("date_start")), B.day_of(r.get("date_end"))
+    return bool(pc) and pc == pr and None not in (d, ds, de) and ds <= d <= de
+
+
 def pay_confirmed(facts):
-    """Оплата подтверждена, только если в кассе есть строка оплаты аренды И второй независимый источник:
-    подписанный договор либо аренда из листа «клиенты» вместе с той же суммой в переписке (правило 03.10.2026-1)."""
-    rent = [f for f in facts if f["kind"] == "cash" and f["role"] == R_RENT]
+    """Оплата подтверждена, только если аренда обращения одна, в кассе есть строка оплаты ЭТОЙ аренды И второй
+    независимый источник ТОЙ ЖЕ аренды: договор, привязанный к ней кодом, либо её строка листа «клиенты» вместе с той
+    же суммой в переписке (правило 03.10.2026-1; привязка — AGENTDEDUP0410)."""
+    bk = rental_of(facts)
+    if bk is None:
+        return False
+    rent = [f for f in facts if f["kind"] == "cash" and f["role"] == R_RENT and cash_of_rental(f, bk, facts)]
     if not rent:
         return False
-    if any(f["kind"] == "contract" for f in facts):
+    if any(f["kind"] == "contract" and str(f.get("booking_id") or "") == bk for f in facts):
         return True
     said = {a for f in facts if f["kind"] == "history" for a in f["amounts"]}
-    return any(f["kind"] == "rental" for f in facts) and any(f["amount"] in said for f in rent)
+    return (any(f["kind"] == "rental" and str(f.get("booking_id") or "") == bk for f in facts)
+            and any(f["amount"] in said for f in rent))
 
 
 def known_amounts(price, facts, figures):
@@ -546,45 +660,64 @@ def render(results):
 
 
 def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend=None,
-        max_calls=MAX_CALLS, max_sec=MAX_SEC):
-    """Сверка одного черновика → {state, raw, usage, results, journal, calls, sec}.
-    state: DONE — модель дала итог; OVER — предел вызовов или секунд, итога нет; ABORTED — новое входящее."""
+        max_calls=MAX_CALLS, max_sec=MAX_SEC, reserve=FALLBACK_SEC):
+    """Сверка одного черновика → {state, raw, usage, results, journal, calls, doors, sec, deadline}.
+    state: DONE — модель дала итог; OVER — предел вызовов или секунд, итога нет; ABORTED — новое входящее.
+    Общий предел (AGENTDEDUP0410): `deadline` = t0 + max_sec на ВСЮ сверку с запасным вызовом; новых вызовов модели и
+    дверей сверка не начинает после deadline − reserve (остаток — запасному вызову вызывающего)."""
     t0 = clock()
+    deadline = t0 + max_sec
+    stop = deadline - max(0.0, min(reserve, max_sec))
     jr = Journal(re.sub(r"\D", "", str(number))[-4:])
-    results, calls = [], 0
-    ctx = bind_ctx(number, doors, results, clock)
+    results, n = [], {"calls": 0, "doors": 0}
+
+    def may_call():
+        return clock() < stop
+
+    def counted(fn):
+        def door(**kw):
+            n["doors"] += 1
+            return fn(**kw)
+        return door
+    doors = {k: (counted(v) if callable(v) else v) for k, v in (doors or {}).items()}
+    ctx = bind_ctx(number, doors, results, clock, may_call)
     head = (TOOLS_BLOCK % max_calls) + "\n\n" + user
+
+    def out(state, raw=None, usage=None):
+        return {"state": state, "raw": raw, "usage": usage, "results": results, "journal": jr, "calls": n["calls"],
+                "doors": n["doors"], "sec": clock() - t0, "deadline": deadline}
     while True:
         if fresh is not None and fresh():
-            return {"state": ABORTED, "raw": None, "usage": None, "results": results, "journal": jr,
-                    "calls": calls, "sec": clock() - t0}
-        if calls >= max_calls or clock() - t0 > max_sec:
-            return {"state": OVER, "raw": None, "usage": None, "results": results, "journal": jr,
-                    "calls": calls, "sec": clock() - t0}
+            return out(ABORTED)
+        if n["calls"] >= max_calls or not may_call():
+            return out(OVER)
         block = render(results)
         raw, usage = call(system, head + ("\n\n" + block if block else ""))
-        calls += 1
+        n["calls"] += 1
         if spend is not None:
             spend(usage)
         turn = parse_turn(raw)
         if turn is None or turn[0] == "final":
-            if clock() - t0 > max_sec:
-                return {"state": OVER, "raw": None, "usage": usage, "results": results, "journal": jr,
-                        "calls": calls, "sec": clock() - t0}
-            return {"state": DONE, "raw": raw, "usage": usage, "results": results, "journal": jr,
-                    "calls": calls, "sec": clock() - t0}
+            if clock() > deadline:
+                return out(OVER, usage=usage)
+            return out(DONE, raw, usage)
         _, tool, args = turn
+        if not may_call():                                # модель просит дверь, а времени на новый вызов нет
+            return out(OVER, usage=usage)
         t1 = clock()
         res = call_tool(tool, args, doors, clock, ctx)
         results.append(res)
         jr.call(len(results), tool, args, res, clock() - t1)
 
 
-def judge(text, price, results, jr):
-    """Итоговый текст + исход цены + результаты → [слова причин] и заполненный журнал (факты, конфликты)."""
-    facts = accepted(results)
+def judge(text, price, results, jr, since=None):
+    """Итоговый текст + исход цены + результаты → [слова причин] и заполненный журнал (факты, конфликты).
+    Опора — отсеянное `sift` (AGENTDEDUP0410): каждый факт один раз, последняя версия, без снятых и устаревших
+    (`since` — время последнего входящего клиента)."""
+    facts, dropped = sift(results, since)
     figures = calc(facts)
     jr.facts = facts
+    jr.refusals.extend(d for d in dropped if d not in jr.refusals)
     jr.conflicts = conflicts(facts, figures)
     words = []
     if money_claims(text, price, known_amounts(price, facts, figures)):

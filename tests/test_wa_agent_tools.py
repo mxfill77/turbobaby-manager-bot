@@ -120,7 +120,10 @@ def reasons(out):
 def test_paid_confirmed_by_cash_and_contract():
     s = Script({"tool": "cash", "args": {"bike": BIKE}}, {"tool": "contract", "args": {"phone": NUMBER}},
                final("Оплата 4900 бат получена, спасибо!"))
-    a = adapter(s, {"cash": lambda **kw: tx([tx_item()]), "contract": lambda **kw: CONTRACT_ONE},
+    # строка кассы — ТОЙ ЖЕ аренды, к которой код привязал договор (bk-2, ADV 8004): до AGENTDEDUP0410 фикстура
+    # смешивала кассу аренды bk-1 с договором аренды bk-2 и считалась подтверждением — ровно дефект П2
+    ivan = dict(tx_item(booking_id="bk-2"), bike="ADV 750 8004")
+    a = adapter(s, {"cash": lambda **kw: tx([ivan]), "contract": lambda **kw: CONTRACT_ONE},
                 book=Book([RENTAL_IVAN]))
     out = a.draft(NUMBER, 5)
     assert T.PAY_WORDS not in reasons(out), reasons(out)
@@ -332,15 +335,35 @@ def test_call_limit_falls_back_to_plain_draft():
 def test_time_limit_90s():
     s = Script({"tool": "history", "args": {}}, final("Ок"))
     clk = Clock(step=50.0)                                # каждый взгляд на часы — +50 с
+    plain = []
 
     def call(system, user):
         if user == "USER":
+            plain.append(1)
             return json.dumps(final("Без сверки."), ensure_ascii=False), {"in": 1, "out": 1}
         return s(system, user)
     a = adapter(call, {}, clock=clk)
     out = a.draft(NUMBER, 5)
-    assert a.last["tools"]["state"] == T.OVER and reasons(out)[0] == T.INCOMPLETE_WORDS
+    assert a.last["tools"]["state"] == T.OVER
     assert a.last["tools"]["calls"] < T.MAX_CALLS
+    # AGENTDEDUP0410: предел 90 с — на ВСЮ сверку с запасным вызовом; часы ушли за дедлайн — запасной не начат
+    assert out is None and plain == [] and a.last["fallback"] is False
+
+
+def test_time_limit_leaves_room_for_fallback():
+    """Сверка встаёт за FALLBACK_SEC до дедлайна — запасной обычный вызов успевает начаться в пределе."""
+    s = Script({"tool": "history", "args": {}}, final("Ок"))
+    clk = Clock()
+
+    def call(system, user):
+        if user == "USER":
+            assert clk.t < 1790000000.0 + T.MAX_SEC
+            return json.dumps(final("Без сверки."), ensure_ascii=False), {"in": 1, "out": 1}
+        clk.t += T.MAX_SEC - T.FALLBACK_SEC                   # модель думала до остатка запасному
+        return s(system, user)
+    a = adapter(call, {}, clock=clk)
+    out = a.draft(NUMBER, 5)
+    assert a.last["tools"]["state"] == T.OVER and reasons(out)[0] == T.INCOMPLETE_WORDS
 
 
 # ------------------------------- опора money_claims -------------------------------

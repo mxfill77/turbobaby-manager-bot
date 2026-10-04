@@ -424,6 +424,17 @@ def paid_call(model_name=None, env_file=None):
     return call
 
 
+def door_budget(seconds):
+    """Общий бюджет плеч моста на время сверки (AGENTDEDUP0410): двери кассы и договоров — методы `bridge_client`, и их
+    лестницы повторов режутся тем же `card_budget`, что у карточки «Инфо». Модуля нет (ПК без fcntl) — без бюджета."""
+    try:
+        import bridge_client
+        return bridge_client.card_budget(seconds, label="сверки агента")
+    except Exception:                                                # noqa: BLE001
+        import contextlib
+        return contextlib.nullcontext()
+
+
 # ── адаптер ────────────────────────────────────────────────────────────────────────────
 
 class ModelAdapter(wa_agent.Model):
@@ -625,7 +636,9 @@ class ModelAdapter(wa_agent.Model):
                 "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
                 "avail": avail, "rental": rental, "book_words": book_words,
-                "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache}
+                "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache,
+                # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
+                "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
         return system, user, info
 
     def draft(self, number, upto_id):
@@ -691,9 +704,10 @@ class ModelAdapter(wa_agent.Model):
         завершена» первой. Новое входящее посреди сверки — черновика нет (служба повторит позже)."""
         import wa_agent_tools as T
         system, user, info = self.build(number, upto_id)
-        out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
-                    fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
-                    spend=lambda u: self._spend(u, "сверка:"))
+        with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
+            out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
+                        fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
+                        spend=lambda u: self._spend(u, "сверка:"))
         jr = out["journal"]
         if out["state"] == T.ABORTED:
             for line in jr.lines():
@@ -703,12 +717,20 @@ class ModelAdapter(wa_agent.Model):
             return None
         reasons, raw, usage = [], out["raw"], out["usage"]
         if out["state"] == T.OVER:
+            if self.clock() >= out["deadline"]:              # общий предел — и для запасного пути (AGENTDEDUP0410)
+                for line in jr.lines():
+                    self.log(line)
+                self.log("сверка: общий предел %d с исчерпан — запасной вызов не начат, черновика нет (повтор позже)"
+                         % T.MAX_SEC)
+                self.last = {"info": info, "tools": out, "fallback": False}
+                return None
             raw, usage = self.call(system, user)                # тот же один вызов, что и без флага
             self._spend(usage, "черновик:")
             reasons = [T.INCOMPLETE_WORDS]
             out["results"] = []                                 # факты незавершённой сверки не опора
         got = parse_reply(raw)
-        words_t, figures = T.judge(got["text"] if got else "", info["price"], out["results"], jr)
+        words_t, figures = T.judge(got["text"] if got else "", info["price"], out["results"], jr,
+                                   since=info.get("last_in"))
         for line in jr.lines():
             self.log(line)
         self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got, "tools": out, "figures": figures}
