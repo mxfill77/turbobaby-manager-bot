@@ -169,12 +169,14 @@ ok("не разобран" in why_notobj, "JSON не-объект → тоже �
 o, _, _, retry = S.classify_response(429, "{}")
 ok(o == S.NOT_SENT and retry is True, "429 → not_sent, но повторить стоит")
 o, _, _, retry = S.classify_response(500, "{}")
-ok(o == S.UNKNOWN and retry is True, "500 → unknown (могло быть принято) + повтор")
+ok(o == S.UNKNOWN and retry is False, "500 → unknown (могло быть принято), повтора нет (WAPARTFIX0410)")
 o, _, _, retry = S.classify_response(503, "{}")
-ok(o == S.UNKNOWN and retry is True, "503 → unknown + повтор")
+ok(o == S.UNKNOWN and retry is False, "503 → unknown, повтора нет")
 o, why, _, retry = S.classify_response(None, "", err="timeout")
-ok(o == S.UNKNOWN and retry is True, "молчание транспорта → unknown + повтор")
+ok(o == S.UNKNOWN and retry is False, "молчание транспорта → unknown, повтора нет")
 ok("мог долететь" in why, "и сказано прямо, что запрос мог долететь")
+o, _, _, retry = S.classify_response(None, "", err=S.PRE_SEND + "ConnectionRefusedError")
+ok(o == S.NOT_SENT and retry is True, "сбой ДО отправки → not_sent, повтор безвреден")
 
 ok(S.backoff_delay(1) == 0.0, "первая попытка без паузы")
 ok(S.backoff_delay(2) == 1.0 and S.backoff_delay(3) == 2.0, "паузы растут вдвое: 1 с, 2 с")
@@ -202,7 +204,12 @@ slept = []
 fake = _Fake([(500, "{}", None), (200, '{"messages":[{"id":"wamid.OK2"}]}', None)])
 r = S.send_text("66812345678", "привет", now=NOW, db_path=db_open, env=_env(),
                 transport=fake, sleep=slept.append)
-ok(r["outcome"] == S.SENT and r["attempts"] == 2, "500 → повтор → sent со второй попытки")
+ok(r["outcome"] == S.UNKNOWN and r["attempts"] == 1, "500 → unknown, второго POST нет (WAPARTFIX0410)")
+ok(slept == [], "паузы нет — повтора нет: " + str(slept))
+fake = _Fake([(429, "{}", None), (200, '{"messages":[{"id":"wamid.OK2"}]}', None)])
+r = S.send_text("66812345678", "привет", now=NOW, db_path=db_open, env=_env(),
+                transport=fake, sleep=slept.append)
+ok(r["outcome"] == S.SENT and r["attempts"] == 2, "429 (заведомо не принят) → повтор → sent со второй попытки")
 ok(slept == [1.0], "перед второй попыткой пауза 1 с (бэкофф): " + str(slept))
 
 fake = _Fake([(400, '{"error":{"message":"invalid recipient"}}', None)])
@@ -214,8 +221,8 @@ ok(r["outcome"] == S.NOT_SENT and r["attempts"] == 1,
 fake = _Fake([(None, "", "timeout")])
 r = S.send_text("66812345678", "привет", now=NOW, db_path=db_open, env=_env(),
                 transport=fake, sleep=lambda s: None)
-ok(r["outcome"] == S.UNKNOWN, "молчание на всех попытках → unknown")
-ok(r["attempts"] == S.MAX_ATTEMPTS, "исчерпаны все попытки: " + str(r["attempts"]))
+ok(r["outcome"] == S.UNKNOWN, "молчание транспорта → unknown")
+ok(r["attempts"] == 1, "ровно одна попытка — второй POST мог бы дать дубль: " + str(r["attempts"]))
 ok(r["verify"] is True, "unknown несёт требование выяснить, ушло ли — вслепую не повторять")
 
 r = S.send_text("", "привет", now=NOW, db_path=db_open, env=_env(), transport=_Trap())
