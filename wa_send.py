@@ -78,13 +78,18 @@ UNKNOWN — не «наверное, не ушло». Молчание тран�
 здесь потолок стоит на ВСЕЙ отправке (`SEND_BUDGET_SEC`), а не на плече: каждая попытка берёт
 `min(плечо, остаток бюджета)`, и если бюджет исчерпан — к сети не касаемся ВОВСЕ.
 
-ПОВТОРЯЕМ НЕ ВСЁ. Отказ, который сервер вынес САМ (4xx кроме 429), повторять бессмысленно и
-вредно — второй такой же запрос получит тот же отказ. Повторяются только 429, 5xx и молчание
-транспорта, то есть случаи, где вопрос «принято ли» ещё не решён.
+ПОВТОРЯЕМ ТОЛЬКО ЗАВЕДОМО НЕ ПРИНЯТОЕ (WAPARTFIX0410). Отказ, который сервер вынес САМ (4xx
+кроме 429), повторять бессмысленно — второй такой же запрос получит тот же отказ. Молчание
+транспорта после отправки, нечитаемый ответ и 5xx — это «сервер мог принять»: второй POST
+положил бы клиенту ВТОРОЕ сообщение, поэтому такие исходы — unknown БЕЗ повтора (до 04.10.2026
+они повторялись). Повторяются ровно два случая, где запрос заведомо не принят: 429 (сервер
+сказал «не сейчас» и сообщение не взял) и сбой ДО отправки — имя не разрешилось или соединение
+отклонено (`PRE_SEND`), то есть ни один байт запроса до сервера не дошёл.
 """
 
 import json
 import os
+import socket
 import sqlite3
 import time
 import urllib.error
@@ -114,7 +119,13 @@ LEG_TIMEOUT_SEC = 20.0       # плечо одного POST, урезается 
 MAX_ATTEMPTS = 3
 BACKOFF_BASE = 1.0           # паузы 1 с, 2 с — растут вдвое
 
-RETRY_STATUSES = frozenset((429, 500, 502, 503, 504))
+RETRY_STATUSES = frozenset((429, 500, 502, 503, 504))   # повтор ЗАГРУЗКИ медиа (клиенту не видна)
+
+# Сбой ДО отправки: транспорт не довёл запрос до сервера — заведомо не принят, повтор безвреден.
+# urllib заворачивает в URLError всё, что случилось в `h.request` (соединение и отдача тела);
+# из этого «заведомо до сервера» только неразрешённое имя и отклонённое соединение.
+PRE_SEND = "до отправки: "
+_PRE_SEND_ERRORS = (socket.gaierror, ConnectionRefusedError)
 
 # ── медиа (WARELAYMEDIA0210) ─────────────────────────────────────────────────────────────
 # Пределы и форматы WhatsApp Cloud API по видам — документация Meta «Supported media types»
@@ -215,14 +226,18 @@ def classify_response(status, body_text, err=None) -> tuple:
     Три исхода, и граница между ними — ОТВЕТИЛ ЛИ сервер по существу:
       • ответил успехом с идентификатором  → SENT
       • ответил отказом, который вынес сам → NOT_SENT (повтор ничего не изменит)
-      • не ответил / ответил без опознания → UNKNOWN (могло уйти — вслепую не повторять)
+      • не ответил / ответил без опознания → UNKNOWN (могло уйти — НЕ повторять)
+    Повтор (`True`) — только там, где запрос заведомо не принят: сбой до отправки и 429.
     """
     if err:
-        return UNKNOWN, "транспорт молчит (%s) — запрос мог долететь" % err, None, True
+        if str(err).startswith(PRE_SEND):
+            return (NOT_SENT, "запрос не дошёл до сервера (%s) — заведомо не принят" % str(err)[len(PRE_SEND):],
+                    None, True)
+        return UNKNOWN, "транспорт молчит (%s) — запрос мог долететь, повтора нет" % err, None, False
     try:
         code = int(status)
     except (TypeError, ValueError):
-        return UNKNOWN, "код ответа не прочитан", None, True
+        return UNKNOWN, "код ответа не прочитан — запрос мог быть принят, повтора нет", None, False
 
     if 200 <= code < 300:
         wamid = _wamid(body_text)
@@ -231,9 +246,12 @@ def classify_response(status, body_text, err=None) -> tuple:
         # Успех без идентификатора: назвать это отправкой нельзя — доказательства нет.
         return UNKNOWN, "код %d, но идентификатора сообщения в ответе нет" % code, None, False
 
-    if code in RETRY_STATUSES:
-        return (UNKNOWN if code >= 500 else NOT_SENT,
-                "сервер ответил %d%s" % (code, _api_error(body_text)), None, True)
+    if code == 429:
+        return NOT_SENT, "сервер ответил %d%s" % (code, _api_error(body_text)), None, True
+    if code >= 500:
+        # 5xx мог прийти ПОСЛЕ исполнения: сообщение у клиента возможно — второй POST дал бы дубль
+        return UNKNOWN, "сервер ответил %d%s — мог исполнить, повтора нет" % (code, _api_error(body_text)), \
+            None, False
 
     return NOT_SENT, "сервер отказал %d%s" % (code, _api_error(body_text)), None, False
 
@@ -355,6 +373,10 @@ def _open(req, timeout):
         except Exception:
             text = ""
         return e.code, text, None
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), _PRE_SEND_ERRORS):
+            return None, "", PRE_SEND + type(e.reason).__name__
+        return None, "", type(e).__name__
     except Exception as e:
         return None, "", type(e).__name__
 
@@ -471,7 +493,8 @@ def _door(to, payload, now, db_path, env, transport, sleep, budget, clock):
 
 
 def _send_loop(post, payload, key, state, deadline, sleep, clock):
-    """Отправка сообщения под общим дедлайном: повтор только 429, 5xx и молчания транспорта."""
+    """Отправка сообщения под общим дедлайном: повтор только заведомо не принятого (429, сбой до отправки);
+    молчание после отправки, нечитаемый ответ и 5xx — unknown, второго POST нет."""
     out = _out
     url = API_BASE + SEND_PATH
     attempts = 0

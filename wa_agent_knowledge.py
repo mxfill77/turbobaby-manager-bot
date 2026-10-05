@@ -13,7 +13,8 @@
 Импорты — только stdlib без сети (тест по ast).
 
 ТРИ ИСХОДА ЦЕНЫ, и ни один не подменяет другой:
-  number  — число двери с разбивкой (сутки, ставка, итог, депозит) на срок внутри ОДНОГО сезона;
+  number  — число двери с разбивкой (сутки, ставка, итог, скидка за срок — всегда, и 0%; депозит) на срок внутри
+            ОДНОГО сезона; скидки в ответе двери нет — «неизвестна» и причина человеку (WAPRICECTX0410);
   human   — «эту цену считает человек» с причиной из списка ниже;
   unknown — проверить нечем (дверь молчит, парк не прочитан, дат нет). Не ноль и не «от».
 Формы «от … ฿» нет ни на одной дороге: смешанный период уходит человеку ДО двери.
@@ -159,7 +160,21 @@ def _base(model, ds, de):
     return {"outcome": PRICE_UNKNOWN, "reason": None, "why": "", "model": model, "unit": None,
             "date_start": ds.isoformat() if ds else None, "date_end": de.isoformat() if de else None,
             "days": None, "day_price": None, "total": None, "deposit": None, "season": None,
-            "door_calls": 0, "line": ""}
+            "discount": None, "door_calls": 0, "line": ""}
+
+
+# Скидка за срок (WAPRICECTX0410): дверь отдаёт её ТОЛЬКО словами в поле text — «(скидка за срок N%, …)»
+# (QuotePrice.js, строка text), отдельного поля нет. Строка цены несёт её всегда, и 0% тоже; в text её нет —
+# «скидка за срок неизвестна» и причина человеку (`handoff`), числом её не называем.
+_DOOR_DISCOUNT = re.compile(r"скидка\s+за\s+срок\s+(\d{1,3})\s*%", re.I)
+R_DISCOUNT_UNKNOWN = "discount_unknown"
+DISCOUNT_UNKNOWN_WORDS = "скидка за срок неизвестна — дверь цены её не назвала, проверьте"
+
+
+def door_discount(q):
+    """Ответ двери → скидка за срок в процентах (int) | None (в text её нет)."""
+    m = _DOOR_DISCOUNT.search(q.get("text") or "") if isinstance(q, dict) and isinstance(q.get("text"), str) else None
+    return int(m.group(1)) if m else None
 
 
 def _human(res, reason, why):
@@ -230,12 +245,53 @@ def quote(model, date_start, date_end, door, units, no_price_models=()):
     res.update(outcome=PRICE_NUMBER, reason=None, why="", day_price=day, total=total,
                deposit=deposit if deposit is not None and deposit >= 0 else None,
                season=season.get("label") if isinstance(season, dict) else None,
-               model=q.get("model") or model)
+               model=q.get("model") or model, discount=door_discount(q))
     dep = ("депозит %s ฿" % _money(res["deposit"])) if res["deposit"] is not None \
         else "депозит — уточнит человек"
-    res["line"] = "%s, %s — %s: %d сут., %s ฿ в сутки, итого %s ฿ за срок; %s." % (
-        res["date_start"], res["date_end"], res["model"], days, _money(day), _money(total), dep)
+    disc = ("скидка за срок %d%%" % res["discount"]) if res["discount"] is not None else \
+        "скидка за срок неизвестна (дверь её не назвала: числом не называй, скажи, что уточнит коллега)"
+    res["line"] = "%s, %s — %s: %d сут., %s ฿ в сутки, итого %s ฿ за срок; %s; %s." % (
+        res["date_start"], res["date_end"], res["model"], days, _money(day), _money(total), disc, dep)
     return res
+
+
+# Несколько вариантов «модель + срок» из переписки (WAPRICECTX0410): каждый — свой `quote` с прежними воротами,
+# вместе — один исход для промпта и сверок. Один вариант — он сам, как раньше.
+PRICE_SET_HEAD = "по вариантам из переписки (%d) — назови цену КАЖДОГО, модель и срок словами, не выбирай за клиента: "
+
+
+def price_set(results, dropped=0):
+    """[исход quote, …] → один исход: один — он сам; несколько — первый с полем `quotes` (все), строкой `line`
+    по номерам и общим `outcome` (число есть хоть у одного — number; иначе человек есть — human; иначе unknown).
+    dropped — вариантов сверх предела: называются в строке числом."""
+    results = [r for r in results or () if isinstance(r, dict)]
+    if not results:
+        return None
+    if len(results) == 1 and not dropped:
+        return results[0]
+    outs = [r.get("outcome") for r in results]
+    res = dict(results[0])
+    res["quotes"] = results
+    res["outcome"] = PRICE_NUMBER if PRICE_NUMBER in outs else (PRICE_HUMAN if PRICE_HUMAN in outs else PRICE_UNKNOWN)
+    res["door_calls"] = sum(int(r.get("door_calls") or 0) for r in results)
+    res["line"] = PRICE_SET_HEAD % len(results) + " ".join(
+        "(%d) %s" % (i, r.get("line") or "") for i, r in enumerate(results, 1)) + (
+        " Ещё вариантов из переписки: %d — их цену не считали, скажи, что уточнишь." % dropped if dropped else "")
+    return res
+
+
+def quotes_of(price):
+    """Исход цены → [исход каждого варианта] (один исход — список из него)."""
+    if not isinstance(price, dict):
+        return []
+    q = price.get("quotes")
+    return list(q) if isinstance(q, list) else [price]
+
+
+def discounts(price):
+    """Скидки за срок, которые назвала дверь в этом вызове (проценты) — опора процента скидки в черновике."""
+    return {q["discount"] for q in quotes_of(price)
+            if q.get("outcome") == PRICE_NUMBER and isinstance(q.get("discount"), int)}
 
 
 # ------------------------------- «нужен человек» по тексту клиента -------------------------------
@@ -385,8 +441,10 @@ def handoff(text, price=None):
             found[reason] = "слово в сообщении клиента"
     if lang_of(s) == "other":
         found[R_LANGUAGE] = "язык сообщения"
-    if isinstance(price, dict) and price.get("outcome") == PRICE_HUMAN and price.get("reason"):
-        found.setdefault(price["reason"], price.get("why") or "")
+    quotes = quotes_of(price)                     # каждый вариант цены (WAPRICECTX0410); один исход — он сам
+    for q in quotes:
+        if q.get("outcome") == PRICE_HUMAN and q.get("reason"):
+            found.setdefault(q["reason"], q.get("why") or "")
     out = []
     for r, w in REASONS:
         if r not in found:
@@ -396,6 +454,10 @@ def handoff(text, price=None):
             out += [{"reason": r, "label": key, "words": words, "why": found[r]} for key, words in labels]
         else:
             out.append({"reason": r, "words": w, "why": found[r]})
+    blind = [q for q in quotes if q.get("outcome") == PRICE_NUMBER and q.get("discount") is None]
+    if blind:                                     # число есть, скидки за срок в ответе двери нет — проверит человек
+        out.append({"reason": R_DISCOUNT_UNKNOWN, "words": DISCOUNT_UNKNOWN_WORDS,
+                    "why": "вариантов без скидки в ответе двери: %d" % len(blind)})
     return out
 
 
@@ -411,12 +473,16 @@ MONEY_CLAIM_WORDS = "денежное утверждение без опоры"
 # WAKNOWFRESH0310: причина по СНИМКУ ЗНАНИЙ — узел старше предела, его текста в промпте нет (см. `node_stale`)
 R_STALE = "stale_knowledge"
 STALE_WORDS = "знания устарели"
+# WADAYS0410: причина по ТЕКСТУ ЧЕРНОВИКА — число суток у диапазона дат не равно разности дат (`wa_agent_model.days_claims`)
+R_DAYS_CLAIM = "days_claim"
+DAYS_CLAIM_WORDS = "срок: агент посчитал сутки не так — проверьте"
 _WORD_CATS = dict(
     [(REASON_WORDS[R_AVAILABILITY], R_AVAILABILITY), (REASON_WORDS[R_SEASON_CROSS], CAT_PRICE),
      (REASON_WORDS[R_NO_PRICE_MODEL], CAT_PRICE), (REASON_WORDS[R_LONG_TERM], CAT_PRICE),
      (REASON_WORDS[R_DISCOUNT], R_DISCOUNT), (REASON_WORDS[R_DOOR_NO_PRICE], CAT_PRICE),
      (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE),
-     (MONEY_CLAIM_WORDS, R_MONEY_CLAIM), (STALE_WORDS, R_STALE)]
+     (MONEY_CLAIM_WORDS, R_MONEY_CLAIM), (STALE_WORDS, R_STALE), (DAYS_CLAIM_WORDS, R_DAYS_CLAIM),
+     (DISCOUNT_UNKNOWN_WORDS, R_DISCOUNT_UNKNOWN)]          # своя категория: не «скидка — решение человека»
     + [(words, key) for key, words in MONEY_WORDS.items()])
 _RULES = dict(_TEXT_RULES)
 _KEYWORD_CATS = ((R_AVAILABILITY, _RULES[R_AVAILABILITY]), (R_DISCOUNT, _RULES[R_DISCOUNT]))
@@ -520,16 +586,55 @@ def thb_amounts(text):
     return out
 
 
+# Процент скидки за срок, который назвала дверь (WAPRICECTX0410), опору имеет: число равно скидке из ответа двери
+# этого вызова (`discounts`) и стоит рядом со словом скидки — «скидка за срок 5%», «discount 5%», «5% off». Иначе —
+# прежнее «процент без опоры» («5% off» без блока «ЦЕНА» или при скидке 0% ловится).
+_DISC_BEFORE = re.compile(r"(?:скидк|скидоч|discount)\w*[^\d%]{0,30}$", re.I)
+_DISC_AFTER = re.compile(r"\s*(?:off\b|скидк|discount)", re.I)
+
+
+def _sentences(s):
+    """Предложения с позициями — разрез тем же `_SENTENCE`, что у `money_claims`: [(начало, конец)]."""
+    out, a = [], 0
+    for m in _SENTENCE.finditer(s):
+        out.append((a, m.start()))
+        a = m.end()
+    out.append((a, len(s)))
+    return out
+
+
+def _pct_hits(s, price):
+    """Проценты в предложениях со словом предоплаты, депозита или скидки → [(начало, конец, что, опора есть)]."""
+    known, out = discounts(price), []
+    for a, b in _sentences(s):
+        sent = s[a:b]
+        if not _CLAIM_PCT_WORDS.search(sent):
+            continue
+        for m in _CLAIM_PCT.finditer(sent):
+            val = float(re.match(r"\d+(?:[.,]\d+)?", m.group(0)).group(0).replace(",", "."))
+            ok = val in known and bool(_DISC_BEFORE.search(sent[max(0, m.start() - 40):m.start()])
+                                       or _DISC_AFTER.match(sent, m.end()))
+            out.append((a + m.start(), a + m.end(), m.group(0).strip(), ok))
+    return out
+
+
+def without_known_discount(text, price):
+    """Текст черновика без процентов скидки за срок, которые назвала дверь (для судей, которым исход цены не
+    передаётся процентом — сверка `wa_agent_tools`). Прочее — как было."""
+    s = str(text or "")
+    for a, b, _what, ok in reversed(_pct_hits(s, price)):
+        if ok:
+            s = s[:a] + s[b:]
+    return s
+
+
 def money_claims(text, price=None):
     """Текст черновика модели (+ исход цены этого вызова) → [(вид, что)] денежных утверждений без опоры:
-    ('процент', «30%») — процент в одном предложении со словом предоплаты, депозита или скидки;
-    ('сумма', 3500) — сумма в батах, которой нет среди сумм блока «ЦЕНА» (`price["line"]`). Пусто — опора есть
-    или денег в тексте нет."""
+    ('процент', «30%») — процент в одном предложении со словом предоплаты, депозита или скидки (кроме скидки за
+    срок, названной дверью, — WAPRICECTX0410); ('сумма', 3500) — сумма в батах, которой нет среди сумм блока
+    «ЦЕНА» (`price["line"]`). Пусто — опора есть или денег в тексте нет."""
     s = str(text or "")
-    out = []
-    for sent in _SENTENCE.split(s):
-        if _CLAIM_PCT_WORDS.search(sent):
-            out += [("процент", m.group(0).strip()) for m in _CLAIM_PCT.finditer(sent)]
+    out = [("процент", what) for _a, _b, what, ok in _pct_hits(s, price) if not ok]
     line = price.get("line") if isinstance(price, dict) else None
     known = set(thb_amounts(line))
     out += [("сумма", v) for v in thb_amounts(s) if v not in known]

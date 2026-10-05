@@ -12,9 +12,13 @@
   • снимки узлов `faq` и `business_rules` с возрастом (`wa_agent_knowledge.Knowledge`); не прочитан —
     НЕИЗВЕСТНО словами, а не пусто. Снимок старше предела (`max_stale`, 3 × `max_age` = 30 мин, WAKNOWFRESH0310)
     — тоже НЕИЗВЕСТНО, без текста, и причина «знания устарели» первой из причин кода;
-  • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене И в его словах есть
-    модель из парка И обе даты. Без дат или модели дверь цены не зовётся. Модель ищется по ключу живых имён
-    парка (`wa_book_read.find_model`, WADRAFTFIX0210), дверь цены на вопрос — не больше одного раза;
+  • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене. Модель и обе даты в его
+    словах — одна дверь. Модели или дат нет — пары «модель + срок» из последних сообщений диалога (WAPRICECTX0410):
+    до трёх, каждая — своя дверь с прежними воротами. Пары — только из слов КЛИЕНТА (WAPAIRS0410): срок идёт к модели,
+    только если их связал клиент; наши минимумы, сроки, даты и модели пар не дают; начало срока числом суток — дата
+    клиента, нет — числа нет, агент спрашивает даты. Модель ищется по ключу живых имён парка (`wa_book_read`,
+    WADRAFTFIX0210); сокращение без кубатуры — ключ, только если в парке такая модель одна, иначе модель НЕИЗВЕСТНА.
+    Скидка за срок — в строке цены всегда, и 0%; дверь её не назвала — «неизвестна» и причина;
   • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас;
   • уроки людей (WAAGENTLESSON0210) — ТОЛЬКО действующие (`wa_agent.active_lessons`, своя база агента
     mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
@@ -31,6 +35,16 @@
 ОТВЕТ МОДЕЛИ — JSON {text, lang, handoff[], why}. Не JSON, нет текста — черновика нет, строка журнала
 (ядро повторит не раньше MODEL_RETRY_SEC). lang не ru/en — причина «язык». Итог `draft` — словарь
 {text, handoff[слова], lang, why} (ядро принимает и прежнюю строку); причины — кода и модели вместе.
+
+КАРТОЧКА СОТРУДНИКА (WACARDQ0410) — итог `draft` несёт ещё {question, q_lang, q_ru, text_ru}: вопрос — блок последних
+реплик клиента ровно в том виде, что ушёл в модель (под маской); язык вопроса — кодом (`question_lang` → `K.lang_of`);
+не русский — тем же вызовом два перевода на русский (блок `TR_BLOCK` в сообщении), русский — переводов нет. Клиенту
+уходит только text.
+
+НАШИ ПРЕЖНИЕ СЛОВА (WAOURWORDS0410) — правило 12 инструкции: строки «мы» в истории обязывают, из двух наших сообщений
+о том же действует более позднее, расхождение со знаниями — в handoff. «Позднее» модель читает по времени строки:
+`wa_history.model_line` даёт каждой «ДД.ММ.ГГГГ ЧЧ:ММ» (Пхукет). Кодом правило не проверяется: проверка денег
+(`K.money_claims`) нашу прежнюю сумму опорой по-прежнему не считает — повтор ставит причину «нужен человек».
 
 ПЛАТЕЛЬЩИК — платный ключ API тем же путём, что у Splinter (`claude_client.ClaudeClient`:
 ANTHROPIC_API_KEY из .env корня дерева, учёт трат `spend_ledger.meter`). Значение ключа не печатается.
@@ -63,7 +77,9 @@ import wa_history
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = "claude-sonnet-4-5"          # как CLAUDE_MODEL Splinter по умолчанию (claude_client)
-MAX_TOKENS = 700
+# WACARDQ0410: при вопросе не по-русски тот же ответ несёт ещё два перевода (вопроса до TR_Q_MAX знаков и ответа);
+# при 700 длинный вопрос обрывал бы JSON — черновика не было бы вовсе. Цена — по фактическим токенам, не по пределу
+MAX_TOKENS = 1500
 HISTORY_MAX = 60000                           # символов истории; старше — обрезается с головы, словами
 TAIL_MAX = 4000
 LESSON_ITEM_MAX = 600                         # было/стало/причина одного урока в промпте, символов
@@ -105,6 +121,9 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 7. Если вопрос требует решения человека (наличие и брони, скидка, срок через границу сезонов, срок от месяца, повреждения, штрафы, депозит, споры, оплаты, жалоба, иной язык, что-то, чего нет в знаниях и что нельзя сказать уклончиво) — всё равно напиши вежливый короткий черновик, но перечисли причины в handoff. Причины из блока «НУЖЕН ЧЕЛОВЕК» перенеси в handoff обязательно.
 8. На «спасибо», «ок» и подобное — короткий вежливый ответ без новых вопросов и предложений.
 9. Метки «[скрыто: …]» — это скрытые данные клиента; не проси их повторить и не упоминай.
+10. Число суток аренды называй ТОЛЬКО из блоков «СРОКИ» и «ЦЕНА» — там его посчитал код: дата возврата минус дата выдачи («с 5 по 7» — двое суток, не трое). Блоков нет — числа суток не называй. Клиент назвал другое число суток на те же даты — мягко поправь числом из «СРОКИ».
+11. В ответе о цене скидку за срок называй ВСЕГДА — числом из блока «ЦЕНА», и когда она 0% («скидка за срок 0%»). В блоке «скидка за срок неизвестна» — скажи, что скидку за срок уточнит коллега, числа скидки не называй. Блок «ЦЕНА» с несколькими вариантами — назови цену каждого варианта (модель и срок), не выбирай за клиента. Другой скидки сверх этой не обещай (правило 6).
+12. НАШИ ПРЕЖНИЕ СЛОВА ОБЯЗЫВАЮТ. Строки «мы» в истории — уже сказанное клиенту компанией: с телефона, из темы или через «Отправить». Наше последнее предложение, условие, срок или цена о том же действуют, пока мы сами их не изменили: продолжай их, не спорь с ними и не подменяй прежними нашими словами, знаниями или своим расчётом. Два наших сообщения о том же расходятся — действует более позднее. Наше слово расходится со знаниями — клиенту не противоречь, а перенеси расхождение в handoff: «наше сообщение ЧЧ:ММ расходится с правилом …». Число, которое мы уже назвали, повторяй только к той же модели и тому же сроку; нового числа из него не выводи.
 
 Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
 {"text": "текст ответа клиенту", "lang": "ru" или "en" (язык клиента; иной — его код), "handoff": ["причина словами", …] или [], "why": "одна строка для сотрудника: что спросил клиент и почему такой ответ"}"""
@@ -122,6 +141,29 @@ if SYSTEM_PROMPT.count(_RULE4_OLD) != 1 or SYSTEM_PROMPT.count(_RULE7_OLD) != 1:
     raise RuntimeError("SYSTEM_PROMPT: правила 4/7 для броней не найдены ровно по одному разу")
 SYSTEM_PROMPT_BOOK = SYSTEM_PROMPT.replace(_RULE4_OLD, _RULE4_BOOK).replace(_RULE7_OLD, _RULE7_BOOK)
 
+# ── вопрос клиента и перевод для сотрудника на карточке (WACARDQ0410) ───────────────────
+# Вопрос на карточке — ровно то, что ушло в модель последним блоком (хвост реплик клиента после нашей последней,
+# под той же маской), а не пересказ модели. Язык вопроса судит КОД (`K.lang_of`), поле lang модели — нет. Не русский —
+# в сообщение (не в инструкцию: префикс кэша прежний) идёт блок с просьбой двух переводов тем же вызовом; русский или
+# букв нет — блока нет, промпт байт-в-байт прежний. Переводы видит только сотрудник: клиенту уходит одно поле text.
+TR_Q_MAX = 800                                # перевод вопроса — не длиннее, знаков (просьба модели и обрезка кода)
+TR_A_MAX = 3000                               # перевод ответа — не длиннее, знаков (обрезка кода)
+TR_BLOCK = ("ПЕРЕВОД ДЛЯ СОТРУДНИКА (код определил: клиент пишет не по-русски). В тот же JSON добавь ещё два поля: "
+            "\"q_ru\" — перевод на русский того, о чём клиент спрашивает в последнем блоке (не длиннее %d знаков; "
+            "длинное сократи, сохранив смысл), и \"text_ru\" — перевод на русский твоего ответа из поля \"text\". "
+            "Переводы видит только сотрудник; клиенту уходит одно поле \"text\" на языке клиента." % TR_Q_MAX)
+_LABEL = re.compile(r"\[[^\[\]\n]{1,40}\]")   # метки маски «[скрыто: …]» и медиа «[фото]» — не слова клиента
+
+
+def question_lang(question):
+    """Язык вопроса клиента — кодом: `K.lang_of` по словам клиента без наших меток. → 'ru' | 'en' | 'other' | None."""
+    return K.lang_of(_LABEL.sub(" ", str(question or "")))
+
+
+def need_translation(lang):
+    """Перевод нужен, если язык вопроса не русский; букв нет (None) — переводить нечего."""
+    return lang not in ("ru", None)
+
 
 # ── даты и модель в словах клиента ─────────────────────────────────────────────────────
 
@@ -136,7 +178,9 @@ _MONTHS = {
 _MON = r"(янв\w*|фев\w*|мар\w*|апр\w*|ма[яй]|июн\w*|июл\w*|авг\w*|сен\w*|окт\w*|ноя\w*|дек\w*|" \
        r"jan\w*|feb\w*|mar\w*|apr\w*|may|jun\w*|jul\w*|aug\w*|sep\w*|oct\w*|nov\w*|dec\w*)"
 _RX_NUM = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)|(?<![\d.])(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?![\d])")
-_RX_RANGE_WORD = re.compile(r"(?i)(?<!\d)(\d{1,2})\s*(?:-|–|—|по|до|to|till|until)\s*(\d{1,2})\s+" + _MON)
+# «5 - 7 of October» — один диапазон (WAPAIRS0410 п.3): без «of» он читался двумя датами 07.10 и 08.10 соседних
+# диапазонов, а начало 05.10 терялось
+_RX_RANGE_WORD = re.compile(r"(?i)(?<!\d)(\d{1,2})\s*(?:-|–|—|по|до|to|till|until)\s*(\d{1,2})\s+(?:of\s+)?" + _MON)
 _RX_DAY_MON = re.compile(r"(?i)(?<!\d)(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MON)
 _RX_MON_DAY = re.compile(r"(?i)" + _MON + r"\s+(\d{1,2})(?:st|nd|rd|th)?(?!\d)")
 
@@ -198,6 +242,221 @@ def find_dates(text, today):
     return out
 
 
+# ── сутки по датам (WADAYS0410) ────────────────────────────────────────────────────────
+# «С 5 по 7» — двое суток: дата возврата минус дата выдачи, как у двери цены (`K.quote`, QuotePrice.js). Код считает
+# сутки каждому диапазону дат клиента (блок «СРОКИ») и сверяет число суток у диапазона в черновике модели.
+
+TERMS_MAX = 6                                  # диапазонов в блоке «СРОКИ»: новые важнее
+TERM_MAX_DAYS = 400                            # длиннее — не срок аренды, а неразобранная пара чисел
+TERMS_HEAD = "СРОКИ (сутки посчитал код: дата возврата минус дата выдачи; «с 5 по 7» — двое суток): "
+_SEP = r"\s*(?:-|–|—|по|до|to|till|until)\s*"
+_ORD = r"(?:st|nd|rd|th)?"
+_NOT_TIME = r"(?![.:/]\d)(?!\s*(?:час|ч\b|утр|вечер|ноч|мин|am\b|pm\b|h\b|o'?clock))"
+_RANGES = (                                    # (вид, выражение); место, занятое первым, следующие не трогают
+    ("iso", re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})" + _SEP + r"(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")),
+    ("num", re.compile(r"(?<![\d.])(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?" + _SEP
+                       + r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?!\d)")),
+    ("dm_dm", re.compile(r"(?i)(?<!\d)(\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MON + _SEP + r"(\d{1,2})" + _ORD
+                         + r"\s+(?:of\s+)?" + _MON)),
+    ("md_md", re.compile(r"(?i)\b" + _MON + r"\s+(\d{1,2})" + _ORD + _SEP + _MON + r"\s+(\d{1,2})" + _ORD
+                         + r"(?!\d)")),
+    ("d_dm", _RX_RANGE_WORD),
+    ("dm_d", re.compile(r"(?i)(?<!\d)(\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MON + _SEP + r"(\d{1,2})" + _ORD
+                        + r"(?!\d)" + _NOT_TIME)),
+    ("md_d", re.compile(r"(?i)\b" + _MON + r"\s+(\d{1,2})" + _ORD + _SEP + r"(\d{1,2})" + _ORD + r"(?!\d)"
+                        + _NOT_TIME)),
+    ("bare", re.compile(r"(?i)(?<!\w)с\s+(\d{1,2})\s+по\s+(\d{1,2})(?!\d)" + _NOT_TIME)),
+)
+
+
+def term_days(ds, de):
+    """Сутки аренды: дата возврата минус дата выдачи («с 5 по 7» — двое), как `K.quote` и дверь цены."""
+    return (de - ds).days
+
+
+def _span(today, d1, m1, y1, d2, m2, y2):
+    """Пара дат диапазона → (выдача, возврат) | None. Год не назван — возврат ближайший будущий (как `_mk`), выдача —
+    последняя такая дата не позже возврата: «с 30 сентября по 2 октября» — двое суток при любом «сегодня»."""
+    def yr(y):
+        y = int(y)
+        return y + 2000 if y < 100 else y
+    try:
+        if y2 is not None:
+            de = datetime.date(yr(y2), int(m2), int(d2))
+        elif y1 is not None:
+            de = datetime.date(yr(y1), int(m2), int(d2))
+        else:
+            de = _mk(today, d2, m2)
+        if de is None:
+            return None
+        if y1 is not None:
+            ds = datetime.date(yr(y1), int(m1), int(d1))
+            if y2 is None and de < ds:
+                de = datetime.date(de.year + 1, int(m2), int(d2))
+        else:
+            ds = datetime.date(de.year, int(m1), int(d1))
+            if ds > de:
+                ds = datetime.date(de.year - 1, int(m1), int(d1))
+    except (ValueError, TypeError, AttributeError):      # не дата · «сегодня» не задано — не диапазон
+        return None
+    return (ds, de) if ds < de else None
+
+
+def _range_of(kind, g, today):
+    """Совпадение выражения диапазона → {ds, de, days, label} | None (не диапазон)."""
+    if kind == "bare":                         # «с 5 по 7» без месяца: дат нет, сутки — разность чисел одного месяца
+        d1, d2 = int(g[0]), int(g[1])
+        if not 1 <= d1 < d2 <= 31:
+            return None
+        return {"ds": None, "de": None, "days": term_days(datetime.date(2001, 1, d1), datetime.date(2001, 1, d2)),
+                "label": "с %d по %d (месяц не назван)" % (d1, d2)}
+    y1 = y2 = None
+    if kind == "iso":
+        y1, m1, d1, y2, m2, d2 = g
+    elif kind == "num":
+        d1, m1, y1, d2, m2, y2 = g
+    elif kind == "dm_dm":
+        d1, w1, d2, w2 = g
+        m1, m2 = _mon(w1), _mon(w2)
+    elif kind == "md_md":
+        w1, d1, w2, d2 = g
+        m1, m2 = _mon(w1), _mon(w2)
+    elif kind == "d_dm":
+        d1, d2, w = g
+        m1 = m2 = _mon(w)
+    elif kind == "dm_d":
+        d1, w, d2 = g
+        m1 = m2 = _mon(w)
+    else:                                      # md_d
+        w, d1, d2 = g
+        m1 = m2 = _mon(w)
+    if m1 is None or m2 is None:
+        return None
+    span = _span(today, d1, m1, y1, d2, m2, y2)
+    if span is None:
+        return None
+    days = term_days(*span)
+    if days > TERM_MAX_DAYS:
+        return None
+    return {"ds": span[0], "de": span[1], "days": days,
+            "label": "с %s по %s" % (span[0].strftime("%d.%m"), span[1].strftime("%d.%m"))}
+
+
+def find_ranges(text, today):
+    """Диапазоны дат в тексте по порядку появления → [{a, b, ds, de, days, label}]. Сутки — `term_days`."""
+    s = str(text or "")
+    taken, out = [], []
+    for kind, rx in _RANGES:
+        for m in rx.finditer(s):
+            a, b = m.span()
+            if any(x < b and a < y for x, y in taken):
+                continue
+            got = _range_of(kind, m.groups(), today)
+            if got is not None:
+                taken.append((a, b))
+                out.append(dict(got, a=a, b=b))
+    return sorted(out, key=lambda r: r["a"])
+
+
+def client_terms(items, today):
+    """История → диапазоны дат из слов КЛИЕНТА, без повторов, не больше TERMS_MAX (новые важнее)."""
+    seen, out = set(), []
+    for it in items or ():
+        if it.get("who") != "клиент" or not it.get("text"):
+            continue
+        for r in find_ranges(it["text"], today):
+            key = (r["label"], r["days"])
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+    return out[-TERMS_MAX:]
+
+
+def terms_line(ranges):
+    """Диапазоны → блок «СРОКИ» | '' (дат нет — блока нет)."""
+    if not ranges:
+        return ""
+    return TERMS_HEAD + "; ".join("%s — %d сут." % (r["label"], r["days"]) for r in ranges)
+
+
+_CNT_WORDS = {
+    "один": 1, "одни": 1, "одних": 1, "одна": 1, "два": 2, "две": 2, "двух": 2, "двое": 2, "три": 3, "трое": 3,
+    "трёх": 3, "трех": 3, "четыре": 4, "четверо": 4, "четырёх": 4, "четырех": 4, "пять": 5, "пятеро": 5, "пяти": 5,
+    "шесть": 6, "шестеро": 6, "шести": 6, "семь": 7, "семеро": 7, "семи": 7, "восемь": 8, "восьми": 8,
+    "девять": 9, "девяти": 9, "десять": 10, "десяти": 10,
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_RX_COUNT = re.compile(
+    r"(?i)(?<![\w.,])(\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)) + r")"
+    r"(?:-?(?:х|ти|ми|ух|ёх|ех))?(?:\s+|\s*-\s*)"
+    r"(?:сут(?:ки|ок|ка|кам|ках)|дн(?:я|ей|ям)|день|ноч(?:ь|и|ей)|days?|nights?)\b")
+# число суток — не срок аренды: «через 2 дня», «от 3 суток», «минимальный срок 3 дня», «за 1 день до выдачи»
+_CNT_SKIP_BEFORE = re.compile(
+    r"(?i)(?<!\w)(?:через|спустя|в\s+течение|кажд\w+|минимум|минимальн\w*(?:\s+\w+){0,2}|не\s+(?:менее|меньше|более|больше)|"
+    r"более|больше|менее|меньше|от|до|within|in|after|every|at\s+least|minimum|min|from|up\s+to|more\s+than|"
+    r"less\s+than)\s*$")
+_CNT_SKIP_AFTER = re.compile(r"(?i)\s+(?:до|before|назад|ago|после|after)\b")
+
+
+def day_counts(text):
+    """Текст → [(начало, конец, число суток)] по порядку: «3 суток», «двое суток», «3-х дней», «2 nights», «2-day»."""
+    s = str(text or "")
+    out = []
+    for m in _RX_COUNT.finditer(s):
+        w = m.group(1).lower()
+        n = int(w) if w.isdigit() else _CNT_WORDS.get(w)
+        if n is None or _CNT_SKIP_BEFORE.search(s[max(0, m.start() - 40):m.start()]) \
+                or _CNT_SKIP_AFTER.match(s, m.end()):
+            continue
+        out.append((m.start(), m.end(), n))
+    return out
+
+
+_RX_LEADS = re.compile(r"(?i)\s*(?:\(|с|from|на|for|:)?\s*")
+
+
+def _owner_of(ranges, a, b, sent):
+    """Чей это срок: число сразу вводит диапазон («на 3 дня с 5 по 7», «3 суток (с 5 по 7)») — его; иначе —
+    ближайший диапазон ПЕРЕД числом («5–7 октября — 3 суток, 5–8 — …»); перед числом нет — первый после."""
+    after = [r for r in ranges if r["a"] >= b]
+    if after and _RX_LEADS.fullmatch(sent[b:after[0]["a"]]):
+        return after[0]
+    before = [r for r in ranges if r["b"] <= a]
+    if before:
+        return before[-1]
+    return after[0] if after else ranges[0]
+
+
+def days_claims(text, today, known=(), price=None):
+    """Текст черновика → [(что, названо, по датам)] — число суток без опоры на даты:
+    (а) у диапазона дат в одном предложении названо число суток, и ни одно из них не равно разности дат;
+    (б) число суток без диапазона рядом, когда сутки известны (блок «СРОКИ», «ЦЕНА», диапазоны самого черновика),
+        и ни одно число суток черновика не совпало ни с одним известным. Пусто — сверять нечего или всё верно.
+    Поправка клиента («вы написали 3 дня, но с 5 по 7 — двое суток») причиной не становится: верное число названо."""
+    s = str(text or "")
+    out, free, every, ref = [], [], [], set(known or ())
+    for q in K.quotes_of(price):                          # каждый вариант цены (WAPRICECTX0410)
+        if isinstance(q.get("days"), int):
+            ref.add(q["days"])
+    for sent in K._SENTENCE.split(s):
+        ranges, counts = find_ranges(sent, today), day_counts(sent)
+        ref.update(r["days"] for r in ranges)
+        every += [n for _a, _b, n in counts]
+        if not ranges:
+            free += [n for _a, _b, n in counts]
+            continue
+        near = {}
+        for a, b, n in counts:                 # число — диапазону своего предложения (`_owner_of`)
+            r = _owner_of(ranges, a, b, sent)
+            near.setdefault(r["a"], (r, []))[1].append(n)
+        for r, ns in near.values():
+            if r["days"] not in ns:
+                out += [(r["label"], n, r["days"]) for n in ns]
+    if ref and free and not any(n in ref for n in every):
+        out += [("сутки без дат рядом", n, "/".join(str(x) for x in sorted(ref))) for n in free if n not in ref]
+    return out
+
+
 def _alnum(s):
     return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
 
@@ -241,6 +500,244 @@ def units_of(model, bikes):
     return [b.get("name") for b in bikes if mk and mk in _nocc(b.get("name"))]
 
 
+# ── вопрос о цене без модели или дат — варианты из переписки (WAPRICECTX0410) ───────────────
+# Повод — владелец 05.10, черновик №11: «сколько будет стоить?» относилось к вариантам из переписки, а цена бралась
+# только из слов клиента «сейчас». Вопрос о цене без модели или без двух дат дополняется последними сообщениями
+# диалога (новые первыми): пары «модель + срок», без повторов, не больше PAIRS_MAX, каждая — свой `K.quote` с прежними
+# воротами (срок до месяца, один сезон, модель с ценой и в парке).
+#
+# ПАРЫ НЕ БЫВАЮТ ЧУЖИМИ (WAPAIRS0410; повод — WACTXLIST0410 §4: вершина на входе №11 дала CB 650R 07.10–12.10 и
+# 07.10–10.10 — срок «5» из НАШЕЙ фразы о минимумах ушёл к CB 650R, диапазон с «of» прочитан двумя датами).
+# Пара — только из слов КЛИЕНТА: модель и срок, которые он связал в одном сообщении (его перечень «X или Y, N или M
+# суток» — каждая модель с каждым сроком; вперемешку «2 days CB 1 day ADV» — каждой модели свой срок, связь не ясна —
+# пары нет). Наши строки не дают ни сроков, ни моделей: наши минимумы и прежние числа клиентским сроком не становятся.
+# Срок из сообщения о ДРУГОЙ модели к модели вопроса не идёт. Срок вопроса без модели — к моделям самого нового
+# сообщения клиента с моделями; срок клиента без модели — к модели, только если клиент назвал ровно одну. Начало срока
+# числом суток — дата КЛИЕНТА (самый новый его диапазон, иначе первая дата самого нового его сообщения с датой); нет —
+# цена НЕИЗВЕСТНА, агент спрашивает даты. Сокращение модели без кубатуры («ADV», «NMAX») — ключ парка, только если в
+# парке одна модель с таким первым словом; иначе («CB»: CB 300 и CB 650R) модель НЕИЗВЕСТНА — двери нет.
+
+CTX_MSGS = 6                                   # сообщений диалога до вопроса, где ищутся модель и срок
+PAIRS_MAX = 3                                  # вариантов «модель + срок» на вопрос; дверь цены — не чаще
+NO_START_LINE = ("%s на %d сут.: цена НЕИЗВЕСТНА — дата начала аренды в переписке не названа. Числа цены не "
+                 "называть; спроси у клиента даты (с какого по какое число).")
+MODEL_UNKNOWN_LINE = ("«%s» на %d сут.: цена НЕИЗВЕСТНА — модель не определена: сокращение подходит к моделям парка "
+                      "%s. Числа цены не называть; спроси у клиента, какая модель.")
+WHO_CLIENT = "клиент"                          # метка роли строки истории (`wa_history.who_of`)
+_ALIAS_COMMON = frozenset(("click",))          # первое слово ключа — обычное слово («click the link»): не сокращение
+
+
+def _norm_map(text):
+    """Текст → (строка как у `B._nocc`: строчные латиница и цифры без «cc»; [место каждого её знака в тексте])."""
+    keep = [(c, i) for i, c in enumerate(str(text or "").lower()) if "a" <= c <= "z" or "0" <= c <= "9"]
+    out, i = [], 0
+    while i < len(keep):                       # «cc» снимается слева направо без перекрытий — как re.sub("cc", "")
+        if keep[i][0] == "c" and i + 1 < len(keep) and keep[i + 1][0] == "c":
+            i += 2
+            continue
+        out.append(keep[i])
+        i += 1
+    return "".join(c for c, _ in out), [p for _, p in out]
+
+
+def find_models(text, bikes):
+    """Модели из парка в тексте → [(место в тексте, модель)] по порядку, каждая один раз. Ключ — как у
+    `B.find_model` (живые имена парка без «CC»); совпадение внутри более длинного ключа — не своё."""
+    t, pos = _norm_map(text)
+    keys = {}
+    for b in bikes or ():
+        m = B.model_key((b or {}).get("name"))
+        k = B._nocc(m)
+        if len(k) >= 3:
+            keys.setdefault(k, m)
+    hits = []
+    for k, m in keys.items():
+        at = t.find(k)
+        while at >= 0:
+            hits.append((at, at + len(k), m))
+            at = t.find(k, at + 1)
+    hits = [h for h in hits if not any(o[0] <= h[0] and h[1] <= o[1] and o[1] - o[0] > h[1] - h[0] for o in hits)]
+    out, seen = [], set()
+    for a, _b, m in sorted(hits):
+        if m not in seen:
+            seen.add(m)
+            out.append((pos[a], m))
+    return out
+
+
+def model_hits(text, bikes):
+    """Модели в словах → [(начало, конец, модель | None, слово, [кандидаты])] по месту, КАЖДОЕ упоминание. Полный ключ
+    парка — как у `find_models`. Сокращение без кубатуры — первое слово ключа («ADV», «NMAX», «X-ADV» = XADV): модель,
+    только если в парке ОДНА модель с таким первым словом; несколько («CB»: CB 300CC и CB 650R) — модель None,
+    НЕИЗВЕСТНА (WAPAIRS0410 п.4). Сокращение с числом кубатуры не из парка («CB 500») — не модель, как и прежде."""
+    s = str(text or "")
+    t, pos = _norm_map(s)
+    keys, alias = {}, {}
+    for b in bikes or ():
+        m = B.model_key((b or {}).get("name"))
+        k = B._nocc(m)
+        if len(k) >= 3:
+            keys.setdefault(k, m)
+        toks = m.split()
+        if len(toks) > 1 and not re.search(r"\d", toks[0]):
+            a = re.sub(r"[^a-z0-9]", "", toks[0].lower())
+            if len(a) >= 2 and a not in _ALIAS_COMMON:
+                alias.setdefault(a, set()).add(m)
+    hits = []
+    for k, m in keys.items():
+        at = t.find(k)
+        while at >= 0:
+            hits.append((at, at + len(k), m))
+            at = t.find(k, at + 1)
+    hits = [h for h in hits if not any(o[0] <= h[0] and h[1] <= o[1] and o[1] - o[0] > h[1] - h[0] for o in hits)]
+    out = [(pos[a], pos[b - 1] + 1, m, m, [m]) for a, b, m in hits]
+    low = s.lower()
+    for w in re.finditer(r"(?<![a-z0-9-])[a-z0-9]+(?:-[a-z0-9]+)*", low):
+        a = w.group().replace("-", "")
+        if a not in alias or any(x < w.end() and w.start() < y for x, y, _m, _w, _c in out):
+            continue
+        if re.match(r"\s*-?\s*\d{3}", low[w.end():]):            # названа кубатура, которой нет в парке
+            continue
+        ms = sorted(alias[a])
+        out.append((w.start(), w.end(), ms[0] if len(ms) == 1 else None, s[w.start():w.end()], ms))
+    return sorted(out)
+
+
+_RX_COUNT_LIST = re.compile(
+    r"(?i)(?<![\w.,])((?:\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)) + r")"
+    r"(?:\s*(?:,|/|-|–|—|или|либо|or|to)\s*(?:\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)) +
+    r"))+)(?:-?(?:х|ти|ми|ух|ёх|ех))?(?:\s+|\s*-\s*)"
+    r"(?:сут(?:ки|ок|ка|кам|ках)|дн(?:я|ей|ям)|день|ноч(?:ь|и|ей)|days?|nights?)\b")
+_RX_COUNT_ONE = re.compile(r"(?i)\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)))
+
+
+def count_list(text):
+    """Числа суток клиента → [(место, число)] по порядку: как `day_counts` и ещё перечень «3 или 4 дня», «3 or 4 days»,
+    «3-4 дня» — каждое число (WAPAIRS0410 п.2; `day_counts` из «3 or 4 days» брал одно 4)."""
+    s = str(text or "")
+    out = {a: n for a, _b, n in day_counts(s)}
+    for m in _RX_COUNT_LIST.finditer(s):
+        if _CNT_SKIP_BEFORE.search(s[max(0, m.start() - 40):m.start()]) or _CNT_SKIP_AFTER.match(s, m.end()):
+            out = {a: n for a, n in out.items() if not m.start() <= a < m.end()}   # «минимум 3 или 4 дня» — не срок
+            continue
+        for x in _RX_COUNT_ONE.finditer(m.group(1)):
+            w = x.group().lower()
+            n = int(w) if w.isdigit() else _CNT_WORDS.get(w)
+            if n is not None:
+                out.setdefault(m.start(1) + x.start(), n)
+    return sorted(out.items())
+
+
+def _terms(text, today):
+    """Сроки сообщения → [{a, ds, de, days}]: диапазоны дат; их нет — числа суток («на 5 дней», «3 или 4 дня») без дат.
+    Диапазон без месяца («с 5 по 7») — срока нет: ни дат, ни уверенности в числе."""
+    rs = find_ranges(text, today)
+    full = [r for r in rs if r["ds"] is not None]
+    if full:
+        return [{"a": r["a"], "ds": r["ds"], "de": r["de"], "days": r["days"]} for r in full]
+    if rs:
+        return []
+    return [{"a": a, "ds": None, "de": None, "days": n} for a, n in count_list(text) if 0 < n <= TERM_MAX_DAYS]
+
+
+def context_start(msgs, today):
+    """Начало срока из слов КЛИЕНТА (его сообщения, новые первыми; WAPAIRS0410 п.3): самый новый диапазон дат — его
+    начало; диапазонов нет — первая дата самого нового сообщения с датой; дат нет — None (двери нет)."""
+    for text in msgs:
+        full = [r for r in find_ranges(text, today) if r["ds"] is not None]
+        if full:
+            return full[0]["ds"]
+    for text in msgs:
+        dates = find_dates(text, today)
+        if dates:
+            return dates[0]
+    return None
+
+
+def _ident(hit):
+    """Упоминание модели → ключ тождества: модель парка; сокращение НЕИЗВЕСТНОЙ модели — «?» + слово."""
+    return hit[2] if hit[2] is not None else "?" + hit[3].lower()
+
+
+def _distinct(hits):
+    out, seen = [], set()
+    for h in hits:
+        if _ident(h) not in seen:
+            seen.add(_ident(h))
+            out.append(h)
+    return out
+
+
+def _link(hits, terms):
+    """Модели и сроки ОДНОГО сообщения клиента → [(упоминание, срок)] — что связал клиент. Одна модель или один срок,
+    либо все сроки по одну сторону от всех моделей («ADV 350 или CB 650R, 3 или 4 дня») — перечень: каждая модель с
+    каждым сроком. Вперемешку — каждой модели сроки между ней и соседней моделью: после неё («CB на 3 дня, ADV на 2»)
+    или перед ней («2 days CB 1 day ADV»); подходят обе стороны или ни одна — связь не ясна, пар нет."""
+    if not hits or not terms:
+        return []
+    ms, ts = sorted(hits), sorted(terms, key=lambda t: t["a"])
+    if len(ms) == 1 or len(ts) == 1 or ts[-1]["a"] < ms[0][0] or ms[-1][0] < ts[0]["a"]:
+        return [(h, t) for h in ms for t in ts]
+    after = [[t for t in ts if h[0] < t["a"] and (i + 1 == len(ms) or t["a"] < ms[i + 1][0])] for i, h in enumerate(ms)]
+    before = [[t for t in ts if t["a"] < h[0] and (i == 0 or ms[i - 1][0] < t["a"])] for i, h in enumerate(ms)]
+    ok_after = all(after) and sum(len(g) for g in after) == len(ts)
+    ok_before = all(before) and sum(len(g) for g in before) == len(ts)
+    if ok_after == ok_before:
+        return []
+    return [(h, t) for h, g in zip(ms, after if ok_after else before) for t in g]
+
+
+def _who_text(c):
+    """Элемент переписки → (кто, текст): `_context` даёт (кто, текст); голая строка — автор неизвестен, не клиент."""
+    if isinstance(c, (tuple, list)) and len(c) == 2:
+        return str(c[0] or ""), str(c[1] or "")
+    return "", str(c or "")
+
+
+def price_pairs(ask, ctx, today, bikes):
+    """Вопрос о цене + сообщения диалога до него (новые первыми; (кто, текст)) → ([(модель, {ds, de, days})],
+    отброшено сверх PAIRS_MAX). Модель — имя модели парка либо {"alias", "cands"} — сокращение, подходящее к нескольким
+    моделям (цена НЕИЗВЕСТНА). Пары — только из слов клиента (WAPAIRS0410, шапка раздела): в вопросе модель и срок —
+    что связал вопрос; только модель — сроки, которые клиент связал с ЭТОЙ моделью в самом новом таком сообщении (срок без
+    модели — если клиент назвал одну модель); только срок — модели самого нового сообщения клиента с моделями; ни того,
+    ни другого — пары, которые клиент связал сам, по сообщениям. Срок числом суток — от `context_start` слов клиента;
+    начала нет — ds и de None (цены нет, агент спрашивает даты)."""
+    msgs = [(WHO_CLIENT, str(ask or ""))] + [_who_text(c) for c in list(ctx or ())[:CTX_MSGS]]
+    mine = [t for who, t in msgs if who == WHO_CLIENT]           # слова клиента, новые первыми; [0] — вопрос
+    parsed = [(model_hits(t, bikes), _terms(t, today)) for t in mine]
+    a_hits, a_terms = parsed[0]
+    dates = find_dates(mine[0], today)
+    if not a_terms and len(dates) >= 2 and dates[1] > dates[0]:      # две даты вопроса — срок, как раньше
+        a_terms = [{"a": 0, "ds": dates[0], "de": dates[1], "days": term_days(dates[0], dates[1])}]
+    named = _distinct([h for hs, _ts in parsed for h in hs])
+    solo = named[0] if len(named) == 1 and named[0][2] is not None else None
+    raw = []
+    if a_hits and a_terms:
+        raw = _link(a_hits, a_terms)
+    elif a_hits:
+        for h in _distinct(a_hits):
+            got = next((g for g in ([p for p in _link(hs, ts) if _ident(p[0]) == _ident(h)] for hs, ts in parsed[1:])
+                        if g), [])
+            if not got and solo is not None and _ident(h) == _ident(solo):
+                got = [(h, t) for t in next((ts for hs, ts in parsed[1:] if ts and not hs), [])]
+            raw += got
+    elif a_terms:
+        raw = [(h, t) for h in _distinct(next((hs for hs, _ts in parsed[1:] if hs), [])) for t in a_terms]
+    else:
+        for hs, ts in parsed[1:]:
+            raw += _link(hs, ts) if hs else [(solo, t) for t in ts] if solo is not None else []
+    start = context_start(mine, today)
+    pairs, seen = [], set()
+    for h, t in raw:
+        if t["ds"] is None and start is not None:
+            t = dict(t, ds=start, de=start + datetime.timedelta(days=t["days"]))
+        key = (_ident(h), t["ds"], t["de"], t["days"])
+        if key not in seen:
+            seen.add(key)
+            pairs.append((h[2] if h[2] is not None else {"alias": h[3], "cands": list(h[4])}, t))
+    return pairs[:PAIRS_MAX], max(0, len(pairs) - PAIRS_MAX)
+
+
 # ── ответ модели ───────────────────────────────────────────────────────────────────────
 
 def parse_reply(raw):
@@ -259,8 +756,27 @@ def parse_reply(raw):
         return None
     hand = data.get("handoff")
     hand = [str(h).strip() for h in hand if str(h).strip()] if isinstance(hand, list) else []
-    return {"text": text.strip(), "lang": str(data.get("lang") or "").strip().lower()[:8],
-            "handoff": hand[:8], "why": str(data.get("why") or "").strip()[:300]}
+
+    out = {"text": text.strip(), "lang": str(data.get("lang") or "").strip().lower()[:8],
+           "handoff": hand[:8], "why": str(data.get("why") or "").strip()[:300]}
+    for key, cap in (("q_ru", TR_Q_MAX), ("text_ru", TR_A_MAX)):   # перевод для сотрудника (WACARDQ0410) — если дан
+        v = data.get(key)
+        if isinstance(v, str) and v.strip():
+            out[key] = v.strip()[:cap]
+    return out
+
+
+def card_fields(info, got):
+    """Поля карточки сотрудника (WACARDQ0410): вопрос — из блока последних реплик клиента, что ушёл в модель (под
+    маской); язык — кодом; переводы — только при не русском вопросе. Клиенту из этого не уходит ничего.
+    Вопроса в сведениях нет (сборка без него) — полей нет: карточка прежняя."""
+    question = info.get("question")
+    if question is None:
+        return {}
+    lang = info.get("q_lang")
+    keep = need_translation(lang)
+    return {"question": question, "q_lang": lang or "",
+            "q_ru": got.get("q_ru", "") if keep else "", "text_ru": got.get("text_ru", "") if keep else ""}
 
 
 # ── кэш промпта и цена по usage (WAAGENTCACHE0210) ─────────────────────────────────────
@@ -424,6 +940,17 @@ def paid_call(model_name=None, env_file=None):
     return call
 
 
+def door_budget(seconds):
+    """Общий бюджет плеч моста на время сверки (AGENTDEDUP0410): двери кассы и договоров — методы `bridge_client`, и их
+    лестницы повторов режутся тем же `card_budget`, что у карточки «Инфо». Модуля нет (ПК без fcntl) — без бюджета."""
+    try:
+        import bridge_client
+        return bridge_client.card_budget(seconds, label="сверки агента")
+    except Exception:                                                # noqa: BLE001
+        import contextlib
+        return contextlib.nullcontext()
+
+
 # ── адаптер ────────────────────────────────────────────────────────────────────────────
 
 class ModelAdapter(wa_agent.Model):
@@ -434,8 +961,12 @@ class ModelAdapter(wa_agent.Model):
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
                  manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db="",
-                 lessons_db="", book=None, cache=None):
+                 lessons_db="", book=None, cache=None, tools=None, fresh=None):
         self.queue_db, self.call = queue_db, call
+        # инструменты чтения (AGENTLOOPA0310, флаг WA_AGENT_TOOLS): None — выкл, черновик одним вызовом, как в 9c4aac6;
+        # dict дверей моста (cash/contract/contract_pdf) — модель сама выбирает, что прочитать (`wa_agent_tools`)
+        self.tools = tools
+        self.fresh = fresh                                # fresh(number, upto_id) → новое входящее посреди сверки
         self.cache = cache if cache in CACHE_TTLS else None   # срок кэша промпта (WAAGENTCACHE0210); None — выкл
         self.spend = {"calls": 0, "in": 0, "cw": 0, "cr": 0, "out": 0, "usd": 0.0, "usd_nocache": 0.0}
         self.book = book                                  # снимок броней `wa_book_read.Snapshot`; None — выкл
@@ -512,12 +1043,14 @@ class ModelAdapter(wa_agent.Model):
             self.log("уроки не прочитаны: %s — блока уроков нет" % type(e).__name__)
             return []
 
-    def _price(self, ask, today):
-        """Цена — только на вопрос о цене с моделью и обеими датами. → (исход quote | None, слова)."""
+    def _price(self, ask, today, ctx=()):
+        """Цена — только на вопрос о цене. Одна модель и обе даты в вопросе — одна дверь, как раньше; модели или дат
+        нет (или моделей несколько) — варианты «модель + срок» из вопроса и переписки `ctx` (сообщения до вопроса, новые
+        первыми; `price_pairs`, WAPRICECTX0410), каждый — свой `K.quote`. → (исход | None, слова)."""
         if not _PRICE_ASK.search(ask):
             return None, "о цене не спрашивают"
         dates = find_dates(ask, today)
-        if len(dates) < 2:
+        if len(dates) < 2 and not ctx:
             return None, "о цене спрашивают без дат — дверь не звана"
         if self.fleet is None or self.door is None:
             return None, "двери цены нет"
@@ -527,13 +1060,53 @@ class ModelAdapter(wa_agent.Model):
             bikes = None
             self.log("парк не прочитан: %s" % type(e).__name__)
         if bikes is None:
+            if len(dates) < 2:                                       # моделей переписки не найти — как без дат
+                return None, "о цене спрашивают без дат, парк не прочитан — дверь не звана"
             return K.quote("?", dates[0], dates[1], self.door, lambda m: None), "парк не прочитан"
-        model = B.find_model(ask, bikes)                            # ключ модели — живые имена парка
-        if not model:
-            return None, "о цене спрашивают без модели из парка — дверь не звана"
-        res = K.quote(model, dates[0], dates[1], self.door, lambda m: units_of(m, bikes),
-                      self.no_price_models)
-        return res, "цена: %s" % res["outcome"]
+        if len(dates) >= 2 and len(find_models(ask, bikes)) <= 1:
+            model = B.find_model(ask, bikes)                        # ключ модели — живые имена парка
+            if model:
+                res = K.quote(model, dates[0], dates[1], self.door, lambda m: units_of(m, bikes),
+                              self.no_price_models)
+                return res, "цена: %s" % res["outcome"]
+        pairs, dropped = price_pairs(ask, ctx, today, bikes)
+        if not pairs:
+            return None, ("о цене спрашивают без модели из парка — дверь не звана" if len(dates) >= 2 else
+                          "о цене спрашивают без дат — дверь не звана")
+        got = [self._quote_pair(m, t, bikes) for m, t in pairs]
+        n = {o: sum(1 for r in got if r["outcome"] == o) for o in (K.PRICE_NUMBER, K.PRICE_HUMAN, K.PRICE_UNKNOWN)}
+        return K.price_set(got, dropped), "цена по переписке: вариантов %d (число %d, человек %d, неизвестно %d)%s" % (
+            len(got), n[K.PRICE_NUMBER], n[K.PRICE_HUMAN], n[K.PRICE_UNKNOWN],
+            ", сверх предела %d" % dropped if dropped else "")
+
+    def _quote_pair(self, model, term, bikes):
+        """Пара «модель + срок» → исход `K.quote` (прежние ворота). Модель НЕИЗВЕСТНА (сокращение подходит к нескольким
+        моделям, WAPAIRS0410) или начала срока нет — дверь не зовётся: цена неизвестна, агент спрашивает модель или
+        даты."""
+        if isinstance(model, dict):
+            res = K.quote(model["alias"], None, None, self.door, lambda m: None)
+            res.update(days=term["days"], why="модель не определена",
+                       line=MODEL_UNKNOWN_LINE % (model["alias"], term["days"], " / ".join(model["cands"])))
+            return res
+        if term["ds"] is None:
+            res = K.quote(model, None, None, self.door, lambda m: None)
+            res.update(days=term["days"], why="дата начала не названа", line=NO_START_LINE % (model, term["days"]))
+            return res
+        return K.quote(model, term["ds"], term["de"], self.door, lambda m: units_of(m, bikes), self.no_price_models)
+
+    @staticmethod
+    def _context(items, tail):
+        """Сообщения диалога ДО вопроса клиента (наши и клиента, без автоприветствия) под маской, новые первыми, не
+        больше CTX_MSGS: [(кто, текст)] — в словах клиента ищутся модель и срок вопроса о цене (WAPRICECTX0410,
+        WAPAIRS0410: наши строки пар не дают)."""
+        skip, out = {id(it) for it in tail}, []
+        for it in reversed(items):
+            if it.get("auto") or id(it) in skip or not it.get("text"):
+                continue
+            out.append((it.get("who") or "", K.mask(it["text"])[0]))
+            if len(out) >= CTX_MSGS:
+                break
+        return out
 
     def _book(self, number, ask, today, now):
         """Брони на чтение (WABOOKTOOLS0210) — кодом ДО модели и только на явный вопрос: о свободном байке
@@ -584,7 +1157,9 @@ class ModelAdapter(wa_agent.Model):
         ask_raw = "\n".join(it["text"] or ("[%s]" % it["word"] if it["word"] else "") for it in tail)
         ask, n_mask2 = K.mask(ask_raw[-TAIL_MAX:])
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
-        price, price_words = self._price(ask, today)
+        terms = client_terms(items, today)              # сутки каждому диапазону дат клиента — кодом (WADAYS0410)
+        ctx = self._context(items, tail)                # переписка до вопроса: модель и срок цены (WAPRICECTX0410)
+        price, price_words = self._price(ask, today, ctx)
         reasons = K.handoff(ask, price)
         avail, rental, book_words = self._book(number, ask, today, now)
         if avail is not None or rental is not None:
@@ -606,25 +1181,48 @@ class ModelAdapter(wa_agent.Model):
         lesson_text, n_mask3 = K.mask(lessons_block(lessons))
         if lesson_text:
             blocks.append(lesson_text)
+        terms_text = terms_line(terms)
+        if terms_text:
+            blocks.append(terms_text)
         if "price" in parts:
             blocks.append(parts["price"])
         blocks += [fact["line"] for fact in (avail, rental) if fact is not None]
         if "handoff" in parts:
             blocks.append(parts["handoff"])
+        question = ask or "[пусто]"                     # ровно то, что уйдёт последним блоком (WACARDQ0410)
+        q_lang = question_lang(question)
+        if need_translation(q_lang):
+            blocks.append(TR_BLOCK)
         blocks.append("ИСТОРИЯ ПЕРЕПИСКИ (вся, по времени; «мы» — наша сторона):\n" +
                       (hist or "переписки раньше не было") +
                       ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
-        blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + (ask or "[пусто]"))
+        blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + question)
         user = "\n\n".join(blocks)
         system = self._system(SYSTEM_PROMPT if self.book is None else SYSTEM_PROMPT_BOOK, node_list, now)
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
                 "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
-                "avail": avail, "rental": rental, "book_words": book_words,
-                "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache}
+                "avail": avail, "rental": rental, "book_words": book_words, "today": today, "terms": terms,
+                "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache,
+                "question": question, "q_lang": q_lang,           # карточка сотрудника (WACARDQ0410)
+                # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
+                "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
         return system, user, info
 
+    def _days_check(self, text, info, words):
+        """Сверка суток черновика (WADAYS0410): у диапазона дат число суток не равно разности — причина «нужен
+        человек» первой строкой, «Отправить» на версии 1 закрыто (тот же замок, что у денег без опоры). Текст
+        не правится; в журнал — только числа."""
+        bad = days_claims(text, info.get("today"), [r["days"] for r in info.get("terms") or ()], info.get("price"))
+        if not bad:
+            return words
+        self.log("модель: сутки не по датам %d (названо %s, по датам %s) — причина «нужен человек»"
+                 % (len(bad), ",".join(str(n) for _w, n, _r in bad), ",".join(str(r) for _w, _n, r in bad)))
+        return K.reason_first(words, K.DAYS_CLAIM_WORDS)
+
     def draft(self, number, upto_id):
+        if self.tools is not None:
+            return self._draft_tools(number, upto_id)
         system, user, info = self.build(number, upto_id)
         raw, usage = self.call(system, user)
         self._spend(usage, "черновик:")
@@ -639,6 +1237,7 @@ class ModelAdapter(wa_agent.Model):
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
         words = K.merge_reasons(words, got["handoff"])      # дедуп по категории (WACARDCOMPACT0310)
+        words = self._days_check(got["text"], info, words)   # сутки у дат не по разности — причина (WADAYS0410)
         # деньги в тексте черновика (WAMONEYCHECK0310): процент предоплаты, депозита или скидки и сумма в батах не из
         # блока «ЦЕНА» этого вызова — причина «нужен человек» ПЕРВОЙ строкой (на карточке видна при любом числе
         # причин). Текст ответа не правится. В журнал — только числа: текст черновика туда не идёт.
@@ -651,7 +1250,91 @@ class ModelAdapter(wa_agent.Model):
         self.log("модель: черновик %d симв., история %d строк / %d симв., маска %d, %s, причин %d (%s)"
                  % (len(got["text"]), info["history_items"], info["history_chars"], info["masked"],
                     info["price_words"], len(words), tok))
-        return {"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]}
+        return dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]},
+                    **card_fields(info, got))
+
+    # ── черновик со сверкой (AGENTLOOPA0310, Т4а) ─────────────────────────────────────────
+
+    def _tool_doors(self, number, upto_id):
+        """Двери адаптера (переписка, аренда, правила) + двери моста из `self.tools`. Все — только чтение."""
+        def history():
+            items, _missing = self._history(number, upto_id)
+            return items
+
+        def rental():
+            if self.book is None:
+                return {"ok": False, "error": "брони выключены"}
+            rows, _bikes, _age, why = self.book.get(self.clock())
+            if rows is None:
+                return {"ok": False, "error": why or "снимок броней не прочитан"}
+            digits = re.sub(r"\D", "", str(number or ""))
+            key = digits[-B.KEY_DIGITS:] if len(digits) >= B.KEY_DIGITS else None
+            hits = [r for r in rows if key and B.is_active(r) and key in B.phone_keys(r.get("contacts"))]
+            return {"ok": True, "rows": hits}
+
+        def rules():
+            return self.knowledge.snap.get("business_rules")
+
+        doors = {"history": history, "rental": rental, "rules": rules}
+        doors.update({k: v for k, v in (self.tools or {}).items() if k in ("cash", "contract", "contract_pdf")})
+        return doors
+
+    def _draft_tools(self, number, upto_id):
+        """Сверка: модель вызывает инструменты (≤ T.MAX_CALLS вызовов, ≤ T.MAX_SEC с), код принимает факты, считает
+        суммы и судит денежные роли. Предел превышен — обычный черновик одним вызовом без фактов и причина «сверка не
+        завершена» первой. Новое входящее посреди сверки — черновика нет (служба повторит позже)."""
+        import wa_agent_tools as T
+        system, user, info = self.build(number, upto_id)
+        with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
+            out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
+                        fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
+                        spend=lambda u: self._spend(u, "сверка:"))
+        jr = out["journal"]
+        if out["state"] == T.ABORTED:
+            for line in jr.lines():
+                self.log(line)
+            self.log("сверка прервана: новое входящее — черновика нет")
+            self.last = {"info": info, "tools": out}
+            return None
+        reasons, raw, usage = [], out["raw"], out["usage"]
+        if out["state"] == T.OVER:
+            if self.clock() >= out["deadline"]:              # общий предел — и для запасного пути (AGENTDEDUP0410)
+                for line in jr.lines():
+                    self.log(line)
+                self.log("сверка: общий предел %d с исчерпан — запасной вызов не начат, черновика нет (повтор позже)"
+                         % T.MAX_SEC)
+                self.last = {"info": info, "tools": out, "fallback": False}
+                return None
+            raw, usage = self.call(system, user)                # тот же один вызов, что и без флага
+            self._spend(usage, "черновик:")
+            reasons = [T.INCOMPLETE_WORDS]
+            out["results"] = []                                 # факты незавершённой сверки не опора
+        got = parse_reply(raw)
+        # процент скидки за срок, названной дверью, — с опорой (WAPRICECTX0410): судья сверки процент судит без
+        # исхода цены, поэтому названная дверью скидка снимается из текста до суда; прочее — как было
+        said = K.without_known_discount(got["text"], info["price"]) if got else ""
+        words_t, figures = T.judge(said, info["price"], out["results"], jr,
+                                   since=info.get("last_in"))
+        for line in jr.lines():
+            self.log(line)
+        self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got, "tools": out, "figures": figures}
+        if got is None:
+            self.log("модель: ответ не JSON или без текста — черновика нет (сверка %s, вызовов %d)"
+                     % (out["state"], out["calls"]))
+            return None
+        words = [r["words"] for r in info["code_reasons"]]
+        if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
+            words.append(K.REASON_WORDS[K.R_LANGUAGE])
+        words = K.merge_reasons(words, got["handoff"])
+        words = self._days_check(got["text"], info, words)      # сутки у дат (WADAYS0410)
+        for w in reversed(words_t):                             # причины кода о деньгах — вперёд
+            words = K.reason_first(words, w)
+        for w in reversed(reasons):                             # «сверка не завершена» — самой первой
+            words = K.reason_first(words, w)
+        self.log("модель: черновик %d симв. со сверкой (%s, вызовов %d, %.1f с), причин %d"
+                 % (len(got["text"]), out["state"], out["calls"], out["sec"], len(words)))
+        return dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"]},
+                    **card_fields(info, got))
 
     # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────
 

@@ -81,6 +81,7 @@ F_LESSON_ADMINS = "WA_AGENT_LESSON_ADMINS"  # кто переводит урок
 F_FOLLOW = "WA_AGENT_FOLLOWUP"            # напоминание притихшему (WAFOLLOWUP0210)
 F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чтение: наличие и конец аренды (WABOOKTOOLS0210)
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
+F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 
@@ -137,7 +138,7 @@ class NoModel(wa_agent.Model):
         return None
 
 
-def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False, cache=None):
+def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False, cache=None, tools=False):
     """Адаптер модели (WAAGENTMODEL0210): история — очередь и архив службы показа, знания, парк и цена —
     мост (только чтение), плательщик — платный ключ тем же путём, что у Splinter. → (модель | None, почему).
     Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели.
@@ -160,7 +161,10 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
         agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)),
         lessons_db=(env.get("agent_db") or "") if lessons else "",
         book=wa_book_read.Snapshot(lambda: bridge.clients(filter="all"), bridge.fleet) if book else None,
-        cache=cache)
+        cache=cache,
+        # WA_AGENT_TOOLS (AGENTLOOPA0310): двери чтения кассы и договоров; выкл — None, черновик как в 9c4aac6
+        tools={"cash": bridge.tx_find, "contract": bridge.contract_find,
+               "contract_pdf": bridge.contract_pdf} if tools else None)
     return model, ""
 
 
@@ -320,10 +324,15 @@ def main():
     model, why = None, ""
     if flags_of(os.environ)[F_DRAFTS]:
         import wa_agent_model
+        # WA_AGENT_TOOLS выкл — вызов той же формы, что в 9c4aac6 (без ключа tools)
+        more = {"tools": True} if wa_agent_tg.flag_on(os.environ.get(F_TOOLS)) else {}
         model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)),
                                 book=wa_agent_tg.flag_on(os.environ.get(F_BOOK)),
-                                cache=wa_agent_model.cache_ttl_of(os.environ.get(F_CACHE)))
+                                cache=wa_agent_model.cache_ttl_of(os.environ.get(F_CACHE)), **more)
     core, tg, _flags, words = build(env, model=model)
+    if model is not None and getattr(model, "tools", None) is not None:
+        # новое входящее посреди сверки обрывает её (AGENTLOOPA0310): тот же признак, что ядро судит после модели
+        model.fresh = lambda number, upto: core._fresh(number, upto) is not None
     log.info("%s", start_line(env, words))
     if why:
         log.info("wa-agent: WA_AGENT_DRAFTS=1, но %s — черновиков нет", why)

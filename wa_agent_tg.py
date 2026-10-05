@@ -24,6 +24,12 @@
 влезает сам ответ — он уходит отдельным сообщением перед карточкой (`tg_card_parts`, реплай на него — та же
 правка). «why» модели на карточке не показывается.
 
+ВОПРОС И ПЕРЕВОД (WACARDQ0410). Над ответом — вопрос клиента: блок его последних реплик, ушедший в модель (под
+маской; `Core.card_extra`). Язык вопроса не русский (вердикт кода) — под ответом перевод вопроса и ответа на русский с
+пометкой «перевод для сотрудника, клиенту не уходит»; перевода нет — «перевода нет: модель не дала»; у версии человека —
+«перевод — к версии 1». Резка по порядку: подробности, переводы, вопрос (с числом скрытых знаков); ответ — никогда.
+«Отправить» шлёт только текст ответа. Вопроса у ядра нет (черновик старше, напоминание) — карточка прежняя.
+
 «ИСПРАВИТЬ». Кнопка только подсказывает; правка — РЕПЛАЙ человека на карточку: `Core.revise` с
 версией карточки, новая карточка версии +1, «Отправить» на ней шлёт текст человека дословно.
 Реплай на прежнюю версию — «устарело».
@@ -53,8 +59,12 @@
 наружу не идут; бот (и «от имени группы») — тоже. Исход в теме: отправлено — реакция бота 👌 на
 сообщение человека; не отправлено — ответ с причиной словами; неизвестно — «не знаю, дошло ли», без
 повтора. Правка — не уходит, одна строка в ответ. Удаление сообщения Bot API боту не присылает.
-«Отправить» по черновику — строкой «мы · агент, отправил <имя>: текст» в теме клиента.
 Выключатель `WA_AGENT_RELAY` по умолчанию выключен — сообщения тем не читаются и не отправляются.
+
+СТРОКА ПОКАЗА УШЕДШЕГО АГЕНТОМ (WAMIRROR0410). «Отправить» по черновику — строкой в теме клиента (`agent_line`):
+время, «агент», кто подтвердил, № черновика, версия, часть, текст; «неизвестно» — «исход неизвестен, проверьте
+телефон». Флаг relay её больше не решает; строку собирает и хранит ядро (`Core.show_agent`, ключ «wamid|часть»).
+Строку пишет бот — в WhatsApp она не уходит: из темы наружу идёт только сообщение человека (`on_topic`).
 
 УРОКИ ЛЮДЕЙ (WAAGENTLESSON0210). Принятое «Исправить» при включённых уроках — на новой карточке строка
 «📚 урок №N записан кандидатом», ниже отдельным сообщением урок: было/стало, автор, источник и кнопка
@@ -110,7 +120,6 @@ NO_CAPTION_GEN = {"voice": "голосового", "audio": "аудио", "stick
 NO_PAIR = (("contact", "контакт"), ("poll", "опрос"), ("dice", "кубик"), ("game", "игра"),
            ("story", "история"), ("paid_media", "платное медиа"), ("invoice", "счёт"),
            ("giveaway", "розыгрыш"), ("checklist", "список задач"))
-AGENT_LINE = "мы · агент, отправил %s: %s"
 POLL_RETRY_SEC = 1                 # getUpdates не удался — следующий опрос не раньше
 CONFLICT_PAUSE = 30                # 409 (второй читатель) — следующий опрос не раньше; такт идёт
 
@@ -151,6 +160,7 @@ CARD_ACTIONS = {
     K.R_LANGUAGE: "язык: проверьте, что ответ на языке клиента",
     K.R_MONEY_CLAIM: "деньги в ответе: агент назвал процент или сумму без опоры — проверьте и исправьте",
     K.R_STALE: "знания устарели: агент писал без свежих правил и FAQ — сверьте ответ сами",   # WAKNOWFRESH0310
+    K.R_DAYS_CLAIM: K.DAYS_CLAIM_WORDS,                                                   # WADAYS0410
 }
 W_HAND = "🙋 НУЖЕН ЧЕЛОВЕК — сделайте:"
 W_DOOR_CLOSED = "⛔ отправка выключена — ответьте клиенту сами"
@@ -163,6 +173,21 @@ W_DETAILS_CUT = "…\n(скрыто знаков подробностей: %d)"
 W_DETAILS_HIDDEN = "\n\n(подробности скрыты: %d знаков)"
 W_ANSWER_LEAD = " · ответ клиенту целиком, карточка — следующим сообщением:\n\n"
 W_ANSWER_ABOVE = "\n↑ ответ клиенту — сообщением выше (%d знаков)\n\n"
+
+# вопрос клиента и перевод для сотрудника (WACARDQ0410)
+W_Q_HEAD = "❓ клиент спрашивает:"
+W_A_HEAD = "✉️ ответ клиенту:"
+W_A_LEAD_Q = "✉️ ответ клиенту целиком, карточка — следующим сообщением:\n\n"
+W_Q_CUT = "…\n(скрыто знаков вопроса: %d)"
+W_Q_HIDDEN = "(вопрос не поместился: %d знаков)"
+W_TR_HEAD = "🔤 перевод для сотрудника, клиенту не уходит:"
+W_TR_Q, W_TR_A = "вопрос: ", "ответ: "
+W_TR_EMPTY = "— (модель не дала)"
+W_TR_NONE = "🔤 перевода нет: модель не дала"
+W_TR_VER = "🔤 перевод — к версии %d; у этой версии (текст человека) перевода нет"
+W_TR_CUT = "…\n(скрыто знаков перевода: %d)"
+W_TR_HIDDEN = "(перевод не поместился: %d знаков)"
+Q_SPLIT_MAX = 1000                  # вопрос над ответом, ушедшим отдельным сообщением, — не длиннее, знаков
 
 # уроки людей (WAAGENTLESSON0210)
 LESSON_TEXT_MAX = 1500                           # было/стало в сообщении урока, символов
@@ -380,20 +405,82 @@ def fit_details(head, details, room=CARD_ROOM):
     return hidden if len(hidden) <= room else None
 
 
-def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX):
+def card_trans(extra):
+    """Поля карточки ядра (`Core.card_extra`) → (строка блока перевода | "", тело | ""). Вопрос русский или букв нет —
+    ("", ""): перевода не бывает. Перевод этой версии — заголовок с пометкой и оба перевода; перевод есть, но к другой
+    версии — «перевод — к версии N»; перевода нет — «перевода нет: модель не дала» (WACARDQ0410)."""
+    if not extra or extra.get("q_lang") in (None, "", "ru"):
+        return "", ""
+    q_ru, a_ru = extra.get("q_ru"), extra.get("a_ru")
+    if q_ru or a_ru:
+        return W_TR_HEAD, W_TR_Q + (q_ru or W_TR_EMPTY) + "\n" + W_TR_A + (a_ru or W_TR_EMPTY)
+    if extra.get("tr_ver"):
+        return W_TR_VER % int(extra["tr_ver"]), ""
+    return W_TR_NONE, ""
+
+
+def _cut(body, over, cut_word, hidden_word):
+    """Тело короче на over знаков с числом скрытых | «не поместился» с числом знаков вместо тела."""
+    keep = len(body) - over - len(cut_word % len(body))
+    if keep >= 1:
+        return body[:keep] + cut_word % (len(body) - keep)
+    return hidden_word % len(body)
+
+
+def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX, question="", trans=("", "")):
     """→ [тексты сообщений]; последнее — карточка с кнопками. Ответ клиенту не режется НИКОГДА: не влезает
     карточка — режутся подробности; не влезает сам ответ — он уходит отдельно (длиннее сообщения —
-    подряд несколькими), карточка — следующим сообщением."""
-    one = fit_details(top + "\n\n" + answer + "\n\n" + notes, details, room)
+    подряд несколькими), карточка — следующим сообщением.
+    question — вопрос клиента над ответом, trans — (строка, тело) перевода под ответом (WACARDQ0410); вопроса нет —
+    карточка байт-в-байт прежняя. Резка по порядку: подробности, переводы, вопрос; ответ — нет."""
+    if not question:
+        one = fit_details(top + "\n\n" + answer + "\n\n" + notes, details, room)
+        if one is not None:
+            return [one]
+        first = top + W_ANSWER_LEAD
+        parts, rest = [first + answer[:msg_max - len(first)]], answer[msg_max - len(first):]
+        while rest:
+            parts.append(rest[:msg_max])
+            rest = rest[msg_max:]
+        card_head = top + W_ANSWER_ABOVE % len(answer) + notes
+        return parts + [fit_details(card_head, details, room) or card_head[:room]]
+    th, tb_full = trans or ("", "")
+
+    def tr_part(tb):
+        return th + ("\n" + tb if tb else "")
+
+    def head(qb, tb):
+        return "\n\n".join([top, W_Q_HEAD + "\n" + qb, W_A_HEAD + "\n" + answer] + ([tr_part(tb)] if th else [])
+                           + [notes])
+
+    one = fit_details(head(question, tb_full), details, room)
     if one is not None:
         return [one]
-    first = top + W_ANSWER_LEAD
+    hid = W_DETAILS_HIDDEN % len(details) if details else ""
+    tb = tb_full
+    if tb:                                          # подробности уже скрыты — режутся переводы
+        tb = _cut(tb, len(head(question, tb)) + len(hid) - room, W_TR_CUT, W_TR_HIDDEN)
+        if len(head(question, tb)) + len(hid) <= room:
+            return [head(question, tb) + hid]
+    qb = _cut(question, len(head(question, tb)) + len(hid) - room, W_Q_CUT, W_Q_HIDDEN)   # затем вопрос
+    if len(head(qb, tb)) + len(hid) <= room:
+        return [head(qb, tb) + hid]
+    # не влезает сам ответ — он отдельно; вопрос над ним, в первом сообщении
+    qs = question if len(question) <= Q_SPLIT_MAX else _cut(question, len(question) - Q_SPLIT_MAX, W_Q_CUT,
+                                                            W_Q_HIDDEN)
+    first = top + "\n\n" + W_Q_HEAD + "\n" + qs + "\n\n" + W_A_LEAD_Q
     parts, rest = [first + answer[:msg_max - len(first)]], answer[msg_max - len(first):]
     while rest:
         parts.append(rest[:msg_max])
         rest = rest[msg_max:]
-    card_head = top + W_ANSWER_ABOVE % len(answer) + notes
-    return parts + [fit_details(card_head, details, room) or card_head[:room]]
+
+    def card_head(tb):
+        return top + W_ANSWER_ABOVE % len(answer) + ((tr_part(tb) + "\n\n") if th else "") + notes
+    card = fit_details(card_head(tb_full), details, room)
+    if card is None and tb_full:
+        card = card_head(_cut(tb_full, len(card_head(tb_full)) + len(hid) - room, W_TR_CUT, W_TR_HIDDEN)) + hid
+        card = card if len(card) <= room else None
+    return parts + [card or card_head("")[:room]]
 
 
 class Tg(wa_agent.Telegram):
@@ -503,8 +590,12 @@ class Tg(wa_agent.Telegram):
         door_open = door() if door else True
         name, link = self._topic(number)
         top = "%s №%d · версия %d · %s" % ("🔔 Напоминание" if follow else "📝 Черновик", draft_id, ver, name)
+        # вопрос клиента над ответом и перевод для сотрудника (WACARDQ0410); нет у ядра — карточка прежняя
+        extra = getattr(self.core, "card_extra", None)
+        extra = extra(draft_id, ver, str(text or "")) if extra else None
         texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson),
-                           card_details(hand, link))
+                           card_details(hand, link), question=(extra or {}).get("question") or "",
+                           trans=card_trans(extra))
         row = [{"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
                {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]
         if not (hand and ver == 1):
@@ -950,21 +1041,28 @@ class Tg(wa_agent.Telegram):
         self._topic_reply(thread, mid, RELAY_EDIT_WORDS)
         return True
 
-    def agent_sent(self, number, text, who):
-        """Ушедшее агентом по «Отправить» — одной строкой в тему клиента. → id сообщения или None."""
-        if not self.relay:
+    def agent_line(self, number, line):
+        """Строка показа ушедшего агентом (WAMIRROR0410) — в тему клиента. Флаг relay её НЕ решает: до правки строка
+        жила только при WA_AGENT_RELAY и при выключенном молча не ложилась. Строку собирает и хранит ядро
+        (`Core.show_agent`, ключ «wamid|часть»), руки только кладут её. → id сообщения темы · None — темы нет или
+        Telegram отказал (ядро повторит тем же ключом) · AnswerLost — ответа нет (сеть): строка могла лечь."""
+        if not self.show_chat:
+            self.log("тема: строки показа нет — форум показа не задан")
             return None
         rows, why = self._topics("number=?", number)
         thread = rows[0][1] if rows else None
         if not thread:
-            self.log("тема: строки «отправил агент» нет — %s" % (why or "у клиента нет темы"))
+            self.log("тема: строки показа нет — %s" % (why or "у клиента нет темы"))
             return None
-        line = AGENT_LINE % (str(who or "").split(" (id ")[0] or "—", text)
-        if len(line) > TG_TEXT_MAX:
-            line = line[:TG_TEXT_MAX - 1] + "…"
-        ok, res = self.api("sendMessage", {"chat_id": self.show_chat, "message_thread_id": int(thread),
-                                           "text": line})
-        return int(res.get("message_id")) if ok else None
+        text = str(line or "")
+        if len(text) > TG_TEXT_MAX:
+            text = text[:TG_TEXT_MAX - 1] + "…"
+        ok, res = self.api("sendMessage", {"chat_id": self.show_chat, "message_thread_id": int(thread), "text": text})
+        if ok is None:
+            raise wa_agent.AnswerLost("sendMessage: ответа нет")
+        if not ok:
+            return None
+        return int(res.get("message_id"))
 
     # ── реакции наружу (WAREACTOUT0110) ───────────────────────────────────────────────────
 

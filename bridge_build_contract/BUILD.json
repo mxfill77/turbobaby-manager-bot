@@ -1,0 +1,38 @@
+{
+ "added": [
+  "ContractDoor.js"
+ ],
+ "base_prod_version": 84,
+ "base_sha256": {
+  "Bridge.js": "0489756aa0af93a27de364e7abf44f9ecc1a5c3ccd0d075627858b52cf9a44d8"
+ },
+ "build_sha256": {
+  "Bridge.js": "f14a3b8e8949ac5a98a08d9214bd2a5a86930d408aa29422ceabfa7358aaa01b",
+  "ContractDoor.js": "c0f367a2d6134a103cd1d0af9bea03997eb25936c5a8627a37ef8e413a4b6cc3"
+ },
+ "changed": [
+  "Bridge.js"
+ ],
+ "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
+ "база": "bridge_prod/ (зеркало задеплоенной версии @84, паспорт MIRROR.json)",
+ "выкладке_подлежат": [
+  "Bridge.js",
+  "ContractDoor.js"
+ ],
+ "выложено": "НЕТ. Сборка НЕ выложена: clasp push/redeploy — красная зона владельца и в этот заход не входили. Прод-мост на contract_find/contract_pdf отвечает unknown_action.",
+ "до_первого_вызова": [
+  "Script Properties проекта моста: ESIGN_REGISTRY_ID = id таблицы «Договоры — реестр подписей (TB e-Sign)»; ESIGN_SIGNED_FOLDER_ID = id папки подписанных PDF. Не заданы — дверь отвечает no_registry_config / no_signed_folder_config",
+  "у аккаунта, от имени которого развёрнут мост (executeAs USER_DEPLOYING), должен быть доступ на чтение к реестру и к папке подписанных — отсюда это не проверялось"
+ ],
+ "не_каталог_выкладки": "настроек проекта (.clasp.json) здесь НЕТ намеренно: из репозитория залить прод нельзя. Выкладка собирает свой каталог вне репо и СНАЧАЛА снимает свежий отпечаток прода (deploy/bridge_prod_diff.py).",
+ "перед_выкладкой": [
+  "deploy/bridge_prod_diff.py — прод не ушёл вперёд с @84?",
+  "base_sha256 здесь совпадает с bridge_prod/ (стережёт tests/test_contract_door.py::test_build_passport)",
+  "ветка tx-find-0310 тоже правит Bridge.js (маршрут tx_find + help) — при выкладке обеих дверей Bridge.js свести из двух сборок: обе только вставляют, конфликт ровно в строке help",
+  "после выкладки свести зеркало bridge_prod/ (bridge_deploy.py шаг [7/7] делает это сам)"
+ ],
+ "почему_отдельный_каталог": "bridge_build/ — след выложенной сборки двери отмены ТО (@83), его судит tests/test_undo_door.py; bridge_build_tx_find/ — сборка соседней ветки tx-find-0310. bridge_deploy.py принимает каталог аргументом, поэтому сборка живёт рядом.",
+ "тема": "дверь договоров TB e-Sign — read-only contract_find (реестр подписей по телефону, имени, байку, сроку) и contract_pdf (подписанный PDF только из реестра и папки подписанных), 03.10.2026",
+ "правка_04.10": "CONTRACTFIX0410 (Codex TB-CHECK-0410-0025 п.1): дата строки — исходное значение (contract_date_raw/created_raw), день только при верной календарной дате, «Документ создан» только при пустой дате договора; при сроке строка без дня не выпадает молча (undated_items, checked.undated/date_unparsed), подписанный среди них → outcome incomplete с reason, pick нет; checked.complete и unread; pick — полная запись + pdf_ready. Bridge.js не менялся.",
+ "что_это": "КАТАЛОГ СБОРКИ ЗАХОДА. Здесь лежит НЕ прод, а то, что заход предлагает выложить. Истина о проде — bridge_prod/ (зеркало под паспортом MIRROR.json)."
+}

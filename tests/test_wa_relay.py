@@ -86,7 +86,9 @@ def test_agent_send_line_in_topic():
     assert w.sends == [(NUM, "черновик модели")], w.sends
     lines = w.show_msgs()
     assert len(lines) == 1, lines
-    assert lines[0]["message_thread_id"] == 42 and lines[0]["text"] == "мы · агент, отправил Дарья: черновик модели", lines
+    # строка показа ушедшего агентом (WAMIRROR0410): время · агент · кто подтвердил · № черновика, версия · часть
+    assert lines[0]["message_thread_id"] == 42 and " · агент · подтвердил Дарья · черновик №1, версия 1 · текст:\n" \
+        "черновик модели" in lines[0]["text"], lines
 
 
 def test_human_wrote_pauses_agent():
