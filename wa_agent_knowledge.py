@@ -476,12 +476,17 @@ STALE_WORDS = "знания устарели"
 # WADAYS0410: причина по ТЕКСТУ ЧЕРНОВИКА — число суток у диапазона дат не равно разности дат (`wa_agent_model.days_claims`)
 R_DAYS_CLAIM = "days_claim"
 DAYS_CLAIM_WORDS = "срок: агент посчитал сутки не так — проверьте"
+# WATIMECLAIMB0510: причина по ТЕКСТУ ЧЕРНОВИКА — день или время приезда, доставки, выдачи, прихода сотрудника без
+# опоры на даты блоков этого вызова (`wa_agent_model.arrival_claims`)
+R_ARRIVAL_CLAIM = "arrival_claim"
+ARRIVAL_CLAIM_WORDS = "срок или приезд без опоры на даты — проверьте день и время"
 _WORD_CATS = dict(
     [(REASON_WORDS[R_AVAILABILITY], R_AVAILABILITY), (REASON_WORDS[R_SEASON_CROSS], CAT_PRICE),
      (REASON_WORDS[R_NO_PRICE_MODEL], CAT_PRICE), (REASON_WORDS[R_LONG_TERM], CAT_PRICE),
      (REASON_WORDS[R_DISCOUNT], R_DISCOUNT), (REASON_WORDS[R_DOOR_NO_PRICE], CAT_PRICE),
      (REASON_WORDS[R_MONEY], R_MONEY), (REASON_WORDS[R_LANGUAGE], R_LANGUAGE),
      (MONEY_CLAIM_WORDS, R_MONEY_CLAIM), (STALE_WORDS, R_STALE), (DAYS_CLAIM_WORDS, R_DAYS_CLAIM),
+     (ARRIVAL_CLAIM_WORDS, R_ARRIVAL_CLAIM),
      (DISCOUNT_UNKNOWN_WORDS, R_DISCOUNT_UNKNOWN)]          # своя категория: не «скидка — решение человека»
     + [(words, key) for key, words in MONEY_WORDS.items()])
 _RULES = dict(_TEXT_RULES)

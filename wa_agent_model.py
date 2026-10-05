@@ -46,6 +46,14 @@
 `wa_history.model_line` даёт каждой «ДД.ММ.ГГГГ ЧЧ:ММ» (Пхукет). Кодом правило не проверяется: проверка денег
 (`K.money_claims`) нашу прежнюю сумму опорой по-прежнему не считает — повтор ставит причину «нужен человек».
 
+СРОК И ПРИЕЗД БЕЗ ОПОРЫ (WATIMECLAIMB0510) — повод №18 v1 05.10: модель продолжила наше «в течение часа-двух» с
+телефона 12:22 и через 20 мин пообещала приезд как новый. Правило 12 дополнено: относительный срок нашей прежней строки
+отсчитывался от её ЧЧ:ММ. Кодом (`arrival_claims`, оба пути черновика): день или время приезда, доставки, выдачи или
+прихода сотрудника, чей день не из дат блоков этого вызова («СРОКИ», «ЦЕНА», «НАЛИЧИЕ», «АРЕНДА КЛИЕНТА»), — причина
+`K.ARRIVAL_CLAIM_WORDS` первой строкой (перед ней — только деньги и «сверка не завершена»). Наши прежние слова опорой
+не считаются. Час кодом не сверяется: в блоках его нет — судится день. «Отправить» не запирается (решение 05.10
+12:39). В журнал — только числа.
+
 ПЛАТЕЛЬЩИК — платный ключ API тем же путём, что у Splinter (`claude_client.ClaudeClient`:
 ANTHROPIC_API_KEY из .env корня дерева, учёт трат `spend_ledger.meter`). Значение ключа не печатается.
 
@@ -123,7 +131,7 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 9. Метки «[скрыто: …]» — это скрытые данные клиента; не проси их повторить и не упоминай.
 10. Число суток аренды называй ТОЛЬКО из блоков «СРОКИ» и «ЦЕНА» — там его посчитал код: дата возврата минус дата выдачи («с 5 по 7» — двое суток, не трое). Блоков нет — числа суток не называй. Клиент назвал другое число суток на те же даты — мягко поправь числом из «СРОКИ».
 11. В ответе о цене скидку за срок называй ВСЕГДА — числом из блока «ЦЕНА», и когда она 0% («скидка за срок 0%»). В блоке «скидка за срок неизвестна» — скажи, что скидку за срок уточнит коллега, числа скидки не называй. Блок «ЦЕНА» с несколькими вариантами — назови цену каждого варианта (модель и срок), не выбирай за клиента. Другой скидки сверх этой не обещай (правило 6).
-12. НАШИ ПРЕЖНИЕ СЛОВА ОБЯЗЫВАЮТ. Строки «мы» в истории — уже сказанное клиенту компанией: с телефона, из темы или через «Отправить». Наше последнее предложение, условие, срок или цена о том же действуют, пока мы сами их не изменили: продолжай их, не спорь с ними и не подменяй прежними нашими словами, знаниями или своим расчётом. Два наших сообщения о том же расходятся — действует более позднее. Наше слово расходится со знаниями — клиенту не противоречь, а перенеси расхождение в handoff: «наше сообщение ЧЧ:ММ расходится с правилом …». Число, которое мы уже назвали, повторяй только к той же модели и тому же сроку; нового числа из него не выводи.
+12. НАШИ ПРЕЖНИЕ СЛОВА ОБЯЗЫВАЮТ. Строки «мы» в истории — уже сказанное клиенту компанией: с телефона, из темы или через «Отправить». Наше последнее предложение, условие, срок или цена о том же действуют, пока мы сами их не изменили: продолжай их, не спорь с ними и не подменяй прежними нашими словами, знаниями или своим расчётом. Два наших сообщения о том же расходятся — действует более позднее. Наше слово расходится со знаниями — клиенту не противоречь, а перенеси расхождение в handoff: «наше сообщение ЧЧ:ММ расходится с правилом …». Число, которое мы уже назвали, повторяй только к той же модели и тому же сроку; нового числа из него не выводи. Относительный срок из нашей прежней строки («через час», «час-два», «сегодня») отсчитывался от её ЧЧ:ММ — как новый не повторяй. День и время приезда, доставки или выдачи называй только из фактов этого вызова или наших последних слов о том же; иначе скажи, что уточнишь у сотрудника.
 13. Поле "why" — для сотрудника, клиенту оно не уходит: 1–3 короткие строки — что спросил клиент; каждое число твоего ответа и откуда оно (блок «ЦЕНА», наши прежние слова — с временем, слова клиента); чего ты не знаешь. Чисел в ответе нет — так и напиши.
 
 Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
@@ -456,6 +464,119 @@ def days_claims(text, today, known=(), price=None):
                 out += [(r["label"], n, r["days"]) for n in ns]
     if ref and free and not any(n in ref for n in every):
         out += [("сутки без дат рядом", n, "/".join(str(x) for x in sorted(ref))) for n in free if n not in ref]
+    return out
+
+
+# ── срок и приезд без опоры (WATIMECLAIMB0510) ─────────────────────────────────────────────────
+# Утверждение — предложение черновика, где есть И слово приезда (доставка, привоз, выдача, приезд, приход сотрудника), И
+# метка срока: относительная («через час», «час-два», «в течение часа», «within an hour») и «сегодня» — день сегодня;
+# «завтра»/«послезавтра», день недели, дата в предложении, время ЧЧ:ММ («в 15:00», «at 3 pm»; без дня — сегодня),
+# «утром»/«вечером» без дня — день неизвестен. Опора — день среди дат блоков этого вызова (`call_dates`); наши прежние
+# слова опорой не считаются. «до 17:30» — граница из правил, а не обещание: не метка.
+_RX_ARRIVE = re.compile(
+    r"привез|привёз|привоз|подвез|подвёз|подвоз|завез|завёз|завоз|довез|довёз|достав|приед|приезж|приезд|подъед|"
+    r"подъезж|прибуд|выда(?:д|м|ст|ё|е|ч|ть)|забер|сотрудник|курьер|водител|"
+    r"буд(?:ет|ем|у|ут)\s+у\s+вас|"
+    r"\bdeliver|\bbring|\bbrought|\bdrop(?:ped|ping)?\s*-?\s*off\b|\bdrop\s+(?:it|the\s+bike|you)\b|\barriv|"
+    r"\bcom(?:e|es|ing)\b(?!\s+back)|\bpick(?:ed|ing)?\s+(?:it\s+|the\s+bike\s+|you\s+)?up\b|\bhand(?:ed)?\s+over\b|"
+    r"\bcourier|\bdriver|\bstaff|\bemployee|\bour\s+(?:guy|man|team)\b|\bbe\s+(?:there|with\s+you)\b", re.I)
+_DUR = r"(?:час|ч\b|мин|полчас|полтор)"
+_EN_N = r"(?:an?|one|two|three|few|a\s+few|a\s+couple\s+of|couple\s+of|half\s+an|\d+(?:\s*[-–]\s*\d+)?)"
+_ARRIVE_MARKS = (                                # (вид, выражение, сдвиг дня от сегодня | None — день неизвестен)
+    ("относительный", re.compile(r"(?i)через\s+(?:[\w\-–—]+\s+){0,2}?" + _DUR), 0),
+    ("относительный", re.compile(r"(?i)в\s+течени[еи]\s+(?:[\w\-–—]+\s+){0,2}?(?:час|мин|получас|полутор)"), 0),
+    ("относительный", re.compile(r"(?i)час(?:а|ов)?\s*(?:[-–—]|или)\s*(?:два|двух|три|трёх|трех)|пар[уы]\s+час|"
+                                 r"(?<![\d.,:])\d{1,2}\s*[-–—]\s*\d{1,2}\s*(?:час|ч\b|мин)|в\s+ближайш\w+\s+"
+                                 r"(?:\d+\s+)?(?:час|полчас|минут)"), 0),
+    ("относительный", re.compile(r"(?i)\b(?:within|in)\s+(?:about\s+|around\s+)?" + _EN_N +
+                                 r"\s*(?:hours?|hrs?|minutes?|mins?)\b|\b(?:an?|one|\d+)\s*(?:[-–]|or|to)\s*(?:two|three|\d+)"
+                                 r"\s*hours?\b|\ban?\s+hour\s+or\s+two\b|\bwithin\s+the\s+hour\b|"
+                                 r"\b(?:asap|right\s+away)\b"), 0),
+    ("сегодня", re.compile(r"(?i)(?<![\w-])сегодня|\btoday\b|\btonight\b|\bthis\s+(?:morning|afternoon|evening)\b"), 0),
+    ("завтра", re.compile(r"(?i)(?<![\w-])послезавтра|\bday\s+after\s+tomorrow\b"), 2),
+    ("завтра", re.compile(r"(?i)(?<![\w-])завтра|\btomorrow\b"), 1),
+    ("утро/вечер", re.compile(r"(?i)(?<![\w-])(?:утром|вечером|днём|днем|ночью)(?![\w-])|"
+                              r"\bin\s+the\s+(?:morning|afternoon|evening)\b"), None),
+)
+_WEEKDAYS = (r"понедельник\w*|monday", r"вторник\w*|tuesday", r"сред[ауы]|wednesday", r"четверг\w*|thursday",
+             r"пятниц\w+|friday", r"суббот\w+|saturday", r"воскресень\w+|sunday")     # день → weekday() по порядку
+_RX_WEEKDAY = re.compile(r"(?i)(?<![\w-])(?:" + "|".join("(%s)" % p for p in _WEEKDAYS) + r")(?![\w-])")
+_RX_CLOCK = re.compile(r"(?i)(?<![\d:.])([01]?\d|2[0-3]):([0-5]\d)(?![\d:])|"
+                       r"(?<![\w-])(?:в|к|около|после|at|by|around)\s+(\d{1,2})\s*(?:час\w*|ч\b|утра|вечера|дня|ночи|"
+                       r"(?:a\.?m\.?|p\.?m\.?)(?![\w]))")
+_RX_UNTIL = re.compile(r"(?i)(?:(?<![\w-])до|\buntil|\btill|\bbefore)\s*$")
+_RX_DAYS_REL = re.compile(r"(?i)через\s+(\d+|" + "|".join(_CNT_WORDS) + r"|пару)\s+(?:дн|сут)|\bin\s+(\d+|"
+                          r"two|three|a\s+couple\s+of)\s+days?\b")
+
+
+def _iso_day(v):
+    if isinstance(v, datetime.datetime):
+        return v.date()
+    if isinstance(v, datetime.date):
+        return v
+    try:
+        return datetime.date.fromisoformat(str(v)[:10]) if v else None
+    except ValueError:
+        return None
+
+
+def call_dates(info):
+    """Даты блоков этого вызова → множество дней: «СРОКИ» (начало и конец), «ЦЕНА» (каждый вариант), «НАЛИЧИЕ»,
+    «АРЕНДА КЛИЕНТА» (конец каждой аренды). Пусто — блоков с датами нет."""
+    info = info or {}
+    out = set()
+    for r in info.get("terms") or ():
+        out.update(d for d in (_iso_day(r.get("ds")), _iso_day(r.get("de"))) if d)
+    for q in K.quotes_of(info.get("price")) + [info.get("avail") or {}]:
+        if isinstance(q, dict):
+            out.update(d for d in (_iso_day(q.get("date_start")), _iso_day(q.get("date_end"))) if d)
+    rental = info.get("rental") or {}
+    for h in (rental.get("rentals") or ()) if isinstance(rental, dict) else ():
+        d = _iso_day((h or {}).get("end"))
+        if d:
+            out.add(d)
+    return out
+
+
+def arrival_claims(text, today, known=()):
+    """Текст черновика → [(вид, день ISO | None)] — сроков и времени приезда, доставки, выдачи или прихода сотрудника,
+    чей день не среди `known` (дни блоков вызова, `call_dates`). Вид — см. `_ARRIVE_MARKS`, ещё «день недели»,
+    «дата», «время», «через N суток». Пусто — срока у приезда нет или день с опорой."""
+    s = str(text or "")
+    known = set(known or ())
+    out = []
+    for sent in K._SENTENCE.split(s):
+        if not _RX_ARRIVE.search(sent):
+            continue
+        dates = [d for d in find_dates(sent, today) if d] if today else []
+        marks = []
+        for kind, rx, shift in _ARRIVE_MARKS:
+            for m in rx.finditer(sent):
+                if not any(a < m.end() and m.start() < b for a, b, _k, _d in marks):
+                    marks.append((m.start(), m.end(), kind,
+                                  (today + datetime.timedelta(days=shift)) if today and shift is not None else None))
+        for m in _RX_DAYS_REL.finditer(sent):
+            w = (m.group(1) or m.group(2) or "").lower()
+            n = int(w) if w.isdigit() else {"пару": 2, "a couple of": 2, "two": 2, "three": 3}.get(w, _CNT_WORDS.get(w))
+            marks.append((m.start(), m.end(), "через N суток",
+                          today + datetime.timedelta(days=n) if today and n else None))
+        for m in _RX_WEEKDAY.finditer(sent):
+            wd = next(i for i in range(7) if m.group(i + 1))
+            marks.append((m.start(), m.end(), "день недели",
+                          today + datetime.timedelta(days=(wd - today.weekday()) % 7) if today else None))
+        for m in _RX_CLOCK.finditer(sent):
+            if _RX_UNTIL.search(sent[max(0, m.start() - 8):m.start()]):
+                continue
+            marks.append((m.start(), m.end(), "время", None if dates else today))
+        for d in dates:
+            marks.append((0, 0, "дата", d))
+        for _a, _b, kind, day in marks:
+            if kind == "время" and dates:
+                ok = any(d in known for d in dates)
+            else:
+                ok = day is not None and day in known
+            if not ok:
+                out.append((kind, day.isoformat() if day else None))
     return out
 
 
@@ -1222,6 +1343,23 @@ class ModelAdapter(wa_agent.Model):
                  % (len(bad), ",".join(str(n) for _w, n, _r in bad), ",".join(str(r) for _w, _n, r in bad)))
         return K.reason_first(words, K.DAYS_CLAIM_WORDS)
 
+    def _arrival_check(self, text, info, words):
+        """Срок и приезд без опоры (WATIMECLAIMB0510): день или время приезда, доставки, выдачи или прихода сотрудника
+        не из дат блоков этого вызова — причина «нужен человек» первой строкой. «Отправить» не запирается (решение
+        владельца 05.10 12:39), текст не правится; в журнал — только числа."""
+        known = call_dates(info)
+        bad = arrival_claims(text, info.get("today"), known)
+        if bad:
+            self.log("модель: срок или приезд без опоры %d (относительных %d, сегодня %d, завтра %d, времени %d, "
+                     "прочих %d), дней в блоках %d — причина «нужен человек»"
+                     % (len(bad), sum(1 for k, _d in bad if k == "относительный"),
+                        sum(1 for k, _d in bad if k == "сегодня"), sum(1 for k, _d in bad if k == "завтра"),
+                        sum(1 for k, _d in bad if k == "время"),
+                        sum(1 for k, _d in bad if k not in ("относительный", "сегодня", "завтра", "время")),
+                        len(known)))
+            words = K.reason_first(words, K.ARRIVAL_CLAIM_WORDS)
+        return words
+
     def draft(self, number, upto_id):
         if self.tools is not None:
             return self._draft_tools(number, upto_id)
@@ -1240,6 +1378,7 @@ class ModelAdapter(wa_agent.Model):
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
         words = K.merge_reasons(words, got["handoff"])      # дедуп по категории (WACARDCOMPACT0310)
         words = self._days_check(got["text"], info, words)   # сутки у дат не по разности — причина (WADAYS0410)
+        words = self._arrival_check(got["text"], info, words)   # срок и приезд без опоры (WATIMECLAIMB0510)
         # деньги в тексте черновика (WAMONEYCHECK0310): процент предоплаты, депозита или скидки и сумма в батах не из
         # блока «ЦЕНА» этого вызова — причина «нужен человек» ПЕРВОЙ строкой (на карточке видна при любом числе
         # причин). Текст ответа не правится. В журнал — только числа: текст черновика туда не идёт.
@@ -1330,6 +1469,7 @@ class ModelAdapter(wa_agent.Model):
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
         words = K.merge_reasons(words, got["handoff"])
         words = self._days_check(got["text"], info, words)      # сутки у дат (WADAYS0410)
+        words = self._arrival_check(got["text"], info, words)   # срок и приезд без опоры (WATIMECLAIMB0510)
         for w in reversed(words_t):                             # причины кода о деньгах — вперёд
             words = K.reason_first(words, w)
         for w in reversed(reasons):                             # «сверка не завершена» — самой первой
