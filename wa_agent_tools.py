@@ -583,10 +583,18 @@ _BARE = re.compile(r"(?<![\w.,:/+-])(\d{1,3}(?:[ ,  ]\d{3})+|\d{2,6})(?!\w|%|
 _MODEL_BEFORE = re.compile(r"[A-Za-z]{2,}\s*$")
 
 
+def _bare_numbers(sent):
+    """Числа без валюты предложения — те же, что судит `money_claims` (имя модели, дни, км, проценты — нет)."""
+    return [int(re.sub(r"\D", "", m.group(1))) for m in _BARE.finditer(sent)
+            if not _MODEL_BEFORE.search(sent[:m.start()])]
+
+
 def money_claims(text, price, known):
-    """Опора = «ЦЕНА» ∪ факты ∪ расчёты. Сумма в батах и ЧИСЛО БЕЗ ВАЛЮТЫ в предложении с денежным словом
-    судятся (имя модели «PCX 160», дни, км, проценты — нет). → [(вид, что)] без опоры."""
+    """Опора = «ЦЕНА» ∪ факты ∪ расчёты ∪ сдача (`K.change_backed`: N − M = T, WASDACHA0510). Сумма в батах и ЧИСЛО
+    БЕЗ ВАЛЮТЫ в предложении с денежным словом судятся (имя модели «PCX 160», дни, км, проценты — нет). → [(вид, что)]
+    без опоры."""
     s = str(text or "")
+    known = set(known) | K.change_backed(s, known, _bare_numbers)
     out = [c for c in K.money_claims(s, None) if c[0] == "процент"]
     out += [("сумма", v) for v in K.thb_amounts(s) if v not in known]
     for sent in K._SENTENCE.split(s):
@@ -660,9 +668,16 @@ def money_roles(text, facts):
         out.append((ROLE_WORDS, "текст говорит о залоге, в кассе строки залога нет (оплата аренды ≠ залог)"))
     if _REFUND_PROMISE.search(s) and any(f["kind"] == "cash" and f["role"] == R_REFUND for f in facts):
         out.append((ROLE_WORDS, "возврат уже записан в кассе — «вернём» запрещено"))
+    return out + change_role(s)
+
+
+def change_role(text):
+    """Роль сдачи (запись 03.10.2026-1 п. 2): текст говорит о сдаче — только «в конце, с возвратом залога». Одна
+    проверка на оба пути черновика (WASDACHA0510): `money_roles` сверки и `draft()` без сверки. → [(слова, что)]."""
+    s = str(text or "")
     if _CHANGE.search(s) and not _CHANGE_OK.search(s):
-        out.append((ROLE_WORDS, "сдача — только «в конце, с возвратом залога»"))
-    return out
+        return [(ROLE_WORDS, "сдача — только «в конце, с возвратом залога»")]
+    return []
 
 
 def conflicts(facts, figures):

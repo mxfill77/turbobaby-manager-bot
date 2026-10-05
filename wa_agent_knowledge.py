@@ -637,15 +637,49 @@ def without_known_discount(text, price):
     return s
 
 
+# Сдача с опорой (WASDACHA0510, запись 05.10.2026-2): клиент платит наличными больше итога — агент называет итог точно
+# и сдачу. Сумма клиента N и сдача M в строке цены не стоят, их опора — РАЗНОСТЬ: в предложении со словом сдачи
+# (сдача, change) сумма M с опорой, если черновик называет сумму с опорой T и сумму N, где N − M = T и N > T; тогда с
+# опорой и N. Неверная разность, N без M, M без T — без опоры, как было. Одна функция на оба пути черновика.
+_CHANGE_WORD = re.compile(r"\bсдач\w*\b(?!\s+(?:байк|мотоцикл|скутер|транспорт))|\bchange\b", re.I)
+
+
+def change_backed(text, known, numbers=None):
+    """Текст черновика + суммы с опорой → множество сумм, получивших опору сдачей (пусто — пары нет). numbers(часть) →
+    [число] — числа без валюты, которые судит вызывающий (путь со сверкой); нет — только суммы в батах."""
+    s = str(text or "")
+    known = set(known or ())
+
+    def nums(part):
+        got = list(thb_amounts(part))
+        return got + [v for v in (numbers(part) if numbers else ()) if v not in got]
+
+    sents = [s[a:b] for a, b in _sentences(s)]
+    named = {v for sent in sents for v in nums(sent)}
+    totals = named & known
+    out = set()
+    for sent in sents:
+        if not _CHANGE_WORD.search(sent):
+            continue
+        for m in nums(sent):
+            for t in totals:
+                for n in named:
+                    if n > t and n - m == t:
+                        out.update((m, n))
+    return out
+
+
 def money_claims(text, price=None):
     """Текст черновика модели (+ исход цены этого вызова) → [(вид, что)] денежных утверждений без опоры:
     ('процент', «30%») — процент в одном предложении со словом предоплаты, депозита или скидки (кроме скидки за
     срок, названной дверью, — WAPRICECTX0410); ('сумма', 3500) — сумма в батах, которой нет среди сумм блока
-    «ЦЕНА» (`price["line"]`). Пусто — опора есть или денег в тексте нет."""
+    «ЦЕНА» (`price["line"]`) и которой не дала опору сдача (`change_backed`, WASDACHA0510). Пусто — опора есть или
+    денег в тексте нет."""
     s = str(text or "")
     out = [("процент", what) for _a, _b, what, ok in _pct_hits(s, price) if not ok]
     line = price.get("line") if isinstance(price, dict) else None
     known = set(thb_amounts(line))
+    known |= change_backed(s, known)                      # сдача: N − M = T (WASDACHA0510)
     out += [("сумма", v) for v in thb_amounts(s) if v not in known]
     return out
 
