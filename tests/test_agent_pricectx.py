@@ -282,8 +282,8 @@ CASES = [c_owner_adv350_5_days, c_owner_ready_for_5_days, c_two_models_two_lines
 # (файл, правило, было, стало); «было» с префиксом LINE: — вся строка исходника, что начинается так.
 
 MUTANTS = [
-    (MODEL_SRC, "контекст выключен", "        price, price_words = self._price(ask, today, ctx)\n",
-     "        price, price_words = self._price(ask, today, ())\n"),
+    (MODEL_SRC, "контекст выключен", "        price, price_words = self._price(ask, today, ctx, ask_day)\n",
+     "        price, price_words = self._price(ask, today, (), ask_day)\n"),    # ask_day — WAMINPRICE0510
     (KNOW_SRC, "скидка выпала из строки",
      '    res["line"] = "%s, %s — %s: %d сут., %s ฿ в сутки, итого %s ฿ за срок; %s; %s." % (\n',
      '    res["line"] = "%s, %s — %s: %d сут., %s ฿ в сутки, итого %s ฿ за срок; %.0s%s." % (\n'),

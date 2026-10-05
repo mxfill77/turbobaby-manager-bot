@@ -133,6 +133,7 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 11. В ответе о цене скидку за срок называй ВСЕГДА — числом из блока «ЦЕНА», и когда она 0% («скидка за срок 0%»). В блоке «скидка за срок неизвестна» — скажи, что скидку за срок уточнит коллега, числа скидки не называй. Блок «ЦЕНА» с несколькими вариантами — назови цену каждого варианта (модель и срок), не выбирай за клиента. Другой скидки сверх этой не обещай (правило 6).
 12. НАШИ ПРЕЖНИЕ СЛОВА ОБЯЗЫВАЮТ. Строки «мы» в истории — уже сказанное клиенту компанией: с телефона, из темы или через «Отправить». Наше последнее предложение, условие, срок или цена о том же действуют, пока мы сами их не изменили: продолжай их, не спорь с ними и не подменяй прежними нашими словами, знаниями или своим расчётом. Два наших сообщения о том же расходятся — действует более позднее. Наше слово расходится со знаниями — клиенту не противоречь, а перенеси расхождение в handoff: «наше сообщение ЧЧ:ММ расходится с правилом …». Число, которое мы уже назвали, повторяй только к той же модели и тому же сроку; нового числа из него не выводи. Относительный срок из нашей прежней строки («через час», «час-два», «сегодня») отсчитывался от её ЧЧ:ММ — как новый не повторяй. День и время приезда, доставки или выдачи называй только из фактов этого вызова или наших последних слов о том же; иначе скажи, что уточнишь у сотрудника.
 13. Поле "why" — для сотрудника, клиенту оно не уходит: 1–3 короткие строки — что спросил клиент; каждое число твоего ответа и откуда оно (блок «ЦЕНА», наши прежние слова — с временем, слова клиента); чего ты не знаешь. Чисел в ответе нет — так и напиши.
+14. Строка блока «ЦЕНА» с «минимум N сут.» — клиент срок не назвал или назвал короче минимума: срок НЕ спрашивай, скажи «аренда от N суток» и сразу дай цену этой строкой — в сутки, итого за срок, скидка за срок, депозит. Что клиент уже назвал в переписке (модель, даты, срок), не переспрашивай.
 
 Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
 {"text": "текст ответа клиенту", "lang": "ru" или "en" (язык клиента; иной — его код), "handoff": ["причина словами", …] или [], "why": "1–3 короткие строки для сотрудника по правилу 13"}"""
@@ -193,6 +194,13 @@ _RX_NUM = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)|(?<![\d.])(\d{1,
 _RX_RANGE_WORD = re.compile(r"(?i)(?<!\d)(\d{1,2})\s*(?:-|–|—|по|до|to|till|until)\s*(\d{1,2})\s+(?:of\s+)?" + _MON)
 _RX_DAY_MON = re.compile(r"(?i)(?<!\d)(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MON)
 _RX_MON_DAY = re.compile(r"(?i)" + _MON + r"\s+(\d{1,2})(?:st|nd|rd|th)?(?!\d)")
+# «сегодня», «завтра», «послезавтра» (WAMINPRICE0510): дата — от дня ЭТОГО сообщения (`find_dates(..., day)`); день
+# неизвестен — не дата. Без дня — байт-в-байт как было (черновик и наличие относительных слов датой не читают).
+_RX_REL_DAY = (
+    (re.compile(r"(?i)(?<![\w-])послезавтра(?![\w-])|\bday\s+after\s+tomorrow\b"), 2),
+    (re.compile(r"(?i)(?<![\w-])завтра(?![\w-])|\btomorrow\b"), 1),
+    (re.compile(r"(?i)(?<![\w-])сегодня(?![\w-])|\btoday\b|\btonight\b"), 0),
+)
 
 
 def _mon(word):
@@ -212,8 +220,9 @@ def _mk(today, d, m, y=None):
         return None
 
 
-def find_dates(text, today):
-    """Даты в словах клиента по порядку появления → [date, …] (без повторов подряд)."""
+def find_dates(text, today, day=None):
+    """Даты в словах клиента по порядку появления → [date, …] (без повторов подряд). day — день этого сообщения:
+    «сегодня», «завтра», «послезавтра» — от него; None — относительные слова не даты."""
     s = str(text or "")
     hits = []
     for m in _RX_RANGE_WORD.finditer(s):
@@ -244,6 +253,13 @@ def find_dates(text, today):
             d = _mk(today, m.group(4), m.group(5), m.group(6))
         if d:
             hits.append((m.start(), d))
+    if day is not None:
+        rel = []
+        for rx, shift in _RX_REL_DAY:                  # «day after tomorrow» занято — «tomorrow» в нём не второй день
+            for m in rx.finditer(s):
+                if not any(a <= m.start() < b for a, b in rel):
+                    rel.append(m.span())
+                    hits.append((m.start(), day + datetime.timedelta(days=shift)))
     hits.sort(key=lambda h: h[0])
     out = []
     for _, d in hits:
@@ -649,6 +665,71 @@ MODEL_UNKNOWN_LINE = ("«%s» на %d сут.: цена НЕИЗВЕСТНА —
 WHO_CLIENT = "клиент"                          # метка роли строки истории (`wa_history.who_of`)
 _ALIAS_COMMON = frozenset(("click",))          # первое слово ключа — обычное слово («click the link»): не сокращение
 
+# ── минимальный срок аренды (WAMINPRICE0510) ─────────────────────────────────────────────────
+# Повод — №21 (05.10): на вопрос о цене NMAX «на завтра» агент спросил срок, следующая версия назвала ставку без опоры;
+# владелец 16:53 — «скорректировать клиента что от 5 дней и дать цены сразу», 17:08 — лишних вопросов не задавать. Класс
+# модели — КОПИЯ раздела «ПОДБОР МОДЕЛЕЙ ПО КЛАССУ — ПРАВИЛА ВЛАДЕЛЬЦА 20.08.2026» узла business_rules (живой парк по
+# классам, снят 20.08.2026); скутеры — обычные и макси, как прочитано в записи 05.10.2026-1. Минимум — запись 05.10.2026-1
+# п.1: скутер 5 суток, мотоцикл 3, скутер вместе с мотоциклом 3 — только со словом клиента «вместе», «оба», together,
+# both. Тяжёлые (X-ADV 750), модель вне списка, два скутера вместе — минимум НЕИЗВЕСТЕН («до его слова решает человек»):
+# двери на минимум нет, как было. Начало известно, срок клиента не назван или короче минимума — дверь на минимум.
+# Перепишет владелец классы или минимумы — правятся эти таблицы, а не логика.
+MIN_RULE = "05.10.2026-1"
+SCOOTER, MOTO, HEAVY = "скутер", "мотоцикл", "тяжёлый"
+MODEL_CLASSES = (
+    (SCOOTER, ("NMAX 155", "ADV 350", "XMAX 300", "FORZA 300")),
+    (HEAVY, ("X-ADV 750",)),
+    (MOTO, ("CBR 650R", "XSR 155", "CB 300R", "CB 650R", "NINJA 400", "MT-03 300", "VULCAN 650S")),
+)
+MIN_DAYS = {SCOOTER: 5, MOTO: 3}
+MIN_TOGETHER = 3
+MIN_NOTE = " Аренда от %d сут.: минимум %d сут. (%s)"
+CLIENT_NOTE = "; клиент назвал %d сут"           # точку ставит mark_minimum: «сут.», а не «сут..» (WAMINPRICEB0510)
+_RX_TOGETHER = re.compile(r"(?i)(?<![\w-])(?:вместе|оба|обе|обоих|обеих)(?![\w-])|\b(?:together|both)\b")
+
+
+def model_class(model):
+    """Модель парка → класс по копии раздела 20.08 | None (вне списка). Ключ парка короче имени списка («CB 300CC» —
+    CB 300R, «MT-03» — MT-03 300, «VULCAN 650» — VULCAN 650S) — класс того имени, с которого он начинается, если такое
+    имя одного класса."""
+    k = B._nocc(model)
+    if len(k) < 3:
+        return None
+    got = {c for c, ns in MODEL_CLASSES for n in ns
+           if B._nocc(n) == k or (k[-1].isdigit() and B._nocc(n).startswith(k))}
+    return got.pop() if len(got) == 1 else None
+
+
+def term_minimum(models, together=False):
+    """Модели вопроса → {модель: минимум суток | None}. Вместе (слово клиента) и моделей больше одной: скутер с
+    мотоциклом — 3 каждой; без мотоцикла или с моделью без класса — НЕИЗВЕСТНО (None). Иначе — минимум своего класса."""
+    cls = {m: model_class(m) for m in models if isinstance(m, str)}
+    if together and len(cls) > 1:
+        n = MIN_TOGETHER if set(cls.values()) in ({SCOOTER, MOTO}, {MOTO}) else None
+        return {m: n for m in cls}
+    return {m: MIN_DAYS.get(c) for m, c in cls.items()}
+
+
+def mark_minimum(res, term):
+    """Исход двери пары на минимум → строка «минимум N сут. (05.10.2026-1)», клиент назвал короче — «клиент назвал M
+    сут.»; поля min_days, client_days. Пара без минимума — исход как есть."""
+    if isinstance(res, dict) and term.get("min"):
+        res.update(min_days=term["min"], client_days=term.get("client"))
+        res["line"] = (res.get("line") or "") + MIN_NOTE % (term["min"], term["min"], MIN_RULE) + (
+            CLIENT_NOTE % term["client"] if term.get("client") else "") + "."
+    return res
+
+
+class _Said(str):
+    """Слова сообщения с днём (Пхукет), когда он известен: «сегодня»/«завтра» в них — от этого дня (WAMINPRICE0510)."""
+    day = None
+
+
+def _said(text, day):
+    s = _Said(text)
+    s.day = day
+    return s
+
 
 def _norm_map(text):
     """Текст → (строка как у `B._nocc`: строчные латиница и цифры без «cc»; [место каждого её знака в тексте])."""
@@ -765,13 +846,14 @@ def _terms(text, today):
 
 def context_start(msgs, today):
     """Начало срока из слов КЛИЕНТА (его сообщения, новые первыми; WAPAIRS0410 п.3): самый новый диапазон дат — его
-    начало; диапазонов нет — первая дата самого нового сообщения с датой; дат нет — None (двери нет)."""
+    начало; диапазонов нет — первая дата самого нового сообщения с датой («завтра» — от дня сообщения, WAMINPRICE0510);
+    дат нет — None (двери нет)."""
     for text in msgs:
         full = [r for r in find_ranges(text, today) if r["ds"] is not None]
         if full:
             return full[0]["ds"]
     for text in msgs:
-        dates = find_dates(text, today)
+        dates = find_dates(text, today, getattr(text, "day", None))
         if dates:
             return dates[0]
     return None
@@ -811,21 +893,26 @@ def _link(hits, terms):
 
 
 def _who_text(c):
-    """Элемент переписки → (кто, текст): `_context` даёт (кто, текст); голая строка — автор неизвестен, не клиент."""
+    """Элемент переписки → (кто, текст): `_context` даёт (кто, текст, день) — текст несёт день сообщения; (кто, текст) —
+    день неизвестен; голая строка — автор неизвестен, не клиент."""
+    if isinstance(c, (tuple, list)) and len(c) == 3:
+        return str(c[0] or ""), _said(str(c[1] or ""), c[2])
     if isinstance(c, (tuple, list)) and len(c) == 2:
         return str(c[0] or ""), str(c[1] or "")
     return "", str(c or "")
 
 
-def price_pairs(ask, ctx, today, bikes):
-    """Вопрос о цене + сообщения диалога до него (новые первыми; (кто, текст)) → ([(модель, {ds, de, days})],
+def price_pairs(ask, ctx, today, bikes, ask_day=None):
+    """Вопрос о цене + сообщения диалога до него (новые первыми; (кто, текст[, день])) → ([(модель, {ds, de, days})],
     отброшено сверх PAIRS_MAX). Модель — имя модели парка либо {"alias", "cands"} — сокращение, подходящее к нескольким
     моделям (цена НЕИЗВЕСТНА). Пары — только из слов клиента (WAPAIRS0410, шапка раздела): в вопросе модель и срок —
     что связал вопрос; только модель — сроки, которые клиент связал с ЭТОЙ моделью в самом новом таком сообщении (срок без
     модели — если клиент назвал одну модель); только срок — модели самого нового сообщения клиента с моделями; ни того,
     ни другого — пары, которые клиент связал сам, по сообщениям. Срок числом суток — от `context_start` слов клиента;
-    начала нет — ds и de None (цены нет, агент спрашивает даты)."""
-    msgs = [(WHO_CLIENT, str(ask or ""))] + [_who_text(c) for c in list(ctx or ())[:CTX_MSGS]]
+    начала нет — ds и de None (цены нет, агент спрашивает даты). Минимум класса (WAMINPRICE0510, `term_minimum`):
+    начало известно, срок модели не назван или короче минимума — срок на минимум, в сроке min и client (что назвал
+    клиент); ask_day — день вопроса для «сегодня/завтра»."""
+    msgs = [(WHO_CLIENT, _said(str(ask or ""), ask_day))] + [_who_text(c) for c in list(ctx or ())[:CTX_MSGS]]
     mine = [t for who, t in msgs if who == WHO_CLIENT]           # слова клиента, новые первыми; [0] — вопрос
     parsed = [(model_hits(t, bikes), _terms(t, today)) for t in mine]
     a_hits, a_terms = parsed[0]
@@ -843,17 +930,31 @@ def price_pairs(ask, ctx, today, bikes):
                         if g), [])
             if not got and solo is not None and _ident(h) == _ident(solo):
                 got = [(h, t) for t in next((ts for hs, ts in parsed[1:] if ts and not hs), [])]
-            raw += got
+            raw += got or [(h, None)]                    # срок модели не назван — только на минимум (WAMINPRICE0510)
     elif a_terms:
         raw = [(h, t) for h in _distinct(next((hs for hs, _ts in parsed[1:] if hs), [])) for t in a_terms]
     else:
         for hs, ts in parsed[1:]:
             raw += _link(hs, ts) if hs else [(solo, t) for t in ts] if solo is not None else []
+        if not raw:                                      # модели клиента без срока — только на минимум
+            raw = [(h, None) for h in _distinct(next((hs for hs, _ts in parsed[1:] if hs), []))]
     start = context_start(mine, today)
+    # «сегодня/завтра» — начало только у пары с минимумом класса; без минимума (X-ADV 750, вне списка, два скутера
+    # вместе) — начало как было, без относительных слов (WAMINPRICE0510: «как было»)
+    start_was = context_start([str(t) for t in mine], today)
+    need = term_minimum([h[2] for h, _t in raw], bool(_RX_TOGETHER.search(" ".join(mine))))
     pairs, seen = [], set()
     for h, t in raw:
-        if t["ds"] is None and start is not None:
-            t = dict(t, ds=start, de=start + datetime.timedelta(days=t["days"]))
+        mn = need.get(h[2]) if h[2] is not None else None
+        at = start if mn is not None else start_was
+        if t is None:
+            if mn is None or at is None:                 # минимума или начала нет — как было: пары нет
+                continue
+            t = {"a": 0, "ds": at, "de": at + datetime.timedelta(days=mn), "days": mn, "min": mn}
+        if t["ds"] is None and at is not None:
+            t = dict(t, ds=at, de=at + datetime.timedelta(days=t["days"]))
+        if mn is not None and t["ds"] is not None and t["days"] < mn:
+            t = dict(t, de=t["ds"] + datetime.timedelta(days=mn), days=mn, min=mn, client=t["days"])
         key = (_ident(h), t["ds"], t["de"], t["days"])
         if key not in seen:
             seen.add(key)
@@ -1166,14 +1267,15 @@ class ModelAdapter(wa_agent.Model):
             self.log("уроки не прочитаны: %s — блока уроков нет" % type(e).__name__)
             return []
 
-    def _price(self, ask, today, ctx=()):
+    def _price(self, ask, today, ctx=(), ask_day=None):
         """Цена — только на вопрос о цене. Одна модель и обе даты в вопросе — одна дверь, как раньше; модели или дат
         нет (или моделей несколько) — варианты «модель + срок» из вопроса и переписки `ctx` (сообщения до вопроса, новые
-        первыми; `price_pairs`, WAPRICECTX0410), каждый — свой `K.quote`. → (исход | None, слова)."""
+        первыми; `price_pairs`, WAPRICECTX0410), каждый — свой `K.quote`. Срок короче минимума класса или не назван при
+        известном начале — дверь на минимум (WAMINPRICE0510); ask_day — день вопроса («завтра»). → (исход | None, слова)."""
         if not _PRICE_ASK.search(ask):
             return None, "о цене не спрашивают"
         dates = find_dates(ask, today)
-        if len(dates) < 2 and not ctx:
+        if len(dates) < 2 and not ctx and not find_dates(ask, today, ask_day):   # «на завтра» — начало (минимум)
             return None, "о цене спрашивают без дат — дверь не звана"
         if self.fleet is None or self.door is None:
             return None, "двери цены нет"
@@ -1189,10 +1291,14 @@ class ModelAdapter(wa_agent.Model):
         if len(dates) >= 2 and len(find_models(ask, bikes)) <= 1:
             model = B.find_model(ask, bikes)                        # ключ модели — живые имена парка
             if model:
-                res = K.quote(model, dates[0], dates[1], self.door, lambda m: units_of(m, bikes),
-                              self.no_price_models)
+                term = {"ds": dates[0], "de": dates[1], "days": term_days(dates[0], dates[1])}
+                mn = term_minimum([model]).get(model)
+                if mn is not None and 0 < term["days"] < mn:         # короче минимума — дверь на минимум
+                    term = dict(term, de=dates[0] + datetime.timedelta(days=mn), min=mn, client=term["days"])
+                res = mark_minimum(K.quote(model, term["ds"], term["de"], self.door, lambda m: units_of(m, bikes),
+                                           self.no_price_models), term)
                 return res, "цена: %s" % res["outcome"]
-        pairs, dropped = price_pairs(ask, ctx, today, bikes)
+        pairs, dropped = price_pairs(ask, ctx, today, bikes, ask_day)
         if not pairs:
             return None, ("о цене спрашивают без модели из парка — дверь не звана" if len(dates) >= 2 else
                           "о цене спрашивают без дат — дверь не звана")
@@ -1215,18 +1321,26 @@ class ModelAdapter(wa_agent.Model):
             res = K.quote(model, None, None, self.door, lambda m: None)
             res.update(days=term["days"], why="дата начала не названа", line=NO_START_LINE % (model, term["days"]))
             return res
-        return K.quote(model, term["ds"], term["de"], self.door, lambda m: units_of(m, bikes), self.no_price_models)
+        return mark_minimum(K.quote(model, term["ds"], term["de"], self.door, lambda m: units_of(m, bikes),
+                                    self.no_price_models), term)
+
+    @staticmethod
+    def _day(ts):
+        """Время сообщения (эпоха) → день по Пхукету | None (времени нет)."""
+        if not ts:
+            return None
+        return datetime.datetime.fromtimestamp(int(ts) + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
 
     @staticmethod
     def _context(items, tail):
         """Сообщения диалога ДО вопроса клиента (наши и клиента, без автоприветствия) под маской, новые первыми, не
-        больше CTX_MSGS: [(кто, текст)] — в словах клиента ищутся модель и срок вопроса о цене (WAPRICECTX0410,
-        WAPAIRS0410: наши строки пар не дают)."""
+        больше CTX_MSGS: [(кто, текст, день)] — в словах клиента ищутся модель и срок вопроса о цене (WAPRICECTX0410,
+        WAPAIRS0410: наши строки пар не дают); день — для «завтра» (WAMINPRICE0510)."""
         skip, out = {id(it) for it in tail}, []
         for it in reversed(items):
             if it.get("auto") or id(it) in skip or not it.get("text"):
                 continue
-            out.append((it.get("who") or "", K.mask(it["text"])[0]))
+            out.append((it.get("who") or "", K.mask(it["text"])[0], ModelAdapter._day(it.get("ts"))))
             if len(out) >= CTX_MSGS:
                 break
         return out
@@ -1282,7 +1396,9 @@ class ModelAdapter(wa_agent.Model):
         today = datetime.datetime.fromtimestamp(now + wa_history.PHUKET_OFFSET, datetime.timezone.utc).date()
         terms = client_terms(items, today)              # сутки каждому диапазону дат клиента — кодом (WADAYS0410)
         ctx = self._context(items, tail)                # переписка до вопроса: модель и срок цены (WAPRICECTX0410)
-        price, price_words = self._price(ask, today, ctx)
+        ask_days = {self._day(it.get("ts")) for it in tail}   # «завтра» вопроса — от его дня; дни разные — неизвестен
+        ask_day = ask_days.pop() if len(ask_days) == 1 else None
+        price, price_words = self._price(ask, today, ctx, ask_day)
         reasons = K.handoff(ask, price)
         avail, rental, book_words = self._book(number, ask, today, now)
         if avail is not None or rental is not None:

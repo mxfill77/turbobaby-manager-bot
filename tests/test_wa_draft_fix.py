@@ -169,14 +169,20 @@ def test_price_no_cross_model():
 
 
 def test_price_gate_question_model_both_dates():
-    """− дверь цены только на явный вопрос о цене с моделью и обеими датами: без слова цены, с одной датой, без
-    дат — ни двери, ни чтения парка."""
+    """− дверь цены только на явный вопрос о цене с моделью и датой: без слова цены, без дат — ни двери, ни чтения
+    парка. С одной датой — до WAMINPRICE0510 тоже ни двери; теперь начало известно, срок не назван — дверь на минимум
+    класса (XMAX 300 — скутер, 5 суток, запись 05.10.2026-1; слово владельца 05.10 16:53 «дать цены сразу»):
+    05.11–10.11, парк прочитан один раз."""
     for text, words in (("Нужен XMAX 300 %s, доставка есть?" % DATES, "о цене не спрашивают"),
-                        ("Сколько стоит XMAX 300 с 5 ноября?", "без дат"),
                         ("Сколько стоит XMAX 300 в сутки?", "без дат")):
         br, user, info = asked(text)
         assert info["price"] is None and words in info["price_words"], (text, info["price_words"])
         assert "ЦЕНА:" not in user and br.doors == [] and br.fleets == 0, (text, br.doors, br.fleets)
+    br, user, info = asked("Сколько стоит XMAX 300 с 5 ноября?")
+    assert info["price"] is not None and "вариантов 1" in info["price_words"], info["price_words"]
+    assert [(B.model_key(d[0]), d[1], d[2]) for d in br.doors] == [("XMAX 300CC", "2026-11-05", "2026-11-10")] and \
+        br.fleets == 1, (br.doors, br.fleets)
+    assert "ЦЕНА:" in user and "минимум 5 сут. (05.10.2026-1)" in user, user[-600:]
 
 
 def test_old_fixture_case_unchanged():
