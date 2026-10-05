@@ -111,8 +111,20 @@ class Fetch:
                 "content_b64": base64.b64encode(self.data).decode()}
 
 
+class Find:
+    """Подделка двери contract_find (T4B3BASIS0510): реестр при нажатии отвечает тем же подписанным договором."""
+    def __init__(self, pick=None):
+        self.calls = []
+        self.pick = pick or {"row": 41, "doc_id": "D41", "pdf_id": "F41", "signed_at": "2026-10-01", "signed": True}
+
+    def __call__(self, **kw):
+        self.calls.append(kw)
+        return {"ok": True, "outcome": "one", "pick": dict(self.pick),
+                "checked": {"rows_scanned": 50, "unread": [], "undated_signed": 0, "complete": True}}
+
+
 class World:
-    def __init__(self, tools="ok", door=None, fetch=None, attach=True, cls=X.AttachCore):
+    def __init__(self, tools="ok", door=None, fetch=None, attach=True, cls=X.AttachCore, find=None):
         d = tempfile.mkdtemp(prefix="wa_attach_t_")
         self.qpath, self.dbpath = os.path.join(d, "q.db"), os.path.join(d, "agent.db")
         q = sqlite3.connect(self.qpath)
@@ -121,6 +133,7 @@ class World:
         q.close()
         self.model = FakeModel(tools_ok() if tools == "ok" else tools)
         self.tg, self.door, self.fetch = FakeTG(), door or FakeDoor(), fetch or Fetch()
+        self.find = find or Find()
         self.attach, self.cls, self.lines = attach, cls, []
         self.core = self.new_core()
         self.core.tick(T0 - 1000)
@@ -129,7 +142,7 @@ class World:
         if self.cls is A.Core:
             return A.Core(self.dbpath, self.qpath, self.model, self.tg, self.door, log=self.lines.append)
         return self.cls(self.dbpath, self.qpath, self.model, self.tg, self.door, log=self.lines.append,
-                        attach=self.attach, pdf_fetch=self.fetch)
+                        attach=self.attach, pdf_fetch=self.fetch, contract_find=self.find)
 
     def put(self, ts, kind="in", number=NUM, wamid=None, word="x"):
         echo, msg_type = (1, "text") if kind == "echo" else (0, "text")
@@ -573,7 +586,7 @@ def test_core_untouched():
     tree = ast.parse(open(os.path.join(ROOT, "wa_agent_attach.py"), encoding="utf-8").read())
     names = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
              for a in (n.names if isinstance(n, ast.Import) else [ast.alias(n.module or "")])}
-    assert names == {"base64", "hashlib", "re", "wa_agent"}, names
+    assert names == {"base64", "hashlib", "re", "wa_agent", "wa_agent_tools"}, names     # tools — только sift (T4B3)
 
 
 def main():

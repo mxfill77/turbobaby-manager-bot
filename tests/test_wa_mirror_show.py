@@ -258,7 +258,8 @@ class PdfWorld:
         q.close()
         self.tg, self.door = TG(), AT.FakeDoor(media=media)
         self.core = X.AttachCore(self.dbpath, self.qpath, AT.FakeModel(AT.tools_ok()), self.tg, self.door,
-                                 clock=lambda: T0 - 5000, attach=True, pdf_fetch=AT.Fetch())
+                                 clock=lambda: T0 - 5000, attach=True, pdf_fetch=AT.Fetch(),
+                                 contract_find=AT.Find())          # реестр при нажатии — тот же договор (T4B3)
         self.core.tick(T0 - 1000)
         q = sqlite3.connect(self.qpath)
         q.execute("INSERT INTO wa_inbox(ts_queued, from_number, msg_type, text, ts_msg, echo, history, wamid) "
