@@ -34,6 +34,10 @@ THRESHOLD_USD = float(os.environ.get("SPEND_LEDGER_THRESHOLD", "2") or "2")
 # Источник — прайс Anthropic (claude-api skill, кэш 2026-06-24). Приблизительно (для сигнала).
 # Ключи матчатся по ПРЕФИКСУ (модель может нести дату-суффикс: claude-haiku-4-5-20251001).
 PRICE_PER_MTOK = {
+    # Источник двух строк ниже — Anthropic 05.10.2026 по заданию Штаба 012az-7e2.0510 (WAOPUSHIGHC0510):
+    # claude-opus-5-5 — $4 вход / $20 выход за 1 млн; claude-sonnet-5-5 — $2 / $10. Префикс длиннее «claude-sonnet-5».
+    "claude-opus-5-5":   (4.0, 20.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
     "claude-opus-4-8":   (5.0, 25.0),
     "claude-opus-4-7":   (5.0, 25.0),
     "claude-opus-4-6":   (5.0, 25.0),

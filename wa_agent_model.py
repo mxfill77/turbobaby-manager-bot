@@ -57,6 +57,13 @@
 ПЛАТЕЛЬЩИК — платный ключ API тем же путём, что у Splinter (`claude_client.ClaudeClient`:
 ANTHROPIC_API_KEY из .env корня дерева, учёт трат `spend_ledger.meter`). Значение ключа не печатается.
 
+УРОВЕНЬ И ПРЕДЕЛ (WAOPUSHIGHC0510) — повод: владелец 05.10 19:01, Opus 5.5 уровня high. По Anthropic 05.10 уровень
+идёт в запросе `output_config.effort` (по умолчанию medium), max_tokens — общий предел мыслей и текста. Уровень —
+аргумент `paid_call(effort=…)` или WA_AGENT_EFFORT: low, medium, high, xhigh, max; задан — `output_config` через
+extra_body; не задан — запрос как был; иное — не шлётся, словами в строке старта. Предел — `paid_call(max_tokens=…)`
+или WA_AGENT_MAX_TOKENS; не задан — при уровне MAX_TOKENS_EFFORT, без уровня MAX_TOKENS. Аргумент сильнее окружения.
+Ответ, оборванный пределом (stop_reason max_tokens), — черновика нет, причина `CUT_WORDS` в журнале.
+
 ЖУРНАЛ — только номер черновика у ядра, объёмы, токены, причины словами. Текстов, номеров и имён
 клиентов в журнале нет. Знания — строкой «знания: …» на каждый вызов (WAKNOWFRESH0310): имя узла, прочитан ли
 сейчас, длина, sha16 и возраст снимка; текста узлов в журнале нет.
@@ -88,7 +95,13 @@ DEFAULT_MODEL = "claude-sonnet-4-5"          # как CLAUDE_MODEL Splinter по
 # WACARDQ0410: при вопросе не по-русски тот же ответ несёт ещё два перевода (вопроса до TR_Q_MAX знаков и ответа);
 # при 700 длинный вопрос обрывал бы JSON — черновика не было бы вовсе. Цена — по фактическим токенам, не по пределу
 MAX_TOKENS = 1500
-HISTORY_MAX = 60000                           # символов истории; старше — обрезается с головы, словами
+# уровень мышления (WAOPUSHIGHC0510): max_tokens — общий предел мыслей и текста; при уровне 1500 съели бы мысли
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+F_MODEL, F_EFFORT, F_MAX_TOKENS = "WA_AGENT_MODEL", "WA_AGENT_EFFORT", "WA_AGENT_MAX_TOKENS"
+MAX_TOKENS_EFFORT = 16000
+STOP_CUT = "max_tokens"                       # stop_reason ответа, оборванного пределом
+CUT_WORDS = "ответ модели оборван пределом токенов"
+HISTORY_MAX = 60000                          # символов истории; старше — обрезается с головы, словами
 TAIL_MAX = 4000
 LESSON_ITEM_MAX = 600                         # было/стало/причина одного урока в промпте, символов
 LESSONS_MAX = 8000                            # блок уроков целиком; не помещается — старшие уходят, словами
@@ -1209,25 +1222,70 @@ class _LedgerUsage:
 
 # ── платный вызов (как у Splinter) ─────────────────────────────────────────────────────
 
-def paid_call(model_name=None, env_file=None):
+def model_settings(model_name=None, effort=None, max_tokens=None, env=None):
+    """Модель, уровень и предел вызова (WAOPUSHIGHC0510) → {model, effort, effort_bad, max_tokens, tokens_bad}.
+    Аргумент сильнее окружения. Уровень — из EFFORTS (регистр и пробелы не важны); иное — не шлётся (effort None),
+    слово — в effort_bad для строки старта. Предел — целое больше нуля; не задан или не принят — при уровне
+    MAX_TOKENS_EFFORT, без уровня MAX_TOKENS; не принятое — в tokens_bad."""
+    env = os.environ if env is None else env
+    name = model_name or env.get(F_MODEL) or env.get("CLAUDE_MODEL") or DEFAULT_MODEL
+    raw = effort if effort not in (None, "") else env.get(F_EFFORT)
+    level, bad = str(raw or "").strip().lower(), ""
+    if level and level not in EFFORTS:
+        level, bad = "", str(raw).strip()
+    raw_t = max_tokens if max_tokens not in (None, "") else env.get(F_MAX_TOKENS)
+    tokens, tbad = None, ""
+    if str(raw_t or "").strip():
+        t = str(raw_t).strip()
+        tokens = int(t) if t.isdigit() and int(t) > 0 else None
+        tbad = "" if tokens else t
+    return {"model": name, "effort": level or None, "effort_bad": bad,
+            "max_tokens": tokens or (MAX_TOKENS_EFFORT if level else MAX_TOKENS), "tokens_bad": tbad}
+
+
+def settings_words(s):
+    """Строка старта о модели (WAOPUSHIGHC0510): модель, уровень и предел — словами, ключей нет."""
+    if not s:
+        return "модель: настройки не названы — вызов модели собран не через paid_call"
+    if s["effort"]:
+        lvl = "уровень %s (output_config.effort)" % s["effort"]
+    elif s["effort_bad"]:
+        lvl = "уровень «%s» не принят (%s) — не шлётся, запрос без уровня" % (s["effort_bad"], ", ".join(EFFORTS))
+    else:
+        lvl = "уровень не задан — запрос без уровня, как раньше"
+    lim = "предел %d токенов%s" % (s["max_tokens"], " на мысли и текст" if s["effort"] else "")
+    if s["tokens_bad"]:
+        lim += " (%s «%s» не принят — нужно целое больше нуля)" % (F_MAX_TOKENS, s["tokens_bad"])
+    return "модель (%s, %s, %s): %s · %s · %s" % (F_MODEL, F_EFFORT, F_MAX_TOKENS, s["model"], lvl, lim)
+
+
+def paid_call(model_name=None, env_file=None, effort=None, max_tokens=None, env=None, client=None):
     """→ call(system, user) → (текст, usage-словарь). Ключ — ANTHROPIC_API_KEY из .env дерева тем же
     путём, что у Splinter; учёт трат — `spend_ledger.meter`. Значение ключа нигде не печатается.
-    system — строка (кэш выключен) или список блоков с `cache_control` (WAAGENTCACHE0210) — уходит как есть."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(env_file or os.path.join(ROOT, ".env"))
-    except Exception:                                                # noqa: BLE001
-        pass
-    from anthropic import Anthropic
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY нет — платного ключа нет")
-    client = Anthropic(api_key=key)
-    name = model_name or os.environ.get("WA_AGENT_MODEL") or os.environ.get("CLAUDE_MODEL") or DEFAULT_MODEL
+    system — строка (кэш выключен) или список блоков с `cache_control` (WAAGENTCACHE0210) — уходит как есть.
+    Уровень и предел — `model_settings` (WAOPUSHIGHC0510); usage несёт stop — stop_reason ответа; `call.settings` —
+    настройки для строки старта. env — настройки словарём, client — готовый клиент (тесты): тогда .env не читается."""
+    if env is None:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_file or os.path.join(ROOT, ".env"))
+        except Exception:                                            # noqa: BLE001
+            pass
+        env = os.environ
+    if client is None:
+        from anthropic import Anthropic
+        key = env.get("ANTHROPIC_API_KEY")
+        if not key:
+            raise RuntimeError("ANTHROPIC_API_KEY нет — платного ключа нет")
+        client = Anthropic(api_key=key)
+    s = model_settings(model_name, effort, max_tokens, env)
+    name = s["model"]
+    # уровень задан — output_config через extra_body; не задан или не принят — запрос байт-в-байт прежний
+    more = {"extra_body": {"output_config": {"effort": s["effort"]}}} if s["effort"] else {}
 
     def call(system, user):
-        resp = client.messages.create(model=name, max_tokens=MAX_TOKENS, system=system,
-                                      messages=[{"role": "user", "content": user}])
+        resp = client.messages.create(model=name, max_tokens=s["max_tokens"], system=system,
+                                      messages=[{"role": "user", "content": user}], **more)
         u = getattr(resp, "usage", None)
         use = usage_of(u)
         model = getattr(resp, "model", name) or name
@@ -1238,7 +1296,8 @@ def paid_call(model_name=None, env_file=None):
         except Exception:                                            # noqa: BLE001
             pass
         text = "\n".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
-        return text, dict(use, model=model)
+        return text, dict(use, model=model, stop=getattr(resp, "stop_reason", None))
+    call.settings = s
     return call
 
 
@@ -1309,6 +1368,16 @@ class ModelAdapter(wa_agent.Model):
         s["usd_nocache"] += cost["usd_nocache"]
         self.log("%s %s" % (what, cost_words(use, cost)))
         return cost
+
+    def _cut(self, usage, what):
+        """Ответ оборван пределом (WAOPUSHIGHC0510): stop_reason max_tokens — черновика нет, причина `CUT_WORDS`
+        в журнал; обрывок не судится, даже если он разбирается. → True — оборван."""
+        stop = (usage or {}).get("stop")
+        if stop != STOP_CUT:
+            return False
+        self.log("%s %s — черновика нет (токены in=%s out=%s)" % (what, CUT_WORDS, (usage or {}).get("in"),
+                                                                 (usage or {}).get("out")))
+        return True
 
     def _history(self, number, upto_id):
         items, missing = wa_history.read_history(number, self.queue_db, self.archive_db, self.manifest,
@@ -1593,6 +1662,9 @@ class ModelAdapter(wa_agent.Model):
         system, user, info = self.build(number, upto_id)
         raw, usage = self.call(system, user)
         self._spend(usage, "черновик:")
+        if self._cut(usage, "модель:"):                     # обрыв пределом — черновика нет (WAOPUSHIGHC0510)
+            self.last = {"info": info, "usage": usage, "raw": raw, "parsed": None}
+            return None
         got = parse_reply(raw)
         self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got}
         tok = "токены in=%s out=%s" % ((usage or {}).get("in"), (usage or {}).get("out"))
@@ -1680,6 +1752,11 @@ class ModelAdapter(wa_agent.Model):
             self._spend(usage, "черновик:")
             reasons = [T.INCOMPLETE_WORDS]
             out["results"] = []                                 # факты незавершённой сверки не опора
+        if self._cut(usage, "модель:"):                         # обрыв пределом — черновика нет (WAOPUSHIGHC0510)
+            for line in jr.lines():
+                self.log(line)
+            self.last = {"info": info, "usage": usage, "raw": raw, "parsed": None, "tools": out}
+            return None
         got = parse_reply(raw)
         # процент скидки за срок, названной дверью, — с опорой (WAPRICECTX0410): судья сверки процент судит без
         # исхода цены, поэтому названная дверью скидка снимается из текста до суда; прочее — как было
@@ -1749,6 +1826,9 @@ class ModelAdapter(wa_agent.Model):
         system, user, info = self.build_followup(number, upto_id)
         raw, usage = self.call(system, user)
         self._spend(usage, "напоминание:")
+        if self._cut(usage, "модель (напоминание):"):       # обрыв пределом — решения нет, повтор позже
+            self.last = {"info": info, "usage": usage, "raw": raw, "parsed": None}
+            return None
         got = parse_followup(raw)
         self.last = {"info": info, "usage": usage, "raw": raw, "parsed": got}
         tok = "токены in=%s out=%s" % ((usage or {}).get("in"), (usage or {}).get("out"))

@@ -168,6 +168,15 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
     return model, ""
 
 
+def model_line(model):
+    """Строка старта о модели (WAOPUSHIGHC0510): модель, уровень и предел вызова словами — их несёт `call.settings`
+    от `wa_agent_model.paid_call`; ключей в строке нет. Адаптера нет — модель не зовётся."""
+    if model is None:
+        return "модель: адаптера нет — модель не зовётся"
+    import wa_agent_model
+    return wa_agent_model.settings_words(getattr(getattr(model, "call", None), "settings", None))
+
+
 def build(env, environ=None, model=None, http=None, send=None, react_send=None, clock=time.time,
           line=None, send_media=None):
     """Собрать ядро и руки. model=None — адаптера нет, черновики выключены при любом WA_AGENT_DRAFTS.
@@ -205,6 +214,7 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     ttl = getattr(model, "cache", None)
     line("кэш промпта (%s): %s" % (F_CACHE, "вкл, срок %s — инструкция и узлы знаний впереди с отметкой кэша" % ttl
                                    if ttl else "выкл — запрос модели как раньше"))
+    line(model_line(model))                     # модель, уровень и предел (WAOPUSHIGHC0510); ключей нет
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                          log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
                          followup=follow)
