@@ -122,7 +122,7 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 Как отвечать:
 1. Отвечай на то, что клиент спрашивает СЕЙЧАС (блок «КЛИЕНТ СЕЙЧАС»). Вся история — чтобы понимать контекст: кто он, что уже обсуждали, что ему уже ответили. Историю НЕ пересказывай и не повторяй то, что клиенту уже сказали.
 2. Коротко: обычно 1–3 предложения, как живой менеджер в мессенджере. Без канцелярита, без списков, если о них не просили.
-3. Пиши на языке клиента: русский или английский. Если клиент пишет на другом языке — ответь по-английски коротко и поставь в handoff причину «язык не русский и не английский».
+3. Пиши на языке из строки «ЯЗЫК РАЗГОВОРА» — её посчитал код по последним сообщениям клиента; одна фраза клиента на другом языке язык разговора не меняет. Строки нет — пиши на языке клиента: русский или английский. Если клиент пишет на другом языке — ответь по-английски коротко и поставь в handoff причину «язык не русский и не английский».
 4. Цены, наличие и брони НЕ выдумывай. Цену называй ТОЛЬКО из блока «ЦЕНА» и только так, как он разрешает; блока нет или он говорит «считает человек»/«неизвестна» — чисел цены не называй вовсе (ни точного, ни «от», ни диапазона), скажи, что коллега уточнит и вернётся с точной суммой. Наличие и брони ты не видишь — не обещай «есть» и «забронировано».
 5. Факты о компании (доставка, депозит, документы, правила) — только из узлов знаний ниже. Узел НЕИЗВЕСТНО или нужного там нет — «уточню у коллег», а не по памяти.
 6. От имени людей не обещай: никаких «коллега позвонит в 15:00», «мы вернём депозит», «сделаем скидку». Можно: «передам коллеге, он ответит».
@@ -174,6 +174,35 @@ def question_lang(question):
 def need_translation(lang):
     """Перевод нужен, если язык вопроса не русский; букв нет (None) — переводить нечего."""
     return lang not in ("ru", None)
+
+
+# ── язык разговора (WALANGCONVB0510) ────────────────────────────────────────────────────
+# Повод — №21 v2 (05.10 16:56): разговор шёл по-русски, последняя фраза клиента — по-английски, ответ ушёл английским:
+# правило 3 отдавало выбор языка модели, а модель смотрела на одну фразу. Теперь язык разговора считает КОД —
+# `K.lang_of` по каждому из последних CONV_LAST сообщений клиента с буквами (без наших меток): большинство, ничья —
+# язык самого нового; букв нет ни в одном — неизвестен. В сообщение модели (не в инструкцию: префикс кэша прежний)
+# идёт строка «ЯЗЫК РАЗГОВОРА: …» только для русского и английского; иначе строки нет — как было.
+CONV_LAST = 4                                 # последних сообщений клиента с буквами
+CONV_NAMES = {"ru": "русский", "en": "английский"}
+
+
+def conversation_lang(texts):
+    """Сообщения клиента (старые → новые) → (язык | None, сколько за него, сколько учтено). Язык — 'ru' | 'en' |
+    'other'; без букв — (None, 0, 0). Большинство последних CONV_LAST с буквами; ничья — язык самого нового."""
+    langs = [lang for lang in (question_lang(t) for t in texts or ()) if lang][-CONV_LAST:]
+    if not langs:
+        return None, 0, 0
+    top = max(langs.count(x) for x in set(langs))
+    lang = next(x for x in reversed(langs) if langs.count(x) == top)
+    return lang, top, len(langs)
+
+
+def conv_line(conv):
+    """(язык, за него, учтено) → строка «ЯЗЫК РАЗГОВОРА» | '' (не русский и не английский или неизвестен)."""
+    lang, n, total = conv
+    if lang not in CONV_NAMES:
+        return ""
+    return "ЯЗЫК РАЗГОВОРА: %s (%d из %d последних сообщений клиента)" % (CONV_NAMES[lang], n, total)
 
 
 # ── даты и модель в словах клиента ─────────────────────────────────────────────────────
@@ -1432,6 +1461,9 @@ class ModelAdapter(wa_agent.Model):
         q_lang = question_lang(question)
         if need_translation(q_lang):
             blocks.append(TR_BLOCK)
+        conv = conversation_lang(it["text"] for it in items if it.get("who") == "клиент")   # WALANGCONVB0510
+        if conv_line(conv):
+            blocks.append(conv_line(conv))
         blocks.append("ИСТОРИЯ ПЕРЕПИСКИ (вся, по времени; «мы» — наша сторона):\n" +
                       (hist or "переписки раньше не было") +
                       ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
@@ -1444,6 +1476,7 @@ class ModelAdapter(wa_agent.Model):
                 "avail": avail, "rental": rental, "book_words": book_words, "today": today, "terms": terms,
                 "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache,
                 "question": question, "q_lang": q_lang,           # карточка сотрудника (WACARDQ0410)
+                "conv": conv,                                     # язык разговора кодом (WALANGCONVB0510)
                 # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
                 "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
         return system, user, info
@@ -1476,6 +1509,19 @@ class ModelAdapter(wa_agent.Model):
             words = K.reason_first(words, K.ARRIVAL_CLAIM_WORDS)
         return words
 
+    def _lang_check(self, text, info, words):
+        """Язык ответа против языка разговора (WALANGCONVB0510): `K.lang_of` по тексту черновика не совпал с языком,
+        который код посчитал по последним сообщениям клиента, — причина «нужен человек». «Отправить» не запирается,
+        текст не правится, перевод для карточки — как был; в журнал — только языки и числа. Языка разговора нет (не
+        русский и не английский, букв нет) или у ответа букв нет — проверки нет."""
+        lang, n, total = info.get("conv") or (None, 0, 0)
+        said = question_lang(text)
+        if lang not in CONV_NAMES or said is None or said == lang:
+            return words
+        self.log("модель: язык ответа %s, язык разговора %s (%d из %d) — причина «нужен человек»"
+                 % (said, lang, n, total))
+        return K.merge_reasons(words, [K.LANG_CONV_WORDS])
+
     def draft(self, number, upto_id):
         if self.tools is not None:
             return self._draft_tools(number, upto_id)
@@ -1495,6 +1541,7 @@ class ModelAdapter(wa_agent.Model):
         words = K.merge_reasons(words, got["handoff"])      # дедуп по категории (WACARDCOMPACT0310)
         words = self._days_check(got["text"], info, words)   # сутки у дат не по разности — причина (WADAYS0410)
         words = self._arrival_check(got["text"], info, words)   # срок и приезд без опоры (WATIMECLAIMB0510)
+        words = self._lang_check(got["text"], info, words)      # язык ответа против языка разговора (WALANGCONVB0510)
         # деньги в тексте черновика (WAMONEYCHECK0310): процент предоплаты, депозита или скидки и сумма в батах не из
         # блока «ЦЕНА» этого вызова — причина «нужен человек» ПЕРВОЙ строкой (на карточке видна при любом числе
         # причин). Текст ответа не правится. В журнал — только числа: текст черновика туда не идёт.
@@ -1586,6 +1633,7 @@ class ModelAdapter(wa_agent.Model):
         words = K.merge_reasons(words, got["handoff"])
         words = self._days_check(got["text"], info, words)      # сутки у дат (WADAYS0410)
         words = self._arrival_check(got["text"], info, words)   # срок и приезд без опоры (WATIMECLAIMB0510)
+        words = self._lang_check(got["text"], info, words)      # язык ответа против языка разговора (WALANGCONVB0510)
         for w in reversed(words_t):                             # причины кода о деньгах — вперёд
             words = K.reason_first(words, w)
         for w in reversed(reasons):                             # «сверка не завершена» — самой первой
