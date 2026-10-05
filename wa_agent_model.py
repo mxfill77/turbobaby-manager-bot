@@ -13,10 +13,12 @@
     НЕИЗВЕСТНО словами, а не пусто. Снимок старше предела (`max_stale`, 3 × `max_age` = 30 мин, WAKNOWFRESH0310)
     — тоже НЕИЗВЕСТНО, без текста, и причина «знания устарели» первой из причин кода;
   • цена — `wa_agent_knowledge.quote` ТОЛЬКО когда клиент сейчас спрашивает о цене. Модель и обе даты в его
-    словах — одна дверь. Модели или дат нет — пары «модель + срок» из последних сообщений диалога, наших и клиента
-    (WAPRICECTX0410): до трёх, каждая — своя дверь с прежними воротами; срок числом суток — от начала из переписки,
-    начала нет — числа нет, агент спрашивает даты. Модель ищется по ключу живых имён парка (`wa_book_read`,
-    WADRAFTFIX0210). Скидка за срок — в строке цены всегда, и 0%; дверь её не назвала — «неизвестна» и причина;
+    словах — одна дверь. Модели или дат нет — пары «модель + срок» из последних сообщений диалога (WAPRICECTX0410):
+    до трёх, каждая — своя дверь с прежними воротами. Пары — только из слов КЛИЕНТА (WAPAIRS0410): срок идёт к модели,
+    только если их связал клиент; наши минимумы, сроки, даты и модели пар не дают; начало срока числом суток — дата
+    клиента, нет — числа нет, агент спрашивает даты. Модель ищется по ключу живых имён парка (`wa_book_read`,
+    WADRAFTFIX0210); сокращение без кубатуры — ключ, только если в парке такая модель одна, иначе модель НЕИЗВЕСТНА.
+    Скидка за срок — в строке цены всегда, и 0%; дверь её не назвала — «неизвестна» и причина;
   • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас;
   • уроки людей (WAAGENTLESSON0210) — ТОЛЬКО действующие (`wa_agent.active_lessons`, своя база агента
     mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
@@ -176,7 +178,9 @@ _MONTHS = {
 _MON = r"(янв\w*|фев\w*|мар\w*|апр\w*|ма[яй]|июн\w*|июл\w*|авг\w*|сен\w*|окт\w*|ноя\w*|дек\w*|" \
        r"jan\w*|feb\w*|mar\w*|apr\w*|may|jun\w*|jul\w*|aug\w*|sep\w*|oct\w*|nov\w*|dec\w*)"
 _RX_NUM = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)|(?<![\d.])(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?![\d])")
-_RX_RANGE_WORD = re.compile(r"(?i)(?<!\d)(\d{1,2})\s*(?:-|–|—|по|до|to|till|until)\s*(\d{1,2})\s+" + _MON)
+# «5 - 7 of October» — один диапазон (WAPAIRS0410 п.3): без «of» он читался двумя датами 07.10 и 08.10 соседних
+# диапазонов, а начало 05.10 терялось
+_RX_RANGE_WORD = re.compile(r"(?i)(?<!\d)(\d{1,2})\s*(?:-|–|—|по|до|to|till|until)\s*(\d{1,2})\s+(?:of\s+)?" + _MON)
 _RX_DAY_MON = re.compile(r"(?i)(?<!\d)(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MON)
 _RX_MON_DAY = re.compile(r"(?i)" + _MON + r"\s+(\d{1,2})(?:st|nd|rd|th)?(?!\d)")
 
@@ -497,16 +501,30 @@ def units_of(model, bikes):
 
 
 # ── вопрос о цене без модели или дат — варианты из переписки (WAPRICECTX0410) ───────────────
-# Повод — владелец 05.10, черновик №11: «сколько будет стоить?» относилось и к ADV 350 на 5 дней из НАШЕГО ответа, а
-# цена бралась только из слов клиента «сейчас». Вопрос о цене без модели или без двух дат дополняется последними
-# сообщениями диалога (наши и клиента, новые первыми): пары «модель + срок», без повторов, не больше PAIRS_MAX, каждая —
-# свой `K.quote` с прежними воротами (срок до месяца, один сезон, модель с ценой и в парке). Срок числом суток
-# («на 5 дней») — от начала, названного в переписке (самая новая дата); начала нет — числа нет, агент спрашивает даты.
+# Повод — владелец 05.10, черновик №11: «сколько будет стоить?» относилось к вариантам из переписки, а цена бралась
+# только из слов клиента «сейчас». Вопрос о цене без модели или без двух дат дополняется последними сообщениями
+# диалога (новые первыми): пары «модель + срок», без повторов, не больше PAIRS_MAX, каждая — свой `K.quote` с прежними
+# воротами (срок до месяца, один сезон, модель с ценой и в парке).
+#
+# ПАРЫ НЕ БЫВАЮТ ЧУЖИМИ (WAPAIRS0410; повод — WACTXLIST0410 §4: вершина на входе №11 дала CB 650R 07.10–12.10 и
+# 07.10–10.10 — срок «5» из НАШЕЙ фразы о минимумах ушёл к CB 650R, диапазон с «of» прочитан двумя датами).
+# Пара — только из слов КЛИЕНТА: модель и срок, которые он связал в одном сообщении (его перечень «X или Y, N или M
+# суток» — каждая модель с каждым сроком; вперемешку «2 days CB 1 day ADV» — каждой модели свой срок, связь не ясна —
+# пары нет). Наши строки не дают ни сроков, ни моделей: наши минимумы и прежние числа клиентским сроком не становятся.
+# Срок из сообщения о ДРУГОЙ модели к модели вопроса не идёт. Срок вопроса без модели — к моделям самого нового
+# сообщения клиента с моделями; срок клиента без модели — к модели, только если клиент назвал ровно одну. Начало срока
+# числом суток — дата КЛИЕНТА (самый новый его диапазон, иначе первая дата самого нового его сообщения с датой); нет —
+# цена НЕИЗВЕСТНА, агент спрашивает даты. Сокращение модели без кубатуры («ADV», «NMAX») — ключ парка, только если в
+# парке одна модель с таким первым словом; иначе («CB»: CB 300 и CB 650R) модель НЕИЗВЕСТНА — двери нет.
 
 CTX_MSGS = 6                                   # сообщений диалога до вопроса, где ищутся модель и срок
 PAIRS_MAX = 3                                  # вариантов «модель + срок» на вопрос; дверь цены — не чаще
 NO_START_LINE = ("%s на %d сут.: цена НЕИЗВЕСТНА — дата начала аренды в переписке не названа. Числа цены не "
                  "называть; спроси у клиента даты (с какого по какое число).")
+MODEL_UNKNOWN_LINE = ("«%s» на %d сут.: цена НЕИЗВЕСТНА — модель не определена: сокращение подходит к моделям парка "
+                      "%s. Числа цены не называть; спроси у клиента, какая модель.")
+WHO_CLIENT = "клиент"                          # метка роли строки истории (`wa_history.who_of`)
+_ALIAS_COMMON = frozenset(("click",))          # первое слово ключа — обычное слово («click the link»): не сокращение
 
 
 def _norm_map(text):
@@ -547,21 +565,84 @@ def find_models(text, bikes):
     return out
 
 
+def model_hits(text, bikes):
+    """Модели в словах → [(начало, конец, модель | None, слово, [кандидаты])] по месту, КАЖДОЕ упоминание. Полный ключ
+    парка — как у `find_models`. Сокращение без кубатуры — первое слово ключа («ADV», «NMAX», «X-ADV» = XADV): модель,
+    только если в парке ОДНА модель с таким первым словом; несколько («CB»: CB 300CC и CB 650R) — модель None,
+    НЕИЗВЕСТНА (WAPAIRS0410 п.4). Сокращение с числом кубатуры не из парка («CB 500») — не модель, как и прежде."""
+    s = str(text or "")
+    t, pos = _norm_map(s)
+    keys, alias = {}, {}
+    for b in bikes or ():
+        m = B.model_key((b or {}).get("name"))
+        k = B._nocc(m)
+        if len(k) >= 3:
+            keys.setdefault(k, m)
+        toks = m.split()
+        if len(toks) > 1 and not re.search(r"\d", toks[0]):
+            a = re.sub(r"[^a-z0-9]", "", toks[0].lower())
+            if len(a) >= 2 and a not in _ALIAS_COMMON:
+                alias.setdefault(a, set()).add(m)
+    hits = []
+    for k, m in keys.items():
+        at = t.find(k)
+        while at >= 0:
+            hits.append((at, at + len(k), m))
+            at = t.find(k, at + 1)
+    hits = [h for h in hits if not any(o[0] <= h[0] and h[1] <= o[1] and o[1] - o[0] > h[1] - h[0] for o in hits)]
+    out = [(pos[a], pos[b - 1] + 1, m, m, [m]) for a, b, m in hits]
+    low = s.lower()
+    for w in re.finditer(r"(?<![a-z0-9-])[a-z0-9]+(?:-[a-z0-9]+)*", low):
+        a = w.group().replace("-", "")
+        if a not in alias or any(x < w.end() and w.start() < y for x, y, _m, _w, _c in out):
+            continue
+        if re.match(r"\s*-?\s*\d{3}", low[w.end():]):            # названа кубатура, которой нет в парке
+            continue
+        ms = sorted(alias[a])
+        out.append((w.start(), w.end(), ms[0] if len(ms) == 1 else None, s[w.start():w.end()], ms))
+    return sorted(out)
+
+
+_RX_COUNT_LIST = re.compile(
+    r"(?i)(?<![\w.,])((?:\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)) + r")"
+    r"(?:\s*(?:,|/|-|–|—|или|либо|or|to)\s*(?:\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)) +
+    r"))+)(?:-?(?:х|ти|ми|ух|ёх|ех))?(?:\s+|\s*-\s*)"
+    r"(?:сут(?:ки|ок|ка|кам|ках)|дн(?:я|ей|ям)|день|ноч(?:ь|и|ей)|days?|nights?)\b")
+_RX_COUNT_ONE = re.compile(r"(?i)\d{1,3}|" + "|".join(sorted(_CNT_WORDS, key=len, reverse=True)))
+
+
+def count_list(text):
+    """Числа суток клиента → [(место, число)] по порядку: как `day_counts` и ещё перечень «3 или 4 дня», «3 or 4 days»,
+    «3-4 дня» — каждое число (WAPAIRS0410 п.2; `day_counts` из «3 or 4 days» брал одно 4)."""
+    s = str(text or "")
+    out = {a: n for a, _b, n in day_counts(s)}
+    for m in _RX_COUNT_LIST.finditer(s):
+        if _CNT_SKIP_BEFORE.search(s[max(0, m.start() - 40):m.start()]) or _CNT_SKIP_AFTER.match(s, m.end()):
+            out = {a: n for a, n in out.items() if not m.start() <= a < m.end()}   # «минимум 3 или 4 дня» — не срок
+            continue
+        for x in _RX_COUNT_ONE.finditer(m.group(1)):
+            w = x.group().lower()
+            n = int(w) if w.isdigit() else _CNT_WORDS.get(w)
+            if n is not None:
+                out.setdefault(m.start(1) + x.start(), n)
+    return sorted(out.items())
+
+
 def _terms(text, today):
-    """Сроки сообщения → [{a, ds, de, days}]: диапазоны дат; их нет — числа суток («на 5 дней») без дат. Диапазон без
-    месяца («с 5 по 7») — срока нет: ни дат, ни уверенности в числе."""
+    """Сроки сообщения → [{a, ds, de, days}]: диапазоны дат; их нет — числа суток («на 5 дней», «3 или 4 дня») без дат.
+    Диапазон без месяца («с 5 по 7») — срока нет: ни дат, ни уверенности в числе."""
     rs = find_ranges(text, today)
     full = [r for r in rs if r["ds"] is not None]
     if full:
         return [{"a": r["a"], "ds": r["ds"], "de": r["de"], "days": r["days"]} for r in full]
     if rs:
         return []
-    return [{"a": a, "ds": None, "de": None, "days": n} for a, _b, n in day_counts(text) if 0 < n <= TERM_MAX_DAYS]
+    return [{"a": a, "ds": None, "de": None, "days": n} for a, n in count_list(text) if 0 < n <= TERM_MAX_DAYS]
 
 
 def context_start(msgs, today):
-    """Начало срока из переписки (сообщения новые первыми): самый новый диапазон дат — его начало; диапазонов нет —
-    первая дата самого нового сообщения с датой; дат нет — None."""
+    """Начало срока из слов КЛИЕНТА (его сообщения, новые первыми; WAPAIRS0410 п.3): самый новый диапазон дат — его
+    начало; диапазонов нет — первая дата самого нового сообщения с датой; дат нет — None (двери нет)."""
     for text in msgs:
         full = [r for r in find_ranges(text, today) if r["ds"] is not None]
         if full:
@@ -573,47 +654,87 @@ def context_start(msgs, today):
     return None
 
 
-def _pair_up(models, terms):
-    """Модели и сроки одного сообщения → [(модель, срок)]: одна модель — со всеми сроками, один срок — со всеми
-    моделями; иначе каждой модели — ближайший срок по месту в тексте (поровну — тот, что после модели)."""
-    if not models or not terms:
+def _ident(hit):
+    """Упоминание модели → ключ тождества: модель парка; сокращение НЕИЗВЕСТНОЙ модели — «?» + слово."""
+    return hit[2] if hit[2] is not None else "?" + hit[3].lower()
+
+
+def _distinct(hits):
+    out, seen = [], set()
+    for h in hits:
+        if _ident(h) not in seen:
+            seen.add(_ident(h))
+            out.append(h)
+    return out
+
+
+def _link(hits, terms):
+    """Модели и сроки ОДНОГО сообщения клиента → [(упоминание, срок)] — что связал клиент. Одна модель или один срок,
+    либо все сроки по одну сторону от всех моделей («ADV 350 или CB 650R, 3 или 4 дня») — перечень: каждая модель с
+    каждым сроком. Вперемешку — каждой модели сроки между ней и соседней моделью: после неё («CB на 3 дня, ADV на 2»)
+    или перед ней («2 days CB 1 day ADV»); подходят обе стороны или ни одна — связь не ясна, пар нет."""
+    if not hits or not terms:
         return []
-    if len(models) == 1:
-        return [(models[0][1], t) for t in terms]
-    if len(terms) == 1:
-        return [(m, terms[0]) for _p, m in models]
-    return [(m, min(terms, key=lambda t: (abs(t["a"] - p), t["a"] < p))) for p, m in models]
+    ms, ts = sorted(hits), sorted(terms, key=lambda t: t["a"])
+    if len(ms) == 1 or len(ts) == 1 or ts[-1]["a"] < ms[0][0] or ms[-1][0] < ts[0]["a"]:
+        return [(h, t) for h in ms for t in ts]
+    after = [[t for t in ts if h[0] < t["a"] and (i + 1 == len(ms) or t["a"] < ms[i + 1][0])] for i, h in enumerate(ms)]
+    before = [[t for t in ts if t["a"] < h[0] and (i == 0 or ms[i - 1][0] < t["a"])] for i, h in enumerate(ms)]
+    ok_after = all(after) and sum(len(g) for g in after) == len(ts)
+    ok_before = all(before) and sum(len(g) for g in before) == len(ts)
+    if ok_after == ok_before:
+        return []
+    return [(h, t) for h, g in zip(ms, after if ok_after else before) for t in g]
+
+
+def _who_text(c):
+    """Элемент переписки → (кто, текст): `_context` даёт (кто, текст); голая строка — автор неизвестен, не клиент."""
+    if isinstance(c, (tuple, list)) and len(c) == 2:
+        return str(c[0] or ""), str(c[1] or "")
+    return "", str(c or "")
 
 
 def price_pairs(ask, ctx, today, bikes):
-    """Вопрос о цене + сообщения диалога до него (новые первыми) → ([(модель, {ds, de, days})], отброшено сверх
-    PAIRS_MAX). Модели и сроки вопроса — первыми, недостающее — из самого нового сообщения, где оно есть; в вопросе нет
-    ни модели, ни срока — пары каждого сообщения (недостающее так же). Срок числом суток — от `context_start`; начала нет —
-    ds и de None (цены нет, агент спрашивает даты)."""
-    msgs = [str(ask or "")] + [str(c or "") for c in list(ctx or ())[:CTX_MSGS]]
-    parsed = [(find_models(t, bikes), _terms(t, today)) for t in msgs]
-    a_models, a_terms = parsed[0]
-    dates = find_dates(msgs[0], today)
+    """Вопрос о цене + сообщения диалога до него (новые первыми; (кто, текст)) → ([(модель, {ds, de, days})],
+    отброшено сверх PAIRS_MAX). Модель — имя модели парка либо {"alias", "cands"} — сокращение, подходящее к нескольким
+    моделям (цена НЕИЗВЕСТНА). Пары — только из слов клиента (WAPAIRS0410, шапка раздела): в вопросе модель и срок —
+    что связал вопрос; только модель — сроки, которые клиент связал с ЭТОЙ моделью в самом новом таком сообщении (срок без
+    модели — если клиент назвал одну модель); только срок — модели самого нового сообщения клиента с моделями; ни того,
+    ни другого — пары, которые клиент связал сам, по сообщениям. Срок числом суток — от `context_start` слов клиента;
+    начала нет — ds и de None (цены нет, агент спрашивает даты)."""
+    msgs = [(WHO_CLIENT, str(ask or ""))] + [_who_text(c) for c in list(ctx or ())[:CTX_MSGS]]
+    mine = [t for who, t in msgs if who == WHO_CLIENT]           # слова клиента, новые первыми; [0] — вопрос
+    parsed = [(model_hits(t, bikes), _terms(t, today)) for t in mine]
+    a_hits, a_terms = parsed[0]
+    dates = find_dates(mine[0], today)
     if not a_terms and len(dates) >= 2 and dates[1] > dates[0]:      # две даты вопроса — срок, как раньше
         a_terms = [{"a": 0, "ds": dates[0], "de": dates[1], "days": term_days(dates[0], dates[1])}]
-    fill_m = next((ms for ms, _ts in parsed if ms), [])
-    fill_t = a_terms or next((ts for _ms, ts in parsed if ts), [])
-    if a_models or a_terms:
-        raw = _pair_up(a_models or fill_m, fill_t)
+    named = _distinct([h for hs, _ts in parsed for h in hs])
+    solo = named[0] if len(named) == 1 and named[0][2] is not None else None
+    raw = []
+    if a_hits and a_terms:
+        raw = _link(a_hits, a_terms)
+    elif a_hits:
+        for h in _distinct(a_hits):
+            got = next((g for g in ([p for p in _link(hs, ts) if _ident(p[0]) == _ident(h)] for hs, ts in parsed[1:])
+                        if g), [])
+            if not got and solo is not None and _ident(h) == _ident(solo):
+                got = [(h, t) for t in next((ts for hs, ts in parsed[1:] if ts and not hs), [])]
+            raw += got
+    elif a_terms:
+        raw = [(h, t) for h in _distinct(next((hs for hs, _ts in parsed[1:] if hs), [])) for t in a_terms]
     else:
-        raw = []
-        for ms, ts in parsed[1:]:
-            if ms or ts:
-                raw += _pair_up(ms or fill_m, ts or fill_t)
-    start = context_start(msgs, today)
+        for hs, ts in parsed[1:]:
+            raw += _link(hs, ts) if hs else [(solo, t) for t in ts] if solo is not None else []
+    start = context_start(mine, today)
     pairs, seen = [], set()
-    for m, t in raw:
+    for h, t in raw:
         if t["ds"] is None and start is not None:
             t = dict(t, ds=start, de=start + datetime.timedelta(days=t["days"]))
-        key = (m, t["ds"], t["de"], t["days"])
+        key = (_ident(h), t["ds"], t["de"], t["days"])
         if key not in seen:
             seen.add(key)
-            pairs.append((m, t))
+            pairs.append((h[2] if h[2] is not None else {"alias": h[3], "cands": list(h[4])}, t))
     return pairs[:PAIRS_MAX], max(0, len(pairs) - PAIRS_MAX)
 
 
@@ -959,8 +1080,14 @@ class ModelAdapter(wa_agent.Model):
             ", сверх предела %d" % dropped if dropped else "")
 
     def _quote_pair(self, model, term, bikes):
-        """Пара «модель + срок» → исход `K.quote` (прежние ворота). Начала срока нет — дверь не зовётся: цена
-        неизвестна, агент спрашивает даты."""
+        """Пара «модель + срок» → исход `K.quote` (прежние ворота). Модель НЕИЗВЕСТНА (сокращение подходит к нескольким
+        моделям, WAPAIRS0410) или начала срока нет — дверь не зовётся: цена неизвестна, агент спрашивает модель или
+        даты."""
+        if isinstance(model, dict):
+            res = K.quote(model["alias"], None, None, self.door, lambda m: None)
+            res.update(days=term["days"], why="модель не определена",
+                       line=MODEL_UNKNOWN_LINE % (model["alias"], term["days"], " / ".join(model["cands"])))
+            return res
         if term["ds"] is None:
             res = K.quote(model, None, None, self.door, lambda m: None)
             res.update(days=term["days"], why="дата начала не названа", line=NO_START_LINE % (model, term["days"]))
@@ -970,12 +1097,13 @@ class ModelAdapter(wa_agent.Model):
     @staticmethod
     def _context(items, tail):
         """Сообщения диалога ДО вопроса клиента (наши и клиента, без автоприветствия) под маской, новые первыми, не
-        больше CTX_MSGS: в них ищутся модель и срок вопроса о цене (WAPRICECTX0410)."""
+        больше CTX_MSGS: [(кто, текст)] — в словах клиента ищутся модель и срок вопроса о цене (WAPRICECTX0410,
+        WAPAIRS0410: наши строки пар не дают)."""
         skip, out = {id(it) for it in tail}, []
         for it in reversed(items):
             if it.get("auto") or id(it) in skip or not it.get("text"):
                 continue
-            out.append(K.mask(it["text"])[0])
+            out.append((it.get("who") or "", K.mask(it["text"])[0]))
             if len(out) >= CTX_MSGS:
                 break
         return out

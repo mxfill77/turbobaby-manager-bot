@@ -150,16 +150,22 @@ def test_price_en_question_live_names():
 
 
 def test_price_no_cross_model():
-    """− чужая модель не цепляется: XADV ≠ ADV, CB 650R ≠ CBR 650R; модели нет в парке (PCX) или названо только
-    семейство без кубатуры (NMAX) → дверь не звана, «без модели из парка»."""
+    """− чужая модель не цепляется: XADV ≠ ADV, CB 650R ≠ CBR 650R; модели нет в парке (PCX) → дверь не звана, «без
+    модели из парка». WAPAIRS0410 п.4: сокращение без кубатуры — ключ парка, только если такая модель в парке одна
+    (NMAX → NMAX 155CC, одна дверь; до WAPAIRS0410 «NMAX» двери не звал); несколько («CB»: CB 300CC и CB 650R) —
+    модель НЕИЗВЕСТНА, двери нет."""
     br, _u, info = asked("Сколько стоит XADV 750 %s?" % DATES)
     assert info["price"]["model"] == "XADV 750CC" and B.model_key(br.doors[-1][0]) == "XADV 750CC", br.doors
     br, _u, info = asked("Сколько стоит CB 650R %s?" % DATES)
     assert info["price"]["model"] == "CB 650R" and B.model_key(br.doors[-1][0]) == "CB 650R", br.doors
-    for words in ("PCX 160", "NMAX", "скутер"):
+    for words in ("PCX 160", "скутер"):
         br, user, info = asked("Сколько стоит %s %s?" % (words, DATES))
         assert info["price"] is None and "без модели из парка" in info["price_words"], (words, info["price_words"])
         assert "ЦЕНА:" not in user and br.doors == [], (words, br.doors)
+    br, _u, info = asked("Сколько стоит NMAX %s?" % DATES)
+    assert len(br.doors) == 1 and B.model_key(br.doors[0][0]) == "NMAX 155CC", br.doors
+    br, user, info = asked("Сколько стоит CB %s?" % DATES)
+    assert br.doors == [] and "модель не определена" in user and "CB 300CC / CB 650R" in user, (br.doors, user[-400:])
 
 
 def test_price_gate_question_model_both_dates():
