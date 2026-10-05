@@ -449,7 +449,13 @@ def test_flag_off_golden_equals_9c4aac6():
     if base is None:
         print("  ПРОПУЩЕНО: git show 9c4aac6 недоступен — голден не сверен (это НЕ зелёное)")
         return
-    assert _run_off(M) == _run_off(base)
+    # WACARDUI0510: черновик несёт новое поле claims (проверка чисел кодом для низа карточки) — сверяется
+    # отдельно; всё прочее — байт-в-байт как у 9c4aac6
+    now, was = _run_off(M), _run_off(base)
+    for (d, _log), reply in zip(now, GOLDEN_REPLIES):
+        if d is not None:
+            assert d.pop("claims") == [list(c) for c in K.money_claims(d["text"], {"line": "ЦЕНА: 2 800 ฿"})], d
+    assert now == was
 
 
 def test_flag_off_no_tools_module_import():

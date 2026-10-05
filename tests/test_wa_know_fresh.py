@@ -2,7 +2,7 @@
 """Предельный возраст знаний черновика и строка журнала о них (WAKNOWFRESH0310). Снимок узла перечитывается
 не чаще max_age (600 с); при отказе моста прежний текст идёт с возрастом, но не дольше max_stale (3 × max_age
 = 1800 с). Старше — вместо текста узла «НЕИЗВЕСТНО: снимок старше N мин, <причина>», ни одной строки текста, и
-причина «знания устарели» в handoff: «Отправить» на версии 1 нет. На каждый вызов — строка журнала «знания: …»:
+причина «знания устарели» в handoff: «Отправить» на версии 1 есть, пометка видна (WACARDUI0510). На каждый вызов — строка журнала «знания: …»:
 имя, прочитан ли сейчас, длина, sha16, возраст; текста узлов в журнале нет.
 Всё на подделках: модель, мост (узлы, парк, дверь цены), часы, Bot API и дверь отправки — из test_wa_agent_model;
 сети нет, модели нет. Тексты узлов выдуманы.
@@ -125,10 +125,11 @@ def test_draft_old_text_then_unknown():
         assert ("УЗЕЛ %s: НЕИЗВЕСТНО: снимок старше 30 мин, мост не отвечает (TimeoutError)" % n) in prompt, n
     assert "НУЖЕН ЧЕЛОВЕК: " + STALE in prompt, prompt[-600:]
     assert hand == [STALE], hand
-    assert TM.buttons(card) == ["wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)        # «Отправить» на версии 1 нет
+    assert TM.buttons(card) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)   # «Отправить» есть (WACARDUI0510)
     assert actions(card["text"]) == [ACT_STALE], card["text"]
-    w.press("wa:send:1:1", 101)                                                       # старая кнопка — отправок 0
-    assert w.door.sends == [] and w.drafts()[0][1] == TM.A.PENDING, w.door.sends
+    assert TM.G.W_SEND_HAND in card["text"], card["text"]
+    w.press("wa:send:1:1", 101)                                                       # решил человек
+    assert w.door.sends == [(TM.NUM, w.drafts()[0][3])], w.door.sends
 
 
 def test_journal_line_sha16_without_text():

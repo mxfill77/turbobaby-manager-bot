@@ -118,7 +118,7 @@ def test_avail_busy_all_units_read():
 
 
 def test_avail_door_disagrees_unknown():
-    """− снимок говорит «свободен», дверь цены — нет → «не знаю», причина «нужен человек», «Отправить» заперто."""
+    """− снимок говорит «свободен», дверь цены — нет → «не знаю», причина «нужен человек»; «Отправить» доходит до двери — решил человек (WACARDUI0510)."""
     w, br = world([row("PCX 160 1234", "Бронь", "2026-11-01 10:00", "2026-11-06 12:00")], available=False)
     w.ask(ASK_FREE)
     a = w.adapter.last["info"]["avail"]
@@ -126,7 +126,7 @@ def test_avail_door_disagrees_unknown():
     assert "НАЛИЧИЕ: НЕИЗВЕСТНО" in w.call.calls[0][1]
     assert B.W_AVAIL_UNKNOWN in hand(w), hand(w)
     w.press("wa:send:1:1", 101)
-    assert w.door.sends == [], w.door.sends
+    assert w.door.sends == [(TM.NUM, w.drafts()[0][3])], w.door.sends
 
 
 def test_avail_door_silent_unknown():
@@ -263,14 +263,14 @@ def test_avail_without_dates_no_table():
 
 
 def test_booking_intent_reason():
-    """+ «забронируйте» — факт наличия есть, но бронь делает человек: причина и «Отправить» заперто."""
+    """+ «забронируйте» — факт наличия есть, но бронь делает человек: причина; «Отправить» доходит до двери — решил человек (WACARDUI0510)."""
     w, br = world([])
     w.ask("Забронируйте PCX 160 с 5 по 12 ноября")
     assert w.adapter.last["info"]["avail"]["outcome"] == B.FREE
     h = hand(w)
     assert B.W_BOOKING in h and K.REASON_WORDS[K.R_AVAILABILITY] not in h, h
     w.press("wa:send:1:1", 101)
-    assert w.door.sends == []
+    assert w.door.sends == [(TM.NUM, w.drafts()[0][3])], w.door.sends
 
 
 # ═══ когда кончается аренда ═══════════════════════════════════════════════════════════════

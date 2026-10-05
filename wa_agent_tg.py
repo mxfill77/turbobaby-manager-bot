@@ -22,7 +22,13 @@
 любой версии «отправка выключена — ответьте клиенту сами»), подсказка про реплай; в самом низу — подробности
 (тема, полный список оснований). Не влезает — первыми режутся подробности с числом скрытых знаков; не
 влезает сам ответ — он уходит отдельным сообщением перед карточкой (`tg_card_parts`, реплай на него — та же
-правка). «why» модели на карточке не показывается.
+правка).
+
+НИЗ КАРТОЧКИ (WACARDUI0510, решения владельца 05.10 12:35 и 12:39). «✅ Отправить» есть на КАЖДОЙ версии: причины «нужен
+человек» — пометка первой, под ней «Отправить» открыто — сначала проверьте пометку выше». После ответа и пометок —
+«💭 Как считал агент: <why версии модели>» (пусто — «💭 агент не объяснил»; у версии человека строки нет) и проверка
+чисел КОДОМ: денежные утверждения без опоры (`K.money_claims`, вид и число) или «🔎 числа сверены с блоком «ЦЕНА»».
+Не влезает — режется хвост why со строкой «…обрезано N симв.»; ответ клиенту не режется. Клиенту why не уходит.
 
 ВОПРОС И ПЕРЕВОД (WACARDQ0410). Над ответом — вопрос клиента: блок его последних реплик, ушедший в модель (под
 маской; `Core.card_extra`). Язык вопроса не русский (вердикт кода) — под ответом перевод вопроса и ответа на русский с
@@ -164,8 +170,15 @@ CARD_ACTIONS = {
 }
 W_HAND = "🙋 НУЖЕН ЧЕЛОВЕК — сделайте:"
 W_DOOR_CLOSED = "⛔ отправка выключена — ответьте клиенту сами"
-W_SEND_LOCKED = "«Отправить» — на исправленной версии"
+W_SEND_HAND = "«Отправить» открыто — сначала проверьте пометку выше"     # версия модели с причинами (WACARDUI0510)
 W_SEND_OPEN = "исправлено человеком — «Отправить» открыто"
+# как считал агент и проверка чисел кодом (WACARDUI0510)
+W_WHY = "💭 Как считал агент: "
+W_WHY_NONE = "💭 агент не объяснил"
+W_WHY_CUT = "\n…обрезано %d симв."
+W_CHECK_OK = "🔎 числа сверены с блоком «ЦЕНА»"
+W_CHECK_BAD = "🔎 проверка кодом — без опоры в блоке «ЦЕНА»: %s"
+W_CHECK_NONE = "🔎 числа кодом не проверялись"
 W_HINT = "✏️ ответьте на карточку полным готовым текстом для клиента — он целиком станет новой версией"
 W_FOLLOW = "🔔 НАПОМИНАНИЕ — клиент молчит после нашего ответа; написал сам до нажатия — карточка «устарело»"
 DETAILS_SEP = "\n\n── подробности ──\n"
@@ -375,7 +388,7 @@ def card_notes(hand, ver, door_open, follow=False, lesson=None):
     if not door_open:
         lines.append(W_DOOR_CLOSED)                  # на любой версии: пока дверь закрыта, клиенту не уйдёт
     elif hand and ver == 1:
-        lines.append(W_SEND_LOCKED)
+        lines.append(W_SEND_HAND)
     elif hand:
         lines.append(W_SEND_OPEN)
     if lesson:
@@ -419,6 +432,39 @@ def card_trans(extra):
     return W_TR_NONE, ""
 
 
+def _num(v):
+    """Число проверки — разрядами через пробел (40 000); прочее — как есть («30%»)."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return "{:,}".format(int(v)).replace(",", " ")
+    return str(v)
+
+
+def card_check(claims):
+    """Проверка чисел кодом (WACARDUI0510): [[вид, что]] → строка. [] — сверено; None — код не проверял (не «чисто»)."""
+    if claims is None:
+        return W_CHECK_NONE
+    if not claims:
+        return W_CHECK_OK
+    return W_CHECK_BAD % "; ".join("%s %s" % (c[0], _num(c[1])) for c in claims)
+
+
+def card_agent(extra):
+    """Поля ядра → (why | None, строка проверки) низа карточки или None (версия человека, черновик старше — низа
+    нет). why «» — модель не объяснила."""
+    if not extra or not extra.get("agent"):
+        return None
+    return str(extra.get("why") or ""), card_check(extra.get("claims"))
+
+
+def agent_block(why, check, keep=None):
+    """Низ карточки: строка why (хвост режется до keep знаков со строкой «…обрезано N») и строка проверки."""
+    if not why:
+        return W_WHY_NONE + "\n" + check
+    if keep is not None and keep < len(why):
+        return W_WHY + why[:keep] + W_WHY_CUT % (len(why) - keep) + "\n" + check
+    return W_WHY + why + "\n" + check
+
+
 def _cut(body, over, cut_word, hidden_word):
     """Тело короче на over знаков с числом скрытых | «не поместился» с числом знаков вместо тела."""
     keep = len(body) - over - len(cut_word % len(body))
@@ -427,12 +473,39 @@ def _cut(body, over, cut_word, hidden_word):
     return hidden_word % len(body)
 
 
-def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX, question="", trans=("", "")):
+def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX, question="", trans=("", ""),
+               agent=None):
     """→ [тексты сообщений]; последнее — карточка с кнопками. Ответ клиенту не режется НИКОГДА: не влезает
     карточка — режутся подробности; не влезает сам ответ — он уходит отдельно (длиннее сообщения —
     подряд несколькими), карточка — следующим сообщением.
     question — вопрос клиента над ответом, trans — (строка, тело) перевода под ответом (WACARDQ0410); вопроса нет —
-    карточка байт-в-байт прежняя. Резка по порядку: подробности, переводы, вопрос; ответ — нет."""
+    карточка байт-в-байт прежняя. Резка по порядку: подробности, переводы, вопрос; ответ — нет.
+    agent — (why | «», строка проверки) низа карточки (WACARDUI0510): идёт после пометок; нет — карточка прежняя.
+    Блок обязан уместиться в карточке целиком (room и msg_max); не умещается — режется хвост why со строкой
+    «…обрезано N симв.» (наибольший хвост, при котором блок цел); ответ клиенту не режется."""
+    if not agent:
+        return _card_texts(top, answer, notes, details, room, msg_max, question, trans)
+    why, check = agent
+
+    def build(keep=None):
+        block = agent_block(why, check, keep)
+        texts = _card_texts(top, answer, notes + "\n\n" + block, details, room, msg_max, question, trans)
+        return texts, block in texts[-1] and len(texts[-1]) <= min(room, msg_max)
+    texts, ok = build()
+    if ok or not why:
+        return texts
+    lo, hi, best = 0, len(why) - 1, None                  # наибольший keep, при котором блок цел
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        t, ok = build(mid)
+        if ok:
+            best, lo = t, mid + 1
+        else:
+            hi = mid - 1
+    return best if best is not None else build(0)[0]
+
+
+def _card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX, question="", trans=("", "")):
     if not question:
         one = fit_details(top + "\n\n" + answer + "\n\n" + notes, details, room)
         if one is not None:
@@ -573,10 +646,8 @@ class Tg(wa_agent.Telegram):
     def card(self, draft_id, ver, number, text):
         if not self.enabled:
             return None
-        # «нужен человек» (WAAGENTMODEL0210): пометка с причинами; на версии модели «Отправить» нет —
-        # оно появляется на исправленной версии (замок в ядре тот же: Core.send_locked)
-        # «нужен человек» (WAAGENTMODEL0210): причины; на версии модели «Отправить» нет — оно появляется на
-        # исправленной версии (замок в ядре тот же: Core.send_locked)
+        # «нужен человек» (WAAGENTMODEL0210): пометка с причинами первой; «Отправить» — на КАЖДОЙ версии
+        # (WACARDUI0510, решение владельца 05.10 12:39): решает человек, ядро пишет нажатие в журнал
         probe = getattr(self.core, "handoff", None)
         hand = probe(draft_id) if probe else []
         # урок людей (WAAGENTLESSON0210): эта версия — правка, записанная кандидатом урока
@@ -595,11 +666,10 @@ class Tg(wa_agent.Telegram):
         extra = extra(draft_id, ver, str(text or "")) if extra else None
         texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson),
                            card_details(hand, link), question=(extra or {}).get("question") or "",
-                           trans=card_trans(extra))
-        row = [{"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
+                           trans=card_trans(extra), agent=card_agent(extra))
+        row = [{"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)},
+               {"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
                {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]
-        if not (hand and ver == 1):
-            row.insert(0, {"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)})
         kb = {"inline_keyboard": [row]}
         mid = None
         for i, body in enumerate(texts):

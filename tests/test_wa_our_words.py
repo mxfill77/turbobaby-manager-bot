@@ -9,7 +9,7 @@
 Случаи — сквозь живой `build` адаптера на подделках test_wa_agent_model (очередь, архив, мост; сети и модели нет):
 сообщение модели целиком, без её вызова. Форма жизни №14 — выдуманными текстами: приветствие архива прошлого года, два
 наших «по отдельности — от 5 и от 3», наше позднее «вместе — каждый от 3», вопрос клиента. Деньги (п.6 задания) —
-назвать, не чинить: повтор нашего же числа проверка денег по-прежнему ставит причиной, «Отправить» на версии 1 заперто.
+назвать, не чинить: повтор нашего же числа проверка денег по-прежнему ставит причиной, «Отправить» на версии 1 есть, пометка видна (WACARDUI0510).
 Мутанты — правка исходника в памяти (wa_agent_model.py, wa_history.py): без правила, без времени, обратный порядок."""
 
 import json
@@ -107,14 +107,16 @@ def system_text(system):
 # ------------------------------- случаи -------------------------------
 
 def c_rule_verbatim_last(M):
-    """Правило 12 дословно, сразу после правила 11, в обоих вариантах инструкции; пунктов ровно 12, по порядку."""
+    """Правило 12 дословно, сразу после правила 11 и сразу перед правилом 13 (поле why, WACARDUI0510 — решение
+    владельца 05.10 12:35), в обоих вариантах инструкции; пунктов ровно 13, по порядку."""
     for p in (M.SYSTEM_PROMPT, M.SYSTEM_PROMPT_BOOK):
         assert RULE in p, p[-700:]
         nums = [int(x) for x in re.findall(r"^(\d{1,2})\. ", p.split("Ответ — РОВНО")[0], re.M)]
-        assert nums == list(range(1, 13)), nums
+        assert nums == list(range(1, 14)), nums
         lines = p.splitlines()
         i = lines.index(RULE)
-        assert lines[i - 1].startswith("11. ") and lines[i + 1] == "", lines[i - 1:i + 2]
+        assert lines[i - 1].startswith("11. ") and lines[i + 1].startswith("13. Поле \"why\""), lines[i - 1:i + 2]
+        assert lines[i + 2] == "", lines[i + 1:i + 3]
 
 
 def c_rule_in_system_not_user(M):
@@ -176,7 +178,7 @@ def c_handoff_form_matches_history(M):
 
 def c_money_repeat_still_locks_send(M):
     """П.6 — назвать, не чинить: агент повторил наше же число к той же модели и сроку — проверка денег опорой его не
-    считает (опора — только «ЦЕНА» этого вызова), причина первой, «Отправить» на версии 1 заперто."""
+    считает (опора — только «ЦЕНА» этого вызова), причина первой, «Отправить» на версии 1 есть (WACARDUI0510)."""
     reply = json.dumps({"text": "CB 650R на 3 суток — 6 223 бат, как мы и писали.", "lang": "ru", "handoff": [],
                            "why": "повтор нашей цены"}, ensure_ascii=False)
     w = world(M, reply)
@@ -191,7 +193,7 @@ def c_money_repeat_still_locks_send(M):
     hand = json.loads(d[0][4]) if d[0][4] else []
     assert hand and hand[0] == K.MONEY_CLAIM_WORDS, hand
     cards = [p for p in w.http.of("sendMessage") if "reply_markup" in p]
-    assert cards and "wa:send:1:1" not in TM.buttons(cards[-1]), cards and TM.buttons(cards[-1])
+    assert cards and "wa:send:1:1" in TM.buttons(cards[-1]), cards and TM.buttons(cards[-1])   # WACARDUI0510
 
 
 CASES = [c_rule_verbatim_last, c_rule_in_system_not_user, c_every_history_line_has_time,

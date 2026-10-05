@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Деньги в черновике модели без опоры → причина «нужен человек» (WAMONEYCHECK0310). После parse_reply текст
 черновика проверяется кодом: процент рядом со словом предоплаты, депозита или скидки и сумма в батах, которой нет в
-блоке «ЦЕНА» этого вызова, дают причину «денежное утверждение без опоры»; на версии 1 «Отправить» нет. Число, равное
+блоке «ЦЕНА» этого вызова, дают причину «денежное утверждение без опоры»; на версии 1 «Отправить» есть, пометка видна (WACARDUI0510). Число, равное
 сумме двери из «ЦЕНА», — не причина; ответ без денег — как раньше. Текст ответа не правится.
 Всё на подделках: модель, мост (узлы, парк, дверь цены), Bot API и дверь отправки — из test_wa_agent_model; сети нет,
 модели нет. Фразы клиентов и ответы модели выдуманы.
@@ -67,10 +67,11 @@ def test_prepay_30_without_client_question():
     w, d, hand, card = run(PLAIN_Q, text)
     assert hand == [CLAIM], hand
     assert d[3] == text, d[3]                                             # текст ответа не тронут
-    assert TM.buttons(card) == ["wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)   # «Отправить» на версии 1 нет
+    assert TM.buttons(card) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)   # «Отправить» есть (WACARDUI0510)
     assert actions(card["text"]) == [ACT_CLAIM], card["text"]
-    w.press("wa:send:1:1", 101)                                           # старая/подделанная кнопка
-    assert w.door.sends == [] and w.drafts()[0][1] == TM.A.PENDING, w.door.sends
+    assert TM.G.W_SEND_HAND in card["text"], card["text"]                 # пометка — проверьте выше
+    w.press("wa:send:1:1", 101)                                           # решил человек
+    assert w.door.sends == [(TM.NUM, text)], w.door.sends
     # английский ответ — то же
     _w, _d, hand_en, _c = run("Hi, I want a PCX 160 for a week", "Sure! To book it we need a 30% deposit.",
                               lang="en")
@@ -79,7 +80,7 @@ def test_prepay_30_without_client_question():
 
 def test_prepay_100():
     _w, d, hand, card = run(PLAIN_Q, "Бронь — только при 100% предоплате.")
-    assert hand == [CLAIM] and "wa:send:1:1" not in TM.buttons(card), (hand, TM.buttons(card))
+    assert hand == [CLAIM] and "wa:send:1:1" in TM.buttons(card), (hand, TM.buttons(card))
     for t in ("Бронь — только при 100% предоплате.", "100% предоплата обязательна.",
               "We take 100% prepayment upfront.", "Нужна предоплата: 100 процентов.", "скидка 10%",
               "10% off for a month", "Залог — 50% от стоимости."):
@@ -101,7 +102,7 @@ def test_sum_equals_door_total_no_reason():
 
 def test_sum_not_from_price_block():
     _w, _d, hand, card = run(PRICE_Q, "PCX 160 на эти даты — 3 500 ฿.")
-    assert hand == [CLAIM] and "wa:send:1:1" not in TM.buttons(card), (hand, TM.buttons(card))
+    assert hand == [CLAIM] and "wa:send:1:1" in TM.buttons(card), (hand, TM.buttons(card))
     _w, _d, hand2, _c = run(PLAIN_Q, "Депозит за PCX 160 — 5 000 бат.")         # блока «ЦЕНА» нет вовсе
     assert hand2 == [CLAIM], hand2
     price = price_of()

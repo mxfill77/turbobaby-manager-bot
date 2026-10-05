@@ -92,7 +92,8 @@ def test_clock_after_waits_draft_no_cache():
     for n in K.NODES:
         assert ("УЗЕЛ %s: НЕИЗВЕСТНО: снимок старше 30 мин, мост не отвечает (TimeoutError)" % n) in prompt, n
     assert "НУЖЕН ЧЕЛОВЕК: " + STALE in prompt and hand == [STALE], hand
-    assert TM.buttons(card) == ["wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)      # «Отправить» на версии 1 нет
+    assert TM.buttons(card) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)   # «Отправить» есть (WACARDUI0510)
+    assert TM.G.W_SEND_HAND in card["text"], card["text"]
     assert F.actions(card["text"]) == [ACT_STALE], card["text"]
     line_1910(w)
 
@@ -137,7 +138,8 @@ def test_unread_failed_gets_reason():
     w, prompt, hand, card = F.draft_at(K.Knowledge(br.read_doc), T0)
     assert "УЗЕЛ faq: НЕИЗВЕСТНО — не прочитан (мост не отвечает (TimeoutError))" in prompt, prompt[-600:]
     assert "НУЖЕН ЧЕЛОВЕК: " + STALE in prompt and hand == [STALE], hand
-    assert TM.buttons(card) == ["wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)
+    assert TM.buttons(card) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)   # «Отправить» есть (WACARDUI0510)
+    assert TM.G.W_SEND_HAND in card["text"], card["text"]
     assert F.actions(card["text"]) == [ACT_STALE], card["text"]
     got = K.stale_reasons([K.Knowledge(br.read_doc).refresh(T0)[n] for n in K.NODES], T0)
     assert [r["words"] for r in got] == [STALE] and "снимка нет, чтение не удалось: faq, business_rules" in got[0]["why"]

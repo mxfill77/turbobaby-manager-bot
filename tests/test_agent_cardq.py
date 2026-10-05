@@ -106,7 +106,8 @@ def c_question_is_masked_tail(mods):
     assert "Добрый день" in sent and "[скрыто: пароль]" in sent and "Qwerty12345zz" not in sent, sent
     t = cards(w)[-1]["text"]
     assert G.W_Q_HEAD + "\n" + sent + "\n\n" + G.W_A_HEAD in t, t
-    assert "Qwerty12345zz" not in t and WHY not in t, t
+    assert "Qwerty12345zz" not in t and WHY not in t.split(G.W_A_HEAD)[0], t      # вопрос — не пересказ
+    assert t.count(WHY) == 1 and ("💭 Как считал агент: " + WHY) in t, t        # пересказ — строкой низа (WACARDUI0510)
     assert w.core.db.execute("SELECT question FROM drafts WHERE id=1").fetchone()[0] == sent
 
 
@@ -219,7 +220,8 @@ def c_old_draft_without_translation(mods):
     w.ask(Q_EN)
     t = cards(w)[-1]["text"]
     assert t.split("\n\n")[1] == A_EN and G.W_Q_HEAD not in t and "перевод" not in t, t
-    assert w.core.card_extra(1, 1, A_EN) is None
+    assert (w.core.card_extra(1, 1, A_EN) or {}).get("question") is None     # вопроса нет; why — низом (WACARDUI0510)
+    assert ("💭 Как считал агент: " + WHY) in t, t
     w.press("wa:send:1:1", card_id(w))
     assert w.door.sends == [(TM.NUM, A_EN)], w.door.sends
     # база до правки: drafts без question/q_lang, draft_tr нет — ядро только добавляет
