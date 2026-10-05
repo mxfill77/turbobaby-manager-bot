@@ -112,19 +112,17 @@ def system_text(system):
 
 def c_rule_verbatim_last(M):
     """Правило 12 дословно, сразу после правила 11 и сразу перед правилом 13 (поле why, WACARDUI0510 — решение
-    владельца 05.10 12:35), в обоих вариантах инструкции; пунктов ровно 15, по порядку (14 — минимальный срок,
-    WAMINPRICE0510, слово владельца 05.10 16:53; 15 — итог точно и сдача из строки блока, WASDACHA0510, запись
-    05.10.2026-2; до них пунктов было 13 и за 13 шла пустая строка)."""
+    владельца 05.10 12:35), в обоих вариантах инструкции; пунктов ровно 14, по порядку (14 — минимальный срок,
+    WAMINPRICE0510, слово владельца 05.10 16:53; до него пунктов было 13 и за 13 шла пустая строка)."""
     for p in (M.SYSTEM_PROMPT, M.SYSTEM_PROMPT_BOOK):
         assert RULE in p, p[-700:]
         nums = [int(x) for x in re.findall(r"^(\d{1,2})\. ", p.split("Ответ — РОВНО")[0], re.M)]
-        assert nums == list(range(1, 16)), nums
+        assert nums == list(range(1, 15)), nums
         lines = p.splitlines()
         i = lines.index(RULE)
         assert lines[i - 1].startswith("11. ") and lines[i + 1].startswith("13. Поле \"why\""), lines[i - 1:i + 2]
         assert lines[i + 2].startswith("14. Строка блока «ЦЕНА» с «минимум N сут.»"), lines[i + 1:i + 3]
-        assert lines[i + 3].startswith("15. Строка блока «ЦЕНА» «клиент назвал N ฿"), lines[i + 2:i + 4]
-        assert lines[i + 4] == "", lines[i + 3:i + 5]
+        assert lines[i + 3] == "", lines[i + 2:i + 4]
 
 
 def c_rule_in_system_not_user(M):

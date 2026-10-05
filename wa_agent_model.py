@@ -147,7 +147,6 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 12. НАШИ ПРЕЖНИЕ СЛОВА ОБЯЗЫВАЮТ. Строки «мы» в истории — уже сказанное клиенту компанией: с телефона, из темы или через «Отправить». Наше последнее предложение, условие, срок или цена о том же действуют, пока мы сами их не изменили: продолжай их, не спорь с ними и не подменяй прежними нашими словами, знаниями или своим расчётом. Два наших сообщения о том же расходятся — действует более позднее. Наше слово расходится со знаниями — клиенту не противоречь, а перенеси расхождение в handoff: «наше сообщение ЧЧ:ММ расходится с правилом …». Число, которое мы уже назвали, повторяй только к той же модели и тому же сроку; нового числа из него не выводи. Относительный срок из нашей прежней строки («через час», «час-два», «сегодня») отсчитывался от её ЧЧ:ММ — как новый не повторяй. День и время приезда, доставки или выдачи называй только из фактов этого вызова или наших последних слов о том же; иначе скажи, что уточнишь у сотрудника.
 13. Поле "why" — для сотрудника, клиенту оно не уходит: 1–3 короткие строки — что спросил клиент; каждое число твоего ответа и откуда оно (блок «ЦЕНА», наши прежние слова — с временем, слова клиента); чего ты не знаешь. Чисел в ответе нет — так и напиши.
 14. Строка блока «ЦЕНА» с «минимум N сут.» — клиент срок не назвал или назвал короче минимума: срок НЕ спрашивай, скажи «аренда от N суток» и сразу дай цену этой строкой — в сутки, итого за срок, скидка за срок, депозит. Что клиент уже назвал в переписке (модель, даты, срок), не переспрашивай.
-15. Строка блока «ЦЕНА» «клиент назвал N ฿: итог T ฿, сдача M ฿» — итог называй точно, числом T, без округления до суммы клиента; сдачу называй числом M из этой строки и словами строки: отдаётся в конце аренды с залогом. Строки нет — сдачу не считай и не называй.
 
 Ответ — РОВНО один JSON-объект без пояснений и без ``` вокруг:
 {"text": "текст ответа клиенту", "lang": "ru" или "en" (язык клиента; иной — его код), "handoff": ["причина словами", …] или [], "why": "1–3 короткие строки для сотрудника по правилу 13"}"""
@@ -761,54 +760,6 @@ def mark_minimum(res, term):
         res["line"] = (res.get("line") or "") + MIN_NOTE % (term["min"], term["min"], MIN_RULE) + (
             CLIENT_NOTE % term["client"] if term.get("client") else "") + "."
     return res
-
-
-# ── сдача при оплате наличными (WASDACHA0510) ─────────────────────────────────────────────────
-# Повод — №16 v1 (05.10 12:32): итог 39 352 ฿, в ответе 40 000 ฿, сдачи нет; владелец 12:35 — «он должен был предложить
-# сдачу» (запись 05.10.2026-2: итог точно, без округления до суммы клиента, сдача — разница). Клиент в окне (его реплики
-# вопроса и его сообщения из CTX_MSGS до вопроса, новые первыми) назвал сумму N больше итога T единственного варианта с
-# числом двери — строка блока «ЦЕНА» со сдачей M = N − T; когда отдаётся — запись 03.10.2026-1 п. 2. Иначе строки нет.
-# N и M в строку цены (`price["line"]`) не идут: их опора в черновике — разность (`K.change_backed`), а не блок.
-CHANGE_RULE = "05.10.2026-2"
-CHANGE_LINE = ("клиент назвал %s ฿: итог %s ฿, сдача %s ฿ (" + CHANGE_RULE + "); отдаётся в конце аренды с залогом "
-               "(03.10.2026-1 п. 2)")
-_RX_CASH_WORD = re.compile(r"(?i)наличн\w*|\bналом\b|\bкэш\w*|\bкеш\w*|\bcash\b|\b(?:дам|даю|дадим|отдам|отдаю)\b|"
-                           r"заплач\w*|оплач\w*|\bплачу\b|\bpay\w*|\bgive\b|купюр\w*")
-_RX_CASH_NUM = re.compile(r"(?<![\w.,:/+-])(\d{1,3}(?:[   ,]\d{3})+|\d{4,6})(?![\w%]|[.,:/-]\d)")
-
-
-def client_sums(text):
-    """Слова клиента → [сумма, …] по порядку: в батах («40 000 ฿») — везде; без валюты (от 1 000) — только в
-    предложении со словом оплаты наличными («дам 40 000 наличными»)."""
-    s = str(text or "")
-    out = list(K.thb_amounts(s))
-    for sent in K._SENTENCE.split(s):
-        if not _RX_CASH_WORD.search(sent):
-            continue
-        for m in _RX_CASH_NUM.finditer(sent):
-            v = int(re.sub(r"\D", "", m.group(1)))
-            if v not in out:
-                out.append(v)
-    return out
-
-
-def cash_change(price, texts):
-    """Исход цены + слова клиента в окне (новые первыми) → {client, total, change, line} | None. Итог T — `total`
-    ЕДИНСТВЕННОГО варианта с числом двери; первая сумма клиента больше T — сдача M = N − T строкой CHANGE_LINE.
-    Вариантов несколько, числа нет, суммы больше итога нет — None: строки нет."""
-    quotes = K.quotes_of(price)
-    if len(quotes) != 1 or quotes[0].get("outcome") != K.PRICE_NUMBER:
-        return None
-    total = quotes[0].get("total")
-    if not isinstance(total, int) or isinstance(total, bool) or total <= 0:
-        return None
-    for text in texts or ():
-        over = [v for v in client_sums(text) if v > total]
-        if over:
-            n = over[0]
-            return {"client": n, "total": total, "change": n - total,
-                    "line": CHANGE_LINE % (K._money(n), K._money(total), K._money(n - total))}
-    return None
 
 
 class _Said(str):
@@ -1546,10 +1497,6 @@ class ModelAdapter(wa_agent.Model):
         ask_days = {self._day(it.get("ts")) for it in tail}   # «завтра» вопроса — от его дня; дни разные — неизвестен
         ask_day = ask_days.pop() if len(ask_days) == 1 else None
         price, price_words = self._price(ask, today, ctx, ask_day)
-        # сдача (WASDACHA0510): сумма клиента в окне больше итога — строка блока «ЦЕНА»; окно — его реплики вопроса и
-        # его сообщения из `ctx`, новые первыми, под маской
-        change = cash_change(price, [K.mask(it["text"])[0] for it in reversed(tail) if it.get("text")]
-                             + [t for who, t, _d in ctx if who == WHO_CLIENT])
         reasons = K.handoff(ask, price)
         avail, rental, book_words = self._book(number, ask, today, now)
         if avail is not None or rental is not None:
@@ -1575,7 +1522,7 @@ class ModelAdapter(wa_agent.Model):
         if terms_text:
             blocks.append(terms_text)
         if "price" in parts:
-            blocks.append(parts["price"] + ("\n" + change["line"] if change else ""))   # сдача (WASDACHA0510)
+            blocks.append(parts["price"])
         blocks += [fact["line"] for fact in (avail, rental) if fact is not None]
         if "handoff" in parts:
             blocks.append(parts["handoff"])
@@ -1599,7 +1546,6 @@ class ModelAdapter(wa_agent.Model):
                 "user_chars": len(user), "system_chars": system_chars(system), "cache": self.cache,
                 "question": question, "q_lang": q_lang,           # карточка сотрудника (WACARDQ0410)
                 "conv": conv,                                     # язык разговора кодом (WALANGCONVB0510)
-                "change": change,                                 # строка сдачи блока «ЦЕНА» | None (WASDACHA0510)
                 # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
                 "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
         return system, user, info
@@ -1645,17 +1591,6 @@ class ModelAdapter(wa_agent.Model):
                  % (said, lang, n, total))
         return K.merge_reasons(words, [K.LANG_CONV_WORDS])
 
-    def _change_check(self, text, words):
-        """Роль сдачи в пути без сверки (WASDACHA0510): та же проверка, что у `_draft_tools` (`T.change_role`), — сдача
-        только «в конце, с возвратом залога» (запись 03.10.2026-1 п. 2), иначе причина первой. «Отправить» не
-        запирается, текст не правится; в журнал — только число."""
-        import wa_agent_tools as T
-        wrong = T.change_role(text)
-        if wrong:
-            self.log("модель: сдача без «в конце, с возвратом залога» %d — причина «нужен человек»" % len(wrong))
-            words = K.reason_first(words, T.ROLE_WORDS)
-        return words
-
     def draft(self, number, upto_id):
         if self.tools is not None:
             return self._draft_tools(number, upto_id)
@@ -1679,7 +1614,6 @@ class ModelAdapter(wa_agent.Model):
         words = self._days_check(got["text"], info, words)   # сутки у дат не по разности — причина (WADAYS0410)
         words = self._arrival_check(got["text"], info, words)   # срок и приезд без опоры (WATIMECLAIMB0510)
         words = self._lang_check(got["text"], info, words)      # язык ответа против языка разговора (WALANGCONVB0510)
-        words = self._change_check(got["text"], words)          # роль сдачи, как у _draft_tools (WASDACHA0510)
         # деньги в тексте черновика (WAMONEYCHECK0310): процент предоплаты, депозита или скидки и сумма в батах не из
         # блока «ЦЕНА» этого вызова — причина «нужен человек» ПЕРВОЙ строкой (на карточке видна при любом числе
         # причин). Текст ответа не правится. В журнал — только числа: текст черновика туда не идёт.
