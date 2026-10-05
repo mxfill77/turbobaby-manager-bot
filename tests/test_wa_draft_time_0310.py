@@ -116,7 +116,8 @@ def test_lessons_wait_draft():
             for n in K.NODES:
                 assert ("УЗЕЛ %s: НЕИЗВЕСТНО: снимок старше 30 мин, мост не отвечает (TimeoutError)" % n) in user, n
         assert "НУЖЕН ЧЕЛОВЕК: " + STALE in user and hand == [STALE], (cache, hand)
-        assert TM.buttons(card) == ["wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)    # «Отправить» на версии 1 нет
+        assert TM.buttons(card) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], TM.buttons(card)   # «Отправить» есть (WACARDUI0510)
+        assert TM.G.W_SEND_HAND in card["text"], card["text"]
         assert F.actions(card["text"]) == [ACT_STALE], card["text"]
         know_line(w, 1801)
 

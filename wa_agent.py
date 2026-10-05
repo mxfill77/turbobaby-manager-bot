@@ -404,13 +404,14 @@ def relay_words(state, res):
     return W_DOOR_ERR % (reason[:150] or "причина не названа")
 
 # «Нужен человек» (WAAGENTMODEL0210): причины кода и модели — JSON-список слов в drafts.handoff.
-# Черновик с причинами «Отправить» не шлёт, пока человек не нажал «Исправить» (версия > 1).
-HANDOFF_LOCK_WORDS = "нужен человек — сначала «Исправить»: «Отправить» откроется на исправленной версии"
+# «Отправить» есть на КАЖДОЙ версии (решение владельца 05.10 12:39, WACARDUI0510): причины — пометка первой строкой
+# карточки, решает человек; нажатие на версии с причинами — строка журнала с их числом.
+SEND_HAND_LOG = "черновик %d: «Отправить» на версии %d при причинах «нужен человек»: %d — решил человек (%s)"
 
 
 def handoff_of(raw):
     """drafts.handoff → [слова]; NULL — [] (причин нет). Битая запись — None («не прочитано», не «причин
-    нет»): замок `send_locked` и карточка считают такой черновик черновиком с причинами."""
+    нет»): карточка и журнал нажатия считают такой черновик черновиком с причинами."""
     try:
         val = json.loads(raw or "[]")
     except (ValueError, TypeError):
@@ -451,6 +452,31 @@ def draft_card(out):
         v = out.get(key)
         return v.strip() if isinstance(v, str) else ""
     return {"question": out["question"], "q_lang": s("q_lang"), "q_ru": s("q_ru"), "a_ru": s("text_ru")}
+
+
+def draft_why(out):
+    """Ответ Model.draft → (why, claims) для низа карточки (WACARDUI0510). why — строка сотруднику («» — модель не
+    объяснила; прежний контракт-строка — тоже «»); claims — [[вид, что]] денежных утверждений без опоры, посчитанные
+    КОДОМ адаптера ([] — проверено, без опоры нет), None — код числа не проверял. Клиенту из этого не уходит ничего."""
+    if not isinstance(out, dict):
+        return "", None
+    why = out.get("why")
+    why = why.strip() if isinstance(why, str) else ""
+    claims = out.get("claims")
+    if not isinstance(claims, (list, tuple)):
+        return why, None
+    return why, [[str(c[0]), c[1]] for c in claims if isinstance(c, (list, tuple)) and len(c) == 2]
+
+
+def claims_of(raw):
+    """drafts.claims → [[вид, что]] | None (не проверялось или запись не читается — «не проверено», а не «чисто»)."""
+    if raw is None:
+        return None
+    try:
+        val = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return val if isinstance(val, list) else None
 
 
 def tr_pick(rows, ver, text):
@@ -611,6 +637,10 @@ class Core:
             self.db.execute("ALTER TABLE drafts ADD COLUMN ctx INTEGER")  # NULL — черновик старше версии контекста
         # вопрос клиента и язык вопроса (WACARDQ0410); NULL — черновик старше или напоминание: карточка прежняя
         for col in ("question", "q_lang"):
+            if col not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
+                self.db.execute("ALTER TABLE drafts ADD COLUMN %s TEXT" % col)
+        # как считал агент и проверка чисел кодом (WACARDUI0510); NULL — черновик старше: низа карточки нет
+        for col in ("why", "claims"):
             if col not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
                 self.db.execute("ALTER TABLE drafts ADD COLUMN %s TEXT" % col)
         have = {r[1] for r in self.db.execute("PRAGMA table_info(card_out)")}
@@ -1213,9 +1243,10 @@ class Core:
                 out = self.model.draft(number, upto)
                 text, hand = draft_out(out)
                 card = draft_card(out)                               # вопрос и перевод для карточки (WACARDQ0410)
+                why, claims = draft_why(out)                         # низ карточки (WACARDUI0510)
             except Exception as e:                                   # noqa: BLE001
                 self.log("модель упала: %s" % type(e).__name__)
-                text, hand, card = None, [], None
+                text, hand, card, why, claims = None, [], None, "", None
             if not isinstance(text, str) or not text.strip():
                 self.db.execute("UPDATE clients SET next_try=? WHERE number=?",
                                 (now + MODEL_RETRY_SEC, number))
@@ -1224,10 +1255,11 @@ class Core:
             if self._fresh(number, upto):
                 continue
             cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, handoff, ctx, "
-                                  "question, q_lang) VALUES(?,?,1,?,?,?,?,?,?,?)",
+                                  "question, q_lang, why, claims) VALUES(?,?,1,?,?,?,?,?,?,?,?,?)",
                                   (number, PENDING, text, upto, now,
                                    json.dumps(hand, ensure_ascii=False) if hand else None, ctx,
-                                   card["question"] if card else None, card["q_lang"] if card else None))
+                                   card["question"] if card else None, card["q_lang"] if card else None,
+                                   why, None if claims is None else json.dumps(claims, ensure_ascii=False)))
             did = cur.lastrowid
             self.log("черновик %d (до строки %d, %d симв.%s)" % (
                 did, upto, len(text), ", нужен человек: причин %d" % len(hand) if hand else ""))
@@ -1314,10 +1346,6 @@ class Core:
             self.log("черновик %d: отложенное отменено" % draft_id)
             self._done(draft_id, "отменено до срока: %s, %s — клиенту ничего не ушло" % (who, hm_phuket(now)), now)
             return {"ok": True, "state": DECLINED, "words": "отменено — клиенту ничего не ушло"}
-        if action == ACT_SEND and self.send_locked(draft_id, ver):
-            # «нужен человек»: ДО захвата и до двери — черновик ждёт правки, кнопки живы
-            self.log("черновик %d: «Отправить» заперто — нужен человек, ждём «Исправить»" % draft_id)
-            return {"ok": False, "state": PENDING, "words": HANDOFF_LOCK_WORDS}
         if action == ACT_SEND and not self._door_open():
             # дверь выключена (WA_SEND): ДО захвата — черновик остаётся pending, кнопки живы
             row = self.db.execute("SELECT state, ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
@@ -1333,6 +1361,10 @@ class Core:
             return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
         number, upto, text = self.db.execute("SELECT number, upto_id, text FROM drafts WHERE id=?",
                                              (draft_id,)).fetchone()
+        if action == ACT_SEND:
+            hand = self.handoff(draft_id)
+            if hand:                     # «нужен человек» (WACARDUI0510): замка нет — решил человек, след в журнале
+                self.log(SEND_HAND_LOG % (draft_id, int(ver), len(hand), who))
         if action == ACT_DECLINE:
             self.db.execute("UPDATE drafts SET closed_at=? WHERE id=?", (now, draft_id))
             self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, ?) WHERE number=?", (upto, number))
@@ -1726,26 +1758,25 @@ class Core:
         """Вопрос и перевод для карточки версии ver с текстом text (WACARDQ0410) → None (вопроса нет: черновик старше
         или напоминание — карточка прежняя) | {question, q_lang, q_ru, a_ru, tr_ver}: переводы — только этой версии
         с этим текстом; tr_ver — версия, к которой перевод есть, если он не к этой."""
-        row = self.db.execute("SELECT question, q_lang FROM drafts WHERE id=?", (draft_id,)).fetchone()
-        if not row or row[0] is None:
+        row = self.db.execute("SELECT question, q_lang, why, claims FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row:
             return None
-        rows = self.db.execute("SELECT ver, a_sha, q_ru, a_ru FROM draft_tr WHERE draft_id=?", (draft_id,)).fetchall()
-        q_ru, a_ru, tr_ver = tr_pick(rows, ver, text)
-        return {"question": row[0], "q_lang": row[1] or None, "q_ru": q_ru, "a_ru": a_ru, "tr_ver": tr_ver}
+        # как считал агент (WACARDUI0510): только у версии модели (1); у версии человека и у черновика старше — нет
+        agent = row[2] is not None and int(ver) == 1
+        if row[0] is None and not agent:
+            return None
+        out = {"question": row[0], "q_lang": row[1] or None, "q_ru": None, "a_ru": None, "tr_ver": None,
+               "agent": agent, "why": row[2] if agent else None, "claims": claims_of(row[3]) if agent else None}
+        if row[0] is not None:
+            rows = self.db.execute("SELECT ver, a_sha, q_ru, a_ru FROM draft_tr WHERE draft_id=?",
+                                   (draft_id,)).fetchall()
+            out["q_ru"], out["a_ru"], out["tr_ver"] = tr_pick(rows, ver, text)
+        return out
 
     def handoff(self, draft_id):
         row = self.db.execute("SELECT handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
         hand = handoff_of(row[0]) if row else []
         return [UNREAD_REASON] if hand is None else hand
-
-    def send_locked(self, draft_id, ver):
-        """«Отправить» заперто: черновик ждёт с этой версией, у него есть причины «нужен человек»,
-        и человек его ещё не исправлял (версия 1 — текст модели; «Исправить» даёт версию +1)."""
-        row = self.db.execute("SELECT state, ver, handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
-        if not row or row[0] != PENDING or row[1] != int(ver):
-            return False
-        hand = handoff_of(row[2])
-        return (hand is None or bool(hand)) and row[1] == 1
 
     def _door_open(self):
         """Дверь без `is_open` — открыта (прежний контракт); `is_open` упал — закрыта."""

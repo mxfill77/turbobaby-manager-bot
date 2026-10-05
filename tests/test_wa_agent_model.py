@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Адаптер модели wa-agent (WAAGENTMODEL0210): история и знания доходят до модели, маска, «нужен
-человек» → пометка и «Отправить» заперто до «Исправить», не JSON — черновика нет, WA_AGENT_DRAFTS
+человек» → пометка первой, «Отправить» на каждой версии (WACARDUI0510), не JSON — черновика нет, WA_AGENT_DRAFTS
 выключен — модель не звана, цена без дат — двери нет. Всё на подделках: временные очередь и архив,
 поддельные модель, мост (узлы, парк, дверь цены), Bot API и дверь отправки. Сети нет, модели нет.
 
@@ -229,9 +229,8 @@ def test_handoff_mark_send_locked_until_fix():
     assert "🙋 НУЖЕН ЧЕЛОВЕК" in card["text"] and "жалоба" in card["text"], card["text"]
     # причина кода — сработавший ярлык денег, а не весь перечень (WACARDCOMPACT0310)
     assert "повреждения и штрафы" in card["text"] and K.REASON_WORDS[K.R_MONEY] not in card["text"], card["text"]
-    assert buttons(card) == ["wa:fix:1:1", "wa:no:1:1"], buttons(card)
-    w.press("wa:send:1:1", 101)                                              # старая/подделанная кнопка
-    assert w.door.sends == [] and w.answers()[-1] == A.HANDOFF_LOCK_WORDS[:G.ANSWER_MAX], w.answers()
+    assert buttons(card) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], buttons(card)   # WACARDUI0510
+    assert G.W_SEND_HAND in card["text"], card["text"]
     assert w.drafts()[0][1] == A.PENDING
     w.reply(101, "Очень жаль! Коллега Дарья уже звонит вам.")
     card2 = w.http.of("sendMessage")[1]
@@ -239,6 +238,13 @@ def test_handoff_mark_send_locked_until_fix():
     assert "исправлено человеком" in card2["text"], card2["text"]
     w.press("wa:send:1:2", 102)
     assert w.door.sends == [(NUM, "Очень жаль! Коллега Дарья уже звонит вам.")], w.door.sends
+    # версия 1 с причинами: нажатие доходит до двери, журнал — число причин (WACARDUI0510)
+    w1 = World(reply=rep)
+    w1.ask("Байк сломался на второй день, очень недоволен")
+    w1.press("wa:send:1:1", 101)
+    assert w1.door.sends == [(NUM, "Сожалеем, передам коллеге.")], w1.door.sends
+    n = len(json.loads(w1.drafts()[0][4]))
+    assert any(("при причинах «нужен человек»: %d" % n) in ln for ln in w1.lines), w1.lines[-5:]
 
 
 def test_code_reason_alone_locks():
@@ -246,8 +252,9 @@ def test_code_reason_alone_locks():
     w.ask("А скидку сделаете?")
     hand = json.loads(w.drafts()[0][4])
     assert K.REASON_WORDS[K.R_DISCOUNT] in hand, hand
-    w.press("wa:send:1:1", 101)
-    assert w.door.sends == [], w.door.sends
+    w.press("wa:send:1:1", 101)                   # «Отправить» открыто — решил человек (WACARDUI0510)
+    assert w.door.sends == [(NUM, w.drafts()[0][3])], w.door.sends
+    assert any("при причинах «нужен человек»: %d" % len(hand) in ln for ln in w.lines), w.lines[-5:]
 
 
 def test_broken_handoff_record_locks():
@@ -255,9 +262,10 @@ def test_broken_handoff_record_locks():
     w.ask("Спасибо!")
     w.core.db.execute("UPDATE drafts SET handoff='{битое' WHERE id=1")
     assert A.handoff_of("{битое") is None and A.handoff_of(None) == []
-    w.press("wa:send:1:1", 101)
-    assert w.door.sends == [] and w.answers()[-1] == A.HANDOFF_LOCK_WORDS[:G.ANSWER_MAX], w.answers()
-    assert w.core.handoff(1) == [A.UNREAD_REASON]
+    assert w.core.handoff(1) == [A.UNREAD_REASON]       # битая запись — «причины не прочитаны» пометкой
+    w.press("wa:send:1:1", 101)                         # «Отправить» открыто — решил человек (WACARDUI0510)
+    assert w.door.sends == [(NUM, w.drafts()[0][3])], w.door.sends
+    assert any("при причинах «нужен человек»: 1" in ln for ln in w.lines), w.lines[-5:]
 
 
 def test_other_language_by_model_lang():

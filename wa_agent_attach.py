@@ -12,6 +12,17 @@
 листа (`rental` = fact) на тот же байк. Иначе вложения нет, и черновик хранит ПРИЧИНУ словами. В базе — только
 метаданные (id, имя, размер, sha256, строка реестра); байты PDF берутся из `contract_pdf` в момент отправки.
 
+ОСНОВАНИЕ — ОПОРА СУДЬИ (T4B3BASIS0510, Т4б-3). Факты берутся не из сырых `results`, а после `wa_agent_tools.sift` с
+`since` = последнее входящее клиента (`ModelAdapter.last["info"]["last_in"]`) — та же опора, на которой стоит judge:
+поздний отказ того же запроса и чтение раньше последнего входящего основание снимают. В `attach` — версия договора
+(`signed_at`, без неё вложения нет) и ключ перечитывания: номер обращения и срок аренды.
+
+ПЕРЕЧИТЫВАНИЕ ПЕРЕД ОТПРАВКОЙ. Дверь `contract_find` — параметром, как `pdf_fetch`. «Отправить» черновика с PDF
+перечитывает реестр ДО текстовой части, «Дослать PDF» — ДО PDF. Пропуск (`recheck_of`) — только `one`, пустой `unread`,
+`undated_signed` = 0, подписанный `pick` и совпавшие row, doc_id, pdf_id и signed_at. Иначе (отзыв, новая версия,
+второй подписанный, неполный ответ, дверь упала или ответ не разобран): «Отправить» — черновик stale с причиной,
+ничего не отправлено, пересборка со сверкой (как W_NO_CHECK); «Дослать» — отказ с причиной, PDF не уходит.
+
 ДВЕ ЧАСТИ. Текст — прежний черновик (`drafts.state`). PDF — строка `pdf_parts`: wait (ждёт текста) → claimed (захват,
 байты сверяются) → sending (ДО двери) → sent · not_sent · unsure. PDF зовётся ТОЛЬКО после sent текста; текст не ушёл
 или неизвестен — дверь PDF не звали, файл без текста не уходит. sha256 байтов при отправке не равен sha256 сверки —
@@ -39,6 +50,7 @@ import hashlib
 import re
 
 import wa_agent as A
+import wa_agent_tools as T
 
 F_ATTACH = "WA_AGENT_ATTACH"
 
@@ -62,6 +74,9 @@ W_RISK = ("доставка PDF статусами провайдера не п�
           "дослать можно только отдельной кнопкой «Дослать PDF — риск дубля»")
 W_FOREIGN = ("после попытки есть статус сообщения, которого мы не знаем (%d) — возможно, это PDF; доставкой его не "
              "считаем: PDF — неизвестно; дослать кнопкой нельзя, повтор может дать дубль — проверьте переписку")
+W_BASIS = "устарело: основание PDF не подтверждено реестром при нажатии — %s; ничего не отправлено, черновик пересобирается"
+W_BASIS_PDF = "дослать нельзя: основание PDF не подтверждено реестром — %s; PDF не ушёл"
+BASIS_COLS = (("signed_at", "TEXT"), ("number", "TEXT"), ("date_from", "TEXT"), ("date_to", "TEXT"))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS attach (
@@ -73,7 +88,11 @@ CREATE TABLE IF NOT EXISTS attach (
     row         INTEGER,                          -- строка реестра подписей
     doc_id      TEXT,
     reason      TEXT,
-    ts          REAL    NOT NULL
+    ts          REAL    NOT NULL,
+    signed_at   TEXT,                             -- версия договора при сверке (T4B3BASIS0510)
+    number      TEXT,                             -- ключ перечитывания: номер обращения …
+    date_from   TEXT,                             -- … и срок аренды (ISO, пусто — неизвестен)
+    date_to     TEXT
 );
 CREATE TABLE IF NOT EXISTS pdf_parts (
     draft_id    INTEGER PRIMARY KEY,
@@ -114,30 +133,65 @@ def _bike(s):
     return re.sub(r"\s+", " ", str(s or "")).strip().lower()
 
 
-def attach_of(tools_out):
+def _day(v):
+    d = T.B.day_of(v) if v not in (None, "") else None
+    return d.isoformat() if d is not None else ""
+
+
+def _term(res, c, rent):
+    """Срок аренды для перечитывания: окно привязки договора кодом (`bind_contract`, ISO «a…b») — иначе дни аренды."""
+    key = T.fact_key(c)
+    for r in reversed(res):
+        if r.get("tool") == "contract" and r.get("outcome") == T.FACT and \
+                any(isinstance(f, dict) and T.fact_key(f) == key for f in r.get("facts") or []):
+            a, _, b = str(r.get("window") or "").partition("…")
+            if _day(a) and _day(b):
+                return _day(a), _day(b)
+            break
+    return _day(rent.get("date_start")), _day(rent.get("date_end"))
+
+
+def attach_of(tools_out, since=None):
     """Итог сверки Т4а (`ModelAdapter.last["tools"]`) → (метаданные PDF | None, причина словами).
-    Вложение — только при однозначно принятом подписанном договоре этой аренды; иначе — почему вложения нет."""
+    Вложение — только при однозначно принятом подписанном договоре этой аренды В ОПОРЕ СУДЬИ (`sift` с `since` =
+    последнее входящее клиента, T4B3BASIS0510); иначе — почему вложения нет."""
     if not isinstance(tools_out, dict):
         return None, "сверки не было"
     if tools_out.get("state") != "done":
         return None, "сверка не завершена (%s) — вложения нет" % tools_out.get("state")
     res = [r for r in tools_out.get("results") or [] if isinstance(r, dict)]
+    try:
+        facts, dropped = T.sift(res, since)
+    except Exception as e:                                           # noqa: BLE001
+        return None, "опора сверки не разобрана (%s) — вложения нет" % type(e).__name__
 
     def by(tool):
         return [r for r in res if r.get("tool") == tool]
 
+    def kind(k):
+        return [f for f in facts if isinstance(f, dict) and f.get("kind") == k]
+
+    def snapped(tool, what):
+        why = [d for d in dropped if d.startswith(tool + ":") or d.startswith(what + ":")]
+        return "%s снят опорой судьи: %s — вложения нет" % (
+            {"contract": "договор", "rental": "аренда", "contract_pdf": "PDF"}[tool], why[-1] if why else "не опора")
+
     con = by("contract")
-    facts = [f for r in con if r.get("outcome") == "fact" for f in r.get("facts") or []]
+    cfs = kind("contract")
     if not con:
         return None, "договор не сверялся (contract не звали)"
-    if not facts:
+    if not cfs:
+        if any(r.get("outcome") == T.FACT for r in con):
+            return None, snapped("contract", "contract")
         last = con[-1]
         return None, "договор не принят сверкой: %s — %s" % (last.get("outcome"), last.get("reason") or "")
-    if len({f.get("doc_id") for f in facts}) != 1:
+    if len({f.get("doc_id") for f in cfs}) != 1:
         return None, "сверка приняла разные договоры — выбрать нельзя"
-    c = facts[-1]
-    rent = [f for r in by("rental") if r.get("outcome") == "fact" for f in r.get("facts") or []]
+    c = cfs[-1]
+    rent = kind("rental")
     if not rent:
+        if any(r.get("outcome") == T.FACT for r in by("rental")):
+            return None, snapped("rental", "rental")
         why = (by("rental")[-1].get("reason") or by("rental")[-1].get("outcome")) if by("rental") else "rental не звали"
         return None, "аренда не подтверждена сверкой (%s) — договор не привязать" % why
     if len({_bike(f.get("bike")) for f in rent}) != 1 or not _bike(c.get("bike")) \
@@ -146,10 +200,12 @@ def attach_of(tools_out):
     pdf = [r for r in by("contract_pdf")]
     if not pdf:
         return None, "PDF договора не сверен (contract_pdf не звали)"
-    pf = [f for r in pdf if r.get("outcome") == "fact" for f in r.get("facts") or []
-          if str(f.get("id") or "") == str(c.get("pdf_id") or "") and c.get("pdf_id")]
+    pf = [f for f in kind("pdf") if str(f.get("id") or "") == str(c.get("pdf_id") or "") and c.get("pdf_id")]
     if not pf:
-        bad = [r for r in pdf if r.get("outcome") != "fact"]
+        if any(r.get("outcome") == T.FACT and any(str((f or {}).get("id") or "") == str(c.get("pdf_id") or "")
+                                                  for f in r.get("facts") or []) for r in pdf) and c.get("pdf_id"):
+            return None, snapped("contract_pdf", "pdf")
+        bad = [r for r in pdf if r.get("outcome") != T.FACT]
         if bad:
             return None, "PDF не принят сверкой: %s — %s" % (bad[-1].get("outcome"), bad[-1].get("reason") or "")
         return None, "сверен PDF не этого договора"
@@ -158,9 +214,59 @@ def attach_of(tools_out):
     size = p.get("size")
     if not _SHA.match(sha) or not isinstance(size, int) or isinstance(size, bool) or size <= 0:
         return None, "у PDF нет sha256 или размера — прикладывать нельзя"
+    signed_at = str(c.get("signed_at") or "").strip()
+    if not signed_at:
+        return None, "у договора нет signed_at — версию перед отправкой не сверить, вложения нет"
+    date_from, date_to = _term(res, c, rent[-1])
     return {"file_id": str(p.get("id")), "name": str(p.get("name") or "contract.pdf"), "size": size,
             "sha256": sha, "row": p.get("row") if p.get("row") is not None else c.get("row"),
-            "doc_id": c.get("doc_id")}, ""
+            "doc_id": c.get("doc_id"), "signed_at": signed_at, "date_from": date_from, "date_to": date_to}, ""
+
+
+def recheck_of(resp, basis):
+    """Живое чтение реестра (`contract_find`) против основания черновика → (True, "") | (False, причина словами).
+    Пропуск — только `one`, пустой `unread`, `undated_signed` = 0, подписанный `pick` и совпавшие row, doc_id, pdf_id и
+    signed_at. Всё прочее — отказ: перечитать не удалось, ответ не разобран, отзыв, новая версия, второй подписанный."""
+    if not isinstance(basis, dict) or not str(basis.get("signed_at") or "").strip():
+        return False, "версия договора при сверке не записана — перечитать не с чем"
+    if not isinstance(resp, dict):
+        return False, "ответ реестра не разобран (не словарь)"
+    if not resp.get("ok"):
+        return False, "реестр не прочитан: %s" % (str(resp.get("error") or "ответ без ok")[:120])
+    out = resp.get("outcome")
+    checked = resp.get("checked") if isinstance(resp.get("checked"), dict) else None
+    if out == "ambiguous":
+        return False, "в реестре подписанных несколько — второй подписанный договор, выбрать нельзя"
+    if out == "incomplete":
+        return False, "ответ реестра неполон — подписанный без известного дня"
+    if out == "none_signed":
+        return False, "подписанного договора больше нет — договор отозван"
+    if out == "none":
+        return False, "договор в реестре не найден — договор отозван или убран"
+    if out != "one":
+        return False, "исход реестра не разобран: %s" % str(out)[:40]
+    if checked is None:
+        return False, "ответ реестра не разобран: нет checked"
+    unread, undated = checked.get("unread"), checked.get("undated_signed")
+    if not isinstance(unread, list) or not isinstance(undated, int) or isinstance(undated, bool):
+        return False, "ответ реестра не разобран: нет полей полноты unread/undated_signed"
+    if unread:
+        return False, "реестр прочитан не целиком (не прочитано: %s)" % ", ".join(str(u) for u in unread)[:120]
+    if undated != 0:
+        return False, "подписанных без известного дня %d" % undated
+    pick = resp.get("pick")
+    if not isinstance(pick, dict):
+        return False, "ответ реестра не разобран: нет pick"
+    if pick.get("signed") is not True:
+        return False, "договор не подписан — отозван"
+    for key, have, want in (("row", pick.get("row"), basis.get("row")),
+                            ("doc_id", pick.get("doc_id"), basis.get("doc_id")),
+                            ("pdf_id", pick.get("pdf_id"), basis.get("file_id")),
+                            ("signed_at", pick.get("signed_at"), basis.get("signed_at"))):
+        if str(have if have is not None else "").strip() != str(want if want is not None else "").strip():
+            return False, "договор сменился: %s при сверке %s, в реестре сейчас %s" % (
+                key, str(want)[:40], str(have)[:40])
+    return True, ""
 
 
 def parts_words(text_state, pdf_state=None, pdf_reason=""):
@@ -183,7 +289,10 @@ class _Probe:
     def draft(self, number, upto_id):
         got = self._inner.draft(number, upto_id)
         last = getattr(self._inner, "last", None)
-        self._seen[(number, upto_id)] = last.get("tools") if isinstance(last, dict) else None
+        tools = last.get("tools") if isinstance(last, dict) else None
+        info = last.get("info") if isinstance(last, dict) and isinstance(last.get("info"), dict) else {}
+        # since — то же последнее входящее клиента, что судья получает в judge(since=info["last_in"]) (T4B3BASIS0510)
+        self._seen[(number, upto_id)] = None if tools is None else (tools, info.get("last_in"))
         return got
 
     def __getattr__(self, name):
@@ -193,9 +302,10 @@ class _Probe:
 class AttachCore(A.Core):
     """Ядро с PDF договора второй частью. attach=False — каждый метод отдаёт управление `Core` (голден 24ad256)."""
 
-    def __init__(self, *args, attach=False, pdf_fetch=None, **kw):
+    def __init__(self, *args, attach=False, pdf_fetch=None, contract_find=None, **kw):
         self.attach = bool(attach)
         self.pdf_fetch = pdf_fetch                  # file_id → ответ `bridge_client.contract_pdf` (content_b64, verified)
+        self.contract_find = contract_find          # (phone, date_from, date_to) → ответ `bridge_client.contract_find`
         self._seen = {}
         self._hold = None                           # черновик, чей исход на карточку пишем после обеих частей
         super().__init__(*args, **kw)
@@ -209,6 +319,10 @@ class AttachCore(A.Core):
         if not self.attach:
             return
         self.db.executescript(_SCHEMA)
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(attach)").fetchall()}
+        for col, typ in BASIS_COLS:                 # база до T4B3BASIS0510: строки без версии — перечитать не с чем
+            if col not in have:
+                self.db.execute("ALTER TABLE attach ADD COLUMN %s %s" % (col, typ))
         n1 = self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE state=?",
                              (A.UNSURE, "рестарт посреди отправки PDF — могло уйти, не повторяем", A.SENDING)).rowcount
         n2 = self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE state=?",
@@ -228,6 +342,29 @@ class AttachCore(A.Core):
     def _attach(self, draft_id):
         return self.db.execute("SELECT file_id, name, size, sha256, row, reason FROM attach WHERE draft_id=?",
                                (draft_id,)).fetchone()
+
+    def _basis(self, draft_id):
+        """Основание PDF черновика: версия договора и ключ перечитывания (T4B3BASIS0510)."""
+        row = self.db.execute("SELECT file_id, row, doc_id, signed_at, number, date_from, date_to FROM attach "
+                              "WHERE draft_id=?", (draft_id,)).fetchone()
+        if not row:
+            return None
+        return dict(zip(("file_id", "row", "doc_id", "signed_at", "number", "date_from", "date_to"), row))
+
+    def _recheck(self, draft_id, number):
+        """Живое чтение реестра перед отправкой → (True, "") | (False, причина). Дверь упала или её нет — отказ."""
+        basis = self._basis(draft_id) or {}
+        if not callable(self.contract_find):
+            return False, "двери contract_find нет — реестр не перечитан"
+        try:
+            got = self.contract_find(phone=str(basis.get("number") or number or ""),
+                                     date_from=str(basis.get("date_from") or ""), date_to=str(basis.get("date_to") or ""))
+        except Exception as e:                                       # noqa: BLE001
+            return False, "дверь contract_find упала: %s" % type(e).__name__
+        try:
+            return recheck_of(got, basis)
+        except Exception as e:                                       # noqa: BLE001
+            return False, "ответ реестра не разобран (%s)" % type(e).__name__
 
     def _part(self, draft_id):
         return self.db.execute("SELECT state, attempt, who, at, wamid, reason, sending_at FROM pdf_parts "
@@ -249,15 +386,17 @@ class AttachCore(A.Core):
             return made
         for did in made:
             number, upto = self.db.execute("SELECT number, upto_id FROM drafts WHERE id=?", (did,)).fetchone()
-            out = self._seen.pop((number, upto), None)
-            if out is None:
+            seen = self._seen.pop((number, upto), None)
+            if seen is None:
                 continue                            # сверки не было: строки нет — «без сверки»
-            meta, why = attach_of(out)
+            out, since = seen
+            meta, why = attach_of(out, since)       # опора судьи: sift с since = последнее входящее (T4B3BASIS0510)
             m = meta or {}
             self.db.execute("INSERT OR REPLACE INTO attach(draft_id, file_id, name, size, sha256, row, doc_id, "
-                            "reason, ts) VALUES(?,?,?,?,?,?,?,?,?)",
+                            "reason, ts, signed_at, number, date_from, date_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (did, m.get("file_id"), m.get("name"), m.get("size"), m.get("sha256"), m.get("row"),
-                             m.get("doc_id"), why or None, now))
+                             m.get("doc_id"), why or None, now, m.get("signed_at"), number if meta else None,
+                             m.get("date_from"), m.get("date_to")))
             self.log("черновик %d: вложение %s" % (
                 did, "PDF договора, sha256 %s…" % m["sha256"][:12] if meta else "нет — %s" % why))
         self._seen.clear()
@@ -318,6 +457,14 @@ class AttachCore(A.Core):
             res = super()._deliver(draft_id, number, upto, text, who, now, from_state)
             self._plog(draft_id, "text", 1, who, now, res["state"] or "?", self._wamid(draft_id))
             return res
+        ok, why = self._recheck(draft_id, number)   # реестр перечитан ДО текстовой части (T4B3BASIS0510)
+        if not ok:
+            words = W_BASIS % why
+            if not self._close(draft_id, A.STALE, words, now, from_states=(from_state,)):
+                return {"ok": False, "state": None, "words": self._decided(draft_id)}
+            self.log("черновик %d → stale: основание PDF не подтверждено реестром при нажатии — ничего не отправлено"
+                     % draft_id)
+            return {"ok": False, "state": A.STALE, "words": words}
         self.db.execute("INSERT OR IGNORE INTO pdf_parts(draft_id, state, attempt) VALUES(?,?,1)", (draft_id, P_WAIT))
         self._hold = draft_id
         try:
@@ -484,6 +631,10 @@ class AttachCore(A.Core):
             if not permit:
                 self.log("черновик %d: «Дослать PDF» — доставка не подтверждена, нужен явный повтор" % draft_id)
                 return {"ok": False, "state": A.UNSURE, "words": W_RISK, "need_permit": True}
+        ok, basis_why = self._recheck(draft_id, number)     # реестр перечитан ДО PDF (T4B3BASIS0510)
+        if not ok:
+            self.log("черновик %d: «Дослать PDF» — основание не подтверждено реестром, PDF не ушёл" % draft_id)
+            return {"ok": False, "state": pstate, "words": W_BASIS_PDF % basis_why}
         pstate2, why = self._send_pdf(draft_id, number, who, now, patt + 1, (pstate,), meta, permit=permit,
                                       prev=int(attempt))
         if pstate2 is None:
@@ -507,8 +658,8 @@ class AttachCore(A.Core):
         return out
 
 
-def make_core(env, *args, pdf_fetch=None, **kw):
-    """Флаг выкл — прежний `Core` (24ad256); вкл — `AttachCore` с дверью байтов PDF."""
+def make_core(env, *args, pdf_fetch=None, contract_find=None, **kw):
+    """Флаг выкл — прежний `Core` (24ad256); вкл — `AttachCore` с дверью байтов PDF и дверью реестра договоров."""
     if not enabled(env):
         return A.Core(*args, **kw)
-    return AttachCore(*args, attach=True, pdf_fetch=pdf_fetch, **kw)
+    return AttachCore(*args, attach=True, pdf_fetch=pdf_fetch, contract_find=contract_find, **kw)

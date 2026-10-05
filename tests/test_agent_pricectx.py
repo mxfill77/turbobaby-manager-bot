@@ -182,7 +182,7 @@ def c_discount_5_in_line_and_answer(M):
                                       "за срок; скидка за срок 5%; депозит 3 000 ฿."], price_block(r["user"])
     assert r["hand"] == [] and r["kb"][0] == SEND, (r["hand"], r["kb"])
     r2 = run(M, [], q, "PCX 160 с 10 по 16 октября — 2 280 ฿, скидка за срок 10%.")
-    assert r2["hand"] == [K.MONEY_CLAIM_WORDS] and SEND not in r2["kb"], (r2["hand"], r2["kb"])
+    assert r2["hand"] == [K.MONEY_CLAIM_WORDS] and SEND in r2["kb"], (r2["hand"], r2["kb"])   # WACARDUI0510
     price, text = r["info"]["price"], "PCX 160 с 10 по 16 октября — 2 280 ฿, скидка за срок 5%."
     known = set(K.thb_amounts(price["line"]))
     assert ("процент", "5%") in T.money_claims(text, price, known), T.money_claims(text, price, known)
@@ -193,11 +193,11 @@ def c_discount_5_in_line_and_answer(M):
 def c_5pct_off_without_line_caught(M):
     """«5% off» без строки цены — ловится; при скидке 0% в строке — тоже; «discount for the term 0%» — чисто."""
     r = run(M, [], "Hi! Do you deliver to Kata?", "Yes, we deliver, and we can give you 5% off.", lang="en")
-    assert r["hand"] == [K.MONEY_CLAIM_WORDS] and SEND not in r["kb"], (r["hand"], r["kb"])
+    assert r["hand"] == [K.MONEY_CLAIM_WORDS] and SEND in r["kb"], (r["hand"], r["kb"])   # WACARDUI0510
     q = "How much is PCX 160 from 10 to 15 October?"
     r2 = run(M, [], q, "PCX 160 from 10 to 15 October is 2 000 ฿, and 5% off for you.", lang="en")
     assert "скидка за срок 0%" in price_block(r2["user"])[0], price_block(r2["user"])
-    assert r2["hand"] == [K.MONEY_CLAIM_WORDS] and SEND not in r2["kb"], (r2["hand"], r2["kb"])
+    assert r2["hand"] == [K.MONEY_CLAIM_WORDS] and SEND in r2["kb"], (r2["hand"], r2["kb"])   # WACARDUI0510
     r3 = run(M, [], q, "PCX 160 from 10 to 15 October is 2 000 ฿, discount for the term 0%.", lang="en")
     assert r3["hand"] == [] and r3["kb"][0] == SEND, (r3["hand"], r3["kb"])
 
@@ -210,7 +210,7 @@ def c_season_cross_human(M):
     assert r["br"].doors == [] and r["br"].fleets >= 1, (r["br"].doors, r["br"].fleets)
     blk = price_block(r["user"])
     assert blk and "Эту цену считает человек: срок через границу сезонов" in blk[0], blk
-    assert K.REASON_WORDS[K.R_SEASON_CROSS] in r["hand"] and SEND not in r["kb"], (r["hand"], r["kb"])
+    assert K.REASON_WORDS[K.R_SEASON_CROSS] in r["hand"] and SEND in r["kb"], (r["hand"], r["kb"])
     ours = [("клиент", "Нужен ADV 350"), ("мы", "ADV 350 свободен с 28 октября по 3 ноября")]
     r2 = run(M, ours, "Сколько будет стоить?", "Подскажите даты, пожалуйста.")
     assert r2["br"].doors == [] and not price_block(r2["user"]), (r2["br"].doors, price_block(r2["user"]))
@@ -244,12 +244,12 @@ def c_no_start_asks_dates(M):
 
 
 def c_discount_unknown_reason(M):
-    """Дверь без скидки в ответе — «скидка за срок неизвестна» в строке и причина человеку; «Отправить» закрыто."""
+    """Дверь без скидки в ответе — «скидка за срок неизвестна» в строке и причина человеку; «Отправить» есть — решает человек (WACARDUI0510)."""
     r = run(M, [], "Сколько стоит PCX 160 с 10 по 15 октября?",
             "PCX 160 с 10 по 15 октября — 2 000 ฿, скидку за срок уточнит коллега.", with_text=False)
     blk = price_block(r["user"])
     assert blk and "скидка за срок неизвестна" in blk[0] and "%" not in blk[0], blk
-    assert r["hand"] == [K.DISCOUNT_UNKNOWN_WORDS] and SEND not in r["kb"], (r["hand"], r["kb"])
+    assert r["hand"] == [K.DISCOUNT_UNKNOWN_WORDS] and SEND in r["kb"], (r["hand"], r["kb"])   # WACARDUI0510
 
 
 def c_old_paths_kept(M):
@@ -282,8 +282,8 @@ CASES = [c_owner_adv350_5_days, c_owner_ready_for_5_days, c_two_models_two_lines
 # (файл, правило, было, стало); «было» с префиксом LINE: — вся строка исходника, что начинается так.
 
 MUTANTS = [
-    (MODEL_SRC, "контекст выключен", "        price, price_words = self._price(ask, today, ctx)\n",
-     "        price, price_words = self._price(ask, today, ())\n"),
+    (MODEL_SRC, "контекст выключен", "        price, price_words = self._price(ask, today, ctx, ask_day)\n",
+     "        price, price_words = self._price(ask, today, (), ask_day)\n"),    # ask_day — WAMINPRICE0510
     (KNOW_SRC, "скидка выпала из строки",
      '    res["line"] = "%s, %s — %s: %d сут., %s ฿ в сутки, итого %s ฿ за срок; %s; %s." % (\n',
      '    res["line"] = "%s, %s — %s: %d сут., %s ฿ в сутки, итого %s ฿ за срок; %.0s%s." % (\n'),

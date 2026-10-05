@@ -282,7 +282,12 @@ def test_adapter_dedup_and_label():
 def test_why_not_on_card():
     w = World()
     msgs = w.draft("Какой депозит?", why="ФАКТ-МОДЕЛИ: клиент уже оплатил")
-    assert not any("ФАКТ-МОДЕЛИ" in p["text"] for p in msgs), msgs
+    # WACARDUI0510 (решение владельца 05.10 12:35): why — только строкой «как считал агент», не действием и
+    # не ответом; клиенту не уходит
+    t = card(msgs)["text"]
+    assert sum("ФАКТ-МОДЕЛИ" in p["text"] for p in msgs) == 1 and t.count("ФАКТ-МОДЕЛИ") == 1, msgs
+    assert (G.W_WHY + "ФАКТ-МОДЕЛИ: клиент уже оплатил") in t, t
+    assert not any("ФАКТ-МОДЕЛИ" in a for a in actions(t)) and "ФАКТ-МОДЕЛИ" not in t.split("\n\n")[1], t
 
 
 def test_actions_max_three_details_full():
@@ -312,11 +317,16 @@ def test_details_cut_hidden_counted():
 
 
 def test_lock_and_buttons_unchanged():
+    # WACARDUI0510 (решение владельца 05.10 12:39): «Отправить» на версии 1 с причинами есть, пометка видна
+    w0 = World()
+    c0 = card(w0.draft("Какой депозит?"))
+    assert buttons(c0) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], buttons(c0)
+    assert G.W_HAND in c0["text"] and G.W_SEND_HAND in c0["text"], c0["text"]
+    w0.feed(w0.press("wa:send:1:1", 101))
+    assert w0.door.sends == [(NUM, ANSWER)], w0.door.sends
     w = World()
     c1 = card(w.draft("Какой депозит?"))
-    assert buttons(c1) == ["wa:fix:1:1", "wa:no:1:1"], buttons(c1)
-    w.feed(w.press("wa:send:1:1", 101))
-    assert w.door.sends == [] and w.state()[0] == A.PENDING
+    assert buttons(c1) == ["wa:send:1:1", "wa:fix:1:1", "wa:no:1:1"], buttons(c1)
     w.feed(w.reply(101, "Готовый текст."))
     c2 = card(w.http.of("sendMessage")[1:])
     assert buttons(c2) == ["wa:send:1:2", "wa:fix:1:2", "wa:no:1:2"], buttons(c2)
