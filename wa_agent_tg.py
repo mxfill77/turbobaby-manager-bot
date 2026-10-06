@@ -36,6 +36,11 @@
 «перевод — к версии 1». Резка по порядку: подробности, переводы, вопрос (с числом скрытых знаков); ответ — никогда.
 «Отправить» шлёт только текст ответа. Вопроса у ядра нет (черновик старше, напоминание) — карточка прежняя.
 
+ШАБЛОН ПОСЛЕ 24 ЧАСОВ (NIGHT0710-B3g, WA_AGENT_TEMPLATES; выключен — карточка и нажатия прежние). Окно клиента
+измеренно закрыто — под ответом строка с текстом шаблона, который уйдёт дословно, и вторым рядом кнопка «📨 Отправить
+шаблоном» `wa:tpl:<черновик>:<версия>` (`Core.template_offer`); шаблона нет (язык, уже уходил) — строка почему.
+«✅ Отправить» в закрытое окно и сам шаблон отвечают словами ядра и правят карточку `card_tpl` (кнопки живы).
+
 «ИСПРАВИТЬ». Кнопка только подсказывает; правка — РЕПЛАЙ человека на карточку: `Core.revise` с
 версией карточки, новая карточка версии +1, «Отправить» на ней шлёт текст человека дословно.
 Реплай на прежнюю версию — «устарело».
@@ -376,8 +381,21 @@ def card_actions(hand):
     return acts
 
 
-def card_notes(hand, ver, door_open, follow=False, lesson=None):
-    """Строки под ответом: напоминание, до ACTIONS_MAX действий, «Отправить», урок, подсказка про реплай."""
+W_TPL_BUTTON = "📨 Отправить шаблоном"
+W_TPL_OFFER = "📨 окно 24 ч закрыто — обычной кнопкой не уйдёт; «%s» %s (%s): «%s»"
+W_TPL_NONE = "📨 окно 24 ч закрыто — шаблона нет: %s; напишите клиенту с телефона"
+
+
+def tpl_note(offer):
+    """Строка шаблона на карточке (NIGHT0710-B3g): что уйдёт клиенту дословно — или почему шаблона нет."""
+    if offer.get("name"):
+        text = wa_send.template_text(offer["name"], offer["lang"], offer.get("params") or ())
+        return W_TPL_OFFER % (W_TPL_BUTTON, offer["name"], offer["lang"], text or "текста шаблона нет")
+    return W_TPL_NONE % offer.get("why", "причина не названа")
+
+
+def card_notes(hand, ver, door_open, follow=False, lesson=None, tpl=None):
+    """Строки под ответом: напоминание, до ACTIONS_MAX действий, «Отправить», урок, шаблон, подсказка про реплай."""
     lines = [W_FOLLOW] if follow else []
     acts = card_actions(hand)
     if acts:
@@ -393,8 +411,20 @@ def card_notes(hand, ver, door_open, follow=False, lesson=None):
         lines.append(W_SEND_OPEN)
     if lesson:
         lines.append("📚 урок №%d записан кандидатом — «Сделать правилом» под ним" % lesson)
+    if tpl:
+        lines.append(tpl_note(tpl))                  # шаблон после 24 часов (NIGHT0710-B3g); нет — карточка прежняя
     lines.append(W_HINT)
     return "\n".join(lines)
+
+
+def card_keyboard(draft_id, ver, offer=None):
+    """Кнопки карточки: прежний ряд из трёх; шаблон к месту (NIGHT0710-B3g) — вторым рядом «📨 Отправить шаблоном»."""
+    rows = [[{"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)},
+             {"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
+             {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]]
+    if offer and offer.get("name"):
+        rows.append([{"text": W_TPL_BUTTON, "callback_data": "wa:tpl:%d:%d" % (draft_id, ver)}])
+    return {"inline_keyboard": rows}
 
 
 def card_details(hand, link):
@@ -664,13 +694,13 @@ class Tg(wa_agent.Telegram):
         # вопрос клиента над ответом и перевод для сотрудника (WACARDQ0410); нет у ядра — карточка прежняя
         extra = getattr(self.core, "card_extra", None)
         extra = extra(draft_id, ver, str(text or "")) if extra else None
-        texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson),
+        # шаблон после 24 часов (NIGHT0710-B3g): окно закрыто — кнопка и текст шаблона; выключено — None, карточка прежняя
+        offer = getattr(self.core, "template_offer", None)
+        offer = offer(draft_id, ver) if offer else None
+        texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson, offer),
                            card_details(hand, link), question=(extra or {}).get("question") or "",
                            trans=card_trans(extra), agent=card_agent(extra))
-        row = [{"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)},
-               {"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
-               {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]
-        kb = {"inline_keyboard": [row]}
+        kb = card_keyboard(draft_id, ver, offer)
         mid = None
         for i, body in enumerate(texts):
             card = i == len(texts) - 1
@@ -716,6 +746,18 @@ class Tg(wa_agent.Telegram):
         kb = {"inline_keyboard": [[{"text": "↩️ Отменить", "callback_data": "wa:cancel:%d:%d" % (draft_id, ver)}]]}
         self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
                                      "text": body + "\n\n— ⏳ " + words, "reply_markup": kb})
+
+    def card_tpl(self, draft_id, card_id, ver, words, offer):
+        """Шаблон после 24 часов (NIGHT0710-B3g): карточка получает слова (окно закрыто, шаблон ушёл, не отправлен —
+        почему), кнопки живы; offer — плюс «📨 Отправить шаблоном». → True — правка легла · False · None — нечего."""
+        if not self.enabled or not card_id:
+            return None
+        row = self.db.execute("SELECT body FROM tg_cards WHERE card_id=?", (int(card_id),)).fetchone()
+        body = (row[0] if row else "📝 Черновик №%d" % draft_id)[:CARD_ROOM]
+        ok, _ = self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
+                                             "text": body + "\n\n— " + str(words)[:max(190, TG_TEXT_MAX - 4 - len(body))],
+                                             "reply_markup": card_keyboard(draft_id, ver, offer)})
+        return bool(ok)
 
     # ── уроки людей (WAAGENTLESSON0210) ───────────────────────────────────────────────────
 
@@ -922,6 +964,11 @@ class Tg(wa_agent.Telegram):
             else:
                 words = self.core._decided(a, b)
             return self.answer(cq.get("id"), words)
+        if act == "tpl":
+            # шаблон после 24 часов (NIGHT0710-B3g): решает ядро, отвечаем его словами
+            res = self.core.press_template(a, b, who)
+            self.log("нажатие: черновик %d версия %d шаблон → %s" % (a, b, res.get("state")))
+            return self.answer(cq.get("id"), res.get("words"))
         if act not in ACTIONS:
             return self.answer(cq.get("id"), "неизвестная кнопка")
         res = self.core.press(a, b, ACTIONS[act], who)

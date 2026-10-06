@@ -92,7 +92,15 @@ gave_up. Показанный ключ второй строки не даёт �
 `agent_line` у Telegram; рук нет — показа нет. Строка показа клиенту не уходит, паузы не ставит и текстом из темы
 не считается: её пишет бот, а из темы наружу идёт только сообщение человека (`wa_agent_tg.Tg.on_topic`).
 
-ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа (это
+ШАБЛОН ПОСЛЕ 24 ЧАСОВ (NIGHT0710-B3g, выключатель службы WA_AGENT_TEMPLATES, по умолчанию выключен — всё как раньше).
+Включён — ядро спрашивает окно у ДВЕРИ (`Door.window`, своего правила окна нет). «✅ Отправить» при измеренно закрытом
+окне отказывает ДО захвата словами (черновик ждёт), карточка получает «📨 Отправить шаблоном» (`template_offer`:
+reply_request, язык текста версии ru|en, {{1}} — «байка»/«bike»). Нажатие — `press_template`: таблица `tpl_out`,
+`sending` ДО двери, один шаблон на черновик и на последнее входящее клиента, повтора нет (not_sent — можно ещё
+раз), ушедший — в `outbox`. Одобрение у Meta судит дверь по ответу провайдера; любой отказ — словами на карточке.
+Клиент ответил — окно открыто, черновик пересобирается и уходит обычной кнопкой.
+
+ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа само (это
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
 """
 
@@ -172,6 +180,33 @@ SHOW_WAIT, SHOW_SENDING, SHOW_SHOWN, SHOW_GAVE_UP = "wait", "sending", "shown", 
 SHOW_MAX = 12                                 # попыток строки показа не больше (≈ 40 мин по CARD_RETRY), дальше — журнал
 SHOW_SINCE = "show_since"                     # meta: показ ушедшего — с первого старта этого кода, прошлое — нет
 W_SHOW_UNSURE = "исход неизвестен, проверьте телефон"
+
+# ── шаблон после 24 часов (NIGHT0710-B3g, выключатель службы WA_AGENT_TEMPLATES, по умолчанию выключен) ──
+# Окно 24 ч закрыто — свободный текст Meta не примет. «✅ Отправить» тогда отказывает ДО захвата (черновик ждёт), а
+# карточка предлагает «📨 Отправить шаблоном» reply_request на языке клиента. Шаблон — только нажатием человека, один на
+# черновик и на последнее сообщение клиента; одобрение у Meta судит дверь по ответу провайдера. Клиент ответил —
+# окно открыто, черновик пересобирается и уходит обычной кнопкой.
+VIA_TEMPLATE = "шаблон"
+TPL_REPLY = "reply_request"
+TPL_WORD = {"ru": "байка", "en": "bike"}          # {{1}} «аренда …»: общее слово — модель из аренды по номеру ненадёжна
+TPL_OFF_WORDS = "шаблоны выключены (WA_AGENT_TEMPLATES) — ничего не отправлено"
+W_TPL_CLOSED = "окно 24 ч закрыто%s — обычной кнопкой клиенту не уйдёт"
+_TPL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tpl_out (
+    draft_id    INTEGER PRIMARY KEY,                  -- шаблон к черновику: не больше одного ушедшего
+    number      TEXT    NOT NULL,
+    upto_id     INTEGER NOT NULL,                     -- последнее входящее клиента: второго шаблона до нового нет
+    ver         INTEGER NOT NULL,
+    name        TEXT    NOT NULL,
+    lang        TEXT    NOT NULL,
+    state       TEXT    NOT NULL,                     -- sending ДО двери, потом sent | not_sent | unsure
+    reason      TEXT,
+    wamid       TEXT,
+    who         TEXT,
+    tries       INTEGER NOT NULL DEFAULT 1,           -- not_sent можно ещё раз: Meta одобрит — шаблон уйдёт
+    ts          REAL    NOT NULL
+);
+"""
 
 
 def follow_out(out):
@@ -541,6 +576,11 @@ class Telegram:
         Рук нет — ничего."""
         return None
 
+    def card_tpl(self, draft_id, card_id, ver, words, offer):
+        """Шаблон после 24 часов (NIGHT0710-B3g): карточка получает слова, кнопки живы; offer — кнопка
+        «📨 Отправить шаблоном» (None — без неё). Рук нет — ничего."""
+        return None
+
 
 class Door:
     """send_text(to, text) → {"outcome": sent|not_sent|unknown, "reason": str, "wamid": str|None}.
@@ -552,6 +592,15 @@ class Door:
     def send_media(self, to, media):
         """Медиа из темы (WARELAYMEDIA0210) — контракт `wa_send.send_media`. Двери без медиа — отказ."""
         return {"outcome": "not_sent", "reason": "дверь не умеет медиа", "wamid": None}
+
+    def window(self, number):
+        """Окно 24 ч клиента по правилу двери (NIGHT0710-B3g) → {"state": open|closed|unknown, "age": с} | None.
+        Двери без пробы — None: окно не измерено, шаблон не предлагается."""
+        return None
+
+    def send_template(self, to, name, lang, params):
+        """Шаблон (NIGHT0710-B3g) — контракт `wa_send.send_template`. Двери без шаблонов — отказ."""
+        return {"outcome": "not_sent", "reason": "дверь не умеет шаблоны", "wamid": None}
 
 
 def media_text(media):
@@ -596,8 +645,12 @@ def show_line(at, outcome, who, draft_id, ver, part, body):
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
                  clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random,
-                 lessons=False, lesson_admins=None, followup=False):
+                 lessons=False, lesson_admins=None, followup=False, templates=False, lang_of=None):
         quiet = int(quiet)
+        # WA_AGENT_TEMPLATES (NIGHT0710-B3g): выключен — окно ядро не спрашивает, кнопки шаблона нет, «Отправить» прежнее;
+        # lang_of — правило языка по тексту (`wa_agent_knowledge.lang_of`, приносит служба: ядро его не импортирует)
+        self.templates = bool(templates)
+        self.lang_of = lang_of
         # WA_AGENT_FOLLOWUP (WAFOLLOWUP0210): выключен — притихших не ищем, модель о напоминании не зовётся
         self.followup = bool(followup)
         self._follow_last = None
@@ -649,6 +702,8 @@ class Core:
                 self.db.execute("ALTER TABLE card_out ADD COLUMN %s INTEGER NOT NULL DEFAULT 0" % col)
         # показ ушедшего агентом (WAMIRROR0410): с этой минуты; ушедшее раньше строки не получает
         self.db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", (SHOW_SINCE, repr(float(self.clock()))))
+        if self.templates:
+            self.db.executescript(_TPL_SCHEMA)        # выключено — таблицы нет, база прежняя
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -689,6 +744,12 @@ class Core:
                              (SHOW_WAIT, SHOW_SENDING)).rowcount
         if n6:
             self.log("старт: строка показа sending→wait %d (ответ неизвестен — возможна вторая строка)" % n6)
+        # шаблон (NIGHT0710-B3g): рестарт посреди отправки — мог уйти, не повторяем
+        if self._tpl_table():
+            n7 = self.db.execute("UPDATE tpl_out SET state=?, reason=? WHERE state=?",
+                                 (UNSURE, "рестарт посреди отправки шаблона — мог уйти, не повторяем", SENDING)).rowcount
+            if n7:
+                self.log("старт: шаблон sending→unsure %d" % n7)
 
     def _queue(self):
         return sqlite3.connect("file:%s?mode=ro" % self.queue_path, uri=True, timeout=5)
@@ -1354,6 +1415,11 @@ class Core:
                 return {"ok": False, "state": PENDING,
                         "words": "отправка выключена — черновик ждёт, кнопки живы"}
             return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
+        if action == ACT_SEND and self.templates:
+            # шаблоны (NIGHT0710-B3g): окно 24 ч закрыто — ДО захвата, черновик ждёт, на карточке — шаблон
+            closed = self._send_closed(draft_id, ver, who, now)
+            if closed:
+                return closed
         n = self.db.execute("UPDATE drafts SET state=?, decided_by=?, decided_at=? "
                             "WHERE id=? AND state='pending' AND ver=?",
                             (target, who, now, draft_id, int(ver))).rowcount
@@ -1777,6 +1843,176 @@ class Core:
         row = self.db.execute("SELECT handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
         hand = handoff_of(row[0]) if row else []
         return [UNREAD_REASON] if hand is None else hand
+
+    # ── шаблон после 24 часов (NIGHT0710-B3g) ─────────────────────────────────────────────
+
+    def _tpl_table(self):
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tpl_out'").fetchone() is not None
+
+    def _window(self, number):
+        """Окно 24 ч клиента — пробой двери (`Door.window`, правило `wa_send.last_inbound_ts`/`window_state`; своего
+        правила у ядра нет) → (open | closed | unknown, возраст последнего входящего, с | None). Пробы нет или она
+        упала — unknown: не измерено — не «закрыто»."""
+        probe = getattr(self.door, "window", None)
+        if probe is None:
+            return "unknown", None
+        try:
+            got = probe(number)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дверь: проба окна упала: %s — окно неизвестно" % type(e).__name__)
+            return "unknown", None
+        if isinstance(got, str):
+            return got, None
+        got = got or {}
+        return str(got.get("state") or "unknown"), got.get("age")
+
+    def _tpl_lang(self, text, q_lang):
+        """Язык шаблона: язык текста версии, которую одобряет человек (`lang_of`), иначе язык вопроса клиента
+        (drafts.q_lang, вердикт кода). Не ru и не en — None: шаблонов на другом языке нет."""
+        try:
+            first = self.lang_of(text) if self.lang_of else None
+        except Exception as e:                                       # noqa: BLE001
+            self.log("язык шаблона: правило упало: %s" % type(e).__name__)
+            first = None
+        for cand in (first, q_lang):
+            if cand in ("ru", "en"):
+                return cand
+        return None
+
+    def _tpl_taken(self, draft_id, number, upto):
+        """Шаблон по этому черновику или этому клиенту после того же входящего уже уходил (sending, sent, unsure) →
+        (черновик, состояние, кто, когда) | None. not_sent — не уходил: можно ещё раз."""
+        if not self._tpl_table():
+            return None
+        return self.db.execute("SELECT draft_id, state, who, ts FROM tpl_out WHERE (draft_id=? OR (number=? AND "
+                               "upto_id>=?)) AND state IN (?,?,?) ORDER BY ts DESC LIMIT 1",
+                               (draft_id, number, upto, SENDING, SENT, UNSURE)).fetchone()
+
+    @staticmethod
+    def _tpl_decided(taken):
+        if not taken:
+            return "шаблон уже уходил — второй раз не шлём"
+        did, state, who, ts = taken
+        return "шаблон уже %s (черновик №%d): %s, %s — второй раз не шлём, ждём ответа клиента" % (
+            {SENT: "ушёл", UNSURE: "уходил, исход неизвестен", SENDING: "уходит"}.get(state, state), int(did),
+            who or "—", hm_phuket(ts))
+
+    def template_offer(self, draft_id, ver=None):
+        """Шаблон к карточке → None (не к месту: выключено, черновик не ждёт, напоминание, дверь закрыта, окно не
+        измерено ЗАКРЫТЫМ) | {"name", "lang", "params"} — кнопка «📨 Отправить шаблоном» | {"why": слова} — окно
+        закрыто, а шаблона нет (язык не ru/en, шаблон уже уходил)."""
+        if not self.templates:
+            return None
+        row = self.db.execute("SELECT number, state, ver, kind, text, q_lang, upto_id FROM drafts WHERE id=?",
+                              (draft_id,)).fetchone()
+        if not row or row[1] != PENDING or (ver is not None and int(ver) != row[2]):
+            return None
+        number, _state, _ver, kind, text, q_lang, upto = row
+        if kind == KIND_FOLLOW:                       # напоминание молчащему вне окна — уже рассылка, не предлагаем
+            return None
+        if not self._door_open():
+            return None
+        if self._window(number)[0] != "closed":
+            return None
+        taken = self._tpl_taken(draft_id, number, upto)
+        if taken:
+            return {"why": self._tpl_decided(taken)}
+        lang = self._tpl_lang(text, q_lang)
+        if lang is None:
+            return {"why": "язык клиента не ru и не en — шаблоны поданы только на них"}
+        return {"name": TPL_REPLY, "lang": lang, "params": [TPL_WORD[lang]]}
+
+    def _send_closed(self, draft_id, ver, who, now):
+        """«✅ Отправить» при ИЗМЕРЕННО закрытом окне 24 ч: ДО захвата — черновик pending, клиенту ничего, на карточке
+        словами — почему и «📨 Отправить шаблоном», если он к месту. Окно открыто или не измерено — None: путь
+        прежний (дверь судит окно сама)."""
+        row = self.db.execute("SELECT number, state, ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or row[1] != PENDING or row[2] != int(ver):
+            return None
+        state, age = self._window(row[0])
+        if state != "closed":
+            return None
+        offer = self.template_offer(draft_id, ver)
+        button = offer if offer and offer.get("name") else None
+        try:
+            ago = " (последнее сообщение клиента %d ч назад)" % (int(float(age)) // 3600) if age is not None else ""
+        except (TypeError, ValueError):
+            ago = ""
+        words = W_TPL_CLOSED % ago + (
+            "; на карточке «📨 Отправить шаблоном» %s (%s)" % (button["name"], button["lang"]) if button
+            else "; шаблона нет: %s — напишите клиенту с телефона" % offer["why"] if offer and offer.get("why")
+            else "; напишите клиенту с телефона")
+        self.log("черновик %d: «Отправить» — окно 24 ч закрыто, черновик ждёт, %s" % (
+            draft_id, "шаблон предложен" if button else "шаблона нет"))
+        self._tg("card_tpl", draft_id, self._card(draft_id), int(ver),
+                 "%s — нажал %s, %s" % (words, who, hm_phuket(now)), button)
+        return {"ok": False, "state": PENDING, "words": words}
+
+    def press_template(self, draft_id, ver, who, now=None):
+        """«📨 Отправить шаблоном» → {"ok", "state", "words"}. Шаблон — ОДИН на черновик и последнее входящее клиента:
+        `sending` пишется ДО двери, исход sent · not_sent (можно ещё раз) · unsure (не повторяем; рестарт посреди —
+        unsure). Ушедший — в `outbox` (эхо не ставит паузу, история видит «мы»). Черновик остаётся pending: клиент
+        ответит — окно откроется, черновик пересоберётся и уйдёт обычной кнопкой. Отказ — словами на карточке."""
+        now = self.clock() if now is None else now
+        if not self.templates:
+            return {"ok": False, "state": None, "words": TPL_OFF_WORDS}
+        if not self._door_open():
+            return {"ok": False, "state": None, "words": "отправка выключена (WA_SEND) — шаблон не отправлен"}
+        row = self.db.execute("SELECT number, state, ver, upto_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or row[1] != PENDING or row[2] != int(ver):
+            return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
+        number, upto = row[0], row[3]
+        old = self._outdated(draft_id)
+        if old:
+            return {"ok": False, "state": PENDING, "words": "устарело: %s — шаблон не нужен, черновик пересоберётся" % old}
+        offer = self.template_offer(draft_id, ver)
+        if not offer:
+            win = self._window(number)[0]
+            return {"ok": False, "state": PENDING, "words": (
+                "окно 24 ч открыто — шаблон не нужен, жмите «✅ Отправить»" if win == "open"
+                else "окно 24 ч не измерено — шаблон не шлём" if win != "closed"
+                else "к этому черновику шаблон не предлагается")}
+        if offer.get("why"):
+            return {"ok": False, "state": PENDING, "words": "шаблон не отправлен: " + offer["why"]}
+        name, lang, params = offer["name"], offer["lang"], list(offer["params"])
+        # ── захват: sending ДО двери; not_sent — можно ещё раз, остальное — нет ──
+        if self.db.execute("INSERT OR IGNORE INTO tpl_out(draft_id, number, upto_id, ver, name, lang, state, who, ts) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                           (draft_id, number, upto, int(ver), name, lang, SENDING, who, now)).rowcount != 1:
+            if self.db.execute("UPDATE tpl_out SET state=?, number=?, upto_id=?, ver=?, name=?, lang=?, who=?, ts=?, "
+                               "reason=NULL, wamid=NULL, tries=tries+1 WHERE draft_id=? AND state=?",
+                               (SENDING, number, upto, int(ver), name, lang, who, now, draft_id,
+                                NOT_SENT)).rowcount != 1:
+                return {"ok": False, "state": PENDING,
+                        "words": self._tpl_decided(self._tpl_taken(draft_id, number, upto))}
+        try:
+            res = self.door.send_template(number, name, lang, params) or {}
+        except Exception as e:                                       # noqa: BLE001
+            res = {"outcome": "unknown", "reason": "дверь упала: %s" % type(e).__name__}
+        state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
+        wamid = res.get("wamid") if state == SENT else None
+        reason = str(res.get("reason") or "")
+        self.db.execute("UPDATE tpl_out SET state=?, reason=?, wamid=? WHERE draft_id=? AND state=?",
+                        (state, reason[:300], wamid, draft_id, SENDING))
+        body = res.get("text") or "[шаблон %s (%s)]" % (name, lang)
+        if state == SENT:
+            self._sent_out(wamid, number, body, VIA_TEMPLATE, now)
+        hm = hm_phuket(now)
+        if state == SENT:
+            card_w = ("📨 шаблон %s (%s) ушёл: %s, %s — клиенту: «%s». Ответит клиент — окно откроется, черновик "
+                      "пересоберётся и уйдёт обычной «✅ Отправить»" % (name, lang, who, hm, body[:300]))
+            words = "шаблон ушёл (%s, %s) — ждём ответа клиента" % (name, lang)
+        elif state == NOT_SENT:
+            card_w = "📨 шаблон не отправлен: %s — %s, %s; черновик ждёт, кнопки живы" % (
+                reason[:400] or "причина не названа", who, hm)
+            words = "шаблон не отправлен: " + (reason[:170] or "причина не названа")
+        else:
+            card_w = "📨 шаблон: %s — %s, %s" % (W_UNSURE, who, hm)
+            words = "шаблон: " + W_UNSURE
+        self.log("черновик %d: шаблон %s (%s) → %s%s" % (
+            draft_id, name, lang, state, ", одобрение %s" % res.get("approval") if res.get("approval") else ""))
+        self._tg("card_tpl", draft_id, self._card(draft_id), int(ver), card_w, offer if state == NOT_SENT else None)
+        return {"ok": state == SENT, "state": state, "words": words}
 
     def _door_open(self):
         """Дверь без `is_open` — открыта (прежний контракт); `is_open` упал — закрыта."""

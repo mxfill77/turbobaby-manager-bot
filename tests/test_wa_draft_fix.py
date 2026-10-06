@@ -216,8 +216,10 @@ def test_hm_phuket_unit():
 
 
 _TIME_CALLS = {"strftime", "gmtime", "localtime", "ctime", "asctime", "fromtimestamp", "utcfromtimestamp"}
-SITES = {"wa_agent": 18, "wa_agent_tg": 2, "wa_watch": 1}   # WADRAFTSAFE0210: +2 ядра — «снят до срока … ЧЧ:ММ»
+SITES = {"wa_agent": 21, "wa_agent_tg": 2, "wa_watch": 1}   # WADRAFTSAFE0210: +2 ядра — «снят до срока … ЧЧ:ММ»
 # WAMIRROR0410: +1 ядра — время строки показа ушедшего агентом (`show_line`), та же одна функция
+# NIGHT0710-B3g: +3 ядра — шаблон после 24 часов: «окно закрыто — нажал …, ЧЧ:ММ» (`_send_closed`), исход шаблона
+# на карточке (`press_template`), «шаблон уже ушёл: кто, ЧЧ:ММ» (`_tpl_decided`) — та же одна функция
 
 
 def _scan(mod):
