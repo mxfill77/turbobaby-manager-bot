@@ -40,6 +40,12 @@
                     и снимки узлов знаний без возраста идут впереди одним префиксом с отметкой кэша, остальное — после.
                     Выключен (пусто или иное значение) — запрос модели прежний. Цена вызова по usage пишется всегда:
                     строкой журнала и итогом в сводку. Работает только с черновиками.
+  WA_AGENT_ATTACH — PDF договора второй частью «Отправить» (NIGHT0710-B3v, `wa_agent_attach.AttachCore`): текст и
+                    подписанный PDF той же аренды двумя частями, у каждой своё подтверждение провайдера; «Дослать PDF»
+                    кнопкой. Засчитывается ТОЛЬКО при черновиках и сверке Т4а (WA_AGENT_TOOLS: двери contract_pdf и
+                    contract берутся из `model.tools`); без сверки — прежнее ядро и строка «флаг 1, сверки нет». PDF
+                    реально приложится только при WA_AGENT_BOOK_READ (без броней аренда не станет фактом). Флаг не
+                    запрошен — ни строки, ни импорта: путь прежний байт-в-байт.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -82,8 +88,10 @@ F_FOLLOW = "WA_AGENT_FOLLOWUP"            # напоминание притих�
 F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чтение: наличие и конец аренды (WABOOKTOOLS0210)
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
+F_ATTACH = "WA_AGENT_ATTACH"              # PDF договора второй частью «Отправить» (NIGHT0710-B3v); не в FLAGS
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
+PRESS_BRIDGE_SEC = 60                     # бюджет плеч моста на ОДИН вызов двери договоров при нажатии (= карточки «Инфо»)
 
 log = logging.getLogger("wa_agent")
 
@@ -168,6 +176,49 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
     return model, ""
 
 
+def _press_budget(seconds):
+    """Общий бюджет плеч моста (`wa_agent_model.door_budget` → `bridge_client.card_budget`); модуля нет — без бюджета."""
+    try:
+        import wa_agent_model
+        return wa_agent_model.door_budget(seconds)
+    except Exception:                                                # noqa: BLE001
+        import contextlib
+        return contextlib.nullcontext()
+
+
+def press_door(fn, budget=None):
+    """Дверь моста на нажатии (NIGHT0710-B3v): вызов под общим бюджетом плеч — поток службы один, и больной мост не
+    держит такт и нажатия дольше PRESS_BRIDGE_SEC на вызов (бюджет кончился — мост отвечает ok=False, PDF не уходит)."""
+    budget = budget or _press_budget
+
+    def call(*a, **kw):
+        with budget(PRESS_BRIDGE_SEC):
+            return fn(*a, **kw)
+    return call
+
+
+def attach_of(environ, drafts, model, budget=None):
+    """Флаг WA_AGENT_ATTACH → (вкл?, двери {pdf_fetch, contract_find} | None, слова строки старта | None).
+    Правило флага ОДНО со всеми выключателями (`flag_on`). Засчитывается только при черновиках и сверке Т4а —
+    `model.tools` с дверями `contract_pdf` и `contract` (тот же клиент моста, что у сверки): без сверки любое
+    «Отправить» уходило бы в stale (`W_NO_CHECK`), без двери реестра — в stale «реестр не перечитан».
+    Флаг не запрошен → (False, None, None): строки старта нет, путь прежний байт-в-байт."""
+    if not wa_agent_tg.flag_on(environ.get(F_ATTACH)):
+        return False, None, None
+    tools = getattr(model, "tools", None) if drafts else None
+    if not isinstance(tools, dict) or not callable(tools.get("contract_pdf")) or not callable(tools.get("contract")):
+        why = ("черновиков нет (WA_AGENT_DRAFTS выкл или адаптера модели нет)" if not drafts else
+               "сверки нет (%s выкл)" % F_TOOLS if tools is None else "у сверки нет дверей contract_pdf/contract")
+        return False, None, "флаг 1, %s — прежнее ядро, «Отправить» шлёт только текст" % why
+    doors = {"pdf_fetch": press_door(tools["contract_pdf"], budget),
+             "contract_find": press_door(tools["contract"], budget)}
+    book = wa_agent_tg.flag_on(environ.get(F_BOOK))
+    return True, doors, ("вкл — «Отправить» шлёт текст и подписанный PDF двумя частями, «Дослать PDF» кнопкой; "
+                         "двери contract_pdf и contract — от сверки, бюджет моста %d с на вызов; брони %s"
+                         % (PRESS_BRIDGE_SEC, "вкл" if book else
+                            "ВЫКЛ — аренда не станет фактом, PDF не приложится, уйдёт только текст"))
+
+
 def model_line(model):
     """Строка старта о модели (WAOPUSHIGHC0510): модель, уровень и предел вызова словами — их несёт `call.settings`
     от `wa_agent_model.paid_call`; ключей в строке нет. Адаптера нет — модель не зовётся."""
@@ -215,9 +266,19 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     line("кэш промпта (%s): %s" % (F_CACHE, "вкл, срок %s — инструкция и узлы знаний впереди с отметкой кэша" % ttl
                                    if ttl else "выкл — запрос модели как раньше"))
     line(model_line(model))                     # модель, уровень и предел (WAOPUSHIGHC0510); ключей нет
-    core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
-                         log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
-                         followup=follow)
+    # PDF клиенту (NIGHT0710-B3v): флаг не запрошен — ни строки, ни импорта; не засчитан — прежнее ядро и слова
+    attach, doors, attach_words = attach_of(environ, drafts, model)
+    if attach_words:
+        line("PDF клиенту (%s): %s" % (F_ATTACH, attach_words))
+    if attach:
+        import wa_agent_attach
+        core = wa_agent_attach.AttachCore(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
+                                          log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons,
+                                          lesson_admins=admins, followup=follow, attach=True, **doors)
+    else:
+        core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
+                             log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
+                             followup=follow)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
     # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210); порог и тихие часы — настройки
@@ -281,7 +342,16 @@ def summary(core, tg, words, stats):
             + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else "")
             + (" · напоминаний %s" % _pairs(core.follow_counts()) if getattr(core, "followup", False) else "")
             + (" · %s" % spend_words(spend) if isinstance(spend, dict) else "")
-            + cards_words(core))
+            + cards_words(core) + pdf_words(core))
+
+
+def pdf_words(core):
+    """Части PDF по состояниям (NIGHT0710-B3v) — только у ядра с PDF-частью; иначе пусто (строка прежняя)."""
+    if not getattr(core, "attach", False):
+        return ""
+    parts = dict(core.db.execute("SELECT state, COUNT(*) FROM pdf_parts GROUP BY state").fetchall())
+    stats = dict(core.db.execute("SELECT status, COUNT(*) FROM part_status GROUP BY status").fetchall())
+    return " · PDF-частей %s · статусов частей %s" % (_pairs(parts), _pairs(stats))
 
 
 def cards_words(core):

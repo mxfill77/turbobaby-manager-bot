@@ -43,6 +43,17 @@ PDF not_sent с причиной. Повтора нет: unsure двери и р
 со своей карточкой. При флаге вкл. черновик без сверки (нет строки `attach`) не уходит: «Отправить» снимает его stale.
 
 ЖУРНАЛ. `part_log` и строки `self.log`: кто, когда, часть, попытка, исход, wamid, sha256 — без текстов и номеров.
+
+В СЛУЖБЕ (NIGHT0710-B3v). Собирает `wa_agent_svc.build` — только при флаге (правило `flag_on` службы, одно на всех) И
+сверке Т4а (двери `contract_pdf`/`contract` берутся из `model.tools`, второго клиента моста нет). Руки Telegram: кнопки
+«Дослать PDF» / «— риск дубля» приходят из `card_buttons` на исход карточки, нажатия идут в `press`.
+АТОМАРНОСТЬ. Исход части, строка outbox и строка журнала части пишутся ОДНОЙ транзакцией (`BEGIN IMMEDIATE`) после
+ответа двери: обрыв посреди — не легло ничего, часть осталась sending → старт скажет «неизвестно», повтора нет.
+РЕСТАРТ МЕЖДУ ЧАСТЯМИ. Старт кладёт исход обеих частей на карточку (правка — первым тактом, очередь `card_out`) с кнопкой
+«Дослать PDF»: PDF не теряется и без человека не уходит.
+ПОЗДНИЕ СТАТУСЫ. `part_status` хранит каждый статус (sent · delivered · read · failed) по ТОЧНОМУ wamid части — текста или
+попытки PDF — из очереди и из таблицы квитанций вебхука `wa_status` (там на wamid живут все статусы, в `wa_inbox` — только
+первый). Чужой wamid части не подтверждает никогда.
 """
 
 import base64
@@ -64,7 +75,15 @@ STATUS_DELIVERED = ("delivered", "read")       # доставка — тольк
 STATUS_ACCEPTED = "sent"                       # «принято WhatsApp» — у WhatsApp, но клиенту ещё не доставлено
 STATUS_ANY = (STATUS_ACCEPTED,) + STATUS_DELIVERED
 STATUS_SKEW = 120                              # часы провайдера и наши: статус раньше попытки на столько — ещё её
+STATUS_FAILED = "failed"                       # провайдер не доставил — хранится, доставкой не считается
+STATUS_KEEP = STATUS_ANY + (STATUS_FAILED,)    # что `part_status` хранит по точной части
+STATUS_EVERY = 60                              # такт сбора статусов частей — не чаще, с
+STATUS_DAYS = 7                                # статусы собираются для частей не старше, суток
 D_DELIVERED, D_ACCEPTED, D_UNKNOWN = "delivered", "accepted", "unknown"
+D_FAILED = "failed"
+TRUE_WORDS = ("1", "true", "yes", "on")        # то же правило, что `wa_agent_tg.flag_on` у всех выключателей службы
+W_DOOR_OFF = "отправка выключена (WA_SEND) — PDF не ушёл, кнопка жива"
+W_RESTART = "рестарт службы"
 
 W_NO_CHECK = ("устарело: черновик без сверки — при WA_AGENT_ATTACH не уходит; ничего не отправлено, "
               "черновик пересобирается")
@@ -119,14 +138,26 @@ CREATE TABLE IF NOT EXISTS part_log (
     sha256      TEXT,
     reason      TEXT
 );
+CREATE TABLE IF NOT EXISTS part_status (
+    wamid       TEXT    NOT NULL,                 -- ТОЧНЫЙ wamid части (текста или попытки PDF)
+    status      TEXT    NOT NULL,                 -- sent | delivered | read | failed
+    part        TEXT    NOT NULL,                 -- text | pdf
+    draft_id    INTEGER NOT NULL,
+    attempt     INTEGER NOT NULL,
+    ts          REAL,                             -- время статуса у провайдера (если названо)
+    seen        REAL    NOT NULL,                 -- когда агент его сохранил
+    src         TEXT,                             -- wa_inbox | wa_status
+    PRIMARY KEY (wamid, status)
+);
 """
 
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 
 
 def enabled(env):
-    """WA_AGENT_ATTACH — только «1» включает; всё прочее — выкл."""
-    return str((env or {}).get(F_ATTACH) or "").strip() == "1"
+    """WA_AGENT_ATTACH — ТО ЖЕ правило, что у всех выключателей службы (`wa_agent_tg.flag_on`): 1/true/yes/on включает,
+    всё прочее — выкл (NIGHT0710-B3v: до этого здесь включала только «1», и «true» служба читала вкл, а ядро — выкл)."""
+    return str((env or {}).get(F_ATTACH) or "").strip().lower() in TRUE_WORDS
 
 
 def _bike(s):
@@ -299,6 +330,34 @@ class _Probe:
         return getattr(self._inner, name)
 
 
+class _TxDoor:
+    """Дверь на время текстовой части (NIGHT0710-B3v): ответ двери получен — открывается транзакция, и исход текста,
+    строка outbox (пишет ядро) и строка журнала части (пишет `_text_part`) ложатся ОДНОЙ записью или не ложатся вовсе.
+    sending ядро пишет ДО двери отдельно (автокоммит) — рестарт после него повтора не даёт. Смерть процесса посреди
+    двери (не Exception) транзакции не открывает."""
+
+    def __init__(self, inner, begin):
+        self._inner, self._begin = inner, begin
+
+    def send_text(self, to, text):
+        try:
+            res = self._inner.send_text(to, text)
+        except Exception:                                            # noqa: BLE001 — ядро разберёт как «неизвестно»
+            self._open()
+            raise
+        self._open()
+        return res
+
+    def _open(self):
+        try:
+            self._begin()
+        except Exception:                                            # noqa: BLE001
+            pass                    # транзакция не открылась — ответ двери важнее: исход ляжет без неё, как раньше
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class AttachCore(A.Core):
     """Ядро с PDF договора второй частью. attach=False — каждый метод отдаёт управление `Core` (голден 24ad256)."""
 
@@ -308,6 +367,8 @@ class AttachCore(A.Core):
         self.contract_find = contract_find          # (phone, date_from, date_to) → ответ `bridge_client.contract_find`
         self._seen = {}
         self._hold = None                           # черновик, чей исход на карточку пишем после обеих частей
+        self._held = None                           # слова ядра о тексте, придержанные на время части
+        self._status_last = None                    # такт сбора статусов частей (STATUS_EVERY)
         super().__init__(*args, **kw)
         if self.attach:
             self.model = _Probe(self.model, self._seen)
@@ -323,12 +384,15 @@ class AttachCore(A.Core):
         for col, typ in BASIS_COLS:                 # база до T4B3BASIS0510: строки без версии — перечитать не с чем
             if col not in have:
                 self.db.execute("ALTER TABLE attach ADD COLUMN %s %s" % (col, typ))
+        moved = [r[0] for r in self.db.execute("SELECT draft_id FROM pdf_parts WHERE state IN (?,?)",
+                                               (A.SENDING, P_CLAIMED)).fetchall()]
         n1 = self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE state=?",
                              (A.UNSURE, "рестарт посреди отправки PDF — могло уйти, не повторяем", A.SENDING)).rowcount
         n2 = self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE state=?",
                              (A.NOT_SENT, "рестарт до двери PDF — не отправлено", P_CLAIMED)).rowcount
         rows = self.db.execute("SELECT p.draft_id, d.state FROM pdf_parts p JOIN drafts d ON d.id=p.draft_id "
                                "WHERE p.state=?", (P_WAIT,)).fetchall()
+        waited = 0
         for did, tstate in rows:
             if tstate in (A.SENDING, A.CLAIMED, A.PENDING, A.SCHEDULED):
                 continue                            # текст ещё не решён — PDF ждёт его
@@ -336,8 +400,52 @@ class AttachCore(A.Core):
                    W_TEXT_UNSURE if tstate == A.UNSURE else W_TEXT_NOT)
             self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE draft_id=? AND state=?",
                             (A.NOT_SENT, why, did, P_WAIT))
+            moved.append(did)
+            waited += 1
         if n1 or n2 or rows:
             self.log("старт: PDF sending→unsure %d, claimed→not_sent %d, ждали текста %d" % (n1, n2, len(rows)))
+        # исход обеих частей — на карточку (NIGHT0710-B3v): `_hold` погасил итог текста, а итог части процесс не дописал;
+        # правка ляжет первым тактом (очередь `card_out`), с кнопкой «Дослать PDF» — без человека PDF не уходит
+        now = self.clock()
+        for did in sorted(set(moved)):
+            self._card_settle(did, now)
+        if moved:
+            self.log("старт: исход частей на карточку — черновиков %d (рестарт между частями %d)" % (
+                len(set(moved)), waited))
+
+    def _card_settle(self, draft_id, now):
+        """Исход обеих частей черновика → очередь правки карточки (`card_out`): решена, правка ждёт первого такта.
+        Карточки в очереди нет (запись старше неё) — только строка журнала: править нечем."""
+        row = self.db.execute("SELECT d.state, d.ver, p.state, p.reason FROM drafts d JOIN pdf_parts p "
+                              "ON p.draft_id=d.id WHERE d.id=?", (draft_id,)).fetchone()
+        if not row:
+            return False
+        tstate, ver, pstate, preason = row
+        words = "%s — %s, %s" % (parts_words(tstate, pstate, preason), W_RESTART, A.hm_phuket(now))
+        n = self.db.execute("UPDATE card_out SET state=?, decided_at=COALESCE(decided_at, ?), words=?, "
+                            "edit=CASE WHEN message_id IS NULL THEN NULL ELSE ? END, edit_tries=0, edit_unk=0, "
+                            "next_at=0 WHERE draft_id=? AND ver=?",
+                            (A.CARD_DECIDED, now, words, A.EDIT_WAIT, draft_id, int(ver))).rowcount
+        return n == 1
+
+    # ── атомарность записей части (NIGHT0710-B3v) ─────────────────────────────────────────────
+
+    def _tx_begin(self):
+        if not self.db.in_transaction:
+            self.db.execute("BEGIN IMMEDIATE")
+
+    def _tx_end(self, ok=True):
+        if self.db.in_transaction:
+            self.db.execute("COMMIT" if ok else "ROLLBACK")
+
+    def _our_wamid(self, wamid):
+        """Эхо нашего — и PDF любой попытки (`pdf_parts`, `part_log`), не только черновик и outbox."""
+        if super()._our_wamid(wamid):
+            return True
+        if not self.attach or not wamid:
+            return False
+        return (self.db.execute("SELECT 1 FROM pdf_parts WHERE wamid=?", (wamid,)).fetchone() is not None
+                or self.db.execute("SELECT 1 FROM part_log WHERE wamid=?", (wamid,)).fetchone() is not None)
 
     def _attach(self, draft_id):
         return self.db.execute("SELECT file_id, name, size, sha256, row, reason FROM attach WHERE draft_id=?",
@@ -446,16 +554,35 @@ class AttachCore(A.Core):
 
     def _done(self, draft_id, words, now):
         if self._hold == draft_id:
-            return                                  # исход обеих частей ляжет на карточку одной правкой
+            self._held = words                      # исход ляжет на карточку одной правкой — после записи части
+            return
         super()._done(draft_id, words, now)
+
+    def _text_part(self, draft_id, number, upto, text, who, now, from_state):
+        """Текстовая часть (дверь ядра) + строка журнала части — ОДНОЙ транзакцией после ответа двери (`_TxDoor`).
+        Итог на карточку ядро не пишет (`_hold`): его слова — в `self._held`, Telegram в транзакции не зовётся.
+        Исключение после ответа двери — откат: часть осталась sending, старт скажет «неизвестно», повтора нет."""
+        inner, self._hold, self._held = self.door, draft_id, None
+        self.door = _TxDoor(inner, self._tx_begin)
+        try:
+            res = super()._deliver(draft_id, number, upto, text, who, now, from_state)
+            self._plog(draft_id, "text", 1, who, now, res.get("state") or "?", self._wamid(draft_id))
+            self._tx_end()
+        except Exception:                                            # noqa: BLE001
+            self._tx_end(ok=False)
+            raise
+        finally:
+            self.door, self._hold = inner, None
+        return res
 
     def _deliver(self, draft_id, number, upto, text, who, now, from_state):
         if not self.attach:
             return super()._deliver(draft_id, number, upto, text, who, now, from_state)
         meta = self._attach(draft_id)
         if not meta or not meta[0]:
-            res = super()._deliver(draft_id, number, upto, text, who, now, from_state)
-            self._plog(draft_id, "text", 1, who, now, res["state"] or "?", self._wamid(draft_id))
+            res = self._text_part(draft_id, number, upto, text, who, now, from_state)
+            if self._held is not None:              # слова ядра — те же, что легли бы без транзакции
+                super()._done(draft_id, self._held, now)
             return res
         ok, why = self._recheck(draft_id, number)   # реестр перечитан ДО текстовой части (T4B3BASIS0510)
         if not ok:
@@ -466,20 +593,18 @@ class AttachCore(A.Core):
                      % draft_id)
             return {"ok": False, "state": A.STALE, "words": words}
         self.db.execute("INSERT OR IGNORE INTO pdf_parts(draft_id, state, attempt) VALUES(?,?,1)", (draft_id, P_WAIT))
-        self._hold = draft_id
-        try:
-            res = super()._deliver(draft_id, number, upto, text, who, now, from_state)
-        finally:
-            self._hold = None
+        res = self._text_part(draft_id, number, upto, text, who, now, from_state)
         tstate = res.get("state")
         if tstate is None:                          # захват sending проигран — решил другой; часть ждёт его исхода
             return res
-        self._plog(draft_id, "text", 1, who, now, tstate, self._wamid(draft_id))
         if tstate != A.SENT:
             why = W_TEXT_UNSURE if tstate == A.UNSURE else W_TEXT_NOT
-            self.db.execute("UPDATE pdf_parts SET state=?, reason=?, who=?, at=? WHERE draft_id=? AND state=?",
-                            (A.NOT_SENT, why, who, now, draft_id, P_WAIT))
-            self._plog(draft_id, "pdf", 1, who, now, A.NOT_SENT, reason=why)
+
+            def write():
+                self.db.execute("UPDATE pdf_parts SET state=?, reason=?, who=?, at=? WHERE draft_id=? AND state=?",
+                                (A.NOT_SENT, why, who, now, draft_id, P_WAIT))
+                self._plog(draft_id, "pdf", 1, who, now, A.NOT_SENT, reason=why)
+            self._in_tx(write)
             pstate, preason = A.NOT_SENT, why
         else:
             pstate, preason = self._send_pdf(draft_id, number, who, now, 1, (P_WAIT,), meta, prev=1)
@@ -497,7 +622,7 @@ class AttachCore(A.Core):
         """Захват части → байты из contract_pdf и сверка sha256 → sending ДО двери → дверь → исход. → (state, reason).
         Захват — сравнение-и-запись: состояние из `from_states` И номер попытки равен ожидаемому `prev` (номер на кнопке).
         Номер уже сменился (другое нажатие решило раньше) — строк 0, «уже решено», двери нет."""
-        file_id, name, size, sha, _row, _why = meta
+        file_id, name, size, sha, row, _why = meta
         q = "UPDATE pdf_parts SET state=?, attempt=?, who=?, at=?, permit=?, reason=NULL WHERE draft_id=? " \
             "AND attempt=? AND state IN (%s)" % ",".join("?" * len(from_states))
         if self.db.execute(q, (P_CLAIMED, int(attempt), who, now, int(bool(permit)), draft_id, int(prev))
@@ -505,9 +630,11 @@ class AttachCore(A.Core):
             return None, "уже решено"
 
         def fail(why, outcome=A.NOT_SENT):
-            self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE draft_id=? AND state=?",
-                            (outcome, why, draft_id, P_CLAIMED))
-            self._plog(draft_id, "pdf", attempt, who, now, outcome, sha=sha, reason=why)
+            def write():
+                self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE draft_id=? AND state=?",
+                                (outcome, why, draft_id, P_CLAIMED))
+                self._plog(draft_id, "pdf", attempt, who, now, outcome, sha=sha, reason=why)
+            self._in_tx(write)
             return outcome, why
 
         try:
@@ -525,6 +652,12 @@ class AttachCore(A.Core):
         if now_sha != sha:
             return fail("sha256 PDF при отправке %s… не равен sha256 сверки %s… — файл изменился, не отправлено" % (
                 now_sha[:12], sha[:12]))
+        # второй замок того же договора (NIGHT0710-B3v): мост назвал строку реестра — она обязана быть строкой сверки.
+        # Не назвал — не судим (поле ответа необязательно); signed_at не сличается: его формат у contract_pdf не сверен
+        have = got.get("row")
+        if have not in (None, "") and row is not None and str(have).strip() != str(row).strip():
+            return fail("строка реестра PDF при отправке %s, при сверке %s — договор сменился, не отправлено" % (
+                str(have)[:20], str(row)[:20]))
         # ── sending ДО двери: рестарт после этой строки повтора не даст ──
         if self.db.execute("UPDATE pdf_parts SET state=?, sending_at=?, sha256=? WHERE draft_id=? AND state=?",
                            (A.SENDING, now, now_sha, draft_id, P_CLAIMED)).rowcount != 1:
@@ -538,12 +671,31 @@ class AttachCore(A.Core):
         state = A._DOOR_STATE.get(res.get("outcome"), A.UNSURE)
         wamid = res.get("wamid") if state == A.SENT else None
         reason = A.relay_words(state, res) if state == A.NOT_SENT else str(res.get("reason") or "")[:300]
-        self.db.execute("UPDATE pdf_parts SET state=?, reason=?, wamid=? WHERE draft_id=? AND state=?",
-                        (state, reason, wamid, draft_id, A.SENDING))
-        if state == A.SENT:
-            self._sent_out(wamid, number, "", A.VIA_AGENT, now, kind="document")
-        self._plog(draft_id, "pdf", attempt, who, now, state, wamid, now_sha, reason)
+
+        def write():                                # исход части + outbox + журнал — одной транзакцией
+            self.db.execute("UPDATE pdf_parts SET state=?, reason=?, wamid=? WHERE draft_id=? AND state=?",
+                            (state, reason, wamid, draft_id, A.SENDING))
+            if state == A.SENT:
+                self._sent_out(wamid, number, "", A.VIA_AGENT, now, kind="document")
+            self._plog(draft_id, "pdf", attempt, who, now, state, wamid, now_sha, reason)
+        self._in_tx(write)
         return state, reason
+
+    def _in_tx(self, write):
+        """Записи одной транзакцией: все легли — COMMIT; исключение — ROLLBACK и наружу (не легло ничего).
+        Транзакция не открылась (база занята) — записи без неё, как до NIGHT0710-B3v: исход двери не теряем."""
+        try:
+            self._tx_begin()
+        except Exception as e:                                       # noqa: BLE001
+            self.log("транзакция части не открылась (%s) — запись без неё" % type(e).__name__)
+            return write()
+        try:
+            out = write()
+            self._tx_end()
+            return out
+        except Exception:                                            # noqa: BLE001
+            self._tx_end(ok=False)
+            raise
 
     def delivery_check(self, number, wamid):
         """Статусы провайдера по ТОЧНОМУ wamid попытки → (исход, слова). Исходы: delivered (delivered/read) ·
@@ -551,22 +703,108 @@ class AttachCore(A.Core):
         Без wamid попытки подтверждать нечем: чужой статус этой попытке не принадлежит никогда."""
         if not wamid:
             return D_UNKNOWN, "у попытки нет wamid — статусом её не подтвердить"
+        words = set()
+        if self.attach:                             # сохранённые по точной части (NIGHT0710-B3v)
+            words |= {str(w or "").strip().lower() for (w,) in self.db.execute(
+                "SELECT status FROM part_status WHERE wamid=?", (wamid,)).fetchall()}
         try:
             q = self._queue()
             try:
                 rows = q.execute("SELECT text FROM wa_inbox WHERE wamid=? AND from_number=? AND msg_type='status'",
                                  (wamid, number)).fetchall()
+                if _has_table(q, "wa_status"):      # квитанции вебхука: все статусы wamid, а не первый
+                    rows += q.execute("SELECT status FROM wa_status WHERE wamid=? AND recipient=?",
+                                      (wamid, number)).fetchall()
             finally:
                 q.close()
         except Exception as e:                                       # noqa: BLE001
-            return D_UNKNOWN, "статусы провайдера не прочитаны (%s)" % type(e).__name__
-        words = {str(w or "").strip().lower() for (w,) in rows}
+            if not words:
+                return D_UNKNOWN, "статусы провайдера не прочитаны (%s)" % type(e).__name__
+            rows = []
+        words |= {str(w or "").strip().lower() for (w,) in rows}
         hit = [w for w in STATUS_DELIVERED if w in words]
         if hit:
             return D_DELIVERED, "доставлен (статус %s по wamid попытки)" % hit[-1]
+        if STATUS_FAILED in words:
+            return D_FAILED, "провайдер не доставил (статус failed по wamid попытки)"
         if STATUS_ACCEPTED in words:
             return D_ACCEPTED, "принято WhatsApp (статус sent по wamid попытки) — доставка не подтверждена"
         return D_UNKNOWN, "статуса по wamid попытки нет"
+
+    def collect_statuses(self, now):
+        """Поздние статусы по ТОЧНОЙ части (NIGHT0710-B3v): каждый wamid части из `part_log` (текст и каждая попытка
+        PDF, не старше STATUS_DAYS) → его статусы из очереди (`wa_inbox` — первый на wamid) и из квитанций вебхука
+        (`wa_status` — все). Получатель статуса обязан быть номером черновика; чужой wamid не берётся вовсе.
+        → число сохранённых этим вызовом · None — очередь не прочитана (хранимое не трогается)."""
+        if not self.attach:
+            return 0
+        ours = {}
+        for did, part, att, wamid, number in self.db.execute(
+                "SELECT l.draft_id, l.part, l.attempt, l.wamid, d.number FROM part_log l JOIN drafts d "
+                "ON d.id=l.draft_id WHERE l.wamid IS NOT NULL AND l.at >= ?",
+                (float(now) - STATUS_DAYS * 86400,)).fetchall():
+            ours[wamid] = (did, part, att, number)
+        if not ours:
+            return 0
+        found = []
+        try:
+            q = self._queue()
+            try:
+                status_table = _has_table(q, "wa_status")
+                keys = sorted(ours)
+                for i in range(0, len(keys), 200):
+                    chunk = keys[i:i + 200]
+                    marks = ",".join("?" * len(chunk))
+                    found += [r + ("wa_inbox",) for r in q.execute(
+                        "SELECT wamid, text, from_number, COALESCE(ts_msg, ts_queued) FROM wa_inbox "
+                        "WHERE msg_type='status' AND wamid IN (%s)" % marks, chunk).fetchall()]
+                    if status_table:
+                        found += [r + ("wa_status",) for r in q.execute(
+                            "SELECT wamid, status, recipient, COALESCE(ts_msg, ts_queued) FROM wa_status "
+                            "WHERE wamid IN (%s)" % marks, chunk).fetchall()]
+            finally:
+                q.close()
+        except Exception as e:                                       # noqa: BLE001
+            self.log("статусы частей не прочитаны: %s" % type(e).__name__)
+            return None
+        n = 0
+        for wamid, word, who, ts, src in found:
+            word = str(word or "").strip().lower()
+            did, part, att, number = ours[wamid]
+            if word not in STATUS_KEEP or not who or who != number:
+                continue
+            n += self.db.execute("INSERT OR IGNORE INTO part_status(wamid, status, part, draft_id, attempt, ts, seen, "
+                                 "src) VALUES(?,?,?,?,?,?,?,?)", (wamid, word, part, did, int(att), ts, now,
+                                                                   src)).rowcount
+        if n:
+            self.log("статусы частей: сохранено %d" % n)
+        return n
+
+    def tick(self, now=None):
+        now = self.clock() if now is None else now
+        made = super().tick(now)
+        if self.attach and (self._status_last is None or now - self._status_last >= STATUS_EVERY):
+            self._status_last = now
+            try:
+                self.collect_statuses(now)
+            except Exception as e:                                   # noqa: BLE001
+                self.log("статусы частей упали: %s" % type(e).__name__)
+        return made
+
+    def card_buttons(self, draft_id):
+        """Кнопки исхода карточки (рукам Telegram, `card_done`) → [(надпись, действие, черновик, попытка)]. Текст ушёл,
+        PDF не ушёл — «Дослать PDF»; PDF «неизвестно» — ещё «Дослать PDF — риск дубля». На кнопке номер ПОПЫТКИ:
+        устаревшая ответит «уже решено». Иначе — пусто: кнопки снимаются, как у ядра."""
+        if not self.attach:
+            return []
+        row = self.db.execute("SELECT state FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        part, meta = self._part(draft_id), self._attach(draft_id)
+        if not row or row[0] != A.SENT or not part or not meta or not meta[0] or part[0] not in (A.NOT_SENT, A.UNSURE):
+            return []
+        out = [("📄 Дослать PDF", ACT_PDF, int(draft_id), int(part[1]))]
+        if part[0] == A.UNSURE:
+            out.append(("⚠️ Дослать PDF — риск дубля", ACT_PDF_RISK, int(draft_id), int(part[1])))
+        return out
 
     def _foreign_after(self, number, since):
         """Статусы НЕИЗВЕСТНЫХ нам сообщений этого номера после попытки → список wamid; None — не прочитаны.
@@ -610,12 +848,15 @@ class AttachCore(A.Core):
             verdict, extra = self.delivery_check(number, _wamid)
             if verdict in (D_DELIVERED, D_ACCEPTED):
                 # статус ТОЧНОГО wamid этой попытки: WhatsApp сообщение взял — PDF sent, повтор был бы дублем
-                n = self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE draft_id=? AND state=? "
-                                    "AND attempt=?", (A.SENT, extra, draft_id, A.UNSURE, patt)).rowcount
-                if n != 1:
+                def confirm():                      # исход + outbox + журнал — одной транзакцией
+                    if self.db.execute("UPDATE pdf_parts SET state=?, reason=? WHERE draft_id=? AND state=? "
+                                       "AND attempt=?", (A.SENT, extra, draft_id, A.UNSURE, patt)).rowcount != 1:
+                        return False
+                    self._sent_out(_wamid, number, "", A.VIA_AGENT, now, kind="document")
+                    self._plog(draft_id, "pdf", patt, who, now, A.SENT, _wamid, reason="сверка статусов: %s" % verdict)
+                    return True
+                if not self._in_tx(confirm):
                     return {"ok": False, "state": None, "words": "уже решено"}
-                self._sent_out(_wamid, number, "", A.VIA_AGENT, now, kind="document")
-                self._plog(draft_id, "pdf", patt, who, now, A.SENT, _wamid, reason="сверка статусов: %s" % verdict)
                 words = parts_words(A.SENT, A.SENT) + " (%s) — дослать нельзя" % extra
                 self._done(draft_id, "%s — %s, %s" % (words, who, A.hm_phuket(now)), now)
                 return {"ok": False, "state": A.SENT, "words": words, "delivery": verdict}
@@ -631,6 +872,9 @@ class AttachCore(A.Core):
             if not permit:
                 self.log("черновик %d: «Дослать PDF» — доставка не подтверждена, нужен явный повтор" % draft_id)
                 return {"ok": False, "state": A.UNSURE, "words": W_RISK, "need_permit": True}
+        if not self._door_open():                   # дверь WA_SEND закрыта — ДО моста и захвата (как у «Отправить»)
+            self.log("черновик %d: «Дослать PDF» — отправка выключена, часть ждёт" % draft_id)
+            return {"ok": False, "state": pstate, "words": W_DOOR_OFF}
         ok, basis_why = self._recheck(draft_id, number)     # реестр перечитан ДО PDF (T4B3BASIS0510)
         if not ok:
             self.log("черновик %d: «Дослать PDF» — основание не подтверждено реестром, PDF не ушёл" % draft_id)
@@ -653,9 +897,14 @@ class AttachCore(A.Core):
                "words": parts_words(t, part[0] if part else None, part[5] if part else "")}
         if part:
             # «ушёл» — дверь приняла; доставку говорит ТОЛЬКО статус wamid этой попытки (sent — «принято WhatsApp»)
-            num = self.db.execute("SELECT number FROM drafts WHERE id=?", (draft_id,)).fetchone()
+            num = self.db.execute("SELECT number, wamid FROM drafts WHERE id=?", (draft_id,)).fetchone()
             out["delivery"] = self.delivery_check(num[0] if num else None, part[4])
+            out["text_delivery"] = self.delivery_check(num[0] if num else None, num[1] if num else None)
         return out
+
+
+def _has_table(con, name):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
 def make_core(env, *args, pdf_fetch=None, contract_find=None, **kw):

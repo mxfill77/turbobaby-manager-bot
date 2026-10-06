@@ -183,6 +183,21 @@ CREATE TABLE IF NOT EXISTS wa_contacts (
 )
 """
 
+# Квитанции по wamid — ВСЕ статусы, а не первый (NIGHT0710-B3v). wa_inbox держит на wamid одну строку (UNIQUE
+# idx_wa_wamid, квитанции не дополняются) — delivered/read после sent там не остаются. Эта таблица ДОБАВОЧНАЯ:
+# wa_inbox, его счёт `inserted` и дедуп не меняются ни на байт; повтор того же статуса — OR IGNORE.
+_STATUS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wa_status (
+    wamid      TEXT    NOT NULL,
+    status     TEXT    NOT NULL,
+    recipient  TEXT,
+    ts_msg     INTEGER,
+    ts_queued  INTEGER NOT NULL,
+    source     TEXT,
+    PRIMARY KEY (wamid, status)
+)
+"""
+
 MEDIA_PLACEHOLDER    = "media_placeholder"   # тип сообщения истории: медиа было, файла нет
 MEDIA_NOTE_NO_FILE   = "no_file"
 MEDIA_NOTE_FILE_LATE = "file_late"
@@ -261,6 +276,7 @@ class WAQueueDB:
                     conn.execute("ALTER TABLE wa_inbox ADD COLUMN " + col + " " + decl)
             conn.execute(_PULL_INDEX)
             conn.execute(_CONTACTS_SCHEMA)
+            conn.execute(_STATUS_SCHEMA)
             conn.commit()
 
     def enqueue(self, events: list, source: str = "") -> int:
@@ -280,6 +296,14 @@ class WAQueueDB:
         with self._lock:
             with self._conn() as conn:
                 for ev in events:
+                    if ev.get("type") == "status" and ev.get("wamid") and ev.get("text"):
+                        try:            # все статусы wamid (NIGHT0710-B3v); wa_inbox ниже — как был
+                            conn.execute("INSERT OR IGNORE INTO wa_status(wamid, status, recipient, ts_msg, "
+                                         "ts_queued, source) VALUES (?,?,?,?,?,?)",
+                                         (ev.get("wamid"), str(ev.get("text")).strip().lower(), ev.get("from"),
+                                          ev.get("ts"), now, ev.get("source") or source or ""))
+                        except Exception as e:
+                            log.warning("wa_queue status error: %s", e)
                     try:
                         conn.execute(
                             """INSERT OR IGNORE INTO wa_inbox

@@ -146,6 +146,9 @@ WA_FULL_FORM = {
 
 ACTIONS = {"send": wa_agent.ACT_SEND, "no": wa_agent.ACT_DECLINE,
            "cancel": wa_agent.ACT_CANCEL}         # «Отменить» отложенного по ритму (WAHUMANPACE0210)
+# «Дослать PDF» / «— риск дубля» (NIGHT0710-B3v): `wa:<act>:<черновик>:<попытка>` — только у ядра с PDF-частью
+# (`core.attach`); у прежнего ядра это «неизвестная кнопка», как было. Имена = wa_agent_attach.ACT_PDF / ACT_PDF_RISK
+PDF_ACTIONS = ("pdf", "pdf_risk")
 
 # компактная карточка (WACARDCOMPACT0310)
 CARD_ROOM = TG_TEXT_MAX - 200       # card_done/card_wait дописывают исход к телу и режут его по этой границе
@@ -702,8 +705,15 @@ class Tg(wa_agent.Telegram):
             return None
         row = self.db.execute("SELECT body FROM tg_cards WHERE card_id=?", (int(card_id),)).fetchone()
         body = (row[0] if row else "📝 Черновик №%d" % draft_id)[:TG_TEXT_MAX - 200]
-        ok, _ = self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
-                                             "text": body + "\n\n— " + words})
+        params = {"chat_id": self.chat, "message_id": int(card_id), "text": body + "\n\n— " + words}
+        # кнопки исхода (NIGHT0710-B3v): «Дослать PDF» — у ядра с PDF-частью; у прежнего ядра пробы нет — кнопки сняты
+        probe = getattr(self.core, "card_buttons", None)
+        buttons = probe(draft_id) if probe else []
+        if buttons:
+            params["reply_markup"] = {"inline_keyboard": [[
+                {"text": label, "callback_data": "wa:%s:%d:%d" % (act, int(a), int(b))}
+                for label, act, a, b in buttons]]}
+        ok, _ = self.api("editMessageText", params)
         return bool(ok)
 
     def card_wait(self, draft_id, card_id, words, ver):
@@ -922,6 +932,11 @@ class Tg(wa_agent.Telegram):
             else:
                 words = self.core._decided(a, b)
             return self.answer(cq.get("id"), words)
+        if act in PDF_ACTIONS and getattr(self.core, "attach", False):
+            # «Дослать PDF» (NIGHT0710-B3v): второе число — номер ПОПЫТКИ; захват и «уже решено» — в ядре
+            res = self.core.press(a, b, act, who)
+            self.log("нажатие: черновик %d попытка PDF %d %s → %s" % (a, b, act, res.get("state")))
+            return self.answer(cq.get("id"), res.get("words"))
         if act not in ACTIONS:
             return self.answer(cq.get("id"), "неизвестная кнопка")
         res = self.core.press(a, b, ACTIONS[act], who)
