@@ -458,7 +458,9 @@ def _addresses_bot(msg, context, text: str) -> bool:
       2) reply на бота, где НЕТ тега другого человека;
       3) reply на бота, где есть тег @бота (даже если рядом тегнут кто-то ещё) — покрыт п.1;
       4) открытый awaiting в теме (КРОМЕ случая «тегнут другой человек без тега бота»).
-    Простое упоминание @Pleummmm/чужого тега без тега бота и без reply боту → False (молчит)."""
+    Простое упоминание @Pleummmm/чужого тега без тега бота и без reply боту → False (молчит).
+    Ответ ДРУГОМУ человеку в «Обслуживании» при решателе в бою — не обращение к Splinter и в окне awaiting
+    (SPLRELB0610: правило SPLLANGC0610 без переводчика; сообщение решает решатель, мозг не зовём)."""
     u = msg.from_user
     allowed = splinter.OWNER_USERNAMES | splinter.PYM_USERNAMES
     if not u or not u.username or u.username.lower() not in allowed:
@@ -469,6 +471,10 @@ def _addresses_bot(msg, context, text: str) -> bool:
     # 1) явный тег бота → вступаем (даже если тегнут ещё кто-то)
     if bot_tagged:
         return True
+    # 1') ответ другому человеку → не к Splinter, и в окне awaiting тоже — только «Обслуживание» и решатель в бою
+    if (splinter.GROUPS.get(msg.chat_id) == "servicing" and splinter.decider_live_on()
+            and splinter.reply_to_other_human(msg)):
+        return False
     r = msg.reply_to_message
     is_reply_to_bot = bool(r and r.from_user and context.bot and r.from_user.id == context.bot.id)
     # 2,3) reply на бота: вступаем, ЕСЛИ не тегнут другой человек (тег бота уже выше)

@@ -579,8 +579,11 @@ TRANSLATE_RU_TH = """Переведи русский текст на ТАЙСК�
 - Тон рабочий, вежливый (ครับ). НЕ добавляй пояснений вида «вот перевод» — верни ТОЛЬКО перевод."""
 
 # Запрещённые «автомобильные» слова → байк (страховка против соскальзывания LLM / авто-перевода Telegram).
+# ЦЕЛЫМ СЛОВОМ (SPLRELA0610, 06.10.2026): «машина» и «автомобиль» в своих падежах — байк; слово, в котором они лишь
+# начало («машинное масло», «машинка», «машинист», «автомобильный»), — не трогаем (было «байкное масло»).
 import re as _re_lang
-_CAR_RU = _re_lang.compile("автомобил[а-я]*|машин[ауыеой]?", _re_lang.IGNORECASE)
+_CAR_RU = _re_lang.compile(r"\b(?:автомобил(?:ями|ям|ях|ем|ей|ь|я|ю|е|и)|машин(?:ами|ам|ах|ой|ою|а|у|ы|е)?)\b",
+                           _re_lang.IGNORECASE)
 _THAI_RE = _re_lang.compile("[฀-๿]")
 
 
@@ -600,6 +603,10 @@ def _extract_ru(text):
     return t.strip()
 
 
+# Тайский указатель «подробности — в русском тексте ниже»: фоллбэк перевода и запасной текст без модели.
+_TH_POINTER = "ดูรายละเอียดในข้อความภาษารัสเซียด้านล่างครับ"
+
+
 def _translate_ru_th(claude, ru_text):
     """RU→TH точный перевод ОДНИМ вызовом (+страховка _no_car). Фоллбэк при пустом/сбое —
     короткий тайский указатель на RU-блок (без кириллицы, чтобы аудитор не флагал смешение)."""
@@ -614,7 +621,7 @@ def _translate_ru_th(claude, ru_text):
         th = ""
     th = _no_car(th)
     if not th or not _THAI_RE.search(th):   # нет тайских символов → фоллбэк
-        return "ดูรายละเอียดในข้อความภาษารัสเซียด้านล่างครับ"
+        return _TH_POINTER
     return th
 
 
@@ -624,6 +631,14 @@ def bilingual_from_ru(claude, ru_text, head="🐀 Splinter"):
     ru = _no_car((ru_text or "").strip())
     th = _translate_ru_th(claude, ru)
     body = f"🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}"
+    return (head + "\n" + body) if head else body
+
+
+def _bilingual_pointer(ru_text, head="🐀 Splinter"):
+    """Запасной текст БЕЗ МОДЕЛИ (SPLRELA0610): та же форма, что у `bilingual_from_ru` при сбое перевода — 🇹🇭 тайский
+    указатель, 🇷🇺 русская основа после `_no_car`. Модель не зовётся, `log.exception` не пишется: это не сбой модели."""
+    ru = _no_car((ru_text or "").strip())
+    body = f"🇹🇭 {_TH_POINTER if ru else ''}\n{_SEP}\n🇷🇺 {ru}"
     return (head + "\n" + body) if head else body
 
 
@@ -1418,6 +1433,22 @@ def decider_reply_to_own(msg) -> bool:
         return False
 
 
+def reply_to_other_human(msg) -> bool:
+    """Реплай на сообщение ДРУГОГО человека (слово владельца 06.10.2026 19:43, SPLRELB0610: правило SPLLANGC0610
+    «ответ человеку — не к Splinter» без переводчика): автор исходного — человек, не бот и не сам отвечающий.
+    Не реплай, реплай на служебное «тема создана», ответ боту (любому его сообщению) и самому себе → False.
+    Так судят `decider_live` и `bot._addresses_bot`. Не бросает."""
+    try:
+        u = getattr(msg, "from_user", None)
+        if u is None or _tfeed.reply_to_of(msg) is None:  # не реплай или реплай на служебное «тема создана»
+            return False
+        au = getattr(getattr(msg, "reply_to_message", None), "from_user", None)
+        return (au is not None and not getattr(au, "is_bot", False)
+                and getattr(au, "id", None) != getattr(u, "id", None))
+    except Exception:
+        return False
+
+
 def decider_paused(chat_id, topic_id):
     _dlive_load()
     return _DLIVE["pauses"].get(_dkey(chat_id, topic_id))
@@ -1520,8 +1551,31 @@ async def decider_note_button(update, context) -> None:
         log.warning(f"  ⏸ решатель (бой): кнопка не разобрана ({type(e).__name__})")
 
 
-async def _decider_execute(msg, context, bridge, snap, v) -> str:
-    """Исполнить итог правил через ПРЕЖНИЕ двери. Возврат — имя двери (для журнала)."""
+async def _decider_staff_text(claude, ru):
+    """Текст решателя сотрудникам ДВУЯЗЫЧНО (слово владельца 06.10.2026 01:50/01:52: обращение к персоналу —
+    всегда на двух языках, сотрудники тайцы; повод — зов Пыма 06.10 01:30 только по-русски). Одно сообщение:
+    шапка, 🇹🇭 перевод, 🇷🇺 прежний русский текст — `bilingual_from_ru`; сбой перевода (модель упала, пусто,
+    без тайских букв) — тайский указатель `_translate_ru_th`, оба блока всё равно на месте.
+    Модель синхронна — перевод в потоке, цикл событий не держим. Не бросает.
+    Страховки SPLRELA0610: перевод не дольше таймаута решателя (`_tdec.live_timeout()`) — не уложился, тайский
+    указатель и строка журнала с секундами, решатель идёт дальше (поток модели прервать нельзя: он доработает сам,
+    ответ выбрасывается); модели нет, таймаут или сборка упала — запасной текст `_bilingual_pointer` без вызова
+    модели и без `log.exception`."""
+    import asyncio as _aio
+    if claude is not None:
+        tmo = _tdec.live_timeout()
+        try:
+            return await _aio.wait_for(_aio.to_thread(bilingual_from_ru, claude, ru), tmo)
+        except _aio.TimeoutError:
+            log.warning(f"  🧠 решатель (бой): перевод не уложился в {tmo:g} с (таймаут решателя) — тайский указатель")
+        except Exception as e:
+            log.warning(f"  🧠 решатель (бой): перевод не собран ({type(e).__name__}) — тайский указатель")
+    return _bilingual_pointer(ru)
+
+
+async def _decider_execute(msg, context, bridge, snap, v, claude=None) -> str:
+    """Исполнить итог правил через ПРЕЖНИЕ двери. Возврат — имя двери (для журнала).
+    «Спросить» (мимо `staff_ask_post`) и «позвать» пишут сотрудникам ДВУЯЗЫЧНО (`_decider_staff_text`)."""
     it, chat_id, topic_id, bike = v["итог"], snap["chat"], snap["topic"], snap["bike"]
     a, k, now = it.get("действие"), _dkey(snap["chat"], snap["topic"]), _time.time()
     if a == "записать":
@@ -1554,7 +1608,7 @@ async def _decider_execute(msg, context, bridge, snap, v) -> str:
                 return "вопрос сотрудникам: " + " + ".join(r["posted"])
             if r.get("qid"):
                 return "вопрос сотрудникам уже открыт — без повтора"
-        sent = await msg.reply_text(f"🐀 Splinter\n{q}")
+        sent = await msg.reply_text(await _decider_staff_text(claude, q))
         smid = getattr(sent, "message_id", None)
         _DLIVE["asks"].setdefault(k, {})[_tdec.ask_kind(it.get("ждём_что"))] = {"mid": smid, "ts": now}
         _dlive_mark(chat_id, topic_id, smid)
@@ -1566,12 +1620,40 @@ async def _decider_execute(msg, context, bridge, snap, v) -> str:
         if not _tdec.call_allowed(last, now, _tdec.call_window()):
             return "зов (уже был в окне — без повтора)"
         why = str(it.get("зачем") or "")[:160]
-        sent = await msg.reply_text(f"🐀 Splinter\n🙋 {PYM_HANDLE}: {why}")
+        sent = await msg.reply_text(await _decider_staff_text(claude, f"🙋 {PYM_HANDLE}: {why}"))
         smid = getattr(sent, "message_id", None)
         _DLIVE["calls"][k] = {"ts": now, "mid": smid}
         _dlive_mark(chat_id, topic_id, smid)
         return "зов Пыма"
     return ""
+
+
+_HUMAN_QUIET = ("позвать", "спросить")
+
+
+def human_reply_verdict(v, dec):
+    """Итог решателя на ответ человеку (SPLRELB0610; образец — `talk_verdict` SPLLANGC0610, без переводчика).
+    «Записать» и «ничего» — как сейчас; «ответить» — прежний путь (не в `LIVE_ACTIONS`). «Позвать»/«спросить»,
+    которых хотела САМА модель, гасятся правилом «ответ_человеку», прежний итог — полем «было» (журнал и лента).
+    Итог, к которому привело ПРАВИЛО, а не модель, исполняется, как сейчас, — двуязычно (`_decider_staff_text`).
+    Такие правила сегодня два, оба `topic_decider.rules`: «убывание» и «потолок» (модель хотела «записать» пробег —
+    правило зовёт Пыма)."""
+    a = v["итог"].get("действие")
+    by_rule = bool(v.get("правило")) and a != dec.get("действие")
+    if a in _HUMAN_QUIET and not by_rule:
+        return {"итог": {"действие": "ничего", "почему": "ответ человеку — не к Splinter"},
+                "правило": "ответ_человеку", "дверь": "", "модель": dec.get("действие"), "было": dict(v["итог"])}
+    return v
+
+
+def _human_was(v) -> str:
+    """Хвост строки журнала: погашенный итог — действие и кого/что ждали, без текста людей и модели."""
+    b = v.get("было") or {}
+    if not b:
+        return ""
+    a = b.get("действие")
+    return f" · было {a}" + (f" ({b.get('кого')})" if a == "позвать" else
+                             f" (ждём {_tdec.ask_kind(b.get('ждём_что'))})" if a == "спросить" else "")
 
 
 async def decider_live(msg, context, bridge, claude, kind="text") -> bool:
@@ -1586,6 +1668,8 @@ async def decider_live(msg, context, bridge, claude, kind="text") -> bool:
         if getattr(getattr(msg, "from_user", None), "is_bot", False):
             return False
         chat_id, topic_id = msg.chat_id, getattr(msg, "message_thread_id", None)
+        # ответ человеку (SPLRELB0610): текст-реплай другому человеку без тега Splinter
+        human = kind == "text" and reply_to_other_human(msg) and not _bot_mentioned(msg, context)
         p = decider_paused(chat_id, topic_id)
         if p:
             log.info(f"  🧠 решатель (бой): #{mid} → тема на паузе — прежний путь")
@@ -1604,13 +1688,16 @@ async def decider_live(msg, context, bridge, claude, kind="text") -> bool:
             return False
         v = _tdec.rules(dec, snap["facts"])
         v["модель"] = dec.get("действие")
+        if human:                                    # ответ человеку: зов и вопрос модели гасятся, итог правила — нет
+            v = human_reply_verdict(v, dec)
         if v["итог"].get("действие") not in _tdec.LIVE_ACTIONS:
             log.info(f"  🧠 решатель (бой): #{mid} → {v['итог'].get('действие')} в бою не исполняется — прежний путь")
             return False
-        door = await _decider_execute(msg, context, bridge, snap, v)
-        log.info(_tdec.live_say(v, mid, door))
+        door = await _decider_execute(msg, context, bridge, snap, v, claude=claude)
+        log.info(_tdec.live_say(v, mid, door) + _human_was(v))
         _tfeed.append(chat_id, topic_id, "decision", role="bot", reply_to=mid, text="", on=mid,
-                      input_kind=kind, live=True, model=dec, final=v["итог"], rule=v["правило"], door=door)
+                      input_kind=kind, live=True, model=dec, final=v["итог"], rule=v["правило"], door=door,
+                      было=v.get("было"))
         return True
     except Exception as e:
         log.warning(f"  🧠 решатель (бой): #{mid} сбой ({type(e).__name__}) — прежний путь")
