@@ -122,8 +122,11 @@ def hint_block(prev, hint):
     def cut(s, n):
         s = str(s or "").strip()
         return s if len(s) <= n else s[:n] + "…"
+    # A9c (круг 2): пояснение — свободный текст сотрудника; переводы строк сводятся в пробел, как в lessons_block,
+    # иначе строка «КЛИЕНТ СЕЙЧАС …» внутри пояснения встаёт в запрос вторым заголовком
+    flat = " ".join(str(hint or "").split())
     return "%s\nпрежний черновик: «%s»\nпояснение: «%s»" % (HINT_HEAD, cut(prev, HINT_PREV_MAX),
-                                                            cut(hint, LESSON_ITEM_MAX))
+                                                            cut(flat, LESSON_ITEM_MAX))
 
 
 def lessons_block(rows):

@@ -170,7 +170,8 @@ LESSON_OFF_WORDS = "уроки выключены (WA_AGENT_LESSONS)"
 LESSON_REJECTED = "rejected"                  # кандидат-пояснение отклонён владельцем: в промпт не идёт
 KIND_HINT = "hint"                            # lessons.kind: правило из пояснения; NULL — урок правкой текстом
 HINT_WAIT, HINT_DONE, HINT_FAIL = "wait", "done", "fail"
-HINT_MAX = 1000                               # пояснение, символов (в промпт — не длиннее LESSON_ITEM_MAX адаптера)
+HINT_MAX = 600                                # пояснение, символов = LESSON_ITEM_MAX адаптера (A9a/A9f: хранится,
+                                              # показывается на карточке и идёт в правило ОДИН и тот же текст)
 HINTS_PER_TICK = 1                            # версий по пояснению за такт: каждая — платный вызов, такт держит опрос
 HINT_LIST_HOUR = 21                           # суточный список владельцу — после этого часа по Пхукету
 HINT_LIST_KEY, HINT_LIST_NEXT = "hint_list_day", "hint_list_next"   # meta: день ушедшего списка · повтор не раньше
@@ -1856,7 +1857,9 @@ class Core:
         now = self.clock() if now is None else now
         if not self.hints:
             return {"ok": False, "words": HINT_OFF_WORDS}
-        text = (text or "").strip()[:HINT_MAX]
+        text = (text or "").strip()
+        cut = len(text) > HINT_MAX                          # A9f: длинное режется — автору говорим, не молча
+        text = text[:HINT_MAX]
         if not text:
             return {"ok": False, "words": "не принято: нужен текст пояснения"}
         row = self.db.execute("SELECT text FROM drafts WHERE id=? AND state=? AND ver=?",
@@ -1870,12 +1873,29 @@ class Core:
                               "msg_id, ts, state) VALUES(?,?,?,?,?,?,?,?,?)",
                               (draft_id, int(ver), text, row[0], who, _int_or_none(who_id), msg_id, now, HINT_WAIT))
         if cur.rowcount != 1:
-            return {"ok": False, "words": "не принято: пояснение к версии %d уже есть — ждите версию %d" % (
-                int(ver), int(ver) + 1)}
-        hid = cur.lastrowid
-        self.log("черновик %d: пояснение %d к версии %d (%s, %d симв.)" % (draft_id, hid, int(ver), who, len(text)))
+            # A12 (NIGHT0710-B2, круг 2): пояснение к этой версии уже было и кончилось сбоем (модель упала, клиент
+            # написал) — черновик всё ещё ждёт на той же версии, значит новое пояснение законно. Строка `fail`
+            # возвращается в очередь условным UPDATE (state='fail'): ждущее или сделанное пояснение не трогается.
+            old = self.db.execute("SELECT id FROM hints WHERE draft_id=? AND ver_from=? AND state=?",
+                                  (draft_id, int(ver), HINT_FAIL)).fetchone()
+            if old is None or self.db.execute(
+                    "UPDATE hints SET text=?, prev_text=?, author=?, author_id=?, msg_id=?, ts=?, state=?, "
+                    "reason=NULL, done_at=NULL, ver_to=NULL WHERE id=? AND state=?",
+                    (text, row[0], who, _int_or_none(who_id), msg_id, now, HINT_WAIT, old[0],
+                     HINT_FAIL)).rowcount != 1:
+                return {"ok": False, "words": "не принято: пояснение к версии %d уже есть — ждите версию %d" % (
+                    int(ver), int(ver) + 1)}
+            hid = old[0]
+            self.log("черновик %d: пояснение %d к версии %d повторно после сбоя (%s, %d симв.)" % (
+                draft_id, hid, int(ver), who, len(text)))
+        else:
+            hid = cur.lastrowid
+            self.log("черновик %d: пояснение %d к версии %d (%s, %d симв.)" % (draft_id, hid, int(ver), who,
+                                                                           len(text)))
         return {"ok": True, "hint": hid,
-                "words": "пояснение №%d принято — агент делает версию %d" % (hid, int(ver) + 1)}
+                "words": "пояснение №%d принято%s — агент делает версию %d" % (
+                    hid, " (обрезано до %d симв. — длиннее в правило не идёт)" % HINT_MAX if cut else "",
+                    int(ver) + 1)}
 
     def _hint_fail(self, hint_id, words, now):
         """Версии по пояснению нет: `fail` с причиной, ответ словами на сообщение пояснения."""
