@@ -20,6 +20,10 @@ Environment (.env):
   WA_360_SANDBOX_KEY  — 360dialog sandbox API key (D360-API-KEY header)
   WA_D360_PATH_SECRET — random hex secret embedded in the 360dialog webhook path
   WA_PULL_SECRET      — random hex secret in the PC pull/ack path (absent → those doors 404)
+  TG_PUSH_SECRET      — Bearer secret of the PC Telegram feed door (absent → /tg-queue/push 404)
+  TG_CHANNEL_SINCE    — unix seconds UTC the Telegram channel was switched on; rows older → history=1
+                        (absent or not a number → /tg-queue/push 404: without it old feed reads as live)
+  TG_QUEUE_DB         — path to the Telegram queue file (default: tg_queue.db next to this file)
 
 Endpoints:
   GET  /wa-webhook                            — Meta hub.verify-token handshake
@@ -28,6 +32,8 @@ Endpoints:
                                                 (auth by path secret, no HMAC)
   GET  /wa-queue/pull/<WA_PULL_SECRET>        — PC takes up to 20 undelivered rows (leases them)
   POST /wa-queue/ack/<WA_PULL_SECRET>         — PC confirms it processed the given ids
+  POST /tg-queue/push                         — PC pushes its Telegram feed rows into tg_queue.db
+                                                (auth: Authorization: Bearer <TG_PUSH_SECRET>)
 
 BIND IS LOOPBACK BY DEFAULT (06.09.2026). TLS and the outside world are Caddy's job; the
 webhook itself has no reason to be reachable on a public interface. Direction of doubt is
@@ -105,6 +111,9 @@ def _env():
         "d360_key":         os.environ.get("WA_360_SANDBOX_KEY", ""),
         "d360_path_secret": os.environ.get("WA_D360_PATH_SECRET", ""),
         "pull_secret":      os.environ.get("WA_PULL_SECRET", ""),
+        "tg_push_secret":   os.environ.get("TG_PUSH_SECRET", ""),
+        "tg_channel_since": os.environ.get("TG_CHANNEL_SINCE", ""),
+        "tg_queue_db":      os.environ.get("TG_QUEUE_DB", os.path.join(ROOT, "tg_queue.db")),
     }
 
 
@@ -233,6 +242,39 @@ def _enrichment(row: dict, ev: dict) -> dict:
 LEASE_SECS = 300     # 5 minutes — PC took it and went silent → someone must get it again
 PULL_LIMIT = 20      # rows handed out per pull
 
+# ONE insert for every writer of the table (05.10.2026): `enqueue_stats` and `enqueue_confirmed` share
+# the statement and the column mapping, so a column added for one door cannot silently miss the other.
+_INSERT_SQL = """INSERT OR IGNORE INTO wa_inbox
+                               (ts_queued, channel, from_number, name, msg_type, text, media_id,
+                                ts_msg, echo, history, status, raw, wamid, source,
+                                mime, caption, media_note, react_to, edit_to, edit_text)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?,?,?,?,?,?)"""
+
+
+def _insert_params(ev: dict, now: int, source: str = "") -> tuple:
+    """Normalised event → the parameters of `_INSERT_SQL` (the mapping that lived inline before)."""
+    return (
+        now,
+        ev.get("channel", "wa"),
+        ev.get("from"),
+        ev.get("name") or "",
+        ev.get("type"),
+        ev.get("text"),
+        ev.get("media_id"),
+        ev.get("ts"),
+        1 if ev.get("echo") else 0,
+        1 if ev.get("history") else 0,
+        json.dumps(ev.get("raw"), ensure_ascii=False),
+        ev.get("wamid"),
+        ev.get("source") or source or "",
+        ev.get("mime"),
+        ev.get("caption"),
+        ev.get("media_note"),
+        ev.get("react_to"),
+        ev.get("edit_to"),
+        ev.get("edit_text"),
+    )
+
 
 class WAQueueDB:
     """Thread-safe SQLite queue for incoming WA events."""
@@ -281,34 +323,7 @@ class WAQueueDB:
             with self._conn() as conn:
                 for ev in events:
                     try:
-                        conn.execute(
-                            """INSERT OR IGNORE INTO wa_inbox
-                               (ts_queued, channel, from_number, name, msg_type, text, media_id,
-                                ts_msg, echo, history, status, raw, wamid, source,
-                                mime, caption, media_note, react_to, edit_to, edit_text)
-                               VALUES (?,?,?,?,?,?,?,?,?,?,'new',?,?,?,?,?,?,?,?,?)""",
-                            (
-                                now,
-                                ev.get("channel", "wa"),
-                                ev.get("from"),
-                                ev.get("name") or "",
-                                ev.get("type"),
-                                ev.get("text"),
-                                ev.get("media_id"),
-                                ev.get("ts"),
-                                1 if ev.get("echo") else 0,
-                                1 if ev.get("history") else 0,
-                                json.dumps(ev.get("raw"), ensure_ascii=False),
-                                ev.get("wamid"),
-                                ev.get("source") or source or "",
-                                ev.get("mime"),
-                                ev.get("caption"),
-                                ev.get("media_note"),
-                                ev.get("react_to"),
-                                ev.get("edit_to"),
-                                ev.get("edit_text"),
-                            ),
-                        )
+                        conn.execute(_INSERT_SQL, _insert_params(ev, now, source))
                         if conn.execute("SELECT changes()").fetchone()[0]:
                             inserted += 1
                             continue
@@ -331,6 +346,52 @@ class WAQueueDB:
                         log.warning("wa_queue enqueue error: %s", e)
                 conn.commit()
         return {"inserted": inserted, "enriched": enriched}
+
+    def enqueue_confirmed(self, events: list, source: str = "") -> set:
+        """Insert events ALL OR NOTHING → the set of their wamids that exist AFTER the commit.
+
+        Written for a door whose answer is a receipt (`/tg-queue/push`, 05.10.2026): there an
+        acknowledged key that never reached the disk is a lost message, so this method has none of
+        `enqueue_stats`'s per-row forgiveness. Any database error rolls the whole batch back and is
+        RAISED — the caller answers 500 and confirms nothing. Only after the commit succeeded are
+        the wamids read back from the table: a row inserted now and a row that was already there
+        (a resent batch) are the same answer — «it is on disk». No enrichment of known rows.
+
+        Every event must carry a non-empty `wamid`: without it the read-back cannot name the row.
+        """
+        wamids = []
+        for ev in events:
+            w = ev.get("wamid")
+            if not isinstance(w, str) or not w:
+                raise ValueError("enqueue_confirmed: every event needs a wamid")
+            wamids.append(w)
+        if not wamids:
+            return set()
+        now = int(time.time())
+        present = set()
+        with self._lock:
+            conn = self._conn()
+            try:
+                try:
+                    for ev in events:
+                        conn.execute(_INSERT_SQL, _insert_params(ev, now, source))
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise
+                uniq = sorted(set(wamids))
+                for i in range(0, len(uniq), 500):
+                    part = uniq[i:i + 500]
+                    rows = conn.execute(
+                        "SELECT wamid FROM wa_inbox WHERE wamid IN (" + ",".join("?" * len(part)) + ")",
+                        part).fetchall()
+                    present.update(r[0] for r in rows)
+            finally:
+                conn.close()
+        return present
 
     def upsert_contacts(self, contacts: list, source: str = "") -> int:
         """Contacts of the business phone → wa_contacts. Returns rows inserted or updated.
@@ -965,6 +1026,124 @@ def archive_raw(path: str, body: bytes, max_bytes: int = RAW_ARCHIVE_MAX_BYTES,
         return "error"
 
 
+# ─── Telegram feed door (05.10.2026, TGDOOR0510) ─────────────────────────────────────
+#
+# The PC userbot writes one JSON row per private client message (tg_feed.py, branch tg-feed-0310)
+# and its pusher (tg_feed_push.py) POSTs them here. CONTRACT (one for PC and server):
+#   POST /tg-queue/push · Authorization: Bearer <TG_PUSH_SECRET> · Content-Type: application/json
+#   body  {"batch_id": "...", "rows": [{chat_id, msg_id, dir, ts, kind, text, reply_to, sender_id}, …]}
+#   200   {"accepted": [[chat_id, msg_id, dir], …]} — keys that are ON DISK after the commit, resent ones too.
+# Anything else confirms NOTHING on the pusher side (its cursor stays), so every failure here is a
+# non-200 and never a partial lie.
+#
+# SEPARATE FILE, SAME CLASS. Rows go to tg_queue.db through WAQueueDB: same schema, same dedup by
+# wamid, same lock. Nothing of Telegram lands in wa_queue.db, so /wa-queue/pull cannot hand it out.
+#
+# KINDS ARE RENAMED TO WA NAMES, so wa_kind and the agent read a TG row as they read a WA row:
+# photo→image, voice→audio, file→document; text/video/sticker/location keep their names; `other`
+# and any kind the contract does not list stay `other` — not an inbound type, so wa_kind calls the
+# row `unknown` (seen, never a card). Media captions go to `caption`, as WA does.
+#
+# HISTORY CUTOFF lives HERE and not in the order of deploy steps (TGPLAN0510 §1 risk): a row whose
+# message is older than TG_CHANNEL_SINCE is stored history=1 whatever the agent's cursor does.
+
+TG_CHANNEL = "tg"
+TG_SOURCE = "tg_push"
+TG_PUSH_PATH = "/tg-queue/push"
+TG_PUSH_MAX_BYTES = 256 * 1024          # the pusher's own batch ceiling (BATCH_BYTES), 256 KiB
+_TG_DRAIN_MAX = 4 * TG_PUSH_MAX_BYTES   # a 413 reads at most this much so the client can see the answer
+TG_DIRS = ("in", "out")
+
+TG_KIND_TO_WA = {
+    "text":     "text",
+    "photo":    "image",
+    "voice":    "audio",
+    "video":    "video",
+    "sticker":  "sticker",
+    "file":     "document",
+    "location": "location",
+    "other":    "other",
+}
+_TG_CAPTION_TYPES = frozenset(("image", "audio", "video", "document", "sticker"))
+
+
+def _tg_int(v):
+    """An int that is not a bool, else None (JSON true must not pass as id 1)."""
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def tg_wamid(chat_id: int, msg_id: int, direction: str) -> str:
+    """Queue key of a feed row: dedup is exactly (chat_id, msg_id, dir)."""
+    return "tg:%d:%d:%s" % (chat_id, msg_id, direction)
+
+
+def tg_since_of(raw):
+    """TG_CHANNEL_SINCE → unix seconds (int ≥ 0), or None when unset / not a plain number.
+
+    None keeps the door CLOSED: without the switch-on moment every backlog row would be stored
+    as live and the agent would draft answers to old messages."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    s = str(raw).strip()
+    return int(s) if re.fullmatch(r"[0-9]{1,12}", s) else None
+
+
+def tg_row_event(row, since: int):
+    """One feed row → (key, queue event), or (None, None) for a malformed row.
+
+    Malformed = not a dict · chat_id/msg_id not ints · dir not in/out · ts not an int ≥ 0 ·
+    kind not a string · text neither a string nor null. Such a row is not written and its key is
+    not accepted (the pusher stops in front of it loudly, it does not lose it silently)."""
+    if not isinstance(row, dict):
+        return None, None
+    cid, mid, direction = _tg_int(row.get("chat_id")), _tg_int(row.get("msg_id")), row.get("dir")
+    ts = _tg_int(row.get("ts"))
+    kind, text = row.get("kind"), row.get("text")
+    if cid is None or mid is None or direction not in TG_DIRS:
+        return None, None
+    if ts is None or ts < 0 or not isinstance(kind, str):
+        return None, None
+    if text is not None and not isinstance(text, str):
+        return None, None
+    wa_type = TG_KIND_TO_WA.get(kind, "other")
+    body = text or None
+    media = wa_type in _TG_CAPTION_TYPES
+    event = {
+        "channel":  TG_CHANNEL,
+        "from":     "tg:%d" % cid,
+        "name":     "",
+        "type":     wa_type,
+        "text":     None if media else (text if text is not None else ""),
+        "caption":  body if media else None,
+        "media_id": None,
+        "ts":       ts,
+        "echo":     direction == "out",
+        "history":  ts < since,
+        "wamid":    tg_wamid(cid, mid, direction),
+        "source":   TG_SOURCE,
+        "raw":      row,
+    }
+    return (cid, mid, direction), event
+
+
+def bearer_secret_ok(configured: str, authorization) -> bool:
+    """Does `Authorization: Bearer <token>` carry the configured secret?
+
+    FAIL-CLOSED like path_secret_ok: no secret configured, no header, another scheme or an empty
+    token → False. Bytes are compared with compare_digest (constant time; a non-ASCII header can
+    not raise TypeError here and turn a 404 into a 500)."""
+    if not configured or not isinstance(authorization, str):
+        return False
+    scheme, _, token = authorization.strip().partition(" ")
+    token = token.strip()
+    if scheme.lower() != "bearer" or not token:
+        return False
+    return hmac.compare_digest(str(configured).encode("utf-8"),
+                               token.encode("utf-8", "replace"))
+
+
 # ─── HMAC signature verification ─────────────────────────────────────────────────────
 
 def path_secret_ok(configured: str, given: str) -> bool:
@@ -1020,6 +1199,9 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
     raw_archive:      str = ""                       # '' → архива нет (make_server ставит путь)
     raw_archive_max:  int = RAW_ARCHIVE_MAX_BYTES
     raw_archive_floor: int = RAW_ARCHIVE_FREE_FLOOR
+    tg_push_secret:   str = ""                       # '' → /tg-queue/push answers 404
+    tg_since:         int = None                     # None → /tg-queue/push answers 404
+    tg_db:            WAQueueDB = None               # tg_queue.db; None → /tg-queue/push answers 404
 
     # Socket r/w timeout per request — a slow/stalled client closes the connection
     # rather than holding the thread indefinitely (incident 15.07: TCP open, HTTP hung).
@@ -1070,6 +1252,8 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             self._do_d360_post(path)
         elif path.startswith("/wa-queue/ack/"):
             self._do_ack(path)
+        elif path == TG_PUSH_PATH:
+            self._do_tg_push()
         else:
             self._send(404, "Not found")
 
@@ -1125,6 +1309,77 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             return
         log.info("WA ack: %d of %d ids marked processed", n, len(ids))
         self._send_json(200, {"ok": True, "acked": n})
+
+    # ── PC Telegram feed door (05.10.2026) ────────────────────────────────────
+    #
+    # ORDER IS THE CONTRACT: secret (404, same body as an unknown URL — before the size, so a 413
+    # never confirms the door to a stranger) → size (413) → body (400) → ONE all-or-nothing write
+    # → answer. The 200 with keys is sent only after the commit and the read-back; a database error
+    # is 500 with no `accepted` at all. Nothing is answered before the write, unlike the Meta and
+    # d360 doors: there the sender only needs «received», here the answer IS the receipt.
+
+    def _tg_door_open(self) -> bool:
+        return bool(self.tg_push_secret) and self.tg_since is not None and self.tg_db is not None
+
+    # POST /tg-queue/push  header Authorization: Bearer <TG_PUSH_SECRET>
+    def _do_tg_push(self):
+        if not self._tg_door_open() or not bearer_secret_ok(
+                self.tg_push_secret, self.headers.get("Authorization")):
+            self._send(404, "Not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length"))
+        except (TypeError, ValueError):
+            self._send_json(400, {"ok": False, "error": "bad_length"})
+            return
+        if length < 0:
+            self._send_json(400, {"ok": False, "error": "bad_length"})
+            return
+        if length > TG_PUSH_MAX_BYTES:
+            log.warning("TG push: body of %d bytes over the %d-byte ceiling — 413, nothing written",
+                        length, TG_PUSH_MAX_BYTES)
+            if length <= _TG_DRAIN_MAX:
+                try:
+                    self.rfile.read(length)      # let an honest client read the answer
+                except Exception:
+                    pass
+            self._send_json(413, {"ok": False, "error": "too_large", "max_bytes": TG_PUSH_MAX_BYTES})
+            return
+        body = self.rfile.read(length)
+        if len(body) != length:
+            self._send_json(400, {"ok": False, "error": "short_body"})
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception as e:
+            log.warning("TG push: JSON parse error: %s", type(e).__name__)
+            self._send_json(400, {"ok": False, "error": "bad_json"})
+            return
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            self._send_json(400, {"ok": False, "error": "rows_must_be_list"})
+            return
+        keys, events, seen, bad = [], [], set(), 0
+        for row in rows:
+            key, event = tg_row_event(row, self.tg_since)
+            if key is None:
+                bad += 1
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+            events.append(event)
+        try:
+            present = self.tg_db.enqueue_confirmed(events, source=TG_SOURCE)
+        except Exception as e:
+            log.error("TG push: queue write failed, NOTHING accepted: %s: %s", type(e).__name__, e)
+            self._send_json(500, {"ok": False, "error": "push_failed"})
+            return
+        accepted = [[c, m, d] for (c, m, d) in keys if tg_wamid(c, m, d) in present]
+        # Counts only — the rows are client correspondence and do not belong in our log.
+        log.info("TG push: %d rows, %d accepted, %d malformed", len(rows), len(accepted), bad)
+        self._send_json(200, {"ok": True, "accepted": accepted, "malformed": bad})
 
     # POST /wa-webhook — Meta Cloud API v2, HMAC-verified
     def _do_meta_post(self):
@@ -1250,6 +1505,20 @@ def make_server(env: dict) -> ThreadingHTTPServer:
     _Handler.pull_secret      = env.get("pull_secret", "")
     _Handler.raw_archive      = raw_archive_path(env["queue_db"])
 
+    # Telegram feed door: opens only with BOTH its own secret and the switch-on moment, and never
+    # on the WA queue file (the same path for both would mix the channels — refused, door closed).
+    tg_secret = str(env.get("tg_push_secret") or "").strip()
+    tg_since = tg_since_of(env.get("tg_channel_since"))
+    tg_path = env.get("tg_queue_db") or os.path.join(
+        os.path.dirname(os.path.abspath(env["queue_db"])), "tg_queue.db")
+    same_file = os.path.realpath(tg_path) == os.path.realpath(env["queue_db"])
+    if same_file:
+        log.error("TG push door: tg_queue_db is the WA queue file — door stays CLOSED")
+    _Handler.tg_push_secret = tg_secret
+    _Handler.tg_since       = tg_since
+    _Handler.tg_db          = (WAQueueDB(tg_path)
+                               if tg_secret and tg_since is not None and not same_file else None)
+
     server =ThreadingHTTPServer((bind_host(env.get("bind_host")), env["port"]), _Handler)
     server.daemon_threads = True
     return server
@@ -1269,6 +1538,12 @@ def main():
         server.server_address[0], env["port"], env["queue_db"],
         "on" if env.get("pull_secret") else "OFF (WA_PULL_SECRET not set → pull/ack answer 404)",
     )
+    h = server.RequestHandlerClass
+    if h.tg_db is not None:
+        log.info("TG push door: on → %s  since=%d (rows older → history=1)", h.tg_db.db_path, h.tg_since)
+    else:
+        log.info("TG push door: OFF (TG_PUSH_SECRET / TG_CHANNEL_SINCE not set → %s answers 404)",
+                 TG_PUSH_PATH)
     log.info("D360 raw archive: %s  cap=%d  free_floor=%d",
              server.RequestHandlerClass.raw_archive, RAW_ARCHIVE_MAX_BYTES,
              RAW_ARCHIVE_FREE_FLOOR)
