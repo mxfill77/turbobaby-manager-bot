@@ -79,6 +79,14 @@
 урок получает кнопку «↩️ Откатить №N» `wa:unrule:<урок>:0`; откат по номеру — и текстом «откатить №N» в
 группе. В журнал — номер урока, кто и исход; было/стало и причины в журнале нет.
 
+ПОЯСНЕНИЕ → ПРАВИЛО (NIGHT0710-B2, выключатель WA_AGENT_HINTS ядра; выключен — всё как раньше). «✏️ Исправить» шлёт
+в группу приглашение с force_reply реплаем на карточку (`tg_hint_prompts`: сообщение → черновик, версия); ответ на
+приглашение — пояснение (`Core.hint`), реплай прямо на карточку — по-прежнему правка полным текстом. Голос и пустое —
+ответ словами, пояснения нет. Карточка версии по пояснению несёт строку «💬 версия N по пояснению №P». «Отправить»
+передаёт ядру id нажавшего (`who_id`) — владелец судится по нему. Суточный список владельцу (`hint_list`) — одно
+сообщение: у кандидата «✅ правило №N» `wa:rule:N:0` и «✖ отклонить №N» `wa:lno:N:0`, у нового правила «↩️ отменить
+№N» `wa:unrule:N:0`; после решения список перерисовывается по базе. Право — у ядра (только владелец по id).
+
 МЕДИА ИЗ ТЕМЫ → WHATSAPP (WARELAYMEDIA0210). Фото, видео (и гиф, и кружок), документ, голосовое, аудио,
 статичный стикер и место из темы клиента уходят клиенту своим видом (`media_of` → `Core.relay(media=…)` →
 `wa_send.send_media`): файл берётся `getFile` и скачивается В ПАМЯТЬ (`Tg.download`, на диск не ложится),
@@ -206,6 +214,23 @@ Q_SPLIT_MAX = 1000                  # вопрос над ответом, уше
 LESSON_TEXT_MAX = 1500                           # было/стало в сообщении урока, символов
 RX_ROLLBACK = re.compile(r"(?i)^\s*откатить\s+(?:урок\s+)?№?\s*(\d+)\s*$")
 
+# пояснение → правило (NIGHT0710-B2)
+W_EXPLAIN = "💬 «Исправить» — пояснение агенту: ответьте на приглашение, агент сделает новую версию с его учётом"
+W_HINT_VER = ("💬 версия %d по пояснению №%d (%s): «%s» — «Отправить» владельца сделает пояснение правилом, "
+              "сотрудника — кандидатом")
+W_HINT_ASK = ("💬 Пояснение к черновику №%d, версия %d: ответьте на ЭТО сообщение текстом — что поправить и почему. "
+              "Агент сделает версию %d с учётом пояснения; «Отправить» на ней владельца сделает пояснение правилом, "
+              "сотрудника — кандидатом. Полный готовый текст — по-прежнему реплаем на саму карточку.")
+W_HINT_ASKED = "приглашение в группе — ответьте на него текстом пояснения; полный текст — реплаем на карточку"
+W_HINT_TEXT_ONLY = "пояснение принимается только текстом — голос не расшифровывается; версии и правила нет"
+HINT_SHOW_MAX = 200                              # пояснение на карточке, символов
+HINT_ROW_MAX = 150                               # пояснение в строке суточного списка, символов
+HINT_LIST_MAX = 20                               # строк в одном списке (кнопок ≤ 2 на строку — меньше 100)
+W_LIST_HEAD = "📋 Пояснения за сутки — решает только владелец (по id): новые правила и кандидаты"
+W_LIST_MORE = "ещё %d — в следующем списке"
+LIST_STATE = {wa_agent.LESSON_CANDIDATE: "кандидат", wa_agent.LESSON_ACTIVE: "действующее правило",
+              wa_agent.LESSON_ROLLED: "отменено", wa_agent.LESSON_REJECTED: "отклонено"}
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tg_clients (
     cid     INTEGER PRIMARY KEY AUTOINCREMENT,      -- короткий id клиента для callback_data
@@ -240,6 +265,15 @@ CREATE TABLE IF NOT EXISTS tg_lessons (
     lesson_id INTEGER PRIMARY KEY,                   -- номер урока (lessons.id ядра)
     msg_id    INTEGER,                               -- сообщение урока в группе
     body      TEXT
+);
+CREATE TABLE IF NOT EXISTS tg_hint_prompts (
+    msg_id    INTEGER PRIMARY KEY,                   -- приглашение к пояснению (NIGHT0710-B2)
+    draft_id  INTEGER NOT NULL,
+    ver       INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tg_hint_lists (
+    msg_id    INTEGER PRIMARY KEY,                   -- суточный список владельцу (NIGHT0710-B2)
+    ids       TEXT    NOT NULL                       -- номера строк через запятую
 );
 CREATE TABLE IF NOT EXISTS tg_react_out (
     msg_id    INTEGER PRIMARY KEY,                   -- что уже уходило клиенту на это сообщение
@@ -376,8 +410,10 @@ def card_actions(hand):
     return acts
 
 
-def card_notes(hand, ver, door_open, follow=False, lesson=None):
-    """Строки под ответом: напоминание, до ACTIONS_MAX действий, «Отправить», урок, подсказка про реплай."""
+def card_notes(hand, ver, door_open, follow=False, lesson=None, hint=None, explain=False):
+    """Строки под ответом: напоминание, до ACTIONS_MAX действий, «Отправить», урок, подсказка про реплай.
+    hint — (номер, пояснение, автор): версия по пояснению (NIGHT0710-B2), её текст — от модели; explain — «Исправить»
+    зовёт пояснение (WA_AGENT_HINTS). Без них строки прежние."""
     lines = [W_FOLLOW] if follow else []
     acts = card_actions(hand)
     if acts:
@@ -387,12 +423,18 @@ def card_notes(hand, ver, door_open, follow=False, lesson=None):
             lines.append("• ещё %d — в подробностях" % (len(acts) - ACTIONS_MAX))
     if not door_open:
         lines.append(W_DOOR_CLOSED)                  # на любой версии: пока дверь закрыта, клиенту не уйдёт
-    elif hand and ver == 1:
+    elif hand and (ver == 1 or hint):
         lines.append(W_SEND_HAND)
     elif hand:
         lines.append(W_SEND_OPEN)
     if lesson:
         lines.append("📚 урок №%d записан кандидатом — «Сделать правилом» под ним" % lesson)
+    if hint:
+        said = " ".join(str(hint[1] or "").split())
+        lines.append(W_HINT_VER % (ver, hint[0], hint[2], said if len(said) <= HINT_SHOW_MAX
+                                   else said[:HINT_SHOW_MAX] + "…"))
+    if explain:
+        lines.append(W_EXPLAIN)
     lines.append(W_HINT)
     return "\n".join(lines)
 
@@ -659,12 +701,16 @@ class Tg(wa_agent.Telegram):
         # дверь отправки (WA_SEND): та же проба, что у нажатия «Отправить»; пробы нет — открыта
         door = getattr(self.core, "_door_open", None)
         door_open = door() if door else True
+        # пояснение → правило (NIGHT0710-B2): флаг выключен — ни строки версии по пояснению, ни подсказки
+        explain = bool(getattr(self.core, "hints", False))
+        hint = getattr(self.core, "hint_of", None) if explain and ver > 1 else None
+        hint = hint(draft_id, ver) if hint else None
         name, link = self._topic(number)
         top = "%s №%d · версия %d · %s" % ("🔔 Напоминание" if follow else "📝 Черновик", draft_id, ver, name)
         # вопрос клиента над ответом и перевод для сотрудника (WACARDQ0410); нет у ядра — карточка прежняя
         extra = getattr(self.core, "card_extra", None)
         extra = extra(draft_id, ver, str(text or "")) if extra else None
-        texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson),
+        texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson, hint, explain),
                            card_details(hand, link), question=(extra or {}).get("question") or "",
                            trans=card_trans(extra), agent=card_agent(extra))
         row = [{"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)},
@@ -720,21 +766,29 @@ class Tg(wa_agent.Telegram):
     # ── уроки людей (WAAGENTLESSON0210) ───────────────────────────────────────────────────
 
     def _lesson_body(self, lesson_id):
-        row = self.db.execute("SELECT state, author, ts, draft_id, ver_from, ver_to, was_text, now_text, reason "
-                              "FROM lessons WHERE id=?", (int(lesson_id),)).fetchone()
+        row = self.db.execute("SELECT state, author, ts, draft_id, ver_from, ver_to, was_text, now_text, reason, kind, "
+                              "hint, decided_by FROM lessons WHERE id=?", (int(lesson_id),)).fetchone()
         if not row:
             return None, None
-        state, author, ts, did, v1, v2, was, now, reason = row
+        state, author, ts, did, v1, v2, was, now, reason, kind, hint, by = row
+        at = wa_agent.hm_phuket(ts)
 
         def cut(s):
             s = str(s or "")
             return s if len(s) <= LESSON_TEXT_MAX else s[:LESSON_TEXT_MAX] + " … (обрезано в показе)"
+        if kind == wa_agent.KIND_HINT:
+            # правило из пояснения (NIGHT0710-B2): номер, автор пояснения, время, источник, кто решил, откат
+            return state, ("📚 Правило №%d · %s\nпояснение: %s\nавтор пояснения: %s · %s · черновик №%d, версия %d → "
+                           "%d (по пояснению)\nрешил: %s\nВ промпт агента идёт только действующее правило — со "
+                           "следующего черновика; правило, отклонение и откат — только владелец (по id Telegram)."
+                           % (int(lesson_id), LIST_STATE.get(state, state), cut(hint), author, at, did, v1, v2,
+                              by or "— (кандидат: решит владелец в суточном списке)"))
         return state, ("📚 Урок №%d · %s\nисправил: %s, %s · черновик №%d, версия %d → %d\nбыло: %s\nстало: %s\n"
                        "причина: %s\nВ промпт агента идёт только действующее правило; перевод — «Сделать "
                        "правилом» (владелец или список WA_AGENT_LESSON_ADMINS)."
                        % (int(lesson_id), {"candidate": "кандидат", "active": "действующее правило",
                                            "rolled_back": "откатан"}.get(state, state),
-                          author, wa_agent.hm_phuket(ts), did, v1, v2, cut(was), cut(now),
+                          author, at, did, v1, v2, cut(was), cut(now),
                           cut(reason) if reason else "— (ответьте реплаем на это сообщение — запишу причиной)"))
 
     @staticmethod
@@ -763,9 +817,11 @@ class Tg(wa_agent.Telegram):
         return mid
 
     def lesson_done(self, lesson_id, words, state):
-        """Перевод или откат: сообщение урока получает исход; у действующего — кнопка «Откатить №N»."""
+        """Перевод или откат: сообщение урока получает исход; у действующего — кнопка «Откатить №N». Номер стоит в
+        суточном списке (NIGHT0710-B2) — список перерисовывается по базе."""
         if not self.enabled:
             return
+        self._hint_lists_refresh(lesson_id)
         row = self.db.execute("SELECT msg_id FROM tg_lessons WHERE lesson_id=?", (int(lesson_id),)).fetchone()
         if not row or not row[0]:
             return
@@ -788,6 +844,107 @@ class Tg(wa_agent.Telegram):
         if kb:
             params["reply_markup"] = kb
         self.api("editMessageText", params)
+
+    # ── пояснение → правило (NIGHT0710-B2) ───────────────────────────────────────────────────
+
+    def _hint_ask(self, draft_id, ver, card_msg):
+        """«Исправить» при WA_AGENT_HINTS: приглашение с force_reply реплаем на карточку; связь сообщения приглашения
+        с черновиком и версией — `tg_hint_prompts`. Одно приглашение на версию. → слова нажавшему."""
+        if self.db.execute("SELECT 1 FROM tg_hint_prompts WHERE draft_id=? AND ver=?", (draft_id, ver)).fetchone():
+            return W_HINT_ASKED
+        params = {"chat_id": self.chat, "text": W_HINT_ASK % (draft_id, ver, ver + 1),
+                  "reply_markup": {"force_reply": True, "input_field_placeholder": "что поправить и почему"}}
+        if card_msg:
+            params["reply_parameters"] = {"message_id": int(card_msg), "allow_sending_without_reply": True}
+        ok, res = self.api("sendMessage", params)
+        if not ok:
+            return "приглашение не ушло (Telegram не принял) — нажмите ещё раз; полный текст — реплаем на карточку"
+        mid = int(res.get("message_id"))
+        self.db.execute("INSERT OR REPLACE INTO tg_hint_prompts(msg_id, draft_id, ver) VALUES(?,?,?)",
+                        (mid, draft_id, ver))
+        self.log("пояснение: приглашение к черновику %d версии %d → сообщение %d" % (draft_id, ver, mid))
+        return W_HINT_ASKED
+
+    def _on_hint_text(self, msg, reply, who, frm):
+        """Реплай на приглашение — пояснение (`Core.hint`). Голос, фото без подписи, пустое — ответ словами, пояснения
+        нет. → True — сообщение разобрано здесь; None — это не ответ на приглашение."""
+        row = self.db.execute("SELECT draft_id, ver FROM tg_hint_prompts WHERE msg_id=?", (reply,)).fetchone()
+        if row is None:
+            return None
+        if frm.get("is_bot"):
+            self.log("отказ: пояснение прислал бот %s (черновик %d)" % (who, row[0]))
+            return True
+        text = msg.get("text") or ""
+        if not text.strip():
+            self.log("пояснение: не текст от %s (черновик %d) — словами" % (who, row[0]))
+            self._say(msg, W_HINT_TEXT_ONLY)
+            return True
+        res = self.core.hint(row[0], row[1], text, who, frm.get("id"), msg_id=msg.get("message_id"))
+        self._say(msg, res.get("words"))
+        return True
+
+    def hint_note(self, hint_id, words):
+        """Пояснение без версии: ответ словами на сообщение пояснения."""
+        if not self.enabled:
+            return None
+        row = self.db.execute("SELECT msg_id FROM hints WHERE id=?", (int(hint_id),)).fetchone()
+        self._say({"message_id": row[0] if row and row[0] else 0}, words)
+        return True
+
+    def _hint_list_render(self, ids):
+        """Номера → (показанные номера, текст, клавиатура). Строка — «№N · состояние · автор · ЧЧ:ММ · черновик» и
+        пояснение; кнопки — по состоянию из базы. Не больше HINT_LIST_MAX строк и TG_TEXT_MAX знаков."""
+        lines, kb, shown = [W_LIST_HEAD], [], []
+        size = len(W_LIST_HEAD) + 40
+        for lid in ids:
+            row = self.db.execute("SELECT state, author, ts, draft_id, ver_to, hint FROM lessons WHERE id=?",
+                                  (int(lid),)).fetchone()
+            if row is None:
+                continue
+            state, author, ts, did, ver, hint = row
+            said = " ".join(str(hint or "").split())
+            line = "№%d · %s · %s · %s · черновик №%d, версия %d\n«%s»" % (
+                int(lid), LIST_STATE.get(state, state), author, wa_agent.hm_phuket(ts), did, ver,
+                said if len(said) <= HINT_ROW_MAX else said[:HINT_ROW_MAX] + "…")
+            if len(shown) >= HINT_LIST_MAX or size + len(line) + 2 > TG_TEXT_MAX:
+                break
+            lines.append(line)
+            size += len(line) + 2
+            shown.append(int(lid))
+            if state == wa_agent.LESSON_CANDIDATE:
+                kb.append([{"text": "✅ правило №%d" % int(lid), "callback_data": "wa:rule:%d:0" % int(lid)},
+                           {"text": "✖ отклонить №%d" % int(lid), "callback_data": "wa:lno:%d:0" % int(lid)}])
+            elif state == wa_agent.LESSON_ACTIVE:
+                kb.append([{"text": "↩️ отменить №%d" % int(lid), "callback_data": "wa:unrule:%d:0" % int(lid)}])
+        if len(shown) < len(ids):
+            lines.append(W_LIST_MORE % (len(ids) - len(shown)))
+        return shown, "\n\n".join(lines), {"inline_keyboard": kb}
+
+    def hint_list(self, lesson_ids):
+        """Суточный список владельцу — одно сообщение в «Агенты». → [показанные номера] | None (выключено, строк нет
+        или Telegram не принял: ядро повторит)."""
+        if not self.enabled:
+            return None
+        shown, text, kb = self._hint_list_render(lesson_ids)
+        if not shown:
+            return None
+        ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": text, "reply_markup": kb})
+        if not ok:
+            return None
+        mid = int(res.get("message_id"))
+        self.db.execute("INSERT OR REPLACE INTO tg_hint_lists(msg_id, ids) VALUES(?,?)",
+                        (mid, ",".join(str(x) for x in shown)))
+        self.log("суточный список → сообщение %d (строк %d)" % (mid, len(shown)))
+        return shown
+
+    def _hint_lists_refresh(self, lesson_id):
+        """Решение по номеру из суточного списка — список перерисовывается по базе (решённые без кнопок)."""
+        for mid, ids in self.db.execute("SELECT msg_id, ids FROM tg_hint_lists").fetchall():
+            nums = [int(x) for x in str(ids).split(",") if x.strip().isdigit()]
+            if int(lesson_id) in nums:
+                _shown, text, kb = self._hint_list_render(nums)
+                self.api("editMessageText", {"chat_id": self.chat, "message_id": int(mid), "text": text,
+                                             "reply_markup": kb})
 
     def _say(self, msg, words):
         self.api("sendMessage", {"chat_id": self.chat, "text": words,
@@ -908,14 +1065,22 @@ class Tg(wa_agent.Telegram):
         act, a, b = parts[1], int(parts[2]), int(parts[3])
         if act == "go":
             return self._on_resume(cq, a, b, who)
-        if act in ("rule", "unrule"):
-            # уроки (WAAGENTLESSON0210): право решает ядро по id нажавшего
-            fn = self.core.lesson_promote if act == "rule" else self.core.lesson_rollback
+        if act in ("rule", "unrule", "lno"):
+            # уроки (WAAGENTLESSON0210) и правила из пояснений (NIGHT0710-B2): право решает ядро по id нажавшего
+            fn = {"rule": self.core.lesson_promote, "unrule": self.core.lesson_rollback,
+                  "lno": getattr(self.core, "lesson_reject", None)}[act]
+            if fn is None:
+                return self.answer(cq.get("id"), "неизвестная кнопка")
             res = fn(a, who, frm.get("id"))
             self.log("урок %d: %s → %s" % (a, act, res.get("state") or "нет"))
             return self.answer(cq.get("id"), res.get("words"))
         if act == "fix":
             row = self.db.execute("SELECT state, ver FROM drafts WHERE id=?", (a,)).fetchone()
+            if row and row[0] == wa_agent.PENDING and row[1] == b and getattr(self.core, "hints", False) \
+                    and self.core.draft_kind(a) != wa_agent.KIND_FOLLOW:
+                # пояснение (NIGHT0710-B2): приглашение реплаем на карточку; правка текстом — как раньше, реплаем на неё;
+                # напоминание по пояснению не переписывается (запрос модели у него свой) — только правка текстом
+                return self.answer(cq.get("id"), self._hint_ask(a, b, (cq.get("message") or {}).get("message_id")))
             if row and row[0] == wa_agent.PENDING and row[1] == b:
                 words = "ответьте реплаем на эту карточку своим текстом — будет версия %d, " \
                         "«Отправить» на ней шлёт ваш текст дословно" % (b + 1)
@@ -924,7 +1089,7 @@ class Tg(wa_agent.Telegram):
             return self.answer(cq.get("id"), words)
         if act not in ACTIONS:
             return self.answer(cq.get("id"), "неизвестная кнопка")
-        res = self.core.press(a, b, ACTIONS[act], who)
+        res = self.core.press(a, b, ACTIONS[act], who, who_id=frm.get("id"))   # владелец — по id (NIGHT0710-B2)
         self.log("нажатие: черновик %d версия %d %s → %s" % (a, b, act, res.get("state")))
         return self.answer(cq.get("id"), res.get("words"))
 
@@ -953,6 +1118,9 @@ class Tg(wa_agent.Telegram):
         frm = msg.get("from") or {}
         who = who_of(frm)
         if not frm.get("is_bot") and self._on_lesson_text(msg, reply, who, frm):
+            return
+        # пояснение (NIGHT0710-B2): вид правки решает сообщение, на которое ответили, — приглашение, а не карточка
+        if reply and getattr(self.core, "hints", False) and self._on_hint_text(msg, reply, who, frm):
             return
         card = self.db.execute("SELECT draft_id, ver FROM tg_cards WHERE card_id=?",
                                (reply,)).fetchone() if reply else None

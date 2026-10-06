@@ -404,9 +404,10 @@ class AttachCore(A.Core):
 
     # ── нажатие ───────────────────────────────────────────────────────────────────────────
 
-    def press(self, draft_id, ver, action, who, now=None):
+    def press(self, draft_id, ver, action, who, now=None, who_id=None):
+        # who_id — id нажавшего (NIGHT0710-B2): пробрасывается ядру, иначе руки уронили бы нажатие TypeError'ом молча
         if not self.attach:
-            return super().press(draft_id, ver, action, who, now)
+            return super().press(draft_id, ver, action, who, now, who_id=who_id)
         now = self.clock() if now is None else now
         if action == ACT_REBUILD:
             return self.rebuild(draft_id, ver, who, now)
@@ -421,7 +422,7 @@ class AttachCore(A.Core):
             self.log("черновик %d → stale: без сверки при WA_AGENT_ATTACH" % draft_id)
             self._done(draft_id, W_NO_CHECK, now)
             return {"ok": False, "state": A.STALE, "words": W_NO_CHECK}
-        return super().press(draft_id, ver, action, who, now)
+        return super().press(draft_id, ver, action, who, now, who_id=who_id)
 
     def rebuild(self, draft_id, ver, who, now=None):
         """«Пересобрать со сверкой»: ждущий черновик superseded тем же захватом, новый проход Т4а → новый черновик."""

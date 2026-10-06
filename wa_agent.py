@@ -71,6 +71,16 @@ superseded и пауза, у фото/видео/документа — без �
 WA_AGENT_LESSON_ADMINS, по умолчанию владелец); остальным — отказ словами. Откат по номеру убирает
 урок из промпта. Хранилище своё — с уроками и правилами Splinter не смешивается.
 
+ПОЯСНЕНИЕ → ПРАВИЛО (NIGHT0710-B2, выключатель службы WA_AGENT_HINTS, по умолчанию выключен — «Исправить» и
+«Отправить» как раньше). Включён — «Исправить» зовёт пояснение текстом (`hint`, очередь `hints`); версию +1 по
+пояснению делает такт (`make_hint_versions`: модель, тот же условный UPDATE, что у правки текстом). «Отправить»
+на такой версии (нажатие выиграно и не снято) пишет в ту же таблицу `lessons` строку вида `hint`: нажал владелец —
+по id, строго `LESSON_OWNER_IDS` (`owner`), список WA_AGENT_LESSON_ADMINS не действует — действующее правило с
+номером, автором пояснения, временем, источником (черновик, версии) и откатом; нажал сотрудник — кандидат. Правка
+текстом и версия модели правила не рождают. Суточный список владельцу — одно сообщение (`hint_list_due`): новые
+правила с «отменить», кандидаты с «правило»/«отклонить»; решает только владелец. Правила идут в промпт тем же
+путём, что уроки (`active_lessons`), со следующего черновика.
+
 НАПОМИНАНИЕ ПРИТИХШЕМУ (WAFOLLOWUP0210, выключатель службы WA_AGENT_FOLLOWUP, по умолчанию выключен). Включён —
 раз в FOLLOW_EVERY такт ищет клиентов, у которых последнее слово НАШЕ (ушедшее через API или эхо с телефона,
 автоприветствие не в счёт) и после него FOLLOW_QUIET тишины; окно 24 ч открыто (правило `wa_send.window_state`,
@@ -156,6 +166,17 @@ LESSON_OWNER_IDS = frozenset({504608015, 6879003264, 5466425480})
 LESSON_REASON_MAX = 500                       # причина урока, символов
 LESSON_OFF_WORDS = "уроки выключены (WA_AGENT_LESSONS)"
 
+# ── пояснение → правило (NIGHT0710-B2) ────────────────────────────────────────────────────
+LESSON_REJECTED = "rejected"                  # кандидат-пояснение отклонён владельцем: в промпт не идёт
+KIND_HINT = "hint"                            # lessons.kind: правило из пояснения; NULL — урок правкой текстом
+HINT_WAIT, HINT_DONE, HINT_FAIL = "wait", "done", "fail"
+HINT_MAX = 1000                               # пояснение, символов (в промпт — не длиннее LESSON_ITEM_MAX адаптера)
+HINTS_PER_TICK = 1                            # версий по пояснению за такт: каждая — платный вызов, такт держит опрос
+HINT_LIST_HOUR = 21                           # суточный список владельцу — после этого часа по Пхукету
+HINT_LIST_KEY, HINT_LIST_NEXT = "hint_list_day", "hint_list_next"   # meta: день ушедшего списка · повтор не раньше
+HINT_LIST_RETRY = 300                         # Telegram не принял список — повтор не раньше, с
+HINT_OFF_WORDS = "пояснения выключены (WA_AGENT_HINTS)"
+
 # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────────
 KIND_FOLLOW = "followup"                      # drafts.kind: черновик-напоминание; NULL — ответ на сообщение
 FOLLOW_QUIET = 15 * 60                        # тишина клиента после нашего последнего сообщения
@@ -199,10 +220,15 @@ def lesson_admins_of(raw):
 
 
 def active_lessons(db):
-    """Действующие уроки → [(номер, было, стало, причина)] по номеру. Одно правило для ядра и адаптера
-    модели: кандидат и откатанный в промпт не идут."""
-    return db.execute("SELECT id, was_text, now_text, reason FROM lessons WHERE state=? ORDER BY id",
-                      (LESSON_ACTIVE,)).fetchall()
+    """Действующие уроки → [(номер, было, стало, причина, вид, пояснение)] по номеру. Одно правило для ядра и
+    адаптера модели: кандидат, откатанный и отклонённый в промпт не идут. Вид NULL — урок правкой текстом; база
+    старше колонок вида (NIGHT0710-B2) — прежние четыре поля и вид NULL."""
+    try:
+        return db.execute("SELECT id, was_text, now_text, reason, kind, hint FROM lessons WHERE state=? ORDER BY id",
+                          (LESSON_ACTIVE,)).fetchall()
+    except sqlite3.OperationalError:
+        return [tuple(r) + (None, None) for r in db.execute(
+            "SELECT id, was_text, now_text, reason FROM lessons WHERE state=? ORDER BY id", (LESSON_ACTIVE,))]
 
 
 def greet_fps(raw):
@@ -310,6 +336,22 @@ CREATE TABLE IF NOT EXISTS lessons (
     rolled_by   TEXT,                                 -- откат: кто, когда
     rolled_at   REAL,
     UNIQUE (draft_id, ver_to)
+);
+CREATE TABLE IF NOT EXISTS hints (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,    -- номер пояснения (NIGHT0710-B2)
+    draft_id    INTEGER NOT NULL,
+    ver_from    INTEGER NOT NULL,                     -- версия, к которой пояснение
+    ver_to      INTEGER,                              -- версия, сделанная по нему; NULL — ещё нет
+    text        TEXT    NOT NULL,                     -- пояснение (в журнал не идёт)
+    prev_text   TEXT    NOT NULL,                     -- текст версии ver_from: «было» правила
+    author      TEXT    NOT NULL,                     -- кто пояснил: имя (id N)
+    author_id   INTEGER,
+    msg_id      INTEGER,                              -- сообщение пояснения в группе: ответ словами — на него
+    ts          REAL    NOT NULL,
+    state       TEXT    NOT NULL,                     -- wait → done | fail
+    reason      TEXT,                                 -- почему версии нет
+    done_at     REAL,
+    UNIQUE (draft_id, ver_from)
 );
 CREATE TABLE IF NOT EXISTS followups (
     number      TEXT    NOT NULL,
@@ -503,6 +545,11 @@ class Model:
         не дала ответа). Адаптера нет — None."""
         return None
 
+    def redraft(self, number, upto_id, prev_text, hint):
+        """Версия по пояснению сотрудника (NIGHT0710-B2) → тот же ответ, что у draft. Адаптера нет — None: версии
+        нет, пояснение отвечается словами."""
+        return None
+
 
 class AnswerLost(Exception):
     """Вызов Telegram ушёл, ответа нет (сеть, таймаут): сообщение могло лечь. Руки поднимают его там, где «не знаю»
@@ -539,6 +586,14 @@ class Telegram:
     def lesson_done(self, lesson_id, words, state):
         """Урок переведён или откатан: сообщение урока получает исход; у действующего — «Откатить».
         Рук нет — ничего."""
+        return None
+
+    def hint_note(self, hint_id, words):
+        """Пояснение без версии (NIGHT0710-B2): ответ словами на сообщение пояснения. Рук нет — ничего."""
+        return None
+
+    def hint_list(self, lesson_ids):
+        """Суточный список владельцу (NIGHT0710-B2) → [показанные номера] | None (не ушёл). Рук нет — None."""
         return None
 
 
@@ -596,8 +651,12 @@ def show_line(at, outcome, who, draft_id, ver, part, body):
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
                  clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random,
-                 lessons=False, lesson_admins=None, followup=False):
+                 lessons=False, lesson_admins=None, followup=False, hints=False, hint_hour=HINT_LIST_HOUR):
         quiet = int(quiet)
+        # WA_AGENT_HINTS (NIGHT0710-B2): выключен — «Исправить» и «Отправить» как раньше, правил из пояснений нет;
+        # hint_hour — час суточного списка владельцу по Пхукету (24 — списка нет)
+        self.hints = bool(hints)
+        self.hint_hour = hint_hour
         # WA_AGENT_FOLLOWUP (WAFOLLOWUP0210): выключен — притихших не ищем, модель о напоминании не зовётся
         self.followup = bool(followup)
         self._follow_last = None
@@ -647,6 +706,13 @@ class Core:
         for col in ("lost", "edit_unk"):                                  # очередь старше WACARDDONEFIX0210
             if col not in have:
                 self.db.execute("ALTER TABLE card_out ADD COLUMN %s INTEGER NOT NULL DEFAULT 0" % col)
+        # правило из пояснения (NIGHT0710-B2): вид, пояснение, кто нажал «Отправить», id решавших, попадание в список
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(lessons)")}
+        for col, typ in (("kind", "TEXT"), ("hint", "TEXT"), ("sent_by", "TEXT"), ("sent_by_id", "INTEGER"),
+                         ("sent_at", "REAL"), ("decided_by_id", "INTEGER"), ("rolled_by_id", "INTEGER"),
+                         ("listed_at", "REAL")):
+            if col not in have:
+                self.db.execute("ALTER TABLE lessons ADD COLUMN %s %s" % (col, typ))
         # показ ушедшего агентом (WAMIRROR0410): с этой минуты; ушедшее раньше строки не получает
         self.db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", (SHOW_SINCE, repr(float(self.clock()))))
         self._startup()
@@ -1100,6 +1166,8 @@ class Core:
         now = self.clock() if now is None else now
         self.send_due(now)                    # отложенное уходит в срок и при выключенных черновиках
         self.show_agent(now)                  # строки показа: новые исходы и повтор не легших (WAMIRROR0410)
+        if self.hints:
+            self.hint_list_due(now)           # суточный список владельцу (NIGHT0710-B2)
         if not self.drafts:
             self.follow()
             self.deliver_cards(now)
@@ -1108,6 +1176,8 @@ class Core:
         made = self.make_drafts(now)
         if self.followup:
             made += self.make_followups(now)
+        if self.hints:
+            self.make_hint_versions(now)      # версии по пояснениям (NIGHT0710-B2)
         self.deliver_cards(now)               # повтор карточек, которые Telegram не принял (WADRAFTSAFE0210)
         return made
 
@@ -1328,8 +1398,9 @@ class Core:
             return "уже решено: %s, %s — %s" % (by, hm_phuket(at), state)
         return "уже решено: снят, %s — %s (версия %d)" % (hm_phuket(closed), state, ver)
 
-    def press(self, draft_id, ver, action, who, now=None):
-        """Нажатие кнопки карточки. → {"ok": bool, "state": …, "words": …}."""
+    def press(self, draft_id, ver, action, who, now=None, who_id=None):
+        """Нажатие кнопки карточки. → {"ok": bool, "state": …, "words": …}. who_id — id Telegram нажавшего
+        (NIGHT0710-B2): по нему и только по нему судится «владелец» на версии по пояснению."""
         now = self.clock() if now is None else now
         target = CLAIMED if action == ACT_SEND else DECLINED
         if action not in (ACT_SEND, ACT_DECLINE, ACT_CANCEL):
@@ -1409,6 +1480,10 @@ class Core:
             return {"ok": False, "state": state, "words": "не отправлено: " + (
                 "ответили с телефона" if state == SUPERSEDED else "клиент написал ещё")}
 
+        # ── пояснение → правило (NIGHT0710-B2): нажатие выиграно и не снято — до ритма и двери: одобрено содержание
+        # версии, отказ WhatsApp одобрения не отменяет; одно место на «сразу» и «на срок», send_due правил не рождает
+        rule = self._lesson_on_send(draft_id, int(ver), who, who_id, now) if self.hints else None
+
         # ── человеческий ритм (WAHUMANPACE0210): срок не настал — отправка ставится на срок ──
         # напоминание (WAFOLLOWUP0210) ритму не подлежит: тишина в нём уже есть, а отложенное ушло бы и
         # после нового сообщения клиента (send_due снимает только по эху)
@@ -1424,8 +1499,8 @@ class Core:
                 words = "уйдёт в %s" % hm_phuket(due)
                 self._tg("card_wait", draft_id, self._card(draft_id), "%s — нажал %s, %s" % (words, who, hm_phuket(now)),
                          int(ver))
-                return {"ok": True, "state": SCHEDULED, "words": words}
-        return self._deliver(draft_id, number, upto, text, who, now, CLAIMED)
+                return self._rule_words({"ok": True, "state": SCHEDULED, "words": words}, rule)
+        return self._rule_words(self._deliver(draft_id, number, upto, text, who, now, CLAIMED), rule)
 
     def _deliver(self, draft_id, number, upto, text, who, now, from_state):
         """Дверь для захваченного черновика: «Отправить» (claimed) или срок ритма (scheduled)."""
@@ -1693,6 +1768,8 @@ class Core:
             return "уже решено: урок №%d — действующее правило: %s, %s" % (int(lesson_id), by, hm_phuket(at))
         if state == LESSON_ROLLED:
             return "уже решено: урок №%d откатан: %s, %s" % (int(lesson_id), rby, hm_phuket(rat))
+        if state == LESSON_REJECTED:
+            return "уже решено: №%d отклонено: %s, %s" % (int(lesson_id), by, hm_phuket(at))
         return "урок №%d — кандидат" % int(lesson_id)
 
     def _lesson_deny(self, lesson_id, what):
@@ -1700,8 +1777,11 @@ class Core:
             what, int(lesson_id))
 
     def lesson_promote(self, lesson_id, who, who_id, now=None):
-        """«Сделать правилом»: кандидат → действующий, только тем, кто в праве. → {"ok", "state", "words"}."""
+        """«Сделать правилом»: кандидат → действующий, только тем, кто в праве. → {"ok", "state", "words"}.
+        Правило из пояснения (NIGHT0710-B2) решает только владелец по id (`_hint_decide`)."""
         now = self.clock() if now is None else now
+        if self._lesson_kind(lesson_id) == KIND_HINT:
+            return self._hint_decide(lesson_id, LESSON_ACTIVE, who, who_id, now)
         if not self.lessons:
             return {"ok": False, "state": None, "words": "%s — урок №%d не переведён" % (
                 LESSON_OFF_WORDS, int(lesson_id))}
@@ -1722,11 +1802,15 @@ class Core:
         """«Откатить №N»: действующий (или кандидат) → откатан, только тем, кто в праве. Из промпта уходит
         со следующего черновика. Откат работает и при выключенных уроках — это шаг в безопасную сторону."""
         now = self.clock() if now is None else now
-        if not self.lesson_admin(who_id):
+        # правило из пояснения (NIGHT0710-B2): откат — только владелец по id; список WA_AGENT_LESSON_ADMINS не действует
+        hint = self._lesson_kind(lesson_id) == KIND_HINT
+        if not (self.owner(who_id) if hint else self.lesson_admin(who_id)):
             self.log("урок %d: откат — отказ, нет права: %s" % (int(lesson_id), who))
-            return {"ok": False, "state": None, "words": self._lesson_deny(lesson_id, "откатить урок")}
-        n = self.db.execute("UPDATE lessons SET state=?, rolled_by=?, rolled_at=? WHERE id=? AND state IN (?,?)",
-                            (LESSON_ROLLED, who, now, int(lesson_id), LESSON_ACTIVE, LESSON_CANDIDATE)).rowcount
+            return {"ok": False, "state": None, "words": (self._hint_deny if hint else self._lesson_deny)(
+                lesson_id, "откатить урок")}
+        n = self.db.execute("UPDATE lessons SET state=?, rolled_by=?, rolled_at=?, rolled_by_id=? WHERE id=? AND "
+                            "state IN (?,?)", (LESSON_ROLLED, who, now, _int_or_none(who_id), int(lesson_id),
+                                               LESSON_ACTIVE, LESSON_CANDIDATE)).rowcount
         if n != 1:
             return {"ok": False, "state": None, "words": self._lesson_decided(lesson_id)}
         self.log("урок %d → откатан (%s)" % (int(lesson_id), who))
@@ -1749,6 +1833,222 @@ class Core:
 
     def lesson_counts(self):
         return dict(self.db.execute("SELECT state, COUNT(*) FROM lessons GROUP BY state").fetchall())
+
+    # ── пояснение → правило (NIGHT0710-B2) ───────────────────────────────────────────────────
+
+    def owner(self, who_id):
+        """Владелец ли нажавший: id Telegram строго в `LESSON_OWNER_IDS` (= splinter.OWNER_IDS). Имя не читается
+        нигде; список WA_AGENT_LESSON_ADMINS здесь не действует. Нет id — не владелец."""
+        uid = _int_or_none(who_id)
+        return uid is not None and uid in LESSON_OWNER_IDS
+
+    def _lesson_kind(self, lesson_id):
+        row = self.db.execute("SELECT kind FROM lessons WHERE id=?", (int(lesson_id),)).fetchone()
+        return row[0] if row else None
+
+    def _hint_deny(self, lesson_id, what):
+        return "отказ: %s вправе только владелец (по id Telegram) — №%d не тронут" % (what, int(lesson_id))
+
+    def hint(self, draft_id, ver, text, who, who_id=None, msg_id=None, now=None):
+        """Пояснение к версии черновика (реплай на приглашение «Исправить»). Модель здесь не зовётся: пояснение
+        встаёт в очередь `hints`, версию делает такт (`make_hint_versions`) — приём обновлений не ждёт модели,
+        рестарт пояснения не теряет. Одно пояснение на версию. → {"ok", "words"[, "hint"]}."""
+        now = self.clock() if now is None else now
+        if not self.hints:
+            return {"ok": False, "words": HINT_OFF_WORDS}
+        text = (text or "").strip()[:HINT_MAX]
+        if not text:
+            return {"ok": False, "words": "не принято: нужен текст пояснения"}
+        row = self.db.execute("SELECT text FROM drafts WHERE id=? AND state=? AND ver=?",
+                              (draft_id, PENDING, int(ver))).fetchone()
+        if row is None:
+            return {"ok": False, "words": "не принято: " + self._decided(draft_id, ver)}
+        if self.draft_kind(draft_id) == KIND_FOLLOW:
+            return {"ok": False, "words": "не принято: напоминание по пояснению не переписывается — поправьте его "
+                                          "полным текстом реплаем на карточку"}
+        cur = self.db.execute("INSERT OR IGNORE INTO hints(draft_id, ver_from, text, prev_text, author, author_id, "
+                              "msg_id, ts, state) VALUES(?,?,?,?,?,?,?,?,?)",
+                              (draft_id, int(ver), text, row[0], who, _int_or_none(who_id), msg_id, now, HINT_WAIT))
+        if cur.rowcount != 1:
+            return {"ok": False, "words": "не принято: пояснение к версии %d уже есть — ждите версию %d" % (
+                int(ver), int(ver) + 1)}
+        hid = cur.lastrowid
+        self.log("черновик %d: пояснение %d к версии %d (%s, %d симв.)" % (draft_id, hid, int(ver), who, len(text)))
+        return {"ok": True, "hint": hid,
+                "words": "пояснение №%d принято — агент делает версию %d" % (hid, int(ver) + 1)}
+
+    def _hint_fail(self, hint_id, words, now):
+        """Версии по пояснению нет: `fail` с причиной, ответ словами на сообщение пояснения."""
+        if self.db.execute("UPDATE hints SET state=?, reason=?, done_at=? WHERE id=? AND state=?",
+                           (HINT_FAIL, words[:300], now, hint_id, HINT_WAIT)).rowcount == 1:
+            self.log("пояснение %d: версии нет — %s" % (hint_id, words.split(" — ")[0]))
+            self._tg("hint_note", hint_id, "пояснение №%d: %s" % (hint_id, words))
+
+    def make_hint_versions(self, now):
+        """Версии по пояснениям, по HINTS_PER_TICK за такт. Модель (`Model.redraft`) переписывает черновик с учётом
+        пояснения; новая версия — тем же условным UPDATE, что у правки текстом (state='pending' AND ver=?), прежняя
+        карточка «устарело», новая — через очередь доставки. Черновик снят или сменил версию, клиент написал, модель
+        не дала текста — версии нет (`_hint_fail`). → [(черновик, новая версия)]."""
+        out = []
+        rows = self.db.execute("SELECT id, draft_id, ver_from, text, prev_text, author FROM hints WHERE state=? "
+                               "ORDER BY id LIMIT ?", (HINT_WAIT, HINTS_PER_TICK)).fetchall()
+        for hid, did, v_from, hint_text, prev, author in rows:
+            cur = self.db.execute("SELECT number, upto_id, state, ver, card_id FROM drafts WHERE id=?",
+                                  (did,)).fetchone()
+            if not cur or cur[2] != PENDING or cur[3] != v_from:
+                self._hint_fail(hid, "устарело — " + self._decided(did, v_from), now)
+                continue
+            number, upto, _state, _ver, card_was = cur
+            try:
+                got = self.model.redraft(number, upto, prev, hint_text)
+                new_text, reasons = draft_out(got)
+                tr = draft_card(got)
+            except Exception as e:                                   # noqa: BLE001
+                self.log("пояснение %d: модель упала: %s" % (hid, type(e).__name__))
+                new_text, reasons, tr = None, [], None
+            if not isinstance(new_text, str) or not new_text.strip():
+                self._hint_fail(hid, "модель не дала текста — версии нет; полный текст — реплаем на карточку", now)
+                continue
+            if self._fresh(number, upto):
+                self._hint_fail(hid, "клиент написал ещё — версии нет, черновик пересобирается", now)
+                continue
+            v_to = v_from + 1
+            if self.db.execute("UPDATE drafts SET text=?, ver=?, handoff=? WHERE id=? AND state=? AND ver=?",
+                               (new_text, v_to, json.dumps(reasons, ensure_ascii=False) if reasons else None, did,
+                                PENDING, v_from)).rowcount != 1:
+                self._hint_fail(hid, "устарело — " + self._decided(did, v_from), now)
+                continue
+            self.db.execute("UPDATE hints SET state=?, ver_to=?, done_at=? WHERE id=?", (HINT_DONE, v_to, now, hid))
+            self.log("черновик %d: версия %d по пояснению %d (%d симв.)" % (did, v_to, hid, len(new_text)))
+            if tr and (tr["q_ru"] or tr["a_ru"]):
+                self.db.execute("INSERT OR REPLACE INTO draft_tr(draft_id, ver, a_sha, q_ru, a_ru, ts) "
+                                "VALUES(?,?,?,?,?,?)", (did, v_to, text_sha(new_text), tr["q_ru"], tr["a_ru"], now))
+            self._card_close(did, v_from, "устарело: версия %d по пояснению №%d — %s" % (v_to, hid, author), now,
+                             card_was)
+            self.db.execute("UPDATE drafts SET card_id=NULL WHERE id=? AND ver=?", (did, v_to))
+            self._card_new(did, v_to, now)
+            out.append((did, v_to))
+        return out
+
+    def hint_of(self, draft_id, ver):
+        """Версия сделана по пояснению → (номер пояснения, текст, автор) | None (версия модели или правка текстом)."""
+        return self.db.execute("SELECT id, text, author FROM hints WHERE draft_id=? AND ver_to=? AND state=?",
+                               (draft_id, int(ver), HINT_DONE)).fetchone()
+
+    def _lesson_on_send(self, draft_id, ver, who, who_id, now):
+        """«Отправить» выиграно на версии по пояснению: нажал владелец (`owner`, строго по id) — пояснение становится
+        действующим правилом; сотрудник — кандидатом в суточный список. Версия модели и правка текстом правила не
+        рождают. Одно правило на версию: UNIQUE(draft_id, ver_to). → (номер, состояние) | None. Сбой — строка
+        журнала и None: обучение отправке не мешает."""
+        try:
+            src = self.db.execute("SELECT id, ver_from, text, prev_text, author, author_id FROM hints "
+                                  "WHERE draft_id=? AND ver_to=? AND state=?", (draft_id, ver, HINT_DONE)).fetchone()
+            if src is None:
+                return None
+            hid, v_from, hint_text, prev, author, author_id = src
+            sent = self.db.execute("SELECT text FROM drafts WHERE id=?", (draft_id,)).fetchone()[0]
+            boss = self.owner(who_id)
+            state = LESSON_ACTIVE if boss else LESSON_CANDIDATE
+            uid = _int_or_none(who_id)
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO lessons(state, author, author_id, ts, draft_id, ver_from, ver_to, was_text, "
+                "now_text, kind, hint, sent_by, sent_by_id, sent_at, decided_by, decided_by_id, decided_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (state, author, author_id, now, draft_id, v_from, ver, prev, sent, KIND_HINT, hint_text, who, uid,
+                 now, who if boss else None, uid if boss else None, now if boss else None))
+            if cur.rowcount != 1:
+                had = self.db.execute("SELECT id, state FROM lessons WHERE draft_id=? AND ver_to=?",
+                                      (draft_id, ver)).fetchone()
+                return tuple(had) if had else None
+            lid = cur.lastrowid
+            self.log("правило %d: %s по пояснению %d (черновик %d, версия %d, нажал %s)" % (
+                lid, "действующее" if boss else "кандидат", hid, draft_id, ver, who))
+            if boss:
+                self._tg("lesson_card", lid)          # сообщение правила с «Откатить №N»
+            return lid, state
+        except Exception as e:                                       # noqa: BLE001
+            self.log("правило по пояснению не записано (черновик %d): %s" % (draft_id, type(e).__name__))
+            return None
+
+    @staticmethod
+    def _rule_words(res, rule):
+        """Ответ нажатию + номер правила или кандидата (NIGHT0710-B2). Правила нет — ответ прежний."""
+        if not rule:
+            return res
+        lid, state = rule
+        res = dict(res)
+        res["rule"] = lid
+        res["words"] = "%s · %s" % (res.get("words"), "правило №%d — действует, идёт в промпт агента" % lid
+                                    if state == LESSON_ACTIVE else
+                                    "пояснение — кандидат №%d: решит владелец в суточном списке" % lid)
+        return res
+
+    def _hint_decide(self, lesson_id, state, who, who_id, now):
+        """Кандидат-пояснение → действующее правило или отклонено: только владелец по id. → {"ok", "state", "words"}."""
+        lid = int(lesson_id)
+        what = "сделать правилом" if state == LESSON_ACTIVE else "отклонить"
+        if not self.hints:
+            return {"ok": False, "state": None, "words": "%s — №%d не тронут" % (HINT_OFF_WORDS, lid)}
+        if not self.owner(who_id):
+            self.log("правило %d: %s — отказ, не владелец: %s" % (lid, what, who))
+            return {"ok": False, "state": None, "words": self._hint_deny(lid, what)}
+        n = self.db.execute("UPDATE lessons SET state=?, decided_by=?, decided_by_id=?, decided_at=? WHERE id=? AND "
+                            "state=? AND kind=?", (state, who, _int_or_none(who_id), now, lid, LESSON_CANDIDATE,
+                                                   KIND_HINT)).rowcount
+        if n != 1:
+            return {"ok": False, "state": None, "words": self._lesson_decided(lid)}
+        self.log("правило %d → %s (%s)" % (lid, state, who))
+        self._tg("lesson_done", lid, "%s — %s, %s" % ("✅ действующее правило" if state == LESSON_ACTIVE
+                                                      else "✖ отклонено", who, hm_phuket(now)), state)
+        return {"ok": True, "state": state, "words": "№%d — %s" % (lid, "действующее правило: идёт в промпт агента"
+                                                                    if state == LESSON_ACTIVE
+                                                                    else "отклонено: в промпт агента не идёт")}
+
+    def lesson_reject(self, lesson_id, who, who_id, now=None):
+        """«Отклонить» кандидата-пояснение из суточного списка: только владелец по id. Урок правкой текстом так не
+        решается — у него «Откатить»."""
+        now = self.clock() if now is None else now
+        if self._lesson_kind(lesson_id) != KIND_HINT:
+            return {"ok": False, "state": None, "words": "№%d — не пояснение: отклонения нет" % int(lesson_id)}
+        return self._hint_decide(lesson_id, LESSON_REJECTED, who, who_id, now)
+
+    def _meta_get(self, key):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def _meta_set(self, key, value):
+        self.db.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, str(value)))
+
+    def hint_list_due(self, now):
+        """Суточный список владельцу: раз в сутки по Пхукету, после `hint_hour`, если есть не показанные новые
+        правила или кандидаты из пояснений, — одно сообщение рук (`hint_list`). Замок «один список в сутки» — meta,
+        переживает рестарт и ставится только по доставке; не ушёл — повтор не раньше HINT_LIST_RETRY.
+        Не поместившиеся в список строки остаются на следующий. → [показанные номера] | None."""
+        local = float(now) + PHUKET_OFFSET               # время по Пхукету арифметикой: функций времени ядро не зовёт
+        day = int(local // 86400)
+        if local % 86400 < self.hint_hour * 3600 or self._meta_get(HINT_LIST_KEY) == str(day):
+            return None
+        nxt = self._meta_get(HINT_LIST_NEXT)
+        if nxt is not None and float(nxt) > now:
+            return None
+        ids = [r[0] for r in self.db.execute("SELECT id FROM lessons WHERE kind=? AND listed_at IS NULL AND state IN "
+                                             "(?,?) ORDER BY id", (KIND_HINT, LESSON_CANDIDATE, LESSON_ACTIVE))]
+        if not ids:
+            return None
+        shown = self._tg("hint_list", ids)
+        if not shown:
+            self._meta_set(HINT_LIST_NEXT, now + HINT_LIST_RETRY)
+            self.log("суточный список: не ушёл — повтор не раньше %d с" % HINT_LIST_RETRY)
+            return None
+        self.db.execute("UPDATE lessons SET listed_at=? WHERE id IN (%s)" % ",".join("?" * len(shown)),
+                        (now,) + tuple(int(x) for x in shown))
+        self._meta_set(HINT_LIST_KEY, day)
+        self.log("суточный список: строк %d из %d" % (len(shown), len(ids)))
+        return shown
+
+    def hint_counts(self):
+        return dict(self.db.execute("SELECT state, COUNT(*) FROM hints GROUP BY state").fetchall())
 
     def _card(self, draft_id):
         row = self.db.execute("SELECT card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
