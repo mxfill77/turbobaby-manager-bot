@@ -176,6 +176,7 @@ FOLLOW_STALE_WORDS = "устарело: клиент написал сам (ст
 
 # ── строка показа ушедшего агентом (WAMIRROR0410) ────────────────────────────────────────
 PART_TEXT, PART_PDF = "text", "pdf"
+PART_TPL = "tpl"                              # шаблон после 24 часов (NIGHT0710-B3g): эха у API-сообщения нет — строка здесь
 SHOW_WAIT, SHOW_SENDING, SHOW_SHOWN, SHOW_GAVE_UP = "wait", "sending", "shown", "gave_up"
 SHOW_MAX = 12                                 # попыток строки показа не больше (≈ 40 мин по CARD_RETRY), дальше — журнал
 SHOW_SINCE = "show_since"                     # meta: показ ушедшего — с первого старта этого кода, прошлое — нет
@@ -204,7 +205,8 @@ CREATE TABLE IF NOT EXISTS tpl_out (
     wamid       TEXT,
     who         TEXT,
     tries       INTEGER NOT NULL DEFAULT 1,           -- not_sent можно ещё раз: Meta одобрит — шаблон уйдёт
-    ts          REAL    NOT NULL
+    ts          REAL    NOT NULL,
+    body        TEXT                                  -- что увидел клиент (текст шаблона) — для строки показа
 );
 """
 
@@ -636,7 +638,8 @@ def show_line(at, outcome, who, draft_id, ver, part, body):
     часть; «неизвестно» — со словами «исход неизвестен, проверьте телефон»; ниже — текст (PDF — имя файла)."""
     name = str(who or "").split(" (id ")[0] or "—"
     head = "%s · агент · подтвердил %s · черновик №%d, версия %d · %s" % (
-        hm_phuket(at), name, int(draft_id), int(ver or 1), "PDF" if part == PART_PDF else "текст")
+        hm_phuket(at), name, int(draft_id), int(ver or 1),
+        "PDF" if part == PART_PDF else "шаблон" if part == PART_TPL else "текст")
     if outcome == UNSURE:
         head += " · " + W_SHOW_UNSURE
     return head + ":\n" + str(body or "")
@@ -704,6 +707,8 @@ class Core:
         self.db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", (SHOW_SINCE, repr(float(self.clock()))))
         if self.templates:
             self.db.executescript(_TPL_SCHEMA)        # выключено — таблицы нет, база прежняя
+            if "body" not in {r[1] for r in self.db.execute("PRAGMA table_info(tpl_out)")}:
+                self.db.execute("ALTER TABLE tpl_out ADD COLUMN body TEXT")   # таблица кандидата №1 — без текста
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -891,6 +896,14 @@ class Core:
             (SENT, UNSURE, since, PART_TEXT)).fetchall()
         for did, ver, number, state, wamid, who, text, at in rows:
             self._show_put(wamid, PART_TEXT, did, ver, 1, number, who, state, text, at)
+        if self._tpl_table():
+            # шаблон (NIGHT0710-B3g): ушедший через API — эха нет, в тему клиента он ложится только отсюда
+            rows = self.db.execute(
+                "SELECT draft_id, ver, number, state, wamid, who, tries, ts, body, name, lang FROM tpl_out "
+                "WHERE state IN (?,?) AND ts >= ?", (SENT, UNSURE, since)).fetchall()
+            for did, ver, number, state, wamid, who, tries, at, body, name, lang in rows:
+                self._show_put(wamid, PART_TPL, did, ver, tries, number, who, state,
+                               body or "[шаблон %s (%s)]" % (name, lang), at)
         if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdf_parts'").fetchone():
             return
         rows = self.db.execute(
@@ -1504,6 +1517,19 @@ class Core:
         except Exception as e:                                       # noqa: BLE001
             res = {"outcome": "unknown", "reason": "дверь упала: %s" % type(e).__name__}
         state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
+        if (state == NOT_SENT and self.templates and res.get("window") == "closed"
+                and self._window(number)[0] == "closed"):
+            # шаблоны (NIGHT0710-B3g): окно закрылось между пробой ядра и воротами двери (граница 24 ч, срок ритма) —
+            # дверь отказала ДО сети; черновик назад в pending, на карточке — «📨 Отправить шаблоном», как у «Отправить»
+            # при закрытом окне. Иначе черновик умер бы not_sent, а шаблон по нему не предлагался бы вовсе.
+            if self.db.execute("UPDATE drafts SET state=?, decided_by=NULL, decided_at=NULL WHERE id=? AND state=?",
+                               (PENDING, draft_id, SENDING)).rowcount == 1:
+                ver = self.db.execute("SELECT ver FROM drafts WHERE id=?", (draft_id,)).fetchone()[0]
+                self.log("черновик %d: дверь — окно 24 ч закрылось при отправке, черновик ждёт, шаблон к месту" % draft_id)
+                closed = self._send_closed(draft_id, ver, who, now)
+                if closed:
+                    return closed
+                return {"ok": False, "state": PENDING, "words": "окно 24 ч закрылось при отправке — черновик ждёт"}
         wamid = res.get("wamid") if state == SENT else None
         self.db.execute("UPDATE drafts SET state=?, reason=?, wamid=?, closed_at=? WHERE id=? AND state=?",
                         (state, str(res.get("reason") or "")[:300], wamid, now, draft_id, SENDING))
@@ -1866,18 +1892,28 @@ class Core:
         got = got or {}
         return str(got.get("state") or "unknown"), got.get("age")
 
-    def _tpl_lang(self, text, q_lang):
-        """Язык шаблона: язык текста версии, которую одобряет человек (`lang_of`), иначе язык вопроса клиента
-        (drafts.q_lang, вердикт кода). Не ru и не en — None: шаблонов на другом языке нет."""
+    def _text_lang(self, text):
+        """Язык текста версии по правилу службы (`lang_of`): ru | en | other | None (букв нет, правила нет, упало)."""
         try:
-            first = self.lang_of(text) if self.lang_of else None
+            return self.lang_of(text) if self.lang_of else None
         except Exception as e:                                       # noqa: BLE001
             self.log("язык шаблона: правило упало: %s" % type(e).__name__)
-            first = None
-        for cand in (first, q_lang):
+            return None
+
+    def _tpl_lang(self, text, q_lang):
+        """Язык шаблона — язык КЛИЕНТА: язык его вопроса (drafts.q_lang, вердикт кода по буквам) первым; не записан
+        или не ru/en — язык текста версии (`lang_of`). Клиенту уходит текст шаблона, а не версии, поэтому латиница
+        в версии (модель, цена «THB/day») язык клиента не перебивает. Не ru и не en — None: шаблонов на нём нет."""
+        for cand in (q_lang, self._text_lang(text)):
             if cand in ("ru", "en"):
                 return cand
         return None
+
+    def _tpl_nolang(self, text, q_lang):
+        """Почему шаблона нет по языку — словами: язык не определён (ни вопроса, ни букв в версии) ≠ «не ru и не en»."""
+        if not q_lang and self._text_lang(text) is None:
+            return "язык клиента не определён (язык вопроса не записан, в тексте версии букв нет) — шаблон не предлагается"
+        return "язык клиента не ru и не en — шаблоны поданы только на них"
 
     def _tpl_taken(self, draft_id, number, upto):
         """Шаблон по этому черновику или этому клиенту после того же входящего уже уходил (sending, sent, unsure) →
@@ -1919,7 +1955,7 @@ class Core:
             return {"why": self._tpl_decided(taken)}
         lang = self._tpl_lang(text, q_lang)
         if lang is None:
-            return {"why": "язык клиента не ru и не en — шаблоны поданы только на них"}
+            return {"why": self._tpl_nolang(text, q_lang)}
         return {"name": TPL_REPLY, "lang": lang, "params": [TPL_WORD[lang]]}
 
     def _send_closed(self, draft_id, ver, who, now):
@@ -1965,6 +2001,32 @@ class Core:
         old = self._outdated(draft_id)
         if old:
             return {"ok": False, "state": PENDING, "words": "устарело: %s — шаблон не нужен, черновик пересоберётся" % old}
+        # ── перепроверка очереди ДО двери, как у «✅ Отправить» (WADRAFTSAFE0210): ответили с телефона, клиент написал
+        #    ещё или клиент на паузе (человек вмешался) — шаблон не уходит; очередь не прочитана — наружу ничего ──
+        try:
+            fresh = self._fresh(number, upto)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("черновик %d: очередь не прочитана при нажатии шаблона (%s) — шаблон не отправлен, черновик ждёт"
+                     % (draft_id, type(e).__name__))
+            return {"ok": False, "state": PENDING,
+                    "words": "очередь не прочитана — шаблон не отправлен, черновик ждёт: нажмите ещё раз"}
+        paused = self.db.execute("SELECT paused FROM clients WHERE number=?", (number,)).fetchone()
+        if fresh or (paused and paused[0]):
+            kind, rid = fresh or (wa_kind.KIND_ECHO, None)
+            state = SUPERSEDED if kind == wa_kind.KIND_ECHO else STALE
+            why = ("ответили с телефона" if fresh and state == SUPERSEDED else "клиент написал ещё" if fresh
+                   else "человек вмешался, клиент на паузе")
+            self._close(draft_id, state, "снят при нажатии «📨»: %s — шаблон не отправлен" % why, now)
+            if state == SUPERSEDED and rid is not None:
+                self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
+                try:
+                    prid = self._pausing_echo(number, upto)   # «📨»: та же пауза, что у «Отправить»
+                except Exception as e:                               # noqa: BLE001
+                    prid = rid                # очередь не прочитана — как у «Отправить»: пауза
+                    self.log("черновик %d: вид эха не прочитан (%s) — пауза, как прежде" % (draft_id, type(e).__name__))
+                if prid is not None:
+                    self._pause(number, prid, now)
+            return {"ok": False, "state": state, "words": "шаблон не отправлен: " + why}
         offer = self.template_offer(draft_id, ver)
         if not offer:
             win = self._window(number)[0]
@@ -1992,9 +2054,9 @@ class Core:
         state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
         wamid = res.get("wamid") if state == SENT else None
         reason = str(res.get("reason") or "")
-        self.db.execute("UPDATE tpl_out SET state=?, reason=?, wamid=? WHERE draft_id=? AND state=?",
-                        (state, reason[:300], wamid, draft_id, SENDING))
         body = res.get("text") or "[шаблон %s (%s)]" % (name, lang)
+        self.db.execute("UPDATE tpl_out SET state=?, reason=?, wamid=?, body=? WHERE draft_id=? AND state=?",
+                        (state, reason[:300], wamid, body, draft_id, SENDING))
         if state == SENT:
             self._sent_out(wamid, number, body, VIA_TEMPLATE, now)
         hm = hm_phuket(now)
@@ -2012,6 +2074,8 @@ class Core:
         self.log("черновик %d: шаблон %s (%s) → %s%s" % (
             draft_id, name, lang, state, ", одобрение %s" % res.get("approval") if res.get("approval") else ""))
         self._tg("card_tpl", draft_id, self._card(draft_id), int(ver), card_w, offer if state == NOT_SENT else None)
+        if state in (SENT, UNSURE):
+            self.show_agent(now)              # ушедший шаблон — строкой в тему клиента (WAMIRROR0410): эха у него нет
         return {"ok": state == SENT, "state": state, "words": words}
 
     def _door_open(self):
