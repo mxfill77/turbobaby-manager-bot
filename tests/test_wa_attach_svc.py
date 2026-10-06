@@ -124,7 +124,7 @@ class World:
                     "log_path": os.path.join(d, "wa_agent.log")}
         if webhook:
             import wa_webhook
-            wa_webhook.WAQueueDB(self.env["queue_db"])           # очередь живой схемой вебхука
+            wa_webhook.WAQueueDB(self.env["queue_db"], statuses=True)   # очередь живой схемой вебхука (квитанции вкл)
         else:
             q = sqlite3.connect(self.env["queue_db"])
             q.execute(SV.QSCHEMA)
@@ -633,7 +633,7 @@ def test_late_statuses_saved_by_exact_part():
     w = World(ON, webhook=True)
     w.ready()
     w.press("wa:send:1:1")
-    qdb = wa_webhook.WAQueueDB(w.env["queue_db"])
+    qdb = wa_webhook.WAQueueDB(w.env["queue_db"], statuses=True)
     for i, (wamid, word) in enumerate((("wamid.P1", "sent"), ("wamid.P1", "delivered"), ("wamid.P1", "read"),
                                        ("wamid.T1", "delivered"), ("wamid.X9", "read"))):
         qdb.enqueue([{"type": "status", "from": NUM, "text": word, "wamid": wamid, "ts": T0 + 300 + i,
@@ -656,7 +656,7 @@ def test_late_status_other_recipient_not_attributed():
     w = World(ON, webhook=True)
     w.ready()
     w.press("wa:send:1:1")
-    wa_webhook.WAQueueDB(w.env["queue_db"]).enqueue([{"type": "status", "from": OTHER, "text": "read",
+    wa_webhook.WAQueueDB(w.env["queue_db"], statuses=True).enqueue([{"type": "status", "from": OTHER, "text": "read",
                                                       "wamid": "wamid.P1", "ts": T0 + 300, "echo": True}])
     w.core.tick(T0 + 600)
     assert w.q("SELECT COUNT(*) FROM part_status")[0][0] == 0
@@ -682,7 +682,7 @@ def test_saved_status_survives_queue_loss():
     w = World(ON, webhook=True)
     w.ready()
     w.press("wa:send:1:1")
-    wa_webhook.WAQueueDB(w.env["queue_db"]).enqueue([{"type": "status", "from": NUM, "text": "read",
+    wa_webhook.WAQueueDB(w.env["queue_db"], statuses=True).enqueue([{"type": "status", "from": NUM, "text": "read",
                                                       "wamid": "wamid.P1", "ts": T0 + 300, "echo": True}])
     w.core.tick(T0 + 600)
     w.core.queue_path = os.path.join(os.path.dirname(w.env["queue_db"]), "нет.db")
@@ -693,8 +693,8 @@ def test_webhook_status_table_additive():
     """Вебхук: все статусы wamid — в `wa_status`; wa_inbox и счёт вставок прежние (первый статус, остальные — 0)."""
     import wa_webhook
     d = tempfile.mkdtemp(prefix="wa_status_t_")
-    qdb = wa_webhook.WAQueueDB(os.path.join(d, "q.db"))
-    counts = [qdb.enqueue([{"type": "status", "from": NUM, "text": w_, "wamid": "wamid.Z1", "ts": T0 + i,
+    qdb = wa_webhook.WAQueueDB(os.path.join(d, "q.db"), statuses=True)
+    counts =[qdb.enqueue([{"type": "status", "from": NUM, "text": w_, "wamid": "wamid.Z1", "ts": T0 + i,
                             "echo": True}]) for i, w_ in enumerate(("sent", "delivered", "read", "read"))]
     assert counts == [1, 0, 0, 0], counts
     con = sqlite3.connect(os.path.join(d, "q.db"))

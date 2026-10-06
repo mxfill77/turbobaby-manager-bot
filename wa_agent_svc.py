@@ -177,10 +177,11 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
 
 
 def _press_budget(seconds):
-    """Общий бюджет плеч моста (`wa_agent_model.door_budget` → `bridge_client.card_budget`); модуля нет — без бюджета."""
+    """Общий бюджет плеч моста (`bridge_client.card_budget`) со СВОЕЙ меткой нажатия — таймаут на нажатии в журнале не
+    выдаёт себя за таймаут сверки агента (второй круг); модуля нет (ПК без fcntl) — без бюджета."""
     try:
-        import wa_agent_model
-        return wa_agent_model.door_budget(seconds)
+        import bridge_client
+        return bridge_client.card_budget(seconds, label="нажатия PDF (двери договоров)")
     except Exception:                                                # noqa: BLE001
         import contextlib
         return contextlib.nullcontext()

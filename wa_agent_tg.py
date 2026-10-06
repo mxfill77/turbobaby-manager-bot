@@ -667,7 +667,14 @@ class Tg(wa_agent.Telegram):
         # вопрос клиента над ответом и перевод для сотрудника (WACARDQ0410); нет у ядра — карточка прежняя
         extra = getattr(self.core, "card_extra", None)
         extra = extra(draft_id, ver, str(text or "")) if extra else None
-        texts = card_texts(top, str(text or ""), card_notes(hand, ver, door_open, follow, lesson),
+        notes = card_notes(hand, ver, door_open, follow, lesson)
+        # PDF второй частью (NIGHT0710-B3v, второй круг): «Отправить» шлёт договор — карточка говорит об этом первой
+        # строкой под ответом; у прежнего ядра пробы нет — карточка байт-в-байт прежняя
+        pdf = getattr(self.core, "card_pdf", None)
+        pdf = pdf(draft_id, ver) if pdf else None
+        if pdf:
+            notes = pdf + "\n" + notes
+        texts = card_texts(top, str(text or ""), notes,
                            card_details(hand, link), question=(extra or {}).get("question") or "",
                            trans=card_trans(extra), agent=card_agent(extra))
         row = [{"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)},
