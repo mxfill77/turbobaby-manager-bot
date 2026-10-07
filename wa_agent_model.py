@@ -1672,8 +1672,17 @@ class ModelAdapter(wa_agent.Model):
     def redraft(self, number, upto_id, prev_text, hint):
         """Версия по пояснению сотрудника (NIGHT0710-B2): тот же запрос, что у черновика, плюс блок «ПОЯСНЕНИЕ
         СОТРУДНИКА» (прежний черновик и пояснение, под маской). Один вызов без сверки; разбор ответа и проверки кодом
-        (деньги, сутки, приезд, язык) — те же, что у черновика: путь `draft` один."""
+        (деньги, сутки, приезд, язык) — те же, что у черновика: путь `draft` один. Со сверкой — `redraft_checked`."""
         return self.draft(number, upto_id, hint=(prev_text, hint))
+
+    def redraft_checked(self, number, upto_id, prev_text, hint):
+        """Версия по пояснению СО СВЕРКОЙ Т4а (Д2 INTEG0710, «PDF выключает обучение»): тот же путь сверки, что у
+        черновика модели (`_draft_tools`), с блоком «ПОЯСНЕНИЕ СОТРУДНИКА»; итог сверки — в `last["tools"]`, как у
+        черновика. Зовёт её только `wa_agent_attach._Probe` (WA_AGENT_ATTACH); без флага версия по пояснению — прежний
+        `redraft` одним вызовом. Сверки нет (WA_AGENT_TOOLS выкл) — прежний `redraft`: итога сверки нет."""
+        if self.tools is None:
+            return self.redraft(number, upto_id, prev_text, hint)
+        return self._draft_tools(number, upto_id, hint=(prev_text, hint))
 
     # ── черновик со сверкой (AGENTLOOPA0310, Т4а) ─────────────────────────────────────────
 
@@ -1701,12 +1710,16 @@ class ModelAdapter(wa_agent.Model):
         doors.update({k: v for k, v in (self.tools or {}).items() if k in ("cash", "contract", "contract_pdf")})
         return doors
 
-    def _draft_tools(self, number, upto_id):
+    def _draft_tools(self, number, upto_id, hint=None):
         """Сверка: модель вызывает инструменты (≤ T.MAX_CALLS вызовов, ≤ T.MAX_SEC с), код принимает факты, считает
         суммы и судит денежные роли. Предел превышен — обычный черновик одним вызовом без фактов и причина «сверка не
-        завершена» первой. Новое входящее посреди сверки — черновика нет (служба повторит позже)."""
+        завершена» первой. Новое входящее посреди сверки — черновика нет (служба повторит позже). hint — (прежний
+        черновик, пояснение): версия по пояснению со сверкой (Д2 INTEG0710), блок тот же, что у `build`."""
         import wa_agent_tools as T
-        system, user, info = self.build(number, upto_id)
+        if hint is None:
+            system, user, info = self.build(number, upto_id)
+        else:                                               # версия по пояснению со сверкой (Д2): блок пояснения
+            system, user, info = self.build(number, upto_id, hint=hint)
         with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
             out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
                         fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
