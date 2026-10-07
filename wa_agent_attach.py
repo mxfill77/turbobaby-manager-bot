@@ -379,6 +379,7 @@ class AttachCore(A.Core):
         self._seen = {}
         self._hold = None                           # черновик, чей исход на карточку пишем после обеих частей
         self._held = None                           # слова ядра о тексте, придержанные на время части
+        self._held_tg = None                        # правка карточки ядром, отложенная до COMMIT части (INTEG0710)
         self._status_last = None                    # такт сбора статусов частей (STATUS_EVERY)
         super().__init__(*args, **kw)
         if self.attach:
@@ -638,11 +639,21 @@ class AttachCore(A.Core):
             return
         super()._done(draft_id, words, now)
 
+    def _tg(self, method, *args):
+        # INTEG0710 (Б3в × Б3г): окно 24 ч закрылось у ворот двери ВНУТРИ текстовой части — ядро вернуло черновик в
+        # pending и правит карточку «📨 Отправить шаблоном» (`Core._deliver` → `_send_closed`); правка ложится после
+        # COMMIT части (`_text_part`), как итог `_done`: Telegram в транзакции не зовётся
+        if self._hold is not None and method == "card_tpl":
+            self._held_tg = (method, args)
+            return None
+        return super()._tg(method, *args)
+
     def _text_part(self, draft_id, number, upto, text, who, now, from_state):
         """Текстовая часть (дверь ядра) + строка журнала части — ОДНОЙ транзакцией после ответа двери (`_TxDoor`).
-        Итог на карточку ядро не пишет (`_hold`): его слова — в `self._held`, Telegram в транзакции не зовётся.
+        Итог на карточку ядро не пишет (`_hold`): его слова — в `self._held`, Telegram в транзакции не зовётся;
+        правка «📨» ядра (окно закрылось у ворот двери, INTEG0710) — в `self._held_tg`, ложится после COMMIT.
         Исключение после ответа двери — откат: часть осталась sending, старт скажет «неизвестно», повтора нет."""
-        inner, self._hold, self._held = self.door, draft_id, None
+        inner, self._hold, self._held, self._held_tg = self.door, draft_id, None, None
         self.door = _TxDoor(inner, self._tx_begin, self.log)
         try:
             res = super()._deliver(draft_id, number, upto, text, who, now, from_state)
@@ -653,6 +664,10 @@ class AttachCore(A.Core):
             raise
         finally:
             self.door, self._hold = inner, None
+        # правка ядра, отложенная до COMMIT (INTEG0710, Б3в × Б3г); откат части (исключение выше) её не кладёт
+        held, self._held_tg = self._held_tg, None
+        if held:
+            super()._tg(held[0], *held[1])
         return res
 
     def _deliver(self, draft_id, number, upto, text, who, now, from_state):
@@ -684,6 +699,11 @@ class AttachCore(A.Core):
         res = self._text_part(draft_id, number, upto, text, who, now, from_state)
         tstate = res.get("state")
         if tstate is None:                          # захват sending проигран — решил другой; часть ждёт его исхода
+            return res
+        if tstate == A.PENDING:
+            # INTEG0710 (Б3в × Б3г): окно 24 ч закрылось между пробой ядра и воротами двери — ядро вернуло черновик в
+            # pending, на карточке «📨 Отправить шаблоном». Текст не решён: часть PDF ждёт его (wait, попытка 1 — как у
+            # старта), исход обеих частей на карточку не пишется — иначе правка сняла бы кнопки ждущего черновика
             return res
         if tstate != A.SENT:
             why = W_TEXT_UNSURE if tstate == A.UNSURE else W_TEXT_NOT
