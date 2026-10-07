@@ -69,6 +69,22 @@
 ЦИКЛ — `wa_agent_tg.run`, один поток; читатель `getUpdates` у бота показа ОДИН — эта служба. Второй
 читатель даёт 409: строка журнала на серию, опрос раз в 30 с, такт идёт, служба не падает.
 
+КАНАЛ TELEGRAM — WA_AGENT_TG (TGCOREA0610, план TGPLAN0510 З2), по умолчанию ВЫКЛЮЧЕН: выключен — ни второго ядра,
+ни его базы, ни строки журнала; служба байт-в-байт прежняя. Включён — второе ядро `wa_agent.Core` на очереди
+tg_queue.db (TG_QUEUE_DB, по умолчанию рядом с этим файлом — тот же путь, что у двери приёма wa_webhook) и СВОЁМ
+файле агента tg_agent.db (TG_AGENT_DB, по умолчанию рядом с wa_agent.db): курсор, смещение бота, клиенты и
+черновики у двух ядер разные, номера черновиков не пересекаются по базам. Совпал файл агента или очереди с файлом
+WA — канал НЕ собирается (строка журнала). У ядра TG выключены ритм, напоминание, ожидание, уроки, показ в форуме,
+перенос из темы и реакции; дверь отправки закрыта насовсем (`TgDoor.is_open` → False всегда, wa_send не зовётся);
+модели не даются брони и инструменты (ключ tg:<id> по цифрам дал бы чужой «телефон»). Карточки — в те же «Агенты»
+тем же ботом, кнопки `tg:…`; читатель getUpdates по-прежнему ОДИН (руки WA): нажатие `tg:` и реплай на карточку
+ядра TG уходят ядру TG, `wa:` — ядру WA. Строка старта канала называет его отдельной строкой.
+Поверх (TGCOREC0610, проверка Штаба): сбой сборки канала (ядро, модель, прицеп к читателю) — «канал не собран: <имя
+ошибки>», WA работает как при выключенном флаге; файлы агента и очереди TG не совпадают ни друг с другом, ни с
+файлами WA (агент, очередь, показ, архив) — по realpath, у существующих ещё и samefile; падение такта TG — строка на
+серию и строка восстановления с числом упавших тактов; карточка TG при закрытой двери — без «Отправить»; кнопки
+уроков — с префиксом рук; строки модели TG — с приставкой «TG: »; сводка TG — с недоставленными карточками.
+
 ЖУРНАЛ — файл `wa_agent.log` (или WA_AGENT_LOG): только id, состояния и числа; сводка числами раз в
 5 минут. Текстов, номеров и имён клиентов в журнале нет. При включённых черновиках сводка несёт очередь
 карточек и число ждущих черновиков без доставленной карточки (WADRAFTSAFE0210). Ответ Telegram неизвестен —
@@ -104,6 +120,10 @@ F_TEMPLATES = wa_send.TEMPLATES_FLAG      # шаблон после 24 часо�
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 PRESS_BRIDGE_SEC = 60                     # бюджет плеч моста на ОДИН вызов двери договоров при нажатии (= карточки «Инфо»)
+F_TG = "WA_AGENT_TG"                      # канал Telegram: второе ядро на tg_queue.db (TGCOREA0610); выкл — нет его
+TG_PREFIX = "tg"                          # первое слово callback_data кнопок ядра TG
+TG_DOOR_WORDS = "отправка в Telegram закрыта насовсем — ответьте клиенту сами"
+TG_FAIL = "канал не собран: %s"           # сбой сборки канала TG — имя ошибки (TGCOREC0610)
 
 log = logging.getLogger("wa_agent")
 
@@ -123,7 +143,10 @@ def env_of():
             "archive_db": env.get("archive_db"), "archive_manifest": env.get("archive_manifest"),
             "archive_media": env.get("archive_media"),
             "agent_db": os.environ.get("WA_AGENT_DB", os.path.join(base, "wa_agent.db")),
-            "log_path": os.environ.get("WA_AGENT_LOG", os.path.join(ROOT, "wa_agent.log"))}
+            "log_path": os.environ.get("WA_AGENT_LOG", os.path.join(ROOT, "wa_agent.log")),
+            # канал Telegram (TGCOREA0610): очередь — тот же путь, что у двери приёма (wa_webhook._env), агент — свой
+            "tg_queue_db": os.environ.get("TG_QUEUE_DB", os.path.join(ROOT, "tg_queue.db")),
+            "tg_agent_db": os.environ.get("TG_AGENT_DB", os.path.join(base, "tg_agent.db"))}
 
 
 class SendDoor(wa_agent.Door):
@@ -173,6 +196,124 @@ class NoModel(wa_agent.Model):
 
     def draft(self, number, upto_id):
         return None
+
+
+# ═══ канал Telegram (TGCOREA0610) ═════════════════════════════════════════════════════════
+
+class TgDoor(wa_agent.Door):
+    """Дверь ядра TG: закрыта НАСОВСЕМ. `is_open` — False всегда, без ручки и без окружения; отправка текста и
+    медиа — «не отправлено» словами, ни wa_send, ни сети. Писать клиенту Telegram сервер не умеет (TGPLAN0510 п. 4)."""
+
+    def is_open(self):
+        return False
+
+    def send_text(self, to, text):
+        return {"outcome": wa_send.NOT_SENT, "reason": TG_DOOR_WORDS, "wamid": None}
+
+    def send_media(self, to, media):
+        return {"outcome": wa_send.NOT_SENT, "reason": TG_DOOR_WORDS, "wamid": None}
+
+
+class TgSide(wa_agent_tg.Tg):
+    """Руки ядра TG: те же карточки в «Агенты», префикс кнопок `tg`, getUpdates не зовут (reader=False).
+    Шапка — «TG · <ключ клиента>»: темы показа у канала нет, базу показа WA не читаем.
+    «Отправить» — только при открытой двери ядра (send_closed=False, решение владельца 00:59, TGCOREC0610)."""
+
+    def _topic(self, number):
+        return "TG · " + str(number), ""
+
+
+class TgHands(wa_agent.Telegram):
+    """Что видит ядро TG: только интерфейс карточек. Строки показа (`agent_line`) у этих рук НЕТ — `show_agent`
+    ядра TG молчит по устройству; уроки — базовые «ничего»."""
+
+    def __init__(self, side):
+        self.side = side
+        self.chat = side.chat
+
+    def card(self, draft_id, ver, number, text):
+        return self.side.card(draft_id, ver, number, text)
+
+    def card_done(self, draft_id, card_id, words):
+        return self.side.card_done(draft_id, card_id, words)
+
+    def card_wait(self, draft_id, card_id, words, ver):
+        return self.side.card_wait(draft_id, card_id, words, ver)
+
+    def ask_pause(self, number, pause_no, via=None):
+        return self.side.ask_pause(number, pause_no, via)
+
+
+def _key(path):
+    return os.path.normcase(os.path.realpath(str(path)))
+
+
+def _same(a, b):
+    """Один ли это файл (TGCOREC0610): realpath (регистр — по правилу ОС); у существующих — ещё и samefile
+    (жёсткая ссылка, иной путь к тому же файлу). Путь не задан — не совпадает ни с чем."""
+    if not a or not b:
+        return False
+    if _key(a) == _key(b):
+        return True
+    try:
+        return os.path.exists(str(a)) and os.path.exists(str(b)) and os.path.samefile(str(a), str(b))
+    except OSError:
+        return False
+
+
+TG_FILES = (("агента TG", "tg_agent_db"), ("очереди TG", "tg_queue_db"))
+WA_FILES = (("агента WA", "agent_db"), ("очереди WA", "queue_db"), ("показа WA", "mirror_db"),
+            ("архива WA", "archive_db"))
+
+
+def tg_clash(env):
+    """Совпадение файлов канала TG (TGCOREC0610): агент и очередь TG — ни друг с другом, ни с ЛЮБЫМ файлом WA
+    (агент, очередь, показ, архив), не только своего рода. → слова совпадения или ''."""
+    if _same(env.get("tg_agent_db"), env.get("tg_queue_db")):
+        return "файл агента TG совпал с файлом очереди TG"
+    for tname, tkey in TG_FILES:
+        for wname, wkey in WA_FILES:
+            if _same(env.get(tkey), env.get(wkey)):
+                return "файл %s совпал с файлом %s" % (tname, wname)
+    return ""
+
+
+def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=None):
+    """Второе ядро канала Telegram. → (ядро | None, слова). Собирается ТОЛЬКО при WA_AGENT_TG; файл агента или
+    очереди TG совпал с другим файлом канала или с любым файлом WA — не собирается (смешало бы курсор, смещение,
+    клиентов и номера черновиков). Исключение сборки идёт наружу — его ловит `build` (TGCOREC0610)."""
+    line = line or (lambda s: log.info("%s", s))
+    tg_agent, tg_queue = env.get("tg_agent_db"), env.get("tg_queue_db")
+    if not tg_agent or not tg_queue:
+        return None, "канал не собран: путь файла агента или очереди TG не задан"
+    clash = tg_clash(env)
+    if clash:
+        return None, "канал не собран: %s — смешал бы два канала" % clash
+    tline = (lambda s: line("TG: " + str(s)))
+    side = TgSide(env.get("tg_token"), enabled=flags[F_CARDS], http=http, clock=clock, log=tline,
+                  prefix=TG_PREFIX, reader=False, send_closed=False)
+    drafts = flags[F_DRAFTS] and model is not None
+    core = wa_agent.Core(env["tg_agent_db"], tg_queue, model or NoModel(), TgHands(side), TgDoor(), clock=clock,
+                         log=tline, drafts=drafts, greet=(), pace=False, lessons=False, followup=False)
+    side.bind(core)
+    reader.attach(side)
+    core.watch = None
+    return core, ("вкл — черновики %s, карточки %s" % ("вкл" if drafts else "выкл", "вкл" if side.enabled else "выкл"))
+
+
+def tg_core_of(tg):
+    """Ядро TG у читателя (или None — канал выключен)."""
+    side = getattr(tg, "peers", {}).get(TG_PREFIX)
+    return side.core if side is not None else None
+
+
+def tg_start_line(env, core, words):
+    return ("wa-agent: канал TG (%s): %s · база агента %s (своя) · очередь %s (только чтение) · отправка закрыта "
+            "насовсем (is_open всегда False) · ритм, напоминание, ожидание, уроки, показ, тема → клиенту и реакции "
+            "выкл · кнопки %s:… — этому ядру, читатель getUpdates — один (руки WA)"
+            % (F_TG, words, os.path.basename(str(env.get("tg_agent_db") or "")),
+               "есть" if os.path.exists(str(env.get("tg_queue_db") or "")) else "нет", TG_PREFIX)
+            if core is not None else "wa-agent: канал TG (%s): %s" % (F_TG, words))
 
 
 def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False, cache=None, tools=False,
@@ -251,6 +392,41 @@ def attach_of(environ, drafts, model, budget=None):
                             "ВЫКЛ — аренда не станет фактом, PDF не приложится, уйдёт только текст"))
 
 
+def tg_model_of(env, environ, line=None):
+    """Модель ядра TG (TGCOREA0610, TGCOREC0610): история — tg_queue.db, архива телефона нет; без уроков, броней и
+    инструментов (ключ tg:<id> по цифрам дал бы чужой «телефон»); строки адаптера — с приставкой «TG: », чтобы их не
+    читали строками модели WA. → (модель | None, почему). Исключение идёт наружу — его ловит `models_of`."""
+    import wa_agent_model
+    line = line or (lambda s: log.info("%s", s))
+    env_t = dict(env, queue_db=env["tg_queue_db"], agent_db=env["tg_agent_db"], archive_db="",
+                 archive_manifest="", archive_media="")
+    return make_model(env_t, line=lambda s: line("TG: " + str(s)),
+                      cache=wa_agent_model.cache_ttl_of(environ.get(F_CACHE)))
+
+
+def models_of(env, environ, line=None):
+    """Модели службы (то, что делает `main`): WA — при WA_AGENT_DRAFTS, вызов той же формы, что прежде; TG — при
+    WA_AGENT_TG и WA_AGENT_DRAFTS (`tg_model_of`). Сбой сборки модели TG — не падение службы: имя ошибки третьим
+    полем, канал не соберётся (TGCOREC0610). → (модель, почему, модель TG, почему TG, сбой TG | None)."""
+    model, why = None, ""
+    if flags_of(environ)[F_DRAFTS]:
+        import wa_agent_model
+        # WA_AGENT_TOOLS выкл — вызов той же формы, что в 9c4aac6 (без ключа tools)
+        more = {"tools": True} if wa_agent_tg.flag_on(environ.get(F_TOOLS)) else {}
+        if wa_agent_tg.flag_on(environ.get(F_HINTS)):
+            more["hints"] = True              # WA_AGENT_HINTS (NIGHT0710-B2): выкл — вызов прежней формы
+        model, why = make_model(env, lessons=wa_agent_tg.flag_on(environ.get(F_LESSONS)),
+                                book=wa_agent_tg.flag_on(environ.get(F_BOOK)),
+                                cache=wa_agent_model.cache_ttl_of(environ.get(F_CACHE)), **more)
+    tg_model, tg_why, tg_fail = None, "", None
+    if wa_agent_tg.flag_on(environ.get(F_TG)) and flags_of(environ)[F_DRAFTS]:
+        try:
+            tg_model, tg_why = tg_model_of(env, environ, line=line)
+        except Exception as e:                                       # noqa: BLE001
+            tg_fail = type(e).__name__
+    return model, why, tg_model, tg_why, tg_fail
+
+
 def model_line(model):
     """Строка старта о модели (WAOPUSHIGHC0510): модель, уровень и предел вызова словами — их несёт `call.settings`
     от `wa_agent_model.paid_call`; ключей в строке нет. Адаптера нет — модель не зовётся."""
@@ -261,9 +437,14 @@ def model_line(model):
 
 
 def build(env, environ=None, model=None, http=None, send=None, react_send=None, clock=time.time,
-          line=None, send_media=None):
+          line=None, send_media=None, tg_model=None, tg_fail=None):
     """Собрать ядро и руки. model=None — адаптера нет, черновики выключены при любом WA_AGENT_DRAFTS.
-    → (core, tg, flags, words): flags — запрошенные, words — действующие состояния словами."""
+    → (core, tg, flags, words): flags — запрошенные, words — действующие состояния словами.
+    WA_AGENT_TG (TGCOREA0610) — второе ядро (`build_tg`, модель tg_model); его берут `tg_core_of(tg)`,
+    words[WA_AGENT_TG] — его состояние словами. Выключен — ни ключа в words, ни строки журнала.
+    Сбой сборки канала (TGCOREC0610): модель — tg_fail (имя ошибки от `models_of`), ядро или прицеп — исключение
+    `build_tg`; канал НЕ собран, words[WA_AGENT_TG] = «канал не собран: <имя>», руки TG от читателя отцеплены —
+    WA работает как при выключенном флаге."""
     environ = environ if environ is not None else os.environ
     line = line or (lambda s: log.info("%s", s))
     flags = flags_of(environ)
@@ -346,6 +527,15 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
         F_WATCH: ("вкл" if tg.watch else "выкл") + ("" if tg.watch or not flags[F_WATCH]
                                                     else " (флаг 1, ключа бота нет)"),
     }
+    if wa_agent_tg.flag_on(environ.get(F_TG)):
+        if tg_fail:
+            words[F_TG] = TG_FAIL % tg_fail
+        else:
+            try:
+                _tg_core, words[F_TG] = build_tg(env, tg, flags, model=tg_model, http=http, clock=clock, line=line)
+            except Exception as e:                                   # noqa: BLE001
+                tg.peers.pop(TG_PREFIX, None)                        # прицеп мог лечь до сбоя — читатель снова один
+                words[F_TG] = TG_FAIL % type(e).__name__
     return core, tg, flags, words
 
 
@@ -417,12 +607,52 @@ def cards_words(core):
     return words
 
 
+class TwoCores:
+    """Такт двух ядер в одном потоке (TGCOREA0610): ядро WA — как было (его падение — прежнее «такт упал» цикла),
+    затем ядро TG; падение такта TG — свой счётчик (каждый такт), такт WA им не задет. Журнал (TGCOREC0610): строка
+    на СЕРИЮ упавших тактов подряд и строка восстановления с их числом — канал без очереди падал бы строкой раз
+    в такт."""
+
+    def __init__(self, wa, tg, line, stats):
+        self.wa, self.tg, self.line, self.stats = wa, tg, line, stats
+        self.down = 0                                               # упавших тактов TG подряд
+
+    def tick(self, now=None):
+        try:
+            return self.wa.tick(now)
+        finally:
+            try:
+                self.tg.tick(now)
+            except Exception as e:                                   # noqa: BLE001
+                self.stats["tg_tick_fail"] = self.stats.get("tg_tick_fail", 0) + 1
+                self.down += 1
+                if self.down == 1:
+                    self.line("TG: такт упал: %s — строка на серию; такт WA идёт, число упавших — в сводке TG"
+                              % type(e).__name__)
+            else:
+                if self.down:
+                    self.line("TG: такт снова идёт — упало тактов подряд: %d" % self.down)
+                    self.down = 0
+
+
+def tg_summary(tg_core, stats):
+    """Сводка канала TG числами (только при включённом канале); недоставленные карточки — словами, как у WA
+    (`cards_words`, TGCOREC0610)."""
+    return ("сводка TG: черновики %s · карточек %d · на паузе %d · тактов TG упало %d"
+            % (_pairs(tg_core.counts()), tg_core.db.execute("SELECT COUNT(*) FROM tg_cards").fetchone()[0],
+               tg_core.db.execute("SELECT COUNT(*) FROM clients WHERE paused=1").fetchone()[0],
+               stats.get("tg_tick_fail", 0))
+            + cards_words(tg_core))
+
+
 def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every=SUMMARY_EVERY,
           line=None):
-    """Цикл службы: `wa_agent_tg.run` + сводка раз в `every` секунд (первая — сразу)."""
+    """Цикл службы: `wa_agent_tg.run` + сводка раз в `every` секунд (первая — сразу).
+    Канал TG включён — такт обоих ядер (`TwoCores`) и строка «сводка TG»; выключен — цикл прежний."""
     line = line or (lambda s: log.info("%s", s))
     stats, last = {}, [None]
     watch = getattr(core, "watch", None)
+    tg_core = tg_core_of(tg)
 
     def on_turn(now):
         if watch is not None:
@@ -436,9 +666,14 @@ def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every
                 line(summary(core, tg, words, stats))
             except Exception as e:                                   # noqa: BLE001
                 line("сводка не собрана: %s" % type(e).__name__)
+            if tg_core is not None:
+                try:
+                    line(tg_summary(tg_core, stats))
+                except Exception as e:                               # noqa: BLE001
+                    line("сводка TG не собрана: %s" % type(e).__name__)
 
-    wa_agent_tg.run(core, tg, should_stop, clock=clock, sleep=sleep, log=line, on_turn=on_turn,
-                    stats=stats)
+    wa_agent_tg.run(core if tg_core is None else TwoCores(core, tg_core, line, stats), tg, should_stop,
+                    clock=clock, sleep=sleep, log=line, on_turn=on_turn, stats=stats)
     return stats
 
 
@@ -446,21 +681,18 @@ def main():
     env = env_of()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                         handlers=[logging.FileHandler(env["log_path"], encoding="utf-8")])
-    model, why = None, ""
-    if flags_of(os.environ)[F_DRAFTS]:
-        import wa_agent_model
-        # WA_AGENT_TOOLS выкл — вызов той же формы, что в 9c4aac6 (без ключа tools)
-        more = {"tools": True} if wa_agent_tg.flag_on(os.environ.get(F_TOOLS)) else {}
-        if wa_agent_tg.flag_on(os.environ.get(F_HINTS)):
-            more["hints"] = True              # WA_AGENT_HINTS (NIGHT0710-B2): выкл — вызов прежней формы
-        model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)),
-                                book=wa_agent_tg.flag_on(os.environ.get(F_BOOK)),
-                                cache=wa_agent_model.cache_ttl_of(os.environ.get(F_CACHE)), **more)
-    core, tg, _flags, words = build(env, model=model)
+    # модели WA и TG (TGCOREC0610 — одной функцией, её и проверяет набор); сбой модели TG — канал не собран;
+    # WA_AGENT_HINTS (NIGHT0710-B2) передаёт в make_model та же функция (INTEG0710)
+    model, why, tg_model, tg_why, tg_fail = models_of(env, os.environ)
+    core, tg, _flags, words = build(env, model=model, tg_model=tg_model, tg_fail=tg_fail)
     if model is not None and getattr(model, "tools", None) is not None:
         # новое входящее посреди сверки обрывает её (AGENTLOOPA0310): тот же признак, что ядро судит после модели
         model.fresh = lambda number, upto: core._fresh(number, upto) is not None
     log.info("%s", start_line(env, words))
+    if F_TG in words:
+        log.info("%s", tg_start_line(env, tg_core_of(tg), words[F_TG]))
+        if tg_why:
+            log.info("wa-agent: канал TG — %s, черновиков TG нет", tg_why)
     if why:
         log.info("wa-agent: WA_AGENT_DRAFTS=1, но %s — черновиков нет", why)
     stop = []

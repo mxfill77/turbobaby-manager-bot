@@ -464,13 +464,18 @@ def card_notes(hand, ver, door_open, follow=False, lesson=None, hint=None, expla
     return "\n".join(lines)
 
 
-def card_keyboard(draft_id, ver, offer=None):
-    """Кнопки карточки: прежний ряд из трёх; шаблон к месту (NIGHT0710-B3g) — вторым рядом «📨 Отправить шаблоном»."""
-    rows = [[{"text": "✅ Отправить", "callback_data": "wa:send:%d:%d" % (draft_id, ver)},
-             {"text": "✏️ Исправить", "callback_data": "wa:fix:%d:%d" % (draft_id, ver)},
-             {"text": "✖️ Не нужно", "callback_data": "wa:no:%d:%d" % (draft_id, ver)}]]
+def card_keyboard(draft_id, ver, offer=None, prefix="wa", send=True):
+    """Кнопки карточки: прежний ряд из трёх; шаблон к месту (NIGHT0710-B3g) — вторым рядом «📨 Отправить шаблоном».
+    prefix — первое слово callback_data рук («wa» — ядро WhatsApp, как было; «tg» — ядро TG, TGCOREA0610); send=False —
+    руки TG при закрытой двери: «Отправить» нет (TGCOREC0610). Умолчания — клавиатура ветки Б3г байт-в-байт (INTEG0710)."""
+    row = [{"text": "✅ Отправить", "callback_data": "%s:send:%d:%d" % (prefix, draft_id, ver)},
+           {"text": "✏️ Исправить", "callback_data": "%s:fix:%d:%d" % (prefix, draft_id, ver)},
+           {"text": "✖️ Не нужно", "callback_data": "%s:no:%d:%d" % (prefix, draft_id, ver)}]
+    if not send:
+        row = row[1:]
+    rows = [row]
     if offer and offer.get("name"):
-        rows.append([{"text": W_TPL_BUTTON, "callback_data": "wa:tpl:%d:%d" % (draft_id, ver)}])
+        rows.append([{"text": W_TPL_BUTTON, "callback_data": "%s:tpl:%d:%d" % (prefix, draft_id, ver)}])
     return {"inline_keyboard": rows}
 
 
@@ -634,8 +639,20 @@ def _card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX
 
 
 class Tg(wa_agent.Telegram):
+    """prefix — первое слово callback_data кнопок этих рук («wa» — ядро WhatsApp, как было), и кнопок карточки, и
+    кнопок уроков (TGCOREC0610). reader=False — руки второго ядра (TGCOREA0610): getUpdates не зовут НИКОГДА,
+    обновления им передаёт единственный читатель через `attach` — нажатие по префиксу, реплай «Исправить» по карточке
+    своей базы. send_closed — «Отправить» на карточке и при закрытой двери (руки WA, решение владельца 05.10 12:39);
+    False — только при открытой двери ядра, и подсказка «Исправить» тогда отправку не обещает (руки TG, решение
+    владельца 00:59, TGCOREC0610)."""
+
     def __init__(self, token, enabled=False, chat_id=AGENTS_CHAT, show_chat=None, mirror_db=None,
-                 http=None, clock=time.time, log=None, react=False, react_send=None, relay=False, watch=False):
+                 http=None, clock=time.time, log=None, react=False, react_send=None, relay=False, watch=False,
+                 prefix="wa", reader=True, send_closed=True):
+        self.prefix = str(prefix)
+        self.reader = bool(reader)
+        self.send_closed = bool(send_closed)
+        self.peers = {}                                     # префикс → руки второго ядра (только у читателя)
         self.token = token or ""
         self.enabled = bool(enabled) and bool(self.token)
         self.react = bool(react) and bool(self.token)
@@ -659,6 +676,14 @@ class Tg(wa_agent.Telegram):
         self.core, self.db = core, core.db
         self.db.executescript(_SCHEMA)
         return self
+
+    def attach(self, side):
+        """Руки второго ядра (TGCOREA0610) — к единственному читателю: нажатия `<префикс>:…` и реплаи на его
+        карточки идут ему. Свой префикс и читатель взять нельзя — иначе разбор снова стал бы общим."""
+        if side.prefix == self.prefix or side.reader or side.prefix in self.peers:
+            raise ValueError("руки второго ядра: префикс %r занят или они читатель" % side.prefix)
+        self.peers[side.prefix] = side
+        return side
 
     @property
     def reading(self):
@@ -758,7 +783,9 @@ class Tg(wa_agent.Telegram):
         texts = card_texts(top, str(text or ""), notes,
                            card_details(hand, link), question=(extra or {}).get("question") or "",
                            trans=card_trans(extra), agent=card_agent(extra))
-        kb = card_keyboard(draft_id, ver, offer)
+        # кнопки — с префиксом рук; руки TG при закрытой двери — без «Отправить» (TGCOREC0610); шаблон к месту — вторым
+        # рядом «📨» (NIGHT0710-B3g); одна функция на карточку и на её правку шаблоном (INTEG0710)
+        kb = card_keyboard(draft_id, ver, offer, prefix=self.prefix, send=self.send_closed or door_open)
         mid = None
         for i, body in enumerate(texts):
             card = i == len(texts) - 1
@@ -808,7 +835,8 @@ class Tg(wa_agent.Telegram):
             return
         row = self.db.execute("SELECT body FROM tg_cards WHERE card_id=?", (int(card_id),)).fetchone()
         body = (row[0] if row else "📝 Черновик №%d" % draft_id)[:TG_TEXT_MAX - 200]
-        kb = {"inline_keyboard": [[{"text": "↩️ Отменить", "callback_data": "wa:cancel:%d:%d" % (draft_id, ver)}]]}
+        kb = {"inline_keyboard": [[{"text": "↩️ Отменить",
+                                    "callback_data": "%s:cancel:%d:%d" % (self.prefix, draft_id, ver)}]]}
         self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
                                      "text": body + "\n\n— ⏳ " + words, "reply_markup": kb})
 
@@ -821,7 +849,8 @@ class Tg(wa_agent.Telegram):
         body = (row[0] if row else "📝 Черновик №%d" % draft_id)[:CARD_ROOM]
         ok, _ = self.api("editMessageText", {"chat_id": self.chat, "message_id": int(card_id),
                                              "text": body + "\n\n— " + str(words)[:max(190, TG_TEXT_MAX - 4 - len(body))],
-                                             "reply_markup": card_keyboard(draft_id, ver, offer)})
+                                             "reply_markup": card_keyboard(draft_id, ver, offer, prefix=self.prefix,
+                                                                           send=self._send_shown())})
         return bool(ok)
 
     # ── уроки людей (WAAGENTLESSON0210) ───────────────────────────────────────────────────
@@ -852,14 +881,15 @@ class Tg(wa_agent.Telegram):
                           author, at, did, v1, v2, cut(was), cut(now),
                           cut(reason) if reason else "— (ответьте реплаем на это сообщение — запишу причиной)"))
 
-    @staticmethod
-    def _lesson_kb(lesson_id, state):
+    def _lesson_kb(self, lesson_id, state):
+        """Кнопки урока — с префиксом рук (TGCOREC0610): у WA прежние `wa:rule`/`wa:unrule`, урок ядра TG ушёл бы
+        под `wa:` рукам WA и решил бы ЧУЖОЙ урок с тем же номером."""
         if state == wa_agent.LESSON_CANDIDATE:
             return {"inline_keyboard": [[{"text": "📚 Сделать правилом",
-                                          "callback_data": "wa:rule:%d:0" % int(lesson_id)}]]}
+                                          "callback_data": "%s:rule:%d:0" % (self.prefix, int(lesson_id))}]]}
         if state == wa_agent.LESSON_ACTIVE:
             return {"inline_keyboard": [[{"text": "↩️ Откатить №%d" % int(lesson_id),
-                                          "callback_data": "wa:unrule:%d:0" % int(lesson_id)}]]}
+                                          "callback_data": "%s:unrule:%d:0" % (self.prefix, int(lesson_id))}]]}
         return None
 
     def lesson_card(self, lesson_id):
@@ -1021,7 +1051,7 @@ class Tg(wa_agent.Telegram):
                 % (self._head(number), "Человек написал клиенту в теме" if via else "Ответили с телефона",
                    pause_no))
         kb = {"inline_keyboard": [[{"text": "▶️ Продолжить",
-                                    "callback_data": "wa:go:%d:%d" % (cid, pause_no)}]]}
+                                    "callback_data": "%s:go:%d:%d" % (self.prefix, cid, pause_no)}]]}
         ok, res = self.api("sendMessage", {"chat_id": self.chat, "text": body, "reply_markup": kb})
         mid = int(res.get("message_id")) if ok else None
         self.db.execute("INSERT OR REPLACE INTO tg_pauses(cid, pause_no, msg_id, body) VALUES(?,?,?,?)",
@@ -1047,8 +1077,9 @@ class Tg(wa_agent.Telegram):
                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(int(value)),))
 
     def poll(self, timeout=0):
-        """Один getUpdates. → число разобранных обновлений или None (вызов не удался)."""
-        if not self.reading:
+        """Один getUpdates. → число разобранных обновлений или None (вызов не удался). Руки второго ядра
+        (reader=False) не опрашивают никогда: второй читатель того же бота дал бы 409."""
+        if not self.reading or not self.reader:
             return 0
         allowed = []
         for name in ((ALLOWED_UPDATES if self.enabled else []) + (RELAY_UPDATES if self.relay else [])
@@ -1089,7 +1120,7 @@ class Tg(wa_agent.Telegram):
         try:
             if "callback_query" in u:
                 if self.enabled:
-                    self.on_press(u["callback_query"])
+                    self._press_owner(u["callback_query"]).on_press(u["callback_query"])
             elif "message" in u:
                 if self._is_show(u["message"]):
                     self.on_topic(u["message"])
@@ -1108,6 +1139,20 @@ class Tg(wa_agent.Telegram):
     def answer(self, cq_id, words):
         self.api("answerCallbackQuery", {"callback_query_id": cq_id, "text": str(words)[:ANSWER_MAX]})
 
+    def _send_shown(self):
+        """Есть ли «Отправить» на карточке этих рук (TGCOREC0610): у WA — всегда; у рук TG — при открытой двери ядра
+        (та же проба, что у карточки: пробы нет — открыта)."""
+        if self.send_closed:
+            return True
+        door = getattr(self.core, "_door_open", None)
+        return bool(door()) if door else True
+
+    def _press_owner(self, cq):
+        """Чьё нажатие (TGCOREA0610): первое слово callback_data — префикс рук. Префикс второго ядра — его рукам и
+        его базе; всё прочее — этим рукам, где чужой префикс получает прежнее «неизвестная кнопка»."""
+        head = str((cq or {}).get("data") or "").split(":", 1)[0]
+        return self.peers.get(head, self) if head != self.prefix else self
+
     def on_press(self, cq):
         frm = cq.get("from") or {}
         chat = ((cq.get("message") or {}).get("chat") or {}).get("id")
@@ -1121,7 +1166,7 @@ class Tg(wa_agent.Telegram):
             self.log("отказ: нажал бот %s" % who)
             return self.answer(cq.get("id"), "отказ: боты не нажимают — решает человек группы")
         parts = data.split(":")
-        if len(parts) != 4 or parts[0] != "wa" or not (parts[2].isdigit() and parts[3].isdigit()):
+        if len(parts) != 4 or parts[0] != self.prefix or not (parts[2].isdigit() and parts[3].isdigit()):
             return self.answer(cq.get("id"), "неизвестная кнопка")
         act, a, b = parts[1], int(parts[2]), int(parts[3])
         if act == "go":
@@ -1142,7 +1187,11 @@ class Tg(wa_agent.Telegram):
                 # пояснение (NIGHT0710-B2): приглашение реплаем на карточку; правка текстом — как раньше, реплаем на неё;
                 # напоминание по пояснению не переписывается (запрос модели у него свой) — только правка текстом
                 return self.answer(cq.get("id"), self._hint_ask(a, b, (cq.get("message") or {}).get("message_id")))
-            if row and row[0] == wa_agent.PENDING and row[1] == b:
+            if row and row[0] == wa_agent.PENDING and row[1] == b and not self._send_shown():
+                # руки TG при закрытой двери (TGCOREC0610): кнопки «Отправить» нет — и обещания отправки нет
+                words = "ответьте реплаем на эту карточку своим текстом — будет версия %d; отправки отсюда нет — " \
+                        "ответьте клиенту сами" % (b + 1)
+            elif row and row[0] == wa_agent.PENDING and row[1] == b:
                 words = "ответьте реплаем на эту карточку своим текстом — будет версия %d, " \
                         "«Отправить» на ней шлёт ваш текст дословно" % (b + 1)
             else:
@@ -1193,13 +1242,35 @@ class Tg(wa_agent.Telegram):
         # пояснение (NIGHT0710-B2): вид правки решает сообщение, на которое ответили, — приглашение, а не карточка
         if reply and getattr(self.core, "hints", False) and self._on_hint_text(msg, reply, who, frm):
             return
+        card = self._card_of(reply)
+        if not card:
+            # реплай на карточку второго ядра (TGCOREA0610): её знает только его база
+            for side in self.peers.values():
+                if side.on_reply(msg):
+                    return
+            return
+        self._revise_reply(msg, card, who, frm)
+
+    def _card_of(self, reply):
+        """Реплай → (черновик, версия) карточки СВОЕЙ базы или None."""
         card = self.db.execute("SELECT draft_id, ver FROM tg_cards WHERE card_id=?",
                                (reply,)).fetchone() if reply else None
         if not card and reply:
             # реплай на ответ клиенту, ушедший отдельным сообщением перед карточкой (WACARDCOMPACT0310)
             card = self.db.execute("SELECT draft_id, ver FROM tg_card_parts WHERE msg_id=?", (reply,)).fetchone()
+        return card
+
+    def on_reply(self, msg):
+        """Руки второго ядра (TGCOREA0610): реплай на СВОЮ карточку — правка своему ядру. → True — карточка своя."""
+        reply = (msg.get("reply_to_message") or {}).get("message_id")
+        card = self._card_of(reply)
         if not card:
-            return
+            return False
+        frm = msg.get("from") or {}
+        self._revise_reply(msg, card, who_of(frm), frm)
+        return True
+
+    def _revise_reply(self, msg, card, who, frm):
         if frm.get("is_bot"):
             self.log("отказ: правку прислал бот %s (черновик %d)" % (who, card[0]))
             return
