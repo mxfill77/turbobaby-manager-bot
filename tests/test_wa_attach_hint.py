@@ -6,7 +6,9 @@ AttachCore, что версия модели (сверка Т4а → `attach_of`
 
 До Д2 (A15, NIGHT0710-B2 круг 2) при WA_AGENT_ATTACH пояснение отклонялось словами (`W_HINT_NO_CHECK`), а версия по
 пояснению шла под замок «без сверки» — обучение при PDF было выключено. Отрицательные формы (сверки версии нет, модель
-сверку не умеет, флаги выключены) — здесь же.
+сверку не умеет, флаги выключены) — здесь же. Раздел 7 (исправление 08.10 по проверке Д2): двойник R03 на версии по
+пояснению и сверка ЭТОЙ версии при второй версии по пояснению — до него мутанты проверяющих R11/R07 и R06/R17 выживали
+на всех наборах ветки.
 
 Всё на подделках: ядро `AttachCore` (база во временном каталоге), руки Telegram (поддельный Bot API), НАСТОЯЩИЙ адаптер
 `ModelAdapter` с НАСТОЯЩЕЙ сверкой `wa_agent_tools.run` и моделью-сценарием (rental → contract → contract_pdf → итог),
@@ -63,6 +65,8 @@ PICK = {"row": 41, "doc_id": "D41", "bike": BIKE, "contract_date": "2026-09-19",
 REVOKED = {"ok": True, "outcome": "none_signed", "checked": {"rows_scanned": 50, "unread": [], "undated_signed": 0}}
 OWNER_WHO = "Филипп (id 504608015)"
 STAFF_WHO = "Дарья (id 501)"
+HINT2 = "и ещё: про залог — только наличными"                         # второе пояснение — версия 3 (раздел 7)
+PDF_PROMISE = "«Отправить» шлёт ВТОРЫМ сообщением подписанный PDF"     # обещание PDF на карточке (раздел 7)
 
 
 # ═══ подделки ═══════════════════════════════════════════════════════════════════════════════════
@@ -166,8 +170,8 @@ def ver_text(w, did=1):
     return w.core.db.execute("SELECT ver, text, state FROM drafts WHERE id=?", (did,)).fetchone()
 
 
-def hint_card_pdf():
-    return X.W_HINT_CHECK % (2, X.W_HINT_CHECK_PDF % (PDF_NAME, X._size_words(len(PDF)), 41))
+def hint_card_pdf(ver=2):
+    return X.W_HINT_CHECK % (ver, X.W_HINT_CHECK_PDF % (PDF_NAME, X._size_words(len(PDF)), 41))
 
 
 # ═══ 1. владелец: версия по пояснению со сверкой → карточка с итогом → текст + PDF + правило ════════════
@@ -434,6 +438,91 @@ def test_service_path_attach_and_hints_live():
     row = L.core.db.execute("SELECT state, decided_by_id, ver_to FROM lessons WHERE kind='hint'").fetchall()
     assert row == [(A.LESSON_ACTIVE, 504608015, 2)], row
     assert not [ln for ln in L.lines if "упало" in ln or "упал:" in ln], [ln for ln in L.lines if "упал" in ln]
+
+
+# ═══ 7. двойник R03 и сверка ЭТОЙ версии (исправление 08.10 по проверке Д2) ══════════════════════════════════
+
+def twin_world():
+    """Черновик 1: версия модели со сверкой, «Отправить» владельца — текст и PDF ушли. Клиент пишет снова — черновик 2:
+    его сверка находит тот же договор (тот же sha256), и двойник R03 снимает PDF уже у версии 1. Сотрудник даёт
+    пояснение к черновику 2 — такт делает версию 2 со своей сверкой Т4а."""
+    w = ready(world())
+    words = w.send(OWNER, ver=1)
+    assert words.startswith("текст: ушёл · PDF: ушёл") and len(w.door.media) == 1, (words, w.door.media)
+    # часы адаптера мира стоят на T0, а второе входящее — T0+200: без сдвига судья сверки законно снял бы факт договора
+    # как прочитанный раньше последнего входящего; сверка черновика 2 идёт позже его входящего
+    w.adapter.clock = lambda: T0 + 300
+    w.ask("и ещё: доставка в Раваи?", ts=T0 + 200)
+    assert w.core.db.execute("SELECT ver, state FROM drafts WHERE id=2").fetchone() == (1, A.PENDING)
+    twin = X.W_TWIN % (SHA[:12], 1, A.SENT)
+    assert twin in w.card_text(1, did=2), w.card_text(1, did=2)       # версия 1 черновика 2 — двойник (как было)
+    w.explain(did=2)
+    assert ver_text(w, 2) == (2, NEW, A.PENDING), (ver_text(w, 2), w.sent()[-1]["text"][:160])
+    return w, twin
+
+
+def test_twin_pdf_hint_version_card_says_not_attached():
+    """Двойник R03 на версии по пояснению (находка R11 проверки Д2; у второго проверяющего — R07): своя сверка версии 2
+    черновика 2 снова нашла договор, уже ушедший этому клиенту, — строка attach несёт причину-двойник и номер версии,
+    карточка версии говорит «PDF не приложен — … уже уходил» и PDF не обещает (шапка модуля: «той же проверкой
+    двойника, что у версии 1»)."""
+    w, twin = twin_world()
+    card = w.card_text(2, did=2)
+    assert X.W_HINT_CHECK % (2, X.W_HINT_CHECK_NOPDF % twin) in card, card
+    assert PDF_PROMISE not in card, card
+    row = w.core.db.execute("SELECT file_id, reason, ver FROM attach WHERE draft_id=2").fetchone()
+    assert row == (None, twin, 2), row
+    assert not w.fell(), w.fell()
+
+
+def test_twin_pdf_hint_version_send_no_second_copy():
+    """Граница той же находки: «Отправить» владельца на версии 2 черновика 2 — текст и действующее правило, второй копии
+    договора клиенту нет (части PDF у черновика 2 не заводится; рубеж нажатия `_deliver` её снял бы и сам)."""
+    w, _twin = twin_world()
+    words = w.send(OWNER, ver=2, did=2)
+    assert words.startswith("sent") and "правило №1 — действует" in words, words
+    assert w.door.sends[-1] == (NUM, NEW) and len(w.door.media) == 1, (w.door.sends, w.door.media)
+    assert w.core.db.execute("SELECT COUNT(*) FROM pdf_parts WHERE draft_id=2").fetchone() == (0,)
+    assert w.count_rules() == 1 and not w.fell(), (w.rules(), w.fell())
+
+
+def test_second_hint_version_without_own_check_locked():
+    """Сверка ЭТОЙ версии (находка R06 второго проверяющего; у первого — R17): версия 2 по пояснению сверена
+    (attach.ver = 2), версия 3 по второму пояснению своей сверки не получила — строка attach остаётся за версией 2,
+    карточка версии 3 говорит «сверки нет» и PDF не обещает, «Отправить» снимает версию stale без сверки: клиенту
+    ничего, правила нет."""
+    w = ready(world())
+    w.explain()
+    assert ver_text(w) == (2, NEW, A.PENDING), ver_text(w)
+    assert w.core.db.execute("SELECT file_id, ver FROM attach WHERE draft_id=1").fetchone() == ("F41", 2)
+    w.adapter.redraft_checked = lambda number, upto, prev, hint: w.adapter.redraft(number, upto, prev, hint)
+    w.explain(text=HINT2, ver=2)
+    assert ver_text(w)[:2] == (3, NEW), (ver_text(w), w.sent()[-1]["text"][:160])
+    assert w.core.db.execute("SELECT ver FROM attach WHERE draft_id=1").fetchone() == (2,)
+    card3 = w.card_text(3)
+    assert X.W_HINT_CHECK_NONE % 3 in card3 and PDF_PROMISE not in card3, card3
+    assert w.send(OWNER, ver=3) == X.W_NO_CHECK, w.answers()
+    assert w.door.sends == [] and w.door.media == [] and w.count_rules() == 0, (w.door.sends, w.rules())
+    assert ver_text(w)[2] == A.STALE, ver_text(w)
+
+
+def test_second_hint_version_own_check_rule_and_pdf():
+    """Близнец предыдущего — то же без порчи: версия 3 по второму пояснению прошла СВОЮ сверку — строка attach за
+    версией 3, карточка называет PDF, «Отправить» владельца шлёт текст и PDF двумя частями, действующее правило —
+    из второго пояснения (версия 2 → 3)."""
+    w = ready(world())
+    w.explain()
+    w.explain(text=HINT2, ver=2)
+    assert ver_text(w) == (3, NEW, A.PENDING), ver_text(w)
+    assert w.core.db.execute("SELECT file_id, ver FROM attach WHERE draft_id=1").fetchone() == ("F41", 3)
+    assert hint_card_pdf(3) in w.card_text(3), w.card_text(3)
+    words = w.send(OWNER, ver=3)
+    assert words.startswith("текст: ушёл · PDF: ушёл") and "правило №1 — действует" in words, words
+    r = w.rules()
+    assert len(r) == 1 and r[0][1] == A.LESSON_ACTIVE and (r[0][6], r[0][7]) == (2, 3) and r[0][8] == HINT2, r
+    assert w.door.sends == [(NUM, NEW)] and w.door.media == [(NUM, "document", PDF_NAME, SHA)], (
+        w.door.sends, w.door.media)
+    assert not w.fell(), w.fell()
 
 
 # ═══ замок пробы ═══════════════════════════════════════════════════════════════════════════════════
