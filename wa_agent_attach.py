@@ -42,6 +42,17 @@ PDF not_sent с причиной. Повтора нет: unsure двери и р
 «ПЕРЕСОБРАТЬ СО СВЕРКОЙ». Ждущий черновик superseded тем же захватом (state+ver), новый проход Т4а даёт новый черновик
 со своей карточкой. При флаге вкл. черновик без сверки (нет строки `attach`) не уходит: «Отправить» снимает его stale.
 
+ПОЯСНЕНИЕ ПРИ СВЕРКЕ (Д2 INTEG0710, «PDF выключает обучение»; выключатель пояснений — WA_AGENT_HINTS ядра). До Д2 (A15)
+пояснение при флаге отклонялось словами, и обучение при PDF было выключено. Теперь версия по пояснению проходит ТУ ЖЕ сверку,
+что версия модели, и в такте, а не в обработчике нажатия: такт ядра (`make_hint_versions`) зовёт `redraft`, обёртка `_Probe`
+ведёт его путём сверки Т4а (`ModelAdapter.redraft_checked` → `_draft_tools` с блоком пояснения) и запоминает итог по ключу
+версии; до карточки версии (`_card_new`) итог ложится строкой `attach` с номером этой версии (`attach.ver`) — тем же
+`attach_of` и той же проверкой двойника, что у версии 1. Карточка версии по пояснению всегда называет итог ЕЁ сверки
+(`card_pdf`): PDF уйдёт вторым сообщением · PDF не приложен и почему · сверки нет. «Отправить» на версии, чья сверка записана,
+— путь ядра Б2 (владелец по id — правило, сотрудник — кандидат) и две части; сверки этой версии нет — тот же замок «без
+сверки» (stale, правила нет). Модель сверку не умеет (`_Probe.hint_check`: нет дверей `tools` или пути `redraft_checked`) или
+пояснения выключены — пояснение не принимается словами сразу, модель не зовётся (как до Д2).
+
 ЖУРНАЛ. `part_log` и строки `self.log`: кто, когда, часть, попытка, исход, wamid, sha256 — без текстов и номеров.
 
 В СЛУЖБЕ (NIGHT0710-B3v). Собирает `wa_agent_svc.build` — только при флаге (правило `flag_on` службы, одно на всех) И
@@ -96,6 +107,13 @@ W_NO_CHECK = ("устарело: черновик без сверки — при
               "черновик пересобирается")
 W_HINT_NO_CHECK = ("не принято: при сверке вложений (WA_AGENT_ATTACH) версия по пояснению сверку не проходит — "
                    "поправьте полным текстом реплаем на карточку")
+# Д2 (INTEG0710): версия по пояснению — со сверкой Т4а, итог ЕЁ сверки на карточке
+HINT_SEEN = "hint"                # ключ итога сверки версии по пояснению в `_seen`: (HINT_SEEN, номер, upto)
+W_HINT_CHECK = "🔎 сверка Т4а версии %d по пояснению — та же, что у версии модели: %s"
+W_HINT_CHECK_PDF = "«Отправить» шлёт ВТОРЫМ сообщением подписанный PDF договора: %s · %s · строка реестра %s"
+W_HINT_CHECK_NOPDF = "PDF не приложен — %s; уйдёт только текст"
+W_HINT_CHECK_NONE = ("⚠️ у версии %d по пояснению сверки Т4а нет — «Отправить» её не отправит и правила не даст: черновик "
+                     "снимется и пересоберётся; полный текст — реплаем на карточку")
 W_TEXT_NOT = "текст не ушёл — дверь PDF не звали"
 W_TEXT_UNSURE = "текст: неизвестно — PDF не шлём, файл без текста не уходит"
 W_RISK = ("доставка PDF статусами провайдера не подтверждена — повтор может дать клиенту ВТОРОЙ такой же PDF; "
@@ -104,7 +122,8 @@ W_FOREIGN = ("после попытки есть статус сообщения
              "считаем: PDF — неизвестно; дослать кнопкой нельзя, повтор может дать дубль — проверьте переписку")
 W_BASIS = "устарело: основание PDF не подтверждено реестром при нажатии — %s; ничего не отправлено, черновик пересобирается"
 W_BASIS_PDF = "дослать нельзя: основание PDF не подтверждено реестром — %s; PDF не ушёл"
-BASIS_COLS = (("signed_at", "TEXT"), ("number", "TEXT"), ("date_from", "TEXT"), ("date_to", "TEXT"))
+BASIS_COLS = (("signed_at", "TEXT"), ("number", "TEXT"), ("date_from", "TEXT"), ("date_to", "TEXT"),
+              ("ver", "INTEGER"))         # ver — Д2: версия по пояснению, чья сверка записана (NULL — версия 1)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS attach (
@@ -120,7 +139,8 @@ CREATE TABLE IF NOT EXISTS attach (
     signed_at   TEXT,                             -- версия договора при сверке (T4B3BASIS0510)
     number      TEXT,                             -- ключ перечитывания: номер обращения …
     date_from   TEXT,                             -- … и срок аренды (ISO, пусто — неизвестен)
-    date_to     TEXT
+    date_to     TEXT,
+    ver         INTEGER                           -- Д2: версия по пояснению, чья сверка записана; NULL — версия 1
 );
 CREATE TABLE IF NOT EXISTS pdf_parts (
     draft_id    INTEGER PRIMARY KEY,
@@ -321,7 +341,8 @@ def parts_words(text_state, pdf_state=None, pdf_reason=""):
 
 
 class _Probe:
-    """Модель-обёртка: после каждого черновика запоминает итог сверки Т4а по (номер, upto) — ядро о нём не знает."""
+    """Модель-обёртка: после каждого черновика запоминает итог сверки Т4а по (номер, upto) — ядро о нём не знает.
+    Версия по пояснению (Д2 INTEG0710) — тем же путём сверки, если модель его умеет; итог — по (HINT_SEEN, номер, upto)."""
 
     def __init__(self, inner, seen):
         self._inner, self._seen = inner, seen
@@ -333,6 +354,28 @@ class _Probe:
         info = last.get("info") if isinstance(last, dict) and isinstance(last.get("info"), dict) else {}
         # since — то же последнее входящее клиента, что судья получает в judge(since=info["last_in"]) (T4B3BASIS0510)
         self._seen[(number, upto_id)] = None if tools is None else (tools, info.get("last_in"))
+        return got
+
+    def hint_check(self):
+        """Умеет ли модель версию по пояснению СО СВЕРКОЙ Т4а (Д2): двери сверки есть (`tools`) и путь `redraft_checked`
+        есть. Нет — версия по пояснению сверку не пройдёт."""
+        return getattr(self._inner, "tools", None) is not None and \
+            callable(getattr(self._inner, "redraft_checked", None))
+
+    def redraft(self, number, upto_id, prev_text, hint):
+        """Версия по пояснению (Д2): модель умеет — путь сверки Т4а (`redraft_checked`), итог запоминается по ключу версии;
+        не умеет — прежний `redraft`, итога нет («без сверки»). Итог берётся только из `last`, записанного ЭТИМ вызовом:
+        прежний `last` (сверка версии 1) за сверку версии по пояснению не выдаётся."""
+        checked = self.hint_check()
+        before = getattr(self._inner, "last", None)
+        if checked:
+            got = self._inner.redraft_checked(number, upto_id, prev_text, hint)
+        else:
+            got = self._inner.redraft(number, upto_id, prev_text, hint)
+        last = getattr(self._inner, "last", None) if checked else None
+        tools = last.get("tools") if isinstance(last, dict) and last is not before else None
+        info = last.get("info") if isinstance(last, dict) and isinstance(last.get("info"), dict) else {}
+        self._seen[(HINT_SEEN, number, upto_id)] = None if tools is None else (tools, info.get("last_in"))
         return got
 
     def __getattr__(self, name):
@@ -517,22 +560,34 @@ class AttachCore(A.Core):
 
     def _card_new(self, draft_id, ver, now):
         """Вложение решается ДО первой карточки (второй круг, R01): карточка обязана назвать PDF, который уйдёт по её
-        «Отправить», а ядро шлёт её изнутри `make_drafts`, раньше, чем там легла бы строка `attach`."""
+        «Отправить», а ядро шлёт её изнутри `make_drafts`, раньше, чем там легла бы строка `attach`. Версия по пояснению
+        (Д2) — так же: итог ЕЁ сверки ложится до её карточки (ядро шлёт её изнутри `make_hint_versions`)."""
         if self.attach and int(ver) == 1:
             self._attach_decide(draft_id, now)
+        elif self.attach and self.hint_of(draft_id, int(ver)) is not None:
+            self._attach_decide(draft_id, now, ver=int(ver))
         return super()._card_new(draft_id, ver, now)
 
-    def _attach_decide(self, did, now):
+    def _ver_checked(self, draft_id, ver):
+        """Сверка ЭТОЙ версии по пояснению записана (Д2): строка `attach` черновика несёт её номер."""
+        return self.db.execute("SELECT 1 FROM attach WHERE draft_id=? AND ver=?",
+                               (draft_id, int(ver))).fetchone() is not None
+
+    def _attach_decide(self, did, now, ver=None):
         """Итог сверки черновика → строка `attach` (вложение или причина). Строка уже есть или сверки не было — ничего.
-        Тот же договор (sha256) этому номеру уже уходил или мог уйти — вложения нет, причина словами (R03)."""
-        if self._attach(did) is not None:
+        Тот же договор (sha256) этому номеру уже уходил или мог уйти — вложения нет, причина словами (R03).
+        ver — версия по пояснению (Д2): итог ЕЁ сверки (ключ HINT_SEEN) заменяет строку черновика и метит её номером
+        версии (`attach.ver`); сверки этой версии не было — строка не трогается, версия остаётся «без сверки»."""
+        if ver is None and self._attach(did) is not None:
             return
         row = self.db.execute("SELECT number, upto_id FROM drafts WHERE id=?", (did,)).fetchone()
         if not row:
             return
         number, upto = row
-        seen = self._seen.pop((number, upto), None)
+        seen = self._seen.pop((number, upto) if ver is None else (HINT_SEEN, number, upto), None)
         if seen is None:
+            if ver is not None:
+                self.log("черновик %d: версия %d по пояснению без сверки Т4а — «Отправить» её снимет" % (did, ver))
             return                                  # сверки не было: строки нет — «без сверки»
         out, since = seen
         meta, why = attach_of(out, since)           # опора судьи: sift с since = последнее входящее (T4B3BASIS0510)
@@ -546,8 +601,11 @@ class AttachCore(A.Core):
                         (did, m.get("file_id"), m.get("name"), m.get("size"), m.get("sha256"), m.get("row"),
                          m.get("doc_id"), why or None, now, m.get("signed_at"), number if meta else None,
                          m.get("date_from"), m.get("date_to")))
-        self.log("черновик %d: вложение %s" % (
-            did, "PDF договора, sha256 %s…" % m["sha256"][:12] if meta else "нет — %s" % why))
+        if ver is not None:                         # Д2: строка — итог сверки ЭТОЙ версии по пояснению
+            self.db.execute("UPDATE attach SET ver=? WHERE draft_id=?", (int(ver), did))
+        self.log("черновик %d: вложение %s%s" % (
+            did, "PDF договора, sha256 %s…" % m["sha256"][:12] if meta else "нет — %s" % why,
+            " (сверка версии %d по пояснению)" % ver if ver is not None else ""))
 
     def _pdf_twin(self, number, sha, draft_id):
         """Тот же PDF (sha256) этому номеру в ДРУГОМ черновике уже ушёл или мог уйти → (черновик, состояние, sha256) |
@@ -562,10 +620,13 @@ class AttachCore(A.Core):
 
     def card_pdf(self, draft_id, ver):
         """Строка карточки о PDF (второй круг, R01/R02): «Отправить» шлёт договор — карточка обязана это сказать, на
-        КАЖДОЙ версии (правка человека PDF не снимает). Вложения нет по делу (договор сверялся) — почему. Иначе None."""
+        КАЖДОЙ версии (правка человека PDF не снимает). Вложения нет по делу (договор сверялся) — почему. Иначе None.
+        Версия по пояснению (Д2) — строка итога ЕЁ сверки всегда (`_hint_card`)."""
         if not self.attach:
             return None
         meta = self._attach(draft_id)
+        if self.hint_of(draft_id, int(ver)) is not None:
+            return self._hint_card(draft_id, int(ver), meta)
         if not meta:
             return None
         file_id, name, size, _sha, row, why = meta
@@ -580,6 +641,19 @@ class AttachCore(A.Core):
             line += " — текст правил человек, договор уйдёт всё равно; не нужен — «Не нужно» и ответ с телефона"
         return line
 
+    def _hint_card(self, draft_id, ver, meta):
+        """Строка карточки версии по пояснению (Д2): итог ЕЁ сверки Т4а — PDF уйдёт (имя · размер · строка реестра) ·
+        PDF не приложен и почему · сверки нет («Отправить» снимет версию, правила не будет). Текст версии писал агент, а
+        не человек, — оговорки «текст правил человек» здесь нет."""
+        if not meta or not self._ver_checked(draft_id, ver):
+            return W_HINT_CHECK_NONE % ver
+        file_id, name, size, _sha, row, why = meta
+        if file_id:
+            said = W_HINT_CHECK_PDF % (name, _size_words(size), row if row is not None else "—")
+        else:
+            said = W_HINT_CHECK_NOPDF % str(why or "причина не названа")[:180]
+        return W_HINT_CHECK % (ver, said)
+
     # ── нажатие ───────────────────────────────────────────────────────────────────────────
 
     def press(self, draft_id, ver, action, who, now=None, who_id=None):
@@ -592,9 +666,11 @@ class AttachCore(A.Core):
         if action in (ACT_PDF, ACT_PDF_RISK):
             return self.press_pdf(draft_id, ver, who, now, permit=action == ACT_PDF_RISK)
         # напоминание (WAFOLLOWUP0210) сверкой Т4а не строится никогда — замок «без сверки» его не касается
-        # A15 (NIGHT0710-B2, круг 2): строка attach ключуется черновиком, а версию по пояснению модель пишет без
-        # сверки Т4а — такая версия идёт под тот же замок «без сверки», что и черновик без строки attach
-        unchecked = self._attach(draft_id) is None or self.hint_of(draft_id, int(ver)) is not None
+        # A15 (NIGHT0710-B2, круг 2) → Д2 (INTEG0710): строка attach ключуется черновиком; версия по пояснению «со
+        # сверкой», только если записана сверка ЭТОЙ версии (`attach.ver`, такт до её карточки) — иначе она идёт под тот
+        # же замок «без сверки», что и черновик без строки attach
+        hint_ver = self.hint_of(draft_id, int(ver)) is not None
+        unchecked = self._attach(draft_id) is None or (hint_ver and not self._ver_checked(draft_id, int(ver)))
         if action == A.ACT_SEND and unchecked and self.draft_kind(draft_id) != A.KIND_FOLLOW:
             n = self.db.execute("UPDATE drafts SET state=?, reason=?, closed_at=? WHERE id=? AND state=? AND ver=?",
                                 (A.STALE, W_NO_CHECK, now, draft_id, A.PENDING, int(ver))).rowcount
@@ -606,11 +682,31 @@ class AttachCore(A.Core):
         return super().press(draft_id, ver, action, who, now, who_id=who_id)
 
     def hint(self, draft_id, ver, text, who, who_id=None, msg_id=None, now=None):
-        """A15 (NIGHT0710-B2, круг 2): при WA_AGENT_ATTACH версия по пояснению сверку Т4а не проходит — пояснение
-        не принимается словами сразу, а не после вызова модели и устаревания на «Отправить»."""
-        if self.attach:
+        """Д2 (INTEG0710; было A15 NIGHT0710-B2): при WA_AGENT_ATTACH пояснение принимается, когда версия по нему пройдёт
+        ту же сверку Т4а, что версия модели (пояснения включены, модель сверку умеет — `_Probe.hint_check`): версию со
+        сверкой сделает такт. Иначе — не принимается словами сразу, а не после вызова модели и устаревания на
+        «Отправить» (как до Д2)."""
+        if self.attach and not (self.hints and self._hint_checkable()):
             return {"ok": False, "words": W_HINT_NO_CHECK}
         return super().hint(draft_id, ver, text, who, who_id=who_id, msg_id=msg_id, now=now)
+
+    def _hint_checkable(self):
+        """Модель (обёртка `_Probe`) умеет версию по пояснению со сверкой Т4а. Пробы нет или она упала — не умеет."""
+        probe = getattr(self.model, "hint_check", None)
+        try:
+            return bool(probe()) if callable(probe) else False
+        except Exception:                                            # noqa: BLE001
+            return False
+
+    def make_hint_versions(self, now):
+        """Версии по пояснениям — такт ядра (NIGHT0710-B2); при WA_AGENT_ATTACH каждая — со сверкой Т4а (`_Probe.redraft`),
+        итог ложится до её карточки (`_card_new`). Итоги сверки версий, не дошедших до карточки (клиент написал ещё,
+        черновик снят), такт не переживают (Д2)."""
+        try:
+            return super().make_hint_versions(now)
+        finally:
+            for key in [k for k in self._seen if len(k) == 3 and k[0] == HINT_SEEN]:
+                self._seen.pop(key, None)
 
     def rebuild(self, draft_id, ver, who, now=None):
         """«Пересобрать со сверкой»: ждущий черновик superseded тем же захватом, новый проход Т4а → новый черновик."""
