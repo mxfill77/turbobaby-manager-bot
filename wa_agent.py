@@ -108,7 +108,9 @@ gave_up. Показанный ключ второй строки не даёт �
 reply_request, язык текста версии ru|en, {{1}} — «байка»/«bike»). Нажатие — `press_template`: таблица `tpl_out`,
 `sending` ДО двери, один шаблон на черновик и на последнее входящее клиента, повтора нет (not_sent — можно ещё
 раз), ушедший — в `outbox`. Одобрение у Meta судит дверь по ответу провайдера; любой отказ — словами на карточке.
-Клиент ответил — окно открыто, черновик пересобирается и уходит обычной кнопкой.
+Клиент ответил — окно открыто, черновик пересобирается и уходит обычной кнопкой. Исход двери в `tpl_out` и строка
+`outbox` — ОДНОЙ транзакцией (INTEG0710 Д5, как исход части у Б3в): обрыв посреди не оставит «ушёл» без outbox, разовый
+сбой базы чинит вторая атомарная попытка, записи без транзакции нет.
 
 ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа само (это
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
@@ -214,6 +216,8 @@ TPL_REPLY = "reply_request"
 TPL_WORD = {"ru": "байка", "en": "bike"}          # {{1}} «аренда …»: общее слово — модель из аренды по номеру ненадёжна
 TPL_OFF_WORDS = "шаблоны выключены (WA_AGENT_TEMPLATES) — ничего не отправлено"
 W_TPL_CLOSED = "окно 24 ч закрыто%s — обычной кнопкой клиенту не уйдёт"
+# исход двери известен, а в базу не лёг за две попытки (INTEG0710 Д5): tpl_out остаётся sending, старт — «неизвестно»
+W_TPL_UNSAVED = "в базу агента не записано (%s) — второй раз не шлём, после рестарта службы: «исход неизвестен»"
 _TPL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS tpl_out (
     draft_id    INTEGER PRIMARY KEY,                  -- шаблон к черновику: не больше одного ушедшего
@@ -2309,7 +2313,8 @@ class Core:
         """«📨 Отправить шаблоном» → {"ok", "state", "words"}. Шаблон — ОДИН на черновик и последнее входящее клиента:
         `sending` пишется ДО двери, исход sent · not_sent (можно ещё раз) · unsure (не повторяем; рестарт посреди —
         unsure). Ушедший — в `outbox` (эхо не ставит паузу, история видит «мы»). Черновик остаётся pending: клиент
-        ответит — окно откроется, черновик пересоберётся и уйдёт обычной кнопкой. Отказ — словами на карточке."""
+        ответит — окно откроется, черновик пересоберётся и уйдёт обычной кнопкой. Отказ — словами на карточке.
+        Исход двери и строка outbox — одной транзакцией (`_tpl_tx`, INTEG0710 Д5); не легли — словами, не тихо."""
         now = self.clock() if now is None else now
         if not self.templates:
             return {"ok": False, "state": None, "words": TPL_OFF_WORDS}
@@ -2376,10 +2381,10 @@ class Core:
         wamid = res.get("wamid") if state == SENT else None
         reason = str(res.get("reason") or "")
         body = res.get("text") or "[шаблон %s (%s)]" % (name, lang)
-        self.db.execute("UPDATE tpl_out SET state=?, reason=?, wamid=?, body=? WHERE draft_id=? AND state=?",
-                        (state, reason[:300], wamid, body, draft_id, SENDING))
-        if state == SENT:
-            self._sent_out(wamid, number, body, VIA_TEMPLATE, now)
+        # ── исход двери и строка outbox — ОДНОЙ транзакцией (INTEG0710 Д5): легли обе или ни одна ──
+        lost = self._tpl_tx(lambda: self._tpl_settle(draft_id, number, state, reason, wamid, body, now),
+                            "черновик %d: шаблон %s (%s) → %s по ответу двери%s" % (
+                                draft_id, name, lang, state, ", wamid %s" % wamid if wamid else ""))
         hm = hm_phuket(now)
         if state == SENT:
             card_w = ("📨 шаблон %s (%s) ушёл: %s, %s — клиенту: «%s». Ответит клиент — окно откроется, черновик "
@@ -2392,12 +2397,54 @@ class Core:
         else:
             card_w = "📨 шаблон: %s — %s, %s" % (W_UNSURE, who, hm)
             words = "шаблон: " + W_UNSURE
+        if lost:                              # исход двери известен, в базу не лёг — словами на карточке, не тихо
+            card_w += " · ⚠️ " + W_TPL_UNSAVED % lost
+            words += " · ⚠️ " + W_TPL_UNSAVED % lost
         self.log("черновик %d: шаблон %s (%s) → %s%s" % (
             draft_id, name, lang, state, ", одобрение %s" % res.get("approval") if res.get("approval") else ""))
         self._tg("card_tpl", draft_id, self._card(draft_id), int(ver), card_w, offer if state == NOT_SENT else None)
         if state in (SENT, UNSURE):
             self.show_agent(now)              # ушедший шаблон — строкой в тему клиента (WAMIRROR0410): эха у него нет
         return {"ok": state == SENT, "state": state, "words": words}
+
+    def _tpl_settle(self, draft_id, number, state, reason, wamid, body, now):
+        """Исход двери в tpl_out и строка outbox — тело записи, которую `_tpl_tx` кладёт ОДНОЙ транзакцией
+        (INTEG0710 Д5). Обе записи идемпотентны (исход — только из sending, outbox — INSERT OR IGNORE): повтор
+        безопасен."""
+        self.db.execute("UPDATE tpl_out SET state=?, reason=?, wamid=?, body=? WHERE draft_id=? AND state=?",
+                        (state, reason[:300], wamid, body, draft_id, SENDING))
+        if state == SENT:
+            self._sent_out(wamid, number, body, VIA_TEMPLATE, now)
+
+    def _tpl_tx(self, write, what):
+        """Записи исхода шаблона ОДНОЙ транзакцией (INTEG0710 Д5, как исход части у Б3в): BEGIN IMMEDIATE → write() →
+        COMMIT — легли все или ни одна, «ушёл» без строки outbox не бывает. Сбой посреди (исключение записи, COMMIT или
+        BEGIN не прошли) — ROLLBACK и ещё ОДНА такая же транзакция (записи идемпотентны, повтор безопасен, даже если
+        первая на деле легла). Записи без транзакции нет ни на какой ветке. Чужая открытая транзакция не открывается и
+        не закрывается: записи ложатся в неё, решает владелец. → None — легло · имя исключения — не легло за две
+        попытки: откат, tpl_out остаётся sending (старт скажет «неизвестно»), второй раз не шлём. Обрыв процесса (не
+        Exception) транзакцию не закрывает — незакоммиченное снимет сама база."""
+        if self.db.in_transaction:
+            write()
+            return None
+        err = None
+        for attempt in (1, 2):
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                write()
+                self.db.execute("COMMIT")
+                return None
+            except Exception as e:                                   # noqa: BLE001
+                err = type(e).__name__
+                try:
+                    if self.db.in_transaction:
+                        self.db.execute("ROLLBACK")
+                except Exception:                                    # noqa: BLE001
+                    pass
+                self.log("%s — запись не легла (%s), попытка %d из 2: откат, не легло ничего" % (what, err, attempt))
+        self.log("%s — в базу НЕ легло за 2 попытки (%s): tpl_out остаётся sending (старт скажет «неизвестно»), второй "
+                 "раз не шлём" % (what, err))
+        return err
 
     def _door_open(self):
         """Дверь без `is_open` — открыта (прежний контракт); `is_open` упал — закрыта."""
