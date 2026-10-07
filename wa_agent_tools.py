@@ -182,6 +182,25 @@ def contract_phones(cell):
     return [p for p in (last9(piece) for piece in re.split(r"[,;/|\n]+", str(cell or ""))) if p]
 
 
+def phone_country_clash(cell, number):
+    """Номер договора совпал с обращением ТОЛЬКО хвостом 9 цифр, а записан с ЯВНЫМ кодом страны («+» или «00»), и
+    полный номер другой → True (NIGHT0710-B3v, второй круг, R12: «+7 981 234-56-78» и 66812345678 — разные люди с одним
+    хвостом). Номер без явного кода («081…», «8 981…») сверяется по-прежнему хвостом — местную запись не судим."""
+    key = last9(number)
+    full = re.sub(r"\D", "", str(number or ""))
+    hits = [p for p in re.split(r"[,;/|\n]+", str(cell or "")) if key and last9(p) == key]
+    if not hits:
+        return False
+    for piece in hits:
+        raw = piece.strip()
+        d = re.sub(r"\D", "", raw)
+        intl = d if raw.startswith("+") else d[2:] if d.startswith("00") else ""
+        # «+66 081…» (лишний ноль после кода) — тот же номер: сравниваются приставки до хвоста без конечных нулей
+        if not intl or intl[:-9].rstrip("0") == full[:-9].rstrip("0"):
+            return False                            # хоть одна запись этого номера — местная или та же целиком
+    return True
+
+
 def _tail(key):
     return "…" + key[-4:] if key else "—"
 
@@ -198,6 +217,9 @@ def bind_contract(fact, resp, number, rental, ref="", at=None):
     flt = resp.get("filter") if isinstance(resp.get("filter"), dict) else {}
     on = fact.get("matched_on") if isinstance(fact.get("matched_on"), list) else []
     phones = contract_phones(fact.get("phone"))
+    if key in phones and phone_country_clash(fact.get("phone"), number):
+        return result("contract", CONFLICT, src, ref, at, reason="договор другого номера: телефон договора с кодом "
+                      "страны совпал с обращением только последними 9 цифрами (%s), полный номер другой" % _tail(key))
     if key in phones:
         by = "телефон"
     elif "nick" in on and str(flt.get("phone_last9") or "") == key:

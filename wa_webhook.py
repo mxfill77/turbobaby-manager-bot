@@ -183,6 +183,33 @@ CREATE TABLE IF NOT EXISTS wa_contacts (
 )
 """
 
+# Квитанции по wamid — ВСЕ статусы, а не первый (NIGHT0710-B3v). wa_inbox держит на wamid одну строку (UNIQUE
+# idx_wa_wamid, квитанции не дополняются) — delivered/read после sent там не остаются. Эта таблица ДОБАВОЧНАЯ:
+# wa_inbox, его счёт `inserted` и дедуп не меняются ни на байт; повтор того же статуса — OR IGNORE.
+_STATUS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wa_status (
+    wamid      TEXT    NOT NULL,
+    status     TEXT    NOT NULL,
+    recipient  TEXT,
+    ts_msg     INTEGER,
+    ts_queued  INTEGER NOT NULL,
+    source     TEXT,
+    PRIMARY KEY (wamid, status)
+)
+"""
+
+STATUS_FLAG = "WA_AGENT_ATTACH"   # тот же выключатель, что у PDF клиенту; правило — `wa_agent_tg.flag_on`
+STATUS_TRUE = ("1", "true", "yes", "on")
+
+
+def statuses_on(environ=None) -> bool:
+    """Квитанции `wa_status` — ПОД ВЫКЛЮЧАТЕЛЕМ (второй круг NIGHT0710-B3v, R15): по умолчанию выключено — таблица не
+    заводится и не пишется, вебхук байт-в-байт прежний при любом рестарте wa-webhook. Включается тем же словом
+    WA_AGENT_ATTACH (1/true/yes/on) в окружении службы wa-webhook."""
+    env = os.environ if environ is None else environ
+    return str(env.get(STATUS_FLAG) or "").strip().lower() in STATUS_TRUE
+
+
 MEDIA_PLACEHOLDER    = "media_placeholder"   # тип сообщения истории: медиа было, файла нет
 MEDIA_NOTE_NO_FILE   = "no_file"
 MEDIA_NOTE_FILE_LATE = "file_late"
@@ -237,9 +264,11 @@ PULL_LIMIT = 20      # rows handed out per pull
 class WAQueueDB:
     """Thread-safe SQLite queue for incoming WA events."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, statuses=None):
         self.db_path = db_path
         self._lock = threading.Lock()
+        # квитанции всех статусов wamid (`wa_status`) — только под выключателем; None — из окружения службы
+        self.statuses = statuses_on() if statuses is None else bool(statuses)
         self._init_db()
 
     def _conn(self):
@@ -261,6 +290,8 @@ class WAQueueDB:
                     conn.execute("ALTER TABLE wa_inbox ADD COLUMN " + col + " " + decl)
             conn.execute(_PULL_INDEX)
             conn.execute(_CONTACTS_SCHEMA)
+            if self.statuses:
+                conn.execute(_STATUS_SCHEMA)
             conn.commit()
 
     def enqueue(self, events: list, source: str = "") -> int:
@@ -280,6 +311,14 @@ class WAQueueDB:
         with self._lock:
             with self._conn() as conn:
                 for ev in events:
+                    if self.statuses and ev.get("type") == "status" and ev.get("wamid") and ev.get("text"):
+                        try:            # все статусы wamid (NIGHT0710-B3v); wa_inbox ниже — как был
+                            conn.execute("INSERT OR IGNORE INTO wa_status(wamid, status, recipient, ts_msg, "
+                                         "ts_queued, source) VALUES (?,?,?,?,?,?)",
+                                         (ev.get("wamid"), str(ev.get("text")).strip().lower(), ev.get("from"),
+                                          ev.get("ts"), now, ev.get("source") or source or ""))
+                        except Exception as e:
+                            log.warning("wa_queue status error: %s", e)
                     try:
                         conn.execute(
                             """INSERT OR IGNORE INTO wa_inbox
