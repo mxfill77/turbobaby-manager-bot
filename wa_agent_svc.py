@@ -40,6 +40,13 @@
                     и снимки узлов знаний без возраста идут впереди одним префиксом с отметкой кэша, остальное — после.
                     Выключен (пусто или иное значение) — запрос модели прежний. Цена вызова по usage пишется всегда:
                     строкой журнала и итогом в сводку. Работает только с черновиками.
+  WA_AGENT_HINTS — пояснение → правило (NIGHT0710-B2): «Исправить» зовёт пояснение текстом, такт делает по нему версию
+                    моделью (карточка «💬 версия N по пояснению»); «Отправить» на ней владельца (id строго из
+                    LESSON_OWNER_IDS, список WA_AGENT_LESSON_ADMINS не действует) — действующее правило с номером,
+                    автором, временем, источником и откатом, сотрудника — кандидат; суточный список владельцу после
+                    21:00 по Пхукету — одно сообщение. Правила идут в промпт тем же блоком уроков со следующего
+                    черновика (адаптеру база агента даётся и без WA_AGENT_LESSONS). Выключен — «Исправить» и
+                    «Отправить» как раньше, правил из пояснений в промпте нет. Версии по пояснению — только с черновиками.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -79,6 +86,7 @@ F_PACE = "WA_AGENT_PACE"                  # человеческий ритм «
 F_LESSONS = "WA_AGENT_LESSONS"            # уроки людей из «Исправить» (WAAGENTLESSON0210)
 F_LESSON_ADMINS = "WA_AGENT_LESSON_ADMINS"  # кто переводит урок в действующие и откатывает; пусто — владелец
 F_FOLLOW = "WA_AGENT_FOLLOWUP"            # напоминание притихшему (WAFOLLOWUP0210)
+F_HINTS = "WA_AGENT_HINTS"                # пояснение → правило (NIGHT0710-B2), по умолчанию выключен
 F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чтение: наличие и конец аренды (WABOOKTOOLS0210)
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
@@ -138,13 +146,15 @@ class NoModel(wa_agent.Model):
         return None
 
 
-def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False, cache=None, tools=False):
+def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False, cache=None, tools=False,
+               hints=False):
     """Адаптер модели (WAAGENTMODEL0210): история — очередь и архив службы показа, знания, парк и цена —
     мост (только чтение), плательщик — платный ключ тем же путём, что у Splinter. → (модель | None, почему).
     Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели.
     lessons — WA_AGENT_LESSONS: включён — действующие уроки из базы агента идут в промпт (WAAGENTLESSON0210).
     book — WA_AGENT_BOOK_READ: включён — снимок броней `clients`(filter=all)+`fleet` моста, GET (WABOOKTOOLS0210).
-    cache — срок кэша промпта «1h»/«5m» или None (WA_AGENT_CACHE, WAAGENTCACHE0210)."""
+    cache — срок кэша промпта «1h»/«5m» или None (WA_AGENT_CACHE, WAAGENTCACHE0210).
+    hints — WA_AGENT_HINTS (NIGHT0710-B2): правила из пояснений идут в промпт; база агента читается и без уроков."""
     import wa_agent_model
     import wa_book_read
     try:
@@ -159,7 +169,7 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
         door=bridge.quote_price, archive_db=env.get("archive_db") or "",
         manifest=env.get("archive_manifest") or "", media_dir=env.get("archive_media") or "",
         agent_db=env.get("agent_db") or "", log=line or (lambda s: log.info("%s", s)),
-        lessons_db=(env.get("agent_db") or "") if lessons else "",
+        lessons_db=(env.get("agent_db") or "") if lessons or hints else "", hints=hints, text_lessons=lessons,
         book=wa_book_read.Snapshot(lambda: bridge.clients(filter="all"), bridge.fleet) if book else None,
         cache=cache,
         # WA_AGENT_TOOLS (AGENTLOOPA0310): двери чтения кассы и договоров; выкл — None, черновик как в 9c4aac6
@@ -204,6 +214,12 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
         admin_words))
     # напоминание притихшему (WAFOLLOWUP0210): тем же правилом; без черновиков не работает (такт их не ищет)
     follow = wa_agent_tg.flag_on(environ.get(F_FOLLOW))
+    # пояснение → правило (NIGHT0710-B2): выключено — «Исправить» и «Отправить» как раньше
+    hints = wa_agent_tg.flag_on(environ.get(F_HINTS))
+    line("пояснения (%s): %s" % (F_HINTS, "вкл — «Исправить» = пояснение агенту, версия по нему; «Отправить» "
+                                          "владельца — правило, сотрудника — кандидат; суточный список после %d:00; "
+                                          "право: только владелец (id)" % wa_agent.HINT_LIST_HOUR if hints
+                                 else "выкл — «Исправить» как раньше"))
     line("напоминание (%s): %s" % (F_FOLLOW, ("вкл — 15 мин тишины после нашего: черновик-напоминание, "
                                               "не больше %d на беседу" % wa_agent.FOLLOW_MAX) if follow
                                    else "выкл — притихших не ищем"))
@@ -217,7 +233,7 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     line(model_line(model))                     # модель, уровень и предел (WAOPUSHIGHC0510); ключей нет
     core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                          log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
-                         followup=follow)
+                         followup=follow, hints=hints)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
     # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210); порог и тихие часы — настройки
@@ -280,6 +296,7 @@ def summary(core, tg, words, stats):
                " · тревог ожидания %s" % _pairs(watch.counts()) if watch is not None else "")
             + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else "")
             + (" · напоминаний %s" % _pairs(core.follow_counts()) if getattr(core, "followup", False) else "")
+            + (" · пояснений %s" % _pairs(core.hint_counts()) if getattr(core, "hints", False) else "")
             + (" · %s" % spend_words(spend) if isinstance(spend, dict) else "")
             + cards_words(core))
 
@@ -336,6 +353,8 @@ def main():
         import wa_agent_model
         # WA_AGENT_TOOLS выкл — вызов той же формы, что в 9c4aac6 (без ключа tools)
         more = {"tools": True} if wa_agent_tg.flag_on(os.environ.get(F_TOOLS)) else {}
+        if wa_agent_tg.flag_on(os.environ.get(F_HINTS)):
+            more["hints"] = True              # WA_AGENT_HINTS (NIGHT0710-B2): выкл — вызов прежней формы
         model, why = make_model(env, lessons=wa_agent_tg.flag_on(os.environ.get(F_LESSONS)),
                                 book=wa_agent_tg.flag_on(os.environ.get(F_BOOK)),
                                 cache=wa_agent_model.cache_ttl_of(os.environ.get(F_CACHE)), **more)

@@ -68,6 +68,8 @@ D_DELIVERED, D_ACCEPTED, D_UNKNOWN = "delivered", "accepted", "unknown"
 
 W_NO_CHECK = ("устарело: черновик без сверки — при WA_AGENT_ATTACH не уходит; ничего не отправлено, "
               "черновик пересобирается")
+W_HINT_NO_CHECK = ("не принято: при сверке вложений (WA_AGENT_ATTACH) версия по пояснению сверку не проходит — "
+                   "поправьте полным текстом реплаем на карточку")
 W_TEXT_NOT = "текст не ушёл — дверь PDF не звали"
 W_TEXT_UNSURE = "текст: неизвестно — PDF не шлём, файл без текста не уходит"
 W_RISK = ("доставка PDF статусами провайдера не подтверждена — повтор может дать клиенту ВТОРОЙ такой же PDF; "
@@ -404,16 +406,20 @@ class AttachCore(A.Core):
 
     # ── нажатие ───────────────────────────────────────────────────────────────────────────
 
-    def press(self, draft_id, ver, action, who, now=None):
+    def press(self, draft_id, ver, action, who, now=None, who_id=None):
+        # who_id — id нажавшего (NIGHT0710-B2): пробрасывается ядру, иначе руки уронили бы нажатие TypeError'ом молча
         if not self.attach:
-            return super().press(draft_id, ver, action, who, now)
+            return super().press(draft_id, ver, action, who, now, who_id=who_id)
         now = self.clock() if now is None else now
         if action == ACT_REBUILD:
             return self.rebuild(draft_id, ver, who, now)
         if action in (ACT_PDF, ACT_PDF_RISK):
             return self.press_pdf(draft_id, ver, who, now, permit=action == ACT_PDF_RISK)
         # напоминание (WAFOLLOWUP0210) сверкой Т4а не строится никогда — замок «без сверки» его не касается
-        if action == A.ACT_SEND and self._attach(draft_id) is None and self.draft_kind(draft_id) != A.KIND_FOLLOW:
+        # A15 (NIGHT0710-B2, круг 2): строка attach ключуется черновиком, а версию по пояснению модель пишет без
+        # сверки Т4а — такая версия идёт под тот же замок «без сверки», что и черновик без строки attach
+        unchecked = self._attach(draft_id) is None or self.hint_of(draft_id, int(ver)) is not None
+        if action == A.ACT_SEND and unchecked and self.draft_kind(draft_id) != A.KIND_FOLLOW:
             n = self.db.execute("UPDATE drafts SET state=?, reason=?, closed_at=? WHERE id=? AND state=? AND ver=?",
                                 (A.STALE, W_NO_CHECK, now, draft_id, A.PENDING, int(ver))).rowcount
             if n != 1:
@@ -421,7 +427,14 @@ class AttachCore(A.Core):
             self.log("черновик %d → stale: без сверки при WA_AGENT_ATTACH" % draft_id)
             self._done(draft_id, W_NO_CHECK, now)
             return {"ok": False, "state": A.STALE, "words": W_NO_CHECK}
-        return super().press(draft_id, ver, action, who, now)
+        return super().press(draft_id, ver, action, who, now, who_id=who_id)
+
+    def hint(self, draft_id, ver, text, who, who_id=None, msg_id=None, now=None):
+        """A15 (NIGHT0710-B2, круг 2): при WA_AGENT_ATTACH версия по пояснению сверку Т4а не проходит — пояснение
+        не принимается словами сразу, а не после вызова модели и устаревания на «Отправить»."""
+        if self.attach:
+            return {"ok": False, "words": W_HINT_NO_CHECK}
+        return super().hint(draft_id, ver, text, who, who_id=who_id, msg_id=msg_id, now=now)
 
     def rebuild(self, draft_id, ver, who, now=None):
         """«Пересобрать со сверкой»: ждущий черновик superseded тем же захватом, новый проход Т4а → новый черновик."""
