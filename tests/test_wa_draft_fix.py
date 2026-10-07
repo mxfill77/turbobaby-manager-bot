@@ -216,10 +216,13 @@ def test_hm_phuket_unit():
 
 
 _TIME_CALLS = {"strftime", "gmtime", "localtime", "ctime", "asctime", "fromtimestamp", "utcfromtimestamp"}
-SITES = {"wa_agent": 20, "wa_agent_tg": 3, "wa_watch": 1}   # WADRAFTSAFE0210: +2 ядра — «снят до срока … ЧЧ:ММ»
+SITES = {"wa_agent": 23, "wa_agent_tg": 3, "wa_watch": 1}   # WADRAFTSAFE0210: +2 ядра — «снят до срока … ЧЧ:ММ»
 # WAMIRROR0410: +1 ядра — время строки показа ушедшего агентом (`show_line`), та же одна функция
 # NIGHT0710-B2: +2 ядра — «отклонено … ЧЧ:ММ» (`_lesson_decided`) и решение по правилу из пояснения
 # (`_hint_decide`); +1 рук — время строки суточного списка владельцу (`_hint_list_render`), та же одна функция
+# NIGHT0710-B3g: +3 ядра — шаблон после 24 часов: «окно закрыто — нажал …, ЧЧ:ММ» (`_send_closed`), исход шаблона
+# на карточке (`press_template`), «шаблон уже ушёл: кто, ЧЧ:ММ» (`_tpl_decided`) — та же одна функция
+# INTEG0710: обе ветки вместе — ядро 18 + 2 (Б2) + 3 (Б3г) = 23, руки 2 + 1 (Б2) = 3
 
 
 def _scan(mod):

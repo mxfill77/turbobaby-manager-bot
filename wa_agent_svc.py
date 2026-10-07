@@ -36,6 +36,9 @@
                     на даты» или «когда кончается аренда» адаптер кодом до модели читает снимок `clients`+`fleet` моста
                     (GET, в памяти 10 мин) и даёт факт с возрастом; нет факта — «нужен человек». Выключен — таблица
                     броней не читается, промпт прежний. Работает только с черновиками.
+  WA_AGENT_TEMPLATES — шаблон после 24 часов (NIGHT0710-B3g): окно клиента закрыто — «✅ Отправить» отвечает словами
+                    ДО захвата, карточка предлагает «📨 Отправить шаблоном» (reply_request ru/en, одобренный у Meta —
+                    по ответу провайдера); проверяет и дверь (`wa_send.templates_enabled`). Выключен — как раньше.
   WA_AGENT_CACHE — кэш промпта (WAAGENTCACHE0210, `wa_agent_model`): «1h»/«5m» — срок, 1/true/yes/on — «1h»; инструкция
                     и снимки узлов знаний без возраста идут впереди одним префиксом с отметкой кэша, остальное — после.
                     Выключен (пусто или иное значение) — запрос модели прежний. Цена вызова по usage пишется всегда:
@@ -97,6 +100,7 @@ F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чте�
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
 F_ATTACH = "WA_AGENT_ATTACH"              # PDF договора второй частью «Отправить» (NIGHT0710-B3v); не в FLAGS
+F_TEMPLATES = wa_send.TEMPLATES_FLAG      # шаблон после 24 часов (NIGHT0710-B3g): одно имя у ядра и двери
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
 PRESS_BRIDGE_SEC = 60                     # бюджет плеч моста на ОДИН вызов двери договоров при нажатии (= карточки «Инфо»)
@@ -126,11 +130,12 @@ class SendDoor(wa_agent.Door):
     """Дверь текста: `wa_send.send_text` с очередью службы (окно 24 ч, ключ, три исхода — там).
     `is_open` — ручка WA_SEND тем же правилом, что у двери (`wa_send.send_enabled`)."""
 
-    def __init__(self, queue_path, environ=None, send=None, send_media=None):
+    def __init__(self, queue_path, environ=None, send=None, send_media=None, send_template=None):
         self.queue_path = queue_path
         self.environ = environ if environ is not None else os.environ
         self.send = send or wa_send.send_text
         self.media = send_media or wa_send.send_media
+        self.tpl = send_template or wa_send.send_template
 
     def is_open(self):
         return wa_send.send_enabled(self.environ)
@@ -145,6 +150,22 @@ class SendDoor(wa_agent.Door):
         if not self.is_open():
             return {"outcome": wa_send.NOT_SENT, "reason": DOOR_OFF_WORDS, "wamid": None}
         return self.media(to, media, db_path=self.queue_path)
+
+    def window(self, number, now=None):
+        """Окно 24 ч клиента правилом двери (NIGHT0710-B3g): `wa_send.last_inbound_ts` по очереди службы →
+        `window_state`. Очередь не прочитана — unknown, а не «закрыто»."""
+        scan = wa_send.last_inbound_ts(number, self.queue_path)
+        if not scan.ok:
+            return {"state": wa_send.WINDOW_UNKNOWN, "age": None}
+        state, info = wa_send.window_state(scan.payload, time.time() if now is None else now)
+        return {"state": state, "age": info.get("age")}
+
+    def send_template(self, to, name, lang, params):
+        """Шаблон (NIGHT0710-B3g): `wa_send.send_template` — WA_SEND, WA_AGENT_TEMPLATES, белый список, одобрение по
+        ответу провайдера, три исхода — там."""
+        if not self.is_open():
+            return {"outcome": wa_send.NOT_SENT, "reason": DOOR_OFF_WORDS, "wamid": None}
+        return self.tpl(to, name, lang, params, env=self.environ)
 
 
 class NoModel(wa_agent.Model):
@@ -283,6 +304,11 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     line("кэш промпта (%s): %s" % (F_CACHE, "вкл, срок %s — инструкция и узлы знаний впереди с отметкой кэша" % ttl
                                    if ttl else "выкл — запрос модели как раньше"))
     line(model_line(model))                     # модель, уровень и предел (WAOPUSHIGHC0510); ключей нет
+    # шаблон после 24 часов (NIGHT0710-B3g): тем же правилом; ту же ручку проверяет и дверь
+    templates = wa_agent_tg.flag_on(environ.get(F_TEMPLATES))
+    line("шаблоны (%s): %s" % (F_TEMPLATES, "вкл — окно 24 ч закрыто: «✅ Отправить» отвечает словами, на карточке "
+                               "«📨 Отправить шаблоном» (одобренный у Meta, ru/en)" if templates
+                               else "выкл — вне окна только отказ двери, как раньше"))
     # PDF клиенту (NIGHT0710-B3v): флаг не запрошен — ни строки, ни импорта; не засчитан — прежнее ядро и слова
     attach, doors, attach_words = attach_of(environ, drafts, model)
     if attach_words:
@@ -291,11 +317,12 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
         import wa_agent_attach
         core = wa_agent_attach.AttachCore(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                                           log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons,
-                                          lesson_admins=admins, followup=follow, hints=hints, attach=True, **doors)
+                                          lesson_admins=admins, followup=follow, hints=hints, templates=templates,
+                                          lang_of=wa_agent_tg.K.lang_of, attach=True, **doors)
     else:
         core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                              log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
-                             followup=follow, hints=hints)
+                             followup=follow, hints=hints, templates=templates, lang_of=wa_agent_tg.K.lang_of)
     tg.bind(core)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
     # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210); порог и тихие часы — настройки

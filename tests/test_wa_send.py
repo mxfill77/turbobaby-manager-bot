@@ -331,8 +331,13 @@ ok("import wa_send" not in src and "from wa_send" not in src,
 send_src = open(os.path.join(REPO, "wa_send.py"), encoding="utf-8").read()
 ok(send_src.count("urlopen") == 1,
    "выход в сеть РОВНО один (_post) — иначе подмена транспорта не гарантировала бы тишины")
-ok("template" not in send_src.lower(),
-   "шаблонов Meta дверь не умеет вовсе — вне окна отказ, а не обход правила")
+# NIGHT0710-B3g: прежний замок «слова template в двери нет вовсе» снят решением владельца 02.10 (WATEMPLATES0210):
+# дверь шлёт ровно три названных шаблона и только под своей ручкой. Замок теперь — список ровно из трёх и ручка
+# выключена по умолчанию; текст, реакция и медиа вне окна по-прежнему отказывают (секция (7) выше).
+ok(sorted(S.TEMPLATE_PARAMS) == ["payment_reminder", "rental_end_reminder", "reply_request"],
+   "шаблонов Meta дверь знает РОВНО три (решение владельца 02.10) — прочего вне окна не шлёт")
+ok(S.templates_enabled({}) is False and S.templates_enabled({"WA_SEND": "1"}) is False,
+   "ручка шаблонов WA_AGENT_TEMPLATES закрыта по умолчанию и WA_SEND её не открывает")
 
 import wa_webhook as W
 ok(getattr(W, "send_text", None) is None, "у приёмника нет отправляющей функции")
