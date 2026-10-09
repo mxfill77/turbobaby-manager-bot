@@ -215,7 +215,9 @@ def c_model_args_foreign_run(T):
                        {"tool": "contract_pdf", "args": {"file_id": PDF_B}}, final("Ваш договор во вложении.")),
                 "S", "U", doors, number=NUM_NINA, clock=Clock())
     res = out["results"]
-    assert seen == [{"phone": "0812345678"}], seen                    # аргументы модели дошли до двери как есть
+    # K3-FIX3 п.1 (real judge_cases §4.1): поиск ставит код в контексте обращения — чужой номер модели даёт CONFLICT ДО
+    # двери, чужой реестр не читается (было: аргументы модели доходили до двери как есть)
+    assert seen == [], seen
     assert [r["outcome"] for r in res] == [T.CONFLICT, T.REFUSED], [(r["outcome"], r["reason"]) for r in res]
     words, _ = T.judge("Ваш договор во вложении.", None, res, out["journal"])
     assert T.CONTRACT_WORDS in words, words
@@ -301,8 +303,9 @@ MUTANTS = [
     ("день конца включительно", "cd <= de.isoformat():", "cd < de.isoformat():"),
     ("PDF только принятого договора",
      '    if not resp.get("id") or resp.get("id") not in set(allowed or ()):\n', "    if False:\n"),
-    ("номер — кодом, не аргументом модели", 'number=ctx.get("number") or ""',
-     'number=(args or {}).get("phone") or ctx.get("number") or ""'),
+    # K3-FIX3 п.1: правило живёт в фильтре поиска (`contract_query`) — чужой номер модели до двери не доходит
+    ("номер — кодом, не аргументом модели",
+     "    if phone and (last9(phone) != key or phone_country_clash(phone, number)):\n", "    if False:\n"),
     ("сверка передаёт контекст привязки", "        res = call_tool(tool, args, doors, clock, ctx)\n",
      "        res = call_tool(tool, args, doors, clock)\n"),
     ("конфликт договора виден человеку", '        if r["outcome"] == CONFLICT:\n', "        if False:\n"),

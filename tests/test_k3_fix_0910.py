@@ -155,7 +155,8 @@ def test_f5_control_fresh_snapshot_fact():
     """КОНТРОЛЬ (зелёный и до ремонта): снимок моложе предела — FACT, как было; узел без предела — FACT, как было."""
     for node in (_node(60), _node(7200, max_stale=None)):
         r = T.rules_result(node, at=AT)
-        assert r["outcome"] == T.FACT and r["version"] == "26 симв.", r
+        # K3-FIX3 п.4 (F2_CONTRACT §1.2): длина текста — не версия источника; она в факте `len`, поле `version` пусто
+        assert r["outcome"] == T.FACT and not r["version"] and r["facts"][0]["len"] == 26, r
 
 
 def test_f5_through_knowledge_and_door():

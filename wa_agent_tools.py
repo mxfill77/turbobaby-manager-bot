@@ -12,7 +12,8 @@
   contract_pdf — метаданные подписанного PDF (`contract_pdf`; содержимое отбрасывается — отправка PDF это Т4б);
   delivery — Delivery: двери нет, исход всегда «неизвестно»;  rules — правила (узел мозга business_rules).
 
-Ответ каждого инструмента: tool · outcome · source · ref · at (время чтения) · version · window · reason · facts.
+Ответ каждого инструмента: tool · outcome · source · ref · at (начало нашего запроса) · read_at (время данных; у
+снимков — время снимка) · source_version (+ source_version_basis) · version (мёртвое, пусто) · window · reason · facts.
 Фактом считается ТОЛЬКО outcome == FACT. Отказ, таймаут, пусто, отменено, неоднозначно, неизвестно и неполная
 выборка — не факт: они идут в журнал отказов, суждения на них не строятся.
 
@@ -55,6 +56,14 @@ calc и pay_confirmed видят только отсеянное. Оплата �
 (модели и дверей, включая аренду, которую код читает сам) после t0 + MAX_SEC − FALLBACK_SEC; остаток — запасному
 обычному вызову. Запасной вызов начинается только до дедлайна; после дедлайна вызовов нет — черновика нет, служба
 повторит (`MODEL_RETRY_SEC`). Уже идущий синхронный вызов этот код не обрывает — его держит собственный таймаут двери.
+
+K3-FIX шаг 3 (09–10.10.2026): договор ищется в ДОВЕРЕННОМ контексте обращения (`contract_query`: номер обращения и
+срок аренды подставляет код; чужой или противоречивый фильтр модели — CONFLICT с причиной, реестр не читается, привязка
+не подменяется; в сроке нет — тот же номер без срока только НАЗЫВАЕТ договор другой аренды, `_other_term`; тождество
+запроса — запрос кода); сдача — детерминированно кодом (`change_of`, блок «РАСЧЁТ КОДА»), слова клиента оплатой не становятся;
+утвердительные формы оплаты («вижу оплату», «оплата отражена», «с оплатой всё в порядке») ловит то же определение
+`_PAY_CLAIM`, отрицание и обещание проверки — нет; поле `version` больше не пишется: версия — только `source_version` от
+источника (сегодня null, «источник версии не отдаёт»), время данных — `read_at` (у снимков — время СНИМКА).
 """
 
 import json
@@ -109,9 +118,19 @@ def role_of(item):
     return R_OTHER
 
 
-def result(tool, outcome, source="", ref="", at=None, version="", window="", reason="", facts=None):
+SV_BASIS = "источник версии не отдаёт"     # K3-FIX3 (F2_CONTRACT §0.1, §1.1): ни одна дверь сегодня версию данных не выдаёт
+_AT = object()                              # read_at не передан — время данных = `at` (прямые двери: часы до вызова двери)
+
+
+def result(tool, outcome, source="", ref="", at=None, version="", window="", reason="", facts=None, read_at=_AT):
+    """Ответ инструмента. K3-FIX3 (F2-честность): `version` — мёртвое поле, код его больше не заполняет (заполнители
+    `signed_at`/«N симв.» версией источника не являются, F2_CONTRACT §0.3, §1.5); версия — ТОЛЬКО `source_version`,
+    выданная источником по явному контракту двери (сегодня такой нет ни у одной двери: null + `source_version_basis`);
+    `read_at` — время ДАННЫХ: у прямых дверей = `at`, у снимочных (rental, rules) — время СНИМКА или None (неизвестно;
+    время вызова старый снимок свежим не делает). `at` по-прежнему — начало НАШЕГО запроса (порядок и свежесть `sift`)."""
     return {"tool": tool, "outcome": outcome, "source": source, "ref": ref, "at": at, "version": version,
-            "window": window, "reason": reason, "facts": list(facts or [])}
+            "window": window, "reason": reason, "facts": list(facts or []),
+            "source_version": None, "source_version_basis": SV_BASIS, "read_at": at if read_at is _AT else read_at}
 
 
 # ------------------------------- разбор ответов дверей -------------------------------
@@ -251,7 +270,8 @@ def bind_contract(fact, resp, number, rental, ref="", at=None):
     # rent_currency (K3-FIX F3): валюта аренды, к которой код привязал договор — опора `pay_verdict`, когда строки листа
     # среди фактов нет; в `_fact_ref` ключа нет — модели и журналу договор показывается прежним
     bound = dict(fact, booking_id=rent.get("booking_id"), bound_by=by, rent_currency=rent.get("currency"))
-    return result("contract", FACT, src, ref, at, version=str(fact.get("signed_at") or ""),
+    # K3-FIX3 (F2): `signed_at` — время подписи, а не версия источника; он лежит в факте, поле `version` не пишется
+    return result("contract", FACT, src, ref, at,
                   window="%s…%s" % (ds.isoformat(), de.isoformat()),
                   reason="привязан: номер по полю «%s», байк %s, дата %s в сроке аренды" % (by, pc, cd), facts=[bound])
 
@@ -308,26 +328,42 @@ def pdf_result(resp, at=None, allowed=()):
         "sha256": resp.get("sha256"), "row": resp.get("row")}])
 
 
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def snap_time(resp):
+    """K3-FIX3 (F2): время СНИМКА, которое снимочная дверь передала зарезервированным ключом `_taken_at` → эпоха | None.
+    Не передано — None («неизвестно»), а не время вызова: свежий вызов старый снимок свежим не делает."""
+    t = resp.get("_taken_at") if isinstance(resp, dict) else None
+    return float(t) if _num(t) and t > 0 else None
+
+
 def rental_result(resp, at=None):
     src = "снимок броней (лист «клиенты»)"
+    taken = snap_time(resp)                          # K3-FIX3 (F2): время факта аренды — время снимка, а не вызова
     if not (isinstance(resp, dict) and resp.get("ok")):
-        return _refusal("rental", resp, src, at)
+        return dict(_refusal("rental", resp, src, at), read_at=taken)
     rows = [r for r in resp.get("rows") or [] if isinstance(r, dict)]
     live = [r for r in rows if not _CANCEL.search(str(r.get("status") or ""))]
     if rows and not live:
-        return result("rental", CANCELLED, src, at=at, reason="аренды по номеру отменены")
+        return result("rental", CANCELLED, src, at=at, reason="аренды по номеру отменены", read_at=taken)
     if not live:
         return result("rental", EMPTY, src, at=at,
-                      reason="по номеру аренда не найдена — это «не знаю», а не «аренды нет»")
+                      reason="по номеру аренда не найдена — это «не знаю», а не «аренды нет»", read_at=taken)
     if len(live) > 1:
-        return result("rental", AMBIGUOUS, src, at=at, reason="аренд по номеру %d — выбрать нельзя" % len(live))
+        return result("rental", AMBIGUOUS, src, at=at, reason="аренд по номеру %d — выбрать нельзя" % len(live),
+                      read_at=taken)
     r = live[0]
     return result("rental", FACT, src, ref=str(r.get("booking_id") or r.get("bike") or ""), at=at,
                   window="%s…%s" % (r.get("date_start") or "?", r.get("date_end") or "?"), facts=[{
                       "kind": "rental", "booking_id": r.get("booking_id"), "bike": r.get("bike"),
                       "date_start": r.get("date_start"), "date_end": r.get("date_end"), "status": r.get("status"),
                       "price": r.get("price") if isinstance(r.get("price"), (int, float)) else None,
-                      "currency": str(r.get("currency") or "THB").upper()}])
+                      # K3-FIX3 п.2: итог аренды по листу «клиенты» (колонка J «к оплате», ReadClients.js:48, 106) —
+                      # опора расчёта сдачи (`change_of`); в `_fact_ref` ключа нет — модели и журналу факт прежний
+                      "to_pay": r.get("to_pay") if _num(r.get("to_pay")) else None,
+                      "currency": str(r.get("currency") or "THB").upper()}], read_at=taken)
 
 
 def history_result(items, at=None):
@@ -344,16 +380,18 @@ def history_result(items, at=None):
 def rules_result(node, at=None):
     src = "мозг business_rules"
     if not isinstance(node, dict) or not node.get("read") or not node.get("text"):
-        return result("rules", REFUSED, src, at=at, reason="узел не прочитан")
+        return result("rules", REFUSED, src, at=at, reason="узел не прочитан", read_at=None)
+    taken = node.get("taken_at") if _num(node.get("taken_at")) else None   # K3-FIX3 (F2): время СНИМКА узла
     if K.node_stale(node, at):
         # K3-FIX F5: снимок старше своего предела — тот же признак, по которому промпт уже говорит НЕИЗВЕСТНО
         # (`K.node_block`): FACT со временем «сейчас» подал бы устаревшее модели как свежее
         age = K.node_age(node, at)
         return result("rules", UNKNOWN, src, ref="business_rules", at=at,
                       reason="снимок правил устарел: снят %d мин назад, предел %d мин — НЕИЗВЕСТНО, не факт"
-                      % (int((age or 0) // 60), int(node["max_stale"]) // 60))
+                      % (int((age or 0) // 60), int(node["max_stale"]) // 60), read_at=taken)
     text = str(node["text"])
-    return result("rules", FACT, src, ref="business_rules", at=at, version="%d симв." % len(text), facts=[{
+    # K3-FIX3 (F2): длина текста — не версия источника (тексты одной длины совпадут); она в факте `len`
+    return result("rules", FACT, src, ref="business_rules", at=at, read_at=taken, facts=[{
         "kind": "rules", "len": len(text), "rule_0310": "03.10.2026-1" in text}])
 
 
@@ -384,10 +422,91 @@ def request_key(tool, args):
     return "%s %s" % (tool, json.dumps(norm, ensure_ascii=False))
 
 
+def _rent_one(rental):
+    """Аренда обращения, которую код прочитал сам: ровно одна строка FACT → её факт | None."""
+    if isinstance(rental, dict) and rental.get("outcome") == FACT and len(rental.get("facts") or []) == 1:
+        return rental["facts"][0]
+    return None
+
+
+def contract_query(args, number, rental):
+    """K3-FIX шаг 3 п.1: поиск договора — в ДОВЕРЕННОМ контексте обращения, а не по догадке модели.
+    → (вход двери `contract_find` | None, причина конфликта | "", слова поиска для ответа).
+
+    Модель выбирает ДЕЙСТВИЕ («договор»), фильтр ставит код: телефон = номер обращения (тот же, по которому договор
+    привязывается в `bind_contract`), срок = дни аренды обращения, которую код читает сам (тот же ключ, что у
+    перечитывания перед отправкой `wa_agent_attach.recheck_of`). Номер байка модели угадывать не нужно. Фильтр
+    модели в поиск НЕ идёт: телефон, байк и период лишь сверяются с привязкой; явный чужой или противоречивый
+    (другой номер по 9 цифрам или по явному коду страны, другой байк, другой период) — конфликт с причиной, реестр
+    не читается, привязка не подменяется. Имя модели проверить кодом нечем — в поиск не идёт. Номера обращения нет —
+    поиска нет (без связи с клиентом реестр не читаем)."""
+    key = last9(number)
+    if not key:
+        return None, "", "номер обращения не назван"
+    q = {"phone": str(number)}
+    rent = _rent_one(rental)
+    ds = B.day_of(rent.get("date_start")) if rent else None
+    de = B.day_of(rent.get("date_end")) if rent else None
+    if ds is not None and de is not None:
+        q["date_from"], q["date_to"] = ds.isoformat(), de.isoformat()
+    words = "поиск привязан кодом: номер обращения %s, %s" % (
+        _tail(key), ("срок аренды %s…%s" % (q["date_from"], q["date_to"])) if "date_from" in q
+        else "срок аренды неизвестен")
+    a = args if isinstance(args, dict) else {}
+    other, clash = [], []
+    phone = str(a.get("phone") or "").strip()
+    if phone and (last9(phone) != key or phone_country_clash(phone, number)):
+        other.append("телефон %s, обращение %s" % (_tail(last9(phone) or re.sub(r"\D", "", phone)), _tail(key)))
+    bike = str(a.get("bike") or "").strip()
+    if bike and rent:
+        pm, pr = plate_of(bike), plate_of(rent.get("bike"))
+        if pm and pr and pm != pr:
+            clash.append("байк %s, байк аренды %s" % (pm, pr))
+    for k in ("date_from", "date_to"):
+        v = str(a.get(k) or "").strip()
+        if v and k in q and (B.day_of(v) is None or B.day_of(v).isoformat() != q[k]):
+            clash.append("%s %s, срок аренды %s…%s" % (k, v[:20], q["date_from"], q["date_to"]))
+    if other:
+        return None, ("договор другого номера: фильтр модели — %s; чужой реестр не читаю, привязку к обращению не "
+                      "подменяю" % "; ".join(other + clash)), words
+    if clash:
+        return None, ("договор другой аренды: фильтр модели — %s; поиск вне аренды обращения не делаю, привязку не "
+                      "подменяю" % "; ".join(clash)), words
+    return q, "", words
+
+
+def _other_term(empty, door, q, at, number, rental):
+    """K3-FIX3 п.1 (K07): в сроке аренды обращения подписанного договора нет (`empty` — EMPTY поиска со сроком). Тот же
+    номер обращения БЕЗ срока — только чтобы НАЗВАТЬ договор другой аренды, а не принять его: `one` привязывает код
+    (`bind_contract` → CONFLICT «дата договора вне срока аренды»), подписанных несколько → CONFLICT. Фактом второй поиск
+    не становится никогда: FACT здесь — противоречие двери (в сроке не нашла, без срока нашла договор в сроке) →
+    UNKNOWN. Не найдено, отказ, таймаут второго поиска — прежнее EMPTY поиска в сроке."""
+    try:
+        raw = door(phone=q["phone"])
+    except Exception:                                               # noqa: BLE001 — второй поиск — не опора
+        return empty
+    if not (isinstance(raw, dict) and raw.get("ok")):
+        return empty
+    wide = contract_result(raw, at, number=number, rental=rental)
+    if wide["outcome"] == EMPTY:
+        return empty
+    head = "в сроке аренды %s…%s подписанного договора нет; без срока по номеру обращения: " % (
+        q.get("date_from"), q.get("date_to"))
+    if wide["outcome"] == FACT:
+        return result("contract", UNKNOWN, wide["source"], wide["ref"], at,
+                      reason=head + "найден договор В сроке — ответы двери противоречат друг другу, не факт")
+    if wide["outcome"] == AMBIGUOUS:
+        return result("contract", CONFLICT, wide["source"], wide["ref"], at,
+                      reason=head + "подписанных несколько — договор другой аренды, не прикладываю")
+    return dict(wide, reason=head + wide["reason"])
+
+
 def call_tool(tool, args, doors, clock=time.time, ctx=None):
-    """Имя + вход → результат по контракту, с тождеством запроса `req` (AGENTDEDUP0410)."""
+    """Имя + вход → результат по контракту, с тождеством запроса `req` (AGENTDEDUP0410). K3-FIX3: у договора
+    тождество — запрос, который код ПОСЛАЛ в дверь (`_read` кладёт его в `req`), а не аргументы модели: два вызова
+    с разными словами модели и одним запросом двери — один запрос для `sift`."""
     res = _read(tool, args, doors, clock, ctx)
-    res["req"] = request_key(tool, args)
+    res.setdefault("req", request_key(tool, args))
     return res
 
 
@@ -401,18 +520,40 @@ def _read(tool, args, doors, clock=time.time, ctx=None):
         return result(tool, REFUSED, at=at, reason="неизвестный инструмент")
     if tool == "delivery" or door is None:
         return result(tool, UNKNOWN, at=at, reason="двери %s нет — неизвестно" % tool)
+    ctx = ctx or {}
+    call_args, words, sent = args or {}, "", {}
+    if tool == "contract":                       # K3-FIX3 п.1: поиск — в доверенном контексте обращения
+        rental = ctx["rental"]() if callable(ctx.get("rental")) else None
+        call_args, clash, words = contract_query(args, ctx.get("number"), rental)
+        src = "реестр подписей TB e-Sign (contract_find)"
+        if clash:
+            return dict(result("contract", CONFLICT, src, at=at, reason=clash), query=words)
+        if call_args is None:
+            return result("contract", UNKNOWN, src, at=at,
+                          reason="номер обращения не назван — договор не к чему привязать, реестр не читаю")
+        # тождество запроса — то, что код послал в дверь (срок аренды; номер обращения в сверке один — без него)
+        sent = {"req": request_key("contract", dict({k: v for k, v in call_args.items() if k != "phone"},
+                                                    bound="code")), "query": words}
     try:
-        raw = door(**(args or {}))
+        raw = door(**call_args)
     except TimeoutError:
-        return result(tool, TIMEOUT, at=at, reason="таймаут двери")
+        return dict(result(tool, TIMEOUT, at=at, reason="таймаут двери"), **sent)
     except Exception as e:                                          # noqa: BLE001
         if "timeout" in type(e).__name__.lower():
-            return result(tool, TIMEOUT, at=at, reason="таймаут двери")
-        return result(tool, REFUSED, at=at, reason="дверь упала: %s" % type(e).__name__)
-    ctx = ctx or {}
+            return dict(result(tool, TIMEOUT, at=at, reason="таймаут двери"), **sent)
+        return dict(result(tool, REFUSED, at=at, reason="дверь упала: %s" % type(e).__name__), **sent)
     if tool == "contract":
-        rental = ctx["rental"]() if callable(ctx.get("rental")) else None
-        return contract_result(raw, at, number=ctx.get("number") or "", rental=rental)
+        res = contract_result(raw, at, number=ctx.get("number") or "", rental=rental)
+        if res["outcome"] == EMPTY and "date_from" in call_args:    # K07: договор другой аренды — назвать, не принять
+            more = ctx.get("may_call")
+            if callable(more) and not more():   # второй поиск — тоже вызов двери: после предела сверки его нет
+                res["reason"] += "; договор другой аренды не искали — предел сверки"
+            else:
+                res = _other_term(res, door, call_args, at, ctx.get("number") or "", rental)
+        res.update(sent)                         # слова поиска — ответу и журналу (только хвост номера)
+        if res["outcome"] != FACT:
+            res["reason"] = "%s (%s)" % (res["reason"], words)
+        return res
     if tool == "contract_pdf":
         allowed = {f.get("pdf_id") for f in accepted(ctx.get("results") or []) if f.get("kind") == "contract"}
         return pdf_result(raw, at, allowed={a for a in allowed if a})
@@ -432,7 +573,8 @@ def bind_ctx(number, doors, results, clock=time.time, may_call=None):
                 return result("rental", TIMEOUT, at=clock(), reason="предел сверки — аренда не прочитана")
             memo["r"] = call_tool("rental", {}, doors, clock)
         return memo["r"]
-    return {"number": number, "rental": rental, "results": results}
+    # may_call — и второму поиску договора (K07 вне срока, K3-FIX3): после предела сверки вызовов дверей нет
+    return {"number": number, "rental": rental, "results": results, "may_call": may_call}
 
 
 # ------------------------------- код считает -------------------------------
@@ -634,7 +776,113 @@ def known_amounts(price, facts, figures):
                 out.add(abs(int(round(f[k]))))
     for v in list(figures["sums"].values()) + [d["value"] for d in figures["diffs"]]:
         out.add(abs(int(round(v))))
+    ch = figures.get("change") if isinstance(figures.get("change"), dict) else {}
+    if ch.get("state") == CHANGE_OK:              # K3-FIX3 п.2: числа расчёта сдачи кодом — опора ответа
+        out.update(abs(int(round(ch[k]))) for k in ("value", "total", "tendered"))
     return out
+
+
+# ------------------------------- сдача (K3-FIX шаг 3 п.2) -------------------------------
+
+CHANGE_OK, CHANGE_NO = "ok", "refused"
+CHANGE_HEAD = "РАСЧЁТ КОДА — сдача (считает код, не ты; другой суммы сдачи не называй):"
+CHANGE_WORDS = "сдача посчитана со слов клиента о переданных наличных — сумму подтверждает человек"
+_HANDED = re.compile(r"наличн|сдач|отдал|передал|(?<!\w)дал[аи]?(?!\w)|\bcash\b|\bchange\b|\bgave\b|\bhanded\b", re.I)
+
+
+def cash_said(text):
+    """Суммы, которые клиент назвал ПЕРЕДАННЫМИ наличными: числа в батах из его предложений о передаче денег или сдаче
+    (`K.thb_amounts`; голое число без валюты суммой не считается). Это СЛОВА клиента: фактом оплаты они не становятся
+    (в факты, `pay_verdict` и `pay_backing` не идут) — по ним код лишь считает сдачу при оплате, подтверждённой кассой."""
+    out = []
+    for sent in K._SENTENCE.split(str(text or "")):
+        if _HANDED.search(sent):
+            for v in K.thb_amounts(sent):
+                if v > 0 and v not in out:
+                    out.append(v)
+    return out
+
+
+def change_of(facts, handed=()):
+    """Сдача кодом (K3-FIX шаг 3 п.2) → None (клиент не называл переданных наличных — сдачи в разговоре нет) |
+    {state: ok, value, currency, total, tendered, paid, booking_id, basis} | {state: refused, why}.
+
+    Только ПРОВЕРЕННЫЕ деньги одной аренды и одной валюты: аренда обращения одна (`rental_of`), её валюта известна
+    (`rent_currency`), её итог назван листом «клиенты» (`to_pay` строки аренды), в кассе есть строки оплаты аренды ЭТОЙ
+    аренды (`cash_split` → `cash_of_rental`, роль «оплата аренды»: залог и чужие деньги не складываются) только в её валюте
+    (строка другой валюты этой аренды — отказ: пересчёта нет). Сдача = переданное − итог, когда касса оплатила итог
+    ровно (переданное — слова клиента, кассой НЕ подтверждено: `basis` и `CHANGE_WORDS` это называют), либо оплачено по
+    кассе − итог, когда касса записала больше итога (и клиент назвал ту же сумму). Иначе — отказ с причиной: сдачу код
+    не выдумывает, называет её человек."""
+    said = sorted({int(round(v)) for v in handed or () if _num(v) and v > 0})
+    if not said:
+        return None
+
+    def no(why):
+        return {"state": CHANGE_NO, "why": why, "handed": said}
+    bk = rental_of(facts)
+    if bk is None:
+        return no("аренда обращения не одна или не установлена — сдачу не к чему привязать")
+    cur = rent_currency(facts, bk)
+    if cur is None:
+        return no("валюта аренды %s неизвестна" % bk)
+    totals = {f.get("to_pay") for f in facts if f["kind"] == "rental" and str(f.get("booking_id") or "") == bk
+              and _num(f.get("to_pay")) and f.get("to_pay") > 0}
+    if len(totals) != 1:
+        return no("итог аренды %s листом «клиенты» не назван (или назван по-разному)" % bk)
+    total = totals.pop()
+    mine = [f for f in cash_split(facts)[0] if f["kind"] == "cash" and cash_of_rental(f, bk, facts)
+            and f["role"] == R_RENT]
+    alien = sorted({str(f.get("currency")) for f in mine if str(f.get("currency") or "").upper() != cur})
+    if alien:
+        return no("в кассе оплата аренды %s и в другой валюте (%s) — пересчёта валют код не делает" % (bk, "/".join(alien)))
+    if not mine:
+        return no("строки оплаты аренды %s в кассе нет — наличные со слов клиента оплатой не являются" % bk)
+    paid = sum(f["amount"] for f in mine)
+    if len(said) != 1:
+        return no("клиент назвал разные суммы переданных наличных (%s) — какая передана, неизвестно"
+                  % ", ".join(str(v) for v in said))
+    t = said[0]
+    if paid < total:
+        return no("по кассе аренда %s оплачена на %s из %s %s — сдачи кодом нет" % (bk, _n(paid), _n(total), cur))
+    if paid > total:
+        if t != int(round(paid)):
+            return no("по кассе оплачено %s %s, клиент называет %s — суммы не совпали" % (_n(paid), cur, t))
+        value, basis = paid - total, "касса: оплачено %s при итоге %s" % (_n(paid), _n(total))
+    elif t < total:
+        return no("клиент назвал %s %s — меньше итога %s; сдачи нет, сумму сверяет человек" % (t, cur, _n(total)))
+    else:
+        value, basis = t - total, ("итог %s оплачен по кассе; переданные %s — со слов клиента, кассой не подтверждены"
+                                   % (_n(total), t))
+    return {"state": CHANGE_OK, "value": value, "currency": cur, "total": total, "tendered": t, "paid": paid,
+            "booking_id": bk, "basis": basis, "handed": said}
+
+
+def _n(v):
+    return str(int(round(v))) if _num(v) and abs(v - round(v)) < 1e-9 else str(v)
+
+
+def change_block(results, handed=()):
+    """Блок «РАСЧЁТ КОДА» для модели (K3-FIX3 п.2): сдачу модель не считает — код подаёт результат или причину, почему
+    его нет. Клиент не называл переданных наличных — блока нет (запрос прежний)."""
+    if not handed:
+        return ""
+    try:
+        ch = change_of(accepted(results), handed)
+    except Exception as e:                                           # noqa: BLE001
+        return CHANGE_HEAD + "\nсдача НЕ посчитана (расчёт упал: %s) — сумму сдачи не называй, передай человеку" % (
+            type(e).__name__)
+    if ch is None:
+        return ""
+    if ch["state"] != CHANGE_OK:
+        return CHANGE_HEAD + "\nсдача НЕ посчитана: %s. Сумму сдачи не называй — передай человеку." % ch["why"]
+    if ch["value"] == 0:
+        return CHANGE_HEAD + "\nаренда %s: итог %s %s оплачен; передано ровно итог — сдачи нет (%s)." % (
+            ch["booking_id"], _n(ch["total"]), ch["currency"], ch["basis"])
+    return CHANGE_HEAD + ("\nаренда %s: итог %s %s, передано %s %s → сдача %s %s (%s). Сдача отдаётся в конце аренды, "
+                          "вместе с возвратом залога; что передано именно %s, подтверждает человек." % (
+                              ch["booking_id"], _n(ch["total"]), ch["currency"], ch["tendered"], ch["currency"],
+                              _n(ch["value"]), ch["currency"], ch["basis"], ch["tendered"]))
 
 
 _MONEY_WORD = re.compile(r"оплат|плат[её]ж|залог|депозит|сдач|возврат|вернём|вернем|сумм|стоимост|цен[аыу]|бат|"
@@ -662,10 +910,54 @@ def money_claims(text, price, known):
     return out
 
 
-_PAY_CLAIM = re.compile(r"оплат\w*\s+(?:\S+\s+){0,3}(?:получен|подтвержд|поступил|прошл|пришл)|"
-                        r"получил[аи]?\s+(?:вашу\s+)?(?:оплату|деньги|перевод)|"
-                        r"payment\s+(?:is\s+|has\s+been\s+)?(?:received|confirmed)|"
-                        r"(?:we\s+)?received\s+(?:your\s+)?(?:payment|money|transfer)|paid\s+in\s+full", re.I)
+# слово окна внутри клаузы: запятая, двоеточие, тире, скобка и конец предложения окно рвут; точка внутри слова
+# (дата «05.10», сумма «2.5») — нет
+_W = r"(?:(?:[^\s,;:.!?—–()]|\.(?=\S))+\s+)"
+_PAY_AFFIRM = re.compile(r"оплат\w*\s+(?:\S+\s+){0,3}(?:получен|подтвержд|поступил|прошл|пришл)|"
+                         r"получил[аи]?\s+(?:вашу\s+)?(?:оплату|деньги|перевод)|"
+                         r"payment\s+(?:is\s+|has\s+been\s+)?(?:received|confirmed)|"
+                         r"(?:we\s+)?received\s+(?:your\s+)?(?:payment|money|transfer)|paid\s+in\s+full|"
+                         # K3-FIX3 N4 (real K15, K02): утвердительные формы — «в кассе вижу оплату…», «оплата … у нас
+                         # отражена», «с оплатой всё в порядке»; окно — внутри клаузы, а не через запятую
+                         r"оплат\w*\s+" + _W + r"{0,10}(?:получен|получил|подтвержд|поступил|прошл|пришл|отражен|"
+                         r"отразил|вижу|видим|видна|видно|в\s+порядке)|"
+                         r"(?:вижу|видим|видна|видно|отражен\w*|отразил\w*|в\s+порядке)\s+" + _W + r"{0,3}оплат|"
+                         r"оплат\w*[^.!?…\n]{0,80}?вс[её]\s+в\s+порядке|"
+                         r"(?:i|we)\s+(?:can\s+)?see\s+" + _W + r"{0,2}payment|"
+                         r"payment\s+" + _W + r"{0,6}(?:reflected|recorded|registered|showing|in\s+order|all\s+good)",
+                         re.I)
+# не утверждение: отрицание и обещание будущей проверки / условие / вопрос В ТОЙ ЖЕ клаузе до конца совпадения
+_PAY_NOT = re.compile(r"(?<!\w)(?:не|нет|ни|no|not|never|cannot)(?!\w)|n't(?!\w)", re.I)
+_PAY_LATER = re.compile(r"(?<!\w)(?:будет|будут|станет|станут|как\s+только|когда|если|ли|проверю|проверим|"
+                        r"проверит|проверят|сверю|сверим|сверит|сверят|уточню|уточним|уточнит|уточнят|подтвердим|"
+                        r"подтвердит|подтвердят|посмотрю|посмотрим|посмотрит|увижу|увидим|will|once|after|when|if|"
+                        r"whether|as\s+soon\s+as|going\s+to|shall|pending)(?!\w)", re.I)
+_PAY_CUT = re.compile(r"[,;:—–(]|\s-\s")
+_PAY_END = re.compile(r"[.!?…\n]")
+
+
+class _PayClaim:
+    """ОДНО определение «текст утверждает, что оплата получена» (K3-FIX3 N4; им живут `money_roles` и `pay_claimed`,
+    т.е. ремонт F3 шага 1 — то же место, не второе). Утверждение — совпадение `_PAY_AFFIRM`, в клаузе которого (от начала
+    клаузы до конца совпадения) нет отрицания и нет будущей проверки, условия или вопроса, а предложение не кончается
+    «?». Отрицание («оплату пока не вижу») и обещание проверки («сверит и подтвердит», «как только отразится») ложного
+    подтверждения не дают — и ложной блокировки тоже. `search` → совпадение | None."""
+
+    def search(self, text):
+        s = str(text or "")
+        for m in _PAY_AFFIRM.finditer(s):
+            head = s[:m.start()]
+            a = max([x.end() for x in _PAY_CUT.finditer(head)] + [x.end() for x in K._SENTENCE.finditer(head)] + [0])
+            clause = s[a:m.end()]
+            end = _PAY_END.search(s, m.end())
+            asked = end is not None and end.group(0) == "?" and not _PAY_CUT.search(s[m.end():end.start()])
+            if _PAY_NOT.search(clause) or _PAY_LATER.search(clause) or asked:
+                continue
+            return m
+        return None
+
+
+_PAY_CLAIM = _PayClaim()
 _DEP_CLAIM = re.compile(r"(?:залог|депозит)\w*\s+(?:\S+\s+){0,3}(?:получен|принят|внес|оплачен)|"
                         r"deposit\s+(?:is\s+|has\s+been\s+)?(?:received|paid)", re.I)
 _REFUND_PROMISE = re.compile(r"\bверн[её]м\b|\bвернут\b|\bвозвратим\b|will\s+(?:refund|return)|"
@@ -759,7 +1051,9 @@ class Journal:
 
     def call(self, i, tool, args, res, sec):
         self.calls.append({"n": i, "tool": tool, "in": masked(args), "source": res["source"], "at": res["at"],
-                           "outcome": res["outcome"], "reason": res["reason"][:200], "sec": round(sec, 2)})
+                           "outcome": res["outcome"], "reason": res["reason"][:200], "sec": round(sec, 2),
+                           # K3-FIX3: время данных (у снимка — время снимка) и поиск, который поставил КОД (договор)
+                           "read_at": res.get("read_at"), "query": res.get("query") or ""})
         if res["outcome"] != FACT:
             self.refusals.append("%s: %s (%s)" % (tool, res["outcome"], res["reason"][:160]))
 
@@ -788,10 +1082,10 @@ def _fact_ref(f):
 TOOLS_BLOCK = """ИНСТРУМЕНТЫ (только чтение). Прежде чем писать о деньгах, оплате, залоге, аренде или договоре — проверь.
 Один ответ = РОВНО один JSON. Вызов инструмента: {"tool": "<имя>", "args": {…}}. Имена и вход:
 history {} — переписка; rental {} — аренда по номеру клиента; cash {"bike": "...", "booking_id": "...", "date_from": "ГГГГ-ММ-ДД", "date_to": "ГГГГ-ММ-ДД"} — касса;
-contract {"phone": "...", "name": "...", "bike": "..."} — подписанный договор; contract_pdf {"file_id": "..."} — метаданные PDF;
+contract {} — подписанный договор ЭТОГО обращения: номер клиента и срок аренды код подставит сам, фильтры не нужны (чужой номер, байк или период — отказ с причиной); contract_pdf {"file_id": "<pdf_id из факта contract>"} — метаданные PDF;
 delivery {} — доставка; rules {} — правила владельца.
 Не больше %d вызовов. Когда хватит — итоговый черновик обычным JSON ответа (text, handoff, lang, why).
-Суммы и разности не считай сам — их посчитает код. Оплату не подтверждай без кассы и договора."""
+Суммы, разности и сдачу не считай сам — их посчитает код (блок «РАСЧЁТ КОДА»). Оплату не подтверждай без кассы и договора."""
 
 
 def parse_turn(raw):
@@ -821,11 +1115,13 @@ def render(results):
 
 
 def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend=None,
-        max_calls=MAX_CALLS, max_sec=MAX_SEC, reserve=FALLBACK_SEC):
+        max_calls=MAX_CALLS, max_sec=MAX_SEC, reserve=FALLBACK_SEC, handed=None):
     """Сверка одного черновика → {state, raw, usage, results, journal, calls, doors, sec, deadline}.
     state: DONE — модель дала итог; OVER — предел вызовов или секунд, итога нет; ABORTED — новое входящее.
     Общий предел (AGENTDEDUP0410): `deadline` = t0 + max_sec на ВСЮ сверку с запасным вызовом; новых вызовов модели и
-    дверей сверка не начинает после deadline − reserve (остаток — запасному вызову вызывающего)."""
+    дверей сверка не начинает после deadline − reserve (остаток — запасному вызову вызывающего). `handed` (K3-FIX3 п.2)
+    — суммы переданных наличных со слов клиента (`cash_said`): к каждому ходу модели код прикладывает свой расчёт сдачи
+    по уже принятым фактам (`change_block`); нет сумм — запрос прежний байт-в-байт."""
     t0 = clock()
     deadline = t0 + max_sec
     stop = deadline - max(0.0, min(reserve, max_sec))
@@ -853,6 +1149,10 @@ def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend
         if n["calls"] >= max_calls or not may_call():
             return out(OVER)
         block = render(results)
+        # K3-FIX3 п.2: расчёт сдачи — кодом, когда касса уже прочитана (до неё отказ «оплаты в кассе нет» был бы ложным)
+        sums = change_block(results, handed) if any(r.get("tool") == "cash" for r in results) else ""
+        if sums:
+            block = (block + "\n\n" + sums) if block else sums
         raw, usage = call(system, head + ("\n\n" + block if block else ""))
         n["calls"] += 1
         if spend is not None:
@@ -871,12 +1171,15 @@ def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend
         jr.call(len(results), tool, args, res, clock() - t1)
 
 
-def judge(text, price, results, jr, since=None):
+def judge(text, price, results, jr, since=None, handed=()):
     """Итоговый текст + исход цены + результаты → [слова причин] и заполненный журнал (факты, конфликты).
     Опора — отсеянное `sift` (AGENTDEDUP0410): каждый факт один раз, последняя версия, без снятых и устаревших
-    (`since` — время последнего входящего клиента)."""
+    (`since` — время последнего входящего клиента). `handed` (K3-FIX3 п.2) — суммы переданных наличных со слов клиента
+    (`cash_said`): сдача кодом (`change_of`) кладётся в `figures["change"]` — её числа опора ответа; сдача по словам
+    клиента, названная текстом, — причина `CHANGE_WORDS` (сумму подтверждает человек)."""
     facts, dropped = sift(results, since)
     figures = calc(facts)
+    figures["change"] = change_of(facts, handed)
     jr.facts = facts
     jr.unbound = [{k: v for k, v in u.items() if k != "why"} for u in figures["unbound"]]
     jr.refusals.extend(d for d in dropped if d not in jr.refusals)
@@ -895,4 +1198,8 @@ def judge(text, price, results, jr, since=None):
                 words.append(CONTRACT_WORDS)
     if jr.conflicts and any(c.startswith("цена аренды") or "расходится" in c for c in jr.conflicts):
         words.append(SUMS_WORDS)
+    ch = figures["change"] or {}
+    if (ch.get("state") == CHANGE_OK and ch.get("value") and int(round(ch["paid"])) != ch["tendered"]
+            and _CHANGE.search(str(text or ""))):
+        words.append(CHANGE_WORDS)                # сдача по словам клиента — эскалация, а не факт
     return words, figures

@@ -1695,13 +1695,17 @@ class ModelAdapter(wa_agent.Model):
         def rental():
             if self.book is None:
                 return {"ok": False, "error": "брони выключены"}
-            rows, _bikes, _age, why = self.book.get(self.clock())
+            now = self.clock()
+            rows, _bikes, age, why = self.book.get(now)
             if rows is None:
                 return {"ok": False, "error": why or "снимок броней не прочитан"}
             digits = re.sub(r"\D", "", str(number or ""))
             key = digits[-B.KEY_DIGITS:] if len(digits) >= B.KEY_DIGITS else None
             hits = [r for r in rows if key and B.is_active(r) and key in B.phone_keys(r.get("contacts"))]
-            return {"ok": True, "rows": hits}
+            out = {"ok": True, "rows": hits}
+            if isinstance(age, (int, float)) and not isinstance(age, bool):
+                out["_taken_at"] = now - age      # K3-FIX3 (F2): время СНИМКА — факт аренды несёт его, а не время вызова
+            return out
 
         def rules():
             return self.knowledge.snap.get("business_rules")
@@ -1720,10 +1724,11 @@ class ModelAdapter(wa_agent.Model):
             system, user, info = self.build(number, upto_id)
         else:                                               # версия по пояснению со сверкой (Д2): блок пояснения
             system, user, info = self.build(number, upto_id, hint=hint)
+        handed = T.cash_said(info.get("question"))         # K3-FIX3 п.2: переданные наличные — СЛОВА клиента
         with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
             out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
                         fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
-                        spend=lambda u: self._spend(u, "сверка:"))
+                        spend=lambda u: self._spend(u, "сверка:"), handed=handed)
         jr = out["journal"]
         if out["state"] == T.ABORTED:
             for line in jr.lines():
@@ -1753,7 +1758,7 @@ class ModelAdapter(wa_agent.Model):
         # процент скидки за срок, названной дверью, — с опорой (WAPRICECTX0410): судья сверки процент судит без
         # исхода цены, поэтому названная дверью скидка снимается из текста до суда; прочее — как было
         said = K.without_known_discount(got["text"], info["price"]) if got else ""
-        words_t, figures = T.judge(said, info["price"], out["results"], jr,
+        words_t, figures = T.judge(said, info["price"], out["results"], jr, handed=handed,
                                    since=info.get("last_in"))
         for line in jr.lines():
             self.log(line)

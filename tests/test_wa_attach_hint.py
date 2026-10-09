@@ -194,7 +194,8 @@ def test_owner_send_checked_hint_version_rule_and_pdf():
     assert ver_text(w) == (2, NEW, A.PENDING), ver_text(w)
     users = [u for _s, u in w.call.calls[n0:]]
     assert len(users) == 4 and all(ASK_MARK in u and TOOLS_HEAD in u for u in users), [u[:60] for u in users]
-    assert w.find.calls[f0:] == [{"phone": NUM}], w.find.calls[f0:]                # реестр прочитан сверкой версии 2
+    # реестр прочитан сверкой версии 2 — запросом КОДА (K3-FIX3 п.1): номер обращения и срок аренды, а не слова модели
+    assert w.find.calls[f0:] == [{"phone": NUM, "date_from": "2026-09-18", "date_to": "2026-09-25"}], w.find.calls[f0:]
     card2 = w.card_text(2)
     assert hint_card_pdf() in card2, card2
     assert "версия 2 по пояснению №1 (%s)" % STAFF_WHO in card2 and NEW in card2, card2
@@ -257,7 +258,10 @@ def test_hint_version_check_is_its_own():
     w.explain()
     assert ver_text(w) == (2, NEW, A.PENDING), (ver_text(w), w.sent()[-1]["text"][:120])
     card2 = w.card_text(2)
-    want = X.W_HINT_CHECK % (2, X.W_HINT_CHECK_NOPDF % "договор не принят сверкой: empty — подписанного нет")
+    # K3-FIX3 п.1: причина отказа называет поиск, который поставил код (хвост номера обращения и срок аренды)
+    want = X.W_HINT_CHECK % (2, X.W_HINT_CHECK_NOPDF % ("договор не принят сверкой: empty — подписанного нет (поиск "
+                                                         "привязан кодом: номер обращения …0009, срок аренды "
+                                                         "2026-09-18…2026-09-25)"))
     assert want in card2, card2
     assert w.core.db.execute("SELECT file_id, ver FROM attach WHERE draft_id=1").fetchone() == (None, 2)
     words = w.send(OWNER)
