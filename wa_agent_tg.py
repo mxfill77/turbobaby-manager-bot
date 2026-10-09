@@ -780,6 +780,12 @@ class Tg(wa_agent.Telegram):
         pdf = pdf(draft_id, ver) if pdf else None
         if pdf:
             notes = pdf + "\n" + notes
+        # опора черновика (K3-FIX F1): факты сверки — источник, время чтения, версия от источника или «неизвестна»; у ядра
+        # без пробы (флаг вложений выкл, прежнее ядро) — None, карточка байт-в-байт прежняя
+        basis = getattr(self.core, "card_basis", None)
+        basis = basis(draft_id, ver) if basis else None
+        if basis:
+            notes = notes + "\n\n" + basis
         texts = card_texts(top, str(text or ""), notes,
                            card_details(hand, link), question=(extra or {}).get("question") or "",
                            trans=card_trans(extra), agent=card_agent(extra))

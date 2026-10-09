@@ -346,7 +346,8 @@ def test_send_two_parts_two_wamids():
     log = w.q("SELECT part, attempt, outcome, wamid FROM part_log WHERE draft_id=1 ORDER BY id")
     assert log == [("text", 1, A.SENT, "wamid.T1"), ("pdf", 1, A.SENT, "wamid.P1")], log
     done = w.edits()[-1]
-    assert "текст: ушёл · PDF: ушёл" in done["text"] and not kb_data(done), done
+    # K3-FIX N1: на карточке у ушедших частей — их wamid
+    assert "текст: ушёл (wamid …wamid.T1) · PDF: ушёл (wamid …wamid.P1)" in done["text"] and not kb_data(done), done
 
 
 def test_pdf_same_client_same_rental():
@@ -441,7 +442,9 @@ def test_restart_mid_pdf_unknown_no_repeat():
     w.core.tick(T0 + 400)
     assert len(w.sends) == 1 and len(w.media) == 1, (w.sends, w.media)
     card = w.edits()[-1]
-    assert "PDF: неизвестно" in card["text"] and kb_data(card) == ["wa:pdf:1:1", "wa:pdf_risk:1:1"], card
+    # K3-FIX N1: «PDF: неизвестно» → слово N2 «исход неизвестен — не повторять, проверить переписку»
+    assert "PDF: исход неизвестен — не повторять, проверить переписку" in card["text"] and \
+        kb_data(card) == ["wa:pdf:1:1", "wa:pdf_risk:1:1"], card
 
 
 def test_resend_door_closed_no_bridge():
@@ -519,7 +522,7 @@ def test_restart_between_parts_no_dup_no_loss():
     assert w.part()[0] == A.NOT_SENT and "между частями" in w.part()[3], w.part()
     w.core.tick(T0 + 400)
     card = w.edits()[-1]
-    assert "текст: ушёл · PDF: не ушёл: рестарт между частями" in card["text"], card["text"]
+    assert "текст: ушёл (wamid …wamid.T1) · PDF: не ушёл: рестарт между частями" in card["text"], card["text"]  # K3-FIX N1
     assert kb_data(card) == ["wa:pdf:1:1"], card
     assert len(w.sends) == 1 and w.media == [], "рестарт сам ничего не отправил"
     w.press("wa:pdf:1:1")

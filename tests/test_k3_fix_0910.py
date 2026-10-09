@@ -368,7 +368,9 @@ def test_n2_reread_pdf_sent():
     assert ans.startswith("текст: ушёл · PDF: ушёл"), ans
     assert "не ушёл" not in ans and w.media == [], (ans, w.media)
     words = _card_words(w)
-    assert words and words[-1].startswith("текст: ушёл · PDF: ушёл") and "опоздал" in words[-1], words
+    # шаг 2 (K3-FIX N1): на карточке у ушедших частей — их wamid по базе
+    assert words and words[-1].startswith("текст: ушёл (wamid …wamid.T1) · PDF: ушёл (wamid …d.OTHER1)") \
+        and "опоздал" in words[-1], words
 
 
 def test_n2_reread_pdf_unsure_no_blind_repeat():
@@ -424,12 +426,14 @@ def test_n2_press_pdf_late_attempt_card_untouched():
 
 
 def test_n2_control_normal_path_words_unchanged():
-    """КОНТРОЛЬ (зелёный и до ремонта): без гонки слова и карточка прежние («текст: ушёл · PDF: ушёл»)."""
+    """КОНТРОЛЬ (зелёный и до ремонта): без гонки слова нажавшему прежние («текст: ушёл · PDF: ушёл»); карточка — те же
+    слова, с шага 2 (K3-FIX N1) — с wamid ушедших частей."""
     w = AS.World(AS.ON)
     w.ready()
     w.press("wa:send:1:1")
     assert w.answers()[-1] == "текст: ушёл · PDF: ушёл", w.answers()
-    assert _card_words(w)[-1].startswith("текст: ушёл · PDF: ушёл — "), _card_words(w)
+    assert _card_words(w)[-1].startswith("текст: ушёл (wamid …wamid.T1) · PDF: ушёл (wamid …wamid.P1) — "), \
+        _card_words(w)
 
 
 def main():

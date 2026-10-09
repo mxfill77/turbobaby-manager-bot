@@ -124,7 +124,8 @@ W_FOREIGN = ("после попытки есть статус сообщения
 W_BASIS = "устарело: основание PDF не подтверждено реестром при нажатии — %s; ничего не отправлено, черновик пересобирается"
 W_BASIS_PDF = "дослать нельзя: основание PDF не подтверждено реестром — %s; PDF не ушёл"
 BASIS_COLS = (("signed_at", "TEXT"), ("number", "TEXT"), ("date_from", "TEXT"), ("date_to", "TEXT"),
-              ("ver", "INTEGER"))         # ver — Д2: версия по пояснению, чья сверка записана (NULL — версия 1)
+              ("ver", "INTEGER"),         # ver — Д2: версия по пояснению, чья сверка записана (NULL — версия 1)
+              ("opora", "TEXT"))          # opora — K3-FIX F1: опора черновика словами для карточки (NULL — записана до F1)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS attach (
@@ -141,7 +142,8 @@ CREATE TABLE IF NOT EXISTS attach (
     number      TEXT,                             -- ключ перечитывания: номер обращения …
     date_from   TEXT,                             -- … и срок аренды (ISO, пусто — неизвестен)
     date_to     TEXT,
-    ver         INTEGER                           -- Д2: версия по пояснению, чья сверка записана; NULL — версия 1
+    ver         INTEGER,                          -- Д2: версия по пояснению, чья сверка записана; NULL — версия 1
+    opora       TEXT                              -- K3-FIX F1: опора черновика (источник · время чтения · версия)
 );
 CREATE TABLE IF NOT EXISTS pdf_parts (
     draft_id    INTEGER PRIMARY KEY,
@@ -284,6 +286,75 @@ def attach_of(tools_out, since=None):
             "doc_id": c.get("doc_id"), "signed_at": signed_at, "date_from": date_from, "date_to": date_to}, ""
 
 
+# ── K3-FIX F1: опора черновика на карточке — источник, время ЧТЕНИЯ, версия ТОЛЬКО от источника ──────────────────
+OPORA_HEAD = "🧾 опора черновика — факты сверки Т4а (инструмент · источник · время чтения · версия источника)%s:"
+OPORA_NONE = "🧾 опора черновика: фактов сверки нет%s"
+OPORA_UNREAD = "🧾 опора черновика не разобрана (%s) — источники фактов не названы"
+OPORA_LEGACY = "🧾 опора черновика не записана: сверка записана до K3-FIX F1"
+OPORA_OFF = "• прочитано фактом, но не в опоре судьи (тот же запрос прочитан позже, устарел или снят): %d"
+OPORA_CUT = "• … не показано строк опоры: %d (предел карточки — %d строк, %d знаков)"
+OPORA_ROWS, OPORA_CHARS = 6, 700
+W_VER_UNKNOWN = "неизвестна"
+_OPORA_STATE = {T.DONE: "", T.OVER: " (сверка не завершена: предел вызовов или времени)",
+                T.ABORTED: " (сверка оборвана новым сообщением клиента)"}
+
+
+def _opora_row(r, n):
+    at = r.get("at")
+    when = ("прочитано %s" % A.hm_phuket(at) if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0
+            else "время чтения неизвестно")
+    ver = r.get("source_version")                    # только поле контракта «версия, выданная источником» (F2 §1.1)
+    ver = str(ver).strip()[:40] if isinstance(ver, str) and ver.strip() else W_VER_UNKNOWN
+    src = str(r.get("source") or "").strip() or "источник не назван"
+    return "• %s · %s · %s · версия: %s%s" % (r.get("tool") or "?", src[:80], when, ver,
+                                             " · фактов %d" % n if n > 1 else "")
+
+
+def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS):
+    """Итог сверки Т4а (`ModelAdapter.last["tools"]`) → опора черновика словами для карточки (K3-FIX F1) | None (сверки
+    нет). Строка — на КАЖДЫЙ ответ инструмента, чьи факты остались в опоре судьи (`sift` с тем же since, что у
+    `attach_of`), по порядку чтения: инструмент · источник (`source` ответа: дверь, лист, узел) · время ЧТЕНИЯ (`at` —
+    `_read` ставит его ДО вызова двери; по Пхукету, как все слова сотрудникам) · версия ТОЛЬКО если её отдал источник
+    (`source_version` ответа, F2_CONTRACT §1.1; сегодня её не отдаёт ни одна дверь) — иначе «неизвестна». Поле `version`
+    результата версией источника НЕ является (там `signed_at` договора и длина правил — F2_CONTRACT §0.3), служебное
+    `stand_meta` подделки моста в результат не попадает вовсе. Новых обращений к мосту нет — только уже прочитанное.
+    Длина — потолок строк и знаков; усечение названо числом, как и факты, снятые опорой судьи."""
+    if not isinstance(tools_out, dict):
+        return None
+    res = [r for r in tools_out.get("results") or [] if isinstance(r, dict)]
+    try:
+        facts, _dropped = T.sift(res, since)
+        order = T.read_order(res)
+    except Exception as e:                                           # noqa: BLE001
+        return OPORA_UNREAD % type(e).__name__
+    keep = {id(f) for f in facts}
+    rows, off = [], 0
+    for i in order:
+        r = res[i]
+        if r.get("outcome") != T.FACT:
+            continue
+        n = sum(1 for f in r.get("facts") or [] if id(f) in keep)
+        if n:
+            rows.append(_opora_row(r, n))
+        else:
+            off += 1
+    tail = _OPORA_STATE.get(tools_out.get("state"), " (исход сверки не разобран)")
+    if not rows:
+        return OPORA_NONE % tail + ("\n" + OPORA_OFF % off if off else "")
+    out = [OPORA_HEAD % tail]
+    shown = 0
+    for line in rows:
+        if shown >= rows_max or len("\n".join(out[1:] + [line])) > chars_max:
+            break
+        out.append(line)
+        shown += 1
+    if shown < len(rows):
+        out.append(OPORA_CUT % (len(rows) - shown, rows_max, chars_max))
+    if off:
+        out.append(OPORA_OFF % off)
+    return "\n".join(out)
+
+
 def recheck_of(resp, basis):
     """Живое чтение реестра (`contract_find`) против основания черновика → (True, "") | (False, причина словами).
     Пропуск — только `one`, пустой `unread`, `undated_signed` = 0, подписанный `pick` и совпавшие row, doc_id, pdf_id и
@@ -330,39 +401,63 @@ def recheck_of(resp, basis):
     return True, ""
 
 
-def parts_words(text_state, pdf_state=None, pdf_reason=""):
-    """Исходы частей — рукам словами: «текст: ушёл · PDF: ушёл / не ушёл: причина / неизвестно»."""
-    word = {A.SENT: "ушёл", A.NOT_SENT: "не ушёл", A.UNSURE: "неизвестно"}
-    out = "текст: %s" % word.get(text_state, text_state or "?")
+W_UNKNOWN_NO_REPEAT = "исход неизвестен — не повторять, проверить переписку"
+W_SENDING = "отправляется"
+W_LATE = "ответ этого процесса опоздал: часть решил другой процесс, слова — по базе"
+_DECIDING = (A.PENDING, A.CLAIMED, A.SENDING, A.SCHEDULED, P_WAIT, P_CLAIMED)
+# K3-FIX N1: состояния, которые не являются исходом двери, — словами (A.CLAIMED и P_CLAIMED — одно слово «claimed»)
+_STATE_WORDS = {A.PENDING: "ждёт нажатия", A.CLAIMED: "взят к отправке, двери ещё не было", A.SCHEDULED: "отложен ритмом",
+                P_WAIT: "ждёт текста", A.DECLINED: "не нужно (решил человек)", A.STALE: "устарел, не отправлен",
+                A.SUPERSEDED: "заменён, не отправлен"}
+
+
+def wamid_tail(wamid):
+    """wamid части — хвостом (8 знаков): опознать попытку в журнале и квитанциях, не загромождая карточку."""
+    return "…" + str(wamid)[-8:]
+
+
+def state_word(state, reason=None, wamid=None, pdf=False):
+    """Состояние части → слово сотруднику (K3-FIX N1; одно на нажавшего, карточку, перечитанное N2 и старт K17):
+    sending — «отправляется»; sent — «ушёл (wamid …)» (wamid — когда назван); unsure — «исход неизвестен — не повторять,
+    проверить переписку»; not_sent — «не ушёл: причина» (у текста причина — ответ двери из `drafts.reason`; не передана —
+    «не ушёл»). Внутреннего кода сотрудник не видит; незнакомое состояние названо как неразобранное."""
+    if state == A.SENT:
+        return "ушёл" + (" (wamid %s)" % wamid_tail(wamid) if wamid else "")
+    if state == A.NOT_SENT:
+        why = str(reason or "").strip()
+        if pdf:
+            return "не ушёл: %s" % (why or "причина не названа")[:200]
+        return ("не ушёл: %s" % (why or "причина не названа")[:200]) if reason is not None else "не ушёл"
+    if state == A.UNSURE:
+        return W_UNKNOWN_NO_REPEAT
+    if state == A.SENDING:
+        return W_SENDING
+    return _STATE_WORDS.get(state) or "состояние «%s» не разобрано" % (state or "?")
+
+
+def parts_words(text_state, pdf_state=None, pdf_reason="", text_reason=None, text_wamid=None, pdf_wamid=None):
+    """Исходы частей — рукам словами (K3-FIX N1, словарь `state_word`): «текст: ушёл · PDF: ушёл / не ушёл: причина /
+    исход неизвестен — не повторять, проверить переписку». wamid называется, когда передан (карточка), нажавшему — нет."""
+    out = "текст: %s" % state_word(text_state, text_reason, text_wamid)
     if pdf_state is None:
         return out
-    if pdf_state == A.NOT_SENT:
-        return out + " · PDF: не ушёл: %s" % (str(pdf_reason or "причина не названа")[:200])
-    return out + " · PDF: %s" % word.get(pdf_state, pdf_state)
+    return out + " · PDF: %s" % state_word(pdf_state, pdf_reason, pdf_wamid, pdf=True)
 
 
 # ── K3-FIX N2: исход частей, когда ответ этого процесса опоздал (захват проигран второму экземпляру/конкуренту) ──
-W_UNKNOWN_NO_REPEAT = "исход неизвестен — не повторять, проверить переписку"
-W_LATE = "ответ этого процесса опоздал: часть решил другой процесс, слова — по базе"
-_DECIDING = (A.PENDING, A.CLAIMED, A.SENDING, A.SCHEDULED, P_WAIT, P_CLAIMED)
-
-
-def reread_words(text_state, pdf_state=None, pdf_reason=""):
-    """Исходы частей словами по ПЕРЕЧИТАННЫМ устойчивым состояниям (K3-FIX N2). «не ушёл» — только при not_sent в базе;
-    unsure — «исход неизвестен — не повторять, проверить переписку»; часть посреди чужого захода — тоже неизвестен."""
-    def one(state, reason, pdf):
-        if state == A.SENT:
-            return "ушёл"
-        if state == A.NOT_SENT:
-            return ("не ушёл: %s" % str(reason or "причина не названа")[:200]) if pdf else "не ушёл"
-        if state == A.UNSURE:
-            return W_UNKNOWN_NO_REPEAT
+def reread_words(text_state, pdf_state=None, pdf_reason="", text_reason=None, text_wamid=None, pdf_wamid=None):
+    """Исходы частей словами по ПЕРЕЧИТАННЫМ устойчивым состояниям (K3-FIX N2, словарь N1 `state_word`). «не ушёл» —
+    только при not_sent в базе; unsure — «исход неизвестен — не повторять, проверить переписку»; часть посреди чужого
+    захода — тоже неизвестен (состояние — словом)."""
+    def one(state, reason, wamid, pdf):
         if state in _DECIDING:
-            return "решается другим процессом (%s) — %s" % (state, W_UNKNOWN_NO_REPEAT)
-        return "решён иначе (%s)" % (state or "?")
-    out = "текст: %s" % one(text_state, "", False)
+            return "решается другим процессом (%s) — %s" % (state_word(state), W_UNKNOWN_NO_REPEAT)
+        if state in (A.SENT, A.NOT_SENT, A.UNSURE):
+            return state_word(state, reason, wamid, pdf)
+        return "решён иначе (%s)" % state_word(state)
+    out = "текст: %s" % one(text_state, text_reason, text_wamid, False)
     if pdf_state is not None:
-        out += " · PDF: %s" % one(pdf_state, pdf_reason, True)
+        out += " · PDF: %s" % one(pdf_state, pdf_reason, pdf_wamid, True)
     return out
 
 
@@ -809,6 +904,10 @@ class AttachCore(A.Core):
     # ── база ──────────────────────────────────────────────────────────────────────────────
 
     def _startup(self):
+        # K3-FIX K17: черновики посреди текстовой двери (sending) — до того, как ядро переведёт их в unsure: у текста без
+        # части PDF исход старта тоже ложится на карточку (иначе на ней жила кнопка «Отправить»)
+        mid_text = [r[0] for r in self.db.execute("SELECT id FROM drafts WHERE state=?", (A.SENDING,)).fetchall()] \
+            if self.attach else []
         super()._startup()
         if not self.attach:
             return
@@ -851,16 +950,29 @@ class AttachCore(A.Core):
         if moved:
             self.log("старт: исход частей на карточку — черновиков %d (рестарт между частями %d)" % (
                 len(set(moved)), waited))
+        # K3-FIX K17: текст без части PDF, прерванный рестартом посреди двери: ядро перевело его в unsure (могло уйти —
+        # повтора нет); исход «неизвестен — не повторять, проверить» ложится на карточку вместо живой кнопки «Отправить».
+        # Это НЕ дубль: двери второй раз не было и не будет — предотвращённый повтор дублем не называется
+        alone = [did for did in mid_text if did not in set(moved) and self.db.execute(
+            "SELECT 1 FROM drafts d WHERE d.id=? AND d.state=? AND NOT EXISTS (SELECT 1 FROM pdf_parts p "
+            "WHERE p.draft_id=d.id)", (did, A.UNSURE)).fetchone()]
+        settled = [did for did in alone if self._card_settle(did, now)]
+        if alone:
+            self.log("старт: текст без PDF посреди двери — исход «неизвестен, не повторять» на карточку: черновиков %d "
+                     "(карточка в очереди правки у %d)" % (len(alone), len(settled)))
 
     def _card_settle(self, draft_id, now, why=W_RESTART):
-        """Исход обеих частей черновика → очередь правки карточки (`card_out`): решена, правка ждёт первого такта.
-        Карточки в очереди нет (запись старше неё) — только строка журнала: править нечем."""
-        row = self.db.execute("SELECT d.state, d.ver, p.state, p.reason FROM drafts d JOIN pdf_parts p "
-                              "ON p.draft_id=d.id WHERE d.id=?", (draft_id,)).fetchone()
+        """Исход частей черновика → очередь правки карточки (`card_out`): решена, правка ждёт первого такта.
+        Карточки в очереди нет (запись старше неё) — только строка журнала: править нечем.
+        K3-FIX N1/K17: и черновик БЕЗ части PDF (только текст) — его исход тоже ложится на карточку; слова — словарём
+        `state_word`, у ушедших частей — wamid."""
+        row = self.db.execute("SELECT d.state, d.ver, p.state, p.reason, d.reason, d.wamid, p.wamid FROM drafts d "
+                              "LEFT JOIN pdf_parts p ON p.draft_id=d.id WHERE d.id=?", (draft_id,)).fetchone()
         if not row:
             return False
-        tstate, ver, pstate, preason = row
-        words = "%s — %s, %s" % (parts_words(tstate, pstate, preason), why, A.hm_phuket(now))
+        tstate, ver, pstate, preason, treason, tw, pw = row
+        words = "%s — %s, %s" % (parts_words(tstate, pstate, preason, text_reason=treason or "", text_wamid=tw,
+                                             pdf_wamid=pw), why, A.hm_phuket(now))
         n = self.db.execute("UPDATE card_out SET state=?, decided_at=COALESCE(decided_at, ?), words=?, "
                             "edit=CASE WHEN message_id IS NULL THEN NULL ELSE ? END, edit_tries=0, edit_unk=0, "
                             "next_at=0 WHERE draft_id=? AND ver=?",
@@ -974,11 +1086,12 @@ class AttachCore(A.Core):
             if twin:
                 meta, why = None, W_TWIN % (twin[2][:12], twin[0], twin[1])
         m = meta or {}
+        opora = opora_of(out, since)                # K3-FIX F1: опора для карточки — из того же итога сверки, мост не зовётся
         self.db.execute("INSERT OR REPLACE INTO attach(draft_id, file_id, name, size, sha256, row, doc_id, "
-                        "reason, ts, signed_at, number, date_from, date_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "reason, ts, signed_at, number, date_from, date_to, opora) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (did, m.get("file_id"), m.get("name"), m.get("size"), m.get("sha256"), m.get("row"),
                          m.get("doc_id"), why or None, now, m.get("signed_at"), number if meta else None,
-                         m.get("date_from"), m.get("date_to")))
+                         m.get("date_from"), m.get("date_to"), opora))
         if ver is not None:                         # Д2: строка — итог сверки ЭТОЙ версии по пояснению
             self.db.execute("UPDATE attach SET ver=? WHERE draft_id=?", (int(ver), did))
         self.log("черновик %d: вложение %s%s" % (
@@ -1031,6 +1144,20 @@ class AttachCore(A.Core):
         else:
             said = W_HINT_CHECK_NOPDF % str(why or "причина не названа")[:180]
         return W_HINT_CHECK % (ver, said)
+
+    def card_basis(self, draft_id, ver):
+        """Опора черновика на карточке (K3-FIX F1) → текст | None. Опора записана при сверке (`attach.opora`, итог
+        `opora_of`): по каждому ответу инструмента в опоре судьи — источник, время чтения, версия от источника или
+        «неизвестна». Флаг выкл или сверки не было (строки `attach` нет) — None: карточка прежняя. Версия по пояснению
+        без своей сверки — None: карточка уже говорит «сверки нет», чужую опору ей не приписываем."""
+        if not self.attach:
+            return None
+        if self.hint_of(draft_id, int(ver)) is not None and not self._ver_checked(draft_id, int(ver)):
+            return None
+        row = self.db.execute("SELECT opora FROM attach WHERE draft_id=?", (draft_id,)).fetchone()
+        if not row:
+            return None
+        return row[0] if row[0] else OPORA_LEGACY
 
     # ── нажатие ───────────────────────────────────────────────────────────────────────────
 
@@ -1160,6 +1287,15 @@ class AttachCore(A.Core):
                 meta = self._attach(draft_id)
         if not meta or not meta[0]:
             res = self._text_part(draft_id, number, upto, text, who, now, from_state)
+            tstate = res.get("state")
+            if tstate in (A.SENT, A.NOT_SENT, A.UNSURE):
+                # K3-FIX N1: исход двери — словами (словарь `state_word`), а не кодом ядра «sent/unsure/not_sent»;
+                # перечитан из базы, как у двух частей (N2): проигранный захват — слова по базе, карточку, уже решённую
+                # другим процессом (старт второго экземпляра), поздний ответ не перекрывает
+                words, card, fresh, tnow, _p = self._settled(draft_id, ver0, tstate, None, "", 1, keep_decided=True)
+                if fresh:
+                    super()._done(draft_id, "%s — %s, %s" % (card, who, A.hm_phuket(now)), now)
+                return dict(res, words=words, parts={"text": tnow, "pdf": None})
             if self._held is not None:              # слова ядра — те же, что легли бы без транзакции
                 super()._done(draft_id, self._held, now)
             return res
@@ -1192,37 +1328,76 @@ class AttachCore(A.Core):
             pstate, preason = A.NOT_SENT, why
         else:
             pstate, preason = self._send_pdf(draft_id, number, who, now, 1, (P_WAIT,), meta, prev=1)
-        words, fresh, tnow, pnow = self._settled(draft_id, ver0, tstate, pstate, preason, 1, keep_decided=True)
+        words, card, fresh, tnow, pnow = self._settled(draft_id, ver0, tstate, pstate, preason, 1, keep_decided=True)
         if fresh:
-            self._done(draft_id, "%s — %s, %s" % (words, who, A.hm_phuket(now)), now)
+            self._done(draft_id, "%s — %s, %s" % (card, who, A.hm_phuket(now)), now)
         return dict(res, words=words, parts={"text": tnow, "pdf": pnow})
 
     def _settled(self, draft_id, ver0, tstate, pstate, preason, attempt, keep_decided=False):
-        """K3-FIX N2: исход частей ПЕРЕЧИТЫВАЕТСЯ из базы после двери → (слова, править ли карточку, текст, PDF).
-        База совпала с ответом этого процесса (версия черновика, состояния обеих частей и номер попытки) — слова прежние
-        (`parts_words`), карточка правится, как раньше.
+        """K3-FIX N2: исход частей ПЕРЕЧИТЫВАЕТСЯ из базы после двери → (слова нажавшему, слова карточки, править ли
+        карточку, текст, PDF). База совпала с ответом этого процесса (версия черновика, состояния обеих частей и номер
+        попытки) — слова по ответу (`parts_words`), карточка правится, как раньше.
         Не совпала — захват проигран (второй экземпляр службы, конкурент): слова по ПЕРЕЧИТАННОМУ (`reread_words`):
         «не ушёл» — только при not_sent в базе, unsure — «исход неизвестен — не повторять, проверить». Карточку поздний ответ
         правит, только если версия черновика та же и номер попытки PDF не вырос; keep_decided — карточка, уже решённая
-        другим процессом (исход старта второго экземпляра), не перекрывается."""
-        row = self.db.execute("SELECT d.state, d.ver, p.state, p.attempt, p.reason FROM drafts d LEFT JOIN pdf_parts p "
-                              "ON p.draft_id=d.id WHERE d.id=?", (draft_id,)).fetchone()
+        другим процессом (исход старта второго экземпляра), не перекрывается.
+        K3-FIX N1: слова — словарём `state_word` (без внутренних кодов); у текста — причина двери (`drafts.reason`), на
+        карточке у ушедших частей — их wamid из базы."""
+        row = self.db.execute("SELECT d.state, d.ver, p.state, p.attempt, p.reason, d.reason, d.wamid, p.wamid FROM drafts d "
+                              "LEFT JOIN pdf_parts p ON p.draft_id=d.id WHERE d.id=?", (draft_id,)).fetchone()
         if not row:
-            return parts_words(tstate, pstate, preason), True, tstate, pstate
-        t_db, ver_db, p_db, att_db, why_db = row
+            words = parts_words(tstate, pstate, preason)
+            return words, words, True, tstate, pstate
+        t_db, ver_db, p_db, att_db, why_db, twhy_db, tw_db, pw_db = row
+        twhy_db = twhy_db or ""
         if (ver_db == ver0 and t_db == tstate and p_db == pstate
                 and (att_db is None or int(att_db) == int(attempt))):
-            return parts_words(tstate, pstate, preason), True, tstate, pstate
-        words = "%s (%s)" % (reread_words(t_db, p_db, why_db), W_LATE)
+            return (parts_words(tstate, pstate, preason, text_reason=twhy_db),
+                    parts_words(tstate, pstate, preason, text_reason=twhy_db, text_wamid=tw_db, pdf_wamid=pw_db),
+                    True, tstate, pstate)
+        words = "%s (%s)" % (reread_words(t_db, p_db, why_db, text_reason=twhy_db), W_LATE)
+        card = "%s (%s)" % (reread_words(t_db, p_db, why_db, text_reason=twhy_db, text_wamid=tw_db, pdf_wamid=pw_db),
+                            W_LATE)
         fresh = ver_db == ver0 and (att_db is None or int(att_db) <= int(attempt))
         if fresh and keep_decided:
-            card = self.db.execute("SELECT state FROM card_out WHERE draft_id=? AND ver=?",
-                                   (draft_id, int(ver_db))).fetchone()
-            fresh = not (card and card[0] == A.CARD_DECIDED)
+            got = self.db.execute("SELECT state FROM card_out WHERE draft_id=? AND ver=?",
+                                  (draft_id, int(ver_db))).fetchone()
+            fresh = not (got and got[0] == A.CARD_DECIDED)
         self.log("черновик %d: ответ попытки %d опоздал — база: текст %s, PDF %s (попытка %s); карточку %s" % (
             draft_id, int(attempt), t_db, p_db, att_db, "правлю по базе" if fresh else
             "не трогаю: её уже решил другой процесс, версия или попытка новее"))
-        return words, fresh, t_db, p_db
+        return words, card, fresh, t_db, p_db
+
+    def _said(self, draft_id, wamids=False):
+        """Исход черновика словами по БАЗЕ (K3-FIX N1): текст (и PDF, если часть есть) — `parts_words`; черновик, решённый
+        не дверью (не нужно, устарел, заменён, ждёт), — словом его состояния. wamids — для карточки."""
+        row = self.db.execute("SELECT d.state, d.reason, d.wamid, p.state, p.reason, p.wamid FROM drafts d LEFT JOIN "
+                              "pdf_parts p ON p.draft_id=d.id WHERE d.id=?", (draft_id,)).fetchone()
+        if not row:
+            return "черновика нет"
+        tstate, treason, tw, pstate, preason, pw = row
+        if tstate not in (A.SENT, A.NOT_SENT, A.UNSURE, A.SENDING):
+            return state_word(tstate)
+        return parts_words(tstate, pstate, preason, text_reason=treason or "",
+                           text_wamid=tw if wamids else None, pdf_wamid=pw if wamids else None)
+
+    def _decided(self, draft_id, ver=None):
+        """«Уже решено» проигравшему (K3-FIX N1): при WA_AGENT_ATTACH исход — словами (`_said`), а не кодом состояния;
+        порядок проверок и вид фразы — `Core._decided` (по-прежнему начинается с «уже решено» / «устарело»). Флаг выкл —
+        ядро без изменений."""
+        if not self.attach:
+            return super()._decided(draft_id, ver)
+        row = self.db.execute("SELECT state, decided_by, decided_at, closed_at, ver FROM drafts WHERE id=?",
+                              (draft_id,)).fetchone()
+        if not row:
+            return "черновика нет"
+        state, by, at, closed, ver_now = row
+        if ver is not None and int(ver) != ver_now:
+            return "устарело: версия %d, действует версия %d — %s" % (
+                int(ver), ver_now, "жмите кнопки новой карточки" if state == A.PENDING else self._decided(draft_id))
+        if by:
+            return "уже решено: %s, %s — %s" % (by, A.hm_phuket(at), self._said(draft_id))
+        return "уже решено: снят, %s — %s (версия %d)" % (A.hm_phuket(closed), self._said(draft_id), ver_now)
 
     def _wamid(self, draft_id):
         row = self.db.execute("SELECT wamid FROM drafts WHERE id=?", (draft_id,)).fetchone()
@@ -1491,7 +1666,8 @@ class AttachCore(A.Core):
         pstate, patt, pwho, pat, _wamid, preason, psend = part
         if int(attempt) != patt or pstate not in (A.NOT_SENT, A.UNSURE):
             return {"ok": False, "state": pstate, "words": "уже решено: PDF — %s, %s, попытка %d%s" % (
-                pwho or "—", A.hm_phuket(pat) if pat else "—", patt, " — %s" % pstate)}
+                pwho or "—", A.hm_phuket(pat) if pat else "—", patt,
+                " — %s" % state_word(pstate, preason, pdf=True))}          # K3-FIX N1: словом, а не кодом
         if tstate != A.SENT:
             return {"ok": False, "state": pstate, "words": "дослать нельзя: %s" % (
                 W_TEXT_UNSURE if tstate == A.UNSURE else W_TEXT_NOT)}
@@ -1519,7 +1695,8 @@ class AttachCore(A.Core):
                 if not self._in_tx(confirm):
                     return {"ok": False, "state": None, "words": "уже решено"}
                 words = parts_words(A.SENT, A.SENT) + " (%s) — дослать нельзя" % extra
-                self._done(draft_id, "%s — %s, %s" % (words, who, A.hm_phuket(now)), now)
+                card = self._said(draft_id, wamids=True) + " (%s) — дослать нельзя" % extra   # K3-FIX N1: с wamid
+                self._done(draft_id, "%s — %s, %s" % (card, who, A.hm_phuket(now)), now)
                 return {"ok": False, "state": A.SENT, "words": words, "delivery": verdict}
             foreign = self._foreign_after(number, psend)
             if foreign is None:
@@ -1547,19 +1724,20 @@ class AttachCore(A.Core):
         if pstate2 is None:
             return {"ok": False, "state": None, "words": "уже решено: PDF — повтор уже идёт"}
         # K3-FIX N2: исход попытки перечитан; поздний ответ (попытка или версия новее) карточку не правит
-        words, fresh, _tnow, pnow = self._settled(draft_id, ver0, A.SENT, pstate2, why, patt + 1)
+        words, card, fresh, _tnow, pnow = self._settled(draft_id, ver0, A.SENT, pstate2, why, patt + 1)
         if fresh:
-            self._done(draft_id, "%s — дослал %s, %s%s" % (words, who, A.hm_phuket(now),
+            self._done(draft_id, "%s — дослал %s, %s%s" % (card, who, A.hm_phuket(now),
                                                             " (риск дубля принят)" if permit else ""), now)
         return {"ok": pnow == A.SENT, "state": pnow, "words": words}
 
     def parts(self, draft_id):
         """Исходы частей черновика → {"text": state, "pdf": state | None, "words": …}."""
-        row = self.db.execute("SELECT state FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        row = self.db.execute("SELECT state, reason FROM drafts WHERE id=?", (draft_id,)).fetchone()
         part = self._part(draft_id) if self.attach else None
         t = row[0] if row else None
         out = {"text": t, "pdf": part[0] if part else None,
-               "words": parts_words(t, part[0] if part else None, part[5] if part else "")}
+               "words": parts_words(t, part[0] if part else None, part[5] if part else "",
+                                    text_reason=(row[1] or "") if row else None)}
         if part:
             # «ушёл» — дверь приняла; доставку говорит ТОЛЬКО статус wamid этой попытки (sent — «принято WhatsApp»)
             num = self.db.execute("SELECT number, wamid FROM drafts WHERE id=?", (draft_id,)).fetchone()

@@ -261,7 +261,8 @@ def test_hint_version_check_is_its_own():
     assert want in card2, card2
     assert w.core.db.execute("SELECT file_id, ver FROM attach WHERE draft_id=1").fetchone() == (None, 2)
     words = w.send(OWNER)
-    assert words.startswith("sent") and "правило №1 — действует" in words, words
+    # K3-FIX N1: текст без PDF — нажавшему слово «текст: ушёл», а не код ядра «sent»
+    assert words.startswith("текст: ушёл") and "правило №1 — действует" in words, words
     assert w.door.sends == [(NUM, NEW)] and w.door.media == [] and w.fetch.calls == ["F41", "F41"], (
         w.door.sends, w.door.media, w.fetch.calls)                                 # PDF читала только сверка
     assert w.count_rules() == 1 and not w.fell(), (w.rules(), w.fell())
@@ -481,7 +482,8 @@ def test_twin_pdf_hint_version_send_no_second_copy():
     договора клиенту нет (части PDF у черновика 2 не заводится; рубеж нажатия `_deliver` её снял бы и сам)."""
     w, _twin = twin_world()
     words = w.send(OWNER, ver=2, did=2)
-    assert words.startswith("sent") and "правило №1 — действует" in words, words
+    # K3-FIX N1: текст без PDF — нажавшему слово «текст: ушёл», а не код ядра «sent»
+    assert words.startswith("текст: ушёл") and "правило №1 — действует" in words, words
     assert w.door.sends[-1] == (NUM, NEW) and len(w.door.media) == 1, (w.door.sends, w.door.media)
     assert w.core.db.execute("SELECT COUNT(*) FROM pdf_parts WHERE draft_id=2").fetchone() == (0,)
     assert w.count_rules() == 1 and not w.fell(), (w.rules(), w.fell())

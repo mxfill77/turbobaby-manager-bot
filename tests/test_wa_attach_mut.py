@@ -293,7 +293,9 @@ def _unknown_not_resent(door):
     w = T.World(door=door)
     did = w.draft()
     out = w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
-    assert w.part(did)[:3] == (A.UNSURE, 1, None) and out["words"] == "текст: ушёл · PDF: неизвестно", (w.part(did), out)
+    # K3-FIX N1: «PDF: неизвестно» → слово N2 «исход неизвестен — не повторять, проверить переписку»
+    assert w.part(did)[:3] == (A.UNSURE, 1, None) and \
+        out["words"] == "текст: ушёл · PDF: " + X.W_UNKNOWN_NO_REPEAT, (w.part(did), out)
     got = w.core.press(did, 1, X.ACT_PDF, "Пым", T0 + 300)
     assert got.get("need_permit") and len(door.media) == 1 and w.part(did)[0] == A.UNSURE, got
 
@@ -377,7 +379,7 @@ def test_no_pdf_draft_card_gets_outcome():
     out = w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
     assert out["ok"] and w.door.media == [], out
     mine = [words for d, words in w.tg.done if d == did]
-    assert mine and mine[-1].startswith(A.SENT), w.tg.done
+    assert mine and mine[-1].startswith("текст: ушёл (wamid …wamid.T1)"), w.tg.done   # K3-FIX N1: было код «sent»
 
 
 # ═══ служба: флаг засчитывается только при обеих дверях сверки ═════════════════════════════════════
