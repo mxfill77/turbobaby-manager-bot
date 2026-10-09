@@ -23,10 +23,11 @@ import wa_agent as A  # noqa: E402
 import wa_agent_attach as X  # noqa: E402
 import test_wa_agent_attach as T  # noqa: E402  (ядро: FakeTG, FakeDoor, Fetch, Find, World)
 import test_wa_attach_svc as SVC  # noqa: E402  (служба: World с поддельным Bot API)
+import k3_pdf_fixture  # noqa: E402  (K3-FIX F4: скелет PDF сверяется перед дверью — фикстура живого формата)
 
 NUM, T0 = T.NUM, T.T0
 OTHER = "66899999999"
-PDF_B = b"%PDF-1.4 OTHER client signed contract bytes"
+PDF_B = k3_pdf_fixture.classic(b"OTHER client signed contract bytes")   # было b"%PDF-1.4 OTHER client signed contract bytes"
 
 
 def sha(data):

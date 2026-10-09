@@ -46,6 +46,7 @@ socket.create_connection = _no_net
 
 import test_wa_hint_rule as H  # noqa: E402  (подмена spend_ledger — в шапке набора)
 import wa_agent_attach as X  # noqa: E402
+import k3_pdf_fixture  # noqa: E402  (K3-FIX F4: скелет PDF сверяется перед дверью — фикстура живого формата)
 
 A, G, WM, SV, TM = H.A, H.G, H.WM, H.SV, H.TM
 NUM, CHAT, T0 = H.NUM, H.CHAT, H.T0
@@ -53,7 +54,7 @@ OWNER, STAFF = H.OWNER, H.STAFF
 HINT, NEW, MODEL_TEXT, ASK_MARK = H.HINT, H.NEW, H.MODEL_TEXT, H.ASK_MARK
 TOOLS_HEAD = "ИНСТРУМЕНТЫ (только чтение)"                             # первая строка блока сверки (wa_agent_tools)
 RESULTS_HEAD = "РЕЗУЛЬТАТЫ ИНСТРУМЕНТОВ"
-PDF = b"%PDF-1.4 signed contract bytes D2 INTEG0710"
+PDF = k3_pdf_fixture.classic(b"signed contract bytes D2 INTEG0710")   # было b"%PDF-1.4 signed contract bytes D2 INTEG0710"
 SHA = hashlib.sha256(PDF).hexdigest()
 PDF_NAME = "contract_41.pdf"
 SIGNED = "2026-09-19 10:15:00"

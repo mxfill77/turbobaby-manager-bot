@@ -248,7 +248,9 @@ def bind_contract(fact, resp, number, rental, ref="", at=None):
     if not ds.isoformat() <= cd <= de.isoformat():
         return result("contract", CONFLICT, src, ref, at, reason="дата договора %s вне срока аренды %s…%s"
                       % (cd, ds.isoformat(), de.isoformat()))
-    bound = dict(fact, booking_id=rent.get("booking_id"), bound_by=by)
+    # rent_currency (K3-FIX F3): валюта аренды, к которой код привязал договор — опора `pay_verdict`, когда строки листа
+    # среди фактов нет; в `_fact_ref` ключа нет — модели и журналу договор показывается прежним
+    bound = dict(fact, booking_id=rent.get("booking_id"), bound_by=by, rent_currency=rent.get("currency"))
     return result("contract", FACT, src, ref, at, version=str(fact.get("signed_at") or ""),
                   window="%s…%s" % (ds.isoformat(), de.isoformat()),
                   reason="привязан: номер по полю «%s», байк %s, дата %s в сроке аренды" % (by, pc, cd), facts=[bound])
@@ -343,6 +345,13 @@ def rules_result(node, at=None):
     src = "мозг business_rules"
     if not isinstance(node, dict) or not node.get("read") or not node.get("text"):
         return result("rules", REFUSED, src, at=at, reason="узел не прочитан")
+    if K.node_stale(node, at):
+        # K3-FIX F5: снимок старше своего предела — тот же признак, по которому промпт уже говорит НЕИЗВЕСТНО
+        # (`K.node_block`): FACT со временем «сейчас» подал бы устаревшее модели как свежее
+        age = K.node_age(node, at)
+        return result("rules", UNKNOWN, src, ref="business_rules", at=at,
+                      reason="снимок правил устарел: снят %d мин назад, предел %d мин — НЕИЗВЕСТНО, не факт"
+                      % (int((age or 0) // 60), int(node["max_stale"]) // 60))
     text = str(node["text"])
     return result("rules", FACT, src, ref="business_rules", at=at, version="%d симв." % len(text), facts=[{
         "kind": "rules", "len": len(text), "rule_0310": "03.10.2026-1" in text}])
@@ -567,21 +576,51 @@ def cash_split(facts):
     return bound, [f for f in cash if not any(f is g for g in bound)]
 
 
-def pay_confirmed(facts):
-    """Оплата подтверждена, только если аренда обращения одна, в кассе есть строка оплаты ЭТОЙ аренды И второй
-    независимый источник ТОЙ ЖЕ аренды: договор, привязанный к ней кодом, либо её строка листа «клиенты» вместе с той
-    же суммой в переписке (правило 03.10.2026-1; привязка — AGENTDEDUP0410)."""
+def rent_currency(facts, bk):
+    """Валюта аренды bk (K3-FIX F3) → строка | None. Источники — только факты этой аренды: её строка листа «клиенты»
+    (`rental_result`: лист валюты не пишет — THB по умолчанию, как было) и договор, привязанный к ней кодом
+    (`bind_contract` кладёт `rent_currency` — валюту аренды, к которой привязан). Не названа ни одним или названа по-разному
+    — None: валюта аренды неизвестна, оплату не подтверждаем."""
+    cur = {str(f.get("currency") or "").strip().upper() for f in facts
+           if f["kind"] == "rental" and str(f.get("booking_id") or "") == bk}
+    cur |= {str(f.get("rent_currency") or "").strip().upper() for f in facts
+            if f["kind"] == "contract" and str(f.get("booking_id") or "") == bk}
+    cur.discard("")
+    return cur.pop() if len(cur) == 1 else None
+
+
+def pay_verdict(facts):
+    """Подтверждена ли оплата аренды → (True, "") | (False, причина словами) (K3-FIX F3; правило — `pay_confirmed`).
+    Деньги — только по совпадению суммы И валюты: строка роли «оплата аренды» в валюте, отличной от валюты аренды, оплатой
+    этой аренды не засчитывается (пересчёта валют код не делает); валюта аренды неизвестна — не подтверждаем."""
     bk = rental_of(facts)
     if bk is None:
-        return False
-    rent = [f for f in facts if f["kind"] == "cash" and f["role"] == R_RENT and cash_of_rental(f, bk, facts)]
+        return False, "аренда обращения не одна или не установлена — оплату не к чему привязать"
+    rows = [f for f in facts if f["kind"] == "cash" and f["role"] == R_RENT and cash_of_rental(f, bk, facts)]
+    if not rows:
+        return False, "в кассе нет строки оплаты аренды %s" % bk
+    cur = rent_currency(facts, bk)
+    if cur is None:
+        return False, "валюта аренды %s неизвестна — оплату не подтверждаю" % bk
+    rent = [f for f in rows if str(f.get("currency") or "").upper() == cur]
     if not rent:
-        return False
+        return False, "строка оплаты аренды %s в %s, валюта аренды %s — валюта не совпала, оплатой аренды не засчитана " \
+                      "(пересчёта валют код не делает)" % (bk, "/".join(sorted({str(f.get("currency")) for f in rows})), cur)
     if any(f["kind"] == "contract" and str(f.get("booking_id") or "") == bk for f in facts):
-        return True
+        return True, ""
     said = {a for f in facts if f["kind"] == "history" for a in f["amounts"]}
-    return (any(f["kind"] == "rental" and str(f.get("booking_id") or "") == bk for f in facts)
-            and any(f["amount"] in said for f in rent))
+    if (any(f["kind"] == "rental" and str(f.get("booking_id") or "") == bk for f in facts)
+            and any(f["amount"] in said for f in rent)):
+        return True, ""
+    return False, "нет второго источника той же аренды %s (договора или строки листа с той же суммой в переписке)" % bk
+
+
+def pay_confirmed(facts):
+    """Оплата подтверждена, только если аренда обращения одна, в кассе есть строка оплаты ЭТОЙ аренды В ВАЛЮТЕ АРЕНДЫ
+    (K3-FIX F3: валюта неизвестна или другая — нет) И второй независимый источник ТОЙ ЖЕ аренды: договор, привязанный к
+    ней кодом, либо её строка листа «клиенты» вместе с той же суммой в переписке (правило 03.10.2026-1; привязка —
+    AGENTDEDUP0410). Причина отказа словами — `pay_verdict`."""
+    return pay_verdict(facts)[0]
 
 
 def known_amounts(price, facts, figures):
@@ -657,8 +696,13 @@ def pay_backing(facts):
     bk = rental_of(facts)
     rows = cash_split(facts)[0]
     figures = calc(facts)
+    # K3-FIX F3: опора подтверждения — деньги ВАЛЮТЫ АРЕНДЫ (сумма и валюта совпадают); строки и итоги другой валюты —
+    # не опора; валюта аренды неизвестна — сравнивать не с чем (без аренды обращения — как было)
+    cur = rent_currency(facts, bk) if bk is not None else None
+    rows = [f for f in rows if bk is None or str(f.get("currency") or "").upper() == cur]
     out = {abs(int(round(f["amount"]))) for f in rows}
-    out.update(abs(int(round(v))) for v in list(figures["sums"].values()) + [d["value"] for d in figures["diffs"]])
+    out.update(abs(int(round(v))) for k, v in figures["sums"].items() if bk is None or k.endswith(" %s" % cur))
+    out.update(abs(int(round(d["value"]))) for d in figures["diffs"] if bk is None or d["currency"] == cur)
     out.update(abs(int(round(f["price"]))) for f in facts if f["kind"] == "rental" and bk is not None
                and str(f.get("booking_id") or "") == bk and isinstance(f.get("price"), (int, float)))
     return out
@@ -671,8 +715,10 @@ def money_roles(text, facts):
     s = str(text or "")
     out = []
     bound = cash_split(facts)[0]
-    if _PAY_CLAIM.search(s) and not pay_confirmed(facts):
-        out.append((PAY_WORDS, "текст подтверждает оплату без кассы и второго источника"))
+    paid, why = pay_verdict(facts)
+    if _PAY_CLAIM.search(s) and not paid:
+        # K3-FIX F3: причина словами — та, что вынес `pay_verdict` (в т.ч. «валюта не совпала» / «валюта неизвестна»)
+        out.append((PAY_WORDS, "текст подтверждает оплату без кассы и второго источника: %s" % why))
     elif _PAY_CLAIM.search(s):
         alien = sorted(pay_claimed(s) - pay_backing(facts))
         if alien:

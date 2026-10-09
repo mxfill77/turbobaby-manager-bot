@@ -20,6 +20,9 @@ if os.environ.get("WA_AGENT_SRC"):
 import wa_agent as A  # noqa: E402
 import wa_agent_attach as X  # noqa: E402
 
+sys.path.append(HERE)
+import k3_pdf_fixture  # noqa: E402  (K3-FIX F4: скелет PDF сверяется перед дверью — фикстура живого формата)
+
 QSCHEMA = """CREATE TABLE wa_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_queued INTEGER NOT NULL,
  channel TEXT NOT NULL DEFAULT 'wa', from_number TEXT, name TEXT, msg_type TEXT, text TEXT, media_id TEXT,
  ts_msg INTEGER, echo INTEGER NOT NULL DEFAULT 0, history INTEGER NOT NULL DEFAULT 0,
@@ -27,7 +30,7 @@ QSCHEMA = """CREATE TABLE wa_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_que
 
 NUM = "66812345678"
 T0 = 1_790_000_000
-PDF = b"%PDF-1.4 signed contract bytes"
+PDF = k3_pdf_fixture.classic(b"signed contract bytes")      # было b"%PDF-1.4 signed contract bytes" (не PDF)
 SHA = hashlib.sha256(PDF).hexdigest()
 TEXT = "Здравствуйте, договор ниже"
 
@@ -586,7 +589,8 @@ def test_core_untouched():
     tree = ast.parse(open(os.path.join(ROOT, "wa_agent_attach.py"), encoding="utf-8").read())
     names = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
              for a in (n.names if isinstance(n, ast.Import) else [ast.alias(n.module or "")])}
-    assert names == {"base64", "hashlib", "re", "wa_agent", "wa_agent_tools"}, names     # tools — только sift (T4B3)
+    # tools — только sift (T4B3); zlib (K3-FIX F4) — stdlib, распаковка /FlateDecode при проверке скелета PDF, не зависимость
+    assert names == {"base64", "hashlib", "re", "zlib", "wa_agent", "wa_agent_tools"}, names
 
 
 def main():

@@ -70,6 +70,7 @@ PDF not_sent с причиной. Повтора нет: unsure двери и р
 import base64
 import hashlib
 import re
+import zlib
 
 import wa_agent as A
 import wa_agent_tools as T
@@ -338,6 +339,383 @@ def parts_words(text_state, pdf_state=None, pdf_reason=""):
     if pdf_state == A.NOT_SENT:
         return out + " · PDF: не ушёл: %s" % (str(pdf_reason or "причина не названа")[:200])
     return out + " · PDF: %s" % word.get(pdf_state, pdf_state)
+
+
+# ── K3-FIX N2: исход частей, когда ответ этого процесса опоздал (захват проигран второму экземпляру/конкуренту) ──
+W_UNKNOWN_NO_REPEAT = "исход неизвестен — не повторять, проверить переписку"
+W_LATE = "ответ этого процесса опоздал: часть решил другой процесс, слова — по базе"
+_DECIDING = (A.PENDING, A.CLAIMED, A.SENDING, A.SCHEDULED, P_WAIT, P_CLAIMED)
+
+
+def reread_words(text_state, pdf_state=None, pdf_reason=""):
+    """Исходы частей словами по ПЕРЕЧИТАННЫМ устойчивым состояниям (K3-FIX N2). «не ушёл» — только при not_sent в базе;
+    unsure — «исход неизвестен — не повторять, проверить переписку»; часть посреди чужого захода — тоже неизвестен."""
+    def one(state, reason, pdf):
+        if state == A.SENT:
+            return "ушёл"
+        if state == A.NOT_SENT:
+            return ("не ушёл: %s" % str(reason or "причина не названа")[:200]) if pdf else "не ушёл"
+        if state == A.UNSURE:
+            return W_UNKNOWN_NO_REPEAT
+        if state in _DECIDING:
+            return "решается другим процессом (%s) — %s" % (state, W_UNKNOWN_NO_REPEAT)
+        return "решён иначе (%s)" % (state or "?")
+    out = "текст: %s" % one(text_state, "", False)
+    if pdf_state is not None:
+        out += " · PDF: %s" % one(pdf_state, pdf_reason, True)
+    return out
+
+
+# ── K3-FIX F4: скелет PDF — проверка ТЕХ ЖЕ байтов, что уйдут двери, ДО двери ──
+PDF_LEVEL = ("скелет PDF (K3-FIX F4): заголовок «%PDF-» в байте 0 · «startxref <смещение>» и «%%EOF» в последних 1024 "
+             "байтах · смещение startxref указывает на таблицу ссылок «xref» (или поток ссылок /Type /XRef), и она "
+             "разбирается вместе с цепочкой /Prev (и /XRefStm) · трейлер называет /Root · по таблице ссылок находится "
+             "каталог /Type /Catalog со ссылкой /Pages · по таблице ссылок находится корень дерева страниц /Type /Pages "
+             "с /Count ≥ 1 и непустым /Kids · каждый ребёнок корня находится по таблице ссылок и он /Page или /Pages. "
+             "Сжатые объекты — только /FlateDecode (предиктор PNG). НЕ проверяется: содержимое и потоки страниц, "
+             "шрифты, прочие объекты, подписи — это НЕ «PDF исправен», а «скелет PDF цел»")
+W_PDF_SHAPE = "скелет PDF не сошёлся: %s — двери не было, повтора нет; откройте файл договора"
+_PDF_TAIL = 1024
+_PDF_MAX_SECTIONS = 64
+_PDF_MAX_KIDS = 4096
+_WSB = b" \t\r\n\f\x00"
+_W = rb"[ \t\r\n\f\x00]"
+_RX_OBJ = re.compile(_W + rb"*(\d+)" + _W + rb"+(\d+)" + _W + rb"+obj(?![A-Za-z0-9])")
+_RX_XREF = re.compile(_W + rb"*xref(?![A-Za-z0-9])")
+_RX_SUB = re.compile(_W + rb"*(\d+)[ \t]+(\d+)[ \t]*(?:\r\n|\r|\n)")
+_RX_ENT = re.compile(rb"(\d{10})[ \t](\d{5})[ \t]([nf])[ \t]*(?:\r\n|\r|\n)")
+_RX_TRAILER = re.compile(_W + rb"*trailer(?![A-Za-z0-9])")
+_RX_STARTXREF = re.compile(rb"startxref" + _W + rb"+(\d+)" + _W + rb"+%%EOF")
+_RX_STREAM = re.compile(_W + rb"*stream(?:\r\n|\n|\r)")
+
+
+class _PdfBad(Exception):
+    """Скелет PDF не сошёлся на заявленном уровне — причина словами."""
+
+
+def _pdf_dict(buf, pos):
+    """Словарь «<< … >>» с позиции pos → (верхний уровень, текст целиком, конец). Верхний уровень — тот же текст, где
+    вложенные словари, строки и комментарии заменены пробелами той же длины: ключ вложенного словаря за ключ верхнего не
+    сойдёт, а позиции совпадают с текстом целиком."""
+    i, n = pos, len(buf)
+    while i < n and buf[i] in _WSB:
+        i += 1
+    if buf[i:i + 2] != b"<<":
+        raise _PdfBad("на месте словаря нет «<<» (байт %d)" % i)
+    start, depth, top = i, 0, bytearray()
+    while i < n:
+        two = buf[i:i + 2]
+        if two == b"<<":
+            depth += 1
+            top += two if depth == 1 else b"  "
+            i += 2
+            continue
+        if two == b">>":
+            depth -= 1
+            top += two if depth == 0 else b"  "
+            i += 2
+            if depth == 0:
+                return bytes(top), buf[start:i], i
+            continue
+        c = buf[i:i + 1]
+        if c == b"(":                                   # строка: вложенные скобки и экраны
+            j, lvl = i + 1, 1
+            while j < n and lvl:
+                ch = buf[j:j + 1]
+                if ch == b"\\":
+                    j += 2
+                    continue
+                lvl += 1 if ch == b"(" else -1 if ch == b")" else 0
+                j += 1
+            if lvl:
+                raise _PdfBad("строка в словаре без конца")
+            top += b" " * (j - i)
+            i = j
+            continue
+        if c == b"<":                                   # шестнадцатеричная строка
+            j = buf.find(b">", i + 1)
+            if j < 0:
+                raise _PdfBad("шестнадцатеричная строка в словаре без конца")
+            top += b" " * (j + 1 - i)
+            i = j + 1
+            continue
+        if c == b"%":                                   # комментарий до конца строки
+            j = i
+            while j < n and buf[j:j + 1] not in (b"\r", b"\n"):
+                j += 1
+            top += b" " * (j - i)
+            i = j
+            continue
+        top += c if depth == 1 else b" "
+        i += 1
+    raise _PdfBad("словарь без конца «>>»")
+
+
+def _pdf_name(top, key):
+    m = re.search(rb"/" + key + rb"(?![A-Za-z0-9])" + _W + rb"*/([A-Za-z0-9_.+-]+)", top)
+    return m.group(1) if m else None
+
+
+def _pdf_ref(top, key):
+    m = re.search(rb"/" + key + rb"(?![A-Za-z0-9])" + _W + rb"*(\d+)" + _W + rb"+(\d+)" + _W + rb"+R(?![A-Za-z0-9])", top)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _pdf_int(top, key):
+    """Прямое целое ключа | None (ссылка «N G R» — не прямое целое)."""
+    m = re.search(rb"/" + key + rb"(?![A-Za-z0-9])" + _W + rb"*(-?\d+)(?![\d.])(?!" + _W + rb"+\d+" + _W + rb"+R)", top)
+    return int(m.group(1)) if m else None
+
+
+def _pdf_array(top, key):
+    m = re.search(rb"/" + key + rb"(?![A-Za-z0-9])" + _W + rb"*\[([^\]]*)\]", top)
+    return m.group(1) if m else None
+
+
+def _pdf_stream(buf, end, top):
+    """Байты потока объекта, чей словарь кончился на end: по прямому /Length, если за ним «endstream», иначе до
+    «endstream»."""
+    m = _RX_STREAM.match(buf, end)
+    if not m:
+        raise _PdfBad("за словарём потока нет «stream»")
+    s, length = m.end(), _pdf_int(top, b"Length")
+    if length is not None and 0 <= length <= len(buf) - s and re.match(_W + rb"*endstream", buf[s + length:s + length + 40]):
+        return buf[s:s + length]
+    e = buf.find(b"endstream", s)
+    if e < 0:
+        raise _PdfBad("поток без «endstream»")
+    return buf[s:e]
+
+
+def _pdf_decode(data, top, whole):
+    """Поток → байты: без фильтра или /FlateDecode (+ предиктор PNG, 1 байт на отсчёт). Иное — не этот уровень."""
+    filt = re.findall(rb"/([A-Za-z0-9]+)", (re.search(rb"/Filter(?![A-Za-z0-9])" + _W + rb"*(\[[^\]]*\]|/[A-Za-z0-9]+)",
+                                                        top) or [None, b""])[1]) if b"/Filter" in top else []
+    if filt and filt != [b"FlateDecode"]:
+        raise _PdfBad("фильтр потока %s этим уровнем не разбирается — не проверено" % b"/".join(filt).decode("latin-1"))
+    if filt:
+        try:
+            d = zlib.decompressobj()
+            data = d.decompress(data) + d.flush()
+        except zlib.error:
+            raise _PdfBad("поток /FlateDecode не распаковывается")
+    k = top.find(b"/DecodeParms")
+    if k < 0:
+        return data
+    ptop, _w, _e = _pdf_dict(whole, k + len(b"/DecodeParms"))
+    pred = _pdf_int(ptop, b"Predictor") or 1
+    if pred == 1:
+        return data
+    cols, colors, bpc = _pdf_int(ptop, b"Columns") or 1, _pdf_int(ptop, b"Colors") or 1, _pdf_int(ptop, b"BitsPerComponent") or 8
+    if pred < 10 or colors != 1 or bpc != 8 or cols < 1:
+        raise _PdfBad("предиктор %d (Colors %d, BitsPerComponent %d) этим уровнем не разбирается — не проверено"
+                      % (pred, colors, bpc))
+    row = cols + 1
+    if len(data) % row:
+        raise _PdfBad("поток с предиктором PNG не делится на строки")
+    out, prev = bytearray(), bytearray(cols)
+    for k in range(0, len(data), row):
+        ft, line = data[k], bytearray(data[k + 1:k + row])
+        for x in range(cols):
+            a, b, c = (line[x - 1] if x else 0), prev[x], (prev[x - 1] if x else 0)
+            if ft == 1:
+                line[x] = (line[x] + a) & 255
+            elif ft == 2:
+                line[x] = (line[x] + b) & 255
+            elif ft == 3:
+                line[x] = (line[x] + ((a + b) >> 1)) & 255
+            elif ft == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[x] = (line[x] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+            elif ft != 0:
+                raise _PdfBad("строка предиктора PNG с типом %d" % ft)
+        out += line
+        prev = line
+    return bytes(out)
+
+
+def _pdf_xref_table(buf, off):
+    """Таблица ссылок «xref» по смещению → ({номер: запись}, верхний уровень трейлера) | None — там не «xref»."""
+    m = _RX_XREF.match(buf, off)
+    if not m:
+        return None
+    pos, entries, subs = m.end(), {}, 0
+    while True:
+        h = _RX_SUB.match(buf, pos)
+        if not h:
+            break
+        first, count = int(h.group(1)), int(h.group(2))
+        pos = h.end()
+        if count > (len(buf) - pos) // 18 + 1:
+            raise _PdfBad("подраздел таблицы ссылок (%d записей) длиннее файла" % count)
+        for i in range(count):
+            e = _RX_ENT.match(buf, pos)
+            if not e:
+                raise _PdfBad("запись %d таблицы ссылок не разобрана (байт %d)" % (first + i, pos))
+            pos = e.end()
+            entries.setdefault(first + i, ("n", int(e.group(1)), int(e.group(2))) if e.group(3) == b"n" else ("f",))
+        subs += 1
+    if not subs:
+        raise _PdfBad("в таблице ссылок нет ни одного подраздела")
+    t = _RX_TRAILER.match(buf, pos)
+    if not t:
+        raise _PdfBad("за таблицей ссылок нет «trailer» (байт %d)" % pos)
+    return entries, _pdf_dict(buf, t.end())[0]
+
+
+def _pdf_xref_stream(buf, off):
+    """Поток ссылок по смещению → ({номер: запись}, верхний уровень его словаря) | None — там не объект."""
+    m = _RX_OBJ.match(buf, off)
+    if not m:
+        return None
+    top, whole, end = _pdf_dict(buf, m.end())
+    if _pdf_name(top, b"Type") != b"XRef":
+        raise _PdfBad("по смещению %d объект, но не поток ссылок /Type /XRef" % off)
+    data = _pdf_decode(_pdf_stream(buf, end, top), top, whole)
+    w = [int(x) for x in re.findall(rb"\d+", _pdf_array(top, b"W") or b"")]
+    size = _pdf_int(top, b"Size")
+    idx = [int(x) for x in re.findall(rb"\d+", _pdf_array(top, b"Index") or b"")] or [0, size or 0]
+    if len(w) != 3 or size is None or len(idx) % 2 or not sum(w):
+        raise _PdfBad("словарь потока ссылок без /W из трёх чисел или /Size")
+    width, pos, entries = sum(w), 0, {}
+    for start, count in zip(idx[0::2], idx[1::2]):
+        for i in range(count):
+            rec = data[pos:pos + width]
+            if len(rec) < width:
+                raise _PdfBad("поток ссылок короче, чем объявляют /W и /Index")
+            pos += width
+            f, p = [], 0
+            for n_ in w:
+                f.append(int.from_bytes(rec[p:p + n_], "big") if n_ else None)
+                p += n_
+            kind = f[0] if w[0] else 1
+            if kind == 0:
+                entries.setdefault(start + i, ("f",))
+            elif kind == 1:
+                entries.setdefault(start + i, ("n", f[1], f[2] or 0))
+            elif kind == 2:
+                entries.setdefault(start + i, ("c", f[1], f[2] or 0))
+    return entries, top
+
+
+def _pdf_sections(buf, off):
+    """Цепочка таблиц ссылок от startxref: сама, её /XRefStm, затем /Prev → [(записи, трейлер)] от новой к старой."""
+    out, seen, todo = [], set(), [off]
+    while todo:
+        o = todo.pop(0)
+        if o in seen:
+            continue
+        if len(seen) >= _PDF_MAX_SECTIONS:
+            raise _PdfBad("цепочка /Prev длиннее %d таблиц" % _PDF_MAX_SECTIONS)
+        seen.add(o)
+        if not 0 <= o < len(buf):
+            raise _PdfBad("смещение таблицы ссылок %d вне файла (%d байт)" % (o, len(buf)))
+        got = _pdf_xref_table(buf, o) or _pdf_xref_stream(buf, o)
+        if got is None:
+            raise _PdfBad("смещение %d указывает не на таблицу ссылок «xref» и не на поток ссылок" % o)
+        out.append(got)
+        xs = _pdf_int(got[1], b"XRefStm")
+        if xs is not None:
+            hyb = _pdf_xref_stream(buf, xs) if 0 <= xs < len(buf) else None
+            if hyb is None:
+                raise _PdfBad("/XRefStm %d не указывает на поток ссылок" % xs)
+            out.append(hyb)
+        prev = _pdf_int(got[1], b"Prev")
+        if prev is not None:
+            todo.append(prev)
+    return out
+
+
+def _pdf_at(buf, table, ref, stms):
+    """Объект ref по таблице ссылок → верхний уровень его словаря. Сжатый в потоке объектов — из распакованного потока."""
+    num = ref[0]
+    ent = table.get(num)
+    if ent is None:
+        raise _PdfBad("объекта %d нет в таблице ссылок" % num)
+    if ent[0] == "f":
+        raise _PdfBad("объект %d в таблице ссылок помечен свободным" % num)
+    if ent[0] == "n":
+        if not 0 <= ent[1] < len(buf):
+            raise _PdfBad("смещение объекта %d (%d) вне файла" % (num, ent[1]))
+        m = _RX_OBJ.match(buf, ent[1])
+        if not m or int(m.group(1)) != num:
+            raise _PdfBad("по смещению объекта %d из таблицы ссылок (%d) нет «%d %d obj»" % (num, ent[1], num, ref[1]))
+        return _pdf_dict(buf, m.end())[0]
+    if ent[1] not in stms:
+        sent = table.get(ent[1])
+        if not sent or sent[0] != "n":
+            raise _PdfBad("поток объектов %d для объекта %d не найден по таблице ссылок" % (ent[1], num))
+        m = _RX_OBJ.match(buf, sent[1]) if 0 <= sent[1] < len(buf) else None
+        if not m or int(m.group(1)) != ent[1]:
+            raise _PdfBad("по смещению потока объектов %d нет «%d 0 obj»" % (ent[1], ent[1]))
+        top, whole, end = _pdf_dict(buf, m.end())
+        if _pdf_name(top, b"Type") != b"ObjStm":
+            raise _PdfBad("объект %d — не поток объектов /Type /ObjStm" % ent[1])
+        data, first, count = _pdf_decode(_pdf_stream(buf, end, top), top, whole), _pdf_int(top, b"First"), \
+            _pdf_int(top, b"N")
+        head = [int(x) for x in re.findall(rb"\d+", data[:first or 0])]
+        if first is None or count is None or len(head) < 2 * count:
+            raise _PdfBad("заголовок потока объектов %d не разобран" % ent[1])
+        stms[ent[1]] = (data, first, dict(zip(head[0:2 * count:2], head[1:2 * count:2])))
+    data, first, offs = stms[ent[1]]
+    if num not in offs:
+        raise _PdfBad("объекта %d нет в потоке объектов %d" % (num, ent[1]))
+    return _pdf_dict(data, first + offs[num])[0]
+
+
+def pdf_shape(raw):
+    """Байты PDF → (True, "") | (False, причина словами). Уровень — ровно `PDF_LEVEL`, не шире (K3-FIX F4)."""
+    try:
+        return _pdf_shape(bytes(raw or b""))
+    except _PdfBad as e:
+        return False, str(e)
+    except Exception as e:                                           # noqa: BLE001 — сбой разбора = не проверено = не шлём
+        return False, "скелет PDF не разобран (%s)" % type(e).__name__
+
+
+def _pdf_shape(buf):
+    if not buf.startswith(b"%PDF-"):
+        raise _PdfBad("нет заголовка «%PDF-» в начале файла")
+    tail = max(0, len(buf) - _PDF_TAIL)
+    eof = buf.rfind(b"%%EOF", tail)
+    if eof < 0:
+        raise _PdfBad("нет «%%EOF» в последних 1024 байтах — файл обрезан или повреждён")
+    sx = buf.rfind(b"startxref", tail, eof)
+    m = _RX_STARTXREF.match(buf, sx) if sx >= 0 else None
+    if not m:
+        raise _PdfBad("нет «startxref <смещение>» перед последним «%%EOF»")
+    sections = _pdf_sections(buf, int(m.group(1)))
+    table = {}
+    for entries, _top in sections:
+        for num, ent in entries.items():
+            table.setdefault(num, ent)
+    root = next((r for r in (_pdf_ref(top, b"Root") for _e, top in sections) if r), None)
+    if root is None:
+        raise _PdfBad("трейлер не называет /Root")
+    stms = {}
+    cat = _pdf_at(buf, table, root, stms)
+    if _pdf_name(cat, b"Type") != b"Catalog":
+        raise _PdfBad("/Root %d — не каталог /Type /Catalog" % root[0])
+    pages = _pdf_ref(cat, b"Pages")
+    if pages is None:
+        raise _PdfBad("в каталоге нет ссылки /Pages")
+    ptop = _pdf_at(buf, table, pages, stms)
+    if _pdf_name(ptop, b"Type") != b"Pages":
+        raise _PdfBad("корень дерева страниц %d — не /Type /Pages" % pages[0])
+    count = _pdf_int(ptop, b"Count")
+    if count is None:
+        raise _PdfBad("у корня дерева страниц нет прямого целого /Count")
+    if count < 1:
+        raise _PdfBad("у корня дерева страниц /Count %d — страниц нет" % count)
+    kids = [(int(a), int(b)) for a, b in re.findall(rb"(\d+)" + _W + rb"+(\d+)" + _W + rb"+R(?![A-Za-z0-9])",
+                                                    _pdf_array(ptop, b"Kids") or b"")]
+    if not kids:
+        raise _PdfBad("у корня дерева страниц пустой /Kids")
+    for kid in kids[:_PDF_MAX_KIDS]:
+        if _pdf_name(_pdf_at(buf, table, kid, stms), b"Type") not in (b"Page", b"Pages"):
+            raise _PdfBad("ребёнок %d корня дерева страниц — не /Page и не /Pages" % kid[0])
+    return True, ""
 
 
 class _Probe:
@@ -770,6 +1148,8 @@ class AttachCore(A.Core):
         if not self.attach:
             return super()._deliver(draft_id, number, upto, text, who, now, from_state)
         meta = self._attach(draft_id)
+        ver0 = self.db.execute("SELECT ver FROM drafts WHERE id=?", (draft_id,)).fetchone()   # K3-FIX N2: версия нажатия
+        ver0 = ver0[0] if ver0 else None
         if meta and meta[0]:
             twin = self._pdf_twin(number, meta[3], draft_id)    # тот же договор успел уйти другим черновиком (R03)
             if twin:
@@ -812,9 +1192,37 @@ class AttachCore(A.Core):
             pstate, preason = A.NOT_SENT, why
         else:
             pstate, preason = self._send_pdf(draft_id, number, who, now, 1, (P_WAIT,), meta, prev=1)
-        words = parts_words(tstate, pstate, preason)
-        self._done(draft_id, "%s — %s, %s" % (words, who, A.hm_phuket(now)), now)
-        return dict(res, words=words, parts={"text": tstate, "pdf": pstate})
+        words, fresh, tnow, pnow = self._settled(draft_id, ver0, tstate, pstate, preason, 1, keep_decided=True)
+        if fresh:
+            self._done(draft_id, "%s — %s, %s" % (words, who, A.hm_phuket(now)), now)
+        return dict(res, words=words, parts={"text": tnow, "pdf": pnow})
+
+    def _settled(self, draft_id, ver0, tstate, pstate, preason, attempt, keep_decided=False):
+        """K3-FIX N2: исход частей ПЕРЕЧИТЫВАЕТСЯ из базы после двери → (слова, править ли карточку, текст, PDF).
+        База совпала с ответом этого процесса (версия черновика, состояния обеих частей и номер попытки) — слова прежние
+        (`parts_words`), карточка правится, как раньше.
+        Не совпала — захват проигран (второй экземпляр службы, конкурент): слова по ПЕРЕЧИТАННОМУ (`reread_words`):
+        «не ушёл» — только при not_sent в базе, unsure — «исход неизвестен — не повторять, проверить». Карточку поздний ответ
+        правит, только если версия черновика та же и номер попытки PDF не вырос; keep_decided — карточка, уже решённая
+        другим процессом (исход старта второго экземпляра), не перекрывается."""
+        row = self.db.execute("SELECT d.state, d.ver, p.state, p.attempt, p.reason FROM drafts d LEFT JOIN pdf_parts p "
+                              "ON p.draft_id=d.id WHERE d.id=?", (draft_id,)).fetchone()
+        if not row:
+            return parts_words(tstate, pstate, preason), True, tstate, pstate
+        t_db, ver_db, p_db, att_db, why_db = row
+        if (ver_db == ver0 and t_db == tstate and p_db == pstate
+                and (att_db is None or int(att_db) == int(attempt))):
+            return parts_words(tstate, pstate, preason), True, tstate, pstate
+        words = "%s (%s)" % (reread_words(t_db, p_db, why_db), W_LATE)
+        fresh = ver_db == ver0 and (att_db is None or int(att_db) <= int(attempt))
+        if fresh and keep_decided:
+            card = self.db.execute("SELECT state FROM card_out WHERE draft_id=? AND ver=?",
+                                   (draft_id, int(ver_db))).fetchone()
+            fresh = not (card and card[0] == A.CARD_DECIDED)
+        self.log("черновик %d: ответ попытки %d опоздал — база: текст %s, PDF %s (попытка %s); карточку %s" % (
+            draft_id, int(attempt), t_db, p_db, att_db, "правлю по базе" if fresh else
+            "не трогаю: её уже решил другой процесс, версия или попытка новее"))
+        return words, fresh, t_db, p_db
 
     def _wamid(self, draft_id):
         row = self.db.execute("SELECT wamid FROM drafts WHERE id=?", (draft_id,)).fetchone()
@@ -862,12 +1270,19 @@ class AttachCore(A.Core):
         if have not in (None, "") and row is not None and str(have).strip() != str(row).strip():
             return fail("строка реестра PDF при отправке %s, при сверке %s — договор сменился, не отправлено" % (
                 str(have)[:20], str(row)[:20]))
+        # K3-FIX F4: скелет PDF судится на ТЕХ ЖЕ байтах, что уйдут двери (`body` — его же отдаёт `media["fetch"]`), ДО
+        # sending: не сошёлся — часть not_sent с причиной человеку, двери нет, повтора нет. Уровень — `PDF_LEVEL`
+        body = raw
+        shape_ok, shape_why = pdf_shape(body)
+        if not shape_ok:
+            self.log("черновик %d: PDF не прошёл проверку скелета (%s) — двери нет" % (draft_id, shape_why[:120]))
+            return fail(W_PDF_SHAPE % shape_why)
         # ── sending ДО двери: рестарт после этой строки повтора не даст ──
         if self.db.execute("UPDATE pdf_parts SET state=?, sending_at=?, sha256=? WHERE draft_id=? AND state=?",
                            (A.SENDING, now, now_sha, draft_id, P_CLAIMED)).rowcount != 1:
             return None, "уже решено"
-        media = {"kind": "document", "mime": PDF_MIME, "size": len(raw), "filename": name, "caption": "",
-                 "fetch": lambda cap: (raw, "")}
+        media = {"kind": "document", "mime": PDF_MIME, "size": len(body), "filename": name, "caption": "",
+                 "fetch": lambda cap: (body, "")}
         try:
             res = self.door.send_media(number, media) or {}
         except Exception as e:                                       # noqa: BLE001
@@ -1125,14 +1540,18 @@ class AttachCore(A.Core):
         if not ok:
             self.log("черновик %d: «Дослать PDF» — основание не подтверждено реестром, PDF не ушёл" % draft_id)
             return {"ok": False, "state": pstate, "words": W_BASIS_PDF % basis_why}
+        ver0 = self.db.execute("SELECT ver FROM drafts WHERE id=?", (draft_id,)).fetchone()   # K3-FIX N2
+        ver0 = ver0[0] if ver0 else None
         pstate2, why = self._send_pdf(draft_id, number, who, now, patt + 1, (pstate,), meta, permit=permit,
                                       prev=int(attempt))
         if pstate2 is None:
             return {"ok": False, "state": None, "words": "уже решено: PDF — повтор уже идёт"}
-        words = parts_words(A.SENT, pstate2, why)
-        self._done(draft_id, "%s — дослал %s, %s%s" % (words, who, A.hm_phuket(now),
-                                                        " (риск дубля принят)" if permit else ""), now)
-        return {"ok": pstate2 == A.SENT, "state": pstate2, "words": words}
+        # K3-FIX N2: исход попытки перечитан; поздний ответ (попытка или версия новее) карточку не правит
+        words, fresh, _tnow, pnow = self._settled(draft_id, ver0, A.SENT, pstate2, why, patt + 1)
+        if fresh:
+            self._done(draft_id, "%s — дослал %s, %s%s" % (words, who, A.hm_phuket(now),
+                                                            " (риск дубля принят)" if permit else ""), now)
+        return {"ok": pnow == A.SENT, "state": pnow, "words": words}
 
     def parts(self, draft_id):
         """Исходы частей черновика → {"text": state, "pdf": state | None, "words": …}."""

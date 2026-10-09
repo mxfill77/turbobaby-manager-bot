@@ -31,10 +31,11 @@ import wa_agent as A  # noqa: E402
 import wa_agent_svc as S  # noqa: E402
 import wa_agent_tg as G  # noqa: E402
 import test_wa_agent_svc as SV  # noqa: E402  (поддельный Bot API, часы, схема очереди)
+import k3_pdf_fixture  # noqa: E402  (K3-FIX F4: скелет PDF сверяется перед дверью — фикстура живого формата)
 
 NUM, CHAT, SHOW, T0, HUMAN = SV.NUM, SV.CHAT, SV.SHOW, SV.T0, SV.HUMAN
 OTHER = "66899999999"
-PDF = b"%PDF-1.4 signed contract bytes NIGHT0710"
+PDF = k3_pdf_fixture.classic(b"signed contract bytes NIGHT0710")   # было b"%PDF-1.4 signed contract bytes NIGHT0710"
 SHA = hashlib.sha256(PDF).hexdigest()
 TEXT = "черновик модели"
 SIGNED = "2026-10-01 10:15:00"
