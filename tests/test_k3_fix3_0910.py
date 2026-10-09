@@ -12,9 +12,16 @@ VERDICT §4.1, §4.2, §4.5, §7 N4; F2_CONTRACT §§0, 1, 3.4):
      оплаты; отрицание и обещание будущей проверки не дают ни ложного подтверждения, ни ложной блокировки.
 п.4 F2 — версия источника только от источника (сегодня null + причина), `version` не выводится из signed_at, длины,
      msg_id, номера строки; у rental/rules время данных — время СНИМКА, свежий вызов старый снимок свежим не делает.
+Шаг 3b (10.10.2026, приёмка шага 3 fix_review VERDICT, PASS_WITH_REMARKS на cbe186f):
+п.3b D1 — 8 близких утвердительных форм приёмки («Аренда оплачена.», «Платёж получен.», «Оплата есть в кассе.», «Your
+     payment went through.» …) определение не ловило: ремонт — ФОРМЫ (`_PAY_FORMS`), а не список; отрицание, будущее,
+     долженствование, проверка, условие, вопрос, предмет после предлога, роль залога — не утверждение.
+D3   — проверки, которые падают под мутантами приёмки m3r (FACT второго поиска договора не снят в НЕИЗВЕСТНО) и m3v
+     (недоплата по кассе не отказ); на cbe186f они ПРОХОДЯТ — ловят мутанты, а не дефект кода.
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на f2f7295 и на коммите шага 2 (996ee09) он падает по существу, на
 ремонте проходит. Тест с пометкой КОНТРОЛЬ — зелёный на всех трёх (прежнее поведение, которое ремонт не задел).
+Тесты п.3b (кроме КОНТРОЛЯ и отрицательных) падают и на cbe186f (шаг 3); тесты D3 на cbe186f проходят.
 
 Всё на подменах: двери — функции ответа живого формата (`bridge_client.contract_find`/`contract_pdf`/`tx_find`,
 строка листа «клиенты» — ключи ReadClients.js), модель — сценарий. Сети, моста, Telegram, WhatsApp, SQLite и
@@ -522,6 +529,125 @@ def test_p3_control_backed_confirmation_not_blocked():
     facts = T.accepted([T.rental_result({"ok": True, "rows": [dict(ROW)]}, at=T0), T.cash_result(tx([tx_item()]), at=T0),
                         con])
     assert T.money_roles(AFFIRM[1], facts) == [], T.money_roles(AFFIRM[1], facts)
+
+
+# ═══ п.3b N4 (D1 приёмки шага 3, fix_review VERDICT §9): ФОРМЫ, а не список фраз ═══════════════════════════════
+
+CLOSE_ACCEPT = ["В кассе есть ваша оплата аренды на 7790 бат.", "Оплата есть в кассе.",            # приёмка ДОСЛОВНО:
+                "Оплата зафиксирована в кассе.", "Аренда оплачена.", "Оплачено, спасибо!",           # fix_review VERDICT §9,
+                "Платёж получен.", "Деньги получили, спасибо.", "Your payment went through."]       # out_rv_newx_a :49-56
+CLOSE_OWN = ["Оплата за аренду учтена в кассе.", "Ваш перевод пришёл, спасибо.", "Средства зачислены на счёт.",
+             "Платёж прошёл успешно.", "Получена ваша оплата за аренду 7790 бат.", "Зафиксировали ваш платёж.",
+             "Бронь полностью оплачена.", "Предоплата внесена, спасибо.", "Деньги дошли.",
+             "На счёте имеется ваш платёж.",
+             "The rental is paid.", "Your rent has been paid.", "We got your transfer, thanks.",
+             "The money arrived this morning.", "All paid, thank you!", "Funds have been credited to our account."]
+NOT_CLOSE = ["Оплата пока не поступила.", "Аренда ещё не оплачена.", "Деньги ещё не получили.",          # отрицание
+             "Платёж поступит завтра.", "Оплата будет зафиксирована после сверки.", "Оплачено будет при выдаче байка.",
+             "Платёж должен быть проведён до выдачи байка.",                                          # будущее, долг
+             "Проверю, получена ли оплата.", "Если аренда оплачена, договор пришлём.",                 # проверка, условие
+             "If the money arrived, please let us know.",
+             "Оплачено?", "Деньги получили?", "Has your payment gone through?",                        # вопрос
+             "Your payment hasn't gone through yet.",
+             "Оплата наличными тоже есть.", "Получили ваш запрос на оплату.", "Payment link received, thank you.",
+             "Перевод договора на английский получен.", "Срок оплаты прошёл.", "The rent is paid at pickup."]
+
+
+def _facts_backed():
+    """Касса этой аренды + её строка листа + договор, привязанный к ней кодом: оплата подтверждена, опора 7790."""
+    rent = T.rental_result({"ok": True, "rows": [dict(ROW)]}, at=T0)
+    con = T.contract_result(Registry([DOC1])(phone=NUMBER), at=T0, number=NUMBER, rental=rent)
+    return T.accepted([rent, T.cash_result(tx([tx_item()]), at=T0), con])
+
+
+def test_p3b_acceptance_close_forms_flagged():
+    """D1: 8 близких утвердительных форм приёмки шага 3 (дословно) без второго источника — причина «оплата не
+    подтверждена сверкой» тем же определением (`_PayClaim`)."""
+    facts = _facts_no_second_source()
+    miss = [t for t in CLOSE_ACCEPT if [w for w, _why in T.money_roles(t, facts)] != [T.PAY_WORDS]]
+    assert not miss, miss
+
+
+def test_p3b_own_close_forms_flagged():
+    """D1: свои близкие формы RU/EN (причастие оплаты, предмет + сказуемое получения/учёта, сказуемое + предмет) —
+    ловятся формами, а не списком."""
+    facts = _facts_no_second_source()
+    miss = [t for t in CLOSE_OWN if [w for w, _why in T.money_roles(t, facts)] != [T.PAY_WORDS]]
+    assert not miss, miss
+
+
+def test_p3b_not_claims_not_blocked():
+    """D1, отрицательный: отрицание, будущее/долженствование, проверка, условие, вопрос; «есть» без кассы/учёта;
+    предмет после предлога; «payment link»; «перевод договора»; «срок оплаты»; правило «is paid at pickup» — не
+    утверждение: ни причины, ни сумм «полученной оплаты»."""
+    facts = _facts_no_second_source()
+    bad = [(t, T.money_roles(t, facts), sorted(T.pay_claimed(t))) for t in NOT_CLOSE
+           if T.money_roles(t, facts) or T.pay_claimed(t)]
+    assert not bad, bad
+
+
+def test_p3b_claimed_sums_close_forms():
+    """D1: сумма, названная полученной оплатой близкой формой, — тем же определением (7790), без чисел — пусто."""
+    assert T.pay_claimed(CLOSE_ACCEPT[0]) == {7790}, T.pay_claimed(CLOSE_ACCEPT[0])
+    assert T.pay_claimed("Получена ваша оплата за аренду 7790 бат.") == {7790}
+    assert T.pay_claimed("Платёж получен.") == set()
+
+
+def test_p3b_deposit_subject_existing_role():
+    """D1 + роли money_roles: подлежащее — залог («Залог оплачен», «деньги за залог получили») — роль залога
+    (`_DEP_CLAIM`), а не оплата аренды; аренда названа раньше залога — утверждение оплаты аренды."""
+    facts = _facts_no_second_source()
+    assert [w for w, _why in T.money_roles("Залог оплачен.", facts)] == [T.ROLE_WORDS]
+    assert T.pay_claimed("Залог оплачен.") == set()
+    assert T.PAY_WORDS not in [w for w, _why in T.money_roles("Деньги за залог получили.", facts)]
+    assert T.PAY_WORDS in [w for w, _why in T.money_roles("Аренда и залог оплачены.", facts)]
+
+
+def test_p3b_control_backed_close_forms_not_blocked():
+    """КОНТРОЛЬ D1: близкие формы С опорой (касса + договор той же аренды, сумма 7790) — причины нет."""
+    facts = _facts_backed()
+    assert T.pay_confirmed(facts) is True
+    bad = [(t, T.money_roles(t, facts)) for t in CLOSE_ACCEPT + CLOSE_OWN if T.money_roles(t, facts)]
+    assert not bad, bad
+
+
+# ═══ D3 приёмки шага 3: проверки, которые убивают мутанты m3r и m3v ═══════════════════════════════════════════
+
+class SelfContradicting(Registry):
+    """Дверь противоречит сама себе: со сроком аренды — «не найден», без срока — тот же договор В сроке."""
+
+    def __call__(self, **kw):
+        out = super().__call__(**kw)
+        if kw.get("date_from"):
+            out = dict(out, outcome="none", pick=None, items=[])
+        return out
+
+
+def test_d3_m3r_door_contradicts_itself_unknown():
+    """D3 (мутант m3r_contradiction_is_fact): в сроке «нет», без срока — договор В сроке → НЕИЗВЕСТНО (не FACT), договор
+    и PDF не приняты, вложения нет."""
+    reg = SelfContradicting([DOC1])
+    out = run(Script({"tool": "contract", "args": {}}, {"tool": "contract_pdf", "args": {"file_id": "PDF-0001"}},
+                     final("Ок")), reg)
+    assert len(reg.calls) == 2 and reg.calls[0].get("date_from") == TERM[0] and "date_from" not in reg.calls[1], \
+        reg.calls
+    res = [r for r in out["results"] if r["tool"] == "contract"][0]
+    assert res["outcome"] == T.UNKNOWN and "противоречат" in res["reason"], (res["outcome"], res["reason"])
+    assert not [f for f in T.accepted(out["results"]) if f["kind"] in ("contract", "pdf")], T.accepted(out["results"])
+    assert X.attach_of({"state": T.DONE, "results": out["results"]})[0] is None
+
+
+def test_d3_m3v_underpaid_cash_no_change():
+    """D3 (мутант m3v_underpaid_off): касса этой аренды записала МЕНЬШЕ итога (7000 из 7790), клиент назвал 8000 —
+    сдачи кодом нет («оплачена на 7000 из 7790»), ни в расчёте, ни в блоке запроса модели."""
+    res = [T.rental_result({"ok": True, "rows": [dict(ROW)]}, at=T0),
+           T.cash_result(tx([tx_item(amount=7000, description="Nmax 90101 +7000 аренда K3-BK-001")]), at=T0)]
+    ch = T.change_of(T.accepted(res), [8000])
+    assert ch["state"] == T.CHANGE_NO and "оплачена на 7000 из 7790" in ch["why"], ch
+    blk = T.change_block(res, [8000])
+    assert "сдача НЕ посчитана" in blk and "→ сдача" not in blk, blk
+    _refused([tx_item(amount=7000, description="Nmax 90101 +7000 аренда K3-BK-001")], C3_TEXT,
+             "оплачена на 7000 из 7790")
 
 
 # ═══ п.4 F2-честность ═════════════════════════════════════════════════════════════════════════════════════════

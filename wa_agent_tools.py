@@ -64,6 +64,9 @@ K3-FIX шаг 3 (09–10.10.2026): договор ищется в ДОВЕРЕН
 утвердительные формы оплаты («вижу оплату», «оплата отражена», «с оплатой всё в порядке») ловит то же определение
 `_PAY_CLAIM`, отрицание и обещание проверки — нет; поле `version` больше не пишется: версия — только `source_version` от
 источника (сегодня null, «источник версии не отдаёт»), время данных — `read_at` (у снимков — время СНИМКА).
+K3-FIX шаг 3b (10.10.2026, D1 приёмки): то же определение ловит утвердительные ФОРМЫ оплаты («аренда оплачена»,
+«платёж получен», «оплата зафиксирована/есть в кассе», «деньги получили», «your payment went through»), а не список
+фраз (`_PAY_FORMS`, второй проход `_PayClaim`); прежние формы не тронуты.
 """
 
 import json
@@ -935,23 +938,118 @@ _PAY_LATER = re.compile(r"(?<!\w)(?:будет|будут|станет|стан�
 _PAY_CUT = re.compile(r"[,;:—–(]|\s-\s")
 _PAY_END = re.compile(r"[.!?…\n]")
 
+# K3-FIX шаг 3b (D1 приёмки шага 3, 10.10.2026): утвердительные ФОРМЫ оплаты, а не список фраз приёмки — глагол или
+# причастие оплаты в утвердительной клаузе. Три вида:
+#   (1) причастие самой оплаты: «оплачен(а/о/ы)», «предоплачено»; англ. «was/were/been paid», «already/fully/all paid»,
+#       «is/are paid» в конце клаузы (а не «is paid at pickup» — правило оплаты), «rent(al) paid»;
+#   (2) предмет оплаты + сказуемое получения или учёта: «оплата/оплату/платёж/деньги/перевод/средства … есть/имеется/
+#       получен(а)/получили/поступила/пришёл/прошёл/дошли/зафиксирована/отражена/учтена/зачислены/принята/внесена/
+#       проведён/записана/подтверждена/видна/в порядке»; англ. «payment/money/transfer/funds … went through/came
+#       through/cleared/arrived/credited/processed/received/confirmed/recorded/settled»;
+#   (3) сказуемое + предмет: «получена ваша оплата», «зафиксировали платёж», «в кассе есть ваша оплата»; англ.
+#       «got/received/credited … your transfer».
+# Прежние формы `_PAY_AFFIRM` НЕ тронуты: расширение только добавляет второй проход ТЕМ ЖЕ определением (`_PayClaim`) —
+# с теми же исключениями (отрицание, будущее/проверка, условие, вопрос в клаузе до конца совпадения) и с четырьмя своими
+# (`_PayClaim._form_ok`): предмет после предлога («ссылку на оплату», «вопрос про платёж») оплатой не является; «есть/
+# имеется» — только при кассе/учёте/счёте или «ваша оплата» (а не «оплата картой тоже есть»); подлежащее — залог/депозит
+# (без аренды раньше него) — роль залога `_DEP_CLAIM`, а не оплата аренды (новых ролей нет); долженствование и будущее
+# в клаузе («должен быть проведён», «оплачено будет») — не утверждение.
+_PF_NOUN_NOM = r"(?:(?:пред|до)?оплата|плат[её]ж|плат[её]жи|деньги|перевод|переводы|средства)"
+_PF_NOUN_ACC = r"(?:(?:пред|до)?оплат[ау]|плат[её]ж|плат[её]жи|деньги|перевод|переводы|средства)"
+_PF_PRED = (r"(?:получен[аоы]?|получил[аои]?|поступил[аои]?|пришл[ао]|пришёл|пришел|прошл[аои]|прошёл|прошел|"
+            r"дошл[ао]|дошёл|дошел|зафиксирован[аоы]?|зафиксировал[аои]?|отражен[аоы]?|отражён|"
+            r"отразил(?:ась|ось|ся|ись|[аои])?|учтен[аоы]?|учтён|учли|зачислен[аоы]?|зачислил[аои]?|принят[аоы]?|"
+            r"принял[аои]?|внесен[аоы]?|внесён|проведен[аоы]?|проведён|записан[аоы]?|записали|подтвержден[аоы]?|"
+            r"подтверждён|подтверждаю|подтверждаем|подтвердил[аои]?|видн[аоы]|виден|вижу|видим|в\s+порядке|"
+            r"есть|имеется|имеются)")
+_PF_EN_NOUN = r"(?:payments?|money|transfers?|funds)"
+_PF_EN_PRED = (r"(?:went\s+through|gone\s+through|came\s+through|come\s+through|cleared|arrived|credited|processed|"
+               r"received|confirmed|recorded|registered|reflected|showing|settled|in\s+order|all\s+good)")
+_PAY_FORMS = re.compile(
+    r"(?<!\w)(?P<pp>(?:пред|до)?оплачен[аоы]?)(?!\w)|"
+    r"(?<!\w)(?P<pe>(?:was|were|been)\s+(?:already\s+|fully\s+)?paid|(?:already|fully|all)\s+paid|"
+    r"(?:is|are)\s+(?:already\s+|fully\s+|now\s+)?paid(?=\s*(?:$|[.!?,;:…\n—–()])|\s+(?:in\s+full|for|up\s+to|until|"
+    r"thank))|(?P<n5>rent|rental)\s+(?:already\s+|fully\s+)?paid)(?!\w)|"
+    r"(?<!\w)(?P<n1>" + _PF_NOUN_NOM + r"|(?:пред|до)?оплату)\s+" + _W + r"{0,8}(?P<v1>" + _PF_PRED + r")(?!\w)|"
+    r"(?<!\w)(?P<n2>деньги|средства|плат[её]жи|переводы)\s+" + _W + r"{0,4}(?:пришли|дошли)(?!\w)|"
+    r"(?<!\w)(?P<v3>" + _PF_PRED + r")\s+" + _W + r"{0,3}(?P<n3>" + _PF_NOUN_ACC + r")(?!\w)|"
+    r"(?<!\w)(?P<n4>" + _PF_EN_NOUN + r")\s+" + _W + r"{0,5}" + _PF_EN_PRED + r"(?!\w)|"
+    r"(?<!\w)(?:received|got|recorded|registered|credited|confirmed|processed|cleared)\s+" + _W + r"{0,3}"
+    r"(?P<n6>" + _PF_EN_NOUN + r")(?!\w)",
+    re.I)
+_PAY_PASSES = (_PAY_AFFIRM, _PAY_FORMS)            # ОДНО определение, два прохода: прежние формы, затем формы шага 3b
+_PF_DET = re.compile(r"ваш\w*|наш\w*|эт\w+|тот|та|ту|те|the|a|an|your|our|my|this|that|these|those", re.I)
+_PF_PREP = re.compile(r"на|за|по|про|о|об|обо|для|к|ко|от|до|из|с|со|в|во|у|при|без|через|после|перед|под|над|"
+                      r"насч[её]т|for|about|of|on|to|with|without|after|before|regarding|via|by", re.I)
+_PF_EXIST = re.compile(r"есть|имеется|имеются", re.I)
+_PF_HELD = re.compile(r"касс|уч[её]т|сч[её]т|счету|выписк|(?<!\w)ваш[аеиу]?\s+(?:(?:пред|до)?оплат|плат[её]ж|деньг|"
+                      r"перевод|средств)", re.I)
+_PF_DEP = re.compile(r"залог|депозит|deposit", re.I)
+_PF_RENT = re.compile(r"аренд|прокат|брон|rent|booking", re.I)
+_PF_MUST = re.compile(r"(?<!\w)(?:должен|должн\w*|нужно|надо|необходимо|обязан\w*|будет|будут|станет|станут|must|should|"
+                      r"need\s+to|has\s+to|have\s+to|will|shall)(?!\w)", re.I)
+_PF_EN_NEXT = re.compile(r"\s+(?:links?|details|methods?|options?|receipts?|screenshots?|info|information|terms|"
+                         r"deadline|date|requests?|reminders?|instructions?|page|button|plan|schedule|form|reference)"
+                         r"(?!\w)", re.I)
+_PF_TRANSL_NEXT = re.compile(r"\s+(?:договор|документ|текст|сообщени|правил|инструкци)", re.I)  # «перевод договора»
+
 
 class _PayClaim:
     """ОДНО определение «текст утверждает, что оплата получена» (K3-FIX3 N4; им живут `money_roles` и `pay_claimed`,
-    т.е. ремонт F3 шага 1 — то же место, не второе). Утверждение — совпадение `_PAY_AFFIRM`, в клаузе которого (от начала
-    клаузы до конца совпадения) нет отрицания и нет будущей проверки, условия или вопроса, а предложение не кончается
-    «?». Отрицание («оплату пока не вижу») и обещание проверки («сверит и подтвердит», «как только отразится») ложного
+    т.е. ремонт F3 шага 1 — то же место, не второе). Утверждение — совпадение `_PAY_AFFIRM` или (шаг 3b, D1) формы
+    `_PAY_FORMS`, в клаузе которого (от начала клаузы до конца совпадения) нет отрицания и нет будущей проверки, условия
+    или вопроса, а предложение не кончается «?»; у форм шага 3b — ещё `_form_ok`. Отрицание («оплату пока не вижу»,
+    «не поступила») и обещание проверки («сверит и подтвердит», «как только отразится», «будет зафиксирована») ложного
     подтверждения не дают — и ложной блокировки тоже. `search` → совпадение | None."""
+
+    @staticmethod
+    def _matches(s):
+        for rx in _PAY_PASSES:
+            for m in rx.finditer(s):
+                yield rx, m
+
+    @staticmethod
+    def _form_ok(s, m, a):
+        """Формы шага 3b (D1): клауза совпадения от `a` до разрыва/конца предложения. Не утверждение — долженствование
+        или будущее в клаузе; предмет оплаты после предлога («ссылку на оплату») или англ. «payment link/details»,
+        «перевод договора»; «есть/имеется» без кассы/учёта/счёта/«ваша оплата»; подлежащее — залог/депозит."""
+        stop = [x.start() for x in (_PAY_CUT.search(s, m.end()), _PAY_END.search(s, m.end())) if x is not None]
+        clause = s[a:min(stop) if stop else len(s)]
+        if _PF_MUST.search(clause):
+            return False
+        gd = m.groupdict()
+        for k in ("n1", "n2", "n3", "n4", "n5", "n6"):
+            if gd.get(k):
+                before = re.findall(r"[^\W\d_]+", s[a:m.start(k)])
+                while before and _PF_DET.fullmatch(before[-1]):
+                    before.pop()
+                if before and _PF_PREP.fullmatch(before[-1]):
+                    return False
+                nxt = s[m.end(k):]
+                if (k in ("n4", "n6") and _PF_EN_NEXT.match(nxt)) or \
+                        (gd[k].lower().startswith("перевод") and _PF_TRANSL_NEXT.match(nxt)):
+                    return False
+                break
+        if _PF_EXIST.fullmatch(gd.get("v1") or gd.get("v3") or "") and not _PF_HELD.search(clause):
+            return False
+        dep = _PF_DEP.search(clause)
+        if dep is not None:
+            rent = _PF_RENT.search(clause)
+            if rent is None or dep.start() < rent.start():
+                return False
+        return True
 
     def search(self, text):
         s = str(text or "")
-        for m in _PAY_AFFIRM.finditer(s):
+        for rx, m in self._matches(s):
             head = s[:m.start()]
             a = max([x.end() for x in _PAY_CUT.finditer(head)] + [x.end() for x in K._SENTENCE.finditer(head)] + [0])
             clause = s[a:m.end()]
             end = _PAY_END.search(s, m.end())
             asked = end is not None and end.group(0) == "?" and not _PAY_CUT.search(s[m.end():end.start()])
             if _PAY_NOT.search(clause) or _PAY_LATER.search(clause) or asked:
+                continue
+            if rx is _PAY_FORMS and not self._form_ok(s, m, a):
                 continue
             return m
         return None
