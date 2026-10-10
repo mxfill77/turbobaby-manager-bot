@@ -37,6 +37,13 @@ R3   — два семейства, которых не ловил ни один
 2    — «долга нет» («задолженности по аренде нет», «ничего не должны», «счёт закрыт», «no balance due», «all settled»);
 3    — число без валюты при сказуемом получения, в том числе не вплотную («Да, 7790 получили.»), — утверждение, когда
      оно равно известной денежной сумме сверки (`pay_sums`) либо входящее об оплате; номер байка — нет.
+Шаг 3f (10.10.2026, решение координатора после круга 3e; остатки О1 и О3 строителя 3e):
+п.3f 1 — на входящее об оплате ответ, который ЦЕЛИКОМ состоит из согласия, одобрения, благодарности, принятия или знака
+     («Конечно.», «Принято.», «Спасибо!», «Of course.», «👍»), — утверждение оплаты; слово согласия во главе предложения
+     («Конечно. Ждём вас завтра.») судится как «да»; то же на входящее не об оплате и без входящего — нет; ответ с
+     содержанием, проверкой, передачей человеку («Конечно, договор пришлём.», «Спасибо, проверим поступление.») — нет;
+2    — знак препинания между предметом и сказуемым получения клаузу не рвёт: «7790 — получили.» (О3), «7790 бат —
+     получены», «Оплата: получена ✅», «Получено: 7790 бат.»; остаток О5 (время в той же клаузе без запятой) не закрыт.
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на f2f7295 и на коммите шага 2 (996ee09) он падает по существу, на
 ремонте проходит. Тест с пометкой КОНТРОЛЬ — зелёный на всех трёх (прежнее поведение, которое ремонт не задел).
@@ -45,6 +52,8 @@ R3   — два семейства, которых не ловил ни один
 Тесты п.3d (кроме КОНТРОЛЯ `…backed…` и отрицательного `…reviewer_not_claims…`) падают и на f6ed7bd (шаг 3c).
 Тесты п.3e (кроме КОНТРОЛЯ `…backed…`) падают и на 44ba8ee (шаг 3d): утвердительные — по существу (причины нет),
 отрицательные — оттого, что на 44ba8ee нет самого контекста сверки (признака входящего и сумм фактов у определения).
+Тесты п.3f (кроме КОНТРОЛЯ `…prior_outcomes_kept`) падают и на b7dea68 (шаг 3e): утвердительные — по существу (причины
+нет), отрицательные — оттого, что на b7dea68 у новых дорог нет названного исхода (`PC_NOASK`, `PC_OTHER`, `PC_NUM` …).
 
 Всё на подменах: двери — функции ответа живого формата (`bridge_client.contract_find`/`contract_pdf`/`tx_find`,
 строка листа «клиенты» — ключи ReadClients.js), модель — сценарий. Сети, моста, Telegram, WhatsApp, SQLite и
@@ -1487,6 +1496,315 @@ def test_p3e_control_backed_new_families_not_blocked():
     rows = E1_RV_OPEN + E1_AFFIRM + [(t, Q_NONE) for t in E2_AFFIRM + E3_AFFIRM] + E_FRESH_AFFIRM
     bad = [(t, q, _judged(t, q, backed)) for t, q in rows if T.PAY_WORDS in _judged(t, q, backed)]
     assert not bad, bad
+
+
+# ═══ п.3f: согласие и знаки в ответ на входящее об оплате; знак препинания перед сказуемым (решение круга 3f) ═══
+
+Q_EMPTY = ""                                            # входящего нет вовсе
+QP_RU5 = "Я оплатил аренду, подтвердите"                # K15 real — клиент СООБЩАЕТ об оплате
+Q_CARD = "Can I pay by card?"                           # о способе оплаты
+THUMB, CHECKMARK, OKHAND, PRAY = chr(0x1F44D), chr(0x2705), chr(0x1F44C), chr(0x1F64F)    # 👍 ✅ 👌 🙏
+TICK, BALLOT, OKSQUARE, HANDSHAKE = chr(0x2714), chr(0x2611), chr(0x1F197), chr(0x1F91D)  # ✔ ☑ 🆗 🤝
+SMILE, SKIN, VS16 = chr(0x1F60A), chr(0x1F3FB), chr(0xFE0F)                               # 😊, оттенок кожи, вариант
+
+# словарь решения круга 3f (п.1) — ДОСЛОВНО: согласие, одобрение, благодарность, принятие, знаки
+F1_DEC_RU = ["да", "ага", "угу", "конечно", "разумеется", "верно", "точно", "именно", "именно так", "так и есть",
+             "принято", "получено", "хорошо", "отлично", "супер", "спасибо", "благодарю"]
+F1_DEC_EN = ["yes", "yep", "yeah", "sure", "of course", "certainly", "absolutely", "right", "correct", "indeed",
+             "received", "got it", "great", "perfect", "thanks", "thank you"]
+F1_DEC_SIGNS = [THUMB, CHECKMARK, OKHAND, PRAY]
+# близкие слова и знаки, добавленные строителем (каждое — своя строка словаря определения)
+F1_ADD_RU = ["да-да", "конечно же", "безусловно", "естественно", "так точно", "всё верно", "всё так", "всё точно",
+             "всё правильно", "правильно", "совершенно верно", "абсолютно", "абсолютно верно", "несомненно", "принял",
+             "приняла", "приняли", "понял", "поняла", "поняли", "понятно", "ясно", "прекрасно", "замечательно",
+             "великолепно", "здорово", "ок", "окей", "спасибо большое", "большое спасибо", "огромное спасибо",
+             "спасибо вам", "вам спасибо", "большое вам спасибо", "благодарим", "благодарю вас"]
+F1_ADD_EN = ["yup", "sure thing", "definitely", "exactly", "that's right", "that's correct", "for sure", "well received",
+             "noted", "understood", "acknowledged", "awesome", "wonderful", "excellent", "brilliant", "lovely", "nice",
+             "good", "fine", "super", "cool", "ok", "okay", "all right", "alright", "many thanks", "thanks a lot",
+             "thanks so much", "thank you so much", "thank you very much", "thank u", "much appreciated", "appreciated",
+             "cheers"]
+F1_ADD_SIGNS = [TICK, BALLOT, OKSQUARE, HANDSHAKE]
+# ответ ЦЕЛИКОМ из согласия: сочетания слов и знаков, приветствие и прощание, обращение по имени, регистр, пунктуация
+F1_AGREE = [
+    ("Отлично, спасибо!", QP_RU2), ("Хорошо, спасибо.", QP_RU3), ("Принято, спасибо!", QP_RU3), ("Да, принято.", QP_RU1),
+    ("Конечно, спасибо!", QP_RU1), ("Супер! Спасибо большое!", QP_RU3), ("Спасибо, принято.", QP_RU5),
+    ("Понял, спасибо.", QP_RU3), ("Хорошо, принял.", QP_RU2), ("Да, всё верно.", QP_RU1), ("Ок, спасибо", QP_RU3),
+    ("Спасибо " + PRAY, QP_RU3), ("Спасибо! " + SMILE, QP_RU3), ("Отлично " + THUMB, QP_RU2),
+    # знак перед словом, которое ловит и прежний проход краткого подтверждения, — здесь его ловит только правило шага
+    (CHECKMARK + " Принято", QP_RU3), (CHECKMARK + " Получено", QP_RU3), (CHECKMARK + " Так и есть", QP_RU3),
+    (THUMB + " Received", QP_EN2), (THUMB + " Got it", QP_EN2), (THUMB + " Well received", QP_EN2),
+    (THUMB + THUMB, QP_RU3), (THUMB + PRAY, QP_RU3), (THUMB + SKIN, QP_RU3), (TICK + VS16, QP_RU3),
+    (THUMB + " " + SMILE, QP_RU3), (OKHAND + "!", QP_EN2),
+    ("Спасибо, Алексей!", QP_RU3), ("Спасибо, Иван Петрович!", QP_RU3), ("Принято, Алексей, спасибо.", QP_RU3),
+    ("Здравствуйте, Алексей! Спасибо!", QP_RU2), ("Thank you, John!", QP_EN2),
+    ("СПАСИБО!", QP_RU3), ("спасибо", QP_RU3), ("Спасибо…", QP_RU3), ("Хорошо - спасибо", QP_RU3),
+    ("Спасибо!\nХорошего дня!", QP_RU3), ("  Принято.  ", QP_RU3), ("Спасибо :)", QP_RU3), ("Спасибо; принято.", QP_RU3),
+    ("Great, thank you!", QP_EN2), ("Perfect, thanks a lot!", QP_EN2), ("Noted, thanks.", QP_EN2),
+    ("Got it, thanks! " + THUMB, QP_EN1), ("OK, thank you.", QP_EN2), ("Yes, of course.", QP_EN1),
+    ("Sure, thanks!", QP_EN2), ("Absolutely, thank you so much!", QP_EN1),
+    ("Спасибо!", Q_MIX), ("Конечно.", Q_MIX)]                             # смешанное входящее — утверждение
+# приветствие и прощание рядом с согласием — по фразе на каждую строку словаря вежливости
+F1_POLITE = [
+    ("Здравствуйте! Спасибо!", QP_RU2), ("Здравствуй! Спасибо!", QP_RU2), ("Добрый день! Принято, спасибо.", QP_RU3),
+    ("Доброе утро! Спасибо!", QP_RU2), ("Привет! Спасибо!", QP_RU2), ("Спасибо! Хорошего дня!", QP_RU3),
+    ("Отлично, спасибо. Всего доброго!", QP_RU2), ("Спасибо, до завтра!", QP_RU3),
+    ("Hello! Thank you!", QP_EN2), ("Hi, sure.", QP_EN1), ("Hey, thanks!", QP_EN2), ("Good morning! Thank you!", QP_EN2),
+    ("Thanks, have a nice day!", QP_EN2), ("Thank you! See you tomorrow.", QP_EN2), ("Thanks, bye!", QP_EN2),
+    ("Thank you, goodbye!", QP_EN2), ("Thanks, take care!", QP_EN2)]
+# слово согласия во главе предложения — как «да»; дальше в ответе содержание без признака непроверенности
+F1_YES = [
+    ("Конечно. Ждём вас завтра в 10:00.", QP_RU1), ("Конечно! Договор пришлём сегодня.", QP_RU1),
+    ("Конечно же. Ждём вас завтра.", QP_RU1), ("Разумеется. До встречи завтра в офисе.", QP_RU5),
+    ("Безусловно. Байк будет готов к 10:00.", QP_RU1), ("Естественно. Ждём вас завтра.", QP_RU3),
+    ("Здравствуйте! Конечно. Ждём вас завтра.", QP_RU1),
+    ("Of course. See you tomorrow at 10.", QP_EN1), ("Sure! The bike is ready for tomorrow.", QP_EN1),
+    ("Sure thing. The bike is ready for tomorrow.", QP_EN1), ("Certainly. See you at the office.", QP_EN2),
+    ("Absolutely. Everything is ready for tomorrow.", QP_EN2), ("Definitely. See you tomorrow.", QP_EN1),
+    ("Indeed. See you tomorrow.", QP_EN1)]
+# те же ответы на входящее НЕ об оплате и без входящего — причины нет, исход назван `PC_NOASK`
+F1_NOASK = [
+    ("Конечно.", QD_RU), ("Спасибо!", QD_RU), ("Отлично, спасибо!", QD_RU), ("Принято.", QD_RU), (THUMB, QD_RU),
+    ("Of course.", QD_EN), ("Sure.", QD_EN), ("Great, thank you!", QD_EN), ("Спасибо, Алексей!", QD_RU),
+    ("Конечно. Ждём вас завтра в 10:00.", QD_RU),
+    ("Хорошо.", Q_NONE), (THUMB, Q_NONE), ("Спасибо!", Q_NONE), ("Thanks!", Q_EMPTY), ("Конечно.", Q_EMPTY),
+    (PRAY, Q_EMPTY), ("Конечно. Ждём вас завтра.", Q_NONE), ("Здравствуйте! Спасибо!", Q_NONE),
+    ("Конечно.", Q_HOW), (CHECKMARK, Q_HOW), ("Sure.", Q_CARD),
+    ("Хорошо.", Q_FUT), ("Хорошо, спасибо!", Q_FUT), ("Конечно.", Q_FUT), (THUMB, Q_FUT),     # оплата ещё только будет
+    ("Принято.", Q_FAIL), ("Хорошо.", Q_FAIL), ("Понял, спасибо.", Q_FAIL), (OKHAND, Q_FAIL)]  # оплата не прошла
+# входящее ОБ ОПЛАТЕ, но ответ — не согласие целиком: содержание, проверка, передача, отказ, вопрос (ответ, входящее,
+# имя исхода | None — совпадения определения нет вовсе)
+F1_NOT = [
+    ("Конечно, договор пришлём.", QP_RU1, V_OTHER),                        # решение — дословно
+    ("Спасибо, проверим поступление.", QP_RU2, None),                      # решение — дословно
+    ("Хорошо, уточню у коллег.", QP_RU2, None),                            # решение — дословно
+    ("Спасибо! Проверим и сообщим.", QP_RU2, None), ("Хорошо, сейчас проверю.", QP_RU2, None),
+    ("Принято, проверим поступление и подтвердим.", QP_RU2, None), ("Конечно, сейчас проверим.", QP_RU1, V_HOLD),
+    ("Конечно. Сейчас проверим и сообщим.", QP_RU1, V_HOLD), ("Ок, уточню.", QP_RU5, None),
+    ("Sure, let me check.", QP_EN2, V_HOLD),
+    ("Sure. I'll check with my colleague and get back to you.", QP_EN2, V_HOLD), ("Thanks, we'll check.", QP_EN2, None),
+    ("Спасибо, передам коллеге, он проверит.", QP_RU2, None), ("Понял, передаю коллеге.", QP_RU2, None),
+    ("Thanks, I'll pass it to my colleague to verify.", QP_EN2, None),
+    ("Нет.", QP_RU1, None), ("Пока нет.", QP_RU1, None), ("Спасибо, но оплату пока не видим.", QP_RU1, None),
+    ("Not yet, sorry.", QP_EN1, None), ("Да нет, пока не видим.", QP_RU1, None),
+    ("Конечно?", QP_RU1, None), ("Спасибо?", QP_RU3, None), ("Sure?", QP_EN1, None),
+    ("Конечно, шлем дадим.", QP_RU1, V_OTHER), ("Конечно, можно и картой.", QP_RU1, V_OTHER),
+    ("Sure, we can deliver tomorrow.", QP_EN2, V_OTHER), ("Спасибо за информацию.", QP_RU3, None),
+    ("Спасибо за сообщение!", QP_RU3, None), ("Thanks for letting us know.", QP_EN2, None),
+    # ответ с содержанием (реквизиты, вопрос, инструкция) правилом «ответ целиком из согласия» не судится
+    ("Спасибо! Реквизиты для залога: карта 1234 5678.", QP_RU3, None), ("Спасибо! А чек пришлёте?", QP_RU3, None),
+    ("Отлично, тогда пришлите, пожалуйста, чек.", QP_RU2, None), ("Thanks! Could you send the receipt?", QP_EN2, None),
+    ("Договор пришлём сегодня. Спасибо!", QP_RU1, None),                   # согласие не от начала ответа
+    ("Ждём вас завтра в 10:00. Спасибо!", QP_RU1, None),                   # благодарность в конце — вежливость
+    ("Спасибо, ждём.", QP_RU3, None),                                      # слово со строчной буквы — не имя
+    ("Здравствуйте!", QP_RU1, None), ("Добрый день!", QP_RU1, None), (SMILE, QP_RU3, None), ("Минуту.", QP_RU1, None),
+    ("Хорошего дня!", QP_RU1, None), ("Good morning!", QP_EN1, None), ("One moment.", QP_EN1, None),
+    ("Точно так же можно оплатить и картой.", QP_RU1, None), ("Right now we are closed.", QP_EN1, None)]
+# знак препинания между предметом и сказуемым получения (остаток О3 шага 3e и его соседи): тире и двоеточие
+F3_PUNCT = [
+    ("7790 — получили.", Q_NONE),                                          # О3 — дословно
+    ("7790 – получили, спасибо.", Q_NONE), ("7790 - получили.", Q_NONE), ("7790 — уже получили.", Q_NONE),
+    ("7790 — пришли.", Q_NONE), ("Да, 7790 — получили.", Q_NONE), ("7790 — received, thank you.", Q_NONE),
+    ("7790 — получили " + THUMB, Q_NONE),
+    ("7790 бат — получили.", Q_NONE), ("7790 бат — получены, спасибо!", Q_NONE), ("7 790 бат — всё получено.", Q_NONE),
+    ("7790 бат — поступили.", Q_NONE), ("Аренда: 7790 бат — получили.", Q_NONE), ("7790 THB — received.", Q_NONE),
+    ("7790 baht - all received.", Q_NONE), ("7790 бат — получили " + CHECKMARK, Q_NONE),
+    ("5000 — получили.", QP_RU3),                                          # число не из фактов — входящее об оплате
+    ("Оплата: получена.", Q_NONE), ("Оплата: получена " + CHECKMARK, Q_NONE), ("Статус оплаты: получена.", Q_NONE),
+    ("Аренда NMAX 155\nОплата: получена\nЗалог: 3000 бат при получении", Q_NONE), ("Платёж: зачислен.", Q_NONE),
+    ("Статус платежа: получен.", Q_NONE),
+    ("Предоплата: уже получена, спасибо.", Q_NONE), ("Payment: received.", Q_NONE),
+    ("Payment status: confirmed.", Q_NONE),
+    ("Получено: 7790 бат.", Q_NONE), ("Поступило: 7790 бат.", Q_NONE), ("Получено: от вас 7790 бат, спасибо.", Q_NONE),
+    ("Received: 7790 THB.", Q_NONE)]
+F3_NOT = [                                              # (ответ, входящее, имя исхода | None)
+    ("Байк 90101 — получили.", Q_NONE, V_NUM), ("Номер заказа 12345 — получили.", Q_NONE, V_NUM),
+    ("NMAX 90101 — получили.", Q_NONE, V_NUM), ("5000 — получили.", Q_NONE, V_NUM),
+    ("7790 — получили?", Q_NONE, V_ASKED), ("7790 бат — получили?", Q_NONE, V_ASKED),
+    ("7790 — не получили.", Q_NONE, None), ("7790 бат — пока не пришли.", Q_NONE, None),
+    ("Залог 3000 бат — получили.", Q_NONE, V_DEP), ("7790 бат — получена скидка 10 %.", Q_NONE, None),
+    ("7790 — получена скидка.", Q_NONE, None), ("Итог 7790 бат — получите договор после оплаты.", Q_NONE, None),
+    ("Вы 7790 — получили.", Q_NONE, V_THEIR), ("Вы 210 бат — получили.", Q_NONE, V_THEIR),
+    ("Счёт на 7790 бат — получили.", Q_NONE, V_PREP), ("Счёт на 7790 — получили.", Q_NONE, V_PREP),
+    ("7790 — получим завтра.", Q_NONE, None), ("Если 7790 бат — получили, напишите.", Q_NONE, V_LATER),
+    ("Оплата: наличными или картой.", Q_NONE, None), ("Оплата: получена ссылка.", Q_NONE, None),
+    ("Оплата: при получении байка.", Q_NONE, None), ("Оплата: есть.", Q_NONE, V_NOASK),
+    ("Способ оплаты: перевод.", Q_NONE, None), ("Оплата: не получена.", Q_NONE, None),
+    ("Оплата: будет получена завтра.", Q_NONE, None), ("Оплата: получена?", Q_NONE, V_ASKED),
+    ("Статус оплаты: проверяется.", Q_NONE, None), ("Оплата: ожидается.", Q_NONE, None),
+    ("Ссылка для оплаты: получена.", Q_NONE, V_PREP), ("Залог: получен.", Q_NONE, V_NOASK),
+    ("Получено: 3000 бат залога.", Q_NONE, V_DEP), ("Получено: фото паспорта.", Q_NONE, V_NOASK),
+    ("К оплате: 7790 бат.", Q_NONE, None), ("Не получено: 7790 бат.", Q_NONE, V_NOT),
+    ("Получено: 7790 бат?", Q_NONE, V_ASKED), ("Вы получили: 210 бат.", Q_NONE, V_THEIR)]
+# свой свежий поиск шага 3f (step3f/fresh3f.py) — находки, чиненные тем же определением
+F_FRESH_AFFIRM = [
+    ("Ага, спасибо!", QP_RU3), ("Угу " + THUMB, QP_RU3), ("Да-да, конечно, спасибо большое!", QP_RU3),
+    ("Замечательно, благодарю вас!", QP_RU2), ("Принял, благодарю.", QP_RU3), ("Всё верно, спасибо.", QP_RU3),
+    ("Естественно, спасибо!", QP_RU3), ("Absolutely, thanks!", QP_EN1), ("Perfect " + OKHAND, QP_EN2),
+    ("Yes, definitely.", QP_EN1), ("Thank you so much! " + PRAY, QP_EN2), ("For sure, thank you.", QP_EN1),
+    (CHECKMARK + CHECKMARK + CHECKMARK, QP_RU3), (HANDSHAKE, QP_RU3), ("Thanks a lot, Mike!", QP_EN2),
+    ("Добрый день, Анна! Принято, спасибо.", QP_RU2), ("Понятно, спасибо. До встречи!", QP_RU2),
+    ("Hello! Got it, thanks. Have a great day!", QP_EN1),
+    ("Certainly. We look forward to seeing you tomorrow.", QP_EN1), ("Разумеется! Шлем тоже будет готов.", QP_RU3),
+    ("7790 бат – пришли, спасибо!", Q_NONE), ("7790 THB - received " + THUMB, Q_NONE), ("7790 — всё получили.", Q_NONE),
+    ("Ваши 7790 бат — зачислены.", Q_NONE), ("Оплата: зачислена, спасибо.", Q_NONE), ("Платёж: прошёл.", Q_NONE),
+    ("Предоплата: внесена.", Q_NONE), ("Payment: cleared.", Q_NONE), ("Оплата: полностью получена!", Q_NONE),
+    ("Получили: 7790 бат.", Q_NONE), ("Зачислено: 7790 бат.", Q_NONE)]
+
+
+def _whole(word, sign=False):
+    """Слово или знак словаря — ответом целиком: слово с заглавной буквы и точкой, знак — как есть."""
+    return word if sign else word[0].upper() + word[1:] + "."
+
+
+def test_p3f_agreement_dictionary_each_word_and_sign():
+    """п.1 (остаток О1 шага 3e, шире одного слова): КАЖДОЕ слово и знак словаря (решение — дословно, 17 + 16 + 4, и
+    близкие слова строителя) ответом ЦЕЛИКОМ на входящее об оплате — утверждение оплаты: при фактах «только аренда» и
+    «касса без второго источника» причина «оплата не подтверждена сверкой». То же слово на входящее о документе и без
+    входящего — причины нет (`PC_NOASK`); с признаком непроверенности («…, проверим поступление.») — причины нет."""
+    assert (len(F1_DEC_RU), len(F1_DEC_EN), len(F1_DEC_SIGNS)) == (17, 16, 4)
+    ru = [(_whole(w), QP_RU1) for w in F1_DEC_RU + F1_ADD_RU]
+    en = [(_whole(w), QP_EN1) for w in F1_DEC_EN + F1_ADD_EN]
+    signs = [(s, QP_RU3) for s in F1_DEC_SIGNS + F1_ADD_SIGNS]
+    miss = _missed(ru + en + signs)
+    assert not miss, miss
+    twins = [(t, QD_RU, V_NOASK) for t, _q in ru + signs] + [(t, QD_EN, V_NOASK) for t, _q in en]
+    twins += [(t, q, V_NOASK) for t, _q in ru + en + signs for q in (Q_NONE, Q_EMPTY)]
+    bad = _hit(twins)
+    assert not bad, bad
+    held = [(t[:-1] + ", проверим поступление.", QP_RU1, None) for t, _q in ru]
+    held += [(t[:-1] + ", we will check and confirm.", QP_EN1, None) for t, _q in en]
+    held += [(s + " Проверим поступление.", QP_RU3, None) for s, _q in signs]
+    bad = [(t, q) for t, q, _name in held
+           if [1 for r in (_results_rent_only(), _results_no_second()) if T.PAY_WORDS in _judged(t, q, r)]]
+    assert not bad, bad
+
+
+def test_p3f_whole_reply_agreement_flagged():
+    """п.1: ответ ЦЕЛИКОМ из согласия, одобрения, благодарности, принятия или знака — сочетания слов, знак при слове и
+    одни знаки, приветствие и прощание рядом (по фразе на каждую строку словаря вежливости), обращение по имени после
+    запятой, регистр и пунктуация; смешанное входящее (оплата и документ) — тоже утверждение."""
+    miss = _missed(F1_AGREE + F1_POLITE)
+    assert not miss, miss
+
+
+def test_p3f_yes_word_heads_sentence_flagged():
+    """п.1: слово согласия во главе предложения («Конечно.», «Разумеется.», «Of course.», «Sure.», «Certainly.») судится
+    как «да»: дальше в ответе содержание без признака непроверенности — утверждение (как «Да. Ждём вас завтра.»)."""
+    miss = _missed(F1_YES)
+    assert not miss, miss
+    assert T.PAY_WORDS in _judged("Да. Ждём вас завтра в 10:00.", QP_RU1, _results_rent_only())    # прежнее — так же
+
+
+def test_p3f_agreement_without_payment_question_no_reason():
+    """п.1, отрицательный с близнецом: входящее о документе, о способе или БУДУЩЕЙ оплате («Оплачу завтра утром,
+    хорошо?» — «Хорошо.»), оплата не прошла, входящего нет — ответ-согласие причины не получает и назван `PC_NOASK`;
+    ТОТ ЖЕ ответ на входящее об оплате — утверждение."""
+    bad = _hit([(t, q, V_NOASK) for t, q in F1_NOASK])
+    assert not bad, bad
+    twins = [(t, QP_EN1 if re.match(r"[A-Za-z]", t) else QP_RU1) for t, _q in F1_NOASK]
+    miss = _missed(twins)
+    assert not miss, miss
+
+
+def test_p3f_reply_with_content_or_check_not_blocked():
+    """п.1, отрицательный (не менее 15 не-утверждений рядом): на входящее об оплате ответ с содержанием (реквизиты,
+    вопрос, инструкция — правилом «целиком согласие» не судится), с обещанием проверки или передачей человеку, отказ,
+    вопрос, согласие о другом предмете, согласие не от начала ответа, слово со строчной буквы после запятой (не имя),
+    одно приветствие или значок — ни причины, ни сумм; у совпадения исход назван."""
+    assert len(F1_NOT) >= 15
+    bad = _hit(F1_NOT)
+    assert not bad, bad
+
+
+def test_p3f_punctuation_before_predicate_flagged():
+    """п.2 (остаток О3 шага 3e и соседи): тире между суммой или числом и сказуемым получения клаузу не рвёт («7790 —
+    получили.», «7790 бат — получены, спасибо!»), двоеточие между словом оплаты и сказуемым и между сказуемым и суммой
+    — тоже («Оплата: получена ✅», «Получено: 7790 бат.») — утверждение на тех же основаниях; число без валюты — когда
+    равно известной сумме сверки либо входящее об оплате. С опорой своя сумма причины не получает."""
+    miss = _missed(F3_PUNCT)
+    assert not miss, miss
+    sums = T.pay_sums(T.accepted(_results_no_second()))
+    assert T.pay_claimed("7790 — получили.", False, sums) == {7790}
+    assert T.pay_claimed("7790 бат — получили.") == {7790} and T.pay_claimed("Получено: 7790 бат.") == {7790}
+    backed = _results_backed()
+    for text in ("7790 — получили.", "7790 бат — получили.", "Оплата: получена.", "Получено: 7790 бат."):
+        assert T.PAY_WORDS not in _judged(text, Q_NONE, backed), text
+    assert T.PAY_WORDS in _judged("8000 бат — получили.", Q_NONE, backed)   # чужая сумма при подтверждённой оплате
+
+
+def test_p3f_punctuation_not_claims_not_blocked():
+    """п.2, отрицательный: номер байка или заказа перед тире, число не из фактов без входящего об оплате, вопрос,
+    отрицание, будущее, условие, залог, получатель — клиент, счёт на сумму, не сказуемое получения за тире или
+    двоеточием («получена скидка», «получена ссылка», «есть», «ожидается»), способ оплаты, «К оплате: 7790 бат.» — ни
+    причины, ни сумм, исход назван."""
+    bad = _hit(F3_NOT)
+    assert not bad, bad
+
+
+def test_p3f_own_fresh_search_fixed():
+    """Свой свежий поиск шага 3f (существенные находки чинены тем же определением): сочетания согласия со знаками,
+    обращением и вежливостью, согласие во главе предложения, тире и двоеточие перед сказуемым получения."""
+    miss = _missed(F_FRESH_AFFIRM)
+    assert not miss, miss
+
+
+def test_p3f_verdict_named_on_every_road():
+    """Храповик слепых читателей: у правил шага 3f исход — тоже всегда НЕПУСТОЕ имя, и `search` говорит «утверждение»
+    ровно тогда, когда так назван хотя бы один исход — с контекстом сверки и без него."""
+    rows = [(t, q) for t, q in F1_AGREE + F1_POLITE + F1_YES + F1_NOASK + F3_PUNCT + F_FRESH_AFFIRM]
+    rows += [(t, q) for t, q, _name in F1_NOT + F3_NOT]
+    rows += [(_whole(w), QP_RU1) for w in F1_DEC_RU + F1_ADD_RU + F1_DEC_EN + F1_ADD_EN]
+    rows += [(s, QP_RU3) for s in F1_DEC_SIGNS + F1_ADD_SIGNS]
+    for text, question in rows:
+        for asked, sums in (_ctx_of(question), (False, ())):
+            got = T._PAY_CLAIM.explain(text, asked, sums)
+            assert all(isinstance(v, str) and v.strip() for _match, v in got), (text, got)
+            assert (V_CLAIM in [v for _match, v in got]) == bool(T._PAY_CLAIM.search(text, asked, sums)), (text, got)
+    assert {v for _m, v in T._PAY_CLAIM.explain("Конечно.")} == {V_NOASK}
+    assert {v for _m, v in T._PAY_CLAIM.explain("Конечно.", True)} == {V_CLAIM}
+    assert {v for _m, v in T._PAY_CLAIM.explain("Спасибо, Алексей!")} == {V_NOASK}
+    assert {v for _m, v in T._PAY_CLAIM.explain(THUMB, True)} == {V_CLAIM}
+    assert {v for _m, v in T._PAY_CLAIM.explain("Конечно, договор пришлём.", True)} == {V_OTHER}
+    assert {v for _m, v in T._PAY_CLAIM.explain("Спасибо, проверим поступление.", True)} == set()   # совпадения нет
+    assert {v for _m, v in T._PAY_CLAIM.explain("NMAX 90101 — получили.", False, {7790})} == {V_NUM}
+    assert {v for _m, v in T._PAY_CLAIM.explain("7790 — получили.", False, {7790})} == {V_CLAIM}
+    assert {v for _m, v in T._PAY_CLAIM.explain("7790 — получили.")} == {V_NUM}                # без сумм фактов
+    assert {v for _m, v in T._PAY_CLAIM.explain("Ссылка для оплаты: получена.")} == {V_PREP, V_NOASK}
+
+
+def test_p3f_agreement_parse_is_unambiguous():
+    """п.1, устройство: разбор «ответа целиком из согласия» на слова ОДНОЗНАЧЕН — на длинном ответе, который согласием
+    не кончается, перебор вариантов не растёт взрывом (первый вариант правки на таком тексте не кончался вовсе): слово
+    словаря не бывает именем, «спасибо большое», «абсолютно верно», «да-да» разбираются одним способом."""
+    import time
+    for unit in (", спасибо", ", Спасибо", " спасибо большое", " абсолютно верно", " именно так точно", "-да",
+                 ", Алексей, спасибо", " thanks so much", ", Привет", " " + THUMB):
+        text = "Спасибо" + unit * 28 + ", ждём вас завтра"                 # 28 повторов: неоднозначный разбор — секунды
+        t0 = time.perf_counter()
+        got = T._PAY_CLAIM.explain(text, True)
+        took = time.perf_counter() - t0
+        assert took < 1.0, (unit, took)
+        assert V_CLAIM not in [v for _m, v in got], (unit, got)
+        whole = "Спасибо" + unit * 28                                       # тот же текст без содержания — согласие
+        assert V_CLAIM in [v for _m, v in T._PAY_CLAIM.explain(whole, True)], unit
+
+
+def test_p3f_control_prior_outcomes_kept():
+    """КОНТРОЛЬ п.3f (зелёный и на b7dea68): прежние исходы не задеты — «Да.», «Да, получили.» и их имена; сказуемое за
+    тире при входящем об оплате — прежнее краткое подтверждение и тогда, когда число перед тире стоит на месте номера
+    («NMAX 90101 — получили.»); остаток О5 с запятой — утверждение; с опорой (касса + договор) согласие причины не
+    получает."""
+    assert not _missed([("Да.", QP_RU1), ("Да, получили.", QP_RU1), ("Да, конечно.", QP_RU3), ("7790 — получили.", QP_RU1),
+                        ("NMAX 90101 — получили.", QP_RU1), ("Байк 90101 — получили.", QP_RU1),
+                        ("Когда приедете за байком, оплата уже получена.", Q_NONE), ("Оплата уже получена.", Q_NONE)])
+    assert {v for _m, v in T._PAY_CLAIM.explain("Да, получили.", True)} == {V_OTHER, V_CLAIM}
+    assert {v for _m, v in T._PAY_CLAIM.explain("Да, получили.")} == {V_NOASK}
+    backed = _results_backed()
+    rows = F1_AGREE + F1_POLITE + F1_YES + [(_whole(w), QP_RU1) for w in F1_DEC_RU] + [(s, QP_RU3) for s in F1_DEC_SIGNS]
+    bad = [(t, q) for t, q in rows if T.PAY_WORDS in _judged(t, q, backed)]
+    assert not bad, bad
+    assert not _hit([("Да, получили.", QD_RU, V_NOASK), ("Оплату пока не вижу, коллега проверит.", QP_RU1, None)])
 
 
 # ═══ D3 приёмки шага 3: проверки, которые убивают мутанты m3r и m3v ═══════════════════════════════════════════
