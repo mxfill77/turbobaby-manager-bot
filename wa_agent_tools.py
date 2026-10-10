@@ -1397,6 +1397,8 @@ _PC_BARE, _PC_NUMS = ("q1", "q2", "q3", "q4"), ("b1", "b2", "b3", "b4", "b5", "b
 # слова при сумме, которые сами стоят после предлога: «ссылку на ОПЛАТУ 7790 бат получили» — предлог судится у них
 _PC_OF = re.compile(r"(?:пред|до)?оплат\w*|плат[её]ж\w*|аренд\w*|брон\w*|продлени\w*|payment|rent\w*|booking", re.I)
 _PC_YOU = re.compile(r"(?<!\w)(?:вы|ты|you)(?:\s+(?:уже|тоже|также|have|had|already|also))*\s*$", re.I)
+_PC_LEAD = ("a1", "b1")                    # шаг 3e: сумма и число ПЕРЕД сказуемым получения — получатель стоит до них
+_PC_THANK = re.compile(r"(?<!\w)thanks?\s+(?:to\s+)?(?:you|u)\s*$", re.I)
 
 
 class _PayClaim:
@@ -1500,9 +1502,15 @@ class _PayClaim:
             rent = _PF_RENT.search(wide)
             if rent is None or dep.start() < rent.start():
                 return PC_DEP
-        # шаг 3d (R3): получатель суммы — клиент («вы получили 210 бат») — не наше подтверждение
-        if [1 for k in _PC_RCPT if gd.get(k) and _PC_YOU.search(s[a:m.start(k)])]:
-            return PC_THEIR
+        # шаг 3d (R3): получатель суммы — клиент («вы получили 210 бат») — не наше подтверждение; шаг 3e: у суммы или
+        # числа ПЕРЕД сказуемым («вы 7790 получили обратно», «вы 210 бат получили») получатель стоит перед ними — клауза
+        # читается до них («Thank you 7790 received» — благодарность, а не получатель)
+        lead = min([m.start(k) for k in _PC_LEAD if gd.get(k)] + [len(s)])
+        for k in _PC_RCPT:
+            if gd.get(k):
+                pre = s[a:min(m.start(k), lead)]
+                if _PC_YOU.search(pre) and not (lead < m.start(k) and _PC_THANK.search(pre)):
+                    return PC_THEIR
         return PC_CLAIM
 
     @staticmethod
