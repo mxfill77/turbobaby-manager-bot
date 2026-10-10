@@ -30,12 +30,21 @@ R2   — контроль «ничего не потеряно» собран и
      (вшиты данными: списки `RV_*` — дословно fix_review3c/rv3c_corpus.py и rv3c_corpus2.py);
 R3   — два семейства, которых не ловил ни один коммит: подтверждение получения отглагольным существительным и
      сказуемое получения с денежной суммой или словом суммы; плюс находки своего состязательного поиска (`ADV_*`).
+Шаг 3e (10.10.2026, решение координатора после круга 3d; остатки (а)–(в) строителя 3d):
+п.3e 1 — краткое утвердительное получение или подтверждение БЕЗ предмета («Да, всё пришло.», «We got it, thanks!») —
+     утверждение оплаты, когда входящее клиента об оплате: признак — одно чистое определение `pay_asked`, адаптер
+     передаёт его в `T.run` и `T.judge` рядом с `cash_said`; без признака (вопрос о документе, вопроса нет) — нет;
+2    — «долга нет» («задолженности по аренде нет», «ничего не должны», «счёт закрыт», «no balance due», «all settled»);
+3    — число без валюты при сказуемом получения, в том числе не вплотную («Да, 7790 получили.»), — утверждение, когда
+     оно равно известной денежной сумме сверки (`pay_sums`) либо входящее об оплате; номер байка — нет.
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на f2f7295 и на коммите шага 2 (996ee09) он падает по существу, на
 ремонте проходит. Тест с пометкой КОНТРОЛЬ — зелёный на всех трёх (прежнее поведение, которое ремонт не задел).
 Тесты п.3b (кроме КОНТРОЛЯ и отрицательных) падают и на cbe186f (шаг 3); тесты D3 на cbe186f проходят.
 Тесты п.3c (кроме КОНТРОЛЯ) падают и на 6f6e754 (шаг 3b).
 Тесты п.3d (кроме КОНТРОЛЯ `…backed…` и отрицательного `…reviewer_not_claims…`) падают и на f6ed7bd (шаг 3c).
+Тесты п.3e (кроме КОНТРОЛЯ `…backed…`) падают и на 44ba8ee (шаг 3d): утвердительные — по существу (причины нет),
+отрицательные — оттого, что на 44ba8ee нет самого контекста сверки (признака входящего и сумм фактов у определения).
 
 Всё на подменах: двери — функции ответа живого формата (`bridge_client.contract_find`/`contract_pdf`/`tx_find`,
 строка листа «клиенты» — ключи ReadClients.js), модель — сценарий. Сети, моста, Telegram, WhatsApp, SQLite и
@@ -1055,6 +1064,402 @@ def test_p3d_control_backed_new_families_not_blocked():
     assert T.pay_confirmed(facts) is True
     bad = [(t, T.money_roles(t, facts)) for t in R3_NOUN_AFFIRM + R3_SUM_AFFIRM + ADV_AFFIRM + RV_RESIDUAL[:8]
            if T.money_roles(t, facts)]
+    assert not bad, bad
+
+
+# ═══ п.3e: контекст вопроса об оплате, «долга нет», число без валюты (решение координатора после круга 3d) ═════
+
+V_NOASK = "краткое подтверждение без вопроса клиента об оплате"
+V_HOLD = "ответ сам говорит: оплата не видна или проверяется"
+V_OTHER = "согласие относится к другому предмету"
+V_NUM = "число — не известная денежная сумма сверки"
+V_ITEM = "речь о другой услуге, а не об оплате аренды"
+V_NOMONEY = "«закрыто» без оплаты, аренды, счёта или долга"
+V_SAID = "слова клиента в пересказе"
+
+# входящее клиента: об оплате · смешанное · о документе · о способе оплаты · о будущей оплате · оплата не прошла · без вопроса
+QP_RU1 = "Я перевёл оплату за аренду, деньги пришли?"
+QP_RU2 = "Оплатил аренду, проверьте, пожалуйста."
+QP_RU3 = "Скинул вам 7790 на карту."
+QP_RU4 = "Здравствуйте! Вы видите мой платёж?"
+QP_EN1 = "I sent the payment for the rental, did you receive it?"
+QP_EN2 = "I've paid, please confirm."
+Q_MIX = "Отправил фото паспорта и оплатил аренду, получили?"
+QD_RU = "Отправил вам фото паспорта, получили?"
+QD_EN = "I sent you my passport photo, did you get it?"
+Q_HOW = "Как можно оплатить аренду?"
+Q_FUT = "Оплачу завтра утром, хорошо?"
+Q_FAIL = "Оплата не прошла, попробую ещё раз позже."
+Q_NONE = "Добрый день!"
+
+E_ASK_YES = [                                           # входящее клиента — ОБ ОПЛАТЕ (`pay_asked`)
+    QP_RU1, QP_RU2, QP_RU3, QP_RU4, QP_EN1, QP_EN2, Q_MIX, "Я оплатил аренду, подтвердите",            # K15 real
+    "Добрый день! Я оплатил аренду NMAX 90101 — 7790 бат. Подтвердите, пожалуйста, что оплата пришла.",   # K02 real
+    C3_QUESTION, "Деньги дошли?", "Перевод прошёл?", "Аренда оплачена?", "Заплатила вчера вечером.",
+    "Внёс предоплату, посмотрите.", "Отправил чек об оплате.", "Перевёл 3000.", "Деньги ещё не пришли?",
+    "Оплата прошла, можно забирать байк?", "Вам поступил мой перевод?", "Проверьте, пожалуйста, поступление оплаты.",
+    "Я же вчера оплатил, разве не пришло?", "Оплату отправил ещё утром", "Сделал перевод на 7790 бат",
+    "Payment sent, please check.", "Hi, I just transferred the rent. Has it arrived?", "Did you get my transfer?",
+    "Has my payment come through?", "I paid yesterday.", "Money sent!", "Can you confirm my payment?",
+    "Just made the payment.", "Закинул вам на карту, гляньте.", "Деньги списались, а у вас видно?",
+    "Paid, please check."]
+E_ASK_NO = [                                            # не об оплате: документ, способ, цена, будущая, несостоявшаяся
+    Q_NONE, "", QD_RU, QD_EN, Q_HOW, Q_FUT, Q_FAIL, "Можно оплатить картой?", "Сколько стоит аренда на 10 дней?",
+    "Когда нужно внести оплату?", "Я ещё не оплатил.", "Хочу оплатить наличными при получении.",
+    "Оплата при получении байка?", "Куда отправить деньги?", "Пришлите, пожалуйста, договор.",
+    "Подскажите, до какого числа у меня аренда?", "Сделал перевод договора на английский.",
+    "Отправил вам номер 0812345678.", "Скинул геолокацию отеля.", "Сделал скриншот брони.", "Получили мои документы?",
+    "Во сколько привезёте байк?", "How can I pay?", "Can I pay by card?", "I will pay tomorrow.",
+    "Is it paid at pickup?", "How can I get the payment link?", "Can I check payment options?",
+    "My payment failed, I will try again.", "I haven't paid yet."]
+
+# семейство 1 — краткое получение или подтверждение БЕЗ предмета в ответ на входящее об оплате: (ответ, входящее)
+E1_RV_OPEN = [("Да, всё пришло.", QP_RU1), ("We got it, thanks!", QP_EN1)]    # RESIDUAL_INFO проверяющего: 15-я и 16-я
+E1_AFFIRM = [
+    ("Да, получили.", QP_RU1), ("Получили, спасибо.", QP_RU2), ("Всё в порядке, получили.", QP_RU1),   # решение — дословно
+    ("Да, всё получили, спасибо большое!", QP_RU2), ("Пришло, спасибо!", QP_RU1), ("Да, дошло.", QP_RU3),
+    ("Да, поступило.", QP_RU1), ("Подтверждаю.", QP_RU2), ("Да, подтверждаю, получили.", QP_RU2),
+    ("Да, вижу, спасибо.", QP_RU4), ("Да, всё в порядке.", QP_RU1), ("Всё в порядке, спасибо!", QP_RU2),
+    ("Да, спасибо!", QP_RU1), ("Да.", QP_RU1), ("Получено.", QP_RU2), ("Да, уже получили, ждём вас завтра.", QP_RU1),
+    ("Здравствуйте! Да, получили.", QP_RU1), ("Да, пришла.", QP_RU1), ("Да, получена.", QP_RU2),
+    ("Получили, не волнуйтесь.", QP_RU1), ("Подтверждаем получение.", QP_RU2), ("Да, на карту пришло.", QP_RU3),
+    ("Получили в полном объёме.", QP_RU2), ("Да, есть.", QP_RU1), ("Да, упали.", QP_RU3),
+    ("Да, получили её, спасибо.", QP_RU1), ("Да, получили 👍", QP_RU3), ("Да 👍", QP_RU3),
+    ("Да, оплата есть.", QP_RU1),                                          # «есть» без кассы — при входящем об оплате
+    ("Да, оплата на месте, спасибо.", QP_RU1), ("Деньги на месте.", QP_RU3),   # замечание (д) круга 3d
+    ("Да, получили. Договор проверим и пришлём сегодня.", QP_RU1),         # проверяют договор, а не оплату
+    ("Получили, но не полностью.", QP_RU1),                                # как «Оплата получена не полностью.»
+    ("Да, всё дошло и зачислено.", QP_RU3),
+    ("Да, всё пришло. Уточню у коллеги время доставки.", QP_RU3),
+    ("Да, получили.", Q_MIX),                                              # смешанное входящее — утверждение
+    ("Yes, we did.", QP_EN1), ("Yes, we received them.", QP_EN1),
+    ("Yes, received.", QP_EN1), ("All good, got it.", QP_EN1),            # решение — дословно
+    ("Received, thank you!", QP_EN2), ("Yes, we have received it.", QP_EN1), ("Yes, it came through.", QP_EN1),
+    ("Confirmed, thanks.", QP_EN2), ("Yes, all good.", QP_EN1), ("Yes, thank you!", QP_EN2), ("We can confirm.", QP_EN2),
+    ("Yes, it arrived.", QP_EN1), ("Yes, I can confirm we received it.", QP_EN2), ("Yes, got it this morning.", QP_EN1)]
+# то же входящее об оплате, но ответ — НЕ подтверждение: (ответ, входящее, имя исхода краткой клаузы | None — клаузы нет)
+E1_NOT = [
+    ("Нет, пока не получили.", QP_RU1, None), ("Пока не видим, проверим и сообщим.", QP_RU1, None),
+    ("Получили, проверим и сообщим.", QP_RU2, V_HOLD),                     # получено СООБЩЕНИЕ, оплата — проверим
+    ("Получили, договор проверим завтра.", QP_RU2, V_LATER),               # проверка в том же предложении
+    ("Получили, спасибо. Оплату проверит коллега и подтвердит.", QP_RU2, V_HOLD),
+    ("Получили, спасибо. Оплата пока не поступила.", QP_RU2, V_HOLD),
+    ("Спасибо, получили. Проверим и ответим.", QP_RU2, V_HOLD),            # проверка без иного предмета — об оплате
+    ("Получили. Чек проверим и подтвердим.", QP_RU2, V_HOLD), ("Получили. В кассе пока не видим.", QP_RU1, V_HOLD),
+    ("Получили, но в кассе пока не видим.", QP_RU1, V_HOLD),
+    ("Получили, верно?", QP_RU1, V_ASKED), ("Получили?", QP_RU1, V_ASKED),
+    ("Сообщение получили, оплату пока не вижу.", QP_RU1, None), ("Получили ваш чек, передам коллеге.", QP_RU2, None),
+    ("Скриншот получили, спасибо.", QP_RU3, None), ("Вы получили договор?", QP_RU1, None),
+    ("Спасибо за информацию, получили.", QP_RU2, V_OTHER),                 # предмет назван раньше в том же предложении
+    ("Вижу, что вы отправили чек, передам коллеге.", QP_RU2, None),
+    ("Да, шлем дадим.", QP_RU1, V_OTHER), ("Да, конечно, договор пришлём сегодня.", QP_RU2, V_OTHER),
+    ("Как только придёт, сообщим.", QP_RU1, None), ("Если получили, напишите.", QP_RU1, None),
+    ("Здравствуйте! Коллега сверит поступления и вам ответит.", QP_RU2, None),
+    ("Got it, I'll check with my colleague.", QP_EN1, V_HOLD), ("We'll confirm once received.", QP_EN2, None),
+    ("Not received yet.", QP_EN1, None), ("Did you get it?", QP_EN1, None),
+    ("Yes, we can deliver the bike tomorrow.", QP_EN2, V_OTHER), ("Thanks, we got your passport photo.", QP_EN1, None),
+    ("Thank you for your payment request, received.", QP_EN2, V_OTHER),
+    ("Оплата картой тоже есть.", QP_RU1, V_EXIST), ("Есть оплата картой и наличными.", QP_RU2, V_EXIST)]   # способ оплаты
+# входящее НЕ об оплате — те же краткие ответы причины не получают: (ответ, входящее)
+E1_NOASK = [
+    ("Да, получили.", QD_RU), ("Получили, спасибо.", Q_NONE), ("We got it, thanks!", QD_EN), ("Да, всё пришло.", QD_RU),
+    ("Да, всё в порядке.", Q_HOW), ("Да, хорошо.", Q_FUT), ("Да.", Q_NONE), ("Да, получили.", Q_FAIL),
+    ("Yes, received.", QD_EN), ("Всё в порядке, получили.", Q_NONE), ("Подтверждаю.", Q_NONE), ("Да, спасибо!", Q_HOW),
+    ("Здравствуйте! Да, получили, спасибо.", QD_RU), ("Да, есть.", QD_RU), ("Оплата на месте, спасибо.", Q_NONE),
+    ("Yes, we did.", QD_EN), ("Да, получили 👍", QD_RU)]
+
+# семейство 2 — «долга нет» (вопрос клиента не нужен)
+E2_AFFIRM = [
+    "Долга по аренде нет, всё закрыто.",                                   # остаток круга 3d — дословно
+    "Задолженности по аренде нет.", "Долга нет.", "У вас нет задолженности.", "Вы ничего не должны.",
+    "Вы нам ничего не должны, спасибо.", "Больше ничего не должны.", "Долг погашен.",
+    "Задолженность по аренде погашена.", "Всё погашено, спасибо.", "Счёт закрыт.", "По аренде всё закрыто.",
+    "Аренда полностью закрыта.", "Задолженность отсутствует.", "Долгов за вами не числится.",
+    "За аренду вы ничего не должны.", "Баланс нулевой.", "Остаток к оплате — 0 бат.", "Доплачивать ничего не нужно.",
+    "Больше ничего платить не нужно.", "Вы уже всё оплатили, спасибо.", "Да, вы полностью рассчитались.",
+    "Вы оплатили аренду полностью.", "С оплатой проблем нет.", "По оплате вопросов нет.",
+    "You've paid, thank you.", "You have paid for the whole rental.", "No issues with your payment.",
+    "There is no balance due.", "No outstanding balance.", "Nothing owed, all settled.", "You don't owe anything.",
+    "You owe nothing.", "All settled, thank you.", "Your balance is zero.", "Nothing is due.",
+    "Everything is settled.", "No debt on your rental.", "The bill is settled.", "Nothing left to pay.",
+    "You're all paid up.", "Zero balance on your rental."]
+E2_NOT = [
+    ("Долга нет?", V_ASKED), ("Долг ещё есть.", None), ("Долг пока не погашен.", V_NOT),
+    ("Если долга нет, пришлём договор.", V_LATER), ("Долга не будет, если оплатите до пятницы.", None),
+    ("Заявка закрыта.", None), ("Обращение закрыто, спасибо.", None), ("Вопрос закрыт.", None),
+    ("Вопрос решён, всё закрыто.", V_NOMONEY), ("Офис закрыт до 9:00.", None), ("Бронь закрыта.", None),
+    ("За доставку вы ничего не должны.", V_ITEM), ("За отмену брони вы ничего не должны.", V_ITEM),
+    ("Вы не должны ничего подписывать.", None), ("Долг должен быть погашен до выдачи байка.", V_MUST),
+    ("Когда долг будет погашен, сообщим.", V_LATER), ("Вопросов по долгу нет.", V_PREP), ("Долга по залогу нет.", V_DEP),
+    ("Сейчас вы ничего не должны — оплата при получении байка.", V_LATER), ("Мы вам ничего не должны.", V_OTHER),
+    ("Долг по аренде — 500 бат.", None), ("Остаток к оплате 500 бат.", None),
+    ("Is there no balance due?", V_ASKED), ("There is still a balance due.", None),
+    ("If nothing is owed, we will send the contract.", V_LATER), ("You owe nothing for the helmet.", V_ITEM),
+    ("Nothing is due until pickup.", V_LATER), ("Glad you're all settled in.", None), ("The ticket is closed.", None),
+    ("Вы написали, что оплатили аренду.", None), ("По вашим словам, вы оплатили вчера.", V_SAID),    # пересказ клиента
+    ("Если вы оплатили, пришлите чек.", V_LATER), ("Вы уже оплатили?", V_ASKED), ("Вы ещё не оплатили аренду.", None),
+    ("Вы оплатили только залог.", V_DEP), ("Вы оплатили, но в кассе оплату пока не вижу.", V_HOLD),
+    ("Once you have paid, we will confirm.", V_LATER), ("Have you paid?", V_ASKED),
+    ("You paid for the helmet only.", V_ITEM), ("За шлем платить ничего не нужно.", None),
+    ("Оплата не требуется, это бесплатно.", None), ("Вы оплатили бы меньше при аренде на месяц.", None),
+    ("Долга нет, если оплатите сегодня.", V_LATER), ("Доплата не нужна, если вернёте байк вовремя.", V_LATER)]
+
+# семейство 3 — число БЕЗ валюты при сказуемом получения; итог аренды 7790 — известная денежная сумма сверки
+E3_AFFIRM = [
+    "Да, 7790 получили.", "7790 пришли, спасибо.",                         # остаток 3d и решение — дословно
+    "7790 получены.", "Получили от вас вчера 7790.", "7790 уже у нас.", "В кассе вижу 7790.", "Ваши 7790 поступили.",
+    "7 790 получили, спасибо.", "Получили 7790 за аренду.", "7790 от вас получили.", "7790 на карту пришли.",
+    "За аренду 7790 получили, спасибо.", "Зачислили 7790.", "7.790 получили, спасибо.",
+    "Yes, 7790 received.", "We received your 7790 yesterday.", "7790 has been received.", "We have your 7790.",
+    "Got the 7790 this morning, thanks.", "7790 came through.", "7790 landed in our account.", "THB 7790 received."]
+E3_ASKED = [("Да, 3000 получили.", QP_RU3), ("Yes, 3000 received.", QP_EN1),   # число не из фактов — входящее об оплате
+            ("Получили 4000, остальное ждём.", QP_RU2),
+            ("Received THB 5000 from you.", Q_NONE)]                       # …либо код валюты ПЕРЕД числом
+E3_NOT = [                                              # (ответ, входящее, имя исхода | None)
+    ("Байк 90101 получили, спасибо.", Q_NONE, V_NUM), ("NMAX 90101 получили.", Q_NONE, V_NUM),
+    ("Заказ 12345 получили.", Q_NONE, V_NUM), ("Байк № 7790 получили.", Q_NONE, V_NUM),
+    ("Договор 7790 получили.", Q_NONE, V_NUM), ("Получили 7790?", Q_NONE, V_ASKED),
+    ("7790 пока не получили.", Q_NONE, V_NOT), ("Если 7790 пришли, напишите.", Q_NONE, V_LATER),
+    ("7790 получим завтра.", Q_NONE, None), ("Счёт на 7790 получили.", Q_NONE, V_PREP),
+    ("За 7790 получили бы NMAX на 10 дней.", Q_NONE, None), ("За 7790 получили скидку.", Q_NONE, V_PREP),
+    ("5000 получили.", Q_NONE, V_NUM),
+    ("Номер +66 81 234 5678 получили.", Q_NONE, V_NUM), ("Получили 125 фото, спасибо.", Q_NONE, None),
+    ("Bike 90101 received.", Q_NONE, V_NUM), ("Order 12345 received, thanks.", Q_NONE, V_NUM),
+    ("We received 90101 yesterday.", Q_NONE, V_NUM), ("Вы 7790 получили?", Q_NONE, V_ASKED),
+    ("Байк 90101 получили, спасибо.", QP_RU1, V_NUM),    # номер байка на месте номера — и при входящем об оплате
+    ("Да, 3000 получили.", QD_RU, V_NUM),                # число не из фактов, входящее не об оплате
+    ("Вижу 7790 бат в вашем чеке, передам коллеге.", Q_NONE, V_OTHER),     # сумма видна в БУМАГЕ клиента
+    ("Вижу в договоре сумму 7790 бат.", Q_NONE, None), ("Не вижу 7790 бат в кассе.", Q_NONE, V_NOT),
+    ("Счёт за аренду 7790 бат получили.", Q_NONE, V_PREP), ("PCX 5580 received.", Q_NONE, V_NUM),
+    ("7790 получили бы только при оплате за месяц.", Q_NONE, None)]
+# свой свежий поиск шага 3e — существенные находки, чиненные тем же определением (вне трёх списков выше)
+E_FRESH_AFFIRM = [
+    ("Спасибо, получили!", QP_RU3), ("Здравствуйте, получили, спасибо!", QP_RU2), ("Да, конечно, получили.", QP_RU3),
+    ("Да, всё ок.", QP_RU1), ("Всё на месте, спасибо.", QP_RU2), ("Да, конечно.", QP_RU3), ("Да!", QP_RU3),
+    ("Received with thanks.", QP_EN2), ("Yep, we've got it.", QP_EN2), ("Got it — thank you!", QP_EN1),
+    ("Everything is fine, see you tomorrow.", QP_EN1),
+    ("По оплате долгов нет.", Q_NONE), ("Расчёт закрыт, спасибо.", Q_NONE), ("К оплате 0.", Q_NONE),
+    ("Доплата не требуется, всё в расчёте.", Q_NONE), ("Your account is settled.", Q_NONE),
+    ("There's nothing outstanding.", Q_NONE), ("Your balance due is 0.", Q_NONE),
+    ("В кассе вижу 7790 бат по вашей брони.", Q_NONE), ("Вижу ваши 7790 бат, спасибо.", Q_NONE),     # «вижу» + сумма
+    ("7790 бат в кассе вижу.", Q_NONE), ("We can see your 7790 baht in our records.", Q_NONE),
+    ("За аренду 7790 бат получили.", Q_NONE), ("Да, все 7790 пришли.", QP_RU3)]
+
+
+def _results_rent_only():
+    """Факты «только аренда»: строка листа «клиенты» (итог 7790), кассы и договора нет."""
+    return [T.rental_result({"ok": True, "rows": [dict(ROW)]}, at=T0)]
+
+
+def _results_no_second():
+    """Факты «касса без второго источника»: аренда + строка кассы той же аренды; договора и суммы в переписке нет."""
+    return _results_rent_only() + [T.cash_result(tx([tx_item()]), at=T0)]
+
+
+def _results_backed():
+    rent = _results_rent_only()[0]
+    con = T.contract_result(Registry([DOC1])(phone=NUMBER), at=T0, number=NUMBER, rental=rent)
+    return [rent, T.cash_result(tx([tx_item()]), at=T0), con]
+
+
+def _judged(text, question, results):
+    """Причины ПОЛНОГО судьи так, как его зовёт адаптер: переданные наличные и признак «входящее об оплате» — из
+    входящего клиента. На дереве до шага 3e признака нет — судья зовётся прежней подписью (и краткий ответ не судит)."""
+    kw = {"handed": T.cash_said(question)}
+    if hasattr(T, "pay_asked"):
+        kw["asked"] = T.pay_asked(question)
+    return T.judge(text, None, [dict(r) for r in results], T.Journal("5678"), **kw)[0]
+
+
+def _missed(pairs):
+    """Утверждения, НЕ получившие причину оплаты хотя бы при одном из двух наборов фактов без достаточного основания."""
+    return [(t, q, [T.PAY_WORDS in _judged(t, q, r) for r in (_results_rent_only(), _results_no_second())])
+            for t, q in pairs
+            if not all(T.PAY_WORDS in _judged(t, q, r) for r in (_results_rent_only(), _results_no_second()))]
+
+
+def _ctx_of(question):
+    """Контекст сверки определения для входящего: (признак «об оплате», известные денежные суммы фактов и клиента)."""
+    return T.pay_asked(question), T.pay_sums(T.accepted(_results_no_second()), T.cash_said(question))
+
+
+def _hit(triples):
+    """Не-утверждения, получившие причину оплаты, сумму «полученной оплаты» или НЕ то имя исхода краткой клаузы."""
+    out = []
+    for t, q, name in triples:
+        asked, sums = _ctx_of(q)
+        names = {v for _match, v in T._PAY_CLAIM.explain(t, asked, sums)}
+        flags = [T.PAY_WORDS in _judged(t, q, r) for r in (_results_rent_only(), _results_no_second())]
+        if any(flags) or T.pay_claimed(t, asked, sums) or (name is not None and name not in names) or V_CLAIM in names:
+            out.append((t, q, flags, sorted(T.pay_claimed(t, asked, sums)), sorted(names)))
+    return out
+
+
+def test_p3e_incoming_about_payment_sign():
+    """п.1: признак «входящее клиента — об оплате» — одно чистое определение: клиент говорит о СОСТОЯВШЕЙСЯ оплате
+    («оплатил», «перевёл 3000», «отправил чек», «I paid») или спрашивает, получена ли она («деньги дошли?», «did you get
+    my transfer?»); смешанное входящее — да. Вопрос о способе, цене, будущей или несостоявшейся оплате, о документе,
+    пустое входящее — нет."""
+    wrong = [(t, True) for t in E_ASK_YES if T.pay_asked(t) is not True]
+    wrong += [(t, False) for t in E_ASK_NO if T.pay_asked(t) is not False]
+    assert not wrong, wrong
+
+
+def test_p3e_bare_confirmation_on_payment_question_flagged():
+    """п.1 (остаток (а) круга 3d): на входящее об оплате краткое утвердительное получение или подтверждение БЕЗ
+    предмета («Да, всё пришло.», «We got it, thanks!» — две открытые фразы RESIDUAL_INFO проверяющего; «Да, получили.»,
+    «Получили, спасибо.», «Всё в порядке, получили.», «Yes, received.», «All good, got it.» — решение дословно) судится
+    полным судьёй как утверждение оплаты: при фактах «только аренда» и «касса без второго источника» — причина «оплата
+    не подтверждена сверкой». Смешанное входящее (оплата и документ) — утверждение."""
+    miss = _missed(E1_RV_OPEN + E1_AFFIRM)
+    assert not miss, miss
+    assert len(RV_RESIDUAL) + len(E1_RV_OPEN) == 16                       # RESIDUAL_INFO проверяющего — все 16
+
+
+def test_p3e_payment_question_but_not_confirmation_not_blocked():
+    """п.1, отрицательный: то же входящее об оплате, но ответ — не подтверждение: отрицание, обещание проверки
+    («Получили, проверим и сообщим»), вопрос, условие, названный предмет («получили ваш чек»), ответ сам говорит, что
+    оплата не видна или проверяется, «да» о другом предмете — ни причины, ни сумм; у краткой клаузы исход назван."""
+    bad = _hit(E1_NOT)
+    assert not bad, bad
+
+
+def test_p3e_no_payment_question_bare_reply_no_reason():
+    """п.1, отрицательный с близнецом: входящее НЕ об оплате (вопрос о документе, о способе или будущей оплате, оплата
+    не прошла, вопроса нет) — краткий ответ причины не получает и назван `PC_NOASK`; ТОТ ЖЕ ответ на входящее об оплате
+    — утверждение."""
+    bad = _hit([(t, q, V_NOASK) for t, q in E1_NOASK])
+    assert not bad, bad
+    twins = [(t, QP_EN1 if re.match(r"[A-Za-z]", t) else QP_RU1) for t, _q in E1_NOASK]
+    miss = _missed(twins)
+    assert not miss, miss
+
+
+def test_p3e_adapter_passes_sign_to_run_and_judge():
+    """п.1, адаптер: признак считает `T.pay_asked(info["question"])` тем же местом, что `cash_said`, и передаёт в
+    `T.run` (итог и журнал сверки его несут) и в `T.judge`: черновик «Да, получили, спасибо!» на «…деньги пришли?»
+    получает причину кода; на вопрос о фото паспорта — нет. Запрос модели от признака не зависит."""
+    seen = {}
+    for name, question in (("pay", QP_RU1), ("doc", QD_RU)):
+        s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}},
+                   final("Да, получили, спасибо!"))
+        a = adapter(s, [tx_item()], question=question)
+        out = a.draft(NUMBER, 5)
+        seen[name] = (out["handoff"], a.last["tools"].get("asked"), getattr(a.last["tools"]["journal"], "asked", None),
+                      list(s.seen))
+    assert T.PAY_WORDS in seen["pay"][0] and seen["pay"][1] is True and seen["pay"][2] is True, seen["pay"][:3]
+    assert T.PAY_WORDS not in seen["doc"][0] and seen["doc"][1] is False and seen["doc"][2] is False, seen["doc"][:3]
+    assert seen["pay"][3] == seen["doc"][3], "запрос модели изменился от признака"
+
+
+def test_p3e_run_records_sign_request_unchanged():
+    """п.1: `T.run(..., asked=…)` только ЗАПИСЫВАЕТ признак (итог `asked`, журнал) — запросы модели те же байт-в-байт;
+    `T.judge(..., asked=…)` кладёт его в журнал, по нему и судит."""
+    outs = {}
+    for flag in (True, False):
+        s = Script({"tool": "rental", "args": {}}, final("Да, получили."))
+        out = T.run(s, "S", "U", {"rental": rental_door()}, number=NUMBER, clock=Clock(), asked=flag)
+        words, _fig = T.judge("Да, получили.", None, out["results"], out["journal"], asked=flag)
+        outs[flag] = (out["asked"], out["journal"].asked, list(s.seen), T.PAY_WORDS in words)
+    assert outs[True][:2] == (True, True) and outs[False][:2] == (False, False), (outs[True][:2], outs[False][:2])
+    assert outs[True][2] == outs[False][2], "запрос модели изменился от признака"
+    assert outs[True][3] is True and outs[False][3] is False, (outs[True][3], outs[False][3])
+
+
+def test_p3e_debt_family_flagged():
+    """п.2 (остаток (б)): «долга / задолженности (по аренде) нет», «ничего не должны», «долг погашен», «всё погашено»,
+    «счёт закрыт», «аренда закрыта», «баланс нулевой», «доплачивать ничего не нужно»; англ. «no balance due», «nothing
+    owed», «you don't owe anything», «all settled», «balance is zero» — утверждение оплаты на тех же основаниях;
+    собственное «нет / не / no» семейства отрицанием не считается. «Всё закрыто» без слова денег — при входящем об оплате."""
+    miss = _missed([(t, Q_NONE) for t in E2_AFFIRM] + [("Да, всё закрыто.", QP_RU1)])
+    assert not miss, miss
+    assert len([t for t in E2_AFFIRM if re.match(r"[A-Za-z]", t)]) >= 10 and len(E2_AFFIRM) >= 30
+    assert T.pay_claimed("Остаток к оплате — 0 бат.") == set()             # ноль — не сумма полученной оплаты
+
+
+def test_p3e_debt_not_claims_not_blocked():
+    """п.2, отрицательный: вопрос, «долг ещё есть», «долг не погашен», будущее и условие, долженствование; «закрыто» про
+    заявку, обращение, вопрос, офис, бронь; другая услуга («за доставку вы ничего не должны»); правило о сроке оплаты
+    («сейчас вы ничего не должны — оплата при получении»); «мы вам ничего не должны»; сумма долга; залог — ни причины,
+    ни сумм, исход назван."""
+    bad = _hit([(t, Q_NONE, name) for t, name in E2_NOT])
+    assert not bad, bad
+
+
+def test_p3e_bare_number_known_money_sum_flagged():
+    """п.3 (остаток (в)): число БЕЗ валюты при сказуемом получения, в том числе не вплотную («Да, 7790 получили.»,
+    «7790 пришли, спасибо.», «В кассе вижу 7790.», «Yes, 7790 received.») — утверждение, когда число равно известной
+    денежной сумме сверки (итог аренды 7790); число не из фактов — когда входящее клиента об оплате. Сумма идёт в
+    `pay_claimed`; с опорой своя сумма причины не получает, чужая — получает."""
+    miss = _missed([(t, Q_NONE) for t in E3_AFFIRM] + E3_ASKED)
+    assert not miss, miss
+    assert len([t for t in E3_AFFIRM if re.search(r"[A-Za-z]{3}", t)]) >= 7 and len(E3_AFFIRM) >= 20
+    sums = T.pay_sums(T.accepted(_results_no_second()))
+    assert sums == {7790}, sums
+    assert T.pay_claimed("Да, 7790 получили.", False, sums) == {7790}
+    assert T.pay_claimed("Да, 7790 получили.") == set()                    # без фактов число деньгами не названо
+    backed = _results_backed()
+    assert T.PAY_WORDS not in _judged("Да, 7790 получили.", Q_NONE, backed)
+    assert T.PAY_WORDS in _judged("Да, 8000 получили.", QP_RU1, backed)    # чужая сумма при подтверждённой оплате
+
+
+def test_p3e_bare_number_not_money_not_blocked():
+    """п.3, отрицательный: номер байка рядом со сказуемым получения («Байк 90101 получили», «NMAX 90101 получили» — и
+    при входящем об оплате), номер заказа или договора, часть телефона, число не из фактов без вопроса об оплате,
+    вопрос, отрицание, условие, будущее, документ («счёт на 7790 получили»), сумма в БУМАГЕ клиента («вижу 7790 бат в
+    вашем чеке») — ни причины, ни сумм, исход назван."""
+    bad = _hit(E3_NOT)
+    assert not bad, bad
+    assert T.pay_claimed("Вы 7790 получили?", False, {7790}) == set()      # вопрос сумм полученной оплаты не называет
+    assert T.pay_claimed("Получили 7790?") == set()
+
+
+def test_p3e_own_fresh_search_fixed():
+    """Свой свежий поиск шага 3e (существенные находки чинены тем же определением): краткие ответы с приветствием,
+    «конечно», «всё ок / на месте», «Да!»; «по оплате долгов нет», «расчёт закрыт», «к оплате 0», «account is
+    settled»; «в кассе вижу 7790 бат», «за аренду 7790 бат получили» — утверждение."""
+    miss = _missed(E_FRESH_AFFIRM)
+    assert not miss, miss
+
+
+def test_p3e_old_not_claims_stay_clean_under_payment_question():
+    """Отрицательный: ни одно не-утверждение прежних списков (шаги 3–3d и корпуса проверяющего) не получает причины и
+    при входящем об оплате — признак судит только краткую клаузу без предмета."""
+    facts = _facts_no_second_source()
+    nots = (NOT_CLAIM + NOT_CLOSE + RV_OWN_NOT + RV_NAMED3 + RV_OWN_PLAIN + RV_TWINS_NOT
+            + [t for t, _name in OLD_NOT + SAME_3B + R1_OWN_NOT + R3_NOUN_NOT + R3_SUM_NOT + ADV_NOT])
+    bad = [(t, T._PAY_CLAIM.explain(t, True)) for t in nots
+           if T.PAY_WORDS in [w for w, _why in T.money_roles(t, facts, asked=True)]]
+    assert not bad, bad
+
+
+def test_p3e_verdict_named_on_every_road():
+    """Храповик слепых читателей: у четвёртого прохода исход — тоже всегда НЕПУСТОЕ имя, и `search` говорит
+    «утверждение» ровно тогда, когда так назван хотя бы один исход — с контекстом сверки и без него; новые имена названы."""
+    rows = [(t, q) for t, q in E1_RV_OPEN + E1_AFFIRM + E1_NOASK + E3_ASKED + E_FRESH_AFFIRM]
+    rows += [(t, q) for t, q, _name in E1_NOT + E3_NOT] + [(t, Q_NONE) for t in E2_AFFIRM + E3_AFFIRM]
+    rows += [(t, Q_NONE) for t, _name in E2_NOT]
+    for text, question in rows:
+        for asked, sums in (_ctx_of(question), (False, ())):
+            got = T._PAY_CLAIM.explain(text, asked, sums)
+            assert all(isinstance(v, str) and v.strip() for _match, v in got), (text, got)
+            assert (V_CLAIM in [v for _match, v in got]) == bool(T._PAY_CLAIM.search(text, asked, sums)), (text, got)
+    assert {v for _m, v in T._PAY_CLAIM.explain("Да, получили.")} == {V_NOASK}
+    assert {v for _m, v in T._PAY_CLAIM.explain("Да, получили.", True)} == {V_OTHER, V_CLAIM}   # «да» — к «получили»
+    assert {v for _m, v in T._PAY_CLAIM.explain("Вопрос решён, всё закрыто.")} == {V_NOMONEY}
+    assert {v for _m, v in T._PAY_CLAIM.explain("За доставку вы ничего не должны.")} == {V_ITEM}
+    assert {v for _m, v in T._PAY_CLAIM.explain("Байк 90101 получили, спасибо.", True, {7790})} == {V_NUM}
+    assert V_HOLD in {v for _m, v in T._PAY_CLAIM.explain("Получили, спасибо. Оплату проверит коллега.", True)}
+    assert {v for _m, v in T._PAY_CLAIM.explain("По вашим словам, вы оплатили вчера.")} == {V_SAID}
+
+
+def test_p3e_control_backed_new_families_not_blocked():
+    """КОНТРОЛЬ п.3e: новые семейства С опорой (касса + договор той же аренды, сумма 7790) причины не получают — ни на
+    ремонте, ни до него."""
+    backed = _results_backed()
+    assert T.pay_confirmed(T.accepted(backed)) is True
+    rows = E1_RV_OPEN + E1_AFFIRM + [(t, Q_NONE) for t in E2_AFFIRM + E3_AFFIRM] + E_FRESH_AFFIRM
+    bad = [(t, q, _judged(t, q, backed)) for t, q in rows if T.PAY_WORDS in _judged(t, q, backed)]
     assert not bad, bad
 
 

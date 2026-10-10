@@ -1725,10 +1725,11 @@ class ModelAdapter(wa_agent.Model):
         else:                                               # версия по пояснению со сверкой (Д2): блок пояснения
             system, user, info = self.build(number, upto_id, hint=hint)
         handed = T.cash_said(info.get("question"))         # K3-FIX3 п.2: переданные наличные — СЛОВА клиента
+        asked = T.pay_asked(info.get("question"))          # K3-FIX шаг 3e: входящее клиента — об оплате (признак судье)
         with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
             out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
                         fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
-                        spend=lambda u: self._spend(u, "сверка:"), handed=handed)
+                        spend=lambda u: self._spend(u, "сверка:"), handed=handed, asked=asked)
         jr = out["journal"]
         if out["state"] == T.ABORTED:
             for line in jr.lines():
@@ -1758,7 +1759,7 @@ class ModelAdapter(wa_agent.Model):
         # процент скидки за срок, названной дверью, — с опорой (WAPRICECTX0410): судья сверки процент судит без
         # исхода цены, поэтому названная дверью скидка снимается из текста до суда; прочее — как было
         said = K.without_known_discount(got["text"], info["price"]) if got else ""
-        words_t, figures = T.judge(said, info["price"], out["results"], jr, handed=handed,
+        words_t, figures = T.judge(said, info["price"], out["results"], jr, handed=handed, asked=asked,
                                    since=info.get("last_in"))
         for line in jr.lines():
             self.log(line)
