@@ -44,6 +44,13 @@ R3   — два семейства, которых не ловил ни один
      содержанием, проверкой, передачей человеку («Конечно, договор пришлём.», «Спасибо, проверим поступление.») — нет;
 2    — знак препинания между предметом и сказуемым получения клаузу не рвёт: «7790 — получили.» (О3), «7790 бат —
      получены», «Оплата: получена ✅», «Получено: 7790 бат.»; остаток О5 (время в той же клаузе без запятой) не закрыт.
+Шаг 3g (10.10.2026, независимая проверка 3d+3e+3f — fix_review3f/VERDICT.md, FAIL на d55b689: блокеры D1 и D2 одного
+     класса; решение координатора — правило КЛАССА, а не слово в словарь):
+п.3g — тема оплаты ОТКРЫТА (хвост клиента об оплате · блок клиента перед нашим последним ответом — об оплате · наш
+     последний ответ об оплате) и оплата кодом НЕ подтверждена ⇒ причина кода «нужен человек» при ЛЮБОМ тексте ответа:
+     «Деньги пришли?» — «Да, с оплатой всё хорошо.»; «Проверили?» после «перевёл → проверим» — «Да, всё пришло.»; «Sent!»
+     после наших реквизитов — «Спасибо, получили!». При подтверждённой оплате и без открытой темы новой причины нет;
+     общую причину по входящему правило не дублирует; словарь N4 и `pay_asked` не тронуты.
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на f2f7295 и на коммите шага 2 (996ee09) он падает по существу, на
 ремонте проходит. Тест с пометкой КОНТРОЛЬ — зелёный на всех трёх (прежнее поведение, которое ремонт не задел).
@@ -54,6 +61,8 @@ R3   — два семейства, которых не ловил ни один
 отрицательные — оттого, что на 44ba8ee нет самого контекста сверки (признака входящего и сумм фактов у определения).
 Тесты п.3f (кроме КОНТРОЛЯ `…prior_outcomes_kept`) падают и на b7dea68 (шаг 3e): утвердительные — по существу (причины
 нет), отрицательные — оттого, что на b7dea68 у новых дорог нет названного исхода (`PC_NOASK`, `PC_OTHER`, `PC_NUM` …).
+Тесты п.3g (кроме КОНТРОЛЯ `…prior_lists_kept`) падают и на d55b689 (шаг 3f): (i)–(iii) и путь до карточки — по существу
+(причины кода нет), прочие — оттого, что на d55b689 нет самого определения темы (`pay_topic`, `topic_reason`, `_before`).
 
 Всё на подменах: двери — функции ответа живого формата (`bridge_client.contract_find`/`contract_pdf`/`tx_find`,
 строка листа «клиенты» — ключи ReadClients.js), модель — сценарий. Сети, моста, Telegram, WhatsApp, SQLite и
@@ -1805,6 +1814,487 @@ def test_p3f_control_prior_outcomes_kept():
     bad = [(t, q) for t, q in rows if T.PAY_WORDS in _judged(t, q, backed)]
     assert not bad, bad
     assert not _hit([("Да, получили.", QD_RU, V_NOASK), ("Оплату пока не вижу, коллега проверит.", QP_RU1, None)])
+
+
+# ═══ п.3g: открытая тема оплаты без подтверждения кодом — причина класса (блокеры D1, D2 проверки 3d+3e+3f) ═════
+# Словарь утверждений N4 класс не закрывает (15 из 32 свежих утвердительных обычного строя): на входящем без слов общей
+# причины кода (`K.handoff`) черновик уходил вовсе без причины. Правило класса: тема оплаты ОТКРЫТА и оплата кодом НЕ
+# подтверждена ⇒ причина кода есть при ЛЮБОМ тексте ответа. Всё — настоящим путём адаптера: `build` НЕ подменён,
+# подменён только `_history` (история сценария в форме `wa_history`); причин модели нет — всё, что вернулось, поставил код.
+G_FAMILY = ("оплата со слов клиента — поступление не проверено", "вопрос об оплате", "оплата")   # K.MONEY_WORDS оплаты
+G_SAID, G_ASK, G_PLAIN = G_FAMILY
+V_TAIL = "тема оплаты открыта: клиент сейчас сообщает об оплате или спрашивает о поступлении"
+V_PREV = "тема оплаты открыта: клиент сообщал об оплате или спрашивал о поступлении перед нашим последним ответом"
+V_OURS = "тема оплаты открыта: наш последний ответ — об оплате"
+V_NONE = "тема оплаты не открыта"
+V_PAID = "тема оплаты открыта, оплата подтверждена кодом — причины класса нет"
+
+# (i) D2 — входящее об оплате БЕЗ слов общей причины кода, истории нет. PATH_B — дословно fix_review3f/my_corpus2.py
+GB1, GB2, GB3 = "Деньги пришли?", "Скинул 7790 на карту, гляньте.", "Has the money arrived?"
+GB4, GB5 = "Закинул вам на карту, посмотрите.", "Money sent, please confirm."
+G_PATH_B = [
+    (GB1, "Да, всё пришло, спасибо!"), (GB1, "Да, оплата получена."), (GB1, "Да, с оплатой всё хорошо."),
+    (GB1, "Да, деньги на счёте."), (GB1, "Да, деньги на счёте, спасибо! Договор пришлю сегодня."),
+    (GB2, "Да, видим, спасибо!"), (GB2, "Спасибо! Ждём вас завтра в 10:00."),
+    (GB2, "Отлично! Договор пришлю сегодня вечером."), (GB3, "Yes, your payment is complete."),
+    (GB3, "Yes, everything is fine with your payment."), (GB3, "Yes, it's in, thank you!"),
+    (GB5, "Confirmed, thank you!"), (GB5, "Happy to confirm receipt of your payment."), (GB4, "Да, всё на месте.")]
+G_HEDGED = ([(q, t) for q in (GB1, GB2, GB4)                                      # оговорки: «не видим», «проверим»
+             for t in ("Пока не видим, проверим.", "Пока оплату в кассе не вижу, коллега проверит и ответит.",
+                       "Спасибо! Сейчас проверим кассу и вернёмся с ответом.")]
+            + [(q, t) for q in (GB3, GB5) for t in ("We don't see it yet, we will check and reply.",
+                                                    "Thank you! We will check our records and confirm shortly.")])
+G_PATH_B_OWN = [                                # СВОИ пары: на d55b689 признак входящего True, причин кода [] при обоих наборах
+    ("Видите мои деньги?", "Да, с оплатой порядок, ждём вас завтра."), ("Деньги дошли?", "Всё зачтено, спасибо!"),
+    ("Отправил вам 7790 бат, посмотрите.", "Да, видим вашу сумму, всё верно."),
+    ("Кинул 7790 на карту, глянь.", "Спасибо, всё у нас! Ждём вас завтра в 10:00."),
+    ("Средства поступили?", "Супер, спасибо! Байк будет готов к 10:00."),
+    ("Вы получили деньги?", "С деньгами всё ок, ждём вас."), ("Закинул 7790, гляньте.", "Отлично, тогда оформляю договор."),
+    ("Деньги отправил, гляньте.", "Благодарю! Договор пришлю сегодня вечером."),
+    ("Передал деньги водителю.", "Замечательно! Шлем тоже подготовим."),
+    ("Did the money come through?", "Yes, you're all set. See you tomorrow!"),
+    ("Sent 7790 baht, can you see it?", "Great! See you tomorrow at 10."),
+    ("Have you got the money?", "Perfect — you're good to go."), ("Has the money landed?", "Yes, sorted, thanks!"),
+    ("Funds sent, please confirm.", "Thanks! Everything's set for tomorrow.")]
+
+# (ii) D1 — хвост без слов оплаты после обмена «клиент сообщил об оплате → мы: проверим». PATH_C, FOLLOWUP — дословно
+G_PAID = "Перевёл вам 7790 бат за аренду, проверьте, пожалуйста."
+G_H_CHECK = [("клиент", G_PAID), ("мы", "Спасибо! Проверим поступление и вернёмся с ответом.")]
+G_PATH_C = [
+    ("Проверили?", "Да, проверили — всё пришло, спасибо!"), ("Проверили?", "Да, оплата получена."),
+    ("Проверили?", "Да, деньги пришли."), ("Проверили?", "Да, 7790 получили."), ("Проверили?", "Да, всё в порядке."),
+    ("Ну что там?", "Всё в порядке, получили."), ("Ну как, пришло?", "Да, пришло, спасибо!"),
+    ("Есть новости по моему вопросу?", "Да, всё получили, спасибо. Ждём вас завтра."),
+    ("Any news?", "Yes, all received, thank you!"), ("Did it arrive?", "Yes, it arrived this morning."),
+    ("Ну что?", "Да, всё на месте."), ("Получили?", "Получили, спасибо!")]
+G_FOLLOWUP = [
+    ("Проверили?", "Да, всё пришло, спасибо!"), ("Ну что, получили?", "Да, получили, спасибо!"), ("Пришло?", "Да, пришло."),
+    ("Есть новости?", "Да, всё получили, спасибо."), ("Did you get it?", "Yes, we got it, thanks!"),
+    ("Any update?", "Yes, received, thank you."), ("Transferred 7790 baht, please check.", "Yes, received, thank you!"),
+    ("Отправил, проверьте, пожалуйста.", "Да, получили, спасибо!"), ("[фото]", "Получили, спасибо!"),
+    ("Sent!", "Got it, thanks!"), ("Готово, скинул.", "Да, всё дошло."), ("Дошло?", "Да, дошло.")]
+G_D1_OWN = [                                    # СВОИ: иные обмены «клиент сообщил об оплате → мы ответили»
+    ([("клиент", "Деньги отправил, гляньте."), ("мы", "Спасибо, сейчас посмотрим.")], "Ну как?", "Да, всё пришло, спасибо!"),
+    ([("клиент", "I've just sent the money, please confirm."), ("мы", "Thank you! We will check and get back to you.")],
+     "So?", "Yes, all good, thank you!"),
+    ([("клиент", "Закинул вам 7790 на карту."), ("мы", "Принято, уточню у коллег и вернусь.")], "Алло?", "Да, получили."),
+    ([("клиент", "Оплатила аренду, проверьте."), ("мы", "Пока не видим поступления, проверяем.")],
+     "Есть что-нибудь?", "Да, всё в порядке."),
+    ([("клиент", "Отправил вам 7790 бат."), ("клиент", "Посмотрите, пожалуйста."), ("мы", "Здравствуйте!"),
+      ("мы", "Минуту, смотрим.")], "Жду ответа.", "Спасибо за ожидание! Всё хорошо, ждём вас завтра."),
+    ([("клиент", "Передал деньги вашему водителю."), ("мы", "Хорошо, спасибо.")],     # наш ответ без слов оплаты: часть (2)
+     "И что дальше?", "Всё отлично, байк ваш до 15 октября.")]
+G_D1_CHAIN = [                                  # тема тянется через наше «проверяем»: клиент об оплате — два обмена назад
+    ([("клиент", "Перевёл 7790 бат."), ("мы", "Спасибо, проверим."), ("клиент", "Ок, жду."), ("мы", "Ещё проверяем.")],
+     "Ну как?", "Да, всё пришло!"),
+    ([("клиент", "Sent you the money."), ("мы", "Thanks, we will check."), ("клиент", "Ok."),
+      ("мы", "We will check again, one moment.")], "Any luck?", "Yes, all good, thank you!")]
+
+# (iii) — первое сообщение без слов словаря после НАШЕГО ответа об оплате (способ, реквизиты, сумма к оплате)
+G_H_HOW = [("клиент", "Как можно оплатить аренду?"),
+           ("мы", "Оплатить можно переводом на карту — реквизиты пришлю следующим сообщением — или наличными при "
+                  "получении байка.")]
+G_H_HOW_EN = [("клиент", "How can I pay for the rental?"),
+              ("мы", "You can pay by bank transfer — I will send the details — or in cash at pickup.")]
+G_PHOTO = ("медиа", "фото")
+G_CHAIN3 = [(G_H_HOW, q, t)                                                          # дословно решение: 5 × 3
+            for q in ("Sent!", "Готово, скинул.", G_PHOTO, "Wired the money.", "Отправил, проверьте, пожалуйста.")
+            for t in ("Спасибо, получили!", "Да, всё пришло.", THUMB)]
+G_CHAIN3_EN = [(G_H_HOW_EN, q, t) for q in ("Sent!", "Wired the money.", G_PHOTO)
+               for t in ("Thank you, received!", "Yes, all received.", THUMB)]
+G_CHAIN3_OWN = [                                # СВОИ: иные наши ответы об оплате; у каждого — какая подчасть (3) её узнаёт
+    ([("клиент", "Куда платить?"), ("мы", "Реквизиты для перевода: Тест Банк, счёт TEST-ACC-0001, получатель Test Co.")],
+     "Готово.", "Спасибо, получили!"),
+    ([("клиент", "How do I pay?"), ("мы", "You can pay by bank transfer or in cash at pickup. The total is 7790 THB.")],
+     "Done!", "Great, thank you!"),
+    ([("клиент", "Сколько с меня?"), ("мы", "К оплате 7790 бат за 10 дней, залог 3000 бат.")],
+     "Всё, сделал.", "Да, всё пришло, спасибо."),
+    ([("клиент", "Можно картой?"), ("мы", "Да, картой можно. Переведите 7790 бат на карту — номер пришлю.")],
+     "Отправил.", THUMB),                                                          # только группа оплаты R_MONEY
+    ([("клиент", "Хочу продлить на неделю."), ("мы", "Продление на 7 дней — 5453 бат, оплатить можно до конца аренды.")],
+     "Вот.", "Спасибо! Ждём вас завтра в 10:00."),
+    ([("клиент", "Ок, беру."), ("мы", "Отлично! Деньги можно передать курьеру при встрече либо отправить заранее.")],
+     "Ок, держите.", "Получили, спасибо!"),                                         # только слово оплаты `_PQ_PAYWORD`
+    ([("клиент", "Здравствуйте."), ("мы", "Здравствуйте! Счёт на 7790 бат отправили вам на почту, чек пришлём после.")],
+     "Готово, спасибо.", "Отлично, спасибо!"),
+    ([("клиент", "Is everything ok with my booking?"), ("мы", "Yes. Payment for the rental is by transfer or cash.")],
+     "Lovely, done.", "Perfect, thanks!"),
+    ([("клиент", "Когда платить?"), ("мы", "Проверим и ответим.")], "Скинул только что.", "Отлично, спасибо!"),   # обещание
+    ([("клиент", "Что по расчётам?"), ("мы", "Задолженности по аренде нет.")], "Тогда ещё докинул.", "Спасибо, получили!")]
+
+# без открытой темы: новой причины нет (общая причина по входящему, если была, — как была)
+G_DOC = "Здравствуйте! Пришлите, пожалуйста, договор аренды."
+G_CLOSED = [
+    ([], "Как можно оплатить аренду?", "Оплатить можно наличными при получении байка или переводом на тайский счёт."),
+    ([], "Можно оплатить картой?", "Да, картой можно — через терминал при получении байка."),
+    ([], "Оплачу завтра утром, хорошо?", "Хорошо, ждём вас завтра."),
+    ([], G_DOC, "Договор во вложении. Если будут вопросы по условиям — пишите."),
+    ([], QD_RU, "Да, получили, спасибо!"),
+    ([], "Здравствуйте! Есть шлемы?", "Да, шлем входит в стоимость аренды."),
+    ([("клиент", "Во сколько вы открываетесь?"), ("мы", "Мы работаем с 9:00 до 20:00 каждый день.")],
+     "Спасибо!", "Пожалуйста! Ждём вас."),
+    ([("клиент", "Пришлите договор."), ("мы", "Договор проверим и пришлём сегодня.")], "Ок, жду.", "Спасибо за ожидание!"),
+    ([("клиент", "Можно шлем побольше?"), ("мы", "Да, подберём размер L.")], "Супер", "Отлично, до встречи!"),
+    ([("клиент", "Do you deliver to Kata?"), ("мы", "Yes, delivery to Kata is available.")], "Great, thanks!",
+     "You're welcome!"),
+    # окно — ровно один обмен: клиент говорил об оплате ДВА обмена назад, наш последний ответ — не об оплате
+    ([("клиент", "Перевёл 7790 бат."), ("мы", "Спасибо, проверим."), ("клиент", "А шлем дадите?"), ("мы", "Да, шлем дадим.")],
+     "Супер, до завтра.", "До встречи!"),
+    # автоприветствие нашим ответом не считается (его слово «оплата» тему не открывает)
+    ([("клиент", "Здравствуйте."), ("авто", "Здравствуйте! Это TurboBaby, оплата и вопросы — здесь.")],
+     "Есть NMAX на завтра?", "Уточню наличие и вернусь.")]
+# общая причина по входящему уже стоит (слова R_MONEY во входящем): правило её не дублирует — список причин прежний
+G_MERGED = [
+    ([], QP_RU1, "Да, с оплатой всё хорошо.", [G_SAID]),
+    ([], G_PAID, "Да, деньги на счёте, спасибо!", [G_SAID]),
+    ([], QP_EN1, "Yes, everything is fine with your payment.", [G_SAID]),
+    (G_H_CHECK, "Ну что с оплатой?", "Да, всё пришло.", [G_ASK]),                    # общая по хвосту + тема по части (2)
+    (G_H_HOW, "Оплатил, проверьте.", "Спасибо, получили!", ["оплата не подтверждена сверкой", G_SAID]),
+    ([], "Как можно оплатить аренду?", "Оплата принимается наличными в батах при выдаче байка.", [G_ASK])]
+
+
+def _items3g(history, tail):
+    """История сценария → элементы формы `wa_history` (key, ts, who, text, word, file; «авто» — автоприветствие)."""
+    rows, out = list(history) + [("клиент", tail)], []
+    for i, (who, said) in enumerate(rows):
+        media = isinstance(said, tuple)
+        it = {"key": "g%d" % i, "ts": int(T0) - 60 * (len(rows) - i), "who": "мы" if who == "авто" else who,
+              "text": "" if media else said, "word": said[1] if media else None, "file": None}
+        if who == "авто":
+            it["auto"] = True
+        out.append(it)
+    return out
+
+
+def _draft3g(history, tail, text, facts="cash", handoff=(), hint=None):
+    """Черновик настоящим путём адаптера (`draft` → `build` → `_draft_tools`) на истории сценария → (итог, адаптер,
+    сценарий модели, журнал). facts: «none» — строки кассы нет; «cash» — касса без второго источника; «backed» — касса и
+    договор той же аренды (оплата подтверждена кодом); «over» — предел вызовов, запасной вызов без фактов."""
+    steps = [{"tool": "rental", "args": {}}] * T.MAX_CALLS if facts == "over" else \
+        [{"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}}] + \
+        ([{"tool": "contract", "args": {}}] if facts == "backed" else [])
+    s, logs = Script(*(steps + [final(text, handoff)])), []
+    tools = {"cash": (lambda **kw: tx([] if facts == "none" else [tx_item()])), "contract": Registry([DOC1]),
+             "contract_pdf": pdf_door}
+    a = M.ModelAdapter(":memory:-не-открывается", s, read_doc=None, clock=Clock(), log=logs.append,
+                       book=Book([dict(ROW)], 60.0), tools=tools, fresh=None)
+    items = _items3g(history, tail)
+    a._history = lambda number, upto_id: (items, [])
+    out = a.draft(NUMBER, 5) if hint is None else a.redraft_checked(NUMBER, 5, *hint)
+    return out, a, s, logs
+
+
+def _family(out):
+    """Причины кода семьи оплаты в итоговом списке черновика (слова `K.MONEY_WORDS`: заявил · спросил · нейтральное)."""
+    return [w for w in out["handoff"] if w in G_FAMILY]
+
+
+def _topic3g(a):
+    """Исход определения «тема оплаты открыта» на том, что собрал настоящий `build` этого черновика."""
+    info = a.last["info"]
+    return T.pay_topic(info["question"], *info["before"])
+
+
+def _no_reason3g(rows, want, need_words):
+    """Сценарии без причины семьи оплаты при «строки кассы нет» / «касса без второго источника» либо с иным исходом
+    определения, чем `want`, либо с иными словами, чем `need_words(адаптер)`."""
+    bad = []
+    for history, tail, text in rows:
+        for facts in ("none", "cash"):
+            out, a, _s, _logs = _draft3g(history, tail, text, facts)
+            name, _words = _topic3g(a)
+            if out["text"] != text or name != want or _family(out) != [need_words(a)] \
+                    or T.pay_confirmed(a.last["tools"]["journal"].facts):
+                bad.append((tail, text, facts, name, out["handoff"]))
+    return bad
+
+
+def test_p3g_topic_definition_named_parts():
+    """Определение «тема оплаты открыта» — ОДНО, исход назван всегда: (1) хвост клиента об оплате; (2) блок клиента перед
+    нашим последним ответом — об оплате; (3) наш последний ответ об оплате — обещал проверку или «не видим», подтвердил
+    оплату, назвал её предметом (слово оплаты — `_PQ_PAYWORD` либо группа оплаты выражения R_MONEY); иначе — не открыта.
+    Слова причины — существующие `K.MONEY_WORDS`: части (1)–(2) — смысл слов клиента (`K.payment_mode`), часть (3) —
+    нейтральное «оплата». Первая сработавшая часть называет исход: хвост, затем предыдущий обмен, затем наш ответ."""
+    assert (T.PT_TAIL, T.PT_PREV, T.PT_OURS, T.PT_NONE, T.PT_PAID) == (V_TAIL, V_PREV, V_OURS, V_NONE, V_PAID)
+    assert G_FAMILY == (K.MONEY_WORDS[K.MONEY_PAYMENT], K.MONEY_WORDS[K.MONEY_PAYMENT_ASK],
+                        K.MONEY_WORDS[K.MONEY_PAYMENT_UNCLEAR])
+    assert T.pay_topic("Деньги пришли?") == (V_TAIL, G_ASK)                       # спросил о поступлении
+    assert T.pay_topic("Скинул 7790 на карту, гляньте.") == (V_TAIL, G_SAID)       # заявил оплату
+    assert T.pay_topic("Проверили?", G_PAID, "Проверим.") == (V_PREV, G_SAID)
+    assert T.pay_topic("Ну что?", "Деньги пришли?", "Минуту.") == (V_PREV, G_ASK)
+    assert T.pay_topic("Деньги пришли?", G_PAID, "Проверим оплату.") == (V_TAIL, G_ASK)   # хвост сильнее предыдущего
+    assert T.pay_topic("Sent!", G_PAID, "Проверим оплату.") == (V_PREV, G_SAID)            # предыдущий сильнее нашего
+    ours = [("Проверим и вернёмся с ответом.", "обещание проверки без иного предмета"),       # только `unsettled`
+            ("В кассе пока не видим.", "«не видим»"),
+            ("Задолженности по аренде нет.", "подтвердил оплату: «долга нет»"),                  # только утверждение N4
+            ("All settled.", "подтвердил оплату"),
+            ("Деньги можно передать курьеру при встрече.", "слово оплаты `_PQ_PAYWORD`"),        # только `_PQ_PAYWORD`
+            ("Переведите 7790 бат на карту — номер пришлю.", "группа оплаты R_MONEY"),           # только R_MONEY
+            ("You can pay in cash or by card at pickup.", "группа оплаты R_MONEY"),
+            ("Оплатить можно наличными при получении байка.", "слово оплаты"),
+            ("Реквизиты для оплаты отправил выше.", "реквизиты"), ("К оплате 7790 бат.", "сумма к оплате"),
+            ("Оплата получена, спасибо!", "подтвердил оплату"), ("Чек пришлём после.", "чек")]
+    for text, why in ours:
+        assert T.pay_topic("Sent!", "Как оплатить?", text) == (V_OURS, G_PLAIN), (text, why)
+    for text in ("Да, шлем дадим.", "Мы работаем с 9:00 до 20:00.", "Договор проверим и пришлём сегодня.",
+                 "Уточню наличие байка и вернусь.", "Ждём вас завтра в 10:00.", "", None, "👍"):
+        name, words = T.pay_topic("Sent!", "Как оплатить?", text)
+        assert name == V_NONE and words, (text, name)
+    assert T.pay_topic() == (V_NONE, G_PLAIN) and T.pay_topic(None, None, None)[0] == V_NONE
+    for q in ("Как оплатить?", "Можно картой?", "Оплачу завтра.", "Пришлите договор.", "Спасибо!", "[пусто]"):
+        assert T.pay_topic(q)[0] == V_NONE, q                                       # вопрос о способе, будущая оплата
+
+
+def test_p3g_rule_open_topic_and_unconfirmed_payment():
+    """Правило класса: тема открыта И `pay_verdict` оплату не подтверждает (фактов нет, только аренда, касса без второго
+    источника, чужая валюта) — причина есть, её слова — слова темы; оплата подтверждена (касса + договор той же аренды) —
+    `PT_PAID`, причины нет; тема не открыта — причины нет при любых фактах. Исход назван на каждой ветке."""
+    usd = _results_rent_only() + [T.cash_result(tx([tx_item(currency="USD")]), at=T0)]
+    unpaid = {"фактов нет": [], "только аренда": T.accepted(_results_rent_only()),
+              "касса без второго источника": T.accepted(_results_no_second()), "чужая валюта": T.accepted(usd)}
+    backed = T.accepted(_results_backed())
+    assert T.pay_confirmed(backed) is True and not [k for k, f in unpaid.items() if T.pay_confirmed(f)]
+    for name, words in ((V_TAIL, G_ASK), (V_TAIL, G_SAID), (V_PREV, G_SAID), (V_OURS, G_PLAIN)):
+        for label, facts in unpaid.items():
+            assert T.topic_reason((name, words), facts) == (name, [words]), (name, label)
+        assert T.topic_reason((name, words), backed) == (V_PAID, []), name
+    for facts in list(unpaid.values()) + [backed]:
+        assert T.topic_reason((V_NONE, G_PLAIN), facts) == (V_NONE, [])
+        assert T.topic_reason(None, facts) == (V_NONE, []) and T.topic_reason((), facts) == (V_NONE, [])
+        assert T.topic_reason(("иное имя", G_PLAIN), facts) == (V_NONE, [])
+
+
+def test_p3g_d2_incoming_about_payment_any_reply_has_code_reason():
+    """(i) D2: входящее об оплате БЕЗ слов общей причины кода («Деньги пришли?», «Скинул 7790 на карту, гляньте.», «Has
+    the money arrived?», «Money sent, please confirm.» и 14 своих) × ЛЮБОЙ ответ — утверждение вне словаря N4 («Да, с
+    оплатой всё хорошо.», «Yes, your payment is complete.»), ответ с содержанием («Спасибо! Ждём вас завтра в 10:00.»),
+    оговорка («Пока не видим, проверим.») — при «строки кассы нет» и при «касса без второго источника» черновик несёт
+    причину кода семьи оплаты, ровно одну, словами смысла входящего."""
+    rows = [([], q, t) for q, t in G_PATH_B + G_HEDGED + G_PATH_B_OWN]
+    assert (len(G_PATH_B), len(G_HEDGED), len(G_PATH_B_OWN)) == (14, 13, 14)
+    for _h, q, _t in rows:
+        assert T.pay_asked(q) is True and K.handoff(q, None) == [], q            # общей причины по входящему нет
+    bad = _no_reason3g(rows, V_TAIL, lambda a: K.MONEY_WORDS[K.payment_mode(a.last["info"]["question"])])
+    assert not bad, bad
+    out, _a, _s, _logs = _draft3g([], GB1, "Да, с оплатой всё хорошо.", "cash")
+    assert out["handoff"] == [G_ASK], out["handoff"]                              # была []: N4 фразу не ловит
+    out, _a, _s, _logs = _draft3g([], GB2, "Спасибо! Ждём вас завтра в 10:00.", "none")
+    assert out["handoff"] == [G_SAID], out["handoff"]
+
+
+def test_p3g_d1_followup_after_payment_exchange_has_code_reason():
+    """(ii) D1: хвост без слов оплаты («Проверили?», «Ну как, пришло?», «Any news?», «Sent!», «[фото]») после обмена, где
+    клиент сообщал об оплате, а мы ответили («проверим», «сейчас посмотрим», «хорошо, спасибо»), — причина кода семьи
+    оплаты при обоих наборах фактов; слова — смысл слов клиента ПРЕДЫДУЩЕГО блока. Тема тянется и через наше
+    «проверяем» (клиент об оплате — два обмена назад): тогда слова — нейтральное «оплата»."""
+    rows = [(G_H_CHECK, q, t) for q, t in G_PATH_C + G_FOLLOWUP] + G_D1_OWN
+    assert (len(G_PATH_C), len(G_FOLLOWUP), len(G_D1_OWN)) == (12, 12, 6)
+    # у одного хвоста («Transferred 7790 baht…») общая причина по входящему уже стоит — её слова и остаются
+    plain = [r for r in rows if not K.handoff(r[1], None)]
+    assert len(rows) - len(plain) == 1 and not [1 for _h, q, _t in rows if T.pay_asked(q)]
+    bad = _no_reason3g(plain, V_PREV, lambda a: K.MONEY_WORDS[K.payment_mode(a.last["info"]["before"][0])])
+    assert not bad, bad
+    for facts in ("none", "cash"):
+        out, a, _s, _logs = _draft3g(G_H_CHECK, "Transferred 7790 baht, please check.", "Yes, received, thank you!", facts)
+        assert _topic3g(a)[0] == V_PREV and _family(out) == [G_ASK], out["handoff"]
+    out, a, _s, _logs = _draft3g(G_H_CHECK, "Проверили?", "Да, проверили — всё пришло, спасибо!", "cash")
+    assert out["handoff"] == [G_SAID] and a.last["info"]["before"] == (G_PAID, G_H_CHECK[1][1]), out["handoff"]
+    bad = _no_reason3g(G_D1_CHAIN, V_OURS, lambda a: G_PLAIN)
+    assert not bad, bad
+
+
+def test_p3g_first_message_after_our_payment_answer_has_code_reason():
+    """(iii): мы назвали способ, реквизиты или сумму к оплате → клиент: «Sent!», «Готово, скинул.», «[фото]», «Wired the
+    money.», «Отправил, проверьте, пожалуйста.» (признак хвоста False, предыдущий блок клиента — не об оплате) → краткое
+    подтверждение («Спасибо, получили!», «Да, всё пришло.», «👍») — причина кода «оплата» при обоих наборах фактов.
+    Свои — по ответу на каждую подчасть (3): обещание проверки, утверждение оплаты, слово оплаты, группа оплаты R_MONEY."""
+    rows = G_CHAIN3 + G_CHAIN3_EN + G_CHAIN3_OWN
+    assert (len(G_CHAIN3), len(G_CHAIN3_EN), len(G_CHAIN3_OWN)) == (15, 9, 10)
+    for history, tail, _text in rows:
+        said = tail if isinstance(tail, str) else "[%s]" % tail[1]
+        assert T.pay_asked(said) is False and T.pay_asked(history[-2][1]) is False, (said, history)
+        assert K.handoff(said, None) == [], said
+    bad = _no_reason3g(rows, V_OURS, lambda a: G_PLAIN)
+    assert not bad, bad
+    out, a, _s, _logs = _draft3g(G_H_HOW, G_PHOTO, THUMB, "none")
+    assert out["handoff"] == [G_PLAIN] and a.last["info"]["question"] == "[фото]", (out["handoff"], a.last["info"])
+
+
+def test_p3g_confirmed_payment_adds_nothing():
+    """Близнецы: ТЕ ЖЕ пары (i)–(iii) при ПОДТВЕРЖДЁННОЙ оплате (касса аренды обращения + договор той же аренды) — новой
+    причины нет ни в одной: в списке нет причины семьи оплаты сверх общей причины по входящему, исход правила —
+    `PT_PAID`. Полезный сценарий (оплата подтверждена, ответ с PDF) правилом не задет."""
+    rows = [([], q, t) for q, t in G_PATH_B + G_HEDGED + G_PATH_B_OWN]
+    rows += [(G_H_CHECK, q, t) for q, t in G_PATH_C + G_FOLLOWUP] + G_D1_OWN + G_D1_CHAIN
+    rows += G_CHAIN3 + G_CHAIN3_EN + G_CHAIN3_OWN
+    assert len(rows) == 107
+    bad = []
+    for history, tail, text in rows:
+        out, a, _s, logs = _draft3g(history, tail, text, "backed")
+        facts = a.last["tools"]["journal"].facts
+        by_tail = [r["words"] for r in a.last["info"]["code_reasons"]]
+        if not T.pay_confirmed(facts) or T.topic_reason(_topic3g(a), facts) != (V_PAID, []) \
+                or _family(out) != [w for w in by_tail if w in G_FAMILY] or "оплата не подтверждена сверкой" in out["handoff"] \
+                or not [ln for ln in logs if ln.startswith("правило класса: " + V_PAID)]:
+            bad.append((tail, text, out["handoff"]))
+    assert not bad, bad
+    out, _a, _s, _logs = _draft3g([], GB1, "Да, оплата получена. Договор отправляю следующим сообщением.", "backed")
+    assert out["handoff"] == [], out["handoff"]
+
+
+def test_p3g_closed_topic_adds_nothing():
+    """Без открытой темы новой причины нет: первое обращение «как оплатить?» (общая причина «вопрос об оплате» — как была,
+    одна), вопрос о документе, о шлеме, благодарность после ответа не об оплате; клиент говорил об оплате ДВА обмена
+    назад, а наш последний ответ не об оплате (окно — ровно один обмен); автоприветствие нашим ответом не считается —
+    при «строки кассы нет» и «касса без второго источника» список причин равен причинам кода по входящему."""
+    bad = []
+    for history, tail, text in G_CLOSED:
+        for facts in ("none", "cash"):
+            out, a, _s, logs = _draft3g(history, tail, text, facts)
+            by_tail = [r["words"] for r in a.last["info"]["code_reasons"]]
+            if _topic3g(a)[0] != V_NONE or out["handoff"] != by_tail or [ln for ln in logs if ln.startswith("правило класса")]:
+                bad.append((tail, facts, _topic3g(a)[0], out["handoff"], by_tail))
+    assert not bad, bad
+    out, a, _s, _logs = _draft3g(*G_CLOSED[-1], facts="cash")
+    assert a.last["info"]["before"] == ("", ""), a.last["info"]["before"]         # автоприветствие — не наш ответ
+
+
+def test_p3g_merge_with_general_reason_no_duplicate():
+    """Слияние: общая причина по входящему (слова R_MONEY во входящем) уже стоит — правило второй причины оплаты не
+    добавляет и порядка не меняет: список причин дословно прежний (K02: одна «оплата со слов клиента — поступление не
+    проверено»), в журнале — «не добавлена (оплату уже назвал код по входящему)»."""
+    bad = []
+    for history, tail, text, want in G_MERGED:
+        closed = _topic3g(_draft3g(history, tail, text, "cash")[1])[0] == V_NONE
+        for facts in ("none", "cash"):
+            out, a, _s, logs = _draft3g(history, tail, text, facts)
+            said = [ln for ln in logs if ln.startswith("правило класса")]
+            if out["handoff"] != want or len(_family(out)) != 1 or (not closed and not [1 for ln in said if "не добавлена" in ln]) \
+                    or (closed and said):
+                bad.append((tail, facts, out["handoff"], said))
+    assert not bad, bad
+    # причина МОДЕЛИ об оплате — пересказ: отпадает как повтор причины кода, а не вытесняет её
+    out, _a, _s, _logs = _draft3g([], GB1, "Да, с оплатой всё хорошо.", "cash",
+                                  handoff=["клиент спрашивает об оплате — проверьте поступление"])
+    assert out["handoff"] == [G_ASK], out["handoff"]
+
+
+def test_p3g_adapter_path_history_to_card():
+    """Путь адаптера целиком: история → `build` (хвост, блок клиента перед нашим ответом, наш ответ — в сведениях
+    `before`, в ЗАПРОС модели признаки не идут) → исход определения → причина ПЕРВОЙ среди причин не о деньгах текста →
+    поля карточки сотрудника: слова → категория → ярлык действия (`wa_agent_tg.card_actions`), строка «НУЖЕН ЧЕЛОВЕК»."""
+    import wa_agent_tg as TG
+    labels = {G_SAID: TG.CARD_ACTIONS[K.MONEY_PAYMENT], G_ASK: TG.CARD_ACTIONS[K.MONEY_PAYMENT_ASK],
+              G_PLAIN: TG.CARD_ACTIONS[K.MONEY_PAYMENT_UNCLEAR]}
+    cases = [([], GB1, "Да, с оплатой всё хорошо.", G_ASK),
+             (G_H_CHECK, "Проверили?", "Да, всё в порядке.", G_SAID),
+             (G_H_HOW, "Готово, скинул.", "Спасибо, получили!", G_PLAIN)]
+    for history, tail, text, want in cases:
+        out, a, s, logs = _draft3g(history, tail, text, "cash")
+        hand = A.draft_out(out)[1]
+        assert hand == [want] and K.word_categories(want) and TG.card_actions(hand) == [labels[want]], (tail, hand)
+        notes = TG.card_notes(hand, 1, True)
+        assert TG.W_HAND in notes and "• " + labels[want] in notes and TG.W_SEND_HAND in notes, notes
+        assert out["question"] == tail and not [u for u in s.seen if "НУЖЕН ЧЕЛОВЕК" in u], out["question"]
+        assert [ln for ln in logs if ln.startswith("правило класса") and "причина кода добавлена" in ln], logs
+    # порядок: причина класса — впереди причин не о деньгах, сразу за причинами судьи по тексту
+    q = "Деньги пришли? И есть ли свободный NMAX со скидкой?"
+    assert [r["words"] for r in K.handoff(q, None)] == [K.REASON_WORDS[K.R_AVAILABILITY], K.REASON_WORDS[K.R_DISCOUNT]]
+    out, _a, _s, _logs = _draft3g([], q, "Уточню у коллег и вернусь.", "cash")
+    assert out["handoff"] == [G_ASK, K.REASON_WORDS[K.R_AVAILABILITY], K.REASON_WORDS[K.R_DISCOUNT]], out["handoff"]
+    out, _a, _s, _logs = _draft3g([], q, "Да, оплата получена.", "cash")
+    assert out["handoff"][:2] == ["оплата не подтверждена сверкой", G_ASK], out["handoff"]
+
+
+def test_p3g_unfinished_check_and_hint_paths():
+    """Тот же признак — в каждом пути черновика со сверкой: сверка НЕ завершена (предел вызовов → запасной вызов без
+    фактов: оплата кодом не подтверждена) — причина класса стоит за «сверка не завершена»; версия по пояснению со
+    сверкой (`redraft_checked`) — тот же путь. Без открытой темы у незавершённой сверки причины класса нет."""
+    rows = [([], GB1, "Да, с оплатой всё хорошо.", G_ASK), (G_H_CHECK, "Проверили?", "Да, всё в порядке.", G_SAID),
+            (G_H_HOW, "Sent!", THUMB, G_PLAIN)]
+    for history, tail, text, want in rows:
+        out, a, s, _logs = _draft3g(history, tail, text, "over")
+        assert a.last["tools"]["state"] == T.OVER and len(s.seen) == T.MAX_CALLS + 1, a.last["tools"]["state"]
+        assert out["handoff"][:2] == [T.INCOMPLETE_WORDS, want] and _family(out) == [want], out["handoff"]
+        out, a, _s, _logs = _draft3g(history, tail, text, "cash", hint=("прежний черновик", "скажи короче"))
+        assert a.last["info"].get("hint") is True and _family(out) == [want], out["handoff"]
+    out, _a, _s, _logs = _draft3g([], G_DOC, "Договор пришлём.", "over")
+    assert out["handoff"] == [T.INCOMPLETE_WORDS], out["handoff"]
+
+
+def test_p3g_cash_said_opens_topic_until_confirmed():
+    """K05 и соседи: клиент заявил ПЕРЕДАННЫЕ наличные («отдал вашему водителю 8000 бат наличными…») — это сообщение об
+    оплате (`pay_asked`), а общая причина по входящему называет только сдачу («возврат денег»). Пока касса и второй
+    источник оплату не подтвердили, правило добавляет причину семьи оплаты к прежним причинам кода (за причинами судьи
+    по тексту, впереди прочих); подтвердили (K05 стенда: касса + договор той же аренды) — список причин прежний."""
+    assert T.pay_asked(C3_QUESTION) is True and T.pay_topic(C3_QUESTION)[0] == V_TAIL
+    want = K.MONEY_WORDS[K.payment_mode(C3_QUESTION)]
+    out, a, _s, _logs = _draft3g([], C3_QUESTION, C3_TEXT, "backed")
+    by_tail = [r["words"] for r in a.last["info"]["code_reasons"]]
+    assert by_tail and not [w for w in by_tail if w in G_FAMILY], by_tail          # общая причина — не об оплате
+    assert T.pay_confirmed(a.last["tools"]["journal"].facts) and out["handoff"] == [CHANGE_WORDS] + by_tail, out["handoff"]
+    out, _a, _s, _logs = _draft3g([], C3_QUESTION, C3_TEXT, "cash")
+    assert out["handoff"] == [CHANGE_WORDS, want] + by_tail, out["handoff"]
+    out, _a, _s, _logs = _draft3g([], C3_QUESTION, C3_TEXT, "none")
+    assert out["handoff"][1:] == [want] + by_tail and _family(out) == [want], out["handoff"]
+
+
+def test_p3g_before_collects_previous_exchange():
+    """Сбор признаков из истории (`ModelAdapter._before`): блок сообщений клиента перед нашим последним ответом и сам
+    ответ — реплики подряд, склеенные по порядку; хвост в них не входит; автоприветствие и неизвестный отправитель
+    пропускаются; медиа без подписи — словом; тексты под маской и не длиннее предела; ответа не было — пустые."""
+    def items(*rows):
+        return _items3g(rows[:-1], rows[-1][1])
+    its = items(("клиент", "раньше"), ("мы", "старое"), ("клиент", "раз"), ("клиент", ("медиа", "фото")), ("мы", "ответ 1"),
+                ("авто", "приветствие"), ("?", "шум"), ("мы", "ответ 2"), ("клиент", "хвост 1"), ("клиент", "хвост 2"))
+    assert [it["text"] for it in M.ModelAdapter._tail(its)] == ["хвост 1", "хвост 2"]
+    assert M.ModelAdapter._before(its) == ("раз\n[фото]", "ответ 1\nответ 2")
+    first = items(("клиент", "первое"), ("клиент", "второе"))
+    assert M.ModelAdapter._before(first) == ("", "")                                # нашего ответа ещё не было
+    ours_last = _items3g([("клиент", "вопрос"), ("мы", "ответ")], "x")[:-1]         # последнее слово — наше, хвоста нет
+    assert M.ModelAdapter._tail(ours_last) == [] and M.ModelAdapter._before(ours_last) == ("вопрос", "ответ")
+    secret = items(("клиент", "мой пароль qwerty12345"), ("мы", "x" * (M.TAIL_MAX + 50) + " оплата"), ("клиент", "ок"))
+    prev, ours = M.ModelAdapter._before(secret)
+    assert "qwerty12345" not in prev and "[скрыто" in prev and len(ours) == M.TAIL_MAX and ours.endswith(" оплата")
+
+
+def test_p3g_n4_and_incoming_sign_untouched():
+    """Словарь утверждений N4 и признак входящего правилом не тронуты: фразы блокеров словарь по-прежнему НЕ ловит (судья
+    по тексту причины не даёт и слов семьи оплаты не ставит никогда — их ставит только правило класса в адаптере), а
+    пойманное им ловится как было; `PAY_WORDS` правило не ставит ни при одном исходе."""
+    for q, t in ((GB1, "Да, с оплатой всё хорошо."), (GB2, "Спасибо! Ждём вас завтра в 10:00."),
+                 (GB3, "Yes, your payment is complete."), ("Проверили?", "Да, всё в порядке.")):
+        for res in (_results_rent_only(), _results_no_second()):
+            assert _judged(t, q, res) == [], (q, t)
+    assert not _missed([("Да, оплата получена.", GB1), ("Да, всё пришло, спасибо!", GB1), ("Оплата получена.", Q_NONE)])
+    assert T.pay_asked("Проверили?") is False and T.pay_asked("Sent!") is False and T.pay_asked(GB1) is True
+    for topic in ((V_TAIL, G_ASK), (V_PREV, G_SAID), (V_OURS, G_PLAIN), (V_NONE, G_PLAIN)):
+        for facts in ([], T.accepted(_results_no_second()), T.accepted(_results_backed())):
+            assert T.PAY_WORDS not in T.topic_reason(topic, facts)[1]
+
+
+def test_p3g_topic_on_long_answer_is_fast():
+    """Устройство: определение темы на длинном нашем ответе (предел сбора — `TAIL_MAX` знаков) считается быстро."""
+    import time
+    for unit in ("Ждём вас завтра в 10:00 у офиса. ", "Спасибо, всё хорошо, конечно, да. ", "Thanks, great, sure, yes. ",
+                 "7790, 3000, 210 — всё по списку. "):
+        text = (unit * 400)[:M.TAIL_MAX]
+        t0 = time.perf_counter()
+        name, _words = T.pay_topic("Ок", "Ок", text)
+        assert time.perf_counter() - t0 < 2.0 and name in (V_OURS, V_NONE), (unit, name)
+
+
+def test_p3g_control_prior_lists_kept():
+    """КОНТРОЛЬ п.3g (зелёный и на d55b689): где правило молчит, список причин дословно прежний — общая причина по
+    входящему (K02 и соседи), закрытая тема, подтверждённая оплата на входящем со словом общей причины."""
+    for history, tail, text, want in G_MERGED:
+        for facts in ("none", "cash"):
+            assert _draft3g(history, tail, text, facts)[0]["handoff"] == want, (tail, facts)
+    for history, tail, text in G_CLOSED:
+        out, a, _s, _logs = _draft3g(history, tail, text, "cash")
+        assert out["handoff"] == [r["words"] for r in a.last["info"]["code_reasons"]], tail
+    out, _a, _s, _logs = _draft3g([], QP_RU1, "Да, оплата получена.", "backed")
+    assert out["handoff"] == [G_SAID], out["handoff"]
 
 
 # ═══ D3 приёмки шага 3: проверки, которые убивают мутанты m3r и m3v ═══════════════════════════════════════════

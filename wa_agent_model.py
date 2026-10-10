@@ -1376,6 +1376,26 @@ class ModelAdapter(wa_agent.Model):
                 tail.append(it)
         return list(reversed(tail))
 
+    @staticmethod
+    def _before(items):
+        """Предыдущий обмен (K3-FIX шаг 3g) → (блок сообщений клиента ПЕРЕД нашим последним ответом, наш последний ответ):
+        тексты под маской, не длиннее TAIL_MAX; медиа без подписи — словом, как в вопросе. Наш последний ответ — наши
+        реплики подряд перед хвостом (`_tail`: реплики клиента после него сюда не входят); автоприветствие (`auto`)
+        ответом не считается, как и у хвоста. Ответа не было — ("", ""). Это только ПРИЗНАКИ для правила класса «тема
+        оплаты открыта» (`wa_agent_tools.pay_topic`): в запрос модели они не идут."""
+        ours, prev = [], []
+        for it in reversed(items):
+            if it.get("auto"):
+                continue
+            if it["who"] == "мы":
+                if prev:
+                    break
+                ours.append(it)
+            elif it["who"] == "клиент" and ours:
+                prev.append(it)
+        return tuple(K.mask("\n".join(it["text"] or ("[%s]" % it["word"] if it["word"] else "")
+                                      for it in reversed(block))[-TAIL_MAX:])[0] for block in (prev, ours))
+
     def _lessons(self):
         """Действующие уроки из базы агента (mode=ro). Выключено — []; не прочитано — [] и строка журнала:
         без уроков агент пишет как раньше, а не выдумывает правила."""
@@ -1580,7 +1600,9 @@ class ModelAdapter(wa_agent.Model):
                 "question": question, "q_lang": q_lang,           # карточка сотрудника (WACARDQ0410)
                 "conv": conv,                                     # язык разговора кодом (WALANGCONVB0510)
                 # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
-                "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
+                "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None),
+                # K3-FIX шаг 3g: предыдущий обмен — признаки правила класса «тема оплаты открыта» (в запрос не идут)
+                "before": self._before(items)}
         if hint:
             info["masked"] += n_hint
             info["hint"] = True
@@ -1726,6 +1748,8 @@ class ModelAdapter(wa_agent.Model):
             system, user, info = self.build(number, upto_id, hint=hint)
         handed = T.cash_said(info.get("question"))         # K3-FIX3 п.2: переданные наличные — СЛОВА клиента
         asked = T.pay_asked(info.get("question"))          # K3-FIX шаг 3e: входящее клиента — об оплате (признак судье)
+        # K3-FIX шаг 3g: тема оплаты открыта? — хвост, предыдущий обмен, наш последний ответ (признак правилу класса)
+        topic = T.pay_topic(info.get("question"), *(info.get("before") or ("", "")))
         with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
             out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
                         fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
@@ -1771,12 +1795,21 @@ class ModelAdapter(wa_agent.Model):
         words = [r["words"] for r in info["code_reasons"]]
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
-        words = K.merge_reasons(words, got["handoff"])
+        # K3-FIX шаг 3g (правило класса): тема оплаты открыта, а оплата кодом не подтверждена (принятые факты ЭТОЙ сверки;
+        # у незавершённой их нет) — причина кода при любом тексте ответа. Она встаёт к причинам кода ДО причин модели
+        # (пересказ модели об оплате отпадает как повтор); оплату уже назвал код по входящему — второй такой нет
+        why_t, rule = T.topic_reason(topic, jr.facts)
+        rule = K.merge_reasons(words, rule)[len(words):]
+        words = K.merge_reasons(words + rule, got["handoff"])
         words = self._days_check(got["text"], info, words)      # сутки у дат (WADAYS0410)
         words = self._arrival_check(got["text"], info, words)   # срок и приезд без опоры (WATIMECLAIMB0510)
         words = self._lang_check(got["text"], info, words)      # язык ответа против языка разговора (WALANGCONVB0510)
-        for w in reversed(words_t):                             # причины кода о деньгах — вперёд
+        for w in reversed(words_t + rule):                      # причины кода о деньгах — вперёд
             words = K.reason_first(words, w)
+        if why_t != T.PT_NONE:
+            self.log("правило класса: %s; причина кода %s" % (
+                why_t, "добавлена" if rule else "не добавлена (оплату уже назвал код по входящему)"
+                if why_t in T.PT_OPEN else "не нужна"))
         for w in reversed(reasons):                             # «сверка не завершена» — самой первой
             words = K.reason_first(words, w)
         self.log("модель: черновик %d симв. со сверкой (%s, вызовов %d, %.1f с), причин %d"
