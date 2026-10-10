@@ -23,11 +23,19 @@ D3   — проверки, которые падают под мутантами
      оплаты договор пришлём», «Оплата должна быть получена до выдачи…», «Ссылку на оплату получили» и др.): те же
      исключения — одним определением на оба прохода; исход каждого совпадения НАЗВАН (`_PayClaim.verdict`/`explain`,
      храповик слепых читателей 74 → 72); ни одно прежде пойманное утверждение не теряется (КОНТРОЛЬ).
+Шаг 3d (10.10.2026, независимая проверка 3b+3c — fix_review3c/VERDICT.md, FAIL на f6ed7bd; решение координатора):
+п.3d R1 — исключения шага 3c теряли утверждения, которые ловили cbe186f и 6f6e754 (25 из 38 состязательных фраз
+     проверяющего): долженствование судится при СВОЁМ сказуемом, предлог цели — только при слове документа перед ним;
+R2   — контроль «ничего не потеряно» собран из ОБЪЕДИНЕНИЯ всех известных списков, включая корпуса проверяющего
+     (вшиты данными: списки `RV_*` — дословно fix_review3c/rv3c_corpus.py и rv3c_corpus2.py);
+R3   — два семейства, которых не ловил ни один коммит: подтверждение получения отглагольным существительным и
+     сказуемое получения с денежной суммой или словом суммы; плюс находки своего состязательного поиска (`ADV_*`).
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на f2f7295 и на коммите шага 2 (996ee09) он падает по существу, на
 ремонте проходит. Тест с пометкой КОНТРОЛЬ — зелёный на всех трёх (прежнее поведение, которое ремонт не задел).
 Тесты п.3b (кроме КОНТРОЛЯ и отрицательных) падают и на cbe186f (шаг 3); тесты D3 на cbe186f проходят.
 Тесты п.3c (кроме КОНТРОЛЯ) падают и на 6f6e754 (шаг 3b).
+Тесты п.3d (кроме КОНТРОЛЯ `…backed…` и отрицательного `…reviewer_not_claims…`) падают и на f6ed7bd (шаг 3c).
 
 Всё на подменах: двери — функции ответа живого формата (`bridge_client.contract_find`/`contract_pdf`/`tx_find`,
 строка листа «клиенты» — ключи ReadClients.js), модель — сценарий. Сети, моста, Telegram, WhatsApp, SQLite и
@@ -733,6 +741,321 @@ def test_p3c_control_nothing_caught_is_lost():
     assert T.pay_claimed("После проверки кассы оплата 7790 бат получена.") == {7790}
     # роль залога на прежние формы НЕ распространена: «залог» раньше «аренды» в клаузе оплату аренды не снимает
     assert T.PAY_WORDS in [w for w, _why in T.money_roles("Залог и оплата аренды получены.", facts)]
+
+
+# ═══ п.3d: R1 — потерянные утверждения, R2 — контроль из объединения списков, R3 — два семейства ═══════════════
+
+V_NOT, V_LATER, V_ASKED = "отрицание", "будущее, проверка или условие", "вопрос"
+V_THEIR = "получатель — клиент, а не мы"
+
+# КОРПУСА ПРОВЕРЯЮЩЕГО кругов 3b+3c — ДОСЛОВНО, данными (источник: tmp/k3_0910/fix_review3c/rv3c_corpus.py, sha256
+# f5ac0c13…8211, и rv3c_corpus2.py, 04294a3d…70df; имена списков — те же с приставкой RV_). ACCEPT8 = CLOSE_ACCEPT выше.
+RV_K15 = ("Здравствуйте! В кассе вижу оплату аренды по вашей брони от 05.10 на 7790 бат. Если вы сегодня оплачивали "
+          "что-то ещё, коллега проверит поступление и вам ответит. Договор тоже передам коллеге, он пришлёт его "
+          "отдельным сообщением.")
+RV_K02 = "Добрый день! Да, оплата аренды NMAX 90101 на 7790 бат у нас отражена, всё в порядке."
+RV_OWN_AFFIRM = [
+    "Ваш платёж зачислен, спасибо.", "Оплату за аренду приняли, спасибо.", "Перевод на 7790 бат дошёл.",
+    "Деньги за аренду пришли, всё отлично.", "Аренда за 10 дней оплачена полностью.", "Всё оплачено, ждём вас завтра.",
+    "Мы зафиксировали вашу оплату в журнале.", "Платёж по вашей брони проведён.", "Вашу оплату подтверждаю.",
+    "Средства поступили на наш счёт сегодня утром.", "Оплата аренды внесена в полном объёме.",
+    "Предоплата за байк учтена.", "Видим ваш перевод, спасибо.", "Подтверждаем: оплата принята.",
+    "Your payment has cleared.", "The transfer has been credited, thank you.",
+    "We have received the funds for your rental.", "Your booking is fully paid.", "The rental was paid yesterday.",
+    "Payment for your booking has been processed.", "Your money came through this morning.",
+    "The rent is paid, thank you.", "We confirmed your payment.", "Your transfer arrived safely."]
+RV_OWN_NOT = [
+    "Ваш платёж пока не зачислен.", "Перевод ещё не дошёл до нас.", "К сожалению, средства на счёт не поступили.",
+    "The transfer has not arrived yet.", "Your booking isn't paid yet.", "Как только перевод дойдёт, сразу сообщим.",
+    "Платёж будет проведён завтра утром.", "Мы проверим, зачислены ли средства.",
+    "We will let you know once the funds are credited.", "Your payment will be processed tomorrow.",
+    "Если перевод уже дошёл, пришлём договор.", "When the money arrives, we'll confirm.",
+    "Once your payment has cleared, the booking is confirmed.", "Платёж уже проведён?", "Вы уже оплатили аренду?",
+    "Has the transfer been credited?", "Аренда оплачена?", "Аренда должна быть оплачена до выдачи байка.",
+    "The rent must be paid before pickup.", "Оплату нужно внести до 12:00.", "Перевод ожидается сегодня.",
+    "Оплата ожидается сегодня, пока не поступила."]
+RV_NAMED3 = ["После оплаты договор пришлём.", "Оплата должна быть получена до выдачи байка.",
+             "Ссылку на оплату получили."]
+RV_OWN_PLAIN = [
+    "Ваш запрос получен, скоро ответим.", "После оплаты пришлём договор.", "Оплата должна поступить до выдачи байка.",
+    "Ссылку на оплату отправили вам в этот чат.", "Ваше сообщение получили, спасибо.", "Документы получены, спасибо.",
+    "Оплата возможна наличными или переводом.", "Оплата производится при получении байка.",
+    "Способ оплаты подтвердим позже.", "Для оплаты пришлите, пожалуйста, фото паспорта.",
+    "Когда поступит оплата, мы сообщим.", "Оплата картой проходит через терминал.",
+    "Бронь подтверждена, оплата при встрече.", "Заявку на возврат залога получили.",
+    "Чек об оплате пришлите сюда, пожалуйста.", "Оплата за следующий месяц должна прийти до пятницы.",
+    "Информацию об оплате вы получите в договоре.", "Подтверждение оплаты придёт вам на почту.",
+    "Оплата прошлого месяца не учитывается.", "Мы приняли вашу заявку на оплату картой.",
+    "Получили ваш вопрос про перевод.", "Вижу ваше сообщение про деньги.", "Есть оплата картой и наличными.",
+    "Оплаченные дни не возвращаются.", "Сумма к оплате указана в договоре.", "Оплата принимается наличными.",
+    "Your request has been received, we will reply soon.", "We sent you the payment link.",
+    "Payment is due at pickup.", "The payment details are in the contract."]
+RV_ADVERSARIAL = [
+    "You should know that your payment has been received.",
+    "I need to let you know that your payment has been received.",
+    "I should mention that we received your payment.", "We have to tell you that the payment is confirmed.",
+    "Thank you for the payment received today.", "Thanks for your payment received.",
+    "7790 бат на оплату аренды получены.", "Сумма на оплату аренды получена.", "Деньги на оплату аренды получены.",
+    "Ваша оплата должна была поступить вчера и поступила.", "Надо сказать что оплата получена.",
+    "Оплата получена нужно только подписать договор.", "Без оплаты залога оплата аренды получена.",
+    "После оплаты получили ваш чек, всё в порядке.", "Вашу оплату для брони получили.",
+    "После вашего перевода оплата получена.", "На карту оплата получена.", "Оплата на карту получена.",
+    "Оплата получена, нужно только подписать договор.", "Оплата получена и байк ждёт вас.",
+    "Payment received and you should get the contract soon.",
+    "Your payment has been received and we will send the contract.", "Как и должно быть, оплата получена.",
+    "Оплата необходимой суммы получена.", "Оплата ожидаемой суммы получена.", "Байк ждёт вас, оплата получена."]
+# RESIDUAL_INFO проверяющего (16 наблюдений): 14 — с причиной; две фразы БЕЗ слова оплаты, денег или суммы
+# («Да, всё пришло.», «We got it, thanks!») определение по ТЕКСТУ не судит — их смысл задаёт вопрос клиента, которого
+# `money_roles` не видит (остаток круга 3d, назван в FIX.md); набор о них ничего не утверждает
+RV_RESIDUAL = [
+    "Подтвердили поступление оплаты, спасибо.", "Подтверждаю получение оплаты.",
+    "Подтверждаем поступление оплаты за аренду.", "Поступление оплаты подтверждаем.", "Получили 7790 бат, спасибо.",
+    "Да, 7790 бат получили.", "Деньги у нас, спасибо.", "Сумма получена.",
+    "Платёж 4100 бат в кассе записан на другую бронь, а 150 долларов — в иностранной валюте; подтверждать сам не "
+    "буду — передаю коллеге.",
+    "Подтверждаю оплату при получении байка: наличными.", "Оплата получена не полностью.",
+    "Платёж принят банком в обработку.", "Бронь подтверждена оплата при встрече", "Payment confirmed."]
+RV_RESIDUAL_OPEN = ["Да, всё пришло.", "We got it, thanks!"]
+RV_OLD_CONTROL = [
+    "Оплата получена.", "Мы получили вашу оплату.", "Оплата 7790 бат получена, спасибо.", "Оплата 8000 бат получена.",
+    "Оплата прошла успешно.", "Оплата поступила, спасибо.", "Оплату вижу, всё в порядке.", "С оплатой всё в порядке.",
+    "Оплата подтверждена.", "Получили деньги, спасибо.", "Получили перевод, спасибо.", "Payment received, thank you.",
+    "We received your payment.", "Payment is confirmed.", "Paid in full, thank you.", "We can see your payment.",
+    "Payment has been received.", "Ваша оплата за аренду у нас отражена.", "В кассе видна ваша оплата.",
+    "Оплата аренды за 10 дней пришла."]
+RV_MORE_ADV = [
+    "We must confirm that we received your payment in full.", "Thank you for your payment received on 5 October.",
+    "We need to mention the payment is confirmed.", "Ваши 7790 бат на оплату аренды поступили.",
+    "Сумма для оплаты брони поступила.", "8000 бат для оплаты аренды получили, спасибо.",
+    "Оплата за аренду должна была прийти вчера и пришла.", "На оплату аренды получили от вас 7790 бат.",
+    "После оплаты всё прошло успешно.", "Вам нужно знать что оплата получена.",
+    "You need to know your payment is confirmed.", "Должен сообщить что ваша оплата поступила."]
+RV_TWINS_OK = [
+    "Just to let you know that your payment has been received.",
+    "I'm happy to confirm that your payment has been received.", "Thank you, payment received for the rental.",
+    "Перевод для оплаты аренды получили.", "В счёт оплаты аренды получили 7790 бат.", "Оплату на 7790 бат получили.",
+    "Вам нужно знать: оплата получена.", "Должен сообщить, что ваша оплата поступила.",
+    "Нужно отметить: оплата получена.", "Оплата до 12:00 получена."]
+RV_TWINS_NOT = [
+    "You should pay before pickup so that the payment is confirmed.", "The payment must be received before pickup.",
+    "Ссылку для оплаты получили?", "Счёт на оплату аренды получен, спасибо.",
+    "После оплаты подтверждение придёт автоматически.", "Оплата должна была поступить вчера.",
+    "Thank you for your payment request, received.", "We need to confirm your payment first."]
+
+# СВОИ фразы шага 3d (нет ни в одном прежнем корпусе)
+R1_OWN = [                                              # R1: слово долженствования и предлог — НЕ при этом сказуемом
+    "You should know we received your payment.", "I should add that your payment has cleared.",
+    "Надо отметить что платёж получен.", "Должны сообщить что деньги поступили.",
+    "Оплата должна была поступить сегодня и поступила.", "Thanks a lot for the payment received yesterday.",
+    "Перевод на оплату аренды получили.", "3000 бат на оплату продления получены.",
+    "Оплата получена можно забирать байк.", "Можем сообщить что оплата поступила.",
+    "We will send the contract now that your payment has been received.",    # причинный союз без запятой
+    "Договор отправим сегодня потому что оплата получена.",
+    "Без оплаты доставки оплата аренды получена.", "После оплаты получили от вас чек, спасибо.",
+    "It should be noted that your payment has been received.",
+    "For the payment received yesterday, thank you.", "Отправленное вами на оплату аренды получили."]
+R1_OWN_NOT = [                                          # те же исключения там, где они на своём месте
+    ("Нужно проверить что оплата прошла.", V_MUST),                        # обязанность ПРОВЕРИТЬ — не утверждение
+    ("We need to check that your payment has been received.", V_MUST),
+    ("Нужно чтобы оплата поступила до выдачи байка.", V_MUST),             # цель
+    ("Оплата должна быть получена и подтверждена до выдачи байка.", V_MUST),
+    ("We need to wait until the payment is confirmed.", V_MUST),
+    ("Оплата может быть произведена наличными или картой.", V_MUST),       # возможность — правило, а не факт
+    ("The payment should have been received by Friday.", V_MUST),
+    ("Оплата должна до выдачи байка быть получена.", V_MUST),
+    ("Payment can be made in cash or by transfer.", None),
+    ("Payment can be received in cash or by transfer.", V_MUST),
+    ("Ссылку на оплату 7790 бат получили.", V_PREP),
+    ("После оплаты 7790 бат бронь подтверждается автоматически.", V_PREP),
+    ("Квитанцию для оплаты получили.", V_PREP),
+    ("Invoice for payment received, thanks.", V_PREP),
+    ("Thank you for your payment request received yesterday.", V_NEXT)]
+R3_NOUN_AFFIRM = [                                      # R3 (i): подтверждение получения существительным
+    "Подтверждаю получение платежа.", "Подтверждаем поступление предоплаты.",
+    "Подтвердили зачисление средств, спасибо.", "Получение денег подтверждаем.", "Поступление платежа подтверждено.",
+    "Подтверждаю приход оплаты за аренду.", "Могу подтвердить получение оплаты.", "Вижу поступление 7790 бат от вас.",
+    "We confirm receipt of your payment.", "I can confirm receipt of your transfer.",
+    "We acknowledge receipt of the funds.", "Confirmed receipt of your payment, thank you.",
+    "Receipt of your transfer acknowledged.", "Payment receipt confirmed."]
+R3_NOUN_NOT = [
+    ("Поступление оплаты подтвердить не могу.", None), ("Подтвердим получение оплаты после сверки.", None),
+    ("Подтвердите получение договора, пожалуйста.", None), ("Подтверждение получения оплаты придёт на почту.", None),
+    ("Подтверждаю получение паспорта и прав.", None), ("Подтверждаем поступление заявки.", None),
+    ("Вы подтвердили получение оплаты?", V_ASKED), ("Поступление оплаты должно быть подтверждено коллегой.", V_MUST),
+    ("Подтверждаю получение залога.", None), ("We will confirm receipt of your payment tomorrow.", None),
+    ("Can you confirm receipt of the payment?", None), ("Please confirm receipt of the payment link.", None),
+    ("We confirm receipt of your documents.", None), ("We cannot confirm receipt of your payment yet.", None)]
+R3_SUM_AFFIRM = [                                       # R3 (ii): сказуемое получения с суммой или словом суммы
+    "Получили от вас 7790 бат, спасибо.", "7790 бат поступили на счёт.", "Ваши 7790 бат получены.",
+    "Сумму получили полностью.", "Вся сумма поступила, спасибо.", "Деньги уже у нас.", "Ваши 7790 бат у нас.",
+    "Приняли 7790 бат наличными.", "Поступило 7 790 бат, спасибо.", "Получили 7790, спасибо.",
+    "We received 7790 baht, thank you.", "Got your 7790 THB, thanks.", "7790 baht has been received.",
+    "The full amount has been received.", "We have received the full amount.", "We have your payment.",
+    "Your 7790 baht arrived this morning."]
+R3_SUM_NOT = [
+    ("7790 бат пока не получили.", V_NOT), ("Сумма ещё не поступила.", V_NOT),
+    ("Как только 7790 бат поступят, сообщим.", None), ("Сумма будет получена завтра.", V_LATER),
+    ("Если сумма получена, пришлём договор.", V_LATER), ("Вы получили 7790 бат?", V_ASKED),
+    ("Сумма должна быть получена до выдачи байка.", V_MUST),
+    ("Получили ваш запрос на 7790 бат.", V_PREP), ("Счёт на сумму 7790 бат получили.", V_PREP),       # документ
+    ("За 7790 бат получили бы NMAX на 10 дней.", V_PREP),
+    ("Получили ваш паспорт и фото прав, спасибо.", None), ("Получили 3 фото, спасибо.", None),
+    ("2 батареи получили, спасибо.", None),
+    ("Итог аренды 7790 бат.", None), ("Итого к оплате 7790 бат.", None), ("С 8000 сдача 210 бат.", None),   # цена, итог, сдача
+    ("Вы написали, что перевели 7790 бат.", None),                                                  # слова клиента
+    ("Вы получили 500 бат обратно.", V_THEIR), ("You received 210 baht change.", V_THEIR),
+    ("Получили 3000 бат залога.", V_DEP),                                                           # роль залога
+    ("Оплата у нас проходит через терминал.", None), ("We have not received 7790 baht yet.", V_NOT),
+    ("The total is 7790 baht.", None), ("We received your request for 7790 baht.", V_PREP),
+    ("Once we have your payment, we will confirm.", V_LATER)]
+ADV_AFFIRM = [                                          # свой состязательный поиск шага 3d: чинено тем же определением
+    "Оплата произведена, спасибо.", "Оплата успешно завершена.", "Платёж успешно обработан.",
+    "Оплата засчитана, бронь за вами.", "Оплата зачтена в счёт аренды.", "Мы увидели вашу оплату, спасибо.",
+    "Ваша оплата отображается в кассе.", "Оплата выполнена успешно.", "Оплата в системе есть.",
+    "Спасибо за оплату!", "Благодарим за оплату аренды.", "Your payment was successful.",
+    "Payment successful, thank you.", "Your payment came in this morning.", "Your payment has landed, thanks.",
+    "Your payment has been made, thank you.", "Thank you for your payment!", "Thanks for the transfer.",
+    "Paid, thank you!"]
+ADV_NOT = [
+    ("Оплата ещё не произведена.", V_NOT), ("Your payment was not successful.", V_NOT),
+    ("Оплата обрабатывается банком до трёх дней.", None), ("Заранее спасибо за оплату.", None),
+    ("Thank you in advance for your payment.", None), ("Спасибо за вопрос про оплату.", None),
+    ("Спасибо за перевод договора.", None), ("Thank you for the payment details.", None),
+    ("Thanks for the payment confirmation, our colleague will check it.", None),
+    ("Спасибо за оплату залога.", V_DEP), ("Договор не отправили потому что оплата не получена.", V_NOT),
+    ("The rent can be paid at pickup.", None), ("Оплата в системе появится завтра.", None)]
+
+
+def _pay(text, facts):
+    return T.PAY_WORDS in [w for w, _why in T.money_roles(text, facts)]
+
+
+def _blocked(pairs, facts):
+    """Не-утверждения, получившие причину оплаты, сумму «полученной оплаты» или НЕ то имя исхода."""
+    return [(t, name, T.money_roles(t, facts), sorted(T.pay_claimed(t)), T._PAY_CLAIM.explain(t)) for t, name in pairs
+            if _pay(t, facts) or T.pay_claimed(t) or (name is not None and _verdicts(t) != {name})]
+
+
+def test_p3d_r1_lost_claims_caught_again():
+    """R1: 38 состязательных утверждений проверяющего (ADVERSARIAL 26 + MORE_ADV 12) и свои того же строя — причина
+    «оплата не подтверждена сверкой», как на cbe186f и 6f6e754. На f6ed7bd 25 из 38 терялись: модальное слово главной
+    части («You should know that…», «Надо сказать что…») и предлог перед словом оплаты («7790 бат на оплату аренды
+    получены», «Thank you for the payment received») снимали утверждение. Сумма возвращается в `pay_claimed`."""
+    facts = _facts_no_second_source()
+    miss = [(t, T._PAY_CLAIM.explain(t)) for t in RV_ADVERSARIAL + RV_MORE_ADV + R1_OWN if not _pay(t, facts)]
+    assert not miss, miss
+    assert T.pay_claimed("7790 бат на оплату аренды получены.") == {7790}
+    assert T.pay_claimed("На оплату аренды получили от вас 7790 бат.") == {7790}
+
+
+def test_p3d_r1_exclusions_stay_where_they_belong():
+    """R1, отрицательный: долженствование ПРИ сказуемом, обязанность проверить или дождаться, цель («чтобы», «so
+    that»), возможность, документ перед предлогом цели, правило «после оплаты …» — по-прежнему не утверждение, и исход
+    назван своим именем. Ложные блокировки, снятые шагом 3c, не вернулись (OLD_NOT, три названные решением)."""
+    facts = _facts_no_second_source()
+    bad = _blocked(R1_OWN_NOT + OLD_NOT, facts)
+    assert not bad, bad
+
+
+def test_p3d_r2_union_of_all_known_lists_nothing_lost_nothing_blocked():
+    """R2: контроль «ничего не потеряно» — из ОБЪЕДИНЕНИЯ всех известных списков, а не из списков строителя: реальный
+    прогон (K15, K02), приёмка шага 3, списки шагов 3–3c, корпуса проверяющего 3b+3c (вшиты выше дословно), свои
+    списки шага 3d. Каждое утверждение — с причиной; каждое не-утверждение — без причины и без сумм (мутант «у форм
+    прочие предлоги не судятся» краснит именно здесь: «Получили ваш вопрос про перевод.»). На f6ed7bd — красный."""
+    facts = _facts_no_second_source()
+    claims = (AFFIRM + CLOSE_ACCEPT + CLOSE_OWN + OLD_AFFIRM + [RV_K15, RV_K02] + RV_OWN_AFFIRM + RV_ADVERSARIAL
+              + RV_MORE_ADV + RV_OLD_CONTROL + RV_TWINS_OK + RV_RESIDUAL + R1_OWN + R3_NOUN_AFFIRM + R3_SUM_AFFIRM
+              + ADV_AFFIRM)
+    nots = (NOT_CLAIM + NOT_CLOSE + RV_OWN_NOT + RV_NAMED3 + RV_OWN_PLAIN + RV_TWINS_NOT
+            + [t for t, _name in OLD_NOT + SAME_3B + R1_OWN_NOT + R3_NOUN_NOT + R3_SUM_NOT + ADV_NOT])
+    assert len(set(claims)) >= 200 and len(set(nots)) >= 160, (len(set(claims)), len(set(nots)))
+    lost = [t for t in claims if not _pay(t, facts)]
+    assert not lost, lost
+    blocked = [(t, sorted(T.pay_claimed(t))) for t in nots if _pay(t, facts) or T.pay_claimed(t)]
+    assert not blocked, blocked
+
+
+def test_p3d_reviewer_not_claims_no_reason():
+    """Отрицательный (зелёный и на f6ed7bd): не-утверждения корпусов проверяющего — NAMED3, OWN_PLAIN, TWINS_NOT,
+    OWN_NOT — ни одной причины оплаты и ни одной суммы «полученной оплаты»."""
+    facts = _facts_no_second_source()
+    bad = [(t, T.money_roles(t, facts), sorted(T.pay_claimed(t)))
+           for t in RV_NAMED3 + RV_OWN_PLAIN + RV_TWINS_NOT + RV_OWN_NOT if _pay(t, facts) or T.pay_claimed(t)]
+    assert not bad, bad
+
+
+def test_p3d_r3_noun_family_confirm_receipt():
+    """R3 (i): подтверждение получения, поступления, зачисления оплаты / платежа / денег / средств отглагольным
+    существительным (RU и EN) — утверждение; отрицание, будущее, вопрос, долженствование, просьба подтвердить,
+    «подтверждение … придёт», получение документа, роль залога — нет."""
+    facts = _facts_no_second_source()
+    miss = [(t, T._PAY_CLAIM.explain(t)) for t in R3_NOUN_AFFIRM + RV_RESIDUAL[:4] if not _pay(t, facts)]
+    assert not miss, miss
+    bad = _blocked(R3_NOUN_NOT, facts)
+    assert not bad, bad
+
+
+def test_p3d_r3_sum_family_receipt_with_amount():
+    """R3 (ii): сказуемое получения с денежной суммой или словом суммы без слова «оплата» (RU и EN), «деньги у нас» —
+    утверждение, сумма идёт в `pay_claimed` и сверяется с деньгами аренды; сумма как цена, итог, сдача; документ
+    («запрос на 7790 бат»); слова клиента; получатель — клиент; роль залога; число без валюты не у сказуемого — нет."""
+    facts = _facts_no_second_source()
+    miss = [(t, T._PAY_CLAIM.explain(t)) for t in R3_SUM_AFFIRM + RV_RESIDUAL[4:8] if not _pay(t, facts)]
+    assert not miss, miss
+    assert T.pay_claimed("Получили 7790 бат, спасибо.") == {7790}
+    assert T.pay_claimed("Да, 7790 бат получили.") == {7790}
+    assert T.pay_claimed("Получили 7790, спасибо.") == {7790}
+    assert T.pay_claimed("Сумма получена.") == set()
+    bad = _blocked(R3_SUM_NOT, facts)
+    assert not bad, bad
+    backed = _facts_backed()                             # с опорой: своя сумма — без причины, чужая — причина
+    assert T.money_roles("Получили 7790 бат, спасибо.", backed) == []
+    assert [w for w, _why in T.money_roles("Получили 8000 бат, спасибо.", backed)] == [T.PAY_WORDS]
+
+
+def test_p3d_reviewer_residual_caught():
+    """RESIDUAL_INFO проверяющего: 14 из 16 наблюдений — с причиной (8 фраз двух семейств R3 и 6, пойманных прежде).
+    Две фразы без слова оплаты, денег или суммы (`RV_RESIDUAL_OPEN`) набор НЕ утверждает ни в одну сторону."""
+    facts = _facts_no_second_source()
+    miss = [(t, T._PAY_CLAIM.explain(t)) for t in RV_RESIDUAL if not _pay(t, facts)]
+    assert not miss, miss
+    assert len(RV_RESIDUAL) + len(RV_RESIDUAL_OPEN) == 16
+
+
+def test_p3d_own_adversarial_search():
+    """Свой состязательный поиск шага 3d (существенные находки чинены тем же определением): сказуемые-синонимы
+    («произведена», «завершена», «обработан», «засчитана», «увидели», «отображается»; successful, came in, landed,
+    has been made), благодарность за оплату, «в системе есть», краткое «Paid, …» — утверждение; их отрицания, «заранее
+    спасибо», «спасибо за вопрос про оплату», «payment details», «обрабатывается», залог — нет."""
+    facts = _facts_no_second_source()
+    miss = [(t, T._PAY_CLAIM.explain(t)) for t in ADV_AFFIRM if not _pay(t, facts)]
+    assert not miss, miss
+    bad = _blocked(ADV_NOT, facts)
+    assert not bad, bad
+
+
+def test_p3d_verdict_named_on_every_road():
+    """Храповик слепых читателей: у новых веток шага 3d исход — тоже всегда НЕПУСТОЕ имя, и `search` говорит
+    «утверждение» ровно тогда, когда так назван хотя бы один исход; новое имя «получатель — клиент» названо."""
+    every = (RV_OWN_AFFIRM + RV_OWN_NOT + RV_NAMED3 + RV_OWN_PLAIN + RV_ADVERSARIAL + RV_RESIDUAL + RV_RESIDUAL_OPEN
+             + RV_OLD_CONTROL + RV_MORE_ADV + RV_TWINS_OK + RV_TWINS_NOT + R1_OWN + R3_NOUN_AFFIRM + R3_SUM_AFFIRM
+             + ADV_AFFIRM + [t for t, _name in R1_OWN_NOT + R3_NOUN_NOT + R3_SUM_NOT + ADV_NOT])
+    for text in every:
+        got = T._PAY_CLAIM.explain(text)
+        assert all(isinstance(v, str) and v.strip() for _match, v in got), (text, got)
+        assert (V_CLAIM in [v for _match, v in got]) == bool(T._PAY_CLAIM.search(text)), (text, got)
+    assert _verdicts("Вы получили 500 бат обратно.") == {V_THEIR}
+    assert _verdicts("Получили 3000 бат залога.") == {V_DEP}
+
+
+def test_p3d_control_backed_new_families_not_blocked():
+    """КОНТРОЛЬ п.3d: новые семейства С опорой (касса + договор той же аренды, сумма 7790) причины не получают — ни на
+    ремонте, ни до него."""
+    facts = _facts_backed()
+    assert T.pay_confirmed(facts) is True
+    bad = [(t, T.money_roles(t, facts)) for t in R3_NOUN_AFFIRM + R3_SUM_AFFIRM + ADV_AFFIRM + RV_RESIDUAL[:8]
+           if T.money_roles(t, facts)]
+    assert not bad, bad
 
 
 # ═══ D3 приёмки шага 3: проверки, которые убивают мутанты m3r и m3v ═══════════════════════════════════════════
