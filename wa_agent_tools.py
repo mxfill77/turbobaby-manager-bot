@@ -67,6 +67,11 @@ K3-FIX шаг 3 (09–10.10.2026): договор ищется в ДОВЕРЕН
 K3-FIX шаг 3b (10.10.2026, D1 приёмки): то же определение ловит утвердительные ФОРМЫ оплаты («аренда оплачена»,
 «платёж получен», «оплата зафиксирована/есть в кассе», «деньги получили», «your payment went through»), а не список
 фраз (`_PAY_FORMS`, второй проход `_PayClaim`); прежние формы не тронуты.
+K3-FIX шаг 3c (10.10.2026): у каждого совпадения определения — НАЗВАННЫЙ исход (`_PayClaim.verdict`: «утверждение»
+либо имя того, почему это не утверждение; пустым исход не бывает, `explain` отдаёт исходы наружу), и исключения
+не-утверждений — одни на оба прохода: долженствование и ожидание («должна быть получена», «требует подтверждения»),
+предмет после предлога цели или времени («ссылку на оплату получили», «после оплаты …»), основа сказуемого внутри
+другого слова («пришлём», «прошлую», «при получении»), документ вместо оплаты («перевод договора», «payment details»).
 """
 
 import json
@@ -950,10 +955,10 @@ _PAY_END = re.compile(r"[.!?…\n]")
 #       «got/received/credited … your transfer».
 # Прежние формы `_PAY_AFFIRM` НЕ тронуты: расширение только добавляет второй проход ТЕМ ЖЕ определением (`_PayClaim`) —
 # с теми же исключениями (отрицание, будущее/проверка, условие, вопрос в клаузе до конца совпадения) и с четырьмя своими
-# (`_PayClaim._form_ok`): предмет после предлога («ссылку на оплату», «вопрос про платёж») оплатой не является; «есть/
-# имеется» — только при кассе/учёте/счёте или «ваша оплата» (а не «оплата картой тоже есть»); подлежащее — залог/депозит
-# (без аренды раньше него) — роль залога `_DEP_CLAIM`, а не оплата аренды (новых ролей нет); долженствование и будущее
-# в клаузе («должен быть проведён», «оплачено будет») — не утверждение.
+# (`_PayClaim.verdict`; до шага 3c — `_form_ok`): предмет после предлога («ссылку на оплату», «вопрос про платёж»)
+# оплатой не является; «есть/имеется» — только при кассе/учёте/счёте или «ваша оплата» (а не «оплата картой тоже
+# есть»); подлежащее — залог/депозит (без аренды раньше него) — роль залога `_DEP_CLAIM`, а не оплата аренды (новых
+# ролей нет); долженствование и будущее в клаузе («должен быть проведён», «оплачено будет») — не утверждение.
 _PF_NOUN_NOM = r"(?:(?:пред|до)?оплата|плат[её]ж|плат[её]жи|деньги|перевод|переводы|средства)"
 _PF_NOUN_ACC = r"(?:(?:пред|до)?оплат[ау]|плат[её]ж|плат[её]жи|деньги|перевод|переводы|средства)"
 _PF_PRED = (r"(?:получен[аоы]?|получил[аои]?|поступил[аои]?|пришл[ао]|пришёл|пришел|прошл[аои]|прошёл|прошел|"
@@ -986,21 +991,51 @@ _PF_HELD = re.compile(r"касс|уч[её]т|сч[её]т|счету|выпис
                       r"перевод|средств)", re.I)
 _PF_DEP = re.compile(r"залог|депозит|deposit", re.I)
 _PF_RENT = re.compile(r"аренд|прокат|брон|rent|booking", re.I)
-_PF_MUST = re.compile(r"(?<!\w)(?:должен|должн\w*|нужно|надо|необходимо|обязан\w*|будет|будут|станет|станут|must|should|"
-                      r"need\s+to|has\s+to|have\s+to|will|shall)(?!\w)", re.I)
+# шаг 3c: краткие формы «должен/должна/должно/должны» (а не «должным образом отражена» — это утверждение) и слова
+# ожидания «требует/ожидает/ждёт (подтверждения)»
+_PF_MUST = re.compile(r"(?<!\w)(?:должен|должн[аоы]|нужно|надо|необходимо|обязан\w*|будет|будут|станет|станут|"
+                      r"требует(?:ся)?|требуют(?:ся)?|ожидает(?:ся)?|ожидают(?:ся)?|жд[её]т|ждут|"
+                      r"must|should|need\s+to|has\s+to|have\s+to|will|shall)(?!\w)", re.I)
 _PF_EN_NEXT = re.compile(r"\s+(?:links?|details|methods?|options?|receipts?|screenshots?|info|information|terms|"
                          r"deadline|date|requests?|reminders?|instructions?|page|button|plan|schedule|form|reference)"
                          r"(?!\w)", re.I)
 _PF_TRANSL_NEXT = re.compile(r"\s+(?:договор|документ|текст|сообщени|правил|инструкци)", re.I)  # «перевод договора»
+
+# K3-FIX шаг 3c (10.10.2026). ИСХОД совпадения НАЗВАН: определение отдаёт наверх не «да/нет», а имя — «утверждение» либо
+# ПОЧЕМУ это не утверждение. До 3c исключения форм отдавали голое False, в двух ветках — оттого, что шаблон НЕ нашёл
+# слова кассы или аренды: «не утверждение по правилу» и «шаблон промолчал» наверху не различались (храповик слепых
+# читателей 72 → 74). Теперь каждая ветка называет себя, `explain` отдаёт имена наружу, тесты сверяют имя с фразой.
+PC_CLAIM = "утверждение"
+PC_WORD = "основа сказуемого — начало другого слова"
+PC_NOT, PC_LATER, PC_ASKED = "отрицание", "будущее, проверка или условие", "вопрос"
+PC_MUST = "долженствование или ожидание"
+PC_PREP = "предмет после предлога"
+PC_NEXT = "предмет — документ, а не оплата"
+PC_EXIST = "«есть» без кассы, учёта, счёта или «ваша оплата»"
+PC_DEP = "подлежащее — залог"
+# Те же исключения — и у ПРЕЖНИХ форм `_PAY_AFFIRM` (сами формы не тронуты ни символом), одним определением (`verdict`):
+#   * предмет прежней формы — её слово оплаты (`_PC_NOUN`); сразу после предлога ЦЕЛИ или ВРЕМЕНИ (`_PC_PREP`: «ссылку на
+#     оплату получили», «реквизиты для оплаты», «после оплаты бронь подтверждается», «без оплаты …») он не подлежащее
+#     получения. Прочие предлоги (`_PF_PREP`) — только у форм 3b, где предмет стоит в им./вин. падеже: у прежних форм
+#     «с оплатой всё в порядке», «по оплате вижу …», «подтверждение об оплате получено» — утверждения, их терять нельзя;
+#   * основа сказуемого прежних форм («пришл», «прошл», «получен», «видим») бывает началом ДРУГОГО слова — «пришлём»,
+#     «пришлите», «пришлось», «прошлую», «при получении», «видимо» (`_PC_WORD`). Тогда сказуемое ищется дальше в той же
+#     клаузе целым словом (`_PC_AGAIN`: «оплаты за прошлую и эту недели получены» — утверждение); нет его — не утверждение.
+_PC_NOUN = re.compile(r"оплат\w*|деньги|перевод|payment|money|transfer", re.I)
+_PC_PREP = re.compile(r"на|для|после|до|перед|без|for|without", re.I)
+_PC_WORD = re.compile(r"(?:пришл|прошл)(?![аои](?!\w))\w*|получени\w+|видим\w+", re.I)
+_PC_AGAIN = re.compile(r"\s+" + _W + r"{0,10}?(?:получен[аоы]?|получил[аи]?|подтвержд\w*|поступил[аои]?|прошл[аои]|"
+                       r"пришл[аои]|отражен\w*|отразил\w*|вижу|видим|видн[ао]|в\s+порядке)(?!\w)", re.I)
 
 
 class _PayClaim:
     """ОДНО определение «текст утверждает, что оплата получена» (K3-FIX3 N4; им живут `money_roles` и `pay_claimed`,
     т.е. ремонт F3 шага 1 — то же место, не второе). Утверждение — совпадение `_PAY_AFFIRM` или (шаг 3b, D1) формы
     `_PAY_FORMS`, в клаузе которого (от начала клаузы до конца совпадения) нет отрицания и нет будущей проверки, условия
-    или вопроса, а предложение не кончается «?»; у форм шага 3b — ещё `_form_ok`. Отрицание («оплату пока не вижу»,
-    «не поступила») и обещание проверки («сверит и подтвердит», «как только отразится», «будет зафиксирована») ложного
-    подтверждения не дают — и ложной блокировки тоже. `search` → совпадение | None."""
+    или вопроса, а предложение не кончается «?», и к которому не приложимо ни одно исключение не-утверждений (шаг 3c —
+    одни на оба прохода, `verdict`). Отрицание («оплату пока не вижу», «не поступила») и обещание проверки («сверит и
+    подтвердит», «как только отразится», «будет зафиксирована») ложного подтверждения не дают — и ложной блокировки
+    тоже. `search` → совпадение | None; `explain` → названные исходы всех совпадений."""
 
     @staticmethod
     def _matches(s):
@@ -1009,49 +1044,70 @@ class _PayClaim:
                 yield rx, m
 
     @staticmethod
-    def _form_ok(s, m, a):
-        """Формы шага 3b (D1): клауза совпадения от `a` до разрыва/конца предложения. Не утверждение — долженствование
-        или будущее в клаузе; предмет оплаты после предлога («ссылку на оплату») или англ. «payment link/details»,
-        «перевод договора»; «есть/имеется» без кассы/учёта/счёта/«ваша оплата»; подлежащее — залог/депозит."""
-        stop = [x.start() for x in (_PAY_CUT.search(s, m.end()), _PAY_END.search(s, m.end())) if x is not None]
-        clause = s[a:min(stop) if stop else len(s)]
-        if _PF_MUST.search(clause):
-            return False
+    def verdict(s, rx, m):
+        """Исход ОДНОГО совпадения: `PC_CLAIM` либо ИМЯ того, почему это не утверждение (шаг 3c; пустым исход не бывает).
+        Клауза — от разрыва/начала предложения `a` до конца совпадения, как было. Исключения форм (до 3c — `_form_ok`,
+        только у форм 3b) судят любое совпадение: долженствование или ожидание в клаузе до конца сказуемого либо сразу
+        за ним («оплачено будет»; слово дальше — уже другое сказуемое: «оплата получена и договор будет отправлен» —
+        утверждение); предмет после предлога; документ вместо оплаты («payment link/details», «перевод договора»);
+        «есть/имеется» без кассы/учёта/счёта/«ваша оплата»; подлежащее — залог/депозит (формы 3b, как было)."""
+        head = s[:m.start()]
+        a = max([x.end() for x in _PAY_CUT.finditer(head)] + [x.end() for x in K._SENTENCE.finditer(head)] + [0])
+        e = m.end()
+        we = e + len(re.match(r"\w*", s[e:]).group(0))             # конец последнего слова совпадения
+        last = re.search(r"[^\W\d_]+$", s[a:we])
+        if last is not None and _PC_WORD.fullmatch(last.group(0)):
+            again = _PC_AGAIN.match(s, we)                         # настоящее сказуемое дальше в той же клаузе
+            if again is None:
+                return PC_WORD
+            e = we = again.end()
+        clause = s[a:e]
+        end = _PAY_END.search(s, e)
+        if _PAY_NOT.search(clause):
+            return PC_NOT
+        if _PAY_LATER.search(clause):
+            return PC_LATER
+        if end is not None and end.group(0) == "?" and not _PAY_CUT.search(s[e:end.start()]):
+            return PC_ASKED
+        after = re.match(r"\s+([^\W\d_]+)", s[we:])
+        if _PF_MUST.search(s[a:we]) or (after is not None and _PF_MUST.fullmatch(after.group(1))):
+            return PC_MUST
+        forms = rx is _PAY_FORMS
         gd = m.groupdict()
-        for k in ("n1", "n2", "n3", "n4", "n5", "n6"):
-            if gd.get(k):
-                before = re.findall(r"[^\W\d_]+", s[a:m.start(k)])
-                while before and _PF_DET.fullmatch(before[-1]):
-                    before.pop()
-                if before and _PF_PREP.fullmatch(before[-1]):
-                    return False
-                nxt = s[m.end(k):]
-                if (k in ("n4", "n6") and _PF_EN_NEXT.match(nxt)) or \
-                        (gd[k].lower().startswith("перевод") and _PF_TRANSL_NEXT.match(nxt)):
-                    return False
-                break
-        if _PF_EXIST.fullmatch(gd.get("v1") or gd.get("v3") or "") and not _PF_HELD.search(clause):
-            return False
-        dep = _PF_DEP.search(clause)
+        spans = [m.span(k) for k in ("n1", "n2", "n3", "n4", "n5", "n6") if gd.get(k)]
+        if not spans and not forms:
+            spans = [x.span() for x in _PC_NOUN.finditer(s, m.start(), we)]
+        for n0, n1 in spans[:1]:
+            n1 += len(re.match(r"\w*", s[n1:]).group(0))
+            before = re.findall(r"[^\W\d_]+", s[a:n0])
+            while before and _PF_DET.fullmatch(before[-1]):
+                before.pop()
+            if before and (_PC_PREP.fullmatch(before[-1]) or (forms and _PF_PREP.fullmatch(before[-1]))):
+                return PC_PREP
+            if (re.fullmatch(_PF_EN_NOUN, s[n0:n1], re.I) and _PF_EN_NEXT.match(s[n1:])) or \
+                    (s[n0:n1].lower().startswith("перевод") and _PF_TRANSL_NEXT.match(s[n1:])):
+                return PC_NEXT
+        stop = [x.start() for x in (_PAY_CUT.search(s, e), _PAY_END.search(s, e)) if x is not None]
+        wide = s[a:min(stop) if stop else len(s)]                  # клауза совпадения до разрыва/конца предложения
+        if _PF_EXIST.fullmatch(gd.get("v1") or gd.get("v3") or "") and not _PF_HELD.search(wide):
+            return PC_EXIST
+        dep = _PF_DEP.search(wide) if forms else None
         if dep is not None:
-            rent = _PF_RENT.search(clause)
+            rent = _PF_RENT.search(wide)
             if rent is None or dep.start() < rent.start():
-                return False
-        return True
+                return PC_DEP
+        return PC_CLAIM
+
+    def explain(self, text):
+        """Названные исходы ВСЕХ совпадений текста → [(совпадение, исход)]: почему фраза утверждение или почему нет."""
+        s = str(text or "")
+        return [(m.group(0), self.verdict(s, rx, m)) for rx, m in self._matches(s)]
 
     def search(self, text):
         s = str(text or "")
         for rx, m in self._matches(s):
-            head = s[:m.start()]
-            a = max([x.end() for x in _PAY_CUT.finditer(head)] + [x.end() for x in K._SENTENCE.finditer(head)] + [0])
-            clause = s[a:m.end()]
-            end = _PAY_END.search(s, m.end())
-            asked = end is not None and end.group(0) == "?" and not _PAY_CUT.search(s[m.end():end.start()])
-            if _PAY_NOT.search(clause) or _PAY_LATER.search(clause) or asked:
-                continue
-            if rx is _PAY_FORMS and not self._form_ok(s, m, a):
-                continue
-            return m
+            if self.verdict(s, rx, m) == PC_CLAIM:
+                return m
         return None
 
 
