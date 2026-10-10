@@ -1377,24 +1377,31 @@ class ModelAdapter(wa_agent.Model):
         return list(reversed(tail))
 
     @staticmethod
-    def _before(items):
-        """Предыдущий обмен (K3-FIX шаг 3g) → (блок сообщений клиента ПЕРЕД нашим последним ответом, наш последний ответ):
-        тексты под маской, не длиннее TAIL_MAX; медиа без подписи — словом, как в вопросе. Наш последний ответ — наши
-        реплики подряд перед хвостом (`_tail`: реплики клиента после него сюда не входят); автоприветствие (`auto`)
-        ответом не считается, как и у хвоста. Ответа не было — ("", ""). Это только ПРИЗНАКИ для правила класса «тема
-        оплаты открыта» (`wa_agent_tools.pay_topic`): в запрос модели они не идут."""
-        ours, prev = [], []
+    def _blocks(items):
+        """История ПЕРЕД хвостом блоками, от нашего последнего ответа назад (K3-FIX шаг 3g, вторая часть) →
+        [(кто, текст, время)]: реплики одной стороны подряд — один блок («мы» | «клиент»); текст под маской, не длиннее
+        TAIL_MAX; медиа без подписи — словом, как в вопросе; время — самой поздней реплики блока (None — времени нет).
+        Первый блок — наш последний ответ: наши реплики подряд перед хвостом (`_tail`: реплики клиента после него сюда
+        не входят); автоприветствие (`auto`) ответом не считается, как и у хвоста; неизвестный отправитель пропускается.
+        Ответа не было — []. Это только ПРИЗНАКИ для правила класса «тема оплаты открыта» (`wa_agent_tools.pay_topic`):
+        в запрос модели они не идут."""
+        runs = []
         for it in reversed(items):
-            if it.get("auto"):
+            if it.get("auto") or it["who"] not in ("мы", "клиент") or (not runs and it["who"] == "клиент"):
                 continue
-            if it["who"] == "мы":
-                if prev:
-                    break
-                ours.append(it)
-            elif it["who"] == "клиент" and ours:
-                prev.append(it)
-        return tuple(K.mask("\n".join(it["text"] or ("[%s]" % it["word"] if it["word"] else "")
-                                      for it in reversed(block))[-TAIL_MAX:])[0] for block in (prev, ours))
+            if not runs or runs[-1][0] != it["who"]:
+                runs.append((it["who"], []))
+            runs[-1][1].append(it)
+        return [(who, K.mask("\n".join(it["text"] or ("[%s]" % it["word"] if it["word"] else "")
+                                       for it in reversed(block))[-TAIL_MAX:])[0],
+                 max((it.get("ts") or 0) for it in block) or None) for who, block in runs]
+
+    @staticmethod
+    def _before(items, blocks=None):
+        """Предыдущий обмен (K3-FIX шаг 3g) → (блок сообщений клиента ПЕРЕД нашим последним ответом, наш последний ответ):
+        тексты первых двух блоков `_blocks` (уже собранных — `blocks`). Ответа не было — ("", "")."""
+        texts = [text for _who, text, _ts in (ModelAdapter._blocks(items) if blocks is None else blocks)[:2]] + ["", ""]
+        return texts[1], texts[0]
 
     def _lessons(self):
         """Действующие уроки из базы агента (mode=ro). Выключено — []; не прочитано — [] и строка журнала:
@@ -1592,6 +1599,7 @@ class ModelAdapter(wa_agent.Model):
         blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + question)
         user = "\n\n".join(blocks)
         system = self._system(SYSTEM_PROMPT if self.book is None else SYSTEM_PROMPT_BOOK, node_list, now)
+        turns = self._blocks(items)                     # история перед хвостом блоками — признаки темы оплаты (шаг 3g)
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
                 "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
@@ -1601,8 +1609,11 @@ class ModelAdapter(wa_agent.Model):
                 "conv": conv,                                     # язык разговора кодом (WALANGCONVB0510)
                 # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
                 "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None),
-                # K3-FIX шаг 3g: предыдущий обмен — признаки правила класса «тема оплаты открыта» (в запрос не идут)
-                "before": self._before(items)}
+                # K3-FIX шаг 3g: признаки правила класса «тема оплаты открыта» (в запрос не идут) — история перед хвостом
+                # блоками со временем (`blocks`; `before` — её первый обмен) и время суждения: время последнего сообщения
+                # хвоста (возраст темы — свойство переписки, а не очереди черновиков), у хвоста времени нет — часы адаптера
+                "before": self._before(items, turns), "blocks": turns,
+                "judged": max([it.get("ts") or 0 for it in tail] + [0]) or now}
         if hint:
             info["masked"] += n_hint
             info["hint"] = True
@@ -1748,8 +1759,10 @@ class ModelAdapter(wa_agent.Model):
             system, user, info = self.build(number, upto_id, hint=hint)
         handed = T.cash_said(info.get("question"))         # K3-FIX3 п.2: переданные наличные — СЛОВА клиента
         asked = T.pay_asked(info.get("question"))          # K3-FIX шаг 3e: входящее клиента — об оплате (признак судье)
-        # K3-FIX шаг 3g: тема оплаты открыта? — хвост, предыдущий обмен, наш последний ответ (признак правилу класса)
-        topic = T.pay_topic(info.get("question"), *(info.get("before") or ("", "")))
+        # K3-FIX шаг 3g: тема оплаты открыта? — хвост и история перед ним блоками, от нашего последнего ответа назад, до
+        # закрывающего события (признак правилу класса; блоков в сведениях нет — один обмен `before`, как в первой части)
+        topic = T.pay_topic(info.get("question"), *(info.get("before") or ("", "")), blocks=info.get("blocks"),
+                            now=info.get("judged"))
         with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
             out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
                         fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
