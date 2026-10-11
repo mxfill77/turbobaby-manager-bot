@@ -84,6 +84,16 @@ R3   — два семейства, которых не ловил ни один
      `test_p3j_changed_expectations_of_prior_lists_named`): краткое подтверждение на входящее с названным предметом
      («Отправил вам фото паспорта, получили?» — «Да, получили, спасибо!») теперь несёт причину N4 — цена стороны отказа,
      принята решением; бывший близнец шага 3i «иной предмет во входящем» (`I_OTHER`) — теперь список ЦЕНЫ.
+Шаг 3k (11.10.2026, решение координатора по находке §9.7 шага 3j — сторона отказа: форма шага 3f «слово согласия
+     отдельным предложением» судила такое предложение как «да» и при содержательном следующем предложении; под признаком
+     правила В причину получали обычные верные ответы, а тот же текст через запятую — нет):
+п.3k — под признаком, который поставило правило В (входящее НЕ об оплате), слово согласия отдельным предложением —
+     утверждение оплаты только в ответе, ЦЕЛИКОМ кратком («Да.», «Да. Спасибо!», «Да. Уже.»); у ответа с содержательным
+     предложением («Конечно! Договор во вложении.», «Да. Шлем дадим бесплатно.») причины нет, исход назван `PC_CONTENT` —
+     как у того же текста через запятую. Не меняется: входящее об оплате («Деньги пришли?» — «Да. Ждём вас в 10.»);
+     ответ целиком краткий; форма получения («Получили, спасибо! Ждём вас завтра.»); подтверждённая кодом оплата;
+     правило Б; словари. ИЗМЕНЁННЫХ ОЖИДАНИЙ прежних проверок НЕТ (вид §9.7 набором закреплён не был — старый набор на
+     новом коде зелёный целиком).
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на f2f7295 и на коммите шага 2 (996ee09) он падает по существу, на
 ремонте проходит. Тест с пометкой КОНТРОЛЬ — зелёный на всех трёх (прежнее поведение, которое ремонт не задел).
@@ -106,6 +116,11 @@ R3   — два семейства, которых не ловил ни один
 падают и на 189d9c9 (шаг 3i): §9.2, §9.3, свои хвосты, цена и поимённые пары прежних списков — по существу (причин кода
 `[]` либо нет причины N4), прочие — оттого, что на 189d9c9 у контекста ещё есть исход «входящее называет иной предмет
 получения» (`PB_OTHER`), а имя исхода `PB_BARE` и слова журнала правила В (`PB_SAID`) называют снятое условие.
+Тесты п.3k (`test_p3k_*`, кроме близнеца `…twin_confirmed_payment…`, КОНТРОЛЯ `…control_receipt_form…` и ГРАНИЦЫ
+`…boundary_brief_one_sentence…`) падают и на 85f1641 (шаг 3j): вид §9.7 (10 пар пробы, свои 22, содержание перед
+словом согласия) и «тот же текст через запятую» — по существу (причина N4 стоит), близнецы «ответ целиком краткий» и
+«входящее об оплате» и проверка определения — оттого, что на 85f1641 у определения нет имени контекста (`by`), исхода
+`PC_CONTENT` и `_whole`.
 
 Всё на подменах: двери — функции ответа живого формата (`bridge_client.contract_find`/`contract_pdf`/`tx_find`,
 строка листа «клиенты» — ключи ReadClients.js), модель — сценарий. Сети, моста, Telegram, WhatsApp, SQLite и
@@ -3733,6 +3748,354 @@ def test_p3j_boundary_answer_outside_n4_forms_still_no_reason():
         for facts in ("none", "cash"):
             hand, state, conf, rule, _by, _paid = _run3i([], tail, text, facts)
             assert hand == [] and state[0] == V_NONE and not conf and not rule, (tail, text, hand)      # ← остаток, не успех
+
+
+# ═══ п.3k: правило В судит слово согласия отдельным предложением только в ответе, ЦЕЛИКОМ кратком (решение 11.10) ═══
+# Находка §9.7 шага 3j: форма шага 3f «слово согласия во главе предложения» (`q3`) судила ОТДЕЛЬНОЕ предложение-согласие
+# как «да» и тогда, когда следующим предложением ответ нёс содержание. Под признаком правила В (входящее не об оплате,
+# оплата кодом не подтверждена) причину «оплата не подтверждена сверкой» получали обычные верные ответы («Пришлите,
+# пожалуйста, договор.» — «Конечно! Договор во вложении.»), а тот же текст через запятую («Конечно, договор во
+# вложении.») — нет: исход зависел от точки вместо запятой. Решение: под признаком, который поставило правило В, слово
+# согласия отдельным предложением — утверждение оплаты только в ответе, ЦЕЛИКОМ кратком; у ответа с содержательным
+# предложением исход назван `PC_CONTENT`. Входящее об оплате — форма судится, как до шага. Слов в словари не добавлено.
+# Всё — настоящим путём адаптера (`_draft3g2`), причин модели нет.
+V_CONTENT = "слово согласия — отдельным предложением ответа с содержанием, входящее не об оплате"
+# вид (а) — ДОСЛОВНО step3j/probe_cost3j.py: согласие отдельным предложением + содержание (на 85f1641 причина N4 у 10 из 10)
+K_97 = [("А шлем дадите?", "Разумеется! Шлем тоже будет готов."), ("А шлем дадите?", "Да. Шлем дадим бесплатно."),
+        ("Доставка к отелю есть?", "Конечно! Привезём к 10:00."), ("Можно забрать байк завтра?", "Да, конечно. Ждём вас в 10."),
+        ("Пришлите, пожалуйста, договор.", "Конечно! Договор во вложении."),
+        ("Вы работаете в воскресенье?", "Да. Работаем с 9 до 20."),
+        ("Можно продлить на два дня?", "Да, конечно! Продление — 779 бат в сутки."),
+        ("Is a helmet included?", "Sure! A helmet is included."),
+        ("Can you send me the contract?", "Of course! The contract is attached."),
+        ("Do you deliver to Kata?", "Yes. Delivery to Kata is available.")]
+# у этих ответов пробы есть причина кода НЕ об оплате (время приезда; сумма без опоры) — она стоит при любых фактах
+K_97_ELSE = ["Конечно! Привезём к 10:00.", "Да, конечно! Продление — 779 бат в сутки.", "Конечно, привезём к 10:00."]
+# вид (б) — ДОСЛОВНО: согласие и содержание в ОДНОМ предложении; вид (в) — ДОСЛОВНО: содержание без слова согласия
+K_97_SAME = [("А шлем дадите?", "Да, шлем дадим бесплатно."), ("Доставка к отелю есть?", "Конечно, привезём к 10:00."),
+             ("Пришлите, пожалуйста, договор.", "Конечно, договор во вложении."),
+             ("Вы работаете в воскресенье?", "Да, работаем с 9 до 20."), ("Is a helmet included?", "Sure, a helmet is included."),
+             ("Can you send me the contract?", "Of course, the contract is attached.")]
+K_97_PLAIN = [("А шлем дадите?", "Шлем дадим бесплатно."), ("Пришлите, пожалуйста, договор.", "Договор во вложении."),
+              ("Вы работаете в воскресенье?", "Работаем с 9 до 20 каждый день."),
+              ("Can you send me the contract?", "The contract is attached.")]
+# СВОИ 22 пары вида (а): русские 14 и английские 8; входящее называет предмет (`_PQ_TOPIC`) у 13, не называет у 9
+K_OWN = [
+    ("Можно шлем побольше?", "Конечно. Подберём шлем по размеру."),
+    ("Договор можно на английском?", "Да. Договор будет на английском и на русском."),
+    ("Байк привезёте к отелю?", "Да! Привезём байк к отелю."),
+    ("Пришлёте фото байка?", "Конечно! Фото пришлю следующим сообщением."),
+    ("Адрес офиса подскажете?", "Да, конечно. Мы на Раваи, рядом с пирсом."),
+    ("Страховка входит?", "Разумеется. Страховка входит в аренду."),
+    ("Пришлите, пожалуйста, договор.", "Да. Договор отправляю файлом."),
+    ("Можно договор на почту?", "Безусловно. Договор пришлём на почту сегодня."),
+    ("Вы открыты завтра?", "Да. Работаем каждый день."),
+    ("Можно приехать после шести?", "Конечно. Ждём вас до восьми вечера."),
+    ("А детское кресло дадите?", "Да. Детское кресло дадим бесплатно."),
+    ("Второй ключ дадите?", "Разумеется! Второй ключ положим в бардачок."),
+    ("Можно приехать пораньше?", "Да, конечно. Приезжайте к девяти."),
+    ("С собакой можно?", "Естественно. Собаку берите с собой."),
+    ("Is delivery to the hotel possible?", "Yes. We deliver to your hotel."),
+    ("Could you send the contract in English?", "Sure. The contract will be in English."),
+    ("Is insurance included?", "Of course! Basic insurance is included."),
+    ("Can I see the bike first?", "Certainly. You can see the bike at our office."),
+    ("Do you have a bigger helmet?", "Absolutely. Helmets come in every size."),
+    ("Are you open on Sunday?", "Yes. We are open every day."),
+    ("Do you have a child seat?", "Absolutely. A child seat is free of charge."),
+    ("Can I come after six?", "Sure! We are here until eight.")]
+# содержательное предложение стоит ПЕРЕД словом согласия — ответ тоже не «целиком краткий»
+K_BEFORE = [("А шлем дадите?", "Шлем дадим бесплатно. Разумеется!"),
+            ("Пришлите, пожалуйста, договор.", "Договор во вложении. Да, конечно."),
+            ("Can you send me the contract?", "The contract is attached. Sure!"),
+            ("Вы работаете в воскресенье?", "Здравствуйте! Да. Работаем с 9 до 20.")]
+# БЛИЗНЕЦ «ответ ЦЕЛИКОМ краткий»: (входящее не об оплате, ответ, сколько кратких предложений) — причина N4 остаётся
+K_BRIEF = [
+    ("Готово.", "Да.", 1), ("Отправил вам фото паспорта.", "Конечно!", 1), ("Подписал.", "Спасибо, получили!", 1),
+    ("А шлем дадите?", "Да. Спасибо!", 2), ("Sent.", "Sure! " + THUMB, 2), ("Отправил.", "Да. Получили.", 2),
+    ("Всё отправил.", "Конечно. Хорошего дня!", 2), ("Signed.", "Of course. Thank you!", 2),
+    ("Отправил.", "Да. Уже.", 2), ("Всё отправил.", "Да, конечно. Всё у нас.", 2), ("Sent.", "Yes. Already.", 2),
+    ("Отправил.", "Да. Сегодня утром.", 2), ("Sent.", "Yes. Just now.", 2),
+    ("Отправил вам документы.", "Да, уже. Хорошего дня!", 2), ("Done.", "Yes, already. Cheers!", 2),
+    ("Вот.", "Да, уже. Принято, спасибо!", 2),
+    ("Готово.", "Да. Конечно. Спасибо!", 3), ("Done.", "Yes. Sure. Thanks!", 3),
+    ("Скинул фото байка.", "Да! Получили. Спасибо!", 3), ("Sent you the documents.", "Yes. Got it. Thanks!", 3),
+    ("Готово.", "Да. Уже. Спасибо!", 3), ("Done.", "Yes. Already. Thank you!", 3),
+    ("Здравствуйте! Отправил.", "Здравствуйте! Да. Уже.", 3)]
+# те из них, где утверждение даёт ТОЛЬКО форма «слово согласия во главе предложения» (`q3`): решает определение шага
+K_BRIEF_Q3 = ["Да. Уже.", "Да, конечно. Всё у нас.", "Yes. Already.", "Да. Сегодня утром.", "Yes. Just now.",
+              "Да, уже. Хорошего дня!", "Yes, already. Cheers!", "Да, уже. Принято, спасибо!", "Да. Уже. Спасибо!",
+              "Yes. Already. Thank you!", "Здравствуйте! Да. Уже."]
+# БЛИЗНЕЦ «входящее ОБ ОПЛАТЕ» (`pay_asked`) + «Да. <содержание>» — форма судится, как до шага
+K_ASKED = [("Деньги пришли?", "Да. Ждём вас в 10."),
+           ("Я перевёл оплату за аренду, деньги пришли?", "Конечно. Ждём вас завтра в 10:00."),
+           ("Оплатил аренду, проверьте, пожалуйста.", "Да. Договор во вложении."),
+           ("Скинул вам 7790 на карту.", "Разумеется! Шлем тоже будет готов."),
+           ("Оплату получили?", "Да. Работаем с 9 до 20."),
+           ("I sent the payment for the rental, did you receive it?", "Sure! The bike is ready for tomorrow."),
+           ("I've paid, please confirm.", "Yes. Delivery to Kata is available."),
+           ("Did you get my payment?", "Of course! The contract is attached.")]
+# КОНТРОЛЬ: форма получения (`q1`, `q2` — сказуемое получения без предмета) шагом НЕ сужается — цена стороны отказа
+K_RCV = [("Отправил вам фото паспорта.", "Получили, спасибо! Ждём вас завтра в 10."),
+         ("Отправил.", "Да, получили. Ждём вас завтра."),
+         ("Есть новости по моему вопросу?", "Да, всё получили, спасибо. Ждём вас завтра."),
+         ("Sent.", "Got it, thanks! See you tomorrow at 10."), ("Готово.", "Всё в порядке. Ждём вас завтра.")]
+# ГРАНИЦА (была и до шага): краткий ответ ОДНИМ предложением, где рядом со словом согласия стоят и слово вне словаря
+# согласия («уже»), и вежливость либо одобрение, — вне форм N4; тот же ответ двумя предложениями причину несёт
+K_GAP = [("Отправил вам документы.", "Да, уже, хорошего дня!", "Да, уже. Хорошего дня!"),
+         ("Done.", "Yes, already, cheers!", "Yes, already. Cheers!"),
+         ("Вот.", "Да, уже, принято, спасибо!", "Да, уже. Принято, спасибо!")]
+
+
+def _comma3k(text):
+    """Тот же ответ ОДНИМ предложением через запятую: первый знак конца предложения → запятая, следующая буква — строчная."""
+    m = re.search(r"[.!]\s+(\S)", text)
+    return text[:m.start()] + ", " + m.group(1).lower() + text[m.end():]
+
+
+def _names3k(text, by, asked=True):
+    """Имена исходов совпадений определения N4 при признаке `asked`, который поставил названный контекст `by`."""
+    return [v for _m, v in T._PayClaim(asked, (), by).explain(text)]
+
+
+def _forms3k(text):
+    """Формы краткого подтверждения (группы четвёртого прохода), совпавшие в ответе."""
+    return [k for rx, m in T._PayClaim._matches(text) if rx is T._PAY_CTX for k in ("q1", "q2", "q3", "q4", "q5") if m.group(k)]
+
+
+def test_p3k_9_7_agreement_sentence_with_content_no_reason():
+    """Находка §9.7 шага 3j — 10 пар пробы ДОСЛОВНО (вид (а)): входящее не об оплате, ответ — слово согласия отдельным
+    предложением и содержание следующим («Конечно! Договор во вложении.», «Да. Шлем дадим бесплатно.», «Sure! A helmet
+    is included.»). На 85f1641 причину «оплата не подтверждена сверкой» несли 10 из 10; теперь при «строки кассы нет» и
+    «касса без второго источника» её нет ни у одной: список причин равен причинам того же черновика при подтверждённой
+    кодом оплате (у двух пар — причина НЕ об оплате: время приезда, сумма без опоры), журнал правило В не называет, исход
+    формы назван `PC_CONTENT`. Виды (б) и (в) пробы — как были: причины нет."""
+    assert (len(K_97), len(K_97_SAME), len(K_97_PLAIN)) == (10, 6, 4)
+    for tail, text in K_97 + K_97_SAME + K_97_PLAIN:
+        assert T.pay_asked(tail) is False and T.pay_brief(tail, False, False) == (V_B_BARE, True), tail
+        base = _run3i([], tail, text, "backed")[0]
+        assert T.PAY_WORDS not in base and bool(base) == (text in K_97_ELSE), (text, base)
+        for facts in ("none", "cash"):
+            hand, state, conf, rule, by_tail, paid = _run3i([], tail, text, facts)
+            assert hand == base and state[0] == V_NONE and not conf and not rule and not by_tail and not paid, \
+                (tail, text, facts, hand, conf)
+    for _tail, text in K_97:
+        assert _names3k(text, T.PB_BARE) == [V_CONTENT], (text, _names3k(text, T.PB_BARE))
+        assert _forms3k(text) == ["q3"], (text, _forms3k(text))
+    for _tail, text in K_97_SAME:
+        assert _names3k(text, T.PB_BARE) == [V_OTHER] and _names3k(text, T.PB_ASKED) == [V_OTHER], text
+    for _tail, text in K_97_PLAIN:
+        assert _names3k(text, T.PB_BARE) == [], text
+
+
+def test_p3k_own_agreement_sentence_with_content_no_reason():
+    """СВОИ 22 пары того же вида (на 85f1641 причина N4 у 22 из 22): русские 14 и английские 8; входящее называет
+    предмет существующим словом (`_PQ_TOPIC`: шлем, договор, байк, фото, адрес, страховка, delivery, contract) у 13 и не
+    называет у 9 — причины нет ни у одной при обоих наборах фактов, с историей и без неё; исход формы — `PC_CONTENT`."""
+    assert len(K_OWN) == 22
+    ru = [p for p in K_OWN if re.search("[а-яё]", p[1])]
+    assert (len(ru), len(K_OWN) - len(ru), len([p for p in K_OWN if T._PQ_TOPIC.search(p[0])])) == (14, 8, 13)
+    for tail, text in K_OWN:
+        assert T.pay_asked(tail) is False and T.pay_brief(tail, False, False) == (V_B_BARE, True), tail
+        assert _forms3k(text) == ["q3"], (text, _forms3k(text))
+        for facts in ("none", "cash"):
+            hand, state, conf, rule, by_tail, paid = _run3i([], tail, text, facts)
+            assert hand == [] and state[0] == V_NONE and not conf and not rule and not by_tail and not paid, \
+                (tail, text, facts, hand, conf)
+    for tail, text in K_OWN[:3] + K_OWN[14:17]:                 # после обмена о брони без слов оплаты — тот же исход
+        hist = I_NEUTRAL["ru" if re.search("[а-яё]", text) else "en"]
+        for facts in ("none", "cash"):
+            hand, state, conf, rule, _by, _paid = _run3i(hist, tail, text, facts)
+            assert hand == [] and state[0] == V_NONE and not conf and not rule, (tail, text, facts, hand)
+    for _tail, text in K_OWN:
+        assert _names3k(text, T.PB_BARE) == [V_CONTENT], (text, _names3k(text, T.PB_BARE))
+
+
+def test_p3k_content_before_agreement_sentence_no_reason():
+    """Содержательное предложение стоит ПЕРЕД словом согласия («Договор во вложении. Да, конечно.», «The contract is
+    attached. Sure!») либо между приветствием и содержанием («Здравствуйте! Да. Работаем с 9 до 20.»): ответ не «целиком
+    краткий» — причины нет (на 85f1641 была у 4 из 4), исход формы — `PC_CONTENT`."""
+    assert len(K_BEFORE) == 4
+    for tail, text in K_BEFORE:
+        assert T.pay_asked(tail) is False, tail
+        for facts in ("none", "cash"):
+            hand, state, conf, rule, _by, _paid = _run3i([], tail, text, facts)
+            assert hand == [] and state[0] == V_NONE and not conf and not rule, (tail, text, facts, hand)
+    for _tail, text in K_BEFORE:
+        assert _names3k(text, T.PB_BARE) == [V_CONTENT], (text, _names3k(text, T.PB_BARE))
+
+
+def test_p3k_same_text_through_comma_same_outcome():
+    """Исход не зависит от точки вместо запятой: у 10 пар пробы и 22 своих ответ двумя предложениями («Конечно! Договор
+    во вложении.») и тот же текст ОДНИМ предложением через запятую («Конечно, договор во вложении.») дают один список
+    причин при обоих наборах фактов (на 85f1641 — разные: через точку стояла причина N4). Имена исходов формы: через
+    точку — `PC_CONTENT`, через запятую — `PC_OTHER`. Ответ целиком краткий — причина есть и через точку, и через
+    запятую («Да. Спасибо!» / «Да, спасибо!», «Да. Уже.» / «Да, уже.»)."""
+    for tail, text in K_97 + K_OWN:
+        one = _comma3k(text)
+        assert one != text and not K._SENTENCE.search(one.rstrip(".!")), (text, one)
+        for facts in ("none", "cash"):
+            a, b = _run3i([], tail, text, facts)[0], _run3i([], tail, one, facts)[0]
+            assert a == b and T.PAY_WORDS not in a, (tail, text, one, facts, a, b)
+    gap = [dot for _tail, _one, dot in K_GAP]
+    both = [(tail, text) for tail, text, n in K_BRIEF if n == 2 and text not in gap]
+    assert len(both) == 10
+    for tail, text in both:
+        for facts in ("none", "cash"):
+            assert _run3i([], tail, text, facts)[0] == _run3i([], tail, _comma3k(text), facts)[0] == [T.PAY_WORDS], (tail, text)
+    for _tail, text in K_97 + K_OWN:
+        assert _names3k(_comma3k(text), T.PB_BARE) == [V_OTHER] and _names3k(text, T.PB_BARE) == [V_CONTENT], text
+
+
+def test_p3k_twin_whole_brief_reply_keeps_reason():
+    """Близнец «ответ ЦЕЛИКОМ краткий» (23 пары; одно, два и три кратких предложения подряд): входящее не об оплате, в
+    ответе нет ни одного содержательного предложения («Да.», «Конечно!», «Да. Спасибо!», «Sure! 👍», «Спасибо,
+    получили!», «Да. Уже.», «Да. Конечно. Спасибо!», «Yes. Already. Thank you!», «Здравствуйте! Да. Уже.») — причина N4
+    стоит при обоих наборах фактов, журнал называет правило В; при подтверждённой кодом оплате её нет. У 11 из них
+    утверждение даёт ТОЛЬКО форма «слово согласия во главе предложения» — их держит определение шага (`_whole`): другое
+    предложение ответа само состоит из слов согласия («Уже.», «Сегодня утром.») либо вместе со словом согласия
+    составляет ответ-согласие («Хорошего дня!», «Принято, спасибо!», «Cheers!»)."""
+    assert len(K_BRIEF) == 23 and [len([1 for _t, _x, n in K_BRIEF if n == k]) for k in (1, 2, 3)] == [3, 13, 7]
+    assert [x for _t, x, _n in K_BRIEF if _forms3k(x) == ["q3"]] == K_BRIEF_Q3 and len(K_BRIEF_Q3) == 11
+    for tail, text, _n in K_BRIEF:
+        assert T.pay_asked(tail) is False and T.pay_brief(tail, False, False) == (V_B_BARE, True), tail
+        names = _names3k(text, T.PB_BARE)
+        assert V_CLAIM in names and (V_CONTENT not in names or text in ("Да. Получили.", "Да! Получили. Спасибо!",
+                                                                         "Yes. Got it. Thanks!")), (text, names)
+        for facts in ("none", "cash"):
+            hand, state, conf, rule, by_tail, paid = _run3i([], tail, text, facts)
+            assert hand == [T.PAY_WORDS] and state[0] == V_NONE and not rule and not by_tail and not paid, (tail, text, hand)
+            assert [ln for ln in conf if V_B_SAID in ln], (tail, text, conf)
+        assert _run3i([], tail, text, "backed")[0] == [], (tail, text)
+    for text in K_BRIEF_Q3:
+        assert _names3k(text, T.PB_BARE) == [V_CLAIM] == _names3k(text, T.PB_ASKED), text
+
+
+def test_p3k_twin_incoming_about_payment_agreement_sentence_as_before():
+    """Близнец «входящее ОБ ОПЛАТЕ» (`pay_asked`; 8 пар): «Деньги пришли?» — «Да. Ждём вас в 10.», «Оплатил аренду,
+    проверьте, пожалуйста.» — «Да. Договор во вложении.» — слово согласия отдельным предложением судится, как до шага:
+    причина N4 стоит первой при обоих наборах фактов, журнал называет её прежними словами (не правилом В), тема оплаты
+    открыта хвостом. ТОТ ЖЕ ответ под признаком правила В — `PC_CONTENT`. Прежний список шага 3f (`F1_YES`, 14 ответов):
+    при входящем об оплате — утверждение; под признаком правила В — нет у 12, а два ответа из согласия и прощания
+    («Definitely. See you tomorrow.») — ответ-согласие шага 3f ЦЕЛИКОМ (`q5`), их причина остаётся (цена стороны отказа)."""
+    assert len(K_ASKED) == 8
+    for tail, text in K_ASKED:
+        assert T.pay_asked(tail) is True and T.pay_brief(tail, True, False) == (V_B_ASKED, True), tail
+        assert _names3k(text, T.PB_ASKED) == [V_CLAIM] == _names3k(text, None), (text, _names3k(text, T.PB_ASKED))
+        assert _names3k(text, T.PB_BARE) == [V_CONTENT], text
+        for facts in ("none", "cash"):
+            hand, state, conf, rule, _by, paid = _run3i([], tail, text, facts)
+            assert hand[0] == T.PAY_WORDS and hand.count(T.PAY_WORDS) == 1 and state[0] == V_TAIL and not paid, (tail, hand)
+            assert [ln for ln in conf if I_OLD_SAID in ln] and not [ln for ln in conf if V_B_SAID in ln], (tail, conf)
+        assert T.PAY_WORDS not in _run3i([], tail, text, "backed")[0], (tail, text)
+    assert len(F1_YES) == 14
+    whole = [text for text, _q in F1_YES if _forms3k(text) == ["q5"]]   # согласие и прощание — ответ-согласие шага 3f целиком
+    assert whole == ["Definitely. See you tomorrow.", "Indeed. See you tomorrow."], whole
+    for text, question in F1_YES:
+        assert T.pay_asked(question) is True, question
+        assert T._PayClaim(True, (), T.PB_ASKED).search(text) is not None and T._PayClaim(True).search(text) is not None, text
+        if text in whole:                                   # ответ целиком краткий — причина и под правилом В (цена 9.6)
+            assert _names3k(text, T.PB_BARE) == [V_CLAIM], text
+            continue
+        assert T._PayClaim(True, (), T.PB_BARE).search(text) is None and V_CONTENT in _names3k(text, T.PB_BARE), text
+
+
+def test_p3k_twin_confirmed_payment_adds_nothing():
+    """Близнец «оплата подтверждена кодом» (касса аренды обращения + договор той же аренды): правило В не применяется —
+    ни у вида §9.7 (10 + 22 + 4), ни у ответа, целиком краткого (23), ни при входящем об оплате (8), ни у формы
+    получения (5) причины N4 нет, журнал правило не называет."""
+    rows = K_97 + K_OWN + K_BEFORE + [(t, x) for t, x, _n in K_BRIEF] + K_ASKED + K_RCV
+    assert len(rows) == 10 + 22 + 4 + 23 + 8 + 5
+    bad = []
+    for tail, text in rows:
+        hand, _state, conf, rule, by_tail, paid = _run3i([], tail, text, "backed")
+        if not paid or T.PAY_WORDS in hand or conf or [ln for ln in rule if "причина кода не нужна" not in ln]:
+            bad.append((tail, text, hand, by_tail, conf, rule))
+    assert not bad, bad
+
+
+def test_p3k_control_receipt_form_not_narrowed():
+    """КОНТРОЛЬ п.3k (зелёный и на 85f1641) — ЦЕНА стороны отказа, НЕ успех: форма получения (`q1`, `q2` — сказуемое
+    получения или «всё в порядке» без предмета) шагом не сужается. «Отправил вам фото паспорта.» — «Получили, спасибо!
+    Ждём вас завтра в 10.» несёт причину N4 и с содержательным вторым предложением: тот же текст через запятую несёт её
+    так же (исход от точки не зависит), а краткое получение без названного предмета — то, что правило В и судит."""
+    assert len(K_RCV) == 5
+    for tail, text in K_RCV:
+        assert T.pay_asked(tail) is False, tail
+        for facts in ("none", "cash"):
+            assert _run3i([], tail, text, facts)[0] == [T.PAY_WORDS], (tail, text, facts)
+            assert _run3i([], tail, _comma3k(text), facts)[0] == [T.PAY_WORDS], (tail, _comma3k(text), facts)
+
+
+def test_p3k_definition_named_outcome_and_context_name():
+    """Определение шага: исход НАЗВАН (`PC_CONTENT`), имя контекста доходит до формы (`_PayClaim.by` — исход
+    `pay_brief`), а без имени и при иных именах всё судится, как до шага. `_whole` — ответ целиком краткий? — на
+    существующих формах: другое предложение из одних слов согласия (`_PQ_ONLY`) либо вместе со словом согласия —
+    ответ-согласие (`q5`); предложение-получение судит своя форма. Исход — непустое имя на каждой дороге (храповик);
+    `search` говорит «утверждение» ровно тогда, когда так назван хотя бы один исход. Судья денежных ролей и судья:
+    под правилом В содержательный ответ причины не получает, при входящем об оплате — получает."""
+    assert T.PC_CONTENT == V_CONTENT and T._PAY_CLAIM.by is None and T._PayClaim(True).by is None
+    assert T._PayClaim(True, (), T.PB_BARE).by == V_B_BARE
+    for text, want in (("Да. Шлем дадим бесплатно.", V_CONTENT), ("Да.", V_CLAIM), ("Да. Спасибо!", V_CLAIM),
+                       ("Да. Уже.", V_CLAIM), ("Да, уже. Хорошего дня!", V_CLAIM), ("Здравствуйте! Да. Уже.", V_CLAIM),
+                       ("Да. Уже. Спасибо большое, Алексей!", V_CLAIM), ("Да!!! Уже…", V_CLAIM), ("Да\nУже", V_CLAIM),
+                       ("Шлем дадим бесплатно. Да.", V_CONTENT), ("Да. Получили.", V_CONTENT), ("Да. Хорошо, ждём!", V_CONTENT),
+                       ("Да. Спасибо за информацию.", V_CONTENT), ("Да… Шлем дадим.", V_CONTENT), ("Да\nШлем дадим", V_CONTENT),
+                       ("Sure! " + THUMB, V_CLAIM), ("Yes. Already. Cheers!", V_CLAIM), ("Yes. See you at ten.", V_CONTENT)):
+        m = [m for rx, m in T._PayClaim._matches(text) if rx is T._PAY_CTX and m.group("q3")]
+        got = "формы q3 в ответе нет"
+        if m:
+            fin = T._PAY_END.search(text, m[0].end())
+            got = T._PayClaim._whole(text, m[0].start(), len(text) if fin is None else fin.start(), m[0].group("q3"))
+        elif want == V_CLAIM:                             # ответ целиком из согласия ловит форма q5 — до `_whole` не доходит
+            got = V_CLAIM if _forms3k(text) == ["q5"] else got
+        assert got == want, (text, got)
+    assert _names3k("Да. Получили.", T.PB_BARE) == [V_CONTENT, V_CLAIM]         # получение судит своя форма — утверждение
+    texts = [x for _t, x in K_97 + K_97_SAME + K_97_PLAIN + K_OWN + K_BEFORE + K_ASKED + K_RCV] + [x for _t, x, _n in K_BRIEF]
+    for by in (None, T.PB_ASKED, T.PB_BARE, T.PB_PAID, T.PB_UNSEEN):
+        for text in texts:
+            for asked in (True, False):
+                got = T._PayClaim(asked, (), by).explain(text)
+                assert all(isinstance(v, str) and v.strip() for _m, v in got), (text, by, got)
+                assert (V_CLAIM in [v for _m, v in got]) == bool(T._PayClaim(asked, (), by).search(text)), (text, by, got)
+            if by != T.PB_BARE:                             # иное имя контекста — как без имени (до шага)
+                assert _names3k(text, by) == _names3k(text, None), (text, by)
+            assert V_CLAIM not in _names3k(text, by, asked=False), (text, by)       # без признака — не утверждение
+    unpaid = [[], T.accepted(_results_rent_only()), T.accepted(_results_no_second())]
+    for facts in unpaid:
+        for incoming, text in K_97[:2] + K_97[4:5] + K_OWN[:2]:
+            assert T.money_roles(text, facts, asked=False, incoming=incoming) == [], (incoming, text)
+            assert T.money_roles(text, facts, asked=False) == [] and T.money_roles(text, facts) == [], text
+            got = T.money_roles(text, facts, asked=True, incoming="Деньги пришли?")
+            assert [w for w, _why in got] == [T.PAY_WORDS] and got[0][1].startswith(I_OLD_SAID + ": "), (text, got)
+            assert [w for w, _why in T.money_roles(text, facts, asked=True)] == [T.PAY_WORDS], text    # признак без текста
+        for text in ("Да.", "Да. Уже.", "Конечно! Спасибо!", "Yes. Already. Thank you!"):
+            got = T.money_roles(text, facts, asked=False, incoming="Готово.")
+            assert [w for w, _why in got] == [T.PAY_WORDS] and got[0][1].startswith(V_B_SAID + ": "), (text, got)
+    for res in (_results_rent_only(), _results_no_second()):
+        assert T.judge("Да. Шлем дадим бесплатно.", None, [dict(r) for r in res], T.Journal("5678"), asked=False,
+                       incoming="А шлем дадите?")[0] == []
+        assert T.judge("Да. Шлем дадим бесплатно.", None, [dict(r) for r in res], T.Journal("5678"), asked=True,
+                       incoming="Деньги пришли?")[0] == [T.PAY_WORDS]
+        assert T.judge("Да.", None, [dict(r) for r in res], T.Journal("5678"), asked=False,
+                       incoming="А шлем дадите?")[0] == [T.PAY_WORDS]
+    backed = T.accepted(_results_backed())
+    for text in ("Да. Шлем дадим бесплатно.", "Да.", "Да. Уже."):
+        assert T.money_roles(text, backed, asked=False, incoming="Готово.") == [], text
+
+
+def test_p3k_boundary_brief_one_sentence_reply_outside_n4_forms_still_no_reason():
+    """ГРАНИЦА (была до шага и шагом не меняется) — проверка ФИКСИРУЕТ нынешний исход и НЕ означает «закрыто». Краткий
+    ответ ОДНИМ предложением, где рядом со словом согласия стоят и слово вне словаря согласия («уже», «already»), и
+    вежливость либо одобрение («Да, уже, хорошего дня!», «Yes, already, cheers!»), — вне форм N4: причины кода нет при
+    обоих наборах фактов (так на всех деревьях). Тот же ответ двумя предложениями («Да, уже. Хорошего дня!») причину N4
+    несёт, как нёс. Слово в словарь по решению не добавляется; редкая фраза нового круга не запускает."""
+    assert len(K_GAP) == 3
+    for tail, one, dot in K_GAP:
+        assert (tail, dot, 2) in K_BRIEF and _comma3k(dot) == one and T._PayClaim(True).search(one) is None, (one, dot)
+        for facts in ("none", "cash"):
+            hand, state, conf, rule, _by, _paid = _run3i([], tail, one, facts)
+            assert hand == [] and state[0] == V_NONE and not conf and not rule, (tail, one, hand)      # ← остаток, не успех
+            assert _run3i([], tail, dot, facts)[0] == [T.PAY_WORDS], (tail, dot)
 
 
 # ═══ D3 приёмки шага 3: проверки, которые убивают мутанты m3r и m3v ═══════════════════════════════════════════

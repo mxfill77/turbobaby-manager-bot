@@ -1796,7 +1796,7 @@ class ModelAdapter(wa_agent.Model):
         # процент скидки за срок, названной дверью, — с опорой (WAPRICECTX0410): судья сверки процент судит без
         # исхода цены, поэтому названная дверью скидка снимается из текста до суда; прочее — как было
         said = K.without_known_discount(got["text"], info["price"]) if got else ""
-        # K3-FIX шаг 3i (вариант В): судье — и сам текст входящего (признак «иного предмета получения нет» считает он)
+        # K3-FIX шаг 3i (вариант В): судье — и сам текст входящего (с шага 3j правилу важен сам факт текста, не слова)
         words_t, figures = T.judge(said, info["price"], out["results"], jr, handed=handed, asked=asked,
                                    incoming=info.get("question"),
                                    since=info.get("last_in"))
