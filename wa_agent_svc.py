@@ -84,6 +84,10 @@ WA — канал НЕ собирается (строка журнала). У я
 файлами WA (агент, очередь, показ, архив) — по realpath, у существующих ещё и samefile; падение такта TG — строка на
 серию и строка восстановления с числом упавших тактов; карточка TG при закрытой двери — без «Отправить»; кнопки
 уроков — с префиксом рук; строки модели TG — с приставкой «TG: »; сводка TG — с недоставленными карточками.
+Шапка карточки TG (TGHEAD1210, предложение NIGHT0710-B4 §2.3) — «TG · @ник · имя» из raw последних TG_HEAD_LOOK рядов
+ЭТОГО клиента в очереди TG (только чтение, mode=ro): ник и имя кладёт в ряд лента ПК (tg_feed.py, необязательные поля),
+дверь — ряд целиком в raw. Невидимые символы (Cc/Cf/Cs) вычищаются, имя ≤ TG_HEAD_NAME_MAX, шапка ≤ TG_HEAD_MAX знаков.
+Нет данных — прежняя «TG · tg:<id>» байт-в-байт; сбой чтения — она же и строка журнала с именем ошибки (без имён).
 
 ЖУРНАЛ — файл `wa_agent.log` (или WA_AGENT_LOG): только id, состояния и числа; сводка числами раз в
 5 минут. Текстов, номеров и имён клиентов в журнале нет. При включённых черновиках сводка несёт очередь
@@ -91,10 +95,13 @@ WA — канал НЕ собирается (строка журнала). У я
 отдельным полем: отправка карточки (возможна вторая карточка) и правка исхода (не подтверждена) (WACARDDONEFIX0210).
 """
 
+import json
 import logging
 import os
+import re
 import signal
 import time
+import unicodedata
 
 import wa_agent
 import wa_agent_tg
@@ -138,6 +145,19 @@ def tg_greet_of(environ):
     return ((wa_agent.GREET_ANY,),
             "приветствие TG: эхо ≤ %d с после первого входящего (до него %d сут тишины) — автоприветствие, вопрос "
             "открыт" % (wa_agent.GREET_SEC, TG_GREET_SILENCE // 86400))
+
+
+# шапка карточки TG (TGHEAD1210, NIGHT0710-B4 §2.3): ник и имя клиента из raw его рядов очереди TG
+TG_HEAD_LOOK = 50                         # рядов ЭТОГО клиента (от новых к старым), где ищутся ник и имя
+TG_HEAD_NAME_MAX = 64                     # имя клиента в шапке, знаков (у Telegram имя и фамилия — по 64)
+TG_HEAD_MAX = 128                         # шапка целиком, знаков
+_TG_KEY = re.compile(r"tg:([0-9]{1,20})")            # ключ клиента канала TG (wa_webhook.tg_row_event: «from»)
+_TG_NICK = re.compile(r"[A-Za-z0-9_]{1,32}")         # ник Telegram: латиница, цифры, «_», не длиннее 32
+_TG_HIDDEN = frozenset(("Cc", "Cf", "Cs"))           # невидимые: управляющие, формата (направление письма), суррогаты
+# буквы, видимые как «ничего»: заполнители хангыля U+115F U+1160 U+3164 U+FFA0 и пустой брайль U+2800 (в исходнике —
+# кодами: невидимых знаков в тексте программы нет)
+_TG_FILLERS = frozenset(chr(c) for c in (0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800))
+_TG_WS = re.compile(r"\s+")
 
 log = logging.getLogger("wa_agent")
 
@@ -228,13 +248,91 @@ class TgDoor(wa_agent.Door):
         return {"outcome": wa_send.NOT_SENT, "reason": TG_DOOR_WORDS, "wamid": None}
 
 
+def tg_nick(value):
+    """Поле `username` ряда ленты → ник без «@» · "" (null: активного ника у клиента нет) · None (не строка или не по
+    алфавиту ника Telegram — мусор, поле «неизвестно»). "" здесь — знание из ряда, а не промах: промах — None."""
+    if isinstance(value, str):
+        value = value.strip()
+        return value if _TG_NICK.fullmatch(value) else None
+    return "" if value is None else None
+
+
+def _tg_visible(ch):
+    cat = unicodedata.category(ch)
+    return ch not in _TG_FILLERS and (cat[0] in "LNPS" or cat in ("Co", "Cn"))
+
+
+def tg_clean(value, cap):
+    """Поле `name` ряда ленты → одна строка без невидимых символов (Cc/Cf/Cs вычищены, пробелы и разрывы строк — один
+    пробел), не длиннее cap знаков · "" (null, пусто или ни одного видимого знака — U+3164, пустой брайль) · None (не
+    строка и не null — мусор, поле «неизвестно»). "" — знание из ряда, а не промах: промах — None."""
+    if not isinstance(value, str):
+        return "" if value is None else None
+    s = "".join(" " if ch.isspace() else ch for ch in value
+                if ch.isspace() or unicodedata.category(ch) not in _TG_HIDDEN)
+    s = _TG_WS.sub(" ", s).strip()[:cap].rstrip()
+    return s if any(_tg_visible(ch) for ch in s) else ""
+
+
+def tg_head(number, raws):
+    """Шапка карточки TG из raw рядов очереди ЭТОГО клиента (от новых к старым) → «TG · @ник · имя» | None.
+
+    raw — ряд ленты ПК целиком (tg_feed.line: необязательные `username`/`name`, NIGHT0710-B4 З3; дверь кладёт его в raw,
+    wa_webhook.tg_row_event). Каждое поле — из самого нового ряда, где оно ЕСТЬ: ключа нет (ряд до 07.10, собеседник не
+    передан) — ищем дальше, повтор ряда старые строки не дополняет; null — «нет», поиск по полю останавливает. Ряд не
+    JSON, не объект, чужой chat_id, поле не по контракту — пропуск. Ника нет — вместо него id клиента. None — сказать
+    нечего: вызывающий ставит прежнюю шапку байт-в-байт. Исключений не бросает."""
+    m = _TG_KEY.fullmatch(str(number))
+    if not m:
+        return None
+    cid, nick, name = int(m.group(1)), None, None
+    for raw in raws or ():
+        if nick is not None and name is not None:
+            break
+        try:
+            rec = json.loads(raw)
+        except Exception:                                            # noqa: BLE001 — мусор в raw: пропуск ряда
+            continue
+        rid = rec.get("chat_id") if isinstance(rec, dict) else None
+        if not isinstance(rid, int) or isinstance(rid, bool) or rid != cid:
+            continue
+        if nick is None and "username" in rec:
+            nick = tg_nick(rec["username"])
+        if name is None and "name" in rec:
+            name = tg_clean(rec["name"], TG_HEAD_NAME_MAX)
+    if not (nick or name):
+        return None
+    who = "@" + nick if nick else m.group(1)
+    return ("TG · " + who + (" · " + name if name else ""))[:TG_HEAD_MAX].rstrip()
+
+
 class TgSide(wa_agent_tg.Tg):
     """Руки ядра TG: те же карточки в «Агенты», префикс кнопок `tg`, getUpdates не зовут (reader=False).
-    Шапка — «TG · <ключ клиента>»: темы показа у канала нет, базу показа WA не читаем.
-    «Отправить» — только при открытой двери ядра (send_closed=False, решение владельца 00:59, TGCOREC0610)."""
+    Шапка — «TG · @ник · имя» (TGHEAD1210, `tg_head`): ник и имя клиента из raw последних TG_HEAD_LOOK рядов ЭТОГО
+    клиента в очереди TG — очередь ядра, только чтение (`Core._queue`, mode=ro). Нет данных — «TG · <ключ клиента>»
+    байт-в-байт как было; сбой чтения — она же и строка журнала с именем ошибки. Темы показа у канала нет, базу показа
+    WA не читаем. «Отправить» — только при открытой двери ядра (send_closed=False, решение владельца 00:59, TGCOREC0610)."""
 
     def _topic(self, number):
-        return "TG · " + str(number), ""
+        head = "TG · " + str(number)
+        if not _TG_KEY.fullmatch(str(number)):
+            return head, ""
+        try:
+            q = self.core._queue()
+            try:
+                raws = [r[0] for r in q.execute(
+                    "SELECT raw FROM wa_inbox WHERE from_number=? AND raw IS NOT NULL ORDER BY id DESC LIMIT ?",
+                    (str(number), TG_HEAD_LOOK)).fetchall()]
+            finally:
+                q.close()
+        except Exception as e:                                       # noqa: BLE001
+            self.log("шапка: очередь TG не прочитана — %s, шапка прежняя" % type(e).__name__)
+            return head, ""
+        try:
+            return (tg_head(number, raws) or head), ""
+        except Exception as e:                                       # noqa: BLE001 — замок: tg_head не бросает
+            self.log("шапка: не собрана — %s, шапка прежняя" % type(e).__name__)
+            return head, ""
 
 
 class TgHands(wa_agent.Telegram):
