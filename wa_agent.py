@@ -1631,8 +1631,15 @@ class Core:
         if state == SENT:
             # ушедшее агентом: история агента; строка в теме клиента — из `agent_show` (WAMIRROR0410), не здесь
             self._sent_out(wamid, number, text, VIA_AGENT, now)
-        self._done(draft_id, "%s: %s, %s" % (state, who, hm_phuket(now)), now)
-        return {"ok": state == SENT, "state": state, "words": state}
+        words = self._door_words(state, res)
+        self._done(draft_id, "%s: %s, %s" % (words, who, hm_phuket(now)), now)
+        return {"ok": state == SENT, "state": state, "words": words}
+
+    def _door_words(self, state, res):
+        """Слова исхода двери — на карточку и в ответ на нажатие. Здесь — само состояние, как было всегда
+        (ядро WA байт-в-байт прежнее); ядро канала TG с открытой дверью (`wa_agent_svc.TgSendCore`,
+        TGSEND1310) добавляет причину двери: «ПК не забрал», «проверьте чат перед повтором»."""
+        return state
 
     # ── человеческий ритм (WAHUMANPACE0210) ───────────────────────────────────────────────
 
