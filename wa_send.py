@@ -32,6 +32,8 @@ WA_SEND, ключ, окно 24 ч, три исхода. Пустой эмодз�
 шлёт сообщение своего вида с id медиа. Загрузка клиенту не видна: любой её провал — `not_sent`
 (повтор загрузки безвреден — лишний файл в 360dialog, не второе сообщение). Исход ОТПРАВКИ —
 прежние три. Пределы и форматы — `MEDIA_MAX`, `MEDIA_MIMES` (Meta, «Supported media types»).
+Имя файла в multipart загрузки — только печатный ASCII (`upload_name`, П1 13.10.2026); имя, которое видит
+клиент, — `document.filename` сообщения, исходное, без изменений.
 
 ЗНАЧЕНИЕ КЛЮЧА НЕ ПОКАЗЫВАЕТСЯ НИГДЕ. Ни в отказе, ни в журнале, ни в исключении не печатается
 ни одного его символа — наружу уходит только «ключ не годен» и почему (пусто / заполнитель).
@@ -601,15 +603,57 @@ def build_location(to, lat, lon, name="", address=""):
             "type": "location", "location": loc}
 
 
+UPLOAD_STEM_MAX = 60         # основа ASCII-имени загрузки, знаков
+UPLOAD_EXT_MAX = 10          # расширение ASCII-имени загрузки, знаков
+
+
+def _ascii_alnum(s, limit):
+    """Строка из ASCII-букв и цифр длиной 1..limit."""
+    return 0 < len(s) <= limit and all(c.isascii() and c.isalnum() for c in s)
+
+
+def upload_name(fname, mime="") -> str:
+    """Имя файла в заголовке части multipart ЗАГРУЗКИ (`POST /media`) → только печатный ASCII (П1, 13.10.2026).
+
+    Клиент это имя НЕ видит: имя документа у клиента — поле `document.filename` сообщения (`build_media`), и туда
+    уходит ИСХОДНОЕ имя, без изменений. Здесь же — только транспорт: сырой UTF-8 в заголовке части есть
+    «распространённая практика» (RFC 7578 §4.2), а не US-ASCII заголовков MIME, `filename*` там запрещён, и как
+    кириллицу разберут 360dialog и Meta, живьём не проверялось ни разу. ASCII-форма этой зависимости не имеет.
+      • печатный ASCII (0x20..0x7E) — байт-в-байт как было до 13.10 (`"` → `_`);
+      • иначе (кириллица, тайский, CR/LF/TAB и прочие управляющие) — «основа.расширение»: знаки основы вне
+        [A-Za-z0-9._-] → `_` (серия — одним), края без `._-`, основа до UPLOAD_STEM_MAX, без букв и цифр — `file`;
+        расширение — исходное, если это ASCII-буквы/цифры до UPLOAD_EXT_MAX, иначе подтип `mime` (`pdf`),
+        иначе `bin`."""
+    raw = str(fname or "")
+    if all(" " <= c <= "~" for c in raw):
+        return raw.replace('"', "_")
+    stem, dot, ext = raw.rpartition(".")
+    if not dot:
+        stem, ext = raw, ""
+    if not _ascii_alnum(ext, UPLOAD_EXT_MAX):
+        sub = str(mime or "").split(";")[0].strip().lower().rsplit("/", 1)[-1]
+        ext = sub if _ascii_alnum(sub, UPLOAD_EXT_MAX) else "bin"
+    out = []
+    for c in stem:
+        ch = c if (c.isascii() and (c.isalnum() or c in "._-")) else "_"
+        if not (ch == "_" and out and out[-1] == "_"):
+            out.append(ch)
+    base = "".join(out).strip("._-")[:UPLOAD_STEM_MAX].strip("._-")
+    if not any(c.isascii() and c.isalnum() for c in base):
+        base = "file"
+    return "%s.%s" % (base, ext.lower())
+
+
 def multipart(fields, fname, data, mime):
-    """multipart/form-data В ПАМЯТИ → (тело bytes, Content-Type). Файл — последней частью."""
+    """multipart/form-data В ПАМЯТИ → (тело bytes, Content-Type). Файл — последней частью.
+    Имя файла в заголовке части — `upload_name` (только ASCII; клиент видит `document.filename`, не его)."""
     bnd = "wa" + os.urandom(12).hex()
     parts = []
     for name, value in fields:
         parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
                       % (bnd, name, value)).encode("utf-8"))
     parts.append(("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
-                  "Content-Type: %s\r\n\r\n" % (bnd, fname.replace('"', "_"), mime)).encode("utf-8"))
+                  "Content-Type: %s\r\n\r\n" % (bnd, upload_name(fname, mime), mime)).encode("utf-8"))
     parts.append(bytes(data))
     parts.append(("\r\n--%s--\r\n" % bnd).encode("utf-8"))
     return b"".join(parts), "multipart/form-data; boundary=" + bnd
