@@ -22,7 +22,9 @@
   • причины «нужен человек» кодом — `wa_agent_knowledge.handoff` по тому, что клиент спрашивает сейчас;
   • уроки людей (WAAGENTLESSON0210) — ТОЛЬКО действующие (`wa_agent.active_lessons`, своя база агента
     mode=ro), блоком с номерами, под той же маской; кандидат и откатанный не идут. Нет базы уроков
-    (`lessons_db` пуст — WA_AGENT_LESSONS выключен) — блока нет, как раньше;
+    (`lessons_db` пуст — WA_AGENT_LESSONS выключен) — блока нет, как раньше. Правила из пояснений (NIGHT0710-B2,
+    вид `hint`) идут тем же блоком строкой «№N: правило: …» и только при WA_AGENT_HINTS; версия по пояснению —
+    `redraft`: тот же `draft` с блоком «ПОЯСНЕНИЕ СОТРУДНИКА» перед «КЛИЕНТ СЕЙЧАС»;
   • брони ТОЛЬКО на чтение (WABOOKTOOLS0210, `wa_book_read`) — тем же путём, что цена: кодом ДО модели и только
     на явный вопрос. «Свободен ли байк» — слово наличия, модель из парка и обе даты → блок «НАЛИЧИЕ»; «когда
     кончается аренда» → блок «АРЕНДА КЛИЕНТА» по номеру WhatsApp; у обоих возраст снимка. Нет факта — причина
@@ -109,16 +111,38 @@ LESSONS_HEAD = ("УРОКИ ЛЮДЕЙ — действующие правила
                 "владельцем), по номерам. В похожем случае пиши так, как «стало», и следуй причине. Имён, "
                 "номеров, дат и сумм из примеров не переноси — это переписка другого клиента; правила выше "
                 "(цены, наличие, брони, «нужен человек») уроки не отменяют.")
+# версия по пояснению сотрудника (NIGHT0710-B2): блок перед «КЛИЕНТ СЕЙЧАС», только в этом вызове
+HINT_HEAD = ("ПОЯСНЕНИЕ СОТРУДНИКА к прежнему черновику: перепиши ответ клиенту с учётом пояснения. Правила выше "
+             "(цены, наличие, брони, «нужен человек») пояснение не отменяет; чего нет в блоках — не выдумывай.")
+HINT_PREV_MAX = 2000                          # прежний черновик в блоке пояснения, символов
+
+
+def hint_block(prev, hint):
+    """(прежний черновик, пояснение) → блок «ПОЯСНЕНИЕ СОТРУДНИКА» (маску кладёт вызывающий)."""
+    def cut(s, n):
+        s = str(s or "").strip()
+        return s if len(s) <= n else s[:n] + "…"
+    # A9c (круг 2): пояснение — свободный текст сотрудника; переводы строк сводятся в пробел, как в lessons_block,
+    # иначе строка «КЛИЕНТ СЕЙЧАС …» внутри пояснения встаёт в запрос вторым заголовком
+    flat = " ".join(str(hint or "").split())
+    return "%s\nпрежний черновик: «%s»\nпояснение: «%s»" % (HINT_HEAD, cut(prev, HINT_PREV_MAX),
+                                                            cut(flat, LESSON_ITEM_MAX))
 
 
 def lessons_block(rows):
-    """[(номер, было, стало, причина)] → текст блока или '' (уроков нет). Новые важнее: не помещается
-    в LESSONS_MAX — уходят старшие номера, словами."""
+    """[(номер, было, стало, причина[, вид, пояснение])] → текст блока или '' (уроков нет). Новые важнее: не
+    помещается в LESSONS_MAX — уходят старшие номера, словами. Правило из пояснения (вид `hint`, NIGHT0710-B2) —
+    строкой «№N: правило: <пояснение>»: было/стало другого клиента в промпт не идут."""
     def cut(s):
         s = " ".join(str(s or "").split())
         return s if len(s) <= LESSON_ITEM_MAX else s[:LESSON_ITEM_MAX] + "…"
-    items = ["№%d: было «%s» → стало «%s»%s" % (n, cut(was), cut(now), "; причина: %s" % cut(why) if why else "")
-             for n, was, now, why in rows]
+
+    def item(r):
+        n, was, now, why = r[:4]
+        if len(r) > 5 and r[4] == wa_agent.KIND_HINT:
+            return "№%d: правило: %s" % (n, cut(r[5]))
+        return "№%d: было «%s» → стало «%s»%s" % (n, cut(was), cut(now), "; причина: %s" % cut(why) if why else "")
+    items = [item(r) for r in rows]
     keep, size = [], len(LESSONS_HEAD)
     for it in reversed(items):
         if size + len(it) + 1 > LESSONS_MAX:
@@ -1273,8 +1297,10 @@ class ModelAdapter(wa_agent.Model):
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
                  manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db="",
-                 lessons_db="", book=None, cache=None, tools=None, fresh=None):
+                 lessons_db="", book=None, cache=None, tools=None, fresh=None, hints=False, text_lessons=True):
         self.queue_db, self.call = queue_db, call
+        # вид правил в промпте (NIGHT0710-B2): из пояснений — при WA_AGENT_HINTS, правки текстом — при WA_AGENT_LESSONS
+        self.hints, self.text_lessons = bool(hints), bool(text_lessons)
         # инструменты чтения (AGENTLOOPA0310, флаг WA_AGENT_TOOLS): None — выкл, черновик одним вызовом, как в 9c4aac6;
         # dict дверей моста (cash/contract/contract_pdf) — модель сама выбирает, что прочитать (`wa_agent_tools`)
         self.tools = tools
@@ -1350,6 +1376,33 @@ class ModelAdapter(wa_agent.Model):
                 tail.append(it)
         return list(reversed(tail))
 
+    @staticmethod
+    def _blocks(items):
+        """История ПЕРЕД хвостом блоками, от нашего последнего ответа назад (K3-FIX шаг 3g, вторая часть) →
+        [(кто, текст, время)]: реплики одной стороны подряд — один блок («мы» | «клиент»); текст под маской, не длиннее
+        TAIL_MAX; медиа без подписи — словом, как в вопросе; время — самой поздней реплики блока (None — времени нет).
+        Первый блок — наш последний ответ: наши реплики подряд перед хвостом (`_tail`: реплики клиента после него сюда
+        не входят); автоприветствие (`auto`) ответом не считается, как и у хвоста; неизвестный отправитель пропускается.
+        Ответа не было — []. Это только ПРИЗНАКИ для правила класса «тема оплаты открыта» (`wa_agent_tools.pay_topic`):
+        в запрос модели они не идут."""
+        runs = []
+        for it in reversed(items):
+            if it.get("auto") or it["who"] not in ("мы", "клиент") or (not runs and it["who"] == "клиент"):
+                continue
+            if not runs or runs[-1][0] != it["who"]:
+                runs.append((it["who"], []))
+            runs[-1][1].append(it)
+        return [(who, K.mask("\n".join(it["text"] or ("[%s]" % it["word"] if it["word"] else "")
+                                       for it in reversed(block))[-TAIL_MAX:])[0],
+                 max((it.get("ts") or 0) for it in block) or None) for who, block in runs]
+
+    @staticmethod
+    def _before(items, blocks=None):
+        """Предыдущий обмен (K3-FIX шаг 3g) → (блок сообщений клиента ПЕРЕД нашим последним ответом, наш последний ответ):
+        тексты первых двух блоков `_blocks` (уже собранных — `blocks`). Ответа не было — ("", "")."""
+        texts = [text for _who, text, _ts in (ModelAdapter._blocks(items) if blocks is None else blocks)[:2]] + ["", ""]
+        return texts[1], texts[0]
+
     def _lessons(self):
         """Действующие уроки из базы агента (mode=ro). Выключено — []; не прочитано — [] и строка журнала:
         без уроков агент пишет как раньше, а не выдумывает правила."""
@@ -1358,12 +1411,14 @@ class ModelAdapter(wa_agent.Model):
         try:
             db = sqlite3.connect("file:%s?mode=ro" % self.lessons_db, uri=True, timeout=5)
             try:
-                return wa_agent.active_lessons(db)
+                rows = wa_agent.active_lessons(db)
             finally:
                 db.close()
         except Exception as e:                                       # noqa: BLE001
             self.log("уроки не прочитаны: %s — блока уроков нет" % type(e).__name__)
             return []
+        # вид (NIGHT0710-B2): правило из пояснения — только при WA_AGENT_HINTS; урок правкой — при WA_AGENT_LESSONS
+        return [r for r in rows if (self.hints if r[4] == wa_agent.KIND_HINT else self.text_lessons)]
 
     def _price(self, ask, today, ctx=(), ask_day=None):
         """Цена — только на вопрос о цене. Одна модель и обе даты в вопросе — одна дверь, как раньше; модели или дат
@@ -1478,8 +1533,9 @@ class ModelAdapter(wa_agent.Model):
         """Время суждения: заданное вызывающим — как есть; иначе часы адаптера в этот момент (WADRAFTFIX0310)."""
         return self.clock() if now is None else now
 
-    def build(self, number, upto_id, now=None):
-        """→ (system, user, сведения) без вызова модели (пробы и тесты меряют то, что уйдёт)."""
+    def build(self, number, upto_id, now=None, hint=None):
+        """→ (system, user, сведения) без вызова модели (пробы и тесты меряют то, что уйдёт). hint — (прежний
+        черновик, пояснение): версия по пояснению (NIGHT0710-B2), блок перед «КЛИЕНТ СЕЙЧАС»."""
         fixed, now = now, self._now(now)
         items, missing = self._history(number, upto_id)
         hist, _ = wa_history.model_view(items)
@@ -1536,9 +1592,14 @@ class ModelAdapter(wa_agent.Model):
         blocks.append("ИСТОРИЯ ПЕРЕПИСКИ (вся, по времени; «мы» — наша сторона):\n" +
                       (hist or "переписки раньше не было") +
                       ("\n⚠️ история неполная: " + "; ".join(missing) if missing else ""))
+        n_hint = 0
+        if hint:                                        # пояснение сотрудника — под маской (NIGHT0710-B2)
+            hint_text, n_hint = K.mask(hint_block(*hint))
+            blocks.append(hint_text)
         blocks.append("КЛИЕНТ СЕЙЧАС (на это и отвечай):\n" + question)
         user = "\n\n".join(blocks)
         system = self._system(SYSTEM_PROMPT if self.book is None else SYSTEM_PROMPT_BOOK, node_list, now)
+        turns = self._blocks(items)                     # история перед хвостом блоками — признаки темы оплаты (шаг 3g)
         info = {"history_items": len(items), "history_chars": len(hist), "history_cut": cut,
                 "masked": n_mask + n_mask2 + n_mask3, "lessons": [r[0] for r in lessons], "missing": missing, "price": price, "price_words": price_words,
                 "code_reasons": reasons, "nodes": {n: (nodes[n]["read"], nodes[n]["len"]) for n in K.NODES},
@@ -1547,7 +1608,15 @@ class ModelAdapter(wa_agent.Model):
                 "question": question, "q_lang": q_lang,           # карточка сотрудника (WACARDQ0410)
                 "conv": conv,                                     # язык разговора кодом (WALANGCONVB0510)
                 # время последнего входящего клиента: факт сверки, прочитанный раньше, — устарел (AGENTDEDUP0410)
-                "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None)}
+                "last_in": max((it["ts"] for it in items if it.get("who") == "клиент" and it.get("ts")), default=None),
+                # K3-FIX шаг 3g: признаки правила класса «тема оплаты открыта» (в запрос не идут) — история перед хвостом
+                # блоками со временем (`blocks`; `before` — её первый обмен) и время суждения: время последнего сообщения
+                # хвоста (возраст темы — свойство переписки, а не очереди черновиков), у хвоста времени нет — часы адаптера
+                "before": self._before(items, turns), "blocks": turns,
+                "judged": max([it.get("ts") or 0 for it in tail] + [0]) or now}
+        if hint:
+            info["masked"] += n_hint
+            info["hint"] = True
         return system, user, info
 
     def _days_check(self, text, info, words):
@@ -1591,10 +1660,13 @@ class ModelAdapter(wa_agent.Model):
                  % (said, lang, n, total))
         return K.merge_reasons(words, [K.LANG_CONV_WORDS])
 
-    def draft(self, number, upto_id):
-        if self.tools is not None:
+    def draft(self, number, upto_id, hint=None):
+        if self.tools is not None and hint is None:
             return self._draft_tools(number, upto_id)
-        system, user, info = self.build(number, upto_id)
+        if hint is None:
+            system, user, info = self.build(number, upto_id)
+        else:                                               # версия по пояснению (NIGHT0710-B2) — тот же путь
+            system, user, info = self.build(number, upto_id, hint=hint)
         raw, usage = self.call(system, user)
         self._spend(usage, "черновик:")
         if self._cut(usage, "модель:"):                     # обрыв пределом — черновика нет (WAOPUSHIGHC0510)
@@ -1630,6 +1702,21 @@ class ModelAdapter(wa_agent.Model):
         return dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"],
                      "claims": [list(c) for c in claims]}, **card_fields(info, got))
 
+    def redraft(self, number, upto_id, prev_text, hint):
+        """Версия по пояснению сотрудника (NIGHT0710-B2): тот же запрос, что у черновика, плюс блок «ПОЯСНЕНИЕ
+        СОТРУДНИКА» (прежний черновик и пояснение, под маской). Один вызов без сверки; разбор ответа и проверки кодом
+        (деньги, сутки, приезд, язык) — те же, что у черновика: путь `draft` один. Со сверкой — `redraft_checked`."""
+        return self.draft(number, upto_id, hint=(prev_text, hint))
+
+    def redraft_checked(self, number, upto_id, prev_text, hint):
+        """Версия по пояснению СО СВЕРКОЙ Т4а (Д2 INTEG0710, «PDF выключает обучение»): тот же путь сверки, что у
+        черновика модели (`_draft_tools`), с блоком «ПОЯСНЕНИЕ СОТРУДНИКА»; итог сверки — в `last["tools"]`, как у
+        черновика. Зовёт её только `wa_agent_attach._Probe` (WA_AGENT_ATTACH); без флага версия по пояснению — прежний
+        `redraft` одним вызовом. Сверки нет (WA_AGENT_TOOLS выкл) — прежний `redraft`: итога сверки нет."""
+        if self.tools is None:
+            return self.redraft(number, upto_id, prev_text, hint)
+        return self._draft_tools(number, upto_id, hint=(prev_text, hint))
+
     # ── черновик со сверкой (AGENTLOOPA0310, Т4а) ─────────────────────────────────────────
 
     def _tool_doors(self, number, upto_id):
@@ -1641,13 +1728,17 @@ class ModelAdapter(wa_agent.Model):
         def rental():
             if self.book is None:
                 return {"ok": False, "error": "брони выключены"}
-            rows, _bikes, _age, why = self.book.get(self.clock())
+            now = self.clock()
+            rows, _bikes, age, why = self.book.get(now)
             if rows is None:
                 return {"ok": False, "error": why or "снимок броней не прочитан"}
             digits = re.sub(r"\D", "", str(number or ""))
             key = digits[-B.KEY_DIGITS:] if len(digits) >= B.KEY_DIGITS else None
             hits = [r for r in rows if key and B.is_active(r) and key in B.phone_keys(r.get("contacts"))]
-            return {"ok": True, "rows": hits}
+            out = {"ok": True, "rows": hits}
+            if isinstance(age, (int, float)) and not isinstance(age, bool):
+                out["_taken_at"] = now - age      # K3-FIX3 (F2): время СНИМКА — факт аренды несёт его, а не время вызова
+            return out
 
         def rules():
             return self.knowledge.snap.get("business_rules")
@@ -1656,16 +1747,26 @@ class ModelAdapter(wa_agent.Model):
         doors.update({k: v for k, v in (self.tools or {}).items() if k in ("cash", "contract", "contract_pdf")})
         return doors
 
-    def _draft_tools(self, number, upto_id):
+    def _draft_tools(self, number, upto_id, hint=None):
         """Сверка: модель вызывает инструменты (≤ T.MAX_CALLS вызовов, ≤ T.MAX_SEC с), код принимает факты, считает
         суммы и судит денежные роли. Предел превышен — обычный черновик одним вызовом без фактов и причина «сверка не
-        завершена» первой. Новое входящее посреди сверки — черновика нет (служба повторит позже)."""
+        завершена» первой. Новое входящее посреди сверки — черновика нет (служба повторит позже). hint — (прежний
+        черновик, пояснение): версия по пояснению со сверкой (Д2 INTEG0710), блок тот же, что у `build`."""
         import wa_agent_tools as T
-        system, user, info = self.build(number, upto_id)
+        if hint is None:
+            system, user, info = self.build(number, upto_id)
+        else:                                               # версия по пояснению со сверкой (Д2): блок пояснения
+            system, user, info = self.build(number, upto_id, hint=hint)
+        handed = T.cash_said(info.get("question"))         # K3-FIX3 п.2: переданные наличные — СЛОВА клиента
+        asked = T.pay_asked(info.get("question"))          # K3-FIX шаг 3e: входящее клиента — об оплате (признак судье)
+        # K3-FIX шаг 3g: тема оплаты открыта? — хвост и история перед ним блоками, от нашего последнего ответа назад, до
+        # закрывающего события (признак правилу класса; блоков в сведениях нет — один обмен `before`, как в первой части)
+        topic = T.pay_topic(info.get("question"), *(info.get("before") or ("", "")), blocks=info.get("blocks"),
+                            now=info.get("judged"))
         with door_budget(T.MAX_SEC - T.FALLBACK_SEC):          # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
             out = T.run(self.call, system, user, self._tool_doors(number, upto_id), number=number, clock=self.clock,
                         fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
-                        spend=lambda u: self._spend(u, "сверка:"))
+                        spend=lambda u: self._spend(u, "сверка:"), handed=handed, asked=asked)
         jr = out["journal"]
         if out["state"] == T.ABORTED:
             for line in jr.lines():
@@ -1695,7 +1796,9 @@ class ModelAdapter(wa_agent.Model):
         # процент скидки за срок, названной дверью, — с опорой (WAPRICECTX0410): судья сверки процент судит без
         # исхода цены, поэтому названная дверью скидка снимается из текста до суда; прочее — как было
         said = K.without_known_discount(got["text"], info["price"]) if got else ""
-        words_t, figures = T.judge(said, info["price"], out["results"], jr,
+        # K3-FIX шаг 3i (вариант В): судье — и сам текст входящего (с шага 3j правилу важен сам факт текста, не слова)
+        words_t, figures = T.judge(said, info["price"], out["results"], jr, handed=handed, asked=asked,
+                                   incoming=info.get("question"),
                                    since=info.get("last_in"))
         for line in jr.lines():
             self.log(line)
@@ -1707,12 +1810,21 @@ class ModelAdapter(wa_agent.Model):
         words = [r["words"] for r in info["code_reasons"]]
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
-        words = K.merge_reasons(words, got["handoff"])
+        # K3-FIX шаг 3g (правило класса): тема оплаты открыта, а оплата кодом не подтверждена (принятые факты ЭТОЙ сверки;
+        # у незавершённой их нет) — причина кода при любом тексте ответа. Она встаёт к причинам кода ДО причин модели
+        # (пересказ модели об оплате отпадает как повтор); оплату уже назвал код по входящему — второй такой нет
+        why_t, rule = T.topic_reason(topic, jr.facts)
+        rule = K.merge_reasons(words, rule)[len(words):]
+        words = K.merge_reasons(words + rule, got["handoff"])
         words = self._days_check(got["text"], info, words)      # сутки у дат (WADAYS0410)
         words = self._arrival_check(got["text"], info, words)   # срок и приезд без опоры (WATIMECLAIMB0510)
         words = self._lang_check(got["text"], info, words)      # язык ответа против языка разговора (WALANGCONVB0510)
-        for w in reversed(words_t):                             # причины кода о деньгах — вперёд
+        for w in reversed(words_t + rule):                      # причины кода о деньгах — вперёд
             words = K.reason_first(words, w)
+        if why_t != T.PT_NONE:
+            self.log("правило класса: %s; причина кода %s" % (
+                why_t, "добавлена" if rule else "не добавлена (оплату уже назвал код по входящему)"
+                if why_t in T.PT_OPEN else "не нужна"))
         for w in reversed(reasons):                             # «сверка не завершена» — самой первой
             words = K.reason_first(words, w)
         self.log("модель: черновик %d симв. со сверкой (%s, вызовов %d, %.1f с), причин %d"

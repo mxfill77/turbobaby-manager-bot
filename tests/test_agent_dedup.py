@@ -367,7 +367,9 @@ def c_slow_final_after_deadline(T, M):
 
 
 def c_contract_slow_rental_not_read(T, M):
-    """Дверь договоров шла 40 с с T+55 — аренду код сам уже не читает (T+95 после дедлайна)."""
+    """Дверь договоров шла 40 с с T+55. K3-FIX3 п.1: срок аренды — фильтр поиска договора, поэтому аренду код читает
+    ДО двери (T+55, в пределах бюджета); после дедлайна вызовов 0, ответ двери после дедлайна черновика не даёт.
+    Без времени аренду код сам не читает (`bind_ctx`, may_call ложно) — дверь аренды не зовётся."""
     clk, ev = Clock(), []
     model = Model(clk, ev, [{"tool": "contract", "args": {"phone": NUM_NINA}}, final("Ок")], slow=(55.0,))
     a = adapter(M, model, clk, {"contract": slow_door(clk, ev, "договор", 40.0, S.snap("one_complete"))},
@@ -384,10 +386,13 @@ def c_contract_slow_rental_not_read(T, M):
         d["rental"] = rental
         return d
     a._tool_doors = doors
-    a.draft(NUM_NINA, 5)
+    out = a.draft(NUM_NINA, 5)
     assert after(ev, a.last["tools"]["deadline"]) == [], ev
-    r = a.last["tools"]["results"][0]
-    assert r["outcome"] != T.FACT, r
+    assert [e[0] for e in ev] == ["модель", "аренда", "договор"], ev
+    assert out is None and a.last["tools"]["state"] == T.OVER, out
+    late = []
+    r = T.bind_ctx(NUM_NINA, {"rental": lambda **kw: late.append(1)}, [], clk, may_call=lambda: False)["rental"]()
+    assert r["outcome"] == T.TIMEOUT and late == [], (r, late)
 
 
 def c_fallback_within_deadline(T, M):

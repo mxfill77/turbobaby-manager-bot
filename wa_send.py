@@ -41,9 +41,15 @@ WA_SEND, ключ, окно 24 ч, три исхода. Пустой эмодз�
 ═══════════════════════════════════════════════════════════════════════════════════════════
 
 Свободным текстом клиенту можно отвечать 24 часа с ЕГО последнего сообщения. Вне окна Meta
-принимает только утверждённые шаблоны — а их у TurboBaby нет и заводить их эта дверь не будет:
-рассылки прямо запрещены бизнес-правилами. Поэтому вне окна дверь не «пробует и смотрит, что
-скажет сервер», а отказывает САМА, до сети.
+принимает только утверждённые шаблоны. Текст, реакция и медиа вне окна НЕ уходят: дверь не «пробует
+и смотрит, что скажет сервер», а отказывает САМА, до сети.
+
+ШАБЛОНЫ (NIGHT0710-B3g, решение владельца 02.10.2026 по WATEMPLATES0210). `send_template` — ровно три
+названных шаблона (`TEMPLATE_PARAMS`), языки ru/en, только по нажатию человека на карточке — рассылок нет.
+Своя ручка `WA_AGENT_TEMPLATES` (по умолчанию выключена) поверх WA_SEND. Окна шаблону не нужно (его судит
+вызывающий). Одобрение у Meta — по ОТВЕТУ ПРОВАЙДЕРА: свежий `GET /v1/configs/templates` тем же ключом и
+тем же `_open`; три исхода — одобрен (approved и UTILITY) · не одобрен (словами провайдера) · неизвестно
+(список не прочитан). Шлём только одобренный; отправка — тот же `_send_loop`, те же три исхода.
 
 ТРИ ИСХОДА У ОКНА, а не два (замок против ложного зелёного — тот же, что у `write_fact` и О3):
 
@@ -733,3 +739,258 @@ def send_media(to, media, now=None, db_path=None, env=None, transport=None, uplo
     res["uploads"] = uploads
     res["dropped_caption"] = bool(caption.strip()) and kind not in CAPTION_KINDS
     return res
+
+
+# ═══ шаблоны Meta (NIGHT0710-B3g) ════════════════════════════════════════════════════════════
+# Решение владельца 02.10.2026: ровно три шаблона UTILITY (WATEMPLATES0210 §1), языки поданы кодами
+# «ru» и «en» — Meta сличает код точно, «en_US» не тот же шаблон. Тексты — дословно поданные; число
+# переменных {{N}} — по ним. Вне списка дверь не шлёт ничего: имя, язык и параметры проверяются ДО сети.
+
+TEMPLATES_FLAG = "WA_AGENT_TEMPLATES"
+TEMPLATES_PATH = "/v1/configs/templates"
+TEMPLATES_LIMIT = 1000                         # список целиком одним GET; меньше, чем total, — «неизвестно»
+TEMPLATE_LANGS = ("ru", "en")
+TEMPLATE_PARAMS = {"rental_end_reminder": 2, "payment_reminder": 1, "reply_request": 1}
+TEMPLATE_TEXTS = {
+    ("rental_end_reminder", "ru"): "Здравствуйте! Это TurboBaby. Аренда {{1}} заканчивается {{2}}. Подскажите, "
+                                   "пожалуйста: будете продлевать или вернёте байк? Просто ответьте на это сообщение.",
+    ("rental_end_reminder", "en"): "Hello, this is TurboBaby! Your {{1}} rental ends on {{2}}. Would you like to extend "
+                                   "it or return the bike? Just reply to this message.",
+    ("payment_reminder", "ru"): "Здравствуйте! Это TurboBaby. Напоминаем об оплате аренды {{1}}. Ответьте, "
+                                "пожалуйста, на это сообщение — пришлём сумму и способ оплаты.",
+    ("payment_reminder", "en"): "Hello, this is TurboBaby! A reminder about the payment for your {{1}} rental. Please "
+                                "reply to this message and we will send you the amount and payment options.",
+    ("reply_request", "ru"): "Здравствуйте! Это TurboBaby. У нас вопрос по аренде {{1}}. Ответьте, пожалуйста, на "
+                             "это сообщение, когда будет удобно.",
+    ("reply_request", "en"): "Hello, this is TurboBaby! We have a question about your {{1}} rental. Please reply to "
+                             "this message whenever it is convenient.",
+}
+TEMPLATE_PARAM_MAX = 60                        # наш потолок длины параметра (байк, дата), не предел Meta
+# переводы строки и табуляция для параметра: всё, что `str.splitlines()` зовёт границей строки, и \t
+TEMPLATE_PARAM_BREAKS = "\n\r\t\x0b\x0c\x1c\x1d\x1e\x85" + chr(0x2028) + chr(0x2029)   # U+2028, U+2029
+TPL_APPROVED, TPL_NOT_APPROVED, TPL_UNKNOWN = "approved", "not_approved", "unknown"
+WINDOW_NOT_CHECKED = "not_checked"             # у шаблона дверь окно не меряет — это не «закрыто» и не «открыто»
+
+
+def templates_enabled(env=None) -> bool:
+    """Ручка шаблонов. Всё, кроме явного «1»/«true»/«yes»/«on», — выключено."""
+    env = env if env is not None else os.environ
+    return str(env.get(TEMPLATES_FLAG) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def template_check(name, lang, params) -> str:
+    """Чистая проверка шаблона ДО сети → '' (годно) либо слова отказа. Имя — точное (регистр и пробелы
+    не прощаются), язык — ru|en, параметров ровно столько, сколько переменных у шаблона, каждый — непустая
+    строка без перевода строки (любого: \\n \\r \\v \\f U+0085 U+2028 U+2029 …), табуляции и пяти пробелов подряд (так
+    их не примет Meta). Имя и язык не строкой — отказ словами, а не исключение (дверь НИКОГДА не бросает)."""
+    if not isinstance(name, str) or name not in TEMPLATE_PARAMS:
+        return "шаблон «%s» вне разрешённых (%s)" % (str(name)[:40], ", ".join(sorted(TEMPLATE_PARAMS)))
+    if not isinstance(lang, str) or lang not in TEMPLATE_LANGS:
+        return "язык «%s»: шаблоны поданы только ru и en" % str(lang)[:10]
+    if not isinstance(params, (list, tuple)):
+        return "параметры шаблона не списком"
+    want = TEMPLATE_PARAMS[name]
+    if len(params) != want:
+        return "у шаблона %s переменных %d, передано %d" % (name, want, len(params))
+    for i, p in enumerate(params, 1):
+        if not isinstance(p, str) or not p.strip():
+            return "переменная {{%d}} пустая" % i
+        if any(c in p for c in TEMPLATE_PARAM_BREAKS) or "     " in p:
+            return "переменная {{%d}} с переводом строки, табуляцией или пятью пробелами — Meta не примет" % i
+        if len(p) > TEMPLATE_PARAM_MAX:
+            return "переменная {{%d}} длиннее %d симв." % (i, TEMPLATE_PARAM_MAX)
+    return ""
+
+
+def template_text(name, lang, params):
+    """Текст, который увидит клиент: поданный текст с подставленными переменными. Нет шаблона — None."""
+    text = TEMPLATE_TEXTS.get((name, lang))
+    if text is None:
+        return None
+    for i, p in enumerate(params or (), 1):
+        text = text.replace("{{%d}}" % i, str(p))
+    return text
+
+
+def build_template(to, name, lang, params) -> dict:
+    """Сообщение-шаблон Cloud API: имя, код языка, переменные тела по порядку."""
+    return {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": str(to),
+        "type": "template",
+        "template": {"name": name, "language": {"code": lang},
+                     "components": [{"type": "body",
+                                     "parameters": [{"type": "text", "text": p} for p in params]}]},
+    }
+
+
+def _tpl_said(body_text, with_msg=True):
+    """Слова провайдера об отказе в обеих формах — Graph (`error.message`, `code`, `error_data.details`) и
+    360dialog (`meta.developer_message`). Ничего не сказал — ''. `_api_error` текста не трогаем: его голдены.
+    with_msg=False — только то, чего `_api_error` не берёт: код Meta, подробности, слова 360dialog."""
+    try:
+        data = json.loads(str(body_text or ""))
+    except (TypeError, ValueError):
+        return ": ответ не разобран" if (with_msg and str(body_text or "").strip()) else ""
+    if not isinstance(data, dict):
+        return ": ответ не разобран" if with_msg else ""
+    err = data.get("error") if isinstance(data.get("error"), dict) else {}
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    parts = []
+    msg = err.get("message") or err.get("title")
+    if msg and with_msg:
+        parts.append(str(msg)[:150])
+    if meta.get("developer_message") and not (with_msg and msg):
+        parts.append(str(meta.get("developer_message"))[:150])
+    if err.get("code"):
+        parts.append("код Meta %s" % str(err.get("code"))[:12])
+    details = (err.get("error_data") or {}).get("details") if isinstance(err.get("error_data"), dict) else None
+    if details:
+        parts.append(str(details)[:150])
+    return (": " + " · ".join(parts)) if parts else ""
+
+
+def template_approval(body_text, name, lang) -> tuple:
+    """Ответ списка шаблонов провайдера → (исход, слова). Исходов ТРИ:
+      APPROVED      пара «имя, язык» найдена ровно одна, статус approved (регистр не важен), категория UTILITY
+      NOT_APPROVED  провайдер сказал иное: статус не approved (pending, rejected + причина, paused …), категория
+                    не UTILITY (Meta перевела в MARKETING), пары нет в ПОЛНОМ списке
+      UNKNOWN       не прочитали: не JSON, нет списка, список неполный, пара дважды, статус не назван
+    Шлём ТОЛЬКО на APPROVED: «не прочитали» не выдаётся ни за одобрение, ни за отказ Meta."""
+    try:
+        data = json.loads(str(body_text or ""))
+    except (TypeError, ValueError):
+        return TPL_UNKNOWN, "ответ списка шаблонов не JSON — одобрение не проверено"
+    if not isinstance(data, dict):
+        return TPL_UNKNOWN, "ответ списка шаблонов не объект — одобрение не проверено"
+    items = data.get("waba_templates")
+    if items is None:
+        items = data.get("data")
+    if not isinstance(items, list):
+        return TPL_UNKNOWN, "в ответе провайдера нет списка шаблонов — одобрение не проверено"
+    total = data.get("total")
+    complete = isinstance(total, int) and not isinstance(total, bool) and len(items) >= total
+    if isinstance(total, int) and not isinstance(total, bool) and len(items) < total:
+        return TPL_UNKNOWN, "список шаблонов неполный (%d из %d) — одобрение не проверено" % (len(items), total)
+    hits = [t for t in items if isinstance(t, dict) and t.get("name") == name and t.get("language") == lang]
+    if not hits:
+        if complete:
+            return TPL_NOT_APPROVED, "шаблона %s (%s) у провайдера нет" % (name, lang)
+        return TPL_UNKNOWN, "шаблона %s (%s) в ответе нет, а полнота списка не названа — одобрение не проверено" \
+            % (name, lang)
+    if len(hits) > 1:
+        return TPL_UNKNOWN, "шаблон %s (%s) в списке %d раз — неоднозначно, одобрение не проверено" % (
+            name, lang, len(hits))
+    hit = hits[0]
+    status = str(hit.get("status") or "").strip()
+    category = str(hit.get("category") or "").strip()
+    if not status:
+        return TPL_UNKNOWN, "статус шаблона %s (%s) провайдер не назвал — одобрение не проверено" % (name, lang)
+    if status.lower() != "approved":
+        why = hit.get("rejected_reason")
+        return TPL_NOT_APPROVED, "Meta не одобрила шаблон %s (%s): статус %s%s" % (
+            name, lang, status[:30], (", причина: %s" % str(why)[:120]) if why and str(why).upper() != "NONE" else "")
+    if not category:
+        # категории в ответе нет — это «не прочитали», а не факт Meta (замок трёх исходов)
+        return TPL_UNKNOWN, "категорию шаблона %s (%s) провайдер не назвал — одобрение не проверено" % (name, lang)
+    if category.upper() != "UTILITY":
+        return TPL_NOT_APPROVED, "шаблон %s (%s) одобрен, но Meta сменила категорию на %s — шлём только UTILITY" % (
+            name, lang, category[:30])
+    return TPL_APPROVED, "одобрен Meta (approved, UTILITY)"
+
+
+def _get(url, key, timeout):
+    """Один GET. → (status, body_text, err). Сеть — только через `_open`; тесты подменяют этот шов."""
+    req = urllib.request.Request(url, method="GET")
+    req.add_header(KEY_HEADER, key)
+    return _open(req, timeout)
+
+
+def template_status(name, lang, key, get=None, deadline=None, clock=time.monotonic) -> tuple:
+    """Одобрение пары «имя, язык» по ответу провайдера ПРЯМО СЕЙЧАС (без кэша) → (исход, слова)."""
+    left = (deadline - clock()) if deadline is not None else LEG_TIMEOUT_SEC
+    if left <= 0:
+        return TPL_UNKNOWN, "бюджет исчерпан до проверки одобрения — одобрение не проверено"
+    try:
+        status, body, err = (get or _get)("%s%s?limit=%d" % (API_BASE, TEMPLATES_PATH, TEMPLATES_LIMIT), key,
+                                          min(LEG_TIMEOUT_SEC, left))
+    except Exception as e:                                            # noqa: BLE001
+        status, body, err = None, "", type(e).__name__
+    if err:
+        return TPL_UNKNOWN, "список шаблонов не прочитан (%s) — одобрение не проверено" % str(err)[:60]
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        return TPL_UNKNOWN, "код ответа списка шаблонов не прочитан — одобрение не проверено"
+    if not 200 <= code < 300:
+        return TPL_UNKNOWN, "провайдер ответил %d на список шаблонов%s — одобрение не проверено" % (
+            code, _tpl_said(body))
+    return template_approval(body, name, lang)
+
+
+def send_template(to, name, lang, params, now=None, env=None, transport=None, get=None,
+                  sleep=time.sleep, budget=SEND_BUDGET_SEC, clock=time.monotonic):
+    """Отправить клиенту ОДИН из трёх шаблонов. Ответ — словарь `send_text`, НИКОГДА не бросает.
+    Порядок: номер → WA_SEND → WA_AGENT_TEMPLATES → имя, язык, параметры → ключ → одобрение у провайдера
+    (GET) → отправка (POST, `_send_loop`). Всё до POST — `not_sent`, к /messages не обращались.
+    Сверх полей `send_text`: template, lang, approval (approved | not_approved | unknown), approval_words,
+    text — что увидит клиент. Окно 24 ч здесь НЕ меряется (`window` = not_checked)."""
+    env = env if env is not None else os.environ
+    secret = {"key": ""}
+
+    def hide(words):
+        """Значение ключа в словах не бывает НИКОГДА — даже если провайдер процитировал его в ответе."""
+        words = str(words or "")
+        return words.replace(secret["key"], "***") if len(secret["key"]) >= 8 else words
+
+    def out(outcome, reason, approval=None, approval_words="", **kw):
+        res = _out(outcome, hide(reason), window=WINDOW_NOT_CHECKED, **kw)
+        res.update({"template": name, "lang": lang, "approval": approval, "approval_words": hide(approval_words),
+                    "text": template_text(name, lang, params) if not template_check(name, lang, params) else None})
+        return res
+
+    if not str(to or "").strip():
+        return out(NOT_SENT, "номер получателя не назван")
+    if not send_enabled(env):
+        return out(NOT_SENT, "дверь отправки выключена (WA_SEND не равен 1) — шаблон не отправлен")
+    if not templates_enabled(env):
+        return out(NOT_SENT, "шаблоны выключены (%s не равен 1) — не отправлено" % TEMPLATES_FLAG)
+    bad = template_check(name, lang, params)
+    if bad:
+        return out(NOT_SENT, bad + " — не отправлено")
+    key, _name, key_why = api_key(env)
+    if not key:
+        return out(NOT_SENT, key_why + " — не отправлено")
+    secret["key"] = str(key)
+    deadline = clock() + float(budget)
+    approval, words = template_status(name, lang, key, get=get, deadline=deadline, clock=clock)
+    if approval != TPL_APPROVED:
+        return out(NOT_SENT, words + " — не отправлено", approval, words)
+    if deadline - clock() <= 0:
+        # проверка одобрения съела общий бюджет: к /messages НЕ обращались — это not_sent, а не «неизвестно»
+        return out(NOT_SENT, "бюджет отправки исчерпан проверкой одобрения — к /messages не обращались, не отправлено",
+                   approval, words)
+    post = transport or _post
+    seen = {}
+
+    def post_seen(url, payload, k, timeout):
+        status, body, err = post(url, payload, k, timeout)
+        seen["status"], seen["body"] = status, body
+        return status, body, err
+
+    res = _send_loop(post_seen, build_template(to, name, lang, list(params)), key, WINDOW_NOT_CHECKED,
+                     deadline, sleep, clock)
+    if res["attempts"] == 0 and res["outcome"] == UNKNOWN:
+        # ни одного POST не состоялось (бюджет кончился до первой попытки) — клиенту заведомо ничего не ушло
+        res = dict(res, outcome=NOT_SENT, reason=res["reason"] + " — POST не было, не отправлено")
+    reason = res["reason"]
+    try:
+        code = int(seen.get("status"))
+    except (TypeError, ValueError):
+        code = 0
+    if res["outcome"] == NOT_SENT and 400 <= code < 500 and code != 429:
+        extra = _tpl_said(seen.get("body"), with_msg=False)    # код Meta и подробности — их `_api_error` не берёт
+        if extra:
+            reason = reason + " (" + extra[2:] + ")"
+    return out(res["outcome"], reason, approval, words, wamid=res["wamid"], attempts=res["attempts"])

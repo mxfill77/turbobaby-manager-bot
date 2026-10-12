@@ -20,6 +20,9 @@ if os.environ.get("WA_AGENT_SRC"):
 import wa_agent as A  # noqa: E402
 import wa_agent_attach as X  # noqa: E402
 
+sys.path.append(HERE)
+import k3_pdf_fixture  # noqa: E402  (K3-FIX F4: скелет PDF сверяется перед дверью — фикстура живого формата)
+
 QSCHEMA = """CREATE TABLE wa_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_queued INTEGER NOT NULL,
  channel TEXT NOT NULL DEFAULT 'wa', from_number TEXT, name TEXT, msg_type TEXT, text TEXT, media_id TEXT,
  ts_msg INTEGER, echo INTEGER NOT NULL DEFAULT 0, history INTEGER NOT NULL DEFAULT 0,
@@ -27,7 +30,7 @@ QSCHEMA = """CREATE TABLE wa_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, ts_que
 
 NUM = "66812345678"
 T0 = 1_790_000_000
-PDF = b"%PDF-1.4 signed contract bytes"
+PDF = k3_pdf_fixture.classic(b"signed contract bytes")      # было b"%PDF-1.4 signed contract bytes" (не PDF)
 SHA = hashlib.sha256(PDF).hexdigest()
 TEXT = "Здравствуйте, договор ниже"
 
@@ -225,7 +228,8 @@ def test_both_parts_sent():
     w.put(T0 + 210, "echo", wamid="wamid.P1")
     w.core.tick(T0 + 220)
     assert w.q("SELECT paused FROM clients WHERE number=?", (NUM,))[0][0] == 0
-    assert w.tg.done[-1][1].startswith("текст: ушёл · PDF: ушёл — Даня")
+    # K3-FIX N1: на карточке у ушедших частей — их wamid (нажавшему — прежние слова)
+    assert w.tg.done[-1][1].startswith("текст: ушёл (wamid …wamid.T1) · PDF: ушёл (wamid …wamid.P1) — Даня")
 
 
 def test_pdf_after_text_order():
@@ -263,7 +267,8 @@ def test_text_not_sent_pdf_door_not_called():
     did = w.draft()
     out = w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
     assert w.door.media == [] and w.fetch.calls == []
-    assert w.part(did)[0] == A.NOT_SENT and out["words"].startswith("текст: не ушёл · PDF: не ушёл: текст не ушёл")
+    # K3-FIX N1: «не ушёл: причина» — у текста причина двери (подделка двери отвечает «ok»)
+    assert w.part(did)[0] == A.NOT_SENT and out["words"].startswith("текст: не ушёл: ok · PDF: не ушёл: текст не ушёл")
     nope = w.core.press(did, 1, X.ACT_PDF, "Даня", T0 + 300)
     assert not nope["ok"] and "дослать нельзя" in nope["words"] and w.door.media == []
 
@@ -272,7 +277,9 @@ def test_text_unsure_pdf_not_sent():
     w = World(door=FakeDoor(text="unknown"))
     did = w.draft()
     out = w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
-    assert w.door.media == [] and out["words"].startswith("текст: неизвестно · PDF: не ушёл: текст: неизвестно")
+    # K3-FIX N1: неизвестный исход — «исход неизвестен — не повторять, проверить переписку» (слово N2), не «неизвестно»
+    assert w.door.media == [] and out["words"].startswith("текст: %s · PDF: не ушёл: текст: неизвестно"
+                                                         % X.W_UNKNOWN_NO_REPEAT)
 
 
 def test_pdf_refused_then_resend():
@@ -322,7 +329,7 @@ def test_foreign_status_stays_unknown():
     w = World(door=door)
     did = w.draft()
     out = w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
-    assert out["words"] == "текст: ушёл · PDF: неизвестно"
+    assert out["words"] == "текст: ушёл · PDF: " + X.W_UNKNOWN_NO_REPEAT          # K3-FIX N1: было «PDF: неизвестно»
     w.put(T0 + 205, "status", wamid="wamid.T1", word="delivered")       # статус ТЕКСТА — не наша часть
     w.put(T0 + 206, "status", wamid="wamid.X9", word="delivered")       # неизвестный wamid после попытки
     got = w.core.press(did, 1, X.ACT_PDF, "Пым", T0 + 300)
@@ -475,7 +482,7 @@ def test_restart_mid_pdf_unknown():
     assert w.part(did)[0] == A.UNSURE and "рестарт посреди отправки PDF" in w.part(did)[4]
     core2.tick(T0 + 400)
     assert w.door.media == [] and w.door.sends == [], "рестарт не повторяет ни одну часть"
-    assert core2.parts(did)["words"] == "текст: ушёл · PDF: неизвестно"
+    assert core2.parts(did)["words"] == "текст: ушёл · PDF: " + X.W_UNKNOWN_NO_REPEAT   # K3-FIX N1: было «неизвестно»
 
 
 def test_restart_mid_text_pdf_not_called():
@@ -530,7 +537,8 @@ def test_text_only_when_no_attachment():
     w = World(tools=tools_ok(contract=res("contract", "empty", reason="подписанного нет")))
     did = w.draft()
     out = w.core.press(did, 1, A.ACT_SEND, "Даня", T0 + 200)
-    assert out["ok"] and out["words"] == A.SENT and w.door.media == [] and w.part(did) is None
+    # K3-FIX N1: нажавшему — слово «текст: ушёл», а не код ядра «sent»
+    assert out["ok"] and out["words"] == "текст: ушёл" and w.door.media == [] and w.part(did) is None
 
 
 # ── 5. журнал ────────────────────────────────────────────────────────────────────────────
@@ -586,7 +594,8 @@ def test_core_untouched():
     tree = ast.parse(open(os.path.join(ROOT, "wa_agent_attach.py"), encoding="utf-8").read())
     names = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))
              for a in (n.names if isinstance(n, ast.Import) else [ast.alias(n.module or "")])}
-    assert names == {"base64", "hashlib", "re", "wa_agent", "wa_agent_tools"}, names     # tools — только sift (T4B3)
+    # tools — только sift (T4B3); zlib (K3-FIX F4) — stdlib, распаковка /FlateDecode при проверке скелета PDF, не зависимость
+    assert names == {"base64", "hashlib", "re", "zlib", "wa_agent", "wa_agent_tools"}, names
 
 
 def main():

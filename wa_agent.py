@@ -71,6 +71,16 @@ superseded и пауза, у фото/видео/документа — без �
 WA_AGENT_LESSON_ADMINS, по умолчанию владелец); остальным — отказ словами. Откат по номеру убирает
 урок из промпта. Хранилище своё — с уроками и правилами Splinter не смешивается.
 
+ПОЯСНЕНИЕ → ПРАВИЛО (NIGHT0710-B2, выключатель службы WA_AGENT_HINTS, по умолчанию выключен — «Исправить» и
+«Отправить» как раньше). Включён — «Исправить» зовёт пояснение текстом (`hint`, очередь `hints`); версию +1 по
+пояснению делает такт (`make_hint_versions`: модель, тот же условный UPDATE, что у правки текстом). «Отправить»
+на такой версии (нажатие выиграно и не снято) пишет в ту же таблицу `lessons` строку вида `hint`: нажал владелец —
+по id, строго `LESSON_OWNER_IDS` (`owner`), список WA_AGENT_LESSON_ADMINS не действует — действующее правило с
+номером, автором пояснения, временем, источником (черновик, версии) и откатом; нажал сотрудник — кандидат. Правка
+текстом и версия модели правила не рождают. Суточный список владельцу — одно сообщение (`hint_list_due`): новые
+правила с «отменить», кандидаты с «правило»/«отклонить»; решает только владелец. Правила идут в промпт тем же
+путём, что уроки (`active_lessons`), со следующего черновика.
+
 НАПОМИНАНИЕ ПРИТИХШЕМУ (WAFOLLOWUP0210, выключатель службы WA_AGENT_FOLLOWUP, по умолчанию выключен). Включён —
 раз в FOLLOW_EVERY такт ищет клиентов, у которых последнее слово НАШЕ (ушедшее через API или эхо с телефона,
 автоприветствие не в счёт) и после него FOLLOW_QUIET тишины; окно 24 ч открыто (правило `wa_send.window_state`,
@@ -92,7 +102,17 @@ gave_up. Показанный ключ второй строки не даёт �
 `agent_line` у Telegram; рук нет — показа нет. Строка показа клиенту не уходит, паузы не ставит и текстом из темы
 не считается: её пишет бот, а из темы наружу идёт только сообщение человека (`wa_agent_tg.Tg.on_topic`).
 
-ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа (это
+ШАБЛОН ПОСЛЕ 24 ЧАСОВ (NIGHT0710-B3g, выключатель службы WA_AGENT_TEMPLATES, по умолчанию выключен — всё как раньше).
+Включён — ядро спрашивает окно у ДВЕРИ (`Door.window`, своего правила окна нет). «✅ Отправить» при измеренно закрытом
+окне отказывает ДО захвата словами (черновик ждёт), карточка получает «📨 Отправить шаблоном» (`template_offer`:
+reply_request, язык текста версии ru|en, {{1}} — «байка»/«bike»). Нажатие — `press_template`: таблица `tpl_out`,
+`sending` ДО двери, один шаблон на черновик и на последнее входящее клиента, повтора нет (not_sent — можно ещё
+раз), ушедший — в `outbox`. Одобрение у Meta судит дверь по ответу провайдера; любой отказ — словами на карточке.
+Клиент ответил — окно открыто, черновик пересобирается и уходит обычной кнопкой. Исход двери в `tpl_out` и строка
+`outbox` — ОДНОЙ транзакцией (INTEG0710 Д5, как исход части у Б3в): обрыв посреди не оставит «ушёл» без outbox, разовый
+сбой базы чинит вторая атомарная попытка, записи без транзакции нет.
+
+ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа само (это
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
 """
 
@@ -156,6 +176,18 @@ LESSON_OWNER_IDS = frozenset({504608015, 6879003264, 5466425480})
 LESSON_REASON_MAX = 500                       # причина урока, символов
 LESSON_OFF_WORDS = "уроки выключены (WA_AGENT_LESSONS)"
 
+# ── пояснение → правило (NIGHT0710-B2) ────────────────────────────────────────────────────
+LESSON_REJECTED = "rejected"                  # кандидат-пояснение отклонён владельцем: в промпт не идёт
+KIND_HINT = "hint"                            # lessons.kind: правило из пояснения; NULL — урок правкой текстом
+HINT_WAIT, HINT_DONE, HINT_FAIL = "wait", "done", "fail"
+HINT_MAX = 600                                # пояснение, символов = LESSON_ITEM_MAX адаптера (A9a/A9f: хранится,
+                                              # показывается на карточке и идёт в правило ОДИН и тот же текст)
+HINTS_PER_TICK = 1                            # версий по пояснению за такт: каждая — платный вызов, такт держит опрос
+HINT_LIST_HOUR = 21                           # суточный список владельцу — после этого часа по Пхукету
+HINT_LIST_KEY, HINT_LIST_NEXT = "hint_list_day", "hint_list_next"   # meta: день ушедшего списка · повтор не раньше
+HINT_LIST_RETRY = 300                         # Telegram не принял список — повтор не раньше, с
+HINT_OFF_WORDS = "пояснения выключены (WA_AGENT_HINTS)"
+
 # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────────
 KIND_FOLLOW = "followup"                      # drafts.kind: черновик-напоминание; NULL — ответ на сообщение
 FOLLOW_QUIET = 15 * 60                        # тишина клиента после нашего последнего сообщения
@@ -168,10 +200,41 @@ FOLLOW_STALE_WORDS = "устарело: клиент написал сам (ст
 
 # ── строка показа ушедшего агентом (WAMIRROR0410) ────────────────────────────────────────
 PART_TEXT, PART_PDF = "text", "pdf"
+PART_TPL = "tpl"                              # шаблон после 24 часов (NIGHT0710-B3g): эха у API-сообщения нет — строка здесь
 SHOW_WAIT, SHOW_SENDING, SHOW_SHOWN, SHOW_GAVE_UP = "wait", "sending", "shown", "gave_up"
 SHOW_MAX = 12                                 # попыток строки показа не больше (≈ 40 мин по CARD_RETRY), дальше — журнал
 SHOW_SINCE = "show_since"                     # meta: показ ушедшего — с первого старта этого кода, прошлое — нет
 W_SHOW_UNSURE = "исход неизвестен, проверьте телефон"
+
+# ── шаблон после 24 часов (NIGHT0710-B3g, выключатель службы WA_AGENT_TEMPLATES, по умолчанию выключен) ──
+# Окно 24 ч закрыто — свободный текст Meta не примет. «✅ Отправить» тогда отказывает ДО захвата (черновик ждёт), а
+# карточка предлагает «📨 Отправить шаблоном» reply_request на языке клиента. Шаблон — только нажатием человека, один на
+# черновик и на последнее сообщение клиента; одобрение у Meta судит дверь по ответу провайдера. Клиент ответил —
+# окно открыто, черновик пересобирается и уходит обычной кнопкой.
+VIA_TEMPLATE = "шаблон"
+TPL_REPLY = "reply_request"
+TPL_WORD = {"ru": "байка", "en": "bike"}          # {{1}} «аренда …»: общее слово — модель из аренды по номеру ненадёжна
+TPL_OFF_WORDS = "шаблоны выключены (WA_AGENT_TEMPLATES) — ничего не отправлено"
+W_TPL_CLOSED = "окно 24 ч закрыто%s — обычной кнопкой клиенту не уйдёт"
+# исход двери известен, а в базу не лёг за две попытки (INTEG0710 Д5): tpl_out остаётся sending, старт — «неизвестно»
+W_TPL_UNSAVED = "в базу агента не записано (%s) — второй раз не шлём, после рестарта службы: «исход неизвестен»"
+_TPL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tpl_out (
+    draft_id    INTEGER PRIMARY KEY,                  -- шаблон к черновику: не больше одного ушедшего
+    number      TEXT    NOT NULL,
+    upto_id     INTEGER NOT NULL,                     -- последнее входящее клиента: второго шаблона до нового нет
+    ver         INTEGER NOT NULL,
+    name        TEXT    NOT NULL,
+    lang        TEXT    NOT NULL,
+    state       TEXT    NOT NULL,                     -- sending ДО двери, потом sent | not_sent | unsure
+    reason      TEXT,
+    wamid       TEXT,
+    who         TEXT,
+    tries       INTEGER NOT NULL DEFAULT 1,           -- not_sent можно ещё раз: Meta одобрит — шаблон уйдёт
+    ts          REAL    NOT NULL,
+    body        TEXT                                  -- что увидел клиент (текст шаблона) — для строки показа
+);
+"""
 
 
 def follow_out(out):
@@ -199,10 +262,15 @@ def lesson_admins_of(raw):
 
 
 def active_lessons(db):
-    """Действующие уроки → [(номер, было, стало, причина)] по номеру. Одно правило для ядра и адаптера
-    модели: кандидат и откатанный в промпт не идут."""
-    return db.execute("SELECT id, was_text, now_text, reason FROM lessons WHERE state=? ORDER BY id",
-                      (LESSON_ACTIVE,)).fetchall()
+    """Действующие уроки → [(номер, было, стало, причина, вид, пояснение)] по номеру. Одно правило для ядра и
+    адаптера модели: кандидат, откатанный и отклонённый в промпт не идут. Вид NULL — урок правкой текстом; база
+    старше колонок вида (NIGHT0710-B2) — прежние четыре поля и вид NULL."""
+    try:
+        return db.execute("SELECT id, was_text, now_text, reason, kind, hint FROM lessons WHERE state=? ORDER BY id",
+                          (LESSON_ACTIVE,)).fetchall()
+    except sqlite3.OperationalError:
+        return [tuple(r) + (None, None) for r in db.execute(
+            "SELECT id, was_text, now_text, reason FROM lessons WHERE state=? ORDER BY id", (LESSON_ACTIVE,))]
 
 
 def greet_fps(raw):
@@ -310,6 +378,22 @@ CREATE TABLE IF NOT EXISTS lessons (
     rolled_by   TEXT,                                 -- откат: кто, когда
     rolled_at   REAL,
     UNIQUE (draft_id, ver_to)
+);
+CREATE TABLE IF NOT EXISTS hints (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,    -- номер пояснения (NIGHT0710-B2)
+    draft_id    INTEGER NOT NULL,
+    ver_from    INTEGER NOT NULL,                     -- версия, к которой пояснение
+    ver_to      INTEGER,                              -- версия, сделанная по нему; NULL — ещё нет
+    text        TEXT    NOT NULL,                     -- пояснение (в журнал не идёт)
+    prev_text   TEXT    NOT NULL,                     -- текст версии ver_from: «было» правила
+    author      TEXT    NOT NULL,                     -- кто пояснил: имя (id N)
+    author_id   INTEGER,
+    msg_id      INTEGER,                              -- сообщение пояснения в группе: ответ словами — на него
+    ts          REAL    NOT NULL,
+    state       TEXT    NOT NULL,                     -- wait → done | fail
+    reason      TEXT,                                 -- почему версии нет
+    done_at     REAL,
+    UNIQUE (draft_id, ver_from)
 );
 CREATE TABLE IF NOT EXISTS followups (
     number      TEXT    NOT NULL,
@@ -503,6 +587,11 @@ class Model:
         не дала ответа). Адаптера нет — None."""
         return None
 
+    def redraft(self, number, upto_id, prev_text, hint):
+        """Версия по пояснению сотрудника (NIGHT0710-B2) → тот же ответ, что у draft. Адаптера нет — None: версии
+        нет, пояснение отвечается словами."""
+        return None
+
 
 class AnswerLost(Exception):
     """Вызов Telegram ушёл, ответа нет (сеть, таймаут): сообщение могло лечь. Руки поднимают его там, где «не знаю»
@@ -541,6 +630,19 @@ class Telegram:
         Рук нет — ничего."""
         return None
 
+    def hint_note(self, hint_id, words):
+        """Пояснение без версии (NIGHT0710-B2): ответ словами на сообщение пояснения. Рук нет — ничего."""
+        return None
+
+    def hint_list(self, lesson_ids):
+        """Суточный список владельцу (NIGHT0710-B2) → [показанные номера] | None (не ушёл). Рук нет — None."""
+        return None
+
+    def card_tpl(self, draft_id, card_id, ver, words, offer):
+        """Шаблон после 24 часов (NIGHT0710-B3g): карточка получает слова, кнопки живы; offer — кнопка
+        «📨 Отправить шаблоном» (None — без неё). Рук нет — ничего."""
+        return None
+
 
 class Door:
     """send_text(to, text) → {"outcome": sent|not_sent|unknown, "reason": str, "wamid": str|None}.
@@ -552,6 +654,15 @@ class Door:
     def send_media(self, to, media):
         """Медиа из темы (WARELAYMEDIA0210) — контракт `wa_send.send_media`. Двери без медиа — отказ."""
         return {"outcome": "not_sent", "reason": "дверь не умеет медиа", "wamid": None}
+
+    def window(self, number):
+        """Окно 24 ч клиента по правилу двери (NIGHT0710-B3g) → {"state": open|closed|unknown, "age": с} | None.
+        Двери без пробы — None: окно не измерено, шаблон не предлагается."""
+        return None
+
+    def send_template(self, to, name, lang, params):
+        """Шаблон (NIGHT0710-B3g) — контракт `wa_send.send_template`. Двери без шаблонов — отказ."""
+        return {"outcome": "not_sent", "reason": "дверь не умеет шаблоны", "wamid": None}
 
 
 def media_text(media):
@@ -587,7 +698,8 @@ def show_line(at, outcome, who, draft_id, ver, part, body):
     часть; «неизвестно» — со словами «исход неизвестен, проверьте телефон»; ниже — текст (PDF — имя файла)."""
     name = str(who or "").split(" (id ")[0] or "—"
     head = "%s · агент · подтвердил %s · черновик №%d, версия %d · %s" % (
-        hm_phuket(at), name, int(draft_id), int(ver or 1), "PDF" if part == PART_PDF else "текст")
+        hm_phuket(at), name, int(draft_id), int(ver or 1),
+        "PDF" if part == PART_PDF else "шаблон" if part == PART_TPL else "текст")
     if outcome == UNSURE:
         head += " · " + W_SHOW_UNSURE
     return head + ":\n" + str(body or "")
@@ -596,8 +708,17 @@ def show_line(at, outcome, who, draft_id, ver, part, body):
 class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
                  clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random,
-                 lessons=False, lesson_admins=None, followup=False):
+                 lessons=False, lesson_admins=None, followup=False, hints=False, hint_hour=HINT_LIST_HOUR,
+                 templates=False, lang_of=None):
         quiet = int(quiet)
+        # WA_AGENT_HINTS (NIGHT0710-B2): выключен — «Исправить» и «Отправить» как раньше, правил из пояснений нет;
+        # hint_hour — час суточного списка владельцу по Пхукету (24 — списка нет)
+        self.hints = bool(hints)
+        self.hint_hour = hint_hour
+        # WA_AGENT_TEMPLATES (NIGHT0710-B3g): выключен — окно ядро не спрашивает, кнопки шаблона нет, «Отправить» прежнее;
+        # lang_of — правило языка по тексту (`wa_agent_knowledge.lang_of`, приносит служба: ядро его не импортирует)
+        self.templates = bool(templates)
+        self.lang_of = lang_of
         # WA_AGENT_FOLLOWUP (WAFOLLOWUP0210): выключен — притихших не ищем, модель о напоминании не зовётся
         self.followup = bool(followup)
         self._follow_last = None
@@ -647,8 +768,19 @@ class Core:
         for col in ("lost", "edit_unk"):                                  # очередь старше WACARDDONEFIX0210
             if col not in have:
                 self.db.execute("ALTER TABLE card_out ADD COLUMN %s INTEGER NOT NULL DEFAULT 0" % col)
+        # правило из пояснения (NIGHT0710-B2): вид, пояснение, кто нажал «Отправить», id решавших, попадание в список
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(lessons)")}
+        for col, typ in (("kind", "TEXT"), ("hint", "TEXT"), ("sent_by", "TEXT"), ("sent_by_id", "INTEGER"),
+                         ("sent_at", "REAL"), ("decided_by_id", "INTEGER"), ("rolled_by_id", "INTEGER"),
+                         ("listed_at", "REAL")):
+            if col not in have:
+                self.db.execute("ALTER TABLE lessons ADD COLUMN %s %s" % (col, typ))
         # показ ушедшего агентом (WAMIRROR0410): с этой минуты; ушедшее раньше строки не получает
         self.db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", (SHOW_SINCE, repr(float(self.clock()))))
+        if self.templates:
+            self.db.executescript(_TPL_SCHEMA)        # выключено — таблицы нет, база прежняя
+            if "body" not in {r[1] for r in self.db.execute("PRAGMA table_info(tpl_out)")}:
+                self.db.execute("ALTER TABLE tpl_out ADD COLUMN body TEXT")   # таблица кандидата №1 — без текста
         self._startup()
 
     # ── база ──────────────────────────────────────────────────────────────────────────────
@@ -689,6 +821,12 @@ class Core:
                              (SHOW_WAIT, SHOW_SENDING)).rowcount
         if n6:
             self.log("старт: строка показа sending→wait %d (ответ неизвестен — возможна вторая строка)" % n6)
+        # шаблон (NIGHT0710-B3g): рестарт посреди отправки — мог уйти, не повторяем
+        if self._tpl_table():
+            n7 = self.db.execute("UPDATE tpl_out SET state=?, reason=? WHERE state=?",
+                                 (UNSURE, "рестарт посреди отправки шаблона — мог уйти, не повторяем", SENDING)).rowcount
+            if n7:
+                self.log("старт: шаблон sending→unsure %d" % n7)
 
     def _queue(self):
         return sqlite3.connect("file:%s?mode=ro" % self.queue_path, uri=True, timeout=5)
@@ -830,6 +968,14 @@ class Core:
             (SENT, UNSURE, since, PART_TEXT)).fetchall()
         for did, ver, number, state, wamid, who, text, at in rows:
             self._show_put(wamid, PART_TEXT, did, ver, 1, number, who, state, text, at)
+        if self._tpl_table():
+            # шаблон (NIGHT0710-B3g): ушедший через API — эха нет, в тему клиента он ложится только отсюда
+            rows = self.db.execute(
+                "SELECT draft_id, ver, number, state, wamid, who, tries, ts, body, name, lang FROM tpl_out "
+                "WHERE state IN (?,?) AND ts >= ?", (SENT, UNSURE, since)).fetchall()
+            for did, ver, number, state, wamid, who, tries, at, body, name, lang in rows:
+                self._show_put(wamid, PART_TPL, did, ver, tries, number, who, state,
+                               body or "[шаблон %s (%s)]" % (name, lang), at)
         if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdf_parts'").fetchone():
             return
         rows = self.db.execute(
@@ -1100,6 +1246,8 @@ class Core:
         now = self.clock() if now is None else now
         self.send_due(now)                    # отложенное уходит в срок и при выключенных черновиках
         self.show_agent(now)                  # строки показа: новые исходы и повтор не легших (WAMIRROR0410)
+        if self.hints:
+            self.hint_list_due(now)           # суточный список владельцу (NIGHT0710-B2)
         if not self.drafts:
             self.follow()
             self.deliver_cards(now)
@@ -1108,6 +1256,8 @@ class Core:
         made = self.make_drafts(now)
         if self.followup:
             made += self.make_followups(now)
+        if self.hints:
+            self.make_hint_versions(now)      # версии по пояснениям (NIGHT0710-B2)
         self.deliver_cards(now)               # повтор карточек, которые Telegram не принял (WADRAFTSAFE0210)
         return made
 
@@ -1328,8 +1478,9 @@ class Core:
             return "уже решено: %s, %s — %s" % (by, hm_phuket(at), state)
         return "уже решено: снят, %s — %s (версия %d)" % (hm_phuket(closed), state, ver)
 
-    def press(self, draft_id, ver, action, who, now=None):
-        """Нажатие кнопки карточки. → {"ok": bool, "state": …, "words": …}."""
+    def press(self, draft_id, ver, action, who, now=None, who_id=None):
+        """Нажатие кнопки карточки. → {"ok": bool, "state": …, "words": …}. who_id — id Telegram нажавшего
+        (NIGHT0710-B2): по нему и только по нему судится «владелец» на версии по пояснению."""
         now = self.clock() if now is None else now
         target = CLAIMED if action == ACT_SEND else DECLINED
         if action not in (ACT_SEND, ACT_DECLINE, ACT_CANCEL):
@@ -1354,6 +1505,11 @@ class Core:
                 return {"ok": False, "state": PENDING,
                         "words": "отправка выключена — черновик ждёт, кнопки живы"}
             return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
+        if action == ACT_SEND and self.templates:
+            # шаблоны (NIGHT0710-B3g): окно 24 ч закрыто — ДО захвата, черновик ждёт, на карточке — шаблон
+            closed = self._send_closed(draft_id, ver, who, now)
+            if closed:
+                return closed
         n = self.db.execute("UPDATE drafts SET state=?, decided_by=?, decided_at=? "
                             "WHERE id=? AND state='pending' AND ver=?",
                             (target, who, now, draft_id, int(ver))).rowcount
@@ -1409,6 +1565,10 @@ class Core:
             return {"ok": False, "state": state, "words": "не отправлено: " + (
                 "ответили с телефона" if state == SUPERSEDED else "клиент написал ещё")}
 
+        # ── пояснение → правило (NIGHT0710-B2): нажатие выиграно и не снято — до ритма и двери: одобрено содержание
+        # версии, отказ WhatsApp одобрения не отменяет; одно место на «сразу» и «на срок», send_due правил не рождает
+        rule = self._lesson_on_send(draft_id, int(ver), who, who_id, now) if self.hints else None
+
         # ── человеческий ритм (WAHUMANPACE0210): срок не настал — отправка ставится на срок ──
         # напоминание (WAFOLLOWUP0210) ритму не подлежит: тишина в нём уже есть, а отложенное ушло бы и
         # после нового сообщения клиента (send_due снимает только по эху)
@@ -1424,8 +1584,8 @@ class Core:
                 words = "уйдёт в %s" % hm_phuket(due)
                 self._tg("card_wait", draft_id, self._card(draft_id), "%s — нажал %s, %s" % (words, who, hm_phuket(now)),
                          int(ver))
-                return {"ok": True, "state": SCHEDULED, "words": words}
-        return self._deliver(draft_id, number, upto, text, who, now, CLAIMED)
+                return self._rule_words({"ok": True, "state": SCHEDULED, "words": words}, rule)
+        return self._rule_words(self._deliver(draft_id, number, upto, text, who, now, CLAIMED), rule)
 
     def _deliver(self, draft_id, number, upto, text, who, now, from_state):
         """Дверь для захваченного черновика: «Отправить» (claimed) или срок ритма (scheduled)."""
@@ -1438,6 +1598,19 @@ class Core:
         except Exception as e:                                       # noqa: BLE001
             res = {"outcome": "unknown", "reason": "дверь упала: %s" % type(e).__name__}
         state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
+        if (state == NOT_SENT and self.templates and res.get("window") == "closed"
+                and self._window(number)[0] == "closed"):
+            # шаблоны (NIGHT0710-B3g): окно закрылось между пробой ядра и воротами двери (граница 24 ч, срок ритма) —
+            # дверь отказала ДО сети; черновик назад в pending, на карточке — «📨 Отправить шаблоном», как у «Отправить»
+            # при закрытом окне. Иначе черновик умер бы not_sent, а шаблон по нему не предлагался бы вовсе.
+            if self.db.execute("UPDATE drafts SET state=?, decided_by=NULL, decided_at=NULL WHERE id=? AND state=?",
+                               (PENDING, draft_id, SENDING)).rowcount == 1:
+                ver = self.db.execute("SELECT ver FROM drafts WHERE id=?", (draft_id,)).fetchone()[0]
+                self.log("черновик %d: дверь — окно 24 ч закрылось при отправке, черновик ждёт, шаблон к месту" % draft_id)
+                closed = self._send_closed(draft_id, ver, who, now)
+                if closed:
+                    return closed
+                return {"ok": False, "state": PENDING, "words": "окно 24 ч закрылось при отправке — черновик ждёт"}
         wamid = res.get("wamid") if state == SENT else None
         self.db.execute("UPDATE drafts SET state=?, reason=?, wamid=?, closed_at=? WHERE id=? AND state=?",
                         (state, str(res.get("reason") or "")[:300], wamid, now, draft_id, SENDING))
@@ -1693,6 +1866,8 @@ class Core:
             return "уже решено: урок №%d — действующее правило: %s, %s" % (int(lesson_id), by, hm_phuket(at))
         if state == LESSON_ROLLED:
             return "уже решено: урок №%d откатан: %s, %s" % (int(lesson_id), rby, hm_phuket(rat))
+        if state == LESSON_REJECTED:
+            return "уже решено: №%d отклонено: %s, %s" % (int(lesson_id), by, hm_phuket(at))
         return "урок №%d — кандидат" % int(lesson_id)
 
     def _lesson_deny(self, lesson_id, what):
@@ -1700,8 +1875,11 @@ class Core:
             what, int(lesson_id))
 
     def lesson_promote(self, lesson_id, who, who_id, now=None):
-        """«Сделать правилом»: кандидат → действующий, только тем, кто в праве. → {"ok", "state", "words"}."""
+        """«Сделать правилом»: кандидат → действующий, только тем, кто в праве. → {"ok", "state", "words"}.
+        Правило из пояснения (NIGHT0710-B2) решает только владелец по id (`_hint_decide`)."""
         now = self.clock() if now is None else now
+        if self._lesson_kind(lesson_id) == KIND_HINT:
+            return self._hint_decide(lesson_id, LESSON_ACTIVE, who, who_id, now)
         if not self.lessons:
             return {"ok": False, "state": None, "words": "%s — урок №%d не переведён" % (
                 LESSON_OFF_WORDS, int(lesson_id))}
@@ -1722,11 +1900,15 @@ class Core:
         """«Откатить №N»: действующий (или кандидат) → откатан, только тем, кто в праве. Из промпта уходит
         со следующего черновика. Откат работает и при выключенных уроках — это шаг в безопасную сторону."""
         now = self.clock() if now is None else now
-        if not self.lesson_admin(who_id):
+        # правило из пояснения (NIGHT0710-B2): откат — только владелец по id; список WA_AGENT_LESSON_ADMINS не действует
+        hint = self._lesson_kind(lesson_id) == KIND_HINT
+        if not (self.owner(who_id) if hint else self.lesson_admin(who_id)):
             self.log("урок %d: откат — отказ, нет права: %s" % (int(lesson_id), who))
-            return {"ok": False, "state": None, "words": self._lesson_deny(lesson_id, "откатить урок")}
-        n = self.db.execute("UPDATE lessons SET state=?, rolled_by=?, rolled_at=? WHERE id=? AND state IN (?,?)",
-                            (LESSON_ROLLED, who, now, int(lesson_id), LESSON_ACTIVE, LESSON_CANDIDATE)).rowcount
+            return {"ok": False, "state": None, "words": (self._hint_deny if hint else self._lesson_deny)(
+                lesson_id, "откатить урок")}
+        n = self.db.execute("UPDATE lessons SET state=?, rolled_by=?, rolled_at=?, rolled_by_id=? WHERE id=? AND "
+                            "state IN (?,?)", (LESSON_ROLLED, who, now, _int_or_none(who_id), int(lesson_id),
+                                               LESSON_ACTIVE, LESSON_CANDIDATE)).rowcount
         if n != 1:
             return {"ok": False, "state": None, "words": self._lesson_decided(lesson_id)}
         self.log("урок %d → откатан (%s)" % (int(lesson_id), who))
@@ -1749,6 +1931,241 @@ class Core:
 
     def lesson_counts(self):
         return dict(self.db.execute("SELECT state, COUNT(*) FROM lessons GROUP BY state").fetchall())
+
+    # ── пояснение → правило (NIGHT0710-B2) ───────────────────────────────────────────────────
+
+    def owner(self, who_id):
+        """Владелец ли нажавший: id Telegram строго в `LESSON_OWNER_IDS` (= splinter.OWNER_IDS). Имя не читается
+        нигде; список WA_AGENT_LESSON_ADMINS здесь не действует. Нет id — не владелец."""
+        uid = _int_or_none(who_id)
+        return uid is not None and uid in LESSON_OWNER_IDS
+
+    def _lesson_kind(self, lesson_id):
+        row = self.db.execute("SELECT kind FROM lessons WHERE id=?", (int(lesson_id),)).fetchone()
+        return row[0] if row else None
+
+    def _hint_deny(self, lesson_id, what):
+        return "отказ: %s вправе только владелец (по id Telegram) — №%d не тронут" % (what, int(lesson_id))
+
+    def hint(self, draft_id, ver, text, who, who_id=None, msg_id=None, now=None):
+        """Пояснение к версии черновика (реплай на приглашение «Исправить»). Модель здесь не зовётся: пояснение
+        встаёт в очередь `hints`, версию делает такт (`make_hint_versions`) — приём обновлений не ждёт модели,
+        рестарт пояснения не теряет. Одно пояснение на версию. → {"ok", "words"[, "hint"]}."""
+        now = self.clock() if now is None else now
+        if not self.hints:
+            return {"ok": False, "words": HINT_OFF_WORDS}
+        text = (text or "").strip()
+        cut = len(text) > HINT_MAX                          # A9f: длинное режется — автору говорим, не молча
+        text = text[:HINT_MAX]
+        if not text:
+            return {"ok": False, "words": "не принято: нужен текст пояснения"}
+        row = self.db.execute("SELECT text FROM drafts WHERE id=? AND state=? AND ver=?",
+                              (draft_id, PENDING, int(ver))).fetchone()
+        if row is None:
+            return {"ok": False, "words": "не принято: " + self._decided(draft_id, ver)}
+        if self.draft_kind(draft_id) == KIND_FOLLOW:
+            return {"ok": False, "words": "не принято: напоминание по пояснению не переписывается — поправьте его "
+                                          "полным текстом реплаем на карточку"}
+        cur = self.db.execute("INSERT OR IGNORE INTO hints(draft_id, ver_from, text, prev_text, author, author_id, "
+                              "msg_id, ts, state) VALUES(?,?,?,?,?,?,?,?,?)",
+                              (draft_id, int(ver), text, row[0], who, _int_or_none(who_id), msg_id, now, HINT_WAIT))
+        if cur.rowcount != 1:
+            # A12 (NIGHT0710-B2, круг 2): пояснение к этой версии уже было и кончилось сбоем (модель упала, клиент
+            # написал) — черновик всё ещё ждёт на той же версии, значит новое пояснение законно. Строка `fail`
+            # возвращается в очередь условным UPDATE (state='fail'): ждущее или сделанное пояснение не трогается.
+            old = self.db.execute("SELECT id FROM hints WHERE draft_id=? AND ver_from=? AND state=?",
+                                  (draft_id, int(ver), HINT_FAIL)).fetchone()
+            if old is None or self.db.execute(
+                    "UPDATE hints SET text=?, prev_text=?, author=?, author_id=?, msg_id=?, ts=?, state=?, "
+                    "reason=NULL, done_at=NULL, ver_to=NULL WHERE id=? AND state=?",
+                    (text, row[0], who, _int_or_none(who_id), msg_id, now, HINT_WAIT, old[0],
+                     HINT_FAIL)).rowcount != 1:
+                return {"ok": False, "words": "не принято: пояснение к версии %d уже есть — ждите версию %d" % (
+                    int(ver), int(ver) + 1)}
+            hid = old[0]
+            self.log("черновик %d: пояснение %d к версии %d повторно после сбоя (%s, %d симв.)" % (
+                draft_id, hid, int(ver), who, len(text)))
+        else:
+            hid = cur.lastrowid
+            self.log("черновик %d: пояснение %d к версии %d (%s, %d симв.)" % (draft_id, hid, int(ver), who,
+                                                                           len(text)))
+        return {"ok": True, "hint": hid,
+                "words": "пояснение №%d принято%s — агент делает версию %d" % (
+                    hid, " (обрезано до %d симв. — длиннее в правило не идёт)" % HINT_MAX if cut else "",
+                    int(ver) + 1)}
+
+    def _hint_fail(self, hint_id, words, now):
+        """Версии по пояснению нет: `fail` с причиной, ответ словами на сообщение пояснения."""
+        if self.db.execute("UPDATE hints SET state=?, reason=?, done_at=? WHERE id=? AND state=?",
+                           (HINT_FAIL, words[:300], now, hint_id, HINT_WAIT)).rowcount == 1:
+            self.log("пояснение %d: версии нет — %s" % (hint_id, words.split(" — ")[0]))
+            self._tg("hint_note", hint_id, "пояснение №%d: %s" % (hint_id, words))
+
+    def make_hint_versions(self, now):
+        """Версии по пояснениям, по HINTS_PER_TICK за такт. Модель (`Model.redraft`) переписывает черновик с учётом
+        пояснения; новая версия — тем же условным UPDATE, что у правки текстом (state='pending' AND ver=?), прежняя
+        карточка «устарело», новая — через очередь доставки. Черновик снят или сменил версию, клиент написал, модель
+        не дала текста — версии нет (`_hint_fail`). → [(черновик, новая версия)]."""
+        out = []
+        rows = self.db.execute("SELECT id, draft_id, ver_from, text, prev_text, author FROM hints WHERE state=? "
+                               "ORDER BY id LIMIT ?", (HINT_WAIT, HINTS_PER_TICK)).fetchall()
+        for hid, did, v_from, hint_text, prev, author in rows:
+            cur = self.db.execute("SELECT number, upto_id, state, ver, card_id FROM drafts WHERE id=?",
+                                  (did,)).fetchone()
+            if not cur or cur[2] != PENDING or cur[3] != v_from:
+                self._hint_fail(hid, "устарело — " + self._decided(did, v_from), now)
+                continue
+            number, upto, _state, _ver, card_was = cur
+            try:
+                got = self.model.redraft(number, upto, prev, hint_text)
+                new_text, reasons = draft_out(got)
+                tr = draft_card(got)
+            except Exception as e:                                   # noqa: BLE001
+                self.log("пояснение %d: модель упала: %s" % (hid, type(e).__name__))
+                new_text, reasons, tr = None, [], None
+            if not isinstance(new_text, str) or not new_text.strip():
+                self._hint_fail(hid, "модель не дала текста — версии нет; полный текст — реплаем на карточку", now)
+                continue
+            if self._fresh(number, upto):
+                self._hint_fail(hid, "клиент написал ещё — версии нет, черновик пересобирается", now)
+                continue
+            v_to = v_from + 1
+            if self.db.execute("UPDATE drafts SET text=?, ver=?, handoff=? WHERE id=? AND state=? AND ver=?",
+                               (new_text, v_to, json.dumps(reasons, ensure_ascii=False) if reasons else None, did,
+                                PENDING, v_from)).rowcount != 1:
+                self._hint_fail(hid, "устарело — " + self._decided(did, v_from), now)
+                continue
+            self.db.execute("UPDATE hints SET state=?, ver_to=?, done_at=? WHERE id=?", (HINT_DONE, v_to, now, hid))
+            self.log("черновик %d: версия %d по пояснению %d (%d симв.)" % (did, v_to, hid, len(new_text)))
+            if tr and (tr["q_ru"] or tr["a_ru"]):
+                self.db.execute("INSERT OR REPLACE INTO draft_tr(draft_id, ver, a_sha, q_ru, a_ru, ts) "
+                                "VALUES(?,?,?,?,?,?)", (did, v_to, text_sha(new_text), tr["q_ru"], tr["a_ru"], now))
+            self._card_close(did, v_from, "устарело: версия %d по пояснению №%d — %s" % (v_to, hid, author), now,
+                             card_was)
+            self.db.execute("UPDATE drafts SET card_id=NULL WHERE id=? AND ver=?", (did, v_to))
+            self._card_new(did, v_to, now)
+            out.append((did, v_to))
+        return out
+
+    def hint_of(self, draft_id, ver):
+        """Версия сделана по пояснению → (номер пояснения, текст, автор) | None (версия модели или правка текстом)."""
+        return self.db.execute("SELECT id, text, author FROM hints WHERE draft_id=? AND ver_to=? AND state=?",
+                               (draft_id, int(ver), HINT_DONE)).fetchone()
+
+    def _lesson_on_send(self, draft_id, ver, who, who_id, now):
+        """«Отправить» выиграно на версии по пояснению: нажал владелец (`owner`, строго по id) — пояснение становится
+        действующим правилом; сотрудник — кандидатом в суточный список. Версия модели и правка текстом правила не
+        рождают. Одно правило на версию: UNIQUE(draft_id, ver_to). → (номер, состояние) | None. Сбой — строка
+        журнала и None: обучение отправке не мешает."""
+        try:
+            src = self.db.execute("SELECT id, ver_from, text, prev_text, author, author_id FROM hints "
+                                  "WHERE draft_id=? AND ver_to=? AND state=?", (draft_id, ver, HINT_DONE)).fetchone()
+            if src is None:
+                return None
+            hid, v_from, hint_text, prev, author, author_id = src
+            sent = self.db.execute("SELECT text FROM drafts WHERE id=?", (draft_id,)).fetchone()[0]
+            boss = self.owner(who_id)
+            state = LESSON_ACTIVE if boss else LESSON_CANDIDATE
+            uid = _int_or_none(who_id)
+            cur = self.db.execute(
+                "INSERT OR IGNORE INTO lessons(state, author, author_id, ts, draft_id, ver_from, ver_to, was_text, "
+                "now_text, kind, hint, sent_by, sent_by_id, sent_at, decided_by, decided_by_id, decided_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (state, author, author_id, now, draft_id, v_from, ver, prev, sent, KIND_HINT, hint_text, who, uid,
+                 now, who if boss else None, uid if boss else None, now if boss else None))
+            if cur.rowcount != 1:
+                had = self.db.execute("SELECT id, state FROM lessons WHERE draft_id=? AND ver_to=?",
+                                      (draft_id, ver)).fetchone()
+                return tuple(had) if had else None
+            lid = cur.lastrowid
+            self.log("правило %d: %s по пояснению %d (черновик %d, версия %d, нажал %s)" % (
+                lid, "действующее" if boss else "кандидат", hid, draft_id, ver, who))
+            if boss:
+                self._tg("lesson_card", lid)          # сообщение правила с «Откатить №N»
+            return lid, state
+        except Exception as e:                                       # noqa: BLE001
+            self.log("правило по пояснению не записано (черновик %d): %s" % (draft_id, type(e).__name__))
+            return None
+
+    @staticmethod
+    def _rule_words(res, rule):
+        """Ответ нажатию + номер правила или кандидата (NIGHT0710-B2). Правила нет — ответ прежний."""
+        if not rule:
+            return res
+        lid, state = rule
+        res = dict(res)
+        res["rule"] = lid
+        res["words"] = "%s · %s" % (res.get("words"), "правило №%d — действует, идёт в промпт агента" % lid
+                                    if state == LESSON_ACTIVE else
+                                    "пояснение — кандидат №%d: решит владелец в суточном списке" % lid)
+        return res
+
+    def _hint_decide(self, lesson_id, state, who, who_id, now):
+        """Кандидат-пояснение → действующее правило или отклонено: только владелец по id. → {"ok", "state", "words"}."""
+        lid = int(lesson_id)
+        what = "сделать правилом" if state == LESSON_ACTIVE else "отклонить"
+        if not self.hints:
+            return {"ok": False, "state": None, "words": "%s — №%d не тронут" % (HINT_OFF_WORDS, lid)}
+        if not self.owner(who_id):
+            self.log("правило %d: %s — отказ, не владелец: %s" % (lid, what, who))
+            return {"ok": False, "state": None, "words": self._hint_deny(lid, what)}
+        n = self.db.execute("UPDATE lessons SET state=?, decided_by=?, decided_by_id=?, decided_at=? WHERE id=? AND "
+                            "state=? AND kind=?", (state, who, _int_or_none(who_id), now, lid, LESSON_CANDIDATE,
+                                                   KIND_HINT)).rowcount
+        if n != 1:
+            return {"ok": False, "state": None, "words": self._lesson_decided(lid)}
+        self.log("правило %d → %s (%s)" % (lid, state, who))
+        self._tg("lesson_done", lid, "%s — %s, %s" % ("✅ действующее правило" if state == LESSON_ACTIVE
+                                                      else "✖ отклонено", who, hm_phuket(now)), state)
+        return {"ok": True, "state": state, "words": "№%d — %s" % (lid, "действующее правило: идёт в промпт агента"
+                                                                    if state == LESSON_ACTIVE
+                                                                    else "отклонено: в промпт агента не идёт")}
+
+    def lesson_reject(self, lesson_id, who, who_id, now=None):
+        """«Отклонить» кандидата-пояснение из суточного списка: только владелец по id. Урок правкой текстом так не
+        решается — у него «Откатить»."""
+        now = self.clock() if now is None else now
+        if self._lesson_kind(lesson_id) != KIND_HINT:
+            return {"ok": False, "state": None, "words": "№%d — не пояснение: отклонения нет" % int(lesson_id)}
+        return self._hint_decide(lesson_id, LESSON_REJECTED, who, who_id, now)
+
+    def _meta_get(self, key):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def _meta_set(self, key, value):
+        self.db.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, str(value)))
+
+    def hint_list_due(self, now):
+        """Суточный список владельцу: раз в сутки по Пхукету, после `hint_hour`, если есть не показанные новые
+        правила или кандидаты из пояснений, — одно сообщение рук (`hint_list`). Замок «один список в сутки» — meta,
+        переживает рестарт и ставится только по доставке; не ушёл — повтор не раньше HINT_LIST_RETRY.
+        Не поместившиеся в список строки остаются на следующий. → [показанные номера] | None."""
+        local = float(now) + PHUKET_OFFSET               # время по Пхукету арифметикой: функций времени ядро не зовёт
+        day = int(local // 86400)
+        if local % 86400 < self.hint_hour * 3600 or self._meta_get(HINT_LIST_KEY) == str(day):
+            return None
+        nxt = self._meta_get(HINT_LIST_NEXT)
+        if nxt is not None and float(nxt) > now:
+            return None
+        ids = [r[0] for r in self.db.execute("SELECT id FROM lessons WHERE kind=? AND listed_at IS NULL AND state IN "
+                                             "(?,?) ORDER BY id", (KIND_HINT, LESSON_CANDIDATE, LESSON_ACTIVE))]
+        if not ids:
+            return None
+        shown = self._tg("hint_list", ids)
+        if not shown:
+            self._meta_set(HINT_LIST_NEXT, now + HINT_LIST_RETRY)
+            self.log("суточный список: не ушёл — повтор не раньше %d с" % HINT_LIST_RETRY)
+            return None
+        self.db.execute("UPDATE lessons SET listed_at=? WHERE id IN (%s)" % ",".join("?" * len(shown)),
+                        (now,) + tuple(int(x) for x in shown))
+        self._meta_set(HINT_LIST_KEY, day)
+        self.log("суточный список: строк %d из %d" % (len(shown), len(ids)))
+        return shown
+
+    def hint_counts(self):
+        return dict(self.db.execute("SELECT state, COUNT(*) FROM hints GROUP BY state").fetchall())
 
     def _card(self, draft_id):
         row = self.db.execute("SELECT card_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
@@ -1777,6 +2194,257 @@ class Core:
         row = self.db.execute("SELECT handoff FROM drafts WHERE id=?", (draft_id,)).fetchone()
         hand = handoff_of(row[0]) if row else []
         return [UNREAD_REASON] if hand is None else hand
+
+    # ── шаблон после 24 часов (NIGHT0710-B3g) ─────────────────────────────────────────────
+
+    def _tpl_table(self):
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tpl_out'").fetchone() is not None
+
+    def _window(self, number):
+        """Окно 24 ч клиента — пробой двери (`Door.window`, правило `wa_send.last_inbound_ts`/`window_state`; своего
+        правила у ядра нет) → (open | closed | unknown, возраст последнего входящего, с | None). Пробы нет или она
+        упала — unknown: не измерено — не «закрыто»."""
+        probe = getattr(self.door, "window", None)
+        if probe is None:
+            return "unknown", None
+        try:
+            got = probe(number)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дверь: проба окна упала: %s — окно неизвестно" % type(e).__name__)
+            return "unknown", None
+        if isinstance(got, str):
+            return got, None
+        got = got or {}
+        return str(got.get("state") or "unknown"), got.get("age")
+
+    def _text_lang(self, text):
+        """Язык текста версии по правилу службы (`lang_of`): ru | en | other | None (букв нет, правила нет, упало)."""
+        try:
+            return self.lang_of(text) if self.lang_of else None
+        except Exception as e:                                       # noqa: BLE001
+            self.log("язык шаблона: правило упало: %s" % type(e).__name__)
+            return None
+
+    def _tpl_lang(self, text, q_lang):
+        """Язык шаблона — язык КЛИЕНТА: язык его вопроса (drafts.q_lang, вердикт кода по буквам) первым; не записан
+        или не ru/en — язык текста версии (`lang_of`). Клиенту уходит текст шаблона, а не версии, поэтому латиница
+        в версии (модель, цена «THB/day») язык клиента не перебивает. Не ru и не en — None: шаблонов на нём нет."""
+        for cand in (q_lang, self._text_lang(text)):
+            if cand in ("ru", "en"):
+                return cand
+        return None
+
+    def _tpl_nolang(self, text, q_lang):
+        """Почему шаблона нет по языку — словами: язык не определён (ни вопроса, ни букв в версии) ≠ «не ru и не en»."""
+        if not q_lang and self._text_lang(text) is None:
+            return "язык клиента не определён (язык вопроса не записан, в тексте версии букв нет) — шаблон не предлагается"
+        return "язык клиента не ru и не en — шаблоны поданы только на них"
+
+    def _tpl_taken(self, draft_id, number, upto):
+        """Шаблон по этому черновику или этому клиенту после того же входящего уже уходил (sending, sent, unsure) →
+        (черновик, состояние, кто, когда) | None. not_sent — не уходил: можно ещё раз."""
+        if not self._tpl_table():
+            return None
+        return self.db.execute("SELECT draft_id, state, who, ts FROM tpl_out WHERE (draft_id=? OR (number=? AND "
+                               "upto_id>=?)) AND state IN (?,?,?) ORDER BY ts DESC LIMIT 1",
+                               (draft_id, number, upto, SENDING, SENT, UNSURE)).fetchone()
+
+    @staticmethod
+    def _tpl_decided(taken):
+        if not taken:
+            return "шаблон уже уходил — второй раз не шлём"
+        did, state, who, ts = taken
+        return "шаблон уже %s (черновик №%d): %s, %s — второй раз не шлём, ждём ответа клиента" % (
+            {SENT: "ушёл", UNSURE: "уходил, исход неизвестен", SENDING: "уходит"}.get(state, state), int(did),
+            who or "—", hm_phuket(ts))
+
+    def template_offer(self, draft_id, ver=None):
+        """Шаблон к карточке → None (не к месту: выключено, черновик не ждёт, напоминание, дверь закрыта, окно не
+        измерено ЗАКРЫТЫМ) | {"name", "lang", "params"} — кнопка «📨 Отправить шаблоном» | {"why": слова} — окно
+        закрыто, а шаблона нет (язык не ru/en, шаблон уже уходил)."""
+        if not self.templates:
+            return None
+        row = self.db.execute("SELECT number, state, ver, kind, text, q_lang, upto_id FROM drafts WHERE id=?",
+                              (draft_id,)).fetchone()
+        if not row or row[1] != PENDING or (ver is not None and int(ver) != row[2]):
+            return None
+        number, _state, _ver, kind, text, q_lang, upto = row
+        if kind == KIND_FOLLOW:                       # напоминание молчащему вне окна — уже рассылка, не предлагаем
+            return None
+        if not self._door_open():
+            return None
+        if self._window(number)[0] != "closed":
+            return None
+        taken = self._tpl_taken(draft_id, number, upto)
+        if taken:
+            return {"why": self._tpl_decided(taken)}
+        lang = self._tpl_lang(text, q_lang)
+        if lang is None:
+            return {"why": self._tpl_nolang(text, q_lang)}
+        return {"name": TPL_REPLY, "lang": lang, "params": [TPL_WORD[lang]]}
+
+    def _send_closed(self, draft_id, ver, who, now):
+        """«✅ Отправить» при ИЗМЕРЕННО закрытом окне 24 ч: ДО захвата — черновик pending, клиенту ничего, на карточке
+        словами — почему и «📨 Отправить шаблоном», если он к месту. Окно открыто или не измерено — None: путь
+        прежний (дверь судит окно сама)."""
+        row = self.db.execute("SELECT number, state, ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or row[1] != PENDING or row[2] != int(ver):
+            return None
+        state, age = self._window(row[0])
+        if state != "closed":
+            return None
+        offer = self.template_offer(draft_id, ver)
+        button = offer if offer and offer.get("name") else None
+        try:
+            ago = " (последнее сообщение клиента %d ч назад)" % (int(float(age)) // 3600) if age is not None else ""
+        except (TypeError, ValueError):
+            ago = ""
+        words = W_TPL_CLOSED % ago + (
+            "; на карточке «📨 Отправить шаблоном» %s (%s)" % (button["name"], button["lang"]) if button
+            else "; шаблона нет: %s — напишите клиенту с телефона" % offer["why"] if offer and offer.get("why")
+            else "; напишите клиенту с телефона")
+        self.log("черновик %d: «Отправить» — окно 24 ч закрыто, черновик ждёт, %s" % (
+            draft_id, "шаблон предложен" if button else "шаблона нет"))
+        self._tg("card_tpl", draft_id, self._card(draft_id), int(ver),
+                 "%s — нажал %s, %s" % (words, who, hm_phuket(now)), button)
+        return {"ok": False, "state": PENDING, "words": words}
+
+    def press_template(self, draft_id, ver, who, now=None):
+        """«📨 Отправить шаблоном» → {"ok", "state", "words"}. Шаблон — ОДИН на черновик и последнее входящее клиента:
+        `sending` пишется ДО двери, исход sent · not_sent (можно ещё раз) · unsure (не повторяем; рестарт посреди —
+        unsure). Ушедший — в `outbox` (эхо не ставит паузу, история видит «мы»). Черновик остаётся pending: клиент
+        ответит — окно откроется, черновик пересоберётся и уйдёт обычной кнопкой. Отказ — словами на карточке.
+        Исход двери и строка outbox — одной транзакцией (`_tpl_tx`, INTEG0710 Д5); не легли — словами, не тихо."""
+        now = self.clock() if now is None else now
+        if not self.templates:
+            return {"ok": False, "state": None, "words": TPL_OFF_WORDS}
+        if not self._door_open():
+            return {"ok": False, "state": None, "words": "отправка выключена (WA_SEND) — шаблон не отправлен"}
+        row = self.db.execute("SELECT number, state, ver, upto_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or row[1] != PENDING or row[2] != int(ver):
+            return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
+        number, upto = row[0], row[3]
+        old = self._outdated(draft_id)
+        if old:
+            return {"ok": False, "state": PENDING, "words": "устарело: %s — шаблон не нужен, черновик пересоберётся" % old}
+        # ── перепроверка очереди ДО двери, как у «✅ Отправить» (WADRAFTSAFE0210): ответили с телефона, клиент написал
+        #    ещё или клиент на паузе (человек вмешался) — шаблон не уходит; очередь не прочитана — наружу ничего ──
+        try:
+            fresh = self._fresh(number, upto)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("черновик %d: очередь не прочитана при нажатии шаблона (%s) — шаблон не отправлен, черновик ждёт"
+                     % (draft_id, type(e).__name__))
+            return {"ok": False, "state": PENDING,
+                    "words": "очередь не прочитана — шаблон не отправлен, черновик ждёт: нажмите ещё раз"}
+        paused = self.db.execute("SELECT paused FROM clients WHERE number=?", (number,)).fetchone()
+        if fresh or (paused and paused[0]):
+            kind, rid = fresh or (wa_kind.KIND_ECHO, None)
+            state = SUPERSEDED if kind == wa_kind.KIND_ECHO else STALE
+            why = ("ответили с телефона" if fresh and state == SUPERSEDED else "клиент написал ещё" if fresh
+                   else "человек вмешался, клиент на паузе")
+            self._close(draft_id, state, "снят при нажатии «📨»: %s — шаблон не отправлен" % why, now)
+            if state == SUPERSEDED and rid is not None:
+                self.db.execute("UPDATE clients SET done_upto=MAX(done_upto, last_in_id) WHERE number=?", (number,))
+                try:
+                    prid = self._pausing_echo(number, upto)   # «📨»: та же пауза, что у «Отправить»
+                except Exception as e:                               # noqa: BLE001
+                    prid = rid                # очередь не прочитана — как у «Отправить»: пауза
+                    self.log("черновик %d: вид эха не прочитан (%s) — пауза, как прежде" % (draft_id, type(e).__name__))
+                if prid is not None:
+                    self._pause(number, prid, now)
+            return {"ok": False, "state": state, "words": "шаблон не отправлен: " + why}
+        offer = self.template_offer(draft_id, ver)
+        if not offer:
+            win = self._window(number)[0]
+            return {"ok": False, "state": PENDING, "words": (
+                "окно 24 ч открыто — шаблон не нужен, жмите «✅ Отправить»" if win == "open"
+                else "окно 24 ч не измерено — шаблон не шлём" if win != "closed"
+                else "к этому черновику шаблон не предлагается")}
+        if offer.get("why"):
+            return {"ok": False, "state": PENDING, "words": "шаблон не отправлен: " + offer["why"]}
+        name, lang, params = offer["name"], offer["lang"], list(offer["params"])
+        # ── захват: sending ДО двери; not_sent — можно ещё раз, остальное — нет ──
+        if self.db.execute("INSERT OR IGNORE INTO tpl_out(draft_id, number, upto_id, ver, name, lang, state, who, ts) "
+                           "VALUES(?,?,?,?,?,?,?,?,?)",
+                           (draft_id, number, upto, int(ver), name, lang, SENDING, who, now)).rowcount != 1:
+            if self.db.execute("UPDATE tpl_out SET state=?, number=?, upto_id=?, ver=?, name=?, lang=?, who=?, ts=?, "
+                               "reason=NULL, wamid=NULL, tries=tries+1 WHERE draft_id=? AND state=?",
+                               (SENDING, number, upto, int(ver), name, lang, who, now, draft_id,
+                                NOT_SENT)).rowcount != 1:
+                return {"ok": False, "state": PENDING,
+                        "words": self._tpl_decided(self._tpl_taken(draft_id, number, upto))}
+        try:
+            res = self.door.send_template(number, name, lang, params) or {}
+        except Exception as e:                                       # noqa: BLE001
+            res = {"outcome": "unknown", "reason": "дверь упала: %s" % type(e).__name__}
+        state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
+        wamid = res.get("wamid") if state == SENT else None
+        reason = str(res.get("reason") or "")
+        body = res.get("text") or "[шаблон %s (%s)]" % (name, lang)
+        # ── исход двери и строка outbox — ОДНОЙ транзакцией (INTEG0710 Д5): легли обе или ни одна ──
+        lost = self._tpl_tx(lambda: self._tpl_settle(draft_id, number, state, reason, wamid, body, now),
+                            "черновик %d: шаблон %s (%s) → %s по ответу двери%s" % (
+                                draft_id, name, lang, state, ", wamid %s" % wamid if wamid else ""))
+        hm = hm_phuket(now)
+        if state == SENT:
+            card_w = ("📨 шаблон %s (%s) ушёл: %s, %s — клиенту: «%s». Ответит клиент — окно откроется, черновик "
+                      "пересоберётся и уйдёт обычной «✅ Отправить»" % (name, lang, who, hm, body[:300]))
+            words = "шаблон ушёл (%s, %s) — ждём ответа клиента" % (name, lang)
+        elif state == NOT_SENT:
+            card_w = "📨 шаблон не отправлен: %s — %s, %s; черновик ждёт, кнопки живы" % (
+                reason[:400] or "причина не названа", who, hm)
+            words = "шаблон не отправлен: " + (reason[:170] or "причина не названа")
+        else:
+            card_w = "📨 шаблон: %s — %s, %s" % (W_UNSURE, who, hm)
+            words = "шаблон: " + W_UNSURE
+        if lost:                              # исход двери известен, в базу не лёг — словами на карточке, не тихо
+            card_w += " · ⚠️ " + W_TPL_UNSAVED % lost
+            words += " · ⚠️ " + W_TPL_UNSAVED % lost
+        self.log("черновик %d: шаблон %s (%s) → %s%s" % (
+            draft_id, name, lang, state, ", одобрение %s" % res.get("approval") if res.get("approval") else ""))
+        self._tg("card_tpl", draft_id, self._card(draft_id), int(ver), card_w, offer if state == NOT_SENT else None)
+        if state in (SENT, UNSURE):
+            self.show_agent(now)              # ушедший шаблон — строкой в тему клиента (WAMIRROR0410): эха у него нет
+        return {"ok": state == SENT, "state": state, "words": words}
+
+    def _tpl_settle(self, draft_id, number, state, reason, wamid, body, now):
+        """Исход двери в tpl_out и строка outbox — тело записи, которую `_tpl_tx` кладёт ОДНОЙ транзакцией
+        (INTEG0710 Д5). Обе записи идемпотентны (исход — только из sending, outbox — INSERT OR IGNORE): повтор
+        безопасен."""
+        self.db.execute("UPDATE tpl_out SET state=?, reason=?, wamid=?, body=? WHERE draft_id=? AND state=?",
+                        (state, reason[:300], wamid, body, draft_id, SENDING))
+        if state == SENT:
+            self._sent_out(wamid, number, body, VIA_TEMPLATE, now)
+
+    def _tpl_tx(self, write, what):
+        """Записи исхода шаблона ОДНОЙ транзакцией (INTEG0710 Д5, как исход части у Б3в): BEGIN IMMEDIATE → write() →
+        COMMIT — легли все или ни одна, «ушёл» без строки outbox не бывает. Сбой посреди (исключение записи, COMMIT или
+        BEGIN не прошли) — ROLLBACK и ещё ОДНА такая же транзакция (записи идемпотентны, повтор безопасен, даже если
+        первая на деле легла). Записи без транзакции нет ни на какой ветке. Чужая открытая транзакция не открывается и
+        не закрывается: записи ложатся в неё, решает владелец. → None — легло · имя исключения — не легло за две
+        попытки: откат, tpl_out остаётся sending (старт скажет «неизвестно»), второй раз не шлём. Обрыв процесса (не
+        Exception) транзакцию не закрывает — незакоммиченное снимет сама база."""
+        if self.db.in_transaction:
+            write()
+            return None
+        err = None
+        for attempt in (1, 2):
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                write()
+                self.db.execute("COMMIT")
+                return None
+            except Exception as e:                                   # noqa: BLE001
+                err = type(e).__name__
+                try:
+                    if self.db.in_transaction:
+                        self.db.execute("ROLLBACK")
+                except Exception:                                    # noqa: BLE001
+                    pass
+                self.log("%s — запись не легла (%s), попытка %d из 2: откат, не легло ничего" % (what, err, attempt))
+        self.log("%s — в базу НЕ легло за 2 попытки (%s): tpl_out остаётся sending (старт скажет «неизвестно»), второй "
+                 "раз не шлём" % (what, err))
+        return err
 
     def _door_open(self):
         """Дверь без `is_open` — открыта (прежний контракт); `is_open` упал — закрыта."""
