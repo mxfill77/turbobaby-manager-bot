@@ -6967,6 +6967,263 @@ def test_p3q_skeleton_pdf_refused_at_its_door():
     assert ok is False and shape and (X.W_PDF_SHAPE % shape).startswith("скелет PDF не сошёлся: "), shape
 
 
+# ═══ п.3r: код сам читает PDF привязанного договора (B2 повтора real, решение интегратора 12.10) ══════════════════
+# Повтор real на 7d20845 (real_far2/judge_cases/VERDICT.md §6, B2): реальная модель позвала `contract {}` (K06; K15 —
+# после `rental` и `cash`), договор принят и привязан КОДОМ, а `contract_pdf` не позвала; ядро отказало во вложении «PDF
+# договора не сверен (contract_pdf не звали)», клиенту обещан «PDF следующим сообщением», документов 0. Ремонт ОДИН:
+# `AttachCore._attach_decide` даёт `attach_of` чтение `contract_pdf` КОДОМ (`_code_pdf`: дверь `pdf_fetch` — та же дверь
+# `contract_pdf` сверки, разбор `T.call_tool` → `T.pdf_result`) по `pdf_id` ЭТОГО договора, ОДИН раз и только когда модель
+# contract_pdf не звала; дальше — прежние проверки; на карточке (опора) — строка PDF с отметкой «прочитал КОД». Проверки
+# идут путём ЯДРА (World набора `test_wa_agent_attach`, класс ядра — `X.AttachCore` этого набора), сценарий модели —
+# ПОРЯДОК ВЫЗОВОВ real (real_far2/out_1/K06/logs/service.log:16-23, K15/logs/service.log:23-34).
+R_K06 = [{"tool": "contract", "args": {}}]
+R_K15 = [{"tool": "rental", "args": {}},
+         {"tool": "cash", "args": {"bike": "", "booking_id": BK, "date_from": TERM[0], "date_to": TERM[1]}},
+         {"tool": "contract", "args": {}}]
+R_TEXT = "Нашли ваш подписанный договор, PDF пришлём следующим сообщением."
+R_PICK = {"row": 5, "doc_id": "K3-DOC-001", "pdf_id": "PDF-0001", "signed_at": DOC1["signed_at"], "signed": True}
+R_NOT_CALLED = "PDF договора не сверен (contract_pdf не звали)"          # отказ B2 на 7d20845 (литералом)
+R_CODE_FAIL = "PDF договора не получен: модель contract_pdf не звала, код читал сам — "
+R_MARK = "прочитал КОД: модель contract_pdf не звала"
+
+
+class _RDoor:
+    """Дверь `contract_pdf` живого формата (`bridge_client.contract_pdf`: ok, id, name, size, sha256, row, verified,
+    content_b64) со счётчиком вызовов. PDF-0001 — байты `raw` (подписанный договор K3-DOC-001, строка 5), PDF-0002 —
+    другой договор (строка 6). `mode` — как отказывает: refused · timeout · crash · empty · unverified · other (мост
+    ответил ЧУЖИМ id)."""
+
+    def __init__(self, raw, mode=None):
+        self.raw, self.mode, self.calls = raw, mode, []
+
+    def __call__(self, file_id=""):
+        import base64
+        import hashlib
+        self.calls.append(file_id)
+        if self.mode == "timeout":
+            raise TimeoutError("дверь молчит")
+        if self.mode == "crash":
+            raise RuntimeError("мост упал")
+        if self.mode == "empty":
+            return None
+        if self.mode == "refused" or file_id not in ("PDF-0001", "PDF-0002"):
+            return {"ok": False, "error": "not_in_registry"}
+        fid = "PDF-0002" if self.mode == "other" else file_id
+        data = self.raw if fid == "PDF-0001" else b"%PDF-1.4 K3 other contract"
+        return {"ok": True, "id": fid, "name": "%s_signed.pdf" % fid, "mime": "application/pdf", "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(), "row": 5 if fid == "PDF-0001" else 6,
+                "verified": self.mode != "unverified", "content_b64": base64.b64encode(data).decode()}
+
+
+def _r_run(steps, rows, rental=None, pdf=None):
+    """Сверка `T.run` по сценарию модели `steps` (+ итог `R_TEXT`): двери живого формата набора → итог сверки."""
+    doors = {"rental": rental or _QRental(), "contract": Registry(rows), "cash": (lambda **kw: tx([tx_item()])),
+             "contract_pdf": pdf or _q_pdf_door(_q_bytes())}
+    return T.run(Script(*(list(steps) + [final(R_TEXT)])), "S", "U", doors, number=NUMBER, clock=Clock())
+
+
+def _r_core(out, door):
+    """Ядро вложений (WA_AGENT_ATTACH вкл) с итогом сверки `out` у модели: черновик → строка `attach`. → (мир, черновик).
+    Класс ядра — `X.AttachCore` ЭТОГО набора (подмена модуля мутантом доходит до ядра); реестр при нажатии — K3-DOC-001;
+    door None — у ядра двери contract_pdf нет вовсе."""
+    if HERE not in sys.path:
+        sys.path.append(HERE)
+    import test_wa_agent_attach as AT
+    w = AT.World(tools={"state": out["state"], "results": out["results"]}, fetch=door,
+                 find=AT.Find(pick=dict(R_PICK)), cls=X.AttachCore)
+    if door is None:
+        w.core.pdf_fetch = None
+    return w, w.draft()
+
+
+def _r_attach(w, did):
+    return w.q("SELECT file_id, size, sha256, row, doc_id, signed_at, date_from, date_to, reason, opora FROM attach "
+               "WHERE draft_id=?", (did,))[0]
+
+
+def test_p3r_real_form_code_reads_bound_contract_pdf():
+    """ФОРМА REAL K06 (`contract {}`; реестр — текущий и будущий договор того же байка и только текущий) и K15 (`rental`
+    → `cash` → `contract {}`): договор принят и привязан кодом, contract_pdf модель НЕ звала. Код прочитал PDF ЭТОГО
+    договора РОВНО раз (дверь звана с PDF-0001 — pdf_id K3-DOC-001; PDF-0002 будущего договора — никогда): вложение
+    РЕШЕНО — sha256 и размер = байтам подписанного источника, строка реестра 5, срок аренды, причины нет; опора на
+    карточке — строка contract_pdf с отметкой «прочитал КОД», журнал службы называет чтение кодом. Журнал модели прежний:
+    в результатах сверки contract_pdf нет, «РЕЗУЛЬТАТЫ ИНСТРУМЕНТОВ» его не называют; `attach_of` без чтения кодом — прежний
+    отказ. На 7d20845 — отказ «PDF договора не сверен (contract_pdf не звали)» (step3r/probe3r_x7d20845.out.txt)."""
+    import hashlib
+    raw = _q_bytes()
+    for steps, rows in ((R_K06, [DOC1, DOC2]), (R_K06, [DOC1]), (R_K15, [DOC1])):
+        out = _r_run(steps, rows)
+        assert [r["tool"] for r in out["results"]] == [s["tool"] for s in steps] and \
+            outcomes(out, "contract") == [("contract", T.FACT)], [(r["tool"], r["outcome"]) for r in out["results"]]
+        assert X.attach_of({"state": T.DONE, "results": out["results"]}) == (None, R_NOT_CALLED)
+        door = _RDoor(raw)
+        w, did = _r_core(out, door)
+        got = _r_attach(w, did)
+        assert got[:9] == ("PDF-0001", len(raw), hashlib.sha256(raw).hexdigest(), 5, "K3-DOC-001", DOC1["signed_at"])\
+            + TERM + (None,), got[:9]
+        assert door.calls == ["PDF-0001"], door.calls
+        assert len(out["results"]) == len(steps) and "contract_pdf" not in T.render(out["results"])
+        assert R_MARK in got[9] and "• contract_pdf · подписанный PDF (contract_pdf)" in got[9], got[9]
+        assert w.core.card_basis(did, 1) == got[9]
+        assert w.core.card_pdf(did, 1).startswith("📄 «Отправить» шлёт ВТОРЫМ сообщением подписанный PDF договора: "
+                                                  "PDF-0001_signed.pdf"), w.core.card_pdf(did, 1)
+        assert [ln for ln in w.lines if "вложение PDF договора" in ln and "PDF прочитан кодом" in ln], w.lines
+
+
+def test_p3r_two_separate_parts_after_code_read():
+    """«Отправить» после чтения кодом (K06 и K15 формы real): ДВЕ ОТДЕЛЬНЫЕ части — текст (попытка 1, wamid.T1) и
+    подписанный PDF (попытка 1, wamid.P1), байты у провайдера = источнику; реестр перечитан перед текстом один раз,
+    PDF перед дверью перечитан и сверен ещё раз (дверь contract_pdf звана дважды: код при черновике и отправка). Квитанции —
+    по СВОЕМУ wamid каждой части: sent текста — «принято», delivered PDF — доставлен; двойное нажатие — «уже решено»."""
+    import hashlib
+    raw = _q_bytes()
+    for steps, rows in ((R_K06, [DOC1, DOC2]), (R_K15, [DOC1])):
+        door = _RDoor(raw)
+        w, did = _r_core(_r_run(steps, rows), door)
+        res = w.core.press(did, 1, A.ACT_SEND, "Даня", 1_790_000_200)
+        again = w.core.press(did, 1, A.ACT_SEND, "Пым", 1_790_000_201)
+        assert res["ok"] and res["words"] == "текст: ушёл · PDF: ушёл" and res["parts"] == {"text": A.SENT, "pdf": A.SENT}, res
+        assert not again["ok"] and again["words"].startswith("уже решено"), again
+        assert len(w.door.sends) == 1 and [m[1:] for m in w.door.media] == \
+            [("document", "application/pdf", "PDF-0001_signed.pdf", hashlib.sha256(raw).hexdigest())], w.door.media
+        assert door.calls == ["PDF-0001", "PDF-0001"] and len(w.find.calls) == 1, (door.calls, w.find.calls)
+        assert w.q("SELECT state, wamid FROM drafts WHERE id=?", (did,))[0] == (A.SENT, "wamid.T1")
+        assert w.part(did)[:3] == (A.SENT, 1, "wamid.P1"), w.part(did)
+        log = w.q("SELECT part, attempt, outcome, wamid FROM part_log WHERE draft_id=? ORDER BY id", (did,))
+        assert log == [("text", 1, A.SENT, "wamid.T1"), ("pdf", 1, A.SENT, "wamid.P1")], log
+        w.put(1_790_000_205, "status", wamid="wamid.T1", word="sent")
+        w.put(1_790_000_206, "status", wamid="wamid.P1", word="delivered")
+        parts = w.core.parts(did)
+        assert parts["delivery"][0] == X.D_DELIVERED and parts["text_delivery"][0] == X.D_ACCEPTED, parts
+
+
+def test_p3r_twins_prior_refusal_kept():
+    """БЛИЗНЕЦЫ — вложения нет, причина ПРЕЖНЯЯ слово в слово, дверь contract_pdf при черновике НЕ звана (проверка зелёная
+    и на 7d20845): (1) договор ИНОЙ аренды (K07: у номера только договор другого периода) — conflict; (2) БЕЗ доказанной
+    привязки: принятый договор без отметки привязки кодом (`bound_by` снят) или ответ `contract` без окна срока — при
+    `rental` модели «PDF договора не сверен (contract_pdf не звали)», без `rental` — отказ шага 3q; (3) неполный реестр
+    (K08) — incomplete; (4) WA_AGENT_BOOK_READ выкл — аренда не факт, договор не привязан (стык 2)."""
+    import copy
+    raw = _q_bytes()
+
+    def decide(out):
+        door = _RDoor(raw)
+        w, did = _r_core(out, door)
+        return _r_attach(w, did), door.calls
+    got, calls = decide(_r_run(R_K06, [DOC2]))                                                          # (1)
+    assert got[0] is None and got[8].startswith("договор не принят сверкой: conflict — ") and "вне срока аренды" in got[8] \
+        and calls == [], (got[8], calls)
+    for with_rent in (True, False):                                                                     # (2)
+        good = _r_run(([Q_RENT] if with_rent else []) + R_K06, [DOC1])
+        unbound, nowin = copy.deepcopy(good), copy.deepcopy(good)
+        for r in unbound["results"]:
+            for f in r["facts"]:
+                f.pop("bound_by", None)
+        for r in nowin["results"]:
+            if r["tool"] == "contract":
+                r["window"] = ""
+        want = R_NOT_CALLED if with_rent else Q_REFUSED
+        for out in (unbound, nowin):
+            got, calls = decide(out)
+            assert (got[0], got[8], calls) == (None, want, []), (with_rent, got[8], calls)
+    got, calls = decide(_r_run(R_K06, [DOC1, DOC3]))                                                    # (3)
+    assert got[0] is None and got[8].startswith("договор не принят сверкой: incomplete — ") and calls == [], got[8]
+    off = _QRental(every={"ok": False, "error": "брони выключены"})                                     # (4)
+    got, calls = decide(_r_run(R_K06, [DOC1], rental=off))
+    assert got[0] is None and calls == [] and got[8].startswith(
+        "договор не принят сверкой: unknown — аренда обращения не установлена (rental: refused)"), got[8]
+
+
+def test_p3r_door_failed_truthful_refusal_no_retry():
+    """Чтение кодом НЕ удалось — вложения нет, причина ПРАВДИВАЯ (код читал сам и чем кончилось), дверь звана РОВНО раз
+    (слепого повтора нет), «Отправить» шлёт только текст, документов 0: мост отказал (not_in_registry) · таймаут · дверь
+    упала · пустой ответ · длина и sha256 не сверены клиентом · двери нет (`pdf_fetch` не подан) · мост ответил ЧУЖИМ id
+    (PDF-0002 — PDF не принятого договора: чужой PDF не прикладывается никогда)."""
+    raw = _q_bytes()
+    out = _r_run(R_K06, [DOC1, DOC2])
+    cases = [("refused", "refused — not_in_registry"), ("timeout", "timeout — таймаут двери"),
+             ("crash", "refused — дверь упала: RuntimeError"), ("empty", "refused — ответ не словарь"),
+             ("unverified", "refused — длина и sha256 не сверены клиентом"),
+             ("other", "refused — PDF не принятого договора этой аренды — не прикладывается"),
+             (None, "unknown — двери contract_pdf нет — неизвестно")]
+    for mode, tail in cases:
+        door = _RDoor(raw, mode or "refused")
+        w, did = _r_core(out, door if mode else None)
+        got = _r_attach(w, did)
+        assert got[0] is None and got[8] == R_CODE_FAIL + tail, (mode, got[8])
+        assert door.calls == (["PDF-0001"] if mode else []), (mode, door.calls)
+        assert w.core.card_pdf(did, 1) == "📄 PDF не приложен: " + R_CODE_FAIL + tail, w.core.card_pdf(did, 1)
+        res = w.core.press(did, 1, A.ACT_SEND, "Даня", 1_790_000_200)
+        assert res["ok"] and res["words"] == "текст: ушёл" and len(w.door.sends) == 1 and w.door.media == [], (mode, res)
+        assert door.calls == (["PDF-0001"] if mode else []), (mode, door.calls)
+
+
+def test_p3r_model_called_contract_pdf_prior_path():
+    """МОДЕЛЬ ПОЗВАЛА contract_pdf — путь прежний, код не читает (проверка зелёная и на 7d20845): (а) свой PDF — вложение
+    решено её ответом (дверь ядра при черновике не звана, отметки «прочитал КОД» нет); (б) ЧУЖОЙ pdf_id (PDF-0002 будущего
+    договора) — прежний отказ «PDF не принят сверкой: refused — …», подмены на PDF своего договора нет; (в) её вызов
+    кончился таймаутом — прежний отказ «PDF не принят сверкой: timeout — …», код повторно не читает."""
+    raw = _q_bytes()
+    own = [{"tool": "contract_pdf", "args": {"file_id": "PDF-0001"}}]
+    door = _RDoor(raw)
+    w, did = _r_core(_r_run(R_K06 + own, [DOC1, DOC2]), door)                                          # (а)
+    got = _r_attach(w, did)
+    assert got[0] == "PDF-0001" and got[8] is None and door.calls == [] and "прочитал КОД" not in got[9], (got, door.calls)
+    assert not [ln for ln in w.lines if "PDF прочитан кодом" in ln]
+    door = _RDoor(raw)
+    w, did = _r_core(_r_run(R_K06 + [{"tool": "contract_pdf", "args": {"file_id": "PDF-0002"}}], [DOC1, DOC2]), door)  # (б)
+    got = _r_attach(w, did)
+    assert (got[0], got[8], door.calls) == (
+        None, "PDF не принят сверкой: refused — PDF не принятого договора этой аренды — не прикладывается", []), got[8]
+
+    def slow(file_id=""):
+        raise TimeoutError("дверь молчит")
+    door = _RDoor(raw)
+    w, did = _r_core(_r_run(R_K06 + own, [DOC1], pdf=slow), door)                                     # (в)
+    got = _r_attach(w, did)
+    assert (got[0], got[8], door.calls) == (None, "PDF не принят сверкой: timeout — таймаут двери", []), got[8]
+
+
+def test_p3r_skeleton_pdf_refused_at_its_door():
+    """СКЕЛЕТ PDF (K09: подписанный PDF источника обрезан) в форме real без contract_pdf: код прочитал PDF, вложение решено
+    с sha256 обрезанных байтов, а при «Отправить» PDF не уходит у СВОЕЙ двери — проверка скелета тех же байтов ДО двери
+    (`W_PDF_SHAPE`, повтора нет): текст ушёл, документов 0. На 7d20845 путь до двери скелета не доходил (отказ B2)."""
+    import hashlib
+    cut = _q_bytes(cut=True)
+    door = _RDoor(cut)
+    w, did = _r_core(_r_run(R_K06, [DOC1]), door)
+    assert _r_attach(w, did)[:3] == ("PDF-0001", len(cut), hashlib.sha256(cut).hexdigest())
+    res = w.core.press(did, 1, A.ACT_SEND, "Даня", 1_790_000_200)
+    assert res["parts"] == {"text": A.SENT, "pdf": A.NOT_SENT} and w.door.media == [], res
+    assert w.part(did)[0] == A.NOT_SENT and str(w.part(did)[4]).startswith("скелет PDF не сошёлся: "), w.part(did)
+    assert door.calls == ["PDF-0001", "PDF-0001"], door.calls
+
+
+def test_p3r_attach_of_reader_contract():
+    """Контракт `attach_of(…, read_pdf)`: читатель зовётся РОВНО раз, с pdf_id принятого договора и результатами сверки
+    модели, только когда модель contract_pdf не звала и договор привязан кодом (`bound_by` + окно срока); иначе не зовётся
+    вовсе и причина прежняя. Читатель упал — отказ словами, не исключение."""
+    out = _r_run(R_K06, [DOC1])
+    seen = []
+
+    def reader(pdf_id, results):
+        seen.append((pdf_id, len(results)))
+        return T.call_tool("contract_pdf", {"file_id": pdf_id}, {"contract_pdf": _RDoor(_q_bytes())}, Clock(),
+                           {"results": results})
+    meta, why = X.attach_of({"state": T.DONE, "results": out["results"]}, None, reader)
+    assert why == "" and meta["file_id"] == "PDF-0001" and meta.get("pdf_by") == "код" and seen == [("PDF-0001", 1)], why
+    seen.clear()
+    meta, why = X.attach_of({"state": T.DONE, "results": _r_run(Q_REAL, [DOC1])["results"]}, None, reader)
+    assert why == "" and meta and "pdf_by" not in meta and seen == [], (why, seen)
+    meta, why = X.attach_of({"state": T.DONE, "results": _r_run(R_K06, [DOC2])["results"]}, None, reader)
+    assert meta is None and why.startswith("договор не принят сверкой: conflict") and seen == [], why
+
+    def boom(pdf_id, results):
+        raise RuntimeError("сбой")
+    assert X.attach_of({"state": T.DONE, "results": out["results"]}, None, boom) == (
+        None, R_CODE_FAIL + "unknown — чтение упало: RuntimeError")
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     bad = 0

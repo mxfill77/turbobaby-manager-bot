@@ -10,8 +10,10 @@
 сверка ОДНОЗНАЧНО приняла подписанный договор ЭТОЙ аренды — ровно один подписанный договор (`contract` = fact), PDF
 этого договора сверен клиентом моста (`contract_pdf` = fact, id = pdf_id договора, sha256 и размер есть) и аренда из
 листа (`rental` = fact) на тот же байк — либо, когда модель `rental` не звала, аренда, к которой договор привязал сам код
-(K3-FIX шаг 3q, `attach_of`). Иначе вложения нет, и черновик хранит ПРИЧИНУ словами. В базе — только
-метаданные (id, имя, размер, sha256, строка реестра); байты PDF берутся из `contract_pdf` в момент отправки.
+(K3-FIX шаг 3q, `attach_of`). PDF модель не звала, а договор привязан кодом, — `contract_pdf` по `pdf_id` этого
+договора читает сам код той же дверью (K3-FIX шаг 3r, `AttachCore._code_pdf`). Иначе вложения нет, и черновик хранит
+ПРИЧИНУ словами. В базе — только метаданные (id, имя, размер, sha256, строка реестра); байты PDF берутся из `contract_pdf`
+в момент отправки.
 
 ОСНОВАНИЕ — ОПОРА СУДЬИ (T4B3BASIS0510, Т4б-3). Факты берутся не из сырых `results`, а после `wa_agent_tools.sift` с
 `since` = последнее входящее клиента (`ModelAdapter.last["info"]["last_in"]`) — та же опора, на которой стоит judge:
@@ -104,6 +106,10 @@ W_PAUSED = ("дослать нельзя: клиент на паузе — бе�
 W_FAILED = "провайдер не доставил PDF (статус failed по wamid попытки %d) — можно дослать кнопкой"
 W_PROVIDER = "статус провайдера"
 W_NO_ATTACH_QUIET = ("сверки не было", "договор не сверялся")   # причины без договора — карточку ими не шумим
+# K3-FIX шаг 3r (B2 повтора real): модель contract_pdf не звала — PDF привязанного кодом договора читает код
+W_PDF_NOT_CALLED = "PDF договора не сверен (contract_pdf не звали)"
+W_PDF_CODE_FAIL = "PDF договора не получен: модель contract_pdf не звала, код читал сам — %s — %s"
+W_PDF_CODE_NOTE = " (PDF читал код: модель contract_pdf не звала)"
 
 W_NO_CHECK = ("устарело: черновик без сверки — при WA_AGENT_ATTACH не уходит; ничего не отправлено, "
               "черновик пересобирается")
@@ -215,10 +221,11 @@ def _term(res, c, rent):
     return _day(rent.get("date_start")), _day(rent.get("date_end"))
 
 
-def attach_of(tools_out, since=None):
+def attach_of(tools_out, since=None, read_pdf=None):
     """Итог сверки Т4а (`ModelAdapter.last["tools"]`) → (метаданные PDF | None, причина словами).
     Вложение — только при однозначно принятом подписанном договоре этой аренды В ОПОРЕ СУДЬИ (`sift` с `since` =
-    последнее входящее клиента, T4B3BASIS0510); иначе — почему вложения нет."""
+    последнее входящее клиента, T4B3BASIS0510); иначе — почему вложения нет. `read_pdf(pdf_id, results)` (K3-FIX шаг 3r)
+    — ответ `contract_pdf`, прочитанный КОДОМ: зовётся не больше раза и только когда модель contract_pdf не звала."""
     if not isinstance(tools_out, dict):
         return None, "сверки не было"
     if tools_out.get("state") != "done":
@@ -273,9 +280,28 @@ def attach_of(tools_out, since=None):
             or _bike(rent[-1].get("bike")) != _bike(c.get("bike")):
         return None, "байк аренды и договора расходится"
     pdf = [r for r in by("contract_pdf")]
+    code = None
+    if not pdf and callable(read_pdf) and c.get("pdf_id") and str(c.get("bound_by") or "").strip() \
+            and all(_term(res, c, {})):
+        # K3-FIX шаг 3r (B2 повтора real, решение интегратора 12.10): модель позвала `contract {}`, договор принят и
+        # привязан КОДОМ (`bound_by`, окно срока ответа `contract`), а `contract_pdf` не звала (real_far2 K06, K15: текст
+        # «PDF следующим сообщением», документов 0). PDF ЭТОГО договора (`pdf_id`) читает код — ОДИН раз, той же дверью и
+        # тем же разбором, что у модели (`AttachCore._code_pdf`); дальше — прежние проверки. Модель contract_pdf звала
+        # (свой или чужой id) — путь прежний; чтение не удалось — отказ словами, повтора нет; в журнал модели не идёт.
+        try:
+            code = read_pdf(str(c.get("pdf_id")), res)
+        except Exception as e:                                       # noqa: BLE001
+            return None, W_PDF_CODE_FAIL % ("unknown", "чтение упало: %s" % type(e).__name__)
+        if not (isinstance(code, dict) and code.get("outcome") == T.FACT):
+            got = code if isinstance(code, dict) else {}
+            return None, W_PDF_CODE_FAIL % (got.get("outcome") or "unknown", got.get("reason") or "ответа нет")
+        pdf = [code]
     if not pdf:
-        return None, "PDF договора не сверен (contract_pdf не звали)"
-    pf = [f for f in kind("pdf") if str(f.get("id") or "") == str(c.get("pdf_id") or "") and c.get("pdf_id")]
+        return None, W_PDF_NOT_CALLED
+    pdfs = [f for f in code.get("facts") or [] if isinstance(f, dict) and f.get("kind") == "pdf"] if code else kind("pdf")
+    pf = [f for f in pdfs if str(f.get("id") or "") == str(c.get("pdf_id") or "") and c.get("pdf_id")]
+    if not pf and code:
+        return None, "сверен PDF не этого договора" + W_PDF_CODE_NOTE
     if not pf:
         if any(r.get("outcome") == T.FACT and any(str((f or {}).get("id") or "") == str(c.get("pdf_id") or "")
                                                   for f in r.get("facts") or []) for r in pdf) and c.get("pdf_id"):
@@ -288,14 +314,17 @@ def attach_of(tools_out, since=None):
     sha = str(p.get("sha256") or "").lower()
     size = p.get("size")
     if not _SHA.match(sha) or not isinstance(size, int) or isinstance(size, bool) or size <= 0:
-        return None, "у PDF нет sha256 или размера — прикладывать нельзя"
+        return None, "у PDF нет sha256 или размера — прикладывать нельзя" + (W_PDF_CODE_NOTE if code else "")
     signed_at = str(c.get("signed_at") or "").strip()
     if not signed_at:
         return None, "у договора нет signed_at — версию перед отправкой не сверить, вложения нет"
     date_from, date_to = _term(res, c, rent[-1])
-    return {"file_id": str(p.get("id")), "name": str(p.get("name") or "contract.pdf"), "size": size,
-            "sha256": sha, "row": p.get("row") if p.get("row") is not None else c.get("row"),
-            "doc_id": c.get("doc_id"), "signed_at": signed_at, "date_from": date_from, "date_to": date_to}, ""
+    meta = {"file_id": str(p.get("id")), "name": str(p.get("name") or "contract.pdf"), "size": size,
+           "sha256": sha, "row": p.get("row") if p.get("row") is not None else c.get("row"),
+           "doc_id": c.get("doc_id"), "signed_at": signed_at, "date_from": date_from, "date_to": date_to}
+    if code:
+        meta["pdf_by"] = "код"                  # K3-FIX шаг 3r: PDF прочитан кодом — отметка на карточке (опора)
+    return meta, ""
 
 
 # ── K3-FIX F1: опора черновика на карточке — источник, время ЧТЕНИЯ, версия ТОЛЬКО от источника ──────────────────
@@ -306,6 +335,7 @@ OPORA_LEGACY = "🧾 опора черновика не записана: све
 OPORA_OFF = "• прочитано фактом, но не в опоре судьи (тот же запрос прочитан позже, устарел или снят): %d"
 OPORA_CUT = "• … не показано строк опоры: %d (предел карточки — %d строк, %d знаков)"
 OPORA_ROWS, OPORA_CHARS = 6, 700
+OPORA_CODE = " · прочитал КОД: модель contract_pdf не звала"   # K3-FIX шаг 3r: строка PDF, прочитанного кодом
 W_VER_UNKNOWN = "неизвестна"
 _OPORA_STATE = {T.DONE: "", T.OVER: " (сверка не завершена: предел вызовов или времени)",
                 T.ABORTED: " (сверка оборвана новым сообщением клиента)"}
@@ -324,7 +354,7 @@ def _opora_row(r, n):
                                              " · фактов %d" % n if n > 1 else "")
 
 
-def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS):
+def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS, code=None):
     """Итог сверки Т4а (`ModelAdapter.last["tools"]`) → опора черновика словами для карточки (K3-FIX F1) | None (сверки
     нет). Строка — на КАЖДЫЙ ответ инструмента, чьи факты остались в опоре судьи (`sift` с тем же since, что у
     `attach_of`), по порядку чтения: инструмент · источник (`source` ответа: дверь, лист, узел) · время ЧТЕНИЯ ДАННЫХ
@@ -333,7 +363,8 @@ def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS):
     (`source_version` ответа, F2_CONTRACT §1.1; сегодня её не отдаёт ни одна дверь) — иначе «неизвестна». Поле `version`
     результата версией источника НЕ является (там `signed_at` договора и длина правил — F2_CONTRACT §0.3), служебное
     `stand_meta` подделки моста в результат не попадает вовсе. Новых обращений к мосту нет — только уже прочитанное.
-    Длина — потолок строк и знаков; усечение названо числом, как и факты, снятые опорой судьи."""
+    Длина — потолок строк и знаков; усечение названо числом, как и факты, снятые опорой судьи. `code` (K3-FIX шаг 3r) —
+    ответ `contract_pdf`, прочитанный КОДОМ для вложения: последней строкой, с отметкой `OPORA_CODE`."""
     if not isinstance(tools_out, dict):
         return None
     res = [r for r in tools_out.get("results") or [] if isinstance(r, dict)]
@@ -353,6 +384,8 @@ def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS):
             rows.append(_opora_row(r, n))
         else:
             off += 1
+    if isinstance(code, dict) and code.get("outcome") == T.FACT:
+        rows.append(_opora_row(code, len(code.get("facts") or [])) + OPORA_CODE)
     tail = _OPORA_STATE.get(tools_out.get("state"), " (исход сверки не разобран)")
     if not rows:
         return OPORA_NONE % tail + ("\n" + OPORA_OFF % off if off else "")
@@ -1095,13 +1128,20 @@ class AttachCore(A.Core):
                 self.log("черновик %d: версия %d по пояснению без сверки Т4а — «Отправить» её снимет" % (did, ver))
             return                                  # сверки не было: строки нет — «без сверки»
         out, since = seen
-        meta, why = attach_of(out, since)           # опора судьи: sift с since = последнее входящее (T4B3BASIS0510)
+        code = {}                                   # K3-FIX шаг 3r: ответ contract_pdf, прочитанный кодом (модель не звала)
+
+        def read_pdf(pdf_id, results):
+            code["r"] = self._code_pdf(pdf_id, results)
+            return code["r"]
+        meta, why = attach_of(out, since, read_pdf)  # опора судьи: sift с since = последнее входящее (T4B3BASIS0510)
+        by_code = bool(meta and meta.get("pdf_by"))
         if meta:
             twin = self._pdf_twin(number, meta["sha256"], did)
             if twin:
                 meta, why = None, W_TWIN % (twin[2][:12], twin[0], twin[1])
         m = meta or {}
-        opora = opora_of(out, since)                # K3-FIX F1: опора для карточки — из того же итога сверки, мост не зовётся
+        # K3-FIX F1: опора для карточки — из того же итога сверки; шаг 3r: + PDF, прочитанный кодом, с отметкой
+        opora = opora_of(out, since, code=code.get("r") if by_code else None)
         self.db.execute("INSERT OR REPLACE INTO attach(draft_id, file_id, name, size, sha256, row, doc_id, "
                         "reason, ts, signed_at, number, date_from, date_to, opora) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (did, m.get("file_id"), m.get("name"), m.get("size"), m.get("sha256"), m.get("row"),
@@ -1109,9 +1149,18 @@ class AttachCore(A.Core):
                          m.get("date_from"), m.get("date_to"), opora))
         if ver is not None:                         # Д2: строка — итог сверки ЭТОЙ версии по пояснению
             self.db.execute("UPDATE attach SET ver=? WHERE draft_id=?", (int(ver), did))
-        self.log("черновик %d: вложение %s%s" % (
+        self.log("черновик %d: вложение %s%s%s" % (
             did, "PDF договора, sha256 %s…" % m["sha256"][:12] if meta else "нет — %s" % why,
+            " — PDF прочитан кодом (модель contract_pdf не звала)" if meta and by_code else "",
             " (сверка версии %d по пояснению)" % ver if ver is not None else ""))
+
+    def _code_pdf(self, file_id, results):
+        """K3-FIX шаг 3r: `contract_pdf` по `pdf_id` привязанного кодом договора — КОДОМ, когда модель его не звала.
+        Дверь — та же, что у сверки модели (`pdf_fetch` — дверь `contract_pdf` из `model.tools`, `wa_agent_svc.attach_of`),
+        разбор — тот же (`T.call_tool` → `T._read` → `T.pdf_result`: факт только для pdf_id договора, принятого сверкой).
+        Один вызов, без повтора; двери нет, отказ, таймаут — исход со словами, а не исключение."""
+        return T.call_tool("contract_pdf", {"file_id": file_id}, {"contract_pdf": self.pdf_fetch}, self.clock,
+                           {"results": results})
 
     def _pdf_twin(self, number, sha, draft_id):
         """Тот же PDF (sha256) этому номеру в ДРУГОМ черновике уже ушёл или мог уйти → (черновик, состояние, sha256) |
