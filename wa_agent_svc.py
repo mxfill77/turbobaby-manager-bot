@@ -89,6 +89,21 @@ WA — канал НЕ собирается (строка журнала). У я
 дверь — ряд целиком в raw. Невидимые символы (Cc/Cf/Cs) вычищаются, имя ≤ TG_HEAD_NAME_MAX, шапка ≤ TG_HEAD_MAX знаков.
 Нет данных — прежняя «TG · tg:<id>» байт-в-байт; сбой чтения — она же и строка журнала с именем ошибки (без имён).
 
+ОТПРАВКА В TELEGRAM ЧЕРЕЗ ПК — WA_AGENT_TG_SEND (TGSEND1310), по умолчанию ВЫКЛЮЧЕНА: выключена (или не запрошена) —
+дверь TG закрыта насовсем, как выше, ни файла очереди, ни строки, ни импорта `tg_outbox`; канал байт-в-байт прежний.
+Включена (вместе с WA_AGENT_TG) — `TgDoor` открыт: «✅ Отправить» кладёт ответ в СВОЮ очередь `tg_outbox.db`
+(TG_OUTBOX_DB, по умолчанию рядом с tg_queue.db; совпал с любым файлом WA или TG — дверь закрыта, словами в старте)
+и ЖДЁТ подтверждения ПК не дольше WA_AGENT_TG_SEND_SEC (по умолчанию 20 с, 5–60: не дольше бюджета отправки WhatsApp,
+который цикл службы уже допускает на нажатии). Исходы: ПК подтвердил «ушло» с msg_id → sent, `wamid` = ключ эха
+`tg:<chat>:<msg_id>:out` (тот, с которым эхо вернётся лентой в tg_queue.db); ПК отказал → not_sent с причиной; срок
+вышел, а ПК ряд НЕ забрал → ряд отменяется атомарно (queued → cancelled), not_sent «ПК не забрал за N с — не
+отправлено»; ПК забрал, но не подтвердил → unknown (UNSURE) «проверьте чат клиента перед повтором». Отменённый ряд
+не выдаётся ПК ни одной дорогой. Выдачу и подтверждение несёт вход `wa_webhook` (/tg-queue/outbox, /tg-queue/ack;
+тот же Bearer, что у /tg-queue/push; та же ручка WA_AGENT_TG_SEND в его окружении). Своё эхо — `TgSendCore`: эхо с
+ключом нашей отправки не ответ человека (ни паузы, ни снятия черновиков); подтверждение пришло после срока двери —
+сверка по id сообщения из очереди; id не известен вовсе (исход unknown) — тот же текст в том же чате в окне 15 мин,
+одно эхо на одну отправку. Эхо человека с телефона — как было.
+
 ЖУРНАЛ — файл `wa_agent.log` (или WA_AGENT_LOG): только id, состояния и числа; сводка числами раз в
 5 минут. Текстов, номеров и имён клиентов в журнале нет. При включённых черновиках сводка несёт очередь
 карточек и число ждущих черновиков без доставленной карточки (WADRAFTSAFE0210). Ответ Telegram неизвестен —
@@ -102,6 +117,7 @@ import re
 import signal
 import time
 import unicodedata
+import uuid
 
 import wa_agent
 import wa_agent_tg
@@ -131,6 +147,8 @@ F_TG = "WA_AGENT_TG"                      # канал Telegram: второе я
 TG_PREFIX = "tg"                          # первое слово callback_data кнопок ядра TG
 TG_DOOR_WORDS = "отправка в Telegram закрыта насовсем — ответьте клиенту сами"
 TG_FAIL = "канал не собран: %s"           # сбой сборки канала TG — имя ошибки (TGCOREC0610)
+F_TG_SEND = "WA_AGENT_TG_SEND"            # отправка в Telegram через ПК (TGSEND1310); по умолчанию выкл
+TG_SEND_POLL = 0.5                        # дверь TG перечитывает свой ряд очереди раз в столько секунд
 F_TG_GREET = "WA_AGENT_TG_GREET"          # автоприветствие TG по времени (TGGREET1310); по умолчанию вкл, «0» — выкл
 TG_GREET_OFF = ("0", "off", "false", "no")
 TG_GREET_SILENCE = 7 * 86400              # приветствие Telegram Business — после 7+ сут без переписки (меньший выбор)
@@ -235,17 +253,197 @@ class NoModel(wa_agent.Model):
 # ═══ канал Telegram (TGCOREA0610) ═════════════════════════════════════════════════════════
 
 class TgDoor(wa_agent.Door):
-    """Дверь ядра TG: закрыта НАСОВСЕМ. `is_open` — False всегда, без ручки и без окружения; отправка текста и
-    медиа — «не отправлено» словами, ни wa_send, ни сети. Писать клиенту Telegram сервер не умеет (TGPLAN0510 п. 4)."""
+    """Дверь ядра TG. Без очереди (`outbox=None`, по умолчанию) — закрыта НАСОВСЕМ, как была: `is_open` — False
+    всегда, отправка текста и медиа — «не отправлено» словами, ни wa_send, ни сети, ни файла. Писать клиенту
+    Telegram сервер сам не умеет (TGPLAN0510 п. 4) и не учится.
+
+    С очередью (WA_AGENT_TG_SEND, TGSEND1310) — открыта: текст уходит РУКАМИ ПК. `send_text` кладёт ряд в
+    `tg_outbox.db` и ждёт подтверждения ПК не дольше `wait` секунд (часы `mono`, пауза `sleep`, перечитывание раз
+    в `poll`). Исход — три слова контракта `Door`, синхронно; ответ ПК → sent/not_sent/unknown; срок вышел, ряд не
+    забран → отмена queued → cancelled ОДНИМ условным UPDATE и not_sent; забран без ответа → unknown. Медиа этой
+    дверью не уходят (переноса из темы у канала TG нет)."""
+
+    def __init__(self, outbox=None, wait=None, clock=time.time, mono=time.monotonic, sleep=time.sleep,
+                 poll=TG_SEND_POLL, log=None):
+        self.outbox = outbox
+        self.wait = int(wait if wait is not None else 20)
+        self.clock, self.mono, self.sleep, self.poll = clock, mono, sleep, float(poll)
+        self.log = log or (lambda s: None)
 
     def is_open(self):
-        return False
+        return self.outbox is not None
 
     def send_text(self, to, text):
-        return {"outcome": wa_send.NOT_SENT, "reason": TG_DOOR_WORDS, "wamid": None}
+        if self.outbox is None:
+            return {"outcome": wa_send.NOT_SENT, "reason": TG_DOOR_WORDS, "wamid": None}
+        return self._send_via_pc(to, text)
 
     def send_media(self, to, media):
-        return {"outcome": wa_send.NOT_SENT, "reason": TG_DOOR_WORDS, "wamid": None}
+        if self.outbox is None:
+            return {"outcome": wa_send.NOT_SENT, "reason": TG_DOOR_WORDS, "wamid": None}
+        return {"outcome": wa_send.NOT_SENT, "reason": "медиа в Telegram этой дверью не уходят — только текст",
+                "wamid": None}
+
+    # ── отправка через ПК (TGSEND1310) ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _out(outcome, reason, wamid=None):
+        return {"outcome": outcome, "reason": reason, "wamid": wamid}
+
+    def _final(self, row):
+        """Исход ряда очереди → ответ двери; ряд ещё не решён → None."""
+        import tg_outbox as O
+        state = (row or {}).get("state")
+        if state == O.SENT and isinstance(row.get("msg_id"), int):
+            return self._out(wa_send.SENT, "ушло через userbot на ПК (сообщение %d)" % row["msg_id"],
+                             O.echo_wamid(row["chat_id"], row["msg_id"]))
+        if state == O.FAILED:
+            return self._out(wa_send.NOT_SENT, "ПК отказал: %s — клиенту ничего не ушло"
+                             % (str(row.get("error") or "причина не названа")[:160]))
+        if state == O.UNKNOWN:
+            return self._out(wa_send.UNKNOWN, "ПК не уверен, ушло ли (%s) — проверьте чат клиента перед повтором"
+                             % (str(row.get("error") or "причина не названа")[:120]))
+        if state == O.CANCELLED:
+            return self._out(wa_send.NOT_SENT, "ПК не забрал за %d с — не отправлено" % self.wait)
+        return None
+
+    def _send_via_pc(self, to, text):
+        import tg_outbox as O
+        chat = O.chat_of(to)
+        if chat is None:
+            return self._out(wa_send.NOT_SENT, "ключ клиента не tg:<число> — не отправлено")
+        if chat <= 0:
+            return self._out(wa_send.NOT_SENT, "чат не личный — в группы и каналы агент не пишет, не отправлено")
+        body = str(text or "")
+        if not body.strip():
+            return self._out(wa_send.NOT_SENT, "пустой текст — не отправлено")
+        if O.tg_len(body) > O.TEXT_MAX:
+            return self._out(wa_send.NOT_SENT, "текст %d знаков, Telegram берёт не больше %d — сократите через "
+                                               "«Исправить», не отправлено" % (O.tg_len(body), O.TEXT_MAX))
+        t0 = self.mono()
+        token = uuid.uuid4().hex                               # свой ДО записи: отменить можно и при потерянном ответе
+        try:
+            rid, _ = self.outbox.put(chat, body, self.wait, token=token, now=self.clock())
+        except Exception as e:                                       # noqa: BLE001
+            # запись могла лечь (сбой на подтверждении транзакции) — снимаем её по своему токену
+            try:
+                self.outbox.cancel_queued(token, "дверь: запись не подтвердилась")
+                row = self.outbox.get(token)
+            except Exception:                                        # noqa: BLE001
+                self.log("дверь: очередь отправки не записана и не перечитана (%s) — исход неизвестен"
+                         % type(e).__name__)
+                return self._out(wa_send.UNKNOWN, "очередь отправки не записана и не перечитана (%s) — проверьте "
+                                                  "чат клиента перед повтором" % type(e).__name__)
+            if row is None or row.get("state") == O.CANCELLED:
+                return self._out(wa_send.NOT_SENT, "очередь отправки не записана (%s) — не отправлено"
+                                 % type(e).__name__)
+            rid = row.get("id")
+        deadline = t0 + self.wait
+        while True:
+            try:
+                fin = self._final(self.outbox.get(token))
+            except Exception:                                        # noqa: BLE001 — прочтём в следующий раз
+                fin = None
+            if fin is not None:
+                self.log("дверь: ряд %s → %s за %.1f с" % (rid, fin["outcome"], self.mono() - t0))
+                return fin
+            left = deadline - self.mono()
+            if left <= 0:
+                break
+            self.sleep(min(self.poll, left))
+        # срок вышел: незабранный ряд отменяется условно; забранный — дверь перестаёт ждать, исход неизвестен
+        try:
+            if self.outbox.cancel_queued(token, "дверь: ПК не забрал за %d с" % self.wait):
+                self.log("дверь: ряд %s отменён — ПК не забрал за %d с" % (rid, self.wait))
+                return self._out(wa_send.NOT_SENT, "ПК не забрал за %d с — не отправлено" % self.wait)
+            row = self.outbox.get(token)
+            fin = self._final(row)
+            if fin is not None:
+                self.log("дверь: ряд %s → %s в срок" % (rid, fin["outcome"]))
+                return fin
+            if (row or {}).get("state") == O.CLAIMED:
+                self.outbox.give_up(token, now=self.clock())
+                self.log("дверь: ряд %s забран ПК, подтверждения за %d с нет — исход неизвестен" % (rid, self.wait))
+                return self._out(wa_send.UNKNOWN, "ПК забрал, но не подтвердил за %d с — проверьте чат клиента "
+                                                  "перед повтором" % self.wait)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дверь: ряд %s — очередь не прочитана в срок (%s)" % (rid, type(e).__name__))
+            return self._out(wa_send.UNKNOWN, "очередь отправки не прочитана в срок (%s) — проверьте чат клиента "
+                                              "перед повтором" % type(e).__name__)
+        return self._out(wa_send.UNKNOWN, "ряд очереди в непонятном состоянии — проверьте чат клиента перед повтором")
+
+
+_OWN_ECHO_SCHEMA = """CREATE TABLE IF NOT EXISTS tg_own_echo (
+    echo_wamid TEXT PRIMARY KEY,
+    token      TEXT NOT NULL UNIQUE,
+    how        TEXT NOT NULL,
+    ts         REAL NOT NULL
+)"""
+
+
+class TgSendCore(wa_agent.Core):
+    """Ядро канала TG при ОТКРЫТОЙ двери (WA_AGENT_TG_SEND, TGSEND1310). Отличий от `wa_agent.Core` два:
+
+    1. СВОЁ ЭХО. Ушедшее через ПК вернётся лентой рядом dir=out. Прежний `_our_wamid` узнаёт его по ключу, который
+       дверь вернула полем wamid (`tg:<chat>:<msg>:out` в drafts/outbox). Поверх — две дороги для случаев, когда дверь
+       ключа не знала: (а) подтверждение ПК пришло ПОСЛЕ срока двери — ряд очереди `sent` с этим chat_id+msg_id;
+       (б) id сообщения не известен вовсе (ПК сказал «не уверен» или молчит) — тот же текст в том же чате, очередь
+       поставлена в окне [эхо − 15 мин, эхо + 2 мин]. Одна отправка закрывает не больше одного эха (`tg_own_echo`,
+       UNIQUE token). Не наше или сверить нечем → прежнее «ответ человека» (пауза — направление сомнения прежнее).
+    2. СЛОВА ИСХОДА. Карточка и ответ на нажатие несут причину двери (`_door_words`), а не голое состояние."""
+
+    def __init__(self, *a, outbox=None, **kw):
+        self.tg_outbox = outbox
+        super().__init__(*a, **kw)
+        self.db.execute(_OWN_ECHO_SCHEMA)
+
+    def _door_words(self, state, res):
+        reason = str((res or {}).get("reason") or "").strip()
+        return state + (" — " + reason if reason else "")
+
+    def _our_wamid(self, wamid):
+        if super()._our_wamid(wamid):
+            return True
+        try:
+            return self._tg_own(wamid)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("эхо: сверка с очередью отправки не удалась (%s) — считаю ответом человека, как прежде"
+                     % type(e).__name__)
+            return False
+
+    def _tg_own(self, wamid):
+        import tg_outbox as O
+        pe = O.parse_echo(wamid)
+        if pe is None or self.tg_outbox is None:
+            return False
+        if self.db.execute("SELECT 1 FROM tg_own_echo WHERE echo_wamid=?", (wamid,)).fetchone():
+            return True
+        chat, msg = pe
+        token, how = self.tg_outbox.sent_token(chat, msg), "id"
+        if token is None:
+            q = self._queue()
+            try:
+                # подпись медиа — колонка caption (вход 01.10); очередь старше её не несёт — только текст
+                have = {r[1] for r in q.execute("PRAGMA table_info(wa_inbox)")}
+                row = q.execute("SELECT COALESCE(text, %s''), ts_msg FROM wa_inbox WHERE wamid=? ORDER BY id LIMIT 1"
+                                % ("caption, " if "caption" in have else ""), (wamid,)).fetchone()
+            finally:
+                q.close()
+            if not row or row[1] is None:
+                return False
+            body, how = O.norm_text(row[0]), "text"
+            used = {r[0] for r in self.db.execute("SELECT token FROM tg_own_echo")}
+            token = next((t for t, txt in self.tg_outbox.maybe_sent(chat, float(row[1]))
+                          if t not in used and body and O.norm_text(txt) == body), None)
+            if token is None:
+                return False
+        n = self.db.execute("INSERT OR IGNORE INTO tg_own_echo(echo_wamid, token, how, ts) VALUES(?,?,?,?)",
+                            (wamid, token, how, self.clock())).rowcount
+        if n == 1:
+            self.log("эхо: наша отправка через ПК (сверка %s) — не ответ человека: паузы нет, черновики живы"
+                     % ("по id сообщения" if how == "id" else "по тексту"))
+            return True
+        return bool(self.db.execute("SELECT 1 FROM tg_own_echo WHERE echo_wamid=?", (wamid,)).fetchone())
 
 
 def tg_nick(value):
@@ -390,10 +588,37 @@ def tg_clash(env):
     return ""
 
 
-def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=None, greet=()):
+def tg_send_of(environ, env, clock=time.time):
+    """WA_AGENT_TG_SEND (TGSEND1310) → (очередь | None, ожидание с, слова строки старта | None).
+    Не запрошен — (None, 0, None): ни импорта `tg_outbox`, ни файла, ни слова — канал байт-в-байт прежний.
+    Запрошен: файл очереди совпал с файлом агента/очереди TG или ЛЮБЫМ файлом WA (realpath, samefile) — дверь
+    закрыта, словами; очередь не открылась — то же; иначе очередь и слова «вкл …». Исключение не бросает."""
+    if not wa_agent_tg.flag_on(environ.get(F_TG_SEND)):
+        return None, 0, None
+    import tg_outbox
+    wait, wait_words = tg_outbox.wait_of(environ.get(tg_outbox.WAIT_ENV))
+    path = tg_outbox.path_of(environ, env.get("tg_queue_db") or ROOT)
+    for name, key in TG_FILES + WA_FILES:
+        if _same(path, env.get(key)):
+            return None, wait, "флаг 1, файл исходящей TG совпал с файлом %s — отправка закрыта" % name
+    try:
+        outbox = tg_outbox.Outbox(path, clock=clock)
+    except Exception as e:                                           # noqa: BLE001
+        return None, wait, "флаг 1, очередь %s не открылась (%s) — отправка закрыта" % (
+            os.path.basename(path), type(e).__name__)
+    return outbox, wait, ("вкл — «Отправить» кладёт ответ в %s, userbot ПК шлёт с бизнес-аккаунта; ждём подтверждения "
+                          "ПК до %s: не забрал — отменено, не ушло; забрал без ответа — исход неизвестен"
+                          % (os.path.basename(path), wait_words))
+
+
+def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=None, greet=(), send=None,
+             door_kw=None):
     """Второе ядро канала Telegram. → (ядро | None, слова). Собирается ТОЛЬКО при WA_AGENT_TG; файл агента или
     очереди TG совпал с другим файлом канала или с любым файлом WA — не собирается (смешало бы курсор, смещение,
-    клиентов и номера черновиков). Исключение сборки идёт наружу — его ловит `build` (TGCOREC0610)."""
+    клиентов и номера черновиков). Исключение сборки идёт наружу — его ловит `build` (TGCOREC0610).
+    send — (очередь | None, ожидание с) от `tg_send_of` (TGSEND1310): очередь есть — дверь открыта и ядро
+    `TgSendCore`; нет (умолчание) — дверь закрыта насовсем и ядро прежнее `wa_agent.Core`. door_kw — часы и пауза
+    двери (тесты)."""
     line = line or (lambda s: log.info("%s", s))
     tg_agent, tg_queue = env.get("tg_agent_db"), env.get("tg_queue_db")
     if not tg_agent or not tg_queue:
@@ -405,8 +630,15 @@ def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=No
     side = TgSide(env.get("tg_token"), enabled=flags[F_CARDS], http=http, clock=clock, log=tline,
                   prefix=TG_PREFIX, reader=False, send_closed=False)
     drafts = flags[F_DRAFTS] and model is not None
-    core = wa_agent.Core(env["tg_agent_db"], tg_queue, model or NoModel(), TgHands(side), TgDoor(), clock=clock,
-                         log=tline, drafts=drafts, greet=greet, pace=False, lessons=False, followup=False)
+    outbox, wait = (send or (None, 0))[:2]
+    if outbox is None:
+        core = wa_agent.Core(env["tg_agent_db"], tg_queue, model or NoModel(), TgHands(side), TgDoor(), clock=clock,
+                             log=tline, drafts=drafts, greet=greet, pace=False, lessons=False, followup=False)
+    else:
+        door = TgDoor(outbox, wait=wait, clock=clock, log=tline, **(door_kw or {}))
+        core = TgSendCore(env["tg_agent_db"], tg_queue, model or NoModel(), TgHands(side), door, clock=clock,
+                          log=tline, drafts=drafts, greet=greet, pace=False, lessons=False, followup=False,
+                          outbox=outbox)
     core.greet_silence = TG_GREET_SILENCE
     side.bind(core)
     reader.attach(side)
@@ -420,12 +652,25 @@ def tg_core_of(tg):
     return side.core if side is not None else None
 
 
+TG_DOOR_SHUT_START = "отправка закрыта насовсем (is_open всегда False)"
+
+
+def tg_door_start(core):
+    """Слова о двери TG для строки старта: закрыта — прежние байт-в-байт; открыта (TGSEND1310) — очередь и ожидание."""
+    door = getattr(core, "door", None)
+    outbox = getattr(door, "outbox", None)
+    if outbox is None:
+        return TG_DOOR_SHUT_START
+    return ("отправка через userbot ПК открыта (%s): очередь %s, ждём подтверждения ПК до %d с"
+            % (F_TG_SEND, os.path.basename(str(getattr(outbox, "path", ""))), int(getattr(door, "wait", 0))))
+
+
 def tg_start_line(env, core, words):
-    return ("wa-agent: канал TG (%s): %s · база агента %s (своя) · очередь %s (только чтение) · отправка закрыта "
-            "насовсем (is_open всегда False) · ритм, напоминание, ожидание, уроки, показ, тема → клиенту и реакции "
-            "выкл · кнопки %s:… — этому ядру, читатель getUpdates — один (руки WA)"
+    return ("wa-agent: канал TG (%s): %s · база агента %s (своя) · очередь %s (только чтение) · %s · ритм, "
+            "напоминание, ожидание, уроки, показ, тема → клиенту и реакции выкл · кнопки %s:… — этому ядру, читатель "
+            "getUpdates — один (руки WA)"
             % (F_TG, words, os.path.basename(str(env.get("tg_agent_db") or "")),
-               "есть" if os.path.exists(str(env.get("tg_queue_db") or "")) else "нет", TG_PREFIX)
+               "есть" if os.path.exists(str(env.get("tg_queue_db") or "")) else "нет", tg_door_start(core), TG_PREFIX)
             if core is not None else "wa-agent: канал TG (%s): %s" % (F_TG, words))
 
 
@@ -550,7 +795,7 @@ def model_line(model):
 
 
 def build(env, environ=None, model=None, http=None, send=None, react_send=None, clock=time.time,
-          line=None, send_media=None, tg_model=None, tg_fail=None):
+          line=None, send_media=None, tg_model=None, tg_fail=None, tg_door_kw=None):
     """Собрать ядро и руки. model=None — адаптера нет, черновики выключены при любом WA_AGENT_DRAFTS.
     → (core, tg, flags, words): flags — запрошенные, words — действующие состояния словами.
     WA_AGENT_TG (TGCOREA0610) — второе ядро (`build_tg`, модель tg_model); его берут `tg_core_of(tg)`,
@@ -646,10 +891,15 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
         else:
             try:
                 tg_greet, tg_greet_words = tg_greet_of(environ)
+                # отправка через ПК (TGSEND1310): не запрошена — (None, 0, None), сборка и слова прежние
+                outbox, wait, send_words = tg_send_of(environ, env, clock=clock)
                 _tg_core, words[F_TG] = build_tg(env, tg, flags, model=tg_model, http=http, clock=clock, line=line,
-                                                 greet=tg_greet)
+                                                 greet=tg_greet, send=(outbox, wait) if outbox is not None else None,
+                                                 door_kw=tg_door_kw)
                 if _tg_core is not None:
                     words[F_TG] += " · " + tg_greet_words
+                    if send_words:
+                        words[F_TG] += " · отправка TG (%s): %s" % (F_TG_SEND, send_words)
             except Exception as e:                                   # noqa: BLE001
                 tg.peers.pop(TG_PREFIX, None)                        # прицеп мог лечь до сбоя — читатель снова один
                 words[F_TG] = TG_FAIL % type(e).__name__
@@ -759,7 +1009,17 @@ def tg_summary(tg_core, stats):
             % (_pairs(tg_core.counts()), tg_core.db.execute("SELECT COUNT(*) FROM tg_cards").fetchone()[0],
                tg_core.db.execute("SELECT COUNT(*) FROM clients WHERE paused=1").fetchone()[0],
                stats.get("tg_tick_fail", 0))
-            + cards_words(tg_core))
+            + cards_words(tg_core) + tg_send_words(tg_core))
+
+
+def tg_send_words(tg_core):
+    """Очередь отправки через ПК по состояниям (TGSEND1310) — только у ядра с открытой дверью; иначе пусто
+    (сводка TG прежняя). Своё эхо, узнанное по id и по тексту, — числами."""
+    outbox = getattr(tg_core, "tg_outbox", None)
+    if outbox is None:
+        return ""
+    own = dict(tg_core.db.execute("SELECT how, COUNT(*) FROM tg_own_echo GROUP BY how").fetchall())
+    return " · отправка через ПК %s · своё эхо %s" % (_pairs(outbox.counts()), _pairs(own))
 
 
 def serve(core, tg, words, should_stop, clock=time.time, sleep=time.sleep, every=SUMMARY_EVERY,
