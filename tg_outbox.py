@@ -26,6 +26,19 @@
   • ПОДТВЕРЖДЕНИЕ (`ack`) идемпотентно: первый исход окончателен, повтор того же — «уже записано»,
     иной — «уже записано: <первый>» без перезаписи; чужой токен, неизвестный id, отменённый ряд и
     ряд, который ПК не забирал, — отказ словами. Исход «sent» без целого msg_id > 0 не принимается.
+    failed с признаком ПК `not_started` (отправка НЕ начиналась, причина временная: срок сервера на
+    исходе, стоп-кран, журнал, нет связи) — дверь возвращает черновик ждать (`retry`).
+  • ПК ШЛЁТ ТЕКСТ ДОСЛОВНО, parse_mode=None, И ПОДТВЕРЖДАЕТ СРАЗУ ПОСЛЕ ОТПРАВКИ, ДО РЯДА ЛЕНТЫ — поэтому
+    эхо своей отправки приходит, когда msg_id ряда уже записан, и узнаётся по id, а не по тексту.
+
+ПК НА СВЯЗИ. Вход пишет время КАЖДОГО опроса ПК (GET /tg-queue/outbox) в `meta.pc_seen` (`pc_poll`).
+Дверь, а до неё ядро при нажатии, спрашивают `pc()`: опроса не было дольше PC_FRESH — «ПК не на связи»,
+сразу, без захвата черновика и без ожидания срока. ПК опрашивает раз в 2.5 с, при «off»/ошибке — не
+реже раза в 10 с, поэтому PC_FRESH = 15 с.
+
+ДОКАЗАННО НЕ УШЛО → ЧЕРНОВИК ЖДЁТ. Отменённый ряд (дверь в срок · срок вышел) и failed с `not_started` —
+клиенту ничего не ушло, причина временная: дверь отвечает not_sent с признаком `retry`, ядро возвращает
+черновик в pending, кнопки живы.
 
 КЛЮЧ ЭХА. Ушедшее сообщение вернётся лентой ПК рядом dir=out, и вход `wa_webhook.tg_row_event`
 положит его в tg_queue.db с ключом `tg:<chat_id>:<msg_id>:out` (`wa_webhook.tg_wamid`). Дверь отдаёт
@@ -46,6 +59,7 @@ FLAG = "WA_AGENT_TG_SEND"                 # выключатель: только
 # каждой постановкой; пульс старше DOOR_FRESH, нет файла или нет пульса — «отправка выключена»: выдача пуста,
 # ПК опрашивает реже. Служба выключена флагом, упала или стоит — дверь закрывается сама через DOOR_FRESH.
 DOOR_FRESH = 90                           # с: ожидание двери до 60 с + такт 5 с + запас
+PC_FRESH = 15                             # с: ПК опрашивает раз в 2.5 с, при «off»/ошибке — не реже раза в 10 с
 PATH_ENV = "TG_OUTBOX_DB"                 # путь файла очереди; нет — рядом с tg_queue.db
 FILE_NAME = "tg_outbox.db"
 WAIT_ENV = "WA_AGENT_TG_SEND_SEC"         # сколько дверь ждёт подтверждения ПК, с
@@ -80,14 +94,18 @@ CREATE TABLE IF NOT EXISTS tg_out (
     acked_at     REAL,
     msg_id       INTEGER,
     error        TEXT,
-    cancel_why   TEXT
+    cancel_why   TEXT,
+    not_started  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_tg_out_state ON tg_out(state, expires_at);
 CREATE INDEX IF NOT EXISTS idx_tg_out_msg ON tg_out(chat_id, msg_id);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+_ADDED_COLS = (("not_started", "INTEGER NOT NULL DEFAULT 0"),)   # файлы очереди до круга правок 2
 _BEAT_SQL = ("INSERT INTO meta(key, value) VALUES('door_beat', ?) "
              "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+_PC_SQL = ("INSERT INTO meta(key, value) VALUES('pc_seen', ?) "
+           "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
 
 
 def flag_on(raw) -> bool:
@@ -145,12 +163,19 @@ def _row(r):
     if r is None:
         return None
     keys = ("id", "token", "chat_id", "text", "state", "created_at", "expires_at", "claimed_at", "handed",
-            "door_gave_up", "acked_at", "msg_id", "error", "cancel_why")
+            "door_gave_up", "acked_at", "msg_id", "error", "cancel_why", "not_started")
     return dict(zip(keys, r))
 
 
 _COLS = ("id, token, chat_id, text, state, created_at, expires_at, claimed_at, handed, door_gave_up, acked_at, "
-         "msg_id, error, cancel_why")
+         "msg_id, error, cancel_why, not_started")
+
+
+def _age(raw, now):
+    try:
+        return now - float(raw[0]) if raw else None
+    except (TypeError, ValueError):
+        return None
 
 
 class Outbox:
@@ -170,6 +195,10 @@ class Outbox:
         conn = self._conn()
         try:
             conn.executescript(_SCHEMA)
+            have = {r[1] for r in conn.execute("PRAGMA table_info(tg_out)")}
+            for col, typ in _ADDED_COLS:
+                if col not in have:
+                    conn.execute("ALTER TABLE tg_out ADD COLUMN %s %s" % (col, typ))
         finally:
             conn.close()
 
@@ -232,10 +261,26 @@ class Outbox:
             row = conn.execute("SELECT value FROM meta WHERE key='door_beat'").fetchone()
         finally:
             conn.close()
+        age = _age(row, now)
+        return (age is not None and -fresh <= age <= fresh), age
+
+    # ── ПК на связи: вход пишет время каждого опроса ПК ───────────────────────────────────
+
+    def pc_poll(self, now=None):
+        """ПК опросил очередь (зовёт вход wa_webhook на каждый GET /tg-queue/outbox — и при «on», и при «off»)."""
+        now = self.clock() if now is None else float(now)
+        self._write(lambda conn: conn.execute(_PC_SQL, (repr(now),)))
+
+    def pc(self, now=None, fresh=PC_FRESH):
+        """→ (на связи?, возраст последнего опроса с | None). Опроса не было, он битый, старше fresh или «из
+        будущего» дальше fresh — не на связи: незнание не зовётся «на связи»."""
+        now = self.clock() if now is None else float(now)
+        conn = self._conn()
         try:
-            age = now - float(row[0]) if row else None
-        except (TypeError, ValueError):
-            age = None
+            row = conn.execute("SELECT value FROM meta WHERE key='pc_seen'").fetchone()
+        finally:
+            conn.close()
+        age = _age(row, now)
         return (age is not None and -fresh <= age <= fresh), age
 
     def get(self, token):
@@ -285,14 +330,17 @@ class Outbox:
             return out
         return self._write(fn)
 
-    def ack(self, row_id, token, outcome, msg_id=None, error=None, now=None):
-        """Исход от ПК. → {"ok": bool, "state": …, "dup": bool, "error": слова отказа}. Идемпотентно."""
+    def ack(self, row_id, token, outcome, msg_id=None, error=None, now=None, not_started=False):
+        """Исход от ПК. → {"ok": bool, "state": …, "dup": bool, "error": слова отказа}. Идемпотентно. not_started
+        (только у failed, только True) — признак ПК «отправка не начиналась, причина временная»: дверь вернёт
+        черновик ждать."""
         now = self.clock() if now is None else float(now)
         if outcome not in ACK_OUTCOMES:
             return {"ok": False, "error": "bad_outcome"}
         if outcome == SENT and not (isinstance(msg_id, int) and not isinstance(msg_id, bool) and msg_id > 0):
             return {"ok": False, "error": "bad_msg_id"}
         err = None if error is None else str(error)[:ERROR_MAX]
+        ns = 1 if (outcome == FAILED and not_started is True) else 0
 
         def fn(conn):
             rec = _row(conn.execute("SELECT %s FROM tg_out WHERE id=?" % _COLS, (int(row_id),)).fetchone())
@@ -307,8 +355,9 @@ class Outbox:
             if rec["state"] in FINAL:
                 same = rec["state"] == outcome and (outcome != SENT or rec["msg_id"] == msg_id)
                 return {"ok": True, "state": rec["state"], "dup": True, "same": same, "msg_id": rec["msg_id"]}
-            n = conn.execute("UPDATE tg_out SET state=?, acked_at=?, msg_id=?, error=? WHERE id=? AND state=?",
-                             (outcome, now, msg_id if outcome == SENT else None, err, rec["id"], CLAIMED)).rowcount
+            n = conn.execute("UPDATE tg_out SET state=?, acked_at=?, msg_id=?, error=?, not_started=? WHERE id=? AND "
+                             "state=?", (outcome, now, msg_id if outcome == SENT else None, err, ns, rec["id"],
+                                         CLAIMED)).rowcount
             return {"ok": n == 1, "state": outcome if n == 1 else rec["state"], "dup": False,
                     "msg_id": msg_id if outcome == SENT else None}
         return self._write(fn)

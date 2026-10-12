@@ -263,7 +263,12 @@ class TgDoor(wa_agent.Door):
     `tg_outbox.db` и ждёт подтверждения ПК не дольше `wait` секунд (часы `mono`, пауза `sleep`, перечитывание раз
     в `poll`). Исход — три слова контракта `Door`, синхронно; ответ ПК → sent/not_sent/unknown; срок вышел, ряд не
     забран → отмена queued → cancelled ОДНИМ условным UPDATE и not_sent; забран без ответа → unknown. Медиа этой
-    дверью не уходят (переноса из темы у канала TG нет)."""
+    дверью не уходят (переноса из темы у канала TG нет).
+
+    ПРИЗНАК ПОВТОРА (`retry: True` в ответе, круг 2): клиенту ДОКАЗАННО ничего не ушло и причина временная — ПК не на
+    связи (опроса не было дольше PC_FRESH; проверка ДО постановки, без ожидания срока), ряд отменён (дверью в срок,
+    сроком), ПК отказал с машинным признаком «отправка не начиналась», текст длиннее предела Telegram. Ядро по этому признаку возвращает черновик в pending — кнопки живы, вопрос
+    клиента открыт. Признак — структурный флаг, слова причины его не решают."""
 
     def __init__(self, outbox=None, wait=None, clock=time.time, mono=time.monotonic, sleep=time.sleep,
                  poll=TG_SEND_POLL, log=None):
@@ -289,8 +294,24 @@ class TgDoor(wa_agent.Door):
     # ── отправка через ПК (TGSEND1310) ────────────────────────────────────────────────────
 
     @staticmethod
-    def _out(outcome, reason, wamid=None):
-        return {"outcome": outcome, "reason": reason, "wamid": wamid}
+    def _out(outcome, reason, wamid=None, retry=False):
+        out = {"outcome": outcome, "reason": reason, "wamid": wamid}
+        if retry:
+            out["retry"] = True                # клиенту доказанно ничего не ушло, причина временная — черновик ждёт
+        return out
+
+    def pc_words(self, now=None):
+        """ПК на связи → None; иначе слова «ПК не на связи …» (опроса не было дольше PC_FRESH или очередь не
+        прочитана — незнание тоже «не на связи»: ряд не ставим, клиенту ничего не уходит)."""
+        import tg_outbox as O
+        try:
+            alive, age = self.outbox.pc(self.clock() if now is None else now)
+        except Exception as e:                                       # noqa: BLE001
+            return "ПК не на связи (очередь отправки не прочитана: %s)" % type(e).__name__
+        if alive:
+            return None
+        return "ПК не на связи (%s)" % ("ещё не опрашивал очередь" if age is None
+                                         else "последний опрос %d с назад, ждём не дольше %d с" % (age, O.PC_FRESH))
 
     def _final(self, row):
         """Исход ряда очереди → ответ двери; ряд ещё не решён → None."""
@@ -300,13 +321,19 @@ class TgDoor(wa_agent.Door):
             return self._out(wa_send.SENT, "ушло через userbot на ПК (сообщение %d)" % row["msg_id"],
                              O.echo_wamid(row["chat_id"], row["msg_id"]))
         if state == O.FAILED:
+            if row.get("not_started"):
+                return self._out(wa_send.NOT_SENT, "ПК не начинал отправку: %s — клиенту ничего не ушло"
+                                 % (str(row.get("error") or "причина не названа")[:150]), retry=True)
             return self._out(wa_send.NOT_SENT, "ПК отказал: %s — клиенту ничего не ушло"
                              % (str(row.get("error") or "причина не названа")[:160]))
         if state == O.UNKNOWN:
             return self._out(wa_send.UNKNOWN, "ПК не уверен, ушло ли (%s) — проверьте чат клиента перед повтором"
                              % (str(row.get("error") or "причина не названа")[:120]))
         if state == O.CANCELLED:
-            return self._out(wa_send.NOT_SENT, "ПК не забрал за %d с — не отправлено" % self.wait)
+            why = str(row.get("cancel_why") or "").strip()
+            if why.startswith("дверь:") or not why:
+                why = "ПК не забрал за %d с — не отправлено" % self.wait
+            return self._out(wa_send.NOT_SENT, why[:160], retry=True)
         return None
 
     def _send_via_pc(self, to, text):
@@ -318,10 +345,15 @@ class TgDoor(wa_agent.Door):
             return self._out(wa_send.NOT_SENT, "чат не личный — в группы и каналы агент не пишет, не отправлено")
         body = str(text or "")
         if not body.strip():
-            return self._out(wa_send.NOT_SENT, "пустой текст — не отправлено")
+            return self._out(wa_send.NOT_SENT, "пустой текст — не отправлено", retry=True)
         if O.tg_len(body) > O.TEXT_MAX:
             return self._out(wa_send.NOT_SENT, "текст %d знаков, Telegram берёт не больше %d — сократите через "
-                                               "«Исправить», не отправлено" % (O.tg_len(body), O.TEXT_MAX))
+                                               "«Исправить», не отправлено" % (O.tg_len(body), O.TEXT_MAX), retry=True)
+        off = self.pc_words()
+        if off:
+            # ПК не опрашивает очередь — ряд не ставим и срок не ждём: ответ сразу, цикл службы не стоит 20 с
+            self.log("дверь: %s — ряд не поставлен" % off)
+            return self._out(wa_send.NOT_SENT, off + " — не отправлено", retry=True)
         t0 = self.mono()
         token = uuid.uuid4().hex                               # свой ДО записи: отменить можно и при потерянном ответе
         try:
@@ -338,7 +370,7 @@ class TgDoor(wa_agent.Door):
                                                   "чат клиента перед повтором" % type(e).__name__)
             if row is None or row.get("state") == O.CANCELLED:
                 return self._out(wa_send.NOT_SENT, "очередь отправки не записана (%s) — не отправлено"
-                                 % type(e).__name__)
+                                 % type(e).__name__, retry=True)
             rid = row.get("id")
         deadline = t0 + self.wait
         while True:
@@ -357,14 +389,19 @@ class TgDoor(wa_agent.Door):
         try:
             if self.outbox.cancel_queued(token, "дверь: ПК не забрал за %d с" % self.wait):
                 self.log("дверь: ряд %s отменён — ПК не забрал за %d с" % (rid, self.wait))
-                return self._out(wa_send.NOT_SENT, "ПК не забрал за %d с — не отправлено" % self.wait)
+                return self._out(wa_send.NOT_SENT, "ПК не забрал за %d с — не отправлено" % self.wait, retry=True)
             row = self.outbox.get(token)
             fin = self._final(row)
             if fin is not None:
                 self.log("дверь: ряд %s → %s в срок" % (rid, fin["outcome"]))
                 return fin
             if (row or {}).get("state") == O.CLAIMED:
-                self.outbox.give_up(token, now=self.clock())
+                if not self.outbox.give_up(token, now=self.clock()):
+                    # гонка: ПК подтвердил между чтением и отказом ждать — его исход и есть ответ
+                    fin = self._final(self.outbox.get(token))
+                    if fin is not None:
+                        self.log("дверь: ряд %s → %s на границе срока" % (rid, fin["outcome"]))
+                        return fin
                 self.log("дверь: ряд %s забран ПК, подтверждения за %d с нет — исход неизвестен" % (rid, self.wait))
                 return self._out(wa_send.UNKNOWN, "ПК забрал, но не подтвердил за %d с — проверьте чат клиента "
                                                   "перед повтором" % self.wait)
@@ -392,7 +429,9 @@ class TgSendCore(wa_agent.Core):
        (б) id сообщения не известен вовсе (ПК сказал «не уверен» или молчит) — тот же текст в том же чате, очередь
        поставлена в окне [эхо − 15 мин, эхо + 2 мин]. Одна отправка закрывает не больше одного эха (`tg_own_echo`,
        UNIQUE token). Не наше или сверить нечем → прежнее «ответ человека» (пауза — направление сомнения прежнее).
-    2. СЛОВА ИСХОДА. Карточка и ответ на нажатие несут причину двери (`_door_words`), а не голое состояние."""
+    2. СЛОВА ИСХОДА. Карточка и ответ на нажатие несут причину двери (`_door_words`), а не голое состояние.
+    3. ДО ЗАХВАТА (круг 2): ПК не на связи (опроса нет дольше PC_FRESH), текст пуст или длиннее предела Telegram —
+       «Отправить» отвечает словами, черновик не захватывается, кнопки живы (`_send_unready`)."""
 
     def __init__(self, *a, outbox=None, **kw):
         self.tg_outbox = outbox
@@ -418,6 +457,20 @@ class TgSendCore(wa_agent.Core):
     def _door_words(self, state, res):
         reason = str((res or {}).get("reason") or "").strip()
         return state + (" — " + reason if reason else "")
+
+    def _send_unready(self, draft_id, now):
+        import tg_outbox as O
+        row = self.db.execute("SELECT text FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        text = str((row or ("",))[0] or "")
+        if not text.strip():
+            return "пустой текст — не отправлено; черновик ждёт: «Исправить»"
+        if O.tg_len(text) > O.TEXT_MAX:
+            return ("текст %d знаков, Telegram берёт не больше %d — сократите через «Исправить»; черновик ждёт, "
+                    "кнопки живы" % (O.tg_len(text), O.TEXT_MAX))
+        off = self.door.pc_words(now) if hasattr(self.door, "pc_words") else None
+        if off:
+            return off + " — черновик ждёт, кнопки живы"
+        return None
 
     def _our_wamid(self, wamid):
         if super()._our_wamid(wamid):

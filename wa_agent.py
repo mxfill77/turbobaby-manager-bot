@@ -1517,6 +1517,15 @@ class Core:
                 return {"ok": False, "state": PENDING,
                         "words": "отправка выключена — черновик ждёт, кнопки живы"}
             return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
+        unready = self._send_unready(draft_id, now) if action == ACT_SEND else None
+        if unready:
+            # дверь открыта, но отправить сейчас нельзя (TGSEND1310: ПК не на связи, текст длиннее предела) — ДО
+            # захвата, как при закрытой двери: черновик остаётся pending, кнопки живы, вопрос клиента открыт
+            row = self.db.execute("SELECT state, ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
+            if row and row[0] == PENDING and row[1] == int(ver):
+                self.log("черновик %d: «Отправить» — %s, черновик ждёт" % (draft_id, unready))
+                return {"ok": False, "state": PENDING, "words": unready}
+            return {"ok": False, "state": None, "words": self._decided(draft_id, ver)}
         if action == ACT_SEND and self.templates:
             # шаблоны (NIGHT0710-B3g): окно 24 ч закрыто — ДО захвата, черновик ждёт, на карточке — шаблон
             closed = self._send_closed(draft_id, ver, who, now)
@@ -1610,6 +1619,15 @@ class Core:
         except Exception as e:                                       # noqa: BLE001
             res = {"outcome": "unknown", "reason": "дверь упала: %s" % type(e).__name__}
         state = _DOOR_STATE.get(res.get("outcome"), UNSURE)
+        if state == NOT_SENT and res.get("retry") is True and from_state == CLAIMED:
+            # дверь доказала: клиенту ничего не ушло, причина временная (TGSEND1310 — ПК не на связи, ряд отменён,
+            # ПК не начинал отправку). Черновик назад в pending: кнопки живы, done_upto не трогаем — вопрос открыт.
+            # Признак — структурный флаг двери; дверь WA его не ставит никогда (ядро WA байт-в-байт прежнее)
+            if self.db.execute("UPDATE drafts SET state=?, decided_by=NULL, decided_at=NULL WHERE id=? AND state=?",
+                               (PENDING, draft_id, SENDING)).rowcount == 1:
+                words = self._retry_words(res)
+                self.log("черновик %d: дверь — не отправлено, причина временная: черновик ждёт, кнопки живы" % draft_id)
+                return {"ok": False, "state": PENDING, "words": words}
         if (state == NOT_SENT and self.templates and res.get("window") == "closed"
                 and self._window(number)[0] == "closed"):
             # шаблоны (NIGHT0710-B3g): окно закрылось между пробой ядра и воротами двери (граница 24 ч, срок ритма) —
@@ -1640,6 +1658,16 @@ class Core:
         (ядро WA байт-в-байт прежнее); ядро канала TG с открытой дверью (`wa_agent_svc.TgSendCore`,
         TGSEND1310) добавляет причину двери: «ПК не забрал», «проверьте чат перед повтором»."""
         return state
+
+    def _send_unready(self, draft_id, now):
+        """Почему «Отправить» сейчас нельзя при ОТКРЫТОЙ двери → слова или None. Ядро WA — None всегда (байт-в-байт
+        прежнее); ядро канала TG с открытой дверью (TGSEND1310) — ПК не на связи, текст пуст или длиннее предела."""
+        return None
+
+    def _retry_words(self, res):
+        """Слова «не ушло, черновик ждёт» на нажатие — по ответу двери с признаком повтора."""
+        reason = str((res or {}).get("reason") or "не отправлено").strip()
+        return reason + " — черновик ждёт, кнопки живы"
 
     # ── человеческий ритм (WAHUMANPACE0210) ───────────────────────────────────────────────
 

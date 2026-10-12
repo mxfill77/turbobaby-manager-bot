@@ -59,15 +59,22 @@ def _tmp():
 # ═══ подделка ПК: забирает и подтверждает ряды очереди ════════════════════════════════════
 
 class FakePC:
-    """mode: send — подтвердить «ушло» (msg_id растёт) · fail — отказ · unknown — «не уверен» · claim — забрать и
-    молчать · silent — не забирать вовсе · late — забрать, подтвердить «ушло» только по `late_ack()`."""
+    """mode: send — подтвердить «ушло» (msg_id растёт) · fail — отказ · notstarted — отказ с признаком «отправка не
+    начиналась» · unknown — «не уверен» · claim — забрать и молчать · silent — опрашивает (на связи), но не забирает ·
+    dead — не опрашивает вовсе (ПК спит) · late — забрать, подтвердить «ушло» только по `late_ack()`.
+    Опрос ПК отмечается в очереди (`pc_poll`) — так, как это делает вход wa_webhook на каждый GET."""
 
     def __init__(self, outbox, mode="send", msg_id=555, error="UserIsBlockedError"):
         self.outbox, self.mode, self.msg_id, self.error = outbox, mode, msg_id, error
         self.claimed, self.acks = [], []
 
+    def poll(self):
+        if self.mode != "dead" and self.outbox is not None:
+            self.outbox.pc_poll()
+
     def step(self):
-        if self.mode == "silent":
+        self.poll()
+        if self.mode in ("silent", "dead"):
             return
         for it in self.outbox.claim():
             self.claimed.append(it)
@@ -76,6 +83,9 @@ class FakePC:
                 self.msg_id += 1
             elif self.mode == "fail":
                 self.acks.append(self.outbox.ack(it["id"], it["token"], O.FAILED, error=self.error))
+            elif self.mode == "notstarted":
+                self.acks.append(self.outbox.ack(it["id"], it["token"], O.FAILED, not_started=True,
+                                                 error="срок сервера на исходе (осталось 1.4 с) — отправку не начинаю"))
             elif self.mode == "unknown":
                 self.acks.append(self.outbox.ack(it["id"], it["token"], O.UNKNOWN, error="ConnectionError"))
 
@@ -104,6 +114,7 @@ def door(mode="send", wait=20):
     clock = K.Clock(T0)
     ob = O.Outbox(os.path.join(_tmp(), "tg_outbox.db"), clock=clock)
     pc = FakePC(ob, mode)
+    pc.poll()                                           # ПК опрашивал очередь только что (dead — никогда)
     tk = Ticker(clock, pc)
     return S.TgDoor(ob, wait=wait, clock=clock, **tk.kw()), ob, pc, tk, clock
 
@@ -250,7 +261,8 @@ def test_door_refusal_is_not_sent():
 def test_door_pc_silent_row_cancelled_no_late_send():
     d, ob, pc, tk, clock = door("silent", wait=20)
     res = d.send_text("tg:%d" % CHAT, "x")
-    assert res == {"outcome": "not_sent", "reason": "ПК не забрал за 20 с — не отправлено", "wamid": None}, res
+    assert res == {"outcome": "not_sent", "reason": "ПК не забрал за 20 с — не отправлено", "wamid": None,
+                   "retry": True}, res
     assert rows(ob)[0]["state"] == O.CANCELLED
     assert 20 <= clock.t - T0 <= 20 + S.TG_SEND_POLL, clock.t - T0                  # бюджет не превышен
     pc.mode = "send"
@@ -467,10 +479,16 @@ def test_chain_door_http_pc_sent():
                 got.append(it)
                 h.ack(id=it["id"], token=it["token"], outcome="sent", msg_id=31337)
             time.sleep(0.2)
+    ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
     th = threading.Thread(target=pc, daemon=True)
     th.start()
     try:
-        d = S.TgDoor(O.Outbox(os.path.join(tmp, "tg_outbox.db")), wait=8, poll=0.1)
+        d = S.TgDoor(ob, wait=8, poll=0.1)
+        for _ in range(100):                            # ПК опросил вход — вход отметил «ПК на связи»
+            if ob.pc()[0]:
+                break
+            time.sleep(0.05)
+        assert ob.pc()[0], "вход не отметил опрос ПК"
         t0 = time.monotonic()
         res = d.send_text("tg:%d" % CHAT, "Цена 350 бат в сутки")
         assert res["outcome"] == "sent" and res["wamid"] == W.tg_wamid(CHAT, 31337, "out"), res
@@ -494,6 +512,12 @@ class SendWorld:
         K.World.__init__(w, environ, tg=True, tg_door_kw={"mono": lambda: w.clock.t, "sleep": self.sleep})
         self.w = w
         self.pc.outbox = getattr(w.tgc, "tg_outbox", None)
+        self.pc.poll()                                  # ПК на связи с первой минуты (dead — никогда)
+
+    def pc_alive_always(self):
+        """ПК опрашивает очередь всё время (цикл службы двигает часы на десятки секунд между нажатиями)."""
+        self.pc.outbox.pc = lambda now=None, fresh=O.PC_FRESH: (True, 0.0)
+        return self
 
     def sleep(self, sec):
         """Пауза двери: часы мира вперёд, ПК делает шаг."""
@@ -647,17 +671,17 @@ def test_own_echo_through_real_feed_door():
 
 
 def test_pc_never_claims_press_through_service_loop():
-    """Нажатие идёт тем же циклом службы (`serve`): ПК молчит — дверь ждёт свой срок, черновик not_sent, цикл жив,
-    дверь WA не звана."""
-    sw = SendWorld("silent", wait=20)
+    """Нажатие идёт тем же циклом службы (`serve`): ПК на связи, но ряд не забирает — дверь ждёт свой срок, ряд
+    отменён, черновик ВОЗВРАЩАЕТСЯ ждать (круг 2: клиенту доказанно ничего не ушло), цикл жив, дверь WA не звана."""
+    sw = SendWorld("silent", wait=20).pc_alive_always()
     w = sw.w
     w.core.tick(T0 - 1000)
     w.tgc.tick(T0 - 1000)
     sw.put(K.TGNUM, T0 - 200, text="есть байк?")
     w.http.updates = [[], [], [w.press("tg:send:1:1")], []]
     stats = w.serve(120)
-    assert K.draft(w.env["tg_agent_db"])[1] == A.NOT_SENT, K.draft(w.env["tg_agent_db"])
-    assert any("ПК не забрал за 20 с" in a for a in w.answers()), w.answers()
+    assert K.draft(w.env["tg_agent_db"])[1] == A.PENDING, K.draft(w.env["tg_agent_db"])
+    assert any("ПК не забрал за 20 с" in a and "черновик ждёт, кнопки живы" in a for a in w.answers()), w.answers()
     assert sum(sw.sleeps) <= 20 + S.TG_SEND_POLL, sum(sw.sleeps)
     assert stats.get("ticks", 0) >= 3 and not stats.get("tg_tick_fail") and w.sends == [], stats
     assert O.Outbox(w.tgc.tg_outbox.path).counts() == {O.CANCELLED: 1}
@@ -721,6 +745,134 @@ def test_core_tick_writes_door_pulse_flag_off_writes_nothing():
 def test_bad_wait_setting_named():
     sw = SendWorld("send", wait=999)
     assert sw.w.tgc.door.wait == 20 and "битая" in sw.w.words["WA_AGENT_TG"], sw.w.words["WA_AGENT_TG"]
+
+
+# ═══ 7. круг правок 2 (ревью 5d9b415) ═════════════════════════════════════════════════════
+
+def _st(w, did=1):
+    return w.tgc.db.execute("SELECT state, decided_by FROM drafts WHERE id=?", (did,)).fetchone()
+
+
+def test_r2_proven_not_sent_returns_draft_to_pending():
+    """П.1: ПК на связи, но ряд не забрал за срок (ряд отменён — клиенту доказанно ничего не ушло): черновик назад в
+    pending (decided_by пуст), done_upto не тронут, карточка не правилась — кнопки живы; ПК ожил — то же «Отправить»
+    уходит. Отказ ПК с признаком «отправка не начиналась» — тоже назад ждать; отказ без признака — прежний конец."""
+    sw = SendWorld("silent", wait=20).draft()
+    w = sw.w
+    before = sw.client()
+    edits0 = len(w.http.of("editMessageText"))
+    w.tg.handle(w.press("tg:send:1:1"))
+    assert _st(w) == (A.PENDING, None), _st(w)
+    assert sw.client()[2] == before[2] and sw.client()[3] == before[3] > before[2], (sw.client(), before)
+    assert len(w.http.of("editMessageText")) == edits0, "карточку правили — кнопки сняты"
+    assert w.answers()[-1] == "ПК не забрал за 20 с — не отправлено — черновик ждёт, кнопки живы", w.answers()
+    assert O.Outbox(sw.pc.outbox.path).counts() == {O.CANCELLED: 1}
+    sw.pc.mode = "send"                                                    # ПК ожил — то же «Отправить»
+    w.tg.handle(w.press("tg:send:1:1"))
+    assert K.draft(w.env["tg_agent_db"])[1] == A.SENT, K.draft(w.env["tg_agent_db"])
+    assert w.answers()[-1].startswith("sent — ушло через userbot на ПК"), w.answers()
+    sw2 = SendWorld("notstarted").draft()
+    sw2.w.tg.handle(sw2.w.press("tg:send:1:1"))
+    assert _st(sw2.w) == (A.PENDING, None), _st(sw2.w)
+    assert "ПК не начинал отправку: срок сервера на исходе" in sw2.w.answers()[-1], sw2.w.answers()
+    sw3 = SendWorld("fail").draft()
+    sw3.w.tg.handle(sw3.w.press("tg:send:1:1"))
+    assert _st(sw3.w)[0] == A.NOT_SENT, _st(sw3.w)                       # отказ Telegram — конец, как было
+
+
+def test_r2_pc_offline_answered_at_once_without_capture():
+    """П.1: ПК не опрашивал очередь дольше PC_FRESH — «Отправить» отвечает сразу «ПК не на связи», черновик не
+    захвачен, ряда нет, дверь не ждала ни секунды (цикл службы не стоит 20 с); 16 с — не на связи, 14 с — на связи.
+    Дверь сама (ПК пропал между нажатием и постановкой) — not_sent с признаком повтора, без ряда и ожидания."""
+    sw = SendWorld("dead").draft()
+    w = sw.w
+    t0 = w.clock.t
+    w.tg.handle(w.press("tg:send:1:1"))
+    assert _st(w) == (A.PENDING, None), _st(w)
+    assert w.answers()[-1] == "ПК не на связи (ещё не опрашивал очередь) — черновик ждёт, кнопки живы", w.answers()
+    assert sw.sleeps == [] and w.clock.t == t0 and rows(sw.pc.outbox) == []
+    sw.pc.outbox.pc_poll(w.clock.t - 16)
+    w.tg.handle(w.press("tg:send:1:1"))
+    assert "ПК не на связи (последний опрос 16 с назад" in w.answers()[-1] and _st(w)[0] == A.PENDING, w.answers()
+    sw.pc.outbox.pc_poll(w.clock.t - 14)
+    sw.pc.mode = "send"
+    w.tg.handle(w.press("tg:send:1:1"))
+    assert _st(w)[0] == A.SENT, (_st(w), w.answers())
+    d, ob, pc, tk, clock = door("dead")
+    res = d.send_text("tg:%d" % CHAT, "x")
+    assert res["outcome"] == "not_sent" and res.get("retry") is True and res["reason"].startswith("ПК не на связи"), res
+    assert rows(ob) == [] and tk.sleeps == []
+
+
+def test_r2_hook_stamps_pc_poll_and_ack_contract():
+    """Вход отмечает КАЖДЫЙ опрос ПК (и «off», и «on»); ack несёт not_started (только у failed, только true)."""
+    tmp = _tmp()
+    h = Hook(tmp)
+    try:
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
+        assert ob.pc() == (False, None)
+        assert json.loads(h.req("GET", W.TG_OUTBOX_PATH)[1])["send"] == "off"     # пульса агента нет — «off»…
+        alive, age = ob.pc()
+        assert alive and 0 <= age < 5, (alive, age)                             # …но ПК на связи
+        ob.pc_poll(time.time() - O.PC_FRESH - 1)
+        assert ob.pc()[0] is False
+        ob.beat()
+        assert json.loads(h.req("GET", W.TG_OUTBOX_PATH)[1])["send"] == "on" and ob.pc()[0] is True
+        rows_ = []
+        for _ in range(3):
+            rows_.append(ob.put(CHAT, "x", 60, now=time.time()))
+        items = json.loads(h.req("GET", W.TG_OUTBOX_PATH)[1])["items"]
+        assert len(items) == 3
+        (r1, t1), (r2, t2), (r3, t3) = rows_
+        st, body = h.ack(id=r1, token=t1, outcome="failed", error="срок", not_started=True)
+        assert st == 200 and ob.get(t1)["not_started"] == 1, body
+        h.ack(id=r2, token=t2, outcome="failed", error="x", not_started="yes")      # не true — признака нет
+        h.ack(id=r3, token=t3, outcome="sent", msg_id=11, not_started=True)        # у sent признака не бывает
+        assert ob.get(t2)["not_started"] == 0 and ob.get(t3)["not_started"] == 0
+        # файл очереди прежней схемы (до круга 2) получает столбец признака при открытии
+        old = os.path.join(_tmp(), "old.db")
+        c = sqlite3.connect(old)
+        c.executescript("CREATE TABLE tg_out (id INTEGER PRIMARY KEY AUTOINCREMENT, token TEXT NOT NULL UNIQUE, "
+                        "chat_id INTEGER NOT NULL, text TEXT NOT NULL, state TEXT NOT NULL, created_at REAL NOT NULL, "
+                        "expires_at REAL NOT NULL, claimed_at REAL, handed INTEGER NOT NULL DEFAULT 0, door_gave_up "
+                        "REAL, acked_at REAL, msg_id INTEGER, error TEXT, cancel_why TEXT); CREATE TABLE meta (key "
+                        "TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        c.close()
+        ob_old = O.Outbox(old)
+        assert ob_old.get(ob_old.put(CHAT, "x", 20)[1])["not_started"] == 0
+    finally:
+        h.stop()
+
+
+def test_r2_give_up_race_returns_the_pc_outcome():
+    """П.3: ПК подтвердил «ушло» между последним чтением двери и её отказом ждать — дверь отвечает sent, а не
+    ложным «неизвестно»."""
+    d, ob, pc, tk, clock = door("claim", wait=10)
+    real = ob.give_up
+
+    def racing(token, now=None):
+        it = pc.claimed[-1]
+        ob.ack(it["id"], it["token"], O.SENT, msg_id=4444)
+        return real(token, now=now)
+    ob.give_up = racing
+    res = d.send_text("tg:%d" % CHAT, "x")
+    assert res["outcome"] == "sent" and res["wamid"] == W.tg_wamid(CHAT, 4444, "out"), res
+
+
+def test_r2_too_long_checked_before_capture():
+    """П.4: текст длиннее 4096 (единиц UTF-16) — «Отправить» отвечает ДО захвата: черновик pending, кнопки живы,
+    совет «сократите через Исправить» выполним; ряда нет. Ровно 4096 — уходит."""
+    sw = SendWorld("send").draft()
+    w = sw.w
+    w.tgc.db.execute("UPDATE drafts SET text=? WHERE id=1", ("я" * 4097,))
+    w.tg.handle(w.press("tg:send:1:1"))
+    assert _st(w) == (A.PENDING, None), _st(w)
+    a = w.answers()[-1]
+    assert "4097 знаков" in a and "«Исправить»" in a and "черновик ждёт" in a, a
+    assert rows(sw.pc.outbox) == [] and sw.sleeps == []
+    w.tgc.db.execute("UPDATE drafts SET text=? WHERE id=1", ("я" * 4096,))
+    w.tg.handle(w.press("tg:send:1:1"))
+    assert _st(w)[0] == A.SENT, (_st(w), w.answers())
 
 
 # ═══ 6. флаг выключен — байт-в-байт прежнее ═══════════════════════════════════════════════

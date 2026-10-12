@@ -1187,8 +1187,12 @@ def tg_row_event(row, since: int):
 #        claimed row without an answer is handed again only until its expiry and only while the door still waits;
 #        "send": "off" (+ "why") always comes with an EMPTY list — the PC then polls rarely;
 #   POST /tg-queue/ack  body {"id": int, "token": str, "outcome": "sent"|"failed"|"unknown",
-#        "msg_id": int (sent only), "error": str (optional)} → 200 {"ok": …, "state": …, "dup": …} —
+#        "msg_id": int (sent only), "error": str (optional), "not_started": true (failed only, optional — the PC
+#        never started sending and the cause is temporary)} → 200 {"ok": …, "state": …, "dup": …} —
 #        idempotent: the first outcome is final, a repeat is answered «already recorded».
+#   ПК шлёт текст дословно, parse_mode=None, и подтверждает сразу после отправки, до ряда ленты.
+#   Every GET stamps «the PC polled now» into the outbox (`pc_poll`): the agent's door asks it BEFORE queueing —
+#   no poll for PC_FRESH seconds → «ПК не на связи», the draft is not taken and nobody waits 20 s.
 # Both doors live exactly when the push door does (secret + switch-on moment); otherwise 404 with the body of an
 # unknown URL. THE ONE SWITCH is the agent's (WA_AGENT_TG_SEND in wa-agent's drop-in): the webhook never reads it
 # and never creates the outbox file — it opens an existing file and trusts the door PULSE the agent writes
@@ -1499,6 +1503,10 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             if box is None:
                 self._send_json(200, {"ok": True, "send": "off", "why": TG_SEND_OFF_NOFILE, "now": now, "items": []})
                 return
+            try:
+                box.pc_poll(now)                 # «ПК на связи» — и при «on», и при «off»: по нему дверь не ждёт впустую
+            except Exception as e:
+                log.warning("TG outbox: PC poll time not stamped: %s", type(e).__name__)
             open_, _age = box.door(now)
             if not open_:
                 self._send_json(200, {"ok": True, "send": "off", "why": TG_SEND_OFF_PULSE, "now": now, "items": []})
@@ -1543,11 +1551,12 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             return
         if error is not None and not isinstance(error, str):
             error = str(error)
+        not_started = payload.get("not_started") is True
         try:
             # подтверждение принимается и при закрытой двери: исход ряда, взятого до закрытия, нужен сверке эха
             box = self._tg_box()
             res = ({"ok": False, "error": "not_found"} if box is None
-                   else box.ack(rid, token, outcome, msg_id=msg_id, error=error))
+                   else box.ack(rid, token, outcome, msg_id=msg_id, error=error, not_started=not_started))
         except Exception as e:
             log.error("TG ack: write failed, nothing recorded: %s: %s", type(e).__name__, e)
             self._send_json(500, {"ok": False, "error": "ack_failed"})
