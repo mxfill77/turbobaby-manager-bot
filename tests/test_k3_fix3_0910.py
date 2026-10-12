@@ -6787,6 +6787,186 @@ def test_p3p_dictionaries_not_extended():
     assert len(names) == 22 and "PT_UNPAID" in names and len(T.PT_OPEN) == 18 and T.PT_CLOSED == (V_OLD,)
 
 
+# ═══ п.3q: вложение принимает аренду, привязанную кодом (B1 целевого real, решение интегратора 12.10) ═════════════
+# Целевой real на 31d9ea3 (real_far/judge_cases/VERDICT.md §6, B1): реальная модель зовёт `contract {}` и `contract_pdf
+# {file_id}` и НЕ зовёт `rental` (подсказка: «срок аренды код подставит сам»); договор КОД привязал к аренде, которую
+# прочитал сам (`T.bind_ctx`), а вложение требовало `rental` в журнале модели — 6 из 6 «пришлите договор» ушли текстом
+# без PDF. Ремонт ОДИН, в `wa_agent_attach.attach_of`: модель `rental` не звала, договор привязан кодом (`bound_by`, окно
+# срока ответа `contract`) → опора вложения — аренда привязки. Модель позвала `rental` — путь прежний; журнал модели и
+# причины черновика не меняются. Сценарий модели — ПОРЯДОК ВЫЗОВОВ real (real_far/out_2/K06/logs/service.log:17-21).
+Q_TEXT = "Здравствуйте! Подписанный договор пришлём следующим сообщением."
+Q_REAL = [{"tool": "contract", "args": {}}, {"tool": "contract_pdf", "args": {"file_id": "PDF-0001"}}]
+Q_RENT = {"tool": "rental", "args": {}}
+Q_REFUSED = "аренда не подтверждена сверкой (rental не звали) — договор не привязать"      # слова отказа B1 (31d9ea3)
+
+
+def _q_bytes(cut=False):
+    """Байты ПОДПИСАННОГО источника — PDF живого формата (`k3_pdf_fixture`, скелет цел); cut — обрезан пополам (K09)."""
+    if HERE not in sys.path:
+        sys.path.append(HERE)
+    import k3_pdf_fixture
+    raw = k3_pdf_fixture.classic(b"K3 signed contract p1")
+    return raw[:len(raw) // 2] if cut else raw
+
+
+def _q_pdf_door(raw):
+    """`contract_pdf` после клиентской сверки длины и sha256 (форма `pdf_door`) — длина и sha256 байтов `raw`."""
+    import hashlib
+
+    def door(file_id=""):
+        got = pdf_door(file_id)
+        return dict(got, size=len(raw), sha256=hashlib.sha256(raw).hexdigest()) if got.get("ok") else got
+    return door
+
+
+class _QRental:
+    """Дверь аренды обращения (`rental_door`) со счётчиком вызовов; `first` — исключение либо ответ ПЕРВОГО вызова,
+    `every` — ответ КАЖДОГО вызова."""
+
+    def __init__(self, first=None, every=None):
+        self.n, self.first, self.every = 0, first, every
+
+    def __call__(self):
+        self.n += 1
+        if self.n == 1 and isinstance(self.first, BaseException):
+            raise self.first
+        if self.n == 1 and self.first is not None:
+            return self.first
+        return self.every if self.every is not None else rental_door()()
+
+
+def _q_run(steps, rows, raw=None, rental=None):
+    """Сверка `T.run` по сценарию модели `steps` (+ итог `Q_TEXT`) → (итог, реестр, дверь аренды)."""
+    rental = rental or _QRental()
+    reg = Registry(rows)
+    doors = {"rental": rental, "contract": reg, "contract_pdf": _q_pdf_door(_q_bytes() if raw is None else raw)}
+    return T.run(Script(*(list(steps) + [final(Q_TEXT)])), "S", "U", doors, number=NUMBER, clock=Clock()), reg, rental
+
+
+def _q_attach(out):
+    return X.attach_of({"state": T.DONE, "results": out["results"]})
+
+
+def test_p3q_real_form_attach_resolved_by_code_bound_rental():
+    """ФОРМА REAL K06 и K17 (service.log K06:17-21; у K17 тот же порядок): модель зовёт `contract {}` и `contract_pdf
+    {file_id}`, `rental` НЕ зовёт. Аренду прочитал КОД (дверь звана ровно раз — кодом), поиск договора поставил код
+    (номер обращения + срок аренды), договор привязан и принят, PDF принят. Вложение РЕШЕНО: договор срока аренды (K06:
+    из текущего и будущего — текущий K3-DOC-001), sha256 и размер = байтам подписанного источника (скелет цел), срок
+    перечитывания = срок аренды привязки, причины отказа нет; метаданные — те же, что у контроля «модель зовёт rental
+    первым». Журнал модели прежний: результатов два, строки rental в «РЕЗУЛЬТАТЫ ИНСТРУМЕНТОВ» нет. На 31d9ea3 — отказ
+    «аренда не подтверждена сверкой (rental не звали) — договор не привязать» (step3q/probe3q_x31d9ea3.out.txt)."""
+    import hashlib
+    raw = _q_bytes()
+    for rows in ([DOC1, DOC2], [DOC1]):
+        out, reg, rent = _q_run(Q_REAL, rows, raw)
+        assert outcomes(out) == [("contract", T.FACT), ("contract_pdf", T.FACT)], \
+            [(r["outcome"], r["reason"]) for r in out["results"]]
+        assert rent.n == 1 and reg.calls == [{"phone": NUMBER, "date_from": TERM[0], "date_to": TERM[1]}], (rent.n, reg.calls)
+        assert "rental" not in T.render(out["results"]), T.render(out["results"])
+        meta, why = _q_attach(out)
+        assert why == "" and meta, why
+        assert (meta["file_id"], meta["doc_id"], meta["date_from"], meta["date_to"]) == ("PDF-0001", "K3-DOC-001") + TERM, meta
+        assert meta["sha256"] == hashlib.sha256(raw).hexdigest() and meta["size"] == len(raw), meta
+        assert X.pdf_shape(raw) == (True, "")
+        ctrl, _reg, _rent = _q_run([Q_RENT] + Q_REAL, rows, raw)
+        assert _q_attach(ctrl) == (meta, ""), (_q_attach(ctrl), meta)
+
+
+def test_p3q_adapter_path_real_form_attach_resolved():
+    """Та же форма настоящим путём адаптера (`ModelAdapter.draft`, снимок броней включён — WA_AGENT_BOOK_READ=1, двери
+    моста — подмены): итог сверки `last["tools"]` → `attach_of` с опорой судьи (`since` = последнее входящее) — вложение
+    решено (PDF-0001, срок аренды); вызовов инструментов модели два, rental среди них нет; черновик есть, текст — модели."""
+    raw = _q_bytes()
+    for rows in ([DOC1, DOC2], [DOC1]):
+        a = M.ModelAdapter(":memory:-не-открывается", Script(*(Q_REAL + [final(Q_TEXT)])), read_doc=None, clock=Clock(),
+                           log=lambda *_: None, book=Book([dict(ROW)], 60.0), fresh=None,
+                           tools={"cash": (lambda **kw: tx([])), "contract": Registry(rows), "contract_pdf": _q_pdf_door(raw)})
+        items = _items3g2([], "Пришлите договор")
+        a._history = lambda number, upto_id, items=items: (items, [])
+        got = a.draft(NUMBER, 5)
+        tools = a.last["tools"]
+        assert got and got["text"] == Q_TEXT, got
+        assert [r["tool"] for r in tools["results"]] == ["contract", "contract_pdf"], tools["results"]
+        meta, why = X.attach_of(tools, (a.last.get("info") or {}).get("last_in"))
+        assert why == "" and meta and meta["file_id"] == "PDF-0001" and (meta["date_from"], meta["date_to"]) == TERM, why
+
+
+def test_p3q_twins_prior_refusal_kept():
+    """БЛИЗНЕЦЫ — модель rental не звала, отказ ПРЕЖНИЙ, слово в слово как на 31d9ea3 (проверка зелёная и там):
+    (1) договор ИНОЙ аренды — у номера только договор другого периода (K07): conflict «вне срока аренды», вложения нет;
+    (2) БЕЗ доказанной привязки — принятый договор без отметки привязки кодом (`bound_by` снят) либо ответ `contract` без
+        окна срока аренды: «аренда не подтверждена сверкой (rental не звали) — договор не привязать»;
+    (3) неполный реестр (K08): incomplete;
+    (4) WA_AGENT_BOOK_READ выкл — дверь броней отказывает, аренда не факт, договор не привязан: unknown «аренда обращения
+        не установлена (rental: refused)» — и путём адаптера с `book=None`.
+    Чужой PDF — отдельной проверкой (`…foreign_pdf_never_attached`): на 31d9ea3 до PDF путь не доходил."""
+    import copy
+    two = [{"tool": "contract", "args": {}}, {"tool": "contract_pdf", "args": {"file_id": "PDF-0002"}}]
+    meta, why = _q_attach(_q_run(two, [DOC2])[0])                                                       # (1)
+    assert meta is None and why.startswith("договор не принят сверкой: conflict — ") and "вне срока аренды" in why, why
+    good = _q_run(Q_REAL, [DOC1])[0]
+    unbound = copy.deepcopy(good)                                                                       # (2)
+    for r in unbound["results"]:
+        for f in r["facts"]:
+            f.pop("bound_by", None)
+    nowin = copy.deepcopy(good)
+    for r in nowin["results"]:
+        if r["tool"] == "contract":
+            r["window"] = ""
+    for out in (unbound, nowin):
+        assert _q_attach(out) == (None, Q_REFUSED), _q_attach(out)
+    meta, why = _q_attach(_q_run(Q_REAL, [DOC1, DOC3])[0])                                             # (3)
+    assert meta is None and why.startswith("договор не принят сверкой: incomplete — "), why
+    off = _QRental(every={"ok": False, "error": "брони выключены"})                                     # (4)
+    meta, why = _q_attach(_q_run(Q_REAL, [DOC1], rental=off)[0])
+    want = "договор не принят сверкой: unknown — аренда обращения не установлена (rental: refused)"
+    assert meta is None and why.startswith(want), why
+    a = M.ModelAdapter(":memory:-не-открывается", Script(*(Q_REAL + [final(Q_TEXT)])), read_doc=None, clock=Clock(),
+                       log=lambda *_: None, book=None, fresh=None,
+                       tools={"cash": (lambda **kw: tx([])), "contract": Registry([DOC1]), "contract_pdf": _q_pdf_door(_q_bytes())})
+    items = _items3g2([], "Пришлите договор")
+    a._history = lambda number, upto_id, items=items: (items, [])
+    a.draft(NUMBER, 5)
+    meta, why = X.attach_of(a.last["tools"], (a.last.get("info") or {}).get("last_in"))
+    assert meta is None and why.startswith(want), why
+
+
+def test_p3q_foreign_pdf_never_attached():
+    """ЧУЖОЙ PDF — никогда: в форме real модель просит PDF ДРУГОГО договора (PDF-0002 будущей аренды того же байка, K06),
+    договор привязан кодом к текущей аренде (K3-DOC-001) — PDF не принят (`pdf_result`: «не принятого договора этой
+    аренды»), вложения нет, причина названа. На 31d9ea3 вложения тоже не было, но причина — B1: до PDF путь не доходил."""
+    two = [{"tool": "contract", "args": {}}, {"tool": "contract_pdf", "args": {"file_id": "PDF-0002"}}]
+    out = _q_run(two, [DOC1, DOC2])[0]
+    assert outcomes(out) == [("contract", T.FACT), ("contract_pdf", T.REFUSED)], [(r["outcome"], r["reason"]) for r in out["results"]]
+    assert _q_attach(out) == (None, "PDF не принят сверкой: refused — PDF не принятого договора этой аренды — не прикладывается"), \
+        _q_attach(out)
+
+
+def test_p3q_model_called_rental_prior_path():
+    """МОДЕЛЬ ПОЗВАЛА rental — путь прежний (проверка зелёная и на 31d9ea3): (а) аренда — факт: вложение решено, как было;
+    (б) вызов модели факта не дал (первый вызов двери — таймаут), а код при поиске договора аренду прочитал и договор
+    привязал: отказ прежний «аренда не подтверждена сверкой (таймаут двери) — договор не привязать» — ветка шага 3q
+    сверку, где модель звала rental, не трогает."""
+    meta, why = _q_attach(_q_run([Q_RENT] + Q_REAL, [DOC1])[0])
+    assert why == "" and meta and meta["file_id"] == "PDF-0001", why
+    out, _reg, rent = _q_run([Q_RENT] + Q_REAL, [DOC1], rental=_QRental(first=TimeoutError("дверь молчит")))
+    assert outcomes(out) == [("rental", T.TIMEOUT), ("contract", T.FACT), ("contract_pdf", T.FACT)] and rent.n == 2, \
+        [(r["outcome"], r["reason"]) for r in out["results"]]
+    assert _q_attach(out) == (None, "аренда не подтверждена сверкой (таймаут двери) — договор не привязать"), _q_attach(out)
+
+
+def test_p3q_skeleton_pdf_refused_at_its_door():
+    """СКЕЛЕТ PDF (K09: подписанный PDF источника обрезан) в форме real: вложение теперь решено (опора — аренда привязки) с
+    sha256 обрезанных байтов, а PDF не уходит у СВОЕЙ двери — проверка скелета тех же байтов ДО двери (`pdf_shape` в
+    `AttachCore._send_pdf`, причина `W_PDF_SHAPE`, повтора нет). На 31d9ea3 путь до двери скелета не доходил (отказ B1)."""
+    import hashlib
+    cut = _q_bytes(cut=True)
+    meta, why = _q_attach(_q_run(Q_REAL, [DOC1], cut)[0])
+    assert why == "" and meta and meta["sha256"] == hashlib.sha256(cut).hexdigest(), why
+    ok, shape = X.pdf_shape(cut)
+    assert ok is False and shape and (X.W_PDF_SHAPE % shape).startswith("скелет PDF не сошёлся: "), shape
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     bad = 0
