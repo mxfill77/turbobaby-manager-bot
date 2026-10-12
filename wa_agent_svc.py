@@ -124,6 +124,20 @@ F_TG = "WA_AGENT_TG"                      # канал Telegram: второе я
 TG_PREFIX = "tg"                          # первое слово callback_data кнопок ядра TG
 TG_DOOR_WORDS = "отправка в Telegram закрыта насовсем — ответьте клиенту сами"
 TG_FAIL = "канал не собран: %s"           # сбой сборки канала TG — имя ошибки (TGCOREC0610)
+F_TG_GREET = "WA_AGENT_TG_GREET"          # автоприветствие TG по времени (TGGREET1310); по умолчанию вкл, «0» — выкл
+TG_GREET_OFF = ("0", "off", "false", "no")
+TG_GREET_SILENCE = 7 * 86400              # приветствие Telegram Business — после 7+ сут без переписки (меньший выбор)
+
+
+def tg_greet_of(environ):
+    """Признак автоприветствия канала TG (TGGREET1310) → (отпечатки ядра, слова). Отпечатка у TG нет: приветствие
+    Telegram — картинка без текста, и её эхо через 0 с закрывало первый вопрос клиента. Признак — только время
+    (`wa_agent.GREET_ANY`): эхо ≤ GREET_SEC после «первого» входящего, перед которым GREET_SILENCE тишины."""
+    if str(environ.get(F_TG_GREET) or "").strip().lower() in TG_GREET_OFF:
+        return (), "приветствие TG: выкл — любое эхо закрывает вопрос, как раньше"
+    return ((wa_agent.GREET_ANY,),
+            "приветствие TG: эхо ≤ %d с после первого входящего (до него %d сут тишины) — автоприветствие, вопрос "
+            "открыт" % (wa_agent.GREET_SEC, TG_GREET_SILENCE // 86400))
 
 log = logging.getLogger("wa_agent")
 
@@ -278,7 +292,7 @@ def tg_clash(env):
     return ""
 
 
-def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=None):
+def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=None, greet=()):
     """Второе ядро канала Telegram. → (ядро | None, слова). Собирается ТОЛЬКО при WA_AGENT_TG; файл агента или
     очереди TG совпал с другим файлом канала или с любым файлом WA — не собирается (смешало бы курсор, смещение,
     клиентов и номера черновиков). Исключение сборки идёт наружу — его ловит `build` (TGCOREC0610)."""
@@ -294,7 +308,8 @@ def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=No
                   prefix=TG_PREFIX, reader=False, send_closed=False)
     drafts = flags[F_DRAFTS] and model is not None
     core = wa_agent.Core(env["tg_agent_db"], tg_queue, model or NoModel(), TgHands(side), TgDoor(), clock=clock,
-                         log=tline, drafts=drafts, greet=(), pace=False, lessons=False, followup=False)
+                         log=tline, drafts=drafts, greet=greet, pace=False, lessons=False, followup=False)
+    core.greet_silence = TG_GREET_SILENCE
     side.bind(core)
     reader.attach(side)
     core.watch = None
@@ -532,7 +547,11 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
             words[F_TG] = TG_FAIL % tg_fail
         else:
             try:
-                _tg_core, words[F_TG] = build_tg(env, tg, flags, model=tg_model, http=http, clock=clock, line=line)
+                tg_greet, tg_greet_words = tg_greet_of(environ)
+                _tg_core, words[F_TG] = build_tg(env, tg, flags, model=tg_model, http=http, clock=clock, line=line,
+                                                 greet=tg_greet)
+                if _tg_core is not None:
+                    words[F_TG] += " · " + tg_greet_words
             except Exception as e:                                   # noqa: BLE001
                 tg.peers.pop(TG_PREFIX, None)                        # прицеп мог лечь до сбоя — читатель снова один
                 words[F_TG] = TG_FAIL % type(e).__name__

@@ -166,6 +166,11 @@ _DOOR_STATE = {"sent": SENT, "not_sent": NOT_SENT, "unknown": UNSURE}
 GREET_SEC = 10                                # эхо не позже 10 с после «первого» входящего
 GREET_SILENCE = 14 * 86400                    # «первое»: до него 14 суток тишины в обе стороны
 GREET_FP_MIN = 10                             # отпечаток в настройке — sha256 или его начало от 10 знаков
+# Любой текст (TG, TGGREET1310): у входа Telegram отпечатка в настройке нет — автоприветствие там
+# картинка без текста, и первое же эхо (0 с после первого входящего) закрывало вопрос клиента.
+# Признак тогда только время: те же GREET_SEC после «первого» входящего с GREET_SILENCE тишины.
+# `greet_fps` такого значения не выдаёт никогда (не hex) — WhatsApp им не задет.
+GREET_ANY = "*"
 
 
 # ── уроки людей (WAAGENTLESSON0210) ───────────────────────────────────────────────────────
@@ -289,7 +294,10 @@ def greet_fps(raw):
 
 def greet_hit(text, fps):
     """Отпечаток текста эха совпал с настройкой: sha256 текста начинается с одного из `greet_fps`.
-    Одно правило для ядра и ожидания `wa_watch` (WACHAINFIX0210). Отпечатков нет — не совпал."""
+    Одно правило для ядра и ожидания `wa_watch` (WACHAINFIX0210). Отпечатков нет — не совпал.
+    GREET_ANY среди отпечатков — совпал любой текст, в том числе пустой (решает только время)."""
+    if fps and GREET_ANY in fps:
+        return True
     if not fps or not isinstance(text, str) or not text:
         return False
     h = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -731,6 +739,8 @@ class Core:
         self.rand = rand
         # отпечатки текста автоприветствия (`greet_fps`); пусто — признака нет, любое эхо — пауза
         self.greet = tuple(greet or ())
+        # тишина перед «первым» входящим; ядро TG ставит свою (TGGREET1310: у Telegram Business от 7 сут)
+        self.greet_silence = GREET_SILENCE
         if not QUIET_MIN <= quiet <= QUIET_MAX:
             raise ValueError("пауза черновика %d с вне %d–%d с" % (quiet, QUIET_MIN, QUIET_MAX))
         self.quiet = quiet
@@ -1333,7 +1343,7 @@ class Core:
                     continue
                 before = q.execute("SELECT COUNT(*) FROM wa_inbox WHERE from_number=? AND id<>? "
                                    "AND (msg_type IS NULL OR msg_type<>?) AND ts_msg>=? AND ts_msg<?",
-                                   (number, cid, wa_kind.RECEIPT_TYPE, c_ts - GREET_SILENCE, c_ts)).fetchone()[0]
+                                   (number, cid, wa_kind.RECEIPT_TYPE, c_ts - self.greet_silence, c_ts)).fetchone()[0]
                 if before == 0:
                     return t - c_ts
         finally:
@@ -1351,6 +1361,8 @@ class Core:
             return None, "отпечатка приветствия в настройке нет; " + t_words
         if not greet_hit(text, self.greet):
             return None, "отпечаток не совпал; " + t_words
+        if GREET_ANY in self.greet:
+            return after, "признак только по времени; " + t_words
         return after, "отпечаток совпал; " + t_words
 
     def _greeted(self, rid):
