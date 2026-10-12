@@ -24,9 +24,9 @@ Environment (.env):
   TG_CHANNEL_SINCE    — unix seconds UTC the Telegram channel was switched on; rows older → history=1
                         (absent or not a number → /tg-queue/push 404: without it old feed reads as live)
   TG_QUEUE_DB         — path to the Telegram queue file (default: tg_queue.db next to this file)
-  WA_AGENT_TG_SEND    — 1/true/yes/on opens the Telegram SEND doors below (TGSEND1310); anything else →
-                        they answer 404 exactly like an unknown URL and no outbox file is opened or created
-  TG_OUTBOX_DB        — path to the Telegram outbox file (default: tg_outbox.db next to TG_QUEUE_DB)
+  TG_OUTBOX_DB        — path to the Telegram outbox file (default: tg_outbox.db next to TG_QUEUE_DB); the
+                        webhook only OPENS it, never creates it — wa-agent does, when ITS switch
+                        WA_AGENT_TG_SEND is on (TGSEND1310: the one switch lives in the agent, not here)
 
 Endpoints:
   GET  /wa-webhook                            — Meta hub.verify-token handshake
@@ -39,7 +39,9 @@ Endpoints:
                                                 (auth: Authorization: Bearer <TG_PUSH_SECRET>)
   GET  /tg-queue/outbox                       — PC takes the agent's queued answers (queued → claimed)
   POST /tg-queue/ack                          — PC reports {id, token, outcome, msg_id|error} per answer
-                                                (both: same Bearer as /tg-queue/push; WA_AGENT_TG_SEND=1)
+                                                (both: same Bearer, live whenever /tg-queue/push is; while
+                                                the agent's send door is shut the outbox is an empty list
+                                                with "send": "off")
 
 BIND IS LOOPBACK BY DEFAULT (06.09.2026). TLS and the outside world are Caddy's job; the
 webhook itself has no reason to be reachable on a public interface. Direction of doubt is
@@ -120,8 +122,7 @@ def _env():
         "tg_push_secret":   os.environ.get("TG_PUSH_SECRET", ""),
         "tg_channel_since": os.environ.get("TG_CHANNEL_SINCE", ""),
         "tg_queue_db":      os.environ.get("TG_QUEUE_DB", os.path.join(ROOT, "tg_queue.db")),
-        # отправка Telegram через ПК (TGSEND1310): выключатель и путь очереди; выкл — дверей нет (404)
-        "tg_send":          os.environ.get("WA_AGENT_TG_SEND", ""),
+        # отправка Telegram через ПК (TGSEND1310): только путь очереди; выключатель живёт у wa-agent
         "tg_outbox_db":     os.environ.get("TG_OUTBOX_DB", ""),
     }
 
@@ -1181,23 +1182,25 @@ def tg_row_event(row, since: int):
 # The agent's «✅ Отправить» on a Telegram card puts the answer into tg_outbox.db (`tg_outbox.Outbox`,
 # door `wa_agent_svc.TgDoor`); the PC userbot takes it here, sends it from the business account and
 # reports back. CONTRACT (one for PC and server, auth = the SAME Bearer as /tg-queue/push):
-#   GET  /tg-queue/outbox → 200 {"ok": true, "now": <server unix s>, "items": [{id, token, chat_id, text,
-#        created_at, expires_at, handed}, …]} — rows go queued → claimed in ONE transaction; a claimed row
-#        without an answer is handed again only until its expiry and only while the door still waits;
+#   GET  /tg-queue/outbox → 200 {"ok": true, "send": "on"|"off", "now": <server unix s>, "items": [{id, token,
+#        chat_id, text, created_at, expires_at, handed}, …]} — rows go queued → claimed in ONE transaction; a
+#        claimed row without an answer is handed again only until its expiry and only while the door still waits;
+#        "send": "off" (+ "why") always comes with an EMPTY list — the PC then polls rarely;
 #   POST /tg-queue/ack  body {"id": int, "token": str, "outcome": "sent"|"failed"|"unknown",
 #        "msg_id": int (sent only), "error": str (optional)} → 200 {"ok": …, "state": …, "dup": …} —
 #        idempotent: the first outcome is final, a repeat is answered «already recorded».
-# Both doors exist ONLY with WA_AGENT_TG_SEND=1 and an open push door; otherwise 404 with the body of an
-# unknown URL, and no outbox file is opened. Logs carry counts only — the rows are client correspondence.
+# Both doors live exactly when the push door does (secret + switch-on moment); otherwise 404 with the body of an
+# unknown URL. THE ONE SWITCH is the agent's (WA_AGENT_TG_SEND in wa-agent's drop-in): the webhook never reads it
+# and never creates the outbox file — it opens an existing file and trusts the door PULSE the agent writes
+# there every tick (`tg_outbox.Outbox.door`). No file, no pulse, stale pulse → "send": "off", nothing handed.
+# Logs carry counts only — the rows are client correspondence.
 
 TG_OUTBOX_PATH = "/tg-queue/outbox"
 TG_ACK_PATH = "/tg-queue/ack"
 TG_ACK_MAX_BYTES = 16 * 1024
-
-
-def tg_send_on(raw) -> bool:
-    """WA_AGENT_TG_SEND → bool: only an explicit 1/true/yes/on opens the send doors."""
-    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+TG_SEND_OFF_NOFILE = "очереди отправки нет — отправка не включалась (WA_AGENT_TG_SEND у wa-agent)"
+TG_SEND_OFF_PULSE = "дверь отправки закрыта — нет свежего пульса wa-agent (WA_AGENT_TG_SEND выключен или служба стоит)"
+_TG_BOX_LOCK = threading.Lock()
 
 
 def bearer_secret_ok(configured: str, authorization) -> bool:
@@ -1274,7 +1277,8 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
     tg_push_secret:   str = ""                       # '' → /tg-queue/push answers 404
     tg_since:         int = None                     # None → /tg-queue/push answers 404
     tg_db:            WAQueueDB = None               # tg_queue.db; None → /tg-queue/push answers 404
-    tg_outbox = None                                 # tg_outbox.Outbox; None → outbox/ack answer 404 (TGSEND1310)
+    tg_outbox_path:   str = ""                       # '' → outbox/ack answer 404 (TGSEND1310)
+    tg_outbox = None                                 # tg_outbox.Outbox, opened lazily once wa-agent created the file
 
     # Socket r/w timeout per request — a slow/stalled client closes the connection
     # rather than holding the thread indefinitely (incident 15.07: TCP open, HTTP hung).
@@ -1465,7 +1469,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
     # of an unknown URL (before anything else); then body; then ONE transaction; then the answer.
 
     def _tg_send_open(self) -> bool:
-        return self._tg_door_open() and self.tg_outbox is not None
+        return self._tg_door_open() and bool(self.tg_outbox_path)
 
     def _tg_send_auth(self) -> bool:
         if not self._tg_send_open() or not bearer_secret_ok(
@@ -1474,13 +1478,32 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _tg_box(self):
+        """Очередь отправки или None — файла нет (wa-agent его ещё не завёл). Сами файл не заводим; открытую
+        держим на классе обработчика (один объект на процесс, под замком: запросы идут потоками)."""
+        cls = type(self)
+        with _TG_BOX_LOCK:
+            box = cls.tg_outbox
+            if box is None and os.path.exists(self.tg_outbox_path):
+                import tg_outbox
+                box = cls.tg_outbox = tg_outbox.Outbox(self.tg_outbox_path, create=False)
+            return box
+
     # GET /tg-queue/outbox  header Authorization: Bearer <TG_PUSH_SECRET>
     def _do_tg_outbox(self):
         if not self._tg_send_auth():
             return
+        now = time.time()
         try:
-            now = time.time()
-            items = self.tg_outbox.claim(now=now)
+            box = self._tg_box()
+            if box is None:
+                self._send_json(200, {"ok": True, "send": "off", "why": TG_SEND_OFF_NOFILE, "now": now, "items": []})
+                return
+            open_, _age = box.door(now)
+            if not open_:
+                self._send_json(200, {"ok": True, "send": "off", "why": TG_SEND_OFF_PULSE, "now": now, "items": []})
+                return
+            items = box.claim(now=now)
         except Exception as e:
             log.error("TG outbox: claim failed, nothing handed out: %s: %s", type(e).__name__, e)
             self._send_json(500, {"ok": False, "error": "outbox_failed"})
@@ -1489,7 +1512,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             # Counts only — the texts are answers to clients.
             log.info("TG outbox: %d rows handed to PC (%d of them again)", len(items),
                      sum(1 for it in items if int(it.get("handed") or 0) > 1))
-        self._send_json(200, {"ok": True, "now": now, "items": items})
+        self._send_json(200, {"ok": True, "send": "on", "now": now, "items": items})
 
     # POST /tg-queue/ack  header Authorization: Bearer <TG_PUSH_SECRET>
     def _do_tg_ack(self):
@@ -1521,7 +1544,10 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         if error is not None and not isinstance(error, str):
             error = str(error)
         try:
-            res = self.tg_outbox.ack(rid, token, outcome, msg_id=msg_id, error=error)
+            # подтверждение принимается и при закрытой двери: исход ряда, взятого до закрытия, нужен сверке эха
+            box = self._tg_box()
+            res = ({"ok": False, "error": "not_found"} if box is None
+                   else box.ack(rid, token, outcome, msg_id=msg_id, error=error))
         except Exception as e:
             log.error("TG ack: write failed, nothing recorded: %s: %s", type(e).__name__, e)
             self._send_json(500, {"ok": False, "error": "ack_failed"})
@@ -1638,29 +1664,24 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
 
 # ─── server bootstrap ─────────────────────────────────────────────────────────────────
 
-def tg_outbox_of(env: dict, tg_path: str, push_open: bool):
-    """Outbox of the Telegram send doors (TGSEND1310) or None.
+TG_OUTBOX_FILE = "tg_outbox.db"   # = tg_outbox.FILE_NAME (сверяет тест): модуль очереди здесь не грузится заранее
 
-    Switch not requested → None with NOT ONE touch of the disk and without even importing the outbox
-    module: the webhook is byte-for-byte what it was. Requested, but the push door is closed (no secret /
-    no switch-on moment), the outbox file is the WA queue or the TG queue, or it does not open → None and
-    an ERROR line: the doors stay closed (404), the agent's door then never gets a PC answer and says so."""
-    if not tg_send_on(env.get("tg_send")):
-        return None
-    import tg_outbox
-    path = str(env.get("tg_outbox_db") or "").strip() or tg_outbox.path_of({}, tg_path)
+
+def tg_outbox_path_of(env: dict, tg_path: str, push_open: bool) -> str:
+    """Path of the Telegram outbox for the send doors (TGSEND1310), or '' — doors closed (404).
+
+    The doors live exactly when the push door does. NOT ONE touch of the disk here and no import of the
+    outbox module: the file is opened lazily by the first request that finds it (wa-agent creates it when
+    ITS switch is on). An outbox path equal to the WA queue or the TG queue closes the doors (ERROR line)."""
     if not push_open:
-        log.error("TG send doors: WA_AGENT_TG_SEND=1 but the push door is closed — send doors stay CLOSED")
-        return None
+        return ""
+    path = str(env.get("tg_outbox_db") or "").strip() or os.path.join(
+        os.path.dirname(os.path.abspath(str(tg_path))), TG_OUTBOX_FILE)
     for name, other in (("the WA queue file", env.get("queue_db")), ("the TG queue file", tg_path)):
         if other and os.path.realpath(path) == os.path.realpath(other):
             log.error("TG send doors: TG_OUTBOX_DB is %s — send doors stay CLOSED", name)
-            return None
-    try:
-        return tg_outbox.Outbox(path)
-    except Exception as e:
-        log.error("TG send doors: outbox did not open (%s) — send doors stay CLOSED", type(e).__name__)
-        return None
+            return ""
+    return path
 
 
 def make_server(env: dict) -> ThreadingHTTPServer:
@@ -1695,7 +1716,8 @@ def make_server(env: dict) -> ThreadingHTTPServer:
     _Handler.tg_since       = tg_since
     _Handler.tg_db          = (WAQueueDB(tg_path)
                                if tg_secret and tg_since is not None and not same_file else None)
-    _Handler.tg_outbox      = tg_outbox_of(env, tg_path, _Handler.tg_db is not None)
+    _Handler.tg_outbox_path = tg_outbox_path_of(env, tg_path, _Handler.tg_db is not None)
+    _Handler.tg_outbox      = None
 
     server =ThreadingHTTPServer((bind_host(env.get("bind_host")), env["port"]), _Handler)
     server.daemon_threads = True
@@ -1722,14 +1744,6 @@ def main():
     else:
         log.info("TG push door: OFF (TG_PUSH_SECRET / TG_CHANNEL_SINCE not set → %s answers 404)",
                  TG_PUSH_PATH)
-    if tg_send_on(env.get("tg_send")):
-        # строка ТОЛЬКО при запрошенном флаге: без него старт вебхука байт-в-байт прежний (TGSEND1310)
-        if h.tg_outbox is not None:
-            log.info("TG send doors: on → %s (%s, %s; same Bearer as push)", h.tg_outbox.path,
-                     TG_OUTBOX_PATH, TG_ACK_PATH)
-        else:
-            log.info("TG send doors: OFF despite WA_AGENT_TG_SEND=1 (see the ERROR above) → %s, %s answer 404",
-                     TG_OUTBOX_PATH, TG_ACK_PATH)
     log.info("D360 raw archive: %s  cap=%d  free_floor=%d",
              server.RequestHandlerClass.raw_archive, RAW_ARCHIVE_MAX_BYTES,
              RAW_ARCHIVE_FREE_FLOOR)

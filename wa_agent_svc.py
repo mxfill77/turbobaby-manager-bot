@@ -99,7 +99,9 @@ WA — канал НЕ собирается (строка журнала). У я
 вышел, а ПК ряд НЕ забрал → ряд отменяется атомарно (queued → cancelled), not_sent «ПК не забрал за N с — не
 отправлено»; ПК забрал, но не подтвердил → unknown (UNSURE) «проверьте чат клиента перед повтором». Отменённый ряд
 не выдаётся ПК ни одной дорогой. Выдачу и подтверждение несёт вход `wa_webhook` (/tg-queue/outbox, /tg-queue/ack;
-тот же Bearer, что у /tg-queue/push; та же ручка WA_AGENT_TG_SEND в его окружении). Своё эхо — `TgSendCore`: эхо с
+тот же Bearer, что у /tg-queue/push). Выключатель ОДИН — этот: вход его не читает, а судит по пульсу двери в очереди
+(`TgSendCore.tick` пишет его каждым тактом); нет пульса `tg_outbox.DOOR_FRESH` с — ПК слышит «отправка выключена»,
+выдача пуста. Своё эхо — `TgSendCore`: эхо с
 ключом нашей отправки не ответ человека (ни паузы, ни снятия черновиков); подтверждение пришло после срока двери —
 сверка по id сообщения из очереди; id не известен вовсе (исход unknown) — тот же текст в том же чате в окне 15 мин,
 одно эхо на одну отправку. Эхо человека с телефона — как было.
@@ -394,8 +396,24 @@ class TgSendCore(wa_agent.Core):
 
     def __init__(self, *a, outbox=None, **kw):
         self.tg_outbox = outbox
+        self._beat_fail = None
         super().__init__(*a, **kw)
         self.db.execute(_OWN_ECHO_SCHEMA)
+
+    def tick(self, now=None):
+        """Такт ядра + ПУЛЬС двери в очередь: по нему вход wa_webhook отвечает ПК «отправка включена»
+        (единственный выключатель — WA_AGENT_TG_SEND у этой службы). Пульс не лёг — строка на серию, такт идёт;
+        вход через DOOR_FRESH скажет ПК «выключена», и нажатие честно ответит «ПК не забрал»."""
+        try:
+            self.tg_outbox.beat(self.clock() if now is None else now)
+            if self._beat_fail:
+                self.log("дверь: пульс в очередь снова пишется")
+            self._beat_fail = None
+        except Exception as e:                                       # noqa: BLE001
+            if self._beat_fail is None:
+                self.log("дверь: пульс в очередь не записан (%s) — ПК увидит «отправка выключена»" % type(e).__name__)
+            self._beat_fail = type(e).__name__
+        return super().tick(now)
 
     def _door_words(self, state, res):
         reason = str((res or {}).get("reason") or "").strip()
@@ -603,12 +621,14 @@ def tg_send_of(environ, env, clock=time.time):
             return None, wait, "флаг 1, файл исходящей TG совпал с файлом %s — отправка закрыта" % name
     try:
         outbox = tg_outbox.Outbox(path, clock=clock)
+        outbox.beat()                                                # дверь открыта с этой минуты (пульс — такт ядра)
     except Exception as e:                                           # noqa: BLE001
         return None, wait, "флаг 1, очередь %s не открылась (%s) — отправка закрыта" % (
             os.path.basename(path), type(e).__name__)
     return outbox, wait, ("вкл — «Отправить» кладёт ответ в %s, userbot ПК шлёт с бизнес-аккаунта; ждём подтверждения "
-                          "ПК до %s: не забрал — отменено, не ушло; забрал без ответа — исход неизвестен"
-                          % (os.path.basename(path), wait_words))
+                          "ПК до %s: не забрал — отменено, не ушло; забрал без ответа — исход неизвестен; вход "
+                          "вебхука видит дверь по пульсу такта (нет пульса %d с — ПК слышит «выключена»)"
+                          % (os.path.basename(path), wait_words, tg_outbox.DOOR_FRESH))
 
 
 def build_tg(env, reader, flags, model=None, http=None, clock=time.time, line=None, greet=(), send=None,

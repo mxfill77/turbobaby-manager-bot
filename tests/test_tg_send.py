@@ -327,52 +327,104 @@ class Hook:
         return self.req("POST", W.TG_ACK_PATH, json.dumps(payload).encode("utf-8"))
 
 
-def test_hook_flag_off_doors_404_like_unknown_url_no_file():
+def test_hook_push_door_closed_send_doors_404_and_no_file():
+    """Двери отправки живут ровно тогда, когда дверь приёма: закрыта она — 404 как неизвестный адрес; файл
+    очереди вход не заводит НИКОГДА и модуль очереди не грузит, пока файла нет."""
     tmp = _tmp()
-    for over in ({}, {"tg_send": "0"}, {"tg_send": ""}, {"tg_send": "no"}):
+    for over in ({"tg_channel_since": ""}, {"tg_push_secret": ""},
+                 {"tg_outbox_db": os.path.join(tmp, "wa_queue.db")},           # путь очереди = файл WA
+                 {"tg_outbox_db": os.path.join(tmp, "tg_queue.db")}):          # = файл очереди TG
         h = Hook(tmp, **over)
         try:
             unknown = h.req("GET", "/no-such-door")
             assert h.req("GET", W.TG_OUTBOX_PATH) == unknown == (404, b"Not found"), over
             assert h.req("POST", W.TG_ACK_PATH, b"{}") == (404, b"Not found"), over
-            assert h.srv.RequestHandlerClass.tg_outbox is None
+            assert h.srv.RequestHandlerClass.tg_outbox_path == "" and h.srv.RequestHandlerClass.tg_outbox is None
         finally:
             h.stop()
-    assert not os.path.exists(os.path.join(tmp, "tg_outbox.db")), "файл очереди заведён при выключенном флаге"
-    # флаг выключен — модуль очереди даже не импортирован (отдельный процесс: этот набор его импортирует сам)
-    probe = ("import sys; sys.path.insert(0, %r); import wa_webhook as W; "
-             "W.make_server(dict(verify_token='v', app_secret='', phone_id='', port=0, bind_host='127.0.0.1', "
+    assert not os.path.exists(os.path.join(tmp, "tg_outbox.db")), "вход завёл файл очереди"
+    assert W.TG_OUTBOX_FILE == O.FILE_NAME
+    # дверь приёма открыта, файла нет — модуль очереди даже не импортирован (отдельный процесс: набор грузит его сам)
+    probe = ("import sys, json, http.client, threading; sys.path.insert(0, %r); import wa_webhook as W; "
+             "s = W.make_server(dict(verify_token='v', app_secret='', phone_id='', port=0, bind_host='127.0.0.1', "
              "queue_db=%r, d360_path_secret='', pull_secret='', tg_push_secret='s', tg_channel_since='1', "
-             "tg_queue_db=%r)).server_close(); print('tg_outbox' in sys.modules)"
+             "tg_queue_db=%r)); threading.Thread(target=s.serve_forever, daemon=True).start(); "
+             "c = http.client.HTTPConnection('127.0.0.1', s.server_address[1], timeout=30); "
+             "c.request('GET', W.TG_OUTBOX_PATH, headers={'Authorization': 'Bearer s'}); r = c.getresponse(); "
+             "print(r.status, json.loads(r.read())['send'], 'tg_outbox' in sys.modules); s.shutdown()"
              % (ROOT, os.path.join(tmp, "p_wa.db"), os.path.join(tmp, "p_tg.db")))
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=120)
-    assert out.stdout.strip().splitlines()[-1] == "False", (out.stdout, out.stderr[-500:])
+    assert out.stdout.strip().splitlines()[-1] == "200 off False", (out.stdout, out.stderr[-500:])
+    assert not os.path.exists(os.path.join(tmp, "tg_outbox.db"))
 
 
-def test_hook_on_needs_push_door_and_own_file():
+def test_hook_send_off_until_agent_pulse_one_switch():
+    """ОДИН выключатель — у wa-agent: вход его не читает. Файла нет → «off», пусто; файл есть, пульса нет или он
+    старше DOOR_FRESH → «off», и даже ряд queued НЕ выдаётся; свежий пульс → «on», ряд выдан; подтверждение
+    принимается и при закрытой двери (исход ряда, взятого до закрытия, нужен сверке эха)."""
     tmp = _tmp()
-    for over in ({"tg_send": "1", "tg_channel_since": ""},                    # дверь приёма закрыта
-                 {"tg_send": "1", "tg_push_secret": ""},
-                 {"tg_send": "1", "tg_outbox_db": os.path.join(tmp, "wa_queue.db")},   # файл WA
-                 {"tg_send": "1", "tg_outbox_db": os.path.join(tmp, "tg_queue.db")}):  # файл очереди TG
-        h = Hook(tmp, **over)
-        try:
-            assert h.srv.RequestHandlerClass.tg_outbox is None, over
-            assert h.req("GET", W.TG_OUTBOX_PATH) == (404, b"Not found"), over
-        finally:
-            h.stop()
+    h = Hook(tmp)
+    try:
+        st, body = h.req("GET", W.TG_OUTBOX_PATH)
+        d = json.loads(body)
+        assert st == 200 and (d["send"], d["items"]) == ("off", []) and "не включалась" in d["why"], d
+        assert h.req("POST", W.TG_ACK_PATH, json.dumps({"id": 1, "token": "t", "outcome": "sent",
+                                                         "msg_id": 1}).encode()) == \
+            (200, json.dumps({"ok": False, "error": "not_found"}).encode())
+        assert not os.path.exists(os.path.join(tmp, "tg_outbox.db"))
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))                   # служба агента завела файл…
+        c = sqlite3.connect(ob.path)
+        c.execute("INSERT INTO tg_out(token, chat_id, text, state, created_at, expires_at) VALUES('q', ?, 'x', "
+                  "'queued', ?, ?)", (CHAT, time.time(), time.time() + 60))    # …ряд без пульса (флаг выключили)
+        c.commit()
+        c.close()
+        d = json.loads(h.req("GET", W.TG_OUTBOX_PATH)[1])
+        assert (d["send"], d["items"]) == ("off", []) and "пульса" in d["why"], d
+        ob.beat(time.time() - O.DOOR_FRESH - 5)                            # пульс протух — служба стоит
+        assert json.loads(h.req("GET", W.TG_OUTBOX_PATH)[1])["send"] == "off"
+        assert ob.get("q")["state"] == O.QUEUED, "при закрытой двери ряд выдан"
+        ob.beat()                                                          # такт ядра с открытой дверью
+        d = json.loads(h.req("GET", W.TG_OUTBOX_PATH)[1])
+        assert d["send"] == "on" and [i["token"] for i in d["items"]] == ["q"], d
+        ob.beat(time.time() - O.DOOR_FRESH - 5)                            # дверь закрылась после выдачи
+        rid = ob.get("q")["id"]
+        st, body = h.ack(id=rid, token="q", outcome="sent", msg_id=777)
+        assert st == 200 and json.loads(body)["state"] == "sent", body
+    finally:
+        h.stop()
+
+
+def test_outbox_door_pulse_rules():
+    clock = K.Clock(T0)
+    ob = O.Outbox(os.path.join(_tmp(), "tg_outbox.db"), clock=clock)
+    assert ob.door() == (False, None)
+    ob.beat()
+    assert ob.door() == (True, 0.0)
+    clock.t += O.DOOR_FRESH
+    assert ob.door()[0] is True
+    clock.t += 1
+    assert ob.door()[0] is False
+    ob.put(CHAT, "x", 20)                                                  # постановка — тоже пульс
+    assert ob.door() == (True, 0.0)
+    ob.beat(T0 + 10 ** 6)                                                  # пульс «из будущего» — незнание
+    assert ob.door()[0] is False
+    try:
+        O.Outbox(os.path.join(_tmp(), "нет.db"), create=False)
+        raise AssertionError("create=False завёл файл")
+    except FileNotFoundError:
+        pass
 
 
 def test_hook_outbox_and_ack_contract():
     tmp = _tmp()
-    h = Hook(tmp, tg_send="1")
+    h = Hook(tmp)
     try:
-        ob = h.srv.RequestHandlerClass.tg_outbox
-        assert ob is not None and ob.path == os.path.join(tmp, "tg_outbox.db")
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
+        ob.beat()
         assert h.req("GET", W.TG_OUTBOX_PATH, auth="Bearer chuzhoj") == (404, b"Not found")
         assert h.req("GET", W.TG_OUTBOX_PATH, auth=None) == (404, b"Not found")
         st, body = h.req("GET", W.TG_OUTBOX_PATH)
-        assert st == 200 and json.loads(body)["items"] == [], body
+        assert st == 200 and json.loads(body)["items"] == [] and json.loads(body)["send"] == "on", body
         rid, tok = ob.put(CHAT, "Здравствуйте! Да, PCX свободен.", 20, now=time.time())
         st, body = h.req("GET", W.TG_OUTBOX_PATH)
         items = json.loads(body)["items"]
@@ -404,7 +456,7 @@ def test_hook_outbox_and_ack_contract():
 def test_chain_door_http_pc_sent():
     """Целиком: дверь службы ждёт, «ПК» по HTTP забирает и подтверждает — как userbot (живые часы, короткий срок)."""
     tmp = _tmp()
-    h = Hook(tmp, tg_send="1")
+    h = Hook(tmp)
     stop = []
     got = []
 
@@ -646,6 +698,24 @@ def test_start_words_and_clash():
     assert type(w3.tgc) is A.Core and w3.tgc.door.is_open() is False, type(w3.tgc)
     assert "совпал с файлом агента WA — отправка закрыта" in w3.words["WA_AGENT_TG"], w3.words["WA_AGENT_TG"]
     assert S.TG_DOOR_SHUT_START in S.tg_start_line(w3.env, w3.tgc, w3.words["WA_AGENT_TG"])
+
+
+def test_core_tick_writes_door_pulse_flag_off_writes_nothing():
+    sw = SendWorld("send")
+    w = sw.w
+    ob = w.tgc.tg_outbox
+    assert ob.door(w.clock.t)[0] is True                                   # пульс при сборке
+    w.clock.t += O.DOOR_FRESH + 30
+    assert ob.door(w.clock.t)[0] is False                                  # служба «стоит» — дверь закрылась
+    w.tgc.tick(w.clock.t)
+    assert ob.door(w.clock.t) == (True, 0.0)                               # такт ядра — пульс
+    two = S.TwoCores(w.core, w.tgc, w.lines.append, {})
+    w.clock.t += O.DOOR_FRESH + 30
+    two.tick(w.clock.t)                                                    # тем же путём, что в цикле службы
+    assert ob.door(w.clock.t)[0] is True
+    off = K.World(K.TG_ON, tg=True)                                        # флаг не запрошен — ни файла, ни пульса
+    off.tgc.tick(T0)
+    assert not os.path.exists(os.path.join(off.dir, "tg_outbox.db"))
 
 
 def test_bad_wait_setting_named():

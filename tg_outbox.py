@@ -41,6 +41,11 @@ import time
 import uuid
 
 FLAG = "WA_AGENT_TG_SEND"                 # выключатель: только 1/true/yes/on (правило `wa_agent_tg.flag_on`)
+# ОДИН выключатель — у службы агента (её drop-in). Вход wa_webhook его не читает: он судит по ПУЛЬСУ двери в
+# самой очереди (`meta.door_beat`). Ядро канала TG с открытой дверью пишет пульс каждым тактом (раз в 5 с) и
+# каждой постановкой; пульс старше DOOR_FRESH, нет файла или нет пульса — «отправка выключена»: выдача пуста,
+# ПК опрашивает реже. Служба выключена флагом, упала или стоит — дверь закрывается сама через DOOR_FRESH.
+DOOR_FRESH = 90                           # с: ожидание двери до 60 с + такт 5 с + запас
 PATH_ENV = "TG_OUTBOX_DB"                 # путь файла очереди; нет — рядом с tg_queue.db
 FILE_NAME = "tg_outbox.db"
 WAIT_ENV = "WA_AGENT_TG_SEND_SEC"         # сколько дверь ждёт подтверждения ПК, с
@@ -79,7 +84,10 @@ CREATE TABLE IF NOT EXISTS tg_out (
 );
 CREATE INDEX IF NOT EXISTS idx_tg_out_state ON tg_out(state, expires_at);
 CREATE INDEX IF NOT EXISTS idx_tg_out_msg ON tg_out(chat_id, msg_id);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+_BEAT_SQL = ("INSERT INTO meta(key, value) VALUES('door_beat', ?) "
+             "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
 
 
 def flag_on(raw) -> bool:
@@ -148,9 +156,13 @@ _COLS = ("id, token, chat_id, text, state, created_at, expires_at, claimed_at, h
 class Outbox:
     """Очередь в файле `path`. Соединение — на операцию (два процесса, один файл); запись — BEGIN IMMEDIATE."""
 
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, create=True):
+        """create=False — только существующий файл (вход wa_webhook): нет файла — FileNotFoundError, файла не
+        заводим — заводит его служба агента, когда выключатель включён."""
         self.path = str(path)
         self.clock = clock
+        if not create and not os.path.exists(self.path):
+            raise FileNotFoundError(self.path)
         if not os.path.exists(self.path):
             # тексты клиентам — файл только владельцу (как сырой архив входа); ОС без прав — как есть
             fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -198,10 +210,33 @@ class Outbox:
 
         def fn(conn):
             self._sweep(conn, now)
+            conn.execute(_BEAT_SQL, (repr(now),))          # постановка — тоже пульс: пока дверь ждёт, такта нет
             cur = conn.execute("INSERT INTO tg_out(token, chat_id, text, state, created_at, expires_at) "
                                "VALUES(?,?,?,?,?,?)", (token, int(chat_id), str(text), QUEUED, now, now + float(wait)))
             return cur.lastrowid
         return self._write(fn), token
+
+    # ── пульс двери: единственный выключатель живёт у службы агента ──────────────────────────
+
+    def beat(self, now=None):
+        """Дверь открыта прямо сейчас (зовёт ядро канала TG каждым тактом)."""
+        now = self.clock() if now is None else float(now)
+        self._write(lambda conn: conn.execute(_BEAT_SQL, (repr(now),)))
+
+    def door(self, now=None, fresh=DOOR_FRESH):
+        """→ (открыта?, возраст пульса с | None). Пульса нет, он битый или старше fresh — закрыта; пульс «из
+        будущего» дальше fresh (часы поехали) — тоже закрыта: незнание не открывает дверь."""
+        now = self.clock() if now is None else float(now)
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='door_beat'").fetchone()
+        finally:
+            conn.close()
+        try:
+            age = now - float(row[0]) if row else None
+        except (TypeError, ValueError):
+            age = None
+        return (age is not None and -fresh <= age <= fresh), age
 
     def get(self, token):
         conn = self._conn()
