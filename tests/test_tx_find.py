@@ -11,7 +11,11 @@
 
 Клиентский метод проверяется разбором исходника (ast) и исполнением ЕГО ЖЕ текста на подставном
 `self`: импорт bridge_client тянет `fcntl` и сеть, а у метода зависимостей нет — так тест идёт
-одинаково на сервере и на ПК."""
+одинаково на сервере и на ПК.
+
+MIRROR88 (13.10.2026): дверь в проде с @85; зеркало сведено к @88 (BotData.js несёт поверх txFind
+fail-closed BRIDGEFIX0710 @87, Bridge.js — маршруты обеих дверей), каталог сборки переведён в состояние
+«выложено» (delivered_as_version 88, файлы == зеркалу) и судится общим правилом `tests/build_states.py`."""
 import ast
 import difflib
 import hashlib
@@ -21,6 +25,9 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import build_states                                                    # noqa: E402  (правило трёх состояний)
+
 BUILD = os.path.join(ROOT, "bridge_build_tx_find")
 MIRROR = os.path.join(ROOT, "bridge_prod")
 HARNESS = os.path.join(ROOT, "tests", "tx_find_gs_harness.js")
@@ -86,28 +93,36 @@ def test_harness_covers_key_cases():
 
 
 def test_build_passport():
-    """База сборки = зеркало пофайлово, содержимое = паспорт, настроек проекта нет."""
+    """Паспорт сборки против зеркала — по правилу ТРЁХ состояний (`tests/build_states.py`).
+
+    До MIRROR88 здесь жило одно состояние («не выложено, база == зеркалу»), и сведение зеркала к @88
+    13.10.2026 дало ложный красный «зеркало ушло на @88, сборка на @84 — пересобрать»: дверь в проде с @85.
+    Теперь сборка в состоянии «б» (выложена как @88, файлы побайтно == зеркалу)."""
     passport = json.loads(_read(os.path.join(BUILD, "BUILD.json")))
-    mirror = json.loads(_read(os.path.join(MIRROR, "MIRROR.json")))
-    assert passport["base_prod_version"] == mirror["prod_version"], \
-        f"зеркало ушло на @{mirror['prod_version']}, сборка на @{passport['base_prod_version']} — пересобрать"
-    assert "delivered_as_version" not in passport
     assert sorted(passport["changed"]) == ["BotData.js", "Bridge.js"]
     assert passport["added"] == []
-    for name in passport["changed"]:
-        base = passport["base_sha256"][name]
-        assert base == mirror["files_sha256"][name] == _sha(os.path.join(MIRROR, name)), \
-            f"{name}: база сборки разошлась с зеркалом"
-        assert passport["build_sha256"][name] == _sha(os.path.join(BUILD, name)), \
-            f"{name}: файл сборки разошёлся со своим паспортом"
-    on_disk = sorted(os.listdir(BUILD))
-    assert on_disk == sorted(passport["changed"] + passport["added"] + ["BUILD.json"]), on_disk
+    res = build_states.judge(BUILD, MIRROR)
+    assert not res["problems"], res
+    assert res["state"] in ("a", "b", "c"), res
     assert not os.path.exists(os.path.join(BUILD, ".clasp.json"))
 
 
 def test_build_only_adds_to_mirror():
     """Сборка ничего не стирает у прода: BotData — только вставки; Bridge — вставки и одна
-    правка строки help, где прежний список сохранён целиком."""
+    правка строки help, где прежний список сохранён целиком.
+
+    Это правило НЕ ВЫЛОЖЕННОЙ сборки. У выложенной база ушла в историю git, а сверяется сильнее: в
+    состоянии «б» файлы сборки побайтно равны зеркалу, и дверь живёт в зеркале, то есть в проде."""
+    res = build_states.judge(BUILD, MIRROR)
+    if res["state"] in ("b", "c"):
+        mbr = _read(os.path.join(MIRROR, "Bridge.js"))
+        mbd = _read(os.path.join(MIRROR, "BotData.js"))
+        assert "case 'tx_find':" in mbr and "'get_pending', 'tx_find'" in mbr, "маршрута tx_find в зеркале нет"
+        assert "function txFind(" in mbd, "txFind в зеркале BotData.js нет"
+        if res["state"] == "b":
+            for name in ("BotData.js", "Bridge.js"):
+                assert _sha(os.path.join(BUILD, name)) == _sha(os.path.join(MIRROR, name)), name
+        return
     for name in ("BotData.js", "Bridge.js"):
         old = _read(os.path.join(MIRROR, name)).splitlines()
         new = _read(os.path.join(BUILD, name)).splitlines()

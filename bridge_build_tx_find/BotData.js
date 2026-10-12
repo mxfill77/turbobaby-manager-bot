@@ -5,7 +5,7 @@
  * Пишется в ОТДЕЛЬНУЮ таблицу "TurboBaby Bot Data" на Drive владельца —
  * рабочие таблицы (CRM, Зарплаты) НЕ трогаем.
  *
- * Таблица создаётся автоматически при первой записи.
+ * Таблица заводится ТОЛЬКО ручной setupBotData() (BRIDGEFIX0710, 07.10.2026) — сама мостом не создаётся.
  * Её ID сохраняется в Script Properties → BOT_DATA_SHEET_ID.
  */
 
@@ -116,21 +116,68 @@ var WRITELOG_MAX_ROWS = 3000;
 
 
 /**
- * Возвращает (создаёт при необходимости) таблицу Bot Data.
+ * Возвращает таблицу Bot Data. НИЧЕГО НЕ СОЗДАЁТ и свойств не пишет (BRIDGEFIX0710, 07.10.2026).
+ *
+ * До 07.10 любой сбой openById считался «ID протух»: заводилась новая пустая таблица и молча
+ * перезаписывалось BOT_DATA_SHEET_ID — касса, очередь и журналы уходили на пустую копию, а прежняя
+ * оставалась сиротой. Временный сбой Google и «файла нет» для кода были одним и тем же.
+ * Теперь:
+ *   свойства нет        → ошибка no_botdata_config;
+ *   openById бросил     → ошибка botdata_unavailable с краткой причиной (без id таблицы).
+ * Ошибку ловят общие catch doGet/doPost (Bridge.js) и отдают ok:false с этим кодом; обработчики со
+ * своим catch отдают свой код отказа — тоже ok:false. Новую таблицу заводит ТОЛЬКО setupBotData().
  */
 function getBotDataSpreadsheet_() {
   const props = PropertiesService.getScriptProperties();
-  let id = props.getProperty('BOT_DATA_SHEET_ID');
-
-  if (id) {
-    try {
-      return SpreadsheetApp.openById(id);
-    } catch (e) {
-      // ID протух — пересоздадим
-      id = null;
-    }
+  const id = props.getProperty('BOT_DATA_SHEET_ID');
+  if (!id) {
+    throw botDataStoreError_('no_botdata_config',
+      'свойство BOT_DATA_SHEET_ID не задано — таблицу Bot Data заводит только ручная setupBotData()');
   }
+  try {
+    return SpreadsheetApp.openById(id);
+  } catch (e) {
+    throw botDataStoreError_('botdata_unavailable', 'таблица Bot Data не открылась: ' + botDataReason_(e, id));
+  }
+}
 
+/** Ошибка хранилища Bot Data с названным кодом (doGet/doPost отдают его как error). */
+function botDataStoreError_(code, reason) {
+  const err = new Error(code + ': ' + reason);
+  err.botdata_code = code;
+  err.botdata_reason = reason;
+  return err;
+}
+
+/** Краткая причина сбоя без id таблицы: id вырезается из текста, длина ограничена. */
+function botDataReason_(e, id) {
+  let s = String((e && e.message) || e || 'причина не названа');
+  if (id) s = s.split(String(id)).join('…');
+  return s.length > 200 ? s.slice(0, 200) + '…' : s;
+}
+
+/**
+ * РУЧНАЯ установка Bot Data — ЕДИНСТВЕННОЕ место, где создаётся таблица (BRIDGEFIX0710).
+ * Запускает владелец из редактора Apps Script (как setupBrain); кодом моста не вызывается нигде.
+ * Прежний id (если был) кладётся в BOT_DATA_SHEET_ID_PREV — старая касса не теряется молча.
+ */
+function setupBotData() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const prev = props.getProperty('BOT_DATA_SHEET_ID');
+    const ss = createBotDataSpreadsheet_();
+    if (prev) props.setProperty('BOT_DATA_SHEET_ID_PREV', prev);
+    props.setProperty('BOT_DATA_SHEET_ID', ss.getId());
+    return { ok: true, id6: ss.getId().slice(0, 6), prev_saved: !!prev };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Новая таблица Bot Data с базовыми вкладками. Зовёт ТОЛЬКО setupBotData(); свойств не пишет. */
+function createBotDataSpreadsheet_() {
   // Создаём новую таблицу в главной папке компании
   const ss = SpreadsheetApp.create(BOTDATA.SHEET_TITLE);
   // Переносим в папку MAIN если возможно
@@ -158,7 +205,6 @@ function getBotDataSpreadsheet_() {
   );
   if (def && ss.getSheets().length > 1) ss.deleteSheet(def);
 
-  props.setProperty('BOT_DATA_SHEET_ID', ss.getId());
   return ss;
 }
 
@@ -176,6 +222,12 @@ function initTab_(ss, name, headers) {
 function getBotTab_(tabName) {
   const ss = getBotDataSpreadsheet_();
   let tab = ss.getSheetByName(tabName);
+  if (!tab && tabName === BOTDATA.TABS.TX) {
+    // Вкладка «транзакции» в существующей кассе не бывает «новой»: её нет — значит авария, а не
+    // первый запуск. Досоздать её пустой = показать пустую кассу как сверенную (BRIDGEFIX0710).
+    throw botDataStoreError_('botdata_tab_missing',
+      'в таблице Bot Data нет вкладки «' + tabName + '» — касса НЕ просмотрена, вкладка не создаётся');
+  }
   if (!tab) {
     // Лист ещё не создан (например 'обслуживание' в старой таблице) — создаём с заголовками
     const headersMap = {};

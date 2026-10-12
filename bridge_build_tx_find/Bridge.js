@@ -82,6 +82,16 @@ function doGet(e) {
         return jsonResponse(Object.assign({ action: 'get_pending' },
           getPending_({ status: params.status, lane: params.lane })));
 
+      // --- Договоры TB e-Sign: поиск в реестре подписей (read-only, ContractDoor.js) ---
+      case 'contract_find':
+        return jsonResponse(Object.assign({ action: 'contract_find' },
+          contractFind({ phone: params.phone, name: params.name, bike: params.bike,
+                         date_from: params.date_from, date_to: params.date_to, limit: params.limit })));
+
+      // --- Договоры TB e-Sign: подписанный PDF по id (только из реестра и папки подписанных) ---
+      case 'contract_pdf':
+        return jsonResponse(Object.assign({ action: 'contract_pdf' }, contractPdf({ id: params.id })));
+
       // --- Расчёт цены аренды (read-only, ничего не пишет) ---
       case 'quote_price':
         return jsonResponse(Object.assign({ action: 'quote_price' },
@@ -148,7 +158,7 @@ function doGet(e) {
           version: CONFIG.VERSION,
           actions: [
             'ping', 'fleet', 'clients', 'anomalies',
-            'client_history', 'finance', 'returns_soon', 'daily_pulse', 'get_pending', 'tx_find'
+            'client_history', 'finance', 'returns_soon', 'daily_pulse', 'get_pending', 'tx_find', 'contract_find', 'contract_pdf'
           ],
           examples: {
             ping: '?token=XXX&action=ping',
@@ -182,6 +192,12 @@ function doGet(e) {
     }
 
   } catch (err) {
+    // Хранилище Bot Data не открылось / не настроено / нет вкладки кассы (BRIDGEFIX0710):
+    // названный отказ ok:false с кодом хранилища, а не internal_error. Прочие ошибки — как прежде.
+    if (err && err.botdata_code) {
+      console.error('Bridge BotData:', err.message);
+      return jsonResponse({ ok: false, error: err.botdata_code, message: err.botdata_reason }, 503);
+    }
     // Логируем ошибку для отладки
     console.error('Bridge error:', err.message, err.stack);
     return jsonResponse({
@@ -518,6 +534,10 @@ function doPost(e) {
     }
 
   } catch (err) {
+    if (err && err.botdata_code) {   // хранилище Bot Data — названный отказ (BRIDGEFIX0710), см. doGet
+      console.error('Bridge POST BotData:', err.message);
+      return jsonResponse({ ok: false, error: err.botdata_code, message: err.botdata_reason }, 503);
+    }
     console.error('Bridge POST error:', err.message, err.stack);
     return jsonResponse({ ok: false, error: 'internal_error', message: err.message }, 500);
   }

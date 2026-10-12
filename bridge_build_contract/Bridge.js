@@ -71,6 +71,12 @@ function doGet(e) {
         return jsonResponse(Object.assign({ action: 'read_events' },
           readEvents({ bike: params.bike || '', limit: params.limit })));
 
+      // --- Поиск проводок кассы (read-only лист «транзакции»; байк / бронь / срок, без отменённых) ---
+      case 'tx_find':
+        return jsonResponse(Object.assign({ action: 'tx_find' },
+          txFind({ bike: params.bike, booking_id: params.booking_id,
+                   date_from: params.date_from, date_to: params.date_to, limit: params.limit })));
+
       // --- Очередь оркестратора: задачи по статусу (деф. new), newest-first (дешёвый опрос демоном) ---
       case 'get_pending':
         return jsonResponse(Object.assign({ action: 'get_pending' },
@@ -152,7 +158,7 @@ function doGet(e) {
           version: CONFIG.VERSION,
           actions: [
             'ping', 'fleet', 'clients', 'anomalies',
-            'client_history', 'finance', 'returns_soon', 'daily_pulse', 'get_pending', 'contract_find', 'contract_pdf'
+            'client_history', 'finance', 'returns_soon', 'daily_pulse', 'get_pending', 'tx_find', 'contract_find', 'contract_pdf'
           ],
           examples: {
             ping: '?token=XXX&action=ping',
@@ -186,6 +192,12 @@ function doGet(e) {
     }
 
   } catch (err) {
+    // Хранилище Bot Data не открылось / не настроено / нет вкладки кассы (BRIDGEFIX0710):
+    // названный отказ ok:false с кодом хранилища, а не internal_error. Прочие ошибки — как прежде.
+    if (err && err.botdata_code) {
+      console.error('Bridge BotData:', err.message);
+      return jsonResponse({ ok: false, error: err.botdata_code, message: err.botdata_reason }, 503);
+    }
     // Логируем ошибку для отладки
     console.error('Bridge error:', err.message, err.stack);
     return jsonResponse({
@@ -522,6 +534,10 @@ function doPost(e) {
     }
 
   } catch (err) {
+    if (err && err.botdata_code) {   // хранилище Bot Data — названный отказ (BRIDGEFIX0710), см. doGet
+      console.error('Bridge POST BotData:', err.message);
+      return jsonResponse({ ok: false, error: err.botdata_code, message: err.botdata_reason }, 503);
+    }
     console.error('Bridge POST error:', err.message, err.stack);
     return jsonResponse({ ok: false, error: 'internal_error', message: err.message }, 500);
   }

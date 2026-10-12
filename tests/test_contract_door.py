@@ -17,7 +17,13 @@ GET (`_call`), в мост уходят только названные филь
 CONTRACTFIX0410 (04.10.2026): неизвестный день строки не даёт уверенного единственного ответа —
 секция 18 харнесса (контрпример Codex TB-CHECK-0410-0025 п.1 → incomplete; 31.02.2026 → unparsed;
 created только при пустой дате договора; pick — полная запись), мутант на каждое правило, docstring
-клиента называет incomplete и полноту."""
+клиента называет incomplete и полноту.
+
+MIRROR88 (13.10.2026): дверь в проде с @85, переделана @86 (ESIGNDOOR0410: адреса поиском по имени,
+PDF в «Подписанные/ГГГГ/ММ»), дата договора ДД-ММ-ГГГГ — @88 (P5). Зеркало сведено к @88, каталог сборки
+переведён в состояние «выложено» (delivered_as_version 88, файлы == зеркалу) и судится ОБЩИМ правилом трёх
+состояний `tests/build_states.py`; харнесс — секции 19 (живые даты) и 20 (поиск и уровни папки), мутанты
+на правила @86 и P5."""
 import ast
 import base64
 import difflib
@@ -28,6 +34,9 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import build_states                                                    # noqa: E402  (правило трёх состояний)
+
 BUILD = os.path.join(ROOT, "bridge_build_contract")
 MIRROR = os.path.join(ROOT, "bridge_prod")
 HARNESS = os.path.join(ROOT, "tests", "contract_door_gs_harness.js")
@@ -72,7 +81,7 @@ def test_harness_all_green():
     res = json.loads(out)
     failed = [c for c in res["cases"] if not c["pass"]]
     assert not failed, json.dumps(failed, ensure_ascii=False, indent=1)
-    assert len(res["cases"]) >= 100, len(res["cases"])
+    assert len(res["cases"]) >= 149, len(res["cases"])   # MIRROR88: 102 + секция 19 (33) + секция 20 (14)
 
 
 def test_harness_covers_key_cases():
@@ -89,34 +98,58 @@ def test_harness_covers_key_cases():
                  "fix.counterexample-incomplete", "fix.counterexample-not-one", "fix.feb31-unparsed",
                  "fix.unparsed-no-created", "fix.empty-uses-created", "fix.pick-full-record",
                  "fix.unsigned-undated-keeps-one", "fix.no-term-keeps-undated", "fix.unread-rich",
-                 "fix.ambiguous-over-incomplete", "fix.route-incomplete", "fix.readonly-no-writes"):
+                 "fix.ambiguous-over-incomplete", "fix.route-incomplete", "fix.readonly-no-writes",
+                 # LIVEDATE1210 (P5 @88): живой формат «Дата договора» ДД-ММ-ГГГГ и отрицательные близнецы
+                 "live.day 22-09-2026", "live.term-one 25-09-2026", "live.day 22-09-2026 17:26",
+                 "live.neg-unparsed 31-02-2026", "live.neg-unparsed 22-09-2026x",
+                 "live.neg-term-incomplete 2026-13-01", "live.term-outside-none", "live.pdf-contract-date",
+                 "live.readonly-no-writes",
+                 # ESIGNDOOR0410 (@86): адреса поиском и уровни папки подписанных (MIRROR88)
+                 "search.property-no-drive-search", "search.registry-one", "search.folder-one",
+                 "search.folder-ambiguous", "search.folder-trashed-ignored", "search.registry-ambiguous",
+                 "search.ambiguous-pdf-refused", "search.lookup-failed-named",
+                 "search.folder-lookup-failed-named", "levels.three-ok", "levels.four-refused",
+                 "levels.unreadable-refused", "levels.restored-twin", "search.readonly-no-writes"):
         assert need in names, f"нет кейса {need}: {sorted(names)}"
 
 
 def test_build_passport():
-    """База сборки = зеркало пофайлово, содержимое = паспорт, настроек проекта нет."""
+    """Паспорт сборки против зеркала — по правилу ТРЁХ состояний (`tests/build_states.py`).
+
+    До MIRROR88 здесь жило одно состояние («не выложено, база == зеркалу») и `delivered_as_version`
+    был запрещён — 13.10.2026 на сведении зеркала @84 → @88 тест покраснел «зеркало ушло на @88, сборка
+    на @84 — пересобрать», хотя дверь в проде с @85. Теперь сборка в состоянии «б» (выложена как @88,
+    каждый файл побайтно == зеркалу); прод уедет дальше — состояние «в», начнут строить новое — «а»."""
     passport = json.loads(_read(os.path.join(BUILD, "BUILD.json")))
-    mirror = json.loads(_read(os.path.join(MIRROR, "MIRROR.json")))
-    assert passport["base_prod_version"] == mirror["prod_version"], \
-        f"зеркало ушло на @{mirror['prod_version']}, сборка на @{passport['base_prod_version']} — пересобрать"
-    assert "delivered_as_version" not in passport
     assert passport["changed"] == ["Bridge.js"]
     assert passport["added"] == ["ContractDoor.js"]
-    assert not os.path.exists(os.path.join(MIRROR, "ContractDoor.js")), "новый файл уже в зеркале?"
-    for name in passport["changed"]:
-        base = passport["base_sha256"][name]
-        assert base == mirror["files_sha256"][name] == _sha(os.path.join(MIRROR, name)), \
-            f"{name}: база сборки разошлась с зеркалом"
-    for name in passport["changed"] + passport["added"]:
-        assert passport["build_sha256"][name] == _sha(os.path.join(BUILD, name)), \
-            f"{name}: файл сборки разошёлся со своим паспортом"
-    on_disk = sorted(os.listdir(BUILD))
-    assert on_disk == sorted(passport["changed"] + passport["added"] + ["BUILD.json"]), on_disk
+    res = build_states.judge(BUILD, MIRROR)
+    assert not res["problems"], res
+    assert res["state"] in ("a", "b", "c"), res
+    if res["state"] == "a":
+        assert not os.path.exists(os.path.join(MIRROR, "ContractDoor.js")), "новый файл уже в зеркале?"
+    else:
+        assert os.path.exists(os.path.join(MIRROR, "ContractDoor.js")), \
+            "сборка объявлена выложенной, а двери в зеркале нет — зеркало отстало от прода"
     assert not os.path.exists(os.path.join(BUILD, ".clasp.json"))
 
 
 def test_build_only_adds_to_mirror():
-    """Bridge.js сборки: только вставки и одна правка строки help, где прежний список сохранён."""
+    """Bridge.js сборки: только вставки и одна правка строки help, где прежний список сохранён.
+
+    Это правило НЕ ВЫЛОЖЕННОЙ сборки (её дельта к базе-зеркалу). У выложенной база ушла в историю git
+    (зеркало @84 — коммит c89c7f4), а сверяется сильнее: в состоянии «б» файлы сборки побайтно равны
+    зеркалу, и маршруты двери живут в зеркале, то есть в проде."""
+    res = build_states.judge(BUILD, MIRROR)
+    if res["state"] in ("b", "c"):
+        mbr = _read(os.path.join(MIRROR, "Bridge.js"))
+        for need in ("case 'contract_find':", "case 'contract_pdf':", "contractPdf({ id: params.id })",
+                     "'contract_find', 'contract_pdf'"):
+            assert need in mbr, f"в зеркале прода нет {need!r} — дверь выложенной не выглядит"
+        if res["state"] == "b":
+            for name in ("Bridge.js", "ContractDoor.js"):
+                assert _sha(os.path.join(BUILD, name)) == _sha(os.path.join(MIRROR, name)), name
+        return
     old = _read(os.path.join(MIRROR, "Bridge.js")).splitlines()
     new = _read(os.path.join(BUILD, "Bridge.js")).splitlines()
     sm = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
@@ -252,8 +285,9 @@ MUTANTS = [
     ("pdf-unsigned-allowed", "ContractDoor.js",
      "if (!signedRows.length) return { ok: false, error: 'not_signed',",
      "if (false) return { ok: false, error: 'not_signed',"),
+    # MIRROR88: «было» сдвинуто вслед за кодом @86 (проверка папки переехала в esignInSignedFolder_), суть та же
     ("pdf-folder-skipped", "ContractDoor.js",
-     "if (!inFolder) return", "if (false) return"),
+     "if (!inDir.ok) return inDir;", "if (false) return inDir;"),
     ("pdf-trashed-allowed", "ContractDoor.js",
      "if (file.isTrashed()) return", "if (false) return"),
     ("pdf-size-ignored", "ContractDoor.js",
@@ -318,6 +352,36 @@ MUTANTS = [
     ("fix-pick-thin", "ContractDoor.js",
      "pick = Object.assign({}, signed[0], { pdf_ready: !!signed[0].pdf_id });",
      "pick = { row: signed[0].row, doc_id: signed[0].doc_id, pdf_id: signed[0].pdf_id, pdf_ready: !!signed[0].pdf_id };"),
+    # ── MIRROR88: правила двери @86 (ESIGNDOOR0410) — адреса поиском и уровни папки подписанных ──
+    ("search-registry-takes-first", "ContractDoor.js",
+     "if (found.length !== 1) return { ok: false, error: found.length ? 'registry_ambiguous'",
+     "if (found.length < 1) return { ok: false, error: found.length ? 'registry_ambiguous'"),
+    ("search-folder-takes-first", "ContractDoor.js",
+     "if (found.length !== 1) return { ok: false, error: found.length ? 'signed_folder_ambiguous'",
+     "if (found.length < 1) return { ok: false, error: found.length ? 'signed_folder_ambiguous'"),
+    ("search-registry-trashed-counted", "ContractDoor.js",
+     "return !f.isTrashed() && String(f.getMimeType()) === ESIGN.REGISTRY_MIME;",
+     "return String(f.getMimeType()) === ESIGN.REGISTRY_MIME;"),
+    ("search-registry-mime-ignored", "ContractDoor.js",
+     "return !f.isTrashed() && String(f.getMimeType()) === ESIGN.REGISTRY_MIME;", "return !f.isTrashed();"),
+    ("search-folder-trashed-counted", "ContractDoor.js",
+     "if (!f.isTrashed() && !seen[f.getId()])", "if (!seen[f.getId()])"),
+    ("search-property-ignored", "ContractDoor.js",
+     "getProperty(ESIGN.REGISTRY_PROP);\n  if (id) return", "getProperty(ESIGN.REGISTRY_PROP);\n  if (false) return"),
+    ("search-folder-without-registry", "ContractDoor.js",
+     "if (!regAddr.ok) return regAddr;", "if (false) return regAddr;"),
+    ("levels-too-short", "ContractDoor.js", "SIGNED_FOLDER_LEVELS: 3,", "SIGNED_FOLDER_LEVELS: 2,"),
+    ("levels-too-deep", "ContractDoor.js", "SIGNED_FOLDER_LEVELS: 3,", "SIGNED_FOLDER_LEVELS: 4,"),
+    ("levels-unreadable-passes", "ContractDoor.js",
+     "return { ok: false, error: 'parents_unreadable', level: level,",
+     "return { ok: true, error: 'parents_unreadable', level: level,"),
+    # ── MIRROR88: ремонт даты P5 @88 (LIVEDATE1210) ──
+    ("p5-dash-dropped", "ContractDoor.js",
+     r"else if ((m = s.match(/^(\d{2})([-\/])(\d{2})\2(\d{4})(?:$|[ ,T])/))) { y = m[4]; mo = m[3]; d = m[1]; }",
+     "else if (false) { }"),
+    ("p5-tail-garbage-accepted", "ContractDoor.js", r"(\d{4})(?:$|[ ,T])/)))", r"(\d{4})/)))"),
+    ("p5-day-month-swapped", "ContractDoor.js",
+     "{ y = m[4]; mo = m[3]; d = m[1]; }", "{ y = m[4]; mo = m[1]; d = m[3]; }"),
 ]
 
 

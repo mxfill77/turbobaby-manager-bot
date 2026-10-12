@@ -16,6 +16,14 @@
  * отдаёт Sheets: дата строкой и Date, ссылка на PDF текстом /d/…, голым id, богатым текстом
  * (значение «PDF», ссылка в link) и формулой HYPERLINK (значение «PDF», ссылка в формуле).
  *
+ * МОК DRIVE — ДЕРЕВО, А НЕ ПЛОСКИЙ СПИСОК (MIRROR88, 13.10.2026). Дверь @86/@88 (ESIGNDOOR0410)
+ * ищет адреса по имени (DriveApp.getFilesByName, папка.getFoldersByName), когда свойство не задано,
+ * и поднимается по предкам PDF до ESIGN.SIGNED_FOLDER_LEVELS уровней. Прежний мок отдавал родителя
+ * голым {getId} без getParents и не знал поиска — три давних красных случая (foreign.wrong-folder,
+ * config.no-registry, config.no-folder) были расхождением МОКА с живой Drive, а не двери: ожидания
+ * в них прежние, мок получил API, которым пользуется код @88. Индекс поиска по имени (DRIVE_INDEX)
+ * по умолчанию пуст: случаи 1–19 идут через свойства, поиск судит секция 20.
+ *
  * Печатает JSON {cases:[{name, pass, detail}], failed}; exit 1, если есть провалы.
  * Запускается из tests/test_contract_door.py.
  */
@@ -71,7 +79,9 @@ const PDF_X = 'pdfX0000000000000000000000005', PDF_N = 'pdfN00000000000000000000
 const PDF_T = 'pdfT0000000000000000000000007', PDF_L = 'pdfL0000000000000000000000008';
 const FOREIGN = 'pdfF0000000000000000000000009';
 const SIGNED_DIR = 'dirSigned00000000000000000001', OTHER_DIR = 'dirOther000000000000000000002';
+const REG_DIR = 'dirRegistry0000000000000000003', ROOT_DIR = 'dirRoot00000000000000000000004';
 const REG_ID = 'regEsign000000000000000000000001';
+const REG_NAME = 'Договоры — реестр подписей (TB e-Sign)', SHEET_MIME = 'application/vnd.google-apps.spreadsheet';
 const VIEW = id => 'https://drive.google.com/file/d/' + id + '/view?usp=drivesdk';
 
 const HEADERS = ['ID документа', 'Название', 'Клиент', 'Дата договора', 'Статус', 'Документ создан',
@@ -121,17 +131,44 @@ const OPENED = { reg: 0 };
 function bytesOf(text) { return Array.from(Buffer.concat([Buffer.from('%PDF-1.7\n'), Buffer.from([0xE2, 0xE3, 0xCF, 0xD3]), Buffer.from(text)])); }
 const signedArr = u => u.map(b => (b > 127 ? b - 256 : b));
 const DRIVE_GETS = { n: 0, ids: [] };
+const DRIVE_SEARCH = { n: 0 };                 // обращения к поиску Drive по имени (файлы и папки)
+const SEARCH_FAIL = { on: false };             // поиск файлов по имени бросает (сбой Drive)
+const PARENTS_FAIL = new Set();                // id, у которых чтение родителей бросает
+const DRIVE_INDEX = [];                        // что находит DriveApp.getFilesByName (по умолчанию — ничего)
+function iter(list) { let i = 0; return { hasNext: () => i < list.length, next: () => list[i++] }; }
+// дерево папок: у папки есть свои родители, как у живой Drive (корень — без родителей)
+const FOLDERS = {
+  [ROOT_DIR]: { name: 'Мой диск', parents: [] },
+  [REG_DIR]: { name: 'TB e-Sign', parents: [ROOT_DIR] },
+  [SIGNED_DIR]: { name: 'Подписанные', parents: [REG_DIR] },
+  [OTHER_DIR]: { name: 'Прочее', parents: [ROOT_DIR] },
+};
+function parentsOf(id, ids) {
+  if (PARENTS_FAIL.has(id)) throw new Error('родители не читаются: ' + id);
+  return iter(ids.map(folderOf));
+}
+function folderOf(id) {
+  if (!FOLDERS[id]) throw new Error('папки нет в моке: ' + id);
+  return {
+    getId: () => id, getName: () => FOLDERS[id].name, isTrashed: () => !!FOLDERS[id].trashed,
+    getParents() { return parentsOf(id, FOLDERS[id].parents); },
+    getFoldersByName(n) {
+      DRIVE_SEARCH.n++;
+      return iter(Object.keys(FOLDERS).filter(k => FOLDERS[k].name === n && FOLDERS[k].parents.indexOf(id) >= 0).map(folderOf));
+    },
+    createFolder() { wrote('createFolder'); }, setTrashed() { wrote('setTrashed'); }, setName() { wrote('setName'); },
+  };
+}
 function makeFile(id, o) {
   const u = bytesOf(o.text || id);
   return {
     getId: () => id, getName: () => o.name || (id + '.pdf'), getMimeType: () => o.mime || 'application/pdf',
     getSize: () => (o.size !== undefined ? o.size : u.length), isTrashed: () => !!o.trashed,
-    getParents() { const ps = (o.parents || [SIGNED_DIR]).map(p => ({ getId: () => p })); let i = 0;
-      return { hasNext: () => i < ps.length, next: () => ps[i++] }; },
+    getParents() { return parentsOf(id, o.parents || [SIGNED_DIR]); },
     getBlob() { if (o.size && o.size > 1e6) throw new Error('getBlob на файле сверх потолка'); return { getBytes: () => signedArr(u.slice()) }; },
     setTrashed() { wrote('setTrashed'); }, moveTo() { wrote('moveTo'); }, setName() { wrote('setName'); },
     setContent() { wrote('setContent'); }, addEditor() { wrote('addEditor'); },
-    _unsigned: u,
+    _unsigned: u, _o: o,
   };
 }
 const FILES = {
@@ -144,6 +181,8 @@ const FILES = {
   [PDF_T]: makeFile(PDF_T, { text: 'trashed', trashed: true }),
   [PDF_L]: makeFile(PDF_L, { text: 'big', size: 20 * 1024 * 1024 }),
   [FOREIGN]: makeFile(FOREIGN, { text: 'foreign but in signed folder' }),
+  // сам реестр как файл Drive: по нему дверь находит свою папку, когда ESIGN_SIGNED_FOLDER_ID не задан
+  [REG_ID]: makeFile(REG_ID, { name: REG_NAME, mime: SHEET_MIME, parents: [REG_DIR], text: 'registry' }),
 };
 
 global.SpreadsheetApp = { openById(id) {
@@ -152,7 +191,12 @@ global.SpreadsheetApp = { openById(id) {
   return { getSheetByName: n => SHEETS[n] || null, insertSheet() { wrote('insertSheet'); } };
 } };
 global.DriveApp = { getFileById(id) { DRIVE_GETS.n++; DRIVE_GETS.ids.push(id); if (!FILES[id]) throw new Error('File not found: ' + id); return FILES[id]; },
-  createFile() { wrote('createFile'); } };
+  getFilesByName(n) {
+    DRIVE_SEARCH.n++;
+    if (SEARCH_FAIL.on) throw new Error('Drive search unavailable');
+    return iter(DRIVE_INDEX.filter(f => f.getName() === n));
+  },
+  createFile() { wrote('createFile'); }, createFolder() { wrote('createFolder'); } };
 global.PropertiesService = { getScriptProperties: () => ({ getProperty: k => (k in PROPS ? PROPS[k] : null), setProperty: () => wrote('setProperty') }) };
 global.Session = { getScriptTimeZone: () => 'Asia/Bangkok' };
 global.Utilities = {
@@ -284,7 +328,9 @@ const byRow = (r, n) => (r && r.items || []).find(x => x.row === n) || {};
   const p = safe(() => contractPdf({ id: FOREIGN }));
   check('foreign.not-in-registry', p.ok === false && p.error === 'not_in_registry' && p.checked && p.checked.rows_scanned === 10, J(p));
   check('foreign.drive-not-touched', DRIVE_GETS.n === before, J(DRIVE_GETS.ids.slice(before)));
-  check('foreign.wrong-folder', safe(() => contractPdf({ id: PDF_X })).error === 'not_in_signed_folder', '');
+  // файл в «Прочее» под корнем: предки читаются до корня, «Подписанные» среди них нет → отказ, PDF не отдан
+  const wf = safe(() => contractPdf({ id: PDF_X }));
+  check('foreign.wrong-folder', wf.error === 'not_in_signed_folder' && !('content_b64' in wf), J(wf));
   check('foreign.not-pdf', safe(() => contractPdf({ id: PDF_N })).error === 'not_pdf', '');
   check('foreign.trashed', safe(() => contractPdf({ id: PDF_T })).error === 'trashed', '');
   const big = safe(() => contractPdf({ id: PDF_L }));
@@ -358,13 +404,22 @@ const byRow = (r, n) => (r && r.items || []).find(x => x.row === n) || {};
 }
 
 // ── 15. адреса не заданы → названный отказ, а не пустой ответ ──
+// @86 (ESIGNDOOR0410): свойства нет → дверь ИЩЕТ по имени; не нашла ни одного → тот же отказ, и он называет
+// источник (search) и число найденного (0). Ожидание прежнее, мок получил поиск, которым пользуется код.
 {
   const reg = PROPS.ESIGN_REGISTRY_ID, dir = PROPS.ESIGN_SIGNED_FOLDER_ID;
   delete PROPS.ESIGN_REGISTRY_ID;
+  const o0 = OPENED.reg;
   const r = safe(() => contractFind({ name: 'Ivan' }));
-  check('config.no-registry', r.ok === false && r.error === 'no_registry_config' && !('items' in r), J(r));
+  check('config.no-registry', r.ok === false && r.error === 'no_registry_config' && !('items' in r)
+    && r.source === 'search' && r.found === 0 && OPENED.reg === o0, J(r));
   PROPS.ESIGN_REGISTRY_ID = reg; delete PROPS.ESIGN_SIGNED_FOLDER_ID;
-  check('config.no-folder', safe(() => contractPdf({ id: PDF_A })).error === 'no_signed_folder_config', '');
+  // в папке реестра «Подписанных» нет (папка лежит в другом месте) → отказ, PDF не отдан
+  const keepParents = FOLDERS[SIGNED_DIR].parents; FOLDERS[SIGNED_DIR].parents = [ROOT_DIR];
+  const nf = safe(() => contractPdf({ id: PDF_A }));
+  check('config.no-folder', nf.error === 'no_signed_folder_config' && nf.source === 'search' && nf.found === 0
+    && !('content_b64' in nf), J(nf));
+  FOLDERS[SIGNED_DIR].parents = keepParents;
   PROPS.ESIGN_SIGNED_FOLDER_ID = dir; PROPS.ESIGN_REGISTRY_ID = 'someOtherSheet0000000000000000';
   check('config.unreadable', safe(() => contractFind({ name: 'Ivan' })).error === 'registry_unreadable', '');
   PROPS.ESIGN_REGISTRY_ID = reg;
@@ -541,6 +596,161 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
     && ok2.reason === null && J(ok2.undated_items) === '[]', J(ok2.checked));
   check('fix.raw-date-object', ok2.pick && ok2.pick.contract_date_raw === '2026-09-20 00:00' && ok2.pick.date_src === 'contract_date', J(ok2.pick));
   check('fix.readonly-no-writes', WRITES.n === 0, J(WRITES.what));
+}
+
+// ── 19. LIVEDATE1210: живой формат «Дата договора» реестра TB e-Sign — строка ДД-ММ-ГГГГ ──
+// Значения ячеек ДОСЛОВНО сняты чтением прода 12.10.2026 15:50Z: «Дата договора» '22-09-2026', '01-10-2026',
+// '18-09-2026', '25-09-2026'; «Документ создан» '2026-09-22 17:26'. До правки esignDay_ такие строки шли
+// date_src 'unparsed', и поиск со сроком давал incomplete у всех найденных строк. Имена, телефоны, номера
+// байков — синтетика. Свой реестр подменой листа (как секция 18); случаи 1–18 не тронуты.
+{
+  const CREATED = '2026-09-22 17:26';
+  const LIVE = [['22-09-2026', '2026-09-22'], ['01-10-2026', '2026-10-01'], ['18-09-2026', '2026-09-18'], ['25-09-2026', '2026-09-25']];
+  const SAME = [['22.09.2026', '2026-09-22'], ['2026-09-22', '2026-09-22'], ['22/09/2026', '2026-09-22'],
+    ['22-09-2026 17:26', '2026-09-22']];                    // хвост после даты (пробел и время) законен
+  const NEG = ['31-02-2026', '2026-13-01', '1-2-26', 'abc', '1-2-2026', '22-09/2026', '22-09-2026x'];   // мусор сразу за годом — не дата
+  const ROWS3 = [HEADERS.slice()];
+  const plan = [];
+  [...LIVE, ...SAME, ...NEG.map(x => [x, null])].forEach(([raw, want], i) => {
+    const plate = String(9101 + i);
+    ROWS3.push(rowOf({ 'ID документа': 'L-' + (101 + i), 'Клиент': 'Live Client ' + plate, 'Дата договора': raw,
+      'Документ создан': CREATED, 'Статус': 'ПОДПИСАН', 'PDF (подписанный)': i === 0 ? VIEW(PDF_A) : '',
+      'Телефон': '+66 81 777 ' + plate, 'Байк': 'PCX ' + plate }));
+    plan.push({ row: ROWS3.length, raw, want, plate });
+  });
+  const keep = SHEETS;
+  SHEETS = { 'Реестр': makeSheet(ROWS3, ROWS3.map(() => []), ROWS3.map(() => [])) };
+  const SEPT = { date_from: '2026-09-01', date_to: '2026-09-30' };
+
+  plan.forEach(p => {
+    const tag = p.raw;
+    const r = safe(() => contractFind({ bike: p.plate }));
+    const it = byRow(r, p.row);
+    if (p.want) {
+      // день из ячейки, источник — дата договора (не «Документ создан»), исходное значение названо
+      check('live.day ' + tag, it.contract_date === p.want && it.date_src === 'contract_date'
+        && it.contract_date_raw === p.raw && it.created_raw === CREATED && r.checked && r.checked.date_unparsed === 0, J(it));
+      // поиск со сроком, где день в сроке (граница включительно с обеих сторон) → ровно один, с pick
+      const t = safe(() => contractFind({ bike: p.plate, date_from: p.want, date_to: p.want }));
+      check('live.term-one ' + tag, t.ok === true && t.outcome === 'one' && t.pick && t.pick.row === p.row
+        && t.pick.contract_date === p.want && t.pick.date_src === 'contract_date' && t.reason === null
+        && t.checked.undated === 0 && t.checked.undated_signed === 0 && t.checked.complete === true, J([t.outcome, t.pick, t.checked]));
+    } else {
+      // не дата / нет в календаре → unparsed; «Документ создан» рядом (верная дата) НЕ подставлен
+      check('live.neg-unparsed ' + tag, it.contract_date === null && it.date_src === 'unparsed'
+        && it.contract_date_raw === p.raw && it.created_raw === CREATED && r.checked && r.checked.date_unparsed === 1, J(it));
+      const t = safe(() => contractFind(Object.assign({ bike: p.plate }, SEPT)));
+      check('live.neg-term-incomplete ' + tag, t.outcome === 'incomplete' && t.pick === null
+        && t.reason && J(t.reason.rows) === J([p.row]), J([t.outcome, t.reason]));
+    }
+  });
+
+  // день вне срока → честное «нет» (none), а не incomplete: дата прочитана
+  const oct = plan[1];
+  const out = safe(() => contractFind(Object.assign({ bike: oct.plate }, SEPT)));
+  check('live.term-outside-none', out.outcome === 'none' && out.pick === null && out.checked.undated === 0
+    && out.checked.complete === true, J([out.outcome, out.checked]));
+
+  // PDF по строке живого формата: contract_date в ответе — день, а не ''
+  const pdf = safe(() => contractPdf({ id: PDF_A }));
+  check('live.pdf-contract-date', pdf.ok === true && pdf.row === plan[0].row && pdf.contract_date === '2026-09-22', J([pdf.ok, pdf.row, pdf.contract_date, pdf.error]));
+
+  // Побочное следствие общего разборщика (фильтр срока теперь принимает и ДД-ММ-ГГГГ; текст bad_date прежний) НАМЕРЕННО
+  // не закреплён: решение о нём открыто, живой путь агента шлёт срок только в ISO (wa_agent_tools.contract_query).
+
+  check('live.readonly-no-writes', WRITES.n === 0, J(WRITES.what));
+  SHEETS = keep;
+}
+
+// ── 20. ESIGNDOOR0410 (@86, живёт в @88): адреса поиском по имени и PDF в «Подписанные/ГГГГ/ММ» ──
+// Поведение двери, которого не было в сборке c0f367a2 и которое харнесс до MIRROR88 не судил вовсе. Ожидания —
+// по коду @88 (esignRegistryAddr_ / esignSignedFolderAddr_ / esignInSignedFolder_), у каждого отказа есть близнец.
+{
+  const regProp = PROPS.ESIGN_REGISTRY_ID, dirProp = PROPS.ESIGN_SIGNED_FOLDER_ID;
+  const A = FILES[PDF_A], aParents = A._o.parents;
+
+  // свойства заданы → Drive по имени не ищется вовсе, источник назван property
+  const s0 = DRIVE_SEARCH.n;
+  const p0 = safe(() => contractPdf({ id: PDF_A }));
+  const f0 = safe(() => contractFind({ name: 'Ivan' }));
+  check('search.property-no-drive-search', p0.ok === true && f0.ok === true && DRIVE_SEARCH.n === s0
+    && J(p0.config) === J({ registry: 'property', signed_folder: 'property' }) && J(f0.config) === J({ registry: 'property' })
+    && p0.folder_level === 1, J([p0.config, f0.config, p0.folder_level, DRIVE_SEARCH.n - s0]));
+
+  // свойств нет → поиск: ровно одна живая таблица с именем реестра; приманки (та же в корзине, не-таблица) не в счёт
+  delete PROPS.ESIGN_REGISTRY_ID; delete PROPS.ESIGN_SIGNED_FOLDER_ID;
+  DRIVE_INDEX.push(FILES[REG_ID],
+    makeFile('regTrashed00000000000000000000001', { name: REG_NAME, mime: SHEET_MIME, trashed: true, parents: [REG_DIR] }),
+    makeFile('regPdfCopy00000000000000000000001', { name: REG_NAME, mime: 'application/pdf', parents: [REG_DIR] }));
+  const o1 = OPENED.reg;
+  const f1 = safe(() => contractFind({ name: 'Ivan' }));
+  check('search.registry-one', f1.ok === true && J(rowsOf(f1)) === J([3, 2]) && J(f1.config) === J({ registry: 'search' })
+    && OPENED.reg === o1 + 1, J([f1.ok, f1.error, f1.config, f1.found]));
+  const p1 = safe(() => contractPdf({ id: PDF_A }));
+  check('search.folder-one', p1.ok === true && p1.folder_level === 1 && typeof p1.content_b64 === 'string'
+    && J(p1.config) === J({ registry: 'search', signed_folder: 'search' }), J([p1.ok, p1.error, p1.config, p1.folder_level]));
+
+  // вторая живая «Подписанные» в папке реестра → неоднозначно, первую не берём, PDF не отдан; в корзине — не в счёт
+  FOLDERS.dirSignedTwin000000000000000005 = { name: 'Подписанные', parents: [REG_DIR] };
+  const p2 = safe(() => contractPdf({ id: PDF_A }));
+  check('search.folder-ambiguous', p2.ok === false && p2.error === 'signed_folder_ambiguous' && p2.found === 2
+    && p2.source === 'search' && !('content_b64' in p2), J(p2));
+  FOLDERS.dirSignedTwin000000000000000005.trashed = true;
+  const p2b = safe(() => contractPdf({ id: PDF_A }));
+  check('search.folder-trashed-ignored', p2b.ok === true && J(p2b.config) === J({ registry: 'search', signed_folder: 'search' }),
+    J([p2b.ok, p2b.error]));
+  delete FOLDERS.dirSignedTwin000000000000000005;
+
+  // вторая живая таблица с тем же именем → registry_ambiguous; реестр НЕ открывался, PDF не отдан
+  DRIVE_INDEX.push(makeFile('regTwin0000000000000000000000001', { name: REG_NAME, mime: SHEET_MIME, parents: [ROOT_DIR] }));
+  const o3 = OPENED.reg;
+  const f3 = safe(() => contractFind({ name: 'Ivan' }));
+  check('search.registry-ambiguous', f3.ok === false && f3.error === 'registry_ambiguous' && f3.found === 2
+    && f3.source === 'search' && OPENED.reg === o3 && !('items' in f3), J(f3));
+  const p3 = safe(() => contractPdf({ id: PDF_A }));
+  check('search.ambiguous-pdf-refused', p3.ok === false && p3.error === 'registry_ambiguous' && !('content_b64' in p3)
+    && OPENED.reg === o3, J(p3));
+  DRIVE_INDEX.pop();
+
+  // поиск сорвался → registry_lookup_failed (а не «реестра нет»); папку реестра не прочитать → signed_folder_lookup_failed
+  SEARCH_FAIL.on = true;
+  const f4 = safe(() => contractFind({ name: 'Ivan' }));
+  check('search.lookup-failed-named', f4.ok === false && f4.error === 'registry_lookup_failed' && f4.source === 'search'
+    && !('items' in f4), J(f4));
+  SEARCH_FAIL.on = false;
+  PARENTS_FAIL.add(REG_ID);
+  const p4 = safe(() => contractPdf({ id: PDF_A }));
+  check('search.folder-lookup-failed-named', p4.ok === false && p4.error === 'signed_folder_lookup_failed'
+    && !('content_b64' in p4), J(p4));
+  PARENTS_FAIL.delete(REG_ID);
+  DRIVE_INDEX.length = 0;
+  PROPS.ESIGN_REGISTRY_ID = regProp; PROPS.ESIGN_SIGNED_FOLDER_ID = dirProp;
+
+  // уровни: файл в «Подписанные/2026/09» — уровень 3 законен; глубже — отказ; родители не читаются — отказ
+  FOLDERS.dirYear0000000000000000000000006 = { name: '2026', parents: [SIGNED_DIR] };
+  FOLDERS.dirMonth000000000000000000000007 = { name: '09', parents: ['dirYear0000000000000000000000006'] };
+  FOLDERS.dirDeep0000000000000000000000008 = { name: 'старое', parents: ['dirMonth000000000000000000000007'] };
+  const want = crypto.createHash('sha256').update(Buffer.from(A._unsigned)).digest('hex');
+  A._o.parents = ['dirMonth000000000000000000000007'];
+  const l3 = safe(() => contractPdf({ id: PDF_A }));
+  check('levels.three-ok', l3.ok === true && l3.folder_level === 3 && l3.sha256 === want, J([l3.ok, l3.error, l3.folder_level]));
+  A._o.parents = ['dirDeep0000000000000000000000008'];
+  const l4 = safe(() => contractPdf({ id: PDF_A }));
+  check('levels.four-refused', l4.ok === false && l4.error === 'not_in_signed_folder' && l4.levels_max === 3
+    && l4.levels_checked === 3 && !('content_b64' in l4), J(l4));
+  A._o.parents = ['dirMonth000000000000000000000007'];
+  PARENTS_FAIL.add('dirMonth000000000000000000000007');
+  const lu = safe(() => contractPdf({ id: PDF_A }));
+  check('levels.unreadable-refused', lu.ok === false && lu.error === 'parents_unreadable' && lu.level === 2
+    && !('content_b64' in lu), J(lu));
+  PARENTS_FAIL.delete('dirMonth000000000000000000000007');
+  A._o.parents = aParents;
+  delete FOLDERS.dirYear0000000000000000000000006; delete FOLDERS.dirMonth000000000000000000000007;
+  delete FOLDERS.dirDeep0000000000000000000000008;
+  const back = safe(() => contractPdf({ id: PDF_A }));
+  check('levels.restored-twin', back.ok === true && back.folder_level === 1, J([back.ok, back.error, back.folder_level]));
+
+  check('search.readonly-no-writes', WRITES.n === 0, J(WRITES.what));
 }
 
 const failed = cases.filter(c => !c.pass);
