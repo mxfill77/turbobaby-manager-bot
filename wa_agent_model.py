@@ -169,7 +169,7 @@ SYSTEM_PROMPT = """Ты — менеджер проката мотобайков
 4. Цены, наличие и брони НЕ выдумывай. Цену называй ТОЛЬКО из блока «ЦЕНА» и только так, как он разрешает; блока нет или он говорит «считает человек»/«неизвестна» — чисел цены не называй вовсе (ни точного, ни «от», ни диапазона), скажи, что коллега уточнит и вернётся с точной суммой. Наличие и брони ты не видишь — не обещай «есть» и «забронировано».
 5. Факты о компании (доставка, депозит, документы, правила) — только из узлов знаний ниже. Узел НЕИЗВЕСТНО или нужного там нет — «уточню у коллег», а не по памяти.
 6. От имени людей не обещай: никаких «коллега позвонит в 15:00», «мы вернём депозит», «сделаем скидку». Можно: «передам коллеге, он ответит».
-7. Если вопрос требует решения человека (наличие и брони, скидка, срок через границу сезонов, срок от месяца, повреждения, штрафы, депозит, споры, оплаты, жалоба, иной язык, что-то, чего нет в знаниях и что нельзя сказать уклончиво) — всё равно напиши вежливый короткий черновик, но перечисли причины в handoff. Причины из блока «НУЖЕН ЧЕЛОВЕК» перенеси в handoff обязательно.
+7. Если вопрос требует решения человека (наличие и брони, скидка, срок через границу сезонов, срок от месяца, повреждения, штрафы, депозит, споры, оплаты, жалоба, иной язык, что-то, чего нет в знаниях и что нельзя сказать уклончиво) — всё равно напиши вежливый короткий черновик, но перечисли причины в handoff. Причины из блока «НУЖЕН ЧЕЛОВЕК» перенеси в handoff обязательно. Если ответ упирается в то, что знает только клиент и чего он в переписке ещё не назвал (даты или срок, куда доставить, какая модель, сколько байков), — это спроси у него сам, а не «коллега уточнит»: в черновике ОДИН короткий встречный вопрос о самом нужном; названное клиентом не переспрашивай (правила 8 и 14 сильнее), handoff — как выше.
 8. На «спасибо», «ок» и подобное — короткий вежливый ответ без новых вопросов и предложений.
 9. Метки «[скрыто: …]» — это скрытые данные клиента; не проси их повторить и не упоминай.
 10. Число суток аренды называй ТОЛЬКО из блоков «СРОКИ» и «ЦЕНА» — там его посчитал код: дата возврата минус дата выдачи («с 5 по 7» — двое суток, не трое). Блоков нет — числа суток не называй. Клиент назвал другое число суток на те же даты — мягко поправь числом из «СРОКИ».
@@ -299,8 +299,10 @@ def find_dates(text, today, day=None):
     hits = []
     for m in _RX_RANGE_WORD.finditer(s):
         mo = _mon(m.group(3))
-        for pos, day in ((m.start(1), m.group(1)), (m.start(2), m.group(2))):
-            d = _mk(today, day, mo)
+        # число диапазона — не `day` (USEFULDATES1310): имя затирало день сообщения строкой, и «завтра» рядом с
+        # «5-7 октября» роняло разбор TypeError (черновика нет: «модель упала»)
+        for pos, num in ((m.start(1), m.group(1)), (m.start(2), m.group(2))):
+            d = _mk(today, num, mo)
             if d:
                 hits.append((pos, d))
     taken = [(m.start(), m.end()) for m in _RX_RANGE_WORD.finditer(s)]
@@ -364,6 +366,16 @@ _RANGES = (                                    # (вид, выражение); �
     ("md_d", re.compile(r"(?i)\b" + _MON + r"\s+(\d{1,2})" + _ORD + _SEP + r"(\d{1,2})" + _ORD + r"(?!\d)"
                         + _NOT_TIME)),
     ("bare", re.compile(r"(?i)(?<!\w)с\s+(\d{1,2})\s+по\s+(\d{1,2})(?!\d)" + _NOT_TIME)),
+)
+# Начало срока словом (USEFULDATES1310, живой случай E01 «сегодня до 16 апреля»): «с завтра по 20 октября», «from today
+# till April 16» — начало от дня ЭТОГО сообщения (`find_ranges(..., day)`), конец — ближайшая такая дата не раньше
+# начала. День неизвестен — виды не пробуются вовсе: без дня поиск байт-в-байт прежний. Пробуются ПОСЛЕ `_RANGES`:
+# места, занятые прежними видами, за ними и остаются.
+_REL_START = (r"(?i)(?<![\w-])(послезавтра|завтра(?:шн\w*\s+дн\w*)?|сегодня(?:шн\w*\s+дн\w*)?|"
+              r"day\s+after\s+tomorrow|tomorrow|today)")
+_REL_RANGES = (
+    ("rel_dm", re.compile(_REL_START + _SEP + r"(\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MON)),
+    ("rel_md", re.compile(_REL_START + _SEP + _MON + r"\s+(\d{1,2})" + _ORD + r"(?!\d)" + _NOT_TIME)),
 )
 
 
@@ -440,29 +452,68 @@ def _range_of(kind, g, today):
             "label": "с %s по %s" % (span[0].strftime("%d.%m"), span[1].strftime("%d.%m"))}
 
 
-def find_ranges(text, today):
-    """Диапазоны дат в тексте по порядку появления → [{a, b, ds, de, days, label}]. Сутки — `term_days`."""
+def _rel_range_of(kind, g, day):
+    """Совпадение вида с началом словом → {ds, de, days, label} | None: начало — day + сдвиг слова, конец — ближайшая
+    названная дата не раньше начала (`_mk` от начала); не позже начала или длиннее TERM_MAX_DAYS — не диапазон."""
+    w = g[0].lower()
+    shift = 2 if w.startswith(("после", "day")) else 1 if w.startswith(("завтра", "tomorrow")) else 0
+    d2, mo = (g[1], _mon(g[2])) if kind == "rel_dm" else (g[2], _mon(g[1]))
+    if mo is None:
+        return None
+    ds = day + datetime.timedelta(days=shift)
+    de = _mk(ds, d2, mo)
+    if de is None or de <= ds:
+        return None
+    days = term_days(ds, de)
+    if days > TERM_MAX_DAYS:
+        return None
+    return {"ds": ds, "de": de, "days": days, "label": "с %s по %s" % (ds.strftime("%d.%m"), de.strftime("%d.%m"))}
+
+
+def find_ranges(text, today, day=None):
+    """Диапазоны дат в тексте по порядку появления → [{a, b, ds, de, days, label}]. Сутки — `term_days`. day — день
+    этого сообщения: начало словом («сегодня до 16 апреля») — от него; None — такие диапазоны не ищутся (как было)."""
     s = str(text or "")
     taken, out = [], []
-    for kind, rx in _RANGES:
+    kinds = _RANGES if day is None else _RANGES + _REL_RANGES
+    for kind, rx in kinds:
         for m in rx.finditer(s):
             a, b = m.span()
             if any(x < b and a < y for x, y in taken):
                 continue
-            got = _range_of(kind, m.groups(), today)
+            g = m.groups()
+            got = _rel_range_of(kind, g, day) if kind.startswith("rel_") else _range_of(kind, g, today)
             if got is not None:
                 taken.append((a, b))
                 out.append(dict(got, a=a, b=b))
     return sorted(out, key=lambda r: r["a"])
 
 
-def client_terms(items, today):
-    """История → диапазоны дат из слов КЛИЕНТА, без повторов, не больше TERMS_MAX (новые важнее)."""
-    seen, out = set(), []
-    for it in items or ():
-        if it.get("who") != "клиент" or not it.get("text"):
+def client_series(items):
+    """История → серии КЛИЕНТА [(текст, день | None)] по порядку: его реплики подряд, склеенные через "\\n", как вопрос
+    в `build` («с 7 по 14» + «Марта» — один диапазон). Серию рвёт любая не его реплика, кроме автоприветствия (как в
+    `_tail`); реплика без текста серию не рвёт. День — общий день реплик серии; дни разные или неизвестны — None."""
+    out, cur = [], []
+    for it in list(items or ()) + [{"who": None}]:            # последняя строка-страж закрывает последнюю серию
+        if it.get("auto"):
             continue
-        for r in find_ranges(it["text"], today):
+        if it.get("who") == "клиент":
+            if it.get("text"):
+                cur.append(it)
+            continue
+        if cur:
+            days = {ModelAdapter._day(c.get("ts")) for c in cur}
+            out.append(("\n".join(c["text"] for c in cur), days.pop() if len(days) == 1 else None))
+            cur = []
+    return out
+
+
+def client_terms(items, today):
+    """История → диапазоны дат из слов КЛИЕНТА, без повторов, не больше TERMS_MAX (новые важнее). Разбирается СЕРИЯ
+    (`client_series`) с её днём: месяц следующей реплики относится к числам предыдущей, «сегодня» — от дня серии."""
+    seen, out = set(), []
+    for text, day in client_series(items):
+        for r in find_ranges(text, today, day):
             key = (r["label"], r["days"])
             if key not in seen:
                 seen.add(key)
@@ -906,8 +957,9 @@ def count_list(text):
 
 def _terms(text, today):
     """Сроки сообщения → [{a, ds, de, days}]: диапазоны дат; их нет — числа суток («на 5 дней», «3 или 4 дня») без дат.
-    Диапазон без месяца («с 5 по 7») — срока нет: ни дат, ни уверенности в числе."""
-    rs = find_ranges(text, today)
+    Диапазон без месяца («с 5 по 7») — срока нет: ни дат, ни уверенности в числе. Начало словом («сегодня до 16 апреля»)
+    — от дня сообщения, если текст его несёт (`_said`)."""
+    rs = find_ranges(text, today, getattr(text, "day", None))
     full = [r for r in rs if r["ds"] is not None]
     if full:
         return [{"a": r["a"], "ds": r["ds"], "de": r["de"], "days": r["days"]} for r in full]
@@ -1508,14 +1560,17 @@ class ModelAdapter(wa_agent.Model):
                 break
         return out
 
-    def _book(self, number, ask, today, now):
+    def _book(self, number, ask, today, now, ask_day=None):
         """Брони на чтение (WABOOKTOOLS0210) — кодом ДО модели и только на явный вопрос: о свободном байке
         (слово наличия и обе даты) или о конце аренды. → (наличие | None, аренда | None, слова для журнала).
-        Не спросили — снимок не читается вовсе."""
+        Не спросили — снимок не читается вовсе. Двух дат нет, а период есть («сегодня до 16 апреля» — начало от дня
+        вопроса ask_day, «5 октября - 7») — даты берутся из первого полного диапазона (USEFULDATES1310)."""
         if self.book is None:
             return None, None, "брони выключены"
         asked = B.avail_ask(ask)
         dates = find_dates(ask, today) if asked else []
+        if asked and len(dates) < 2:
+            dates = next(([r["ds"], r["de"]] for r in find_ranges(ask, today, ask_day) if r["ds"] is not None), dates)
         want_avail, want_end = len(dates) >= 2, B.rental_end_ask(ask)
         if not want_avail and not want_end:
             return None, None, ("о наличии без двух дат — таблица не звана" if asked else "о бронях не спрашивают")
@@ -1564,7 +1619,7 @@ class ModelAdapter(wa_agent.Model):
         ask_day = ask_days.pop() if len(ask_days) == 1 else None
         price, price_words = self._price(ask, today, ctx, ask_day)
         reasons = K.handoff(ask, price)
-        avail, rental, book_words = self._book(number, ask, today, now)
+        avail, rental, book_words = self._book(number, ask, today, now, ask_day)
         if avail is not None or rental is not None:
             reasons = B.adjust_reasons(reasons, avail, rental, ask)
         # уроки — SQLite с ожиданием до 5 с: читаются до снятия времени, как и остальное (WATIMEFIX0310)

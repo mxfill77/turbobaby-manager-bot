@@ -839,6 +839,9 @@ def known_amounts(price, facts, figures):
                 out.add(abs(int(round(f[k]))))
     for v in list(figures["sums"].values()) + [d["value"] for d in figures["diffs"]]:
         out.add(abs(int(round(v))))
+    due = due_of(facts)                           # итог «к оплате» аренды обращения (факт rental) — опора ответа
+    if due and due["state"] == CHANGE_OK:
+        out.add(abs(int(round(due["total"]))))
     ch = figures.get("change") if isinstance(figures.get("change"), dict) else {}
     if ch.get("state") == CHANGE_OK:              # K3-FIX3 п.2: числа расчёта сдачи кодом — опора ответа
         out.update(abs(int(round(ch[k]))) for k in ("value", "total", "tendered"))
@@ -1004,6 +1007,92 @@ def change_block(results, handed=()):
                           "вместе с возвратом залога; что передано именно %s, подтверждает человек." % (
                               ch["booking_id"], _n(ch["total"]), ch["currency"], ch["tendered"], ch["currency"],
                               _n(ch["value"]), ch["currency"], ch["basis"], ch["tendered"]))
+
+
+# ------------------------------- к оплате (TB-PHILIPP-UPGRADE-1310, часть B «деньги») -------------------------------
+# Итог аренды «к оплате» (`to_pay` факта rental — колонка J листа «клиенты») модели не показывался вовсе: `_fact_ref`
+# держит ключи журнала, а «РАСЧЁТ КОДА» был только у сдачи. На «сколько в целом?» черновик отвечал «коллега пришлёт
+# сумму», хотя сумма лежала в принятом факте (эпизод E02). Блок подаёт её с РОЛЬЮ (итог ≠ подтверждение оплаты),
+# источником и временем снимка, статусом оплаты по кассе (`pay_verdict`) и строкой «реквизитов нет»; тот же итог —
+# опора чисел ответа (`known_amounts`). Замки оплаты (`pay_verdict`, `money_roles`, `topic_reason`) не тронуты.
+
+DUE_HEAD = "РАСЧЁТ КОДА — к оплате (сумму берёт код из факта аренды, не ты; другой суммы к оплате не называй):"
+DUE_ROLE = ("роль суммы: итог аренды «к оплате» по листу «клиенты» — сколько клиент платит за эту аренду; это НЕ "
+            "подтверждение оплаты и не остаток долга. Называй её, когда клиент спрашивает, сколько платить")
+DUE_NO_SUM = "суммы к оплате не называй — её назовёт человек"
+DUE_NO_CASH = "касса не прочитана — об оплате не утверждай ничего"
+DUE_NO_REQ = "реквизитов для оплаты (номер счёта, карта, QR) в фактах нет — не называй и не выдумывай"
+DUE_READ = (FACT, EMPTY, CANCELLED)        # исходы двери кассы, при которых касса ПРОЧИТАНА (строки есть, нет, отменены)
+
+
+def due_of(facts):
+    """Итог аренды обращения к оплате → None (фактов аренды нет) | {state: ok, booking_id, total, currency} |
+    {state: refused, why}. Только строка листа «клиенты» (факт `rental`) аренды обращения (`rental_of`) в её валюте
+    (`rent_currency`): аренда не одна, валюта неизвестна, итог не назван или назван по-разному — отказ с причиной."""
+    if not any(f.get("kind") == "rental" for f in facts):
+        return None
+    bk = rental_of(facts)
+    if bk is None:
+        return {"state": CHANGE_NO, "why": "аренда обращения не одна или не установлена"}
+    cur = rent_currency(facts, bk)
+    if cur is None:
+        return {"state": CHANGE_NO, "why": "валюта аренды %s неизвестна" % bk}
+    named = sorted({f["to_pay"] for f in facts if f.get("kind") == "rental" and _num(f.get("to_pay"))
+                    and f["to_pay"] > 0 and str(f.get("booking_id") or "") == bk})
+    if len(named) != 1:
+        return {"state": CHANGE_NO, "why": "итог «к оплате» аренды %s листом «клиенты» не назван (или назван "
+                                           "по-разному)" % bk}
+    return {"state": CHANGE_OK, "booking_id": bk, "total": named[0], "currency": cur}
+
+
+def _due_source(results, bk):
+    """Источник и время снимка факта аренды bk: новейшее по началу прочтение `rental`, давшее этот факт. Возраст —
+    от снимка до нашего чтения (`at` − `read_at`); времени снимка нет — так и сказано."""
+    for i in reversed(read_order(results)):
+        r = results[i]
+        if r.get("tool") == "rental" and r.get("outcome") == FACT and any(
+                str(g.get("booking_id") or "") == bk for g in r.get("facts") or ()):
+            t, at = r.get("read_at"), r.get("at")
+            when = ("снят %d мин назад" % int(max(0.0, at - t) // 60)) if _num(t) and _num(at) else \
+                "время снимка неизвестно"
+            return "%s, %s" % (r.get("source") or "лист «клиенты»", when)
+    return "лист «клиенты», время снимка неизвестно"
+
+
+def _due_pay(results, facts):
+    """Статус оплаты для блока: касса прочитана — вердикт кода (`pay_verdict`) со словами причины; иначе — запрет."""
+    cash = [results[i] for i in read_order(results) if results[i].get("tool") == "cash"]
+    if not any(r.get("outcome") in DUE_READ for r in cash):
+        why = (" (cash: %s — %s)" % (cash[-1].get("outcome"), str(cash[-1].get("reason") or "")[:120])) if cash else ""
+        return "оплата: %s%s." % (DUE_NO_CASH, why)
+    ok, why = pay_verdict(facts)
+    if ok:
+        return "оплата: подтверждена кодом (строка кассы этой аренды и второй источник)."
+    return "оплата: кодом НЕ подтверждена — %s. Не пиши, что оплата получена, и не утверждай, что её нет." % why
+
+
+def due_block(results):
+    """Блок «РАСЧЁТ КОДА — к оплате» для модели: итог аренды обращения из факта листа «клиенты» (`due_of`) — сумма,
+    валюта, роль, источник и время снимка; статус оплаты по кассе; «реквизитов в фактах нет». Факта аренды среди
+    принятых нет — блока нет (запрос прежний)."""
+    try:
+        facts = accepted(results)
+        due = due_of(facts)
+        if due is None:
+            return ""
+        out = [DUE_HEAD]
+        if due["state"] == CHANGE_OK:
+            out.append("аренда %s: итог «к оплате» %s %s." % (due["booking_id"], _n(due["total"]), due["currency"]))
+            out.append(DUE_ROLE + ".")
+            out.append("источник: %s." % _due_source(results, due["booking_id"]))
+        else:
+            out.append("сумма к оплате НЕ названа кодом: %s — %s." % (due["why"], DUE_NO_SUM))
+        out.append(_due_pay(results, facts))
+        out.append(DUE_NO_REQ + ".")
+        return "\n".join(out)
+    except Exception as e:                                           # noqa: BLE001
+        return DUE_HEAD + "\nсумма к оплате НЕ посчитана (расчёт упал: %s) — %s; %s; %s." % (
+            type(e).__name__, DUE_NO_SUM, DUE_NO_CASH, DUE_NO_REQ)
 
 
 _MONEY_WORD = re.compile(r"оплат|плат[её]ж|залог|депозит|сдач|возврат|вернём|вернем|сумм|стоимост|цен[аыу]|бат|"
@@ -2447,7 +2536,8 @@ def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend
     — суммы переданных наличных со слов клиента (`cash_said`): к каждому ходу модели код прикладывает свой расчёт сдачи
     по уже принятым фактам (`change_block`); нет сумм — запрос прежний байт-в-байт. `asked` (шаг 3e) — признак «входящее
     клиента — об оплате» (`pay_asked`): сверка только ЗАПИСЫВАЕТ его в журнал и итог (судит по нему `judge`); запрос
-    модели от него не зависит."""
+    модели от него не зависит. Принят факт аренды — к ходу прикладывается и итог «к оплате» (`due_block`, часть B
+    TB-PHILIPP-UPGRADE-1310); фактов аренды нет — запрос прежний."""
     t0 = clock()
     deadline = t0 + max_sec
     stop = deadline - max(0.0, min(reserve, max_sec))
@@ -2479,6 +2569,9 @@ def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend
         if n["calls"] >= max_calls or not may_call():
             return out(OVER)
         block = render(results)
+        due = due_block(results)                          # итог «к оплате» — кодом, из факта аренды (часть B)
+        if due:
+            block = (block + "\n\n" + due) if block else due
         # K3-FIX3 п.2: расчёт сдачи — кодом, когда касса уже прочитана (до неё отказ «оплаты в кассе нет» был бы ложным)
         sums = change_block(results, handed) if any(r.get("tool") == "cash" for r in results) else ""
         if sums:
