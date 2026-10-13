@@ -826,8 +826,14 @@ def pay_confirmed(facts):
     return pay_verdict(facts)[0]
 
 
+class _Known(set):
+    """Опора чисел ответа (`known_amounts`). `due` — итог «к оплате» аренды обращения (`due_amount`): опора ТОЛЬКО в
+    предложении итога (`due_supported`), поэтому в само множество он не входит (USEFUL1310 fix)."""
+    due = None
+
+
 def known_amounts(price, facts, figures):
-    out = set(K.thb_amounts(price.get("line") if isinstance(price, dict) else None))
+    out = _Known(K.thb_amounts(price.get("line") if isinstance(price, dict) else None))
     loose = {id(f) for f in cash_split(facts)[1]}       # «не привязано» — не опора чисел ответа (T4BFACTS0410)
     for f in facts:
         if id(f) in loose:
@@ -839,12 +845,10 @@ def known_amounts(price, facts, figures):
                 out.add(abs(int(round(f[k]))))
     for v in list(figures["sums"].values()) + [d["value"] for d in figures["diffs"]]:
         out.add(abs(int(round(v))))
-    due = due_of(facts)                           # итог «к оплате» аренды обращения (факт rental) — опора ответа
-    if due and due["state"] == CHANGE_OK:
-        out.add(abs(int(round(due["total"]))))
     ch = figures.get("change") if isinstance(figures.get("change"), dict) else {}
     if ch.get("state") == CHANGE_OK:              # K3-FIX3 п.2: числа расчёта сдачи кодом — опора ответа
         out.update(abs(int(round(ch[k]))) for k in ("value", "total", "tendered"))
+    out.due = due_amount(facts)
     return out
 
 
@@ -1014,7 +1018,9 @@ def change_block(results, handed=()):
 # держит ключи журнала, а «РАСЧЁТ КОДА» был только у сдачи. На «сколько в целом?» черновик отвечал «коллега пришлёт
 # сумму», хотя сумма лежала в принятом факте (эпизод E02). Блок подаёт её с РОЛЬЮ (итог ≠ подтверждение оплаты),
 # источником и временем снимка, статусом оплаты по кассе (`pay_verdict`) и строкой «реквизитов нет»; тот же итог —
-# опора чисел ответа (`known_amounts`). Замки оплаты (`pay_verdict`, `money_roles`, `topic_reason`) не тронуты.
+# опора чисел ответа, но ТОЛЬКО в предложении итога (USEFUL1310 fix: `known_amounts(...).due` → `money_claims` →
+# `due_supported`; в самом множестве опоры итог делал «белым» число и в реквизитах, и в подтверждении получения).
+# Замки оплаты (`pay_verdict`, `money_roles`, `topic_reason`) не тронуты.
 
 DUE_HEAD = "РАСЧЁТ КОДА — к оплате (сумму берёт код из факта аренды, не ты; другой суммы к оплате не называй):"
 DUE_ROLE = ("роль суммы: итог аренды «к оплате» по листу «клиенты» — сколько клиент платит за эту аренду; это НЕ "
@@ -1043,6 +1049,13 @@ def due_of(facts):
         return {"state": CHANGE_NO, "why": "итог «к оплате» аренды %s листом «клиенты» не назван (или назван "
                                            "по-разному)" % bk}
     return {"state": CHANGE_OK, "booking_id": bk, "total": named[0], "currency": cur}
+
+
+def due_amount(facts):
+    """Итог «к оплате» аренды обращения целым числом (`due_of`, состояние ok) | None — опора числа ответа только в
+    предложении итога (`due_supported`)."""
+    due = due_of(facts)
+    return abs(int(round(due["total"]))) if due and due["state"] == CHANGE_OK else None
 
 
 def _due_source(results, bk):
@@ -1100,12 +1113,62 @@ _MONEY_WORD = re.compile(r"оплат|плат[её]ж|залог|депозит
 _BARE = re.compile(r"(?<![\w.,:/+-])(\d{1,3}(?:[ ,  ]\d{3})+|\d{2,6})(?!\w|%|[.,:/-]\d)"
                    r"(?!\s*(?:дн|сут|день|дня|дней|ноч|час|мин|шт|км|km|day|night|hour|cc|%))")
 _MODEL_BEFORE = re.compile(r"[A-Za-z]{2,}\s*$")
+# USEFUL1310 fix (находка M1 судьи по смыслу): итог «к оплате» — опора числа ТОЛЬКО в предложении итога. Слово итога или
+# суммы к оплате (`_DUE_SAY`) обязательно; предложение с реквизитами или со словами получения денег (`_DUE_NOT`)
+# предложением итога не является никогда: 8+ цифр подряд (счёт, PromptPay, карта, телефон — пробелы и дефисы между
+# цифрами допустимы), слово реквизитов с номером при нём (номер, равный самому итогу, — не реквизит), «получили»,
+# «пришло», «вижу», «received», «is with us» и т.п. Подтверждение оплаты прежним определением — `pay_claimed`.
+_DUE_SAY = re.compile(r"к\s+оплат|оплатить|итог|всего|стоимост|сумм\w*\s+(?:к\s+оплат|аренд|за)|за\s+аренд|выйдет|"
+                      r"выходит|составит|составляет|\btotal\b|to\s+pay|\bowe\b|\bcost|\bprice|"
+                      r"for\s+(?:the|your)\s+rent", re.I)
+_DUE_NOT = re.compile(
+    r"\d(?:[\s\-–]?\d){7,}"
+    r"|(?<!\w)(?:сч[её]т|account|promptpay|prompt\s*pay|промпт\s*пей|промптпей|iban|swift|карт[аеуы]|card)\w*"
+    r"(?:[^\w\n]+[^\W\d_]+){0,3}[^\w\n]+(?P<id>[\w-]*\d[\w-]*)"
+    r"|(?<!\w)(?:получил\w*|получен\w*|поступил\w*|поступлени\w*|зачислен\w*|пришл[аио]|пришёл|пришел|дошл[аио]|"
+    r"дошёл|дошел|оплатил\w*|оплачен\w*|вижу|видим|received|arrived|came\s+through|got\s+(?:it|your)|"
+    r"(?:is|are)\s+with\s+us|(?:been|already)\s+paid|you'?ve\s+paid|credited)(?!\w)", re.I)
 
 
-def money_claims(text, price, known):
-    """Опора = «ЦЕНА» ∪ факты ∪ расчёты. Сумма в батах и ЧИСЛО БЕЗ ВАЛЮТЫ в предложении с денежным словом
-    судятся (имя модели «PCX 160», дни, км, проценты — нет). → [(вид, что)] без опоры."""
+def _due_sentence(sent, due):
+    """Предложение — «итог к оплате»: слово итога есть, реквизитов и слов получения денег нет."""
+    if not _DUE_SAY.search(sent):
+        return False
+    for m in _DUE_NOT.finditer(sent):
+        num = m.group("id")
+        if num is None or int(re.sub(r"\D", "", num)) != due:
+            return False
+    return True
+
+
+def due_supported(text, due):
+    """Итог «к оплате» `due` (`due_amount`) — опора числа ответа, только если КАЖДОЕ предложение, где это число судилось бы
+    (`money_claims`: сумма в батах; голое число при денежном слове), — предложение итога (`_due_sentence`), и текст не
+    называет его полученной оплатой (`pay_claimed` — то же определение, что у замка оплаты). Иначе — как до части B:
+    опоры нет. Итога нет — False."""
     s = str(text or "")
+    if due is None or due in pay_claimed(s, sums=(due,)):
+        return False
+    for sent in K._SENTENCE.split(s):
+        vals = set(K.thb_amounts(sent))
+        if _MONEY_WORD.search(sent):
+            vals.update(int(re.sub(r"\D", "", m.group(1))) for m in _BARE.finditer(sent)
+                        if not _MODEL_BEFORE.search(sent[:m.start()]))
+        if due in vals and not _due_sentence(sent, due):
+            return False
+    return True
+
+
+def money_claims(text, price, known, due=None):
+    """Опора = «ЦЕНА» ∪ факты ∪ расчёты. Сумма в батах и ЧИСЛО БЕЗ ВАЛЮТЫ в предложении с денежным словом
+    судятся (имя модели «PCX 160», дни, км, проценты — нет). → [(вид, что)] без опоры. `due` — итог «к оплате» аренды
+    обращения (`due_amount`; не задан — тот, что несёт опора `known_amounts`): опора, только когда текст называет его в
+    предложениях итога (`due_supported`)."""
+    s = str(text or "")
+    if due is None:
+        due = getattr(known, "due", None)
+    if due is not None and due not in known and due_supported(s, due):
+        known = set(known) | {due}
     out = [c for c in K.money_claims(s, None) if c[0] == "процент"]
     out += [("сумма", v) for v in K.thb_amounts(s) if v not in known]
     for sent in K._SENTENCE.split(s):

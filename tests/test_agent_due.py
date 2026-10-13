@@ -9,7 +9,15 @@
 Ремонт. `due_of` — итог аренды обращения (одна аренда, известная валюта, один положительный итог листа); `due_block` —
 блок «РАСЧЁТ КОДА — к оплате» в запросе модели: сумма, валюта, РОЛЬ (итог ≠ подтверждение оплаты), источник и время
 снимка, статус оплаты по кассе (`pay_verdict` со словами причины; касса не прочитана — «об оплате не утверждай ничего»)
-и «реквизитов в фактах нет — не называй и не выдумывай». `known_amounts` — тот же итог как опора чисел ответа.
+и «реквизитов в фактах нет — не называй и не выдумывай». Тот же итог — опора чисел ответа, но ТОЛЬКО в предложении
+итога (USEFUL1310 fix, находка M1 судьи по смыслу): первая редакция клала итог в общую опору `known_amounts`, и число
+итога становилось «белым» в любом предложении — «Переведите 7790 бат на счёт 123-4-56789-0», «7790 бат на месте,
+спасибо!» теряли единственную причину. Теперь множество `known_amounts` — прежнее (как на 306350b), итог едет при нём
+отдельно (`.due` = `due_amount`), а `money_claims` засчитывает его, только если каждое предложение, где число судится, —
+предложение итога
+(`_DUE_SAY`: к оплате / итого / всего / стоимость / total / to pay / cost …) без реквизитов и слов получения денег
+(`_DUE_NOT`: 8+ цифр подряд, слово реквизитов с номером, «получили», «пришло», «вижу», «received», «is with us» …), и
+текст не называет его полученной оплатой (`pay_claimed`). Иначе число судится как до части B — без опоры.
 Замки оплаты не тронуты: «получили 7790» без кассы и второго источника — по-прежнему «оплата не подтверждена сверкой».
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на 306350b утвердительные падают по существу (у дерева нет
@@ -211,27 +219,61 @@ def test_block_crash_named_not_raised():
     assert b.startswith(DUE) and "НЕ посчитана (расчёт упал: RuntimeError)" in b and NO_CASH in b and NO_REQ in b, b
 
 
+def _k3_pin():
+    """Единственное закрепление отпечатков модуля — `M_PRINTS_ALL` в tests/test_k3_fix3_0910.py (USEFUL1310 fix, находка
+    R1 проверяющего регрессий: здесь число не дублируется литералом — его читает разбор того файла, без импорта)."""
+    import ast
+    with open(os.path.join(HERE, "test_k3_fix3_0910.py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "M_PRINTS_ALL" for t in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError("M_PRINTS_ALL в test_k3_fix3_0910.py не найден")
+
+
 def test_block_names_free_of_fingerprints():
-    """КОНТРОЛЬ отпечатков модуля (tests/test_k3_fix3_0910.py): новых скомпилированных выражений нет (их 71), строк-шаблонов
-    `_P*`/`_ASK*` — тоже (33); новые константы — обычные имена."""
+    """КОНТРОЛЬ отпечатков модуля: число скомпилированных выражений и строк-шаблонов `_P*`/`_ASK*` — то, что закреплено в
+    tests/test_k3_fix3_0910.py (`M_PRINTS_ALL`, единственное место; новые выражения итога `_DUE_SAY`/`_DUE_NOT` там
+    названы поимённо); константы блока `DUE_*` — обычные строки, не выражения и не строки-шаблоны."""
+    pin = _k3_pin()
     rx = [n for n, v in vars(T).items() if hasattr(v, "pattern")]
     strs = [n for n, v in vars(T).items() if isinstance(v, str) and (n.startswith("_P") or n.startswith("_ASK"))]
-    assert len(rx) == 71 and len(strs) == 33, (len(rx), len(strs))
-    assert not [n for n in vars(T) if n.startswith("DUE") and (n.startswith("_P") or n.startswith("_ASK"))]
+    assert (len(rx), len(strs)) == (pin["T"][0], pin["T_str"][0]), (len(rx), len(strs), pin)
+    due = [n for n in vars(T) if n.startswith("DUE")]
+    assert due and all(isinstance(getattr(T, n), (str, tuple)) and not hasattr(getattr(T, n), "pattern")
+                       for n in due), due
 
 
-# ═══ 3. known_amounts: итог — опора чисел ответа ═════════════════════════════════════════════════════════════════
+# ═══ 3. опора чисел ответа: итог — отдельно от общей опоры, только в предложении итога ═════════════════════════════
 
-def test_known_amounts_has_total_of_rental():
+def test_due_amount_of_rental_not_in_known_amounts():
+    """USEFUL1310 fix: итог — `due_amount`; множество опоры `known_amounts` его НЕ держит (как на 306350b), итог едет при
+    нём отдельно (`.due`): иначе число итога было бы «белым» в любом предложении — в реквизитах и в подтверждении."""
     facts = T.accepted([rental()])
-    assert 7790 in T.known_amounts(None, facts, figures(facts))
+    known = T.known_amounts(None, facts, figures(facts))
+    assert T.due_amount(facts) == 7790 and known.due == 7790 and 7790 not in known, (known, known.due)
 
 
-def test_known_amounts_total_only_when_due_ok():
-    """ОТРИЦАТЕЛЬНЫЙ: итог не опора, когда аренда не одна или валюта неизвестна."""
-    for res in ([rental(), contract(booking="K3-BK-002")], [rental(), contract(cur="USD")]):
+def test_due_amount_only_when_due_ok():
+    """ОТРИЦАТЕЛЬНЫЙ: итога нет, когда аренда не одна, валюта неизвестна, итог не назван или фактов аренды нет."""
+    for res in ([rental(), contract(booking="K3-BK-002")], [rental(), contract(cur="USD")], [rental({"to_pay": None})],
+                [history([7790])], []):
         facts = T.accepted(res)
-        assert 7790 not in T.known_amounts(None, facts, figures(facts)), res
+        known = T.known_amounts(None, facts, figures(facts))
+        assert T.due_amount(facts) is None and known.due is None and 7790 not in known, res
+
+
+def test_money_claims_due_only_in_total_sentence():
+    """`money_claims(…, due)`: итог — опора в предложении итога; в прочем предложении (реквизиты, «на месте») — как до
+    части B; итог в двух предложениях, одно из которых — реквизиты, — без опоры; без `due` — прежний вывод."""
+    assert T.money_claims("К оплате 7790 бат.", None, set(), 7790) == []
+    assert T.money_claims("Итого 7 790 бат, реквизиты пришлёт коллега.", None, set(), 7790) == []
+    assert T.money_claims("7790 бат на месте, спасибо!", None, set(), 7790) == [("сумма", 7790)]
+    assert T.money_claims("К оплате 7790 бат, счёт Kasikorn 1234567890.", None, set(), 7790) == [("сумма", 7790)]
+    assert T.money_claims("К оплате 7790 бат. Переведите 7790 бат на счёт 123-4-56789-0.", None, set(), 7790) == \
+        [("сумма", 7790), ("сумма", 7790)]
+    assert T.money_claims("К оплате 7790 бат.", None, set()) == [("сумма", 7790)]            # без итога — как было
+    assert T.money_claims("7790 бат на месте, спасибо!", None, {7790}, 7790) == []        # опора и без итога — прежняя
 
 
 def test_known_amounts_control_rest_unchanged():
@@ -280,6 +322,57 @@ def test_judge_payment_lock_kept():
     for text in ("Оплату 7790 бат получили, спасибо!", "Да, 7790 получили.", "We received your payment of 7790 THB."):
         words = _judge(text, [rental(), cash([])])
         assert T.PAY_WORDS in words, (text, words)
+
+
+# USEFUL1310 fix: 10 рискованных черновиков судьи по смыслу (accept_meaning/probe_money_fix.py) — дословно: итог «к
+# оплате» 7790, касса пуста; на 306350b каждый получал «денежное утверждение без опоры», на 7dc20b5 — ни одной причины
+RISKY = ("7790 бат на месте, спасибо!", "Деньги на месте, 7790 бат.", "Ваши 7790 бат мы видим.",
+         "7790 THB is with us, thanks!", "Got it, 7790 THB, thanks!",
+         "Переведите 7790 бат на счёт 123-4-56789-0 Kasikorn.", "К оплате 7790 бат, счёт Kasikorn 1234567890.",
+         "Оплата 7790 бат на PromptPay 0812345678.", "Total 7790 THB, bank account 123-4-56789-0 (SCB).",
+         "Счёт для оплаты 1234567890, к оплате 7790.")
+# свои: итог и получение денег в ОДНОМ предложении; реквизиты короче 8 цифр; итог в двух предложениях
+RISKY_MORE = ("Итого 7790 бат получили, спасибо!", "Всего 7790 бат пришло, спасибо.", "Total 7790 THB received, thanks!",
+              "К оплате было 7790 бат — оплачено, спасибо.", "Итого 7790 бат — вижу ваш перевод.",
+              "К оплате 7790 бат, счёт TEST-ACC-0042.", "Total 7790 THB, account TEST-ACC-0042.",
+              "К оплате 7790 бат, PromptPay 081-000-0000.", "К оплате 7790 бат. Переведите 7790 бат на счёт 123-4-56789-0.")
+USEFUL = ANSWERS_OK + ("К оплате за аренду 7790 бат.", "За 10 суток выходит 7790 бат.",
+                       "The total for your rental is 7790 THB.",
+                       "К оплате за аренду 7790 бат. Реквизиты для оплаты пришлёт коллега.",
+                       "Итого 7790 бат, оплатить можно картой или наличными.",
+                       "Total 7790 THB, you can pay by card or cash at pickup.")
+
+
+def test_judge_risky_drafts_get_reason_back():
+    """Итог — опора ТОЛЬКО в предложении итога: реквизиты (8+ цифр, слово реквизитов с номером), получение денег
+    («на месте», «видим», «is with us», «got it», «получили», «пришло», «received») — «денежное утверждение без опоры»,
+    как на 306350b; при кассе пустой и без кассы."""
+    for res in ([rental(), cash([])], [rental()]):
+        for text in RISKY + RISKY_MORE:
+            assert K.MONEY_CLAIM_WORDS in _judge(text, res), (text, [r["tool"] for r in res])
+
+
+def test_judge_receipt_with_total_word_both_locks():
+    """Подтверждение получения рядом со словом итога: и «без опоры», и замок оплаты — как на 306350b."""
+    for text in ("Итого 7790 бат получили, спасибо!", "Total 7790 THB received, thanks!",
+                 "Оплату 7790 бат получили, спасибо!", "We got your 7790 baht, all good."):
+        words = _judge(text, [rental(), cash([])])
+        assert K.MONEY_CLAIM_WORDS in words and T.PAY_WORDS in words, (text, words)
+
+
+def test_judge_useful_totals_no_lock():
+    """Польза части B цела: ответ с итогом в предложении итога — ни одной причины (RU/EN, способ оплаты словом)."""
+    for text in USEFUL:
+        assert _judge(text, [rental(), cash([])]) == [], text
+
+
+def test_judge_e02_total_and_deposit_with_price():
+    """E02-форма «к оплате 7790 + залог 3000»: залог — опора из «ЦЕНА» (в факте аренды залога нет), итог — из факта;
+    причин нет. Без строки цены залог 3000 без опоры — как было и до правки."""
+    price = {"line": "ЦЕНА: NMAX 155 | дней: 10, стоимость: 7790 (779 в день), депозит: 3000 бат"}
+    for text in ("К оплате 7790 бат + залог 3000 бат.", "К оплате 7790 + залог 3000."):
+        assert T.judge(text, price, [rental(), cash([])], T.Journal("5678"))[0] == [], text
+        assert K.MONEY_CLAIM_WORDS in _judge(text, [rental(), cash([])]), text
 
 
 # ═══ 5. цикл сверки: блок в запросе модели ═══════════════════════════════════════════════════════════════════════
@@ -387,6 +480,16 @@ def test_adapter_payment_claim_still_reason():
                final("Оплату 7790 бат получили, спасибо!"))
     out = adapter(s, "Я перевёл 7790, дошло?").draft(NUMBER, 5)
     assert out and T.PAY_WORDS in out["handoff"], out
+
+
+def test_adapter_risky_total_claim_on_card():
+    """ОТРИЦАТЕЛЬНЫЙ на живом пути (E02-вопрос): итог в реквизитах или в «на месте» — причина «без опоры», и низ карточки
+    называет число (опора у судьи и у карточки одна: `known_amounts` с её итогом `.due`)."""
+    for text in ("К оплате 7790 бат, счёт Kasikorn 1234567890.", "7790 бат на месте, спасибо!",
+                 "Переведите 7790 бат на счёт 123-4-56789-0 Kasikorn."):
+        s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}}, final(text))
+        out = adapter(s, QUESTIONS[0][0]).draft(NUMBER, 5)
+        assert out and K.MONEY_CLAIM_WORDS in out["handoff"] and ["сумма", 7790] in out["claims"], (text, out)
 
 
 def main():

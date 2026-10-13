@@ -11,7 +11,8 @@
   п.1 `find_ranges(text, today, day)` — виды «начало словом + разделитель + дата» (сегодня/завтра/послезавтра,
       сегодняшнего/завтрашнего дня, today/tomorrow/day after tomorrow); начало — от дня сообщения; без дня поиск прежний;
   п.2 `client_terms` разбирает СЕРИЮ клиента (`client_series`: реплики подряд, склейка "\\n", как вопрос; рвёт наша
-      реплика, автоприветствие — нет; день — общий день серии);
+      реплика, автоприветствие — нет; день — общий день серии); диапазон ЧЕРЕЗ границу реплик — только при датном
+      контексте до неё (USEFUL1310 fix, находка m1: «Нас будет 2» + «до 20 октября» — не срок с 2-го; `_glue_ok`);
   п.3 `_book`: двух дат нет, а период есть — даты из первого полного диапазона (день вопроса — ask_day);
   п.4 `_terms` (пары цены) — с днём сообщения;
   п.5 `find_dates`: число диапазона «5-7 октября» больше не затирает день сообщения — «завтра» рядом с таким диапазоном
@@ -186,6 +187,28 @@ def c_series_boundaries(M):
     assert terms(M, [it("клиент", "Нас 2 человека"), it("клиент", "приедем в марте")]) == []
 
 
+GLUE_FALSE = [("Нас будет 2", "до 20 октября"), ("Мне 16", "до 20 октября"), ("Шлемов 2", "по 14 марта"),
+              ("Hotel room 12", "- 15 October")]
+GLUE_TRUE = [(("Нужен с 7", "по 14 марта"), ("с 07.03 по 14.03", 7)), (("Хочу с 5 октября", "- 7"), ("с 05.10 по 07.10", 2)),
+             (("Need a bike 7-14", "March"), ("с 07.03 по 14.03", 7)), (("from 3", "to 8 May"), ("с 03.05 по 08.05", 5)),
+             (("Нужен байк с 7", "до 14 марта"), ("с 07.03 по 14.03", 7)),
+             (("Нужен байк 05.10", "- 07.10"), ("с 05.10 по 07.10", 2))]
+
+
+def c_series_glue_needs_date_context(M):
+    """USEFUL1310 fix (находка m1 судьи по смыслу): диапазон ЧЕРЕЗ границу реплик — только при датном контексте ДО
+    границы (разделитель срока, месяц, начало словом) или «с/со/from» прямо перед первым числом. Число из прошлой
+    реплики («Нас будет 2», «Мне 16», «Шлемов 2», «Hotel room 12») началом срока не становится; истинные склейки — те же."""
+    for a, b in GLUE_FALSE:
+        assert terms(M, [it("клиент", a), it("клиент", b)]) == [], (a, b, terms(M, [it("клиент", a), it("клиент", b)]))
+    for (a, b), want in GLUE_TRUE:
+        assert terms(M, [it("клиент", a), it("клиент", b)]) == [want], (a, b, terms(M, [it("клиент", a),
+                                                                                      it("клиент", b)]))
+    rel = [it("клиент", "Нужен байк сегодня", TM.T0 - 60), it("клиент", "до 30 сентября", TM.T0)]
+    assert terms(M, rel) == [("с 21.09 по 30.09", 9)], terms(M, rel)          # начало словом — датный контекст
+    assert terms(M, [it("клиент", "Нас 2"), it("клиент", "с 5 по 7 октября")]) == [("с 05.10 по 07.10", 2)]
+
+
 def c_series_day(M):
     """День серии — общий день её реплик: «сегодня до 16 апреля» — от него; дни разные или неизвестны — не дата."""
     one = [it("клиент", "Здравствуйте, необходим мопед", TM.T0 - 120), it("клиент", E01_2, TM.T0 - 60)]
@@ -271,7 +294,7 @@ def c_range_with_relative_word(M):
 
 
 CASES = [c_rel_start_with_day, c_rel_start_needs_day, c_rel_counterexamples, c_series_month_in_next_message,
-         c_series_boundaries, c_series_day, c_e05_prompt, c_e01_prompt_terms_and_avail, c_book_period,
+         c_series_boundaries, c_series_glue_needs_date_context, c_series_day, c_e05_prompt, c_e01_prompt_terms_and_avail, c_book_period,
          c_book_counterexamples, c_price_term_from_word_start, c_range_with_relative_word]
 
 
@@ -290,6 +313,10 @@ MUTANTS = [
     ("п.2 автоприветствие рвёт серию", '        if it.get("auto"):\n            continue\n',
      '        if False:\n            continue\n'),
     ("п.2 день серии при разных днях", "days.pop() if len(days) == 1 else None", "days.pop()"),
+    ("п.2 склейка через границу без датного контекста", "            if not _glue_ok(text, r):\n                continue\n",
+     ""),
+    ("п.2 «с» перед первым числом — не контекст", '_GLUE_PRE.search(text[:r["a"] + (num.start() if num else 0)])',
+     "False"),
     ("п.3 наличие без периода", "        if asked and len(dates) < 2:\n", "        if False:\n"),
     ("п.3 день вопроса не передан", "self._book(number, ask, today, now, ask_day)",
      "self._book(number, ask, today, now)"),

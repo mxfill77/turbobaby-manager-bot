@@ -4426,7 +4426,10 @@ L_PRINTS_K = {"_CLAIM_THB": "b73d1cea7bf29323"}
 # Интеграция К4 на M (TB-FARISHA-AGENTS-CAPACITY-1210, b4_k4integ): было (71, "a1716e9f7a0d5beb"); ровно одно новое выражение
 # модуля — `_CASE_VER=^case_ver:(\d+)$` (разбор версии дела К4, wa_agent_tools.case_result; слов оплаты в нём нет), прочие
 # 71 и все 22 `wa_agent_knowledge` — побайтно прежние (сверка строк «имя=шаблон» до/после — runs/rx_M, runs/rx_MK4R).
-L_PRINTS_ALL = {"T": (72, "16a00a2164bbf68d"), "K": (22, "34eff516dd9e1e3b")}     # ВСЕ скомпилированные выражения модулей
+# Перенос USEFUL1310 (+ fix) на e357f5f: T 72 → 74 = К4 `_CASE_VER` (`K4_PRINTS_NEW`) + ровно два имени USEFUL1310 fix
+# (`U_PRINTS_NEW`, выражения предложения итога «к оплате»); 71 прежних побайтно те же, обе стороны слияния сверены
+# поимённо — `test_useful1310_fix_prints_named` (модуль без двух имён USEFUL = пин К4, без `_CASE_VER` = пин USEFUL fix)
+L_PRINTS_ALL = {"T": (74, "be9e766345e465ba"), "K": (22, "34eff516dd9e1e3b")}     # ВСЕ скомпилированные выражения модулей
 
 
 def _en3l(text):
@@ -5000,8 +5003,24 @@ M_PRINTS_STR = {"_PM_AMT": "1aeb409af6d8a644", "_PM_BARE": "ffa1c90f5fb84285", "
 M_PRINTS_LABELS = {"damage_fines": "a4af662f2c29d1d8", "deposit": "862e8fd57b2a48e2", "refund": "2a15a7e95ea59527",
                    "dispute": "093cb7b0f235f46a", "payment": "e980d8fc35d09e4b"}
 # Интеграция К4 на M: "T" было (71, "a1716e9f7a0d5beb") — плюс одно `_CASE_VER` (см. L_PRINTS_ALL); T_str, K, K_words прежние
-M_PRINTS_ALL = {"T": (72, "16a00a2164bbf68d"), "K": (22, "34eff516dd9e1e3b"), "T_str": (33, "6c6d6ceca5ddf0bf"),
+# Перенос USEFUL1310 fix на e357f5f: T 72 → 74 (К4 `_CASE_VER` — `K4_PRINTS_NEW`; два имени USEFUL1310 fix — `U_PRINTS_NEW`;
+# прежние 71 — те же, см. U_PRINTS_OLD_T); T_str, K, K_words прежние
+M_PRINTS_ALL = {"T": (74, "be9e766345e465ba"), "K": (22, "34eff516dd9e1e3b"), "T_str": (33, "6c6d6ceca5ddf0bf"),
                 "K_words": "fa3f9028dd677f56"}
+# USEFUL1310 fix (находка M1 судьи по смыслу): итог «к оплате» — опора числа ТОЛЬКО в предложении итога. Новые выражения
+# модуля — ровно два, оба решают «предложение ли это итога», а не «что считать оплатой»: `_DUE_SAY` — слово итога/суммы
+# к оплате, `_DUE_NOT` — реквизиты и слова получения денег (предложение итогом НЕ делают никогда). Определения оплаты
+# (`_PAY_*`, `_PQ_*`, `_PF_*`, `_PD_*`, `_PM_*`, `_ASK_*`, `_CLAIM_THB`, ярлыки и слова причин) не тронуты: отпечаток ВСЕХ
+# прежних выражений модуля без двух новых — прежний (71, a1716e9f7a0d5beb), строки-шаблоны — прежние (33).
+U_PRINTS_NEW = {"_DUE_SAY": "204851e1531d496d", "_DUE_NOT": "3dc589113918828f"}
+U_PRINTS_OLD_T = (71, "a1716e9f7a0d5beb")
+# Перенос USEFUL1310 (+ fix) на e357f5f (живой сервер = 306350b + W15 + К4): выражение К4 закреплено ПО ИМЕНИ рядом с двумя
+# именами USEFUL1310 fix, и каждая сторона слияния сверена своим прежним пином — модуль без `U_PRINTS_NEW` = пин К4 на M
+# (`K4_SIDE_T`, L/M_PRINTS_ALL["T"] дерева e357f5f), модуль без `K4_PRINTS_NEW` = пин USEFUL1310 fix (`U_SIDE_T`, дерево
+# 64e0748); общий T = 71 + 1 + 2 = 74 (L_PRINTS_ALL / M_PRINTS_ALL).
+K4_PRINTS_NEW = {"_CASE_VER": "c9e38b739e816c0c"}
+K4_SIDE_T = (72, "16a00a2164bbf68d")
+U_SIDE_T = (73, "83f747840cc6c0d0")
 
 
 def _amt3m(text):
@@ -7226,6 +7245,34 @@ def test_p3r_attach_of_reader_contract():
         raise RuntimeError("сбой")
     assert X.attach_of({"state": T.DONE, "results": out["results"]}, None, boom) == (
         None, R_CODE_FAIL + "unknown — чтение упало: RuntimeError")
+
+
+def test_useful1310_fix_prints_named():
+    """Перезакрепление отпечатка `wa_agent_tools` — поимённо. USEFUL1310 fix: 71 → 73, новых выражений ровно два
+    (`U_PRINTS_NEW`, шаблоны закреплены по имени); перенос на e357f5f: + выражение К4 `_CASE_VER` (`K4_PRINTS_NEW`, тоже
+    по имени) = 74. Все ПРЕЖНИЕ 71 побайтно те же (отпечаток модуля без трёх новых — `U_PRINTS_OLD_T`, снят с 7dc20b5 и
+    306350b); каждая сторона слияния — своим прежним пином: модуль без двух имён USEFUL = пин К4 (`K4_SIDE_T`), без
+    `_CASE_VER` = пин USEFUL1310 fix (`U_SIDE_T`); строк-шаблонов `_P*`/`_ASK*` — прежние 33; новые имена — не имена
+    определений оплаты (не `_P*`/`_ASK*`/`_CLAIM*`), то есть охрана определений оплаты не ослаблена."""
+    import hashlib
+
+    def h(s):
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+    def mark(skip):
+        rows = sorted("%s=%s" % (n, v.pattern) for n, v in rx.items() if n not in skip)
+        return len(rows), h("|".join(rows))
+    rx = {n: v for n, v in vars(T).items() if hasattr(v, "pattern")}
+    new = dict(U_PRINTS_NEW, **K4_PRINTS_NEW)
+    assert len(new) == len(U_PRINTS_NEW) + len(K4_PRINTS_NEW), new          # имена двух сторон не пересекаются
+    assert mark(new) == U_PRINTS_OLD_T, mark(new)
+    assert mark(U_PRINTS_NEW) == K4_SIDE_T, mark(U_PRINTS_NEW)
+    assert mark(K4_PRINTS_NEW) == U_SIDE_T, mark(K4_PRINTS_NEW)
+    assert {n: h(rx[n].pattern) for n in U_PRINTS_NEW if n in rx} == U_PRINTS_NEW
+    assert {n: h(rx[n].pattern) for n in K4_PRINTS_NEW if n in rx} == K4_PRINTS_NEW
+    assert mark(()) == M_PRINTS_ALL["T"] == L_PRINTS_ALL["T"], mark(())
+    assert len(rx) == U_PRINTS_OLD_T[0] + len(new) == K4_SIDE_T[0] + len(U_PRINTS_NEW) == U_SIDE_T[0] + len(K4_PRINTS_NEW)
+    assert not [n for n in new if n.startswith(("_P", "_ASK", "_CLAIM"))]
 
 
 def main():
