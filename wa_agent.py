@@ -589,6 +589,31 @@ def claims_of(raw):
     return val if isinstance(val, list) else None
 
 
+def draft_checked(out):
+    """Ответ Model.draft → что о деньгах черновика установлено кодом (USEFUL1310 A5, `wa_agent_tools.money_check`):
+    {nums: [[что, [опора, …]], …], pay: оплата кодом подтверждена, said: [предложение, …], more: N} | None (адаптер не
+    дал или форма не та — штампа и строки сверки на карточке нет). Клиенту из этого не уходит ничего."""
+    c = out.get("checked") if isinstance(out, dict) else None
+    if not isinstance(c, dict):
+        return None
+    nums = [[n[0], [str(x) for x in n[1]]] for n in (c.get("nums") or [])
+            if isinstance(n, (list, tuple)) and len(n) == 2 and isinstance(n[1], (list, tuple)) and n[1]]
+    said = [str(x) for x in (c.get("said") or []) if isinstance(x, str) and x.strip()]
+    more = c.get("more") if isinstance(c.get("more"), int) and not isinstance(c.get("more"), bool) else 0
+    return {"nums": nums, "pay": c.get("pay") is True, "said": said, "more": max(0, more)}
+
+
+def checked_of(raw):
+    """drafts.checked → то же, что `draft_checked` | None (черновик старше или запись не читается)."""
+    if raw is None:
+        return None
+    try:
+        val = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return draft_checked({"checked": val})
+
+
 def tr_pick(rows, ver, text):
     """Переводы черновика [(ver, a_sha, q_ru, a_ru)] → (q_ru, a_ru, None) для ЭТОЙ версии с ЭТИМ текстом, иначе
     (None, None, версия, к которой перевод есть | None — перевода нет вовсе)."""
@@ -795,6 +820,9 @@ class Core:
         for col in ("why", "claims"):
             if col not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
                 self.db.execute("ALTER TABLE drafts ADD COLUMN %s TEXT" % col)
+        # что о деньгах установлено кодом (USEFUL1310 A5); NULL — черновик старше: штампа и строки сверки нет
+        if "checked" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
+            self.db.execute("ALTER TABLE drafts ADD COLUMN checked TEXT")
         if self.case is not None:              # дело аренды (К4): колонки drafts и UNIQUE notice_id — только под флагом
             self._case_schema()                # (выключено — база прежняя, как у шаблонов NIGHT0710-B3g ниже)
         have = {r[1] for r in self.db.execute("PRAGMA table_info(card_out)")}
@@ -1587,9 +1615,10 @@ class Core:
                 text, hand = draft_out(out)
                 card = draft_card(out)                               # вопрос и перевод для карточки (WACARDQ0410)
                 why, claims = draft_why(out)                         # низ карточки (WACARDUI0510)
+                checked = draft_checked(out)                         # установлено кодом (USEFUL1310 A5)
             except Exception as e:                                   # noqa: BLE001
                 self.log("модель упала: %s" % type(e).__name__)
-                text, hand, card, why, claims = None, [], None, "", None
+                text, hand, card, why, claims, checked = None, [], None, "", None, None
             if self.case is not None and isinstance(out, dict):     # К4: записи в дело по фактам сверки
                 self._case_after(out.get("case"))
             if not isinstance(text, str) or not text.strip():
@@ -1600,11 +1629,12 @@ class Core:
             if self._fresh(number, upto):
                 continue
             cur = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, handoff, ctx, "
-                                  "question, q_lang, why, claims) VALUES(?,?,1,?,?,?,?,?,?,?,?,?)",
+                                  "question, q_lang, why, claims, checked) VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?)",
                                   (number, PENDING, text, upto, now,
                                    json.dumps(hand, ensure_ascii=False) if hand else None, ctx,
                                    card["question"] if card else None, card["q_lang"] if card else None,
-                                   why, None if claims is None else json.dumps(claims, ensure_ascii=False)))
+                                   why, None if claims is None else json.dumps(claims, ensure_ascii=False),
+                                   None if checked is None else json.dumps(checked, ensure_ascii=False)))
             did = cur.lastrowid
             if self.case is not None:          # К4: черновик помнит дело и версию дела, на которые написан
                 self._case_bind_draft(did, out)
@@ -2411,8 +2441,10 @@ class Core:
     def card_extra(self, draft_id, ver, text):
         """Вопрос и перевод для карточки версии ver с текстом text (WACARDQ0410) → None (вопроса нет: черновик старше
         или напоминание — карточка прежняя) | {question, q_lang, q_ru, a_ru, tr_ver}: переводы — только этой версии
-        с этим текстом; tr_ver — версия, к которой перевод есть, если он не к этой."""
-        row = self.db.execute("SELECT question, q_lang, why, claims FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        с этим текстом; tr_ver — версия, к которой перевод есть, если он не к этой. У версии модели — ещё agent, why,
+        claims (WACARDUI0510) и checked (USEFUL1310 A5: что о деньгах установлено кодом; None — черновик старше)."""
+        row = self.db.execute("SELECT question, q_lang, why, claims, checked FROM drafts WHERE id=?",
+                              (draft_id,)).fetchone()
         if not row:
             return None
         # как считал агент (WACARDUI0510): только у версии модели (1); у версии человека и у черновика старше — нет
@@ -2420,7 +2452,8 @@ class Core:
         if row[0] is None and not agent:
             return None
         out = {"question": row[0], "q_lang": row[1] or None, "q_ru": None, "a_ru": None, "tr_ver": None,
-               "agent": agent, "why": row[2] if agent else None, "claims": claims_of(row[3]) if agent else None}
+               "agent": agent, "why": row[2] if agent else None, "claims": claims_of(row[3]) if agent else None,
+               "checked": checked_of(row[4]) if agent else None}          # USEFUL1310 A5
         if row[0] is not None:
             rows = self.db.execute("SELECT ver, a_sha, q_ru, a_ru FROM draft_tr WHERE draft_id=?",
                                    (draft_id,)).fetchall()

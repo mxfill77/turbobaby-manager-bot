@@ -450,11 +450,13 @@ def test_flag_off_golden_equals_9c4aac6():
         print("  ПРОПУЩЕНО: git show 9c4aac6 недоступен — голден не сверен (это НЕ зелёное)")
         return
     # WACARDUI0510: черновик несёт новое поле claims (проверка чисел кодом для низа карточки) — сверяется
-    # отдельно; всё прочее — байт-в-байт как у 9c4aac6
+    # отдельно; USEFUL1310 A5: и поле checked (что о деньгах установлено кодом: числа с опорой «ЦЕНА», оплата кодом не
+    # подтверждена, предложения о деньгах) — тоже отдельно; всё прочее — байт-в-байт как у 9c4aac6
     now, was = _run_off(M), _run_off(base)
     for (d, _log), reply in zip(now, GOLDEN_REPLIES):
         if d is not None:
             assert d.pop("claims") == [list(c) for c in K.money_claims(d["text"], {"line": "ЦЕНА: 2 800 ฿"})], d
+            assert d.pop("checked") == T.money_check(d["text"], {"line": "ЦЕНА: 2 800 ฿"}, bare=False), d
     assert now == was
 
 

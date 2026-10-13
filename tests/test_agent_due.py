@@ -42,6 +42,14 @@ USEFUL1310 A4 (слепой судья 5 real, E02; решение интегр�
 или остатком (`deposit_supported`); итог — как в A3 (только в предложении итога). Адаптерный случай E02 стенда (R1:
 итог 7790, оплачено 7790, залог 3000): «Итого за аренду 7790 бат, залог 3000 бат (возвратный)» — без ложных замков,
 «К оплате 7790, вы уже оплатили» — заперт.
+USEFUL1310 A5 (находки V1–V4 проверяющего X3 и judge3b; решение интегратора К3, минимально): (а) окно реквизитов,
+перешагнувшее время/дату, номером берёт только номер от 5 цифр («в 10:00, 2 шлема», «7 дней в неделю», «за 3 дня» —
+не реквизиты; «до 18:00: 1234567» — реквизиты); (б) зачин «и/а/and/plus + деньги» больше не эллипсис денег (остались
+«тоже/также/too/as well»); (в) при неподтверждённой кодом оплате черновик о деньгах несёт карточке предложения о
+деньгах, их получении или платёжном документе дословно (`money_said`, до двух) — строка сверки человеком, не замок; (г)
+штамп карточки — только установленное: какие числа и с какой опорой (`money_backing`: блок «ЦЕНА», итог аренды кода,
+залог аренды кода, факты сверки кода); чисел нет — штампа нет. Секция 7; зубы — мутанты в памяти
+(useful3/fix5/teeth5.py).
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на 306350b утвердительные падают по существу (у дерева нет
 `due_of`/`due_block`, а `known_amounts` итога не знает). КОНТРОЛЬ и ОТРИЦАТЕЛЬНЫЙ — прежнее поведение и замки, которые
@@ -786,6 +794,156 @@ def test_a4_adapter_e02_payable_and_paid_locked():
     out = adapter(s, E02_Q).draft(NUMBER, 5)
     assert out and K.MONEY_CLAIM_WORDS in out["handoff"], out
     assert out["claims"] and any(c[1] == 7790 for c in out["claims"]), out
+
+
+# ═══ 7. USEFUL1310 A5 (находки V1–V4 проверяющего X3, judge3b; решение интегратора К3) ════════════════════════════
+# (а) V2: окно реквизитов, перешагнувшее время/дату, номером берёт только номер от 5 цифр. Новые ложные замки X3
+# (verify3/out/cmp_a3.txt, группа c_f2, дословно) — без причин; F2 X3 (номер 7 цифр за временем/датой) — по-прежнему
+# заперт (RISKY выше); граница — 4 цифры за временем не номер, 5 цифр — номер; окно без времени — прежнее.
+A5_F2_FREE = ("К оплате 7790 бат. По карте с 9:00 до 21:00 7 дней в неделю.",
+              "Total 7790 THB. Card payment from 9:00 to 21:00, 7 days a week.",
+              "К оплате 7790 бат. Счёт пришлём 25.10, оплатить за 3 дня.",
+              "К оплате 7790 бат. Счёт до 18:00 сегодня, срок 1 день.",
+              "Total 7790 THB. Card at pickup at 10:00, 2 helmets included.",
+              "К оплате 7790 бат. По карте при выдаче в 10:00, 2 шлема в комплекте.")
+A5_F2_EDGE = (("К оплате 7790 бат. Счёт до 18:00: 1234.", False), ("К оплате 7790 бат. Счёт до 18:00: 12345.", True),
+              ("К оплате 7790 бат. Карта до 15.10: 4521.", False), ("К оплате 7790 бат. Карта до 15.10: 45218.", True),
+              ("К оплате 7790 бат. Карта 4521, до 15.10.", True))   # последнее — окно без времени: номер любой длины
+# (б) V3: зачин «и/а/and/plus + деньги» в следующем предложении больше не эллипсис денег (c_tied, дословно); при
+# «тоже/также/too/as well» — эллипсис, как в A3 (цена оставлена решением К3: остаются запертыми).
+A5_TIED_FREE = ("Got it! And payment is by card at pickup. Total 7790 THB.",
+                "Got your question. And the payment can be made at pickup. Total 7790 THB.",
+                "Получили ваш вопрос. А оплата — при выдаче байка. К оплате 7790 бат.",
+                "Получили ваш вопрос. И оплату можно внести при выдаче. К оплате 7790 бат.",
+                "К оплате 7790 бат. Получили ваш вопрос. А оплата — при выдаче.",
+                "Thanks, received your booking. And the transfer details will follow. Total 7790 THB.")
+A5_TIED_KEPT = ("Got your question. You can pay by transfer as well. Total 7790 THB.",
+                "Got your question. We accept card and transfer too. Total 7790 THB.",
+                "Получили ваш вопрос. Оплату тоже можно сделать картой. К оплате 7790 бат.",
+                "Вижу вашу бронь. Перевод тоже подходит. К оплате 7790 бат.")
+# (в) V1: маскировки получения денег за «подтверждением» (verify3/out/cmp_a3.txt, по форме на механизм, дословно) —
+# судья их по-прежнему не запирает, но строка сверки человеком называет эти предложения дословно
+A5_MASKS = (("Получили ваше сообщение. Деньги — тоже. К оплате 7790 бат.",
+             ["Получили ваше сообщение.", "Деньги — тоже."]),                                    # m_link: тире
+            ("Получили ваше сообщение. Спасибо! Деньги тоже. К оплате 7790 бат.",
+             ["Получили ваше сообщение.", "Деньги тоже."]),                                      # m_skip1
+            ("Получили вашу бронь и депозит. К оплате 7790 бат.", ["Получили вашу бронь и депозит."]),   # m_noun
+            ("Received your booking and deposit. Total 7790 THB.", ["Received your booking and deposit."]),
+            ("Got your message and the bank confirmation. Total 7790 THB.",
+             ["Got your message and the bank confirmation."]),                                    # m_doc
+            ("Got it, paid! Total 7790 THB.", ["Got it, paid!"]),                                # m_thanks
+            ("Деньги тоже. Получили ваше сообщение. К оплате 7790 бат.",
+             ["Деньги тоже.", "Получили ваше сообщение."]),                                      # m_reverse
+            ("Got your message. And your payment. Total 7790 THB.",
+             ["Got your message.", "And your payment."]))                                        # держал зачин (V3)
+# полезные без денег — строки сверки нет (cost_probe проверяющего, дословно; итог судит штамп, не строка сверки)
+A5_NO_SAID = ("К оплате 7790 бат. Байк будет готов в 10:00.", "К оплате 7790 бат. Наш офис: Раваи, Viset Rd 52/7.",
+              "Total 7790 THB. Pickup at 10:00 tomorrow.", "К оплате 7790 бат. Номер брони K3-BK-001.",
+              "Total 7790 THB. Call us at 081-234-5678 if needed.", "Здравствуйте! Байк свободен.",
+              "Получили ваш вопрос. Байк свободен.")      # подтверждение без денег в тексте — не сверка
+
+
+def test_a5_v2_short_number_after_clock_not_requisites():
+    """(а) Новые ложные замки X3 (c_f2) — без причин и с опорой итога; F2 X3 (номер 7 цифр за временем/датой) — заперт;
+    граница: за временем/датой 4 цифры — не номер, 5 — номер; окно без времени — номер любой длины, как было."""
+    for res in ([rental(), cash([])], [rental()]):
+        for text in A5_F2_FREE:
+            assert _judge(text, res) == [] and T.due_supported(text, 7790), (text, _judge(text, res))
+        for text in ("К оплате 7790 бат. Переведите на карту до 15.10 по номеру 1234567.",
+                     "К оплате 7790 бат. Счёт до 18:00 по номеру 1234567.",
+                     "К оплате 7790 бат. Счёт до 18:00: 1234567."):
+            assert K.MONEY_CLAIM_WORDS in _judge(text, res), text
+    for text, locked in A5_F2_EDGE:
+        assert T.due_supported(text, 7790) is not locked, (text, locked)
+
+
+def test_a5_v3_opening_conjunction_not_money_ellipsis():
+    """(б) Зачин «и/а/and/plus + деньги» снят: полезные инструкции после подтверждения — без причин; «тоже/too/as well»
+    по-прежнему эллипсис денег — запирает (названная цена); прочие формы A3 (RISKY) — заперты, как были."""
+    for res in ([rental(), cash([])], [rental()]):
+        for text in A5_TIED_FREE:
+            assert _judge(text, res) == [], (text, _judge(text, res))
+        for text in A5_TIED_KEPT:
+            assert K.MONEY_CLAIM_WORDS in _judge(text, res), text
+    assert not T._DUE_ALSO.search("And the payment can be made at pickup") and T._DUE_ALSO.search("Деньги тоже")
+
+
+def test_a5_v1_money_said_masks_and_no_money():
+    """(в) Предложения о деньгах, их получении или платёжном документе — дословно, до двух (сначала деньги, затем
+    подтверждение; показ — в порядке текста); предложение итога и текст без денег — не идут."""
+    for text, want in A5_MASKS:
+        assert T.money_said(text, 7790) == (want, len(want)), (text, T.money_said(text, 7790))
+    for text in A5_NO_SAID:
+        assert T.money_said(text, 7790) == ([], 0), (text, T.money_said(text, 7790))
+    said, n = T.money_said("Получили ваш вопрос. Деньги тоже. Перевод тоже. Чек тоже. К оплате 7790 бат.", 7790)
+    assert said == ["Деньги тоже.", "Перевод тоже."] and n == 4, (said, n)      # деньги раньше «подтверждения»
+    long = "Получили ваш перевод " + "и ещё раз спасибо " * 20 + "."
+    assert len(T.money_said(long)[0][0]) == T.SAID_CUT and T.money_said(long)[0][0].endswith("…")
+
+
+def test_a5_g_backing_names_numbers_and_source():
+    """(г) Числа ответа с опорой и ИМЯ опоры: итог аренды кода (только в предложении итога), залог аренды кода, блок
+    «ЦЕНА»; число без опоры — не здесь (его называет `money_claims`); чисел нет — пусто."""
+    facts = T.accepted([rental(), cash([])])
+    known = T.known_amounts(None, facts, figures(facts))
+    assert T.money_backing(E02_OK, None, known) == [[7790, [T.SRC_DUE]], [3000, [T.SRC_DEP]]]
+    assert T.money_backing("Здравствуйте! Байк свободен.", None, known) == []
+    assert T.money_backing("Итого за аренду 7990 бат.", None, known) == []          # без опоры — в claims
+    assert T.money_backing("К оплате 7790 бат, счёт Kasikorn 1234567890.", None, known) == []
+    price = {"line": "ЦЕНА: PCX 160: 7 суток, итого 2 800 ฿"}
+    assert T.money_backing("PCX на неделю — 2 800 бат.", price, None, bare=False) == [[2800, [T.SRC_PRICE]]]
+    cash_row = [{"kind": "cash", "role": T.R_RENT, "currency": "THB", "amount": 4900}]
+    assert T.money_backing("Вы внесли 4900 бат.", None, T.known_amounts(None, cash_row, figures(cash_row))) == [
+        [4900, [T.SRC_FACTS]]]
+
+
+def test_a5_adapter_unpaid_said_and_stamp_on_card():
+    """Живой путь (E02-вопрос, касса пуста): маскировка V1 — причин судьи нет (как на X3), но запись карточки несёт
+    итог с опорой «итог аренды кода», «оплата не подтверждена» и предложения дословно; карточка рисует строку сверки
+    и штамп без слова об оплате (`wa_agent.draft_checked` → `wa_agent_tg.card_check`)."""
+    import wa_agent as A
+    import wa_agent_tg as G
+    text = A5_MASKS[0][0]
+    s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}}, final(text))
+    out = adapter(s, E02_Q).draft(NUMBER, 5)
+    assert out["claims"] == [] and out["checked"] == {"nums": [[7790, [T.SRC_DUE]]], "pay": False,
+                                                       "said": A5_MASKS[0][1], "more": 0}, out
+    lines = G.card_check(out["claims"], A.draft_checked(out)).split("\n")
+    assert lines == [G.W_PAY_SAID + " «Получили ваше сообщение.» · «Деньги — тоже.»",
+                     "🔎 сверено кодом: 7 790 — итог аренды кода"], lines
+    # полезный ответ E02 (итог в предложении итога, залог в нём же) — строки сверки нет, штамп называет обе опоры
+    s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}}, final(E02_OK))
+    out = adapter(s, E02_Q).draft(NUMBER, 5)
+    assert out["checked"] == {"nums": [[7790, [T.SRC_DUE]], [3000, [T.SRC_DEP]]], "pay": False, "said": [],
+                              "more": 0}, out["checked"]
+    assert G.card_check(out["claims"], A.draft_checked(out)) == (
+        "🔎 сверено кодом: 7 790 — итог аренды кода; 3 000 — залог аренды кода")
+
+
+def test_a5_adapter_paid_by_code_no_said():
+    """Оплата подтверждена кодом (строка кассы аренды + та же сумма в переписке) — строки сверки нет, хотя текст о
+    получении денег; штамп — только числа."""
+    q = "Я перевёл 7790 бат за аренду, дошло?"
+    s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}},
+               {"tool": "history", "args": {}}, final("Получили ваш перевод, спасибо! Итого за аренду 7790 бат."))
+    a = adapter(s, q, cash_items=[tx_item()])
+    out = a.draft(NUMBER, 5)
+    facts = T.accepted(a.last["tools"]["results"])
+    assert T.pay_verdict(facts) == (True, ""), T.pay_verdict(facts)
+    assert out["checked"]["pay"] is True and out["checked"]["said"] == [], out["checked"]
+
+
+def test_a5_no_tools_path_price_only_and_unpaid():
+    """Черновик без сверки (WA_AGENT_TOOLS выкл): опора — только блок «ЦЕНА»; кассы нет — оплата кодом не подтверждена,
+    предложение о получении денег идёт в строку сверки."""
+    a = M.ModelAdapter(":memory:-не-открывается", Script(final("Деньги получили. PCX на неделю — 2 800 бат.")),
+                       clock=Clock(), log=lambda *_: None)
+    info = {"price": {"line": "ЦЕНА: PCX 160: 7 суток, итого 2 800 ฿"}, "code_reasons": [], "price_words": "цена",
+            "history_items": 1, "history_chars": 10, "masked": 0}
+    a.build = lambda number, upto_id, now=None, hint=None: ("SYSTEM", "USER", info)
+    out = a.draft(NUMBER, 5)
+    assert a.tools is None and out["claims"] == [], out
+    assert out["checked"] == {"nums": [[2800, [T.SRC_PRICE]]], "pay": False, "said": ["Деньги получили."], "more": 0}
 
 
 def main():

@@ -1801,8 +1801,12 @@ class ModelAdapter(wa_agent.Model):
                  % (len(got["text"]), info["history_items"], info["history_chars"], info["masked"],
                     info["price_words"], len(words), tok))
         # claims — проверка чисел кодом для низа карточки (WACARDUI0510): тот же список, что дал причину выше
+        # checked (USEFUL1310 A5) — что установлено кодом: числа с опорой (здесь — только блок «ЦЕНА»), оплата кодом не
+        # подтверждена (кассы без сверки нет), предложения о деньгах — сотруднику сверить; вход модели не меняется
+        import wa_agent_tools as T
+        checked = T.money_check(got["text"], info["price"], bare=False)
         return dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"],
-                     "claims": [list(c) for c in claims]}, **card_fields(info, got))
+                     "claims": [list(c) for c in claims], "checked": checked}, **card_fields(info, got))
 
     def redraft(self, number, upto_id, prev_text, hint):
         """Версия по пояснению сотрудника (NIGHT0710-B2): тот же запрос, что у черновика, плюс блок «ПОЯСНЕНИЕ
@@ -1937,9 +1941,13 @@ class ModelAdapter(wa_agent.Model):
         self.log("модель: черновик %d симв. со сверкой (%s, вызовов %d, %.1f с), причин %d"
                  % (len(got["text"]), out["state"], out["calls"], out["sec"], len(words)))
         # проверка чисел кодом для низа карточки (WACARDUI0510): опора та же, что у судьи сверки — «ЦЕНА» ∪ факты
-        claims = T.money_claims(said, info["price"], T.known_amounts(info["price"], jr.facts, figures))
+        known = T.known_amounts(info["price"], jr.facts, figures)
+        claims = T.money_claims(said, info["price"], known)
+        # USEFUL1310 A5: что установлено кодом — числа с опорой, подтверждена ли оплата (`pay_verdict` принятых фактов
+        # этой сверки), предложения о деньгах при неподтверждённой оплате; вход модели не меняется
+        checked = T.money_check(got["text"], info["price"], known, judged=said, pay=T.pay_verdict(jr.facts)[0])
         res = dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"],
-                    "claims": [list(c) for c in claims]}, **card_fields(info, got))
+                    "claims": [list(c) for c in claims], "checked": checked}, **card_fields(info, got))
         if self.case is not None:
             # К4 (WA_AGENT_CASE): дело и версия, на которые написан черновик, и записи в дело по фактам сверки —
             # их делает ядро (`wa_agent.Core`, роль wa); адаптер только читает. Выкл — ответ прежний

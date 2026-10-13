@@ -1217,6 +1217,12 @@ _MODEL_BEFORE = re.compile(r"[A-Za-z]{2,}\s*$")
 # pay by transfer») прощения не снимает. (F2) время и дата в окне реквизитов слотом слова не считаются — окно их
 # перешагивает («на карту до 15.10 по номеру 1234567» — номер берётся). (F4) «all paid / paid in full / fully paid» —
 # слова получения (`_DUE_GOT`); «оплачено полностью» покрыто прежним `оплачен\w*`.
+# USEFUL1310 A5 (находки V2/V3 проверяющего X3, решение интегратора К3): (V2) окно реквизитов, ПЕРЕШАГНУВШЕЕ время или
+# дату, номером считает только длинный номер — от 5 цифр (`_DUE_ID_LONG`; настоящие короткие номера F2 — 7 цифр):
+# «по карте при выдаче в 10:00, 2 шлема», «с 9:00 до 21:00 7 дней в неделю», «25.10, оплатить за 3 дня» — не реквизиты,
+# «до 18:00: 1234567», «до 15.10 по номеру 1234567» — реквизиты, как в A3; окно без времени и даты — прежнее (номер —
+# любой токен с цифрой). (V3) зачинная альтернатива `_DUE_ALSO` («и/а/and/plus + денежное слово» в начале
+# следующего предложения) снята: эллипсис денег — только денежное существительное при «тоже/также/too/as well».
 _DUE_SAY = re.compile(r"к\s+оплат|оплатить|итог|всего|стоимост|сумм\w*\s+(?:к\s+оплат|аренд|за)|за\s+аренд|выйдет|"
                       r"выходит|составит|составляет|\btotal\b|to\s+pay|\bowe\b|\bcost|\bprice|"
                       r"for\s+(?:the|your)\s+rent", re.I)
@@ -1233,10 +1239,13 @@ _DUE_MONEY_N = (r"(?<!\w)(?:(?:пред)?оплат(?:а|у|ы|е|ой)|плат
                 r"payments?|money|transfers?|funds|чек(?:а|у|ом|е|и|ов)?|квитанци\w*|slips?|receipts?|скрин\w*|"
                 r"screenshots?)(?![\w-])")
 _DUE_SEP = r"[^\w\n]+(?:" + _DUE_CLOCK + r"[^\w\n]+)*"
+_DUE_ID_LONG = r"(?=(?:[\w-]*?\d){5})"         # A5 (V2): номер за перешагнутым временем/датой — от 5 цифр в токене
 _DUE_NOT = re.compile(
     r"\d(?:[\s\-–]?\d){7,}"
     r"|(?<!\w)(?:сч[её]т|account|promptpay|prompt\s*pay|промпт\s*пей|промптпей|iban|swift|карт[аеуы]|card)\w*"
-    r"(?:" + _DUE_SEP + r"[^\W\d_]+){0,3}" + _DUE_SEP + r"(?!" + _DUE_CLOCK + r")(?P<id>[\w-]*\d[\w-]*)"
+    r"(?:(?:[^\w\n]+[^\W\d_]+){0,3}[^\w\n]+"
+    r"|(?:" + _DUE_SEP + r"[^\W\d_]+){0,3}" + _DUE_SEP + _DUE_ID_LONG + r")"
+    r"(?!" + _DUE_CLOCK + r")(?P<id>[\w-]*\d[\w-]*)"
     r"|(?<!\w)(?P<got>" + _DUE_GOT + r")(?!\w)", re.I)
 _DUE_NOPAY = re.compile(
     r"(?<!\w)при\s+получени\w*|(?<!\w)получени\w*\s+(?:байк|мотоцикл|скутер|мопед|ключ)\w*"
@@ -1247,9 +1256,7 @@ _DUE_NOPAY = re.compile(
     r"|(?<!\w)(?:если|if)\s+(?:[^\W\d_]+\s+){0,3}?(?:" + _DUE_GOT + r")(?!\w)"
     r"|(?<!\w)(?:после|по)\s+(?:поступлени|получени|зачислени)\w*", re.I)
 _DUE_PROOF = re.compile(_DUE_CASH + r"|" + _DUE_DOC, re.I)
-_DUE_ALSO = re.compile(
-    _DUE_MONEY_N + r"[\s,]+(?:тоже|также|too|as\s+well)(?!\w)"
-    r"|^\W*(?:и|а|and|plus|а\s+также|as\s+well\s+as)\s+(?:(?:the|your|our|ваш\w*|наш\w*)\s+)?" + _DUE_MONEY_N, re.I)
+_DUE_ALSO = re.compile(_DUE_MONEY_N + r"[\s,]+(?:тоже|также|too|as\s+well)(?!\w)", re.I)   # A5 (V3): без зачина
 # USEFUL1310 A4 (г): сумма залога — опора числа ответа только в предложении залога (`_DEP_WORDS`), где её не называют
 # «к оплате», остатком к оплате или долгом (RU/EN): «Залог 3000 бат, возвратный.» — опора; «К оплате 7790 бат + залог
 # 3000 бат.», «Deposit 3000 THB is due now.» — нет. Предложения итога («Итого», «Total») этим словом не являются.
@@ -1386,6 +1393,96 @@ def money_claims(text, price, known, due=None, deposit=None):
             v = int(re.sub(r"\D", "", m.group(1)))
             if v not in known and ("сумма", v) not in out:
                 out.append(("число", v))
+    return out
+
+
+# USEFUL1310 A5 (находка V1 проверяющего X3 и штамп низа карточки судьи judge3b; решение интегратора К3): низ карточки
+# говорит только то, что установлено кодом. (г) `money_backing` — числа ответа, которые судит `money_claims` (суммы в
+# батах; голое число при денежном слове — `bare`; проценты скидки за срок, названные дверью), и опора КАЖДОГО: блок
+# «ЦЕНА» (суммы строки цены этого вызова, процент скидки двери), итог аренды кода (`due_supported`), залог аренды кода
+# (`deposit_supported`), прочие факты сверки кода (`known_amounts`: касса, расчёты). Число без опоры сюда не входит —
+# его называет `money_claims`; об оплате здесь нет ни слова (опора числа — не подтверждение оплаты). (в) `money_said` —
+# предложения черновика о деньгах, их получении или платёжном документе на основах, которые модуль уже держит (не новый
+# список): слова получения (`_DUE_GOT` — те же, что у ветки `got` `_DUE_NOT`), деньги и документ (`_DUE_PROOF`), залог
+# (`_DEP_WORDS`), формы оплаты (`_PAY_FORMS`); предложение итога (`_due_sentence` — его число судит штамп) в сверку не
+# идёт; текст без денег (`_MONEY_WORD`, `_DUE_PROOF`, `_DEP_WORDS`, суммы в батах) — сверки нет. Нужны они карточке,
+# только когда оплата кодом не подтверждена (`pay_verdict`): строка сверки человеком, не замок — «Отправить» остаётся.
+SRC_PRICE, SRC_DUE, SRC_DEP, SRC_FACTS = "блок «ЦЕНА»", "итог аренды кода", "залог аренды кода", "факты сверки кода"
+SAID_MAX, SAID_CUT = 2, 160                 # предложений в строке сверки и знаков в каждом (длиннее — обрезка с «…»)
+
+
+def money_backing(text, price, known=None, judged=None, bare=True):
+    """Числа ответа с опорой кодом → [[что, [опора, …]], …] по порядку появления, без повторов. `known` — опора
+    `known_amounts` (с `.due`/`.deposit`); None — только блок «ЦЕНА» (черновик без сверки, `K.money_claims`). `judged` —
+    текст, который судил `money_claims` (у сверки — без процента скидки двери); не задан — `text`. `bare` — голые числа
+    при денежном слове судятся (как у `money_claims` модуля; у `K.money_claims` — нет)."""
+    s = str(text or "")
+    j = s if judged is None else str(judged or "")
+    line = price.get("line") if isinstance(price, dict) else None
+    listed = set(K.thb_amounts(line))
+    if known is None:
+        known = _Known(listed)
+    due, dep = getattr(known, "due", None), getattr(known, "deposit", None)
+    due_ok = due is not None and due not in known and due_supported(j, due)
+    dep_ok = dep is not None and dep not in known and deposit_supported(j, dep)
+    vals = list(K.thb_amounts(j))
+    if bare:
+        for sent in K._SENTENCE.split(j):
+            if _MONEY_WORD.search(sent):
+                vals += [int(re.sub(r"\D", "", m.group(1))) for m in _BARE.finditer(sent)
+                         if not _MODEL_BEFORE.search(sent[:m.start()])]
+    out, seen = [], set()
+    for v in vals:
+        if v in seen:
+            continue
+        seen.add(v)
+        src = [SRC_PRICE] if v in listed else []
+        if due_ok and v == due:
+            src.append(SRC_DUE)
+        if dep_ok and v == dep:
+            src.append(SRC_DEP)
+        if not src and v in known:
+            src.append(SRC_FACTS)
+        if src:
+            out.append([v, src])
+    out += [[what, [SRC_PRICE]] for _a, _b, what, ok in K._pct_hits(s, price) if ok]
+    return out
+
+
+def money_said(text, due=None):
+    """Предложения черновика о деньгах, их получении или платёжном документе → (до `SAID_MAX` предложений дословно,
+    каждое не длиннее `SAID_CUT` знаков; сколько таких всего). Первыми — где получение и деньги вместе, затем деньги,
+    затем получение; показ — в порядке текста. Предложение итога (`_due_sentence`) не идёт; текст без денег —
+    ([], 0)."""
+    s = str(text or "")
+    if not (_MONEY_WORD.search(s) or _DUE_PROOF.search(s) or _DEP_WORDS.search(s) or K.thb_amounts(s)):
+        return [], 0
+    spans = K._sentences(s)
+    hits = []
+    for i, (a, b) in enumerate(spans):
+        sent = s[a:b]
+        if not sent.strip() or _due_sentence(sent, due):
+            continue
+        got = re.search(r"(?<!\w)(?:" + _DUE_GOT + r")(?!\w)", sent, re.I) is not None
+        money = bool(_DUE_PROOF.search(sent) or _DEP_WORDS.search(sent) or _PAY_FORMS.search(sent))
+        if got or money:
+            piece = s[a:spans[i + 1][0] if i + 1 < len(spans) else len(s)].strip()
+            if len(piece) > SAID_CUT:
+                piece = piece[:SAID_CUT - 1].rstrip() + "…"
+            hits.append((0 if got and money else 1 if money else 2, i, piece))
+    keep = sorted(sorted(hits)[:SAID_MAX], key=lambda h: h[1])
+    return [h[2] for h in keep], len(hits)
+
+
+def money_check(text, price, known=None, judged=None, pay=False, bare=True):
+    """Что о деньгах черновика установлено кодом — для низа карточки (USEFUL1310 A5) → {"nums": `money_backing`,
+    "pay": оплата аренды подтверждена кодом (`pay_verdict`), "said": `money_said` — только при неподтверждённой оплате,
+    "more": сколько таких предложений сверх показанных}. Клиенту из этого не уходит ничего; причин «нужен человек» и
+    замков не меняет."""
+    out = {"nums": money_backing(text, price, known, judged, bare), "pay": bool(pay), "said": [], "more": 0}
+    if not pay:
+        said, total = money_said(text, getattr(known, "due", None))
+        out["said"], out["more"] = said, max(0, total - len(said))
     return out
 
 

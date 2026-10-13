@@ -3,6 +3,9 @@
 (пометка «нужен человек» видна первой), внизу — как считал агент (why версии модели) и проверка чисел кодом.
 Всё на подделках (Bot API, дверь, модель) — мир карточки берётся готовым у `test_wa_card_compact`, сети нет.
 Фразы клиентов и суммы выдуманы; №16 — синтетика по числам живого случая (итог 39 352, в тексте 40 000).
+USEFUL1310 A5 (решение интегратора К3): штамп «🔎 сверено кодом: число — опора» печатается только при установленной
+опоре (чисел нет — штампа нет; об оплате ни слова); оплата кодом не подтверждена, а черновик говорит о деньгах — строка
+сверки человеком с предложениями дословно, «Отправить» остаётся.
 
 WA_AGENT_SRC=<каталог> подменяет модули (прогон на базе и мутантов)."""
 import os
@@ -25,22 +28,25 @@ TEXT16 = "Здравствуйте! За неделю выйдет 40 000 бат
 
 
 class ClaimsModel(C.FakeModel):
-    """Подделка адаптера с проверкой чисел кодом: claims — как у живого адаптера (`K.money_claims`)."""
+    """Подделка адаптера с проверкой чисел кодом: claims — как у живого адаптера (`K.money_claims`); checked
+    (USEFUL1310 A5) — что о деньгах установлено кодом (`wa_agent_tools.money_check`), если задано."""
 
-    def __init__(self, claims=None):
+    def __init__(self, claims=None, checked=None):
         super().__init__()
-        self.claims = claims
+        self.claims, self.checked = claims, checked
 
     def draft(self, number, upto_id):
         out = super().draft(number, upto_id)
         if self.claims is not None:
             out["claims"] = [list(c) for c in self.claims]
+        if self.checked is not None:
+            out["checked"] = self.checked
         return out
 
 
-def world(door_open=True, claims=()):
+def world(door_open=True, claims=(), checked=None):
     w = C.World(door_open=door_open)
-    w.model = ClaimsModel(list(claims) if claims is not None else None)
+    w.model = ClaimsModel(list(claims) if claims is not None else None, checked)
     w.core.model = w.model
     return w
 
@@ -101,9 +107,14 @@ def test_empty_why_named():
 
 
 def test_check_ok_line():
+    """USEFUL1310 A5, ожидание изменено ПОИМЁННО (было: «🔎 числа сверены с блоком «ЦЕНА»» при пустых claims): ответ
+    без чисел («Добрый день! Подскажу.»), опоры не установлено ни одной — штампа нет вовсе, прежней надписи нет."""
     w = world(claims=[])
     t = C.card(w.draft("Сколько стоит PCX на неделю?"))["text"]
-    assert "🔎 числа сверены с блоком «ЦЕНА»" in t, t
+    assert "🔎" not in t and "числа сверены" not in t, t
+    w = world(claims=[], checked={"nums": [], "pay": False, "said": [], "more": 0})
+    t = C.card(w.draft("Сколько стоит PCX на неделю?"))["text"]
+    assert "🔎" not in t and G.W_PAY_SAID not in t, t
 
 
 def test_draft16_synthetic_40000_in_check():
@@ -130,8 +141,64 @@ def test_core_extra_by_version():
     w.draft("Привет", why=WHY)
     e1 = w.core.card_extra(1, 1, C.ANSWER)
     assert e1 and e1["agent"] and e1["why"] == WHY and e1["claims"] == [], e1
+    assert e1["checked"] is None, e1                       # USEFUL1310 A5: адаптер checked не дал — записи нет
     e2 = w.core.card_extra(1, 2, "текст человека")
     assert not (e2 or {}).get("agent"), e2
+
+
+# ═══ USEFUL1310 A5: штамп — только установленное кодом; сверка человеком при неподтверждённой оплате ═════════════════
+
+TEXT_DUE = "Получили ваше сообщение. Деньги — тоже. К оплате 7790 бат."     # V1 проверяющего X3, m_link дословно
+CHK_DUE = {"nums": [[7790, ["итог аренды кода"]], [2800, ["блок «ЦЕНА»"]]], "pay": False,
+           "said": ["Получили ваше сообщение.", "Деньги — тоже."], "more": 0}
+
+
+def _check_lines(t):
+    return [ln for ln in t.split("\n") if ln.startswith("🔎") or ln.startswith("⚠️ черновик")]
+
+
+def test_a5_stamp_names_numbers_and_backing_not_payment():
+    """Штамп называет, КАКИЕ числа и С КАКОЙ опорой (итог аренды кода, блок «ЦЕНА»); об оплате — ни слова."""
+    w = world(claims=[], checked=dict(CHK_DUE, said=[]))
+    t = C.card(w.draft("Сколько в целом?", answer=TEXT_DUE))["text"]
+    stamp = [ln for ln in t.split("\n") if ln.startswith("🔎")]
+    assert stamp == ["🔎 сверено кодом: 7 790 — итог аренды кода; 2 800 — блок «ЦЕНА»"], stamp
+    assert "оплат" not in stamp[0].lower() and "paid" not in stamp[0].lower(), stamp
+    assert G.W_PAY_SAID not in t, t
+
+
+def test_a5_unpaid_money_said_line_send_kept():
+    """Оплата кодом не подтверждена, черновик говорит о деньгах — строка сверки и сами предложения дословно; кнопка
+    «Отправить» на месте и шлёт ответ дословно (строка — сверка человеком, не отказ)."""
+    w = world(claims=[], checked=CHK_DUE)
+    c1 = C.card(w.draft("Сколько в целом?", answer=TEXT_DUE))
+    lines = _check_lines(c1["text"])
+    assert lines[0] == G.W_PAY_SAID + " «Получили ваше сообщение.» · «Деньги — тоже.»", lines
+    assert lines[1].startswith("🔎 сверено кодом: 7 790"), lines
+    assert kb(c1)[0] == "wa:send:1:1", kb(c1)
+    w.feed(w.press("wa:send:1:1", 101))
+    assert w.door.sends == [(C.NUM, TEXT_DUE)], w.door.sends
+    assert not any("⚠️" in s[1] or "🔎" in s[1] for s in w.door.sends)
+    e1 = w.core.card_extra(1, 1, TEXT_DUE)
+    assert e1["checked"] == CHK_DUE, e1                    # запись ядра — та, что дал адаптер
+
+
+def test_a5_paid_or_no_money_no_said_line():
+    """Оплата подтверждена кодом — строки сверки нет (даже если предложения о деньгах есть); предложений нет — нет."""
+    for chk in (dict(CHK_DUE, pay=True), dict(CHK_DUE, said=[])):
+        w = world(claims=[], checked=chk)
+        t = C.card(w.draft("Сколько в целом?", answer=TEXT_DUE))["text"]
+        assert G.W_PAY_SAID not in t, (chk, t)
+
+
+def test_a5_more_said_counted_and_bad_kept():
+    """Предложений больше двух — названо число скрытых; число без опоры — прежняя строка «без опоры» рядом."""
+    chk = dict(CHK_DUE, nums=[], more=3)
+    line = G.card_check([["сумма", 40000]], chk)
+    assert line.split("\n")[0].endswith(G.W_PAY_MORE % 3), line
+    assert line.split("\n")[1] == "🔎 проверка кодом — без опоры в блоке «ЦЕНА»: сумма 40 000", line
+    assert G.card_check(None, None) == G.W_CHECK_NONE                     # код не проверял — как было
+    assert G.card_check([], None) == ""                                   # записи нет (черновик старше) — штампа нет
 
 
 # ═══ п.3: правило why и предел ══════════════════════════════════════════════════════════
