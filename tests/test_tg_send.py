@@ -1006,6 +1006,74 @@ def test_r2_cancel_failure_keeps_the_push_receipt():
         h.stop()
 
 
+def test_w15_readback_failure_after_commit_still_cancels_queued_answer():
+    """W15 (TGW15): значимая новая строка клиента уже ЗАКОММИЧЕНА, ответ агента ещё queued, а обратное чтение пачки
+    упало ОДИН раз (диск) — вход отвечает 500 «ничего не подтверждено», но строку, вставленную ЭТИМ запросом, судит как
+    новую: queued-ряд чата отменён, ПК его не получит (GET outbox пуст при открытой двери), дверь вернёт черновик ждать.
+    Штатный повтор пушера — 200 с обычной квитанцией, строка на диске одна, и повтор не отменяет НИЧЕГО: отмена в
+    журнале ровно одна, отменённый ряд прежний, новый ряд, поставленный после сбоя, остаётся queued."""
+    import logging
+    tmp = _tmp()
+    h = Hook(tmp)
+    real = h.srv.RequestHandlerClass.tg_db
+    flaky = {"n": 1}
+
+    class FlakyConn(sqlite3.Connection):
+        def execute(self, sql, *a):
+            if flaky["n"] > 0 and sql.startswith("SELECT wamid FROM wa_inbox WHERE wamid IN"):
+                flaky["n"] -= 1
+                raise sqlite3.OperationalError("disk I/O error (подделка теста: обратное чтение)")
+            return super().execute(sql, *a)
+
+    class FlakyDB(W.WAQueueDB):
+        def _conn(self):
+            return sqlite3.connect(self.db_path, check_same_thread=False, timeout=10, factory=FlakyConn)
+
+    seen = []
+
+    class Grab(logging.Handler):
+        def emit(self, rec):
+            seen.append(rec.getMessage())
+    grab = Grab()
+    logging.getLogger("wa_webhook").addHandler(grab)
+    why = "клиент написал ещё — не отправлено"
+    try:
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
+        ob.beat()
+        _, tok = ob.put(CHAT, "ответ агента на вопрос 100", 60, now=time.time())     # «Отправить» нажато
+        row = _feed_row(CHAT, 101, "in", SINCE + 12, "Уже не надо, нашёл байк у другого")
+        h.srv.RequestHandlerClass.tg_db = FlakyDB(real.db_path)
+        try:
+            st, raw = h.req("POST", W.TG_PUSH_PATH, json.dumps({"batch_id": "w15", "rows": [row]}).encode())
+        finally:
+            h.srv.RequestHandlerClass.tg_db = real
+        assert flaky["n"] == 0, "сбой обратного чтения не случился — тест не задел ветку W15"
+        assert (st, json.loads(raw)) == (500, {"ok": False, "error": "push_failed"}), (st, raw)
+        assert ob.get(tok)["state"] == O.CANCELLED and ob.get(tok)["cancel_why"] == why, ob.get(tok)
+        got = json.loads(h.req("GET", W.TG_OUTBOX_PATH)[1])
+        assert got["send"] == "on" and got["items"] == [], got                     # устаревший ответ ПК не получит
+        fin = S.TgDoor(ob, wait=20)._final(ob.get(tok))
+        assert fin == {"outcome": "not_sent", "reason": why, "wamid": None, "retry": True}, fin
+        _, tok2 = ob.put(CHAT, "новый ответ после сбоя", 60, now=time.time())
+        again = _push(h, [row], "w15")                                            # штатный повтор пушера ПК
+        assert again == {"ok": True, "accepted": [[CHAT, 101, "in"]], "malformed": 0}, again
+        assert ob.get(tok2)["state"] == O.QUEUED and ob.get(tok2)["cancel_why"] is None, ob.get(tok2)
+        assert ob.get(tok)["state"] == O.CANCELLED and ob.get(tok)["cancel_why"] == why, ob.get(tok)
+        assert [m for m in seen if "queued rows cancelled" in m] == \
+            ["TG outbox: 1 queued rows cancelled — a new live row came in their chat"], seen
+        assert [m for m in seen if m.startswith("TG push: queue write failed, NOTHING accepted")], seen
+        c = sqlite3.connect(os.path.join(tmp, "tg_queue.db"))
+        try:
+            assert c.execute("SELECT COUNT(*) FROM wa_inbox WHERE wamid=?",
+                             (W.tg_wamid(CHAT, 101, "in"),)).fetchone()[0] == 1
+        finally:
+            c.close()
+    finally:
+        logging.getLogger("wa_webhook").removeHandler(grab)
+        h.srv.RequestHandlerClass.tg_db = real
+        h.stop()
+
+
 def test_enqueue_confirmed_names_only_rows_it_inserted():
     """Дверь записи пачки: ответ — все ключи на диске (и повторные), `inserted` — только вставленные ЭТИМ вызовом;
     без `inserted` — прежний ответ; ошибка — в `inserted` ничего."""

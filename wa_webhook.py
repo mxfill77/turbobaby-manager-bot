@@ -409,7 +409,9 @@ class WAQueueDB:
         `inserted` (optional set, 13.10.2026 TGFRESH1310): after the commit it receives the wamids
         THIS call really wrote (the INSERT OR IGNORE changed a row). A row that was already on disk
         (a resent batch) is NOT in it — the receipt above still names it, the «new row» does not.
-        On any error nothing is added.
+        It is filled RIGHT AFTER the commit, before the read-back: a read-back failure still raises (500, no
+        receipt), but the rows the commit wrote stay named — the caller can still act on them. An error before
+        or during the commit adds nothing.
 
         Every event must carry a non-empty `wamid`: without it the read-back cannot name the row.
         """
@@ -439,6 +441,8 @@ class WAQueueDB:
                     except Exception:
                         pass
                     raise
+                if inserted is not None:
+                    inserted.update(new)          # committed by THIS call — known before the read-back
                 uniq = sorted(set(wamids))
                 for i in range(0, len(uniq), 500):
                     part = uniq[i:i + 500]
@@ -448,8 +452,6 @@ class WAQueueDB:
                     present.update(r[0] for r in rows)
             finally:
                 conn.close()
-        if inserted is not None:
-            inserted.update(new)
         return present
 
     def upsert_contacts(self, contacts: list, source: str = "") -> int:
@@ -1474,6 +1476,7 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             present = self.tg_db.enqueue_confirmed(events, source=TG_SOURCE, inserted=fresh)
         except Exception as e:
             log.error("TG push: queue write failed, NOTHING accepted: %s: %s", type(e).__name__, e)
+            self._tg_cancel_on_live(keys, events, fresh)   # commit landed, read-back failed: its new rows still cancel
             self._send_json(500, {"ok": False, "error": "push_failed"})
             return
         accepted = [[c, m, d] for (c, m, d) in keys if tg_wamid(c, m, d) in present]
