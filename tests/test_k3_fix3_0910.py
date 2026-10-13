@@ -4423,7 +4423,10 @@ L_EXCH = [("А шлем дадите?", "Да, шлем дадим беспла�
 L_PRINTS_T = {"_PF_METHOD": "85fbdb4b7dbe24ec", "_PF_HELD": "f48e6ed3e373ad32", "_PQ_PROOF": "19cb9d2738e3c1c1",
               "_PQ_PAYWORD": "8203aa7c34d97133"}
 L_PRINTS_K = {"_CLAIM_THB": "b73d1cea7bf29323"}
-L_PRINTS_ALL = {"T": (71, "a1716e9f7a0d5beb"), "K": (22, "34eff516dd9e1e3b")}     # ВСЕ скомпилированные выражения модулей
+# Интеграция К4 на M (TB-FARISHA-AGENTS-CAPACITY-1210, b4_k4integ): было (71, "a1716e9f7a0d5beb"); ровно одно новое выражение
+# модуля — `_CASE_VER=^case_ver:(\d+)$` (разбор версии дела К4, wa_agent_tools.case_result; слов оплаты в нём нет), прочие
+# 71 и все 22 `wa_agent_knowledge` — побайтно прежние (сверка строк «имя=шаблон» до/после — runs/rx_M, runs/rx_MK4R).
+L_PRINTS_ALL = {"T": (72, "16a00a2164bbf68d"), "K": (22, "34eff516dd9e1e3b")}     # ВСЕ скомпилированные выражения модулей
 
 
 def _en3l(text):
@@ -4996,7 +4999,8 @@ M_PRINTS_RX = {"_PF_DEP": "db2ddac8172c7e1e", "_PF_METHOD": "85fbdb4b7dbe24ec", 
 M_PRINTS_STR = {"_PM_AMT": "1aeb409af6d8a644", "_PM_BARE": "ffa1c90f5fb84285", "_ASK_AMT": "00e6f83de4eb679d"}
 M_PRINTS_LABELS = {"damage_fines": "a4af662f2c29d1d8", "deposit": "862e8fd57b2a48e2", "refund": "2a15a7e95ea59527",
                    "dispute": "093cb7b0f235f46a", "payment": "e980d8fc35d09e4b"}
-M_PRINTS_ALL = {"T": (71, "a1716e9f7a0d5beb"), "K": (22, "34eff516dd9e1e3b"), "T_str": (33, "6c6d6ceca5ddf0bf"),
+# Интеграция К4 на M: "T" было (71, "a1716e9f7a0d5beb") — плюс одно `_CASE_VER` (см. L_PRINTS_ALL); T_str, K, K_words прежние
+M_PRINTS_ALL = {"T": (72, "16a00a2164bbf68d"), "K": (22, "34eff516dd9e1e3b"), "T_str": (33, "6c6d6ceca5ddf0bf"),
                 "K_words": "fa3f9028dd677f56"}
 
 

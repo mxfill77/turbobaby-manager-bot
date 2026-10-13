@@ -114,6 +114,16 @@ reply_request, язык текста версии ru|en, {{1}} — «байка�
 
 ЧЕГО ЯДРО НЕ ДЕЛАЕТ. Не шлёт без нажатия; не повторяет отправку; не судит окно 24 часа само (это
 дверь, `wa_send.window_state`); не держит текстов клиентов в журнале — только id, состояния, числа.
+
+ДЕЛО АРЕНДЫ (К4, TB-FILIPP-K4-CASE-FOUNDATION-0910; шаг 4 DESIGN_K4 §11; флаг WA_AGENT_CASE, по умолчанию выключен —
+`case=None`: ни одной ветки ниже, модули rental_case* не импортируются, база агента прежняя — схема байт-в-байт).
+Включён (`case` — `wa_agent_tools.CaseLink`): колонки `drafts.case_id, case_ver, notice_id` и частичный UNIQUE по
+`notice_id` (миграция на старте ядра с флагом; откат флагом оставляет колонки — прежний код читает drafts по именам); ядро —
+писатель дела в роли "wa": живое входящее → `on_client_inbound`, эхо человека с телефона → `on_human_intervention`
+(внимание — только при паузе WA, `wa_pause_no`), перед вызовом модели — `reconcile_rental` дел номера по снимку, после
+сверки — `bind_cash`/`record_document` по фактам FACT (`wa_agent_tools.case_plan`); черновик помнит дело и версию, на
+которые написан, и `_outdated` на «Отправить» и в срок ритма судит ещё и версию/состояние дела (хранилище не
+прочитано — «не проверено», ничего не уходит). Клиенту ядро по-прежнему не шлёт ничего без нажатия.
 """
 
 import hashlib
@@ -240,6 +250,14 @@ CREATE TABLE IF NOT EXISTS tpl_out (
     body        TEXT                                  -- что увидел клиент (текст шаблона) — для строки показа
 );
 """
+
+# ── дело аренды (К4, TB-FILIPP-K4-CASE-FOUNDATION-0910; флаг WA_AGENT_CASE, по умолчанию выключен) ──
+# Черновик помнит дело и версию дела, на которые написан, и уведомление дела (notice_id; второго черновика на одно
+# уведомление нет — частичный UNIQUE, CONTRACT_K4 I42). NULL — черновик без дела.
+CASE_DRAFT_COLS = (("case_id", "TEXT"), ("case_ver", "INTEGER"), ("notice_id", "TEXT"))
+CASE_NOTICE_INDEX = ("CREATE UNIQUE INDEX IF NOT EXISTS drafts_notice ON drafts(notice_id) "
+                     "WHERE notice_id IS NOT NULL")
+CASE_UNCHECKED_WORDS = "версия дела не проверена (%s) — ничего не отправлено"
 
 
 def follow_out(out):
@@ -717,8 +735,11 @@ class Core:
     def __init__(self, db_path, queue_path, model, tg, door, quiet=QUIET_DEFAULT,
                  clock=time.time, log=None, drafts=True, greet=(), pace=False, rand=random.random,
                  lessons=False, lesson_admins=None, followup=False, hints=False, hint_hour=HINT_LIST_HOUR,
-                 templates=False, lang_of=None):
+                 templates=False, lang_of=None, case=None):
         quiet = int(quiet)
+        # WA_AGENT_CASE (К4): None — выключен, ядро и база прежние; `wa_agent_tools.CaseLink` — ядро пишет в дело аренды
+        # (роль wa) и судит версию дела на «Отправить» (шаг 4 DESIGN_K4 §11)
+        self.case = case
         # WA_AGENT_HINTS (NIGHT0710-B2): выключен — «Исправить» и «Отправить» как раньше, правил из пояснений нет;
         # hint_hour — час суточного списка владельцу по Пхукету (24 — списка нет)
         self.hints = bool(hints)
@@ -774,6 +795,8 @@ class Core:
         for col in ("why", "claims"):
             if col not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
                 self.db.execute("ALTER TABLE drafts ADD COLUMN %s TEXT" % col)
+        if self.case is not None:              # дело аренды (К4): колонки drafts и UNIQUE notice_id — только под флагом
+            self._case_schema()                # (выключено — база прежняя, как у шаблонов NIGHT0710-B3g ниже)
         have = {r[1] for r in self.db.execute("PRAGMA table_info(card_out)")}
         for col in ("lost", "edit_unk"):                                  # очередь старше WACARDDONEFIX0210
             if col not in have:
@@ -1150,7 +1173,158 @@ class Core:
             return WROTE_WORDS % last_in
         if dctx is not None and dctx != cctx:
             return "беседа сменилась после черновика (контекст %d → %d)" % (dctx, cctx)
+        if self.case is not None:              # К4 (WA_AGENT_CASE): ещё версия и состояние дела черновика
+            return self._case_outdated(draft_id)
         return None
+
+    # ── дело аренды (К4, TB-FILIPP-K4-CASE-FOUNDATION-0910; флаг WA_AGENT_CASE, шаг 4 DESIGN_K4 §11) ─────────────
+    # Каждая ветка ниже зовётся только при `self.case` (флаг вкл). Запись в дело — роль "wa" (`CaseLink.writer`), чтение —
+    # `mode=ro` (`CaseLink.reader`). Сбой дела черновики, паузы и отправку не ломает: строка журнала и прежний путь;
+    # единственное исключение — «Отправить»: версия дела не проверена → устарело, клиенту ничего не уходит.
+
+    def _case_schema(self):
+        """Колонки дела у черновика и частичный UNIQUE `notice_id` (второй черновик на одно уведомление дела
+        невозможен, CONTRACT_K4 I42). Старое чтение drafts идёт по именам колонок — новые NULL его не задевают."""
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}
+        for col, typ in CASE_DRAFT_COLS:
+            if col not in have:
+                self.db.execute("ALTER TABLE drafts ADD COLUMN %s %s" % (col, typ))
+        self.db.execute(CASE_NOTICE_INDEX)
+
+    def _case_outdated(self, draft_id):
+        """Черновик написан по делу (case_id, case_ver) → слова, если дело сменило версию, закрыто/отменено или его
+        нет; хранилище не прочитано — «не проверено» (не «то же»). Черновик без дела — None, как без флага."""
+        row = self.db.execute("SELECT case_id, case_ver FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or not row[0]:
+            return None
+        cid, dver = row
+        try:
+            cur = self.case.case_state(cid)
+        except Exception as e:                                       # noqa: BLE001 — StoreUnavailable, store_busy
+            return CASE_UNCHECKED_WORDS % type(e).__name__
+        if cur is None:
+            return "дела черновика нет в хранилище (%s)" % cid
+        if cur.get("state") != "open":
+            return "дело %s после черновика: %s" % (cid, cur.get("state"))
+        if dver is not None and cur.get("ver") != dver:
+            return "версия дела сменилась после черновика (%s → %s)" % (dver, cur.get("ver"))
+        return None
+
+    def _case_log(self, what, out):
+        code = out.get("code") if isinstance(out, dict) else out
+        why = out.get("reason") if isinstance(out, dict) else ""
+        self.log("дело: %s → %s%s" % (what, code, " (%s)" % why if why else ""))
+
+    def _case_inbound(self, number, rid, ts_q, now):
+        """Живое входящее клиента → `on_client_inbound` во все открытые дела контакта (уведомления intent/drafted
+        устаревают; версию не поднимает, NEW_REQUEST_RULE=UNKNOWN). Ключ — строка очереди: повтор = duplicate."""
+        try:
+            at = float(ts_q) if isinstance(ts_q, (int, float)) and not isinstance(ts_q, bool) else float(now)
+            self._case_log("входящее строки %d" % int(rid), self.case.inbound(number, "wa_inbox:%d" % int(rid), at))
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дело: входящее строки %s не записано (%s)" % (rid, type(e).__name__))
+
+    def _case_echo(self, number, rid, now, ts_msg, msg_type, pause):
+        """Эхо человека с телефона (не автоприветствие) → `on_human_intervention`, канал wa. Внимание дела — тогда и
+        только тогда, когда WA поставил паузу (`wa_pause_no` — номер паузы клиента; фото/видео/документ паузы не
+        ставят — событие без внимания, WAPAUSEMEDIA0410; DESIGN_K4 §8)."""
+        try:
+            wpn = None
+            if pause:
+                r = self.db.execute("SELECT paused, pause_no FROM clients WHERE number=?", (number,)).fetchone()
+                if r and r[0] and r[1]:
+                    wpn = int(r[1])
+            at = float(ts_msg) if isinstance(ts_msg, (int, float)) and not isinstance(ts_msg, bool) else float(now)
+            out = self.case.intervention(number, "wa_inbox:%d" % int(rid), at, str(wa_kind._type(msg_type) or "text"),
+                                         wpn)
+            self._case_log("эхо строки %d (пауза %s)" % (int(rid), wpn if wpn is not None else "нет"), out)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дело: эхо строки %s не записано (%s)" % (rid, type(e).__name__))
+
+    def _case_before(self, number):
+        """Перед вызовом модели — `reconcile_rental` дел номера по снимку броней WA (`CaseLink.reconcile_number`: дела
+        номера ищет единственная функция `resolve`, I38; ключ — снимок: повтор = duplicate, не новее — stale_read)."""
+        try:
+            done, why = self.case.reconcile_number(number)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дело: сверка привязки упала (%s) — черновик идёт без неё" % type(e).__name__)
+            return []
+        if done is None:
+            self.log("дело: снимок броней не прочитан — сверки привязки нет (%s)" % (why or "?"))
+            return []
+        for cid, out in done:
+            self._case_log("сверка привязки %s по снимку" % cid, out)
+        return [cid for cid, _out in done]
+
+    def _case_after(self, plan):
+        """После сверки модели — записи в дело по фактам FACT (`wa_agent_tools.case_plan` → `CaseLink.apply_plan`):
+        касса → `bind_cash`, договор и его PDF → `record_document`. Решает хранилище (одна привязка, I18/I35,
+        принадлежность документа I46); отказ или «неизвестно» — строка журнала, черновик не задевают."""
+        if not (plan or {}).get("writes"):
+            return 0
+        try:
+            done = self.case.apply_plan(plan)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дело: записи по фактам сверки не сделаны (%s)" % type(e).__name__)
+            return 0
+        for what, out in done:
+            self._case_log(what, out)
+        return len(done)
+
+    def _case_bind_draft(self, draft_id, out):
+        """Черновик помнит дело и версию, на которые написан (`case_plan`): «Отправить» сверит их (`_case_outdated`).
+        Сверки дела не было (ответ без `case`) — привязка не трогается."""
+        plan = out.get("case") if isinstance(out, dict) else None
+        if not isinstance(plan, dict):
+            return
+        cid = plan.get("case_id") or None
+        ver = plan.get("case_ver") if cid else None
+        self.db.execute("UPDATE drafts SET case_id=?, case_ver=? WHERE id=?", (cid, ver, draft_id))
+
+    def notice_find(self, notice_id):
+        """NoticePort.find (CONTRACT_K4 §9.1): черновик уведомления дела → {"draft_id", "state", "wamid"} |
+        {"absent": True}; флаг выкл — {"unknown"} (база без дела)."""
+        if self.case is None:
+            return {"unknown": "дело выключено (WA_AGENT_CASE)"}
+        row = self.db.execute("SELECT id, state, wamid FROM drafts WHERE notice_id=?", (str(notice_id),)).fetchone()
+        if row is None:
+            return {"absent": True}
+        return {"draft_id": row[0], "state": row[1], "wamid": row[2]}
+
+    def _case_sent(self, draft_id, wamid, now):
+        """К4 круг 2 (C10): черновик уведомления дела (`notice_id`) ушёл — wamid ДВЕРИ ОТПРАВКИ (не статуса провайдера)
+        записывается хранилищу как привязка отправки (`CaseLink.notice_sent` → `Store.record_notice_sent`) ДО любой
+        доставки; статус доставки сверится с ней (`case_delivery`). Черновик без уведомления дела — ничего."""
+        row = self.db.execute("SELECT notice_id FROM drafts WHERE id=?", (draft_id,)).fetchone()
+        if not row or not row[0] or not wamid:
+            return None
+        try:
+            out = self.case.notice_sent(row[0], int(draft_id), str(wamid), float(now))
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дело: отправка черновика %d не записана в дело (%s)" % (draft_id, type(e).__name__))
+            return None
+        self._case_log("отправка черновика %d" % draft_id, out)
+        return out
+
+    def case_delivery(self, wamid, status, at=None):
+        """Статус провайдера по ТОЧНОМУ wamid черновика уведомления дела (`notice_id`) → `Store.record_delivery`
+        (ступень 6 судит хранилище: только delivered/read и только тот wamid, I12). Черновик не уведомления дела или
+        статус не «доставлено» — None, ничего не пишется. Вызывает его тот, кто видит статусы (подключение — остаток
+        интеграции: статусы текста ядро не читает)."""
+        if self.case is None or not wamid or status not in ("delivered", "read"):
+            return None
+        row = self.db.execute("SELECT id, notice_id FROM drafts WHERE wamid=? AND notice_id IS NOT NULL",
+                              (str(wamid),)).fetchone()
+        if not row:
+            return None
+        t = self.clock() if at is None else float(at)
+        try:
+            out = self.case.delivery(row[1], str(wamid), status, t)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("дело: доставка черновика %d не записана (%s)" % (row[0], type(e).__name__))
+            return None
+        self._case_log("доставка черновика %d (%s)" % (row[0], status), out)
+        return out
 
     # ── вид строки очереди ────────────────────────────────────────────────────────────────
 
@@ -1324,6 +1498,8 @@ class Core:
         # отложенное ритмом — тоже (WADRAFTSAFE0210): одобряли ответ, а клиент уже написал дальше
         self._withdraw(number, STALE, "снят до срока: " + WROTE_WORDS % rid + " — отложенное не уходит, черновик "
                        "пересобирается", now, before=rid)
+        if self.case is not None:              # К4 (WA_AGENT_CASE): входящее — во все открытые дела контакта
+            self._case_inbound(number, rid, ts_q, now)
 
     def _after_first(self, number, rid, ts_msg):
         """Секунд от «первого» входящего клиента до эха, если оно было не раньше GREET_SEC до эха; иначе
@@ -1392,6 +1568,8 @@ class Core:
                        % hm_phuket(now), now, before=rid)
         if pause:
             self._pause(number, rid, now)
+        if self.case is not None:              # К4 (WA_AGENT_CASE): вмешательство человека — во все открытые дела
+            self._case_echo(number, rid, now, ts_msg, msg_type, pause)
 
     def make_drafts(self, now):
         made = []
@@ -1401,6 +1579,9 @@ class Core:
         for number, upto, ctx in due:
             if self._live_draft(number):
                 continue
+            if self.case is not None:          # К4 (WA_AGENT_CASE): привязка дел номера сверена со снимком до модели
+                self._case_before(number)
+            out = None
             try:
                 out = self.model.draft(number, upto)
                 text, hand = draft_out(out)
@@ -1409,6 +1590,8 @@ class Core:
             except Exception as e:                                   # noqa: BLE001
                 self.log("модель упала: %s" % type(e).__name__)
                 text, hand, card, why, claims = None, [], None, "", None
+            if self.case is not None and isinstance(out, dict):     # К4: записи в дело по фактам сверки
+                self._case_after(out.get("case"))
             if not isinstance(text, str) or not text.strip():
                 self.db.execute("UPDATE clients SET next_try=? WHERE number=?",
                                 (now + MODEL_RETRY_SEC, number))
@@ -1423,6 +1606,8 @@ class Core:
                                    card["question"] if card else None, card["q_lang"] if card else None,
                                    why, None if claims is None else json.dumps(claims, ensure_ascii=False)))
             did = cur.lastrowid
+            if self.case is not None:          # К4: черновик помнит дело и версию дела, на которые написан
+                self._case_bind_draft(did, out)
             self.log("черновик %d (до строки %d, %d симв.%s)" % (
                 did, upto, len(text), ", нужен человек: причин %d" % len(hand) if hand else ""))
             if card and (card["q_ru"] or card["a_ru"]):
@@ -1649,6 +1834,8 @@ class Core:
         if state == SENT:
             # ушедшее агентом: история агента; строка в теме клиента — из `agent_show` (WAMIRROR0410), не здесь
             self._sent_out(wamid, number, text, VIA_AGENT, now)
+            if self.case is not None:          # К4 круг 2 (C10): привязка отправки черновика уведомления — до доставки
+                self._case_sent(draft_id, wamid, now)
         words = self._door_words(state, res)
         self._done(draft_id, "%s: %s, %s" % (words, who, hm_phuket(now)), now)
         return {"ok": state == SENT, "state": state, "words": words}
@@ -2083,6 +2270,9 @@ class Core:
                 self._hint_fail(hid, "устарело — " + self._decided(did, v_from), now)
                 continue
             self.db.execute("UPDATE hints SET state=?, ver_to=?, done_at=? WHERE id=?", (HINT_DONE, v_to, now, hid))
+            if self.case is not None:          # К4: версия по пояснению — со своей сверкой дела и своей версией дела
+                self._case_after((got or {}).get("case") if isinstance(got, dict) else None)
+                self._case_bind_draft(did, got)
             self.log("черновик %d: версия %d по пояснению %d (%d симв.)" % (did, v_to, hid, len(new_text)))
             if tr and (tr["q_ru"] or tr["a_ru"]):
                 self.db.execute("INSERT OR REPLACE INTO draft_tr(draft_id, ver, a_sha, q_ru, a_ru, ts) "

@@ -94,9 +94,21 @@ K3-FIX шаг 3g (10.10.2026, решение координатора после
 Открытая тема остаётся открытой для всех следующих сообщений, пока оплату не подтвердит код либо тему не закроет давность
 (`PAY_TOPIC_HOURS`); наше «оплата получена» в переписке её не закрывает (определение N4 приняло бы за него и недоплату);
 история судится от хвоста назад обмен за обменом. Новых слов нет.
+
+Дело аренды (К4, TB-FILIPP-K4-CASE-FOUNDATION-0910; флаг WA_AGENT_CASE, по умолчанию выкл; шаг 3 DESIGN_K4 §11).
+Признак включения ОДИН — дверь `case` в словаре дверей сверки (её кладёт `ModelAdapter._tool_doors`, только когда
+адаптеру дано подключение `CaseLink`). Двери нет — инструменты, их блок, разбор, тождество факта, привязка кассы и
+опора чисел байт-в-байт прежние, модули rental_case* не импортируются. Дверь есть: инструмент `case` (только чтение,
+база дела `mode=ro`: `rental_case.Store(readonly=True)`) отдаёт «факт с источником» CONTRACT_K4 §8.3; дверь `rental`
+выбирает аренду ЕДИНСТВЕННОЙ функцией `Store.resolve(purpose="client")` с контактом от кода (номер обращения), а не
+фильтром активных строк; строка кассы аренды, пришедшей через дело, привязывается `rental_case_rules.bind_cash`
+(одна привязка у дела и агента); виды `case_*` получают своё тождество в `fact_key` и в опору чисел ответа не входят
+(деньги дела — не подтверждение оплаты, I45; `pay_confirmed` их не читает).
 """
 
+import hashlib
 import json
+import os
 import re
 import time
 
@@ -115,6 +127,13 @@ OUTCOMES = (FACT, EMPTY, REFUSED, TIMEOUT, CANCELLED, AMBIGUOUS, UNKNOWN, INCOMP
 DONE, OVER, ABORTED = "done", "over", "aborted"        # исход сверки
 
 TOOLS = ("history", "rental", "cash", "contract", "contract_pdf", "delivery", "rules")
+
+# дело аренды (К4, флаг WA_AGENT_CASE): инструмента нет в TOOLS намеренно — без двери `case` модель, назвавшая его,
+# получает прежний отказ «неизвестный инструмент» (CONTRACT_K4 §8.3: refused — флаг выключен)
+CASE_TOOL = "case"
+F_CASE, F_CASE_DB = "WA_AGENT_CASE", "RENTAL_CASE_DB"
+CASE_SOURCE = "дело аренды (rental_case)"                 # = rental_case.AGENT_SOURCE
+CASE_INTENTS = ("current", "future", "past")              # смысл обращения; "specific" — признаки, их модель не задаёт
 
 INCOMPLETE_WORDS = "сверка не завершена"
 PAY_WORDS = "оплата не подтверждена сверкой"
@@ -546,7 +565,8 @@ def _read(tool, args, doors, clock=time.time, ctx=None):
     "results": принятые до сих пор}. Без ctx договор и PDF фактом не бывают (привязать не к чему)."""
     at = clock()
     door = (doors or {}).get(tool)
-    if tool not in TOOLS:
+    case_on = CASE_TOOL in (doors or {})          # флаг WA_AGENT_CASE (К4): дверь дела есть только при нём
+    if tool not in TOOLS and not (case_on and tool == CASE_TOOL):
         return result(tool, REFUSED, at=at, reason="неизвестный инструмент")
     if tool == "delivery" or door is None:
         return result(tool, UNKNOWN, at=at, reason="двери %s нет — неизвестно" % tool)
@@ -583,10 +603,15 @@ def _read(tool, args, doors, clock=time.time, ctx=None):
         res.update(sent)                         # слова поиска — ответу и журналу (только хвост номера)
         if res["outcome"] != FACT:
             res["reason"] = "%s (%s)" % (res["reason"], words)
-        return res
+        # К4: договор, привязанный к аренде дела, помнит это дело; выкл — ответ прежний
+        return case_stamp_contract(res, rental) if case_on else res
     if tool == "contract_pdf":
         allowed = {f.get("pdf_id") for f in accepted(ctx.get("results") or []) if f.get("kind") == "contract"}
         return pdf_result(raw, at, allowed={a for a in allowed if a})
+    if case_on and tool == CASE_TOOL:             # К4: факт дела с источником (CONTRACT_K4 §8.3)
+        return case_result(raw, at)
+    if case_on and tool == "rental":              # К4: аренду выбрал resolve дела, а не фильтр активных строк
+        return rental_case_result(raw, at)
     parse = {"cash": cash_result, "rental": rental_result, "history": history_result, "rules": rules_result}[tool]
     return parse(raw, at)
 
@@ -623,6 +648,8 @@ def fact_key(f):
         return ("rental", "", str(f.get("bike") or ""), str(f.get("date_start") or ""), str(f.get("date_end") or ""))
     if k == "pdf":
         return ("pdf", str(f.get("id") or ""))
+    if str(k or "").startswith(CASE_TOOL):        # К4: ("case", case_id, case_ver, вид, id) — CONTRACT_K4 §8.3
+        return ("case", str(f.get("case_id") or ""), str(f.get("case_ver") or ""), str(k), case_item_id(f))
     return (str(k),)
 
 
@@ -715,7 +742,11 @@ def rental_of(facts):
 
 
 def cash_of_rental(f, bk, facts):
-    """Строка кассы — этой аренды: её booking_id; без booking_id — байк номером и день внутри срока аренды bk."""
+    """Строка кассы — этой аренды: её booking_id; без booking_id — байк номером и день внутри срока аренды bk.
+    Аренда пришла через дело (К4, флаг WA_AGENT_CASE: у факта аренды есть `case_bind`) — проверку делает та же функция,
+    что у дела, `rental_case_rules.bind_cash` (DESIGN_K4 §3.5, S-M4): привязана только при «bound»."""
+    if any(isinstance(r, dict) and isinstance(r.get("case_bind"), dict) for r in facts):
+        return _cash_of_case(f, bk, facts)
     if f.get("booking_id"):
         return str(f["booking_id"]) == bk
     rent = [r for r in facts if r["kind"] == "rental" and str(r.get("booking_id") or "") == bk]
@@ -800,6 +831,8 @@ def known_amounts(price, facts, figures):
     loose = {id(f) for f in cash_split(facts)[1]}       # «не привязано» — не опора чисел ответа (T4BFACTS0410)
     for f in facts:
         if id(f) in loose:
+            continue
+        if str(f.get("kind") or "").startswith(CASE_TOOL):   # К4: суммы дела — не опора чисел ответа (I45)
             continue
         for k in ("amount", "price"):
             if isinstance(f.get(k), (int, float)) and not isinstance(f.get(k), bool):
@@ -2360,7 +2393,7 @@ class Journal:
 
 def _fact_ref(f):
     keep = ("kind", "row", "msg_id", "link", "at", "booking_id", "role", "amount", "currency", "signed_at",
-            "pdf_id", "id", "size", "sha256", "items", "rule_0310")
+            "pdf_id", "id", "size", "sha256", "items", "rule_0310", "case_id", "case_ver")   # case_* — только К4
     return {k: f[k] for k in keep if k in f and f[k] is not None}
 
 
@@ -2396,6 +2429,10 @@ def render(results):
         out.append("%d) %s → %s · %s · %s · окно %s%s" % (
             i, r["tool"], r["outcome"], r["source"] or "—", r["ref"] or "—", r["window"] or "—",
             (" · " + r["reason"]) if r["reason"] else ""))
+        if r["tool"] == CASE_TOOL:                # К4: факты дела — своим видом (без src-блоков и ПД)
+            for f in r["facts"][:CASE_RENDER_MAX] if r["outcome"] == FACT else []:
+                out.append("   %s" % json.dumps(case_ref(f), ensure_ascii=False))
+            continue
         for f in r["facts"][:10] if r["outcome"] == FACT else []:
             out.append("   %s" % json.dumps(_fact_ref(f), ensure_ascii=False))
     return "РЕЗУЛЬТАТЫ ИНСТРУМЕНТОВ (код; «не факт» — не опора):\n" + "\n".join(out) if out else ""
@@ -2428,7 +2465,10 @@ def run(call, system, user, doors, number="", clock=time.time, fresh=None, spend
         return door
     doors = {k: (counted(v) if callable(v) else v) for k, v in (doors or {}).items()}
     ctx = bind_ctx(number, doors, results, clock, may_call)
-    head = (TOOLS_BLOCK % max_calls) + "\n\n" + user
+    tools_block = TOOLS_BLOCK % max_calls
+    if CASE_TOOL in doors:                        # К4 (WA_AGENT_CASE): строка инструмента дела; выкл — блок прежний
+        tools_block += "\n" + CASE_BLOCK
+    head = tools_block + "\n\n" + user
 
     def out(state, raw=None, usage=None):
         return {"state": state, "raw": raw, "usage": usage, "results": results, "journal": jr, "calls": n["calls"],
@@ -2503,3 +2543,495 @@ def judge(text, price, results, jr, since=None, handed=(), asked=False, incoming
             and _CHANGE.search(str(text or ""))):
         words.append(CHANGE_WORDS)                # сдача по словам клиента — эскалация, а не факт
     return words, figures
+
+
+# ═══════════════ дело аренды (К4, TB-FILIPP-K4-CASE-FOUNDATION-0910; флаг WA_AGENT_CASE, по умолчанию выкл) ═══════════
+# Шаг 3 DESIGN_K4 §11. Всё ниже зовётся ТОЛЬКО при двери `case` (её кладёт `ModelAdapter._tool_doors`, когда адаптеру
+# дано подключение `CaseLink`). Модули rental_case* импортируются лениво — внутри функций: флаг выкл → их нет в
+# sys.modules процесса. Источник истины — tmp/k4_0910/out/CONTRACT_K4.md (§5 resolve/facts_for_agent, §8.3 форма
+# факта, §9.1 RentalSource, §11 ключи idem_key); адреса `файл:строка` — в кандидате f2f7295.
+
+CASE_RENDER_MAX = 25          # фактов дела в блоке результатов модели (у прочих инструментов — 10, как было)
+CASE_TEXT_MAX = 300           # длина строки элемента дела в блоке модели
+CASE_RENTAL_SOURCE = "снимок броней (лист «клиенты»), выбор — дело аренды (rental_case.resolve)"
+CASE_BLOCK = ('case {"intent": "current|future|past", "period_from": "ГГГГ-ММ-ДД", "period_to": "ГГГГ-ММ-ДД"} — дело '
+              'аренды клиента (аренда, байк, документы, обязательства, ответы сотрудников, ожидания); номер клиента '
+              'знает код. rental принимает {"intent": "current|future|past"} — о какой аренде речь. Деньги дела — '
+              'НЕ подтверждение оплаты.')
+CASE_RECON_INTENTS = (None, "current", "future", "past")     # дела номера для сверки привязки — тем же resolve (I38)
+_CASE_VER = re.compile(r"^case_ver:(\d+)$")
+_CASE_ID_KEYS = ("obligation_id", "document_id", "answer_id", "exp_id", "rental_id")
+_CASE_NAME_KEYS = ("name_seen", "client_seen", "name", "client", "anchor")   # якорь несёт имя (plate|день|имя)
+
+
+def case_intent(value):
+    """Смысл обращения от модели → "current" | "future" | "past" | None (иное не принимается: признаки строки —
+    `specific` — модель не задаёт, I36)."""
+    v = str(value or "").strip().lower()
+    return v if v in CASE_INTENTS else None
+
+
+def case_period(date_from, date_to):
+    """Период документа (CONTRACT_K4 §8.3, I46): ничего не задано — None («не спрашивалось»); иначе пара как есть —
+    неполную или кривую судит `documents_for` (period_not_given), код период не выдумывает."""
+    f, t = str(date_from or "").strip(), str(date_to or "").strip()
+    if not f and not t:
+        return None
+    return (f or None, t or None)
+
+
+def case_item_id(f):
+    """id элемента дела в тождестве факта агента (`fact_key`): своё у каждого вида; иначе — отпечаток всего элемента,
+    чтобы разные элементы одного вида не склеились никогда."""
+    k = str(f.get("kind") or "")
+    if k == "case":
+        return str(f.get("case_id") or "")
+    if k == "case_client":
+        return "client"
+    if k == "case_bike":
+        return str(f.get("plate") or "")
+    if k == "case_stage":
+        return "%s:%s" % (f.get("task_id") or "", f.get("stage") or "")
+    for key in _CASE_ID_KEYS:
+        if f.get(key) is not None:
+            return "%s:%s" % (key, f.get(key))
+    blob = json.dumps(f, ensure_ascii=False, sort_keys=True, default=str)
+    return "sha:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def case_result(resp, at=None):
+    """Ответ двери `case` — форма CONTRACT_K4 §8.3 (`Store.facts_for_agent` или исход двери) → результат инструмента.
+    Время — НАЧАЛО запроса (`_read`, T4BFACTS0410), а не часы хранилища. Факт — только outcome fact с номером дела и
+    версией дела «case_ver:<n>»; каждый элемент `case_*` получает case_id и case_ver дела (тождество `fact_key`).
+    Ответ не разобран — UNKNOWN: «не знаю» не превращается ни в факт, ни в «нет»."""
+    if not isinstance(resp, dict) or resp.get("tool") != CASE_TOOL or resp.get("outcome") not in OUTCOMES:
+        return result(CASE_TOOL, UNKNOWN, CASE_SOURCE, at=at, reason="ответ дела не разобран — не факт")
+    out = resp["outcome"]
+    src = str(resp.get("source") or CASE_SOURCE)
+    ref, version = str(resp.get("ref") or ""), str(resp.get("version") or "")
+    reason, window = str(resp.get("reason") or ""), str(resp.get("window") or "")
+    if out != FACT:
+        return result(CASE_TOOL, out, src, ref=ref, at=at, version=version, window=window, reason=reason or out)
+    m = _CASE_VER.match(version)
+    if not ref or not m:
+        return result(CASE_TOOL, UNKNOWN, src, ref=ref, at=at, version=version,
+                      reason="дело без номера или версии дела — не факт")
+    ver = int(m.group(1))
+    facts = []
+    for f in resp.get("facts") or []:
+        if not isinstance(f, dict) or not str(f.get("kind") or "").startswith(CASE_TOOL):
+            continue
+        if f.get("kind") == CASE_TOOL and (f.get("case_id") != ref or f.get("case_ver") != ver):
+            return result(CASE_TOOL, UNKNOWN, src, ref=ref, at=at, version=version,
+                          reason="элемент дела расходится с заголовком (дело/версия) — не факт")
+        g = dict(f)
+        g["case_id"], g["case_ver"] = ref, ver
+        facts.append(g)
+    if not facts:
+        return result(CASE_TOOL, UNKNOWN, src, ref=ref, at=at, version=version, reason="дело без элементов — не факт")
+    return result(CASE_TOOL, FACT, src, ref=ref, at=at, version=version, window=window, reason=reason, facts=facts)
+
+
+def _case_binding_of_row(row, cls):
+    """Строка двери → привязка в форме правил (rules.bind_cash), пока дела у строки нет."""
+    return {"rental_id": None, "booking_id": str(row.get("booking_id") or "").strip() or None,
+            "plate": cls.get("plate"), "start_day": cls.get("start_day"), "end_day": cls.get("end_day"),
+            "crm_row_seen": row.get("row"), "name_seen": row.get("name"), "status_seen": row.get("status")}
+
+
+def rental_case_result(resp, at=None):
+    """Ответ двери `rental` под делом (`CaseLink.rental_door`) → результат `rental` прежней формы факта.
+    Строка выбрана однозначно (`resolve` нашёл дело, дела у строки нет, или выбор строки однозначен, а не подтверждена
+    только связь с делом) — FACT с той же строкой листа, что дала бы прежняя дверь (ключи факта прежние; сверх —
+    case_id/case_ver найденного дела и `case_bind` для привязки кассы). Выбрать нельзя — AMBIGUOUS с вопросом `ask`;
+    аренды по номеру нет — EMPTY «не знаю»; хранилище недоступно — UNKNOWN; брони выключены — прежний отказ."""
+    if not (isinstance(resp, dict) and resp.get("ok")):
+        if isinstance(resp, dict) and resp.get("unknown"):
+            return result("rental", UNKNOWN, CASE_RENTAL_SOURCE, at=at,
+                          reason="дело аренды не прочитано (%s) — аренда не выбрана" % resp.get("unknown"))
+        return _refusal("rental", resp, CASE_RENTAL_SOURCE, at)
+    code, row = resp.get("code"), resp.get("row")
+    ask, why = str(resp.get("ask") or ""), str(resp.get("reason") or "")
+    if isinstance(row, dict) and (code in ("found", "none") or resp.get("pick_found")):
+        fact = {"kind": "rental", "booking_id": row.get("booking_id"), "bike": row.get("bike"),
+                "date_start": row.get("date_start"), "date_end": row.get("date_end"), "status": row.get("status"),
+                "price": row.get("price") if isinstance(row.get("price"), (int, float)) else None,
+                "currency": str(row.get("currency") or "THB").upper()}
+        if code == "found" and resp.get("case_id"):
+            fact["case_id"], fact["case_ver"] = resp["case_id"], resp.get("ver")
+            words = "дело %s, версия %s" % (resp["case_id"], resp.get("ver"))
+        elif code == "none":
+            words = "у строки дела нет"
+        else:
+            words = "связь с делом не подтверждена (%s): %s" % (why or "?", ask)
+        if isinstance(resp.get("bind"), dict):
+            fact["case_bind"] = resp["bind"]
+        return result("rental", FACT, CASE_RENTAL_SOURCE, ref=str(row.get("booking_id") or row.get("bike") or ""),
+                      at=at, window="%s…%s" % (row.get("date_start") or "?", row.get("date_end") or "?"),
+                      reason="аренда выбрана делом: " + words, facts=[fact])
+    if code == "none":
+        return result("rental", EMPTY, CASE_RENTAL_SOURCE, at=at,
+                      reason="номер обращения в деле заменён — это «не знаю», а не «аренды нет»")
+    if code == "unknown":
+        if why.split(":")[0] == "rental_not_found" and not resp.get("candidates"):
+            return result("rental", EMPTY, CASE_RENTAL_SOURCE, at=at,
+                          reason="по номеру аренда не найдена — это «не знаю», а не «аренды нет»" +
+                          (" (%s)" % ask if ask else ""))
+        if why.split(":")[0] == "param_unknown":
+            return result("rental", UNKNOWN, CASE_RENTAL_SOURCE, at=at, reason="норма не принята: %s" % (ask or why))
+        return result("rental", AMBIGUOUS, CASE_RENTAL_SOURCE, at=at,
+                      reason="выбрать нельзя (%s): %s" % (why or "?", ask or "уточните аренду"))
+    return result("rental", UNKNOWN, CASE_RENTAL_SOURCE, at=at, reason="исход выбора дела не разобран: %s" % code)
+
+
+def case_stamp_contract(res, rental):
+    """Договор (FACT), привязанный кодом к аренде, пришедшей через дело, помнит это дело: case_id, case_ver и
+    rental_id привязки (`case_rental_id`) — по ним ядро запишет его в дело (`case_plan`). Аренда кодом читается сама
+    (`bind_ctx`) и в результаты сверки не входит; без этой отметки договор дела не нашёл бы. Иначе — без изменений."""
+    if not (isinstance(res, dict) and res.get("outcome") == FACT and isinstance(rental, dict)
+            and rental.get("outcome") == FACT and len(rental.get("facts") or []) == 1):
+        return res
+    rf = rental["facts"][0]
+    if not rf.get("case_id"):
+        return res
+    cb = rf.get("case_bind") if isinstance(rf.get("case_bind"), dict) else {}
+    rid = (cb.get("rental") or {}).get("rental_id") if isinstance(cb.get("rental"), dict) else None
+    for f in res.get("facts") or []:
+        f["case_id"], f["case_ver"], f["case_rental_id"] = rf["case_id"], rf.get("case_ver"), rid
+    return res
+
+
+def _cash_of_case(f, bk, facts):
+    """Строка кассы — аренды bk, пришедшей через дело: решает `rental_case_rules.bind_cash` (одна функция у дела и
+    агента, DESIGN_K4 §3.5). Аренда bk не одна или пришла не через дело — не привязана (не догадка)."""
+    rent = [r for r in facts if r.get("kind") == "rental" and str(r.get("booking_id") or "") == bk]
+    if len(rent) != 1 or not isinstance(rent[0].get("case_bind"), dict):
+        return False
+    cb = rent[0]["case_bind"]
+    import rental_case_rules as RR                # лениво: только под флагом WA_AGENT_CASE
+    v = RR.bind_cash(f, cb.get("rental") or {}, cb.get("rows") or [], cb.get("params") or RR.PARAMS_DEFAULT)
+    return v.get("code") == "bound"
+
+
+def _case_short(v, depth=0):
+    if isinstance(v, str):
+        return v if len(v) <= CASE_TEXT_MAX else v[:CASE_TEXT_MAX] + "…"
+    if isinstance(v, dict):
+        if depth >= 2:
+            return "{…}"
+        return {k: ("[имя]" if k in _CASE_NAME_KEYS and x else _case_short(x, depth + 1))
+                for k, x in v.items() if k not in ("src", "contacts")}
+    if isinstance(v, (list, tuple)):
+        if depth >= 2:
+            return "[%d]" % len(v)
+        return [_case_short(x, depth + 1) for x in list(v)[:10]]
+    return v
+
+
+def case_ref(f):
+    """Элемент дела для блока результатов МОДЕЛИ: без блоков src (источник — одной строкой) и без контактов; имена —
+    «[имя]», как во входе журнала (`masked`); длинный текст обрезан. Журнал получает `_fact_ref` (без ПД)."""
+    out = _case_short({k: v for k, v in f.items() if k != "case_bind"})
+    s = f.get("src") if isinstance(f.get("src"), dict) else {}
+    if s:
+        out["источник"] = "%s · %s" % (s.get("source") or "—", s.get("ref") or "—")
+    return out
+
+
+class CaseLink(object):
+    """Подключение WA к делу аренды (К4): путь базы дела (RENTAL_CASE_DB — абсолютный), снимок броней, часы.
+
+    Чтение — `rental_case.Store(readonly=True)` (`mode=ro`): инструмент `case`, дверь `rental`, сверка версии дела
+    на «Отправить». Запись (ядро WA, роль "wa") — свой `Store(role="wa")`; путь записи зовёт только `wa_agent.Core`.
+    Хранилище открывается в первом вызове (модули rental_case* импортируются тогда же); неудачное открытие не
+    запоминается — следующий вызов попробует снова. Сеть, окружение и конфиги здесь не читаются: путь, снимок и часы
+    приносит служба (`case_link_of`)."""
+
+    def __init__(self, db_path, book=None, clock=time.time, log=None, params=None, by_name="wa_core"):
+        self.db_path = str(db_path or "")
+        self.book = book
+        self.clock = clock
+        self.log = log or (lambda line: None)
+        self.params = params
+        self.by = {"kind": "code", "id": None, "name": by_name}
+        self._ro = None
+        self._rw = None
+
+    def _store(self, readonly):
+        import rental_case                         # лениво: только при включённом флаге
+        return rental_case.Store(self.db_path, role="wa", clock=self.clock, readonly=readonly, params=self.params)
+
+    def reader(self):
+        if self._ro is None:
+            self._ro = self._store(True)
+        return self._ro
+
+    def writer(self):
+        if self._rw is None:
+            self._rw = self._store(False)
+        return self._rw
+
+    def rows(self):
+        """Снимок броней WA → {ok, rows, observed_at, read_at, source, error} (`RentalSource.from_snapshot`:
+        observed_at = taken_at снимка как есть, CONTRACT_K4 §9.1). Снимка нет — не ok."""
+        if self.book is None:
+            return {"ok": False, "rows": None, "observed_at": None, "read_at": self.clock(), "source": "",
+                    "error": "брони выключены (WA_AGENT_BOOK_READ) — дело не найти"}
+        import rental_case_adapters as RA
+        return RA.RentalSource.from_snapshot(self.book, self.clock).read()
+
+    def resolve_client(self, number, intent=None, rd=None):
+        """Номер обращения → дело ЕДИНСТВЕННОЙ функцией `Store.resolve(purpose="client")` (I38) по снимку; контакт —
+        от кода, не от модели. → (ответ resolve | None, чтение снимка)."""
+        rd = rd if rd is not None else self.rows()
+        if not rd.get("ok"):
+            return None, rd
+        st = self.reader()
+        return st.resolve(purpose="client", rows=rd["rows"], moment=self.clock(), observed_at=rd["observed_at"],
+                          intent=case_intent(intent), contact={"channel": "wa", "value": str(number or "")}), rd
+
+    def _bind(self, r, rows):
+        """Привязка аренды выбора для `bind_cash` агента: дело найдено — его привязка; иначе — выбранная строка."""
+        import rental_case_rules as RR
+        params = dict(self.reader().params)
+        row = r.get("row") if isinstance(r.get("row"), dict) else None
+        if row is None:
+            return None
+        cls = RR.classify(row, self.clock(), params)
+        binding = r.get("rental") if r.get("code") == "found" and isinstance(r.get("rental"), dict) else \
+            _case_binding_of_row(row, cls)
+        plate = binding.get("plate") or cls.get("plate")
+        same = [dict(x) for x in rows or [] if isinstance(x, dict) and RR.plate_of_row(x) == plate] if plate else []
+        return {"rental": dict(binding), "rows": same, "params": params}
+
+    def rental_door(self, number):
+        """Дверь `rental` под делом: аренда, выбранная `resolve(client)` с контактом от кода (DESIGN_K4 §11 шаг 3,
+        `wa_agent_model.py:1695-1704`). Ответ разбирает `rental_case_result`."""
+        def rental(intent=None, **_more):
+            try:
+                r, rd = self.resolve_client(number, intent)
+            except Exception as e:                                   # noqa: BLE001 — хранилище недоступно ≠ «аренды нет»
+                return {"ok": False, "unknown": type(e).__name__}
+            if r is None:
+                return {"ok": False, "error": rd.get("error") or "снимок броней не прочитан"}
+            pk = r.get("pick") if isinstance(r.get("pick"), dict) else {}
+            try:
+                bind = self._bind(r, rd.get("rows")) if isinstance(r.get("row"), dict) else None
+            except Exception as e:                                   # noqa: BLE001
+                return {"ok": False, "unknown": type(e).__name__}
+            return {"ok": True, "code": r.get("code"), "row": r.get("row"), "case_id": r.get("case_id"),
+                    "ver": r.get("ver"), "link_state": r.get("link_state"), "reason": r.get("reason"),
+                    "ask": r.get("ask"), "candidates": len(r.get("candidates") or []),
+                    "pick_found": pk.get("code") == "found", "observed_at": rd.get("observed_at"), "bind": bind}
+        return rental
+
+    def case_door(self, number):
+        """Дверь `case`: дело номера (`resolve`) → `Store.facts_for_agent` (CONTRACT_K4 §8.3). Исходы: дела по номеру
+        нет — empty («не знаю»); выбрать нельзя — ambiguous с вопросом; хранилище или снимок недоступны, норма не
+        принята — unknown. Только чтение (`mode=ro`)."""
+        def case(intent=None, period_from=None, period_to=None, **_more):
+            def out(outcome, reason, ref=""):
+                return {"tool": CASE_TOOL, "outcome": outcome, "source": CASE_SOURCE, "ref": ref, "at": None,
+                        "version": "", "window": "", "reason": reason, "facts": []}
+            try:
+                r, rd = self.resolve_client(number, intent)
+                if r is None:
+                    return out(UNKNOWN, "снимок броней не прочитан (%s) — дело не найти" % (rd.get("error") or "?"))
+                if r.get("code") == "found":
+                    return self.reader().facts_for_agent(r["case_id"], period=case_period(period_from, period_to))
+            except Exception as e:                                   # noqa: BLE001 — StoreUnavailable, store_busy
+                return out(UNKNOWN, "хранилище дела недоступно (%s)" % type(e).__name__)
+            if r.get("code") == "none":
+                return out(EMPTY, "дела по номеру нет — это «не знаю», а не «дела нет»")
+            why = str(r.get("reason") or "")
+            if why.split(":")[0] == "param_unknown":
+                return out(UNKNOWN, "норма не принята: %s" % (r.get("ask") or why))
+            return out(AMBIGUOUS, r.get("ask") or why or "выбрать дело нельзя")
+        return case
+
+    def case_state(self, case_id):
+        """Версия и состояние дела сейчас (`case_view`, только чтение) → {"ver", "state"} | None (дела нет).
+        Исключение (хранилище недоступно) идёт наружу: вызывающий судит «не проверено», а не «то же»."""
+        v = self.reader().case_view(case_id)
+        c = v.get("case") if isinstance(v, dict) else None
+        if not isinstance(c, dict):
+            return None
+        return {"ver": c.get("ver"), "state": c.get("state")}
+
+    # ── запись (ядро WA, роль "wa"; зовёт только wa_agent.Core под флагом) ── ключи — CONTRACT_K4 §11
+
+    def inbound(self, number, ref, at):
+        """Живое входящее → `Store.on_client_inbound` (ключ `in:wa:<ref>`, ref — строка очереди)."""
+        return self.writer().on_client_inbound(contact={"channel": "wa", "value": str(number or "")}, ref=ref,
+                                               at=float(at), by=self.by, idem_key="in:wa:%s" % ref)
+
+    def intervention(self, number, ref, at, kind, wa_pause_no):
+        """Эхо человека → `Store.on_human_intervention`, канал wa (ключ `human:wa:<ref>`); внимание — ⇔ wa_pause_no."""
+        return self.writer().on_human_intervention(
+            contact={"channel": "wa", "value": str(number or "")}, kind=kind, channel="wa", ref=ref, at=float(at),
+            wa_pause_no=wa_pause_no, by=self.by, idem_key="human:wa:%s" % ref)
+
+    def reconcile_number(self, number):
+        """Дела номера (той же `resolve` по смыслам CASE_RECON_INTENTS, I38) → `Store.reconcile_rental` по снимку
+        (ключ `recon:<case_id>:<source.name>:<observed_at>`). → ([(case_id, исход)], "") | (None, почему не прочитан)."""
+        rd = self.rows()
+        if not rd.get("ok"):
+            return None, rd.get("error") or "снимок броней не прочитан"
+        seen = []
+        for intent in CASE_RECON_INTENTS:
+            r, _rd = self.resolve_client(number, intent, rd)
+            if r and r.get("code") == "found" and r.get("case_id") not in seen:
+                seen.append(r["case_id"])
+        src = {"name": rd.get("source") or "снимок броней WA", "ref": "снимок броней WA", "method": "door",
+               "read_at": rd.get("read_at"), "observed_at": rd.get("observed_at")}
+        st = self.writer() if seen else None
+        return [(cid, st.reconcile_rental(cid, rows=rd["rows"], source=src, by=self.by,
+                                          idem_key="recon:%s:%s:%s" % (cid, src["name"], src["observed_at"])))
+                for cid in seen], ""
+
+    def apply_plan(self, plan):
+        """Записи `case_plan` → хранилище: касса → `bind_cash` (строки того же номера байка — из снимка: лишние строки
+        R.bind_cash отбросил бы сам), договор и PDF → `record_document`. → [(что, исход | имя исключения)]."""
+        import rental_case_rules as RR                # лениво: только под флагом
+        out = []
+        rd = None
+        for w in (plan or {}).get("writes") or []:
+            what = "%s %s" % (w.get("op"), w.get("kind") or "строка %s" % (w.get("cash_fact") or {}).get("row"))
+            try:
+                if w.get("op") == "bind_cash":
+                    rd = rd if rd is not None else self.rows()
+                    if not rd.get("ok"):
+                        out.append((what, "не записано: снимок броней не прочитан"))
+                        continue
+                    plate = plate_of((w.get("cash_fact") or {}).get("bike"))
+                    rows = [r for r in rd["rows"] if plate and RR.plate_of_row(r) == plate]
+                    res = self.writer().bind_cash(w["case_id"], cash_fact=w["cash_fact"], rows=rows,
+                                                  source=w["source"], by=self.by, idem_key=w["idem_key"])
+                elif w.get("op") == "record_document":
+                    more = dict((k, w[k]) for k in ("sha256", "signed_at", "reg_row", "rental_id", "contract_result",
+                                                    "pdf_result") if w.get(k) is not None)
+                    res = self.writer().record_document(w["case_id"], kind=w["kind"], ext_id=w["ext_id"],
+                                                        status=w["status"], source=w["source"], by=self.by,
+                                                        idem_key=w["idem_key"], **more)
+                else:
+                    continue
+            except Exception as e:                                   # noqa: BLE001 — запись упала: исход словами
+                res = "упало: %s" % type(e).__name__
+            out.append((what, res))
+        return out
+
+    def notice_sent(self, notice_id, draft_id, wamid, at):
+        """К4 круг 2 (C10): черновик уведомления ушёл, wamid — от двери отправки WA → `Store.record_notice_sent`
+        (ключ `nsent:<notice>:<draft>:<wamid>`): доверенная привязка отправки, хранится до любой доставки."""
+        return self.writer().record_notice_sent(
+            notice_id, draft_id=int(draft_id), wamid=str(wamid), at=float(at),
+            source={"name": "отправка черновика WA (дверь send_text → drafts.wamid)", "ref": "draft:%d" % int(draft_id),
+                    "method": "door", "read_at": self.clock(), "observed_at": float(at)},
+            by=self.by, idem_key="nsent:%s:%s:%s" % (notice_id, draft_id, wamid))
+
+    def delivery(self, notice_id, wamid, status, at):
+        """Статус по точному wamid черновика уведомления → `Store.record_delivery` (ключ `ndel:<notice>:<wamid>:<st>`)."""
+        return self.writer().record_delivery(
+            notice_id, wamid=str(wamid), status=status, at=float(at),
+            source={"name": "статусы WhatsApp (part_status)", "ref": str(wamid), "method": "door",
+                    "read_at": self.clock(), "observed_at": float(at)},
+            by=self.by, idem_key="ndel:%s:%s:%s" % (notice_id, wamid, status))
+
+
+def case_link_of(on, db_path, book=None, clock=time.time, log=None, params=None):
+    """Флаг WA_AGENT_CASE (`on` судит служба единым правилом `flag_on`) и путь RENTAL_CASE_DB → (CaseLink | None,
+    слова строки старта | None). Выкл — (None, None): ни объекта, ни импорта rental_case*. Вкл без абсолютного пути
+    или без файла базы (`Store.create` — шаг интеграции на сервере) — None со словами: дело выключено, а не «пусто»."""
+    if not on:
+        return None, None
+    path = str(db_path or "").strip()
+    if not path or not os.path.isabs(path):
+        return None, "флаг 1, %s не задан или не абсолютный — дело выключено" % F_CASE_DB
+    if not os.path.isfile(path):
+        return None, "флаг 1, базы дела нет (%s) — Store.create не сделан, дело выключено" % os.path.basename(path)
+    if book is None:
+        return None, "флаг 1, броней нет (WA_AGENT_BOOK_READ выкл) — дело не найти, выключено"
+    return CaseLink(path, book=book, clock=clock, log=log, params=params), (
+        "вкл — инструмент case (только чтение, mode=ro), аренда через resolve, касса через bind_cash; база %s"
+        % os.path.basename(path))
+
+
+def case_plan(results, since=None):
+    """Итог сверки под делом → {"case_id", "case_ver", "rental_id", "writes": [...], "words"} — что ядру WA (роль wa)
+    записать в дело ПО ФАКТАМ сверки (DESIGN_K4 §11 шаг 4): строки кассы → `Store.bind_cash`, принятый договор →
+    `record_document(contract_signed)`, PDF принятого договора → `record_document(contract_pdf)`. Чистая функция:
+    опора — отсеянное `sift` (каждый факт один раз, без снятых и устаревших). Дело одно — только если все факты дела и
+    аренды через дело называют одно дело; иначе дела нет (case_id None) и записей нет. Версия — наименьшая из
+    увиденных: черновик, написанный по старшей версии, на «Отправить» устареет, а не уйдёт."""
+    facts, _dropped = sift(results, since)
+    seen = [(f.get("case_id"), f.get("case_ver")) for f in facts
+            if f.get("kind") in (CASE_TOOL, "rental", "contract") and f.get("case_id")]
+    ids = sorted({c for c, _v in seen})
+    plan = {"case_id": None, "case_ver": None, "rental_id": None, "writes": [], "words": ""}
+    if not ids:
+        plan["words"] = "дело в сверке не названо"
+        return plan
+    if len(ids) > 1:
+        plan["words"] = "дел в сверке %d — черновик к делу не привязан, записей нет" % len(ids)
+        return plan
+    cid = ids[0]
+    vers = [v for c, v in seen if c == cid and isinstance(v, int) and not isinstance(v, bool)]
+    plan["case_id"], plan["case_ver"] = cid, (min(vers) if vers else None)
+    rids = set()                                  # привязка аренды дела: факт дела, аренда через дело, договор дела
+    for f in facts:
+        if f.get("case_id") != cid:
+            continue
+        cb = f.get("case_bind") if isinstance(f.get("case_bind"), dict) else {}
+        if f.get("kind") == "case_rental" and f.get("rental_id") is not None:
+            rids.add(f["rental_id"])
+        elif f.get("kind") == "rental" and isinstance(cb.get("rental"), dict) and cb["rental"].get("rental_id"):
+            rids.add(cb["rental"]["rental_id"])
+        elif f.get("kind") == "contract" and f.get("case_rental_id") is not None:
+            rids.add(f["case_rental_id"])
+    rid = rids.pop() if len(rids) == 1 else None  # привязок несколько (дело пересвязано между чтениями) — не пишем
+    plan["rental_id"] = rid
+    accepted_ids = {id(f) for f in facts}
+    by_kind = {"cash": [], "contract": [], "pdf": []}
+    for i in read_order(results):
+        r = results[i]
+        if r.get("outcome") != FACT:
+            continue
+        for f in r.get("facts") or []:
+            if id(f) in accepted_ids and f.get("kind") in by_kind:
+                by_kind[f["kind"]].append((f, r))
+    for f, r in by_kind["cash"]:
+        h = hashlib.sha256(("%s|%s|%s|%s" % (f.get("amount"), f.get("currency"), f.get("status") or "",
+                                             f.get("booking_id") or "")).encode("utf-8")).hexdigest()[:12]
+        plan["writes"].append({"op": "bind_cash", "case_id": cid, "cash_fact": dict(f),
+                               "source": {"name": r.get("source") or "tx_find", "ref": "строка %s" % f.get("row"),
+                                          "method": "door", "read_at": r.get("at"), "observed_at": r.get("at")},
+                               "idem_key": "cash:%s:%s:%s:%s" % (cid, f.get("row"), f.get("msg_id") or f.get("link"),
+                                                                 h)})
+    contract_res = None
+    for f, r in by_kind["contract"]:
+        contract_res = r
+        if rid is None:
+            continue
+        plan["writes"].append({"op": "record_document", "case_id": cid, "kind": "contract_signed",
+                               "ext_id": str(f.get("doc_id") or ""), "status": "verified",
+                               "signed_at": f.get("signed_at"), "reg_row": f.get("row"), "rental_id": rid,
+                               "contract_result": r,
+                               "source": {"name": r.get("source") or "contract_find",
+                                          "ref": "строка %s" % f.get("row"), "method": "door",
+                                          "read_at": r.get("at"), "observed_at": r.get("at")},
+                               "idem_key": "doc:%s:contract_signed:%s:%s" % (cid, f.get("doc_id"),
+                                                                            f.get("signed_at") or "")})
+    for f, r in by_kind["pdf"]:
+        if rid is None:
+            continue
+        plan["writes"].append({"op": "record_document", "case_id": cid, "kind": "contract_pdf",
+                               "ext_id": str(f.get("id") or ""), "status": "verified", "sha256": f.get("sha256"),
+                               "pdf_result": r, "contract_result": contract_res,
+                               "source": {"name": r.get("source") or "contract_pdf", "ref": str(f.get("id") or ""),
+                                          "method": "door", "read_at": r.get("at"), "observed_at": r.get("at")},
+                               "idem_key": "doc:%s:contract_pdf:%s:%s" % (cid, f.get("id"), f.get("sha256") or "")})
+    skipped = len(by_kind["contract"]) + len(by_kind["pdf"]) if rid is None else 0
+    plan["words"] = "дело %s версия %s: записей %d%s" % (
+        cid, plan["case_ver"], len(plan["writes"]),
+        ", документов без привязки аренды дела %d (не пишутся)" % skipped if skipped else "")
+    return plan

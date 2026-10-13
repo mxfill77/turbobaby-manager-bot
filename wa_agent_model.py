@@ -77,6 +77,12 @@ extra_body; не задан — запрос как был; иное — не ш
 вопрос — после, в сообщении. Цена каждого вызова считается по usage (вход, запись в кэш 5 мин/1 ч, чтение
 из кэша, выход) — строкой журнала и итогом в сводку службы (`spend`). Множители — по документации Anthropic
 «Prompt caching»: запись 5 мин 1.25× цены входа, запись 1 ч 2×, чтение 0.1×.
+
+ДЕЛО АРЕНДЫ (К4, TB-FILIPP-K4-CASE-FOUNDATION-0910; флаг WA_AGENT_CASE, по умолчанию выключен — `case=None`, двери
+сверки, промпт и ответ `draft` байт-в-байт прежние). Включён (`case` — `wa_agent_tools.CaseLink`, только при сверке
+WA_AGENT_TOOLS и снимке броней): дверь `rental` выбирает аренду `rental_case.Store.resolve(purpose="client")` с
+номером обращения от кода, инструмент `case` отдаёт факты дела (база дела `mode=ro`), ответ черновика со сверкой
+несёт `case` — дело, версию и записи в дело по фактам (`wa_agent_tools.case_plan`); пишет их ядро, не адаптер.
 """
 
 import datetime
@@ -1297,8 +1303,12 @@ class ModelAdapter(wa_agent.Model):
 
     def __init__(self, queue_db, call, read_doc=None, fleet=None, door=None, archive_db="",
                  manifest="", media_dir="", no_price_models=(), clock=time.time, log=None, agent_db="",
-                 lessons_db="", book=None, cache=None, tools=None, fresh=None, hints=False, text_lessons=True):
+                 lessons_db="", book=None, cache=None, tools=None, fresh=None, hints=False, text_lessons=True,
+                 case=None):
         self.queue_db, self.call = queue_db, call
+        # дело аренды (К4, флаг WA_AGENT_CASE): None — выкл, двери сверки прежние; `wa_agent_tools.CaseLink` —
+        # инструмент `case` (только чтение, mode=ro) и аренда через `resolve` дела; действует только со сверкой (tools)
+        self.case = case
         # вид правил в промпте (NIGHT0710-B2): из пояснений — при WA_AGENT_HINTS, правки текстом — при WA_AGENT_LESSONS
         self.hints, self.text_lessons = bool(hints), bool(text_lessons)
         # инструменты чтения (AGENTLOOPA0310, флаг WA_AGENT_TOOLS): None — выкл, черновик одним вызовом, как в 9c4aac6;
@@ -1745,6 +1755,11 @@ class ModelAdapter(wa_agent.Model):
 
         doors = {"history": history, "rental": rental, "rules": rules}
         doors.update({k: v for k, v in (self.tools or {}).items() if k in ("cash", "contract", "contract_pdf")})
+        if self.case is not None:
+            # К4 (WA_AGENT_CASE, DESIGN_K4 §11 шаг 3): аренда — `resolve(client)` дела с контактом от кода вместо
+            # фильтра активных строк выше; дело — инструмент `case` (только чтение). Выкл — словарь прежний
+            doors["rental"] = self.case.rental_door(number)
+            doors["case"] = self.case.case_door(number)
         return doors
 
     def _draft_tools(self, number, upto_id, hint=None):
@@ -1831,8 +1846,14 @@ class ModelAdapter(wa_agent.Model):
                  % (len(got["text"]), out["state"], out["calls"], out["sec"], len(words)))
         # проверка чисел кодом для низа карточки (WACARDUI0510): опора та же, что у судьи сверки — «ЦЕНА» ∪ факты
         claims = T.money_claims(said, info["price"], T.known_amounts(info["price"], jr.facts, figures))
-        return dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"],
-                     "claims": [list(c) for c in claims]}, **card_fields(info, got))
+        res = dict({"text": got["text"], "handoff": words, "lang": got["lang"], "why": got["why"],
+                    "claims": [list(c) for c in claims]}, **card_fields(info, got))
+        if self.case is not None:
+            # К4 (WA_AGENT_CASE): дело и версия, на которые написан черновик, и записи в дело по фактам сверки —
+            # их делает ядро (`wa_agent.Core`, роль wa); адаптер только читает. Выкл — ответ прежний
+            res["case"] = T.case_plan(out["results"], since=info.get("last_in"))
+            self.log("дело: %s" % res["case"]["words"])
+        return res
 
     # ── напоминание притихшему (WAFOLLOWUP0210) ───────────────────────────────────────────
 

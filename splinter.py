@@ -4785,6 +4785,15 @@ def _deposit_resolve_booking(bridge, bike):
     rec = _RECENT_BOOKINGS.get(plate)
     if rec and rec.get("booking_id") and _time.time() - rec.get("ts", 0) <= _DEPOSIT_LINK_WINDOW:
         return {"booking_id": str(rec["booking_id"]), "row": rec.get("row")}
+    if _rc_on("RENTAL_CASE_PICK"):
+        # К4 шаг 5: CRM-половина → pick(cash) — привязка только при ЕДИНСТВЕННОМ претенденте в его сроке (DESIGN
+        # §3.5: будущая бронь того же номера — тоже претендент; предоплата при CASH_PRE_START_DAYS=UNKNOWN —
+        # вопрос, не привязка). Иначе None — запись как сейчас + подсказка «уточни бронь» у вызывателя.
+        pk = _rc_pick(bridge, bike, "cash")
+        r = pk.get("row") if pk.get("code") == "found" else None
+        if r is None or not str(r.get("booking_id") or "").strip():
+            return None
+        return {"booking_id": str(r["booking_id"]).strip(), "row": r.get("row")}
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -8688,6 +8697,690 @@ def _aggregate_album_vis(vis_list):
     return agg
 
 
+# ===================== К4: ДЕЛО АРЕНДЫ (rental_case) — интеграция Splinter за флагами =====================
+# TB-FILIPP-K4-CASE-FOUNDATION-0910, DESIGN_K4 §11 шаги 5–7; контракт — out/CONTRACT_K4.md. Все ветки за
+# флагами, по умолчанию OFF:
+#   RENTAL_CASE_PICK      — резолверы аренды по байку → rental_case_rules.pick (шаг 5) вместо max(date_start) /
+#                           cand[-1]; unknown → прежний путь «⚠️ не нашёл — руками», но с конкретным вопросом;
+#   RENTAL_CASE           — рождение дела (шаг 6): после create_booking (origin=intake) и на карточке выдачи/приёма
+#                           (Store.resolve → none → open_case(origin=splinter));
+#   RENTAL_CASE_APPROVALS — «да» карточек брони/активации/закрытия — ожидания approval в хранилище (шаг 7): реплай →
+#                           карточка, слова §6.6, одобряющий по id, APPROVAL_TTL_S, execute → claim_execution → мост →
+#                           mark_written → чтение назад; карточке активации/закрытия нужно дело, поэтому этот флаг
+#                           включает и рождение дела на карточке (шаг 6) — см. _rc_cases_on;
+#   RENTAL_CASE_DB        — абсолютный путь хранилища; здесь только ОТКРЫТИЕ (Store.create — отдельный шаг интеграции).
+# При OFF путь прежний, а модулей rental_case* нет в sys.modules процесса: импорт ЛЕНИВО внутри ветки флага
+# (К4-C34). Флаги читаются на КАЖДЫЙ вызов — откат: снять флаг (данные хранилища остаются).
+# «Строка/контакт/номер → дело» здесь — ТОЛЬКО Store.resolve (I38, К4-C22); SQL к rc_* в Splinter нет.
+_RC_STORE = None                 # ОДИН Store(role="splinter") на процесс: boot_id — граница карточки брони (§4.7 п.9)
+_RC_STORE_SAID = {"why": ""}     # последняя причина «хранилище недоступно» (в журнал — один раз на причину)
+_RC_BY = {"kind": "code", "id": None, "name": "splinter"}
+_RC_CLIENTS = "лист «клиенты» (clients filter=all)"      # = rental_case_adapters.CLIENTS_SOURCE
+_RC_REPLY_HINT = "\n↩️ Ответ — РЕПЛАЕМ на эту карточку: да / нет."
+
+
+def _rc_on(name):
+    """Флаг К4 (по умолчанию OFF). Читается на каждый вызов — тест и откат без рестарта процесса."""
+    return str(os.getenv(name, "0")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _rc_cases_on():
+    """Рождение дела (шаг 6): RENTAL_CASE, а также RENTAL_CASE_APPROVALS — карточке activate/close нужно дело
+    (CONTRACT §5.4 request_approval: «case_id None только для booking»)."""
+    return _rc_on("RENTAL_CASE") or _rc_on("RENTAL_CASE_APPROVALS")
+
+
+def _rc_rules():
+    import rental_case_rules   # лениво: только в ветке флага (К4-C34)
+    return rental_case_rules
+
+
+def _rc_store():
+    """Store(role="splinter") — один на процесс. Нет пути / файла / схемы → None: путь К4 молчит («неизвестно»),
+    прежний путь не падает. Сразу после открытия — recover() своей роли (CONTRACT §5); чтение назад его
+    readback-ожиданий (pending_checks) — на такте _rc_tick, где есть мост."""
+    global _RC_STORE
+    if _RC_STORE is not None:
+        return _RC_STORE
+    path = str(os.getenv("RENTAL_CASE_DB", "") or "").strip()
+    why = ""
+    st = None
+    if not path or not os.path.isabs(path):
+        why = "RENTAL_CASE_DB не задан абсолютным путём"
+    else:
+        try:
+            import rental_case   # лениво (К4-C34)
+            st = rental_case.Store(path, role="splinter")
+        except Exception as e:
+            why = f"{type(e).__name__}: {e}"
+    if st is None:
+        if _RC_STORE_SAID.get("why") != why:
+            _RC_STORE_SAID["why"] = why
+            log.warning(f"  📁 дело аренды: хранилище недоступно ({why}) — шаг К4 не исполняется")
+        return None
+    _RC_STORE = st
+    try:
+        r = st.recover(by=_RC_BY)
+        rd = r.get("data") or dict()
+        log.info(f"  📁 дело аренды: хранилище открыто (boot {st.boot_id}), recover: {r.get('code')} {rd}")
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: recover() не прошёл ({type(e).__name__}: {e})")
+    return st
+
+
+def _rc_rows(bridge):
+    """Строки двери clients тем же чтением, что у прежних резолверов. → (rows | None, observed_at, read_at);
+    None — дверь не прочитана (как прежнее исключение)."""
+    t0 = _time.time()
+    try:
+        cl = bridge._call("clients", filter="all").get("data", {})
+        rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
+    except Exception:
+        return None, t0, _time.time()
+    return [r for r in (rows or []) if isinstance(r, dict)], t0, _time.time()
+
+
+def _rc_source(ref, t0, t1):
+    return {"name": _RC_CLIENTS, "ref": str(ref), "method": "door", "read_at": float(t1), "observed_at": float(t0)}
+
+
+def _rc_pick(bridge, bike, purpose):
+    """К4 шаг 5 (RENTAL_CASE_PICK): аренда байка по цели — rental_case_rules.pick (DESIGN §3.3; found только при
+    ровно одном кандидате, без max/[-1]/окна вокруг «сегодня»). → {"code": found|unknown|error, "row", "ask",
+    "reason", "candidates", "rows"}; error — дверь не прочитана или модуль не загрузился (прежнее «не нашёл»).
+    handover: «бронь» со стартом в день момента; бронь УЖЕ активирована сегодня («в аренде» со стартом сегодня,
+    ровно одна) — та же выдача после ручной активации, found с already_active (иначе каждая повторная фраза
+    выдачи давала бы ⚠️, а вкладка состояния теряла клиента; толкование интегратора, записано в отчёте)."""
+    out = {"code": "error", "row": None, "ask": "", "reason": "", "candidates": [], "rows": None}
+    try:
+        R = _rc_rules()
+        rows, t0, _t1 = _rc_rows(bridge)
+        if rows is None:
+            out["reason"] = "read_failed"
+            return out
+        out["rows"] = rows
+        params = R.PARAMS_DEFAULT
+        plate = R.plate_of_row({"bike": bike})
+        q = {"purpose": purpose, "intent": None, "plate": plate}
+        if purpose == "cash":
+            q["cash_day"] = R.day_of_moment(t0, params["TZ_H"]).isoformat()   # день прихода = сейчас
+        pk = R.pick(rows, q, t0, params)
+        if pk.get("code") == "found":
+            out.update(code="found", row=pk.get("row"), candidates=pk.get("candidates") or [])
+            return out
+        if purpose == "handover" and pk.get("reason") == "rental_not_found" and plate:
+            today = R.day_of_moment(t0, params["TZ_H"]).isoformat()
+            act = []
+            for r in rows:
+                c = R.classify(r, t0, params)
+                if c["plate"] == plate and c["cls"] == "current" and c["start_day"] == today:
+                    act.append(r)
+            if len(act) == 1:
+                out.update(code="found", row=act[0], already_active=True)
+                return out
+        out.update(code="unknown", ask=pk.get("ask") or "", reason=pk.get("reason") or "",
+                   candidates=pk.get("candidates") or [])
+        log.info(f"  → К4 выбор аренды {bike} ({purpose}): {out['reason']} — {out['ask']}")
+        return out
+    except Exception as e:
+        log.warning(f"  → К4 выбор аренды {bike} ({purpose}) не прошёл ({type(e).__name__}: {e})")
+        out["reason"] = f"error:{type(e).__name__}"
+        return out
+
+
+def _rc_case_for(bridge, bike, purpose, row_no):
+    """К4 шаг 6: дело строки карточки выдачи/приёма — Store.resolve(row=…) → found; none → open_case(origin=splinter)
+    (S-M2 а). → {"case_id", "ver", "row", "siblings_before", "why"}; case_id None — дела нет, why — почему."""
+    out = {"case_id": None, "ver": None, "row": None, "siblings_before": {}, "why": ""}
+    st = _rc_store()
+    if st is None:
+        out["why"] = "хранилище дела недоступно"
+        return out
+    try:
+        R = _rc_rules()
+        rows, t0, t1 = _rc_rows(bridge)
+        if rows is None:
+            out["why"] = "дверь clients не прочитана"
+            return out
+        plate = R.plate_of_row({"bike": bike})
+        hits = [r for r in rows if r.get("row") == row_no and R.plate_of_row(r) == plate]
+        if len(hits) != 1:
+            out["why"] = f"строка {row_no} при перечитывании найдена {len(hits)} раз"
+            return out
+        r = hits[0]
+        nm = R.name_norm(r.get("name"))
+        out["row"] = r
+        out["siblings_before"] = dict((str(s.get("row")), s.get("status")) for s in rows
+                                      if s is not r and R.plate_of_row(s) == plate and R.name_norm(s.get("name")) == nm)
+
+        def _resolve():
+            return st.resolve(purpose=purpose, rows=rows, moment=t0, observed_at=t0, row=r)
+
+        res = _resolve()
+        if res.get("code") == "none":
+            bk = str(r.get("booking_id") or "").strip()
+            anchor = R.anchor_of(r)
+            src = _rc_source(f"crm_row:{row_no}", t0, t1)
+            key = (f"open:splinter:bk:{bk}" if bk else
+                   (f"open:splinter:anchor:{anchor}" if anchor else f"open:splinter:row:{src['ref']}:{t0}"))
+            oc = st.open_case(origin="splinter", by=_RC_BY, idem_key=key, rental_row=r, source=src)
+            log.info(f"  📁 дело аренды: open_case(splinter) строка {row_no}: {oc.get('code')} {oc.get('reason') or ''}")
+            if oc.get("code") not in ("ok", "duplicate") and not (
+                    oc.get("code") == "rejected" and str(oc.get("reason") or "").startswith("booking_taken")):
+                out["why"] = oc.get("ask") or oc.get("reason") or "дело не открыто"
+                return out
+            res = _resolve()
+        if res.get("code") != "found":
+            out["why"] = res.get("ask") or res.get("reason") or "дело не определено"
+            return out
+        out.update(case_id=res.get("case_id"), ver=res.get("ver"))
+        return out
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: строка {row_no} — {type(e).__name__}: {e}")
+        out["why"] = f"{type(e).__name__}"
+        return out
+
+
+def _rc_case_after_booking(bridge, res, exp_id=None):
+    """К4 шаг 6: успех create_booking → перечитать строку по booking_id → open_case(origin=intake) и, если карточка
+    брони жила в хранилище, attach_expectation. Ничего не бросает; исход — в журнал."""
+    st = _rc_store()
+    if st is None:
+        return None
+    try:
+        bk = str(res.get("booking_id") or "").strip()
+        if not bk:
+            log.warning("  📁 дело аренды: create_booking не вернул booking_id — дело не открыто")
+            return None
+        rows, t0, t1 = _rc_rows(bridge)
+        hits = [r for r in (rows or []) if str(r.get("booking_id") or "").strip() == bk]
+        if len(hits) != 1:
+            log.warning(f"  📁 дело аренды: бронь {bk} при перечитывании найдена {len(hits)} раз — дело не открыто")
+            return None
+        oc = st.open_case(origin="intake", by=_RC_BY, idem_key=f"open:intake:bk:{bk}", booking_id=bk,
+                          rental_row=hits[0], source=_rc_source(f"booking:{bk}", t0, t1))
+        cid = oc.get("case_id") or (oc.get("data") or {}).get("case_id")
+        log.info(f"  📁 дело аренды: open_case(intake) {bk}: {oc.get('code')} {oc.get('reason') or ''} → {cid}")
+        # booking_taken — у этого booking_id дело уже есть (тот же внешний ключ, CONTRACT §5.1): карточка — к нему
+        ok = oc.get("code") in ("ok", "duplicate") or (
+            oc.get("code") == "rejected" and str(oc.get("reason") or "").startswith("booking_taken"))
+        if ok and oc.get("code") == "rejected":
+            # К4 круг 2 (C22, I38): дело занятого booking_id — только через resolve строки; resolve не нашёл ЭТО же дело
+            # (например unknown(link_confirmation)) — карточку к делу не вешаем: вопрос остаётся вопросом
+            rv = st.resolve(purpose="handover", rows=rows, moment=t0, observed_at=t0, row=hits[0])
+            if rv.get("code") != "found" or not cid or rv.get("case_id") != cid:
+                log.warning(f"  📁 дело аренды: бронь {bk} занята делом {cid}, но resolve строки → {rv.get('code')} "
+                            f"{rv.get('reason') or ''} — карточку к делу не вешаю")
+                return None
+        if cid and exp_id and ok:
+            at = st.attach_expectation(exp_id, case_id=cid, by=_RC_BY, idem_key=f"attach:{exp_id}")
+            log.info(f"  📁 дело аренды: attach_expectation {exp_id} → {cid}: {at.get('code')}")
+        return cid if ok else None
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: после create_booking — {type(e).__name__}: {e}")
+        return None
+
+
+def _rc_card_text(action, t):
+    """Текст карточки activate/close — слово в слово прежний (_handover_activation_card / _return_close_card)
+    плюс строка «ответ — реплаем» (APPROVAL_REPLY_REQUIRED=UNKNOWN: исполняет только реплай, CONTRACT §4.7 п.1)."""
+    if action == "activate":
+        dates = (str(t.get("date_start") or "") + " — " + str(t.get("date_end") or "")).strip(" —")
+        return (f"🐀 Splinter\n🏍 ВЫДАЧА: {t.get('bike')} → {t.get('name') or '—'}, "
+                f"бронь строка {t.get('row')} ({dates or 'даты —'}).\n"
+                f"Активирую (Бронь→В аренде)? да / нет" + _RC_REPLY_HINT)
+    km = str(t.get("km") or "").strip()
+    paid = t.get("paid_total")
+    km_line = (f"Пробег на сдаче: {km}." if km
+               else "Пробег на сдаче: не увидел — ответь «да <цифра пробега>».")
+    due_line = (f" Итог закрытия: {_fmt(paid)} ฿." if paid is not None else "")
+    dep = t.get("deposit_disp")
+    dep_line = (f"\n💰 Верни депозит: {dep}" if dep else "\n💰 Депозит: не указан ⚠️")
+    return (f"🐀 Splinter\n📥 ПРИЁМ: {t.get('bike')} вернулся от {t.get('name') or '—'}, "
+            f"строка {t.get('row')}. {km_line}{due_line}{dep_line}\n"
+            f"Завершаю (Завершена"
+            + (f" + пробег {km}" if km else "")
+            + (f" + оплачено {_fmt(paid)}" if paid is not None else "")
+            + ")? да / нет" + _RC_REPLY_HINT)
+
+
+def _rc_card_waiting(st, case_id, action, ttl):
+    """Та же аренда (дело) уже ждёт «да» карточкой этого действия в пределах срока — новую не публикуем (как
+    прежний дедуп `_HANDOVER_ACTIVATIONS`/`_RETURN_CLOSES`: та же строка, status awaiting, ts ≤ TTL). Только чтение."""
+    try:
+        for it in st.stuck() or []:
+            if (it.get("what") == "expectation" and it.get("kind") == "approval" and it.get("action") == action
+                    and it.get("case_id") == case_id and it.get("state") in ("in_flight", "waiting")):
+                ws = it.get("waiting_for_s")
+                if ws is None or ws <= ttl:
+                    return True
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: stuck() не прочитан ({type(e).__name__})")
+    return False
+
+
+async def _rc_publish(context, st):
+    """Публикация планов approval/confirm_link во «Входящие»: claim_for_posting → _send → mark_post_result
+    (запись захвата ДО отправки; исход отправки неизвестен → unknown, повтора нет — I15). → число опубликованных."""
+    try:
+        items = st.claim_for_posting(by=_RC_BY, kinds=("approval", "confirm_link"), limit=10)
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: claim_for_posting не прошёл ({type(e).__name__}: {e})")
+        return 0
+    n = 0
+    for it in items or []:
+        exp_id, rv = it.get("exp_id"), it.get("row_ver")
+        subj = it.get("subject") or {}
+        chat = it.get("chat") or str(INTAKE_CHAT)
+        thread = subj.get("thread_id") if isinstance(subj, dict) else None
+        if it.get("kind") == "confirm_link":
+            text = ("🐀 Splinter\n🔗 Дело аренды: " + str(subj.get("question") or "это та же аренда?")
+                    + "\n↩️ Ответ — РЕПЛАЕМ на это сообщение: да — та же аренда / нет.")
+        else:
+            text = str(subj.get("text") or "")
+        try:
+            kw = {"chat_id": int(chat), "text": text, "bilingual": False}
+            if thread is not None:
+                kw["message_thread_id"] = thread
+            sent = await _send(context, **kw)
+            mid = getattr(sent, "message_id", None)
+            d = getattr(sent, "date", None)
+            at = d.timestamp() if hasattr(d, "timestamp") else _time.time()
+            res = ({"posted": [{"place": "intake", "chat": str(chat), "msg_id": str(mid),
+                                "thread_id": None if thread is None else str(thread), "role": "card", "at": at}],
+                    "qid": None} if mid is not None else {"unknown": "отправка не вернула message_id"})
+        except Exception as e:
+            res = {"unknown": type(e).__name__}
+        try:
+            m = st.mark_post_result(exp_id, result=res, by=_RC_BY, idem_key=f"mark_post_result:{exp_id}:{rv}",
+                                    expect_row_ver=rv)
+            log.info(f"  📁 дело аренды: карточка {it.get('kind')}/{it.get('action')} {exp_id}: "
+                     f"{'опубликована' if 'posted' in res else 'исход неизвестен'} → {m.get('code')}")
+            if "posted" in res:
+                n += 1
+        except Exception as e:
+            log.warning(f"  📁 дело аренды: mark_post_result {exp_id} не прошёл ({type(e).__name__}: {e})")
+    return n
+
+
+async def _rc_request_card(context, st, action, case_id, ver, text, target, chat=None, thread=None):
+    """request_approval (прежняя ждущая карточка того же (чат, действие) → superseded) + публикация.
+    → (exp_id, ref) | None."""
+    chat = chat if chat is not None else INTAKE_CHAT
+    ref = f"{action}:{case_id or '-'}:{int(_time.time() * 1000)}"
+    card = {"ref": ref, "text": text, "target": dict(target, card=ref), "thread_id": thread}
+    key = "appr:%s:%s:%s:%s:%s" % (case_id or "-", ver if ver is not None else "-", action, chat, ref)
+    try:
+        out = st.request_approval(case_id, task_id=None, action=action, chat=str(chat), card=card, by=_RC_BY,
+                                  idem_key=key, expect_ver=ver)
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: request_approval({action}) не прошёл ({type(e).__name__}: {e})")
+        return None
+    if out.get("code") != "ok":
+        log.warning(f"  📁 дело аренды: request_approval({action}) → {out.get('code')} {out.get('reason') or ''}")
+        return None
+    await _rc_publish(context, st)
+    return (out.get("data") or {}).get("exp_id"), ref
+
+
+async def _rc_warn(context, warn_ts, key, cooldown, text):
+    """Прежний анти-спам ⚠️ (кулдаун по байку) для веток К4."""
+    now = _time.time()
+    if now - warn_ts.get(key, 0) < cooldown:
+        return
+    warn_ts[key] = now
+    await _send(context, chat_id=INTAKE_CHAT, bilingual=False, text=text)
+
+
+async def _rc_activation_card(context, bridge, bike, cand):
+    """К4 шаги 6–7 на карточке выдачи. True — путь К4 разобрал карточку сам (прежняя в памяти не заводится)."""
+    c = _rc_case_for(bridge, bike, "handover", cand.get("row"))
+    if not _rc_on("RENTAL_CASE_APPROVALS"):
+        return False                          # только шаг 6: дело рождено/найдено, карточка — прежняя
+    if c.get("case_id") is None:
+        log.info(f"  → ВЫДАЧА {bike}: дело аренды не определено ({c.get('why')}) — ⚠️, активация руками")
+        await _rc_warn(context, _HO_ACT_WARN_TS, bike, _HO_ACT_WARN_COOLDOWN,
+                       f"🐀 Splinter\n⚠️ ВЫДАЧА {bike}: дело аренды не определено — {c.get('why')}. "
+                       f"Активируй руками (Бронь→В аренде).")
+        return True
+    st = _rc_store()
+    if _rc_card_waiting(st, c["case_id"], "activate", _HO_ACT_TTL):
+        return True                           # та же бронь уже ждёт «да» — карточку не дублируем
+    r = c.get("row") or {}
+    target = {"action": "activate", "bike": bike, "name": cand.get("name") or "",
+              "date_start": cand.get("date_start") or "", "date_end": cand.get("date_end") or "",
+              "row": cand.get("row"), "booking_id": str(r.get("booking_id") or "").strip() or None,
+              "status": "В аренде", "siblings_before": c.get("siblings_before") or {}}
+    log.info(f"  → ВЫДАЧА {bike}: карточка активации (дело {c['case_id']}) во Входящие через хранилище")
+    await _rc_request_card(context, st, "activate", c["case_id"], c.get("ver"), _rc_card_text("activate", target),
+                           target)
+    return True
+
+
+async def _rc_close_card(context, bridge, bike, cand, km, paid):
+    """К4 шаги 6–7 на карточке приёма. True — путь К4 разобрал карточку сам."""
+    c = _rc_case_for(bridge, bike, "return", cand.get("row"))
+    if not _rc_on("RENTAL_CASE_APPROVALS"):
+        return False
+    if c.get("case_id") is None:
+        log.info(f"  → ПРИЁМ {bike}: дело аренды не определено ({c.get('why')}) — ⚠️, закрытие руками")
+        await _rc_warn(context, _RET_CLOSE_WARN_TS, bike, _RET_CLOSE_WARN_COOLDOWN,
+                       f"🐀 Splinter\n⚠️ ПРИЁМ {bike}: дело аренды не определено — {c.get('why')}. "
+                       f"Заверши руками (В аренде→Завершена).")
+        return True
+    st = _rc_store()
+    if _rc_card_waiting(st, c["case_id"], "close", _RET_CLOSE_TTL):
+        return True
+    r = c.get("row") or {}
+    target = {"action": "close", "bike": bike, "name": cand.get("name") or "",
+              "date_start": cand.get("date_start") or "", "row": cand.get("row"),
+              "booking_id": str(r.get("booking_id") or "").strip() or None, "km": str(km or "").strip(),
+              "paid_total": paid, "deposit_disp": _return_deposit_disp(cand.get("deposit_raw"), cand.get("deposit")),
+              "status": "Завершена", "siblings_before": c.get("siblings_before") or {}}
+    log.info(f"  → ПРИЁМ {bike}: карточка закрытия (дело {c['case_id']}) во Входящие через хранилище")
+    await _rc_request_card(context, st, "close", c["case_id"], c.get("ver"), _rc_card_text("close", target), target)
+    return True
+
+
+def _rc_readback(bridge, st, exp_id, target, written_at):
+    """Чтение назад строки CRM после красного шага (CrmReadback) → on_readback; «неизвестно» не пишется — его
+    перечитает такт (pending_checks), без повтора записи (I15). Цель без booking_id и строки — читать нечего:
+    ожидание остаётся человеку (stuck())."""
+    t = dict(target or {})
+    if not str(t.get("booking_id") or "").strip() and t.get("row") is None:
+        return None
+    try:
+        import rental_case_adapters as A   # лениво (К4-C34)
+        src = A.RentalSource(lambda: bridge._call("clients", filter="all"), source_name=A.CLIENTS_SOURCE,
+                             clock=_time.time)
+        want = {"booking_id": t.get("booking_id"), "row": t.get("row"), "status": t.get("status"),
+                "siblings_before": t.get("siblings_before") or {}}
+        rs = A.CrmReadback(src).row_status(target=want)
+        outcome = rs.get("outcome")
+        if outcome not in ("landed", "absent"):
+            log.info(f"  📁 дело аренды: чтение назад {exp_id}: {outcome} — перечитает такт")
+            return outcome
+        ra = rs.get("read_at")
+        ev = {"kind": "readback", "ref": f"строка {rs.get('row') or t.get('row') or '?'}", "source": "crm",
+              "written_at": written_at, "read_at": ra, "observed_at": rs.get("observed_at"), "outcome": outcome,
+              "expected": t.get("status"), "got": rs.get("status"), "row": rs.get("row"),
+              "siblings": rs.get("siblings") or []}
+        o = st.on_readback(exp_id, evidence=ev, by=_RC_BY,
+                           idem_key=f"on_readback:{exp_id}:{outcome}:{int(float(ra or 0) * 1000)}")
+        log.info(f"  📁 дело аренды: чтение назад {exp_id}: {outcome} → {o.get('code')} {o.get('reason') or ''}")
+        return outcome
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: чтение назад {exp_id} не прошло ({type(e).__name__}: {e})")
+        return None
+
+
+async def _rc_tick(context, bridge):
+    """Такт К4 Splinter (каждое сообщение «Входящих» при RENTAL_CASE_APPROVALS): публикация планов карточек и
+    confirm_link; pending_checks(role="splinter") → чтение назад (после recover() — тоже здесь, CONTRACT §5)."""
+    st = _rc_store()
+    if st is None:
+        return
+    await _rc_publish(context, st)
+    try:
+        items = st.pending_checks(role="splinter")
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: pending_checks не прочитан ({type(e).__name__})")
+        return
+    for p in items or []:
+        if p.get("what") == "readback":
+            _rc_readback(bridge, st, p.get("exp_id"), p.get("target") or {}, p.get("written_at"))
+
+
+def _rc_exp_info(st, case_id, exp_id):
+    """Вид/действие/тема ожидания для слов ответа: у дела — case_view (только чтение); без дела бывает лишь карточка
+    брони (CONTRACT §5.4)."""
+    if not case_id:
+        return {"kind": "approval", "action": "booking", "subject": {}}
+    try:
+        for e in (st.case_view(case_id) or {}).get("expectations") or []:
+            if e.get("exp_id") == exp_id:
+                return e
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: case_view {case_id} не прочитан ({type(e).__name__})")
+    return {}
+
+
+def _rc_red(bridge, call):
+    """Красный шаг под токен-замком 4.2 — та же форма, что у прежних веток. → (ответ, исключение | None)."""
+    try:
+        ticket = (bridge.issue_write_ticket() or {}).get("ticket")
+        with bridge_client.agent_write(ticket):
+            return call(), None
+    except Exception as e:
+        return {"ok": False, "error": "exception", "message": str(e)}, e
+
+
+async def _rc_execute(msg, context, bridge, st, out, text):
+    """«Да» с execute=True (accepted ∧ yes ∧ переход этим вызовом, I28): claim_execution (CAS версии дела против
+    версии карточки; conflict → моста не зовём) → красный шаг → mark_written → чтение назад."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    data = out.get("data") or {}
+    rb = data.get("readback_exp_id")
+    case_id, ver = out.get("case_id"), out.get("ver")
+
+    async def say(t):
+        await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + t, bilingual=False, message_thread_id=tid)
+
+    try:
+        co = st.claim_execution(rb, by=_RC_BY, idem_key=f"claim_execution:{rb}:1", expect_row_ver=1,
+                                expect_ver=ver if case_id else None)
+    except Exception as e:
+        co = {"code": "error", "reason": type(e).__name__}
+    if co.get("code") != "ok":
+        log.warning(f"  📁 дело аренды: claim_execution {rb} → {co.get('code')} {co.get('reason') or ''} — мост не зову")
+        await say("❌ Не исполняю: " + ("дело изменилось после карточки — нужна новая карточка."
+                                       if co.get("code") == "conflict" else
+                                       f"исполнение не захвачено ({co.get('code')}). Статус в CRM не менял."))
+        return
+    tgt = (co.get("data") or {}).get("target") or {}
+    action = tgt.get("action")
+    who = msg.from_user.username if msg.from_user else "?"
+
+    def written(result):
+        try:
+            m = st.mark_written(rb, result=result, by=_RC_BY, idem_key=f"mark_written:{rb}:2", expect_row_ver=2)
+            log.info(f"  📁 дело аренды: mark_written {rb} {sorted(result)} → {m.get('code')}")
+        except Exception as e:
+            log.warning(f"  📁 дело аренды: mark_written {rb} не прошёл ({type(e).__name__}: {e})")
+
+    if action == "booking":
+        d = _INTAKE_DRAFTS.get(chat_id)
+        if not d or d.get("rc_card_ref") != tgt.get("card"):
+            written({"error": "draft_mismatch"})
+            await say("❌ Не исполняю: черновик этой карточки уже сменился — пришли карточку заново.")
+            return
+        d["status"] = "approved"
+        res, exc = _rc_red(bridge, lambda: bridge.create_booking(**_intake_booking_fields(d)))
+        if res.get("ok"):
+            d["status"] = "booked"
+            _row = res.get("row")
+            written({"ok": True, "row": _row, "written_at": _time.time()})
+            _bid = res.get("booking_id")
+            _pl = plateFromName_(res.get("bike") or d.get("model") or "")
+            if _bid and _pl:
+                _RECENT_BOOKINGS[_pl] = {"booking_id": str(_bid), "row": _row, "ts": _time.time()}
+            log.info(f"  🆕 INTAKE: бронь записана через дело аренды (строка {_row}, @{who}) {d.get('model')}")
+            await say(f"✅ Бронь записана, строка {_row}, статус «Бронь».")
+            if _rc_cases_on():
+                _rc_case_after_booking(bridge, res, data.get("exp_id"))
+            _rc_readback(bridge, st, rb, {"booking_id": _bid, "row": _row, "status": "Бронь"}, _time.time())
+        elif exc is not None:
+            written({"unknown": type(exc).__name__})
+            await say(f"⚠️ Исход записи брони неизвестен ({type(exc).__name__}) — проверь CRM; повтор не делаю.")
+        elif res.get("error") == "duplicate":
+            written({"error": "duplicate"})
+            await say(f"⚠️ Уже есть такая бронь (строка {res.get('row')}).")
+        else:
+            written({"error": str(res.get("error") or "?")})
+            await say(f"❌ Не записалось: {res.get('error') or '?'}. {res.get('message') or ''}")
+        return
+
+    if action == "activate":
+        res, exc = _rc_red(bridge, lambda: bridge.activate_booking(bike=tgt.get("bike"), name=tgt.get("name"),
+                                                                   date_start=(tgt.get("date_start") or None)))
+        if res.get("ok"):
+            _row = res.get("row") or tgt.get("row")
+            written({"ok": True, "row": _row, "written_at": _time.time()})
+            log.info(f"  → ВЫДАЧА: бронь активирована через дело аренды (строка {_row}, @{who}) {tgt.get('bike')}")
+            await say(f"✅ В аренде, строка {_row}.")
+            _rc_readback(bridge, st, rb, tgt, _time.time())
+        elif exc is not None:
+            written({"unknown": type(exc).__name__})
+            await say(f"⚠️ Исход активации неизвестен ({type(exc).__name__}) — проверь CRM; повтор не делаю.")
+        else:
+            written({"error": str(res.get("error") or "?")})
+            await say(f"❌ Активация не прошла: {res.get('error') or '?'}. {res.get('message') or ''}\n"
+                      f"Статус в CRM не менял — переведи руками.")
+        return
+
+    if action == "close":
+        _m = _re_lang.search(r"\d{2,7}", text.replace(" ", ""))
+        _km = (_m.group(0) if _m else "") or tgt.get("km") or None
+        res, exc = _rc_red(bridge, lambda: bridge.close_booking(bike=tgt.get("bike"), name=tgt.get("name"),
+                                                                date_start=(tgt.get("date_start") or None),
+                                                                km_end=_km, paid_total=tgt.get("paid_total")))
+        err = res.get("error")
+        if res.get("ok"):
+            _row = res.get("row") or tgt.get("row")
+            written({"ok": True, "row": _row, "written_at": _time.time()})
+            log.info(f"  → ПРИЁМ: аренда завершена через дело аренды (строка {_row}, @{who}) {tgt.get('bike')} "
+                     f"km_end={_km or '-'}")
+            await say(f"✅ Завершена, строка {_row}.")
+            _rc_readback(bridge, st, rb, tgt, _time.time())
+        elif exc is not None:
+            written({"unknown": type(exc).__name__})
+            await say(f"⚠️ Исход закрытия неизвестен ({type(exc).__name__}) — проверь CRM; повтор не делаю.")
+        elif err in ("unknown_action", "km_required"):
+            # прежде карточка оставалась живой; ожидание уже answered — даём НОВУЮ карточку того же закрытия
+            written({"error": str(err)})
+            if err == "unknown_action":
+                await say("⏳ Закрытие аренды (closeBooking) ещё не задеплоено на Bridge — требуется решение "
+                          "владельца (деплой Bridge); новая карточка ниже — после деплоя ответь на неё «да».")
+            else:
+                await say("❌ Закрыть не могу: нет пробега на сдаче — без него аренду не закрываем. Ответь "
+                          "«да <цифра пробега>» реплаем на новую карточку ниже — или заверши руками "
+                          "(В аренде→Завершена). Статус в CRM не менял.")
+            again = dict((k, v) for k, v in tgt.items() if k != "card")
+            await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
+        elif err == "odo_unverifiable":
+            written({"error": "odo_unverifiable"})
+            await say(f"❌ Закрыть не могу: одометр строки в CRM пуст/не читается — сверить пробег автоматически "
+                      f"нельзя. Сверь и заверши руками (В аренде→Завершена, строка "
+                      f"{res.get('row') or tgt.get('row') or '?'}). Статус в CRM не менял.")
+        else:
+            written({"error": str(err or "?")})
+            await say(f"❌ Закрытие не прошло: {err or '?'}. {res.get('message') or ''}\n"
+                      f"Статус в CRM не менял — заверши руками.")
+        return
+    written({"error": "unknown_card_action"})
+    log.warning(f"  📁 дело аренды: у карточки {rb} нет действия ({action!r}) — мост не зову")
+
+
+async def _rc_intake_reply(msg, context, bridge, text):
+    """К4 шаг 7 (RENTAL_CASE_APPROVALS): сообщение «Входящих» → Store.on_approval_reply. Адресация — реплай на
+    карточку; без реплая при APPROVAL_REPLY_REQUIRED=UNKNOWN — справка reference_no_reply (не исполняется);
+    одобряющий — по id (APPROVER_IDS); срок — APPROVAL_TTL_S (у карточки брони — граница запуска)."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    low = text.lower()
+    d = _INTAKE_DRAFTS.get(chat_id)
+
+    async def say(t):
+        await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + t, bilingual=False, message_thread_id=tid)
+
+    async def edits():
+        if (d and d.get("status") == "awaiting_approval" and _intake_can_approve(msg)
+                and ("правк" in low or "исправ" in low)):
+            await say("✏️ Принял, жду исправленную карточку.")
+
+    st = _rc_store()
+    if st is None:
+        try:
+            dec = _rc_rules().approval_decision(text, _rc_rules().PARAMS_DEFAULT)
+        except Exception:
+            dec = "unclear"
+        if dec != "unclear" and _intake_can_approve(msg):
+            await say("⚠️ Хранилище дела недоступно (RENTAL_CASE_APPROVALS) — «да/нет» не исполняю. "
+                      "Сделай руками.")
+        else:
+            await edits()
+        return
+    u = getattr(msg, "from_user", None)
+    uid = getattr(u, "id", None)
+    uid = uid if isinstance(uid, int) and not isinstance(uid, bool) else None
+    uname = (getattr(u, "username", None) or "") if u is not None else ""
+    rt = getattr(msg, "reply_to_message", None)
+    rt_id = getattr(rt, "message_id", None) if rt is not None else None
+    dt = getattr(msg, "date", None)
+    try:
+        out = st.on_approval_reply(
+            chat=str(chat_id), msg_id=str(msg.message_id), reply_to=(None if rt_id is None else str(rt_id)),
+            reply_to_is_bot=bool(getattr(getattr(rt, "from_user", None), "is_bot", False)),
+            thread_id=(None if tid is None else str(tid)), author_id=uid, author_username=uname,
+            is_bot=bool(getattr(u, "is_bot", False)), text=text,
+            at=(dt.timestamp() if hasattr(dt, "timestamp") else _time.time()),
+            by={"kind": "human", "id": uid, "name": uname})
+    except Exception as e:
+        log.warning(f"  📁 дело аренды: on_approval_reply не прошёл ({type(e).__name__}: {e})")
+        if _intake_can_approve(msg):
+            await say(f"⚠️ Ответ не разобран хранилищем дела ({type(e).__name__}) — не исполняю. Сделай руками.")
+        return
+    code, data = out.get("code"), out.get("data") or {}
+    verdict = data.get("verdict") or out.get("verdict")
+    log.info(f"  📁 дело аренды: ответ во Входящих → {code} {verdict or out.get('reason') or ''} "
+             f"execute={data.get('execute')}")
+    if code == "rejected":
+        await edits()                         # не ответ карточке: прежняя реакция на «правки» к черновику
+        return
+    if code != "ok":
+        return                                # duplicate / conflict / unknown — ничего не исполняем
+    if verdict == "accepted":
+        if data.get("execute") and data.get("readback_exp_id"):
+            await _rc_execute(msg, context, bridge, st, out, text)
+            return
+        info = _rc_exp_info(st, out.get("case_id"), data.get("exp_id"))
+        dec = data.get("decision")
+        if info.get("kind") == "confirm_link":
+            subj = info.get("subject") or {}
+            decision = "same" if dec == "yes" else ("new" if subj.get("type") == "continuation" else "none")
+            try:
+                dl = st.decide_link(data.get("exp_id"), decision=decision, by={"kind": "human", "id": uid,
+                                                                               "name": uname},
+                                    idem_key=f"link:{data.get('exp_id')}:{decision}", expect_ver=out.get("ver"))
+            except Exception as e:
+                dl = {"code": "error", "reason": type(e).__name__}
+            log.info(f"  📁 дело аренды: decide_link {data.get('exp_id')} {decision} → {dl.get('code')}")
+            await say(f"🔗 Дело аренды: решение «{decision}» "
+                      + ("записано." if dl.get("code") in ("ok", "duplicate") else
+                         f"не записано ({dl.get('code')}: {dl.get('ask') or dl.get('reason') or ''})."))
+            return
+        if dec == "no":
+            action = info.get("action")
+            if action == "booking":
+                if d:
+                    d["status"] = "rejected"
+                await say("❌ Бронь отклонена.")
+            elif action == "activate":
+                await say("❌ Активацию отменил — статус в CRM не менял.")
+            elif action == "close":
+                await say("❌ Закрытие отменил — статус в CRM не менял.")
+        return
+    if verdict == "reference_no_reply":
+        await say("ℹ️ «да/нет» засчитываю только ОТВЕТОМ (реплаем) на карточку — ответь на неё. Ничего не исполнил.")
+    elif verdict == "reference_late":
+        await say("⏳ Карточка устарела (срок ответа истёк) — не исполняю. Повтори выдачу/приём — придёт новая.")
+    elif verdict == "reference_restart":
+        await say("⏳ Карточка брони из прошлого запуска — не исполняю. Пришли карточку брони заново.")
+    elif verdict == "reference_unclear":
+        await edits()
+
+
 # ===================== ЛИСТ ЗАКРЫТИЯ =====================
 # Ручные поля команды «закрытие <байк> поле=значение»: рус-ключ → колонка листа.
 _CLOSING_FIELDS = {"топливо": "fuel_level", "доплата_дни": "surcharge_days",
@@ -8710,9 +9403,18 @@ def _date_start_key(c):
     return _dt.datetime.min
 
 
-def _closing_resolve_booking(bridge, bike):
+def _closing_resolve_booking(bridge, bike, purpose="return"):
     """Активная бронь/аренда (Бронь/В аренде) по байку → (booking_id, name, date_end).
-    При нескольких кандидатах — свежайшая date_start. Нет → (None, '', '')."""
+    При нескольких кандидатах — свежайшая date_start. Нет → (None, '', '').
+    К4 шаг 5 (RENTAL_CASE_PICK): аренда по цели `purpose` (return — лист закрытия на возврате, handover — вкладка
+    состояния на выдаче) через rental_case_rules.pick; не однозначно → (None, '', '') — прежний путь «не найдена».
+    При OFF `purpose` не читается."""
+    if _rc_on("RENTAL_CASE_PICK"):
+        pk = _rc_pick(bridge, bike, purpose)
+        r = pk.get("row") if pk.get("code") == "found" else None
+        if r is None:
+            return (None, "", "")
+        return (r.get("booking_id") or None, r.get("name") or "", r.get("date_end") or "")
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -8730,7 +9432,20 @@ def _closing_resolve_booking(bridge, bike):
 def _handover_resolve_activation(bridge, bike):
     """O3-3a: кандидат на активацию при выдаче. Последняя строка CRM по байку со статусом
     Бронь/В аренде → dict {row, name, date_start, date_end, status} или None (брони нет).
-    status=="в аренде" → активировать нечего (уже активна) — решает вызыватель."""
+    status=="в аренде" → активировать нечего (уже активна) — решает вызыватель.
+    К4 шаг 5 (RENTAL_CASE_PICK): pick(handover) — «бронь» со стартом в день выдачи; не однозначно →
+    {"rc_unknown": True, "ask", "reason"} (вызыватель: прежний ⚠️ с конкретным вопросом)."""
+    if _rc_on("RENTAL_CASE_PICK"):
+        pk = _rc_pick(bridge, bike, "handover")
+        if pk.get("code") == "error":
+            return None
+        if pk.get("code") != "found":
+            return {"rc_unknown": True, "ask": pk.get("ask") or "", "reason": pk.get("reason") or "", "row": None}
+        r = pk.get("row") or {}
+        return {"row": r.get("row"), "name": r.get("name") or "",
+                "date_start": str(r.get("date_start") or ""),
+                "date_end": str(r.get("date_end") or ""),
+                "status": str(r.get("status", "")).strip().lower()}
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -8754,6 +9469,13 @@ async def _handover_activation_card(context, bridge, bike):
     красным шагом 4.2 в _handle_intake. Брони нет → ⚠️ «активируй руками» (handover не падает)."""
     cand = _handover_resolve_activation(bridge, bike)
     now = _time.time()
+    if cand is not None and cand.get("rc_unknown"):
+        # К4 шаг 5 (RENTAL_CASE_PICK): бронь не выбрана однозначно — прежний путь ⚠️ «руками», с конкретным вопросом
+        log.info(f"  → ВЫДАЧА {bike}: бронь не выбрана ({cand.get('reason')}) — ⚠️ с вопросом, активация руками")
+        await _rc_warn(context, _HO_ACT_WARN_TS, bike, _HO_ACT_WARN_COOLDOWN,
+                       f"🐀 Splinter\n⚠️ ВЫДАЧА {bike}: {cand.get('ask') or 'бронь не выбрана однозначно'} — "
+                       f"активируй руками (Бронь→В аренде).")
+        return
     if cand is None:
         # анти-спам: повторные handover-фразы по тому же байку не дублируют ⚠️ чаще кулдауна
         if now - _HO_ACT_WARN_TS.get(bike, 0) < _HO_ACT_WARN_COOLDOWN:
@@ -8767,6 +9489,8 @@ async def _handover_activation_card(context, bridge, bike):
     if cand.get("status") == "в аренде":
         log.info(f"  → ВЫДАЧА {bike}: строка {cand.get('row')} уже «В аренде» — активация не нужна")
         return
+    if _rc_cases_on() and await _rc_activation_card(context, bridge, bike, cand):
+        return   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
     prev = _HANDOVER_ACTIVATIONS.get(INTAKE_CHAT)
     if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
             and now - prev.get("ts", 0) <= _HO_ACT_TTL):
@@ -8787,7 +9511,21 @@ async def _handover_activation_card(context, bridge, bike):
 def _return_resolve_close(bridge, bike):
     """O3-3b фаза II: кандидат на закрытие при возврате. Строго «В аренде» по байку;
     при нескольких — свежайшая date_start; закрытые/архивные исключены.
-    Нет → None (вызыватель пошлёт ⚠️ «активной аренды не нашёл, закрой руками»)."""
+    Нет → None (вызыватель пошлёт ⚠️ «активной аренды не нашёл, закрой руками»).
+    К4 шаг 5 (RENTAL_CASE_PICK): pick(return) — ВСЕ «в аренде» номера со стартом не позже дня момента, больше
+    одной → {"rc_unknown": True, "ask", "reason"} вместо свежайшей date_start (DESIGN §3.3)."""
+    if _rc_on("RENTAL_CASE_PICK"):
+        pk = _rc_pick(bridge, bike, "return")
+        if pk.get("code") == "error":
+            return None
+        if pk.get("code") != "found":
+            return {"rc_unknown": True, "ask": pk.get("ask") or "", "reason": pk.get("reason") or "", "row": None}
+        r = pk.get("row") or {}
+        return {"row": r.get("row"), "name": r.get("name") or "",
+                "date_start": str(r.get("date_start") or ""),
+                "status": str(r.get("status", "")).strip().lower(),
+                "deposit_raw": r.get("deposit_raw"),
+                "deposit": r.get("deposit")}
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -8838,6 +9576,13 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None):
     total_due — итог листа закрытия (в K уйдёт ТОЛЬКО числовой > 0)."""
     cand = _return_resolve_close(bridge, bike)
     now = _time.time()
+    if cand is not None and cand.get("rc_unknown"):
+        # К4 шаг 5 (RENTAL_CASE_PICK): аренда не выбрана однозначно — прежний путь ⚠️ «руками», с конкретным вопросом
+        log.info(f"  → ПРИЁМ {bike}: аренда не выбрана ({cand.get('reason')}) — ⚠️ с вопросом, закрытие руками")
+        await _rc_warn(context, _RET_CLOSE_WARN_TS, bike, _RET_CLOSE_WARN_COOLDOWN,
+                       f"🐀 Splinter\n⚠️ ПРИЁМ {bike}: {cand.get('ask') or 'аренда не выбрана однозначно'} — "
+                       f"заверши руками (В аренде→Завершена).")
+        return
     if cand is None:
         # анти-спам: повторные return-фразы по тому же байку не дублируют ⚠️ чаще кулдауна
         if now - _RET_CLOSE_WARN_TS.get(bike, 0) < _RET_CLOSE_WARN_COOLDOWN:
@@ -8848,6 +9593,16 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None):
                     text=f"🐀 Splinter\n⚠️ ПРИЁМ {bike}: активной аренды в CRM не нашёл — "
                          f"заверши руками (В аренде→Завершена).")
         return
+    if _rc_cases_on():
+        _p = None   # итог закрытия — тем же правилом, что ниже (в K только числовой > 0)
+        try:
+            _t = float(total_due)
+            if _t > 0:
+                _p = _t
+        except (TypeError, ValueError):
+            pass
+        if await _rc_close_card(context, bridge, bike, cand, km, _p):
+            return   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
     prev = _RETURN_CLOSES.get(INTAKE_CHAT)
     if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
             and now - prev.get("ts", 0) <= _RET_CLOSE_TTL):
@@ -8883,7 +9638,11 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None):
 
 
 def _closing_crm_debt(bridge, bike):
-    """Долг (CRM I/J) активной брони байка для чек-листа. None если не нашли."""
+    """Долг (CRM I/J) активной брони байка для чек-листа. None если не нашли.
+    К4 шаг 5 (RENTAL_CASE_PICK): аренда — pick(debt) (все «в аренде» номера; больше одной → None), не cand[-1]."""
+    if _rc_on("RENTAL_CASE_PICK"):
+        pk = _rc_pick(bridge, bike, "debt")
+        return (pk.get("row") or {}).get("debt") if pk.get("code") == "found" else None
     try:
         rows = bridge._call("clients", filter="all").get("data", {}).get("clients", [])
         want = plateFromName_(bike)
@@ -11081,7 +11840,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
     # (идемпотентно, без гейта на смену статуса). guard: пустой bike → пропуск + лог (не пишем мусор).
     if _ho_ctx and bike:
         try:
-            _bid, _bname, _bend = _closing_resolve_booking(bridge, bike)
+            _bid, _bname, _bend = _closing_resolve_booking(bridge, bike, purpose="handover")   # purpose — К4, при OFF не читается
             _bk = (bridge.find_bike(bike) or {}).get("name") or bike   # каноничное имя = ключ вкладки
             bridge.state_set(bike=_bk, status="в аренде", client=_bname,
                              date_due=_bend, booking_id=(_bid or ""),
@@ -11522,6 +12281,28 @@ def _intake_passport_line(d) -> str:
     return "⚠️ Паспорт НЕ распознан — проверьте фото\n"
 
 
+def _intake_booking_fields(d):
+    """Поля create_booking из распарсенной карточки — прежняя сборка ветки «да» (3) _handle_intake, вынесена без
+    изменений, чтобы путь К4 (шаг 7) звал мост теми же полями."""
+    dep_type = d.get("deposit_type")
+    if dep_type == "паспорт":
+        deposit = "passport"
+    elif dep_type == "деньги":
+        deposit = _deposit_for_model(d.get("model"))   # сумма по модели (число) или None
+    else:
+        deposit = None
+    note_bits = []
+    if d.get("experience"):    note_bits.append("опыт: " + str(d["experience"]))
+    if d.get("delivery_name"): note_bits.append("доставка: " + str(d["delivery_name"]))
+    if d.get("term"):          note_bits.append("срок: " + str(d["term"]))
+    return dict(
+        bike=d.get("model"), name=(d.get("client") or "—"),
+        date_start=d.get("date_start"), date_end=d.get("date_end"),
+        deposit=deposit, helmets=d.get("helmets"),
+        contacts=d.get("contacts"), note=(" | ".join(note_bits) or None),
+    )
+
+
 async def _intake_finalize(draft, msg, context, bridge):
     """Ре-валидация пакета → если неполный, сказать чего не хватает; если полный — резюме+approve."""
     chat_id = msg.chat_id
@@ -11537,8 +12318,35 @@ async def _intake_finalize(draft, msg, context, bridge):
     avail = _intake_availability(bridge, draft.get("model"),
                                  draft.get("date_start_iso"), draft.get("date_end_iso"))
     draft["status"] = "awaiting_approval"
+    if _rc_on("RENTAL_CASE_APPROVALS"):
+        # К4 шаг 7: карточка брони — ожидание approval/booking в хранилище (без дела; дело — после create_booking)
+        await _rc_booking_card(draft, msg, context, _intake_summary(draft, avail, deliv))
+        return
     await _send(context, chat_id=chat_id, text=_intake_summary(draft, avail, deliv),
                 bilingual=False, message_thread_id=tid)
+
+
+async def _rc_booking_card(draft, msg, context, summary):
+    """К4 шаг 7: request_approval(None, action=booking) + публикация. Прежняя ждущая карточка брони чата → superseded
+    (как перезапись `_INTAKE_DRAFTS[chat_id]`). Хранилища нет → карточка с предупреждением: «да» не исполнится."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    st = _rc_store()
+    if st is None:
+        await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                    text=summary + "\n⚠️ Хранилище дела недоступно (RENTAL_CASE_APPROVALS) — «да» на эту карточку "
+                                   "не исполню; бронь заведи руками.")
+        return
+    target = {"action": "booking", "chat": str(chat_id), "model": draft.get("model"), "client": draft.get("client"),
+              "date_start": draft.get("date_start"), "status": "Бронь"}
+    r = await _rc_request_card(context, st, "booking", None, None, summary + _RC_REPLY_HINT, target,
+                               chat=chat_id, thread=tid)
+    if r:
+        draft["rc_exp_id"], draft["rc_card_ref"] = r
+    else:
+        await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                    text=summary + "\n⚠️ Карточку не удалось завести в хранилище дела — «да» не исполню; "
+                                   "бронь заведи руками.")
 
 
 async def _intake_passport_ocr(photo_msg, chat_id, context, bridge):
@@ -11599,6 +12407,8 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
         photo_msgs = [msg] if msg.photo else []
     has_photo = bool(photo_msgs)
     now = _time.time()
+    if _rc_on("RENTAL_CASE_APPROVALS"):
+        await _rc_tick(context, bridge)   # К4 шаг 7: такт — публикация планов карточек, чтение назад (pending_checks)
 
     # 1) Фото паспорта отдельным сообщением → OCR (B2) + связать с карточкой (окно 5 мин, обе стороны)
     if has_photo and not _intake_is_card(text):
@@ -11678,6 +12488,12 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
         await _intake_finalize(draft, msg, context, bridge)
         return
 
+    # К4 шаг 7 (RENTAL_CASE_APPROVALS): «да/нет» на карточки брони/выдачи/приёма — ожидания хранилища дела
+    # (реплай → карточка; слова §6.6; одобряющий по id; срок APPROVAL_TTL_S). Ветки 3–5 в памяти при флаге не идут.
+    if _rc_on("RENTAL_CASE_APPROVALS"):
+        await _rc_intake_reply(msg, context, bridge, text)
+        return
+
     # 3) approve / нет / правки — только от авторизатора и только по карточке в ожидании
     d = _INTAKE_DRAFTS.get(chat_id)
     if d and d.get("status") == "awaiting_approval" and _intake_can_approve(msg):
@@ -11687,23 +12503,7 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             d["status"] = "approved"
             _who = msg.from_user.username if msg.from_user else "?"
             # --- собрать поля брони из распарсенной карточки ---
-            dep_type = d.get("deposit_type")
-            if dep_type == "паспорт":
-                deposit = "passport"
-            elif dep_type == "деньги":
-                deposit = _deposit_for_model(d.get("model"))   # сумма по модели (число) или None
-            else:
-                deposit = None
-            note_bits = []
-            if d.get("experience"):    note_bits.append("опыт: " + str(d["experience"]))
-            if d.get("delivery_name"): note_bits.append("доставка: " + str(d["delivery_name"]))
-            if d.get("term"):          note_bits.append("срок: " + str(d["term"]))
-            booking_fields = dict(
-                bike=d.get("model"), name=(d.get("client") or "—"),
-                date_start=d.get("date_start"), date_end=d.get("date_end"),
-                deposit=deposit, helmets=d.get("helmets"),
-                contacts=d.get("contacts"), note=(" | ".join(note_bits) or None),
-            )
+            booking_fields = _intake_booking_fields(d)
             # --- КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write → create_booking) ---
             try:
                 ticket = (bridge.issue_write_ticket() or {}).get("ticket")
@@ -11724,6 +12524,8 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                 await _send(context, chat_id=chat_id,
                             text=f"🐀 Splinter\n✅ Бронь записана, строка {_row}, статус «Бронь».",
                             bilingual=False, message_thread_id=tid)
+                if _rc_cases_on():
+                    _rc_case_after_booking(bridge, res)   # К4 шаг 6: дело брони (origin=intake); не бросает
             elif res.get("error") == "duplicate":
                 _row = res.get("row")
                 await _send(context, chat_id=chat_id,
