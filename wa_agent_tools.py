@@ -1128,6 +1128,15 @@ _MODEL_BEFORE = re.compile(r"[A-Za-z]{2,}\s*$")
 # бронь», «Got it» в начале предложения ДО итога) и условие («если вы уже оплатили», «после поступления оплаты»)
 # получением не считаются (`_DUE_NOPAY`; подтверждение с денежным словом дальше в предложении — считается). В
 # предложении самого итога слово получения запирает, как прежде. 8+ цифр запирают по-прежнему в любом предложении.
+# USEFUL1310 A3 (находки F1/F2/F4 проверяющего X2, решение интегратора К3): (F1) прощение подтверждения сообщения или
+# брони и «Got it» (`_DUE_NOPAY`, группы `ack`/`hi`) недействительно, если само подтверждение несёт документ или деньги
+# в ЛЮБОМ месте своего предложения (`_DUE_PROOF`: чек, квитанция, slip, receipt, скриншот, перевод, оплата, деньги…:
+# «Получили ваше сообщение с чеком», «Got it, thanks for the slip») или СЛЕДУЮЩЕЕ за ним предложение эллиптически
+# продолжает его деньгами (`_DUE_ALSO`: денежное существительное при «тоже/также/too/as well» или в начале предложения
+# после «и/а/and/plus»: «Деньги тоже», «And the transfer too»); денежное слово в ином предложении черновика («You can
+# pay by transfer») прощения не снимает. (F2) время и дата в окне реквизитов слотом слова не считаются — окно их
+# перешагивает («на карту до 15.10 по номеру 1234567» — номер берётся). (F4) «all paid / paid in full / fully paid» —
+# слова получения (`_DUE_GOT`); «оплачено полностью» покрыто прежним `оплачен\w*`.
 _DUE_SAY = re.compile(r"к\s+оплат|оплатить|итог|всего|стоимост|сумм\w*\s+(?:к\s+оплат|аренд|за)|за\s+аренд|выйдет|"
                       r"выходит|составит|составляет|\btotal\b|to\s+pay|\bowe\b|\bcost|\bprice|"
                       r"for\s+(?:the|your)\s+rent", re.I)
@@ -1135,20 +1144,32 @@ _DUE_CLOCK = (r"(?:(?:[01]?\d|2[0-3])[:.][0-5]\d|(?:0?[1-9]|[12]\d|3[01])[./](?:
               r"(?!\w|[.:/]\d)")
 _DUE_GOT = (r"получил\w*|получен\w*|поступил\w*|поступлени\w*|зачислен\w*|пришл[аио]|пришёл|пришел|дошл[аио]|"
             r"дошёл|дошел|оплатил\w*|оплачен\w*|вижу|видим|received|arrived|came\s+through|got\s+(?:it|your)|"
-            r"(?:is|are)\s+with\s+us|(?:been|already)\s+paid|you'?ve\s+paid|credited")
+            r"(?:is|are)\s+with\s+us|(?:been|already)\s+paid|you'?ve\s+paid|credited|"
+            r"all\s+paid|paid\s+in\s+full|fully\s+paid")
 _DUE_CASH = r"оплат|плат[её]ж|деньг|денег|перевод|payment|money|transfer|funds"
+_DUE_DOC = (r"(?<!\w)чек(?:а|у|ом|е|и|ов|ами|ах)?(?![\w-])|квитанц|(?<!\w)slips?(?!\w)|(?<!\w)receipts?(?!\w)|"
+            r"(?<!\w)скрин|screenshot")
+_DUE_MONEY_N = (r"(?<!\w)(?:(?:пред)?оплат(?:а|у|ы|е|ой)|плат[её]ж\w*|деньг\w*|денег|перевод(?:а|у|ом|е|ы|ов)?|"
+                r"payments?|money|transfers?|funds|чек(?:а|у|ом|е|и|ов)?|квитанци\w*|slips?|receipts?|скрин\w*|"
+                r"screenshots?)(?![\w-])")
+_DUE_SEP = r"[^\w\n]+(?:" + _DUE_CLOCK + r"[^\w\n]+)*"
 _DUE_NOT = re.compile(
     r"\d(?:[\s\-–]?\d){7,}"
     r"|(?<!\w)(?:сч[её]т|account|promptpay|prompt\s*pay|промпт\s*пей|промптпей|iban|swift|карт[аеуы]|card)\w*"
-    r"(?:[^\w\n]+(?:[^\W\d_]+|" + _DUE_CLOCK + r")){0,3}[^\w\n]+(?!" + _DUE_CLOCK + r")(?P<id>[\w-]*\d[\w-]*)"
+    r"(?:" + _DUE_SEP + r"[^\W\d_]+){0,3}" + _DUE_SEP + r"(?!" + _DUE_CLOCK + r")(?P<id>[\w-]*\d[\w-]*)"
     r"|(?<!\w)(?P<got>" + _DUE_GOT + r")(?!\w)", re.I)
 _DUE_NOPAY = re.compile(
     r"(?<!\w)при\s+получени\w*|(?<!\w)получени\w*\s+(?:байк|мотоцикл|скутер|мопед|ключ)\w*"
-    r"|^\W*(?:ok(?:ay)?\W+)?(?P<hi>got\s+it)(?!\w)(?![^\n]*(?:" + _DUE_CASH + r"))"
-    r"|(?<!\w)(?:получил\w*|получен\w*|received|got|вижу|видим)\s+(?:(?:ваш\w*|твой|твою|твоё|твои|your|the)\s+)?"
-    r"(?:вопрос|сообщени|запрос|брон|message|question|request|booking|reservation)\w*(?![^\n]*(?:" + _DUE_CASH + r"))"
+    r"|^\W*(?:ok(?:ay)?\W+)?(?P<hi>got\s+it)(?!\w)"
+    r"|(?<!\w)(?P<ack>(?:получил\w*|получен\w*|received|got|вижу|видим)\s+"
+    r"(?:(?:ваш\w*|твой|твою|твоё|твои|your|the)\s+)?"
+    r"(?:вопрос|сообщени|запрос|брон|message|question|request|booking|reservation)\w*)"
     r"|(?<!\w)(?:если|if)\s+(?:[^\W\d_]+\s+){0,3}?(?:" + _DUE_GOT + r")(?!\w)"
     r"|(?<!\w)(?:после|по)\s+(?:поступлени|получени|зачислени)\w*", re.I)
+_DUE_PROOF = re.compile(_DUE_CASH + r"|" + _DUE_DOC, re.I)
+_DUE_ALSO = re.compile(
+    _DUE_MONEY_N + r"[\s,]+(?:тоже|также|too|as\s+well)(?!\w)"
+    r"|^\W*(?:и|а|and|plus|а\s+также|as\s+well\s+as)\s+(?:(?:the|your|our|ваш\w*|наш\w*)\s+)?" + _DUE_MONEY_N, re.I)
 
 
 def _due_vals(sent):
@@ -1161,12 +1182,22 @@ def _due_vals(sent):
     return vals
 
 
-def _due_req(sent, due, near=False, ahead=False):
+def _due_req(sent, due, near=False, ahead=False, tied=False):
     """В предложении есть реквизиты или получение денег (`_DUE_NOT`). Номер, равный самому итогу, реквизитом не
     считается; время и дата номером не являются вовсе (`_DUE_CLOCK` в `_DUE_NOT`). `near` — предложение судится как
     СОСЕДНЕЕ итогу: слово получения, которое покрывает `_DUE_NOPAY` (передача байка, подтверждение сообщения или брони,
-    условие), получением денег не считается; «Got it» в начале предложения — только когда оно стоит ДО итога (`ahead`)."""
-    nopay = [m.span() for m in _DUE_NOPAY.finditer(sent) if ahead or m.group("hi") is None] if near else []
+    условие), получением денег не считается; «Got it» в начале предложения — только когда оно стоит ДО итога (`ahead`).
+    A3 (F1): подтверждение сообщения или брони и «Got it» не прощаются, если предложение несёт документ или деньги
+    (`_DUE_PROOF`) или следующее предложение эллиптически продолжает его деньгами (`tied`, `_DUE_ALSO`)."""
+    nopay = []
+    if near:
+        for m in _DUE_NOPAY.finditer(sent):
+            ack = m.group("hi") is not None or m.group("ack") is not None
+            if m.group("hi") is not None and not ahead:
+                continue                                  # «Got it» после итога — подтверждение получения
+            if ack and (tied or _DUE_PROOF.search(sent)):
+                continue                                  # A3 (F1): документ/деньги в подтверждении или после
+            nopay.append(m.span())
     for m in _DUE_NOT.finditer(sent):
         num = m.group("id")
         if num is not None and int(re.sub(r"\D", "", num)) == due:
@@ -1196,15 +1227,22 @@ def due_supported(text, due):
     USEFUL1310 A2 (V1 проверяющего, решение интегратора К3): соседнее время или дата при слове «карта»/«счёт» и слово
     получения не денег опору больше не снимают. Цена, оставленная запертой: 8+ цифр подряд (телефон — он бывает номером
     PromptPay, ISO-дата, номер брони или байка) в ЛЮБОМ предложении; слово получения без признака названных трёх
-    классов («Пришло, спасибо.»); «Got it» после итога; слово получения в самом предложении итога (A6)."""
+    классов («Пришло, спасибо.»); «Got it» после итога; слово получения в самом предложении итога (A6).
+    USEFUL1310 A3 (F1/F2/F4 проверяющего X2): подтверждение с документом или деньгами в своём предложении и
+    подтверждение, которое следующее предложение продолжает деньгами («Получили ваше сообщение. Деньги тоже.»), снова
+    запирают; время и дата не занимают слот окна реквизитов; «all paid / paid in full / fully paid» — слова
+    получения."""
     s = str(text or "")
     if due is None or due in pay_claimed(s, sums=(due,)):
         return False
     sents = K._SENTENCE.split(s)
     vals = [_due_vals(x) for x in sents]
     first = next((i for i, v in enumerate(vals) if due in v), len(sents))
+    full = [i for i, x in enumerate(sents) if x.strip()]
+    nxt = {a: b for a, b in zip(full, full[1:])}    # A3: следующее непустое предложение
     for i, sent in enumerate(sents):                # A1: реквизиты/получение денег в ЛЮБОМ предложении текста
-        if _due_req(sent, due, near=True, ahead=i < first):
+        tied = i in nxt and bool(_DUE_ALSO.search(sents[nxt[i]]))
+        if _due_req(sent, due, near=True, ahead=i < first, tied=tied):
             return False
     for sent, v in zip(sents, vals):
         if due in v and not _due_sentence(sent, due):
