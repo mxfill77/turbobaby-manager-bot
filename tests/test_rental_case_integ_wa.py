@@ -88,18 +88,18 @@ TTMP = os.environ.get("K4_TTMP") or tempfile.gettempdir()
 PROBE_ARG = "--probe-off-imports"
 PROBE_MARK = "K4_OFF_MODULES "
 
-# Блобы базы — по ним голден «флаг выкл = как было». Интеграция К4 на живой M (0a30eb45, дерево cc0ecbb4 = e27ccf4):
-# «было» = M, а не f2f7295 (k4-base 116f0177: wa_agent f787686c — тот же в M; wa_agent_model 37984e6e, wa_agent_tools
-# d285f2b4, блок инструментов c6dba799/7a19b4b7 — до K3-FIX). Значения ниже — блобы e27ccf4 и sha его TOOLS_BLOCK.
+# Блобы базы — по ним голден «флаг выкл = как было». Основа слияния — 306350b (M + TGGREET e57313b, TGHEAD 9207720,
+# P1 99e4ce3, TGSEND 7323cfa/1ddf5da/9fb6972, MIRROR88 a0258bb, TGFRESH 306350b); wa_agent изменён TGGREET и TGSEND;
+# model/tools — те же, что на M.
 BASE_BLOBS = {
-    "wa_agent": "f787686ce04c57b9bb99348e1bc1a78ec8d2fd34",
+    "wa_agent": "5b3fa1bebb1bad4203611c28dbcc14e97c26976f",
     "wa_agent_model": "bb40440a40f35d0a2d3ba2773ecdf114a1a8e945",
     "wa_agent_tools": "d99dd55e777c01a1886ee829ad2c1f4749d03794",
 }
 BASE_TOOLS = ("history", "rental", "cash", "contract", "contract_pdf", "delivery", "rules")
 BASE_TOOLS_BLOCK_SHA = "175b220824b649ce151ae7f463ac864166265b26e9ccd13d42032a93d850d3d1"
 BASE_TOOLS_BLOCK8_SHA = "eb159874fd54433fdac8f637bd7ea24a7fcc32f2db761d117eb97ad0f2e664ad"
-SKIP_WORDS = "ПРОПУЩЕНО: базовый блоб f2f7295 не прочитан git (%s) — голден не сверен, это НЕ зелёное"
+SKIP_WORDS = "ПРОПУЩЕНО: блоб основы слияния не прочитан git (%s) — голден не сверен, это НЕ зелёное"
 
 NUMBER = "66812345678"
 OWNER = 504608015                                  # OWNER_IDS по умолчанию (rental_case_rules.OWNER_IDS)
@@ -150,7 +150,7 @@ def base_module(name):
         return _BASE[name]
     mod = types.ModuleType(name + "_k4base")
     mod.__file__ = os.path.join(ROOT, name + ".py")
-    exec(compile(src, "f2f7295:%s.py" % name, "exec"), mod.__dict__)
+    exec(compile(src, "base:%s.py" % name, "exec"), mod.__dict__)
     _BASE[name] = (mod, "")
     return _BASE[name]
 
@@ -476,7 +476,7 @@ def core_story(mod, case=None):
 
 
 class TestFlagOff(unittest.TestCase):
-    """Флаг WA_AGENT_CASE выкл: инструменты, промпт, двери, черновик, ядро и база — как в кандидате f2f7295."""
+    """Флаг WA_AGENT_CASE выкл: инструменты, промпт, двери, черновик, ядро и база — как на основе слияния."""
 
     def test_tools_block_and_names_pinned(self):
         self.assertEqual(T.TOOLS, BASE_TOOLS, "состав инструментов сменился без флага")
