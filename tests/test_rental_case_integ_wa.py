@@ -88,13 +88,17 @@ TTMP = os.environ.get("K4_TTMP") or tempfile.gettempdir()
 PROBE_ARG = "--probe-off-imports"
 PROBE_MARK = "K4_OFF_MODULES "
 
-# Блобы базы — по ним голден «флаг выкл = как было». Основа слияния — 306350b (M + TGGREET e57313b, TGHEAD 9207720,
-# P1 99e4ce3, TGSEND 7323cfa/1ddf5da/9fb6972, MIRROR88 a0258bb, TGFRESH 306350b); wa_agent изменён TGGREET и TGSEND;
-# model/tools — те же, что на M.
+# Блобы базы — по ним голден «флаг выкл = как было». Основа слияния — e357f5f + USEFUL1310 (7dc20b5 + fix 64e0748):
+# живой сервер e357f5f = 306350b (M + TGGREET e57313b, TGHEAD 9207720, P1 99e4ce3, TGSEND 7323cfa/1ddf5da/9fb6972,
+# MIRROR88 a0258bb, TGFRESH 306350b) + W15 0b74cc6 + К4 0055eee/e357f5f; W15 модулей wa_agent* не трогает, поэтому основа
+# без К4 = дерево useful-1310-fix 64e0748: wa_agent — прежний (USEFUL1310 его не меняет; TGGREET и TGSEND),
+# model/tools — блобы 64e0748 (часть B USEFUL1310 меняет вывод «флаг выкл»: итог «к оплате», даты периодом).
+# Было (основа 306350b): wa_agent_model bb40440a40f3…, wa_agent_tools d99dd55e777c…. Объекты 40033b71…/050d8b32…
+# достижимы из ветки useful-1310-fix (несёт и bundle переноса); без них — ПРОПУЩЕНО, а не зелёное.
 BASE_BLOBS = {
     "wa_agent": "5b3fa1bebb1bad4203611c28dbcc14e97c26976f",
-    "wa_agent_model": "bb40440a40f35d0a2d3ba2773ecdf114a1a8e945",
-    "wa_agent_tools": "d99dd55e777c01a1886ee829ad2c1f4749d03794",
+    "wa_agent_model": "40033b713d232b0c9e399f7d837c950be7964c2b",
+    "wa_agent_tools": "050d8b32431f7314db6e3dc370b45af30d5a96ad",
 }
 BASE_TOOLS = ("history", "rental", "cash", "contract", "contract_pdf", "delivery", "rules")
 BASE_TOOLS_BLOCK_SHA = "175b220824b649ce151ae7f463ac864166265b26e9ccd13d42032a93d850d3d1"
