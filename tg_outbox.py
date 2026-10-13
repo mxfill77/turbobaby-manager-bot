@@ -11,7 +11,7 @@
 
 ЖИЗНЬ РЯДА (каждый переход — условный UPDATE, решает rowcount; SQLite сериализует пишущих):
     queued ──claim──▶ claimed ──ack──▶ sent | failed | unknown        (исход назвал ПК)
-       └──cancel (дверь в срок, ТОЛЬКО из queued)──▶ cancelled           (ПК ряда не видел)
+       └──cancel (дверь в срок · новая живая строка чата, ТОЛЬКО из queued)──▶ cancelled   (ПК ряда не видел)
   • ЗАБРАТЬ (`claim`) можно только queued и только до `expires_at` — ряд, переживший дверь (служба
     упала посреди ожидания), не уйдёт клиенту никогда: его срок вышел, и следующий `put`/`claim`
     называет его cancelled.
@@ -36,9 +36,10 @@
 сразу, без захвата черновика и без ожидания срока. ПК опрашивает раз в 2.5 с, при «off»/ошибке — не
 реже раза в 10 с, поэтому PC_FRESH = 15 с.
 
-ДОКАЗАННО НЕ УШЛО → ЧЕРНОВИК ЖДЁТ. Отменённый ряд (дверь в срок · срок вышел) и failed с `not_started` —
-клиенту ничего не ушло, причина временная: дверь отвечает not_sent с признаком `retry`, ядро возвращает
-черновик в pending, кнопки живы.
+ДОКАЗАННО НЕ УШЛО → ЧЕРНОВИК ЖДЁТ. Отменённый ряд (дверь в срок · срок вышел · клиент написал или ответили
+с телефона, пока ряд ждал ПК — `cancel_chat`, зовёт вход по строке, ВСТАВЛЕННОЙ этим пушем) и failed с
+`not_started` — клиенту ничего не ушло, причина временная: дверь отвечает not_sent с признаком `retry`, ядро
+возвращает черновик в pending, кнопки живы.
 
 КЛЮЧ ЭХА. Ушедшее сообщение вернётся лентой ПК рядом dir=out, и вход `wa_webhook.tg_row_event`
 положит его в tg_queue.db с ключом `tg:<chat_id>:<msg_id>:out` (`wa_webhook.tg_wamid`). Дверь отдаёт
@@ -295,6 +296,13 @@ class Outbox:
         return self._write(lambda conn: conn.execute(
             "UPDATE tg_out SET state=?, cancel_why=? WHERE token=? AND state=?",
             (CANCELLED, str(why)[:ERROR_MAX], str(token), QUEUED)).rowcount) == 1
+
+    def cancel_chat(self, chat_id, why):
+        """Все queued-ряды чата → cancelled (клиент написал или ответили с телефона, пока дверь ждёт). Забранные ПК
+        не трогаем: они могли уйти. → число отменённых ЭТИМ вызовом."""
+        return self._write(lambda conn: conn.execute(
+            "UPDATE tg_out SET state=?, cancel_why=? WHERE chat_id=? AND state=?",
+            (CANCELLED, str(why)[:ERROR_MAX], int(chat_id), QUEUED)).rowcount)
 
     def give_up(self, token, now=None):
         """Дверь перестала ждать claimed-ряд: больше не выдаётся; исход ПК, если придёт, запишется."""

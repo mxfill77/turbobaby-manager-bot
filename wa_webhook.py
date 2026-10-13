@@ -396,7 +396,7 @@ class WAQueueDB:
                 conn.commit()
         return {"inserted": inserted, "enriched": enriched}
 
-    def enqueue_confirmed(self, events: list, source: str = "") -> set:
+    def enqueue_confirmed(self, events: list, source: str = "", inserted: set = None) -> set:
         """Insert events ALL OR NOTHING → the set of their wamids that exist AFTER the commit.
 
         Written for a door whose answer is a receipt (`/tg-queue/push`, 05.10.2026): there an
@@ -405,6 +405,11 @@ class WAQueueDB:
         RAISED — the caller answers 500 and confirms nothing. Only after the commit succeeded are
         the wamids read back from the table: a row inserted now and a row that was already there
         (a resent batch) are the same answer — «it is on disk». No enrichment of known rows.
+
+        `inserted` (optional set, 13.10.2026 TGFRESH1310): after the commit it receives the wamids
+        THIS call really wrote (the INSERT OR IGNORE changed a row). A row that was already on disk
+        (a resent batch) is NOT in it — the receipt above still names it, the «new row» does not.
+        On any error nothing is added.
 
         Every event must carry a non-empty `wamid`: without it the read-back cannot name the row.
         """
@@ -418,12 +423,15 @@ class WAQueueDB:
             return set()
         now = int(time.time())
         present = set()
+        new = []
         with self._lock:
             conn = self._conn()
             try:
                 try:
                     for ev in events:
                         conn.execute(_INSERT_SQL, _insert_params(ev, now, source))
+                        if conn.execute("SELECT changes()").fetchone()[0]:
+                            new.append(ev["wamid"])
                     conn.commit()
                 except Exception:
                     try:
@@ -440,6 +448,8 @@ class WAQueueDB:
                     present.update(r[0] for r in rows)
             finally:
                 conn.close()
+        if inserted is not None:
+            inserted.update(new)
         return present
 
     def upsert_contacts(self, contacts: list, source: str = "") -> int:
@@ -1193,6 +1203,9 @@ def tg_row_event(row, since: int):
 #   ПК шлёт текст дословно, parse_mode=None, и подтверждает сразу после отправки, до ряда ленты.
 #   Every GET stamps «the PC polled now» into the outbox (`pc_poll`): the agent's door asks it BEFORE queueing —
 #   no poll for PC_FRESH seconds → «ПК не на связи», the draft is not taken and nobody waits 20 s.
+#   A NEW live feed row of chat X at /tg-queue/push (the client wrote, or an echo that is not our send) cancels the
+#   still-queued rows of X (`cancel_chat`); «new» = inserted by THAT request — a resent batch cancels nothing and
+#   its receipt is unchanged; rows the PC already took are left alone.
 # Both doors live exactly when the push door does (secret + switch-on moment); otherwise 404 with the body of an
 # unknown URL. THE ONE SWITCH is the agent's (WA_AGENT_TG_SEND in wa-agent's drop-in): the webhook never reads it
 # and never creates the outbox file — it opens an existing file and trusts the door PULSE the agent writes
@@ -1456,8 +1469,9 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
             seen.add(key)
             keys.append(key)
             events.append(event)
+        fresh = set()                        # wamids THIS request really wrote (a resent batch adds none)
         try:
-            present = self.tg_db.enqueue_confirmed(events, source=TG_SOURCE)
+            present = self.tg_db.enqueue_confirmed(events, source=TG_SOURCE, inserted=fresh)
         except Exception as e:
             log.error("TG push: queue write failed, NOTHING accepted: %s: %s", type(e).__name__, e)
             self._send_json(500, {"ok": False, "error": "push_failed"})
@@ -1465,7 +1479,37 @@ class WAWebhookHandler(BaseHTTPRequestHandler):
         accepted = [[c, m, d] for (c, m, d) in keys if tg_wamid(c, m, d) in present]
         # Counts only — the rows are client correspondence and do not belong in our log.
         log.info("TG push: %d rows, %d accepted, %d malformed", len(rows), len(accepted), bad)
+        self._tg_cancel_on_live(keys, events, fresh)
         self._send_json(200, {"ok": True, "accepted": accepted, "malformed": bad})
+
+    def _tg_cancel_on_live(self, keys, events, fresh):
+        """НОВАЯ живая строка чата X (клиент написал, или эхо НЕ нашей отправки — ответили с телефона), пока дверь
+        ждёт: queued-ряды X отменяются — ответ агента устарел, дверь вернёт черновик ждать. Судит ТОЛЬКО строки,
+        реально вставленные ЭТИМ запросом (`fresh`): повтор уже принятой пачки (пушер переслал её при потерянном
+        ответе) не отменяет ничего, а ответ пачки (`accepted`) от этого не зависит вовсе. Забранные ПК ряды не трогаем.
+        Отправка выключена / файла нет / новых живых строк нет — очередь не открываем. Сбой — строка журнала, приём
+        пачки не страдает."""
+        if not self.tg_outbox_path or not fresh:
+            return
+        try:
+            live = [(c, m, d) for (c, m, d), ev in zip(keys, events)
+                    if not ev.get("history") and c > 0 and tg_wamid(c, m, d) in fresh]
+            if not live:
+                return
+            box = self._tg_box()
+            if box is None:
+                return
+            why = {}
+            for c, m, d in live:
+                if d == "in":
+                    why[c] = "клиент написал ещё — не отправлено"
+                elif c not in why and box.sent_token(c, m) is None:
+                    why[c] = "ответили с телефона — не отправлено"
+            n = sum(box.cancel_chat(c, w) for c, w in why.items())
+            if n:
+                log.info("TG outbox: %d queued rows cancelled — a new live row came in their chat", n)
+        except Exception as e:
+            log.warning("TG outbox: queued rows not checked against live rows: %s: %s", type(e).__name__, e)
 
     # ── PC Telegram send doors (13.10.2026, TGSEND1310) ──────────────────────
     #

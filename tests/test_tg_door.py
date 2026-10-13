@@ -415,7 +415,7 @@ class _FailingDB:
         self.real = real
         self.db_path = real.db_path
 
-    def enqueue_confirmed(self, events, source=""):
+    def enqueue_confirmed(self, events, source="", inserted=None):
         raise sqlite3.OperationalError("disk I/O error (подделка теста)")
 
     def enqueue_stats(self, events, source=""):

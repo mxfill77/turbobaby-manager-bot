@@ -875,6 +875,166 @@ def test_r2_too_long_checked_before_capture():
     assert _st(w)[0] == A.SENT, (_st(w), w.answers())
 
 
+def _feed_row(cid, mid, d, ts, text="x"):
+    return {"chat_id": cid, "msg_id": mid, "dir": d, "ts": ts, "kind": "text", "text": text, "reply_to": None,
+            "sender_id": 1}
+
+
+def _push(h, rows_, batch):
+    st, body = h.req("POST", W.TG_PUSH_PATH, json.dumps({"batch_id": batch, "rows": rows_}).encode())
+    assert st == 200, body
+    return json.loads(body)
+
+
+def test_r2_live_row_cancels_queued_rows_of_that_chat():
+    """П.6 (перенос d767d2c): пока дверь ждёт, клиент написал или ответили с телефона — queued-ряды ЭТОГО чата
+    отменяются (ответ агента устарел); забранный ПК ряд не трогаем; эхо НАШЕЙ отправки и ряд истории — не отменяют;
+    дверь отвечает not_sent с признаком повтора и причиной."""
+    tmp = _tmp()
+    h = Hook(tmp)
+    other = CHAT + 1
+
+    def push(cid, mid, d, ts, text="x"):
+        _push(h, [_feed_row(cid, mid, d, ts, text)], "b%d" % mid)
+    try:
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
+        ob.beat()
+        now = time.time()
+        r3, t3 = ob.put(CHAT, "забранный", 60, now=now)
+        ob.claim(now=now)
+        _, t1 = ob.put(CHAT, "ждёт", 60, now=now)
+        _, t2 = ob.put(other, "другой чат", 60, now=now)
+        push(CHAT, 100, "in", SINCE + 10, "а ещё вопрос")
+        assert ob.get(t1)["state"] == O.CANCELLED and ob.get(t1)["cancel_why"].startswith("клиент написал ещё")
+        assert ob.get(t2)["state"] == O.QUEUED and ob.get(t3)["state"] == O.CLAIMED
+        fin = S.TgDoor(ob, wait=20)._final(ob.get(t1))
+        assert fin == {"outcome": "not_sent", "reason": "клиент написал ещё — не отправлено", "wamid": None,
+                       "retry": True}, fin
+        push(other, 101, "in", SINCE - 10)                                   # история — не живой ряд
+        assert ob.get(t2)["state"] == O.QUEUED
+        ob.ack(r3, t3, O.SENT, msg_id=4242)
+        _, t5 = ob.put(CHAT, "ещё один", 60, now=time.time())
+        push(CHAT, 4242, "out", SINCE + 20, "забранный")                     # эхо НАШЕЙ отправки
+        assert ob.get(t5)["state"] == O.QUEUED and ob.get(t3)["state"] == O.SENT
+        push(other, 9999, "out", SINCE + 30, "ответ с телефона")             # эхо не нашей отправки
+        assert ob.get(t2)["state"] == O.CANCELLED and ob.get(t2)["cancel_why"].startswith("ответили с телефона")
+        assert ob.get(t5)["state"] == O.QUEUED
+    finally:
+        h.stop()
+
+
+def test_r2_resent_batch_cancels_nothing_receipt_unchanged():
+    """R2B-3: пушер ПК повторяет УЖЕ принятую пачку (ответ потерян) — строка уже на диске, этим запросом не вставлена:
+    свежий queued-ряд того же чата НЕ отменяется, ответ пачки (accepted) — тот же, что у первой; вход до нажатия
+    ничего не отменяет. Действительно новая строка того же чата — отменяет."""
+    tmp = _tmp()
+    h = Hook(tmp)
+    try:
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
+        ob.beat()
+        old = _feed_row(CHAT, 100, "in", SINCE + 10, "вопрос, на который агент отвечает")
+        phone_old = _feed_row(CHAT, 9001, "out", SINCE + 11, "давний ответ с телефона")
+        first = _push(h, [old, phone_old], "b1")                            # вход ДО нажатия — отменять нечего
+        assert first == {"ok": True, "accepted": [[CHAT, 100, "in"], [CHAT, 9001, "out"]], "malformed": 0}, first
+        _, tok = ob.put(CHAT, "ответ агента на вопрос 100", 60, now=time.time())   # «Отправить» нажато
+        again = _push(h, [old, phone_old], "b1")                            # та же пачка ещё раз
+        assert again == first, (again, first)
+        assert ob.get(tok)["state"] == O.QUEUED and ob.get(tok)["cancel_why"] is None, ob.get(tok)
+        again2 = _push(h, [phone_old], "b1-tail")                           # повтор хвоста с «чужим» эхом
+        assert again2["accepted"] == [[CHAT, 9001, "out"]] and ob.get(tok)["state"] == O.QUEUED
+        c = sqlite3.connect(os.path.join(tmp, "tg_queue.db"))
+        try:
+            n = c.execute("SELECT COUNT(*) FROM wa_inbox WHERE wamid LIKE ?", ("tg:%d:%%" % CHAT,)).fetchone()[0]
+        finally:
+            c.close()
+        assert n == 2, n                                                    # дубля входящего нет
+        # то же сообщение клиента, но НОВОЕ (другой msg_id) — ответ устарел, отмена
+        new = _push(h, [old, _feed_row(CHAT, 101, "in", SINCE + 12, "Уже не надо, нашёл байк у другого")], "b2")
+        assert new["accepted"] == [[CHAT, 100, "in"], [CHAT, 101, "in"]], new
+        assert ob.get(tok)["state"] == O.CANCELLED and ob.get(tok)["cancel_why"].startswith("клиент написал ещё")
+    finally:
+        h.stop()
+
+
+def test_r2_foreign_chat_row_and_mixed_resend():
+    """Чужой чат: новая строка чата Y не трогает queued чата X; пачка «повтор старой строки X + новая строка Y» отменяет
+    ТОЛЬКО ряды Y. Группа (chat_id ≤ 0) не отменяет ничего."""
+    tmp = _tmp()
+    h = Hook(tmp)
+    y = CHAT + 7
+    try:
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
+        ob.beat()
+        old_x = _feed_row(CHAT, 200, "in", SINCE + 10)
+        _push(h, [old_x], "b1")
+        _, tx = ob.put(CHAT, "ответ X", 60, now=time.time())
+        _, ty = ob.put(y, "ответ Y", 60, now=time.time())
+        _push(h, [_feed_row(-1001234, 5, "in", SINCE + 15, "группа")], "g")
+        assert ob.get(tx)["state"] == O.QUEUED and ob.get(ty)["state"] == O.QUEUED
+        got = _push(h, [old_x, _feed_row(y, 300, "in", SINCE + 20, "клиент Y написал")], "b2")
+        assert got["accepted"] == [[CHAT, 200, "in"], [y, 300, "in"]], got
+        assert ob.get(tx)["state"] == O.QUEUED, ob.get(tx)
+        assert ob.get(ty)["state"] == O.CANCELLED and ob.get(ty)["cancel_why"].startswith("клиент написал ещё")
+    finally:
+        h.stop()
+
+
+def test_r2_cancel_failure_keeps_the_push_receipt():
+    """Сбой отмены (исключение в очереди отправки) — приём пачки не страдает: 200, accepted прежний, строка на диске;
+    queued-ряд остаётся (дверь доживёт свой срок как прежде)."""
+    tmp = _tmp()
+    h = Hook(tmp)
+
+    class Broken(O.Outbox):
+        def cancel_chat(self, chat_id, why):
+            raise sqlite3.OperationalError("disk I/O error (подделка теста)")
+    try:
+        ob = O.Outbox(os.path.join(tmp, "tg_outbox.db"))
+        ob.beat()
+        _, tok = ob.put(CHAT, "ответ агента", 60, now=time.time())
+        h.srv.RequestHandlerClass.tg_outbox = Broken(ob.path, create=False)
+        got = _push(h, [_feed_row(CHAT, 400, "in", SINCE + 10, "ещё вопрос")], "b1")
+        assert got == {"ok": True, "accepted": [[CHAT, 400, "in"]], "malformed": 0}, got
+        assert ob.get(tok)["state"] == O.QUEUED
+        c = sqlite3.connect(os.path.join(tmp, "tg_queue.db"))
+        try:
+            assert c.execute("SELECT COUNT(*) FROM wa_inbox WHERE wamid=?",
+                             (W.tg_wamid(CHAT, 400, "in"),)).fetchone()[0] == 1
+        finally:
+            c.close()
+    finally:
+        h.stop()
+
+
+def test_enqueue_confirmed_names_only_rows_it_inserted():
+    """Дверь записи пачки: ответ — все ключи на диске (и повторные), `inserted` — только вставленные ЭТИМ вызовом;
+    без `inserted` — прежний ответ; ошибка — в `inserted` ничего."""
+    db = W.WAQueueDB(os.path.join(_tmp(), "tg_queue.db"))
+
+    def ev(mid):
+        return W.tg_row_event(_feed_row(CHAT, mid, "in", SINCE + mid), SINCE)[1]
+    a = set()
+    assert db.enqueue_confirmed([ev(1), ev(2)], source=W.TG_SOURCE, inserted=a) == {W.tg_wamid(CHAT, 1, "in"),
+                                                                                    W.tg_wamid(CHAT, 2, "in")}
+    assert a == {W.tg_wamid(CHAT, 1, "in"), W.tg_wamid(CHAT, 2, "in")}, a
+    b = set()
+    assert db.enqueue_confirmed([ev(1), ev(2)], source=W.TG_SOURCE, inserted=b) == a and b == set(), b
+    c = set()
+    assert db.enqueue_confirmed([ev(2), ev(3), ev(3)], source=W.TG_SOURCE, inserted=c) == \
+        {W.tg_wamid(CHAT, 2, "in"), W.tg_wamid(CHAT, 3, "in")}
+    assert c == {W.tg_wamid(CHAT, 3, "in")}, c
+    assert db.enqueue_confirmed([ev(1)], source=W.TG_SOURCE) == {W.tg_wamid(CHAT, 1, "in")}
+    bad = dict(ev(9))
+    bad["wamid"] = ""
+    d = set()
+    try:
+        db.enqueue_confirmed([ev(8), bad], source=W.TG_SOURCE, inserted=d)
+        raise AssertionError("ряд без wamid принят")
+    except ValueError:
+        pass
+    assert d == set(), d
+
+
 # ═══ 6. флаг выключен — байт-в-байт прежнее ═══════════════════════════════════════════════
 
 def old_tg_start_line(env, core, words):
