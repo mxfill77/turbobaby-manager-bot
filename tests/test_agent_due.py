@@ -1041,11 +1041,14 @@ def test_a7_f1_money_nouns_quoted_judge_as_a5():
 
 
 def test_a6_f2_money_ellipsis_shown_first():
-    """F2: первыми — получение с деньгами и эллипсис денег (в т.ч. через тире); A7 (W1): затем получение, затем прочие о
-    деньгах — пара ложного эллипсиса («Got your message.» · «The money — too.») видна целиком; число скрытых названо
-    (ожидание изменено ПОИМЁННО: на A6 — «Payment by transfer or cash.» · «The money — too.», скрыто 1)."""
+    """F2: первыми — получение с деньгами и эллипсис денег (в т.ч. через тире); A8 (V1 проверяющего X7, решение К3):
+    затем прочие о деньгах, последними — получение без денег (порядок A5 для остатка) — рядом с ложным эллипсисом
+    («The money — too.») стоит предложение о деньгах («Payment by transfer or cash.»), а не «Got your message.»; число
+    скрытых названо: 2 («You can pay by transfer at pickup too.» и «Got your message.»). Ожидание изменено ПОИМЁННО:
+    на A7 — «Got your message.» · «The money — too.», скрыто 2; на A6 — «Payment by transfer or cash.» · «The money —
+    too.», скрыто 1 (подтверждение без денег на A6 не цитировалось)."""
     said, n = T.money_said(A6_F2, 7790)
-    assert said == ["Got your message.", "The money — too."] and n == 4, (said, n)
+    assert said == ["Payment by transfer or cash.", "The money — too."] and n == 4, (said, n)
     chk = T.money_check(A6_F2, None, None, pay=False)
     assert chk["said"] == said and chk["more"] == 2, chk
 
