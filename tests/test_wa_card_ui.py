@@ -149,8 +149,10 @@ def test_core_extra_by_version():
 # ═══ USEFUL1310 A5: штамп — только установленное кодом; сверка человеком при неподтверждённой оплате ═════════════════
 
 TEXT_DUE = "Получили ваше сообщение. Деньги — тоже. К оплате 7790 бат."     # V1 проверяющего X3, m_link дословно
+# USEFUL1310 A6 (F4): подтверждение без денег («Получили ваше сообщение.») адаптер больше не цитирует — запись та, что
+# адаптер даёт на этот текст (ожидание изменено поимённо: было ещё «Получили ваше сообщение.»)
 CHK_DUE = {"nums": [[7790, ["итог аренды кода"]], [2800, ["блок «ЦЕНА»"]]], "pay": False,
-           "said": ["Получили ваше сообщение.", "Деньги — тоже."], "more": 0}
+           "said": ["Деньги — тоже."], "more": 0}
 
 
 def _check_lines(t):
@@ -173,7 +175,7 @@ def test_a5_unpaid_money_said_line_send_kept():
     w = world(claims=[], checked=CHK_DUE)
     c1 = C.card(w.draft("Сколько в целом?", answer=TEXT_DUE))
     lines = _check_lines(c1["text"])
-    assert lines[0] == G.W_PAY_SAID + " «Получили ваше сообщение.» · «Деньги — тоже.»", lines
+    assert lines[0] == G.W_PAY_SAID + " «Деньги — тоже.»", lines
     assert lines[1].startswith("🔎 сверено кодом: 7 790"), lines
     assert kb(c1)[0] == "wa:send:1:1", kb(c1)
     w.feed(w.press("wa:send:1:1", 101))
@@ -192,13 +194,61 @@ def test_a5_paid_or_no_money_no_said_line():
 
 
 def test_a5_more_said_counted_and_bad_kept():
-    """Предложений больше двух — названо число скрытых; число без опоры — прежняя строка «без опоры» рядом."""
+    """Предложений больше двух — названо число скрытых; число без опоры — строка «без опоры» рядом (USEFUL1310 A6, F5:
+    ожидание изменено ПОИМЁННО — было «…без опоры в блоке «ЦЕНА»»)."""
     chk = dict(CHK_DUE, nums=[], more=3)
     line = G.card_check([["сумма", 40000]], chk)
     assert line.split("\n")[0].endswith(G.W_PAY_MORE % 3), line
-    assert line.split("\n")[1] == "🔎 проверка кодом — без опоры в блоке «ЦЕНА»: сумма 40 000", line
+    assert line.split("\n")[1] == "🔎 проверка кодом — без опоры: сумма 40 000", line
     assert G.card_check(None, None) == G.W_CHECK_NONE                     # код не проверял — как было
     assert G.card_check([], None) == ""                                   # записи нет (черновик старше) — штампа нет
+
+
+# ═══ USEFUL1310 A6: одна формулировка опоры (F5); версия по пояснению — строка сверки и штамп её текста (F3) ═══════
+
+def test_a6_f5_one_backing_wording():
+    """F5: штамп и строка «без опоры» говорят одной формулировкой — «сверено кодом: число — опора» и «без опоры: число»;
+    «в блоке «ЦЕНА»» (опора пути сверки шире блока) нет ни в одной строке."""
+    line = G.card_check([["сумма", 3000]], {"nums": [[7790, ["итог аренды кода"]]], "pay": False, "said": [],
+                                           "more": 0})
+    assert line == "🔎 сверено кодом: 7 790 — итог аренды кода\n🔎 проверка кодом — без опоры: сумма 3 000", line
+    assert "в блоке «ЦЕНА»" not in G.W_CHECK_BAD and "без опоры" in G.W_CHECK_BAD, G.W_CHECK_BAD
+
+
+HINT_MONEY = "Получили вашу бронь и депозит, ждём вас завтра."   # V1 проверяющего X3 (m_noun) — в версии по пояснению
+
+
+def test_a6_f3_hint_version_gets_said_line():
+    """F3: версия по пояснению сотрудника (модель переписала черновик, ver 2, пути без сверки) — на её карточке строка
+    сверки с её предложениями дословно (оплата кодом не подтверждена: сверки нет); строки «💭» нет; запись ядра — то,
+    что дал адаптер на ЕЁ текст. Версия человека (правка полным текстом) низа не получает, как было."""
+    import json
+    import test_wa_hint_rule as H
+
+    class MoneyHint(H.HintCall):
+        def __call__(self, system, user):
+            if H.ASK_MARK in user:
+                self.calls.append((system, user))
+                return (json.dumps({"text": HINT_MONEY, "lang": "ru", "handoff": [], "why": "пояснение"},
+                                   ensure_ascii=False), {"model": "fake", "in": 10, "out": 5})
+            return super().__call__(system, user)
+    w = H.started()
+    money = MoneyHint()
+    money.calls = w.call.calls
+    w.adapter.call = w.call = money
+    w.explain()
+    card2 = w.card_text(2)
+    assert HINT_MONEY in card2 and (G.W_PAY_SAID + " «" + HINT_MONEY + "»") in card2, card2
+    assert "💭" not in card2, card2
+    e2 = w.core.card_extra(1, 2, HINT_MONEY)
+    assert e2["hint_check"] and not e2["agent"] and e2["claims"] == [], e2
+    assert e2["checked"] == {"nums": [], "pay": False, "said": [HINT_MONEY], "more": 0}, e2
+    assert G.card_agent(e2) == (None, G.W_PAY_SAID + " «" + HINT_MONEY + "»"), G.card_agent(e2)
+    # без денег в тексте версии — сказать нечего: низа нет (карточка версии 2 — как до A6)
+    assert G.card_agent(dict(e2, checked={"nums": [], "pay": False, "said": [], "more": 0})) is None
+    w2 = world()
+    w2.draft("Привет", why=WHY)
+    assert not (w2.core.card_extra(1, 2, "текст человека") or {}).get("hint_check")
 
 
 # ═══ п.3: правило why и предел ══════════════════════════════════════════════════════════

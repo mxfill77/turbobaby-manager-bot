@@ -823,6 +823,11 @@ class Core:
         # что о деньгах установлено кодом (USEFUL1310 A5); NULL — черновик старше: штампа и строки сверки нет
         if "checked" not in {r[1] for r in self.db.execute("PRAGMA table_info(drafts)")}:
             self.db.execute("ALTER TABLE drafts ADD COLUMN checked TEXT")
+        # проверка чисел кодом у версии по пояснению (USEFUL1310 A6, F3); NULL — версия старше: низа нет, как было
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(hints)")}
+        for col in ("claims", "checked"):
+            if col not in have:
+                self.db.execute("ALTER TABLE hints ADD COLUMN %s TEXT" % col)
         if self.case is not None:              # дело аренды (К4): колонки drafts и UNIQUE notice_id — только под флагом
             self._case_schema()                # (выключено — база прежняя, как у шаблонов NIGHT0710-B3g ниже)
         have = {r[1] for r in self.db.execute("PRAGMA table_info(card_out)")}
@@ -2284,9 +2289,11 @@ class Core:
                 got = self.model.redraft(number, upto, prev, hint_text)
                 new_text, reasons = draft_out(got)
                 tr = draft_card(got)
+                _why, claims = draft_why(got)                        # USEFUL1310 A6 (F3): проверка кодом ЕЁ текста
+                checked = draft_checked(got)
             except Exception as e:                                   # noqa: BLE001
                 self.log("пояснение %d: модель упала: %s" % (hid, type(e).__name__))
-                new_text, reasons, tr = None, [], None
+                new_text, reasons, tr, claims, checked = None, [], None, None, None
             if not isinstance(new_text, str) or not new_text.strip():
                 self._hint_fail(hid, "модель не дала текста — версии нет; полный текст — реплаем на карточку", now)
                 continue
@@ -2299,7 +2306,9 @@ class Core:
                                 PENDING, v_from)).rowcount != 1:
                 self._hint_fail(hid, "устарело — " + self._decided(did, v_from), now)
                 continue
-            self.db.execute("UPDATE hints SET state=?, ver_to=?, done_at=? WHERE id=?", (HINT_DONE, v_to, now, hid))
+            self.db.execute("UPDATE hints SET state=?, ver_to=?, done_at=?, claims=?, checked=? WHERE id=?",
+                            (HINT_DONE, v_to, now, None if claims is None else json.dumps(claims, ensure_ascii=False),
+                             None if checked is None else json.dumps(checked, ensure_ascii=False), hid))
             if self.case is not None:          # К4: версия по пояснению — со своей сверкой дела и своей версией дела
                 self._case_after((got or {}).get("case") if isinstance(got, dict) else None)
                 self._case_bind_draft(did, got)
@@ -2442,18 +2451,25 @@ class Core:
         """Вопрос и перевод для карточки версии ver с текстом text (WACARDQ0410) → None (вопроса нет: черновик старше
         или напоминание — карточка прежняя) | {question, q_lang, q_ru, a_ru, tr_ver}: переводы — только этой версии
         с этим текстом; tr_ver — версия, к которой перевод есть, если он не к этой. У версии модели — ещё agent, why,
-        claims (WACARDUI0510) и checked (USEFUL1310 A5: что о деньгах установлено кодом; None — черновик старше)."""
+        claims (WACARDUI0510) и checked (USEFUL1310 A5: что о деньгах установлено кодом; None — черновик старше). У
+        версии по пояснению (USEFUL1310 A6, F3) — hint_check и claims/checked ЕЁ текста (agent и why — нет)."""
         row = self.db.execute("SELECT question, q_lang, why, claims, checked FROM drafts WHERE id=?",
                               (draft_id,)).fetchone()
         if not row:
             return None
         # как считал агент (WACARDUI0510): только у версии модели (1); у версии человека и у черновика старше — нет
         agent = row[2] is not None and int(ver) == 1
-        if row[0] is None and not agent:
+        # версия по пояснению (USEFUL1310 A6, F3): проверка кодом её текста лежит у пояснения, сделавшего версию
+        hint = None if agent or int(ver) < 2 else self.db.execute(
+            "SELECT claims, checked FROM hints WHERE draft_id=? AND ver_to=? AND state=? AND checked IS NOT NULL",
+            (draft_id, int(ver), HINT_DONE)).fetchone()
+        if row[0] is None and not agent and hint is None:
             return None
         out = {"question": row[0], "q_lang": row[1] or None, "q_ru": None, "a_ru": None, "tr_ver": None,
                "agent": agent, "why": row[2] if agent else None, "claims": claims_of(row[3]) if agent else None,
                "checked": checked_of(row[4]) if agent else None}          # USEFUL1310 A5
+        if hint is not None:
+            out.update(hint_check=True, claims=claims_of(hint[0]), checked=checked_of(hint[1]))
         if row[0] is not None:
             rows = self.db.execute("SELECT ver, a_sha, q_ru, a_ru FROM draft_tr WHERE draft_id=?",
                                    (draft_id,)).fetchall()

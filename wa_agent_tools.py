@@ -839,10 +839,9 @@ def pay_confirmed(facts):
 
 class _Known(set):
     """Опора чисел ответа (`known_amounts`). `due` — итог аренды обращения (`due_amount`): опора ТОЛЬКО в предложении
-    итога (`due_supported`), поэтому в само множество он не входит (USEFUL1310 fix). `deposit` — денежный залог аренды
-    обращения (`deposit_amount`): опора ТОЛЬКО в предложении залога (`deposit_supported`, USEFUL1310 A4)."""
+    итога (`due_supported`), поэтому в само множество он не входит (USEFUL1310 fix). Залог строки опорой числа ответа
+    не является (USEFUL1310 A6: опора залога A4 откачена — число залога в черновике судится, как на A3)."""
     due = None
-    deposit = None
 
 
 def known_amounts(price, facts, figures):
@@ -862,7 +861,6 @@ def known_amounts(price, facts, figures):
     if ch.get("state") == CHANGE_OK:              # K3-FIX3 п.2: числа расчёта сдачи кодом — опора ответа
         out.update(abs(int(round(ch[k]))) for k in ("value", "total", "tendered"))
     out.due = due_amount(facts)
-    out.deposit = deposit_amount(facts)
     return out
 
 
@@ -1043,6 +1041,13 @@ def change_block(results, handed=()):
 # ролью; сырья нет или оно не разобрано (смешанное, ноль, мусор) — строки нет, блок прежний. (г) сумма залога — опора
 # числа ответа только в предложении залога, где её не называют «к оплате», долгом или остатком (`deposit_supported`).
 # Замки оплаты (`pay_verdict`, `money_roles`, `topic_reason`, `pay_claimed`, `_DUE_*`) не тронуты.
+# USEFUL1310 A6 (находки V1–V5 проверяющего X4, решение интегратора К3): (г) ОТКАЧЕНА — опоры у числа залога нет
+# (`deposit_supported`, `deposit_amount`, `_DEP_AS_DUE`, `known_amounts(...).deposit` сняты): «Внесите залог 3000»,
+# «Итого 7790, включая залог 3000», «Залог 3000 у нас / вернули» и сам «залог 3000 бат (возвратный)» судятся, как на
+# A3, — «денежное утверждение без опоры», число на карточке строкой «без опоры». Строка залога в блоке модели
+# ОСТАЛАСЬ (б), но названа дополнением строки «АРЕНДА КЛИЕНТА» (V4: та говорит «залога … ты не знаешь» о таблице
+# броней — без этих слов вход противоречил сам себе). Сырьё «3.000» (одна точка и ровно три цифры за ней — точка
+# тысяч либо дробь, мост читает его как 3) строки залога не даёт (V5).
 
 DUE_HEAD = "РАСЧЁТ КОДА — итог аренды (сумму берёт код из факта аренды, не ты; другой суммы итога не называй):"
 DUE_ROLE = ("роль суммы: итог аренды по листу «клиенты» — стоимость этой аренды целиком; это НЕ сумма, которую клиенту "
@@ -1052,9 +1057,14 @@ DUE_NO_SUM = "итога аренды не называй — его назов�
 DUE_NO_CASH = "касса не прочитана — об оплате не утверждай ничего"
 DUE_NO_REQ = "реквизитов для оплаты (номер счёта, карта, QR) в фактах нет — не называй и не выдумывай"
 DUE_READ = (FACT, EMPTY, CANCELLED)        # исходы двери кассы, при которых касса ПРОЧИТАНА (строки есть, нет, отменены)
-DUE_DEP_MONEY = ("залог: %s %s, возвратный, в итог не входит (роль: залог по листу «клиенты», а не плата за аренду; "
-                 "внесён ли он — говорит только касса кодом или человек).")
-DUE_DEP_PASSPORT = "залог: паспорт (роль: залог по листу «клиенты» — паспорт, а не деньги; суммы залога не называй)."
+# A6 (V4): строка залога — дополнение строки «АРЕНДА КЛИЕНТА» (wa_book_read.rental_end: «Имени, залога и долга ты не
+# знаешь» — о таблице броней); сама та строка не тронута
+DUE_DEP_SUPPL = ("дополняет строку «АРЕНДА КЛИЕНТА», если она есть: таблица броней залога не знает, а лист «клиенты» "
+                 "его называет")
+DUE_DEP_MONEY = ("по листу «клиенты»: залог %s %s, возвратный, в итог не входит (" + DUE_DEP_SUPPL + "; роль: залог, "
+                 "а не плата за аренду; внесён ли он — говорит только касса кодом или человек).")
+DUE_DEP_PASSPORT = ("по листу «клиенты»: залог — паспорт (" + DUE_DEP_SUPPL + "; роль: паспорт, а не деньги; суммы "
+                    "залога не называй).")
 DEP_MONEY, DEP_PASSPORT = "money", "passport"
 
 
@@ -1090,7 +1100,8 @@ def deposit_of(facts):
     (`rental_of`, строка одна). Деньги — сырьё одно положительное число (пробелы, запятые тысяч, «฿» допустимы), равное
     числу моста (`deposit`, если оно есть), и валюта аренды известна (`rent_currency`); паспорт — «passport»/«паспорт»
     без цифр. Сырья нет, аренда не одна, смешанное («7000 passport» — правило: деньги ЛИБО паспорт), ноль, мусор — None:
-    строки залога нет, опоры нет, как без залога."""
+    строки залога нет, как без залога. USEFUL1310 A6 (V5): одна точка и ровно три цифры за ней («3.000») — точка тысяч
+    либо дробь, а мост читает такое как 3, — None. Опорой числа ответа залог не является (A6 откатила опору A4)."""
     bk = rental_of(facts)
     if bk is None:
         return None
@@ -1105,19 +1116,14 @@ def deposit_of(facts):
     num = low.replace(" ", "").replace(chr(0xA0), "").replace(chr(0x202F), "").replace(",", "").replace("฿", "")
     if not num or num == "." or num.count(".") > 1 or not all(c in "0123456789." for c in num):
         return None
+    if num.count(".") == 1 and len(num.split(".")[1]) == 3:
+        return None                                   # A6 (V5): «3.000» — не «3 THB» и не «3000 THB»
     amount = float(num)
     said = rows[0].get("deposit")
     cur = rent_currency(facts, bk)
     if amount <= 0 or (_num(said) and abs(said - amount) > 1e-9) or cur is None:
         return None
     return {"kind": DEP_MONEY, "amount": amount, "currency": cur, "booking_id": bk}
-
-
-def deposit_amount(facts):
-    """Денежный залог аренды обращения целым числом (`deposit_of`, деньги) | None — опора числа ответа только в
-    предложении залога (`deposit_supported`)."""
-    dep = deposit_of(facts)
-    return abs(int(round(dep["amount"]))) if dep and dep["kind"] == DEP_MONEY else None
 
 
 def _due_source(results, bk):
@@ -1147,8 +1153,9 @@ def _due_pay(results, facts):
 
 
 def _due_deposit(facts):
-    """Строка залога блока (USEFUL1310 A4): деньги — «залог: N <валюта>, возвратный, в итог не входит», паспорт —
-    «залог: паспорт», обе с ролью; залога в строке нет или он не разобран (`deposit_of` → None) — строки нет."""
+    """Строка залога блока (USEFUL1310 A4): деньги — «по листу «клиенты»: залог N <валюта>, возвратный, в итог не
+    входит», паспорт — «по листу «клиенты»: залог — паспорт», обе — дополнением строки «АРЕНДА КЛИЕНТА» (A6, V4) и с
+    ролью; залога в строке нет или он не разобран (`deposit_of` → None) — строки нет."""
     dep = deposit_of(facts)
     if dep is None:
         return None
@@ -1235,9 +1242,11 @@ _DUE_GOT = (r"получил\w*|получен\w*|поступил\w*|посту
 _DUE_CASH = r"оплат|плат[её]ж|деньг|денег|перевод|payment|money|transfer|funds"
 _DUE_DOC = (r"(?<!\w)чек(?:а|у|ом|е|и|ов|ами|ах)?(?![\w-])|квитанц|(?<!\w)slips?(?!\w)|(?<!\w)receipts?(?!\w)|"
             r"(?<!\w)скрин|screenshot")
+# A6 (F1 проверяющего X5, решение К3): в тот же класс денежных существительных — аванс, предоплата, наличные, cash,
+# deposit, advance, prepay… (не новый список: эллипсис `_DUE_ALSO` и строка сверки `money_said` берут их отсюда)
 _DUE_MONEY_N = (r"(?<!\w)(?:(?:пред)?оплат(?:а|у|ы|е|ой)|плат[её]ж\w*|деньг\w*|денег|перевод(?:а|у|ом|е|ы|ов)?|"
                 r"payments?|money|transfers?|funds|чек(?:а|у|ом|е|и|ов)?|квитанци\w*|slips?|receipts?|скрин\w*|"
-                r"screenshots?)(?![\w-])")
+                r"screenshots?|аванс\w*|предоплат\w*|наличн\w*|cash|deposits?|advances?|prepay\w*)(?![\w-])")
 _DUE_SEP = r"[^\w\n]+(?:" + _DUE_CLOCK + r"[^\w\n]+)*"
 _DUE_ID_LONG = r"(?=(?:[\w-]*?\d){5})"         # A5 (V2): номер за перешагнутым временем/датой — от 5 цифр в токене
 _DUE_NOT = re.compile(
@@ -1257,11 +1266,9 @@ _DUE_NOPAY = re.compile(
     r"|(?<!\w)(?:после|по)\s+(?:поступлени|получени|зачислени)\w*", re.I)
 _DUE_PROOF = re.compile(_DUE_CASH + r"|" + _DUE_DOC, re.I)
 _DUE_ALSO = re.compile(_DUE_MONEY_N + r"[\s,]+(?:тоже|также|too|as\s+well)(?!\w)", re.I)   # A5 (V3): без зачина
-# USEFUL1310 A4 (г): сумма залога — опора числа ответа только в предложении залога (`_DEP_WORDS`), где её не называют
-# «к оплате», остатком к оплате или долгом (RU/EN): «Залог 3000 бат, возвратный.» — опора; «К оплате 7790 бат + залог
-# 3000 бат.», «Deposit 3000 THB is due now.» — нет. Предложения итога («Итого», «Total») этим словом не являются.
-_DEP_AS_DUE = re.compile(r"к\s+оплат|осталось\s+(?:до|о|за)?платить|(?<!\w)долг(?:а|у|ом|е|и|ов)?(?!\w)|задолженн|"
-                         r"(?<!\w)(?:to\s+pay|owe[sd]?|due|debts?|outstanding)(?!\w)", re.I)
+# A6 (F2): эллипсис денег для порядка строки сверки — то же денежное существительное при «тоже/также/too/as well», и
+# через тире («Деньги — тоже.», «The money — too.»); строка-шаблон, не выражение модуля (судья — прежний `_DUE_ALSO`)
+_SAID_ALSO = _DUE_MONEY_N + r"[\s,—–-]+(?:тоже|также|too|as\s+well)(?!\w)"
 
 
 def _due_vals(sent):
@@ -1342,46 +1349,17 @@ def due_supported(text, due):
     return True
 
 
-def deposit_supported(text, dep):
-    """Денежный залог `dep` (`deposit_amount`, USEFUL1310 A4 (г)) — опора числа ответа, только если КАЖДОЕ предложение,
-    где это число судилось бы (`_due_vals`, как у итога), — предложение залога: слово залога есть (`_DEP_WORDS`), а
-    «к оплате», «осталось оплатить», «долг» и их английских близнецов нет (`_DEP_AS_DUE`); текст не называет его
-    полученной оплатой (`pay_claimed`) и ни в одном предложении текста нет реквизитов или слов получения денег
-    (`_due_req` — то же правило, что у итога, A1–A3). Иначе — как до A4: опоры нет. Залога деньгами нет — False."""
-    s = str(text or "")
-    if dep is None or dep in pay_claimed(s, sums=(dep,)):
-        return False
-    sents = K._SENTENCE.split(s)
-    vals = [_due_vals(x) for x in sents]
-    first = next((i for i, v in enumerate(vals) if dep in v), len(sents))
-    full = [i for i, x in enumerate(sents) if x.strip()]
-    nxt = {a: b for a, b in zip(full, full[1:])}
-    for i, sent in enumerate(sents):
-        tied = i in nxt and bool(_DUE_ALSO.search(sents[nxt[i]]))
-        if _due_req(sent, dep, near=True, ahead=i < first, tied=tied):
-            return False
-    for sent, v in zip(sents, vals):
-        if dep in v and not (_DEP_WORDS.search(sent) and not _DEP_AS_DUE.search(sent)):
-            return False
-    return True
-
-
-def money_claims(text, price, known, due=None, deposit=None):
+def money_claims(text, price, known, due=None):
     """Опора = «ЦЕНА» ∪ факты ∪ расчёты. Сумма в батах и ЧИСЛО БЕЗ ВАЛЮТЫ в предложении с денежным словом
     судятся (имя модели «PCX 160», дни, км, проценты — нет). → [(вид, что)] без опоры. `due` — итог аренды обращения
     (`due_amount`; не задан — тот, что несёт опора `known_amounts`): опора, только когда текст называет его в
-    предложениях итога (`due_supported`). `deposit` (USEFUL1310 A4) — денежный залог аренды обращения (`deposit_amount`;
-    не задан — тот, что несёт опора): опора, только когда текст называет его в предложениях залога
-    (`deposit_supported`)."""
+    предложениях итога (`due_supported`). Залог строки опорой не является (USEFUL1310 A6: опора залога A4 откачена —
+    его число без опоры, как на A3)."""
     s = str(text or "")
     if due is None:
         due = getattr(known, "due", None)
-    if deposit is None:
-        deposit = getattr(known, "deposit", None)
     if due is not None and due not in known and due_supported(s, due):
         known = set(known) | {due}
-    if deposit is not None and deposit not in known and deposit_supported(s, deposit):
-        known = set(known) | {deposit}
     out = [c for c in K.money_claims(s, None) if c[0] == "процент"]
     out += [("сумма", v) for v in K.thb_amounts(s) if v not in known]
     for sent in K._SENTENCE.split(s):
@@ -1407,24 +1385,31 @@ def money_claims(text, price, known, due=None, deposit=None):
 # (`_DEP_WORDS`), формы оплаты (`_PAY_FORMS`); предложение итога (`_due_sentence` — его число судит штамп) в сверку не
 # идёт; текст без денег (`_MONEY_WORD`, `_DUE_PROOF`, `_DEP_WORDS`, суммы в батах) — сверки нет. Нужны они карточке,
 # только когда оплата кодом не подтверждена (`pay_verdict`): строка сверки человеком, не замок — «Отправить» остаётся.
-SRC_PRICE, SRC_DUE, SRC_DEP, SRC_FACTS = "блок «ЦЕНА»", "итог аренды кода", "залог аренды кода", "факты сверки кода"
+# USEFUL1310 A6 (находки F1/F2/F4 проверяющего X5 и V1 проверяющего X4; решение интегратора К3): опоры «залог аренды
+# кода» больше нет (опора залога A4 откачена — число залога идёт в `money_claims`, штамп о нём не говорит «сверено»).
+# Строка сверки цитирует ТОЛЬКО предложения с денежным словом или платёжным документом (`_DUE_PROOF`, `_DEP_WORDS`,
+# `_PAY_FORMS` и денежные существительные `_DUE_MONEY_N`, куда A6 добавила аванс, предоплату, наличные, cash, deposit,
+# advance, prepay…): подтверждение без денег («Got it!», «Получили ваш вопрос.») не цитируется (F4). Первыми — где
+# получение и деньги вместе и эллипсис денег («Деньги — тоже.», `_SAID_ALSO`), затем прочие о деньгах (F2); до двух
+# дословно и число скрытых.
+SRC_PRICE, SRC_DUE, SRC_FACTS = "блок «ЦЕНА»", "итог аренды кода", "факты сверки кода"
 SAID_MAX, SAID_CUT = 2, 160                 # предложений в строке сверки и знаков в каждом (длиннее — обрезка с «…»)
 
 
 def money_backing(text, price, known=None, judged=None, bare=True):
     """Числа ответа с опорой кодом → [[что, [опора, …]], …] по порядку появления, без повторов. `known` — опора
-    `known_amounts` (с `.due`/`.deposit`); None — только блок «ЦЕНА» (черновик без сверки, `K.money_claims`). `judged` —
-    текст, который судил `money_claims` (у сверки — без процента скидки двери); не задан — `text`. `bare` — голые числа
-    при денежном слове судятся (как у `money_claims` модуля; у `K.money_claims` — нет)."""
+    `known_amounts` (с `.due`); None — только блок «ЦЕНА» (черновик без сверки, `K.money_claims`). `judged` — текст,
+    который судил `money_claims` (у сверки — без процента скидки двери); не задан — `text`. `bare` — голые числа при
+    денежном слове судятся (как у `money_claims` модуля; у `K.money_claims` — нет). Залог строки опорой не является
+    (A6): его число здесь не стоит — его называет `money_claims`."""
     s = str(text or "")
     j = s if judged is None else str(judged or "")
     line = price.get("line") if isinstance(price, dict) else None
     listed = set(K.thb_amounts(line))
     if known is None:
         known = _Known(listed)
-    due, dep = getattr(known, "due", None), getattr(known, "deposit", None)
+    due = getattr(known, "due", None)
     due_ok = due is not None and due not in known and due_supported(j, due)
-    dep_ok = dep is not None and dep not in known and deposit_supported(j, dep)
     vals = list(K.thb_amounts(j))
     if bare:
         for sent in K._SENTENCE.split(j):
@@ -1439,8 +1424,6 @@ def money_backing(text, price, known=None, judged=None, bare=True):
         src = [SRC_PRICE] if v in listed else []
         if due_ok and v == due:
             src.append(SRC_DUE)
-        if dep_ok and v == dep:
-            src.append(SRC_DEP)
         if not src and v in known:
             src.append(SRC_FACTS)
         if src:
@@ -1450,26 +1433,27 @@ def money_backing(text, price, known=None, judged=None, bare=True):
 
 
 def money_said(text, due=None):
-    """Предложения черновика о деньгах, их получении или платёжном документе → (до `SAID_MAX` предложений дословно,
-    каждое не длиннее `SAID_CUT` знаков; сколько таких всего). Первыми — где получение и деньги вместе, затем деньги,
-    затем получение; показ — в порядке текста. Предложение итога (`_due_sentence`) не идёт; текст без денег —
-    ([], 0)."""
+    """Предложения черновика с денежным словом или платёжным документом → (до `SAID_MAX` предложений дословно, каждое
+    не длиннее `SAID_CUT` знаков; сколько таких всего). Подтверждение без денег («Got it!», «Получили ваш вопрос.») не
+    идёт (A6, F4). Первыми — где получение и деньги вместе и эллипсис денег (A6, F2), затем прочие о деньгах; показ — в
+    порядке текста. Предложение итога (`_due_sentence`) не идёт; текст без денег — ([], 0)."""
     s = str(text or "")
-    if not (_MONEY_WORD.search(s) or _DUE_PROOF.search(s) or _DEP_WORDS.search(s) or K.thb_amounts(s)):
-        return [], 0
     spans = K._sentences(s)
     hits = []
     for i, (a, b) in enumerate(spans):
         sent = s[a:b]
         if not sent.strip() or _due_sentence(sent, due):
             continue
+        money = bool(_DUE_PROOF.search(sent) or _DEP_WORDS.search(sent) or _PAY_FORMS.search(sent)
+                     or re.search(_DUE_MONEY_N, sent, re.I))
+        if not money:
+            continue                                  # A6 (F4): подтверждение без денег — не цитируется
         got = re.search(r"(?<!\w)(?:" + _DUE_GOT + r")(?!\w)", sent, re.I) is not None
-        money = bool(_DUE_PROOF.search(sent) or _DEP_WORDS.search(sent) or _PAY_FORMS.search(sent))
-        if got or money:
-            piece = s[a:spans[i + 1][0] if i + 1 < len(spans) else len(s)].strip()
-            if len(piece) > SAID_CUT:
-                piece = piece[:SAID_CUT - 1].rstrip() + "…"
-            hits.append((0 if got and money else 1 if money else 2, i, piece))
+        also = re.search(_SAID_ALSO, sent, re.I) is not None
+        piece = s[a:spans[i + 1][0] if i + 1 < len(spans) else len(s)].strip()
+        if len(piece) > SAID_CUT:
+            piece = piece[:SAID_CUT - 1].rstrip() + "…"
+        hits.append((0 if got or also else 1, i, piece))
     keep = sorted(sorted(hits)[:SAID_MAX], key=lambda h: h[1])
     return [h[2] for h in keep], len(hits)
 
