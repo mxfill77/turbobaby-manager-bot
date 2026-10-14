@@ -93,9 +93,13 @@ class Registry:
     def __init__(self, rows=None):
         self.rows, self.calls = list(live_rows() if rows is None else rows), []
         self.clock, self.slow, self.fail = None, 0, None
+        self.deadline = 0                           # столько вызовов подряд: общий бюджет прохода исчерпан (card_deadline)
 
     def __call__(self, phone="", name="", bike="", date_from="", date_to="", limit=None):
         self.calls.append({"phone": phone, "date_from": date_from, "date_to": date_to})
+        if self.deadline:
+            self.deadline -= 1
+            return {"ok": False, "error": "card_deadline"}
         if self.clock is not None and self.slow:
             self.clock.t += self.slow
         if not (str(phone).strip() or str(name).strip() or str(bike).strip()):
@@ -376,15 +380,24 @@ def test_a_press_sends_text_then_pdf_by_existing_path():
     assert [r[0] for r in w.signed_drafts()] == [did]
 
 
-def test_a_new_inbound_after_card_is_stale_no_second_card():
-    """Новое входящее после карточки — поведение ядра (pending → stale); второй карточки той же версии нет."""
+def test_a_new_inbound_after_card_reopens_version():
+    """Новое входящее после карточки — поведение ядра (pending → stale). Финальный разбор: договор клиенту НЕ ушёл —
+    версия снова открыта; модель промолчала (живого ответа нет) → ОДНА новая карточка той же версии, строка версии одна
+    и указывает на неё, клиенту ничего не уходило; дальше третьей карточки нет."""
     w = World()
     did = _card(w)
     w.put(T_SIGN + 800, "А когда можно забрать?")
     w.tick(T_SIGN + 800 + X.SIGNED_EVERY + 5)
     st = w.q("SELECT state, reason FROM drafts WHERE id=?", (did,))[0]
     assert st[0] == A.STALE and "клиент написал ещё" in st[1], st
-    assert [r[0] for r in w.signed_drafts()] == [did], w.signed_drafts()
+    sd = w.signed_drafts()
+    assert [r[0] for r in sd][0] == did and len(sd) == 2 and sd[1][1] == A.PENDING, sd
+    assert len(w.versions()) == 1 and w.versions()[0][5] == sd[1][0], w.versions()
+    assert w.attach(sd[1][0])[3] == SHA36, "новая карточка несёт тот же PDF"
+    assert w.door.sends == [] and w.door.media == [], (w.door.sends, w.door.media)
+    w.tick(T_SIGN + 800 + 3 * X.SIGNED_EVERY + 10)
+    w.tick(T_SIGN + 800 + X.SIGNED_IDLE + 4 * X.SIGNED_EVERY)
+    assert len(w.signed_drafts()) == 2, ("третьей карточки нет", w.signed_drafts())
 
 
 def test_a_after_card_model_answers_new_message_promptly():
@@ -840,7 +853,8 @@ def test_j_language_when_nothing_superseded():
 
 def test_l_reopen_after_cover_died():
     """Ответ модели с этим PDF «покрыл» версию, клиент написал ещё — ядро сняло его (stale), новый ответ модели без PDF:
-    версия снова открыта — карточка подписи (одна строка версии, черновик — подписи)."""
+    версия снова открыта. Финальный разбор: живой ответ модели ради повтора НЕ снимается — карточка ждёт его решения
+    (реестр не дёргается), затем карточка подписи (одна строка версии, черновик — подписи)."""
     w = World(tools_out=model_pdf36(), text="Договор ниже")
     w.put(T_SIGN + 60)
     w.tick(T_SIGN + 600)
@@ -849,8 +863,15 @@ def test_l_reopen_after_cover_died():
     w.put(T_SIGN + 700, "Ок")
     w.tick(T_SIGN + 800)
     states = dict(w.q("SELECT id, state FROM drafts WHERE id IN (1, 2)"))
+    assert states == {1: A.STALE, 2: A.PENDING} and w.signed_drafts() == [], (states, w.sign_lines())
+    n = len(w.registry.calls)
+    w.tick(T_SIGN + 800 + X.SIGNED_EVERY + 1)
+    assert len(w.registry.calls) == n, "повтор ждёт ответа модели — реестр не спрашивается"
+    assert w.core.press(2, 1, A.ACT_DECLINE, "Даня", T_SIGN + 1000)["ok"]
+    w.model.text = None
+    w.tick(T_SIGN + 1000 + 2 * X.SIGNED_EVERY)
     sd = w.signed_drafts()
-    assert states == {1: A.STALE, 2: A.SUPERSEDED} and len(sd) == 1, (states, sd, w.sign_lines())
+    assert len(sd) == 1, (sd, w.sign_lines())
     assert w.versions() == [(NUM, "D36", "2026-10-14 19:04", "PDF36", SHA36, sd[0][0])], w.versions()
     assert any("версия снова открыта" in ln for ln in w.sign_lines()), w.sign_lines()
 
@@ -935,7 +956,8 @@ def test_m_idle_until_new_inbound():
     assert len(w.registry.calls) == 1, w.registry.calls
     w.put(t + 500, "ещё вопрос")
     w.tick(t + 500 + X.SIGNED_EVERY)
-    assert len(w.registry.calls) == 2 and len(w.signed_drafts()) == 1, w.registry.calls
+    # новое входящее сняло карточку (ядро), модель промолчала — версия снова открыта: одна новая карточка
+    assert len(w.registry.calls) == 2 and len(w.signed_drafts()) == 2, (w.registry.calls, w.signed_drafts())
     w.tick(t + X.SIGNED_IDLE + 2 * X.SIGNED_EVERY + 600)
     assert len(w.registry.calls) == 3, "IDLE вышел — номер проверен снова"
 
@@ -1168,6 +1190,108 @@ def test_svc_summary_counts():
     words = {k: "выкл" for k in S.FLAGS}
     line = S.summary(w.core, TgStub(), words, {})
     assert " · подписей карточка=1" in line, line
+
+
+# ── финальный разбор: текст подписи только вместе с PDF; повтор версии; бюджет прохода ─────────────────────
+
+def test_f_press_pdf_unread_before_text_nothing_sent():
+    """«Отправить» на карточке подписи: PDF при нажатии не прочитан — клиенту НИЧЕГО (ни текста, ни PDF), черновик
+    назад в pending, кнопки живы; PDF снова читается — второе нажатие шлёт текст, затем PDF одним чтением."""
+    w = World()
+    did = _card(w)
+    keep = w.pdfs.files.pop("PDF36")
+    out = w.core.press(did, 1, A.ACT_SEND, "Даня", T_SIGN + 700)
+    assert not out["ok"] and out["state"] == A.PENDING and "ничего не отправлено" in out["words"], out
+    assert w.door.sends == [] and w.door.media == [], (w.door.sends, w.door.media)
+    assert w.q("SELECT state, decided_by FROM drafts WHERE id=?", (did,)) == [(A.PENDING, None)]
+    w.pdfs.files["PDF36"] = keep
+    n = len(w.pdfs.calls)
+    out = w.core.press(did, 1, A.ACT_SEND, "Даня", T_SIGN + 760)
+    assert out["ok"] and out["words"] == "текст: ушёл · PDF: ушёл", out
+    assert w.door.sends == [(NUM, RU_TEXT)] and len(w.door.media) == 1 and w.door.media[0][4] == SHA36, w.door.media
+    assert len(w.pdfs.calls) == n + 1, ("PDF прочитан ОДИН раз за нажатие", w.pdfs.calls)
+
+
+def test_f_press_pdf_changed_before_text_nothing_sent():
+    """Файл подменили между карточкой и нажатием (другой sha256): текст подписи не уходит вовсе, черновик ждёт."""
+    w = World()
+    did = _card(w)
+    w.pdfs.files["PDF36"] = (36, PDF37)
+    out = w.core.press(did, 1, A.ACT_SEND, "Даня", T_SIGN + 700)
+    assert not out["ok"] and out["state"] == A.PENDING and "sha256" in out["words"], out
+    assert w.door.sends == [] and w.door.media == [], (w.door.sends, w.door.media)
+
+
+def test_f_reopen_waits_for_model_answer():
+    """Повтор версии не снимает живой ответ модели на новое сообщение клиента: ответ жив, реестр ради повтора не
+    дёргается; ответ решён — следующим проходом одна новая карточка той же версии."""
+    w = World()
+    did = _card(w)
+    w.model.text = "Байк сдаётся 17.10 в 10:00"
+    w.put(T_SIGN + 630, "А когда вернуть байк?")
+    w.tick(T_SIGN + 630 + w.core.quiet + 45)
+    rows = w.q("SELECT id, state, kind FROM drafts ORDER BY id")
+    assert rows == [(did, A.STALE, X.KIND_SIGNED), (did + 1, A.PENDING, None)], rows
+    n = len(w.registry.calls)
+    w.tick(T_SIGN + 630 + w.core.quiet + 45 + 2 * X.SIGNED_EVERY)
+    assert len(w.registry.calls) == n and w.q("SELECT state FROM drafts WHERE id=?", (did + 1,)) == [(A.PENDING,)]
+    assert w.core.press(did + 1, 1, A.ACT_DECLINE, "Даня", T_SIGN + 1200)["ok"]
+    w.model.text = None
+    w.tick(T_SIGN + 1200 + 2 * X.SIGNED_EVERY)
+    sd = w.signed_drafts()
+    assert len(sd) == 2 and sd[1][1] == A.PENDING and len(w.versions()) == 1, (sd, w.versions())
+    assert w.door.sends == [] and w.door.media == []
+
+
+def test_f_declined_card_never_reopens():
+    """«Не нужно» на карточке подписи — решение человека навсегда: новое входящее версию не открывает."""
+    w = World()
+    did = _card(w)
+    assert w.core.press(did, 1, A.ACT_DECLINE, "Даня", T_SIGN + 650)["ok"]
+    w.put(T_SIGN + 700, "ок")
+    w.tick(T_SIGN + 700 + X.SIGNED_EVERY + 5)
+    w.tick(T_SIGN + 700 + X.SIGNED_IDLE + 3 * X.SIGNED_EVERY)
+    assert [r[0] for r in w.signed_drafts()] == [did], w.signed_drafts()
+
+
+def test_f_budget_short_is_not_door_failure():
+    """Общий бюджет прохода исчерпан на реестре (card_deadline): сбоем номеру не засчитывается (паузы не растут),
+    следующий проход начинается С этого номера — карточка через один шаг такта."""
+    w = World()
+    w.registry.deadline = 1
+    w.put(T_SIGN + 60, "Подписал договор")
+    w.tick(T_SIGN + 600)
+    assert w.signed_drafts() == [], w.signed_drafts()
+    memo = w.core._signed_memo.get(NUM) or {}
+    assert not memo.get("fails") and not memo.get("fail_at"), memo
+    assert w.core._signed_resume == NUM, w.core._signed_resume
+    w.tick(T_SIGN + 600 + X.SIGNED_EVERY + 1)
+    assert len(w.signed_drafts()) == 1, (w.signed_drafts(), w.sign_lines())
+
+
+def test_f_fresh_inbound_before_insert_no_card():
+    """Клиент написал между сканом и вставкой (строка в очереди, скан ещё не разобрал): карточки нет, ничего не легло;
+    модель отвечает первой, карточка — потом."""
+    w = World()
+    w.put(T_SIGN + 60, "Подписал договор")
+    real = w.core._signed_lang
+
+    def lang_then_write(number, upto):
+        w.put(T_SIGN + 599, "а доставка во сколько?")
+        return real(number, upto)
+    w.core._signed_lang = lang_then_write
+    w.tick(T_SIGN + 600)
+    assert w.signed_drafts() == [] and w.versions() == [], (w.signed_drafts(), w.versions())
+
+
+def test_f_signed_card_has_no_pace():
+    """Ритм (WAHUMANPACE0210) карточке подписи не назначается: срока нет — уходит сразу по нажатию."""
+    w = World()
+    did = _card(w)
+    x = w.q("SELECT number FROM drafts WHERE id=?", (did,))[0][0]
+    w.x("UPDATE drafts SET state=? WHERE id=?", (A.CLAIMED, did))
+    due, why = w.core._pace_due(x, 1, "t", T_SIGN + 700)
+    assert due is None and why == X.W_SIGNED_PACE, (due, why)
 
 
 def test_core_imports_untouched():

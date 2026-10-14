@@ -230,11 +230,16 @@ SIGNED_PASS_MAX = 10                           # проход: поисков в
 SIGNED_IDLE = 600                              # решённая версия · раньше водораздела · «договора нет» подряд — не чаще, с
 SIGNED_EMPTY_FREE = 2                          # «договора нет» подряд — столько проходов с обычным шагом, дальше IDLE
 SIGNED_RETRY = (0, 0, 600, 1800, 3600)         # сбой двери/PDF подряд: пауза после N-го сбоя (первые два — шаг такта)
+SIGNED_BUDGET_ERR = "card_deadline"           # = bridge_client.CARD_DEADLINE_ERROR: общий бюджет прохода исчерпан
+SIGNED_PASS_SLACK = 2                          # отказ двери за столько с до конца бюджета прохода — бюджет, а не сбой
 SIGNED_DEAD = (A.STALE, A.SUPERSEDED)          # покрывший черновик снят ЯДРОМ (без решения человека) — версия открыта
 W_SIGNED_LABEL = "📄 Договор подписан"          # метка карточки вместо «📝 Черновик»
 W_SIGNED_SUPERSEDED = "заменён карточкой подписанного договора (черновик №%d)"
 W_SIGNED_NO_PDF = ("устарело: карточка подписанного договора без PDF не уходит — %s; текст без PDF не шлём, ничего не "
                    "отправлено")
+W_SIGNED_PDF_WAIT = ("PDF договора сейчас не прочитан (%s) — клиенту ничего не отправлено, текст без PDF не шлём; "
+                     "черновик ждёт: нажмите «Отправить» ещё раз")
+W_SIGNED_PACE = "карточка подписанного договора — ритму не подлежит: текст и PDF уходят сразу по нажатию"
 SIGNED_TEXT = {"ru": "Направляем ваш подписанный договор.", "en": "Here is your signed rental agreement."}
 SIGNED_SORRY = {"ru": "Извините за задержку с ответом и договором. ",
                 "en": "Sorry for the delay with our reply and the agreement. "}
@@ -1058,7 +1063,10 @@ class AttachCore(A.Core):
         self._signed_cursor = None                  # последний разобранный номер: следующий проход — с номера после него
         self._signed_memo = {}                      # номер → когда проверять снова (решено/пусто/сбой подряд)
         self._signed_halt = None                    # почему прерван прошлый проход (строка журнала — на смену причины)
+        self._signed_resume = None                  # номер, прерванный исчерпанным бюджетом: следующий проход — С него
+        self._signed_t0 = None                      # начало идущего прохода (часы ядра): отказ у конца бюджета — не сбой
         self.signed_made = []                       # черновики подписи последнего вызова `make_signed_cards`
+        self._signed_pre = {}                       # черновик подписи → байты PDF, прочитанные ДО текста (одно нажатие)
         self._seen = {}
         self._hold = None                           # черновик, чей исход на карточку пишем после обеих частей
         self._held = None                           # слова ядра о тексте, придержанные на время части
@@ -1460,6 +1468,15 @@ class AttachCore(A.Core):
             super()._tg(held[0], *held[1])
         return res
 
+    def _pace_due(self, number, upto, text, now):
+        """Ритм (WAHUMANPACE0210) карточке подписи не назначается (SIGNEDCARD1410): отложенное ушло бы мимо нажавшего, а
+        при непрочитанном PDF вернулось бы в pending с карточкой «уйдёт в …». Нажатие захватило черновик подписи этого
+        номера — срока нет, уходит сразу; иначе — ритм ядра."""
+        if self.attach and self.db.execute("SELECT 1 FROM drafts WHERE number=? AND state=? AND kind=?",
+                                           (number, A.CLAIMED, KIND_SIGNED)).fetchone():
+            return None, W_SIGNED_PACE
+        return super()._pace_due(number, upto, text, now)
+
     def _deliver(self, draft_id, number, upto, text, who, now, from_state):
         if not self.attach:
             return super()._deliver(draft_id, number, upto, text, who, now, from_state)
@@ -1506,6 +1523,28 @@ class AttachCore(A.Core):
             self.log("черновик %d → stale: основание PDF не подтверждено реестром при нажатии — ничего не отправлено"
                      % draft_id)
             return {"ok": False, "state": A.STALE, "words": words}
+        if self.draft_kind(draft_id) == KIND_SIGNED:
+            # SIGNEDCARD1410 (финальный разбор): текст подписи — только ВМЕСТЕ с PDF. Байты читаются и сверяются (verified,
+            # sha256 сверки, строка реестра, скелет) ДО текстовой части; часть PDF уйдёт этими же байтами, второго чтения
+            # нет. Не прочитаны — захват назад: клиенту ничего, черновик ждёт, кнопки живы (как «очередь не прочитана»)
+            body, pwhy = self._pdf_checked(draft_id, meta)
+            if body is None:
+                if self.db.execute("UPDATE drafts SET state=?, decided_by=NULL, decided_at=NULL WHERE id=? AND state=?",
+                                   (A.PENDING, draft_id, from_state)).rowcount != 1:
+                    return {"ok": False, "state": None, "words": self._decided(draft_id)}
+                words = W_SIGNED_PDF_WAIT % str(pwhy)[:200]
+                self.log("черновик %d: карточка подписи — PDF не прочитан до текста (%s): ничего не отправлено, черновик "
+                         "ждёт" % (draft_id, str(pwhy)[:120]))
+                return {"ok": False, "state": A.PENDING, "words": words}
+            self._signed_pre[draft_id] = body
+        try:
+            return self._deliver_parts(draft_id, number, upto, text, who, now, from_state, meta, ver0)
+        finally:
+            self._signed_pre.pop(draft_id, None)
+
+    def _deliver_parts(self, draft_id, number, upto, text, who, now, from_state, meta, ver0):
+        """Текст, затем PDF (`_deliver` после перечитывания реестра; SIGNEDCARD1410 — вынесено, чтобы байты подписи,
+        прочитанные до текста, гарантированно не пережили нажатие)."""
         self.db.execute("INSERT OR IGNORE INTO pdf_parts(draft_id, state, attempt) VALUES(?,?,1)", (draft_id, P_WAIT))
         res = self._text_part(draft_id, number, upto, text, who, now, from_state)
         tstate = res.get("state")
@@ -1604,6 +1643,40 @@ class AttachCore(A.Core):
 
     # ── часть PDF ─────────────────────────────────────────────────────────────────────────
 
+    def _pdf_checked(self, draft_id, meta):
+        """Байты PDF из contract_pdf и обе сверки договора — verified, sha256 сверки, строка реестра, скелет (K3-FIX F4) →
+        (байты, None) | (None, причина словами). Одно место на часть PDF (`_send_pdf`) и на карточку подписи, где байты
+        читаются ДО текста (SIGNEDCARD1410): причины те же, что у части PDF до выноса."""
+        file_id, _name, _size, sha, row, _why = meta
+        try:
+            got = self.pdf_fetch(file_id) if self.pdf_fetch else {"ok": False, "error": "двери contract_pdf нет"}
+        except Exception as e:                                       # noqa: BLE001
+            got = {"ok": False, "error": "дверь contract_pdf упала: %s" % type(e).__name__}
+        if not (isinstance(got, dict) and got.get("ok") and got.get("verified") is True):
+            err = got.get("error") if isinstance(got, dict) else "ответ не словарь"
+            return None, "PDF не получен из contract_pdf: %s" % (err or "без verified")
+        try:
+            raw = base64.b64decode(got.get("content_b64") or "", validate=True)
+        except Exception as e:                                       # noqa: BLE001
+            return None, "PDF не декодирован: %s" % type(e).__name__
+        now_sha = hashlib.sha256(raw).hexdigest()
+        if now_sha != sha:
+            return None, "sha256 PDF при отправке %s… не равен sha256 сверки %s… — файл изменился, не отправлено" % (
+                now_sha[:12], sha[:12])
+        # второй замок того же договора (NIGHT0710-B3v): мост назвал строку реестра — она обязана быть строкой сверки.
+        # Не назвал — не судим (поле ответа необязательно); signed_at не сличается: его формат у contract_pdf не сверен
+        have = got.get("row")
+        if have not in (None, "") and row is not None and str(have).strip() != str(row).strip():
+            return None, "строка реестра PDF при отправке %s, при сверке %s — договор сменился, не отправлено" % (
+                str(have)[:20], str(row)[:20])
+        # K3-FIX F4: скелет PDF судится на ТЕХ ЖЕ байтах, что уйдут двери (`body` — его же отдаёт `media["fetch"]`), ДО
+        # sending: не сошёлся — часть not_sent с причиной человеку, двери нет, повтора нет. Уровень — `PDF_LEVEL`
+        shape_ok, shape_why = pdf_shape(raw)
+        if not shape_ok:
+            self.log("черновик %d: PDF не прошёл проверку скелета (%s) — двери нет" % (draft_id, shape_why[:120]))
+            return None, W_PDF_SHAPE % shape_why
+        return raw, None
+
     def _send_pdf(self, draft_id, number, who, now, attempt, from_states, meta, permit=False, prev=None):
         """Захват части → байты из contract_pdf и сверка sha256 → sending ДО двери → дверь → исход. → (state, reason).
         Захват — сравнение-и-запись: состояние из `from_states` И номер попытки равен ожидаемому `prev` (номер на кнопке).
@@ -1623,34 +1696,13 @@ class AttachCore(A.Core):
             self._in_tx(write)
             return outcome, why
 
-        try:
-            got = self.pdf_fetch(file_id) if self.pdf_fetch else {"ok": False, "error": "двери contract_pdf нет"}
-        except Exception as e:                                       # noqa: BLE001
-            got = {"ok": False, "error": "дверь contract_pdf упала: %s" % type(e).__name__}
-        if not (isinstance(got, dict) and got.get("ok") and got.get("verified") is True):
-            err = got.get("error") if isinstance(got, dict) else "ответ не словарь"
-            return fail("PDF не получен из contract_pdf: %s" % (err or "без verified"))
-        try:
-            raw = base64.b64decode(got.get("content_b64") or "", validate=True)
-        except Exception as e:                                       # noqa: BLE001
-            return fail("PDF не декодирован: %s" % type(e).__name__)
-        now_sha = hashlib.sha256(raw).hexdigest()
-        if now_sha != sha:
-            return fail("sha256 PDF при отправке %s… не равен sha256 сверки %s… — файл изменился, не отправлено" % (
-                now_sha[:12], sha[:12]))
-        # второй замок того же договора (NIGHT0710-B3v): мост назвал строку реестра — она обязана быть строкой сверки.
-        # Не назвал — не судим (поле ответа необязательно); signed_at не сличается: его формат у contract_pdf не сверен
-        have = got.get("row")
-        if have not in (None, "") and row is not None and str(have).strip() != str(row).strip():
-            return fail("строка реестра PDF при отправке %s, при сверке %s — договор сменился, не отправлено" % (
-                str(have)[:20], str(row)[:20]))
-        # K3-FIX F4: скелет PDF судится на ТЕХ ЖЕ байтах, что уйдут двери (`body` — его же отдаёт `media["fetch"]`), ДО
-        # sending: не сошёлся — часть not_sent с причиной человеку, двери нет, повтора нет. Уровень — `PDF_LEVEL`
-        body = raw
-        shape_ok, shape_why = pdf_shape(body)
-        if not shape_ok:
-            self.log("черновик %d: PDF не прошёл проверку скелета (%s) — двери нет" % (draft_id, shape_why[:120]))
-            return fail(W_PDF_SHAPE % shape_why)
+        # SIGNEDCARD1410: байты карточки подписи уже прочитаны и сверены ДО текста (`_deliver`) — второго чтения нет
+        body = self._signed_pre.pop(draft_id, None)
+        if body is None:
+            body, why = self._pdf_checked(draft_id, meta)
+            if body is None:
+                return fail(why)
+        now_sha = hashlib.sha256(body).hexdigest()
         # ── sending ДО двери: рестарт после этой строки повтора не даст ──
         if self.db.execute("UPDATE pdf_parts SET state=?, sending_at=?, sha256=? WHERE draft_id=? AND state=?",
                            (A.SENDING, now, now_sha, draft_id, P_CLAIMED)).rowcount != 1:
@@ -1887,7 +1939,15 @@ class AttachCore(A.Core):
         if draft_id is None:
             return None
         row = self.db.execute("SELECT kind, state, decided_by FROM drafts WHERE id=?", (draft_id,)).fetchone()
-        return bool(row) and row[0] != KIND_SIGNED and row[1] in SIGNED_DEAD and not row[2]
+        if not row:
+            return False
+        if row[0] == KIND_SIGNED:
+            # финальный разбор SIGNEDCARD1410: сама карточка подписи, снятая БЕЗ отправки и без «Не нужно» (клиент написал
+            # ещё — до нажатия или при нём; ответили с телефона; реестр не прочитан при нажатии; служба без PDF-ядра) —
+            # договор клиенту не ушёл, версия снова открыта. Двойник, «покрыта», документ человеком, отзыв в реестре —
+            # проверяются заново следующим проходом. Решение человека навсегда: отправка, «Не нужно», «Пересобрать»
+            return row[1] == A.STALE or (row[1] == A.SUPERSEDED and not row[2])
+        return row[1] in SIGNED_DEAD and not row[2]
 
     def _signed_held(self, number, sha, key):
         """Почему версию с этим PDF карточкой подписи не подаём → (черновик | None, слова) | None. Только база агента:
@@ -2035,10 +2095,13 @@ class AttachCore(A.Core):
                                (now - A.FOLLOW_WINDOW - 3600,)).fetchall()     # грубый отсев, как у напоминания
         names = {r[0] for r in rows}
         self._signed_memo = {n: m for n, m in self._signed_memo.items() if n in names}
-        cur = self._signed_cursor
-        if cur is not None:                         # по кругу: прерванный проход продолжается с номера после курсора
+        cur, start, self._signed_resume = self._signed_cursor, self._signed_resume, None
+        if start is not None:                       # номер, которому не хватило бюджета прошлого прохода, — первым
+            rows = [r for r in rows if r[0] >= start] + [r for r in rows if r[0] < start]
+        elif cur is not None:                       # по кругу: прерванный проход продолжается с номера после курсора
             rows = [r for r in rows if r[0] > cur] + [r for r in rows if r[0] <= cur]
         t0, asked, stop = self.clock(), 0, None
+        self._signed_t0 = t0
         with (self.signed_budget(SIGNED_PASS_SEC) if self.signed_budget else _NoBudget()):
             for number, last_in in rows:
                 if self.clock() - t0 >= SIGNED_PASS_SEC:
@@ -2069,6 +2132,29 @@ class AttachCore(A.Core):
         self._signed_last = now + max(0.0, self.clock() - t0)    # пауза SIGNED_EVERY — от КОНЦА прохода
         return made
 
+    def _signed_wait_live(self, number):
+        """Повторное предложение версии (прежнюю карточку подписи сняло ядро — `_signed_dead`) при ЖИВОМ ответе модели
+        этому номеру (pending/claimed/sending/scheduled) ждёт: ответ на новое сообщение клиента («а когда вернуть байк?»)
+        ради шаблона подписи не снимается; карточка — следующим проходом после его решения (финальный разбор
+        SIGNEDCARD1410). Первая карточка версии по-прежнему заменяет ждущий черновик без этого PDF (выбор владельца)."""
+        if not self.db.execute("SELECT 1 FROM drafts WHERE number=? AND state IN (?,?,?,?)",
+                               (number, A.PENDING, A.CLAIMED, A.SENDING, A.SCHEDULED)).fetchone():
+            return False
+        rows = self.db.execute("SELECT draft_id FROM signed_cards WHERE number=? AND draft_id IS NOT NULL",
+                               (number,)).fetchall()
+        return any(self._signed_dead(r[0]) for r in rows)
+
+    def _signed_short(self, number, res):
+        """Отказ двери — исчерпанный ОБЩИЙ бюджет прохода (мост ответил card_deadline либо отказ пришёл у самого конца
+        бюджета: снимок броней теряет причину моста), а не сбой двери. → True: сбоем номеру НЕ засчитывается (паузы
+        SIGNED_RETRY не растут), следующий проход начинается С этого номера (финальный разбор SIGNEDCARD1410)."""
+        reason = str(res.get("reason") or "") if isinstance(res, dict) else ""
+        short = SIGNED_BUDGET_ERR in reason or (
+            self._signed_t0 is not None and self.clock() - self._signed_t0 >= SIGNED_PASS_SEC - SIGNED_PASS_SLACK)
+        if short:
+            self._signed_resume = number
+        return short
+
     def _signed_one(self, number, now, since):
         """Один клиент → (черновик подписи | None, звался ли реестр, почему прервать проход | None). Карточки нет —
         причина в журнал один раз на процесс."""
@@ -2084,6 +2170,8 @@ class AttachCore(A.Core):
             # тишина ядра (`make_drafts`: quiet после последнего входящего) не вышла — первой на него отвечает модель:
             # её черновик с этим PDF «покроет» версию, а вопрос клиента («подписал, во сколько доставка?») увидит она
             return None, False, None
+        if self._signed_wait_live(number):
+            return None, False, None                                     # повторное предложение ждёт ответа модели
         ok, why = self._signed_window(number, now)
         if not ok:
             if why.startswith("очередь"):
@@ -2094,6 +2182,8 @@ class AttachCore(A.Core):
         rental = ctx["rental"]()                                         # та же аренда, что у привязки договора
         got = rental.get("outcome") if isinstance(rental, dict) else None
         if got in (T.TIMEOUT, T.REFUSED):
+            if self._signed_short(number, rental):
+                return None, False, "бюджет прохода %d с исчерпан на двери аренды" % SIGNED_PASS_SEC
             self._signed_fail(number, now)
             self._signed_note((number, "rental", got), "номер %s — дверь аренды: %s (%s), карточки нет" % (
                 tail, got, str(rental.get("reason") or "")[:80]))
@@ -2107,6 +2197,8 @@ class AttachCore(A.Core):
         contract = T.call_tool("contract", {}, doors, self.clock, ctx)
         got = contract.get("outcome")
         if got in (T.TIMEOUT, T.REFUSED):
+            if self._signed_short(number, contract):
+                return None, True, "бюджет прохода %d с исчерпан на реестре подписей" % SIGNED_PASS_SEC
             self._signed_fail(number, now)
             self._signed_note((number, "find", got, contract.get("reason")), "номер %s — реестр подписей: %s (%s), "
                               "карточки нет" % (tail, got, str(contract.get("reason") or "")[:80]))
@@ -2154,10 +2246,13 @@ class AttachCore(A.Core):
         # латиницей — один байк)
         meta, why = attach_of({"state": T.DONE, "results": [contract]}, None, read_pdf)
         if not meta:
+            got_pdf = code.get("r") if isinstance(code.get("r"), dict) else {}
+            if got_pdf.get("outcome") in (T.TIMEOUT, T.REFUSED) and self._signed_short(number, got_pdf):
+                return None, True, "бюджет прохода %d с исчерпан на PDF договора" % SIGNED_PASS_SEC
             self._signed_fail(number, now)                               # PDF не прочитан — паузы SIGNED_RETRY подряд
             self._signed_note((number, "meta") + key[1:], "номер %s, строка реестра %s — PDF не приложить: %s" % (
                 tail, row, str(why)[:160]))
-            pdf = (code.get("r") or {}).get("outcome")
+            pdf = got_pdf.get("outcome")
             return None, True, ("PDF договора: %s" % pdf if pdf in (T.TIMEOUT, T.REFUSED) else None)
         sha = meta["sha256"]
         held = self._signed_held(number, sha, key)
@@ -2194,6 +2289,10 @@ class AttachCore(A.Core):
         opora = opora_of({"state": T.DONE, "results": [rental, contract]}, None, code=code, mark=OPORA_SIGNED)
         lang = self._signed_lang(number, upto)                          # очередь читается ДО транзакции базы агента
         text = signed_text(lang, late)
+        if self._fresh(number, upto):
+            # клиент уже написал ещё (очередь — даже то, что скан не разобрал): первой на это отвечает модель, карточка —
+            # следующим проходом после её ответа (финальный разбор SIGNEDCARD1410); ничего не легло
+            return None, None, lang, False
         self._tx_begin()
         try:
             busy = self.db.execute("SELECT 1 FROM drafts WHERE number=? AND state IN (?,?)",
@@ -2205,6 +2304,10 @@ class AttachCore(A.Core):
                 self._tx_end(ok=False)                  # нажатие, пауза, новое входящее, второй процесс — такт позже
                 return None, None, lang, False
             live = self._live_draft(number)
+            if reopen is not None and (live is not None or self.db.execute(
+                    "SELECT 1 FROM drafts WHERE number=? AND state=?", (number, A.SCHEDULED)).fetchone()):
+                self._tx_end(ok=False)                  # повторное предложение не снимает живой ответ модели — такт позже
+                return None, None, lang, False
             old = live[0] if live else None
             prev = self.db.execute("SELECT question, q_lang, ver FROM drafts WHERE id=?", (old,)).fetchone() \
                 if old is not None else None
