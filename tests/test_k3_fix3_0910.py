@@ -4441,7 +4441,10 @@ L_PRINTS_K = {"_CLAIM_THB": "b73d1cea7bf29323"}
 # USEFUL1310 A6 на 0a87a51: T 78 → 77 (9be86dbf7d377127 → f46dff71a17504d7) — имя USEFUL `_DEP_AS_DUE` снято (опора числа
 # залога A4 откачена решением К3); `_DUE_ALSO` перезакреплён по имени (класс денежных существительных шире); сторона К4
 # (без пяти имён USEFUL) — прежний пин
-L_PRINTS_ALL = {"T": (77, "f46dff71a17504d7"), "K": (22, "34eff516dd9e1e3b")}     # ВСЕ скомпилированные выражения модулей
+# USEFUL1310 A7 на 0a87a51: T 77 → 77 (f46dff71a17504d7 → 750e62ef590e8d17) — новых имён нет; `_DUE_ALSO` снова
+# шаблон A5 (слова F1 — только строке сверки, строкой-шаблоном `_SAID_MONEY_N`); сторона К4 (без пяти имён
+# USEFUL) — прежний пин
+L_PRINTS_ALL = {"T": (77, "750e62ef590e8d17"), "K": (22, "34eff516dd9e1e3b")}     # ВСЕ скомпилированные выражения модулей
 
 
 def _en3l(text):
@@ -5024,7 +5027,9 @@ M_PRINTS_LABELS = {"damage_fines": "a4af662f2c29d1d8", "deposit": "862e8fd57b2a4
 # имени; новых имён нет)
 # USEFUL1310 A6 на 0a87a51: T 78 → 77 (9be86dbf7d377127 → f46dff71a17504d7: `_DEP_AS_DUE` снят — опора залога A4
 # откачена; `_DUE_ALSO` — новый отпечаток по имени)
-M_PRINTS_ALL = {"T": (77, "f46dff71a17504d7"), "K": (22, "34eff516dd9e1e3b"), "T_str": (33, "6c6d6ceca5ddf0bf"),
+# USEFUL1310 A7 на 0a87a51: T 77 → 77 (f46dff71a17504d7 → 750e62ef590e8d17: `_DUE_ALSO` — снова отпечаток A5;
+# новых имён нет)
+M_PRINTS_ALL = {"T": (77, "750e62ef590e8d17"), "K": (22, "34eff516dd9e1e3b"), "T_str": (33, "6c6d6ceca5ddf0bf"),
                 "K_words": "fa3f9028dd677f56"}
 # USEFUL1310 fix (находка M1 судьи по смыслу): итог «к оплате» — опора числа ТОЛЬКО в предложении итога. Новые выражения
 # модуля — ровно два, оба решают «предложение ли это итога», а не «что считать оплатой»: `_DUE_SAY` — слово итога/суммы
@@ -5054,8 +5059,12 @@ M_PRINTS_ALL = {"T": (77, "f46dff71a17504d7"), "K": (22, "34eff516dd9e1e3b"), "T
 # `_DUE_ALSO` перезакреплён по имени (5292f1da82f07454 → 073069e8e372234a: в тот же класс денежных существительных
 # `_DUE_MONEY_N` — аванс, предоплата, наличные, cash, deposit, advance, prepay…); новых имён нет. Определения оплаты не
 # тронуты: модуль без пяти имён — прежний (71, a1716e9f7a0d5beb).
+# USEFUL1310 A7 (решение интегратора К3 по W2 проверяющего X6): `_DUE_ALSO` перезакреплён по имени обратно
+# (073069e8e372234a → 5292f1da82f07454 — ровно шаблон A5: слова F1 в эллипсисе судьи «… cash too / наличными тоже»
+# запирали консультацию; они остались только строке сверки — строкой-шаблоном `_SAID_MONEY_N`, не выражением модуля);
+# новых имён нет. Определения оплаты не тронуты: модуль без пяти имён — прежний (71, a1716e9f7a0d5beb).
 U_PRINTS_NEW = {"_DUE_SAY": "204851e1531d496d", "_DUE_NOT": "b59535615acdae15", "_DUE_NOPAY": "cd55fbeb5d447e1e",
-                "_DUE_PROOF": "e70aaf10e009aea1", "_DUE_ALSO": "073069e8e372234a"}
+                "_DUE_PROOF": "e70aaf10e009aea1", "_DUE_ALSO": "5292f1da82f07454"}
 U_PRINTS_OLD_T = (71, "a1716e9f7a0d5beb")
 # Перенос USEFUL1310 (+ fix) на e357f5f (живой сервер = 306350b + W15 + К4): выражение К4 закреплено ПО ИМЕНИ рядом с двумя
 # именами USEFUL1310 fix, и каждая сторона слияния сверена своим прежним пином — модуль без `U_PRINTS_NEW` = пин К4 на M
@@ -5073,7 +5082,9 @@ U_PRINTS_OLD_T = (71, "a1716e9f7a0d5beb")
 # (76, e8ef0d81d934924b)); сторона К4 — прежняя; общий T = 71 + 1 + 5 = 77.
 K4_PRINTS_NEW = {"_CASE_VER": "c9e38b739e816c0c"}
 K4_SIDE_T = (72, "16a00a2164bbf68d")
-U_SIDE_T = (76, "e8ef0d81d934924b")
+# USEFUL1310 A7 на 0a87a51: сторона USEFUL = пин A7 (`U_SIDE_T` = T дерева useful-1310-a7, (76, e8ef0d81d934924b) →
+# (76, f5f0448b8a363cf4)); сторона К4 — прежняя; общий T = 71 + 1 + 5 = 77.
+U_SIDE_T = (76, "f5f0448b8a363cf4")
 
 
 def _amt3m(text):
@@ -7320,7 +7331,10 @@ def test_useful1310_fix_prints_named():
     USEFUL — прежний `K4_SIDE_T`, без `_CASE_VER` — пин A5.
     USEFUL1310 A6 на 0a87a51: 78 → 77 = 71 + 1 + 5 — имя USEFUL `_DEP_AS_DUE` снято (опора залога A4 откачена),
     `_DUE_ALSO` (класс денежных существительных шире) перезакреплён по имени; модуль без шести новых — по-прежнему
-    `U_PRINTS_OLD_T`, без пяти имён USEFUL — прежний `K4_SIDE_T`, без `_CASE_VER` — пин A6."""
+    `U_PRINTS_OLD_T`, без пяти имён USEFUL — прежний `K4_SIDE_T`, без `_CASE_VER` — пин A6.
+    USEFUL1310 A7 на 0a87a51: 77 = 71 + 1 + 5 — `_DUE_ALSO` снова шаблон A5 (слова F1 — только строке сверки:
+    `_SAID_MONEY_N` и `_SAID_ALSO` — строки-шаблоны, не выражения модуля); модуль без шести новых — по-прежнему
+    `U_PRINTS_OLD_T`, без пяти имён USEFUL — прежний `K4_SIDE_T`, без `_CASE_VER` — пин A7."""
     import hashlib
 
     def h(s):
@@ -7333,6 +7347,7 @@ def test_useful1310_fix_prints_named():
     new = dict(U_PRINTS_NEW, **K4_PRINTS_NEW)
     assert len(new) == len(U_PRINTS_NEW) + len(K4_PRINTS_NEW), new          # имена двух сторон не пересекаются
     assert "_DEP_AS_DUE" not in rx and not hasattr(T, "deposit_supported"), sorted(rx)[:3]     # A6: опора залога снята
+    assert isinstance(T._SAID_MONEY_N, str) and isinstance(T._SAID_ALSO, str), "A7: слова F1 — строкой-шаблоном"
     assert mark(new) == U_PRINTS_OLD_T, mark(new)
     assert mark(U_PRINTS_NEW) == K4_SIDE_T, mark(U_PRINTS_NEW)
     assert mark(K4_PRINTS_NEW) == U_SIDE_T, mark(K4_PRINTS_NEW)

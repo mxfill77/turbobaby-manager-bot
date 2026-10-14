@@ -56,6 +56,11 @@ A3; строка залога в блоке модели осталась, но 
 не даёт (V5); аванс/предоплата/наличные/cash/deposit/advance/prepay — в прежний класс денежных существительных (F1);
 строка сверки цитирует только предложения с денежным словом или платёжным документом, первыми — получение с деньгами и
 эллипсис денег (F2, F4). Тесты A4 об опоре залога перевёрнуты поимённо (секция 2b и адаптер E02); секция 8.
+USEFUL1310 A7 (находки W1, W2, W4, W5 проверяющего X6; решение интегратора К3, последний адресный раунд): строка
+сверки снова берёт предложение со словом получения, как на A5, кроме голого междометия-подтверждения без объекта
+(«Got it!», «Понял!» — готовая форма модуля «ответ целиком из согласия»); порядок — получение с деньгами и эллипсис,
+затем получение, затем прочие о деньгах (W1); слова F1 — только строке сверки, эллипсис судьи — как на A5 (W2); сырьё
+«3.000,00» строки залога не даёт (W4). Ожидания A6 изменены поимённо (секции 7, 8); секция 9.
 
 Каждый тест утверждает ПРАВИЛЬНОЕ поведение; на 306350b утвердительные падают по существу (у дерева нет
 `due_of`/`due_block`, а `known_amounts` итога не знает). КОНТРОЛЬ и ОТРИЦАТЕЛЬНЫЙ — прежнее поведение и замки, которые
@@ -64,6 +69,7 @@ A3; строка залога в блоке модели осталась, но 
 форма tx_find), модель — сценарий. Сети, моста, SQLite и подпроцессов нет; файлов набор не пишет."""
 import json
 import os
+import re
 import sys
 import types
 
@@ -864,12 +870,19 @@ A5_TIED_KEPT = ("Got your question. You can pay by transfer as well. Total 7790 
 # A6 (F4, решение К3): ожидание изменено ПОИМЁННО — подтверждение без денег («Получили ваше сообщение.», «Got your
 # message.») больше не цитируется, ложная часть с деньгами — цитируется; «Got your message and the bank confirmation.» и
 # «Got it, paid!» денежного слова классов модуля не несут — их строки нет (названная цена, A6_PRICE ниже)
-A5_MASKS = (("Получили ваше сообщение. Деньги — тоже. К оплате 7790 бат.", ["Деньги — тоже."]),   # m_link: тире
-            ("Получили ваше сообщение. Спасибо! Деньги тоже. К оплате 7790 бат.", ["Деньги тоже."]),   # m_skip1
+# A7 (W1 проверяющего X6, решение К3): ожидание изменено ПОИМЁННО обратно, как на A5 — предложение со словом получения
+# снова цитируется (не идёт только голое «Got it!» / «Понял!»), порядок — получение с деньгами и эллипсис первыми, затем
+# получение, затем прочие о деньгах; показ — в порядке текста
+A5_MASKS = (("Получили ваше сообщение. Деньги — тоже. К оплате 7790 бат.",                        # m_link: тире
+             ["Получили ваше сообщение.", "Деньги — тоже."]),
+            ("Получили ваше сообщение. Спасибо! Деньги тоже. К оплате 7790 бат.",                  # m_skip1
+             ["Получили ваше сообщение.", "Деньги тоже."]),
             ("Получили вашу бронь и депозит. К оплате 7790 бат.", ["Получили вашу бронь и депозит."]),   # m_noun
             ("Received your booking and deposit. Total 7790 THB.", ["Received your booking and deposit."]),
-            ("Деньги тоже. Получили ваше сообщение. К оплате 7790 бат.", ["Деньги тоже."]),             # m_reverse
-            ("Got your message. And your payment. Total 7790 THB.", ["And your payment."]))         # держал зачин (V3)
+            ("Деньги тоже. Получили ваше сообщение. К оплате 7790 бат.",                            # m_reverse
+             ["Деньги тоже.", "Получили ваше сообщение."]),
+            ("Got your message. And your payment. Total 7790 THB.",                                 # держал зачин (V3)
+             ["Got your message.", "And your payment."]))
 # полезные без денег — строки сверки нет (cost_probe проверяющего, дословно; итог судит штамп, не строка сверки)
 A5_NO_SAID = ("К оплате 7790 бат. Байк будет готов в 10:00.", "К оплате 7790 бат. Наш офис: Раваи, Viset Rd 52/7.",
               "Total 7790 THB. Pickup at 10:00 tomorrow.", "К оплате 7790 бат. Номер брони K3-BK-001.",
@@ -903,14 +916,14 @@ def test_a5_v3_opening_conjunction_not_money_ellipsis():
 
 
 def test_a5_v1_money_said_masks_and_no_money():
-    """(в) Предложения с денежным словом или платёжным документом — дословно, до двух (A6: подтверждение без денег не
-    идёт; показ — в порядке текста); предложение итога и текст без денег — не идут."""
+    """(в) Предложения о деньгах, их получении или платёжном документе — дословно, до двух (A7: предложение со словом
+    получения — снова, как на A5; показ — в порядке текста); предложение итога и текст без денег — не идут."""
     for text, want in A5_MASKS:
         assert T.money_said(text, 7790) == (want, len(want)), (text, T.money_said(text, 7790))
     for text in A5_NO_SAID:
         assert T.money_said(text, 7790) == ([], 0), (text, T.money_said(text, 7790))
     said, n = T.money_said("Получили ваш вопрос. Деньги тоже. Перевод тоже. Чек тоже. К оплате 7790 бат.", 7790)
-    assert said == ["Деньги тоже.", "Перевод тоже."] and n == 3, (said, n)      # A6: «вопрос» без денег — не в счёте
+    assert said == ["Деньги тоже.", "Перевод тоже."] and n == 4, (said, n)      # A7: «вопрос» — в счёте, за эллипсисом
     long = "Получили ваш перевод " + "и ещё раз спасибо " * 20 + "."
     assert len(T.money_said(long)[0][0]) == T.SAID_CUT and T.money_said(long)[0][0].endswith("…")
 
@@ -945,7 +958,7 @@ def test_a5_adapter_unpaid_said_and_stamp_on_card():
     assert out["claims"] == [] and out["checked"] == {"nums": [[7790, [T.SRC_DUE]]], "pay": False,
                                                        "said": A5_MASKS[0][1], "more": 0}, out
     lines = G.card_check(out["claims"], A.draft_checked(out)).split("\n")
-    assert lines == [G.W_PAY_SAID + " «Деньги — тоже.»",                      # A6: «Получили ваше сообщение.» — нет
+    assert lines == [G.W_PAY_SAID + " «Получили ваше сообщение.» · «Деньги — тоже.»",   # A7: снова, как на A5
                      "🔎 сверено кодом: 7 790 — итог аренды кода"], lines
     # полезный ответ E02 (итог в предложении итога, залог в нём же) — строки сверки нет; A6 (ожидание изменено
     # ПОИМЁННО): штамп называет только итог, залог 3000 — строкой «без опоры» той же формулировки опоры
@@ -986,64 +999,143 @@ def test_a5_no_tools_path_price_only_and_unpaid():
 # F1 (verify5, дословно): ложная часть «Аванс тоже» / «Наличные тоже» / «Cash too» строкой сверки не цитировалась — слов
 # не было в классе денежных существительных. A6 кладёт их туда (не новый список): строка их цитирует, эллипсис
 # `_DUE_ALSO` их видит — судья запирает их, как «Деньги тоже».
-A6_F1 = (("Получили вашу бронь. Аванс тоже. К оплате 7790 бат.", ["Аванс тоже."]),
-         ("Получили вашу бронь. Наличные тоже. К оплате 7790 бат.", ["Наличные тоже."]),
-         ("Got your booking. Cash too, thanks! Total 7790 THB.", ["Cash too, thanks!"]))
+# A7 (W2 проверяющего X6, решение К3): ожидание изменено ПОИМЁННО — слова F1 только строке сверки (`_SAID_MONEY_N`),
+# эллипсис судьи `_DUE_ALSO` — как на A5 (не видит их: судья эти формы не запирает, как на A5); строка цитирует ложную
+# часть и (A7, W1) подтверждение перед ней
+A6_F1 = (("Получили вашу бронь. Аванс тоже. К оплате 7790 бат.", ["Получили вашу бронь.", "Аванс тоже."]),
+         ("Получили вашу бронь. Наличные тоже. К оплате 7790 бат.", ["Получили вашу бронь.", "Наличные тоже."]),
+         ("Got your booking. Cash too, thanks! Total 7790 THB.", ["Got your booking.", "Cash too, thanks!"]))
 # F2 (verify5, дословно): ложный эллипсис за двумя законными строками об оплате
 A6_F2 = ("Payment by transfer or cash. You can pay by transfer at pickup too. Got your message. The money — too. "
          "Total 7790 THB.")
 # F4 (c_k3 проверяющего X3, дословно): полезные консультации — подтверждение без денег не цитируется
-A6_F4_NONE = ("Got it! The total is 7790 THB.", "Okay, got it. Total 7790 THB.",
-              "Получили ваш вопрос. К оплате 7790 бат. Оплатить можно переводом.")
+# A7 (W1, решение К3): ожидание изменено ПОИМЁННО — не цитируется ТОЛЬКО голое междометие-подтверждение без объекта
+# («Got it!», «Okay, got it.»; «Понял!», «Принято!», «Ок, понял.» — формы решения К3); подтверждение с объектом
+# («Получили ваш вопрос.», «Thanks, received your booking.») — снова, как на A5 (названная цена решения К3)
+A6_F4_NONE = ("Got it! The total is 7790 THB.", "Okay, got it. Total 7790 THB.", "Понял! К оплате 7790 бат.",
+              "Принято! К оплате 7790 бат.", "Ок, понял. К оплате 7790 бат.")
 A6_F4_MONEY = (("Got it! Total 7790 THB. You can pay by transfer.", ["You can pay by transfer."]),
-               ("Thanks, received your booking. Total 7790 THB. Payment by transfer.", ["Payment by transfer."]))
-# ЦЕНА решения К3 (5), названная: маскировка, где деньги или платёжный документ названы словом ВНЕ классов модуля,
-# судьёй не запирается и строки сверки не получает (прежде её называло подтверждение)
+               ("Thanks, received your booking. Total 7790 THB. Payment by transfer.",
+                ["Thanks, received your booking.", "Payment by transfer."]),
+               ("Получили ваш вопрос. К оплате 7790 бат. Оплатить можно переводом.", ["Получили ваш вопрос."]))
+# ЦЕНА решения К3 (5) на A6: маскировка, где деньги или платёжный документ названы словом ВНЕ классов модуля, судьёй не
+# запирается и строки сверки не получала. A7 (W1): строку снова ставит подтверждение — ожидание изменено ПОИМЁННО
 A6_PRICE = ("Got your message and the bank confirmation. Total 7790 THB.", "Got it, paid! Total 7790 THB.")
 
 
-def test_a6_f1_money_nouns_quoted_and_locked():
-    """F1: аванс, наличные, cash — в прежнем классе денежных существительных: строка сверки цитирует ложную часть
-    дословно, судья запирает эллипсис (касса пуста и касса не читана); эллипсис видит и deposit/prepayment/advance."""
+def test_a7_f1_money_nouns_quoted_judge_as_a5():
+    """F1 → A7 (W2): аванс, наличные, cash — строке сверки: она цитирует ложную часть дословно (и подтверждение перед
+    ней); эллипсис судьи `_DUE_ALSO` — как на A5: этих слов не видит, судья формы F1 не запирает (касса пуста и касса не
+    читана); `_SAID_ALSO` строки сверки видит и deposit/prepayment/advance."""
     for text, want in A6_F1:
-        assert T.money_said(text, 7790) == (want, 1), (text, T.money_said(text, 7790))
+        assert T.money_said(text, 7790) == (want, 2), (text, T.money_said(text, 7790))
         for res in ([rental(), cash([])], [rental()]):
-            assert K.MONEY_CLAIM_WORDS in _judge(text, res), (text, _judge(text, res))
+            assert _judge(text, res) == [], (text, _judge(text, res))
     for piece in ("Аванс тоже", "Наличные тоже", "Cash too", "The deposit too", "The prepayment too",
-                  "Advance as well", "Предоплата тоже"):
-        assert T._DUE_ALSO.search(piece), piece
+                  "Advance as well"):
+        assert re.search(T._SAID_ALSO, piece, re.I) and not T._DUE_ALSO.search(piece), piece
+    for piece in ("Деньги тоже", "The money too", "Перевод тоже", "The transfer as well",
+                  "Предоплата тоже"):                               # «(пред)оплата» — в классе судьи и на A5
+        assert T._DUE_ALSO.search(piece) and re.search(T._SAID_ALSO, piece, re.I), piece
     assert not T._DUE_ALSO.search("Got your booking") and not T._DUE_ALSO.search("Байк тоже свободен")
 
 
 def test_a6_f2_money_ellipsis_shown_first():
-    """F2: первыми — получение с деньгами и эллипсис денег (в т.ч. через тире); прочие о деньгах — после; число скрытых
-    названо."""
+    """F2: первыми — получение с деньгами и эллипсис денег (в т.ч. через тире); A7 (W1): затем получение, затем прочие о
+    деньгах — пара ложного эллипсиса («Got your message.» · «The money — too.») видна целиком; число скрытых названо
+    (ожидание изменено ПОИМЁННО: на A6 — «Payment by transfer or cash.» · «The money — too.», скрыто 1)."""
     said, n = T.money_said(A6_F2, 7790)
-    assert said == ["Payment by transfer or cash.", "The money — too."] and n == 3, (said, n)
+    assert said == ["Got your message.", "The money — too."] and n == 4, (said, n)
     chk = T.money_check(A6_F2, None, None, pay=False)
-    assert chk["said"] == said and chk["more"] == 1, chk
+    assert chk["said"] == said and chk["more"] == 2, chk
 
 
-def test_a6_f4_ack_without_money_not_quoted():
-    """F4: подтверждение без денег («Got it!», «Получили ваш вопрос.») строку сверки не ставит; инструкция об оплате в
-    другом предложении — цитируется (это предложение о деньгах)."""
+def test_a7_f4_bare_ack_not_quoted():
+    """F4 → A7 (W1): голое междометие-подтверждение без объекта строку сверки не ставит; подтверждение с объектом и
+    инструкция об оплате — цитируются; «Got it!»-консультация живым путём — без строки сверки, только штамп."""
     for text in A6_F4_NONE:
         assert T.money_said(text, 7790) == ([], 0), (text, T.money_said(text, 7790))
     for text, want in A6_F4_MONEY:
-        assert T.money_said(text, 7790) == (want, 1), (text, T.money_said(text, 7790))
+        assert T.money_said(text, 7790) == (want, len(want)), (text, T.money_said(text, 7790))
     import wa_agent as A
     import wa_agent_tg as G
-    s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}}, final(A6_F4_NONE[0]))
-    out = adapter(s, E02_Q).draft(NUMBER, 5)
-    assert G.card_check(out["claims"], A.draft_checked(out)) == "🔎 сверено кодом: 7 790 — итог аренды кода", out
+    for text in A6_F4_NONE[:2]:
+        s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}}, final(text))
+        out = adapter(s, E02_Q).draft(NUMBER, 5)
+        assert G.card_check(out["claims"], A.draft_checked(out)) == "🔎 сверено кодом: 7 790 — итог аренды кода", out
 
 
-def test_a6_price_named_no_lock_no_line():
-    """Цена решения К3 (5), названная: деньги/документ словом вне классов модуля («bank confirmation», «paid» после
-    запятой) — ни замка судьи, ни строки сверки."""
+def test_a7_w1_price_masks_quoted_again():
+    """A7 (W1): маскировка словом вне классов модуля («bank confirmation», «paid» после запятой) — судья по-прежнему не
+    запирает (asked нет), но строка сверки снова цитирует подтверждение дословно (на A6 — ни замка, ни строки)."""
     for text in A6_PRICE:
-        assert T.money_said(text, 7790) == ([], 0), (text, T.money_said(text, 7790))
+        assert T.money_said(text, 7790) == ([text.split(" Total")[0]], 1), (text, T.money_said(text, 7790))
         assert _judge(text, [rental(), cash([])]) == [], text
+
+
+# ═══ 9. USEFUL1310 A7 (находки W1, W2, W4 проверяющего X6; решение интегратора К3) ══════════════════════════════════
+# W1 (verify6/out/alt_said6.txt, группы m_doc и m_thanks формы проверяющего X3, дословно): 11 масок, у которых на A6
+# не было ни замка судьи, ни строки сверки — деньги или платёжный документ названы словом вне классов модуля
+A7_W1 = ("Получили ваше сообщение и подтверждение из банка. К оплате 7790 бат.",
+         "Получили ваше сообщение с квитком. К оплате 7790 бат.",
+         "Получили ваше сообщение и выписку. К оплате 7790 бат.",
+         "Получили ваше сообщение и чек-подтверждение. К оплате 7790 бат.",
+         "Got your message with the proof. Total 7790 THB.",
+         "Got your message and the bank confirmation. Total 7790 THB.",
+         "Got it, thanks for the proof! Total 7790 THB.",
+         "Received your booking and the bank statement. Total 7790 THB.",
+         "Got your message and the payslip. Total 7790 THB.",
+         "Got it, thanks for paying! Total 7790 THB.",
+         "Got it, paid! Total 7790 THB.")
+# W2 (verify6/hint_mig6.py, свидетели «… cash too / наличными тоже», дословно): консультация о способах оплаты
+A7_W2 = (("Got it! You can pay by card or cash too. Total 7790 THB.", ["You can pay by card or cash too."]),
+         ("Получили ваш вопрос. Оплатить можно переводом или наличными тоже. К оплате 7790 бат.",
+          ["Получили ваш вопрос."]))
+# W4 (verify6/edge6.py, дословно): сырьё с точкой и ровно тремя цифрами перед запятой — мост читает 3 и 1.5005
+A7_W4 = ({"deposit": 3, "deposit_raw": "3.000,00"}, {"deposit": 1.5005, "deposit_raw": "1.500,50"})
+
+
+def test_a7_w1_receipt_masks_quoted():
+    """W1: все 11 масок — строка сверки цитирует предложение с подтверждением дословно (на A6 — 0 из 11); судья их, как
+    и прежде, не запирает при asked нет (замок «оплата не подтверждена сверкой» при вопросе об оплате — прежний)."""
+    for text in A7_W1:
+        said, n = T.money_said(text, 7790)
+        assert n == 1 and said == [text.split(" К оплате")[0].split(" Total")[0]], (text, said, n)
+        assert _judge(text, [rental(), cash([])]) == [], (text, _judge(text, [rental(), cash([])]))
+
+
+def test_a7_w1_live_path_card_line():
+    """W1 живым путём (E02-вопрос, касса пуста): маскировка без замка судьи — на карточке строка сверки с подтверждением
+    дословно и штамп итога; кнопка «Отправить» не снята (строка — сверка человеком)."""
+    import wa_agent as A
+    import wa_agent_tg as G
+    for text in (A7_W1[0], A7_W1[-1]):
+        s = Script({"tool": "rental", "args": {}}, {"tool": "cash", "args": {"booking_id": BK}}, final(text))
+        out = adapter(s, E02_Q).draft(NUMBER, 5)
+        first = text.split(" К оплате")[0].split(" Total")[0]
+        assert out["checked"]["said"] == [first] and out["checked"]["pay"] is False, out
+        assert G.card_check(out["claims"], A.draft_checked(out)).split("\n")[0] == G.W_PAY_SAID + " «%s»" % first
+
+
+def test_a7_w2_payment_ways_too_no_lock():
+    """W2: «… cash too / наличными тоже» в консультации — не эллипсис судьи (как на A5): причин нет в обоих
+    контекстах, итог с опорой; строка сверки цитирует предложение о способах оплаты либо подтверждение с объектом."""
+    for text, want in A7_W2:
+        assert T.due_supported(text, 7790), text
+        for res in ([rental(), cash([])], [rental()]):
+            assert _judge(text, res) == [], (text, _judge(text, res))
+        assert T.money_said(text, 7790) == (want, len(want)), (text, T.money_said(text, 7790))
+
+
+def test_a7_w4_eu_decimal_raw_no_deposit_line():
+    """W4: «3.000,00» и «1.500,50» (точка и ровно три цифры перед запятой; мост читает их как 3 и 1.5005) — строки
+    залога нет, блок как без залога; «3,000.00» и «3000.00» — по-прежнему 3000."""
+    plain = T.due_block([rental(NO_DEP)])
+    for row in A7_W4:
+        assert T.deposit_of(T.accepted([rental(row)])) is None, row
+        assert T.due_block([rental(row)]) == plain, row
+    for raw in ("3,000.00", "3000.00"):
+        assert T.deposit_of(T.accepted([rental({"deposit": 3000, "deposit_raw": raw})]))["amount"] == 3000, raw
 
 
 def main():
