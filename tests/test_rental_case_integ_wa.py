@@ -120,17 +120,22 @@ PROBE_MARK = "K4_OFF_MODULES "
 # «3.000,00» — без строки залога): tools — блоб d26a764, wa_agent и model — прежние (A7 их не меняет). Голден к пину
 # tools A6 НЕЧУВСТВИТЕЛЕН (прогон на коммите переноса с пином A6 — Ran 35, OK; useful3/fix7/golden_teeth7.py) по той же
 # причине, что на A6: у строки аренды GOLD_SCRIPTS нет номера брони, а ответ сценария строку сверки не меняет;
-# поведение tools A7 закрепляют test_agent_due и test_wa_card_ui. Было (основа 0a87a51 + A6 7d380ac): wa_agent_tools
+# поведение tools A7 закрепляют test_agent_due и test_wa_card_ui.
+# USEFUL1310 A8 на 0a87a51: основа без К4 = дерево useful-1310-a8 c4d8266 (A7 + A8 по решению интегратора К3: порядок
+# цитат строки сверки — снова A5 для остатка, получение без денег последним): tools — блоб c4d8266, wa_agent и model —
+# прежние (A8 их не меняет). Голден к пину tools A7 НЕЧУВСТВИТЕЛЕН (прогон на коммите переноса с пином A7 — Ran 35, OK)
+# по той же причине; поведение tools A8 закрепляет test_agent_due. Было (основа 0a87a51 + A7 d26a764): wa_agent_tools
+# 32a65a63345d…; (основа 0a87a51 + A6 7d380ac): wa_agent_tools
 # 0da046820ae5…; (основа 0a87a51 + A5 6b66667): wa_agent 54bc80ccc1e3…, wa_agent_model e085a752d372…, wa_agent_tools
 # f8d0c90c4877…; (основа 0a87a51 + A4 b0390fe): wa_agent 5b3fa1bebb1b…, wa_agent_model 40033b713d23…, wa_agent_tools
 # fa6223476614…; (основа 0a87a51 + A3 6e27e26): wa_agent_tools 6d48ea6c5e76…; (основа 0a87a51 + A2 68eb7f8):
 # 9571b9914c0b…; (основа 0a87a51 + A1 a6321f6): 474450dca494…; (основа e357f5f + 64e0748): 050d8b32431f…; ещё раньше
-# (основа 306350b): wa_agent_model bb40440a40f3…, wa_agent_tools d99dd55e777c…. Объекты a9663594…/e085a752…/32a65a63…
-# достижимы из ветки useful-1310-a7 (несёт и bundle переноса); без них — ПРОПУЩЕНО, а не зелёное.
+# (основа 306350b): wa_agent_model bb40440a40f3…, wa_agent_tools d99dd55e777c…. Объекты a9663594…/e085a752…/9d682564…
+# достижимы из ветки useful-1310-a8 (несёт и bundle переноса); без них — ПРОПУЩЕНО, а не зелёное.
 BASE_BLOBS = {
     "wa_agent": "a96635943368ac3afc2e9dd577e00679407ca30b",
     "wa_agent_model": "e085a752d37284b26e4bf2908016f1110e58917b",
-    "wa_agent_tools": "32a65a63345d87d7959939a2a254bcfae424a91b",
+    "wa_agent_tools": "9d6825640f0efefb758d3cad78d64fefbddc4757",
 }
 BASE_TOOLS = ("history", "rental", "cash", "contract", "contract_pdf", "delivery", "rules")
 BASE_TOOLS_BLOCK_SHA = "175b220824b649ce151ae7f463ac864166265b26e9ccd13d42032a93d850d3d1"
