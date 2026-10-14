@@ -798,7 +798,10 @@ class Tg(wa_agent.Telegram):
         hint = getattr(self.core, "hint_of", None) if explain and ver > 1 else None
         hint = hint(draft_id, ver) if hint else None
         name, link = self._topic(number)
-        top = "%s №%d · версия %d · %s" % ("🔔 Напоминание" if follow else "📝 Черновик", draft_id, ver, name)
+        # карточка подписанного договора (SIGNEDCARD1410): метка ядра с PDF-частью; у прежнего ядра пробы нет — метка прежняя
+        label = getattr(self.core, "card_label", None)
+        label = label(draft_id) if label else None
+        top = "%s №%d · версия %d · %s" % (label or ("🔔 Напоминание" if follow else "📝 Черновик"), draft_id, ver, name)
         # вопрос клиента над ответом и перевод для сотрудника (WACARDQ0410); нет у ядра — карточка прежняя
         extra = getattr(self.core, "card_extra", None)
         extra = extra(draft_id, ver, str(text or "")) if extra else None

@@ -56,6 +56,16 @@
                     contract берутся из `model.tools`); без сверки — прежнее ядро и строка «флаг 1, сверки нет». PDF
                     реально приложится только при WA_AGENT_BOOK_READ (без броней аренда не станет фактом). Флаг не
                     запрошен — ни строки, ни импорта: путь прежний байт-в-байт.
+  WA_AGENT_SIGNED_CARD — карточка после подписи (SIGNEDCARD1410, `AttachCore.make_signed_cards`): подписанный договор
+                    клиента, писавшего за 24 ч, сам даёт ОДНУ карточку «📄 Договор подписан» с PDF на версию договора;
+                    клиенту уходит только по «Отправить». Работает только при засчитанном WA_AGENT_ATTACH и бронях
+                    (WA_AGENT_BOOK_READ) или деле аренды: без них аренда не станет фактом; дверь аренды ядро берёт у модели
+                    тем же способом, что её сверка. Проход — под своим общим бюджетом плеч моста (`_signed_budget`, метка
+                    «прохода карточки после подписи»): двери договоров его не подменяют своим бюджетом нажатия.
+                    WA_AGENT_SIGNED_LOOKBACK_H (целые часы 0…24, по умолчанию 6; иное — «битая», умолчание) — водораздел
+                    первого запуска: версии, подписанные раньше, карточки не получают. По умолчанию выкл. WA_AGENT_ATTACH
+                    не засчитан при старте — ждущие и отложенные карточки подписи снимаются stale (прежнее ядро отправило
+                    бы их текст без PDF и без перечитывания реестра).
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -141,6 +151,15 @@ F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чте�
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
 F_ATTACH = "WA_AGENT_ATTACH"              # PDF договора второй частью «Отправить» (NIGHT0710-B3v); не в FLAGS
+F_SIGNED = "WA_AGENT_SIGNED_CARD"         # карточка после подписи (SIGNEDCARD1410); по умолчанию выкл; не в FLAGS
+F_SIGNED_LOOKBACK = "WA_AGENT_SIGNED_LOOKBACK_H"   # водораздел первого запуска, часов (по умолчанию 6)
+SIGNED_LOOKBACK_DEFAULT = 6               # = wa_agent_attach.SIGNED_LOOKBACK_H (тест сверяет)
+SIGNED_LOOKBACK_MAX = 24                  # = wa_agent_attach.SIGNED_LOOKBACK_MAX_H (тест сверяет): дальше — «битая»
+SIGNED_EVERY_SEC = 120                    # = wa_agent_attach.SIGNED_EVERY (тест сверяет): только для строки старта
+SIGNED_PASS_SEC = 20                      # = wa_agent_attach.SIGNED_PASS_SEC (тест сверяет): только для строки старта
+SIGNED_KIND = "signed"                    # = wa_agent_attach.KIND_SIGNED (тест сверяет): модуль без флага не импортируем
+W_SIGNED_ORPHAN = ("устарело: карточка подписанного договора — PDF клиенту (WA_AGENT_ATTACH) при старте службы не "
+                   "засчитан, прежнее ядро отправило бы текст без PDF и без перечитывания реестра; ничего не отправлено")
 F_TEMPLATES = wa_send.TEMPLATES_FLAG      # шаблон после 24 часов (NIGHT0710-B3g): одно имя у ядра и двери
 FLAGS = (F_DRAFTS, F_CARDS, F_REACT, F_RELAY, F_SEND, F_WATCH)
 DOOR_OFF_WORDS = "отправка выключена (WA_SEND) — дверь не звана"
@@ -790,12 +809,40 @@ def _press_budget(seconds):
         return contextlib.nullcontext()
 
 
+def _signed_budget(seconds):
+    """Общий бюджет плеч моста на ПРОХОД карточки после подписи (SIGNEDCARD1410) — со СВОЕЙ меткой: таймаут прохода в
+    журнале не выдаёт себя за таймаут нажатия; модуля нет (ПК без fcntl) — без бюджета (предел по часам ядра остаётся)."""
+    try:
+        import bridge_client
+        return bridge_client.card_budget(seconds, label="прохода карточки после подписи")
+    except Exception:                                                # noqa: BLE001
+        import contextlib
+        return contextlib.nullcontext()
+
+
+def _budget_sooner(seconds):
+    """Уже открыт общий бюджет плеч моста, который кончится РАНЬШЕ, чем через seconds (проход карточки после подписи)?
+    Бюджет — контекстная переменная `bridge_client`: вложенный бюджет её подменил бы, и проход стал бы дольше своего
+    потолка на каждом вызове двери. Модуля нет, бюджета нет, дедлайна нет — False: путь двери прежний."""
+    try:
+        import bridge_client
+        state = bridge_client.current_card_budget()
+    except Exception:                                                # noqa: BLE001
+        return None
+    deadline = getattr(state, "deadline", None)
+    return isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and \
+        deadline <= time.monotonic() + float(seconds)
+
+
 def press_door(fn, budget=None):
     """Дверь моста на нажатии (NIGHT0710-B3v): вызов под общим бюджетом плеч — поток службы один, и больной мост не
-    держит такт и нажатия дольше PRESS_BRIDGE_SEC на вызов (бюджет кончился — мост отвечает ok=False, PDF не уходит)."""
+    держит такт и нажатия дольше PRESS_BRIDGE_SEC на вызов (бюджет кончился — мост отвечает ok=False, PDF не уходит).
+    Открыт бюджет КОРОЧЕ (проход карточки после подписи, SIGNEDCARD1410) — дверь идёт под ним, своего не открывает."""
     budget = budget or _press_budget
 
     def call(*a, **kw):
+        if _budget_sooner(PRESS_BRIDGE_SEC):
+            return fn(*a, **kw)
         with budget(PRESS_BRIDGE_SEC):
             return fn(*a, **kw)
     return call
@@ -821,6 +868,63 @@ def attach_of(environ, drafts, model, budget=None):
                          "двери contract_pdf и contract — от сверки, бюджет моста %d с на вызов; брони %s"
                          % (PRESS_BRIDGE_SEC, "вкл" if book else
                             "ВЫКЛ — аренда не станет фактом, PDF не приложится, уйдёт только текст"))
+
+
+def signed_lookback_of(raw):
+    """WA_AGENT_SIGNED_LOOKBACK_H → (часы, слова). Пусто — умолчание; не целое 0…SIGNED_LOOKBACK_MAX — умолчание со
+    словом «битая» (100000 ч поставили бы водораздел в прошлый год: карточки по всем старым договорам)."""
+    s = str(raw or "").strip()
+    if not s:
+        return SIGNED_LOOKBACK_DEFAULT, "%d ч (умолчание)" % SIGNED_LOOKBACK_DEFAULT
+    if not s.isdigit() or int(s) > SIGNED_LOOKBACK_MAX:
+        return SIGNED_LOOKBACK_DEFAULT, "настройка %s битая (целые часы 0…%d) — %d ч (умолчание)" % (
+            F_SIGNED_LOOKBACK, SIGNED_LOOKBACK_MAX, SIGNED_LOOKBACK_DEFAULT)
+    return int(s), "%d ч" % int(s)
+
+
+def signed_of(environ, attach, model, budget=None):
+    """Флаг WA_AGENT_SIGNED_CARD → (вкл?, именованные аргументы `AttachCore` | None, слова строки старта | None).
+    Правило флага — одно со всеми выключателями (`flag_on`). Засчитывается только при засчитанном WA_AGENT_ATTACH (двери
+    contract_find и pdf_fetch), двери аренды модели (`ModelAdapter._tool_doors` — ядро берёт её у модели тем же способом,
+    что её сверка: «rental», при деле аренды и «case») и бронях (WA_AGENT_BOOK_READ) или деле аренды — иначе аренда не
+    станет фактом, а водораздел лёг бы в базу зря. budget(секунд) — общий бюджет плеч моста на проход (по умолчанию
+    `_signed_budget`). Ни флага, ни PDF клиенту — (False, None, None): строки старта нет, путь прежний байт-в-байт."""
+    asked = wa_agent_tg.flag_on(environ.get(F_SIGNED))
+    if not asked:
+        return False, None, ("выкл — карточки после подписи нет: PDF уходит только с ответом на сообщение клиента"
+                             if attach else None)
+    if not attach:
+        return False, None, ("выкл — флаг 1, но PDF клиенту (%s) не засчитан: без дверей договора карточки после "
+                             "подписи нет" % F_ATTACH)
+    if not callable(getattr(model, "_tool_doors", None)):
+        return False, None, "выкл — флаг 1, у модели нет двери аренды (сверка) — карточки после подписи нет"
+    if not (wa_agent_tg.flag_on(environ.get(F_BOOK)) or getattr(model, "case", None) is not None):
+        return False, None, ("выкл — флаг 1, но брони (%s) выключены и дела аренды нет: аренда не станет фактом — "
+                             "карточек после подписи нет, водораздел не пишется" % F_BOOK)
+    hours, hours_words = signed_lookback_of(environ.get(F_SIGNED_LOOKBACK))
+    return True, {"signed": True, "signed_lookback_h": hours, "signed_budget": budget or _signed_budget}, (
+        "вкл — подписанный договор клиента, писавшего за 24 ч, даёт ОДНУ карточку «📄 Договор подписан» с PDF на версию "
+        "(поиск раз в %d с, проход не дольше %d с); клиенту — только по «Отправить»; водораздел первого запуска %s "
+        "(%s): подписанные раньше карточки не получают; дверь аренды — сверки модели" % (
+            SIGNED_EVERY_SEC, SIGNED_PASS_SEC, hours_words, F_SIGNED_LOOKBACK))
+
+
+def close_signed_orphans(core, now, line):
+    """WA_AGENT_ATTACH не засчитан, ядро прежнее (`wa_agent.Core`), а в базе ждут черновики подписи (kind='signed',
+    pending или отложенные ритмом): «Отправить» прежнего ядра отправил бы шаблон «Направляем ваш подписанный договор» без
+    PDF и без перечитывания реестра. Снять их stale словами (карточка закрывается исходом) → число снятых. Черновиков
+    подписи нет — ни строки, путь прежний."""
+    try:
+        rows = core.db.execute("SELECT id, state FROM drafts WHERE kind=? AND state IN (?,?) ORDER BY id",
+                               (SIGNED_KIND, wa_agent.PENDING, wa_agent.SCHEDULED)).fetchall()
+    except Exception as e:                                           # noqa: BLE001
+        line("карточка после подписи: черновики подписи не прочитаны (%s) — снять их на старте нечем" % type(e).__name__)
+        return None
+    n = sum(1 for did, state in rows if core._close(did, wa_agent.STALE, W_SIGNED_ORPHAN, now, from_states=(state,)))
+    if rows:
+        line("карточка после подписи: PDF клиенту не засчитан — карточек подписи снято stale %d из %d (без PDF не "
+             "уходят)" % (n, len(rows)))
+    return n
 
 
 def tg_model_of(env, environ, line=None):
@@ -925,17 +1029,24 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     attach, doors, attach_words = attach_of(environ, drafts, model)
     if attach_words:
         line("PDF клиенту (%s): %s" % (F_ATTACH, attach_words))
+    # карточка после подписи (SIGNEDCARD1410): ни флага, ни PDF клиенту — ни строки, путь прежний байт-в-байт
+    _signed, signed_kw, signed_words = signed_of(environ, attach, model)
+    if signed_words:
+        line("карточка после подписи (%s): %s" % (F_SIGNED, signed_words))
     if attach:
         import wa_agent_attach
         core = wa_agent_attach.AttachCore(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                                           log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons,
                                           lesson_admins=admins, followup=follow, hints=hints, templates=templates,
-                                          lang_of=wa_agent_tg.K.lang_of, attach=True, **doors)
+                                          lang_of=wa_agent_tg.K.lang_of, attach=True, **doors,
+                                          **(signed_kw or {"signed": False}))
     else:
         core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                              log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
                              followup=follow, hints=hints, templates=templates, lang_of=wa_agent_tg.K.lang_of)
     tg.bind(core)
+    if not attach:                              # SIGNEDCARD1410: карточка подписи без PDF-ядра не уходит — снять stale
+        close_signed_orphans(core, clock(), line)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
     # отпечаток приветствия — тот же, что у ядра (WACHAINFIX0210); порог и тихие часы — настройки
     # (WAWATCHTEN0210): битая — умолчание (порог 600 с, тихих часов нет) и строка журнала со словом «битая»
@@ -1016,6 +1127,7 @@ def summary(core, tg, words, stats):
             + (" · уроков %s" % _pairs(core.lesson_counts()) if getattr(core, "lessons", False) else "")
             + (" · напоминаний %s" % _pairs(core.follow_counts()) if getattr(core, "followup", False) else "")
             + (" · пояснений %s" % _pairs(core.hint_counts()) if getattr(core, "hints", False) else "")
+            + (" · подписей %s" % _pairs(core.signed_counts() or {}) if getattr(core, "signed", False) else "")
             + (" · %s" % spend_words(spend) if isinstance(spend, dict) else "")
             + cards_words(core) + pdf_words(core))
 
