@@ -66,6 +66,20 @@
                     первого запуска: версии, подписанные раньше, карточки не получают. По умолчанию выкл. WA_AGENT_ATTACH
                     не засчитан при старте — ждущие и отложенные карточки подписи снимаются stale (прежнее ядро отправило
                     бы их текст без PDF и без перечитывания реестра).
+                    При засчитанном флаге ядро само судит просьбу клиента прислать СВОЙ договор (детектор
+                    `wa_agent_attach.ask_verdict_many`, CASEPDF1510): просьба открывает свою версию (и подписанную раньше
+                    водораздела), смешанная просьба — PDF к ответу модели (код привязывает договор сам), ответ модели не
+                    снимается. Детектор — ограничитель транспорта, ответ по-прежнему строит модель.
+  WA_AGENT_CONTRACT_ASK — откат детектора просьбы (CASEPDF1510). По умолчанию ВКЛ (при засчитанной карточке подписи);
+                    0 / false / no / off — ядру `ask_of=None`: просьба не судится, автоотправки нет, карточка подписи —
+                    как в SIGNEDCARD1410 байт-в-байт; исход — строкой старта автоотправки.
+  WA_AGENT_AUTOSEND_CONTRACT — автоотправка своего договора по ЧИСТОЙ просьбе (CASEPDF1510, `AttachCore(autosend=True)`):
+                    карточку подписи, рождённую явной просьбой без других вопросов, система сама нажимает штатным
+                    «Отправить» (шаблон + PDF, перечитывание реестра, все замки нажатия); не больше 10 в сутки и одной на
+                    версию договора. Засчитывается ТОЛЬКО при засчитанном WA_AGENT_SIGNED_CARD и детекторе. Карточка
+                    события без просьбы, смешанная просьба, ответ модели и карточка, снявшая ответ, который правил человек
+                    или где модель просила человека, — только по нажатию человека. По умолчанию выкл; карточка подписи
+                    засчитана — строка старта называет исход всегда; карточки подписи нет и флаг не запрошен — ни строки.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -158,6 +172,10 @@ SIGNED_LOOKBACK_MAX = 24                  # = wa_agent_attach.SIGNED_LOOKBACK_MA
 SIGNED_EVERY_SEC = 120                    # = wa_agent_attach.SIGNED_EVERY (тест сверяет): только для строки старта
 SIGNED_PASS_SEC = 20                      # = wa_agent_attach.SIGNED_PASS_SEC (тест сверяет): только для строки старта
 SIGNED_KIND = "signed"                    # = wa_agent_attach.KIND_SIGNED (тест сверяет): модуль без флага не импортируем
+F_AUTOSEND = "WA_AGENT_AUTOSEND_CONTRACT"   # автоотправка своего договора по просьбе (CASEPDF1510); по умолчанию выкл
+F_CONTRACT_ASK = "WA_AGENT_CONTRACT_ASK"  # = wa_agent_attach.F_CONTRACT_ASK (тест сверяет): откат детектора просьбы
+CONTRACT_ASK_OFF = ("0", "false", "no", "off")   # детектор по умолчанию вкл; выключают только эти слова
+AUTOSEND_DAY_MAX = 10                     # = wa_agent_attach.AUTOSEND_DAY_MAX (тест сверяет): только для строки старта
 W_SIGNED_ORPHAN = ("устарело: карточка подписанного договора — PDF клиенту (WA_AGENT_ATTACH) при старте службы не "
                    "засчитан, прежнее ядро отправило бы текст без PDF и без перечитывания реестра; ничего не отправлено")
 F_TEMPLATES = wa_send.TEMPLATES_FLAG      # шаблон после 24 часов (NIGHT0710-B3g): одно имя у ядра и двери
@@ -909,6 +927,33 @@ def signed_of(environ, attach, model, budget=None):
             SIGNED_EVERY_SEC, SIGNED_PASS_SEC, hours_words, F_SIGNED_LOOKBACK))
 
 
+def autosend_of(environ, signed):
+    """CASEPDF1510: выключатель детектора WA_AGENT_CONTRACT_ASK и флаг WA_AGENT_AUTOSEND_CONTRACT → (автоотправка вкл?,
+    именованные аргументы `AttachCore` | None, слова строки старта | None). Правило флага автоотправки — одно со всеми
+    выключателями (`flag_on`); детектор по умолчанию ВКЛ, выключает его только явное 0 / false / no / off.
+    Карточки подписи нет (signed=False): ядро просьбу не судит вовсе (детектор живёт только при карточке подписи); флаг
+    автоотправки запрошен — назван словами «не засчитан», не запрошен — (False, None, None): ни строки, путь прежний
+    байт-в-байт. Карточка подписи засчитана: детектор выключен — ядру `ask_of=None` (M2/M3/M4 мертвы, путь SIGNEDCARD1410
+    байт-в-байт), строка называет откат; включён — ядро судит просьбу своим детектором (`ask_verdict_many`, умолчание
+    `AttachCore`), автоотправка — только при флаге; строка старта называет исход всегда."""
+    asked = wa_agent_tg.flag_on(environ.get(F_AUTOSEND))
+    if not signed:
+        return False, None, ("выкл — флаг 1, но карточка после подписи (%s) не засчитана: автоотправки нет" % F_SIGNED
+                             if asked else None)
+    if (environ.get(F_CONTRACT_ASK) or "").strip().lower() in CONTRACT_ASK_OFF:
+        return False, {"ask_of": None, "autosend": False}, (
+            "выкл — детектор просьбы клиента выключен (%s): просьба не судится, карточка подписи — как в SIGNEDCARD1410%s"
+            % (F_CONTRACT_ASK, "; флаг автоотправки не засчитан" if asked else ""))
+    kw = {"autosend": asked}
+    if not asked:
+        return False, kw, ("выкл — карточка подписи по явной просьбе клиента ждёт нажатия «Отправить»; смешанная просьба — "
+                           "PDF к ответу модели, только по нажатию")
+    return True, kw, ("вкл — карточка подписи по ЧИСТОЙ просьбе клиента прислать свой договор уходит сама штатным "
+                      "«Отправить» (шаблон + PDF, перечитывание реестра, все замки нажатия); не больше %d в сутки и одной "
+                      "на версию; смешанная просьба, карточка события, ответ модели и карточка, снявшая ответ, который "
+                      "правил человек или где модель просила человека, — только по нажатию" % AUTOSEND_DAY_MAX)
+
+
 def close_signed_orphans(core, now, line):
     """WA_AGENT_ATTACH не засчитан, ядро прежнее (`wa_agent.Core`), а в базе ждут черновики подписи (kind='signed',
     pending или отложенные ритмом): «Отправить» прежнего ядра отправил бы шаблон «Направляем ваш подписанный договор» без
@@ -1033,13 +1078,17 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     _signed, signed_kw, signed_words = signed_of(environ, attach, model)
     if signed_words:
         line("карточка после подписи (%s): %s" % (F_SIGNED, signed_words))
+    # просьба клиента прислать свой договор (CASEPDF1510): карточки подписи нет и флаг не запрошен — ни строки, ни импорта
+    _auto, auto_kw, auto_words = autosend_of(environ, _signed)
+    if auto_words:
+        line("автоотправка своего договора по просьбе (%s): %s" % (F_AUTOSEND, auto_words))
     if attach:
         import wa_agent_attach
         core = wa_agent_attach.AttachCore(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                                           log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons,
                                           lesson_admins=admins, followup=follow, hints=hints, templates=templates,
                                           lang_of=wa_agent_tg.K.lang_of, attach=True, **doors,
-                                          **(signed_kw or {"signed": False}))
+                                          **(signed_kw or {"signed": False}), **(auto_kw or {}))
     else:
         core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                              log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,

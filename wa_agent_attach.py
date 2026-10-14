@@ -80,6 +80,28 @@ SIGNED_PASS_MAX поисков в реестре, первый таймаут и
 (курсор). Номер с решённой версией, подписью раньше водораздела или третьим подряд «договора нет» проверяется не чаще
 SIGNED_IDLE (новое входящее клиента — сразу); сбой двери или PDF подряд — паузы SIGNED_RETRY.
 
+ПРОСЬБА КЛИЕНТА ПРИСЛАТЬ СВОЙ ДОГОВОР (CASEPDF1510). Детектор — чистые функции ЭТОГО модуля (`ask_verdict`,
+`ask_verdict_many`, только `re`; импорты модуля прежние), `contract_ask` — тонкая обёртка над ними. При карточке подписи
+ядро судит просьбу само (параметр `ask_of` по умолчанию — этот детектор; служба передаёт None выключателем
+WA_AGENT_CONTRACT_ASK=0); карточки подписи нет или `ask_of=None` — путь прежний байт-в-байт. Ответ клиенту строит МОДЕЛЬ
+своим циклом, как прежде; детектор — только ограничитель первого узкого транспорта: вправе ли код сам приложить
+проверенный PDF или сам нажать. Неотвеченные входящие (echo=0, живые, id > done_upto) судятся вместе: pure — явная просьба
+и всё прочее нейтральное; mixed — просьба и рядом другое (в том числе второй вопрос); None — просьбы нет (отказ, вопрос об
+условиях, «договорились», чужой договор). M2 — в проходе подписи: просьба не ждёт паузы номера «договора нет / раньше
+водораздела» (частым шагом — не дольше ASK_EAGER_SEC от последнего входящего, дальше прежний ритм) и открывает версию,
+подписанную раньше водораздела (прочие замки прежние); pure — карточка подписи (шаблон) и, как первая карточка версии,
+замена ждущего ответа модели; mixed — карточки нет, ответ модели жив; двойник и решённая версия — карточки нет, повтор по
+просьбе назван словами. M3 — в `_attach_decide`: модель contract не звала, просьба mixed (или pure, когда первую карточку
+версии проход дать не может: прежнюю карточку сняло ядро, ответ модели жив — `_signed_wait_live`) — код привязывает договор
+тем же помощником, что проход (`_signed_find` → `_signed_pdf`), и строка `attach` несёт PDF с опорой OPORA_ASKED; ответ
+модели не снимается, текст не меняется; неудача — прежняя строка. M4 — WA_AGENT_AUTOSEND_CONTRACT (autosend): карточка
+подписи по pure тем же тактом нажимается системой (`press`, AUTO_WHO), весь путь нажатия прежний; перед нажатием ещё раз
+окно 24 ч, пауза, `_fresh`, потолки AUTOSEND_DAY_MAX в сутки и одна на версию, и карточка не снимала ответ, который правил
+человек (версия больше 1, пояснение) или где модель просила человека (причины «нужен человек» переходят в карточку
+подписи); начало пишется ДО нажатия (`signed_asks.auto_at`) — повтора нет; исход — по ОБЕИМ частям. Автоотправки НЕТ у
+карточки события без просьбы, у mixed и у ответа модели. Таблица `signed_asks` — черновики, рождённые просьбой: номер +
+doc_id + версия + sha256, вид, снятый ответ, исход; текста клиента нет — её прочтёт будущий читатель дела аренды.
+
 ЖУРНАЛ. `part_log` и строки `self.log`: кто, когда, часть, попытка, исход, wamid, sha256 — без текстов и номеров.
 
 В СЛУЖБЕ (NIGHT0710-B3v). Собирает `wa_agent_svc.build` — только при флаге (правило `flag_on` службы, одно на всех) И
@@ -256,6 +278,188 @@ CREATE TABLE IF NOT EXISTS signed_cards (
     PRIMARY KEY (number, doc_id, signed_at, file_id)
 );
 """
+# ── просьба клиента прислать СВОЙ договор (CASEPDF1510) ─────────────────────────────────
+# Детектор — чистые функции ниже (только `re`, импорты модуля прежние — тест сверяет); `contract_ask` — обёртка над ними.
+# Он — ограничитель транспорта, а не голова: ответ строит модель своим циклом, как прежде.
+F_AUTOSEND = "WA_AGENT_AUTOSEND_CONTRACT"      # выключатель службы; ядро окружение не читает (флаг — параметр autosend)
+F_CONTRACT_ASK = "WA_AGENT_CONTRACT_ASK"       # выключатель службы детектора (0 — ask_of=None, путь SIGNEDCARD1410)
+ASK_PURE, ASK_MIXED = "pure", "mixed"          # = contract_ask.PURE / MIXED (тест сверяет)
+ASKED = (ASK_PURE, ASK_MIXED)
+ASK_CARD, ASK_ANSWER = "card", "answer"        # signed_asks.kind: карточка подписи · PDF к ответу модели
+ASK_REOPENS = ("empty", "since")               # паузы номера («договора нет», «раньше водораздела»), которые просьба не ждёт
+ASK_EAGER_SEC = SIGNED_LATE                    # столько от последнего входящего просьба не ждёт паузы номера «договора нет»
+AUTO_WHO = "агент: автоотправка своего договора по просьбе"
+AUTOSEND_DAY_MAX = 10                          # автоотправок на службу за скользящие 24 ч; на версию договора — одна
+AUTO_PRESSING, AUTO_SKIP = "pressing", "skipped"
+AUTO_TEXT_ONLY = "text_only"                   # auto_state: текст ушёл, PDF — нет (`text_only:<исход PDF>`)
+OPORA_ASKED = " · прочитал КОД: клиент просит договор, модель contract не звала"
+W_CONTRACT_NOT_CALLED = "договор не сверялся (contract не звали)"
+W_ASK_OPEN = (W_CONTRACT_NOT_CALLED, "сверки не было")   # итог сверки модели, при котором M3 привязывает договор сам
+W_ASK_REPEAT = ("клиент просит договор, а версия решена без новой карточки — %s; повтор по просьбе не автоматизирован: "
+                "решает человек")
+_ASK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS signed_asks (
+    draft_id    INTEGER PRIMARY KEY,              -- черновик, рождённый явной просьбой клиента прислать СВОЙ договор
+    number      TEXT    NOT NULL,                 -- ключ дела: номер + doc_id + версия (signed_at, file_id) + sha256
+    doc_id      TEXT,
+    signed_at   TEXT,
+    file_id     TEXT,
+    sha256      TEXT,
+    asked       TEXT    NOT NULL,                 -- pure | mixed (contract_ask)
+    kind        TEXT    NOT NULL,                 -- card — карточка подписи · answer — PDF к ответу модели
+    upto_id     INTEGER,                          -- последнее входящее, по которому судилась просьба (текста клиента нет)
+    ts          REAL    NOT NULL,
+    auto_at     REAL,                             -- автоотправка НАЧАТА (до нажатия); NULL — не было
+    auto_state  TEXT,                             -- sent (текст И PDF) · text_only:<PDF> · исход нажатия · skipped · pressing
+    auto_words  TEXT,                             -- слова исхода — наши, без текста клиента
+    replaced_id INTEGER,                          -- ответ, который карточка подписи сняла (NULL — не снимала)
+    replaced_why TEXT                             -- почему автоотправки не будет: снятый ответ правил человек / просила модель
+);
+CREATE INDEX IF NOT EXISTS signed_asks_version ON signed_asks(number, doc_id, signed_at, file_id);
+"""
+_ASK_COLS = (("replaced_id", "INTEGER"), ("replaced_why", "TEXT"))      # база первого прогона выпуска — догнать колонки
+
+# Детектор (M1): «тексты НЕОТВЕЧЕННЫХ входящих → pure | mixed | None». НЕ решает, что ответить клиенту (это модель), и не
+# судит интеллект агента: отвечает ровно на вопрос транспорта — вправе ли код сам приложить проверенный PDF (mixed — к ответу
+# модели) или сам нажать «Отправить» на карточке подписи (pure, флаг WA_AGENT_AUTOSEND_CONTRACT). Примеры живут в тестах.
+#   · pure  — явная просьба прислать / дать / показать СВОЙ договор (копию, PDF договора) или спросить, где он, и всё прочее —
+#             нейтральное (приветствие, спасибо, пожалуйста, «подписал», ок, эмодзи);
+#   · mixed — просьба есть, но рядом другой вопрос или содержание; вопрос «…?», где есть слово кроме вежливости, — содержание
+#             («Где договор? Готово?», «Пришлите договор. Вы подписали?»);
+#   · None  — просьбы нет: «договорились», вопросы о существовании и условиях, «договор подписан / получил», отказ и отмена
+#             (в ЛЮБОМ из сообщений снимает просьбу целиком), чужой договор («его / её / ваш договор», his / her / your).
+# НАПРАВЛЕНИЕ СОМНЕНИЯ — в сторону «НЕ pure» (pure разрешает автоотправку): глагол просьбы и «договор» связаны только
+# служебными словами (мне, пожалуйста, копию, подписанный, мой, the, my, copy of …); вложение без текста, цифры и незнакомые
+# слова — содержание (mixed); не разобрали — None.
+_CA_SEP = r"[\s,;:\-–—]+"                              # между словами одного предложения (без . ? ! и перевода строки)
+_CA_NOUN = (r"(?:(?:договор|контракт)(?:а|у|ом|е|ы|ов)?(?:\s+аренды)?"
+            r"|(?:(?:rental|lease|rent)\s+)?(?:contract|agreement|pdf)s?)")
+_CA_COPY = r"(?:копи(?:ю|я|и)|экземпляр|скан|copy)"     # «пришлите копию» — просьба, если договор назван в сообщении
+# служебные слова между глаголом просьбы и договором: связь «прислать — договор» ими не рвётся. Чужого договора здесь нет:
+# «его / её / ваш договор», his / her / your — связь рвётся, и просьбой СВОЕГО договора это не считается
+_CA_GAP = ("мне", "нам", "пожалуйста", "пожалуйсто", "плиз", "пжл", "пж", "еще", "раз", "снова", "повторно", "уже", "сразу",
+           "ка", "копию", "копия", "скан", "файл", "пдф", "pdf", "подписанный", "подписанного", "подписаный", "подписанную",
+           "подписал", "подписала", "подписали", "мой", "моего", "мою", "наш", "нашего", "этот", "этого",
+           "сюда", "тут", "здесь", "в", "ватсап", "вотсап", "whatsapp", "же", "вы",
+           "me", "us", "the", "my", "our", "a", "an", "copy", "of", "signed", "please", "pls", "plz", "kindly", "again",
+           "here", "over", "back", "this", "that", "final", "full", "scan", "file", "it", "via", "on")
+_CA_GAPS = r"(?:%s(?:%s)\b)*" % (_CA_SEP, "|".join(_CA_GAP))
+# голова просьбы: повелительное, «можете прислать», «где», «жду»; EN — send / can I get / where is
+_CA_HEAD_RU_IMP = (r"(?:(?:при|вы|пере)шли(?:те)?|(?:при|вы|пере)шле(?:шь|те)|(?:при|вы)сыла(?:й|йте)"
+                   r"|скин(?:ь|ьте|ешь|ете)|скидыва(?:й|йте)|кин(?:ь|ьте)|сброс(?:ь|ьте)|отправ(?:ь|ьте|ишь|ите)"
+                   r"|отправля(?:й|йте)|да(?:й|йте|дите|шь)|покаж(?:и|ите))")
+_CA_HEAD_RU_MODAL = (r"(?:(?:вы\s+)?(?:можете|сможете|(?:не\s+)?могли\s+бы(?:\s+вы)?)|можно(?:\s+ли)?)"
+                     r"(?:\s+(?:мне|нам|пожалуйста|бы|ли))*\s+"
+                     r"(?:прислать|выслать|переслать|скинуть|кинуть|сбросить|отправить|дать|показать|получить|увидеть)")
+_CA_HEAD_RU_OTHER = r"(?:где|жд(?:у|ем))"
+_CA_HEAD_EN = (r"(?:(?:(?:can|could|would|will)\s+(?:you|u)\s+(?:please\s+|pls\s+|plz\s+|kindly\s+)?)?"
+               r"(?:send|resend|re-send|forward|share|give)"
+               r"|(?:can|could|may)\s+(?:i|we)\s+(?:please\s+)?(?:get|have|see|receive)"
+               r"|where(?:\s+is|\s+are)?)")
+_CA_HEAD = r"(?:%s|%s|%s|%s)" % (_CA_HEAD_RU_IMP, _CA_HEAD_RU_MODAL, _CA_HEAD_RU_OTHER, _CA_HEAD_EN)
+_CA_RX_HEAD_NOUN = re.compile(r"\b%s\b%s%s\b%s\b" % (_CA_HEAD, _CA_GAPS, _CA_SEP, _CA_NOUN))
+# «договор подписал, пришлите копию», «the contract, please send it» — договор назван ДО глагола
+_CA_RX_NOUN_HEAD = re.compile(r"\b%s\b%s%s\b(?:%s|send|resend|forward|share)\b(?:%s(?:%s|%s)\b)*" % (
+    _CA_NOUN, _CA_GAPS, _CA_SEP, _CA_HEAD_RU_IMP, _CA_SEP, "|".join(_CA_GAP), _CA_COPY))
+_CA_RX_HEAD_COPY = re.compile(r"\b%s\b%s%s\b%s\b%s" % (_CA_HEAD, _CA_GAPS, _CA_SEP, _CA_COPY, _CA_GAPS))
+# «можно (копию) договор(а)» без глагола — просьба, только если до конца предложения нет ничего, кроме нейтрального:
+# «можно договор на год?» — вопрос об условиях, а не просьба
+_CA_RX_CAN_NOUN = re.compile(r"\bможно(?:\s+(?:мне|нам|ли))*%s%s\b%s\b" % (_CA_GAPS, _CA_SEP, _CA_NOUN))
+# сочинение: «пришлите адрес и договор», «send me the price and the contract» — просьба есть, рядом другое
+_CA_RX_COORD = re.compile(r"\b(?:%s|%s)\b[^.?!\n]*?(?:,|\bи\b|\band\b|&)%s\s*\b%s\b" % (
+    _CA_HEAD_RU_IMP, _CA_HEAD_EN, _CA_GAPS, _CA_NOUN))
+_CA_RX_ANY_NOUN = re.compile(r"\b%s\b" % _CA_NOUN)
+_CA_RX_REFUSE = re.compile(
+    r"\bне\s+(?:надо|нужно|нужен|нужна|нужны|требуется|присыла\w*|высыла\w*|отправля\w*|скидыва\w*|кида\w*|шли\w*)\b"
+    r"|\bотмен\w*|\bбез\s+(?:договор|контракт)\w*"
+    r"|\b(?:do\s+not|does\s+not|dont|no\s+need|not\s+need(?:ed)?|never\s*mind|cancel\w*)\b")
+# вежливость — нейтральна и в вопросе («…, да?», «please?», «а?»): пинг, а не второй вопрос
+_CA_POLITE = (
+    r"здравствуйте", r"здравствуй", r"здрасте", r"здрасьте", r"приветствую", r"привет",
+    r"добрый\s+(?:день|вечер)", r"доброе\s+утро", r"доброй\s+ночи", r"доброго\s+(?:дня|утра|вечера|времени\s+суток)",
+    r"спасибо\s+(?:большое|огромное|заранее)", r"спасибо", r"благодарю", r"спс",
+    r"пожалуйста", r"пожалуйсто", r"плиз", r"пжл", r"пж", r"окей", r"оки", r"ок", r"хорошо", r"ладно", r"ага", r"угу",
+    r"да", r"а", r"ну",
+    r"good\s+(?:morning|afternoon|evening|day)", r"hello", r"hiya", r"hi", r"hey",
+    r"thank\s+you\s+(?:so|very)\s+much", r"thank\s+you", r"thanks\s+(?:a\s+lot|so\s+much)", r"thanks", r"thx", r"ty",
+    r"cheers", r"please", r"pls", r"plz", r"kindly", r"okay", r"okey", r"ok", r"sure", r"yes", r"yeah", r"yep")
+# нейтральное вне вопроса: вежливость + «подписал(а)», «уже», «все», местоимения и связки
+_CA_NEUTRAL = _CA_POLITE + (
+    r"ясно", r"понятно", r"отлично", r"супер", r"класс",
+    r"подписала", r"подписали", r"подписал", r"подписано", r"подписана", r"подписан", r"готово", r"сделано",
+    r"уже", r"все", r"я", r"вы", r"и", r"так", r"вот", r"же", r"ой", r"мне", r"нам", r"его", r"еще",
+    r"снова", r"раз", r"повторно", r"мой", r"моего",
+    r"k", r"great", r"good", r"fine", r"perfect", r"alright", r"all\s+right", r"cool",
+    r"i\s+have\s+signed\s+it", r"i\s+have\s+signed", r"i\s+signed\s+it", r"i\s+signed", r"signed\s+it", r"signed",
+    r"just", r"already", r"done", r"and", r"so", r"oh", r"i", r"have", r"it", r"the", r"a", r"an", r"my", r"me",
+    r"us", r"our")
+_CA_RX_NEUTRAL = re.compile(r"\b(?:%s)\b" % "|".join(sorted(_CA_NEUTRAL, key=len, reverse=True)))
+_CA_RX_POLITE = re.compile(r"\b(?:%s)\b" % "|".join(sorted(_CA_POLITE, key=len, reverse=True)))
+_CA_RX_SENTENCE_END = re.compile(r"[.?!\n]")
+_CA_RX_QUESTION = re.compile(r"[^.?!\n]*\?")              # предложение, кончающееся вопросом
+_CA_RX_CONTENT = re.compile(r"[^\W_]")                    # буква или цифра: содержание
+_CA_CONTRACTIONS = ((r"\bi've\b", "i have"), (r"\bwhere's\b", "where is"), (r"\bdon't\b", "do not"),
+                    (r"\bdoesn't\b", "does not"), (r"\bit's\b", "it is"), (r"\bcan't\b", "can not"))
+
+
+def _ca_norm(text):
+    """Нижний регистр, ё → е, апостроф одним знаком, сокращения EN раскрыты, пробелы схлопнуты."""
+    s = str(text or "").lower().replace("ё", "е").replace("’", "'").replace("`", "'")
+    for rx, full in _CA_CONTRACTIONS:
+        s = re.sub(rx, full, s)
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def _ca_left(rx, piece):
+    """Что остаётся в куске, если снять слова шаблона rx: есть ли там буква или цифра."""
+    return _CA_RX_CONTENT.search(rx.sub(" ", piece)) is not None
+
+
+def _ca_tail_neutral(s, pos):
+    """От pos до конца предложения — только нейтральное?"""
+    end = _CA_RX_SENTENCE_END.search(s, pos)
+    return not _ca_left(_CA_RX_NEUTRAL, s[pos:end.start() if end is not None else len(s)])
+
+
+def _ca_parse(text):
+    """Одно сообщение → {"request": есть ли просьба, "other": есть ли рядом другое содержание, "refusal": отказ}."""
+    s = _ca_norm(text)
+    spans = [m.span() for m in _CA_RX_HEAD_NOUN.finditer(s)] + [m.span() for m in _CA_RX_NOUN_HEAD.finditer(s)]
+    # «копию» — только если договор назван в том же сообщении и после «копию» до конца предложения нет своего объекта
+    # («пришлите копию паспорта» — не договор); «можно договор» — только без хвоста условий («можно договор на год?»)
+    copies = [m.span() for m in _CA_RX_HEAD_COPY.finditer(s) if _ca_tail_neutral(s, m.end())] \
+        if _CA_RX_ANY_NOUN.search(s) is not None else []
+    spans += [m.span() for m in _CA_RX_CAN_NOUN.finditer(s) if _ca_tail_neutral(s, m.end())]
+    if copies:                                             # «копию» отсылает к названному договору: он — не содержание
+        spans += copies + [m.span() for m in _CA_RX_ANY_NOUN.finditer(s)]
+    rest = list(s)
+    for a, b in spans:
+        rest[a:b] = " " * (b - a)
+    rest = "".join(rest)
+    coord = _CA_RX_COORD.search(rest) is not None
+    # второй вопрос рядом с просьбой — содержание, даже из «нейтральных» слов («Где договор? Готово?»); голый «?» и
+    # вежливый пинг («…, да?», «please?») — нет
+    question = any(_ca_left(_CA_RX_POLITE, m.group(0)) for m in _CA_RX_QUESTION.finditer(rest))
+    return {"request": bool(spans) or coord, "other": coord or question or _ca_left(_CA_RX_NEUTRAL, rest),
+            "refusal": _CA_RX_REFUSE.search(s) is not None}
+
+
+def ask_verdict(text):
+    """Одно сообщение клиента → "pure" | "mixed" | None (смыслы — выше)."""
+    return ask_verdict_many([text])
+
+
+def ask_verdict_many(texts):
+    """НЕОТВЕЧЕННЫЕ входящие клиента вместе → "pure" | "mixed" | None. Отказ в любом сообщении — None; просьба хотя бы в
+    одном и всё прочее нейтральное — pure; просьба и где угодно другое содержание — mixed; просьбы нет — None.
+    Элемент не строка (вложение без подписи) — нейтральным не считается: зовущий передаёт его словом вида."""
+    got = [_ca_parse(t if isinstance(t, str) else "[%s]" % type(t).__name__) for t in (texts or [])]
+    if not any(p["request"] for p in got) or any(p["refusal"] for p in got):
+        return None
+    return ASK_MIXED if any(p["other"] for p in got) else ASK_PURE
+
+
+_ASK_BUILTIN = object()                                  # умолчание `ask_of`: детектор этого модуля (при карточке подписи)
 _CYR = re.compile(r"[А-Яа-яЁё]")
 _LETTER = re.compile(r"[^\W\d_]")
 
@@ -353,7 +557,7 @@ def attach_of(tools_out, since=None, read_pdf=None):
     con = by("contract")
     cfs = kind("contract")
     if not con:
-        return None, "договор не сверялся (contract не звали)"
+        return None, W_CONTRACT_NOT_CALLED
     if not cfs:
         if any(r.get("outcome") == T.FACT for r in con):
             return None, snapped("contract", "contract")
@@ -457,7 +661,7 @@ def _opora_row(r, n):
                                              " · фактов %d" % n if n > 1 else "")
 
 
-def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS, code=None, mark=OPORA_CODE):
+def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS, code=None, mark=OPORA_CODE, extra=()):
     """Итог сверки Т4а (`ModelAdapter.last["tools"]`) → опора черновика словами для карточки (K3-FIX F1) | None (сверки
     нет). Строка — на КАЖДЫЙ ответ инструмента, чьи факты остались в опоре судьи (`sift` с тем же since, что у
     `attach_of`), по порядку чтения: инструмент · источник (`source` ответа: дверь, лист, узел) · время ЧТЕНИЯ ДАННЫХ
@@ -468,7 +672,8 @@ def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS, 
     `stand_meta` подделки моста в результат не попадает вовсе. Новых обращений к мосту нет — только уже прочитанное.
     Длина — потолок строк и знаков; усечение названо числом, как и факты, снятые опорой судьи. `code` (K3-FIX шаг 3r) —
     ответ `contract_pdf`, прочитанный КОДОМ для вложения: последней строкой, с отметкой `mark` (по умолчанию `OPORA_CODE`;
-    у карточки подписи — `OPORA_SIGNED`)."""
+    у карточки подписи — `OPORA_SIGNED`). `extra` (CASEPDF1510, M3) — ответы аренды и договора, прочитанные КОДОМ по просьбе
+    клиента: после строк модели, перед строкой PDF, с той же отметкой `mark` (пусто — опора прежняя байт-в-байт)."""
     if not isinstance(tools_out, dict):
         return None
     res = [r for r in tools_out.get("results") or [] if isinstance(r, dict)]
@@ -488,6 +693,9 @@ def opora_of(tools_out, since=None, rows_max=OPORA_ROWS, chars_max=OPORA_CHARS, 
             rows.append(_opora_row(r, n))
         else:
             off += 1
+    for r in extra or ():
+        if isinstance(r, dict) and r.get("outcome") == T.FACT:
+            rows.append(_opora_row(r, len(r.get("facts") or [])) + mark)
     if isinstance(code, dict) and code.get("outcome") == T.FACT:
         rows.append(_opora_row(code, len(code.get("facts") or [])) + mark)
     tail = _OPORA_STATE.get(tools_out.get("state"), " (исход сверки не разобран)")
@@ -1041,7 +1249,7 @@ class AttachCore(A.Core):
     """Ядро с PDF договора второй частью. attach=False — каждый метод отдаёт управление `Core` (голден 24ad256)."""
 
     def __init__(self, *args, attach=False, pdf_fetch=None, contract_find=None, signed=False,
-                 signed_lookback_h=SIGNED_LOOKBACK_H, signed_budget=None, **kw):
+                 signed_lookback_h=SIGNED_LOOKBACK_H, signed_budget=None, ask_of=_ASK_BUILTIN, autosend=False, **kw):
         self.attach = bool(attach)
         self.pdf_fetch = pdf_fetch                  # file_id → ответ `bridge_client.contract_pdf` (content_b64, verified)
         self.contract_find = contract_find          # (phone, date_from, date_to) → ответ `bridge_client.contract_find`
@@ -1058,6 +1266,14 @@ class AttachCore(A.Core):
         self.signed_lookback = hours * 3600
         # signed_budget(секунд) → контекст общего бюджета плеч моста на проход (служба: `bridge_client.card_budget`)
         self.signed_budget = signed_budget if callable(signed_budget) else None
+        # просьба клиента прислать СВОЙ договор (CASEPDF1510): ask_of(тексты) → "pure" | "mixed" | None. По умолчанию —
+        # детектор этого модуля (`ask_verdict_many`); None (служба: WA_AGENT_CONTRACT_ASK=0) или карточка подписи
+        # выключена — M2/M3 мертвы, путь прежний байт-в-байт. autosend (WA_AGENT_AUTOSEND_CONTRACT) — только поверх него
+        if ask_of is _ASK_BUILTIN:
+            ask_of = ask_verdict_many
+        self.ask_of = ask_of if callable(ask_of) and self.signed else None
+        self.autosend = bool(autosend) and self.ask_of is not None
+        self._signed_auto = []                      # черновики подписи по чистой просьбе этого прохода — к автоотправке
         self._signed_last = None                    # такт поиска подписанных (SIGNED_EVERY)
         self._signed_said = set()                   # причины «карточки нет» — строкой журнала один раз на процесс
         self._signed_cursor = None                  # последний разобранный номер: следующий проход — с номера после него
@@ -1093,6 +1309,12 @@ class AttachCore(A.Core):
                 self.db.execute("ALTER TABLE attach ADD COLUMN %s %s" % (col, typ))
         if self.signed:                             # SIGNEDCARD1410: выключено — таблицы и метки нет, база прежняя
             self.db.executescript(_SIGNED_SCHEMA)
+            if self.ask_of is not None:             # CASEPDF1510: детектора нет — таблицы нет, база прежняя
+                self.db.executescript(_ASK_SCHEMA)
+                have = {r[1] for r in self.db.execute("PRAGMA table_info(signed_asks)").fetchall()}
+                for col, typ in _ASK_COLS:          # база первого прогона выпуска — колонки снятого ответа догнать
+                    if col not in have:
+                        self.db.execute("ALTER TABLE signed_asks ADD COLUMN %s %s" % (col, typ))
             if self.db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
                                (SIGNED_SINCE, repr(float(self.clock()) - self.signed_lookback))).rowcount == 1:
                 self.log("подпись: водораздел записан — версии, подписанные раньше %s (Пхукет), карточки не получают"
@@ -1267,14 +1489,32 @@ class AttachCore(A.Core):
             code["r"] = self._code_pdf(pdf_id, results)
             return code["r"]
         meta, why = attach_of(out, since, read_pdf)  # опора судьи: sift с since = последнее входящее (T4B3BASIS0510)
+        # CASEPDF1510 (M3): модель contract не звала, а клиент просит СВОЙ договор вместе с другим вопросом (или чисто, но
+        # первую карточку версии проход дать не может) — код сам привязывает договор тем же помощником, что проход
+        # подписи; ответ модели не снимается, текст не меняется
+        asked = None
+        if meta is None and ver is None and why in W_ASK_OPEN and self.ask_of is not None:
+            asked = self._ask_attach(number, upto)     # None — просьбы для M3 нет: строка прежняя
+            if asked is not None and asked["meta"]:
+                meta, why = asked["meta"], ""
+            elif asked is not None:
+                self.log("черновик %d: клиент просит договор (%s) — код PDF не приложил (%s); ответ модели без PDF, "
+                         "строка прежняя" % (did, asked["asked"], str(asked["why"])[:160]))
         by_code = bool(meta and meta.get("pdf_by"))
         if meta:
             twin = self._pdf_twin(number, meta["sha256"], did)
             if twin:
                 meta, why = None, W_TWIN % (twin[2][:12], twin[0], twin[1])
+                if asked is not None:
+                    self.log("черновик %d: %s" % (did, W_ASK_REPEAT % ("этот PDF уже уходил черновиком %d (%s)" % (
+                        twin[0], twin[1]))))
         m = meta or {}
-        # K3-FIX F1: опора для карточки — из того же итога сверки; шаг 3r: + PDF, прочитанный кодом, с отметкой
-        opora = opora_of(out, since, code=code.get("r") if by_code else None)
+        # K3-FIX F1: опора для карточки — из того же итога сверки; шаг 3r: + PDF, прочитанный кодом, с отметкой;
+        # CASEPDF1510 (M3): + аренда, договор и PDF, прочитанные кодом по просьбе клиента, с отметкой OPORA_ASKED
+        if asked is not None and meta:
+            opora = opora_of(out, since, code=asked["code"], mark=OPORA_ASKED, extra=asked["rows"])
+        else:
+            opora = opora_of(out, since, code=code.get("r") if by_code else None)
         self.db.execute("INSERT OR REPLACE INTO attach(draft_id, file_id, name, size, sha256, row, doc_id, "
                         "reason, ts, signed_at, number, date_from, date_to, opora) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (did, m.get("file_id"), m.get("name"), m.get("size"), m.get("sha256"), m.get("row"),
@@ -1282,9 +1522,15 @@ class AttachCore(A.Core):
                          m.get("date_from"), m.get("date_to"), opora))
         if ver is not None:                         # Д2: строка — итог сверки ЭТОЙ версии по пояснению
             self.db.execute("UPDATE attach SET ver=? WHERE draft_id=?", (int(ver), did))
+        if asked is not None and meta:              # черновик помечен просьбой: ключ дела — номер, doc_id, версия
+            self.db.execute("INSERT OR REPLACE INTO signed_asks(draft_id, number, doc_id, signed_at, file_id, sha256, "
+                            "asked, kind, upto_id, ts) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (did, number, m.get("doc_id"), m.get("signed_at"), m.get("file_id"), m.get("sha256"),
+                             asked["asked"], ASK_ANSWER, upto, now))
         self.log("черновик %d: вложение %s%s%s" % (
             did, "PDF договора, sha256 %s…" % m["sha256"][:12] if meta else "нет — %s" % why,
-            " — PDF прочитан кодом (модель contract_pdf не звала)" if meta and by_code else "",
+            (" — клиент просит договор: договор и PDF привязал КОД (модель contract не звала)" if asked is not None
+             else " — PDF прочитан кодом (модель contract_pdf не звала)") if meta and by_code else "",
             " (сверка версии %d по пояснению)" % ver if ver is not None else ""))
 
     def _code_pdf(self, file_id, results):
@@ -2026,17 +2272,17 @@ class AttachCore(A.Core):
             memo.update({"in": last_in, "idle_at": 0, "empty": 0})
         return memo
 
-    def _signed_idle(self, number, last_in, now):
+    def _signed_idle(self, number, last_in, now, why="decided"):
         """Номер решён (версия решена, раньше водораздела, карточка сделана) — до нового входящего не чаще SIGNED_IDLE;
-        сбои подряд кончились."""
+        сбои подряд кончились. why — почему (CASEPDF1510: паузу «раньше водораздела» явная просьба не ждёт)."""
         memo = self._signed_set(number, last_in)
-        memo.update({"idle_at": now + SIGNED_IDLE, "fails": 0, "fail_at": 0})
+        memo.update({"idle_at": now + SIGNED_IDLE, "fails": 0, "fail_at": 0, "why": why})
 
     def _signed_empty(self, number, last_in, now):
         """Подписанного договора в сроке нет (или привязка не факт): первые SIGNED_EMPTY_FREE проходов — обычный шаг
         (клиент подписывает прямо сейчас), дальше до нового входящего — не чаще SIGNED_IDLE."""
         memo = self._signed_set(number, last_in)
-        memo.update({"empty": memo.get("empty", 0) + 1, "fails": 0, "fail_at": 0})
+        memo.update({"empty": memo.get("empty", 0) + 1, "fails": 0, "fail_at": 0, "why": "empty"})
         if memo["empty"] > SIGNED_EMPTY_FREE:
             memo["idle_at"] = now + SIGNED_IDLE
 
@@ -2067,12 +2313,207 @@ class AttachCore(A.Core):
         return W_SIGNED_LABEL if meta and meta[0] else None
 
     def signed_counts(self):
-        """Решения по версиям для сводки службы: карточка · покрыта (другой черновик несёт или нёс этот PDF) · человек."""
+        """Решения по версиям для сводки службы: карточка · покрыта (другой черновик несёт или нёс этот PDF) · человек.
+        CASEPDF1510 (детектор передан): + черновики по просьбе клиента (карточка подписи · PDF к ответу модели) и
+        автоотправки (начато · ушли текст и PDF) — ключ только при ненулевом числе: без просьб сводка прежняя."""
         if not self.signed:
             return None
-        return dict(self.db.execute(
+        out = dict(self.db.execute(
             "SELECT CASE WHEN s.draft_id IS NULL THEN 'человек' WHEN d.kind=? THEN 'карточка' ELSE 'покрыта' END, "
             "COUNT(*) FROM signed_cards s LEFT JOIN drafts d ON d.id=s.draft_id GROUP BY 1", (KIND_SIGNED,)).fetchall())
+        if self.ask_of is not None:
+            row = self.db.execute("SELECT SUM(kind=?), SUM(kind=?), SUM(auto_at IS NOT NULL), SUM(auto_state=?) FROM "
+                                  "signed_asks", (ASK_CARD, ASK_ANSWER, A.SENT)).fetchone()
+            for k, v in zip(("просьба_карточка", "просьба_ответ", "автоотправка", "автоотправка_ушла"), row or ()):
+                if v:
+                    out[k] = int(v)
+        return out
+
+    # ── просьба клиента прислать СВОЙ договор (CASEPDF1510) ──────────────────────────────────
+
+    @staticmethod
+    def _ask_text(msg_type, text):
+        """Входящее → текст детектору: у текста — сам текст; вложение — словом вида (+ подпись): вложение без слов
+        нейтральным не считается — при сомнении НЕ «чистая просьба»."""
+        kind = A.wa_kind._type(msg_type)
+        if kind == "text":
+            return str(text or "")
+        return ("[%s] %s" % (kind or "вложение", text or "")).strip()
+
+    def _signed_asked(self, number, upto=None):
+        """НЕОТВЕЧЕННЫЕ входящие клиента (echo=0, живые входящие `_live_kind`, id > clients.done_upto, id ≤ last_in_id или
+        ≤ upto черновика) → детектор → "pure" | "mixed" | None. Детектора нет — None без чтения очереди (путь прежний);
+        очередь не прочитана или детектор упал — None: при сомнении НЕ просьба. Текстов клиента в журнале нет."""
+        if self.ask_of is None:
+            return None
+        cl = self.db.execute("SELECT last_in_id, done_upto FROM clients WHERE number=?", (number,)).fetchone()
+        if not cl:
+            return None
+        top = int(cl[0]) if upto is None else int(upto)
+        try:
+            q = self._queue()
+            try:
+                rows = q.execute("SELECT id, msg_type, echo, history, text FROM wa_inbox WHERE from_number=? AND echo=0 "
+                                 "AND id>? AND id<=? ORDER BY id", (number, int(cl[1] or 0), top)).fetchall()
+            finally:
+                q.close()
+            texts = [self._ask_text(msg_type, text) for _rid, msg_type, echo, history, text in rows
+                     if self._live_kind(msg_type, echo, history) == A.wa_kind.KIND_INBOUND]
+            got = self.ask_of(texts) if texts else None
+        except Exception as e:                                       # noqa: BLE001
+            self.log("подпись: просьба клиента не разобрана (%s) — как без просьбы" % type(e).__name__)
+            return None
+        return got if got in ASKED else None
+
+    def _signed_carried(self, number):
+        """У номера живой черновик (ждёт · захвачен · уходит · отложен) уже несёт PDF — просьбу ведёт он."""
+        return self.db.execute("SELECT 1 FROM drafts d JOIN attach a ON a.draft_id=d.id WHERE d.number=? AND d.state IN "
+                               "(?,?,?,?) AND a.file_id IS NOT NULL LIMIT 1",
+                               (number, A.PENDING, A.CLAIMED, A.SENDING, A.SCHEDULED)).fetchone() is not None
+
+    def _signed_ask_due(self, number, now):
+        """M2: номер на паузе «договора нет» / «раньше водораздела», а клиент сам просит договор и живого черновика с
+        PDF нет — проверить сейчас (явная просьба паузу не ждёт: клиент подписывает прямо сейчас). Частым шагом — не
+        дольше ASK_EAGER_SEC от последнего входящего клиента: просьба, которую никто не отвечает часами, реестр каждые
+        SIGNED_EVERY не дёргает — дальше прежний ритм паузы (SIGNED_IDLE). Пауза после сбоев двери — ждёт всегда."""
+        if self.ask_of is None:
+            return False
+        memo = self._signed_memo.get(number) or {}
+        if now < memo.get("fail_at", 0) or memo.get("why") not in ASK_REOPENS:
+            return False
+        cl = self.db.execute("SELECT last_in_ts FROM clients WHERE number=?", (number,)).fetchone()
+        eager = cl is not None and now - float(cl[0] or 0) <= ASK_EAGER_SEC
+        return eager and not self._signed_carried(number) and self._signed_asked(number) in ASKED
+
+    def _ask_attach(self, number, upto):
+        """M3: просьба → привязка кодом тем же помощником, что у прохода подписи (аренда-FACT → contract FACT →
+        `_code_pdf` → `attach_of` по договору, привязанному кодом). Смешанная — всегда (карточки подписи у неё нет);
+        чистая — только когда первую карточку версии проход дать не может (`_signed_wait_live`: прежнюю карточку подписи
+        сняло ядро, а этот ответ модели жив и ради шаблона не снимается) — иначе её ведёт карточка подписи (M2).
+        → None — просьбы для M3 нет (строка прежняя) | {"asked", "meta", "why", "rows": [аренда, договор], "code": ответ
+        contract_pdf}. Под общим бюджетом прохода (SIGNED_PASS_SEC): больной мост не держит такт ответа модели дольше
+        прохода подписи."""
+        asked = self._signed_asked(number, upto)
+        if not (asked == ASK_MIXED or (asked == ASK_PURE and self._signed_wait_live(number))):
+            return None
+        got = {"asked": asked, "meta": None, "why": "", "rows": [], "code": None}
+        try:
+            with (self.signed_budget(SIGNED_PASS_SEC) if self.signed_budget else _NoBudget()):
+                rental, contract = self._signed_find(number, upto)
+                if contract is None:
+                    got["why"] = "аренда: %s" % (rental.get("outcome") if isinstance(rental, dict) else "ответа нет")
+                elif contract.get("outcome") != T.FACT:
+                    got["why"] = "договор: %s — %s" % (contract.get("outcome"), str(contract.get("reason") or "")[:80])
+                else:
+                    meta, why, code_r = self._signed_pdf(contract)
+                    got.update(meta=meta, why=why, rows=[rental, contract], code=code_r)
+        except Exception as e:                                       # noqa: BLE001
+            got["why"] = "привязка кодом упала (%s)" % type(e).__name__
+        return got
+
+    def _ask_replaced(self, old, prev):
+        """Ответ модели, который снимает карточка подписи по просьбе, — тронут человеком или модель просила человека? →
+        слова (наши, без текста клиента и без причин модели дословно) | None. Тронут: версия больше 1 (правка «Исправить»
+        или версия по пояснению), пояснение к нему (ждёт или сделано), причины «нужен человек» (или они не прочитаны).
+        Таблицу пояснений не прочитали — тоже «тронут»: при сомнении автоотправки нет."""
+        try:
+            ver = int(prev[2] or 1)
+        except (TypeError, ValueError):
+            ver = 0
+        if ver != 1:
+            return "карточка сняла ответ (черновик %d), который правил человек: версия %s" % (old, prev[2])
+        try:
+            hinted = self.db.execute("SELECT COUNT(*) FROM hints WHERE draft_id=?", (old,)).fetchone()[0]
+        except Exception as e:                                       # noqa: BLE001
+            return "карточка сняла ответ (черновик %d): пояснения человека не прочитаны (%s)" % (old, type(e).__name__)
+        if hinted:
+            return "карточка сняла ответ (черновик %d), к которому было пояснение человека" % old
+        hand = A.handoff_of(prev[3])
+        if hand is None:
+            return "карточка сняла ответ (черновик %d): причины «нужен человек» не прочитаны" % old
+        if hand:
+            return "карточка сняла ответ (черновик %d), где модель просила человека: причин %d" % (old, len(hand))
+        return None
+
+    def _auto_block(self, did, now):
+        """M4: почему автоотправку НЕ делать → слова | None. Только чистая просьба и карточка подписи, черновик ждёт,
+        карточка не снимала ответ, который правил человек или где модель просила человека, по версии автоотправки ещё
+        не было, суточный потолок не исчерпан, клиент не на паузе, окно 24 ч открыто, после черновика клиент не писал и
+        с телефона не отвечали."""
+        if not self.autosend:
+            return "флаг %s выкл" % F_AUTOSEND
+        if not self._door_open():                   # дверь закрыта — попытку версии не тратим: нажатие было бы впустую
+            return "отправка выключена (WA_SEND)"
+        row = self.db.execute("SELECT d.number, d.upto_id, d.state, s.asked, s.kind, s.doc_id, s.signed_at, s.file_id, "
+                              "s.replaced_why FROM drafts d JOIN signed_asks s ON s.draft_id=d.id WHERE d.id=?",
+                              (int(did),)).fetchone()
+        if not row:
+            return "черновик не помечен просьбой клиента"
+        number, upto, state, asked, kind, doc_id, signed_at, file_id, replaced = row
+        if asked != ASK_PURE or kind != ASK_CARD:
+            return "не чистая просьба (%s, %s) — только по нажатию" % (asked, kind)
+        if state != A.PENDING:
+            return "черновик уже не ждёт: %s" % state_word(state)
+        if replaced:                                # решение человека / просьба модели о человеке шаблоном не отменяется
+            return "%s — решает человек" % replaced
+        if self.db.execute("SELECT COUNT(*) FROM signed_asks WHERE number=? AND doc_id=? AND signed_at=? AND file_id=? "
+                           "AND auto_at IS NOT NULL", (number, doc_id, signed_at, file_id)).fetchone()[0]:
+            return "по этой версии договора автоотправка уже была — повтор только нажатием"
+        day = self.db.execute("SELECT COUNT(*) FROM signed_asks WHERE auto_at >= ?", (float(now) - 86400,)).fetchone()[0]
+        if day >= AUTOSEND_DAY_MAX:
+            return "суточный потолок автоотправок %d исчерпан" % AUTOSEND_DAY_MAX
+        cl = self.db.execute("SELECT paused FROM clients WHERE number=?", (number,)).fetchone()
+        if not cl or cl[0]:
+            return "клиент на паузе — беседу ведёт человек" if cl else "клиента нет в базе"
+        ok, why = self._signed_window(number, now)
+        if not ok:
+            return "окно 24 ч: %s" % why
+        try:
+            fresh = self._fresh(number, upto)
+        except Exception as e:                                       # noqa: BLE001
+            return "очередь не прочитана (%s)" % type(e).__name__
+        if fresh:
+            return "после черновика %s (строка %d)" % (
+                "клиент написал ещё" if fresh[0] == A.wa_kind.KIND_INBOUND else "ответили с телефона", fresh[1])
+        return None
+
+    def _signed_autosend(self, did):
+        """M4 (WA_AGENT_AUTOSEND_CONTRACT): карточка подписи по ЧИСТОЙ просьбе — система сама нажимает штатное
+        «Отправить» (`press`, who=AUTO_WHO): весь путь нажатия прежний — захват, `_outdated`, `_fresh`, пауза, ритм,
+        перечитывание реестра, PDF до текста, текст, PDF, квитанции. Начало ложится в `signed_asks.auto_at` ДО нажатия —
+        повтора нет ни тактом, ни рестартом. Исход — строкой журнала и в `signed_asks`. → ответ нажатия | None."""
+        now = self.clock()
+        why = self._auto_block(did, now)
+        if why:
+            self.db.execute("UPDATE signed_asks SET auto_state=?, auto_words=? WHERE draft_id=? AND auto_at IS NULL",
+                            (AUTO_SKIP, why[:300], int(did)))
+            self.log("подпись: автоотправка черновика %d — не делалась: %s; карточка ждёт нажатия «Отправить»"
+                     % (did, why))
+            return None
+        if self.db.execute("UPDATE signed_asks SET auto_at=?, auto_state=? WHERE draft_id=? AND auto_at IS NULL",
+                           (now, AUTO_PRESSING, int(did))).rowcount != 1:
+            return None
+        ver = self.db.execute("SELECT ver FROM drafts WHERE id=?", (int(did),)).fetchone()
+        try:
+            res = self.press(did, int(ver[0]) if ver else 1, A.ACT_SEND, AUTO_WHO, now)
+        except Exception as e:                                       # noqa: BLE001
+            res = {"ok": False, "state": None, "words": "нажатие упало (%s) — исход неизвестен, не повторяем"
+                   % type(e).__name__}
+        res = res if isinstance(res, dict) else {}
+        parts = res.get("parts") if isinstance(res.get("parts"), dict) else {}
+        # исход — по ОБЕИМ частям: «sent» только у текста И PDF; текст ушёл, а PDF нет — не «sent» (клиент получил
+        # «Направляем договор» без файла, на карточке «Дослать PDF»): будущий читатель дела не прочтёт «доставлен»
+        tstate, pstate = parts.get("text"), parts.get("pdf")
+        if tstate == A.SENT and pstate == A.SENT:
+            state = A.SENT
+        elif tstate == A.SENT:
+            state = "%s:%s" % (AUTO_TEXT_ONLY, pstate or "?")
+        else:
+            state = str(tstate or res.get("state") or "?")
+        words = str(res.get("words") or "исход не назван")
+        self.db.execute("UPDATE signed_asks SET auto_state=?, auto_words=? WHERE draft_id=?", (state, words[:300], int(did)))
+        self.log("подпись: автоотправка черновика %d — %s" % (did, words[:300]))
+        return res
 
     def make_signed_cards(self, now):
         """Подписанный договор → ОДНА карточка с PDF на версию (SIGNEDCARD1410). → число созданных карточек.
@@ -2102,6 +2543,7 @@ class AttachCore(A.Core):
             rows = [r for r in rows if r[0] > cur] + [r for r in rows if r[0] <= cur]
         t0, asked, stop = self.clock(), 0, None
         self._signed_t0 = t0
+        self._signed_auto = []
         with (self.signed_budget(SIGNED_PASS_SEC) if self.signed_budget else _NoBudget()):
             for number, last_in in rows:
                 if self.clock() - t0 >= SIGNED_PASS_SEC:
@@ -2110,7 +2552,8 @@ class AttachCore(A.Core):
                 if asked >= SIGNED_PASS_MAX:
                     stop = "поисков в реестре за проход %d" % SIGNED_PASS_MAX
                     break
-                if not self._signed_due(number, last_in, now):
+                # CASEPDF1510 (M2): явная просьба клиента паузу «договора нет» / «раньше водораздела» не ждёт
+                if not self._signed_due(number, last_in, now) and not self._signed_ask_due(number, now):
                     continue
                 self._signed_cursor = number
                 try:
@@ -2129,6 +2572,16 @@ class AttachCore(A.Core):
                     stop = halt
                     break
         self._signed_stop(stop)
+        # CASEPDF1510 (M4): автоотправка — тем же тактом, ПОСЛЕ прохода и вне его общего бюджета: нажатие идёт тем же
+        # путём и с теми же бюджетами дверей, что нажатие человека (перечитывание реестра не съедает остаток прохода)
+        auto, self._signed_auto = self._signed_auto, []
+        for did in auto:
+            try:
+                self._signed_autosend(did)
+            except Exception as e:                                   # noqa: BLE001
+                self._tx_end(ok=False)
+                self.log("подпись: автоотправка черновика %d упала (%s) — исход по базе, не повторяем"
+                         % (did, type(e).__name__))
         self._signed_last = now + max(0.0, self.clock() - t0)    # пауза SIGNED_EVERY — от КОНЦА прохода
         return made
 
@@ -2157,7 +2610,9 @@ class AttachCore(A.Core):
 
     def _signed_one(self, number, now, since):
         """Один клиент → (черновик подписи | None, звался ли реестр, почему прервать проход | None). Карточки нет —
-        причина в журнал один раз на процесс."""
+        причина в журнал один раз на процесс. CASEPDF1510 (M2): явная просьба клиента прислать СВОЙ договор открывает
+        версию, подписанную раньше водораздела; pure — карточка подписи (и к автоотправке при флаге), mixed — карточки нет:
+        PDF к ответу модели прикладывает код (M3); прочие замки прежние."""
         tail = T._tail(T.last9(number))
         if self.db.execute("SELECT 1 FROM drafts WHERE number=? AND state IN (?,?)",
                            (number, A.CLAIMED, A.SENDING)).fetchone():
@@ -2177,9 +2632,9 @@ class AttachCore(A.Core):
             if why.startswith("очередь"):
                 self._signed_note((number, "window", why), "номер %s — %s, карточки нет" % (tail, why))
             return None, False, None                                     # окно закрыто — дверей не зовём
-        doors = self._signed_doors(number, last_in)
-        ctx = T.bind_ctx(number, doors, [], self.clock)
-        rental = ctx["rental"]()                                         # та же аренда, что у привязки договора
+        # CASEPDF1510 (M2): клиент сам просит СВОЙ договор? (детектора нет — None без чтения очереди, путь прежний)
+        ask = self._signed_asked(number)
+        rental, contract = self._signed_find(number, last_in)            # та же аренда, что у привязки договора
         got = rental.get("outcome") if isinstance(rental, dict) else None
         if got in (T.TIMEOUT, T.REFUSED):
             if self._signed_short(number, rental):
@@ -2191,10 +2646,6 @@ class AttachCore(A.Core):
         if got != T.FACT:
             self._signed_ok(number)
             return None, False, None                                     # аренды-факта нет — договор не к чему привязать
-        # второй поиск без срока (K07, `_other_term`) договор только НАЗЫВАЕТ, фактом он не бывает никогда — карточке не
-        # нужен; замыкание аренды выше держит свой `may_call`, этот запрет его не касается
-        ctx["may_call"] = lambda: False
-        contract = T.call_tool("contract", {}, doors, self.clock, ctx)
         got = contract.get("outcome")
         if got in (T.TIMEOUT, T.REFUSED):
             if self._signed_short(number, contract):
@@ -2223,6 +2674,12 @@ class AttachCore(A.Core):
         if rec is not None:
             if not self._signed_dead(rec[0]):
                 self._signed_idle(number, last_in, now)
+                if ask in ASKED:                    # повтор просьбы по решённой версии — назван словами, решает человек
+                    st = self.db.execute("SELECT state FROM drafts WHERE id=?", (rec[0],)).fetchone() \
+                        if rec[0] is not None else None
+                    self._signed_note((number, "ask-decided") + key[1:], W_ASK_REPEAT % (
+                        "версия решена черновиком %d (%s)" % (rec[0], state_word(st[0]) if st else "нет в базе")
+                        if rec[0] is not None else "документ ушёл человеком"))
                 return None, True, None                                  # версия уже решена — одна на версию навсегда
             reopen = rec[0]                                              # «покрытие» сняло ядро — версия снова открыта
         at = signed_epoch(key[2], now)
@@ -2232,21 +2689,17 @@ class AttachCore(A.Core):
                               "карточки нет" % (tail, row))
             return None, True, None
         if at < since:
-            self._signed_idle(number, last_in, now)
-            self._signed_note((number, "since") + key[1:], "номер %s, строка реестра %s — подписан раньше водораздела, "
-                              "карточки нет" % (tail, row))
-            return None, True, None
-        code = {}
-
-        def read_pdf(pdf_id, results):
-            code["r"] = self._code_pdf(pdf_id, results)
-            return code["r"]
-        # путь реальной модели: `contract {}` без `rental` — договор, привязанный КОДОМ к аренде обращения (`bound_by`,
-        # номера байков сверены `bind_contract`); байк не сличается второй раз строкой («400СС» кириллицей и «400CC»
-        # латиницей — один байк)
-        meta, why = attach_of({"state": T.DONE, "results": [contract]}, None, read_pdf)
+            if ask not in ASKED:
+                self._signed_idle(number, last_in, now, why="since")
+                self._signed_note((number, "since") + key[1:], "номер %s, строка реестра %s — подписан раньше "
+                                  "водораздела, карточки нет" % (tail, row))
+                return None, True, None
+            # M2: явная просьба клиента прислать СВОЙ договор сильнее водораздела — версия открыта
+            self._signed_note((number, "since-ask") + key[1:], "номер %s, строка реестра %s — подписан раньше "
+                              "водораздела, но клиент сам просит договор (%s): версия открыта" % (tail, row, ask))
+        meta, why, code_r = self._signed_pdf(contract)
         if not meta:
-            got_pdf = code.get("r") if isinstance(code.get("r"), dict) else {}
+            got_pdf = code_r if isinstance(code_r, dict) else {}
             if got_pdf.get("outcome") in (T.TIMEOUT, T.REFUSED) and self._signed_short(number, got_pdf):
                 return None, True, "бюджет прохода %d с исчерпан на PDF договора" % SIGNED_PASS_SEC
             self._signed_fail(number, now)                               # PDF не прочитан — паузы SIGNED_RETRY подряд
@@ -2261,28 +2714,75 @@ class AttachCore(A.Core):
             held = (None, human) if human else None
         if held is not None:
             self._signed_keep(key, sha, held[0], now, reopen)
-            self._signed_idle(number, last_in, now)
+            self._signed_idle(number, last_in, now, why="held")
             self.log("подпись: строка реестра %s, sha256 %s… — %s, новой карточки нет" % (
                 meta.get("row"), sha[:12], held[1]))
+            if ask in ASKED and (held[0] is None or held[1].startswith("этот PDF уже уходил")):
+                # PDF уже у клиента (ушёл черновиком или документом человека): второй копии сам код не шлёт
+                self._signed_note((number, "ask-held") + key[1:], W_ASK_REPEAT % held[1])
             return None, True, None
-        did, old, lang, asked = self._signed_insert(number, key, meta, now, at, reopen, rental, contract,
-                                                    code.get("r"), last_in)
+        if ask == ASK_MIXED:
+            # M2: просьба вместе с другим вопросом — карточки подписи нет, ответ модели не снимается: PDF к нему
+            # прикладывает код (M3, `_attach_decide`) при его сверке; клиенту ничего без нажатия. Сюда приходят, только
+            # если живого ответа С ЭТИМ PDF нет (иначе версию «покрыл» он, `_signed_held`) — слова говорят, как есть
+            self._signed_idle(number, last_in, now, why="mixed")
+            live = self._live_draft(number)
+            self._signed_note((number, "mixed") + key[1:], "номер %s, строка реестра %s — клиент просит договор вместе "
+                              "с другим вопросом: карточки подписи нет — %s" % (tail, row, (
+                                  "живой ответ модели (черновик %d) этот PDF не несёт; задним числом код его не "
+                                  "прикладывает — решает человек, PDF получит следующий ответ модели" % live[0])
+                                  if live else "ответа модели пока нет; PDF к нему приложит код при его сверке"))
+            return None, True, None
+        did, old, lang, carried = self._signed_insert(number, key, meta, now, at, reopen, rental, contract,
+                                                      code_r, last_in, ask=ask)
         if did is None:
             return None, True, None
-        self._signed_idle(number, last_in, now)
+        self._signed_idle(number, last_in, now, why="card")
         late = now - at > SIGNED_LATE
-        self.log("подпись: черновик %d — карточка подписанного договора, строка реестра %s, sha256 %s…, язык %s%s%s%s%s" % (
-            did, meta.get("row"), sha[:12], lang.upper(),
-            ", с извинением (с подписи %d мин)" % ((now - at) // 60) if late else "",
-            ", заменён черновик %d" % old if old is not None else "",
-            " (вопрос клиента — из него)" if asked else "",
-            ", версия снова открыта: черновик %d с этим PDF снят ядром" % reopen if reopen is not None else ""))
+        self.log("подпись: черновик %d — карточка подписанного договора, строка реестра %s, sha256 %s…, язык %s%s%s%s%s%s"
+                 % (did, meta.get("row"), sha[:12], lang.upper(),
+                    ", с извинением (с подписи %d мин)" % ((now - at) // 60) if late else "",
+                    ", заменён черновик %d" % old if old is not None else "",
+                    " (вопрос клиента — из него)" if carried else "",
+                    ", версия снова открыта: черновик %d с этим PDF снят ядром" % reopen if reopen is not None else "",
+                    ", по просьбе клиента (%s)" % ask if ask in ASKED else ""))
         self._card_new(did, 1, now)                 # очередь карточки легла в транзакции — здесь только первая попытка
+        if ask == ASK_PURE and self.autosend:       # M4: нажатие — после прохода, тем же тактом
+            self._signed_auto.append(did)
         return did, True, None
 
-    def _signed_insert(self, number, key, meta, now, at, reopen, rental, contract, code, upto):
+    def _signed_find(self, number, upto):
+        """Привязка номера — ТЕ ЖЕ двери и тот же код, что у сверки модели (`_signed_doors`, `T.bind_ctx`, `T.call_tool`):
+        аренда обращения, затем `contract {}`, привязанный кодом к ней. → (ответ аренды, ответ договора | None — аренда
+        не факт). Второй поиск без срока (K07, `_other_term`) договор только НАЗЫВАЕТ, фактом он не бывает никогда —
+        здесь не нужен; замыкание аренды держит свой `may_call`, этот запрет его не касается. Один помощник на проход
+        подписи (M2) и на PDF к ответу модели по просьбе (M3)."""
+        doors = self._signed_doors(number, upto)
+        ctx = T.bind_ctx(number, doors, [], self.clock)
+        rental = ctx["rental"]()
+        if (rental.get("outcome") if isinstance(rental, dict) else None) != T.FACT:
+            return rental, None
+        ctx["may_call"] = lambda: False
+        return rental, T.call_tool("contract", {}, doors, self.clock, ctx)
+
+    def _signed_pdf(self, contract):
+        """Договор, привязанный кодом → (метаданные PDF | None, причина, ответ contract_pdf, прочитанный кодом | None).
+        Путь реальной модели: `contract {}` без `rental` — договор, привязанный КОДОМ к аренде обращения (`bound_by`, номера
+        байков сверены `bind_contract`); байк не сличается второй раз строкой («400СС» кириллицей и «400CC» латиницей —
+        один байк). PDF читает код той же дверью (`_code_pdf`)."""
+        code = {}
+
+        def read_pdf(pdf_id, results):
+            code["r"] = self._code_pdf(pdf_id, results)
+            return code["r"]
+        meta, why = attach_of({"state": T.DONE, "results": [contract]}, None, read_pdf)
+        return meta, why, code.get("r")
+
+    def _signed_insert(self, number, key, meta, now, at, reopen, rental, contract, code, upto, ask=None):
         """Черновик подписи — ОДНОЙ транзакцией: перепроверка (нажатие, пауза, новое входящее, двойник, покрытие, решение
         версии), снятие ждущего, вставка черновика, строки attach и версии, очередь карточки и решённая карточка снятого.
+        ask (CASEPDF1510) — черновик рождён явной просьбой клиента: в той же транзакции строка `signed_asks` (ключ дела:
+        номер, doc_id, версия; текста клиента нет).
         → (черновик | None, снятый | None, язык, вопрос перенесён?). Исключение — откат, наружу (не легло ничего)."""
         sha = meta["sha256"]
         late = now - at > SIGNED_LATE
@@ -2309,8 +2809,13 @@ class AttachCore(A.Core):
                 self._tx_end(ok=False)                  # повторное предложение не снимает живой ответ модели — такт позже
                 return None, None, lang, False
             old = live[0] if live else None
-            prev = self.db.execute("SELECT question, q_lang, ver FROM drafts WHERE id=?", (old,)).fetchone() \
+            prev = self.db.execute("SELECT question, q_lang, ver, handoff FROM drafts WHERE id=?", (old,)).fetchone() \
                 if old is not None else None
+            # CASEPDF1510 (M4): карточка по просьбе снимает ответ, который правил человек или где модель просила человека, —
+            # автоотправки у неё не будет (решение человека шаблоном не отменяется), а причины «нужен человек» переходят
+            # в карточку подписи: человек увидит, о чём просила модель. Карточка события без просьбы — как прежде
+            replaced = self._ask_replaced(old, prev) if ask in ASKED and prev is not None else None
+            hand = prev[3] if ask in ASKED and prev is not None and A.handoff_of(prev[3]) != [] else None
             # ждущий без этого PDF снимается тем же условным захватом, что у ядра (`Core._close`): только из pending;
             # не снялся — откат, такт позже
             if old is not None and self.db.execute("UPDATE drafts SET state=?, closed_at=? WHERE id=? AND state=?",
@@ -2320,9 +2825,9 @@ class AttachCore(A.Core):
             # вопрос клиента и его язык (WACARDQ0410) — из снятого ответа модели: карточка подписи покажет, ЧТО спросил
             # клиент, и шаблон после 24 ч возьмёт его язык; снятого нет — язык этого текста
             did = self.db.execute("INSERT INTO drafts(number, state, ver, text, upto_id, created_at, kind, ctx, question, "
-                                  "q_lang) VALUES(?,?,1,?,?,?,?,?,?,?)",
+                                  "q_lang, handoff) VALUES(?,?,1,?,?,?,?,?,?,?,?)",
                                   (number, A.PENDING, text, upto, now, KIND_SIGNED, cl[1], prev[0] if prev else None,
-                                   (prev[1] if prev and prev[1] else lang))).lastrowid
+                                   (prev[1] if prev and prev[1] else lang), hand)).lastrowid
             words = W_SIGNED_SUPERSEDED % did
             if old is not None:
                 self.db.execute("UPDATE drafts SET reason=? WHERE id=?", (words, old))
@@ -2344,6 +2849,10 @@ class AttachCore(A.Core):
             if n != 1:
                 self._tx_end(ok=False)
                 return None, None, lang, False
+            if ask in ASKED:                        # CASEPDF1510: черновик рождён просьбой клиента — ключ дела, без слов
+                self.db.execute("INSERT OR REPLACE INTO signed_asks(draft_id, number, doc_id, signed_at, file_id, sha256, "
+                                "asked, kind, upto_id, ts, replaced_id, replaced_why) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (did, number) + tuple(key[1:]) + (sha, ask, ASK_CARD, upto, now, old, replaced))
             # очередь карточки — в той же транзакции: черновик без строки `card_out` никто бы не показал до рестарта
             self.db.execute("INSERT OR IGNORE INTO card_out(draft_id, ver, state, created_at) VALUES(?,1,?,?)",
                             (did, A.CARD_WAIT, now))
