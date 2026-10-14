@@ -107,15 +107,24 @@ PROBE_MARK = "K4_OFF_MODULES "
 # штамп — только установленное кодом): ВСЕ три блоба — 6b66667 (A5 меняет tools, model — поле `checked` ответа
 # адаптера — и wa_agent — столбец `drafts.checked`, запись и `card_extra`). Голден к A5 ЧУВСТВИТЕЛЕН: с пинами A4 красны
 # оба сравнения — схема базы (`drafts` без `checked`) и ответ адаптера (без `checked`) в первом сценарии GOLD_SCRIPTS.
-# Было (основа 0a87a51 + A4 b0390fe): wa_agent 5b3fa1bebb1b…, wa_agent_model 40033b713d23…, wa_agent_tools
+# USEFUL1310 A6 на 0a87a51: основа без К4 = дерево useful-1310-a6 7d380ac (A5 + A6 по решению интегратора К3: опора числа
+# залога откачена, строка залога — дополнение строки «АРЕНДА КЛИЕНТА», «3.000» — без строки, аванс/наличные/cash —
+# денежные существительные, строка сверки — только предложения о деньгах, версия по пояснению — со строкой сверки):
+# tools и wa_agent — блобы 7d380ac (wa_agent — столбцы `hints.claims/checked`, их запись и `card_extra`), model —
+# прежний (A6 его не меняет). Голден к A6 чувствителен ЧАСТЬЮ (useful3/fix6/golden_teeth6.py): с пином A5 wa_agent
+# красен голден ядра (схема базы: `hints` без двух столбцов); к пину tools A5 голден адаптера НЕЧУВСТВИТЕЛЕН — у строки
+# аренды GOLD_SCRIPTS нет номера брони (аренда обращения не установлена — строки залога в блоке нет ни на A5, ни на A6),
+# а ответ сценария строку сверки не меняет (зубы адаптера — `money_check`-пустышка: красен).
+# Было (основа 0a87a51 + A5 6b66667): wa_agent 54bc80ccc1e3…, wa_agent_model e085a752d372…, wa_agent_tools
+# f8d0c90c4877…; (основа 0a87a51 + A4 b0390fe): wa_agent 5b3fa1bebb1b…, wa_agent_model 40033b713d23…, wa_agent_tools
 # fa6223476614…; (основа 0a87a51 + A3 6e27e26): wa_agent_tools 6d48ea6c5e76…; (основа 0a87a51 + A2 68eb7f8):
 # 9571b9914c0b…; (основа 0a87a51 + A1 a6321f6): 474450dca494…; (основа e357f5f + 64e0748): 050d8b32431f…; ещё раньше
-# (основа 306350b): wa_agent_model bb40440a40f3…, wa_agent_tools d99dd55e777c…. Объекты 54bc80cc…/e085a752…/f8d0c90c…
-# достижимы из ветки useful-1310-a5 (несёт и bundle переноса); без них — ПРОПУЩЕНО, а не зелёное.
+# (основа 306350b): wa_agent_model bb40440a40f3…, wa_agent_tools d99dd55e777c…. Объекты a9663594…/e085a752…/0da04682…
+# достижимы из ветки useful-1310-a6 (несёт и bundle переноса); без них — ПРОПУЩЕНО, а не зелёное.
 BASE_BLOBS = {
-    "wa_agent": "54bc80ccc1e376d8e9035331ffdcb303161b2549",
+    "wa_agent": "a96635943368ac3afc2e9dd577e00679407ca30b",
     "wa_agent_model": "e085a752d37284b26e4bf2908016f1110e58917b",
-    "wa_agent_tools": "f8d0c90c487797660bca5195cf0ed78f2fed317d",
+    "wa_agent_tools": "0da046820ae514cfc40f3d3fc91422694a1aa478",
 }
 BASE_TOOLS = ("history", "rental", "cash", "contract", "contract_pdf", "delivery", "rules")
 BASE_TOOLS_BLOCK_SHA = "175b220824b649ce151ae7f463ac864166265b26e9ccd13d42032a93d850d3d1"
