@@ -351,6 +351,20 @@ def test_rental_last_9_digits():
     assert B.phone_keys("Tel.1: +7 912 345-67-89, Tel.2: 0812345678") == {"123456789", "812345678"}
 
 
+def test_phone_keys_whatsapp_copy_nbhyphen():
+    """PDF-LIVE 14.10: живая форма контактов (маска из листа «клиенты», цифры выдуманы) — номер, скопированный из
+    WhatsApp, несёт неразрывные дефисы U+2011 и знаки направления U+202A/U+202C; прежде ключей было 0."""
+    live = "‪+7 912 345‑67‑89‬, ‪+7 981 234‑56‑78‬,"
+    assert B.phone_keys(live) == {"123456789", "812345678"}, B.phone_keys(live)
+    for dash in "‐‒–—―−":
+        assert B.phone_keys("+7 912 345%s67%s89" % (dash, dash)) == {"123456789"}, dash
+    assert B.phone_keys("‪+66 81 234 5678‬") == {"812345678"}
+    now = B.local_now(T0)
+    r = [row("PCX 160 5678", "В аренде", "2026-09-18 10:00", "2026-09-25 17:30", contacts=live)]
+    assert B.rental_end("79123456789", r, 0, "", now, WM.model_of_name)["outcome"] == B.FOUND
+    assert B.phone_keys("‪+7 912 345‑67‑88‬") != {"123456789"}   # − последняя цифра другая
+
+
 def test_rental_end_without_time_unknown():
     """− конец без времени → «дата и время конца не прочитаны» → «не знаю»."""
     rows = [row("PCX 160 5678", "В аренде", "2026-09-18 10:00", "2026-09-25", contacts=CONTACT)]

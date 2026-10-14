@@ -928,6 +928,17 @@ def test_a5_v1_money_said_masks_and_no_money():
     assert len(T.money_said(long)[0][0]) == T.SAID_CUT and T.money_said(long)[0][0].endswith("…")
 
 
+def test_a9_ratchet_forms_keep_meaning():
+    """A9 (храповик слепых читателей): итога нет — due_supported говорит None («не судилось»), а не False; вердикты
+    при названном итоге и пустой ответ money_said на тексте без денег — прежние."""
+    assert T.due_supported("К оплате 7790 бат.", None) is None
+    assert T.due_supported("К оплате 7790 бат.", 7790) is True
+    assert T.due_supported("К оплате 7790 бат. Номер счёта: 1234567890.", 7790) is False
+    assert T.due_supported("Байк 7790 км, к оплате 7790 бат.", 7790) in (True, False)
+    assert T.money_said("Привет! Байк готов, ждём вас завтра.", 7790) == ([], 0)
+    assert T.money_said("", None) == ([], 0)
+
+
 def test_a5_g_backing_names_numbers_and_source():
     """(г) Числа ответа с опорой и ИМЯ опоры: итог аренды кода (только в предложении итога), блок «ЦЕНА», факты сверки
     кода; число без опоры — не здесь (его называет `money_claims`); чисел нет — пусто. A6 (ожидание изменено

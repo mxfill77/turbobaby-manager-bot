@@ -1331,7 +1331,7 @@ def due_supported(text, due):
     называет его полученной оплатой (`pay_claimed` — то же определение, что у замка оплаты) и НИ В ОДНОМ предложении
     текста нет реквизитов или слов получения денег (`_due_req`: номер, равный самому итогу, время и дата реквизитом не
     считаются; в соседнем предложении не считается и слово получения не денег — передача байка, подтверждение
-    сообщения или брони, условие). Иначе — как до части B: опоры нет. Итога нет — False.
+    сообщения или брони, условие). Иначе — как до части B: опоры нет. Итога нет — None (не судилось; A9).
 
     USEFUL1310 A1 (приёмщик useful2/accept): итог в своём предложении, а счёт/PromptPay/карта или «оплатили»/«got it»
     в СОСЕДНЕМ («К оплате 7790 бат. Номер счёта: 1234567890.») — это тот же ответ «сколько и куда»; проверка только
@@ -1345,7 +1345,9 @@ def due_supported(text, due):
     запирают; время и дата не занимают слот окна реквизитов; «all paid / paid in full / fully paid» — слова
     получения."""
     s = str(text or "")
-    if due is None or due in pay_claimed(s, sums=(due,)):
+    if due is None:                                 # итога нет — не судилось (не «опоры нет»): A9, храповик
+        return None
+    if due in pay_claimed(s, sums=(due,)):
         return False
     sents = K._SENTENCE.split(s)
     vals = [_due_vals(x) for x in sents]
@@ -1356,10 +1358,7 @@ def due_supported(text, due):
         tied = i in nxt and bool(_DUE_ALSO.search(sents[nxt[i]]))
         if _due_req(sent, due, near=True, ahead=i < first, tied=tied):
             return False
-    for sent, v in zip(sents, vals):
-        if due in v and not _due_sentence(sent, due):
-            return False
-    return True
+    return all(_due_sentence(sent, due) for sent, v in zip(sents, vals) if due in v)
 
 
 def money_claims(text, price, known, due=None):
@@ -1464,10 +1463,9 @@ def money_said(text, due=None):
     (A6, F2), затем прочие о деньгах, последними — получение без денег (A8, V1: как на A5); показ — в порядке текста.
     Предложение итога (`_due_sentence`) не идёт; текст без денег — ([], 0), как на A5."""
     s = str(text or "")
-    if not (_MONEY_WORD.search(s) or _DUE_PROOF.search(s) or _DEP_WORDS.search(s) or _PAY_FORMS.search(s)
-            or re.search(_SAID_MONEY_N, s, re.I) or K.thb_amounts(s)):
-        return [], 0
-    spans = K._sentences(s)
+    has_money = bool(_MONEY_WORD.search(s) or _DUE_PROOF.search(s) or _DEP_WORDS.search(s) or _PAY_FORMS.search(s)
+                     or re.search(_SAID_MONEY_N, s, re.I) or K.thb_amounts(s))
+    spans = K._sentences(s) if has_money else []   # текст без денег — ([], 0) общим путём (A9, храповик)
     hits = []
     for i, (a, b) in enumerate(spans):
         sent = s[a:b]

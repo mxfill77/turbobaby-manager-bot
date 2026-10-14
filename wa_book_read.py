@@ -351,11 +351,16 @@ def free_bikes(model, units, ds, de, rows, age, why, now_local, door):
 
 _RX_PHONE = re.compile(r"\+?\d[\d\s\-().]{7,}\d")
 _RX_DIGITS = re.compile(r"\d{9,15}")
+# PDF-LIVE 14.10: номер, скопированный из WhatsApp, несёт НЕРАЗРЫВНЫЕ дефисы (U+2011) и знаки направления
+# (U+202A/U+202C) — `_RX_PHONE` такой номер не видел вовсе (живьём 3 действующие аренды из 13 без ключа)
+_DASHES = str.maketrans({c: "-" for c in "‐‑‒–—―−"})
+_BIDI = re.compile("[‎‏‪-‮⁦-⁩]")
 
 
 def phone_keys(contacts):
-    """Столбец «контакты» → множество последних 9 цифр телефонов в нём (телефоны с разделителями и сплошные)."""
-    s = str(contacts or "")
+    """Столбец «контакты» → множество последних 9 цифр телефонов в нём (телефоны с разделителями и сплошные).
+    Дефисы любого вида — как обычный, знаки направления текста не считаются (копия номера из WhatsApp)."""
+    s = _BIDI.sub("", str(contacts or "").translate(_DASHES))
     keys = set()
     for m in _RX_PHONE.finditer(s):
         d = re.sub(r"\D", "", m.group(0))
