@@ -13,7 +13,7 @@
   },
   "concurrency": {
     "group": "ci-contract-ref-pilot",
-    "cancel_in_progress": true
+    "cancel-in-progress": true
   },
   "jobs": {
     "contract_ref": {
