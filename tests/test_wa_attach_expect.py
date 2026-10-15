@@ -322,8 +322,12 @@ def test_7_expired_and_reopen():
     e = w.expects()[0]
     assert e[7:9] == ("expired", DUE + 10) and e[9] is None, e
     said = [ln for ln in w.expect_lines() if "истекло" in ln]
-    assert said == ["ожидание подписи: истекло — номер %s, открыто 18:57 (просьба): окно 24 ч кончилось без подписанного "
-                    "договора в реестре; клиенту ничего не отправлено" % T._tail(T.last9(NUM))], said
+    # Codex TB-CHECK-1510-1142 (2): истечение называет последний ИЗВЕСТНЫЙ исход проверки и не утверждает отсутствия
+    # договора (реестр спрашивали в 18:57, а не весь срок); прежнее «окно кончилось без подписанного договора» — неправда
+    assert said == ["ожидание подписи: истекло — номер %s, открыто 18:57 (просьба): срок 24 ч вышел, последняя проверка "
+                    "реестра 14.10 18:57 — подписанного не было; отсутствие подписанного договора не доказано; клиенту "
+                    "ничего не отправлено" % T._tail(T.last9(NUM))], said
+    assert "без подписанного договора" not in said[0], said
     assert "• ожидание подписи: истекло 18:52 (срок — 24 ч от сообщения клиента)" in w.block(now=DUE + 20)
     assert w.signed_drafts() == [] and w.door.sends == [] and w.q("SELECT COUNT(*) FROM outbox") == [(0,)]
     w.tick(DUE + 10 + X.SIGNED_EVERY + 1)
@@ -345,6 +349,227 @@ def test_7_expired_after_found_line_says_found():
     assert "без подписанного" not in said[0] and NUM not in said[0], said
     b = w.block(now=DUE + 20)
     assert "• реестр: проверен 14.10 18:57 — подписанный найден (проверка ожидания)" in b, "другой день — с датой"
+
+
+# ═══ 8. остатки Codex TB-CHECK-1510-1142: найденная подпись закрывает ожидание правдивым исходом; сбой аренды ═════════
+#        не чтение реестра; истечение не утверждает «договора нет». Подпись ≠ доставка PDF.
+
+T_PRESS = T_SIGN + 660                                             # 19:15 — «Отправить» сотрудника
+
+
+class FlakyBook(SC.Book):
+    """Снимок броней, падающий таймаутом по флагу: дверь аренды сверки → TIMEOUT у `T.call_tool` (реестр не зовётся)."""
+
+    def __init__(self, rows):
+        SC.Book.__init__(self, rows)
+        self.boom = False
+
+    def get(self, now):
+        if self.boom:
+            raise TimeoutError("снимок броней: таймаут")
+        return SC.Book.get(self, now)
+
+
+def test_8_known_version_closes_truthfully_signature_not_delivery():
+    """(1а) Реестр нашёл подпись, а ИМЕННО эта версия (стр.36: doc, signed_at, PDF) уже учтена раньше — её карточка ушла
+    клиенту в 19:15. Реестр «мигнул» (стр.36 на миг не подписана), когда клиент снова написал «Подписал», — ожидание
+    открыто; стр.36 снова видна → та же версия: новой карточки нет (одна на версию навсегда), ожидание ЗАКРЫТО исходом
+    known:<черновик>, а не висит до срока с частым шагом. Закрытие не говорит, что PDF получен по этому сообщению:
+    доставку в блоке называет только строка PDF (прежняя отправка 19:15); клиенту ничего нового."""
+    w = CT.World()                                                  # реестр живого формата: стр.36 подписана
+    w.put(T_SIGN + 60, "Подписал договор")
+    w.tick(T_SIGN + 600)
+    sd = w.signed_drafts()
+    assert len(sd) == 1 and w.expects() == [], (sd, w.expects())    # подпись видна сразу — ожидание не открывалось
+    did = sd[0][0]
+    w.clock.t = float(T_PRESS)
+    assert w.core.press(did, 1, A.ACT_SEND, "Даня", T_PRESS)["ok"]
+    sent = (len(w.door.sends), len(w.door.media))
+    w.registry.revoke(36)                                           # реестр «мигнул»: подписанной строки нет
+    w.put(T_SIGN + 1200, "Подписал")
+    w.tick(T_SIGN + 1560)
+    e = w.expects()
+    assert len(e) == 1 and e[0][2] == "signed_claim" and e[0][6:8] == (T.EMPTY, "open"), (e, w.sign_lines()[-4:])
+    for r in w.registry.rows:                                       # стр.36 снова подписана — та же версия реестра
+        if r["row"] == 36:
+            r.update(status="ПОДПИСАН", signed=True)
+    t = T_SIGN + 1560 + X.SIGNED_EVERY + 5
+    w.tick(t)
+    assert [r[0] for r in w.signed_drafts()] == [did] and len(w.versions()) == 1, (w.signed_drafts(), w.versions())
+    e = w.expects()[0]
+    assert e[5:9] == (t, T.FACT, "closed", t), ("подпись найдена — ожидание обязано закрыться", e, w.lines[-4:])
+    assert e[9] == "%s:%d" % (X.EXPECT_KNOWN, did), e
+    said = [ln for ln in w.expect_lines() if "закрыто" in ln]
+    assert len(said) == 1 and "строка реестра 36" in said[0] and "уже учтена" in said[0], said
+    assert "черновиком %d" % did in said[0] and "получение PDF клиентом этим не подтверждено" in said[0], said
+    assert NUM not in said[0] and "Подписал" not in said[0], said
+    assert (len(w.door.sends), len(w.door.media)) == sent, "клиенту ничего нового"
+    b = w.block(now=t + 30)
+    assert "• ожидание подписи: закрыто %s — версия уже решена без новой карточки" % A.hm_phuket(t) in b, b
+    assert ("закрыто %s карточкой" % A.hm_phuket(t)) not in b, b
+    assert "• PDF клиенту: ушёл %s; отправил: сотрудник" % A.hm_phuket(T_PRESS) in b, b   # доставка — прежняя отправка
+    n = len(w.registry.calls)
+    assert w.core._cstate_due(NUM, t + 300) is False, "закрыто — частого шага ожидания нет"
+    w.tick(t + X.SIGNED_EVERY + 5)
+    assert len(w.registry.calls) == n, w.registry.calls[n:]
+
+
+def test_8_signed_before_watershed_claim_closes_truthfully():
+    """(1б) Клиент написал «Подписал» (договор не просил), реестр был пуст — ожидание открыто; потом реестр показал
+    подпись РАНЬШЕ водораздела (10:30 при водоразделе 11:04). По политике водораздела карточки нет и PDF код не читает —
+    ожидание ЗАКРЫТО исходом since (подпись найдена), блок называет это, а не «версия решена»; срок потом не наступает
+    («без подписанного договора» не прозвучит). Контроль политики: та же версия при ПРОСЬБЕ прислать договор — карточка и
+    card:<id> (просьба сильнее водораздела, CASEPDF1510 M2)."""
+    early = SC.reg_row(36, "ПОДПИСАН", "2026-10-14 10:30", "PDF36")
+    w, reg = _empty("Подписал")
+    since = float(w.q("SELECT value FROM meta WHERE key=?", (X.SIGNED_SINCE,))[0][0])
+    assert X.signed_epoch(early["signed_at"], T_SIGN) < since, since
+    assert w.expects()[0][7] == "open"
+    reg.rows.append(early)
+    t = T_SIGN + 60
+    w.tick(t)
+    assert w.signed_drafts() == [] and w.versions() == [] and w.pdfs.calls == [], (w.signed_drafts(), w.pdfs.calls)
+    assert any("подписан раньше водораздела, карточки нет" in ln for ln in w.sign_lines()), w.sign_lines()
+    e = w.expects()[0]
+    assert e[5:9] == (t, T.FACT, "closed", t), ("подпись найдена — ожидание обязано закрыться", e, w.lines[-4:])
+    assert e[9] == X.EXPECT_SINCE, e
+    said = [ln for ln in w.expect_lines() if "закрыто" in ln]
+    assert len(said) == 1 and "строка реестра 36 подписана раньше водораздела" in said[0], said
+    assert "получение PDF клиентом этим не подтверждено" in said[0] and NUM not in said[0], said
+    b = w.block(now=t + 30)
+    assert ("• ожидание подписи: закрыто %s — подписанный найден, подписан до запуска карточек: карточки по нему нет"
+            % A.hm_phuket(t)) in b, b
+    assert "версия уже решена" not in b and "• реестр: проверен %s — подписанный найден" % A.hm_phuket(t) in b, b
+    n = len(reg.calls)
+    w.tick(t + X.SIGNED_EVERY + 5)
+    assert len(reg.calls) == n, "закрыто — частого шага ожидания нет"
+    w.tick(DUE + 10)
+    assert not [ln for ln in w.expect_lines() if "истекло" in ln] and w.expects()[0][7] == "closed", w.expects()
+    assert w.door.sends == [] and w.door.media == [] and w.q("SELECT COUNT(*) FROM outbox") == [(0,)]
+    c, creg = _empty(ASK_RU)                                       # контроль: просьба прислать договор
+    creg.rows.append(dict(early))
+    c.tick(t)
+    sd = c.signed_drafts()
+    assert len(sd) == 1 and c.expects()[0][7:] == ("closed", t, "card:%d" % sd[0][0]), (sd, c.expects())
+
+
+def test_8_rental_failure_then_expiry_says_unverified():
+    """(2)+(3) Ожидание открыто (реестр пуст в 18:57); дальше дверь АРЕНДЫ падает таймаутом — реестр не спрашивается
+    вовсе. Исход аренды ложится отдельно (tried), checked_at/outcome остаются 18:57/empty: сбой аренды не выдаётся за
+    чтение реестра. Срок вышел — строка журнала: последняя проверка реестра 18:57 — подписанного не было, после неё
+    проверить не удалось (дверь аренды, timeout), отсутствие подписанного договора НЕ доказано; «без подписанного договора»
+    нет. Контроль: таймаут самого РЕЕСТРА — «проверить не удалось», а не «договора нет»; флаг выкл — ни таблицы, ни строк."""
+    w, reg = _empty("Подписал")
+    fb = FlakyBook([SC.book_row()])
+    w.adapter.book = fb                                            # дверь аренды сверки читает снимок адаптера
+    fb.boom = True
+    n = len(reg.calls)
+    t = T_SIGN - 279
+    w.tick(t)
+    assert len(reg.calls) == n, "аренда упала — реестр не спрашивался"
+    assert w.expects()[0][5:8] == (T_SIGN - 400, T.EMPTY, "open"), ("сбой аренды — не чтение реестра", w.expects())
+    assert "• реестр: проверен 18:57 — подписанного не было (проверка ожидания)" in w.block(now=t + 30)
+    w.tick(DUE + 10)
+    e = w.expects()[0]
+    assert e[5:9] == (T_SIGN - 400, T.EMPTY, "expired", DUE + 10), e
+    said = [ln for ln in w.expect_lines() if "истекло" in ln]
+    assert len(said) == 1 and "без подписанного договора" not in said[0], said
+    assert said == ["ожидание подписи: истекло — номер %s, открыто 18:57 (клиент сообщил о подписи): срок 24 ч вышел, "
+                    "последняя проверка реестра 14.10 18:57 — подписанного не было; после неё проверить не удалось: дверь "
+                    "аренды не ответила (timeout) 14.10 18:59; отсутствие подписанного договора не доказано; клиенту "
+                    "ничего не отправлено" % T._tail(T.last9(NUM))], said
+    # исход аренды — отдельными полями попытки, а не полями чтения реестра
+    assert w.q("SELECT checked_at, outcome, tried_at, tried FROM contract_expect") == [
+        (T_SIGN - 400, T.EMPTY, t, "rental:" + T.TIMEOUT)], w.q("SELECT * FROM contract_expect")
+    # контроль: таймаут двери РЕЕСТРА — тоже исход «проверить не удалось», не отсутствие договора
+    w2, reg2 = _empty("Подписал")
+    reg2.fail = T.last9(NUM)
+    w2.tick(T_SIGN - 279)
+    w2.tick(DUE + 10)
+    said2 = [ln for ln in w2.expect_lines() if "истекло" in ln]
+    assert len(said2) == 1 and ("последняя проверка реестра 14.10 18:59 — реестр не ответил — проверить не удалось; "
+                                "отсутствие подписанного договора не доказано") in said2[0], said2
+    # флаг выкл: тот же сбой аренды — ни таблицы ожидания, ни строк о нём, реестр не зовётся
+    w3, reg3 = _empty("Подписал", cstate=False)
+    fb3 = FlakyBook([SC.book_row()])
+    w3.adapter.book, fb3.boom = fb3, True
+    n3 = len(reg3.calls)
+    w3.tick(T_SIGN - 279)
+    assert "contract_expect" not in w3.tables() and w3.expect_lines() == [] and len(reg3.calls) == n3, w3.lines[-4:]
+
+
+def test_8_ask_answered_then_pre_watershed_names_request_open():
+    """Находка критика дельты (важная): ожидание открыла ПРОСЬБА прислать договор (why=ask, реестр пуст в 18:57);
+    сотрудник отправил ответ модели «Договор пришлём сразу после подписи» — просьба отвечена (done_upto), `_signed_asked`
+    пуст. Затем реестр показал подпись РАНЬШЕ водораздела (10:30 при 11:04). Карточки нет и PDF код не читает (политика
+    водораздела прежняя), но закрытие НЕ говорит «откроет только просьба клиента» — просьба и открыла ожидание: исход
+    since:ask, строка журнала — найденная подпись просьбу не закрывает, получение PDF не проверено, решает человек; блок
+    модели — то же, а не «подписан до запуска карточек» без просьбы. Клиенту ничего нового, PDF нет."""
+    early = SC.reg_row(36, "ПОДПИСАН", "2026-10-14 10:30", "PDF36")
+    w, reg = _empty(ASK_RU)
+    assert [r[2] for r in w.expects()] == ["ask"] and w.expects()[0][7] == "open", w.expects()
+    did, ver = w.q("SELECT id, ver FROM drafts WHERE number=? AND state=?", (NUM, A.PENDING))[0]
+    w.clock.t = float(T_SIGN - 350)
+    assert w.core.press(did, ver, A.ACT_SEND, "Даня", T_SIGN - 350)["ok"]
+    assert w.core._signed_asked(NUM) is None, "просьба отвечена ответом модели (done_upto)"
+    sent = (len(w.door.sends), len(w.door.media))
+    reg.rows.append(early)
+    t = T_SIGN + 60
+    w.tick(t)
+    assert w.signed_drafts() == [] and w.versions() == [] and w.pdfs.calls == [], (w.signed_drafts(), w.pdfs.calls)
+    e = w.expects()[0]
+    assert e[5:9] == (t, T.FACT, "closed", t), ("подпись найдена — ожидание закрыто", e, w.lines[-4:])
+    assert e[9] == "since:ask", ("просьба открыла ожидание — исход с меткой просьбы", e)
+    said = [ln for ln in w.expect_lines() if "закрыто" in ln]
+    assert len(said) == 1 and "строка реестра 36 подписана раньше водораздела — карточки по ней нет" in said[0], said
+    assert "откроет только просьба" not in said[0], ("просьба и открыла ожидание — «просьбы нет» неправда", said)
+    assert e[9] == X.EXPECT_SINCE + X.EXPECT_ASK_TAG and X.W_EXPECT_ASK_LEFT in said[0] and "получение PDF клиентом этим не подтверждено" in said[0], said
+    assert NUM not in said[0] and ASK_RU not in said[0], said
+    b = w.block(now=t + 30)
+    assert ("• ожидание подписи: закрыто %s — подписанный найден до запуска карточек, карточки нет; просьбу о договоре "
+            "это не закрывает" % A.hm_phuket(t)) in b, b
+    assert "подписан до запуска карточек: карточки по нему нет" not in b and "версия уже решена" not in b, b
+    assert (len(w.door.sends), len(w.door.media)) == sent and w.door.media == [], "клиенту ничего нового, PDF нет"
+    assert X.EXPECT_ASK_TAG == CT.CS.EXPECT_ASK_TAG, "метка ядра = метка блока"
+
+
+def test_8_known_version_after_ask_names_request_open():
+    """Та же развилка у known: карточка стр.36 ушла клиенту в 19:15; реестр «мигнул», клиент ПРОСИТ договор (why=ask,
+    реестр пуст); стр.36 снова видна — та же версия: новой карточки нет (одна на версию навсегда), повтор просьбы назван
+    строкой W_ASK_REPEAT, ожидание закрыто known:<черновик>:ask — запись signed_cards доказывает ПРЕЖНЮЮ доставку, а не
+    исполнение этой просьбы; блок модели так и говорит, а не «версия уже решена без новой карточки». Клиенту ничего."""
+    w = CT.World()                                                  # реестр живого формата: стр.36 подписана
+    w.put(T_SIGN + 60, "Подписал договор")
+    w.tick(T_SIGN + 600)
+    did = w.signed_drafts()[0][0]
+    w.clock.t = float(T_PRESS)
+    assert w.core.press(did, 1, A.ACT_SEND, "Даня", T_PRESS)["ok"]
+    sent = (len(w.door.sends), len(w.door.media))
+    w.registry.revoke(36)                                           # реестр «мигнул»: подписанной строки нет
+    w.put(T_SIGN + 1200, ASK_RU)
+    w.tick(T_SIGN + 1560)
+    e = w.expects()
+    assert len(e) == 1 and e[0][2] == "ask" and e[0][6:8] == (T.EMPTY, "open"), (e, w.sign_lines()[-4:])
+    for r in w.registry.rows:                                       # стр.36 снова подписана — та же версия реестра
+        if r["row"] == 36:
+            r.update(status="ПОДПИСАН", signed=True)
+    t = T_SIGN + 1560 + X.SIGNED_EVERY + 5
+    w.tick(t)
+    assert [r[0] for r in w.signed_drafts()] == [did] and len(w.versions()) == 1, (w.signed_drafts(), w.versions())
+    e = w.expects()[0]
+    assert e[5:9] == (t, T.FACT, "closed", t), ("подпись найдена — ожидание закрыто", e, w.lines[-4:])
+    assert e[9] == "known:%d:ask" % did, ("просьба открыла ожидание — исход с меткой просьбы", e)
+    assert [ln for ln in w.sign_lines() if "клиент просит договор, а версия решена без новой карточки" in ln], \
+        w.sign_lines()[-4:]
+    said = [ln for ln in w.expect_lines() if "закрыто" in ln]
+    assert len(said) == 1 and "уже учтена" in said[0] and "найденная подпись её не закрывает" in said[0], said
+    assert e[9] == "%s:%d%s" % (X.EXPECT_KNOWN, did, X.EXPECT_ASK_TAG) and X.W_EXPECT_ASK_LEFT in said[0], said
+    assert NUM not in said[0] and ASK_RU not in said[0], said
+    b = w.block(now=t + 30)
+    assert ("• ожидание подписи: закрыто %s — версия решена раньше, новой карточки нет; просьбу о договоре это не "
+            "закрывает" % A.hm_phuket(t)) in b, b
+    assert "версия уже решена без новой карточки" not in b, b
+    assert (len(w.door.sends), len(w.door.media)) == sent, "клиенту ничего нового"
 
 
 def main():

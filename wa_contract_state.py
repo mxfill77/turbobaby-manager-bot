@@ -44,6 +44,7 @@ OUTCOME_WORDS = {"empty": "подписанного не было", "timeout": "
                  "ambiguous": "подписанных несколько — выбор за человеком", "cancelled": "договор отозван или отменён",
                  "unknown": "исход двери неизвестен", "incomplete": "сверка не завершена"}   # = wa_agent_tools.OUTCOMES
 WHY_WORDS = {"ask": "просьба", "signed_claim": "клиент сообщил о подписи"}
+EXPECT_ASK_TAG = ":ask"     # = wa_agent_attach.EXPECT_ASK_TAG (тест сверяет): known/since ожидания, открытого просьбой
 ASKED_WORDS = {"pure": "чистая", "mixed": "с вопросом"}
 KIND_WORDS = {"card": "карточка", "answer": "к ответу"}
 WHO_WORDS = {"auto": "автоотправка", "staff": "сотрудник"}
@@ -315,6 +316,14 @@ def _expect_line(e, now):
     if state == "closed" and e.get("closed_by") == "card":
         return "ожидание подписи: закрыто %s карточкой%s" % (when(e.get("closed_at"), now),
                                                             " (ждёт нажатия)" if e.get("card_wait") else "")
+    by = str(e.get("closed_by") or "")
+    if state == "closed" and by.endswith(EXPECT_ASK_TAG):     # открыла просьба: подпись найдена ≠ PDF по просьбе ушёл
+        return "ожидание подписи: закрыто %s — %s; просьбу о договоре это не закрывает" % (
+            when(e.get("closed_at"), now), "подписанный найден до запуска карточек, карточки нет"
+            if by.startswith("since") else "версия решена раньше, новой карточки нет")
+    if state == "closed" and e.get("closed_by") == "since":   # подпись найдена, но раньше запуска карточек — не «решена»
+        return "ожидание подписи: закрыто %s — подписанный найден, подписан до запуска карточек: карточки по нему нет" % (
+            when(e.get("closed_at"), now))
     if state == "closed":
         return "ожидание подписи: закрыто %s — версия уже решена без новой карточки" % when(e.get("closed_at"), now)
     if state == "expired":
