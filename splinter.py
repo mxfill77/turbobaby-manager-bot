@@ -51,6 +51,7 @@ import work_intent     # приём работ: вопрос о работе —
 import addressee       # пол: ответ на сообщение бота с другим адресатом — не обращение (26.09)
 import caption_intent  # подпись к фото: короткое указание — заявка, а не совет помыть (24.09, XADV 2478)
 import bike_position   # положение байка: совет C и фраза о депозите в J — только на возврате (25.09)
+import intake_confirm  # ответ на карточку брони: согласие только явное; исход записи — три слова (16.10)
 import act_gate        # одно место перед действием: адресат, лента темы, переспрос до «да» (27.09)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
 import topic_feed as _tfeed   # лента темы обслуживания на диске + контекст мозгу (01.10, SPLTOPICFEED0110)
@@ -156,6 +157,12 @@ def _caption_intake_on():
     """Ручка «подпись к фото — заявка» (24.09.2026). `CAPTION_INTAKE=0` → путь байт-в-байт
     прежний: подпись не судится, в строку событий не пишется, совет C идёт, как шёл."""
     return str(_os_env("CAPTION_INTAKE", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _intake_confirm_strict_on():
+    """Ручка INTAKECONFIRM1610. `INTAKE_CONFIRM_STRICT=0` → ветка «3) approve / нет / правки» и привязка
+    фото паспорта байт-в-байт прежние (cbe1322). Регистр не важен («NO», «Off», «НЕТ»); «false» — тоже откат."""
+    return str(_os_env("INTAKE_CONFIRM_STRICT", "1")).strip().lower() not in ("0", "", "нет", "no", "off", "false")
 
 
 def _bike_position_on():
@@ -12443,6 +12450,185 @@ def _contract_ref_report(bridge, row=None, booking_id=None, booking_key=None, na
         return W_CONTRACT_REF_BROKEN % type(e).__name__
 
 
+# INTAKECONFIRM1610 (16.10.2026): ответ подтверждающего на карточку брони — согласие только явное (решение —
+# `intake_confirm.decide`), исход записи — три слова (`intake_confirm.outcome`). Ручка `INTAKE_CONFIRM_STRICT=0` →
+# прежняя ветка «3) approve / нет / правки» байт-в-байт. Тексты — без префикса «🐀 Splinter\n» (его клеит отправка).
+_IC_ASK = "❓ Ответ неоднозначный — бронь не ставлю. Поставить: «да». Отказ: «нет». Исправить: «правки»."
+_IC_REJECT = "❌ Бронь отклонена — в CRM ничего не записано."
+_IC_UNKNOWN = ("⚠️ Исход записи брони неизвестен ({err}) — проверь CRM; повтор не делаю. "
+               "Брони там нет — пришли карточку заново.")
+_IC_NOT_WRITTEN = "❌ Не записано: {err}.{tail}\nВ CRM ничего не легло — исправь и пришли карточку заново."
+_IC_PHOTO_UNKNOWN = "📎 Паспорт привязан. Исход записи брони неизвестен — проверь CRM; повтор не делаю."
+_IC_EDIT = "✏️ Принял, жду исправленную карточку."   # прежний текст ветки правок
+# Дополнения выпуска (находки критиков 16.10, сверх проекта §2.2): ответ, адресованный НЕ карточке, и «да» после
+# просьбы о правках бронь не ставят; без билета токен-замка запись не уходит.
+_IC_ASK_REPLY = ("❓ Это ответ на другое сообщение — бронь не ставлю. Поставить: «да» ответом на карточку "
+                 "или отдельным сообщением.")
+_IC_EDIT_PENDING = "✏️ По этой карточке просили правки — бронь не ставлю. Пришли исправленную карточку."
+_IC_NO_TICKET = "до отправки: билет не выдан"
+_IC_PRE_PHOTOS = {}      # chat_id → {"ts", "ids"}: фото паспорта, пришедшие ДО карточки (только строгий режим)
+
+
+def _ic_forwarded(msg) -> bool:
+    """Пересланное сообщение — не слова подтверждающего (PTB ≥21: forward_origin; прежние версии: forward_*)."""
+    for attr in ("forward_origin", "forward_date", "forward_from", "forward_from_chat", "forward_sender_name"):
+        try:
+            if getattr(msg, attr, None):
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def _ic_reply_elsewhere(msg, d) -> bool:
+    """Ответ адресован НЕ карточке: реплай на сообщение человека, которое не карточка и не её фото паспорта.
+    Реплай на бота (резюме «Ставлю бронь?») — к карточке. Служебное «тема создана» (Telegram кладёт его в
+    reply_to_message каждому сообщению темы) реплаем не считается. Сомнение → «не карточке» (бронь не ставим)."""
+    try:
+        r = getattr(msg, "reply_to_message", None)
+        if r is None or getattr(r, "forum_topic_created", None):
+            return False
+        fu = getattr(r, "from_user", None)
+        if fu is not None and getattr(fu, "is_bot", False):
+            return False
+        mid = getattr(r, "message_id", None)
+        return not (mid is not None and mid in (d.get("ic_msg_ids") or ()))
+    except Exception:
+        return True
+
+
+def _ic_strip_bot(text, context) -> str:
+    """Упоминание СВОЕГО бота вырезается до разбора: «@бот да» — это «да», а не три прочих слова."""
+    names = {"turbobaby_manager_bot"}
+    try:
+        u = (context.bot.username or "").strip().lower()
+        if u:
+            names.add(u)
+    except Exception:
+        pass
+    pat = r"@(?:%s)(?![A-Za-z0-9_])" % "|".join(_re_pl.escape(n) for n in sorted(names))
+    return _re_pl.sub(pat, " ", str(text or ""), flags=_re_pl.IGNORECASE)
+
+
+def _ic_note_ids(d, msgs):
+    """Строгий режим: какие сообщения принадлежат карточке (сама карточка, её фото паспорта) — реплай на них тоже
+    ответ карточке."""
+    ids = list(d.get("ic_msg_ids") or [])
+    for m in msgs or ():
+        mid = getattr(m, "message_id", None)
+        if mid is not None and mid not in ids:
+            ids.append(mid)
+    d["ic_msg_ids"] = ids
+
+
+async def _intake_reply_strict(d, msg, context, bridge, text, now):
+    """Ветка «3) approve / нет / правки» при `INTAKE_CONFIRM_STRICT` (по умолчанию ВКЛ). Отказ и сомнение бронь не
+    пишут; YES — ровно один create_booking под токен-замком 4.2; исход «неизвестно» не равен «не записано», и
+    карточка не возвращается в awaiting_approval (повтора вслепую нет). Текст сообщения в журнал не идёт (ПДн).
+    Сверх проекта: пересланное — молчание; ответ на чужое сообщение и «да» после просьбы о правках — переспрос;
+    тег своего бота вырезается до разбора; стикер судится своим эмодзи; без билета запись не уходит."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    _who = msg.from_user.username if msg.from_user else "?"
+    said = _ic_strip_bot(text, context)
+    if not said.strip():
+        _st = getattr(msg, "sticker", None)
+        if _st is not None:
+            said = str(getattr(_st, "emoji", None) or "")     # стикер 👍 — как эмодзи 👍 (переспрос)
+    v = intake_confirm.decide(said)
+    why, ask_text = "", _IC_ASK
+    if _ic_forwarded(msg):
+        if v != intake_confirm.SILENT:
+            why = "переслано, не ответ подтверждающего"
+        v = intake_confirm.SILENT
+    elif v != intake_confirm.SILENT and _ic_reply_elsewhere(msg, d):
+        v, why, ask_text = intake_confirm.ASK, "ответ на другое сообщение", _IC_ASK_REPLY
+    elif v == intake_confirm.SILENT:
+        try:
+            if _addressed_bot(msg, context):
+                v = intake_confirm.ASK          # к боту обратились (тег / реплай на бота) — не молчим
+        except Exception:
+            pass
+    elif v == intake_confirm.YES and d.get("ic_edit_asked"):
+        v, why, ask_text = intake_confirm.ASK, "по карточке просили правки", _IC_EDIT_PENDING
+    log.info(f"  🆕 INTAKE: ответ на карточку → {v} (@{_who})" + (f" — {why}" if why else ""))
+
+    async def _say(body):
+        await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False, message_thread_id=tid)
+
+    if v == intake_confirm.SILENT:
+        return
+    if v == intake_confirm.ASK:
+        await _say(ask_text)
+        return
+    if v == intake_confirm.EDIT:
+        d["ic_edit_asked"] = True               # старая карточка больше не ставится «да» — ждём исправленную
+        await _say(_IC_EDIT)
+        return
+    if v == intake_confirm.NO:
+        d["status"] = "rejected"
+        await _say(_IC_REJECT)
+        return
+    # YES — КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write → create_booking), ровно один вызов
+    d["status"] = "approved"
+    sent, res, exc, no_ticket = False, None, None, None
+    try:
+        fields = _intake_booking_fields(d)
+        _tk = bridge.issue_write_ticket()
+        ticket = _tk.get("ticket") if isinstance(_tk, dict) else None
+        if not ticket:
+            # без билета мост гарантированно отвечает no_ticket (и тревогой владельцу) — запись не отправляем
+            no_ticket = str(_tk.get("error") or "") if isinstance(_tk, dict) else ""
+        else:
+            with bridge_client.agent_write(ticket):
+                sent = True                      # строго непосредственно перед вызовом
+                res = bridge.create_booking(**fields)
+    except Exception as e:
+        exc = e
+    out = intake_confirm.outcome(res, sent)
+    if out == intake_confirm.BOOKED:
+        d["status"] = "booked"
+        _row = res.get("row")
+        # O3-3c часть Б: intake-окно 30 мин — deposit-приход в Money по этому байку
+        # привяжется к свежесозданной брони без чтения CRM (приоритет над резолвом).
+        _bid = res.get("booking_id")
+        _pl = plateFromName_(res.get("bike") or d.get("model") or "")
+        if _bid and _pl:
+            _RECENT_BOOKINGS[_pl] = {"booking_id": str(_bid), "row": _row, "ts": now}
+        log.info(f"  🆕 INTAKE: бронь записана (строка {_row}, @{_who}) {d.get('model')}")
+        await _say(f"✅ Бронь записана, строка {_row}, статус «Бронь».")
+        if _rc_cases_on():
+            _rc_case_after_booking(bridge, res)   # К4 шаг 6: дело брони (origin=intake); не бросает
+        return
+    if out == intake_confirm.DUPLICATE:
+        _row = res.get("row")
+        await _say(f"⚠️ Уже есть такая бронь (строка {_row}).")
+        return
+    if out == intake_confirm.NOT_WRITTEN:
+        if not sent and exc is not None:
+            _err, _emsg = "exception", f"до отправки: {type(exc).__name__}: {exc}"
+        elif not sent:
+            _err = "no_ticket"
+            _emsg = _IC_NO_TICKET + (f" ({no_ticket})" if no_ticket else "")
+        else:
+            _err = str(res.get("error") or "?")
+            _emsg = str(res.get("message") or "")
+        d["status"] = "write_failed"
+        log.warning(f"  🆕 INTAKE: бронь НЕ записана ({_err}: {_emsg}) {d.get('model')}")
+        await _say(_IC_NOT_WRITTEN.format(err=_err, tail=(" " + _emsg) if _emsg else ""))
+        return
+    # UNKNOWN: ответ потерян, а запись могла лечь — не «не записано»; повтора нет, карточка не взводится
+    if exc is not None:
+        _err, _emsg = type(exc).__name__, str(exc)
+    elif not isinstance(res, dict):
+        _err, _emsg = "нет ответа", ""
+    else:
+        _err, _emsg = str(res.get("error") or "") or "?", str(res.get("message") or "")
+    d["status"] = "write_unknown"
+    log.warning(f"  🆕 INTAKE: исход записи брони НЕИЗВЕСТЕН ({_err}: {_emsg}) {d.get('model')}")
+    await _say(_IC_UNKNOWN.format(err=_err))
+
+
 async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only.
     photo_msgs — пачка фото (альбом склеен по media_group_id) → один «паспорт получен» + один finalize."""
@@ -12464,8 +12650,18 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             d["passport_photo"] = True
             d["passport_ocr"] = _INTAKE_PASSPORT.get(chat_id)
             _intake_passport_save(chat_id, d, bridge)
+            if _intake_confirm_strict_on():
+                _ic_note_ids(d, photo_msgs)   # INTAKECONFIRM1610: реплай «да» на фото паспорта — ответ карточке
+            if _intake_confirm_strict_on() and d.get("status") == "write_unknown":
+                # INTAKECONFIRM1610: исход записи брони неизвестен — фото карточку НЕ взводит (иначе «да» повторило бы
+                # create_booking вслепую); паспорт привязан и сохранён, как прежде
+                await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + _IC_PHOTO_UNKNOWN,
+                            bilingual=False, message_thread_id=tid_)
+                return
             await _intake_finalize(d, msg, context, bridge)   # резюме покажет распознан/нет + полноту пакета
         else:
+            if _intake_confirm_strict_on():
+                _IC_PRE_PHOTOS[chat_id] = {"ts": now, "ids": [getattr(m, "message_id", None) for m in photo_msgs]}
             # фото пришло ДО карточки — подтвердим, привяжем когда придёт карточка
             ack = ("🐀 Splinter\n📎 Паспорт получен и распознан — привяжу к карточке."
                    if ok_ocr else
@@ -12543,6 +12739,12 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             draft["passport_photo"] = True
             draft["passport_ocr"] = pp
         _INTAKE_DRAFTS[chat_id] = draft
+        if _intake_confirm_strict_on():
+            # INTAKECONFIRM1610: сообщения карточки (она сама + фото паспорта до неё) — реплай на них = ответ карточке
+            _pre = _IC_PRE_PHOTOS.pop(chat_id, None) or {}
+            _ic_note_ids(draft, [msg])
+            if now - _pre.get("ts", 0) <= 300:
+                draft["ic_msg_ids"] += [i for i in (_pre.get("ids") or []) if i is not None]
         if pp and now - pp.get("ts", 0) <= 300:
             _intake_passport_save(chat_id, draft, bridge)
         log.info(f"  🆕 INTAKE: карточка — модель={draft.get('model')} клиент={draft.get('client')}")
@@ -12558,6 +12760,9 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     # 3) approve / нет / правки — только от авторизатора и только по карточке в ожидании
     d = _INTAKE_DRAFTS.get(chat_id)
     if d and d.get("status") == "awaiting_approval" and _intake_can_approve(msg):
+        if _intake_confirm_strict_on():
+            await _intake_reply_strict(d, msg, context, bridge, text, now)
+            return
         low = text.lower()
         tid = getattr(msg, "message_thread_id", None)
         if any(w in low for w in ("да", "ок", "ставь", "подтвержд")):
