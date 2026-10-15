@@ -119,6 +119,15 @@ refused его не закрывают); ритм — `_cstate_due` по баз�
 `outcome`. Клиенту ничего не уходит: карточка подписи и автоотправка CASEPDF1510 — как прежде. Выключено — ни таблицы,
 ни обращений к ней.
 
+СВЕРКА ВЕРСИЙ ДОГОВОРА (CONTRACTREF1510; выключатель службы WA_AGENT_CONTRACT_REF, по умолчанию выкл; параметр `ref_of` —
+только при ожидании подписи в базе). Функция сверки приходит параметром (`contract_ref.ref_of` передаёт служба — замок
+импортов модуля прежний). Проход подписи (и M3) читает реестр той же дверью с теми же аргументами; ответ двери идёт дальше
+без изменений, а последнее чтение по номеру ложится в `contract_versions` (`_ref_note`): итог (исход, причина, бронь) и
+строки реестра — doc_id, строка, статус, подписан ли, signed_at, PDF и роль. Ключ — номер обращения WhatsApp (как у
+signed_cards и contract_expect); из строки реестра имени, телефона, ника, байка и даты договора не берётся.
+Повтор чтения заменяет прежнее. Его читает блок договора модели (`wa_agent_cstate`, строка версии). PDF, перечитывание при
+нажатии, карточки, ожидание подписи и автоотправка — без изменений. Выключено — ни таблицы, ни записи, путь прежний.
+
 ЖУРНАЛ. `part_log` и строки `self.log`: кто, когда, часть, попытка, исход, wamid, sha256 — без текстов и номеров.
 
 В СЛУЖБЕ (NIGHT0710-B3v). Собирает `wa_agent_svc.build` — только при флаге (правило `flag_on` службы, одно на всех) И
@@ -369,6 +378,28 @@ _EXPECT_COLS = (("tried_at", "REAL"), ("tried", "TEXT"))   # база перво
 EXPECT_OUT_WORDS = {T.EMPTY: "подписанного не было", T.TIMEOUT: "реестр не ответил — проверить не удалось",
                     T.REFUSED: "дверь реестра отказала — проверить не удалось"}
 EXPECT_TRIED_WORDS = {T.TIMEOUT: "дверь аренды не ответила", T.REFUSED: "дверь аренды отказала"}
+# ── сверка версий договора: последнее чтение реестра проходом подписи (CONTRACTREF1510) ────────────────────────────
+F_CONTRACT_REF = "WA_AGENT_CONTRACT_REF"        # = wa_agent_svc.F_CONTRACT_REF (тест сверяет); ядро окружение не читает
+W_REF_NOT_SAVED = "сверка версий договора: чтение реестра не записано (%s) — блок модели скажет прежнее"
+REF_SUMMARY = "read"                            # contract_versions.role строки-итога чтения (doc_id '' и row 0)
+REF_REASON_MAX = 200
+_REF_SCHEMA = """
+CREATE TABLE IF NOT EXISTS contract_versions (
+    number     TEXT    NOT NULL,   -- ключ обращения (как в signed_cards / contract_expect)
+    doc_id     TEXT    NOT NULL,   -- '' — строка-итог чтения
+    row        INTEGER NOT NULL,   -- строка реестра; 0 — строка-итог
+    read_at    REAL    NOT NULL,   -- часы ядра сразу после ответа двери
+    outcome    TEXT    NOT NULL,   -- исход versions() этого чтения
+    role       TEXT    NOT NULL,   -- read (итог) | current | signed | pending | superseded | other | foreign | unchecked
+    status     TEXT,               -- статус реестра дословно (у итога NULL)
+    signed     INTEGER,            -- 1/0 (у итога NULL)
+    signed_at  TEXT,
+    pdf_id     TEXT,
+    booking_id TEXT,               -- бронь аренды-факта привязки ('' — нет)
+    reason     TEXT,               -- только у итога, ≤ 200 знаков
+    PRIMARY KEY (number, doc_id, row)
+);
+"""
 
 # Детектор (M1): «тексты НЕОТВЕЧЕННЫХ входящих → pure | mixed | None». НЕ решает, что ответить клиенту (это модель), и не
 # судит интеллект агента: отвечает ровно на вопрос транспорта — вправе ли код сам приложить проверенный PDF (mixed — к ответу
@@ -1327,7 +1358,7 @@ class AttachCore(A.Core):
 
     def __init__(self, *args, attach=False, pdf_fetch=None, contract_find=None, signed=False,
                  signed_lookback_h=SIGNED_LOOKBACK_H, signed_budget=None, ask_of=_ASK_BUILTIN, autosend=False,
-                 cstate=False, claim_of=None, **kw):
+                 cstate=False, claim_of=None, ref_of=None, **kw):
         self.attach = bool(attach)
         self.pdf_fetch = pdf_fetch                  # file_id → ответ `bridge_client.contract_pdf` (content_b64, verified)
         self.contract_find = contract_find          # (phone, date_from, date_to) → ответ `bridge_client.contract_find`
@@ -1355,6 +1386,9 @@ class AttachCore(A.Core):
         # «клиент сообщил о подписи» (детектор `wa_contract_state.signed_claim` передаёт служба: импорты модуля прежние)
         self.cstate = bool(cstate) and self.signed
         self.claim_of = claim_of if callable(claim_of) and self.cstate else None
+        # CONTRACTREF1510: ref_of(ответ двери, номер, аренда) → исход сверки версий (`contract_ref.ref_of` передаёт служба:
+        # замок импортов модуля прежний); только при ожидании подписи в базе (cstate). None — путь прежний, таблицы нет
+        self.ref_of = ref_of if callable(ref_of) and self.cstate else None
         self._signed_auto = []                      # черновики подписи по чистой просьбе этого прохода — к автоотправке
         self._signed_last = None                    # такт поиска подписанных (SIGNED_EVERY)
         self._signed_said = set()                   # причины «карточки нет» — строкой журнала один раз на процесс
@@ -1403,6 +1437,8 @@ class AttachCore(A.Core):
                 for col, typ in _EXPECT_COLS:       # база первого прогона выпуска — колонки попытки догнать
                     if col not in have:
                         self.db.execute("ALTER TABLE contract_expect ADD COLUMN %s %s" % (col, typ))
+                if self.ref_of is not None:         # CONTRACTREF1510: выключено — таблицы нет, база прежняя
+                    self.db.executescript(_REF_SCHEMA)
             if self.db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
                                (SIGNED_SINCE, repr(float(self.clock()) - self.signed_lookback))).rowcount == 1:
                 self.log("подпись: водораздел записан — версии, подписанные раньше %s (Пхукет), карточки не получают"
@@ -3037,7 +3073,10 @@ class AttachCore(A.Core):
         аренда обращения, затем `contract {}`, привязанный кодом к ней. → (ответ аренды, ответ договора | None — аренда
         не факт). Второй поиск без срока (K07, `_other_term`) договор только НАЗЫВАЕТ, фактом он не бывает никогда —
         здесь не нужен; замыкание аренды держит свой `may_call`, этот запрет его не касается. Один помощник на проход
-        подписи (M2) и на PDF к ответу модели по просьбе (M3)."""
+        подписи (M2) и на PDF к ответу модели по просьбе (M3).
+        CONTRACTREF1510: `ref_of` есть — тот же путь (`_signed_find_ref`) плюс запись последнего чтения реестра."""
+        if self.ref_of is not None:
+            return self._signed_find_ref(number, upto)
         doors = self._signed_doors(number, upto)
         ctx = T.bind_ctx(number, doors, [], self.clock)
         rental = ctx["rental"]()
@@ -3045,6 +3084,60 @@ class AttachCore(A.Core):
             return rental, None
         ctx["may_call"] = lambda: False
         return rental, T.call_tool("contract", {}, doors, self.clock, ctx)
+
+    def _signed_find_ref(self, number, upto):
+        """`_signed_find` при сверке версий (CONTRACTREF1510): дверь реестра обёрнута — зовётся та же дверь с теми же
+        аргументами, её ответ (и исключение) идёт дальше без изменений, а себе обёртка запоминает ответ и время после него;
+        после `contract {}` чтение записывается (`_ref_note`). Аренда не факт — реестр не читался, записи нет."""
+        doors = self._signed_doors(number, upto)
+        inner, seen = doors["contract"], {}
+
+        def contract(**kw):
+            try:
+                got = inner(**kw)
+            except Exception as e:                                   # noqa: BLE001 — отдаём дальше как есть
+                seen["raw"], seen["at"] = {"ok": False, "error": "door:%s" % type(e).__name__}, self.clock()
+                raise
+            seen["raw"], seen["at"] = got, self.clock()
+            return got
+        doors["contract"] = contract
+        ctx = T.bind_ctx(number, doors, [], self.clock)
+        rental = ctx["rental"]()
+        if (rental.get("outcome") if isinstance(rental, dict) else None) != T.FACT:
+            return rental, None
+        ctx["may_call"] = lambda: False
+        got = T.call_tool("contract", {}, doors, self.clock, ctx)
+        self._ref_note(number, rental, seen)
+        return rental, got
+
+    def _ref_note(self, number, rental, seen):
+        """Последнее чтение реестра по номеру → `contract_versions` (CONTRACTREF1510): исход `ref_of`, строки чтения, затем
+        строка-итог (читатель берёт только строки с read_at итога — обрыв посреди записи не смешивает чтения). Повторное
+        чтение заменяет прежнее. Дверь не звалась — писать нечего. Сбой — одна строка журнала на процесс и имя ошибки
+        (устойчивый сбой не шумит на каждый номер каждого прохода — как `_signed_note`), проход идёт дальше.
+        Успех журнала не пишет; номера, имени и телефона в журнале нет."""
+        if "raw" not in seen:
+            return
+        try:
+            res = self.ref_of(seen["raw"], number, rental)
+            at, out, bid = float(seen["at"]), str(res["outcome"]), str(res.get("booking_id") or "")
+            for it in res.get("rows") or []:
+                row = it.get("row")
+                if not str(it.get("doc_id") or "") or not isinstance(row, int) or isinstance(row, bool):
+                    continue
+                self.db.execute("INSERT OR REPLACE INTO contract_versions(number, doc_id, row, read_at, outcome, role, "
+                                "status, signed, signed_at, pdf_id, booking_id, reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                                (number, str(it["doc_id"]), row, at, out, str(it.get("role") or ""),
+                                 str(it.get("status") or ""), 1 if it.get("signed") is True else 0,
+                                 str(it.get("signed_at") or ""), str(it.get("pdf_id") or ""), bid))
+            self.db.execute("INSERT OR REPLACE INTO contract_versions(number, doc_id, row, read_at, outcome, role, status, "
+                            "signed, signed_at, pdf_id, booking_id, reason) VALUES(?,'',0,?,?,?,NULL,NULL,NULL,NULL,?,?)",
+                            (number, at, out, REF_SUMMARY, bid, str(res.get("reason") or "")[:REF_REASON_MAX]))
+        except Exception as e:                                       # noqa: BLE001
+            key = ("ref-note", type(e).__name__)
+            if key not in self._signed_said:
+                self._signed_said.add(key)
+                self.log(W_REF_NOT_SAVED % type(e).__name__)
 
     def _signed_pdf(self, contract):
         """Договор, привязанный кодом → (метаданные PDF | None, причина, ответ contract_pdf, прочитанный кодом | None).

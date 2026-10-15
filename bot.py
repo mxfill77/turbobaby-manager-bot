@@ -1226,14 +1226,21 @@ async def scheduled_contract_km(context: ContextTypes.DEFAULT_TYPE):
         return
     today = datetime.now(ZoneInfo(TZ_NAME)).strftime("%Y-%m-%d")
     done = 0
+    # CONTRACTREF1510 (флаг CONTRACT_REF_GEN, по умолчанию выкл; один раз на запуск задания): бронь — по booking_id (кол. Y),
+    # отказ no_passport называет, что лежит в реестре подписей по этой брони (только чтение)
+    gen = splinter._rc_on(splinter.F_CONTRACT_REF_GEN)
     for c in clients:
         if str(c.get("status", "")).strip().lower() != "бронь":
             continue
         if not str(c.get("date_start", "")).startswith(today):   # «YYYY-MM-DD HH:MM»
             continue
+        bid = str(c.get("booking_id") or "").strip()
         try:
             with agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
-                r = bridge.make_contract(name=c.get("name"), date_start=c.get("date_start"))
+                if gen and bid:
+                    r = bridge.make_contract(booking_id=bid)
+                else:
+                    r = bridge.make_contract(name=c.get("name"), date_start=c.get("date_start"))
         except Exception as e:
             r = {"ok": False, "error": str(e)}
         if r.get("ok"):
@@ -1242,6 +1249,10 @@ async def scheduled_contract_km(context: ContextTypes.DEFAULT_TYPE):
                      f"km_request={r.get('flags', {}).get('km_request')}")
         else:
             log.info(f"  📄 contract_km: бронь «{c.get('name')}» — {r.get('error')}")
+            if gen and r.get("error") == "no_passport":
+                # чтение реестра — в потоке: цикл событий бота им не держится (только чтение, contract_find)
+                words = await asyncio.to_thread(splinter._contract_ref_report, bridge, row=c)
+                log.info(f"  📄 contract_km: строка CRM {c.get('row')} — реестр: {words}")
     if done:
         log.info(f"  📄 contract_km: обновлено договоров в день выдачи: {done}")
 

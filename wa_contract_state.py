@@ -20,6 +20,15 @@ AGE_DAYS суток — ещё и с давностью словами («N су
 «достав»; кто отправил — только ролью («сотрудник» / «автоотправка»). Блок — только если по номеру есть хотя бы одна
 запись или вопрос клиента о договоре; иначе None, и запрос модели побайтно прежний.
 
+СВЕРКА ВЕРСИЙ С РЕЕСТРОМ (CONTRACTREF1510, флаг службы WA_AGENT_CONTRACT_REF). Факт «ref» — последнее чтение реестра
+проходом подписи (`contract_versions`, читает `wa_agent_cstate`). Меняется ТОЛЬКО строка версии: снимок новее решения
+версии (или версии нет) и не старше REF_FRESH (окно 24 ч клиента) — строка говорит, действует ли версия по реестру, и
+называет текущую или ждущую подписи («реестр ЧЧ:ММ: ОТОЗВАН — НЕ текущая; новая doc …хвост ждёт подписи (ОТПРАВЛЕН)»);
+снимка нет, он «неизвестно», старше версии или старше суток — строка прежняя байт-в-байт (снимок прошлой беседы о
+прошлой аренде не выдаётся за чтение нынешней). Версия прошлой аренды (срок её аренды прошёл), строки которой в чтении
+нет, при текущей или ждущей по чтению — «прошлой аренды — НЕ текущая» с указателем на текущую / ждущую. Новых строк блока
+нет; номеров строк реестра, pdf_id и полного doc_id в ней нет.
+
 ГРАНИЦА УСТРОЙСТВОМ: импорты ровно `re` и `datetime`; ни файлов, ни сети, ни базы (страж — ast в тесте)."""
 import datetime
 import re
@@ -48,6 +57,37 @@ EXPECT_ASK_TAG = ":ask"     # = wa_agent_attach.EXPECT_ASK_TAG (тест све�
 ASKED_WORDS = {"pure": "чистая", "mixed": "с вопросом"}
 KIND_WORDS = {"card": "карточка", "answer": "к ответу"}
 WHO_WORDS = {"auto": "автоотправка", "staff": "сотрудник"}
+# CONTRACTREF1510: строка версии по последнему чтению реестра проходом подписи (снимок `contract_versions`, флаг службы
+# WA_AGENT_CONTRACT_REF). A — локальная версия есть: действует ли она по реестру и куда смотреть вместо неё (P); B — нет.
+REF_LINE_A = "версия: подписан %s · doc %s · реестр %s: %s"           # + давность/срок аренды + указатель P
+REF_LINE_B = "версия: в базе нет (карточки подписи и сверки ответов) · реестр %s: %s"
+REF_FRESH = 24 * 3600       # снимок старше — строка версии прежняя (= wa_agent.FOLLOW_WINDOW, окно 24 ч; тест сверяет)
+REF_V = {"unread": "не прочитан — статус неизвестен",
+         "absent": "этой строки в чтении нет — статус неизвестен",
+         "past": "прошлой аренды — НЕ текущая",        # срок аренды версии прошёл, в чтении её нет, текущая/ждущая — есть
+         "blank": "строка без статуса — статус неизвестен",
+         "multi": "строка не однозначна — статус неизвестен",
+         "foreign": "другой аренды — НЕ текущая",
+         "unchecked": "привязка не сверена — статус неизвестен",
+         "dead": "%s — НЕ текущая",
+         "resigned": "переподписан %s — эта НЕ текущая",
+         "live": "действует",
+         "ambiguous": "подписанных несколько — выбор за человеком",
+         "incomplete": "прочитан не целиком — выбор за человеком"}
+REF_P_HEAD = {"current": "; текущая ", "pending": "; новая "}       # + «doc …хвост от ДД.ММ ЧЧ:ММ» / «doc …хвост ждёт …»
+REF_P_OUT = {"ambiguous": "; подписанных несколько — выбор за человеком",
+             "incomplete": "; прочитан не целиком — выбор за человеком",
+             "none": "; подписанного в сроке аренды нет"}
+REF_CURRENT_AT = "doc %s от %s"
+REF_PENDING_AT = "doc %s %s"
+REF_MORE = " и ещё %d"
+REF_PEND = {"ОТПРАВЛЕН": "ждёт подписи (ОТПРАВЛЕН)", "НОВЫЙ": "не отправлена на подпись (НОВЫЙ)"}   # ключ — Ё→Е, верх
+REF_PEND_OTHER = "ждёт подписи (%s)"
+REF_Q_CURRENT = "подписан "
+REF_Q = {"ambiguous": "подписанных несколько — выбор за человеком",
+         "incomplete": "прочитан не целиком — выбор за человеком",
+         "none": "подписанного в сроке аренды нет",
+         "unknown": "не прочитан — неизвестно, а не «договора нет»"}
 
 # ── вопрос о договоре и «подписал» ───────────────────────────────────────────────────────────────────────────────
 # Тема — по СЛОВУ, а не по подстроке: «Договорились», «подписка», «sign up», «signal», «Central» (เซ็นทรัล) о договоре
@@ -204,23 +244,163 @@ def _unknown(fact):
     return isinstance(fact, dict) and "unknown" in fact
 
 
-def _version_line(v, now):
-    if _unknown(v):
-        return "версия: " + W_UNKNOWN % v["unknown"]
-    if not isinstance(v, dict):
-        return "версия: в базе нет (карточки подписи и сверки ответов)"
-    line = "версия: подписан %s · doc %s · %s" % (dm_raw(v.get("signed_at")), doc_tail(v.get("doc")),
-                                                 SRC_WORDS.get(v.get("src"), "источник не разобран"))
-    # давность и срок аренды версии: прошлый договор не выдаётся за договор нынешнего обращения (в «ДД.ММ» нет года)
+def _rental_over(v, now):
+    """Срок аренды версии (`date_to` её черновика) прошёл к дню `now` (Пхукет)? Срока нет или не разобран — False."""
+    end, today = raw_day(v.get("date_to")), _day(now) if _num(now) else None
+    return bool(end and today and end < today)
+
+
+def _version_note(v, now, rental=True):
+    """Давность и срок аренды версии: прошлый договор не выдаётся за договор нынешнего обращения (в «ДД.ММ» нет года).
+    → " · вчера, аренда этой версии закончилась" | "". rental=False — только давность (строка уже сказала «прошлой
+    аренды», CONTRACTREF1510)."""
     signed, today = raw_day(v.get("signed_at")), _day(now) if _num(now) else None
     note = []
     if signed and today:
         note.append(age_words((today - signed).days))
-    end = raw_day(v.get("date_to"))
-    if end and today and end < today:
+    if rental and _rental_over(v, now):
         note.append("аренда этой версии закончилась")
     note = [x for x in note if x]
-    return line + (" · " + ", ".join(note) if note else "")
+    return " · " + ", ".join(note) if note else ""
+
+
+def _version_line(v, now, ref=None):
+    if _unknown(v):
+        return "версия: " + W_UNKNOWN % v["unknown"]
+    if _ref_fits(ref, v, now):                    # CONTRACTREF1510: снимок реестра свежий и новее версии — по реестру
+        return _ref_line(v, now, ref)
+    if not isinstance(v, dict):
+        return "версия: в базе нет (карточки подписи и сверки ответов)"
+    line = "версия: подписан %s · doc %s · %s" % (dm_raw(v.get("signed_at")), doc_tail(v.get("doc")),
+                                                 SRC_WORDS.get(v.get("src"), "источник не разобран"))
+    return line + _version_note(v, now)
+
+
+# ── сверка версий договора с реестром (CONTRACTREF1510; снимок прохода подписи `contract_versions`) ──────────────
+
+def _ref_norm(status):
+    return str(status or "").strip().upper().replace("Ё", "Е")
+
+
+def _ref_fits(ref, v, now):
+    """Снимок применим: dict без «unknown» с числом read_at, не старше REF_FRESH к `now` (окно 24 ч клиента: проход
+    подписи читает реестр только в нём, и снимок прошлой беседы о прошлой аренде не выдаётся за чтение нынешней; `now` не
+    число — свежесть неизвестна, не применим), и локальной версии нет либо снимок не старше решения версии
+    (`decided_at`). Иначе строка версии прежняя байт-в-байт."""
+    if not isinstance(ref, dict) or "unknown" in ref or not _num(ref.get("read_at")):
+        return False
+    if not _num(now) or float(now) - ref["read_at"] > REF_FRESH:
+        return False
+    if v is None:
+        return True
+    return isinstance(v, dict) and _num(v.get("decided_at")) and ref["read_at"] >= v["decided_at"]
+
+
+def _ref_same(c, v):
+    """Строка реестра и локальная версия — одна версия: doc_id, signed_at и PDF (pdf_id, иначе file_id) у обоих непусты
+    и равны (= `contract_ref.same_version`; тест сверяет — модуль сюда не импортируется, замок импортов)."""
+    def key(x, doc):
+        return (str(x.get(doc) or "").strip(), str(x.get("signed_at") or "").strip(),
+                str(x.get("pdf_id") or "").strip() or str(x.get("file_id") or "").strip())
+    a, b = key(c, "doc_id"), key(v, "doc")
+    return all(a) and all(b) and a == b
+
+
+def _ref_items(ref, role):
+    return [it for it in ref.get("items") or [] if isinstance(it, dict) and it.get("role") == role]
+
+
+def _ref_pend(item):
+    st = _ref_norm(item.get("status"))
+    return REF_PEND.get(st, REF_PEND_OTHER % str(item.get("status") or "").strip())
+
+
+def _ref_target(ref):
+    """Цель указателя по исходу чтения: текущая (current) или первая ждущая (pending) → (item | None, слова цели)."""
+    out, words, item = ref.get("outcome"), "", None
+    if out == "current":
+        cur = _ref_items(ref, "current")
+        if cur:
+            item = cur[0]
+            words = REF_CURRENT_AT % (doc_tail(item.get("doc_id")), dm_raw(item.get("signed_at")))
+    elif out == "pending":
+        pend = _ref_items(ref, "pending")
+        if pend:
+            item = pend[0]
+            words = REF_PENDING_AT % (doc_tail(item.get("doc_id")), _ref_pend(item)) + (
+                REF_MORE % (len(pend) - 1) if len(pend) > 1 else "")
+    return item, words
+
+
+def _ref_pointer(ref, doc):
+    """P: куда смотреть вместо этой строки — текущая / новая ждущая / что сказал реестр; указателя на тот же документ нет."""
+    out = ref.get("outcome")
+    item, words = _ref_target(ref)
+    pointer = REF_P_OUT.get(out, "")
+    if out in ("current", "pending"):
+        same = item is not None and str(item.get("doc_id") or "").strip() == doc
+        pointer = "" if item is None or same else REF_P_HEAD[out] + words
+    return pointer
+
+
+def _ref_line(v, now, ref):
+    """Строка версии по снимку реестра: есть локальная версия — действует ли она и куда смотреть вместо неё (§4.3-A);
+    нет — что последнее чтение реестра сказало о брони (§4.3-B). Номеров строк, pdf_id, полного doc_id и года нет.
+    Строки версии в чтении нет, срок её аренды прошёл, а чтение (по аренде обращения) называет текущую или ждущую —
+    «прошлой аренды — НЕ текущая» и указатель ДО давности (длинную строку `_cut` режет с конца: указатель остаётся).
+    Строка без статуса — «статус неизвестен» без указателя (пустое поле — не «НЕ текущая»)."""
+    t = when(ref.get("read_at"), now)
+    out = ref.get("outcome")
+    if not isinstance(v, dict):
+        item, words = _ref_target(ref)
+        q = REF_Q.get(out, REF_Q["incomplete"]) if out not in ("current", "pending") or item is None else (
+            (REF_Q_CURRENT if out == "current" else "") + words)
+        return REF_LINE_B % (t, q)
+    doc = str(v.get("doc") or "").strip()
+    cands = [it for it in ref.get("items") or [] if isinstance(it, dict) and doc
+             and str(it.get("doc_id") or "").strip() == doc]
+    local = ref.get("local_row")
+    c, state = None, None
+    if not cands:
+        state = "absent"
+    elif local is not None:
+        hit = [it for it in cands if it.get("row") == local]
+        c, state = (hit[0], None) if hit else (None, "multi")                 # doc есть, а строки нет — MOVED
+    elif len(cands) == 1:
+        c = cands[0]
+    else:
+        state = "multi"
+    cur = _ref_items(ref, "current")
+    pointer, past = False, False
+    if out == "unknown":
+        val = REF_V["unread"]
+    elif state == "absent" and out in ("current", "pending") and _rental_over(v, now) and \
+            _ref_target(ref)[0] is not None:
+        val, past = REF_V["past"], True
+    elif state is not None:
+        val = REF_V[state]
+    elif c.get("role") == "foreign":
+        val, pointer = REF_V["foreign"], True
+    elif c.get("role") == "unchecked":
+        val = REF_V["unchecked"]
+    elif not c.get("signed") and not str(c.get("status") or "").strip():
+        val = REF_V["blank"]
+    elif not c.get("signed"):
+        val, pointer = REF_V["dead"] % str(c.get("status") or "").strip(), True
+    elif not _ref_same(c, v):
+        val, pointer = REF_V["resigned"] % dm_raw(c.get("signed_at")), True
+    elif out == "current" and cur and _ref_same(cur[0], v):
+        val = REF_V["live"]
+    elif out == "ambiguous":
+        val = REF_V["ambiguous"]
+    else:
+        val = REF_V["incomplete"]
+    head = REF_LINE_A % (dm_raw(v.get("signed_at")), doc_tail(v.get("doc")), t, val)
+    if past:                                      # указатель раньше давности; не влезает давность — её нет («прошлой
+        head += _ref_pointer(ref, doc)            # аренды» уже сказало главное), указатель `_cut` не трогает
+        note = _version_note(v, now, rental=False)
+        return head + note if len(head + note) <= LINE_MAX else head
+    return head + _version_note(v, now) + (_ref_pointer(ref, doc) if pointer else "")
 
 
 def _registry_line(e, now):
@@ -342,7 +522,8 @@ def render(facts, now):
         return None
     e = facts.get("expect")
     at = float(now)
-    lines = [HEAD % dm(facts.get("read_at") or now), _version_line(facts.get("version"), at), _registry_line(e, at),
+    lines = [HEAD % dm(facts.get("read_at") or now), _version_line(facts.get("version"), at, facts.get("ref")),
+             _registry_line(e, at),
              _pdf_line(facts.get("pdf"), at), _wa_line(facts.get("wa"), at), _human_line(facts.get("human_doc"), at),
              _ask_line(facts.get("ask"), at), _expect_line(e, at)]
     out = [lines[0]] + ["• " + _cut(x) for x in lines[1:] if x]

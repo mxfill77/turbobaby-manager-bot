@@ -18,7 +18,12 @@ mode=ro, timeout 2 с, выборка только по ТОЧНОМУ номе�
 kind='document', via='тема' после подписи или версия, решённая документом человека (`signed_cards` без черновика) —
 документ человека · `signed_asks` (просьба) · `contract_expect` (ожидание подписи и проверки реестра). Срок аренды
 версии — `attach.date_to` её черновика. Нет таблицы или база не прочитана — «неизвестно (…)», а не «нет». В журнал — только числа и
-имена источников: ни текста клиента, ни номера, ни имён."""
+имена источников: ни текста клиента, ни номера, ни имён.
+
+СВЕРКА ВЕРСИЙ С РЕЕСТРОМ (CONTRACTREF1510). `ref_on` (ставит служба при засчитанном WA_AGENT_CONTRACT_REF) — `read_facts`
+читает ещё и снимок последнего чтения реестра проходом подписи (`contract_versions`: итог и строки ЭТОГО чтения, строка
+реестра локальной версии) в факт «ref»; источником блока он не считается (SOURCES и records прежние). Выкл — вызов
+`read_facts` прежней формы, таблица не читается, даже если она есть."""
 import os
 import sqlite3
 
@@ -48,8 +53,9 @@ def _all_unknown(facts, why):
 class _Reader:
     """Чтение фактов одной базы по одному номеру: каждый источник — своё «есть / нет / неизвестно (почему)»."""
 
-    def __init__(self, con, tables, number, now, facts):
+    def __init__(self, con, tables, number, now, facts, ref=False):
         self.con, self.tables, self.number, self.now, self.facts = con, tables, number, now, facts
+        self.ref = ref                              # CONTRACTREF1510: читать снимок реестра (`contract_versions`)
 
     def q(self, sql, args=()):
         return self.con.execute(sql, args).fetchall()
@@ -81,6 +87,9 @@ class _Reader:
             if isinstance(pdf, dict) and "unknown" not in pdf and pdf.get("wamids"):
                 self.part("wa", self.wa, pdf)
             self.part("human_doc", self.human_doc, ver)
+        if self.ref and not (isinstance(ver, dict) and "unknown" in ver):
+            # CONTRACTREF1510: снимок записью не считается (SOURCES и records прежние) — блок появляется по прежним условиям
+            self.facts["ref"] = self._ref(ver if isinstance(ver, dict) else None)
         self.part("ask", self.ask)
         self.part("expect", self.expect)
 
@@ -205,10 +214,35 @@ class _Reader:
             out["closed_by"] = by
         return out
 
+    def _ref(self, ver):
+        """CONTRACTREF1510: последнее чтение реестра проходом подписи по номеру (`contract_versions`): итог и строки ЭТОГО
+        чтения (read_at итога) + строка реестра локальной версии (`attach.row` её черновика). Таблицы или итога нет — None
+        (строка версии прежняя); сбой — «неизвестно» (в `unread` не идёт: снимок — не источник блока)."""
+        try:
+            if "contract_versions" not in self.tables:
+                return None
+            head = self.q("SELECT read_at, outcome, reason FROM contract_versions WHERE number=? AND doc_id='' AND row=0",
+                          (self.number,))
+            if not head:
+                return None
+            read_at, outcome, reason = head[0]
+            rows = self.q("SELECT doc_id, row, role, status, signed, signed_at, pdf_id FROM contract_versions WHERE "
+                          "number=? AND doc_id<>'' AND read_at=? ORDER BY row DESC", (self.number, read_at))
+            local = None
+            if isinstance(ver, dict) and ver.get("draft_id") is not None:
+                got = self.q("SELECT row FROM attach WHERE draft_id=?", (ver["draft_id"],))
+                local = got[0][0] if got else None
+            return {"read_at": read_at, "outcome": outcome, "reason": reason, "local_row": local,
+                    "items": [{"doc_id": r[0], "row": r[1], "role": r[2], "status": r[3], "signed": bool(r[4]),
+                               "signed_at": r[5], "pdf_id": r[6]} for r in rows]}
+        except Exception as e:                                       # noqa: BLE001
+            return {"unknown": "сверка с реестром не прочитана: %s" % type(e).__name__}
 
-def read_facts(path, number, now, timeout=READ_TIMEOUT):
+
+def read_facts(path, number, now, timeout=READ_TIMEOUT, ref=False):
     """База агента → факты договора номера (`wa_contract_state.render`). Только чтение (sqlite URI mode=ro, timeout),
-    выборка только по ТОЧНОМУ номеру. База не задана, не открылась или заперта — каждый источник «неизвестно (почему)»."""
+    выборка только по ТОЧНОМУ номеру. База не задана, не открылась или заперта — каждый источник «неизвестно (почему)».
+    ref (CONTRACTREF1510) — ещё и снимок реестра «ref» (`_Reader._ref`); выкл — факты прежние."""
     facts = dict({k: None for k in SOURCES}, read_at=float(now), unread=[], records=0)
     if not path:
         return _all_unknown(facts, W_NO_DB)
@@ -221,7 +255,7 @@ def read_facts(path, number, now, timeout=READ_TIMEOUT):
             tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         except Exception as e:                                       # noqa: BLE001
             return _all_unknown(facts, W_DB % type(e).__name__)
-        _Reader(con, tables, str(number), float(now), facts).run()
+        _Reader(con, tables, str(number), float(now), facts, ref=ref).run()
     finally:
         con.close()
     facts["records"] = sum(1 for k in ("version", "pdf", "human_doc", "ask", "expect")
@@ -237,6 +271,7 @@ class ContractStateAdapter(wa_agent_model.ModelAdapter):
         super().__init__(*args, **kw)
         self.cstate_on = True                       # служба гасит, если карточка подписи не засчитана
         self.cstate_timeout = READ_TIMEOUT
+        self.ref_on = False                         # CONTRACTREF1510: служба ставит при засчитанном WA_AGENT_CONTRACT_REF
 
     def build(self, number, upto_id, now=None, hint=None):
         system, user, info = super().build(number, upto_id, now=now, hint=hint)
@@ -244,7 +279,10 @@ class ContractStateAdapter(wa_agent_model.ModelAdapter):
             return system, user, info
         at = self._now(now)
         try:
-            facts = read_facts(self.agent_db, number, at, self.cstate_timeout)
+            if self.ref_on:                         # CONTRACTREF1510: + снимок реестра; выкл — вызов прежней формы
+                facts = read_facts(self.agent_db, number, at, self.cstate_timeout, ref=True)
+            else:
+                facts = read_facts(self.agent_db, number, at, self.cstate_timeout)
             facts["topic"] = CS.topic(info.get("question"))
             block = CS.render(facts, at)
         except Exception as e:                                       # noqa: BLE001

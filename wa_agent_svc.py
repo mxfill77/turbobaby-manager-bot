@@ -88,6 +88,14 @@
                     в базе, а не в памяти процесса; реестр проверяется сам до конца окна 24 ч; закрывает его карточка подписи.
                     Засчитывается ТОЛЬКО вместе с засчитанными WA_AGENT_SIGNED_CARD и WA_AGENT_TOOLS. Клиенту ничего без
                     нажатия; автоотправка — как выше. По умолчанию выкл: ни импорта новых модулей, ни строки, ни таблицы.
+  WA_AGENT_CONTRACT_REF — сверка версий договора с реестром (CONTRACTREF1510): проход подписи пишет последнее чтение
+                    реестра по номеру (таблица `contract_versions` базы агента: doc_id, строка, статус, подписан ли,
+                    signed_at, PDF, роль; ключ — номер обращения, как у signed_cards; имени, телефона и ника из строки
+                    реестра, байка и даты договора нет), а строка версии в блоке договора модели говорит, действует
+                    ли версия по реестру (ОТОЗВАН / переподписан / другой аренды — «НЕ текущая»), и называет текущую или
+                    ждущую подписи; чтение не удалось — «неизвестно», а не «договора нет». Засчитывается ТОЛЬКО при
+                    засчитанном WA_AGENT_CONTRACT_STATE. PDF, карточки и отправка — как прежде. По умолчанию выкл: ни
+                    импорта `contract_ref`, ни строки, ни таблицы.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -185,6 +193,7 @@ F_CONTRACT_ASK = "WA_AGENT_CONTRACT_ASK"  # = wa_agent_attach.F_CONTRACT_ASK (т
 CONTRACT_ASK_OFF = ("0", "false", "no", "off")   # детектор по умолчанию вкл; выключают только эти слова
 AUTOSEND_DAY_MAX = 10                     # = wa_agent_attach.AUTOSEND_DAY_MAX (тест сверяет): только для строки старта
 F_CSTATE = "WA_AGENT_CONTRACT_STATE"      # = wa_agent_attach.F_CSTATE (тест сверяет): блок договора модели (CSTATE1510)
+F_CONTRACT_REF = "WA_AGENT_CONTRACT_REF"  # = wa_agent_attach.F_CONTRACT_REF (тест сверяет): сверка версий (CONTRACTREF1510)
 W_SIGNED_ORPHAN = ("устарело: карточка подписанного договора — PDF клиенту (WA_AGENT_ATTACH) при старте службы не "
                    "засчитан, прежнее ядро отправило бы текст без PDF и без перечитывания реестра; ничего не отправлено")
 F_TEMPLATES = wa_send.TEMPLATES_FLAG      # шаблон после 24 часов (NIGHT0710-B3g): одно имя у ядра и двери
@@ -1001,6 +1010,28 @@ def cstate_of(environ, signed, model):
         "карточка подписи; клиенту ничего без нажатия" % wa_contract_state.BLOCK_LINES)
 
 
+def contract_ref_of(environ, cstate_ok, model):
+    """CONTRACTREF1510: флаг WA_AGENT_CONTRACT_REF → (засчитан? | None, именованные аргументы `AttachCore` | None, слова
+    строки старта | None). Правило флага — одно со всеми выключателями (`flag_on`). Не запрошен — (None, None, None): ни
+    импорта `contract_ref`, ни строки, ни таблицы, путь прежний байт-в-байт. Засчитывается только при засчитанном
+    WA_AGENT_CONTRACT_STATE (cstate_ok is True). Засчитан — модели `ref_on = True` (блок читает снимок), ядру `ref_of`
+    (функция сверки передаётся параметром: замок импортов ядра прежний)."""
+    if not wa_agent_tg.flag_on(environ.get(F_CONTRACT_REF)):
+        return None, None, None
+    if cstate_ok is not True:
+        return False, None, ("не засчитан — флаг 1, но состояние договора для модели (%s) не засчитано: сверки версий нет"
+                             % F_CSTATE)
+    try:
+        import contract_ref
+    except Exception as e:                                           # noqa: BLE001
+        return False, None, "не засчитан — модуль сверки версий не собран (%s)" % type(e).__name__
+    model.ref_on = True
+    return True, {"ref_of": contract_ref.ref_of}, (
+        "вкл — проход подписи пишет последнее чтение реестра по номеру (contract_versions: doc_id, строка, статус, "
+        "подписан, PDF — без имён и телефонов); строка версии в блоке договора модели говорит, действует ли версия по "
+        "реестру, и называет текущую или ждущую подписи; PDF, карточки и отправка — как прежде")
+
+
 def close_signed_orphans(core, now, line):
     """WA_AGENT_ATTACH не засчитан, ядро прежнее (`wa_agent.Core`), а в базе ждут черновики подписи (kind='signed',
     pending или отложенные ритмом): «Отправить» прежнего ядра отправил бы шаблон «Направляем ваш подписанный договор» без
@@ -1135,13 +1166,18 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     _cs, cstate_kw, cstate_words = cstate_of(environ, _signed, model)
     if cstate_words:
         line("договор клиента для модели (%s): %s" % (F_CSTATE, cstate_words))
+    # сверка версий договора (CONTRACTREF1510): флаг не запрошен — ни строки, ни импорта, ни таблицы
+    _cr, ref_kw, ref_words = contract_ref_of(environ, _cs, model)
+    if ref_words:
+        line("сверка версий договора (%s): %s" % (F_CONTRACT_REF, ref_words))
     if attach:
         import wa_agent_attach
         core = wa_agent_attach.AttachCore(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                                           log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons,
                                           lesson_admins=admins, followup=follow, hints=hints, templates=templates,
                                           lang_of=wa_agent_tg.K.lang_of, attach=True, **doors,
-                                          **(signed_kw or {"signed": False}), **(auto_kw or {}), **(cstate_kw or {}))
+                                          **(signed_kw or {"signed": False}), **(auto_kw or {}), **(cstate_kw or {}),
+                                          **(ref_kw or {}))
     else:
         core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                              log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,

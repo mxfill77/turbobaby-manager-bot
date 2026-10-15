@@ -12398,6 +12398,51 @@ def _intake_passport_save(chat_id, draft, bridge):
         log.warning(f"  🆕 INTAKE: save_passport не прошёл: {e}")
 
 
+# CONTRACTREF1510 (генератор): договор, сделанный ФОРМОЙ (TB e-Sign, не мостом), не теряется на make_contract → no_passport.
+# Флаг CONTRACT_REF_GEN (по умолчанию выкл; читается `_rc_on` на каждый запуск — рестарт не нужен): команда «договор <uuid>»
+# зовёт make_contract(booking_id=…), а отказ no_passport (тут и в bot.scheduled_contract_km) называет, что лежит в реестре
+# по этой брони. Реестр — ТОЛЬКО чтение (contract_find), CRM — только чтение (clients); второго make_contract нет.
+F_CONTRACT_REF_GEN = "CONTRACT_REF_GEN"
+_CONTRACT_REF_UUID = _re_lang.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+W_CONTRACT_REF_BROKEN = "сверка с реестром не собрана (%s) — неизвестно, а не «договора нет»"
+
+
+def _contract_ref_report(bridge, row=None, booking_id=None, booking_key=None, name=None, date_start=None):
+    """Бронь → слова сотруднику о договорах в реестре подписей по её байку и сроку (CONTRACTREF1510, §5.3). Только чтение:
+    не больше одного `_call("clients")` (если строки брони нет) и одного `contract_find` на вызов. Исключения наружу не
+    идут; модуль сверки — лениво. Имени клиента в словах нет."""
+    try:
+        import contract_ref as _cref
+    except Exception as e:  # noqa: BLE001
+        return W_CONTRACT_REF_BROKEN % type(e).__name__
+    try:
+        if row is None:
+            try:
+                resp = bridge._call("clients", filter="all")
+            except Exception as e:  # noqa: BLE001
+                return _cref.GEN_CRM_UNREAD % type(e).__name__
+            if not isinstance(resp, dict) or resp.get("ok") is False:
+                why = resp.get("error") if isinstance(resp, dict) else None
+                return _cref.GEN_CRM_UNREAD % (str(why) if why else "ответ не разобран")
+            data = resp.get("data", {})
+            clients = data.get("clients", []) if isinstance(data, dict) else (data or [])
+            row, words = _cref.crm_pick(clients, booking_id=booking_id, booking_key=booking_key, name=name,
+                                        date_start=date_start)
+            if row is None:
+                return words
+        b = _cref.binding_of_crm(row)
+        if not (b["plate"] and b["date_from"] and b["date_to"]):
+            return _cref.GEN_NO_TERM
+        try:
+            found = bridge.contract_find(bike=str(row.get("bike") or ""), date_from=b["date_from"],
+                                         date_to=b["date_to"], limit=100)
+        except Exception as e:  # noqa: BLE001
+            found = {"ok": False, "error": type(e).__name__}
+        return _cref.gen_words(_cref.versions(found, b))
+    except Exception as e:  # noqa: BLE001
+        return W_CONTRACT_REF_BROKEN % type(e).__name__
+
+
 async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only.
     photo_msgs — пачка фото (альбом склеен по media_group_id) → один «паспорт получен» + один finalize."""
@@ -12436,7 +12481,12 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
         sp = text.split(None, 1)
         args = sp[1].strip() if len(sp) > 1 else ""
         bk = nm = ds = None
-        if "|" in args:
+        # CONTRACTREF1510: при флаге «договор <uuid>» — бронь по booking_id (кол. Y), прежний разбор не нужен
+        gen = _rc_on(F_CONTRACT_REF_GEN)
+        bid = args if gen and _CONTRACT_REF_UUID.fullmatch(args) else None
+        if bid is not None:
+            pass
+        elif "|" in args:
             bk = args
         elif args:
             toks = args.rsplit(None, 1)
@@ -12448,14 +12498,17 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             d2 = _INTAKE_DRAFTS.get(chat_id)
             if d2 and d2.get("model") and d2.get("client") and d2.get("date_start"):
                 bk = f"{d2['model']}|{d2['client']}|{d2['date_start']}"
-        if not bk and not (nm and ds):
+        if bid is None and not bk and not (nm and ds):
             await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
                         text=("🐀 Splinter\nУкажи бронь: «договор <booking_key>» или «договор <Имя> <дата>», "
                               "либо отправь после карточки брони."))
             return
         try:
             with bridge_client.agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
-                res = bridge.make_contract(booking_key=bk, name=nm, date_start=ds)
+                if bid is not None:
+                    res = bridge.make_contract(booking_id=bid)
+                else:
+                    res = bridge.make_contract(booking_key=bk, name=nm, date_start=ds)
         except Exception as e:
             res = {"ok": False, "error": "exception", "message": str(e)}
         if res.get("ok"):
@@ -12467,8 +12520,16 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
                         text=f"🐀 Splinter\n✅ Договор готов: {res.get('url')}\n{reminder}")
         else:
-            await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
-                        text=f"🐀 Splinter\n❌ Договор не сделан: {res.get('error')}. {res.get('message','')}")
+            fail = f"🐀 Splinter\n❌ Договор не сделан: {res.get('error')}. {res.get('message','')}"
+            if gen and res.get("error") == "no_passport":
+                # CONTRACTREF1510: договор мог быть сделан формой — что лежит в реестре по этой брони (только чтение;
+                # чтения моста — в потоке, цикл событий ими не держится)
+                import asyncio as _aio
+                words = await _aio.to_thread(_contract_ref_report, bridge, booking_id=bid, booking_key=bk, name=nm,
+                                             date_start=ds)
+                fail += "\n📄 Реестр по этой брони: " + words
+                log.info(f"  🆕 INTAKE: договор не сделан (no_passport) — реестр: {words}")
+            await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False, text=fail)
         return
 
     # 2) Карточка брони
