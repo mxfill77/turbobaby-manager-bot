@@ -12329,8 +12329,12 @@ async def _intake_finalize(draft, msg, context, bridge):
         # К4 шаг 7: карточка брони — ожидание approval/booking в хранилище (без дела; дело — после create_booking)
         await _rc_booking_card(draft, msg, context, _intake_summary(draft, avail, deliv))
         return
-    await _send(context, chat_id=chat_id, text=_intake_summary(draft, avail, deliv),
-                bilingual=False, message_thread_id=tid)
+    sent = await _send(context, chat_id=chat_id, text=_intake_summary(draft, avail, deliv),
+                       bilingual=False, message_thread_id=tid)
+    if _intake_confirm_strict_on():
+        # INTAKECONFIRM1610-привязка: резюме «Ставлю бронь?» — сообщение ЭТОЙ карточки; реплай «да» на него засчитан.
+        # id не получен (отправка вернула не сообщение) → привязкой не считается.
+        _ic_note_ids(draft, [sent])
 
 
 async def _rc_booking_card(draft, msg, context, summary):
@@ -12453,7 +12457,8 @@ def _contract_ref_report(bridge, row=None, booking_id=None, booking_key=None, na
 # INTAKECONFIRM1610 (16.10.2026): ответ подтверждающего на карточку брони — согласие только явное (решение —
 # `intake_confirm.decide`), исход записи — три слова (`intake_confirm.outcome`). Ручка `INTAKE_CONFIRM_STRICT=0` →
 # прежняя ветка «3) approve / нет / правки» байт-в-байт. Тексты — без префикса «🐀 Splinter\n» (его клеит отправка).
-_IC_ASK = "❓ Ответ неоднозначный — бронь не ставлю. Поставить: «да». Отказ: «нет». Исправить: «правки»."
+_IC_ASK = ("❓ Ответ неоднозначный — бронь не ставлю. Поставить: «да» только ответом (реплаем) на карточку брони. "
+           "Отказ: «нет». Исправить: «правки».")
 _IC_REJECT = "❌ Бронь отклонена — в CRM ничего не записано."
 _IC_UNKNOWN = ("⚠️ Исход записи брони неизвестен ({err}) — проверь CRM; повтор не делаю. "
                "Брони там нет — пришли карточку заново.")
@@ -12462,11 +12467,16 @@ _IC_PHOTO_UNKNOWN = "📎 Паспорт привязан. Исход запис
 _IC_EDIT = "✏️ Принял, жду исправленную карточку."   # прежний текст ветки правок
 # Дополнения выпуска (находки критиков 16.10, сверх проекта §2.2): ответ, адресованный НЕ карточке, и «да» после
 # просьбы о правках бронь не ставят; без билета токен-замка запись не уходит.
-_IC_ASK_REPLY = ("❓ Это ответ на другое сообщение — бронь не ставлю. Поставить: «да» ответом на карточку "
-                 "или отдельным сообщением.")
+_IC_ASK_REPLY = ("❓ Это ответ на другое сообщение — бронь не ставлю. Поставить: «да» только ответом (реплаем) "
+                 "на карточку брони.")
 _IC_EDIT_PENDING = "✏️ По этой карточке просили правки — бронь не ставлю. Пришли исправленную карточку."
 _IC_NO_TICKET = "до отправки: билет не выдан"
 _IC_PRE_PHOTOS = {}      # chat_id → {"ts", "ids"}: фото паспорта, пришедшие ДО карточки (только строгий режим)
+# Привязка согласия к карточке (замечание Codex TB-OWNER-CHECK-1610-0307, 16.10): «да» засчитывается ТОЛЬКО реплаем на
+# сообщение ЭТОЙ карточки (`d["ic_msg_ids"]`: сама карточка, её фото паспорта, резюме «Ставлю бронь?», это уточнение).
+# Иначе — адресное уточнение без записи. В тексте карточка названа моделью и датами; имени и телефона клиента нет (ПДн).
+# Подсказки _IC_ASK и _IC_ASK_REPLY поэтому зовут «да» ТОЛЬКО реплаем на карточку (не советуют того, что не засчитано).
+_IC_ASK_BIND ="❓ Это подтверждение брони {card}? Ответьте «да» реплаем на карточку — без реплая бронь не ставлю."
 
 
 def _ic_forwarded(msg) -> bool:
@@ -12483,7 +12493,8 @@ def _ic_forwarded(msg) -> bool:
 def _ic_reply_elsewhere(msg, d) -> bool:
     """Ответ адресован НЕ карточке: реплай на сообщение человека, которое не карточка и не её фото паспорта.
     Реплай на бота (резюме «Ставлю бронь?») — к карточке. Служебное «тема создана» (Telegram кладёт его в
-    reply_to_message каждому сообщению темы) реплаем не считается. Сомнение → «не карточке» (бронь не ставим)."""
+    reply_to_message каждому сообщению темы) реплаем не считается. Сомнение → «не карточке» (бронь не ставим).
+    Для СОГЛАСИЯ этого мало: «да» засчитывается только реплаем на сообщение этой карточки (`_ic_reply_binding`)."""
     try:
         r = getattr(msg, "reply_to_message", None)
         if r is None or getattr(r, "forum_topic_created", None):
@@ -12521,12 +12532,38 @@ def _ic_note_ids(d, msgs):
     d["ic_msg_ids"] = ids
 
 
+def _ic_reply_binding(msg, d) -> str:
+    """Чей ответ «да» (замечание Codex TB-OWNER-CHECK-1610-0307): "card" — реплай на сообщение ЭТОЙ карточки
+    (`d["ic_msg_ids"]`); "none" — реплая нет (служебное «тема создана» реплаем не считается); "other" — реплай на иное
+    сообщение (другая карточка, другой бот, старое резюме, чужое сообщение). Сомнение → "other" (бронь не ставим)."""
+    try:
+        r = getattr(msg, "reply_to_message", None)
+        if r is None or getattr(r, "forum_topic_created", None):
+            return "none"
+        mid = getattr(r, "message_id", None)
+        if mid is not None and mid in (d.get("ic_msg_ids") or ()):
+            return "card"
+        return "other"
+    except Exception:
+        return "other"
+
+
+def _ic_card_name(d) -> str:
+    """Карточка словами для адресного уточнения: модель и даты из черновика. Имени и телефона клиента нет (ПДн)."""
+    model = str(d.get("model") or "").strip() or "—"
+    dates = " — ".join(x for x in (str(d.get("date_start") or "").strip(), str(d.get("date_end") or "").strip())
+                       if x)
+    return model + (" (%s)" % dates if dates else "")
+
+
 async def _intake_reply_strict(d, msg, context, bridge, text, now):
     """Ветка «3) approve / нет / правки» при `INTAKE_CONFIRM_STRICT` (по умолчанию ВКЛ). Отказ и сомнение бронь не
     пишут; YES — ровно один create_booking под токен-замком 4.2; исход «неизвестно» не равен «не записано», и
     карточка не возвращается в awaiting_approval (повтора вслепую нет). Текст сообщения в журнал не идёт (ПДн).
     Сверх проекта: пересланное — молчание; ответ на чужое сообщение и «да» после просьбы о правках — переспрос;
-    тег своего бота вырезается до разбора; стикер судится своим эмодзи; без билета запись не уходит."""
+    тег своего бота вырезается до разбора; стикер судится своим эмодзи; без билета запись не уходит.
+    Привязка (Codex TB-OWNER-CHECK-1610-0307): «да» без реплая или реплаем не на сообщение этой карточки — адресное
+    уточнение `_IC_ASK_BIND` без записи; отказ, правка и молчание — как прежде."""
     chat_id = msg.chat_id
     tid = getattr(msg, "message_thread_id", None)
     _who = msg.from_user.username if msg.from_user else "?"
@@ -12536,12 +12573,14 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
         if _st is not None:
             said = str(getattr(_st, "emoji", None) or "")     # стикер 👍 — как эмодзи 👍 (переспрос)
     v = intake_confirm.decide(said)
-    why, ask_text = "", _IC_ASK
+    why, ask_text, bind_ask = "", _IC_ASK, False
     if _ic_forwarded(msg):
         if v != intake_confirm.SILENT:
             why = "переслано, не ответ подтверждающего"
         v = intake_confirm.SILENT
     elif v != intake_confirm.SILENT and _ic_reply_elsewhere(msg, d):
+        # согласие реплаем на чужое сообщение — адресное уточнение (прежний текст звал «да» «отдельным сообщением»)
+        bind_ask = v == intake_confirm.YES
         v, why, ask_text = intake_confirm.ASK, "ответ на другое сообщение", _IC_ASK_REPLY
     elif v == intake_confirm.SILENT:
         try:
@@ -12551,15 +12590,26 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
             pass
     elif v == intake_confirm.YES and d.get("ic_edit_asked"):
         v, why, ask_text = intake_confirm.ASK, "по карточке просили правки", _IC_EDIT_PENDING
+    elif v == intake_confirm.YES and _ic_reply_binding(msg, d) != "card":
+        # Codex TB-OWNER-CHECK-1610-0307: «да» без реплая / реплаем на сообщение не этой карточки (иной бот, другая
+        # карточка, старое резюме) — не согласие на ЭТУ бронь; create_booking не зовём
+        bind_ask, v = True, intake_confirm.ASK
+        why = ("согласие без реплая на карточку" if _ic_reply_binding(msg, d) == "none"
+               else "согласие реплаем не на эту карточку")
+    if bind_ask:
+        ask_text = _IC_ASK_BIND.format(card=_ic_card_name(d))
     log.info(f"  🆕 INTAKE: ответ на карточку → {v} (@{_who})" + (f" — {why}" if why else ""))
 
     async def _say(body):
-        await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False, message_thread_id=tid)
+        return await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False,
+                           message_thread_id=tid)
 
     if v == intake_confirm.SILENT:
         return
     if v == intake_confirm.ASK:
-        await _say(ask_text)
+        sent = await _say(ask_text)
+        if bind_ask:
+            _ic_note_ids(d, [sent])     # уточнение называет ЭТУ карточку — реплай «да» на него засчитан
         return
     if v == intake_confirm.EDIT:
         d["ic_edit_asked"] = True               # старая карточка больше не ставится «да» — ждём исправленную

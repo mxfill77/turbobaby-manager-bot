@@ -172,15 +172,17 @@ def _negated_edits(s, toks, units):
 def _clear_refusal(s, toks, units):
     """Ясный отказ: первая единица — отказ, а за ним конец фразы, знак препинания или ещё один отказ. Смежное
     продолжение отказом разрешено только после голого слова отказа («нет нет», «нет не ставь»): у прочих
-    («отмена не нужна», «нельзя не ставить») второе отрицание переворачивает смысл — это сомнение, а не отказ."""
-    if not units or units[0][0] != "refuse":
-        return False
-    k = 0
-    while (k + 1 < len(units) and units[k + 1][0] == "refuse" and units[k][3] == "one"
-           and toks[units[k][1]].group(0) in REFUSE_CHAIN_WORDS
-           and _units_adjacent(s, toks, units[k], units[k + 1])):
-        k += 1
-    return k + 1 == len(units) or not _units_adjacent(s, toks, units[k], units[k + 1])
+    («отмена не нужна», «нельзя не ставить») второе отрицание переворачивает смысл — это сомнение, а не отказ.
+    Условие записано положительно: «не ясный отказ» (False) — обычный ответ предиката над уже разобранными
+    единицами, а не пустое из ветки промаха разбора (храповик `blind_readers`)."""
+    if units and units[0][0] == "refuse":
+        k = 0
+        while (k + 1 < len(units) and units[k + 1][0] == "refuse" and units[k][3] == "one"
+               and toks[units[k][1]].group(0) in REFUSE_CHAIN_WORDS
+               and _units_adjacent(s, toks, units[k], units[k + 1])):
+            k += 1
+        return k + 1 == len(units) or not _units_adjacent(s, toks, units[k], units[k + 1])
+    return False
 
 
 def _residue_ok(s, toks):

@@ -25,6 +25,12 @@
 слово «правок» (беглая «о») НЕ узнаёт, буквальная реализация даст NO → rejected. Поэтому N19 разделён: безопасность
 (0 вызовов записи) и соответствие таблице — отдельными тестами.
 
+ОБВЯЗКА ПРИВЯЗКИ 16.10 — правка исправителя, НЕ автора приёмки (в этих местах приёмка перестаёт быть независимой;
+все они помечены этой меткой): после замечания Codex «да» засчитывается только реплаем на сообщение карточки, поэтому
+черновик стенда знает свою карточку (_Card) и резюме бота (_Reply) в ic_msg_ids, Msg по умолчанию — реплай на карточку,
+заглушка отправки возвращает сообщение с message_id, W12 отвечает «да» реплаем на резюме НОВОЙ карточки, T_ASK — новый
+текст подсказки. Ожидаемые исходы и числа вызовов не тронуты; из ожидаемых текстов изменён только T_ASK.
+
 Данные только синтетические (Мария Тест, CB 300CC R 9011). Сети, мозга, CRM, файлов тест не касается; дерево
 берётся от __file__, чужие корни из sys.path убираются.
 """
@@ -72,8 +78,10 @@ KNOB = "INTAKE_CONFIRM_STRICT"
 PFX = "\U0001F400 Splinter\n"
 T_BOOKED = PFX + "\u2705 Бронь записана, строка 33, статус \u00abБронь\u00bb."
 T_DUP = PFX + "\u26a0\ufe0f Уже есть такая бронь (строка 12)."
-T_ASK = PFX + ("\u2753 Ответ неоднозначный \u2014 бронь не ставлю. Поставить: \u00abда\u00bb. "
-               "Отказ: \u00abнет\u00bb. Исправить: \u00abправки\u00bb.")
+# ОБВЯЗКА ПРИВЯЗКИ 16.10 (правка исправителя, не проекта): подсказка переспроса зовёт «да» только реплаем на карточку
+# (прежний литерал «Поставить: «да».» советовал то, что после привязки не засчитывается) = текст splinter._IC_ASK.
+T_ASK = PFX + ("\u2753 Ответ неоднозначный \u2014 бронь не ставлю. Поставить: \u00abда\u00bb только ответом "
+               "(реплаем) на карточку брони. Отказ: \u00abнет\u00bb. Исправить: \u00abправки\u00bb.")
 T_EDIT = PFX + "\u270f\ufe0f Принял, жду исправленную карточку."
 T_REJECT = PFX + "\u274c Бронь отклонена \u2014 в CRM ничего не записано."
 T_PHOTO_UNKNOWN = PFX + ("\U0001F4CE Паспорт привязан. Исход записи брони неизвестен \u2014 проверь CRM; "
@@ -140,6 +148,11 @@ OCR_CALLS = []
 SAVE_CALLS = []
 _MID = itertools.count(5000)
 _DEF = object()
+# ОБВЯЗКА ПРИВЯЗКИ 16.10 (правка исправителя, не проекта): «да» засчитывается только реплаем на сообщение ЭТОЙ
+# карточки (d["ic_msg_ids"]). Стенд: черновик знает свою карточку и резюме бота, «да» по умолчанию — реплай на карточку.
+CARD_MID = 4998       # сообщение карточки «🆕 БРОНЬ…» (автор — человек), см. _Card
+SUMMARY_MID = 4999    # резюме бота «Ставлю бронь?» по этой карточке (= _Reply.message_id)
+SENT = []             # сообщения бота, которые вернула заглушка отправки (резюме новой карточки — W12)
 
 
 class _Cap(logging.Handler):
@@ -171,8 +184,17 @@ class _Reply:
         self.message_id = 4999
 
 
+class _Card:
+    """ОБВЯЗКА ПРИВЯЗКИ 16.10: сообщение карточки брони стенда (автор — человек); его id в d["ic_msg_ids"]."""
+
+    def __init__(self):
+        self.from_user = U(APPROVER)
+        self.text = "\U0001F195 БРОНЬ\nКлиент: Мария Тест\nМодель: " + BIKE
+        self.message_id = CARD_MID
+
+
 class Msg:
-    def __init__(self, text=None, uname=APPROVER, photo=False, reply_to_bot=False, sticker=False):
+    def __init__(self, text=None, uname=APPROVER, photo=False, reply_to_bot=False, sticker=False, reply_to=_DEF):
         self.text = text
         self.caption = None
         self.photo = [object()] if photo else None
@@ -183,7 +205,14 @@ class Msg:
         self.date = datetime.datetime.now(datetime.timezone.utc)
         self.message_id = next(_MID)
         self.from_user = U(uname)
-        self.reply_to_message = _Reply() if reply_to_bot else None
+        # ОБВЯЗКА ПРИВЯЗКИ 16.10: по умолчанию — реплай на карточку стенда (_Card); reply_to_bot — на резюме бота этой
+        # карточки (_Reply); reply_to=<сообщение> — явный адрес (W12: резюме НОВОЙ карточки), reply_to=None — без реплая
+        if reply_to_bot:
+            self.reply_to_message = _Reply()
+        elif reply_to is _DEF:
+            self.reply_to_message = _Card()
+        else:
+            self.reply_to_message = reply_to
 
 
 class Ctx:
@@ -232,8 +261,22 @@ class FakeBridge:
         return [k for n, k in self.calls if n == "create_booking"]
 
 
+class _Sent:
+    """ОБВЯЗКА ПРИВЯЗКИ 16.10: заглушка отправки возвращает сообщение бота с message_id (как send_message PTB) —
+    по нему черновик запоминает своё резюме (ic_msg_ids)."""
+
+    def __init__(self, chat_id, text):
+        self.message_id = next(_MID)
+        self.chat_id = chat_id
+        self.text = text
+        self.from_user = U(BOT_UNAME, is_bot=True)
+
+
 async def rec_send(context, *, chat_id, text, message_thread_id=None, bilingual=True, **k):
     SENDS.append((chat_id, text, {"bilingual": bilingual, "message_thread_id": message_thread_id}))
+    m = _Sent(chat_id, text)
+    SENT.append(m)
+    return m
 
 
 async def fake_ocr(photo_msg, chat_id, context, bridge):
@@ -263,6 +306,7 @@ S._intake_finalize = spy_finalize
 
 def reset():
     SENDS.clear()
+    SENT.clear()
     LOGS.clear()
     FINALIZE_CALLS.clear()
     OCR_CALLS.clear()
@@ -277,6 +321,7 @@ def reset():
 def make_draft(status="awaiting_approval"):
     d = dict(PARSED_CARD)
     d.update(status=status, ts=S._time.time(), passport_photo=True)
+    d["ic_msg_ids"] = [CARD_MID, SUMMARY_MID]   # ОБВЯЗКА ПРИВЯЗКИ 16.10: сообщения ЭТОЙ карточки (карточка, резюме)
     return d
 
 
@@ -681,7 +726,8 @@ class B_WriteOutcome(Base):
         self.assertIsNone(exc, "W12: новая карточка — обработчик бросил %r" % (exc,))
         self.assertEqual(status_now(), "awaiting_approval", "W12: новая карточка заменила черновик")
         self.assertEqual(len(intake_texts()), n0 + 1, "W12: резюме новой карточки")
-        exc = self.say(b, "да")
+        # ОБВЯЗКА ПРИВЯЗКИ 16.10: «да» — реплаем на НОВУЮ карточку (резюме бота по ней, id из заглушки отправки)
+        exc = self.say(b, "да", reply_to=SENT[-1])
         self.assertIsNone(exc)
         self.assertEqual(b.books(), 2, "W12: 1 новый вызов create_booking (законный повтор новой карточкой)")
         self.assertEqual(status_now(), "booked")

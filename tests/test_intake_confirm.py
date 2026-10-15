@@ -18,7 +18,16 @@
   (G) находки критиков 16.10: знаки сомнения рядом с «да» (I1), ответ не карточке и пересланное (I2), тег своего
       бота (И3), почти-согласие и стикер (И4), ложный окончательный отказ (И5/M1), «нет исправь» (M2), «да» после
       просьбы о правках (И6), ручка без учёта регистра и без нового состояния при откате (M3), без билета запись не
-      уходит (M4).
+      уходит (M4);
+  (G2) привязка к карточке (замечание Codex TB-OWNER-CHECK-1610-0307): «да» засчитывается ТОЛЬКО реплаем на
+      сообщение ЭТОЙ карточки (карточка, её фото паспорта, резюме бота «Ставлю бронь?», адресное уточнение по ней);
+      без реплая, реплаем на чужого бота / другую карточку / старое резюме — уточнение `_IC_ASK_BIND` без записи.
+      Буква «G» в задании К3 уже занята находками критиков — раздел назван G2.
+
+Стенд (с 16.10, привязка): сообщение по умолчанию — РЕПЛАЙ НА ТЕКУЩУЮ КАРТОЧКУ (первый id `d["ic_msg_ids"]`), так
+теперь подтверждают; без реплая — явно `reply=NOREPLY`. В черновике `reset()` привязаны карточка (CARD_MID, человек)
+и резюме бота (SUMMARY_MID = id `Reply()` по умолчанию). Подделка `_send` возвращает сообщение с id только при
+`SEND_IDS["on"]` (иначе `None` — «id не получен», привязкой не считается).
 
 Ручка INTAKE_CONFIRM_STRICT снята (проверка «по умолчанию включено»), один случай — с `=1`. Сеть, мозг и CRM не
 трогаются: мост — подделка, `_send` пишет в список. Данные синтетические.
@@ -71,7 +80,9 @@ APPROVER = "deramor"
 # Тексты проекта §2.2/§2.3 — дословно (с префиксом отправки).
 P = "🐀 Splinter\n"
 T_BOOKED = P + "✅ Бронь записана, строка 33, статус «Бронь»."
-T_ASK = P + "❓ Ответ неоднозначный — бронь не ставлю. Поставить: «да». Отказ: «нет». Исправить: «правки»."
+# Подсказка привязки (16.10): «да» — только реплаем на карточку (прежнее «Поставить: «да».» без реплая не засчитывается).
+T_ASK = P + ("❓ Ответ неоднозначный — бронь не ставлю. Поставить: «да» только ответом (реплаем) на карточку брони. "
+             "Отказ: «нет». Исправить: «правки».")
 T_EDIT = P + "✏️ Принял, жду исправленную карточку."
 T_REJECT = P + "❌ Бронь отклонена — в CRM ничего не записано."
 T_PHOTO_UNKNOWN = P + "📎 Паспорт привязан. Исход записи брони неизвестен — проверь CRM; повтор не делаю."
@@ -125,8 +136,20 @@ class Sticker:
             self.emoji = emoji
 
 
+CARD_MID = 4100          # сообщение самой карточки на стенде (автор — человек); привязано в черновике reset()
+SUMMARY_MID = 4999       # резюме бота «Ставлю бронь?» на стенде = id Reply() по умолчанию; привязано в reset()
+NOREPLY = object()       # явное «без реплая»
+ON_CARD = object()       # по умолчанию: реплай на ТЕКУЩУЮ карточку (так подтверждают с 16.10)
+
+
+def _card_reply():
+    d = S._INTAKE_DRAFTS.get(INTAKE) or {}
+    ids = d.get("ic_msg_ids") or []
+    return Reply("dasha_mgr", is_bot=False, mid=ids[0]) if ids else None
+
+
 class Msg:
-    def __init__(self, text, uname=APPROVER, photo=False, reply_to_bot=False, reply=None, mid=4242, forward=None,
+    def __init__(self, text, uname=APPROVER, photo=False, reply_to_bot=False, reply=ON_CARD, mid=4242, forward=None,
                  sticker=None):
         self.text = text
         self.caption = None
@@ -136,7 +159,14 @@ class Msg:
         self.message_id = mid
         self.media_group_id = None
         self.from_user = U(uname)
-        self.reply_to_message = reply if reply is not None else (Reply() if reply_to_bot else None)
+        if reply is NOREPLY:
+            self.reply_to_message = None
+        elif reply is not ON_CARD:
+            self.reply_to_message = reply
+        elif reply_to_bot:
+            self.reply_to_message = Reply()
+        else:
+            self.reply_to_message = _card_reply()
         self.sticker = sticker
         if forward:
             setattr(self, forward, object())      # forward_origin (PTB ≥21) / forward_date / forward_from …
@@ -198,10 +228,15 @@ class FakeBridge:
 
 
 SENDS = []
+SEND_IDS = {"on": False, "next": 9000}   # on → отправка возвращает сообщение с id (как PTB send_message)
 
 
 async def rec_send(context, *, chat_id, text, message_thread_id=None, **k):
     SENDS.append((chat_id, text))
+    if SEND_IDS["on"]:
+        SEND_IDS["next"] += 1
+        return types.SimpleNamespace(message_id=SEND_IDS["next"], text=text)
+    return None
 
 
 S._send = rec_send
@@ -252,7 +287,8 @@ def draft(**kw):
     d = {"model": BIKE, "client": CLIENT, "date_start": "15-11-2026", "date_end": "20-11-2026",
          "date_start_iso": None, "date_end_iso": None, "contacts": "+66 80 000 0000",
          "delivery_url": "https://maps.app.goo.gl/test", "helmets": 2, "deposit_type": "паспорт",
-         "passport_photo": True, "ts": time.time(), "status": "awaiting_approval"}
+         "passport_photo": True, "ts": time.time(), "status": "awaiting_approval",
+         "ic_msg_ids": [CARD_MID, SUMMARY_MID]}
     d.update(kw)
     return d
 
@@ -262,6 +298,7 @@ def reset(**kw):
     del FINALIZE_CALLS[:]
     del PASSPORT_SAVES[:]
     del LOGCAP.records[:]
+    SEND_IDS["on"] = False
     for dct in (S._INTAKE_DRAFTS, S._INTAKE_PASSPORT, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES, S._RECENT_BOOKINGS,
                 S._IC_PRE_PHOTOS):
         dct.clear()
@@ -779,9 +816,12 @@ class F_Purity(unittest.TestCase):
 
 
 # =================================================================================================== (G)
-T_ASK_REPLY = P + ("❓ Это ответ на другое сообщение — бронь не ставлю. Поставить: «да» ответом на карточку "
-                   "или отдельным сообщением.")
+T_ASK_REPLY = P + ("❓ Это ответ на другое сообщение — бронь не ставлю. Поставить: «да» только ответом (реплаем) "
+                   "на карточку брони.")
 T_EDIT_PENDING = P + "✏️ По этой карточке просили правки — бронь не ставлю. Пришли исправленную карточку."
+# Адресное уточнение привязки (G2): карточка названа моделью и датами, без имени и телефона клиента.
+T_BIND = P + ("❓ Это подтверждение брони CB 300CC R 9011 (15-11-2026 — 20-11-2026)? Ответьте «да» реплаем на "
+              "карточку — без реплая бронь не ставлю.")
 CARD = "🆕 БРОНЬ\nсинтетическая карточка"
 
 
@@ -830,14 +870,23 @@ class G_CriticFixes(unittest.TestCase):
     def test_i2_reply_to_other_human_asks(self):
         self._assert_booked(self._one("да", reply_to_bot=True), "близнец: реплай на резюме бота")
         other = Reply("dasha_mgr", is_bot=False, mid=5001)
-        for t in ("да", "ок", "нет", "не ставь", "правки"):
+        # G2 (привязка, 16.10): согласие реплаем на чужое сообщение — адресное уточнение _IC_ASK_BIND (прежний
+        # _IC_ASK_REPLY звал «да» «отдельным сообщением», а без реплая согласие больше не засчитывается);
+        # отказ и правка — _IC_ASK_REPLY, как прежде
+        for t, want in (("да", T_BIND), ("ок", T_BIND), ("нет", T_ASK_REPLY), ("не ставь", T_ASK_REPLY),
+                        ("правки", T_ASK_REPLY)):
             with self.subTest(text=t):
-                self._assert_not_written(self._one(t, reply=other), "awaiting_approval", [T_ASK_REPLY], t)
+                self._assert_not_written(self._one(t, reply=other), "awaiting_approval", [want], t)
         self._assert_not_written(self._one("погода", reply=other), "awaiting_approval", [], "болтовня реплаем")
-        self._assert_not_written(self._one("да", reply=Reply(None, mid=5002)), "awaiting_approval", [T_ASK_REPLY],
+        self._assert_not_written(self._one("да", reply=Reply(None, mid=5002)), "awaiting_approval", [T_BIND],
                                  "реплай на сообщение без автора (канал)")
-        b = self._one("да", reply=Reply("dasha_mgr", is_bot=False, mid=1, topic_created=object()))
-        self._assert_booked(b, "служебное «тема создана» реплаем не считается")
+        # служебное «тема создана» реплаем не считается: для отказа это прежний отказ, для согласия — «да» без реплая
+        topic = Reply("dasha_mgr", is_bot=False, mid=1, topic_created=object())
+        self._assert_not_written(self._one("нет", reply=topic), "rejected", [T_REJECT], "«нет» в теме форума")
+        self._assert_not_written(self._one("да", reply=topic), "awaiting_approval", [T_BIND],
+                                 "«да» в теме форума без реплая на карточку")
+        self.assertIn("  🆕 INTAKE: ответ на карточку → ask (@%s) — согласие без реплая на карточку" % APPROVER,
+                      LOGCAP.records)
         self._one("да", reply=other)
         self.assertIn("  🆕 INTAKE: ответ на карточку → ask (@%s) — ответ на другое сообщение" % APPROVER,
                       LOGCAP.records)
@@ -882,7 +931,7 @@ class G_CriticFixes(unittest.TestCase):
         self.assertEqual(status(), "awaiting_approval")
         n = len(texts())
         say(b, "да", reply=Reply("dasha_mgr", is_bot=False, mid=779))
-        self.assertEqual((b.booked(), status(), texts()[n:]), ([], "awaiting_approval", [T_ASK_REPLY]))
+        self.assertEqual((b.booked(), status(), texts()[n:]), ([], "awaiting_approval", [T_BIND]))
 
     def test_i2_forwarded_is_silent(self):
         self._assert_booked(self._one("Да"), "близнец без пересылки")
@@ -1002,6 +1051,290 @@ class G_CriticFixes(unittest.TestCase):
                 self.assertEqual(texts(), [t_not_written("no_ticket", "до отправки: билет не выдан" + tail)])
                 say(b, "да")
                 self.assertEqual(len(b.calls), 1, "повторное «да» — ни билета, ни записи")
+
+
+# =================================================================================================== (G2)
+class FakeClaudeOther(FakeClaude):
+    """Вторая (другая) карточка: иная модель и даты — чтобы уточнение называло именно АКТУАЛЬНУЮ карточку."""
+    PARSED = '{"model": "NMAX 155 GREY 5960", "client": "Иван Тест", "date_start": "01-12-2026", ' \
+             '"date_end": "03-12-2026", "date_start_iso": null, "date_end_iso": null, ' \
+             '"contacts": "+66 80 000 0001", "delivery_url": "https://maps.app.goo.gl/test2", ' \
+             '"helmets": 1, "deposit_type": "паспорт"}'
+
+
+T_BIND_OTHER = P + ("❓ Это подтверждение брони NMAX 155 GREY 5960 (01-12-2026 — 03-12-2026)? Ответьте «да» реплаем "
+                    "на карточку — без реплая бронь не ставлю.")
+CARD_B = "🆕 БРОНЬ\nвторая синтетическая карточка"
+CONSENT_ONLY = ["да", "Да.", "ок", "ok", "OK", "ставь", "подтверждаю", "да 👍", "ДА!!!", "да, ставь", "конечно",
+                "поставим", "@turbobaby_manager_bot да"]
+
+
+class _RaisingReply:
+    """Реплай на бота, у которого чтение id падает: сомнение → «не эта карточка»."""
+    forum_topic_created = None
+
+    def __init__(self):
+        self.from_user = U("turbobaby_manager_bot", is_bot=True)
+
+    @property
+    def message_id(self):
+        raise RuntimeError("id не читается")
+
+
+class G2_CardBinding(unittest.TestCase):
+    """Замечание Codex TB-OWNER-CHECK-1610-0307 (принято К3): в строгом режиме «да» без реплая и «да» реплаем на ЛЮБОЕ
+    сообщение бота доходили до create_booking. Теперь согласие засчитывается только реплаем на сообщение ЭТОЙ
+    карточки; иначе — адресное уточнение без записи. Отказ, правка, сомнение, молчание — как прежде. У каждого
+    отрицательного случая близнец, где запись проходит."""
+
+    def setUp(self):
+        os.environ.pop("INTAKE_CONFIRM_STRICT", None)
+
+    def tearDown(self):
+        SEND_IDS["on"] = False
+        os.environ.pop("INTAKE_CONFIRM_STRICT", None)
+
+    # ---- помощники ------------------------------------------------------------------------------------------
+    def _one(self, text, **opt):
+        reset()
+        b = FakeBridge()
+        say(b, text, **opt)
+        return b
+
+    def _assert_booked(self, b, ctx, n=1):
+        self.assertEqual(len(b.booked()), n, ctx)
+        self.assertEqual(status(), "booked", ctx)
+        self.assertEqual(texts()[-1], T_BOOKED, ctx)
+
+    def _assert_bind(self, b, ctx, want=T_BIND, st="awaiting_approval"):
+        self.assertEqual(b.calls, [], ctx + ": мост не тронут (ни билета, ни записи)")
+        self.assertEqual(status(), st, ctx)
+        self.assertEqual(texts()[-1:], [want], ctx)
+
+    def _live_card(self, b, mid=777, claude=None, text=CARD, ids=True, fresh=True):
+        """Живой путь: карточка → разбор → резюме бота. ids → отправка возвращает сообщение с id (как PTB)."""
+        if fresh:
+            reset()
+            S._INTAKE_DRAFTS.clear()
+            _passport_ready()
+        SEND_IDS["on"] = ids
+        asyncio.run(S._handle_intake(Msg(text, mid=mid, reply=NOREPLY), Ctx(), b, claude or FakeClaude()))
+        self.assertEqual(status(), "awaiting_approval")
+        return S._INTAKE_DRAFTS[INTAKE]
+
+    # ---- G2.1 «да» без реплая — уточнение, без записи ------------------------------------------------------
+    def test_g1_yes_without_reply_asks_bind(self):
+        self._assert_booked(self._one("да"), "близнец: «да» реплаем на карточку")
+        for t in CONSENT_ONLY:
+            with self.subTest(text=t):
+                self.assertEqual(IC.decide(S._ic_strip_bot(t, Ctx())), IC.YES, "вход — настоящее согласие")
+                b = self._one(t, reply=NOREPLY)
+                self._assert_bind(b, t)
+                self.assertEqual(texts(), [T_BIND], "одно сообщение — адресное уточнение")
+        b = self._one("да", reply=NOREPLY)
+        self.assertIn("  🆕 INTAKE: ответ на карточку → ask (@%s) — согласие без реплая на карточку" % APPROVER,
+                      LOGCAP.records)
+        say(b, "да", reply=NOREPLY)
+        self.assertEqual((b.calls, status(), texts()), ([], "awaiting_approval", [T_BIND, T_BIND]),
+                         "повторное «да» без реплая — снова уточнение, записи нет")
+
+    def test_g1_bind_text_names_card_without_pii(self):
+        self._one("да", reply=NOREPLY)
+        t = texts()[0]
+        self.assertEqual(t, P + S._IC_ASK_BIND.format(card=S._ic_card_name(S._INTAKE_DRAFTS[INTAKE])))
+        self.assertIn(BIKE, t)
+        self.assertIn("15-11-2026", t)
+        self.assertIn("20-11-2026", t)
+        for pii in (CLIENT, "Мария", "+66 80 000 0000", "80 000"):
+            self.assertNotIn(pii, t, "в уточнении нет имени и телефона клиента")
+        self.assertEqual(S._ic_card_name({}), "—")
+        self.assertEqual(S._ic_card_name({"model": BIKE}), BIKE)
+        self.assertEqual(S._ic_card_name({"model": BIKE, "date_start": "15-11-2026"}), BIKE + " (15-11-2026)")
+        self.assertEqual(S._ic_card_name({"model": " ", "date_end": "20-11-2026"}), "— (20-11-2026)")
+
+    # ---- G2.2 резюме «Ставлю бронь?» — сообщение карточки: id запоминается в месте отправки ------------------
+    def test_g2_reply_to_summary_books_live_path(self):
+        b = FakeBridge()
+        d = self._live_card(b, mid=777)
+        summary_mid = SEND_IDS["next"]
+        self.assertEqual(texts(), [SUMMARY], "одно резюме карточки")
+        self.assertEqual(d["ic_msg_ids"], [777, summary_mid], "резюме бота привязано к карточке")
+        say(b, "да", reply=Reply(mid=summary_mid))
+        self._assert_booked(b, "реплай «да» на резюме «Ставлю бронь?»")
+        # отрицательный близнец: тот же живой путь, реплай на сообщение бота НЕ этой карточки
+        b = FakeBridge()
+        self._live_card(b, mid=777)
+        n = len(texts())
+        say(b, "да", reply=Reply(mid=SEND_IDS["next"] + 500))
+        self._assert_bind(b, "реплай на постороннее сообщение бота")
+        self.assertEqual(len(texts()), n + 1)
+
+    def test_g2_summary_without_id_is_not_binding(self):
+        b = FakeBridge()
+        d = self._live_card(b, mid=777, ids=False)
+        self.assertEqual(d["ic_msg_ids"], [777], "id резюме не получен — привязкой не считается")
+        say(b, "да", reply=Reply())                      # реплай на резюме бота, id которого неизвестен
+        self._assert_bind(b, "реплай на резюме с неизвестным id")
+        say(b, "да", reply=Reply("dasha_mgr", is_bot=False, mid=777))
+        self._assert_booked(b, "близнец: реплай на саму карточку")
+
+    def test_g2_photo_rearm_summary_also_binds(self):
+        b = FakeBridge()
+        d = self._live_card(b, mid=777)
+        s1 = SEND_IDS["next"]
+        say(b, None, photo=True, mid=778)               # фото паспорта к свежей карточке → резюме заново
+        s2 = SEND_IDS["next"]
+        self.assertEqual(d["ic_msg_ids"], [777, s1, 778, s2])
+        say(b, "да", reply=Reply(mid=s1))
+        self._assert_booked(b, "реплай на первое резюме той же карточки")
+
+    # ---- G2.3 реплай на сообщение бота, НЕ входящее в ic_msg_ids ------------------------------------------
+    def test_g3_reply_to_foreign_bot_message_asks_bind(self):
+        self._assert_booked(self._one("да", reply_to_bot=True), "близнец: реплай на привязанное резюме")
+        cases = (("своё старое сообщение бота", Reply(mid=6001)),
+                 ("другой бот", Reply("other_helper_bot", is_bot=True, mid=6002)),
+                 ("бот, id не читается", _RaisingReply()),
+                 ("бот без id", Reply(mid=None)))
+        for ctx, r in cases:
+            with self.subTest(case=ctx):
+                b = self._one("да", reply=r)
+                self._assert_bind(b, ctx)
+                self.assertNotIn(T_ASK_REPLY, texts(), "не _IC_ASK_REPLY")
+        self._one("ок", reply=Reply(mid=6001))
+        self.assertIn("  🆕 INTAKE: ответ на карточку → ask (@%s) — согласие реплаем не на эту карточку" % APPROVER,
+                      LOGCAP.records)
+
+    # ---- G2.4 сменилась карточка: реплай на сообщения прежней не засчитан --------------------------------------
+    def test_g4_card_changed_old_messages_do_not_bind(self):
+        b = FakeBridge()
+        da = self._live_card(b, mid=777)
+        sum_a = SEND_IDS["next"]
+        say(b, None, photo=True, mid=778)
+        say(b, "да", reply=NOREPLY)                      # уточнение по карточке A — тоже её сообщение
+        bind_a = SEND_IDS["next"]
+        self.assertIn(bind_a, da["ic_msg_ids"])
+        db = self._live_card(b, mid=888, claude=FakeClaudeOther(), text=CARD_B, fresh=False)
+        sum_b = SEND_IDS["next"]
+        self.assertIsNot(da, db)
+        self.assertEqual(db["ic_msg_ids"], [888, sum_b], "у новой карточки — только свои сообщения")
+        old = (("карточка A", Reply("dasha_mgr", is_bot=False, mid=777)),
+               ("фото паспорта A", Reply("dasha_mgr", is_bot=False, mid=778)),
+               ("резюме A", Reply(mid=sum_a)),
+               ("уточнение по A", Reply(mid=bind_a)))
+        for ctx, r in old:
+            with self.subTest(old=ctx):
+                n = len(texts())
+                say(b, "да", reply=r)
+                self.assertEqual(b.booked(), [], ctx + ": реплай на прежнюю карточку не пишет")
+                self.assertEqual(status(), "awaiting_approval", ctx)
+                self.assertEqual(texts()[n:], [T_BIND_OTHER], ctx + ": уточнение называет АКТУАЛЬНУЮ карточку")
+        say(b, "да", reply=Reply("dasha_mgr", is_bot=False, mid=888))
+        self.assertEqual([c[1]["bike"] for c in b.booked()], ["NMAX 155 GREY 5960"], "близнец: пишется карточка B")
+        self.assertEqual((status(), texts()[-1]), ("booked", T_BOOKED))
+
+    # ---- G2.5 реплай «да» на само уточнение — согласие на названную карточку -----------------------------------
+    def test_g5_reply_to_bind_question_books(self):
+        b = FakeBridge()
+        d = self._live_card(b, mid=777)
+        say(b, "да", reply=NOREPLY)
+        self._assert_bind(b, "без реплая")
+        bind_mid = SEND_IDS["next"]
+        self.assertIn(bind_mid, d["ic_msg_ids"], "уточнение называет карточку — его id запомнен")
+        say(b, "да", reply=Reply(mid=bind_mid))
+        self._assert_booked(b, "реплай на уточнение")
+
+    def test_g5_only_bind_question_is_noted_not_other_asks(self):
+        b = FakeBridge()
+        d = self._live_card(b, mid=777)
+        before = list(d["ic_msg_ids"])
+        for t in ("да?", "👍", "погода @turbobaby_manager_bot"):       # _IC_ASK — карточку не называет
+            say(b, t, reply=NOREPLY)
+        say(b, "нет", reply=Reply("dasha_mgr", is_bot=False, mid=5001))  # _IC_ASK_REPLY
+        self.assertEqual(texts()[-4:], [T_ASK, T_ASK, T_ASK, T_ASK_REPLY])
+        self.assertEqual(d["ic_msg_ids"], before, "переспросы, не называющие карточку, привязкой не становятся")
+        say(b, "да", reply=Reply(mid=SEND_IDS["next"]))                   # реплай на _IC_ASK_REPLY
+        self._assert_bind(b, "реплай «да» на неадресный переспрос")
+
+    # ---- G2.6 отказ, правка, сомнение, молчание — как прежде (без реплая = реплаем на карточку) ------------------
+    def test_g6_non_yes_unchanged_without_reply(self):
+        for rid, text, want, n_calls, st, reply, _twin, opt in ROWS:
+            if want in (None, IC.YES) or opt:
+                continue
+            with self.subTest(rid=rid, text=text):
+                got = []
+                for r in (ON_CARD, NOREPLY):
+                    b = self._one(text, reply=r)
+                    got.append((b.calls, status(), texts()))
+                self.assertEqual(got[0], got[1], "без реплая — то же, что реплаем на карточку")
+                self.assertEqual(got[1], ([], st, [] if reply is None else [reply]))
+
+    def test_g6_no_and_edit_replies_as_before(self):
+        other_human = Reply("dasha_mgr", is_bot=False, mid=5001)
+        other_bot = Reply(mid=6001)
+        self._assert_bind(self._one("нет", reply=other_human), "«нет» реплаем на чужое", want=T_ASK_REPLY)
+        self._assert_bind(self._one("правки", reply=other_human), "«правки» реплаем на чужое", want=T_ASK_REPLY)
+        self._assert_bind(self._one("нет", reply=other_bot), "«нет» реплаем на бота (как прежде — отказ)",
+                          want=T_REJECT, st="rejected")
+        self._assert_bind(self._one("правки", reply=other_bot), "«правки» реплаем на бота", want=T_EDIT)
+        self._assert_bind(self._one("нет", reply=NOREPLY), "«нет» без реплая", want=T_REJECT, st="rejected")
+
+    def test_g6_edit_pending_still_first(self):
+        reset()
+        b = FakeBridge()
+        say(b, "правки", reply=NOREPLY)
+        say(b, "да", reply=NOREPLY)
+        self.assertEqual((b.calls, status(), texts()), ([], "awaiting_approval", [T_EDIT, T_EDIT_PENDING]))
+
+    # ---- G2.7 свойство: без привязанного реплая create_booking не зовётся НИКОГДА ----------------------------
+    def test_g7_property_no_bound_reply_no_write(self):
+        replies = (("без реплая", NOREPLY), ("чужой человек", Reply("dasha_mgr", is_bot=False, mid=5001)),
+                   ("свой бот, старое", Reply(mid=6001)), ("другой бот", Reply("x_bot", is_bot=True, mid=6002)),
+                   ("тема форума", Reply("dasha_mgr", is_bot=False, mid=1, topic_created=object())),
+                   ("id не читается", _RaisingReply()))
+        inputs = CONSENT_ONLY + TRAPS + [r[1] for r in ROWS]
+        self.assertGreaterEqual(len(inputs), 100)
+        n_yes = 0
+        for ctx, r in replies:
+            for t in inputs:
+                with self.subTest(reply=ctx, text=t):
+                    b = self._one(t, reply=r)
+                    self.assertEqual(b.booked(), [], "%s %r: create_booking без привязки" % (ctx, t))
+                    self.assertNotIn(status(), ("approved", "booked", "write_unknown", "write_failed"))
+                    n_yes += IC.decide(S._ic_strip_bot(t, Ctx())) == IC.YES
+        self.assertGreater(n_yes, 50, "среди входов много настоящих согласий — свойство не пустое")
+        # близнец свойства: с привязанным реплаем каждое согласие пишет ровно один раз
+        for t in CONSENT_ONLY:
+            with self.subTest(bound=t):
+                self._assert_booked(self._one(t), t)
+
+    # ---- G2.8 разбор реплая (`_ic_reply_binding`) ----------------------------------------------------------
+    def test_g8_binding_unit(self):
+        d = {"ic_msg_ids": [777, 9001]}
+        m = Msg("да", reply=NOREPLY)
+        self.assertEqual(S._ic_reply_binding(m, d), "none")
+        for r, want in ((Reply("h", is_bot=False, mid=777), "card"), (Reply(mid=9001), "card"),
+                        (Reply(mid=9002), "other"), (Reply("h", is_bot=False, mid=1, topic_created=object()), "none"),
+                        (Reply(mid=None), "other"), (_RaisingReply(), "other")):
+            with self.subTest(mid=getattr(r, "__dict__", {}).get("message_id")):
+                self.assertEqual(S._ic_reply_binding(Msg("да", reply=r), d), want)
+        self.assertEqual(S._ic_reply_binding(Msg("да", reply=Reply(mid=777)), {}), "other", "черновик без id")
+        self.assertEqual(S._ic_reply_binding(Msg("да", reply=Reply(mid=777)), {"ic_msg_ids": None}), "other")
+
+    # ---- G2.9 откат: ручка 0 — прежнее, id резюме не копятся ------------------------------------------------
+    def test_g9_knob_off_unchanged(self):
+        os.environ["INTAKE_CONFIRM_STRICT"] = "0"
+        try:
+            b = FakeBridge()
+            reset()
+            S._INTAKE_DRAFTS.clear()
+            _passport_ready()
+            SEND_IDS["on"] = True
+            asyncio.run(S._handle_intake(Msg(CARD, mid=777, reply=NOREPLY), Ctx(), b, FakeClaude()))
+            self.assertNotIn("ic_msg_ids", S._INTAKE_DRAFTS[INTAKE], "при откате id не копятся")
+            say(b, "да", reply=NOREPLY)
+            self.assertEqual((len(b.booked()), status()), (1, "booked"), "ручка 0: «да» без реплая — прежняя запись")
+        finally:
+            os.environ.pop("INTAKE_CONFIRM_STRICT", None)
 
 
 if __name__ == "__main__":

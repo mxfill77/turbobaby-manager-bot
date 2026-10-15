@@ -496,8 +496,10 @@ def child_off():
     out["ret_card"] = [s.text for s in cards("Завершаю")]
     reset()
     b = Bridge([row_cur()])
-    S._INTAKE_DRAFTS[INTAKE] = draft(status="awaiting_approval")
-    intake(b, "да", uname="deramor", uid=None)
+    # INTAKECONFIRM1610-привязка: черновик знает сообщение своей карточки (ic_msg_ids), «да» — реплаем на неё
+    card = Msg("🆕 БРОНЬ …", chat_id=INTAKE, uname="deramor")
+    S._INTAKE_DRAFTS[INTAKE] = draft(status="awaiting_approval", ic_msg_ids=[card.message_id])
+    intake(b, "да", reply_to=card, uname="deramor", uid=None)
     out["booked"] = len(b.red("create_booking"))
     out["modules"] = sorted(m for m in PRODUCT if m in sys.modules)
     out["net_import"] = NET_AT_IMPORT
@@ -711,8 +713,10 @@ class T06Case(K4SplCase):
     def test_case_after_create_booking_origin_intake(self):
         p = new_store("bk")
         b = Bridge([row_cur()])
-        S._INTAKE_DRAFTS[INTAKE] = draft(status="awaiting_approval")
-        intake(b, "да", uname="deramor", uid=None)
+        # INTAKECONFIRM1610-привязка: черновик знает сообщение своей карточки (ic_msg_ids), «да» — реплаем на неё
+        card = Msg("🆕 БРОНЬ …", chat_id=INTAKE, uname="deramor")
+        S._INTAKE_DRAFTS[INTAKE] = draft(status="awaiting_approval", ic_msg_ids=[card.message_id])
+        intake(b, "да", reply_to=card, uname="deramor", uid=None)
         self.assertEqual(len(b.red("create_booking")), 1)
         cs = cases(p)
         self.assertEqual([(c["origin"], c["state"]) for c in cs], [("intake", "open")], cs)

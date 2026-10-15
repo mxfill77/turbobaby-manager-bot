@@ -243,13 +243,17 @@ def test_ttl_expired():
 def test_intake_draft_priority():
     reset(); b = FakeBridge(clients=[RENT_ROW])
     do_return(b)
+    # INTAKECONFIRM1610-привязка: черновик знает сообщения своей карточки (ic_msg_ids), «да» — реплаем на карточку
+    card = Msg("🆕 БРОНЬ …", chat_id=INTAKE, uname="deramor"); card.message_id = 9151
     S._INTAKE_DRAFTS[INTAKE] = {"status": "awaiting_approval", "ts": S._time.time(),
                                 "model": BIKE, "client": "Иван Тест", "deposit_type": "паспорт",
-                                "date_start": "08-07-2026", "date_end": "15-07-2026"}
+                                "date_start": "08-07-2026", "date_end": "15-07-2026",
+                                "ic_msg_ids": [card.message_id]}
     class BR2(FakeBridge):
         def create_booking(s, **k): s.booked = k; return {"ok": True, "row": 33}
     b2 = BR2(clients=[RENT_ROW]); b2.closed = b.closed
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b2, None))
+    yes = Msg("да", chat_id=INTAKE, uname="deramor"); yes.reply_to_message = card
+    run(S._handle_intake(yes, Ctx(), b2, None))
     assert getattr(b2, "booked", None), "«да» при живой карточке брони по-прежнему ставит бронь"
     assert b2.closed == [], "закрытие НЕ перехватывает «да» у карточки брони"
 
