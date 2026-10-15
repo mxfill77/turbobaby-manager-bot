@@ -93,6 +93,12 @@ _seeded = splinter.seed_topic_bikes()
 log.info(f"  Топики: ✅ привязок тема→байк из memory.db загружено: {_seeded}")
 _seeded_pins = splinter.seed_info_pins()   # закрепы кнопки «ℹ️ Инфо» — чтобы рестарт не плодил дубли
 log.info(f"  Инфо-кнопки: ✅ закрепов из memory.db загружено: {_seeded_pins}")
+# Флаги выпуска (INTAKECONFIRM1610, Codex TB-REL-CDA1AD9-STOP-1610-0431): эффективные значения ручек словом процесса,
+# после load_dotenv; строку требует скрипт рестарта. Сбой — «НЕ ПРОЧИТАНЫ», и скрипт рестарта останавливается.
+try:
+    log.info("  " + splinter.release_flags_line())
+except Exception as e:  # noqa: BLE001
+    log.warning(f"  🧩 флаги выпуска: НЕ ПРОЧИТАНЫ ({type(e).__name__})")
 
 # LLM-надзор за логикой ответов: включается только если заданы старт-группы в .env.
 auditor.set_audit_config(groups=AUDIT_GROUPS, audit_chat_id=AUDIT_CHAT_ID,

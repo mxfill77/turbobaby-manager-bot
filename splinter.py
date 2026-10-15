@@ -165,6 +165,31 @@ def _intake_confirm_strict_on():
     return str(_os_env("INTAKE_CONFIRM_STRICT", "1")).strip().lower() not in ("0", "", "нет", "no", "off", "false")
 
 
+# Строка флагов выпуска (INTAKECONFIRM1610, Codex TB-REL-CDA1AD9-STOP-1610-0431, причина 1): скрипт рестарта доказывает
+# ЭФФЕКТИВНЫЕ значения двух ручек словом самого процесса — после load_dotenv в bot.py, тем же чтением, что и в работе.
+# Значений окружения в строке нет: на ручку одно слово и «задан / не задан». Словари — ровно слова читателей: значение
+# вне словаря читатель решит молча, а выпуск такого решения не доказывает — слово НЕИЗВЕСТНО, скрипт рестарта — стоп.
+_FLAG_WORDS_STRICT = ("0", "", "нет", "no", "off", "false", "1", "да", "yes", "on", "true")   # _intake_confirm_strict_on
+_FLAG_WORDS_RC = ("1", "true", "yes", "on", "0", "", "no", "off", "false", "нет")           # _rc_on («да» — не его слово)
+
+
+def _flag_word(name, on, known):
+    """Слово ручки для строки старта: ВКЛ / ВЫКЛ — решение самого читателя (`on`); НЕИЗВЕСТНО — значение задано, но
+    не из словаря читателя (`known`). Само значение не возвращается никогда."""
+    raw = _os_env(name, None)
+    if raw is not None and str(raw).strip().lower() not in known:
+        return "НЕИЗВЕСТНО (задан)"
+    return ("ВКЛ" if on else "ВЫКЛ") + (" (задан)" if raw is not None else " (не задан)")
+
+
+def release_flags_line():
+    """Строка «🧩 флаги выпуска» для лога старта (bot.py). ВКЛ/ВЫКЛ берутся у тех же функций, что читают ручки в работе
+    (`_intake_confirm_strict_on`, `_rc_on`), — строка не может разойтись с поведением процесса."""
+    return ("🧩 флаги выпуска: INTAKE_CONFIRM_STRICT=%s · %s=%s"
+            % (_flag_word("INTAKE_CONFIRM_STRICT", _intake_confirm_strict_on(), _FLAG_WORDS_STRICT),
+               F_CONTRACT_REF_GEN, _flag_word(F_CONTRACT_REF_GEN, _rc_on(F_CONTRACT_REF_GEN), _FLAG_WORDS_RC)))
+
+
 def _bike_position_on():
     """Ручка «положение байка» (25.09.2026, задание Штаба 0033-74b). `BIKE_POSITION=0` → путь
     байт-в-байт прежний: снимок разбирается прежним промптом, положение не считается, мойка не
