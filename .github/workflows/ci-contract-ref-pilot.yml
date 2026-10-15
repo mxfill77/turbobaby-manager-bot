@@ -1,0 +1,72 @@
+{
+  "name": "CI contract reference pilot",
+  "on": {
+    "push": {
+      "branches": [
+        "codex/ci-contract-ref-pilot"
+      ]
+    },
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "ci-contract-ref-pilot",
+    "cancel_in_progress": true
+  },
+  "jobs": {
+    "contract_ref": {
+      "if": "github.repository == 'mxfill77/turbobaby-manager-bot' && github.event.repository.private == false && github.ref == 'refs/heads/codex/ci-contract-ref-pilot'",
+      "runs-on": "ubuntu-24.04",
+      "timeout-minutes": 25,
+      "env": {
+        "BASE_SHA": "cbe1322de06b9305c676c8b87af332c482216611",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": "",
+        "WA_AGENT_SRC": ""
+      },
+      "steps": [
+        {
+          "name": "Checkout exact published source",
+          "uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+          "with": {
+            "ref": "cbe1322de06b9305c676c8b87af332c482216611",
+            "persist-credentials": false,
+            "fetch-depth": 1,
+            "sparse-checkout-cone-mode": false,
+            "sparse-checkout": "contract_ref.py\nwa_agent_tools.py\nwa_agent_knowledge.py\nwa_book_read.py\nwa_contract_state.py\ntests/test_contract_ref.py"
+          }
+        },
+        {
+          "name": "Python 3.14",
+          "uses": "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+          "with": {
+            "python-version": "3.14"
+          }
+        },
+        {
+          "name": "Record source and runtime",
+          "shell": "bash",
+          "run": "test \"$(git rev-parse HEAD)\" = \"$BASE_SHA\"\npython --version\nsha256sum contract_ref.py wa_agent_tools.py wa_agent_knowledge.py wa_book_read.py wa_contract_state.py tests/test_contract_ref.py"
+        },
+        {
+          "name": "Existing pure synthetic suite",
+          "id": "pure_tests",
+          "shell": "bash",
+          "run": "python -B tests/test_contract_ref.py | tee \"$RUNNER_TEMP/contract-ref.log\""
+        },
+        {
+          "name": "Compact receipt without artifacts",
+          "if": "always()",
+          "shell": "bash",
+          "env": {
+            "TEST_RESULT": "${{ steps.pure_tests.outcome }}"
+          },
+          "run": "{\n  echo '### Contract reference pilot'\n  printf 'Source: %s\\nWorkflow: %s\\nResult: %s\\n' \"$BASE_SHA\" \"$GITHUB_SHA\" \"$TEST_RESULT\"\n  python --version 2>&1 || true\n  if test -f \"$RUNNER_TEMP/contract-ref.log\"; then tail -n 1 \"$RUNNER_TEMP/contract-ref.log\"; fi\n} >> \"$GITHUB_STEP_SUMMARY\""
+        }
+      ]
+    }
+  }
+}
