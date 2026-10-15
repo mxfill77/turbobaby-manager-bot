@@ -132,6 +132,7 @@ PROBE_MARK = "K4_OFF_MODULES "
 # 9571b9914c0b…; (основа 0a87a51 + A1 a6321f6): 474450dca494…; (основа e357f5f + 64e0748): 050d8b32431f…; ещё раньше
 # (основа 306350b): wa_agent_model bb40440a40f3…, wa_agent_tools d99dd55e777c…. Объекты a9663594…/e085a752…/9d682564…
 # достижимы из ветки useful-1310-a8 (несёт и bundle переноса); без них — ПРОПУЩЕНО, а не зелёное.
+# CSTATE1510: wa_agent*.py не тронуты, пины прежние; новое — подкласс wa_agent_cstate.py под WA_AGENT_CONTRACT_STATE.
 BASE_BLOBS = {
     "wa_agent": "a96635943368ac3afc2e9dd577e00679407ca30b",
     "wa_agent_model": "e085a752d37284b26e4bf2908016f1110e58917b",

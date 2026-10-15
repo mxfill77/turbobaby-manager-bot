@@ -102,6 +102,17 @@ WA_AGENT_CONTRACT_ASK=0); карточки подписи нет или `ask_of=
 карточки события без просьбы, у mixed и у ответа модели. Таблица `signed_asks` — черновики, рождённые просьбой: номер +
 doc_id + версия + sha256, вид, снятый ответ, исход; текста клиента нет — её прочтёт будущий читатель дела аренды.
 
+ОЖИДАНИЕ ПОДПИСИ В БАЗЕ (CSTATE1510; выключатель службы WA_AGENT_CONTRACT_STATE, по умолчанию выкл; `cstate=True` — только
+при карточке подписи). «Ждём подпись по просьбе» жило только в памяти процесса (`_signed_memo`); теперь — строка
+`contract_expect` (её же читает блок фактов модели `wa_agent_cstate`). Открывает её ФАКТ, а не обещание из текста модели:
+реестр пуст (EMPTY) и в неотвеченных входящих просьба прислать договор (`ask_of`) или сообщение «подписал» (`claim_of` —
+детектор передаёт служба: замок импортов этого модуля прежний); срок — конец окна 24 ч от последнего входящего (окно
+прохода не расширяется). Каждая проверка реестра по номеру с открытым ожиданием пишет `checked_at`/`outcome` (timeout и
+refused его не закрывают); ритм — `_cstate_due` по базе (первые ASK_EAGER_SEC от открытия — каждый проход, дальше не
+чаще SIGNED_IDLE), после рестарта — без опоры на память. Закрывает карточка подписи (`card:<id>` в ТОЙ ЖЕ транзакции
+`_signed_insert`), решённая версия (`held`, `_signed_keep`) или срок (`expired` и строка журнала). Клиенту ничего не
+уходит: карточка подписи и автоотправка CASEPDF1510 — как прежде. Выключено — ни таблицы, ни обращений к ней.
+
 ЖУРНАЛ. `part_log` и строки `self.log`: кто, когда, часть, попытка, исход, wamid, sha256 — без текстов и номеров.
 
 В СЛУЖБЕ (NIGHT0710-B3v). Собирает `wa_agent_svc.build` — только при флаге (правило `flag_on` службы, одно на всех) И
@@ -318,6 +329,27 @@ CREATE TABLE IF NOT EXISTS signed_asks (
 CREATE INDEX IF NOT EXISTS signed_asks_version ON signed_asks(number, doc_id, signed_at, file_id);
 """
 _ASK_COLS = (("replaced_id", "INTEGER"), ("replaced_why", "TEXT"))      # база первого прогона выпуска — догнать колонки
+# ── ожидание подписи в базе (CSTATE1510) ────────────────────────────────────────────────────────────────────
+F_CSTATE = "WA_AGENT_CONTRACT_STATE"           # выключатель службы; ядро окружение не читает (параметр cstate)
+EXPECT_OPEN, EXPECT_CLOSED, EXPECT_EXPIRED = "open", "closed", "expired"
+EXPECT_ASK, EXPECT_CLAIM = "ask", "signed_claim"   # contract_expect.why: просьба · клиент сообщил о подписи
+EXPECT_HELD = "held"                           # closed_by: версия решена без новой карточки (иначе «card:<id>»)
+_EXPECT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS contract_expect (
+    number      TEXT    NOT NULL,
+    opened_at   REAL    NOT NULL,
+    why         TEXT    NOT NULL,                 -- ask | signed_claim
+    upto_id     INTEGER,                          -- последнее входящее при открытии (текста клиента нет)
+    due_at      REAL    NOT NULL,                 -- конец окна 24 ч от последнего входящего
+    checked_at  REAL,                             -- последняя проверка реестра по номеру
+    outcome     TEXT,                             -- её исход: empty | timeout | refused (fact | conflict — словами T)
+    state       TEXT    NOT NULL,                 -- open | closed | expired
+    closed_at   REAL,
+    closed_by   TEXT,                             -- card:<id> | held
+    PRIMARY KEY (number, opened_at)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS contract_expect_open ON contract_expect(number) WHERE state='open';
+"""
 
 # Детектор (M1): «тексты НЕОТВЕЧЕННЫХ входящих → pure | mixed | None». НЕ решает, что ответить клиенту (это модель), и не
 # судит интеллект агента: отвечает ровно на вопрос транспорта — вправе ли код сам приложить проверенный PDF (mixed — к ответу
@@ -1249,7 +1281,8 @@ class AttachCore(A.Core):
     """Ядро с PDF договора второй частью. attach=False — каждый метод отдаёт управление `Core` (голден 24ad256)."""
 
     def __init__(self, *args, attach=False, pdf_fetch=None, contract_find=None, signed=False,
-                 signed_lookback_h=SIGNED_LOOKBACK_H, signed_budget=None, ask_of=_ASK_BUILTIN, autosend=False, **kw):
+                 signed_lookback_h=SIGNED_LOOKBACK_H, signed_budget=None, ask_of=_ASK_BUILTIN, autosend=False,
+                 cstate=False, claim_of=None, **kw):
         self.attach = bool(attach)
         self.pdf_fetch = pdf_fetch                  # file_id → ответ `bridge_client.contract_pdf` (content_b64, verified)
         self.contract_find = contract_find          # (phone, date_from, date_to) → ответ `bridge_client.contract_find`
@@ -1273,6 +1306,10 @@ class AttachCore(A.Core):
             ask_of = ask_verdict_many
         self.ask_of = ask_of if callable(ask_of) and self.signed else None
         self.autosend = bool(autosend) and self.ask_of is not None
+        # CSTATE1510: ожидание подписи — в базе (`contract_expect`), только при карточке подписи; claim_of(текст) → bool —
+        # «клиент сообщил о подписи» (детектор `wa_contract_state.signed_claim` передаёт служба: импорты модуля прежние)
+        self.cstate = bool(cstate) and self.signed
+        self.claim_of = claim_of if callable(claim_of) and self.cstate else None
         self._signed_auto = []                      # черновики подписи по чистой просьбе этого прохода — к автоотправке
         self._signed_last = None                    # такт поиска подписанных (SIGNED_EVERY)
         self._signed_said = set()                   # причины «карточки нет» — строкой журнала один раз на процесс
@@ -1315,6 +1352,8 @@ class AttachCore(A.Core):
                 for col, typ in _ASK_COLS:          # база первого прогона выпуска — колонки снятого ответа догнать
                     if col not in have:
                         self.db.execute("ALTER TABLE signed_asks ADD COLUMN %s %s" % (col, typ))
+            if self.cstate:                         # CSTATE1510: выключено — таблицы нет, база прежняя
+                self.db.executescript(_EXPECT_SCHEMA)
             if self.db.execute("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
                                (SIGNED_SINCE, repr(float(self.clock()) - self.signed_lookback))).rowcount == 1:
                 self.log("подпись: водораздел записан — версии, подписанные раньше %s (Пхукет), карточки не получают"
@@ -2172,6 +2211,8 @@ class AttachCore(A.Core):
         else:
             self.db.execute("UPDATE signed_cards SET draft_id=?, sha256=?, ts=? WHERE number=? AND doc_id=? AND "
                             "signed_at=? AND file_id=? AND draft_id=?", (draft_id, sha, now) + key + (reopen,))
+        if self.cstate and self._cstate_close(key[0], now, EXPECT_HELD):     # CSTATE1510: версия решена без карточки
+            self.log("ожидание подписи: закрыто — версия решена без новой карточки")
 
     def _signed_record(self, key):
         """Решение по версии (`signed_cards`) → (черновик | None,) | None — версия ещё не решалась."""
@@ -2400,6 +2441,8 @@ class AttachCore(A.Core):
         try:
             with (self.signed_budget(SIGNED_PASS_SEC) if self.signed_budget else _NoBudget()):
                 rental, contract = self._signed_find(number, upto)
+                if contract is not None and self.cstate:
+                    self._cstate_m3(number, contract)   # CSTATE1510: проверка реестра — исход в открытое ожидание
                 if contract is None:
                     got["why"] = "аренда: %s" % (rental.get("outcome") if isinstance(rental, dict) else "ответа нет")
                 elif contract.get("outcome") != T.FACT:
@@ -2527,6 +2570,7 @@ class AttachCore(A.Core):
         if self._signed_last is not None and 0 <= now - self._signed_last < SIGNED_EVERY:
             return made
         self._signed_last = now
+        self._cstate_expire(now)                    # CSTATE1510: срок ожиданий подписи — до прохода (выкл — ничего)
         since = self._signed_since()
         if since is None:
             self._signed_note(("since",), "водораздела нет в базе — карточек подписи нет (метка пишется на старте)")
@@ -2552,8 +2596,10 @@ class AttachCore(A.Core):
                 if asked >= SIGNED_PASS_MAX:
                     stop = "поисков в реестре за проход %d" % SIGNED_PASS_MAX
                     break
-                # CASEPDF1510 (M2): явная просьба клиента паузу «договора нет» / «раньше водораздела» не ждёт
-                if not self._signed_due(number, last_in, now) and not self._signed_ask_due(number, now):
+                # CASEPDF1510 (M2): явная просьба клиента паузу «договора нет» / «раньше водораздела» не ждёт;
+                # CSTATE1510: открытое ожидание подписи — свой ритм по базе (`_cstate_due`), без опоры на память
+                if not self._signed_due(number, last_in, now) and not self._signed_ask_due(number, now) \
+                        and not self._cstate_due(number, now):
                     continue
                 self._signed_cursor = number
                 try:
@@ -2608,6 +2654,129 @@ class AttachCore(A.Core):
             self._signed_resume = number
         return short
 
+    # ── ожидание подписи в базе (CSTATE1510) ──────────────────────────────────────────────────────────────────
+
+    def _cstate_claimed(self, number):
+        """В НЕОТВЕЧЕННЫХ входящих (то же чтение очереди, что у `_signed_asked`: echo=0, живые входящие, id >
+        clients.done_upto и ≤ last_in_id) клиент сообщает, что подписал (`claim_of`)? Детектора нет, клиента нет, очередь
+        не прочитана или детектор упал — нет: при сомнении ожидание не открывается. Текстов клиента в журнале нет."""
+        if self.claim_of is None:
+            return False
+        cl = self.db.execute("SELECT last_in_id, done_upto FROM clients WHERE number=?", (number,)).fetchone()
+        if not cl:
+            return False
+        try:
+            q = self._queue()
+            try:
+                rows = q.execute("SELECT id, msg_type, echo, history, text FROM wa_inbox WHERE from_number=? AND echo=0 "
+                                 "AND id>? AND id<=? ORDER BY id", (number, int(cl[1] or 0), int(cl[0]))).fetchall()
+            finally:
+                q.close()
+            return any(bool(self.claim_of(self._ask_text(msg_type, text))) for _rid, msg_type, echo, history, text in rows
+                       if self._live_kind(msg_type, echo, history) == A.wa_kind.KIND_INBOUND)
+        except Exception as e:                                       # noqa: BLE001
+            self.log("ожидание подписи: сообщение о подписи не разобрано (%s) — ожидание не открыто" % type(e).__name__)
+            return False
+
+    def _cstate_note(self, number, outcome, now, last_in=None, ask=None):
+        """Проверка реестра по номеру (исход двери договора `outcome`) → ожидание подписи в базе. Открытое — пишет
+        `checked_at`/`outcome` (timeout и refused его не закрывают). Открытого нет, реестр пуст (EMPTY), а клиент просит
+        договор (`ask`) или сообщил о подписи (`_cstate_claimed`) — открывается: срок — конец окна 24 ч от последнего
+        входящего. → True — открыто этим вызовом. Выключено — ничего, ни одного обращения к базе; сбой базы — строкой
+        журнала (один раз на процесс), карточка подписи — как прежде."""
+        if not self.cstate:
+            return None
+        try:
+            if self._cstate_checked(number, outcome, now):
+                return None
+            if outcome != T.EMPTY:
+                return None
+            why = EXPECT_ASK if ask in ASKED else EXPECT_CLAIM if self._cstate_claimed(number) else None
+            if why is None:
+                return None
+            cl = self.db.execute("SELECT last_in_ts FROM clients WHERE number=?", (number,)).fetchone()
+            due = float((cl or (0,))[0] or 0) + A.FOLLOW_WINDOW
+            if due <= now:
+                return None
+            n = self.db.execute("INSERT OR IGNORE INTO contract_expect(number, opened_at, why, upto_id, due_at, "
+                                "checked_at, outcome, state) VALUES(?,?,?,?,?,?,?,?)",
+                                (number, now, why, last_in, due, now, outcome, EXPECT_OPEN)).rowcount
+        except Exception as e:                                       # noqa: BLE001
+            self._signed_note(("cstate", type(e).__name__), "ожидание подписи не записано (%s) — карточка подписи как "
+                              "прежде" % type(e).__name__)
+            return None
+        if n == 1:
+            self.log("ожидание подписи: открыто — номер %s, %s, реестр пуст; проверяется сам до %s (Пхукет)" % (
+                T._tail(T.last9(number)), "просьба прислать договор" if why == EXPECT_ASK else "клиент сообщил о подписи",
+                T.B.local_now(due).strftime("%d.%m %H:%M")))
+        return n == 1
+
+    def _cstate_checked(self, number, outcome, now):
+        """Проверка реестра по номеру → открытое ожидание: `checked_at` и `outcome` (исход двери словом
+        `wa_agent_tools`). → число строк: 0 — открытого ожидания у номера нет. Ничего не открывает и не закрывает."""
+        return self.db.execute("UPDATE contract_expect SET checked_at=?, outcome=? WHERE number=? AND state=?",
+                               (now, str(outcome or "?"), number, EXPECT_OPEN)).rowcount
+
+    def _cstate_m3(self, number, contract):
+        """M3 (PDF к ответу модели по просьбе) тоже читает реестр по номеру: исход — в открытое ожидание. Ожидание здесь
+        не открывается (открывает его только проход подписи); сбой записи — строкой журнала, привязка M3 не падает."""
+        try:
+            self._cstate_checked(number, contract.get("outcome"), self.clock())
+        except Exception as e:                                       # noqa: BLE001
+            self._signed_note(("cstate-m3", type(e).__name__), "ожидание подписи: исход проверки реестра при ответе "
+                              "модели не записан (%s)" % type(e).__name__)
+
+    def _cstate_due(self, number, now):
+        """Открытое ожидание подписи → пора ли проверять реестр (CSTATE1510): срок не вышел, паузы после сбоев двери нет;
+        первые ASK_EAGER_SEC от открытия — каждый проход, дальше — не чаще SIGNED_IDLE от прошлой проверки. Ритм — по
+        базе (`contract_expect`), а не по памяти процесса: после рестарта ожидание продолжается."""
+        if not self.cstate:
+            return False
+        if now < (self._signed_memo.get(number) or {}).get("fail_at", 0):
+            return False
+        try:
+            row = self.db.execute("SELECT opened_at, due_at, checked_at FROM contract_expect WHERE number=? AND state=?",
+                                  (number, EXPECT_OPEN)).fetchone()
+        except Exception:                                            # noqa: BLE001
+            return False
+        if not row or now >= float(row[1]):
+            return False
+        if now - float(row[0]) < ASK_EAGER_SEC:
+            return True
+        return row[2] is None or now - float(row[2]) >= SIGNED_IDLE
+
+    def _cstate_close(self, number, now, by):
+        """Открытое ожидание номера → закрыто (`card:<id>` — карточкой подписи в её транзакции; `held` — версия решена
+        без новой карточки). → число закрытых: 0 — открытого не было."""
+        return self.db.execute("UPDATE contract_expect SET state=?, closed_at=?, closed_by=? WHERE number=? AND state=?",
+                               (EXPECT_CLOSED, now, by, number, EXPECT_OPEN)).rowcount
+
+    def _cstate_expire(self, now):
+        """Срок ожиданий подписи (конец окна 24 ч) вышел → expired и строка журнала на каждое (CSTATE1510). Клиенту
+        ничего: ожидание только просило код проверять реестр. → число истёкших; выключено — 0 без обращений к базе."""
+        if not self.cstate:
+            return 0
+        n = 0
+        try:
+            rows = self.db.execute("SELECT number, opened_at, why, outcome FROM contract_expect WHERE state=? AND "
+                                   "due_at<=? ORDER BY opened_at", (EXPECT_OPEN, now)).fetchall()
+            for number, opened, why, outcome in rows:
+                if self.db.execute("UPDATE contract_expect SET state=?, closed_at=? WHERE number=? AND opened_at=? AND "
+                                   "state=?", (EXPECT_EXPIRED, now, number, opened, EXPECT_OPEN)).rowcount != 1:
+                    continue
+                n += 1
+                # последняя проверка нашла подписанный (карточки по нему не было: версия решена, ответ модели) — не
+                # «без подписанного договора»: слова строки — по исходу последней проверки, а не по сроку
+                self.log("ожидание подписи: истекло — номер %s, открыто %s (%s): %s; клиенту ничего не отправлено" % (
+                    T._tail(T.last9(number)), A.hm_phuket(opened),
+                    "просьба" if why == EXPECT_ASK else "клиент сообщил о подписи",
+                    "срок 24 ч вышел — подписанный в реестре найден, новой карточки по нему нет" if outcome == T.FACT
+                    else "окно 24 ч кончилось без подписанного договора в реестре"))
+        except Exception as e:                                       # noqa: BLE001
+            self._signed_note(("cstate-expire", type(e).__name__), "ожидание подписи: срок не проверен (%s)"
+                              % type(e).__name__)
+        return n
+
     def _signed_one(self, number, now, since):
         """Один клиент → (черновик подписи | None, звался ли реестр, почему прервать проход | None). Карточки нет —
         причина в журнал один раз на процесс. CASEPDF1510 (M2): явная просьба клиента прислать СВОЙ договор открывает
@@ -2650,16 +2819,20 @@ class AttachCore(A.Core):
         if got in (T.TIMEOUT, T.REFUSED):
             if self._signed_short(number, contract):
                 return None, True, "бюджет прохода %d с исчерпан на реестре подписей" % SIGNED_PASS_SEC
+            self._cstate_note(number, got, now)     # CSTATE1510: сбой реестра ожидание не закрывает
             self._signed_fail(number, now)
             self._signed_note((number, "find", got, contract.get("reason")), "номер %s — реестр подписей: %s (%s), "
                               "карточки нет" % (tail, got, str(contract.get("reason") or "")[:80]))
             return None, True, "реестр подписей: %s" % got
         if got != T.FACT:
             self._signed_empty(number, last_in, now)
+            # CSTATE1510: реестр пуст, а клиент просит договор или сообщил о подписи — ожидание подписи открывается
+            self._cstate_note(number, got, now, last_in, ask)
             if got != T.EMPTY:
                 self._signed_note((number, "bind", got, contract.get("reason")),
                                   "номер %s — привязка договора не факт (%s), карточки нет" % (tail, got))
             return None, True, None
+        self._cstate_note(number, got, now)         # CSTATE1510: подписанный найден — исход проверки ожидания
         c = (contract.get("facts") or [{}])[-1]
         key = (number, str(c.get("doc_id") or "").strip(), str(c.get("signed_at") or "").strip(),
                str(c.get("pdf_id") or "").strip())
@@ -2849,6 +3022,8 @@ class AttachCore(A.Core):
             if n != 1:
                 self._tx_end(ok=False)
                 return None, None, lang, False
+            # CSTATE1510: ожидание подписи номера закрывает карточка — в ЭТОЙ ЖЕ транзакции (откат — не закрыто)
+            expect = self._cstate_close(number, now, "card:%d" % did) if self.cstate else 0
             if ask in ASKED:                        # CASEPDF1510: черновик рождён просьбой клиента — ключ дела, без слов
                 self.db.execute("INSERT OR REPLACE INTO signed_asks(draft_id, number, doc_id, signed_at, file_id, sha256, "
                                 "asked, kind, upto_id, ts, replaced_id, replaced_why) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -2867,6 +3042,8 @@ class AttachCore(A.Core):
         if old is not None:                         # карточка снятого — исходом, как у ядра (`_close` → `_done`)
             self.log("черновик %d → %s" % (old, A.SUPERSEDED))
             self._done(old, words, now)
+        if expect:
+            self.log("ожидание подписи: закрыто карточкой подписи %d (ждёт нажатия)" % did)
         return did, old, lang, bool(prev and prev[0])
 
     def tick(self, now=None):

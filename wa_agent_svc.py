@@ -80,6 +80,14 @@
                     события без просьбы, смешанная просьба, ответ модели и карточка, снявшая ответ, который правил человек
                     или где модель просила человека, — только по нажатию человека. По умолчанию выкл; карточка подписи
                     засчитана — строка старта называет исход всегда; карточки подписи нет и флаг не запрошен — ни строки.
+  WA_AGENT_CONTRACT_STATE — состояние дела договора для модели (CSTATE1510, вариант C): адаптер модели
+                    `wa_agent_cstate.ContractStateAdapter` на каждом вызове кладёт в начало запроса короткий блок фактов кода
+                    о договоре клиента из базы агента (версия, реестр, PDF клиенту и его статус, документ человека, просьба,
+                    ожидание подписи) — что ответить и какой инструмент позвать, решает модель; PDF прикладывает и проверяет
+                    код, как прежде. Ожидание подписи (просьба или «подписал» при пустом реестре) — строкой `contract_expect`
+                    в базе, а не в памяти процесса; реестр проверяется сам до конца окна 24 ч; закрывает его карточка подписи.
+                    Засчитывается ТОЛЬКО вместе с засчитанными WA_AGENT_SIGNED_CARD и WA_AGENT_TOOLS. Клиенту ничего без
+                    нажатия; автоотправка — как выше. По умолчанию выкл: ни импорта новых модулей, ни строки, ни таблицы.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -176,6 +184,7 @@ F_AUTOSEND = "WA_AGENT_AUTOSEND_CONTRACT"   # автоотправка свое�
 F_CONTRACT_ASK = "WA_AGENT_CONTRACT_ASK"  # = wa_agent_attach.F_CONTRACT_ASK (тест сверяет): откат детектора просьбы
 CONTRACT_ASK_OFF = ("0", "false", "no", "off")   # детектор по умолчанию вкл; выключают только эти слова
 AUTOSEND_DAY_MAX = 10                     # = wa_agent_attach.AUTOSEND_DAY_MAX (тест сверяет): только для строки старта
+F_CSTATE = "WA_AGENT_CONTRACT_STATE"      # = wa_agent_attach.F_CSTATE (тест сверяет): блок договора модели (CSTATE1510)
 W_SIGNED_ORPHAN = ("устарело: карточка подписанного договора — PDF клиенту (WA_AGENT_ATTACH) при старте службы не "
                    "засчитан, прежнее ядро отправило бы текст без PDF и без перечитывания реестра; ничего не отправлено")
 F_TEMPLATES = wa_send.TEMPLATES_FLAG      # шаблон после 24 часов (NIGHT0710-B3g): одно имя у ядра и двери
@@ -785,14 +794,17 @@ def tg_start_line(env, core, words):
 
 
 def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False, cache=None, tools=False,
-               hints=False):
+               hints=False, cstate=False):
     """Адаптер модели (WAAGENTMODEL0210): история — очередь и архив службы показа, знания, парк и цена —
     мост (только чтение), плательщик — платный ключ тем же путём, что у Splinter. → (модель | None, почему).
     Зовётся ТОЛЬКО при включённом WA_AGENT_DRAFTS: выключен — ни моста, ни ключа, ни модели.
     lessons — WA_AGENT_LESSONS: включён — действующие уроки из базы агента идут в промпт (WAAGENTLESSON0210).
     book — WA_AGENT_BOOK_READ: включён — снимок броней `clients`(filter=all)+`fleet` моста, GET (WABOOKTOOLS0210).
     cache — срок кэша промпта «1h»/«5m» или None (WA_AGENT_CACHE, WAAGENTCACHE0210).
-    hints — WA_AGENT_HINTS (NIGHT0710-B2): правила из пояснений идут в промпт; база агента читается и без уроков."""
+    hints — WA_AGENT_HINTS (NIGHT0710-B2): правила из пояснений идут в промпт; база агента читается и без уроков.
+    cstate — WA_AGENT_CONTRACT_STATE (CSTATE1510): адаптер `wa_agent_cstate.ContractStateAdapter` с теми же аргументами
+    (блок фактов договора в начале запроса); выкл — модуль не импортируется, адаптер прежний. Модуль блока не собрался —
+    адаптер прежний (черновики живут), имя ошибки — в `cstate_fail`: строка старта назовёт его (`cstate_of`)."""
     import wa_agent_model
     import wa_book_read
     try:
@@ -802,7 +814,14 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
         call = call or wa_agent_model.paid_call(env_file=os.path.join(ROOT, ".env"))
     except Exception as e:                                           # noqa: BLE001
         return None, "адаптер не собран: %s" % type(e).__name__
-    model = wa_agent_model.ModelAdapter(
+    adapter, cstate_fail = wa_agent_model.ModelAdapter, None
+    if cstate:                                       # CSTATE1510: флаг не запрошен — ни импорта, ни подкласса
+        try:
+            import wa_agent_cstate
+            adapter = wa_agent_cstate.ContractStateAdapter
+        except Exception as e:                                       # noqa: BLE001
+            cstate_fail = type(e).__name__
+    model = adapter(
         env["queue_db"], call, read_doc=lambda n: bridge._call("read_doc", name=n), fleet=bridge.fleet,
         door=bridge.quote_price, archive_db=env.get("archive_db") or "",
         manifest=env.get("archive_manifest") or "", media_dir=env.get("archive_media") or "",
@@ -813,6 +832,8 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
         # WA_AGENT_TOOLS (AGENTLOOPA0310): двери чтения кассы и договоров; выкл — None, черновик как в 9c4aac6
         tools={"cash": bridge.tx_find, "contract": bridge.contract_find,
                "contract_pdf": bridge.contract_pdf} if tools else None)
+    if cstate_fail:
+        model.cstate_fail = cstate_fail             # CSTATE1510: блок не собран — назовёт строка старта
     return model, ""
 
 
@@ -954,6 +975,32 @@ def autosend_of(environ, signed):
                       "правил человек или где модель просила человека, — только по нажатию" % AUTOSEND_DAY_MAX)
 
 
+def cstate_of(environ, signed, model):
+    """CSTATE1510: флаг WA_AGENT_CONTRACT_STATE → (засчитан?, именованные аргументы `AttachCore` | None, слова строки старта |
+    None). Правило флага — одно со всеми выключателями (`flag_on`). Не запрошен — (None, None, None): ни импорта, ни строки,
+    ни таблицы, путь прежний байт-в-байт. Засчитывается только при засчитанной карточке подписи (а она — только при PDF
+    клиенту, то есть при сверке WA_AGENT_TOOLS) и адаптере с блоком (`make_model(cstate=True)`); иначе блок у модели
+    гасится (`cstate_on = False` — её `build` прежний) и строка говорит «не засчитан». Засчитан — ядру `cstate=True` и
+    детектор «подписал» (`wa_contract_state.signed_claim`; замок импортов ядра прежний — детектор передаётся)."""
+    if not wa_agent_tg.flag_on(environ.get(F_CSTATE)):
+        return None, None, None
+    blocked = hasattr(model, "cstate_on")
+    if not signed or not blocked:
+        if blocked:
+            model.cstate_on = False
+        fail = getattr(model, "cstate_fail", None)
+        why = ("карточка после подписи (%s) не засчитана" % F_SIGNED if not signed else
+               "модуль блока договора не собран (%s) — адаптер прежний" % fail if fail else
+               "адаптер модели без блока договора (%s выкл или модели нет)" % F_TOOLS)
+        return False, None, "не засчитан — флаг 1, но %s: блока договора у модели и ожидания подписи в базе нет" % why
+    import wa_contract_state
+    return True, {"cstate": True, "claim_of": wa_contract_state.signed_claim}, (
+        "вкл — модель видит в начале каждого запроса факты кода о договоре клиента (версия, реестр, PDF клиенту и его "
+        "статус, документ человека, просьба, ожидание подписи), не больше %d строк; ожидание подписи (просьба или "
+        "«подписал» при пустом реестре) — в базе (contract_expect), реестр проверяется сам до конца окна 24 ч, закрывает "
+        "карточка подписи; клиенту ничего без нажатия" % wa_contract_state.BLOCK_LINES)
+
+
 def close_signed_orphans(core, now, line):
     """WA_AGENT_ATTACH не засчитан, ядро прежнее (`wa_agent.Core`), а в базе ждут черновики подписи (kind='signed',
     pending или отложенные ритмом): «Отправить» прежнего ядра отправил бы шаблон «Направляем ваш подписанный договор» без
@@ -995,6 +1042,8 @@ def models_of(env, environ, line=None):
         more = {"tools": True} if wa_agent_tg.flag_on(environ.get(F_TOOLS)) else {}
         if wa_agent_tg.flag_on(environ.get(F_HINTS)):
             more["hints"] = True              # WA_AGENT_HINTS (NIGHT0710-B2): выкл — вызов прежней формы
+        if wa_agent_tg.flag_on(environ.get(F_CSTATE)) and wa_agent_tg.flag_on(environ.get(F_TOOLS)):
+            more["cstate"] = True             # CSTATE1510: только со сверкой; выкл — вызов прежней формы
         model, why = make_model(env, lessons=wa_agent_tg.flag_on(environ.get(F_LESSONS)),
                                 book=wa_agent_tg.flag_on(environ.get(F_BOOK)),
                                 cache=wa_agent_model.cache_ttl_of(environ.get(F_CACHE)), **more)
@@ -1082,13 +1131,17 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     _auto, auto_kw, auto_words = autosend_of(environ, _signed)
     if auto_words:
         line("автоотправка своего договора по просьбе (%s): %s" % (F_AUTOSEND, auto_words))
+    # состояние дела договора для модели (CSTATE1510): флаг не запрошен — ни строки, ни импорта, ни таблицы
+    _cs, cstate_kw, cstate_words = cstate_of(environ, _signed, model)
+    if cstate_words:
+        line("договор клиента для модели (%s): %s" % (F_CSTATE, cstate_words))
     if attach:
         import wa_agent_attach
         core = wa_agent_attach.AttachCore(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                                           log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons,
                                           lesson_admins=admins, followup=follow, hints=hints, templates=templates,
                                           lang_of=wa_agent_tg.K.lang_of, attach=True, **doors,
-                                          **(signed_kw or {"signed": False}), **(auto_kw or {}))
+                                          **(signed_kw or {"signed": False}), **(auto_kw or {}), **(cstate_kw or {}))
     else:
         core = wa_agent.Core(env["agent_db"], env["queue_db"], model or NoModel(), tg, door, clock=clock,
                              log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
