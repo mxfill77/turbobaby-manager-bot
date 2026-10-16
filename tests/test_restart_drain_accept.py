@@ -560,10 +560,10 @@ def test_B6_double_on_stop_no_second_run():
     assert r.batches == [[601, 602]], r.batches
     ls = _stop_lines()
     assert len(ls) == 2 and "таймеров 0, в обработке 0, из буфера 0 → доведено 0, не успели 0" in ls[1], ls
-    # К3 16.10 (правка ожидания, названа в коммите): после исправления C7 каждая запись — новый sha (время/pid в теле);
-    # содержимое передачи то же, второго прогона нет.
+    # К3 16.10 (правка ожидания, названа в коммите): после C7 sha — по всему телу; две записи ОДНОГО процесса в пределах
+    # такта часов могут совпасть телом и суммой (это тот же файл), поэтому равенство/неравенство sha здесь не требуется;
+    # содержимое передачи то же, второго прогона нет. Межпроцессный случай (разный pid) — C7.
     assert first["entries"] == second["entries"] and len(second["entries"]) == 1
-    assert first["sha256"] != second["sha256"]
 
 
 def test_B7_drain_failure_still_writes_handoff():
@@ -933,7 +933,10 @@ def _forged(p, mutate):
     obj = _read(p)
     mutate(obj)
     obj["count"] = len(obj["entries"])
-    obj["sha256"] = RH.digest(obj["entries"])                       # сумма подделана честно — ловить должен контракт
+    # К3 16.10 (Codex TB-REL-5EC1F65-STOP-1610-1342 п.2): после C7 сумма — по ВСЕМУ телу; прежняя сумма по записям давала
+    # отказ «сумма не сошлась», и D1–D3 не доходили до проверки контракта. Теперь сумма верная — ловить должен контракт.
+    obj["sha256"] = RH.digest({k: obj[k] for k in ("version", "written_at", "pid", "count", "entries")})
+    assert RH.verify(obj)[1] != "контрольная сумма не сошлась", "подделка обязана пройти сумму"
     _write_json(p, obj)
 
 
@@ -943,6 +946,7 @@ def test_D1_forged_not_waiting_status_rejected():
     _new_process(p)
     res = S.handoff_restore()
     assert res.startswith("НЕ применена") and not S._INTAKE_DRAFTS and not S._HANDOVER_ACTIVATIONS, res
+    assert "ждущем статусе" in res and "сумма" not in res, res
 
 
 def test_D2_two_entries_one_place_rejected():
@@ -957,6 +961,7 @@ def test_D2_two_entries_one_place_rejected():
     _new_process(p)
     res = S.handoff_restore()
     assert res.startswith("НЕ применена") and not S._INTAKE_DRAFTS, res
+    assert "две записи на одно место" in res and "сумма" not in res, res
 
 
 def test_D3_passport_field_injected_rejected():
@@ -965,6 +970,7 @@ def test_D3_passport_field_injected_rejected():
     _new_process(p)
     res = S.handoff_restore()
     assert res.startswith("НЕ применена") and not S._INTAKE_DRAFTS, res
+    assert "вне белого списка" in res and "сумма" not in res, res
 
 
 def test_D4_wrong_version_count_shape_rejected():

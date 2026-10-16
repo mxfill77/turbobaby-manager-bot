@@ -325,6 +325,69 @@ def test_b7_restore_sends_nothing():
     assert "bridge" not in S.handoff_restore.__code__.co_varnames
 
 
+OTHER = -100900
+
+
+def _carry_scene():
+    """C6: передача со старой карточкой на INTAKE (ids 7001) и на другом чате (7002); метка не пишется → перенос."""
+    _fresh()
+    p = _new_path()
+    S._INTAKE_DRAFTS[INTAKE] = dict(_draft(), ic_msg_ids=[7001])
+    S._INTAKE_DRAFTS[OTHER] = dict(_draft(), ic_msg_ids=[7002])
+    S.handoff_write()
+    _restart_same_path()
+    os.makedirs(p + ".applied.tmp")
+    msg = S.handoff_restore()
+    assert msg.startswith("НЕ применена: метку не записать") and S._INTAKE_DRAFTS == {}, msg
+    return p
+
+
+def _next_start_from(p):
+    """Следующий старт с той же передачей на новом месте (на старом метке мешает каталог)."""
+    data = _bytes(p)
+    p2 = _new_path()
+    with open(p2, "wb") as f:
+        f.write(data)
+    _restart_same_path()
+    return S.handoff_restore()
+
+
+def test_b9_carry_never_revives_over_closed_card():
+    """Codex TB-REL-5EC1F65-STOP-1610-1342 п.1: новая карточка того же чата закрыта (booked / write_unknown) — перенос
+    старой на её место НЕ идёт; карточка другого чата переносится."""
+    for status in ("booked", "write_unknown", "approved"):
+        p = _carry_scene()
+        S._INTAKE_DRAFTS[INTAKE] = dict(_draft(status), ic_msg_ids=[8001])    # новая карточка того же чата
+        h, n, _ = S.handoff_write()
+        ids = [e["data"]["ic_msg_ids"] for e in json.loads(_bytes(p))["entries"]]
+        assert n == 1 and ids == [[7002]], (status, ids)
+        assert _next_start_from(p).startswith("применена"), status
+        assert INTAKE not in S._INTAKE_DRAFTS, (status, S._INTAKE_DRAFTS.get(INTAKE))
+        assert S._INTAKE_DRAFTS[OTHER]["ic_msg_ids"] == [7002], status
+
+
+def test_b10_current_awaiting_wins_over_carry():
+    p = _carry_scene()
+    S._INTAKE_DRAFTS[INTAKE] = dict(_draft(), ic_msg_ids=[8001])               # новая ждущая карточка того же чата
+    S.handoff_write()
+    assert _next_start_from(p).startswith("применена")
+    assert S._INTAKE_DRAFTS[INTAKE]["ic_msg_ids"] == [8001] and S._INTAKE_DRAFTS[OTHER]["ic_msg_ids"] == [7002]
+
+
+def test_b11_carry_kept_when_place_free():
+    p = _carry_scene()
+    S.handoff_write()                                                          # мест не занимали — перенос целиком
+    assert _next_start_from(p).startswith("применена")
+    assert S._INTAKE_DRAFTS[INTAKE]["ic_msg_ids"] == [7001] and S._INTAKE_DRAFTS[OTHER]["ic_msg_ids"] == [7002]
+
+
+def test_a6_occupied_counts_any_status():
+    occ = RH.occupied({1: _draft("booked"), 2: _draft()}, {3: dict(HO, status="activated")}, {})
+    assert occ == {("intake", 1), ("intake", 2), ("handover", 3)}
+    carry = RH.select({1: _draft(), 4: _draft()}, {}, {})
+    assert [e["chat_id"] for e in RH.merge([], carry, occ)] == [4]
+
+
 def test_b8_no_file_is_honest_empty():
     _fresh()
     _new_path()

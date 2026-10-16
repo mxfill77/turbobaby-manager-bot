@@ -133,10 +133,20 @@ def plan(entries, intake, handovers, closes):
     return todo, counts
 
 
-def merge(current, carry):
-    """Записи текущей памяти + перенесённые из неприменённой (проверенной) передачи на ещё не занятые места. Текущее
-    сильнее: одна карточка на место, новая карточка процесса заменяет старую так же, как в обычной работе."""
-    have = {(e["kind"], e["chat_id"]) for e in current}
+def occupied(intake, handovers, closes):
+    """Места (вид, chat_id), занятые в памяти процесса ЛЮБОЙ записью — до фильтра статуса. Закрытая (booked) или
+    неизвестная (write_unknown) карточка тоже занимает место: перенос старой карточки на него оживил бы её (Codex
+    TB-REL-5EC1F65-STOP-1610-1342, п.1)."""
+    out = set()
+    for kind, store in ((KIND_INTAKE, intake), (KIND_HANDOVER, handovers), (KIND_CLOSE, closes)):
+        out.update((kind, chat_id) for chat_id in (store or {}))
+    return out
+
+
+def merge(current, carry, taken):
+    """Записи текущей памяти (только ждущие) + перенесённые из неприменённой (проверенной) передачи — ТОЛЬКО на места,
+    которых нет в памяти процесса вовсе (`taken` = `occupied(...)`, любой статус). Текущее сильнее всегда."""
+    have = set(taken) | {(e["kind"], e["chat_id"]) for e in current}
     return list(current) + [e for e in (carry or []) if (e["kind"], e["chat_id"]) not in have]
 
 

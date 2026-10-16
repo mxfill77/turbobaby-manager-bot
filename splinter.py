@@ -4097,7 +4097,8 @@ def handoff_write(now=None):
             log.error(f"  ⚠️ передача карточек: неприменённый файл сохранён как {os.path.basename(keep)}")
             _HANDOFF_SEEN["unapplied"] = False
         entries = _rh.merge(_rh.select(_INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES),
-                            _HANDOFF_SEEN.get("carry"))
+                            _HANDOFF_SEEN.get("carry"),
+                            _rh.occupied(_INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES))
         obj = _rh.pack(entries, written_at=now if now is not None else _time.time(), pid=os.getpid())
         _handoff_dump(path, obj)
         _HANDOFF_SEEN["carry"] = []
