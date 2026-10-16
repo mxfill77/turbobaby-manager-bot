@@ -21,7 +21,10 @@ QUEUE4_INTAKE_SUBSTR_MAP М1–М6 (дерево 13b4188). Проверяетс�
       поведение отката (этот раздел обязан быть зелёным и на 13b4188, и на ветке);
   (P) чистые части: intake_confirm.km_arg / red_outcome / decide_action, rental_case_rules.approval_decision(action);
   (R) Р1 приёмки 571a117: отказ / вопрос / условие БЕЗ реплая не становится согласием ни одним последующим «да» (пробы
-      X-bind приёмки дословно + цепочки, отказ реплаем, снятие прежней привязки, две карточки, флаг 1, бронь).
+      X-bind приёмки дословно + цепочки, отказ реплаем, снятие прежней привязки, две карточки, флаг 1, бронь);
+  (RK) Р1-К повторной приёмки e34e086: согласие ДРУГОГО действия без реплая при одной ждущей карточке («закрывай» при
+      ждущей выдаче, «активируй» при ждущем приёме) — пояснение без привязки, ни одного вызова; зеркала: согласие
+      СВОЕГО действия по-прежнему привязывает уточнение, две карточки — прежний ответ.
 
 Каждый негатив (A)–(E) обязан падать на 13b4188 (там согласие — подстрокой и без привязки к карточке); стражи, уже
 зелёные на 13b4188, названы в отчёте отдельно. Сеть запрещена подменой socket (rental_case_fakes), память Splinter и
@@ -950,6 +953,147 @@ class R_K4_NoReplyRefusalNeverConsent(Case):
                     if text != "стоп":
                         self.k4(b, "да", card)
                         self.assertEqual(_writes(b), [], "К4: отказ реплаем + «да» на карточку → запись: %r" % text)
+
+    def test_r12_k4_other_action_consent_without_reply_zero(self):
+        """Страж (зелёный и до Р1-К): флаг 1, те же 9 форм X приёмки без реплая → «да» на ответы бота и без реплая →
+        0 записей; реплай «да» на саму карточку — ровно одна."""
+        for kind, pool in (("act", X_OTHER_ACT), ("close", X_OTHER_CLOSE)):
+            for text in pool:
+                with self.subTest(kind=kind, text=text):
+                    self.setUp()
+                    b, card = self._card(kind)
+                    n0 = len(SENDS)
+                    self.k4(b, text, None)
+                    for s in list(SENDS[n0:]):
+                        self.k4(b, "да", s)
+                    self.k4(b, "да", None)
+                    self.assertEqual(_writes(b), [], "К4: «%s» без реплая + «да» → запись" % text)
+                    self.k4(b, "да", card)
+                    self.assertEqual(len(_writes(b)), 1, "К4: реплай на саму карточку — ответ ей")
+
+
+# =========================================== (RK) Р1-К: согласие ДРУГОГО действия без реплая при одной ждущей карточке
+# Повторная приёмка e34e086 (accept_r2/accept_r2_new.py, пробы X-f0-act-00…04 и X-f0-close-00…03): согласие решалось
+# объединением слов выдачи и приёма, а вопрос «Это ответ на карточку …?» привязывался к единственной ждущей карточке без
+# сверки ДЕЙСТВИЯ — «активируй» при ждущем только приёме → вопрос про приём → «да» → close_booking (и наоборот).
+X_OTHER_ACT = ("закрывай", "завершай", "заверши", "да, закрывай", "закрываем")      # ждёт ТОЛЬКО выдача (дословно X)
+X_OTHER_CLOSE = ("активируй", "активируем", "да, активируй", "активируйте")         # ждёт ТОЛЬКО приём (дословно X)
+OWN_ACT = ("активируй", "активируем", "активируйте", "да, активируй")               # зеркало: своё действие — выдача
+OWN_CLOSE = ("закрывай", "завершай", "заверши", "да, закрывай", "закрываем")        # зеркало: своё действие — приём
+
+
+class RK_OtherActionConsentNoReply(Case):
+    def _card(self, kind):
+        if kind == "act":
+            b = Bridge([bk_row()])
+            return b, ho_card(b), S._HANDOVER_ACTIVATIONS
+        b = Bridge([rent_row()])
+        return b, ret_card(b), S._RETURN_CLOSES
+
+    def test_rk1_acceptance_x_nine_forms_note_unbound_zero_calls(self):
+        """Пробы X приёмки дословно: «<согласие чужого действия>» без реплая → пояснение (не вопрос, без привязки) →
+        «да» реплаем на ответ бота ×2 → 0 изменяющих вызовов, карточка жива; реплай «да» на саму карточку — ровно один
+        вызов её действия."""
+        for kind, pool in (("act", X_OTHER_ACT), ("close", X_OTHER_CLOSE)):
+            for text in pool:
+                with self.subTest(kind=kind, text=text):
+                    reset()
+                    b, card, store = self._card(kind)
+                    ids0 = list(store[INTAKE].get("msg_ids") or [])
+                    n0 = len(SENDS)
+                    say(b, text)
+                    out = SENDS[n0:]
+                    self.assertEqual(len(out), 1, "на ответ без реплая — ровно одно сообщение: %r" % texts())
+                    self.assertNotIn("Это ответ на карточку", out[0].text, "чужому действию задан адресный вопрос")
+                    self.assertIn("Ответ без реплая на карточку %s" % ("выдачи" if kind == "act" else "приёма"),
+                                  out[0].text, "пояснение называет ждущую карточку")
+                    self.assertEqual(list(store[INTAKE].get("msg_ids") or []), ids0, "пояснение привязано к карточке")
+                    self.assertEqual(list(store[INTAKE].get("ask_ids") or []), [])
+                    for _ in range(2):
+                        say(b, "да", reply=SENDS[-1])
+                    self.assertEqual(_writes(b), [], "Р1-К: «%s» без реплая + «да» на ответ бота → запись" % text)
+                    self.assertEqual(store[INTAKE]["status"], "awaiting")
+                    say(b, "да", reply=card)
+                    if kind == "act":
+                        self.assertEqual(b.red("activate_booking"), _exp_act())
+                        self.assertEqual(b.red("close_booking"), [])
+                    else:
+                        self.assertEqual(b.red("close_booking"), _exp_close("35200"))
+                        self.assertEqual(b.red("activate_booking"), [])
+
+    def test_rk2_mirror_own_action_without_reply_still_binds(self):
+        """Зеркало: согласие СВОЕГО действия без реплая — прежний адресный вопрос, привязанный к карточке; «да» на него
+        — ровно один вызов её действия (для приёма — пробег поля карточки)."""
+        for kind, pool in (("act", OWN_ACT), ("close", OWN_CLOSE)):
+            for text in pool:
+                with self.subTest(kind=kind, text=text):
+                    reset()
+                    b, _card, store = self._card(kind)
+                    n0 = len(SENDS)
+                    say(b, text)
+                    asks = [s for s in SENDS[n0:] if "Это ответ на карточку" in s.text]
+                    self.assertEqual(len(asks), 1, texts())
+                    self.assertIn(asks[0].message_id, store[INTAKE]["msg_ids"], "уточнение не привязано")
+                    self.assertEqual(_writes(b), [], "без реплая ничего не исполняется")
+                    say(b, "да", reply=asks[0])
+                    if kind == "act":
+                        self.assertEqual(b.red("activate_booking"), _exp_act())
+                    else:
+                        self.assertEqual(b.red("close_booking"), _exp_close("35200"))
+                    self.assertEqual(len(_writes(b)), 1)
+
+    def test_rk3_other_action_word_unbinds_earlier_ask(self):
+        """Как прочие не-согласия (r5): уточнение привязано на «да» без реплая; затем согласие ЧУЖОГО действия без
+        реплая — привязка снята, «да» на старое уточнение не исполняет; реплай на саму карточку — исполняет."""
+        for kind, other in (("act", "закрывай"), ("act", "да, закрывай"), ("close", "активируй"),
+                            ("close", "да, активируй")):
+            with self.subTest(kind=kind, other=other):
+                reset()
+                b, card, store = self._card(kind)
+                n0 = len(SENDS)
+                say(b, "да")
+                old_ask = SENDS[n0:][-1]
+                self.assertIn(old_ask.message_id, store[INTAKE]["msg_ids"], texts())
+                say(b, other)
+                self.assertNotIn(old_ask.message_id, store[INTAKE]["msg_ids"], "привязка старого уточнения не снята")
+                say(b, "да", reply=old_ask)
+                self.assertEqual(_writes(b), [], "«да» на старое уточнение после чужого глагола исполнило карточку")
+                say(b, "да", reply=card)
+                self.assertEqual(len(_writes(b)), 1)
+
+    def test_rk4_two_cards_answer_unchanged(self):
+        """Ждут две карточки (приём A, выдача B): глагол любого действия без реплая — прежний ответ «ждут несколько»,
+        ни одного вызова; «да» на этот ответ — тоже ни одного."""
+        for text in ("закрывай", "активируй", "да, закрывай", "да, активируй"):
+            with self.subTest(text=text):
+                reset()
+                b = Bridge([rent_row(), bk_row_b()])
+                ret_card(b, BIKE_A)
+                ho_card(b, BIKE_B)
+                n0 = len(SENDS)
+                say(b, text)
+                out = SENDS[n0:]
+                self.assertEqual(len(out), 1, texts())
+                self.assertIn("Ждут ответа несколько карточек", out[0].text)
+                say(b, "да", reply=out[0])
+                say(b, "да", reply=SENDS[-1])
+                self.assertEqual(_writes(b), [])
+
+    def test_rk5_pure_action_words(self):
+        """Чистая часть, на которой стоит правка: слово чужого действия согласием этой карточки не является."""
+        import intake_confirm as IC
+        for text in X_OTHER_ACT:
+            with self.subTest(action="activate", text=text):
+                self.assertNotEqual(IC.decide_action(text, "activate"), IC.YES)
+        for text in X_OTHER_CLOSE:
+            with self.subTest(action="close", text=text):
+                self.assertNotEqual(IC.decide_action(IC.km_arg(text)[1], "close"), IC.YES)
+        for text in OWN_ACT:
+            with self.subTest(action="activate", own=text):
+                self.assertEqual(IC.decide_action(text, "activate"), IC.YES)
+        for text in OWN_CLOSE:
+            with self.subTest(action="close", own=text):
+                self.assertEqual(IC.decide_action(text, "close"), IC.YES)
 
 
 # =============================================================================== (F) ручка 0: прежнее байт-в-байт

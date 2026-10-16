@@ -13179,6 +13179,17 @@ async def _intake_route_reply(msg, context, bridge, text, now):
         return
     waiting = ([("booking", bk)] if bk is not None else []) + live
     consent = v == intake_confirm.YES
+    if len(waiting) == 1:
+        # Р1-К приёмки: ждёт ОДНА карточка — согласие судится словами ЕЁ действия (как реплай на неё,
+        # `_card_reply_strict`), а не объединением слов выдачи и приёма: «активируй» при ждущем только приёме (и
+        # «закрывай» при ждущей только выдаче) — не согласие этой карточке, ему пояснение без привязки. Приём — после
+        # `km_arg`; названный без реплая пробег согласием не считается: «да» на уточнение его не несёт (r3).
+        _k1 = waiting[0][0]
+        if _k1 == "close":
+            _km1, _rest1 = intake_confirm.km_arg(said)
+            consent = _km1 is None and intake_confirm.decide_action(_rest1, _k1) == intake_confirm.YES
+        else:
+            consent = intake_confirm.decide_action(said, _k1) == intake_confirm.YES
     unbound = 0
     if not consent:
         # Р1: не-согласие без реплая снимает привязку прежних уточнений ждущих карточек — «да» реплаем на старое
