@@ -4101,7 +4101,8 @@ def handoff_write(now=None):
                             _rh.occupied(_INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES))
         obj = _rh.pack(entries, written_at=now if now is not None else _time.time(), pid=os.getpid())
         _handoff_dump(path, obj)
-        _HANDOFF_SEEN["carry"] = []
+        # carry НЕ очищается: эти записи в память процесса не вписаны и обязаны попасть в КАЖДУЮ его передачу (повторный
+        # on_stop иначе терял бы их — приёмка E5); занятые места исключает merge при каждой записи.
         return "записана", len(entries), obj["sha256"][:8]
     except Exception as e:                                           # noqa: BLE001
         log.exception("  ⚠️ передача карточек: НЕ записана")

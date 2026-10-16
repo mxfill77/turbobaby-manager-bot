@@ -1012,6 +1012,92 @@ def test_D6_gitignore_covers_handoff_files():
 
 
 # =====================================================================================================================
+# 6. ПЕРЕНОС (carry) ПОСЛЕ СБОЯ МЕТКИ: старое не оживает поверх нового (приёмка дельты 4775763 → 91ff0ba, 16.10)
+# =====================================================================================================================
+
+def _carry_scene(name, cards):
+    """A пишет передачу с `cards`; B не может записать метку (каталог на месте её временного файла) → перенос.
+    → (каталог, путь, блокер). B остаётся текущим процессом: словари пусты, carry взведён."""
+    d, p = _scene(name)
+    for store, key, val in cards:
+        store[key] = val
+    _stop()                                                           # A
+    _new_process(p)                                                   # B
+    blocker = p + ".applied.tmp"
+    os.mkdir(blocker)
+    r_b = S.handoff_restore()
+    assert r_b.startswith("НЕ применена") and S._HANDOFF_SEEN["carry"], (r_b, S._HANDOFF_SEEN)
+    assert not S._INTAKE_DRAFTS and not S._HANDOVER_ACTIVATIONS and not S._RETURN_CLOSES
+    return d, p, blocker
+
+
+def _to_c(p, blocker):
+    """B остановлен штатно → C стартует (блокер отодвинут: у C метка пишется)."""
+    _stop()                                                           # B
+    raw_b = _raw(p).decode("utf-8")
+    _new_process(p)                                                   # C
+    os.rename(blocker, blocker + ".moved")
+    return S.handoff_restore(), raw_b
+
+
+def test_E1_carry_does_not_revive_old_card_over_booked_new_one():
+    for st in ("booked", "write_unknown"):
+        d, p, blocker = _carry_scene("E1" + st, [(S._INTAKE_DRAFTS, C1, _intake("awaiting_approval"))])
+        # в B в той же группе родилась НОВАЯ карточка и закрылась (бронь записана / исход неизвестен)
+        S._INTAKE_DRAFTS[C1] = _intake(st, client="New Y", ic_msg_ids=[801], ts=NOW - 5)
+        r_c, raw_b = _to_c(p, blocker)
+        assert "Test Client" not in raw_b and "501" not in raw_b, (st, "старая X уехала в передачу B", raw_b[:300])
+        assert C1 not in S._INTAKE_DRAFTS, (st, "старая X ожила в C поверх закрытой новой", r_c, S._INTAKE_DRAFTS.get(C1))
+
+
+def test_E2_current_waiting_card_wins_over_carry():
+    """Контроль: новая карточка той же группы ещё ЖДЁТ — в C доезжает она, а не старая из переноса."""
+    d, p, blocker = _carry_scene("E2", [(S._INTAKE_DRAFTS, C1, _intake("awaiting_approval"))])
+    S._INTAKE_DRAFTS[C1] = _intake("awaiting_approval", client="New Y", ic_msg_ids=[801], ts=NOW - 5)
+    r_c, raw_b = _to_c(p, blocker)
+    dr = S._INTAKE_DRAFTS.get(C1)
+    assert dr is not None and dr["client"] == "New Y" and dr["ic_msg_ids"] == [801], (r_c, dr)
+    assert S._ic_reply_binding(_reply(801), dr) == "card"
+    assert S._ic_reply_binding(_reply(502), dr) == "other", "реплай на старую карточку X привязался к новой"
+    assert len([e for e in _read(p)["entries"] if e["chat_id"] == C1]) == 1
+
+
+def test_E3_other_chat_and_other_kind_from_carry_kept():
+    """Перенос режется ТОЧЕЧНО: место, занятое в B (бронь C1 booked, выдача H1 activated), старое не получает;
+    прочие места переноса (бронь C2, закрытие R1) доезжают до C."""
+    d, p, blocker = _carry_scene("E3", [(S._INTAKE_DRAFTS, C1, _intake("awaiting_approval")),
+                                        (S._INTAKE_DRAFTS, C2, _intake("awaiting_approval", client="Other Z",
+                                                                       ic_msg_ids=[601])),
+                                        (S._HANDOVER_ACTIVATIONS, H1, _ho("awaiting")),
+                                        (S._RETURN_CLOSES, R1, _cl("awaiting"))])
+    S._INTAKE_DRAFTS[C1] = _intake("booked", client="New Y", ic_msg_ids=[801])
+    S._HANDOVER_ACTIVATIONS[H1] = _ho("activated", row=99)
+    r_c, raw_b = _to_c(p, blocker)
+    assert C1 not in S._INTAKE_DRAFTS and H1 not in S._HANDOVER_ACTIVATIONS, (r_c, S._INTAKE_DRAFTS.keys())
+    z = S._INTAKE_DRAFTS.get(C2)
+    assert z is not None and z["client"] == "Other Z" and z["status"] == "awaiting_approval", (r_c, z)
+    assert R1 in S._RETURN_CLOSES and S._RETURN_CLOSES[R1]["ts"] == NOW - 900.75, r_c
+
+
+def test_E4_carry_twin_no_new_card_old_card_arrives():
+    """Близнец E1: в B место свободно — старая X доезжает до C (перенос жив, а не выключен)."""
+    d, p, blocker = _carry_scene("E4", [(S._INTAKE_DRAFTS, C1, _intake("awaiting_approval"))])
+    r_c, raw_b = _to_c(p, blocker)
+    dr = S._INTAKE_DRAFTS.get(C1)
+    assert dr is not None and dr["client"] == "Test Client" and S._ic_reply_binding(_reply(502), dr) == "card", r_c
+
+
+def test_E5_carry_kept_across_double_stop():
+    """Попытка сломать: двойной on_stop в B (как в B6) не должен терять перенесённую карточку."""
+    d, p, blocker = _carry_scene("E5", [(S._INTAKE_DRAFTS, C1, _intake("awaiting_approval"))])
+    _stop()
+    first = [e["chat_id"] for e in _read(p)["entries"]]
+    _stop()
+    second = [e["chat_id"] for e in _read(p)["entries"]]
+    assert first == [C1] and second == [C1], (first, second)
+
+
+# =====================================================================================================================
 
 TESTS = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
 

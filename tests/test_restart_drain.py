@@ -101,7 +101,7 @@ def _fresh():
                bot._ALBUM_INFLIGHT):
         st.clear()
     bot._ALBUM_PROCESSING.clear()
-    S._HANDOFF_SEEN.update(applied_sha=None, unapplied=False)
+    S._HANDOFF_SEEN.update(applied_sha=None, unapplied=False, carry=[])
     bot._SHUTDOWN_T0 = None
     LOGS.clear()
 
@@ -119,7 +119,7 @@ def _restart_same_path():
     """Тот же файл, новый процесс: память пуста, флаги рук сброшены."""
     for st in (S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES):
         st.clear()
-    S._HANDOFF_SEEN.update(applied_sha=None, unapplied=False)
+    S._HANDOFF_SEEN.update(applied_sha=None, unapplied=False, carry=[])
 
 
 def _draft(status="awaiting_approval"):
