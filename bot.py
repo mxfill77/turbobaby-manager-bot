@@ -20,8 +20,10 @@ import json
 import asyncio
 import functools
 import re
+import signal
 import tempfile
 from datetime import time as dtime, datetime
+from time import monotonic as _mono
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -128,7 +130,18 @@ _bg_tasks = set()
 _ALBUM_BUF = {}          # mgid -> {"updates": [Update,...], "context": ctx}
 _ALBUM_TIMERS = {}       # mgid -> asyncio.Task (дебаунс; держим ссылку, см. _bg_tasks-правило)
 _ALBUM_PROCESSING = set()  # mgid в обработке — защита от двойного прогона одного альбома
+_ALBUM_INFLIGHT = {}     # mgid -> asyncio.Task, чей прогон _route_photos идёт сейчас (единственный владелец альбома)
 ALBUM_WINDOW = 1.8       # окно склейки альбома, сек
+
+# === Штатная остановка (Codex TB-CHECK-1610-0742) ===
+# PTB 22.7 при SIGTERM: updater.stop (приём прекращён, новые входы остаются в Telegram) → app.stop (очередь доработана,
+# ждёт только app.create_task) → post_stop → shutdown → loop.close. Таймеры альбомов — обычные задачи, PTB их не ждёт:
+# on_stop доводит альбомы и пишет передачу ждущих карточек, укладываясь в бюджет ВСЕЙ остановки от сигнала (юнит:
+# TimeoutStopSec 90 с; резерв — на передачу и shutdown). Это штатный graceful restart, не сохранность при SIGKILL/OOM.
+SHUTDOWN_BUDGET_SEC = float(os.getenv("SHUTDOWN_BUDGET_SEC", "90") or 90)
+SHUTDOWN_RESERVE_SEC = 15.0
+SHUTDOWN_FALLBACK_SEC = 30.0   # начало остановки неизвестно (сигнал не наш) — бюджет от входа в хук
+_SHUTDOWN_T0 = None            # _mono() сигнала остановки (ставит _on_stop_signal)
 
 
 async def post_audit_card(context, card: dict):
@@ -1329,6 +1342,17 @@ async def on_startup(app: Application):
     log.info(f"  Timezone: {TZ_NAME}")
     log.info(f"  Daily pulse at: {DAILY_HOUR:02d}:{DAILY_MINUTE:02d}")
 
+    # Передача ждущих карточек от прежнего процесса (Codex TB-CHECK-1610-0742): post_init идёт ДО начала опроса, так что
+    # восстановленное на месте раньше первого входа. Сообщений не шлёт, действий не совершает.
+    log.info(f"  🔁 передача карточек: {splinter.handoff_restore()}")
+    # Метка начала остановки для бюджета дренажа: тот же SystemExit, что у PTB, плюс время сигнала.
+    try:
+        _loop = asyncio.get_running_loop()
+        for _sig in (signal.SIGTERM, signal.SIGINT):
+            _loop.add_signal_handler(_sig, _on_stop_signal)
+    except (NotImplementedError, RuntimeError, AttributeError, ValueError) as e:
+        log.warning(f"  🛑 сигнал остановки: метка начала недоступна ({type(e).__name__}) — бюджет дренажа от входа в хук")
+
     # Проверяем Bridge
     ping = bridge.ping()
     if ping.get("ok"):
@@ -1409,25 +1433,103 @@ def _arm_album_timer(mgid):
     t.add_done_callback(_bg_tasks.discard)
 
 
-async def _album_flush(mgid):
-    """Сработка таймера: забрать накопленный альбом и обработать ОДИН раз пачкой фото."""
-    try:
-        await asyncio.sleep(ALBUM_WINDOW)
-    except asyncio.CancelledError:
-        return  # пришло ещё фото — таймер пере-взведён, этот прогон отменён
-    _ALBUM_TIMERS.pop(mgid, None)
+def _album_take(mgid):
+    """ЕДИНСТВЕННЫЙ захват альбома (его зовут и таймер, и дренаж остановки): снять из буфера и пометить «в обработке».
+    Уже в обработке — None (защита от двойного прогона); пусто — None."""
     if mgid in _ALBUM_PROCESSING:
-        return  # уже обрабатывается — защита от двойного прогона
+        return None
     entry = _ALBUM_BUF.pop(mgid, None)
     if not entry or not entry.get("updates"):
-        return
+        return None
     _ALBUM_PROCESSING.add(mgid)
+    return entry
+
+
+async def _album_run(mgid, entry):
+    """Прогон захваченного альбома — ровно один раз; владелец снимается в finally."""
+    _ALBUM_INFLIGHT[mgid] = asyncio.current_task()
     try:
         await _route_photos(entry["context"], entry["updates"])
     except Exception:
         log.exception(f"album flush error (mgid={mgid})")
     finally:
         _ALBUM_PROCESSING.discard(mgid)
+        _ALBUM_INFLIGHT.pop(mgid, None)
+
+
+async def _album_flush(mgid):
+    """Сработка таймера: забрать накопленный альбом и обработать ОДИН раз пачкой фото."""
+    try:
+        await asyncio.sleep(ALBUM_WINDOW)
+    except asyncio.CancelledError:
+        return  # пришло ещё фото — таймер пере-взведён, этот прогон отменён (буфер не тронут)
+    _ALBUM_TIMERS.pop(mgid, None)
+    entry = _album_take(mgid)
+    if entry is None:
+        return
+    await _album_run(mgid, entry)
+
+
+async def _album_drain(deadline):
+    """Довести альбомы до остановки (deadline — _mono()). → счётчики.
+    1) спящие таймеры — отменить и ДОЖДАТЬСЯ (они выходят на CancelledError, буфер не трогают);
+    2) прогоны в работе — дождаться, НЕ отменяя (прерванный прогон хуже недоведённого);
+    3) буфер — захватить тем же _album_take и прогнать самому: один владелец, второго _route_photos нет.
+    Не успели к deadline — названо числом и НЕ отменяется (честно: дальше PTB закроет цикл)."""
+    def left():
+        return max(0.0, deadline - _mono())
+    timers = [t for t in _ALBUM_TIMERS.values() if not t.done()]
+    for t in timers:
+        t.cancel()
+    if timers:
+        await asyncio.wait(timers, timeout=left())
+    for m in [m for m, t in list(_ALBUM_TIMERS.items()) if t.done()]:
+        _ALBUM_TIMERS.pop(m, None)
+    inflight = [t for t in _ALBUM_INFLIGHT.values() if not t.done()]
+    if inflight:
+        await asyncio.wait(inflight, timeout=left())
+    runs = []
+    for mgid in list(_ALBUM_BUF):
+        entry = _album_take(mgid)
+        if entry is not None:
+            t = asyncio.create_task(_album_run(mgid, entry))
+            _bg_tasks.add(t)
+            t.add_done_callback(_bg_tasks.discard)
+            runs.append(t)
+    if runs:
+        await asyncio.wait(runs, timeout=left())
+    late = [t for t in inflight + runs if not t.done()]
+    return {"timers": len(timers), "inflight": len(inflight), "buffered": len(runs),
+            "done": len(inflight) + len(runs) - len(late), "late": len(late), "left_in_buffer": len(_ALBUM_BUF)}
+
+
+def _on_stop_signal():
+    """Сигнал остановки: метка начала (бюджет всей остановки) и тот же SystemExit, что у PTB `_raise_system_exit`."""
+    global _SHUTDOWN_T0
+    if _SHUTDOWN_T0 is None:
+        _SHUTDOWN_T0 = _mono()
+    raise SystemExit
+
+
+async def on_stop(app: Application):
+    """post_stop: PTB зовёт после updater.stop и app.stop, до shutdown (бот ещё открыт). Довести альбомы → записать
+    передачу ждущих карточек → одна машинная строка «🛑 дренаж остановки» (её требует скрипт рестарта)."""
+    t_hook = _mono()
+    t0 = _SHUTDOWN_T0
+    if t0 is not None:
+        deadline, since = t0 + SHUTDOWN_BUDGET_SEC - SHUTDOWN_RESERVE_SEC, f"{t_hook - t0:.1f}"
+    else:
+        deadline, since = t_hook + SHUTDOWN_FALLBACK_SEC, "неизвестно"
+    try:
+        c = await _album_drain(deadline)
+        drain = (f"таймеров {c['timers']}, в обработке {c['inflight']}, из буфера {c['buffered']} → доведено "
+                 f"{c['done']}, не успели {c['late'] + c['left_in_buffer']}")
+    except Exception as e:                                           # noqa: BLE001
+        log.exception("  🛑 дренаж альбомов: сбой")
+        drain = f"СБОЙ ({type(e).__name__})"
+    h, n, sha = splinter.handoff_write()
+    log.info(f"  🛑 дренаж остановки: от сигнала {since} с из {SHUTDOWN_BUDGET_SEC:.0f}; альбомы: {drain}; "
+             f"передача карточек: {h}" + (f" {n} (sha {sha})" if n is not None else ""))
 
 
 async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):
@@ -1542,6 +1644,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(on_startup)
+        .post_stop(on_stop)
         .build()
     )
 

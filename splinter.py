@@ -41,6 +41,7 @@ import work_name       # история обслуживания: слова м�
 import card_works      # «в работе»: ОДИН список на обе половины; доказанно записанное уходит
 import works_ledger    # сторож партии: принято N · записано M, каждая не легшая позиция — поимённо
 import works_persist   # журнал принятых работ на диске: переживает рестарт и истечение TTL буфера
+import restart_handoff as _rh   # передача ждущих карточек следующему процессу при штатной остановке (post_stop/post_init)
 import service_debt    # долг принятой работы: строка ДО показа кнопки; гаснет только доказанным
 import hint_dedup      # замок повторных подсказок: байк × вид × СОСТОЯНИЕ, одна дверь на 15 мест
 import odo_fresh       # срок годности подтверждённого пробега: не спрашиваем число, которое знаем
@@ -3995,6 +3996,102 @@ def _wl_save(state):
     except Exception as e:                                           # noqa: BLE001
         log.error(f"  ⚠️ журнал принятых работ НЕ записался ({e}) — "
                   f"приём работ помнит только память процесса, до рестарта")
+
+
+# === ПЕРЕДАЧА ЖДУЩИХ КАРТОЧЕК ПРИ ШТАТНОЙ ОСТАНОВКЕ (Codex TB-CHECK-1610-0742) ===
+# Решения — `restart_handoff` (чистое); здесь руки: файл передачи, метка применения, журнал. Образец — журнал принятых
+# работ выше: атомарная запись (временный файл → os.replace), «не прочитан» ≠ «пуст», в тестах свой файл на процесс.
+# Файл передачи пишет post_stop ВСЕГДА, в том числе пустой: он = состояние последней штатной остановки. Метка применения
+# (`<файл>.applied`) пишется ДО того, как записи впишутся в память, а post_init идёт до начала опроса: повторный старт с
+# той же передачей не оживит закрытую карточку. Неприменённая передача не затирается — переименовывается рядом.
+_HANDOFF_SEEN = {"applied_sha": None, "unapplied": False}
+
+
+def _handoff_path():
+    p = os.getenv("RESTART_HANDOFF_STATE")
+    if not p:
+        p = (f"/tmp/restart_handoff_test_{os.getpid()}.json" if any(os.getenv(m) for m in _HINT_TEST_MARKS)
+             else os.path.join(os.path.dirname(os.path.abspath(__file__)), "restart_handoff.json"))
+    return p
+
+
+def _handoff_dump(path, obj):
+    """Атомарно и только для владельца (0600): временный файл → fsync → os.replace."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _handoff_read(path):
+    """→ (объект | None, прочитан ли). Файла нет — (None, True): честно пусто. Не прочитан — (None, False)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f), True
+    except FileNotFoundError:
+        return None, True
+    except Exception as e:                                           # noqa: BLE001
+        log.error(f"  ⚠️ передача карточек: {os.path.basename(path)} НЕ прочитан ({type(e).__name__})")
+        return None, False
+
+
+def handoff_restore(now=None):
+    """post_init, ДО опроса: передача → проверка → решение по метке → метка применения → память. Сообщений не шлёт,
+    действий не совершает. → строка-итог для журнала; не бросает."""
+    path = _handoff_path()
+    try:
+        obj, read = _handoff_read(path)
+        if obj is None and read:
+            return "передачи нет"
+        if not read:
+            _HANDOFF_SEEN["unapplied"] = True
+            return "НЕ применена: файл не прочитан — сохранён как есть"
+        entries, why = _rh.verify(obj)
+        if entries is None:
+            _HANDOFF_SEEN["unapplied"] = True
+            return f"НЕ применена: {why} — файл сохранён как есть"
+        marker, mread = _handoff_read(path + ".applied")
+        if not mread:
+            _HANDOFF_SEEN["unapplied"] = True
+            return "НЕ применена: метка применения не прочитана — повтором не рискую, файл сохранён"
+        ok, why = _rh.decide(obj["sha256"], marker)
+        if not ok:
+            _HANDOFF_SEEN["applied_sha"] = obj["sha256"]
+            return f"повторно не применяю: {why} (sha {obj['sha256'][:8]})"
+        todo, counts = _rh.plan(entries, _INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES)
+        _handoff_dump(path + ".applied", {"sha256": obj["sha256"], "pid": os.getpid(),
+                                          "at": now if now is not None else _time.time(), "counts": counts})
+        _rh.apply(todo)
+        _HANDOFF_SEEN["applied_sha"] = obj["sha256"]
+        return (f"применена (sha {obj['sha256'][:8]}): брони {counts['intake']} · выдачи {counts['handover']} · "
+                f"закрытия {counts['close']} · занятых мест {counts['conflict']}")
+    except Exception as e:                                           # noqa: BLE001
+        _HANDOFF_SEEN["unapplied"] = True
+        log.exception("  ⚠️ передача карточек: сбой восстановления")
+        return f"НЕ применена: сбой ({type(e).__name__}) — файл сохранён"
+
+
+def handoff_write(now=None):
+    """post_stop: ждущие карточки → файл передачи (атомарно, 0600). Неприменённый прежний файл не затирается, а
+    переименовывается рядом. → (итог, число записей | None, sha8); не бросает."""
+    path = _handoff_path()
+    try:
+        if _HANDOFF_SEEN["unapplied"] and os.path.exists(path):
+            stem = path[:-5] if path.endswith(".json") else path
+            keep = f"{stem}.unapplied-{int(_time.time())}-{os.getpid()}.json"
+            os.replace(path, keep)
+            log.error(f"  ⚠️ передача карточек: неприменённый файл сохранён как {os.path.basename(keep)}")
+            _HANDOFF_SEEN["unapplied"] = False
+        entries = _rh.select(_INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES)
+        obj = _rh.pack(entries, written_at=now if now is not None else _time.time(), pid=os.getpid())
+        _handoff_dump(path, obj)
+        return "записана", len(entries), obj["sha256"][:8]
+    except Exception as e:                                           # noqa: BLE001
+        log.exception("  ⚠️ передача карточек: НЕ записана")
+        return f"НЕ записана ({type(e).__name__})", None, ""
 
 
 def _wl_accept(chat_id, topic_id, bike, works):
