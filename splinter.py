@@ -4004,7 +4004,9 @@ def _wl_save(state):
 # Файл передачи пишет post_stop ВСЕГДА, в том числе пустой: он = состояние последней штатной остановки. Метка применения
 # (`<файл>.applied`) пишется ДО того, как записи впишутся в память, а post_init идёт до начала опроса: повторный старт с
 # той же передачей не оживит закрытую карточку. Неприменённая передача не затирается — переименовывается рядом.
-_HANDOFF_SEEN = {"applied_sha": None, "unapplied": False}
+# carry — записи ПРОВЕРЕННОЙ передачи, которую не удалось применить из-за сбоя записи метки: они не вписаны в память
+# этого процесса (иначе падение без новой передачи оживило бы их повторно) и уходят в его следующую передачу (приёмка C6).
+_HANDOFF_SEEN = {"applied_sha": None, "unapplied": False, "carry": []}
 
 
 def _handoff_path():
@@ -4062,8 +4064,17 @@ def handoff_restore(now=None):
             _HANDOFF_SEEN["applied_sha"] = obj["sha256"]
             return f"повторно не применяю: {why} (sha {obj['sha256'][:8]})"
         todo, counts = _rh.plan(entries, _INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES)
-        _handoff_dump(path + ".applied", {"sha256": obj["sha256"], "pid": os.getpid(),
-                                          "at": now if now is not None else _time.time(), "counts": counts})
+        try:
+            _handoff_dump(path + ".applied", {"sha256": obj["sha256"], "pid": os.getpid(),
+                                              "at": now if now is not None else _time.time(), "counts": counts})
+        except Exception as e:                                       # noqa: BLE001
+            # Не применяем (без метки падение оживило бы их повторно), но и не теряем: записи проверены и не
+            # применялись никем (метка прочитана, sha другой) — уходят в следующую передачу этого процесса.
+            _HANDOFF_SEEN["unapplied"] = True
+            _HANDOFF_SEEN["carry"] = list(entries)
+            log.error(f"  ⚠️ передача карточек: метку применения не записать ({type(e).__name__})")
+            return (f"НЕ применена: метку не записать ({type(e).__name__}) — записи {len(entries)} перейдут в "
+                    f"следующую передачу, файл сохранён")
         _rh.apply(todo)
         _HANDOFF_SEEN["applied_sha"] = obj["sha256"]
         return (f"применена (sha {obj['sha256'][:8]}): брони {counts['intake']} · выдачи {counts['handover']} · "
@@ -4085,9 +4096,11 @@ def handoff_write(now=None):
             os.replace(path, keep)
             log.error(f"  ⚠️ передача карточек: неприменённый файл сохранён как {os.path.basename(keep)}")
             _HANDOFF_SEEN["unapplied"] = False
-        entries = _rh.select(_INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES)
+        entries = _rh.merge(_rh.select(_INTAKE_DRAFTS, _HANDOVER_ACTIVATIONS, _RETURN_CLOSES),
+                            _HANDOFF_SEEN.get("carry"))
         obj = _rh.pack(entries, written_at=now if now is not None else _time.time(), pid=os.getpid())
         _handoff_dump(path, obj)
+        _HANDOFF_SEEN["carry"] = []
         return "записана", len(entries), obj["sha256"][:8]
     except Exception as e:                                           # noqa: BLE001
         log.exception("  ⚠️ передача карточек: НЕ записана")

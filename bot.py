@@ -1489,8 +1489,8 @@ async def _album_drain(deadline):
     if inflight:
         await asyncio.wait(inflight, timeout=left())
     runs = []
-    for mgid in list(_ALBUM_BUF):
-        entry = _album_take(mgid)
+    for mgid in list(_ALBUM_BUF if left() > 0 else ()):   # срок вышел — новых прогонов не начинаем (без надзора
+        entry = _album_take(mgid)                          # они шли бы во время закрытия PTB); остаются «не успели»
         if entry is not None:
             t = asyncio.create_task(_album_run(mgid, entry))
             _bg_tasks.add(t)

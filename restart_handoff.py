@@ -63,14 +63,22 @@ def _canon(entries):
     return json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def digest(entries):
-    return hashlib.sha256(_canon(entries).encode("utf-8")).hexdigest()
+def digest(body):
+    """sha256 канонического вида ВСЕГО тела передачи (версия, когда, кем, число, записи). Не одних записей: процесс,
+    переписавший то же содержимое при своей штатной остановке, обязан дать НОВЫЙ отпечаток — иначе метка его же
+    восстановления совпала бы, и следующий старт молча пропустил бы карточку, ждущую через два рестарта (приёмка C7)."""
+    return hashlib.sha256(_canon(body).encode("utf-8")).hexdigest()
+
+
+def _body(obj):
+    return {k: obj.get(k) for k in ("version", "written_at", "pid", "count", "entries")}
 
 
 def pack(entries, *, written_at, pid):
-    """Тело файла передачи: версия, когда и кем записано, записи и sha256 их канонического вида."""
-    return {"version": VERSION, "written_at": written_at, "pid": pid, "count": len(entries),
-            "entries": entries, "sha256": digest(entries)}
+    """Тело файла передачи: версия, когда и кем записано, записи и sha256 всего тела."""
+    obj = {"version": VERSION, "written_at": written_at, "pid": pid, "count": len(entries), "entries": entries}
+    obj["sha256"] = digest(obj)
+    return obj
 
 
 def verify(obj):
@@ -84,7 +92,7 @@ def verify(obj):
         return None, "нет списка записей"
     if obj.get("count") != len(entries):
         return None, "число записей %r не равно %d" % (obj.get("count"), len(entries))
-    if obj.get("sha256") != digest(entries):
+    if obj.get("sha256") != digest(_body(obj)):
         return None, "контрольная сумма не сошлась"
     seen = set()
     for e in entries:
@@ -103,8 +111,9 @@ def verify(obj):
 
 
 def decide(handoff_sha, marker):
-    """Применять ли передачу. Метка применения с ТЕМ ЖЕ sha = её уже применил прежний процесс: он мог закрыть карточку
-    и упасть без новой передачи — повторное применение оживило бы завершённое. Тогда — нет; иначе — да."""
+    """Применять ли передачу. Метка применения с ТЕМ ЖЕ sha = ЭТОТ ЖЕ файл уже применил прежний процесс: он мог закрыть
+    карточку и упасть без новой передачи — повторное применение оживило бы завершённое. Тогда — нет; иначе — да.
+    Штатная остановка всегда пишет НОВЫЙ файл с новым sha (время и pid в теле), поэтому ждущая карточка переходит дальше."""
     if isinstance(marker, dict) and marker.get("sha256") == handoff_sha:
         return False, "уже применена процессом %s" % marker.get("pid")
     return True, "ok"
@@ -122,6 +131,13 @@ def plan(entries, intake, handovers, closes):
         todo.append((store, e["chat_id"], json.loads(json.dumps(e["data"]))))   # своя копия значений
         counts[e["kind"]] += 1
     return todo, counts
+
+
+def merge(current, carry):
+    """Записи текущей памяти + перенесённые из неприменённой (проверенной) передачи на ещё не занятые места. Текущее
+    сильнее: одна карточка на место, новая карточка процесса заменяет старую так же, как в обычной работе."""
+    have = {(e["kind"], e["chat_id"]) for e in current}
+    return list(current) + [e for e in (carry or []) if (e["kind"], e["chat_id"]) not in have]
 
 
 def apply(todo):
