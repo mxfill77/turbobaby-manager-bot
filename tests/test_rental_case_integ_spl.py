@@ -488,7 +488,9 @@ def child_off():
     out["ho_card"] = [s.text for s in cards("Активирую")]
     out["ho_pending_row"] = (S._HANDOVER_ACTIVATIONS.get(INTAKE) or {}).get("row")
     out["ho_state_booking"] = [k.get("booking_id") for k in b.red("state_set")]
-    intake(b, "да", uname="deramor", uid=None)
+    # APPROVEFIX1610: «да» засчитывается только реплаем на карточку выдачи (id сохраняется при отправке)
+    _ho_cards = cards("Активирую")
+    intake(b, "да", reply_to=_ho_cards[-1] if _ho_cards else None, uname="deramor", uid=None)
     out["ho_activated"] = b.red("activate_booking")
     reset()
     b = Bridge([row_cur(row=600, name="Новый", date_start=dt(-1)), row_cur(row=500, name="Старый", date_start=dt(-9))])
@@ -566,7 +568,8 @@ class T00FlagsOff(K4SplCase):
         self.assertIn("строка 22", got["ho_card"][0], "OFF: карточка выдачи по cand[-1]")
         self.assertEqual(got["ho_pending_row"], 22)
         self.assertEqual(got["ho_state_booking"], ["bk-fut"], "OFF: state выдачи — свежайшая date_start")
-        self.assertEqual(len(got["ho_activated"]), 1, "OFF: «да» без реплая исполняется по-прежнему")
+        self.assertEqual(len(got["ho_activated"]), 1,
+                         "OFF: «да» реплаем на карточку выдачи исполняется (APPROVEFIX1610: без реплая — уточнение)")
         self.assertEqual(len(got["ret_card"]), 1, got)
         self.assertIn("Новый", got["ret_card"][0], "OFF: две «В аренде» — свежайшая date_start (прежний голден)")
         self.assertEqual(got["booked"], 1, "OFF: «да» на карточку брони пишет бронь по-прежнему")
@@ -752,7 +755,8 @@ class T06Case(K4SplCase):
         b = Bridge([row_today()])
         do_handover(b)
         self.assertEqual(S._HANDOVER_ACTIVATIONS[INTAKE]["status"], "awaiting")
-        intake(b, "да", uname="deramor", uid=None)
+        # APPROVEFIX1610: «да» засчитывается только реплаем на карточку выдачи (id сохраняется при отправке)
+        intake(b, "да", reply_to=cards("Активирую")[-1], uname="deramor", uid=None)
         self.assertEqual(len(b.red("activate_booking")), 1, "нет хранилища — шаг 6 молчит, прежний путь цел")
 
     def test_r2_booking_taken_only_through_resolve(self):

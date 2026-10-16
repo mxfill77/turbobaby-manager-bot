@@ -2,7 +2,7 @@
 Моки: handover в «Обслуживании» → карточка подтверждения в INTAKE_CHAT → «да» авторизатора →
 activate_booking под билетом 4.2 (с date_start) → ✅; «нет» → ничего не записано; брони нет →
 ⚠️ без падения; не-авторизатор → игнор. Сеть/LLM/_send замоканы."""
-import os, sys, json, asyncio, datetime
+import os, sys, json, asyncio, datetime, types
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 import splinter as S
@@ -14,11 +14,12 @@ DATE_START = "2026-07-08 10:00"
 class U:
     def __init__(s, uname="extthiwxer"): s.username = uname; s.is_bot = False
 class Msg:
-    def __init__(s, text, chat_id=SERV_CHAT, uname="extthiwxer", photo=False):
+    def __init__(s, text, chat_id=SERV_CHAT, uname="extthiwxer", photo=False, reply=None):
         s.text = text; s.caption = None; s.photo = ([object()] if photo else None)
         s.chat_id = chat_id; s.message_thread_id = (TOPIC if chat_id == SERV_CHAT else None)
         s.date = datetime.datetime(2026, 7, 8, 8, 0, tzinfo=datetime.timezone.utc)
-        s.message_id = 777; s.from_user = U(uname); s.reply_to_message = None
+        # APPROVEFIX1610: «да/нет» засчитываются только РЕПЛАЕМ на карточку — reply = отправленная карточка
+        s.message_id = 777; s.from_user = U(uname); s.reply_to_message = reply
 class Ctx:
     class B: username = "turbobaby_manager_bot"
     bot = B()
@@ -51,7 +52,15 @@ BOOKING_ROW = {"row": 17, "status": "Бронь", "bike": BIKE, "name": "Ива�
                "date_start": DATE_START, "date_end": "2026-07-15 10:00", "booking_id": "b-1"}
 
 SENDS = []
-async def rec_send(context, *, chat_id, text, message_thread_id=None, **k): SENDS.append((chat_id, text))
+SENT_MSGS = []          # APPROVEFIX1610: отправка возвращает сообщение с id (как PTB send_message) — для реплая
+_MID = [5000]
+async def rec_send(context, *, chat_id, text, message_thread_id=None, **k):
+    SENDS.append((chat_id, text)); _MID[0] += 1
+    m = types.SimpleNamespace(message_id=_MID[0], chat_id=chat_id, text=text); SENT_MSGS.append(m)
+    return m
+def card_msg(word="Активирую"):
+    ms = [m for m in SENT_MSGS if m.chat_id == INTAKE and word in m.text]
+    return ms[-1] if ms else None
 async def rec_pass(*a, **k): pass
 async def rec_dl(pm): return b"x"
 S._send = rec_send; S._send_bike_card = rec_pass; S._after_mileage = rec_pass
@@ -62,7 +71,7 @@ HO_PARSE = {"type": "event", "event_type": "handover", "bike": BIKE,
             "fuel": "", "mileage": "", "works": []}
 
 def reset():
-    SENDS.clear(); S._HANDOVER_ACTIVATIONS.clear(); S._HO_ACT_WARN_TS.clear()
+    SENDS.clear(); SENT_MSGS.clear(); S._HANDOVER_ACTIVATIONS.clear(); S._HO_ACT_WARN_TS.clear()
     S._INTAKE_DRAFTS.clear(); S._CARD_LAST.clear(); S._PENDING_WORKS.clear()
 def run(c): return asyncio.run(c)
 def intake_sends(): return [t for c, t in SENDS if c == INTAKE]
@@ -78,7 +87,7 @@ def test_happy_path_yes():
     assert "Иван Тест" in cards[0] and "строка 17" in cards[0]
     assert S._HANDOVER_ACTIVATIONS[INTAKE]["status"] == "awaiting"
     assert b.states, "state-путь Bot Data должен отработать как раньше (дополнение, не замена)"
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor", reply=card_msg()), Ctx(), b, None))
     assert b.activated == [{"bike": BIKE, "name": "Иван Тест", "date_start": DATE_START}], \
         f"activate должен уйти с date_start: {b.activated}"
     assert b.tickets == 1, "красный шаг — строго под билетом 4.2"
@@ -89,7 +98,7 @@ def test_happy_path_yes():
 def test_no_cancels():
     reset(); b = FakeBridge(clients=[BOOKING_ROW])
     do_handover(b)
-    run(S._handle_intake(Msg("нет", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(Msg("нет", chat_id=INTAKE, uname="deramor", reply=card_msg()), Ctx(), b, None))
     assert b.activated == [], "на «нет» записи в CRM быть не должно"
     assert S._HANDOVER_ACTIVATIONS[INTAKE]["status"] == "rejected"
     assert any("отменил" in t.lower() for t in intake_sends()), f"{SENDS}"
@@ -109,7 +118,7 @@ def test_no_booking_warns():
 def test_non_approver_ignored():
     reset(); b = FakeBridge(clients=[BOOKING_ROW])
     do_handover(b)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="pym_thai"), Ctx(), b, None))
+    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="pym_thai", reply=card_msg()), Ctx(), b, None))
     assert b.activated == [], "Пым/тайцы не авторизуют — «да» не-аппрувера игнорируется (§9)"
     assert S._HANDOVER_ACTIVATIONS[INTAKE]["status"] == "awaiting", "запрос остаётся ждать аппрувера"
 
@@ -132,7 +141,7 @@ def test_ttl_expired():
     reset(); b = FakeBridge(clients=[BOOKING_ROW])
     do_handover(b)
     S._HANDOVER_ACTIVATIONS[INTAKE]["ts"] -= (S._HO_ACT_TTL + 60)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor", reply=card_msg()), Ctx(), b, None))
     assert b.activated == [], "просроченный запрос активации исполняться не должен"
 
 # ---- err от Bridge → честная ошибка, статус error ----
@@ -142,7 +151,7 @@ def test_bridge_error_honest():
         return {"ok": False, "error": "booking_not_found", "message": "не найдена"}
     b.activate_booking = bad_activate
     do_handover(b)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor", reply=card_msg()), Ctx(), b, None))
     assert any("❌ Активация не прошла" in t and "booking_not_found" in t for t in intake_sends()), f"{SENDS}"
     assert S._HANDOVER_ACTIVATIONS[INTAKE]["status"] == "error"
 

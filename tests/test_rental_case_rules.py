@@ -521,7 +521,9 @@ SIGNATURES = {
     "cash_claimants": ["cash_fact", "same_plate_rows", "params"],
     "bind_cash": ["cash_fact", "rental", "same_plate_rows", "params", "human"],
     "answer_verdict": ["exp", "case", "post", "answer", "params"],
-    "approval_decision": ["text", "params"],
+    # APPROVEFIX1610 (Codex TB-OWNER-EFFICIENCY-1610-2054: «в К4 передавать action в решение»): необязательное действие
+    # карточки; осознанное расширение сигнатуры §6, прежние вызовы (text, params) не меняются
+    "approval_decision": ["text", "params", "action"],
     "accept_decision": ["text", "params"],
     "stage_allowed": ["task", "binding", "stage", "evidence", "prior", "used_refs", "answers", "other_rows",
                       "params"],
@@ -1575,8 +1577,13 @@ class TestWords(K4Case):
     def test_yes_whole_word_only(self):
         for text in ("дай подумать", "дальше", "окно", "окей", "надо", "доклад"):
             self.assertEqual(self.ad(text), "unclear", "«да/ок» — только целым словом: %r" % text)
-        for text in ("ДА!", "Ок", "ёлки, да", "подтверждено", "закрывай", "активируй", "ставь бронь", "заверши"):
+        for text in ("ДА!", "Ок", "закрывай", "активируй", "заверши"):
             self.assertEqual(self.ad(text), "yes", text)
+        # APPROVEFIX1610 (карта М4, Codex TB-OWNER-EFFICIENCY-1610-2054): прежний голден «ёлки, да», «подтверждено»,
+        # «ставь бронь» → yes пересмотрен осознанно — постороннее слово рядом с согласием и форма-состояние основы
+        # («подтверждено») согласием не являются (как у строгой брони intake_confirm: ASK, test_intake_confirm TRAPS)
+        for text in ("ёлки, да", "подтверждено", "ставь бронь"):
+            self.assertEqual(self.ad(text), "unclear", text)
 
     def test_word_lists_come_from_params(self):
         """§4.8/§10: списки слов — параметры; нормализация ё→е применяется к тексту."""

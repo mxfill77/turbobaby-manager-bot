@@ -23,6 +23,16 @@ NO (отказ) — только ЯСНЫЙ: отказ стоит первым,
 `outcome(res, sent)` — исход вызова `create_booking` тремя словами (+ прежний duplicate): записано · не
 записано (мост сам вынес отказ ДО записи) · НЕИЗВЕСТНО (ответ потерян, а POST мог исполниться). Сомнение — в
 «неизвестно»: незнакомый или пустой код, ответ не словарь, исключение после отправки.
+
+APPROVEFIX1610 (16.10.2026, Codex TB-OWNER-EFFICIENCY-1610-2054, карта QUEUE4_INTAKE_SUBSTR_MAP М1–М6) — карточки
+ВЫДАЧИ и ПРИЁМА тем же разбором:
+  * `decide(text, extra_consent, extra_neg_stems, extra_near_stems)` — слова действия карточки. Без них (по умолчанию)
+    поведение брони то же до байта: дополнения только расширяют словари, порядок и правила прежние;
+  * `km_arg(text)` — пробег сдачи: ровно одно число целиком (без усечения; допустима группировка «35 300»), длина —
+    прежний диапазон разбора Splinter 2–7 цифр (не новая норма). Второе число, длинное число, одна цифра — пробега нет;
+  * `red_outcome(res, sent, action)` — исход activate_booking/close_booking тремя словами. Список «мост отказал ДО
+    записи» у каждого действия СВОЙ, снят с контракта bridge_prod (Booking.js activateBooking/closeBooking, Bridge.js);
+    список брони сюда не переносится.
 """
 import re
 
@@ -82,6 +92,34 @@ _PLUS_ONLY = r"\s*\+{1,3}\s*1?\s*"
 
 _TOKEN = r"[a-zа-я0-9]+"
 
+# ---- APPROVEFIX1610: слова карточек выдачи и приёма (дополняют словари проекта, брони не касаются) -------------------
+# Согласие — только повелительные и «мы»-формы действия карточки; «не» + слово с основы — отказ; слово с основы, не
+# названное согласием («завершена?», «завершу сам», «активировал»), — почти-согласие → переспрос, а не запись.
+ACTIVATE_CONSENT = frozenset({"активируй", "активируйте", "активируем"})
+ACTIVATE_STEMS = ("актив",)
+CLOSE_CONSENT = frozenset({"завершай", "завершайте", "заверши", "завершите", "завершаем",
+                           "закрывай", "закрывайте", "закрываем"})
+CLOSE_STEMS = ("заверш", "закрыв")
+
+# Пробег сдачи (М6): число ЦЕЛИКОМ. Группы по три цифры через пробел (обычный, неразрывный, узкий) — одно число.
+KM_DIGITS_MIN, KM_DIGITS_MAX = 2, 7            # прежний разбор Splinter `\d{2,7}` (splinter.py:13060, :9387)
+_KM_SEP = "    "
+_NUMBER = r"(?<![0-9])(?:[0-9]{1,3}(?:[" + _KM_SEP + r"][0-9]{3})+|[0-9]+)(?![0-9])"
+
+# Мост вынес отказ ДО записи (bridge_prod): общий слой Bridge.js — bad_json :256, no_ticket :285, unknown_action :530;
+# activateBooking — missing_args :319, bike_not_resolved :322, sheet_not_found :326, booking_not_found :352 (строка
+# не тронута); closeBooking — missing_args :381, bike_not_resolved :385, sheet_not_found :389, not_active :423,
+# not_found :427, ambiguous :432, km_required :440, bad_km_end :444, odo_unverifiable :451, odometer_back :457.
+# write_failed (closeBooking :474 — запись могла лечь частью), internal_error (Bridge.js:542) и коды клиента — НЕ здесь.
+RED_NOT_WRITTEN = {
+    "activate": frozenset({"bad_json", "no_ticket", "unknown_action", "missing_args", "bike_not_resolved",
+                           "sheet_not_found", "booking_not_found"}),
+    "close": frozenset({"bad_json", "no_ticket", "unknown_action", "missing_args", "bike_not_resolved",
+                        "sheet_not_found", "not_active", "not_found", "ambiguous", "km_required", "bad_km_end",
+                        "odo_unverifiable", "odometer_back"}),
+}
+WRITTEN = "written"
+
 
 def _adjacent(s, a, b):
     """Смежны ли токены a и b: между ними в строке только пробелы (запятая и иной знак смежность рвут)."""
@@ -96,19 +134,23 @@ def _is_edit_noun(w):
     return w.startswith(EDIT_NOUN_STEMS)
 
 
-def _is_near(w):
-    if w in CONSENT_WORDS:
+_NO_EXTRA = (frozenset(), (), ())       # (согласие, основы отказа после «не», основы почти-согласия) — бронь
+
+
+def _is_near(w, xv=_NO_EXTRA):
+    if w in CONSENT_WORDS or w in xv[0]:
         return False
-    return w in NEAR_CONSENT_WORDS or w.startswith(NEAR_CONSENT_STEMS) or bool(re.fullmatch(_STRETCHED, w))
+    return (w in NEAR_CONSENT_WORDS or w.startswith(NEAR_CONSENT_STEMS) or bool(re.fullmatch(_STRETCHED, w))
+            or bool(xv[2] and w.startswith(xv[2])))
 
 
-def _neg_pair(w2):
+def _neg_pair(w2, xv=_NO_EXTRA):
     """«не» + w2 — отказ (правило (б) проекта + дополнения)."""
-    return (w2 in CONSENT_WORDS or w2 in NEG_REFUSE_NEXT or w2 in NEG_REFUSE_NEXT_EXTRA
-            or w2.startswith(NEG_REFUSE_STEMS) or _is_near(w2))
+    return (w2 in CONSENT_WORDS or w2 in xv[0] or w2 in NEG_REFUSE_NEXT or w2 in NEG_REFUSE_NEXT_EXTRA
+            or w2.startswith(NEG_REFUSE_STEMS) or bool(xv[1] and w2.startswith(xv[1])) or _is_near(w2, xv))
 
 
-def _units(s, toks):
+def _units(s, toks, xv=_NO_EXTRA):
     """Слева направо: единицы [вид, первый токен, последний токен, метка]. Виды: edit · refuse · consent · near ·
     other. Метка «neg» — пара «не + X» (правило (б)), «a» — пара правила (а)."""
     units = []
@@ -126,7 +168,7 @@ def _units(s, toks):
                 units.append(["near", i, i + 1, "bigram"])       # «нет проблем», «без возражений»
                 i += 2
                 continue
-            if w == "не" and _neg_pair(w2):
+            if w == "не" and _neg_pair(w2, xv):
                 units.append(["refuse", i, i + 1, "neg"])        # б) «не ставь», «не надо», «не ок»
                 i += 2
                 continue
@@ -134,9 +176,9 @@ def _units(s, toks):
             kind = "edit"
         elif w in REFUSE_WORDS or w.startswith(REFUSE_STEMS):
             kind = "refuse"
-        elif w in CONSENT_WORDS:
+        elif w in CONSENT_WORDS or w in xv[0]:
             kind = "consent"
-        elif _is_near(w):
+        elif _is_near(w, xv):
             kind = "near"
         elif w == "не" and not adj:
             kind = "refuse"                                      # «Не.», «не, не надо» — разговорное «нет»
@@ -202,9 +244,13 @@ def _residue_ok(s, toks):
     return True
 
 
-def decide(text):
+def decide(text, extra_consent=(), extra_neg_stems=(), extra_near_stems=()):
     """Ответ подтверждающего → YES | NO | EDIT | ASK | SILENT. Каркас — порядок проекта §2.1, дополнения
-    (почти-согласие, ясность отказа, отрицание при правке, белый список знаков рядом с согласием) названы выше."""
+    (почти-согласие, ясность отказа, отрицание при правке, белый список знаков рядом с согласием) названы выше.
+
+    APPROVEFIX1610: необязательные слова действия карточки (выдача — ACTIVATE_*, приём — CLOSE_*): согласие,
+    основы отказа после «не», основы почти-согласия. Без них — бронь, поведение прежнее."""
+    xv = (frozenset(extra_consent), tuple(extra_neg_stems), tuple(extra_near_stems))
     s = str(text or "").lower().replace("ё", "е")
     if re.fullmatch(_PLUS_ONLY, s):
         return ASK                                               # «+», «++», «+1» — как 👍: переспрос
@@ -212,7 +258,7 @@ def decide(text):
     if not toks:
         marks = CONSENT_EMOJI + REFUSE_EMOJI + DOUBT_EMOJI
         return ASK if any(e in s for e in marks) else SILENT
-    units = _units(s, toks)
+    units = _units(s, toks, xv)
     _negated_edits(s, toks, units)
     kinds = {u[0] for u in units}
     consent, refuse, near = "consent" in kinds, "refuse" in kinds, "near" in kinds
@@ -249,5 +295,60 @@ def outcome(res, sent):
     if err == "duplicate":
         return DUPLICATE
     if err in NOT_WRITTEN_ERRORS:
+        return NOT_WRITTEN
+    return UNKNOWN
+
+
+# ---- APPROVEFIX1610: карточки выдачи и приёма -------------------------------------------------------------------------
+def decide_action(text, action):
+    """decide со словами карточки: action ∈ {"activate", "close"}; иное — бронь (без дополнений)."""
+    if action == "activate":
+        return decide(text, ACTIVATE_CONSENT, ACTIVATE_STEMS, ACTIVATE_STEMS)
+    if action == "close":
+        return decide(text, CLOSE_CONSENT, CLOSE_STEMS, CLOSE_STEMS)
+    return decide(text)
+
+
+def km_arg(text):
+    """Пробег сдачи в ответе → (пробег | None, текст без него). Пробег — ровно одно число в тексте, взятое ЦЕЛИКОМ,
+    длиной KM_DIGITS_MIN…KM_DIGITS_MAX цифр (группы «35 300» — одно число). Нет числа, два числа, одна цифра, восемь и
+    больше цифр — пробега нет, текст возвращается как был (число остаётся словом, и согласия «все слова — согласие» не
+    будет). Смысл остального текста здесь не судится — это работа decide."""
+    s = str(text or "")
+    found = list(re.finditer(_NUMBER, s))
+    if len(found) != 1:
+        return None, s
+    m = found[0]
+    digits = "".join(ch for ch in m.group(0) if ch.isdigit())
+    if not (KM_DIGITS_MIN <= len(digits) <= KM_DIGITS_MAX):
+        return None, s
+    return digits, s[:m.start()] + " " + s[m.end():]
+
+
+def calm_rest(text):
+    """Всё, что не слова, — из белого списка YES (как в decide): для чужих словарей слов (К4 rental_case_rules)."""
+    s = str(text or "").lower().replace("ё", "е")
+    return _residue_ok(s, list(re.finditer(_TOKEN, s)))
+
+
+def is_edit_word(w):
+    """Слово о правке (основы проекта + дополнения выпуска) — для чужих словарей слов (К4 rental_case_rules)."""
+    return _is_edit(str(w or "").lower().replace("ё", "е"))
+
+
+def red_outcome(res, sent, action):
+    """Исход activate_booking / close_booking → WRITTEN | NOT_WRITTEN | UNKNOWN.
+
+    sent — вызов состоялся (флаг ставится строго перед ним). NOT_WRITTEN — только код из RED_NOT_WRITTEN[action]
+    (мост отказал ДО записи); исключение после отправки, ответ не словарь, пустой или незнакомый код — UNKNOWN."""
+    if not sent:
+        return NOT_WRITTEN
+    if not isinstance(res, dict):
+        return UNKNOWN
+    if res.get("ok"):
+        return WRITTEN
+    if res.get("outcome") == "unknown":
+        return UNKNOWN
+    if str(res.get("error") or "") in RED_NOT_WRITTEN.get(action, frozenset()):
         return NOT_WRITTEN
     return UNKNOWN

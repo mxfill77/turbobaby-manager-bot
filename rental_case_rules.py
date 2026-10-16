@@ -28,6 +28,7 @@ import json
 import re
 from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import intake_confirm as _IC    # APPROVEFIX1610: знаки вопроса, слова правки, спокойный остаток, пробег (только `re`)
 import wa_agent_tools as _T
 import wa_book_read as _B
 
@@ -1198,10 +1199,30 @@ def _seq(value):
     return tuple(str(v).lower().replace("ё", "е") for v in value)
 
 
-def approval_decision(text: str, params: Mapping[str, Any]) -> str:
+# APPROVEFIX1610: основа согласия засчитывается согласием только с окончанием повелительного наклонения или «я/мы»
+# настоящего времени («подтверждаю», «завершай», «заверши», «завершаем», «ставьте»). «подтверждено», «завершена»,
+# «завершу» — не согласие (сообщение о состоянии, вопрос, обещание сделать руками), а неясный ответ.
+APPROVAL_YES_ENDINGS = ("", "те", "ай", "айте", "и", "ите", "аю", "аем")
+# Глагол ЧУЖОГО действия согласием этой карточки не является: «активируй» реплаем на карточку закрытия, «завершай» — на
+# карточку выдачи или брони — вероятный промах адреса, а не «да» (тот же словарь у строгой ветки 4/5 Splinter:
+# intake_confirm.ACTIVATE_CONSENT / CLOSE_CONSENT). Без действия (action=None) — прежний набор основ.
+APPROVAL_FOREIGN_STEMS = {"booking": ("заверш", "закрывай", "активируй"), "activate": ("заверш", "закрывай"),
+                          "close": ("активируй",)}
+
+
+def approval_decision(text: str, params: Mapping[str, Any], action: Optional[str] = None) -> str:
     """"yes" | "no" | "unclear". Отказ первым: слово с основы APPROVAL_NO_STEMS; «не» + слово с основы
-    APPROVAL_NO_AFTER_NE; «не» + слово согласия. Затем согласие: слово РАВНО APPROVAL_YES_WORDS или начинается с
-    APPROVAL_YES_STEMS. Иначе unclear (литералы splinter.py:11686, 11739, 11756, 11781, 11797, 11802; У1)."""
+    APPROVAL_NO_AFTER_NE; «не» + слово согласия (литералы splinter.py:11686, 11739, 11756, 11781, 11797, 11802; У1).
+
+    Согласие — строго (APPROVEFIX1610, Codex TB-OWNER-EFFICIENCY-1610-2054, карта М4/М5): нет знака вопроса, нет слова
+    правки, КАЖДОЕ слово — слово APPROVAL_YES_WORDS или основа APPROVAL_YES_STEMS с окончанием APPROVAL_YES_ENDINGS
+    (основа чужого действия — APPROVAL_FOREIGN_STEMS — не в счёт), а всё прочее — спокойные знаки (тот же белый
+    список, что у строгой брони intake_confirm). Число на карточке брони и выдачи согласием не является; у закрытия
+    ровно одно число целиком — аргумент пробега сдачи (`intake_confirm.km_arg`). Без действия (action=None — его не
+    знает вызывающий: Store._judge_answer, ответ без реплая) один целый аргумент тоже допускается — прежний голден
+    §4.8 «да 35200»; исполнение при этом решает answer_verdict, который действие карточки знает и передаёт.
+    «завершена?», «заверши руками», «да, но поправь пробег», «да?», «да, я позвоню клиенту», «ок, позже»,
+    «да 35200» на бронь/выдачу — unclear. Иначе unclear."""
     words = _words(text)
     yes_words = _seq(_p(params, "APPROVAL_YES_WORDS")) or ()
     yes_stems = _seq(_p(params, "APPROVAL_YES_STEMS")) or ()
@@ -1211,6 +1232,12 @@ def approval_decision(text: str, params: Mapping[str, Any]) -> str:
     def is_yes(w):
         return w in yes_words or any(w.startswith(s) for s in yes_stems)
 
+    foreign = APPROVAL_FOREIGN_STEMS.get(action or "", ())
+
+    def is_yes_form(w):
+        return w in yes_words or any(w.startswith(s) and w[len(s):] in APPROVAL_YES_ENDINGS and s not in foreign
+                                     for s in yes_stems)
+
     for i, w in enumerate(words):
         if any(w.startswith(s) for s in no_stems):
             return "no"
@@ -1218,9 +1245,28 @@ def approval_decision(text: str, params: Mapping[str, Any]) -> str:
             nxt = words[i + 1]
             if any(nxt.startswith(s) for s in no_after_ne) or is_yes(nxt):
                 return "no"
-    if any(is_yes(w) for w in words):
-        return "yes"
-    return "unclear"
+    if not any(is_yes(w) for w in words):
+        return "unclear"
+    low = str(text or "").lower().replace("ё", "е")
+    if any(q in low for q in _IC.QUESTION_MARKS) or any(_IC.is_edit_word(w) for w in words):
+        return "unclear"
+    rest = low
+    if action in (None, "close"):
+        _km, rest = _IC.km_arg(low)
+    rest_words = _words(rest)
+    if not rest_words or not all(is_yes_form(w) for w in rest_words) or not _IC.calm_rest(rest):
+        return "unclear"
+    return "yes"
+
+
+def approval_km(text: str, params: Mapping[str, Any]) -> Optional[str]:
+    """Пробег сдачи из ответа на карточку закрытия (APPROVEFIX1610, М6): только если весь ответ — согласие
+    (approval_decision(…, action="close") == "yes") и в нём ровно одно число целиком. Иначе None — пробег берётся из
+    карточки (проверенное поле), а не «первое число в тексте»."""
+    if approval_decision(text, params, action="close") != "yes":
+        return None
+    km, _rest = _IC.km_arg(str(text or "").lower().replace("ё", "е"))
+    return km
 
 
 def accept_decision(text: str, params: Mapping[str, Any]) -> str:
@@ -1276,6 +1322,7 @@ def answer_verdict(exp: Mapping[str, Any], case: Optional[Mapping[str, Any]], po
     answer = answer or {}
     kind = _s(exp.get("kind"))
     text = answer.get("text")
+    act = _s(exp.get("action")) or None          # APPROVEFIX1610: слова судятся по действию карточки
     # 1. бот, пустой текст, нет reply_to
     if answer.get("is_bot") or not _s(text):
         return "not_reply"
@@ -1287,7 +1334,7 @@ def answer_verdict(exp: Mapping[str, Any], case: Optional[Mapping[str, Any]], po
         if rule is True:
             return "not_reply"
         if is_unknown(rule) or rule is not False:
-            return "reference_no_reply" if approval_decision(text, params) != "unclear" else "not_reply"
+            return "reference_no_reply" if approval_decision(text, params, action=act) != "unclear" else "not_reply"
         # False: адресация кандидата к карточке — дальше шаги 3–11 (поста реплая нет — проверки места пропускаются)
     elif post is None:
         return "not_linked"                       # 2. сироту при flight_unknown/escalation_unknown решает Store
@@ -1347,7 +1394,7 @@ def answer_verdict(exp: Mapping[str, Any], case: Optional[Mapping[str, Any]], po
     if answer_ttl is not None and age is not None and age > answer_ttl:
         return "reference_expired"
     # 10. слова решения
-    if kind in ("approval", "confirm_link") and approval_decision(text, params) == "unclear":
+    if kind in ("approval", "confirm_link") and approval_decision(text, params, action=act) == "unclear":
         return "reference_unclear"
     return "accepted"
 

@@ -9290,13 +9290,24 @@ def _rc_exp_info(st, case_id, exp_id):
 
 
 def _rc_red(bridge, call):
-    """Красный шаг под токен-замком 4.2 — та же форма, что у прежних веток. → (ответ, исключение | None)."""
+    """Красный шаг под токен-замком 4.2. → (ответ, исключение | None, отправлено).
+
+    APPROVEFIX1610 (Codex: «билет до отправки и ответ после отправки различать»): без билета вызов не уходит
+    (ответ no_ticket, отправлено=False); флаг «отправлено» ставится строго перед вызовом — исключение до него значит
+    «не записано», после него — «неизвестно»."""
+    sent = False
     try:
-        ticket = (bridge.issue_write_ticket() or {}).get("ticket")
+        _tk = bridge.issue_write_ticket()
+        ticket = _tk.get("ticket") if isinstance(_tk, dict) else None
+        if not ticket:
+            why = str(_tk.get("error") or "") if isinstance(_tk, dict) else ""
+            return {"ok": False, "error": "no_ticket",
+                    "message": _IC_NO_TICKET + (f" ({why})" if why else "")}, None, False
         with bridge_client.agent_write(ticket):
-            return call(), None
+            sent = True
+            return call(), None, True
     except Exception as e:
-        return {"ok": False, "error": "exception", "message": str(e)}, e
+        return {"ok": False, "error": "exception", "message": str(e)}, e, sent
 
 
 async def _rc_execute(msg, context, bridge, st, out, text):
@@ -9340,8 +9351,9 @@ async def _rc_execute(msg, context, bridge, st, out, text):
             await say("❌ Не исполняю: черновик этой карточки уже сменился — пришли карточку заново.")
             return
         d["status"] = "approved"
-        res, exc = _rc_red(bridge, lambda: bridge.create_booking(**_intake_booking_fields(d)))
-        if res.get("ok"):
+        res, exc, sent = _rc_red(bridge, lambda: bridge.create_booking(**_intake_booking_fields(d)))
+        out_w = intake_confirm.outcome(res, sent)       # APPROVEFIX1610: три исхода, словарь брони — свой
+        if out_w == intake_confirm.BOOKED:
             d["status"] = "booked"
             _row = res.get("row")
             written({"ok": True, "row": _row, "written_at": _time.time()})
@@ -9354,10 +9366,12 @@ async def _rc_execute(msg, context, bridge, st, out, text):
             if _rc_cases_on():
                 _rc_case_after_booking(bridge, res, data.get("exp_id"))
             _rc_readback(bridge, st, rb, {"booking_id": _bid, "row": _row, "status": "Бронь"}, _time.time())
-        elif exc is not None:
-            written({"unknown": type(exc).__name__})
-            await say(f"⚠️ Исход записи брони неизвестен ({type(exc).__name__}) — проверь CRM; повтор не делаю.")
-        elif res.get("error") == "duplicate":
+        elif out_w == intake_confirm.UNKNOWN:
+            _err = type(exc).__name__ if exc is not None else (str(res.get("error") or "") or "?")
+            d["status"] = "write_unknown"
+            written({"unknown": _err})
+            await say(f"⚠️ Исход записи брони неизвестен ({_err}) — проверь CRM; повтор не делаю.")
+        elif out_w == intake_confirm.DUPLICATE:
             written({"error": "duplicate"})
             await say(f"⚠️ Уже есть такая бронь (строка {res.get('row')}).")
         else:
@@ -9366,17 +9380,19 @@ async def _rc_execute(msg, context, bridge, st, out, text):
         return
 
     if action == "activate":
-        res, exc = _rc_red(bridge, lambda: bridge.activate_booking(bike=tgt.get("bike"), name=tgt.get("name"),
-                                                                   date_start=(tgt.get("date_start") or None)))
-        if res.get("ok"):
+        res, exc, sent = _rc_red(bridge, lambda: bridge.activate_booking(bike=tgt.get("bike"), name=tgt.get("name"),
+                                                                         date_start=(tgt.get("date_start") or None)))
+        out_w = intake_confirm.red_outcome(res, sent, "activate")   # APPROVEFIX1610: «не менял» — только по коду моста
+        if out_w == intake_confirm.WRITTEN:
             _row = res.get("row") or tgt.get("row")
             written({"ok": True, "row": _row, "written_at": _time.time()})
             log.info(f"  → ВЫДАЧА: бронь активирована через дело аренды (строка {_row}, @{who}) {tgt.get('bike')}")
             await say(f"✅ В аренде, строка {_row}.")
             _rc_readback(bridge, st, rb, tgt, _time.time())
-        elif exc is not None:
-            written({"unknown": type(exc).__name__})
-            await say(f"⚠️ Исход активации неизвестен ({type(exc).__name__}) — проверь CRM; повтор не делаю.")
+        elif out_w == intake_confirm.UNKNOWN:
+            _err = type(exc).__name__ if exc is not None else (str(res.get("error") or "") or "?")
+            written({"unknown": _err})
+            await say(f"⚠️ Исход активации неизвестен ({_err}) — проверь CRM; повтор не делаю.")
         else:
             written({"error": str(res.get("error") or "?")})
             await say(f"❌ Активация не прошла: {res.get('error') or '?'}. {res.get('message') or ''}\n"
@@ -9384,23 +9400,27 @@ async def _rc_execute(msg, context, bridge, st, out, text):
         return
 
     if action == "close":
-        _m = _re_lang.search(r"\d{2,7}", text.replace(" ", ""))
-        _km = (_m.group(0) if _m else "") or tgt.get("km") or None
-        res, exc = _rc_red(bridge, lambda: bridge.close_booking(bike=tgt.get("bike"), name=tgt.get("name"),
-                                                                date_start=(tgt.get("date_start") or None),
-                                                                km_end=_km, paid_total=tgt.get("paid_total")))
+        # APPROVEFIX1610 (М6): пробег — ровно одно число целиком в ответе-согласии (rental_case_rules.approval_km) либо
+        # проверенное поле карточки; не «первое число в тексте» и не усечение длинного числа
+        _R = _rc_rules()
+        _km = _R.approval_km(text, getattr(st, "params", None) or _R.PARAMS_DEFAULT) or tgt.get("km") or None
+        res, exc, sent = _rc_red(bridge, lambda: bridge.close_booking(bike=tgt.get("bike"), name=tgt.get("name"),
+                                                                      date_start=(tgt.get("date_start") or None),
+                                                                      km_end=_km, paid_total=tgt.get("paid_total")))
         err = res.get("error")
-        if res.get("ok"):
+        out_w = intake_confirm.red_outcome(res, sent, "close")
+        if out_w == intake_confirm.WRITTEN:
             _row = res.get("row") or tgt.get("row")
             written({"ok": True, "row": _row, "written_at": _time.time()})
             log.info(f"  → ПРИЁМ: аренда завершена через дело аренды (строка {_row}, @{who}) {tgt.get('bike')} "
                      f"km_end={_km or '-'}")
             await say(f"✅ Завершена, строка {_row}.")
             _rc_readback(bridge, st, rb, tgt, _time.time())
-        elif exc is not None:
-            written({"unknown": type(exc).__name__})
-            await say(f"⚠️ Исход закрытия неизвестен ({type(exc).__name__}) — проверь CRM; повтор не делаю.")
-        elif err in ("unknown_action", "km_required"):
+        elif out_w == intake_confirm.UNKNOWN:
+            _err = type(exc).__name__ if exc is not None else (str(err or "") or "?")
+            written({"unknown": _err})
+            await say(f"⚠️ Исход закрытия неизвестен ({_err}) — проверь CRM; повтор не делаю.")
+        elif sent and err in ("unknown_action", "km_required"):
             # прежде карточка оставалась живой; ожидание уже answered — даём НОВУЮ карточку того же закрытия
             written({"error": str(err)})
             if err == "unknown_action":
@@ -9412,7 +9432,7 @@ async def _rc_execute(msg, context, bridge, st, out, text):
                           "(В аренде→Завершена). Статус в CRM не менял.")
             again = dict((k, v) for k, v in tgt.items() if k != "card")
             await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
-        elif err == "odo_unverifiable":
+        elif sent and err == "odo_unverifiable":
             written({"error": "odo_unverifiable"})
             await say(f"❌ Закрыть не могу: одометр строки в CRM пуст/не читается — сверить пробег автоматически "
                       f"нельзя. Сверь и заверши руками (В аренде→Завершена, строка "
@@ -9522,7 +9542,13 @@ async def _rc_intake_reply(msg, context, bridge, text):
     elif verdict == "reference_restart":
         await say("⏳ Карточка брони из прошлого запуска — не исполняю. Пришли карточку брони заново.")
     elif verdict == "reference_unclear":
-        await edits()
+        # APPROVEFIX1610: неясный ответ реплаем на карточку (вопрос, условие, правка, число не на закрытии) — ничего не
+        # исполнено; одобряющему — переспрос, а не молчание (прежняя реакция на «правки» к черновику — первой)
+        if (d and d.get("status") == "awaiting_approval" and _intake_can_approve(msg)
+                and ("правк" in low or "исправ" in low)):
+            await edits()
+        elif _intake_can_approve(msg):
+            await say("❓ Ответ неоднозначный — не исполняю. Ответь реплаем на карточку: «да» или «нет».")
 
 
 # ===================== ЛИСТ ЗАКРЫТИЯ =====================
@@ -9639,17 +9665,19 @@ async def _handover_activation_card(context, bridge, bike):
     if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
             and now - prev.get("ts", 0) <= _HO_ACT_TTL):
         return   # та же бронь уже ждёт «да» — карточку не дублируем
-    _HANDOVER_ACTIVATIONS[INTAKE_CHAT] = {
+    _HANDOVER_ACTIVATIONS[INTAKE_CHAT] = rec = {
         "bike": bike, "name": cand["name"], "date_start": cand["date_start"],
         "row": cand.get("row"), "ts": now, "status": "awaiting",
     }
+    _card_ids_carry(rec, prev)   # APPROVEFIX1610: реплай на заменённую карточку не исполняет новую
     dates = (cand["date_start"] + " — " + cand["date_end"]).strip(" —")
     log.info(f"  → ВЫДАЧА {bike}: карточка активации во Входящие (строка {cand.get('row')}, "
              f"клиент {cand['name'] or '—'})")
-    await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
-                text=(f"🐀 Splinter\n🏍 ВЫДАЧА: {bike} → {cand['name'] or '—'}, "
-                      f"бронь строка {cand.get('row')} ({dates or 'даты —'}).\n"
-                      f"Активирую (Бронь→В аренде)? да / нет"))
+    sent = await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                       text=(f"🐀 Splinter\n🏍 ВЫДАЧА: {bike} → {cand['name'] or '—'}, "
+                             f"бронь строка {cand.get('row')} ({dates or 'даты —'}).\n"
+                             f"Активирую (Бронь→В аренде)? да / нет"))
+    _card_note_ids(rec, [sent])  # APPROVEFIX1610: id карточки — «да» засчитывается реплаем на неё
 
 
 def _return_resolve_close(bridge, bike):
@@ -9759,11 +9787,12 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None):
     except (TypeError, ValueError):
         pass
     km = str(km or "").strip()
-    _RETURN_CLOSES[INTAKE_CHAT] = {
+    _RETURN_CLOSES[INTAKE_CHAT] = rec = {
         "bike": bike, "name": cand["name"], "date_start": cand["date_start"],
         "row": cand.get("row"), "km": km, "paid_total": _paid,
         "ts": now, "status": "awaiting",
     }
+    _card_ids_carry(rec, prev)   # APPROVEFIX1610: реплай на заменённую карточку не исполняет новую
     km_line = (f"Пробег на сдаче: {km}." if km
                else "Пробег на сдаче: не увидел — ответь «да <цифра пробега>».")
     due_line = (f" Итог закрытия: {_fmt(_paid)} ฿." if _paid is not None else "")
@@ -9772,13 +9801,14 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None):
     log.info(f"  → ПРИЁМ {bike}: карточка закрытия во Входящие (строка {cand.get('row')}, "
              f"клиент {cand['name'] or '—'}, km={km or '-'}, итог={_paid if _paid is not None else '-'}, "
              f"депозит={_dep or 'не указан'})")
-    await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
-                text=(f"🐀 Splinter\n📥 ПРИЁМ: {bike} вернулся от {cand['name'] or '—'}, "
-                      f"строка {cand.get('row')}. {km_line}{due_line}{dep_line}\n"
-                      f"Завершаю (Завершена"
-                      + (f" + пробег {km}" if km else "")
-                      + (f" + оплачено {_fmt(_paid)}" if _paid is not None else "")
-                      + ")? да / нет"))
+    sent = await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                       text=(f"🐀 Splinter\n📥 ПРИЁМ: {bike} вернулся от {cand['name'] or '—'}, "
+                             f"строка {cand.get('row')}. {km_line}{due_line}{dep_line}\n"
+                             f"Завершаю (Завершена"
+                             + (f" + пробег {km}" if km else "")
+                             + (f" + оплачено {_fmt(_paid)}" if _paid is not None else "")
+                             + ")? да / нет"))
+    _card_note_ids(rec, [sent])  # APPROVEFIX1610: id карточки — «да» засчитывается реплаем на неё
 
 
 def _closing_crm_debt(bridge, bike):
@@ -12816,6 +12846,274 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
     await _say(_IC_UNKNOWN.format(err=_err))
 
 
+# ===================== APPROVEFIX1610: ответ на карточки выдачи и приёма — маршрут, смысл, исход =====================
+# Codex TB-OWNER-EFFICIENCY-1610-2054, карта QUEUE4_INTAKE_SUBSTR_MAP М1–М3, М6. Ручка — та же INTAKE_CONFIRM_STRICT:
+# 0 → ветки 3–5 прежние байт-в-байт. Порядок: СНАЧАЛА к какой карточке ответ (реплай на сообщение карточки: id
+# сохраняется при отправке), ПОТОМ что сказано (intake_confirm.decide со словами действия), ПОТОМ исход записи тремя
+# словами (intake_confirm.red_outcome). Согласие и отказ засчитываются только реплаем на карточку; без реплая —
+# адресное уточнение (бронь в одиночку — прежний строгий путь). Текст сообщения в журнал не идёт.
+_CR_WORD = {"activate": "выдачи", "close": "приёма"}
+_CR_TTL = {"activate": _HO_ACT_TTL, "close": _RET_CLOSE_TTL}
+_CR_ASK = {"activate": "❓ Ответ неоднозначный — не активирую. Активировать: «да» реплаем на карточку выдачи. "
+                       "Отказ: «нет».",
+           "close": "❓ Ответ неоднозначный — не закрываю. Закрыть: «да» или «да <пробег>» реплаем на карточку "
+                    "приёма. Отказ: «нет»."}
+_CR_EDIT = {"activate": "✏️ Правки по карточке выдачи не вношу — не активирую. Активировать: «да» реплаем на "
+                        "карточку; отказ: «нет».",
+            "close": "✏️ Правки по карточке приёма не вношу — не закрываю. Пробег: «да <пробег>» реплаем на "
+                     "карточку; отказ: «нет»."}
+_CR_REJECT = {"activate": "❌ Активацию отменил — статус в CRM не менял.",
+              "close": "❌ Закрытие отменил — статус в CRM не менял."}
+_CR_BIND = ("❓ Это ответ на карточку {word} {card}? «да» / «нет» засчитываю только реплаем на карточку — ничего "
+            "не сделал.")
+_CR_MULTI = "❓ Ждут ответа несколько карточек ({cards}) — ответь реплаем на нужную. Ничего не сделал."
+_CR_LABEL = {"booking": "", "activate": "выдача ", "close": "приём "}
+_CR_REPLACED = ("⚠️ Эта карточка {word} заменена новой ({card}) — по старой ничего не делаю. Ответь реплаем на "
+                "актуальную.")
+_CR_LATE = "⏳ Карточка {word} {card} устарела (срок ответа истёк) — не исполняю. Повтори {again} — придёт новая."
+_CR_DONE = "ℹ️ По карточке {word} {card} исход уже есть — повтор не делаю."
+_CR_UNKNOWN = {"activate": "⚠️ Исход активации неизвестен ({err}) — проверь CRM; повтор не делаю.",
+               "close": "⚠️ Исход закрытия неизвестен ({err}) — проверь CRM; повтор не делаю."}
+_CR_IDS_KEEP = 40                     # потолок памяти id заменённых карточек на чат
+
+
+def _card_note_ids(rec, msgs):
+    """Сообщения карточки выдачи/приёма (сама карточка, адресное уточнение по ней) — реплай на них = ответ карточке."""
+    ids = list(rec.get("msg_ids") or [])
+    for m in msgs or ():
+        mid = getattr(m, "message_id", None)
+        if mid is not None and mid not in ids:
+            ids.append(mid)
+    rec["msg_ids"] = ids
+
+
+def _card_ids_carry(rec, prev):
+    """Новая карточка того же места помнит id прежней (любой статус): реплай на старую — «заменена», а не «да» новой."""
+    if not isinstance(prev, dict):
+        return
+    old = list(prev.get("replaced_ids") or []) + list(prev.get("msg_ids") or [])
+    rec["replaced_ids"] = [i for i in old if i is not None][-_CR_IDS_KEEP:]
+
+
+def _card_name(kind, rec) -> str:
+    """Карточка словами для уточнения: байк и строка (имени клиента нет — ПДн)."""
+    if kind == "booking":
+        return "бронь " + _ic_card_name(rec)
+    return "%s, строка %s" % (rec.get("bike") or "—", rec.get("row") if rec.get("row") is not None else "?")
+
+
+def _card_waiting(kind, rec, now) -> bool:
+    return bool(rec) and rec.get("status") == "awaiting" and now - rec.get("ts", 0) <= _CR_TTL[kind]
+
+
+def _card_route(msg, bk, act, ret):
+    """К какой карточке ответ — по реплаю. → (вид, запись): "booking" | "activate" | "close" | "replaced_activate" |
+    "replaced_close" | "none" (реплая нет, служебное «тема создана», реплай не на карточку). Сомнение → "none"."""
+    try:
+        r = getattr(msg, "reply_to_message", None)
+        if r is None or getattr(r, "forum_topic_created", None):
+            return "none", None
+        mid = getattr(r, "message_id", None)
+        if mid is None:
+            return "none", None
+        if bk is not None and mid in (bk.get("ic_msg_ids") or ()):
+            return "booking", bk
+        for kind, rec in (("activate", act), ("close", ret)):
+            if isinstance(rec, dict) and mid in (rec.get("msg_ids") or ()):
+                return kind, rec
+        for kind, rec in (("activate", act), ("close", ret)):
+            if isinstance(rec, dict) and mid in (rec.get("replaced_ids") or ()):
+                return "replaced_" + kind, rec
+    except Exception:
+        pass
+    return "none", None
+
+
+def _card_said(text, msg, context) -> str:
+    said = _ic_strip_bot(text, context)
+    if not said.strip():
+        _st = getattr(msg, "sticker", None)
+        if _st is not None:
+            said = str(getattr(_st, "emoji", None) or "")     # стикер 👍 — как эмодзи 👍 (переспрос)
+    return said
+
+
+async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
+    """Реплай на карточку выдачи (kind="activate") или приёма ("close"): смысл → исход. Ровно один вызов моста на
+    согласие; отказ, вопрос, условие, правка — ни одного. Пробег сдачи — `intake_confirm.km_arg` целиком из ответа либо
+    проверенное поле карточки (`rec["km"]`), не «первое число в тексте»."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    who = msg.from_user.username if msg.from_user else "?"
+    word = _CR_WORD[kind]
+
+    async def say(body):
+        return await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False,
+                           message_thread_id=tid)
+
+    if _ic_forwarded(msg):
+        log.info(f"  → карточка {word}: пересланное — не ответ подтверждающего (@{who})")
+        return
+    said = _card_said(text, msg, context)
+    km = None
+    rest = said
+    if kind == "close":
+        km, rest = intake_confirm.km_arg(said)
+    raw = intake_confirm.decide_action(rest, kind)
+    v = intake_confirm.ASK if raw == intake_confirm.SILENT else raw    # реплай на карточку — обращение к боту
+    log.info(f"  → карточка {word} {rec.get('bike')} строка {rec.get('row')}: ответ → {v} (@{who})")
+    card = _card_name(kind, rec)
+    if rec.get("status") != "awaiting":
+        if raw != intake_confirm.SILENT:
+            await say(_CR_DONE.format(word=word, card=card))
+        return
+    if now - rec.get("ts", 0) > _CR_TTL[kind]:
+        if raw != intake_confirm.SILENT:
+            await say(_CR_LATE.format(word=word, card=card, again="выдачу" if kind == "activate" else "приём"))
+        return
+    if v == intake_confirm.NO:
+        rec["status"] = "rejected"
+        await say(_CR_REJECT[kind])
+        return
+    if v == intake_confirm.EDIT:
+        await say(_CR_EDIT[kind])
+        return
+    if v != intake_confirm.YES:
+        sent_ask = await say(_CR_ASK[kind])
+        _card_note_ids(rec, [sent_ask])          # уточнение по ЭТОЙ карточке — реплай «да» на него засчитан
+        return
+    # YES — КРАСНЫЙ шаг под токен-замком 4.2: билет → флаг отправки → ровно один вызов
+    rec["status"] = "approved"                  # в пути: повторный ответ не исполнит
+    if kind == "close":
+        km_end = km or (str(rec.get("km") or "").strip() or None)
+    sent, res, exc, no_ticket = False, None, None, None
+    try:
+        _tk = bridge.issue_write_ticket()
+        ticket = _tk.get("ticket") if isinstance(_tk, dict) else None
+        if not ticket:
+            no_ticket = str(_tk.get("error") or "") if isinstance(_tk, dict) else ""
+        else:
+            with bridge_client.agent_write(ticket):
+                sent = True                      # строго непосредственно перед вызовом
+                if kind == "activate":
+                    res = bridge.activate_booking(bike=rec["bike"], name=rec["name"],
+                                                  date_start=(rec.get("date_start") or None))
+                else:
+                    res = bridge.close_booking(bike=rec["bike"], name=rec["name"],
+                                               date_start=(rec.get("date_start") or None),
+                                               km_end=km_end, paid_total=rec.get("paid_total"))
+    except Exception as e:
+        exc = e
+    out = intake_confirm.red_outcome(res, sent, kind)
+    if out == intake_confirm.WRITTEN:
+        rec["status"] = "activated" if kind == "activate" else "closed"
+        _row = res.get("row") or rec.get("row")
+        if kind == "activate":
+            log.info(f"  → ВЫДАЧА: бронь активирована (строка {_row}, @{who}) {rec['bike']}")
+            await say(f"✅ В аренде, строка {_row}.")
+        else:
+            log.info(f"  → ПРИЁМ: аренда завершена (строка {_row}, @{who}) {rec['bike']} km_end={km_end or '-'} "
+                     f"paid={rec.get('paid_total') if rec.get('paid_total') is not None else '-'}")
+            await say(f"✅ Завершена, строка {_row}.")
+        return
+    if out == intake_confirm.UNKNOWN:
+        if exc is not None:
+            _err = type(exc).__name__
+        elif not isinstance(res, dict):
+            _err = "нет ответа"
+        else:
+            _err = str(res.get("error") or "") or "?"
+        rec["status"] = "write_unknown"
+        log.warning(f"  → карточка {word}: исход записи НЕИЗВЕСТЕН ({_err}) {rec['bike']}")
+        await say(_CR_UNKNOWN[kind].format(err=_err))
+        return
+    # NOT_WRITTEN: вызова не было (билет/исключение до отправки) или мост отказал ДО записи
+    if not sent:
+        _err = "exception" if exc is not None else "no_ticket"
+        _emsg = (f"до отправки: {type(exc).__name__}" if exc is not None
+                 else _IC_NO_TICKET + (f" ({no_ticket})" if no_ticket else ""))
+    else:
+        _err = str(res.get("error") or "?")
+        _emsg = str(res.get("message") or "")
+    log.warning(f"  → карточка {word}: НЕ записано ({_err}) {rec['bike']}")
+    if kind == "activate":
+        rec["status"] = "error"
+        await say(f"❌ Активация не прошла: {_err}. {_emsg}\nСтатус в CRM не менял — переведи руками.")
+        return
+    if sent and _err == "unknown_action":
+        rec["status"] = "awaiting"               # мост без деплоя closeBooking — карточка жива (прежний путь)
+        await say("⏳ Закрытие аренды (closeBooking) ещё не задеплоено на Bridge — требуется решение владельца "
+                  "(деплой Bridge); карточка останется, после деплоя снова «да».")
+        return
+    if sent and _err == "km_required":
+        rec["status"] = "awaiting"               # fail-closed row705: «да <пробег>» тем же запросом добьёт закрытие
+        await say("❌ Закрыть не могу: нет пробега на сдаче — без него аренду не закрываем. Ответь «да <цифра "
+                  "пробега>» реплаем на карточку — или заверши руками (В аренде→Завершена). Статус в CRM не менял.")
+        return
+    rec["status"] = "error"
+    if sent and _err == "odo_unverifiable":
+        await say(f"❌ Закрыть не могу: одометр строки в CRM пуст/не читается — сверить пробег автоматически нельзя. "
+                  f"Сверь и заверши руками (В аренде→Завершена, строка {res.get('row') or rec.get('row') or '?'}). "
+                  f"Статус в CRM не менял.")
+        return
+    await say(f"❌ Закрытие не прошло: {_err}. {_emsg}\nСтатус в CRM не менял — заверши руками.")
+
+
+async def _intake_route_reply(msg, context, bridge, text, now):
+    """APPROVEFIX1610: ответ во «Входящих» при INTAKE_CONFIRM_STRICT — сначала адрес (какая карточка), потом смысл.
+    Реплай на карточку брони → строгий путь брони; на карточку выдачи/приёма → `_card_reply_strict`; на заменённую →
+    «заменена». Без реплая: ждёт одна бронь — прежний строгий путь брони; ждёт выдача/приём — уточнение, ничего не
+    исполняется и не отменяется."""
+    if not _intake_can_approve(msg):
+        return
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    d = _INTAKE_DRAFTS.get(chat_id)
+    bk = d if (d and d.get("status") == "awaiting_approval") else None
+    act = _HANDOVER_ACTIVATIONS.get(chat_id)
+    ret = _RETURN_CLOSES.get(chat_id)
+    kind, rec = _card_route(msg, bk, act, ret)
+    if kind == "booking":
+        await _intake_reply_strict(bk, msg, context, bridge, text, now)
+        return
+    if kind in ("activate", "close"):
+        await _card_reply_strict(kind, rec, msg, context, bridge, text, now)
+        return
+
+    async def say(body):
+        return await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False,
+                           message_thread_id=tid)
+
+    who = msg.from_user.username if msg.from_user else "?"
+    if kind.startswith("replaced_"):
+        k = kind[len("replaced_"):]
+        log.info(f"  → карточка {_CR_WORD[k]}: реплай на заменённую карточку — не исполняю (@{who})")
+        if not _ic_forwarded(msg):
+            await say(_CR_REPLACED.format(word=_CR_WORD[k], card=_card_name(k, rec)))
+        return
+    live = [(k, r) for k, r in (("activate", act), ("close", ret)) if _card_waiting(k, r, now)]
+    if not live:
+        if bk is not None:
+            await _intake_reply_strict(bk, msg, context, bridge, text, now)   # одна бронь — прежний строгий путь
+        return
+    if _ic_forwarded(msg):
+        return
+    said = _card_said(text, msg, context)
+    v = intake_confirm.decide(said, intake_confirm.ACTIVATE_CONSENT | intake_confirm.CLOSE_CONSENT,
+                              intake_confirm.ACTIVATE_STEMS + intake_confirm.CLOSE_STEMS,
+                              intake_confirm.ACTIVATE_STEMS + intake_confirm.CLOSE_STEMS)
+    if v == intake_confirm.SILENT and not _addressed_bot(msg, context):
+        return
+    waiting = ([("booking", bk)] if bk is not None else []) + live
+    log.info(f"  → Входящие: ответ без реплая на карточку → {v}, ждут {len(waiting)} (@{who}) — уточняю")
+    if len(waiting) == 1:
+        k, r = waiting[0]
+        sent_ask = await say(_CR_BIND.format(word=_CR_WORD[k], card=_card_name(k, r)))
+        _card_note_ids(r, [sent_ask])            # уточнение называет ЭТУ карточку — реплай на него засчитан
+        return
+    await say(_CR_MULTI.format(cards="; ".join(_CR_LABEL[k] + _card_name(k, r) for k, r in waiting)))
+
+
 async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only.
     photo_msgs — пачка фото (альбом склеен по media_group_id) → один «паспорт получен» + один finalize."""
@@ -12944,12 +13242,16 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
         await _rc_intake_reply(msg, context, bridge, text)
         return
 
+    # APPROVEFIX1610 (ручка INTAKE_CONFIRM_STRICT, по умолчанию ВКЛ): сначала — к какой карточке ответ (бронь / выдача /
+    # приём, реплай на сообщение карточки), потом — что сказано; строгий путь брони — внутри маршрута. Ручка 0 → ветки
+    # 3–5 ниже прежние байт-в-байт.
+    if _intake_confirm_strict_on():
+        await _intake_route_reply(msg, context, bridge, text, now)
+        return
+
     # 3) approve / нет / правки — только от авторизатора и только по карточке в ожидании
     d = _INTAKE_DRAFTS.get(chat_id)
     if d and d.get("status") == "awaiting_approval" and _intake_can_approve(msg):
-        if _intake_confirm_strict_on():
-            await _intake_reply_strict(d, msg, context, bridge, text, now)
-            return
         low = text.lower()
         tid = getattr(msg, "message_thread_id", None)
         if any(w in low for w in ("да", "ок", "ставь", "подтвержд")):

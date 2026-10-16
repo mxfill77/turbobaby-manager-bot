@@ -7,7 +7,7 @@ unknown_action (Bridge без деплоя фазы I) → ⏳, карточка
 odo_unverifiable → «сверь и заверши руками», статус error, записи нет.
 Голден 5960 (инцидент 10.07): Завершена row1204 + В аренде row703 → карточка для row703.
 Существующий closing-путь (лист закрытия) НЕ ломается. Сеть/LLM/_send замоканы."""
-import os, sys, json, asyncio, datetime
+import os, sys, json, asyncio, datetime, types
 sys.path.insert(0, "/root/turbobaby-manager-bot")
 os.environ.setdefault("BRIDGE_URL", "http://x"); os.environ.setdefault("BRIDGE_TOKEN", "x")
 import splinter as S
@@ -19,11 +19,12 @@ DATE_START = "2026-07-01 10:00"
 class U:
     def __init__(s, uname="extthiwxer"): s.username = uname; s.is_bot = False
 class Msg:
-    def __init__(s, text, chat_id=SERV_CHAT, uname="extthiwxer", photo=False):
+    def __init__(s, text, chat_id=SERV_CHAT, uname="extthiwxer", photo=False, reply=None):
         s.text = text; s.caption = None; s.photo = ([object()] if photo else None)
         s.chat_id = chat_id; s.message_thread_id = (TOPIC if chat_id == SERV_CHAT else None)
         s.date = datetime.datetime(2026, 7, 8, 8, 0, tzinfo=datetime.timezone.utc)
-        s.message_id = 778; s.from_user = U(uname); s.reply_to_message = None
+        # APPROVEFIX1610: «да/нет» засчитываются только РЕПЛАЕМ на карточку — reply = отправленная карточка
+        s.message_id = 778; s.from_user = U(uname); s.reply_to_message = reply
 class Ctx:
     class B: username = "turbobaby_manager_bot"
     bot = B()
@@ -58,7 +59,17 @@ RENT_ROW = {"row": 21, "status": "В аренде", "bike": BIKE, "name": "Ив�
             "date_start": DATE_START, "date_end": "2026-07-08 10:00", "booking_id": "b-1"}
 
 SENDS = []
-async def rec_send(context, *, chat_id, text, message_thread_id=None, **k): SENDS.append((chat_id, text))
+SENT_MSGS = []          # APPROVEFIX1610: отправка возвращает сообщение с id (как PTB send_message) — для реплая
+_MID = [6000]
+async def rec_send(context, *, chat_id, text, message_thread_id=None, **k):
+    SENDS.append((chat_id, text)); _MID[0] += 1
+    m = types.SimpleNamespace(message_id=_MID[0], chat_id=chat_id, text=text); SENT_MSGS.append(m)
+    return m
+def card_msg(word="Завершаю"):
+    ms = [m for m in SENT_MSGS if m.chat_id == INTAKE and word in m.text]
+    return ms[-1] if ms else None
+def yes(text="да", uname="deramor", word="Завершаю"):
+    return Msg(text, chat_id=INTAKE, uname=uname, reply=card_msg(word))
 async def rec_pass(*a, **k): pass
 async def rec_dl(pm): return b"x"
 S._send = rec_send; S._send_bike_card = rec_pass; S._after_mileage = rec_pass
@@ -69,7 +80,7 @@ RET_PARSE = {"type": "event", "event_type": "return", "bike": BIKE,
              "fuel": "полный", "mileage": "35200", "works": []}
 
 def reset():
-    SENDS.clear(); S._RETURN_CLOSES.clear(); S._RET_CLOSE_WARN_TS.clear()
+    SENDS.clear(); SENT_MSGS.clear(); S._RETURN_CLOSES.clear(); S._RET_CLOSE_WARN_TS.clear()
     S._HANDOVER_ACTIVATIONS.clear(); S._HO_ACT_WARN_TS.clear()
     S._INTAKE_DRAFTS.clear(); S._CARD_LAST.clear(); S._PENDING_WORKS.clear()
 def run(c): return asyncio.run(c)
@@ -88,7 +99,7 @@ def test_happy_path_yes():
     assert "1 500" in cards[0] or "1500" in cards[0], f"итог закрытия должен быть в карточке: {cards[0]}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting"
     assert getattr(b, "closing", None), "closing-путь (лист закрытия) должен отработать как раньше"
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     assert b.closed == [{"bike": BIKE, "name": "Иван Тест", "date_start": DATE_START,
                          "km_end": "35200", "paid_total": 1500.0}], \
         f"close должен уйти с date_start/km_end/paid_total: {b.closed}"
@@ -100,7 +111,7 @@ def test_happy_path_yes():
 def test_no_cancels():
     reset(); b = FakeBridge(clients=[RENT_ROW])
     do_return(b)
-    run(S._handle_intake(Msg("нет", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("нет", uname="deramor"), Ctx(), b, None))
     assert b.closed == [], "на «нет» записи в CRM быть не должно"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "rejected"
     assert any("отменил" in t.lower() for t in intake_sends()), f"{SENDS}"
@@ -109,7 +120,7 @@ def test_no_cancels():
 def test_negation_not_confused():
     reset(); b = FakeBridge(clients=[RENT_ROW])
     do_return(b)
-    run(S._handle_intake(Msg("не завершай", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("не завершай", uname="deramor"), Ctx(), b, None))
     assert b.closed == [], "«не завершай» — отказ, закрытия быть не должно"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "rejected"
 
@@ -128,7 +139,7 @@ def test_no_rent_row_warns():
 def test_non_approver_ignored():
     reset(); b = FakeBridge(clients=[RENT_ROW])
     do_return(b)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="pym_thai"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="pym_thai"), Ctx(), b, None))
     assert b.closed == [], "Пым/тайцы не авторизуют — «да» не-аппрувера игнорируется (§9)"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting", "запрос остаётся ждать аппрувера"
 
@@ -140,11 +151,11 @@ def test_unknown_action_keeps_card():
         return {"ok": False, "error": "unknown_action", "message": "close_booking?"}
     b.close_booking = old_bridge
     do_return(b)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     assert any("⏳" in t and "не задеплоено" in t for t in intake_sends()), f"{SENDS}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting", "карточка должна остаться живой до деплоя"
     b.close_booking = good_close   # «владелец задеплоил Bridge»
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     assert len(b.closed) == 1, f"после деплоя то же «да» должно закрыть: {b.closed}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "closed"
 
@@ -166,7 +177,7 @@ def test_bridge_error_honest():
         return {"ok": False, "error": "odometer_back", "message": "km_end меньше одометра"}
     b.close_booking = bad_close
     do_return(b)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     assert any("❌ Закрытие не прошло" in t and "odometer_back" in t for t in intake_sends()), f"{SENDS}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "error"
 
@@ -182,12 +193,12 @@ def test_km_required_keeps_card():
         return good_close(bike, name, date_start=date_start, km_end=km_end, paid_total=paid_total)
     b.close_booking = strict_close
     do_return(b, parse=dict(RET_PARSE, mileage=""))   # пробега в контексте нет
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     errs = [t for t in intake_sends() if "Закрыть не могу" in t and "пробега" in t]
     assert errs and "руками" in errs[0] and "цифра пробега" in errs[0], f"{SENDS}"
     assert b.closed == [], "без km_end записи в CRM быть не должно (fail-closed)"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting", "карточка должна остаться живой"
-    run(S._handle_intake(Msg("да 35300", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да 35300", uname="deramor"), Ctx(), b, None))
     assert b.closed and b.closed[0]["km_end"] == "35300", f"«да 35300» должно закрыть: {b.closed}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "closed"
 
@@ -199,7 +210,7 @@ def test_odo_unverifiable_manual():
                 "message": "одометр строки 21 пуст — сверь и закрой руками"}
     b.close_booking = unverifiable_close
     do_return(b)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     errs = [t for t in intake_sends() if "Закрыть не могу" in t and "одометр" in t.lower()]
     assert errs and "руками" in errs[0] and "строка 21" in errs[0], f"{SENDS}"
     assert b.closed == [], "одометр не сверить → записи в CRM быть не должно"
@@ -212,7 +223,7 @@ def test_km_from_reply():
     cards = [t for t in intake_sends() if "ПРИЁМ" in t]
     assert len(cards) == 1 and "цифра" in cards[0].lower() or "цифр" in cards[0], \
         f"без пробега карточка должна просить цифру: {cards}"
-    run(S._handle_intake(Msg("да 35300", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да 35300", uname="deramor"), Ctx(), b, None))
     assert b.closed and b.closed[0]["km_end"] == "35300", f"km_end должен взяться из ответа: {b.closed}"
 
 # ---- итог закрытия 0/не число → K не пишем (paid_total=None), карточка без «оплачено» ----
@@ -221,7 +232,7 @@ def test_zero_due_no_paid():
     do_return(b)
     cards = [t for t in intake_sends() if "ПРИЁМ" in t]
     assert cards and "оплачено" not in cards[0], f"итог 0 → «оплачено» в карточке не показываем: {cards}"
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     assert b.closed and b.closed[0]["paid_total"] is None, f"итог 0 → K не трогаем: {b.closed}"
 
 # ---- повторная return-фраза той же аренды → карточка не дублируется ----
@@ -236,7 +247,7 @@ def test_ttl_expired():
     reset(); b = FakeBridge(clients=[RENT_ROW])
     do_return(b)
     S._RETURN_CLOSES[INTAKE]["ts"] -= (S._RET_CLOSE_TTL + 60)
-    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
+    run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
     assert b.closed == [], "просроченный запрос закрытия исполняться не должен"
 
 # ---- приоритет «да»: intake-draft (бронь) выигрывает у карточки приёма ----
@@ -257,7 +268,8 @@ def test_intake_draft_priority():
     assert getattr(b2, "booked", None), "«да» при живой карточке брони по-прежнему ставит бронь"
     assert b2.closed == [], "закрытие НЕ перехватывает «да» у карточки брони"
 
-# ---- приоритет «да»: активация выдачи (4) выигрывает у закрытия (5); карточка приёма остаётся ждать ----
+# ---- приоритет «да»: APPROVEFIX1610 — решает АДРЕС (реплай), а не порядок веток: «да» реплаем на карточку активации —
+# ----   активации; карточка приёма остаётся ждать; без реплая при двух ждущих — уточнение, ни одного вызова ----
 def test_activation_priority_over_close():
     reset(); b = FakeBridge(clients=[RENT_ROW])
     do_return(b)
@@ -265,10 +277,15 @@ def test_activation_priority_over_close():
     def fake_activate(bike, name, date_start=None):
         b.activated.append({"bike": bike, "name": name}); return {"ok": True, "row": 17}
     b.activate_booking = fake_activate
+    act_card = types.SimpleNamespace(message_id=5999, chat_id=INTAKE, text="🏍 ВЫДАЧА … Активирую?")
     S._HANDOVER_ACTIVATIONS[INTAKE] = {"bike": BIKE, "name": "Пётр", "date_start": "",
-                                       "row": 17, "ts": S._time.time(), "status": "awaiting"}
+                                       "row": 17, "ts": S._time.time(), "status": "awaiting",
+                                       "msg_ids": [act_card.message_id]}
     run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor"), Ctx(), b, None))
-    assert b.activated and b.closed == [], "«да» при живой карточке активации идёт активации, не закрытию"
+    assert b.activated == [] and b.closed == [], "без реплая при двух ждущих карточках — ни одного вызова"
+    assert any("несколько карточек" in t for t in intake_sends()), SENDS
+    run(S._handle_intake(Msg("да", chat_id=INTAKE, uname="deramor", reply=act_card), Ctx(), b, None))
+    assert b.activated and b.closed == [], "«да» реплаем на карточку активации идёт активации, не закрытию"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting", "карточка приёма остаётся ждать своего «да»"
 
 # ==== O3-3c часть В: строка депозита в карточке ПРИЁМА (RAW col S, НЕ parseNumber) ====
