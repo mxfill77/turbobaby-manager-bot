@@ -1208,10 +1208,17 @@ APPROVAL_YES_ENDINGS = ("", "те", "ай", "айте", "и", "ите", "аю", 
 # intake_confirm.ACTIVATE_CONSENT / CLOSE_CONSENT). Без действия (action=None) — прежний набор основ.
 APPROVAL_FOREIGN_STEMS = {"booking": ("заверш", "закрывай", "активируй"), "activate": ("заверш", "закрывай"),
                           "close": ("активируй",)}
+# APPROVEFIX1610 (остаток 2 приёмки 8bfcfa3): отказ словами К4 не уже, чем у строгой ветки Splinter — тот же словарь
+# `intake_confirm` (одно определение на обе ветки): слова отказа ЦЕЛИКОМ («нет», «неа», «no», «nope», «нельзя», «стоп»,
+# «stop», «cancel») и основы («отмен», «отклон») сверх параметра APPROVAL_NO_STEMS. Только в сторону отказа: «стоп»
+# реплаем на карточку прежде был «неясным», и карточка оставалась ждать «да».
+APPROVAL_NO_WORDS = _IC.REFUSE_WORDS
+APPROVAL_NO_FLOOR_STEMS = _IC.REFUSE_STEMS
 
 
 def approval_decision(text: str, params: Mapping[str, Any], action: Optional[str] = None) -> str:
-    """"yes" | "no" | "unclear". Отказ первым: слово с основы APPROVAL_NO_STEMS; «не» + слово с основы
+    """"yes" | "no" | "unclear". Отказ первым: слово с основы APPROVAL_NO_STEMS, слово отказа APPROVAL_NO_WORDS целиком
+    или с основы APPROVAL_NO_FLOOR_STEMS (словарь intake_confirm, остаток 2 APPROVEFIX1610); «не» + слово с основы
     APPROVAL_NO_AFTER_NE; «не» + слово согласия (литералы splinter.py:11686, 11739, 11756, 11781, 11797, 11802; У1).
 
     Согласие — строго (APPROVEFIX1610, Codex TB-OWNER-EFFICIENCY-1610-2054, карта М4/М5): нет знака вопроса, нет слова
@@ -1239,7 +1246,8 @@ def approval_decision(text: str, params: Mapping[str, Any], action: Optional[str
                                      for s in yes_stems)
 
     for i, w in enumerate(words):
-        if any(w.startswith(s) for s in no_stems):
+        if (w in APPROVAL_NO_WORDS or any(w.startswith(s) for s in no_stems)
+                or w.startswith(APPROVAL_NO_FLOOR_STEMS)):
             return "no"
         if w == "не" and i + 1 < len(words):
             nxt = words[i + 1]

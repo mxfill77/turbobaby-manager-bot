@@ -24,7 +24,18 @@ QUEUE4_INTAKE_SUBSTR_MAP М1–М6 (дерево 13b4188). Проверяетс�
       X-bind приёмки дословно + цепочки, отказ реплаем, снятие прежней привязки, две карточки, флаг 1, бронь);
   (RK) Р1-К повторной приёмки e34e086: согласие ДРУГОГО действия без реплая при одной ждущей карточке («закрывай» при
       ждущей выдаче, «активируй» при ждущем приёме) — пояснение без привязки, ни одного вызова; зеркала: согласие
-      СВОЕГО действия по-прежнему привязывает уточнение, две карточки — прежний ответ.
+      СВОЕГО действия по-прежнему привязывает уточнение, две карточки — прежний ответ;
+  (RB) остаток 1 приёмки 8bfcfa3 (бронь): «да?» / тег / «нет» реплаем на чужое → «да» на ответ бота → «да» на
+      уточнение — create_booking не рождается; зеркала: «да» без реплая и реплай на сообщение бота этой жизни — прежняя
+      привязка;
+  (RW) остаток 2: словарь отказов К4 (флаг 1) не уже строгой ветки — «стоп», «stop», «cancel», «нельзя», «неа» (и
+      весь intake_confirm.REFUSE_WORDS) — отказ, «да» на карточку после него не пишет;
+  (R3) Р3 и вытеснение: штатный рестарт (передача restart_handoff как в проде, новая граница жизни процесса) и
+      вытеснение памяти пояснений потолком 40 — «да» на старое пояснение адресного вопроса не рождает, второе «да» не
+      пишет; путь «да» без реплая → уточнение → «да» работает;
+  (R2) Р2: пробег — роль и единицы против показания карточки (переспрос без вызова моста, подтверждение повтором того
+      же числа), неуменьшение против Q строки — мостом при записи (подделка моста с живой сверкой Q closeBooking);
+      «да 15» само по себе не ошибка.
 
 Каждый негатив (A)–(E) обязан падать на 13b4188 (там согласие — подстрокой и без привязки к карточке); стражи, уже
 зелёные на 13b4188, названы в отчёте отдельно. Сеть запрещена подменой socket (rental_case_fakes), память Splinter и
@@ -937,8 +948,8 @@ class R_K4_NoReplyRefusalNeverConsent(Case):
     def test_r11_k4_refusal_with_reply_then_yes_on_bot_zero(self):
         """Отказ реплаем на карточку, затем «да» на ответы бота и «да» без реплая — 0 записей. «да» реплаем на САМУ
         карточку после отказа словарём К4 («нет», «не активируй», «не подтверждаю») — тоже 0: ожидание закрыто.
-        «стоп» словарь К4 отказом не знает (APPROVAL_NO_STEMS) — ответ «неоднозначный», карточка жива; это НЕ Р1 и
-        здесь не судится (остаток отчёта), судится только «да» на уточнение."""
+        «стоп» словарь К4 до остатка 2 отказом не знал (APPROVAL_NO_STEMS) — ответ «неоднозначный», карточка жила; здесь
+        это не судится (исключение ниже — след той поры), отказ «стоп» судит раздел (RW)."""
         for kind, pool in (("act", REFUSALS_ACT), ("close", REFUSALS_CLOSE)):
             for text in pool:
                 with self.subTest(kind=kind, text=text):
@@ -1094,6 +1105,494 @@ class RK_OtherActionConsentNoReply(Case):
         for text in OWN_CLOSE:
             with self.subTest(action="close", own=text):
                 self.assertEqual(IC.decide_action(text, "close"), IC.YES)
+
+
+# ===================================== остатки приёмки 8bfcfa3: общие подделки (память маршрута, рестарт, мост с Q)
+_MEM = ("_CR_NOTES", "_CR_FORGOT", "_IC_DEAD_ASKS")          # память маршрута; на 8bfcfa3 двух последних имён нет
+
+
+def _mem_clear():
+    for name in _MEM:
+        getattr(S, name, {}).clear()
+
+
+def restart_process():
+    """Штатный рестарт Splinter, как в проде: post_stop пишет передачу (`handoff_write`), память процесса пропадает
+    целиком (карточки, пояснения, привязки, вытеснение), новая жизнь процесса начинается позже всего, что бот уже
+    написал (`_CR_LIFE_T0`; на 8bfcfa3 имени нет — присваивание ни на что не влияет), post_init поднимает передачу
+    (`handoff_restore`) — переходят только поля белого списка restart_handoff."""
+    S.handoff_write()
+    for d in (S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES):
+        d.clear()
+    _mem_clear()
+    S._HANDOFF_SEEN.update(applied_sha=None, unapplied=False, carry=[])
+    time.sleep(0.05)                                         # всё написанное до рестарта — строго раньше границы
+    S._CR_LIFE_T0 = time.time()
+    out = S.handoff_restore()
+    assert out.startswith("применена"), out
+
+
+def bot_msg(text):
+    """Сообщение бота этой жизни процесса, не входящее ни в одну карточку (например, исход другой карточки)."""
+    _MID[0] += 1
+    s = Sent(_MID[0], INTAKE, text)
+    SENDS.append(s)
+    return s
+
+
+def other_human_msg(text="коллега: клиент перезвонит"):
+    return types.SimpleNamespace(message_id=4200, from_user=U("dasha_mgr"), forum_topic_created=None, text=text,
+                                 date=datetime.datetime.now(datetime.timezone.utc))
+
+
+BK_CARD_MID = 4100
+
+
+def bk_card_msg():
+    return types.SimpleNamespace(message_id=BK_CARD_MID, from_user=U("dasha_mgr"), forum_topic_created=None)
+
+
+class MemCase(Case):
+    def setUp(self):
+        super(MemCase, self).setUp()
+        _mem_clear()
+        self._t0 = getattr(S, "_CR_LIFE_T0", None)
+
+    def tearDown(self):
+        _mem_clear()
+        if self._t0 is not None:
+            S._CR_LIFE_T0 = self._t0
+        super(MemCase, self).tearDown()
+
+
+# ================================================ (RB) остаток 1: бронь — «да?» без реплая не дорастает до записи
+BOOK_NOT_CONSENT_NOREPLY = ("да?", "ок?", "@turbobaby_manager_bot", "🤔", "да 35200")
+
+
+class RB_BookingNotConsentChain(MemCase):
+    def _book(self):
+        b = Bridge([])
+        S._INTAKE_DRAFTS[INTAKE] = booking_draft(BK_CARD_MID)
+        return b
+
+    def test_rb1_not_consent_without_reply_then_yes_chain_zero_create_card_reply_books(self):
+        """Остаток 1 дословно: «да?» без реплая → «да» на ответ бота → «да» на уточнение → … — 0 create_booking;
+        реплай «да» на саму карточку брони — ровно один."""
+        for text in BOOK_NOT_CONSENT_NOREPLY:
+            with self.subTest(text=text):
+                reset()
+                _mem_clear()
+                b = self._book()
+                n0 = len(SENDS)
+                say(b, text)
+                self.assertTrue(SENDS[n0:], "на ответ без реплая бот молчит: %r" % text)
+                for _ in range(3):
+                    say(b, "да", reply=SENDS[-1])
+                self.assertEqual(b.red("create_booking"), [], "бронь: «%s» без реплая + «да»×3 на ответы бота → "
+                                                             "create_booking" % text)
+                self.assertEqual(S._INTAKE_DRAFTS[INTAKE]["status"], "awaiting_approval")
+                say(b, "да", reply=bk_card_msg())
+                self.assertEqual(len(b.red("create_booking")), 1, "реплай на карточку брони — ответ ей")
+
+    def test_rb2_refusal_reply_on_other_human_then_yes_chain_zero_create(self):
+        """«нет» реплаем на чужое сообщение → переспрос «ответ на другое сообщение» → «да» на него → «да» на
+        уточнение — 0 create_booking (тот же класс, другой адрес не-согласия)."""
+        for text in ("нет", "правки потом", "да?"):
+            with self.subTest(text=text):
+                reset()
+                _mem_clear()
+                b = self._book()
+                say(b, text, reply=other_human_msg())
+                for _ in range(2):
+                    say(b, "да", reply=SENDS[-1])
+                self.assertEqual(b.red("create_booking"), [], "«%s» реплаем на чужое + «да»×2 → create" % text)
+
+    def test_rb3_mirror_yes_without_reply_bind_then_reply_books(self):
+        """Зеркало (зелёное и на 8bfcfa3): согласие без реплая — уточнение С привязкой, «да» на него — запись."""
+        b = self._book()
+        say(b, "да")
+        ask = SENDS[-1]
+        self.assertIn(ask.message_id, S._INTAKE_DRAFTS[INTAKE]["ic_msg_ids"], texts())
+        say(b, "да", reply=ask)
+        self.assertEqual(len(b.red("create_booking")), 1)
+
+    def test_rb4_mirror_reply_on_bot_message_of_this_life_still_binds(self):
+        """Зеркало (Codex 0307, «старое сообщение этого бота»): «да» реплаем на сообщение бота ЭТОЙ жизни процесса, не
+        бывшее переспросом к не-согласию, — прежнее уточнение с привязкой; «да» на него — запись."""
+        b = self._book()
+        other = bot_msg(P + "✅ В аренде, строка 7.")
+        say(b, "да", reply=other)
+        ask = SENDS[-1]
+        self.assertIn(ask.message_id, S._INTAKE_DRAFTS[INTAKE]["ic_msg_ids"], "уточнение не привязано: %r" % texts())
+        say(b, "да", reply=ask)
+        self.assertEqual(len(b.red("create_booking")), 1)
+
+    def test_rb5_mute_ask_names_card_but_is_not_bound(self):
+        """Ответ на «да» реплаем на переспрос к «да?» — то же адресное уточнение (называет карточку, ПДн нет), но его
+        id в сообщения карточки не попадает: реплай на него ничего не ставит."""
+        b = self._book()
+        say(b, "да?")
+        say(b, "да", reply=SENDS[-1])
+        mute = SENDS[-1]
+        d = S._INTAKE_DRAFTS[INTAKE]
+        self.assertEqual(mute.text, P + S._IC_ASK_BIND.format(card=S._ic_card_name(d)))
+        self.assertNotIn("Мария", mute.text)
+        self.assertNotIn(mute.message_id, d["ic_msg_ids"], "уточнение к «немому» переспросу привязано к карточке")
+
+
+# ===================================================== (RW) остаток 2: словарь отказов К4 не уже строгой ветки
+K4_REFUSALS = ("стоп", "stop", "cancel", "нельзя", "неа", "Стоп!", "STOP", "no", "nope", "отмени")
+
+
+class RW_K4RefusalWords(Case):
+    def setUp(self):
+        super(RW_K4RefusalWords, self).setUp()
+        os.environ["RENTAL_CASE_APPROVALS"] = "1"
+        import rental_case
+        d = tempfile.mkdtemp(prefix="approvefix_k4w_%s_" % self._testMethodName[5:20], dir=TTMP)
+        p = os.path.join(d, "rental_case.sqlite")
+        rental_case.Store.create(p)
+        os.environ["RENTAL_CASE_DB"] = p
+
+    def k4(self, b, text, reply):
+        return say(b, text, reply=reply, uname=OWNER, uid=OWNER_ID)
+
+    def test_rw1_pure_refusal_words_are_no_for_every_action(self):
+        import intake_confirm as IC
+        import rental_case_rules as R
+        pd = R.PARAMS_DEFAULT
+        words = sorted(set(K4_REFUSALS) | set(IC.REFUSE_WORDS))
+        for action in (None, "activate", "close", "booking"):
+            for w in words:
+                with self.subTest(action=action, word=w):
+                    self.assertEqual(R.approval_decision(w, pd, action=action), "no",
+                                     "К4: «%s» — отказ строгой ветки, а словарь К4 его не знает" % w)
+
+    def test_rw2_guards_not_refusal(self):
+        """Границы: слово отказа — ЦЕЛИКОМ; соседние слова отказом не становятся, согласие — прежнее."""
+        import rental_case_rules as R
+        pd = R.PARAMS_DEFAULT
+        for text, want in (("да", "yes"), ("ок", "yes"), ("да 35200", "unclear"), ("стопка", "unclear"),
+                           ("неактивна", "unclear"), ("nobody", "unclear"), ("nothing", "unclear")):
+            with self.subTest(text=text):
+                self.assertEqual(R.approval_decision(text, pd, action="activate"), want)
+        self.assertEqual(R.approval_decision("да 35200", pd, action="close"), "yes")
+
+    def test_rw3_k4_refusal_reply_on_card_closes_card_then_yes_zero_writes(self):
+        """Флаг 1, реплай «<слово отказа>» на карточку выдачи/приёма → «❌ … отменил»; «да» реплаем на ту же карточку
+        и на ответы бота — 0 записей (прежде: «неоднозначный», карточка ждала, «да» на неё писало)."""
+        for kind in ("act", "close"):
+            for w in ("стоп", "stop", "cancel", "нельзя", "неа"):
+                with self.subTest(kind=kind, word=w):
+                    self.setUp()
+                    if kind == "act":
+                        b = Bridge([bk_row()])
+                        card = ho_card(b)
+                    else:
+                        b = Bridge([rent_row()])
+                        card = ret_card(b)
+                    n0 = len(SENDS)
+                    self.k4(b, w, card)
+                    said = [s.text for s in SENDS[n0:]]
+                    self.assertTrue(any("отменил" in t for t in said), "К4: «%s» не отказ: %r" % (w, said))
+                    for s in list(SENDS[n0:]):
+                        self.k4(b, "да", s)
+                    self.k4(b, "да", card)
+                    self.assertEqual(_writes(b), [], "К4: «%s» реплаем на карточку + «да» → запись" % w)
+
+
+# ============================================================ (R3) Р3: рестарт и вытеснение памяти пояснений
+class R3_RestartAndEviction(MemCase):
+    def _card(self, kind):
+        if kind == "act":
+            b = Bridge([bk_row()])
+            return b, ho_card(b), S._HANDOVER_ACTIVATIONS
+        b = Bridge([rent_row()])
+        return b, ret_card(b), S._RETURN_CLOSES
+
+    def _exp(self, kind):
+        return _exp_act() if kind == "act" else _exp_close("35200")
+
+    def test_r3a_restart_yes_on_old_note_never_writes_then_noreply_path_works(self):
+        """Р3 дословно: «нет» без реплая → пояснение N → штатный рестарт → «да» реплаем на N → «да» на ответ бота →
+        0 записей; карточка пережила рестарт и ждёт; «да» без реплая → уточнение этой жизни → «да» на него — запись."""
+        for kind in ("act", "close"):
+            with self.subTest(kind=kind):
+                reset()
+                _mem_clear()
+                b, _card, store = self._card(kind)
+                say(b, "нет")
+                note = SENDS[-1]
+                restart_process()
+                self.assertEqual(store[INTAKE]["status"], "awaiting", "карточка не пережила рестарт")
+                n0 = len(SENDS)
+                say(b, "да", reply=note)
+                out = [s.text for s in SENDS[n0:]]
+                self.assertFalse(any("Это ответ на карточку" in t for t in out),
+                                 "«да» на старое пояснение родило адресный вопрос: %r" % out)
+                for _ in range(2):
+                    say(b, "да", reply=SENDS[-1])
+                self.assertEqual(_writes(b), [], "Р3: «да» на пояснение до рестарта → запись")
+                self.assertEqual(store[INTAKE]["status"], "awaiting")
+                say(b, "да")
+                ask = SENDS[-1]
+                self.assertIn("Это ответ на карточку", ask.text, texts())
+                say(b, "да", reply=ask)
+                self.assertEqual(b.red("activate_booking" if kind == "act" else "close_booking"), self._exp(kind))
+
+    def test_r3b_restart_reply_on_card_itself_does_not_write_through_chain(self):
+        """После рестарта id карточки не переходят (restart_handoff не тронут): реплай «да» на неё — сообщение
+        неизвестного происхождения: ни записи, ни адресного вопроса, и «да» на ответ бота тоже не пишет."""
+        for kind in ("act", "close"):
+            with self.subTest(kind=kind):
+                reset()
+                _mem_clear()
+                b, card, store = self._card(kind)
+                restart_process()
+                say(b, "да", reply=card)
+                say(b, "да", reply=SENDS[-1])
+                self.assertEqual(_writes(b), [], "после рестарта «да» на карточку + «да» на ответ бота → запись")
+                self.assertEqual(store[INTAKE]["status"], "awaiting")
+
+    def test_r3c_eviction_yes_on_evicted_note_never_writes(self):
+        """Вытеснение: «нет» без реплая → пояснение N1 → 41 «да» на «немые» ответы (N1 выпадает из потолка 40) → «да»
+        реплаем на N1 → «да» на ответ бота — 0 записей; реплай на саму карточку — запись."""
+        for kind in ("act", "close"):
+            with self.subTest(kind=kind):
+                reset()
+                _mem_clear()
+                b, card, store = self._card(kind)
+                say(b, "нет")
+                n1 = SENDS[-1]
+                for _ in range(41):
+                    say(b, "да", reply=SENDS[-1])
+                self.assertNotIn(n1.message_id, S._CR_NOTES.get(INTAKE) or [], "N1 не вытеснен — проба не та")
+                self.assertEqual(_writes(b), [])
+                n0 = len(SENDS)
+                say(b, "да", reply=n1)
+                self.assertFalse(any("Это ответ на карточку" in s.text for s in SENDS[n0:]), texts()[-2:])
+                say(b, "да", reply=SENDS[-1])
+                self.assertEqual(_writes(b), [], "«да» на вытесненное пояснение → запись")
+                say(b, "да", reply=card)
+                self.assertEqual(len(_writes(b)), 1)
+
+    def test_r3d_booking_restart_chain_zero_create_card_reply_books(self):
+        """Бронь: «да?» без реплая → переспрос → штатный рестарт (черновик и id карточки переходят) → «да» на
+        переспрос → «да» на ответ бота — 0 create_booking; реплай на карточку брони — запись."""
+        b = Bridge([])
+        S._INTAKE_DRAFTS[INTAKE] = booking_draft(BK_CARD_MID)
+        say(b, "да?")
+        ask = SENDS[-1]
+        restart_process()
+        self.assertEqual(S._INTAKE_DRAFTS[INTAKE]["status"], "awaiting_approval")
+        say(b, "да", reply=ask)
+        say(b, "да", reply=SENDS[-1])
+        self.assertEqual(b.red("create_booking"), [], "бронь: «да» на переспрос до рестарта → create")
+        say(b, "да", reply=bk_card_msg())
+        self.assertEqual(len(b.red("create_booking")), 1)
+
+    def test_r3e_mirror_bot_message_of_this_life_still_binds(self):
+        """Зеркало (зелёное и на 8bfcfa3): реплай «да» на сообщение бота ЭТОЙ жизни, не пояснение и не вытесненное, —
+        прежний адресный вопрос с привязкой; «да» на него — ровно одна запись."""
+        for kind in ("act", "close"):
+            with self.subTest(kind=kind):
+                reset()
+                _mem_clear()
+                b, _card, store = self._card(kind)
+                other = bot_msg(P + "✅ В аренде, строка 7.")
+                say(b, "да", reply=other)
+                ask = SENDS[-1]
+                self.assertIn("Это ответ на карточку", ask.text, texts())
+                self.assertIn(ask.message_id, store[INTAKE]["msg_ids"])
+                say(b, "да", reply=ask)
+                self.assertEqual(len(_writes(b)), 1)
+
+    def test_r3f_pure_origin_truth_table(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        old = now - datetime.timedelta(hours=1)
+
+        def m(reply):
+            return types.SimpleNamespace(chat_id=INTAKE, reply_to_message=reply)
+
+        S._CR_LIFE_T0 = time.time() - 60
+        S._CR_FORGOT[INTAKE] = 920500
+
+        class Boom(object):
+            @property
+            def message_id(self):
+                raise RuntimeError("не читается")
+
+        cases = ((None, False, "реплая нет"),
+                 (types.SimpleNamespace(message_id=1, from_user=U("x"), date=old), False, "сообщение человека"),
+                 (types.SimpleNamespace(message_id=999999, from_user=BotUser(), date=now), False, "бот, эта жизнь"),
+                 (types.SimpleNamespace(message_id=999999, from_user=BotUser(), date=old), True, "бот, до рестарта"),
+                 (types.SimpleNamespace(message_id=999999, from_user=BotUser()), True, "бот, даты нет"),
+                 (types.SimpleNamespace(message_id=920400, from_user=BotUser(), date=now), True, "не новее вытесн."),
+                 (types.SimpleNamespace(message_id=None, from_user=BotUser(), date=now), True, "id нет"),
+                 (types.SimpleNamespace(message_id=999999, date=now, forum_topic_created=object()), False, "тема"),
+                 (Boom(), True, "разбор упал"))
+        for reply, want, ctx in cases:
+            with self.subTest(case=ctx):
+                self.assertEqual(S._cr_origin_unknown(m(reply)), want, ctx)
+
+
+# ============================================== (R2) Р2: пробег — роль, единицы, текущий Q, неуменьшение при записи
+_Q_RE = __import__("re").compile(r"^(\d+)\s*(?:[KkКк][MmМм][\s\S]*)?$")
+
+
+class QBridge(Bridge):
+    """Мост с ЖИВОЙ сверкой одометра closeBooking — порядок проверок bridge_prod/Booking.js:378-470: строка «В аренде»
+    по байку и клиенту (not_active) · km_end обязателен (km_required) · число (bad_km_end) · Q строки живым форматом
+    «<число> Km, <дата>» (bookingParseOdo_; не разобран → odo_unverifiable) · km_end < Q → odometer_back · иначе
+    A=Завершена, N=km_end. `n` — что записано в N."""
+
+    def __init__(self, rows, q):
+        Bridge.__init__(self, rows)
+        self.q = dict(q)
+        self.n = {}
+
+    def close_booking(self, bike, name, date_start=None, km_end=None, paid_total=None):
+        self.calls.append(("close_booking", {"bike": bike, "name": name, "date_start": date_start, "km_end": km_end,
+                                             "paid_total": paid_total}))
+        r = self._find(bike, name, "В аренде")
+        if r is None:
+            return {"ok": False, "error": "not_active", "message": "нет активной"}
+        if km_end in (None, ""):
+            return {"ok": False, "error": "km_required", "row": r["row"], "message": "km_end обязателен"}
+        try:
+            km = float(km_end)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad_km_end", "message": "km_end не число: %s" % km_end}
+        raw = self.q.get(r["row"], "")
+        mm = _Q_RE.match(str(raw).strip()) if raw not in ("", None) else None
+        odo = float(mm.group(1)) if mm else None
+        if odo is None:
+            return {"ok": False, "error": "odo_unverifiable", "row": r["row"], "odo_raw": str(raw), "km_end": km,
+                    "message": "одометр строки пуст/нечитаем"}
+        if km < odo:
+            return {"ok": False, "error": "odometer_back", "row": r["row"], "odo": odo, "km_end": km,
+                    "message": "km_end (%s) меньше текущего пробега строки (Q=%s)" % (km_end, odo)}
+        r["status"] = "Завершена"
+        self.n[r["row"]] = km_end
+        return {"ok": True, "closed": True, "row": r["row"], "bike": bike, "name": name, "km_end": km}
+
+
+Q_LIVE = "35200 Km, 05.10.2026"
+
+
+class R2_MileageRoleUnitsQ(MemCase):
+    def _b(self, q=Q_LIVE):
+        return QBridge([rent_row()], {21: q})
+
+    def test_r2a_short_number_against_card_reading_asks_without_call_then_full_number_closes(self):
+        """«да 15» реплаем на карточку с показанием 35200 — моста не зовём (ни билета, ни вызова), карточка жива,
+        переспрос называет оба числа; «да» на переспрос — ничего; «да 35300» на карточку — запись N=35300."""
+        b = self._b()
+        card = ret_card(b, km="35200")
+        say(b, "да 15", reply=card)
+        self.assertEqual(b.red("close_booking"), [], "«да 15» при показании 35200 ушло в мост")
+        self.assertEqual(b.tickets, 0)
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "awaiting")
+        self.assertIn("«15»", texts()[-1])
+        self.assertIn("35200", texts()[-1])
+        say(b, "да", reply=SENDS[-1])
+        self.assertEqual(b.red("close_booking"), [])
+        say(b, "да 35300", reply=card)
+        self.assertEqual(b.n, {21: "35300"})
+
+    def test_r2b_extra_digit_up_is_not_written_silently(self):
+        """Единицы вверх: «да 352000» (лишний разряд) при показании 35200 — мост бы ПРИНЯЛ (не меньше Q); теперь
+        моста не зовём. Повтор того же «да 352000» — подтверждение человека: вызов уходит, судит мост; другое
+        полное число — закрывает им."""
+        b = self._b()
+        card = ret_card(b, km="35200")
+        say(b, "да 352000", reply=card)
+        self.assertEqual(b.red("close_booking"), [], "лишний разряд записался бы в N без вопроса")
+        say(b, "да 35300", reply=card)
+        self.assertEqual(b.n, {21: "35300"})
+        reset()
+        _mem_clear()
+        b = self._b()
+        card = ret_card(b, km="35200")
+        say(b, "да 352000", reply=card)
+        say(b, "да 352000", reply=card)
+        self.assertEqual([c["km_end"] for c in b.red("close_booking")], ["352000"], "повтор — подтверждение")
+
+    def test_r2c_short_number_is_not_an_error_by_itself(self):
+        """Codex: «да 15» само по себе не ошибка — без показания на карточке или при показании того же порядка число
+        уходит в мост, и при Q не больше его закрытие записано."""
+        for card_km, q in (("", "10 Km, 05.10.2026"), ("12", "10 Km, 05.10.2026"), ("", "10")):
+            with self.subTest(card_km=card_km, q=q):
+                reset()
+                _mem_clear()
+                b = self._b(q)
+                card = ret_card(b, km=card_km)
+                say(b, "да 15", reply=card)
+                self.assertEqual(b.n, {21: "15"})
+
+    def test_r2d_non_decrease_against_q_is_judged_at_write(self):
+        """Неуменьшение и текущий Q — при записи (мост): без показания на карточке «да 15» уходит, мост против Q=35200
+        отказывает до записи (odometer_back); Q не читается — odo_unverifiable; в N не легло ничего, «✅» нет."""
+        for q, err in ((Q_LIVE, "odometer_back"), ("", "odo_unverifiable"), ("05.10.2026", "odo_unverifiable")):
+            with self.subTest(q=q):
+                reset()
+                _mem_clear()
+                b = self._b(q)
+                card = ret_card(b, km="")
+                say(b, "да 15", reply=card)
+                self.assertEqual(len(b.red("close_booking")), 1)
+                self.assertEqual(b.n, {}, "пробег меньше Q / без сверки записан в N")
+                self.assertEqual(b.rows[0]["status"], "В аренде")
+                self.assertFalse(any("✅ Завершена" in t for t in texts()), texts())
+                self.assertTrue(any(err in t or "Закрыть не могу" in t for t in texts()), texts())
+
+    def test_r2e_same_order_and_power_of_ten_crossing_close_without_question(self):
+        for card_km, q, said, want in (("35200", Q_LIVE, "да 35300", "35300"),
+                                       ("35200", Q_LIVE, "да 35 300", "35300"),
+                                       ("99950", "99950 Km, 05.10.2026", "да 100020", "100020"),
+                                       ("35200", Q_LIVE, "да", "35200")):
+            with self.subTest(said=said, card_km=card_km):
+                reset()
+                _mem_clear()
+                b = self._b(q)
+                card = ret_card(b, km=card_km)
+                say(b, said, reply=card)
+                self.assertEqual(b.n, {21: want})
+
+    def test_r2f_k4_short_number_asks_with_new_card_then_repeat_goes_to_bridge(self):
+        """Флаг 1 (хранилище дела): то же правило. «да 15» на карточку с показанием 35200 → моста не зовём, новая
+        карточка того же закрытия; «да 35300» на неё — запись; повтор «да 15» на неё — вызов, мост против Q
+        отказывает (odometer_back), N не тронут."""
+        import rental_case
+        for second, want_n, want_calls in (("да 35300", {21: "35300"}, ["35300"]), ("да 15", {}, ["15"])):
+            with self.subTest(second=second):
+                reset()
+                _mem_clear()
+                os.environ["RENTAL_CASE_APPROVALS"] = "1"
+                d = tempfile.mkdtemp(prefix="approvefix_k4q_", dir=TTMP)
+                p = os.path.join(d, "rental_case.sqlite")
+                rental_case.Store.create(p)
+                os.environ["RENTAL_CASE_DB"] = p
+                b = self._b()
+                card = ret_card(b, km="35200")
+                n_cards = len(cards("Завершаю"))
+                say(b, "да 15", reply=card, uname=OWNER, uid=OWNER_ID)
+                self.assertEqual(b.red("close_booking"), [], "К4: «да 15» при показании 35200 ушло в мост")
+                self.assertTrue(any("«15»" in t for t in texts()), texts())
+                again = cards("Завершаю")
+                self.assertEqual(len(again), n_cards + 1, "К4: новой карточки того же закрытия нет: %r" % texts())
+                say(b, second, reply=again[-1], uname=OWNER, uid=OWNER_ID)
+                self.assertEqual([c["km_end"] for c in b.red("close_booking")], want_calls)
+                self.assertEqual(b.n, want_n)
+
+    def test_r2g_pure_km_doubt_three_outcomes(self):
+        import intake_confirm as IC
+        for km, ref, want in (("15", "35200", True), ("352000", "35200", True), ("3520", "35200", True),
+                              ("35", "35200", True), ("35300", "35200", False), ("35100", "35200", False),
+                              ("100020", "99950", False), ("15", "12", False), ("15", None, None), (None, "35200", None),
+                              ("", "35200", None), ("15", "0", None), ("15", "—", None)):
+            with self.subTest(km=km, ref=ref):
+                self.assertIs(IC.km_doubt(km, ref), want)
 
 
 # =============================================================================== (F) ручка 0: прежнее байт-в-байт

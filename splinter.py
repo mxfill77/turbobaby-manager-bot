@@ -9403,7 +9403,20 @@ async def _rc_execute(msg, context, bridge, st, out, text):
         # APPROVEFIX1610 (М6): пробег — ровно одно число целиком в ответе-согласии (rental_case_rules.approval_km) либо
         # проверенное поле карточки; не «первое число в тексте» и не усечение длинного числа
         _R = _rc_rules()
-        _km = _R.approval_km(text, getattr(st, "params", None) or _R.PARAMS_DEFAULT) or tgt.get("km") or None
+        _said_km = _R.approval_km(text, getattr(st, "params", None) or _R.PARAMS_DEFAULT)
+        _ref = intake_confirm.km_arg(str(tgt.get("km") or ""))[0]
+        if _said_km and intake_confirm.km_doubt(_said_km, _ref) and str(tgt.get("km_doubt") or "") != _said_km:
+            # Р2 (как у строгой ветки): число ответа и показание карточки разного порядка — моста не зовём; новая
+            # карточка того же закрытия помнит число под сомнением: повтор ТОГО ЖЕ «да <число>» на неё — подтверждение
+            written({"error": "km_doubt"})
+            log.info(f"  → ПРИЁМ: пробег {_said_km} против показания карточки {_ref} — разный порядок, переспрос "
+                     f"новой карточкой без вызова моста (@{who}) {tgt.get('bike')}")
+            await say(_CR_KM_DOUBT.format(km=_said_km, ref=_ref, where="новую карточку ниже"))
+            again = dict((k, v) for k, v in tgt.items() if k != "card")
+            again["km_doubt"] = _said_km
+            await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
+            return
+        _km = _said_km or tgt.get("km") or None
         res, exc, sent = _rc_red(bridge, lambda: bridge.close_booking(bike=tgt.get("bike"), name=tgt.get("name"),
                                                                       date_start=(tgt.get("date_start") or None),
                                                                       km_end=_km, paid_total=tgt.get("paid_total")))
@@ -12730,7 +12743,10 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
     Сверх проекта: пересланное — молчание; ответ на чужое сообщение и «да» после просьбы о правках — переспрос;
     тег своего бота вырезается до разбора; стикер судится своим эмодзи; без билета запись не уходит.
     Привязка (Codex TB-OWNER-CHECK-1610-0307): «да» без реплая или реплаем не на сообщение этой карточки — адресное
-    уточнение `_IC_ASK_BIND` без записи; отказ, правка и молчание — как прежде."""
+    уточнение `_IC_ASK_BIND` без записи; отказ, правка и молчание — как прежде.
+    Остаток 1 / Р3 приёмки 8bfcfa3: переспрос к НЕ-согласию, данному не реплаем на карточку, — «немой»
+    (`_IC_DEAD_ASKS`); «да» реплаем на него или на сообщение бота неизвестного происхождения (`_cr_origin_unknown`)
+    получает то же уточнение, но без привязки — цепочка «да» на ответы бота create_booking не рождает."""
     chat_id = msg.chat_id
     tid = getattr(msg, "message_thread_id", None)
     _who = msg.from_user.username if msg.from_user else "?"
@@ -12740,7 +12756,8 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
         if _st is not None:
             said = str(getattr(_st, "emoji", None) or "")     # стикер 👍 — как эмодзи 👍 (переспрос)
     v = intake_confirm.decide(said)
-    why, ask_text, bind_ask = "", _IC_ASK, False
+    why, ask_text, bind_ask, bind_mute = "", _IC_ASK, False, False
+    _bind = _ic_reply_binding(msg, d)
     if _ic_forwarded(msg):
         if v != intake_confirm.SILENT:
             why = "переслано, не ответ подтверждающего"
@@ -12757,15 +12774,22 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
             pass
     elif v == intake_confirm.YES and d.get("ic_edit_asked"):
         v, why, ask_text = intake_confirm.ASK, "по карточке просили правки", _IC_EDIT_PENDING
-    elif v == intake_confirm.YES and _ic_reply_binding(msg, d) != "card":
+    elif v == intake_confirm.YES and _bind != "card":
         # Codex TB-OWNER-CHECK-1610-0307: «да» без реплая / реплаем на сообщение не этой карточки (иной бот, другая
         # карточка, старое резюме) — не согласие на ЭТУ бронь; create_booking не зовём
         bind_ask, v = True, intake_confirm.ASK
-        why = ("согласие без реплая на карточку" if _ic_reply_binding(msg, d) == "none"
+        why = ("согласие без реплая на карточку" if _bind == "none"
                else "согласие реплаем не на эту карточку")
-    if bind_ask:
+        if _bind == "other" and _ic_bind_unknown(msg):
+            # остаток 1 / Р3: реплай на «немой» переспрос к не-согласию или на сообщение бота неизвестного
+            # происхождения — то же адресное уточнение, но БЕЗ привязки: «да» на него бронь не ставит
+            bind_ask, bind_mute = False, True
+    if bind_ask or bind_mute:
         ask_text = _IC_ASK_BIND.format(card=_ic_card_name(d))
     log.info(f"  🆕 INTAKE: ответ на карточку → {v} (@{_who})" + (f" — {why}" if why else ""))
+    if bind_mute:
+        log.info("  🆕 INTAKE: уточнение без привязки — реплай на переспрос к не-согласию или на сообщение бота "
+                 "неизвестного происхождения")
 
     async def _say(body):
         return await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False,
@@ -12777,6 +12801,8 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
         sent = await _say(ask_text)
         if bind_ask:
             _ic_note_ids(d, [sent])     # уточнение называет ЭТУ карточку — реплай «да» на него засчитан
+        elif _bind != "card":
+            _ic_note_dead(chat_id, [sent])   # остаток 1: переспрос к ответу не реплаем на карточку — «немой»
         return
     if v == intake_confirm.EDIT:
         d["ic_edit_asked"] = True               # старая карточка больше не ставится «да» — ждём исправленную
@@ -12888,6 +12914,84 @@ _CR_NOTE = {"activate": ("ℹ️ Ответ без реплая на карто�
 _CR_NOTE_REPLY = ("ℹ️ Это пояснение, а не вопрос — ответ на него ничего не подтверждает и не отменяет. Ничего не "
                   "сделал. Решение — только реплаем на саму карточку.")
 _CR_NOTES = {}                        # chat_id → id «немых» сообщений (пояснения к ответам без реплая, не согласию)
+# Р3 приёмки 8bfcfa3 (рестарт и вытеснение): память маршрута — пояснения (`_CR_NOTES`), привязки (`msg_ids`/`ask_ids`),
+# заменённые карточки (`replaced_ids`) — живёт в процессе и ограничена `_CR_IDS_KEEP`. Согласие реплаем на сообщение
+# БОТА, которого эта память не знает, рождает адресный вопрос с привязкой, только если память о нём ПОЛНА: сообщение
+# написано в ЭТОЙ жизни процесса (не раньше `_CR_LIFE_T0`) и новее всего, что память вытеснила (`_CR_FORGOT`). Иначе
+# происхождение неизвестно (это могло быть пояснение к отказу) — пояснение без привязки. restart_handoff не тронут.
+_CR_LIFE_T0 = _time.time()            # граница жизни процесса: всё, что бот написал раньше, этой памяти неизвестно
+_CR_FORGOT = {}                       # chat_id → наибольший id сообщения бота, вытесненного из памяти маршрута
+_CR_NOTE_ORIGIN = ("ℹ️ Не помню сообщение, на которое ответ: оно до перезапуска бота или выпало из памяти — по "
+                   "карточке {word} {card} ничего не делаю. Подтвердить: «да» без реплая — переспрошу адресно. Ответ "
+                   "на это сообщение ничего не подтверждает.")
+# Р2 приёмки 8bfcfa3 (Codex: для пробега проверяется роль, текущий Q, единицы и неуменьшение при записи; «да 15» само по
+# себе не ошибка). Число ответа и показание на карточке разного порядка (`intake_confirm.km_doubt`) — роль числа как
+# показания одометра под сомнением: не закрываем, пока человек не повторит ТО ЖЕ число. Неуменьшение против текущего Q
+# строки CRM судит мост при записи (closeBooking: odometer_back / odo_unverifiable) — в Splinter Q не читается.
+_CR_KM_DOUBT = ("❓ «{km}» — это пробег на сдаче (одометр, км)? На карточке {ref}: разница в 10 раз и больше — похоже "
+                "на другие единицы или потерянный / лишний разряд. Не закрываю, статус в CRM не менял. Пробег правда "
+                "{km} — повтори «да {km}» реплаем на {where}; иначе — «да <полный пробег>».")
+# Остаток 1 приёмки 8bfcfa3 (бронь): переспрос строгого пути брони на НЕ-согласие, данное не реплаем на карточку
+# («да?», тег бота, «нет» реплаем на чужое), — «немой», как пояснение у выдачи/приёма: «да» реплаем на него получает
+# адресное уточнение БЕЗ привязки, и цепочка «да» на ответы бота до create_booking не дорастает. Своё хранилище (а не
+# `_CR_NOTES`): реплай на него решает строгий путь брони, а не общий ответ «это пояснение».
+_IC_DEAD_ASKS = {}                    # chat_id → id «немых» переспросов брони
+
+
+def _cr_forgot(chat_id, ids):
+    """Запомнить, что память маршрута вытеснила эти id (потолок `_CR_IDS_KEEP`): сообщение бота не новее наибольшего
+    из них больше нельзя судить по памяти — его происхождение неизвестно (`_cr_origin_unknown`)."""
+    got = [i for i in (ids or ()) if isinstance(i, int) and not isinstance(i, bool)]
+    if got:
+        _CR_FORGOT[chat_id] = max([_CR_FORGOT.get(chat_id, 0)] + got)
+
+
+def _cr_origin_unknown(msg) -> bool:
+    """Р3: реплай на сообщение бота, которое память маршрута (пояснения, привязки, заменённые карточки) могла забыть:
+    из прошлой жизни процесса (дата раньше `_CR_LIFE_T0` — рестарт стирает память) или не новее вытесненного
+    (`_CR_FORGOT`). Зовётся ТОЛЬКО после того, как реплай не опознан памятью (не карточка, не заменённая, не «немое»).
+    Сомнение (нет id, нет даты, разбор упал) → True: происхождение неизвестно. Реплая нет или он на сообщение
+    человека → False: там памяти не было и нет, прежний путь."""
+    try:
+        r = getattr(msg, "reply_to_message", None)
+        if r is None or getattr(r, "forum_topic_created", None):
+            return False
+        fu = getattr(r, "from_user", None)
+        if fu is not None and getattr(fu, "is_bot", None) is False:
+            return False
+        mid = getattr(r, "message_id", None)
+        if not isinstance(mid, int) or isinstance(mid, bool) or mid <= _CR_FORGOT.get(msg.chat_id, 0):
+            return True
+        at = getattr(r, "date", None)
+        ts = at.timestamp() if hasattr(at, "timestamp") else None
+        return not isinstance(ts, (int, float)) or ts < _CR_LIFE_T0
+    except Exception:
+        return True
+
+
+def _ic_note_dead(chat_id, msgs):
+    """Остаток 1: «немые» переспросы брони (см. `_IC_DEAD_ASKS`); вытесненное потолком — в `_CR_FORGOT`."""
+    have = list(_IC_DEAD_ASKS.get(chat_id) or [])
+    for m in msgs or ():
+        mid = getattr(m, "message_id", None)
+        if mid is not None and mid not in have:
+            have.append(mid)
+    _cr_forgot(chat_id, have[:-_CR_IDS_KEEP])
+    _IC_DEAD_ASKS[chat_id] = have[-_CR_IDS_KEEP:]
+
+
+def _ic_bind_unknown(msg) -> bool:
+    """Согласие реплаем на сообщение бота, не входящее в карточку брони: True — адресное уточнение рождается БЕЗ
+    привязки («немым»): это переспрос к не-согласию (`_IC_DEAD_ASKS`, остаток 1) или происхождение сообщения неизвестно
+    (`_cr_origin_unknown`, Р3). Сомнение → True."""
+    try:
+        r = getattr(msg, "reply_to_message", None)
+        mid = getattr(r, "message_id", None) if r is not None else None
+        if mid is not None and mid in (_IC_DEAD_ASKS.get(msg.chat_id) or ()):
+            return True
+    except Exception:
+        return True
+    return _cr_origin_unknown(msg)
 
 
 def _card_note_ids(rec, msgs):
@@ -12919,6 +13023,7 @@ def _cr_note_dead(chat_id, ids):
     for mid in ids or ():
         if mid is not None and mid not in have:
             have.append(mid)
+    _cr_forgot(chat_id, have[:-_CR_IDS_KEEP])        # Р3: вытесненное «немое» больше не опознаётся памятью
     _CR_NOTES[chat_id] = have[-_CR_IDS_KEEP:]
 
 
@@ -12953,8 +13058,9 @@ def _card_ids_carry(rec, prev):
     """Новая карточка того же места помнит id прежней (любой статус): реплай на старую — «заменена», а не «да» новой."""
     if not isinstance(prev, dict):
         return
-    old = list(prev.get("replaced_ids") or []) + list(prev.get("msg_ids") or [])
-    rec["replaced_ids"] = [i for i in old if i is not None][-_CR_IDS_KEEP:]
+    old = [i for i in list(prev.get("replaced_ids") or []) + list(prev.get("msg_ids") or []) if i is not None]
+    _cr_forgot(INTAKE_CHAT, old[:-_CR_IDS_KEEP])     # Р3: карточки живут только во «Входящих» (INTAKE_CHAT)
+    rec["replaced_ids"] = old[-_CR_IDS_KEEP:]
 
 
 def _card_name(kind, rec) -> str:
@@ -13044,6 +13150,17 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
         sent_ask = await say(_CR_ASK[kind])
         _card_bind_ask(rec, [sent_ask])          # уточнение по ЭТОЙ карточке — реплай «да» на него засчитан
         return
+    if kind == "close" and km is not None:
+        # Р2: число ответа против показания карточки — один ли порядок (роль и единицы); разный и не повторено то же
+        # число — переспрос без вызова моста, карточка жива. Неуменьшение против Q строки судит мост при записи.
+        _ref = intake_confirm.km_arg(str(rec.get("km") or ""))[0]
+        if intake_confirm.km_doubt(km, _ref) and rec.get("km_doubt") != km:
+            rec["km_doubt"] = km
+            log.info(f"  → карточка {word} {rec.get('bike')}: пробег {km} против показания карточки {_ref} — разный "
+                     f"порядок, переспрос без вызова моста (@{who})")
+            sent_d = await say(_CR_KM_DOUBT.format(km=km, ref=_ref, where="карточку"))
+            _cr_note_dead(chat_id, [getattr(sent_d, "message_id", None)])
+            return
     # YES — КРАСНЫЙ шаг под токен-замком 4.2: билет → флаг отправки → ровно один вызов
     rec["status"] = "approved"                  # в пути: повторный ответ не исполнит
     if kind == "close":
@@ -13127,7 +13244,9 @@ async def _intake_route_reply(msg, context, bridge, text, now):
     «заменена». Без реплая: ждёт одна бронь — прежний строгий путь брони; ждёт выдача/приём — ничего не исполняется
     и не отменяется: на СОГЛАСИЕ — адресное уточнение, привязанное к карточке (реплай «да» на него засчитан); на
     всё прочее (отказ, вопрос, условие, правка, число, тег бота) — пояснение БЕЗ привязки, «немое»: реплай на него
-    ничего не подтверждает (Р1 приёмки), а прежние привязанные уточнения ждущих карточек снимаются."""
+    ничего не подтверждает (Р1 приёмки), а прежние привязанные уточнения ждущих карточек снимаются.
+    Р3 приёмки 8bfcfa3: согласие реплаем на сообщение бота, которого память не знает и могла забыть (до `_CR_LIFE_T0`
+    или не новее `_CR_FORGOT`), — пояснение `_CR_NOTE_ORIGIN` без привязки, а не адресный вопрос."""
     if not _intake_can_approve(msg):
         return
     chat_id = msg.chat_id
@@ -13196,11 +13315,19 @@ async def _intake_route_reply(msg, context, bridge, text, now):
         # уточнение после «нет» больше не исполняет карточку
         for _k, _r in live:
             unbound += _card_unbind_asks(chat_id, _r)
+    # Р3: согласие реплаем на сообщение бота, которое память маршрута могла забыть (прошлая жизнь процесса, вытеснение)
+    # — привязанный вопрос не рождается: это могло быть пояснение к отказу
+    origin_unknown = consent and len(waiting) == 1 and _cr_origin_unknown(msg)
     log.info(f"  → Входящие: ответ без реплая на карточку → {v}, ждут {len(waiting)} (@{who}) — "
-             + ("уточняю" if consent else "поясняю, уточнение не привязываю")
+             + ("реплай на сообщение неизвестного происхождения — поясняю без привязки" if origin_unknown
+                else "уточняю" if consent else "поясняю, уточнение не привязываю")
              + (f" (снято привязок {unbound})" if unbound else ""))
     if len(waiting) == 1:
         k, r = waiting[0]
+        if origin_unknown:
+            sent_note = await say(_CR_NOTE_ORIGIN.format(word=_CR_WORD[k], card=_card_name(k, r)))
+            _cr_note_dead(chat_id, [getattr(sent_note, "message_id", None)])
+            return
         if consent:
             sent_ask = await say(_CR_BIND.format(word=_CR_WORD[k], card=_card_name(k, r)))
             _card_bind_ask(r, [sent_ask])        # уточнение называет ЭТУ карточку — реплай на него засчитан
