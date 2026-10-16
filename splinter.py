@@ -12875,6 +12875,19 @@ _CR_DONE = "ℹ️ По карточке {word} {card} исход уже ест�
 _CR_UNKNOWN = {"activate": "⚠️ Исход активации неизвестен ({err}) — проверь CRM; повтор не делаю.",
                "close": "⚠️ Исход закрытия неизвестен ({err}) — проверь CRM; повтор не делаю."}
 _CR_IDS_KEEP = 40                     # потолок памяти id заменённых карточек на чат
+# Р1 приёмки (APPROVEFIX1610, 16.10): ответ БЕЗ реплая, который НЕ согласие (отказ, вопрос, условие, правка, число,
+# обращение к боту без слов), получает ПОЯСНЕНИЕ, а не вопрос «Это ответ на карточку …?»: на тот вопрос «да» значит
+# «да, адрес этот», и отказ превращался в запись в CRM одним «да». Пояснение к карточке не привязано, его id — в
+# `_CR_NOTES` («немые» сообщения): реплай на него ничего не подтверждает, не отменяет и не рождает нового вопроса.
+_CR_NOTE = {"activate": ("ℹ️ Ответ без реплая на карточку выдачи {card} — не активирую и не отменяю. Решение — только "
+                         "реплаем на САМУ карточку: «да» — активировать, «нет» — отказ. Ответ на это сообщение ничего "
+                         "не подтверждает."),
+            "close": ("ℹ️ Ответ без реплая на карточку приёма {card} — не закрываю и не отменяю. Решение — только "
+                      "реплаем на САМУ карточку: «да» или «да <пробег>» — закрыть, «нет» — отказ. Ответ на это "
+                      "сообщение ничего не подтверждает.")}
+_CR_NOTE_REPLY = ("ℹ️ Это пояснение, а не вопрос — ответ на него ничего не подтверждает и не отменяет. Ничего не "
+                  "сделал. Решение — только реплаем на саму карточку.")
+_CR_NOTES = {}                        # chat_id → id «немых» сообщений (пояснения к ответам без реплая, не согласию)
 
 
 def _card_note_ids(rec, msgs):
@@ -12885,6 +12898,55 @@ def _card_note_ids(rec, msgs):
         if mid is not None and mid not in ids:
             ids.append(mid)
     rec["msg_ids"] = ids
+
+
+def _card_bind_ask(rec, msgs):
+    """Уточнение, реплай на которое засчитан ответом карточке (`msg_ids`). Его id помнится и в `ask_ids` — чтобы
+    последующий ответ без реплая, не бывший согласием, снял эту привязку (`_card_unbind_asks`). Сама карточка в
+    `ask_ids` не попадает никогда: реплай на неё — канонический адрес."""
+    _card_note_ids(rec, msgs)
+    ask = list(rec.get("ask_ids") or [])
+    for m in msgs or ():
+        mid = getattr(m, "message_id", None)
+        if mid is not None and mid not in ask:
+            ask.append(mid)
+    rec["ask_ids"] = ask
+
+
+def _cr_note_dead(chat_id, ids):
+    """Запомнить «немые» сообщения чата (пояснение, снятое уточнение): реплай на них — не ответ карточке."""
+    have = list(_CR_NOTES.get(chat_id) or [])
+    for mid in ids or ():
+        if mid is not None and mid not in have:
+            have.append(mid)
+    _CR_NOTES[chat_id] = have[-_CR_IDS_KEEP:]
+
+
+def _card_unbind_asks(chat_id, rec) -> int:
+    """Р1: ответ без реплая, не бывший согласием, снимает привязку ранее заданных уточнений этой карточки (реплай «да»
+    на старое уточнение после «нет» исполнил бы карточку). Снятые id — «немые». Возвращает число снятых."""
+    if not isinstance(rec, dict):
+        return 0
+    ask = [i for i in (rec.get("ask_ids") or []) if i is not None]
+    if not ask:
+        return 0
+    rec["msg_ids"] = [i for i in (rec.get("msg_ids") or []) if i not in ask]
+    rec["ask_ids"] = []
+    _cr_note_dead(chat_id, ask)
+    return len(ask)
+
+
+def _cr_reply_dead(msg) -> bool:
+    """Реплай на «немое» сообщение (`_CR_NOTES`). Сомнение → False: ответ идёт обычным маршрутом, где без реплая на
+    карточку ничего не исполняется."""
+    try:
+        r = getattr(msg, "reply_to_message", None)
+        if r is None or getattr(r, "forum_topic_created", None):
+            return False
+        mid = getattr(r, "message_id", None)
+        return mid is not None and mid in (_CR_NOTES.get(msg.chat_id) or ())
+    except Exception:
+        return False
 
 
 def _card_ids_carry(rec, prev):
@@ -12980,7 +13042,7 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
         return
     if v != intake_confirm.YES:
         sent_ask = await say(_CR_ASK[kind])
-        _card_note_ids(rec, [sent_ask])          # уточнение по ЭТОЙ карточке — реплай «да» на него засчитан
+        _card_bind_ask(rec, [sent_ask])          # уточнение по ЭТОЙ карточке — реплай «да» на него засчитан
         return
     # YES — КРАСНЫЙ шаг под токен-замком 4.2: билет → флаг отправки → ровно один вызов
     rec["status"] = "approved"                  # в пути: повторный ответ не исполнит
@@ -13062,8 +13124,10 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
 async def _intake_route_reply(msg, context, bridge, text, now):
     """APPROVEFIX1610: ответ во «Входящих» при INTAKE_CONFIRM_STRICT — сначала адрес (какая карточка), потом смысл.
     Реплай на карточку брони → строгий путь брони; на карточку выдачи/приёма → `_card_reply_strict`; на заменённую →
-    «заменена». Без реплая: ждёт одна бронь — прежний строгий путь брони; ждёт выдача/приём — уточнение, ничего не
-    исполняется и не отменяется."""
+    «заменена». Без реплая: ждёт одна бронь — прежний строгий путь брони; ждёт выдача/приём — ничего не исполняется
+    и не отменяется: на СОГЛАСИЕ — адресное уточнение, привязанное к карточке (реплай «да» на него засчитан); на
+    всё прочее (отказ, вопрос, условие, правка, число, тег бота) — пояснение БЕЗ привязки, «немое»: реплай на него
+    ничего не подтверждает (Р1 приёмки), а прежние привязанные уточнения ждущих карточек снимаются."""
     if not _intake_can_approve(msg):
         return
     chat_id = msg.chat_id
@@ -13092,6 +13156,15 @@ async def _intake_route_reply(msg, context, bridge, text, now):
             await say(_CR_REPLACED.format(word=_CR_WORD[k], card=_card_name(k, rec)))
         return
     live = [(k, r) for k, r in (("activate", act), ("close", ret)) if _card_waiting(k, r, now)]
+    if _cr_reply_dead(msg):
+        # Р1: реплай на пояснение к ответу без реплая (или на снятое уточнение) — ни согласием, ни отказом не
+        # является и нового вопроса не рождает (в т.ч. у брони); ответ — тоже «немой»: цепочка «да» на «да» не
+        # дорастает до записи. Не ждёт ничего — молчание, как у любого ответа без карточки.
+        log.info(f"  → Входящие: реплай на пояснение (не вопрос) — ничего не исполняю (@{who})")
+        if not _ic_forwarded(msg) and (live or bk is not None):
+            sent_note = await say(_CR_NOTE_REPLY)
+            _cr_note_dead(chat_id, [getattr(sent_note, "message_id", None)])
+        return
     if not live:
         if bk is not None:
             await _intake_reply_strict(bk, msg, context, bridge, text, now)   # одна бронь — прежний строгий путь
@@ -13105,13 +13178,30 @@ async def _intake_route_reply(msg, context, bridge, text, now):
     if v == intake_confirm.SILENT and not _addressed_bot(msg, context):
         return
     waiting = ([("booking", bk)] if bk is not None else []) + live
-    log.info(f"  → Входящие: ответ без реплая на карточку → {v}, ждут {len(waiting)} (@{who}) — уточняю")
+    consent = v == intake_confirm.YES
+    unbound = 0
+    if not consent:
+        # Р1: не-согласие без реплая снимает привязку прежних уточнений ждущих карточек — «да» реплаем на старое
+        # уточнение после «нет» больше не исполняет карточку
+        for _k, _r in live:
+            unbound += _card_unbind_asks(chat_id, _r)
+    log.info(f"  → Входящие: ответ без реплая на карточку → {v}, ждут {len(waiting)} (@{who}) — "
+             + ("уточняю" if consent else "поясняю, уточнение не привязываю")
+             + (f" (снято привязок {unbound})" if unbound else ""))
     if len(waiting) == 1:
         k, r = waiting[0]
-        sent_ask = await say(_CR_BIND.format(word=_CR_WORD[k], card=_card_name(k, r)))
-        _card_note_ids(r, [sent_ask])            # уточнение называет ЭТУ карточку — реплай на него засчитан
+        if consent:
+            sent_ask = await say(_CR_BIND.format(word=_CR_WORD[k], card=_card_name(k, r)))
+            _card_bind_ask(r, [sent_ask])        # уточнение называет ЭТУ карточку — реплай на него засчитан
+            return
+        # Р1: отказ / вопрос / условие без реплая — пояснение БЕЗ привязки (у брони так же: splinter `bind_ask`
+        # только при согласии); «да» на пояснение не подтверждает ничего
+        sent_note = await say(_CR_NOTE.get(k, _CR_NOTE_REPLY).format(card=_card_name(k, r)))
+        _cr_note_dead(chat_id, [getattr(sent_note, "message_id", None)])
         return
-    await say(_CR_MULTI.format(cards="; ".join(_CR_LABEL[k] + _card_name(k, r) for k, r in waiting)))
+    sent_multi = await say(_CR_MULTI.format(cards="; ".join(_CR_LABEL[k] + _card_name(k, r) for k, r in waiting)))
+    if not consent:
+        _cr_note_dead(chat_id, [getattr(sent_multi, "message_id", None)])
 
 
 async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):

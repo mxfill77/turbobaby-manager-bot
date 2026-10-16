@@ -19,7 +19,9 @@ QUEUE4_INTAKE_SUBSTR_MAP М1–М6 (дерево 13b4188). Проверяетс�
   (E) флаг 1 (хранилище дела): те же негативы для activate/close/booking (М4/М5), пробег закрытия, исход «неизвестно»;
   (F) ручка INTAKE_CONFIRM_STRICT=0: ветки 4/5 прежние байт-в-байт — дефекты М1/М2/М6 записаны КАК ПРЕЖНЕЕ
       поведение отката (этот раздел обязан быть зелёным и на 13b4188, и на ветке);
-  (P) чистые части: intake_confirm.km_arg / red_outcome / decide_action, rental_case_rules.approval_decision(action).
+  (P) чистые части: intake_confirm.km_arg / red_outcome / decide_action, rental_case_rules.approval_decision(action);
+  (R) Р1 приёмки 571a117: отказ / вопрос / условие БЕЗ реплая не становится согласием ни одним последующим «да» (пробы
+      X-bind приёмки дословно + цепочки, отказ реплаем, снятие прежней привязки, две карточки, флаг 1, бронь).
 
 Каждый негатив (A)–(E) обязан падать на 13b4188 (там согласие — подстрокой и без привязки к карточке); стражи, уже
 зелёные на 13b4188, названы в отчёте отдельно. Сеть запрещена подменой socket (rental_case_fakes), память Splinter и
@@ -712,6 +714,242 @@ class E_CaseStore(Case):
         self.assertEqual(b.red("activate_booking"), [])
         self.k4(b, "да", card_b)
         self.assertEqual([c["bike"] for c in b.red("activate_booking")], [BIKE_B])
+
+
+# ===================================================== (R) Р1 приёмки: не-согласие без реплая не становится согласием
+# Приёмка 571a117 (accept/accept_approvefix.py, пробы X-bind-00…04): отказ / правка без реплая получали уточнение
+# «Это ответ на карточку …?», ПРИВЯЗАННОЕ к карточке, и «да» на него исполняло activate/close. Формы проб перенесены
+# дословно (r1), дальше — свои варианты: цепочка «да» на ответы бота, отказ реплаем, снятие привязки прежнего уточнения,
+# две карточки, тег бота, флаг 1 (хранилище дела), бронь.
+ACT_NOREPLY_NOT_CONSENT = ("нет", "не активируй", "стоп", "да, но поправь дату", "да?", "да, но сначала оплата",
+                           "@turbobaby_manager_bot")
+CLOSE_NOREPLY_NOT_CONSENT = ("нет", "не подтверждаю", "стоп", "да?", "да 35300", "да, но поправь пробег",
+                             "@turbobaby_manager_bot")
+X_BIND_PROBES = (("act", "нет"), ("act", "не активируй"), ("act", "да, но поправь дату"), ("close", "нет"),
+                 ("close", "не подтверждаю"))                   # дословно accept_approvefix.X_CASES
+REFUSALS_ACT = ("нет", "не активируй", "стоп")
+REFUSALS_CLOSE = ("нет", "не подтверждаю", "стоп")
+
+
+def _exp_act():
+    return [{"bike": BIKE_A, "name": "Анна Тест", "date_start": dt(0, "09:00")}]
+
+
+def _exp_close(km):
+    return [{"bike": BIKE_A, "name": "Иван Тест", "date_start": dt(-3), "km_end": km, "paid_total": 1500.0}]
+
+
+def _writes(b):
+    return [n for n, _k in b.calls if n in ("activate_booking", "close_booking", "create_booking")]
+
+
+class R_NoReplyRefusalNeverConsent(Case):
+    def _card(self, kind):
+        if kind == "act":
+            b = Bridge([bk_row()])
+            return b, ho_card(b), S._HANDOVER_ACTIVATIONS
+        b = Bridge([rent_row()])
+        return b, ret_card(b), S._RETURN_CLOSES
+
+    def test_r1_acceptance_probes_x_bind(self):
+        """Пробы X-bind-00…04 приёмки: «<не-согласие>» БЕЗ реплая → ответ бота; «да» реплаем на этот ответ → 0
+        изменяющих вызовов, карточка жива (не исполнена и не снята)."""
+        for kind, text in X_BIND_PROBES:
+            with self.subTest(kind=kind, text=text):
+                reset()
+                b, _card, store = self._card(kind)
+                n0 = len(SENDS)
+                say(b, text)
+                asks = SENDS[n0:]
+                self.assertTrue(asks, "на ответ без реплая бот молчит: %r" % text)
+                self.assertFalse(any("Это ответ на карточку" in s.text for s in asks),
+                                 "не-согласию задан вопрос, на который «да» = «да, адрес этот»: %r" % texts())
+                say(b, "да", reply=asks[-1])
+                self.assertEqual(_writes(b), [], "Р1: «%s» без реплая + «да» на уточнение → запись в CRM" % text)
+                self.assertEqual(store[INTAKE]["status"], "awaiting")
+
+    def test_r2_chain_of_yes_on_bot_replies_never_writes_then_card_reply_works(self):
+        for kind, pool in (("act", ACT_NOREPLY_NOT_CONSENT), ("close", CLOSE_NOREPLY_NOT_CONSENT)):
+            for text in pool:
+                with self.subTest(kind=kind, text=text):
+                    reset()
+                    b, card, store = self._card(kind)
+                    n0 = len(SENDS)
+                    say(b, text)
+                    self.assertTrue(SENDS[n0:], "на ответ без реплая бот молчит: %r" % text)
+                    for _ in range(3):                                   # «да» на каждый следующий ответ бота
+                        say(b, "да", reply=SENDS[-1])
+                    self.assertEqual(_writes(b), [], "«%s» без реплая → цепочка «да» дала запись" % text)
+                    self.assertEqual(store[INTAKE]["status"], "awaiting", "карточку погасило не-согласие без реплая")
+                    say(b, "да", reply=card)                             # канонический адрес — сама карточка
+                    if kind == "act":
+                        self.assertEqual(b.red("activate_booking"), _exp_act())
+                    else:
+                        self.assertEqual(b.red("close_booking"), _exp_close("35200"))
+
+    def test_r3_close_number_without_reply_is_not_written_as_card_km(self):
+        """«да 35300» без реплая прежде шло в привязанное уточнение, и «да» на него закрывало с km_end карточки 35200 —
+        не тем числом, что назвал человек."""
+        b, card, _store = self._card("close")
+        n0 = len(SENDS)
+        say(b, "да 35300")
+        say(b, "да", reply=SENDS[n0:][-1])
+        self.assertEqual(b.red("close_booking"), [])
+        say(b, "да 35300", reply=card)
+        self.assertEqual(b.red("close_booking"), _exp_close("35300"))
+
+    def test_r4_refusal_with_reply_then_yes_never_writes(self):
+        for kind, pool in (("act", REFUSALS_ACT), ("close", REFUSALS_CLOSE)):
+            for text in pool:
+                with self.subTest(kind=kind, text=text):
+                    reset()
+                    b, card, store = self._card(kind)
+                    say(b, text, reply=card)
+                    self.assertEqual(store[INTAKE]["status"], "rejected", "отказ реплаем на карточку снимает её")
+                    say(b, "да", reply=SENDS[-1])                        # «да» на «❌ … отменил»
+                    say(b, "да", reply=card)                             # «да» на снятую карточку
+                    say(b, "да")                                         # «да» без реплая
+                    self.assertEqual(_writes(b), [], "отказ реплаем + «да» → запись: %r" % text)
+
+    def test_r5_later_not_consent_unbinds_earlier_ask(self):
+        """Уточнение уже привязано (на «да» без реплая — `_CR_BIND`, на «да?» реплаем — `_CR_ASK`); затем отказ без
+        реплая — «да» реплаем на СТАРОЕ уточнение больше не исполняет; реплай на саму карточку — исполняет."""
+        for kind, first, first_reply in (("act", "да", False), ("act", "да?", True), ("close", "да", False),
+                                         ("close", "да?", True)):
+            with self.subTest(kind=kind, first=first):
+                reset()
+                b, card, store = self._card(kind)
+                n0 = len(SENDS)
+                say(b, first, reply=card if first_reply else None)
+                old_ask = SENDS[n0:][-1]
+                self.assertIn(old_ask.message_id, store[INTAKE]["msg_ids"], "уточнение не привязано: %r" % texts())
+                say(b, "нет")                                            # передумал — без реплая
+                self.assertNotIn(old_ask.message_id, store[INTAKE]["msg_ids"], "привязка старого уточнения не снята")
+                say(b, "да", reply=old_ask)
+                self.assertEqual(_writes(b), [], "«да» реплаем на старое уточнение после «нет» исполнило карточку")
+                self.assertEqual(store[INTAKE]["status"], "awaiting")
+                say(b, "да", reply=card)
+                self.assertEqual(len(_writes(b)), 1, "реплай на саму карточку — ответ ей")
+
+    def test_r6_positive_yes_without_reply_bind_ask_still_counts(self):
+        b, _card, _store = self._card("act")
+        say(b, "да")
+        asks = [s for s in SENDS if "засчитываю только реплаем" in s.text]
+        self.assertEqual(len(asks), 1, texts())
+        say(b, "да", reply=asks[0])
+        self.assertEqual(b.red("activate_booking"), _exp_act())
+        reset()
+        b, _card, _store = self._card("close")
+        say(b, "да")
+        asks = [s for s in SENDS if "засчитываю только реплаем" in s.text]
+        self.assertEqual(len(asks), 1, texts())
+        say(b, "да 35300", reply=asks[0])
+        self.assertEqual(b.red("close_booking"), _exp_close("35300"))
+
+    def test_r7_two_cards_refusal_without_reply_then_yes_chain_never_activates(self):
+        b = Bridge([rent_row(), bk_row_b()])
+        close_card = ret_card(b, BIKE_A)
+        act_card = ho_card(b, BIKE_B)
+        say(b, "нет")
+        multi = [s for s in SENDS if "несколько карточек" in s.text]
+        self.assertEqual(len(multi), 1, texts())
+        say(b, "да 35300", reply=close_card)                            # приём закрыт реплаем на свою карточку
+        self.assertEqual(len(b.red("close_booking")), 1)
+        say(b, "да", reply=multi[0])                                     # осталась одна выдача
+        say(b, "да", reply=SENDS[-1])
+        self.assertEqual(b.red("activate_booking"), [], "«нет» без реплая при двух карточках → цепочка «да» → выдача")
+        self.assertEqual(S._HANDOVER_ACTIVATIONS[INTAKE]["status"], "awaiting")
+        say(b, "да", reply=act_card)
+        self.assertEqual([c["bike"] for c in b.red("activate_booking")], [BIKE_B])
+
+    def test_r8_note_wording_and_reply_guards(self):
+        b, _card, store = self._card("act")
+        n0 = len(SENDS)
+        say(b, "нет")
+        note = SENDS[n0:][-1]
+        self.assertIn("строка 17", note.text)
+        self.assertNotIn("Анна", note.text, "в пояснении нет имени клиента (ПДн)")
+        self.assertNotIn("?", note.text, "пояснение — не вопрос: «да» на него нечему подтверждать")
+        n1 = len(SENDS)
+        say(b, "да", reply=note, uname="pym_thai")                     # не одобряющий
+        say(b, "да", reply=note, forward=True)                           # пересланное
+        self.assertEqual(len(SENDS), n1, "реплай не одобряющего / пересланный — молчание")
+        say(b, "нет", reply=note)                                        # «нет» на пояснение карточку не снимает
+        self.assertEqual(store[INTAKE]["status"], "awaiting")
+        self.assertEqual(_writes(b), [])
+
+    def test_r9_booking_alone_one_yes_after_not_consent_without_reply_zero_create(self):
+        bk_card = types.SimpleNamespace(message_id=4100, from_user=U("dasha_mgr"), forum_topic_created=None)
+        for text in ("нет", "да?", "да, но поправь дату", "не ставь"):
+            with self.subTest(text=text):
+                reset()
+                b = Bridge([])
+                S._INTAKE_DRAFTS[INTAKE] = booking_draft(bk_card.message_id)
+                n0 = len(SENDS)
+                say(b, text)
+                self.assertTrue(SENDS[n0:], texts())
+                say(b, "да", reply=SENDS[-1])
+                self.assertEqual(b.red("create_booking"), [], "бронь: «%s» без реплая + «да» → create" % text)
+
+
+class R_K4_NoReplyRefusalNeverConsent(Case):
+    """Флаг RENTAL_CASE_APPROVALS=1: путь хранилища дела (`_rc_intake_reply`) — те же формы, 0 записей. Настройка — как
+    у (E) (своя временная база дела на каждый прогон), без наследования: тесты (E) не должны гоняться дважды."""
+
+    def setUp(self):
+        super(R_K4_NoReplyRefusalNeverConsent, self).setUp()
+        os.environ["RENTAL_CASE_APPROVALS"] = "1"
+        import rental_case
+        d = tempfile.mkdtemp(prefix="approvefix_k4r_%s_" % self._testMethodName[5:20], dir=TTMP)
+        p = os.path.join(d, "rental_case.sqlite")
+        rental_case.Store.create(p)
+        os.environ["RENTAL_CASE_DB"] = p
+
+    def k4(self, b, text, reply):
+        return say(b, text, reply=reply, uname=OWNER, uid=OWNER_ID)
+
+    def _card(self, kind):
+        if kind == "act":
+            b = Bridge([bk_row()])
+            return b, ho_card(b)
+        b = Bridge([rent_row()])
+        return b, ret_card(b)
+
+    def test_r10_k4_refusal_without_reply_then_yes_on_bot_zero_then_card_reply_works(self):
+        for kind, pool in (("act", REFUSALS_ACT + ("да, но поправь дату", "да?")),
+                           ("close", REFUSALS_CLOSE + ("да?", "да 35300"))):
+            for text in pool:
+                with self.subTest(kind=kind, text=text):
+                    self.setUp()
+                    b, card = self._card(kind)
+                    n0 = len(SENDS)
+                    self.k4(b, text, None)
+                    for s in list(SENDS[n0:]):
+                        self.k4(b, "да", s)
+                    self.k4(b, "да", None)
+                    self.assertEqual(_writes(b), [], "К4: «%s» без реплая + «да» → запись" % text)
+                    self.k4(b, "да", card)
+                    self.assertEqual(len(_writes(b)), 1, "К4: реплай на саму карточку — ответ ей")
+
+    def test_r11_k4_refusal_with_reply_then_yes_on_bot_zero(self):
+        """Отказ реплаем на карточку, затем «да» на ответы бота и «да» без реплая — 0 записей. «да» реплаем на САМУ
+        карточку после отказа словарём К4 («нет», «не активируй», «не подтверждаю») — тоже 0: ожидание закрыто.
+        «стоп» словарь К4 отказом не знает (APPROVAL_NO_STEMS) — ответ «неоднозначный», карточка жива; это НЕ Р1 и
+        здесь не судится (остаток отчёта), судится только «да» на уточнение."""
+        for kind, pool in (("act", REFUSALS_ACT), ("close", REFUSALS_CLOSE)):
+            for text in pool:
+                with self.subTest(kind=kind, text=text):
+                    self.setUp()
+                    b, card = self._card(kind)
+                    n0 = len(SENDS)
+                    self.k4(b, text, card)
+                    for s in list(SENDS[n0:]):
+                        self.k4(b, "да", s)
+                    self.k4(b, "да", None)
+                    self.assertEqual(_writes(b), [], "К4: отказ реплаем + «да» на уточнение → запись: %r" % text)
+                    if text != "стоп":
+                        self.k4(b, "да", card)
+                        self.assertEqual(_writes(b), [], "К4: отказ реплаем + «да» на карточку → запись: %r" % text)
 
 
 # =============================================================================== (F) ручка 0: прежнее байт-в-байт
