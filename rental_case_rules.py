@@ -1215,6 +1215,47 @@ APPROVAL_FOREIGN_STEMS = {"booking": ("заверш", "закрывай", "ак�
 APPROVAL_NO_WORDS = _IC.REFUSE_WORDS
 APPROVAL_NO_FLOOR_STEMS = _IC.REFUSE_STEMS
 
+# APPROVEFIX-K4COMPAT1810 (Codex TB-OWNER-CHECK-1710-2356 п.4, К4 «г»): окно выкладки. Старый процесс splinter держит в
+# памяти intake_confirm a24a2904 (13b4188 = 5685e53), где нет km_arg, calm_rest и is_edit_word, а этот модуль берёт с
+# диска лениво — первым сообщением ветки К4. Без запаса «да» с хранилищем падало AttributeError, а без хранилища вместо
+# подсказки было молчание (находка 4). Есть имя у intake_confirm — зовётся оно (новый процесс: тот же вызов, поведение то
+# же); нет имени — локальный двойник с тем же телом. km_arg перенесён дословно, константы — те же значения, что в
+# intake_confirm 3b78174. calm_rest и is_edit_word — те же строки над `_residue_ok`, `_TOKEN` и `_is_edit`: в a24a2904 и
+# 3b78174 они совпадают дословно вместе со словарями.
+_KM_DIGITS_MIN, _KM_DIGITS_MAX = 2, 7                       # = intake_confirm.KM_DIGITS_MIN, KM_DIGITS_MAX
+_KM_SEP = "    "                             # = intake_confirm._KM_SEP (пробел, неразрывный, узкий, тонкий)
+_KM_NUMBER = r"(?<![0-9])(?:[0-9]{1,3}(?:[" + _KM_SEP + r"][0-9]{3})+|[0-9]+)(?![0-9])"   # = intake_confirm._NUMBER
+
+
+def _km_arg_local(text):
+    """Двойник intake_confirm.km_arg (3b78174) — для старого модуля в памяти процесса."""
+    s = str(text or "")
+    found = list(re.finditer(_KM_NUMBER, s))
+    if len(found) != 1:
+        return None, s
+    m = found[0]
+    digits = "".join(ch for ch in m.group(0) if ch.isdigit())
+    if not (_KM_DIGITS_MIN <= len(digits) <= _KM_DIGITS_MAX):
+        return None, s
+    return digits, s[:m.start()] + " " + s[m.end():]
+
+
+def _calm_rest_local(text):
+    """Двойник intake_confirm.calm_rest (3b78174)."""
+    s = str(text or "").lower().replace("ё", "е")
+    return _IC._residue_ok(s, list(re.finditer(_IC._TOKEN, s)))
+
+
+def _is_edit_word_local(w):
+    """Двойник intake_confirm.is_edit_word (3b78174)."""
+    return _IC._is_edit(str(w or "").lower().replace("ё", "е"))
+
+
+def _ic(name, local):
+    """Функция intake_confirm, если она у модуля есть; иначе — локальный двойник (старый модуль в памяти процесса)."""
+    f = getattr(_IC, name, None)
+    return local if f is None else f
+
 
 def approval_decision(text: str, params: Mapping[str, Any], action: Optional[str] = None) -> str:
     """"yes" | "no" | "unclear". Отказ первым: слово с основы APPROVAL_NO_STEMS, слово отказа APPROVAL_NO_WORDS целиком
@@ -1256,13 +1297,13 @@ def approval_decision(text: str, params: Mapping[str, Any], action: Optional[str
     if not any(is_yes(w) for w in words):
         return "unclear"
     low = str(text or "").lower().replace("ё", "е")
-    if any(q in low for q in _IC.QUESTION_MARKS) or any(_IC.is_edit_word(w) for w in words):
+    if any(q in low for q in _IC.QUESTION_MARKS) or any(_ic("is_edit_word", _is_edit_word_local)(w) for w in words):
         return "unclear"
     rest = low
     if action in (None, "close"):
-        _km, rest = _IC.km_arg(low)
+        _km, rest = _ic("km_arg", _km_arg_local)(low)
     rest_words = _words(rest)
-    if not rest_words or not all(is_yes_form(w) for w in rest_words) or not _IC.calm_rest(rest):
+    if not rest_words or not all(is_yes_form(w) for w in rest_words) or not _ic("calm_rest", _calm_rest_local)(rest):
         return "unclear"
     return "yes"
 
@@ -1273,7 +1314,7 @@ def approval_km(text: str, params: Mapping[str, Any]) -> Optional[str]:
     карточки (проверенное поле), а не «первое число в тексте»."""
     if approval_decision(text, params, action="close") != "yes":
         return None
-    km, _rest = _IC.km_arg(str(text or "").lower().replace("ё", "е"))
+    km, _rest = _ic("km_arg", _km_arg_local)(str(text or "").lower().replace("ё", "е"))
     return km
 
 
