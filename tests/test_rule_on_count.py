@@ -45,6 +45,12 @@ TMP = tempfile.mkdtemp(prefix="cc_ruleon_suite_")
 os.environ["CC_SHADOW_DIR"] = os.path.join(TMP, "shadow")
 os.environ["CC_SERIES_FILE"] = os.path.join(TMP, "series.json")
 os.environ["CC_CARDS_FILE"] = os.path.join(TMP, "cards.jsonl")
+# ГЕРМЕТИЧНОСТЬ (17.10.2026, TB-CHECK-1710-0742 п.A). Живой process_new пишет пульс ожиданий в
+# /tmp/cc_expect_pulse_test, а guard-маркеры зовёт из /tmp/cc_guard_block (их remove перед
+# запуском). Оба пути — ОБЩИЕ для машины, на сервере это настоящие записи. Пульс уводится явной
+# подменой каталога ДО импорта демона (её читает _expect_pulse_dir), маркеры — модульной
+# константой ПОСЛЕ импорта (см. _confine у import orchestrator_daemon).
+os.environ["CC_EXPECT_DIR"] = os.path.join(TMP, "expect")
 LIVE_STATE = os.path.join(REPO, "chain_series.json")
 
 
@@ -210,6 +216,25 @@ print("\n(6) ЗАМОК D — ПРЕЖНИЕ ЧИСЛА ЦЕЛЫ")
 import orchestrator_daemon as OD                                       # noqa: E402
 
 OD._IS_DAEMON = False
+OD.GUARD_BLOCK_DIR = os.path.join(TMP, "guard_block")
+
+
+def _confine(what, target):
+    """Побочный путь демона обязан лежать СТРОГО внутри TMP сьюта — иначе ни одного run_one."""
+    base = os.path.realpath(TMP)
+    real = os.path.realpath(target)
+    try:
+        inside = real != base and os.path.commonpath([base, real]) == base
+    except ValueError:                     # разные диски Windows — заведомо снаружи
+        inside = False
+    if not inside:
+        raise SystemExit("герметичность: %s = %s не внутри TMP сьюта %s — живые руки не "
+                         "запускаю" % (what, real, base))
+
+
+_confine("каталог пульса ожиданий (OD._expect_pulse_dir)", OD._expect_pulse_dir())
+_confine("каталог guard-маркеров (OD._guard_marker_path)",
+         os.path.dirname(OD._guard_marker_path(0)))
 BEFORE_DERIVED = {"current": 7, "best": 15, "best_ever": 15, "chains": 46, "clean": 42,
                   "line": "серия цепочек: идёт 7 ... лучшая 15, всего цепочек 46",
                   "last_break": {"root": 512, "cause": "ремонт"}}
@@ -331,8 +356,35 @@ def state_now():
         return json.load(f)
 
 
+def activate_rule():
+    """Включение правила в СВОЁМ синтетическом файле счёта — ДО первой постановки.
+
+    ГОНКА ГРАНИЦЫ СЕКУНДЫ (17.10.2026). Чистый лист стирает файл счёта вместе с маркером
+    `rule.since`, и прежде маркер рождался заново ТОЛЬКО на терминале первой записи — то есть
+    ПОЗЖЕ, чем FakeBridge поставил ей `created`. Обе метки округляются до секунды, а продукт
+    честно не считает цепочку, рождённую раньше включения (`born < since`, «прошлое не
+    пересчитываем»). Перешла секунда между постановкой и терминалом — первая цепочка законно
+    выпадает из счёта, и секция (8) краснеет без единого изменения кода. Воспроизведено подменой
+    часов: created=…T12:00:00, since=…T12:00:01Z, skip_why «цепочка старше включения правила».
+
+    Поэтому включение делается здесь, теми же руками демона (`_series_derive` → `_rule_since`,
+    затем `_series_save`), и раньше постановки: при монотонных часах since ≤ created всегда.
+    Продуктовое правило и проверки первой активации (секция 6) не тронуты; пишется ТОЛЬКО
+    синтетический файл этого сьюта — иначе отказ, а не запись."""
+    path = os.environ["CC_SERIES_FILE"]
+    target = OD._series_file()
+    inside = os.path.abspath(target).startswith(os.path.abspath(TMP) + os.sep)
+    if target != path or not inside:
+        raise SystemExit("activate_rule: файл счёта не синтетический (%s) — писать в него "
+                         "нельзя" % target)
+    state = OD._series_state()
+    OD._series_derive(state)
+    OD._series_save(state)
+
+
 def reset(bridge=None):
-    """Чистый лист: файл счёта, журналы тени и память родства тени."""
+    """Чистый лист: файл счёта, журналы тени и память родства тени. При включённом правиле —
+    ещё и его синтетическое включение ДО постановки (`activate_rule`, гонка границы секунды)."""
     for p in (os.environ["CC_SERIES_FILE"], os.environ["CC_CARDS_FILE"]):
         if os.path.exists(p):
             os.remove(p)
@@ -340,6 +392,8 @@ def reset(bridge=None):
     OD._SHADOW_KIN.clear()
     OD._SHADOW_CHAIN.clear()
     OD._REF_VERDICT.update({"key": None, "v": None})
+    if OD._rule_on_count():
+        activate_rule()
     fb = bridge or FakeBridge()
     OD.bc = fb
     return fb
