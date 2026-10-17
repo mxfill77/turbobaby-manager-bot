@@ -30,7 +30,8 @@ NEW_MODULE = "wa_price_carry"
 
 def _probe():
     """Отдельный процесс: служба с флагом не запрошенным, «0», «» и при включённом наличии по переписке — модуля выпуска
-    в процессе нет, класс адаптера прежний, строки старта о цене через ход нет."""
+    в процессе нет, класс адаптера прежний, строки старта о цене через ход нет. PRICECARRY-OFFPIN1810: то же при «1» и
+    «true» — выкл держит код `build()`, а не окружение."""
     import wa_agent_svc as S
     import test_wa_agent_model as TM
     import test_wa_book_read as TB
@@ -38,7 +39,8 @@ def _probe():
     env = {"queue_db": w.qpath, "agent_db": w.dbpath, "mirror_db": "", "tg_token": "", "show_chat": ""}
     runs = []
     for i, extra in enumerate(({}, {"WA_AGENT_PRICE_CARRY": "0"}, {"WA_AGENT_PRICE_CARRY": ""},
-                               {"WA_AGENT_BOOK_CTX": "1"}, {"WA_AGENT_PRICE_CARRY": "off", "WA_AGENT_BOOK_CTX": "1"})):
+                               {"WA_AGENT_BOOK_CTX": "1"}, {"WA_AGENT_PRICE_CARRY": "off", "WA_AGENT_BOOK_CTX": "1"},
+                               {"WA_AGENT_PRICE_CARRY": "1"}, {"WA_AGENT_PRICE_CARRY": "true", "WA_AGENT_BOOK_CTX": "1"})):
         model, _ = S.make_model(env, bridge=br, call=lambda s, u: ("", {}), book=True)
         lines = []
         S.build(dict(env, agent_db=w.dbpath + str(i)), environ=dict({"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1"},
@@ -509,7 +511,8 @@ class Service(unittest.TestCase):
 
     def test_flag_off_subprocess(self):
         """Флаг не запрошен / «0» / «» / «off» (и при включённом наличии по переписке) — в процессе нет модуля выпуска,
-        класс адаптера прежний, строк старта о цене через ход нет, строки старта одинаковы."""
+        класс адаптера прежний, строк старта о цене через ход нет, строки старта одинаковы. PRICECARRY-OFFPIN1810: то же
+        при «1» и «true» (выкл держит код `build()`)."""
         p = subprocess.run([sys.executable, os.path.abspath(__file__), PROBE_ARG], cwd=ROOT, capture_output=True,
                            timeout=300, env=dict(os.environ, PYTHONIOENCODING="utf-8"))
         text = p.stdout.decode("utf-8", "replace")
@@ -518,11 +521,44 @@ class Service(unittest.TestCase):
         r = json.loads(got[-1][len(PROBE_MARK):])
         self.assertEqual(r["mods"], [])
         runs = r["runs"]
-        self.assertEqual([x["type"] for x in runs], ["ModelAdapter"] * 3 + ["BookCtxModelAdapter"] * 2)
-        self.assertEqual([x["carry"] for x in runs], [[]] * 5)
+        self.assertEqual([x["type"] for x in runs], ["ModelAdapter"] * 3 + ["BookCtxModelAdapter"] * 2 +
+                         ["ModelAdapter", "BookCtxModelAdapter"])
+        self.assertEqual([x["carry"] for x in runs], [[]] * 7)
         self.assertEqual(runs[0]["lines"], runs[1]["lines"])
         self.assertEqual(runs[0]["lines"], runs[2]["lines"])
         self.assertEqual(runs[3]["lines"], runs[4]["lines"])
+        self.assertEqual(runs[0]["lines"], runs[5]["lines"])
+        self.assertEqual(runs[3]["lines"], runs[6]["lines"])
+
+    def test_flag_on_env_pinned_off(self):
+        """PRICECARRY-OFFPIN1810: окружение просит ВКЛ («1», «true»; с наличием по переписке и без) — `build()` даёт
+        `price_carry_of` свою карту «0»: `import wa_price_carry` не исполнялся ни разу (подмена `__import__`), примеси
+        нет, строки старта о цене через ход нет, строки старта те же, что без флага."""
+        import builtins
+        w, env = _env()
+        real_import, asked = builtins.__import__, []
+
+        def spy(name, *a, **k):
+            if name.split(".")[0] == NEW_MODULE:
+                asked.append(name)
+            return real_import(name, *a, **k)
+        got = {}
+        for key, extra in (("off", {}), ("1", {S.F_PRICE_CARRY: "1"}), ("true", {S.F_PRICE_CARRY: "true"}),
+                           ("ctx", {S.F_BOOK_CTX: "1"}), ("ctx1", {S.F_BOOK_CTX: "1", S.F_PRICE_CARRY: "1"})):
+            m, lines = _model(env, book=True), []
+            builtins.__import__ = spy
+            try:
+                S.build(dict(env, agent_db=w.dbpath + key), environ=dict({"WA_AGENT_DRAFTS": "1", S.F_BOOK: "1"},
+                                                                        **extra), model=m, line=lines.append)
+            finally:
+                builtins.__import__ = real_import
+            self.assertFalse(any(c is PC.PriceCarryMixin for c in type(m).__mro__), key)
+            self.assertEqual([ln for ln in lines if S.F_PRICE_CARRY in ln or ln.startswith("цена через ход")], [], key)
+            got[key] = lines
+        self.assertEqual(asked, [])
+        self.assertEqual(got["1"], got["off"])
+        self.assertEqual(got["true"], got["off"])
+        self.assertEqual(got["ctx1"], got["ctx"])
 
     def test_flag_off_in_process(self):
         w, env = _env()
@@ -534,7 +570,10 @@ class Service(unittest.TestCase):
 
     def test_flag_on_mixin_and_line_position(self):
         """Флаг 1 → (True, «вкл — …»), класс «примесь + прежний» (и поверх примеси наличия); второй вызов класс не
-        меняет; строка старта — сразу после строки наличия по переписке, а без неё — сразу после строки броней."""
+        меняет; строка старта — сразу после строки наличия по переписке, а без неё — сразу после строки броней.
+        PRICECARRY-OFFPIN1810: `build()` даёт функции свою карту «0», поэтому ВКЛ по пути службы — только ЯВНОЙ подменой
+        карты в тесте: `S.price_carry_of` на время `build` заменён обёрткой, которая записывает карту службы (обязана быть
+        ровно {флаг: «0»}) и зовёт ту же функцию с картой «1»."""
         import wa_agent_cstate as C
         w, env = _env()
         model = _model(env, book=True)
@@ -550,10 +589,20 @@ class Service(unittest.TestCase):
         for extra, after in (({}, "брони (WA_AGENT_BOOK_READ): "),
                              ({S.F_BOOK_CTX: "1"}, "наличие по переписке (WA_AGENT_BOOK_CTX): ")):
             m2 = _model(env, book=True)
-            lines = []
-            S.build(dict(env, agent_db=w.dbpath + str(len(extra))),
-                    environ=dict({"WA_AGENT_DRAFTS": "1", S.F_BOOK: "1", S.F_PRICE_CARRY: "1"}, **extra), model=m2,
-                    line=lines.append)
+            lines, pins = [], []
+            real = S.price_carry_of
+
+            def carry_on(pin, model, real=real, pins=pins):
+                pins.append(dict(pin))
+                return real({S.F_PRICE_CARRY: "1"}, model)
+            S.price_carry_of = carry_on
+            try:
+                S.build(dict(env, agent_db=w.dbpath + str(len(extra))),
+                        environ=dict({"WA_AGENT_DRAFTS": "1", S.F_BOOK: "1", S.F_PRICE_CARRY: "1"}, **extra), model=m2,
+                        line=lines.append)
+            finally:
+                S.price_carry_of = real
+            self.assertEqual(pins, [{S.F_PRICE_CARRY: "0"}])
             i = [k for k, ln in enumerate(lines) if ln.startswith(after)]
             self.assertEqual(len(i), 1, lines)
             self.assertEqual(lines[i[0] + 1], "цена через ход (WA_AGENT_PRICE_CARRY): " + W_ON)

@@ -117,7 +117,9 @@
                     не вызван, число не называется; источник недоступен — «цена неизвестна». Засчитывается только при
                     адаптере модели с дверью цены. Примесь надевается в `build()` на уже выбранный класс адаптера
                     (после примеси наличия, если она есть); `make_model` и `models_of` не тронуты. По умолчанию выкл:
-                    ни импорта `wa_price_carry`, ни строки старта, класс адаптера прежний.
+                    ни импорта `wa_price_carry`, ни строки старта, класс адаптера прежний. С PRICECARRY-OFFPIN1810 —
+                    выкл КОДОМ: `build()` даёт `price_carry_of` свою карту «0», значение в окружении не читается и не
+                    включает ничего; включение — отдельной правкой кода.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -1216,7 +1218,8 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     if bc_words:
         line("наличие по переписке (%s): %s" % (F_BOOK_CTX, bc_words))
     # цена через ход (PRICECARRY1610): флаг не запрошен — ни строки, ни импорта, класс адаптера прежний
-    _pc, pc_words = price_carry_of(environ, model)
+    # PRICECARRY-OFFPIN1810: выкл байтами кода — своя карта «0» вместо окружения; WA_AGENT_PRICE_CARRY не читается
+    _pc, pc_words = price_carry_of({F_PRICE_CARRY: "0"}, model)
     if pc_words:
         line("цена через ход (%s): %s" % (F_PRICE_CARRY, pc_words))
     # кэш промпта (WAAGENTCACHE0210): срок несёт адаптер, его собрал make_model; здесь — только строка старта
