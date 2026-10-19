@@ -67,6 +67,40 @@ function closingBookingOf_(bid) {
 }
 
 /**
+ * CLOSEACCRUAL1910 (замечание приёмки 20.10 — ВЕРСИЯ записи листа): строка листа закрытия по ТОЧНОМУ booking_id —
+ * тем же closingFind_, что closing_upsert (при непустом booking_id фоллбэка по байку нет) — и БЕЗ записи. → {row, cur}
+ * | null. Зовёт closeBooking под замком начисления: части операции карточки сверяются с листом СЕЙЧАС, а не с ответом
+ * closing_upsert, по которому карточка родилась (лист мог смениться повтором возврата или командой «закрытие»).
+ */
+function closingRowById_(bid) {
+  bid = String(bid || '').trim();
+  if (!bid) return null;
+  return closingFind_(getBotTab_(BOTDATA.TABS.CLOSING), BOTDATA.CLOSING_HEADERS, bid, '', '');
+}
+
+/**
+ * CLOSEACCRUAL1910: найденная строка (closingRowById_) → ответ ТОГО ЖЕ вида, что closing_upsert (components +
+ * binding с match 'booking_id' и бронью CRM), но без записи; null → {ok:false, error:'not_found'}. Отдаётся
+ * вызывающему при отказе closing_changed: новую карточку он строит из листа, прочитанного под замком, и судит её
+ * привязку тем же кодом, что на возврате. total_due — как лежит в строке (не пересчёт): части, правленые мимо
+ * closing_upsert, вызывающий поймает сверкой суммы.
+ */
+function closingReplyOf_(found) {
+  if (!found) return { ok: false, error: 'not_found' };
+  var c = found.cur;
+  var bid = String(c.booking_id || '').trim();
+  var bk = closingBookingOf_(bid);
+  var st = c.updated_at;
+  return { ok: true, row: found.row, total_due: c.total_due,
+           components: { surcharge_days: c.surcharge_days, surcharge_fuel: c.surcharge_fuel, damage: c.damage,
+                         other: c.other },
+           binding: { v: 1, row: found.row, match: 'booking_id', booking_id: bid, bike: c.bike,
+                      date_return: c.date_return,
+                      updated_at: Object.prototype.toString.call(st) === '[object Date]' ? st.toISOString() : String(st || ''),
+                      booking: bk.booking, booking_why: bk.why } };
+}
+
+/**
  * Upsert строки закрытия (merge: переданные поля поверх существующих, total_due пересчитывается).
  * body: booking_id?, bike, name?, date_return?, fuel_level?, surcharge_days?, surcharge_fuel?,
  *       damage?, other?, deposit_action?, status?, note?.
@@ -76,6 +110,8 @@ function closingBookingOf_(bid) {
  * вызовом с booking_id; 'bike' — фоллбэк по байку, дата игнорируется, строка может быть ЧУЖОЙ прежней аренды;
  * 'new_no_id' — дописана без booking_id), booking_id, байк, updated_at и бронь CRM этого booking_id
  * (closingBookingOf_). Поиск строки (closingFind_) и запись не менялись: привязку судит вызывающий.
+ * Версией записи для начисления служит СОДЕРЖИМОЕ (booking_id, строка, четыре части — closeBooking сверяет их под
+ * замком), а не штамп updated_at: штамп меняет любой upsert, в том числе правка одного топлива.
  */
 function closingUpsert_(body) {
   var p = body || {};

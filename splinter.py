@@ -9514,6 +9514,17 @@ async def _rc_execute(msg, context, bridge, st, out, text):
             written({"unknown": _err})
             await say(f"⚠️ Исход закрытия неизвестен ({_err}) — проверь CRM; повтор не делаю."
                       + (_ACC_UNKNOWN if _acc is not None else ""))
+        elif sent and err == "closing_changed":
+            # CLOSEACCRUAL1910 (замечание приёмки 20.10): мост ничего не записал — лист закрытия сменился после
+            # карточки; ожидание отвечено, НОВАЯ карточка того же закрытия — новой операцией из листа сейчас
+            written({"error": "closing_changed"})
+            log.info(f"  → ПРИЁМ: лист закрытия изменился после карточки (closing_changed, дело {case_id}) "
+                     f"{tgt.get('bike')} — ничего не записано, новая карточка (@{who})")
+            await say(_acc_changed_words(tgt))
+            again = _acc_rebound(tgt, res.get("closing_now"), tgt.get("bike"))
+            if _said_km:
+                again["km"] = str(_said_km)      # пробег, названный в ответе-согласии, — полем новой карточки
+            await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
         elif sent and err in ("unknown_action", "km_required"):
             # прежде карточка оставалась живой; ожидание уже answered — даём НОВУЮ карточку того же закрытия
             written({"error": str(err)})
@@ -9894,16 +9905,26 @@ def _close_card_parts(km, km_photo, due):
 #       найдена, booking_id и бронь CRM этого id: строка, день начала). Нет привязки / чужая бронь / не целое число /
 #       сумма частей ≠ итогу — начисление стоп ДО записей (само закрытие идёт), карточка называет причину. total_due
 #       на части не раскладываем; closing_get по байку не зовём;
+#       ВЕРСИЯ записи листа (замечание приёмки 20.10): части фиксируются, когда карточка рождается, а лист живёт
+#       дальше (повтор возврата, команда «закрытие»). Мост под замком перечитывает строку листа по ТОЧНОМУ booking_id
+#       и сверяет строку и четыре части с операцией; разошлись — отказ closing_changed ДО записей (ни A/N, ни K, ни
+#       примечания) с листом как он есть (closing_now). Здесь это «не записано»: старая карточка заменяется новой
+#       карточкой НОВОЙ операции (`_acc_reissue` / `_acc_rebound`), её части и привязку судит тот же
+#       `_acc_from_closing`. Старые части в K не пишутся никогда — ни больше, ни меньше листа;
 #   (2)–(4) запись K и примечания, метка IN_PROGRESS/DONE, пустой/текстовый K — на стороне моста (сборка
 #       bridge_build_close_accrual/Booking.js, closeBooking); здесь — тот же вывод стабильного close_op_id
 #       (`_acc_op_id` == closeAccrualOpId_), и он живёт с карточкой (память, restart_handoff.CLOSE_KEYS, цель дела К4);
 #   (5) квитанция начисления в ответе обязательна: старый мост поле молча игнорирует — без квитанции «Доплаты не
 #       записаны: Bridge их не подтвердил». partial / unknown не повторяются и не откатываются: исход называется.
+#       Версия поля `_ACC_V` = 2 («части сверены с листом под замком»): квитанция другой версии — не квитанция.
+_ACC_V = 2
 _ACC_PARTS = ("surcharge_days", "surcharge_fuel", "damage", "other")      # порядок слагаемых — как у моста
 _ACC_LABEL = {"surcharge_days": "дни", "surcharge_fuel": "топливо", "damage": "ущерб", "other": "прочее"}
 _ACC_STATUSES = ("done", "already_done", "stopped", "partial", "unknown")
 _ACC_NO_RECEIPT = " Доплаты не записаны: Bridge их не подтвердил."
 _ACC_UNKNOWN = " Начисление доплат — исход неизвестен вместе с закрытием: проверь K и примечание к A; повтор не делаю."
+_ACC_CHANGED = ("🔁 Лист закрытия этой аренды изменился, пока карточка ждала (в карточке доплаты: {was}) — ничего не "
+                "записал, статус в CRM не менял. Новая карточка ниже — с доплатами листа сейчас; ответь на неё.")
 _ACC_REASON = {
     "bad_accrual": "мост не принял поле начисления", "bad_component": "часть доплаты не целое число",
     "no_addends": "доплат нет", "binding_mismatch": "строка CRM — не та аренда (бронь / строка / день начала)",
@@ -9914,6 +9935,8 @@ _ACC_REASON = {
         "строку или K правили между записями", "note_changed": "примечание правили между записями",
     "note_done_unconfirmed": "метка DONE не подтвердилась", "note_readback_mismatch": "примечание не прочиталось назад",
     "k_readback_mismatch": "K прочитан назад не тем",
+    "closing_changed": "лист закрытия изменился во время закрытия",
+    "closing_unread": "лист закрытия не прочитан — части не сверить",
 }
 
 
@@ -9983,9 +10006,14 @@ def _acc_from_closing(cu, cand, bike, due=None):
     начислять нечего (доплат нет). Условие (1) Codex 2400: привязка — по booking_id той брони CRM, которую
     карточка закрывает (строка и день начала совпали), строка листа найдена по booking_id или дописана с ним;
     фоллбэк листа «последняя open по байку» не годится никогда. due — итог «к доплате» карточки: ответа листа нет, а
-    итог есть — стоп с причиной; нет ни того, ни другого — начислять нечего."""
+    итог есть — стоп с причиной; нет ни того, ни другого — начислять нечего. Тот же разбор судит и closing_now моста
+    (отказ closing_changed, вид ответа closing_upsert): там «строки этой брони в листе нет» — тоже стоп с причиной."""
     if not isinstance(cu, dict) or not cu.get("ok"):
-        return (None, "лист закрытия не ответил — состав доплат неизвестен") if due is not None else (None, None)
+        if due is not None:
+            return None, "лист закрытия не ответил — состав доплат неизвестен"
+        if isinstance(cu, dict) and cu.get("error") in ("not_found", "closing_unread"):
+            return None, "строки листа закрытия этой брони сейчас не прочитать — состав доплат неизвестен"
+        return None, None
     comps = cu.get("components")
     if not isinstance(comps, dict):
         try:
@@ -10077,7 +10105,7 @@ def _acc_payload(rec):
             or _acc_op_id(rec.get("acc_bid"), rec.get("acc_brow"), rec.get("bike"), rec.get("acc_ds"),
                           rec.get("acc_crow"), parts) != rec.get("acc_op")):
         return None, "поля начисления карточки не сошлись с её операцией"
-    return {"v": 1, "close_op_id": rec["acc_op"], "booking_id": rec["acc_bid"], "booking_row": rec["acc_brow"],
+    return {"v": _ACC_V, "close_op_id": rec["acc_op"], "booking_id": rec["acc_bid"], "booking_row": rec["acc_brow"],
             "date_start_day": rec["acc_ds"], "closing_row": rec["acc_crow"],
             "parts": dict(zip(_ACC_PARTS, parts))}, None
 
@@ -10098,11 +10126,12 @@ def _close_booking_accrual(bridge, *, bike, name, date_start, km_end, accrual):
 
 def _acc_receipt_words(res, payload, why):
     """Ответ моста на WRITTEN-закрытие → хвост ответа сотрудникам о начислении. Квитанция обязательна (условие (5)):
-    нет её, не тот op_id, незнакомый статус, нет k_readback — «не подтвердил». «Оплачено» здесь не бывает."""
+    нет её, не та версия поля (`_ACC_V`: мост без сверки листа закрытия под замком), не тот op_id, незнакомый
+    статус, нет k_readback — «не подтвердил». «Оплачено» здесь не бывает."""
     if payload is None:
         return f" Доплаты не записаны: {why}." if why else ""
     rc = res.get("accrual") if isinstance(res, dict) else None
-    if (not isinstance(rc, dict) or rc.get("op_id") != payload.get("close_op_id")
+    if (not isinstance(rc, dict) or rc.get("v") != _ACC_V or rc.get("op_id") != payload.get("close_op_id")
             or rc.get("status") not in _ACC_STATUSES or "k_readback" not in rc):
         return _ACC_NO_RECEIPT
     lbl = _acc_label([payload["parts"].get(k, "") for k in _ACC_PARTS])
@@ -10136,6 +10165,54 @@ def _close_ok_tail(res, payload, why):
     if isinstance(res, dict) and res.get("paid_total_ignored"):
         tail += " «Оплачено» мост в K не записал (paid_total_ignored)."
     return tail
+
+
+def _acc_changed_words(card):
+    """Пояснение к отказу closing_changed: какие доплаты были в карточке (лист сейчас — в новой карточке ниже)."""
+    r = card if isinstance(card, dict) else {}
+    return _ACC_CHANGED.format(was=_acc_label(r.get("acc_parts")) or "—")
+
+
+def _acc_due_now(cu):
+    """Итог листа из closing_now → «к доплате» новой карточки: число > 0 или None (то же правило, что на возврате)."""
+    if not isinstance(cu, dict) or not cu.get("ok"):
+        return None
+    try:
+        t = float(cu.get("total_due"))
+    except (TypeError, ValueError):
+        return None
+    return t if t > 0 else None
+
+
+def _acc_rebound(card, cu, bike):
+    """closing_changed, дело К4 → цель НОВОЙ карточки того же закрытия под новую операцию. Части и привязка — из листа,
+    прочитанного мостом под замком (cu = closing_now), и судит их тот же `_acc_from_closing` против брони карточки
+    (booking_id, строка CRM, день начала). Прежние acc_* снимаются целиком: ни одна часть старой операции не
+    переходит; «к доплате» — итог листа сейчас."""
+    c = card if isinstance(card, dict) else {}
+    out = {k: v for k, v in c.items() if not str(k).startswith("acc_") and k not in ("card", "due_total")}
+    due = _acc_due_now(cu)
+    cand = {"booking_id": c.get("booking_id") or c.get("acc_bid"), "row": c.get("row"), "date_start": c.get("date_start")}
+    acc, why = _acc_from_closing(cu, cand, bike, due)
+    if due is not None:
+        out["due_total"] = due
+    if acc:
+        out.update(acc)
+    elif why:
+        out["acc_stop"] = why
+    return out
+
+
+async def _acc_reissue(context, bridge, card, km, res):
+    """closing_changed, карточка в памяти (строгий и прежний путь ответа) → новая карточка того же закрытия НОВОЙ
+    операцией тем же `_return_close_card`, что рождает карточку на возврате: аренда перечитывается (строка, депозит),
+    части и привязка — из closing_now моста. Старая карточка уже не ждёт (статус «replaced» ставит вызывающий):
+    `_card_ids_carry` помнит её id — реплай на неё «заменена», а не «да» новой. Пробег новой карточки — названный в
+    ответе-согласии (km), иначе её прежний."""
+    cu = res.get("closing_now") if isinstance(res, dict) else None
+    await _return_close_card(context, bridge, card.get("bike"), km=str(km or card.get("km") or ""),
+                             total_due=_acc_due_now(cu), km_photo=str(card.get("km_photo") or ""),
+                             closing=cu if isinstance(cu, dict) else {"ok": False, "error": "closing_unread"})
 
 
 async def _return_close_card(context, bridge, bike, km="", total_due=None, km_photo="", closing=None):
@@ -13679,6 +13756,16 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
         await say("⏳ Закрытие аренды (closeBooking) ещё не задеплоено на Bridge — требуется решение владельца "
                   "(деплой Bridge); карточка останется, после деплоя снова «да».")
         return
+    if sent and _err == "closing_changed":
+        # CLOSEACCRUAL1910 (замечание приёмки 20.10): мост отказал ДО записей — части карточки разошлись с листом
+        # закрытия под замком. Старая карточка больше не исполняется; новая — НОВОЙ операцией из листа сейчас
+        rec["status"] = "replaced"
+        log.info(f"  → ПРИЁМ: лист закрытия изменился после карточки (closing_changed) {rec['bike']} — ничего не "
+                 f"записано, новая карточка (@{who})")
+        sent_c = await say(_acc_changed_words(rec))
+        _cr_note_dead(chat_id, [getattr(sent_c, "message_id", None)])
+        await _acc_reissue(context, bridge, rec, km, res)
+        return
     if sent and _err == "km_required":
         rec["status"] = "awaiting"               # fail-closed row705: «да <пробег>» тем же запросом добьёт закрытие
         await say("❌ Закрыть не могу: нет пробега на сдаче — без него аренду не закрываем. Ответь «да <цифра "
@@ -14106,6 +14193,15 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                                  f"сверить пробег автоматически нельзя. Сверь и заверши руками "
                                  f"(В аренде→Завершена, строка {res.get('row') or ret.get('row') or '?'}). "
                                  f"Статус в CRM не менял.")
+            elif res.get("error") == "closing_changed":
+                # CLOSEACCRUAL1910 (замечание приёмки 20.10): мост ничего не записал — лист закрытия сменился после
+                # карточки; она заменяется новой карточкой НОВОЙ операции (тот же `_return_close_card`)
+                ret["status"] = "replaced"
+                log.info(f"  → ПРИЁМ: лист закрытия изменился после карточки (closing_changed) {ret['bike']} — "
+                         f"ничего не записано, новая карточка (@{_who})")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text="🐀 Splinter\n" + _acc_changed_words(ret))
+                await _acc_reissue(context, bridge, ret, _km, res)
             else:
                 ret["status"] = "error"
                 _err = res.get("error") or "?"

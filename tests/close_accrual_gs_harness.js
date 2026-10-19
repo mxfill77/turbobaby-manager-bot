@@ -13,7 +13,7 @@
  *
  * `--mutant`: исходники подменяются JSON-объектом {имя файла: текст} со stdin, затем идёт весь набор (мутанты).
  * `--stdin`: один заход по JSON со stdin — {mode:'opid', vectors:[…]} → id операции; {mode:'call', crm, closing,
- * call:'closing_upsert'|'close_booking', body} → {res, crm, closing} (состояние листов туда и обратно). Так
+ * call:'closing_upsert'|'closing_get'|'close_booking', body} → {res, crm, closing} (состояние листов туда и обратно). Так
  * tests/test_close_accrual_1910.py гоняет НАСТОЯЩИЙ мост на НАСТОЯЩИХ полях Splinter, не создавая файлов.
  *
  * Печатает JSON {total, failed, cases:[{name, pass, detail}]}; exit 1, если есть провалы. Данные синтетические.
@@ -108,14 +108,16 @@ function makeSheet(rows, opt) {
 }
 
 const LOCK = { busy: false, tries: 0, released: 0, lastMs: null };
+const CUR = { closing: null, closingFail: false };   // лист закрытия текущего окружения (body() кладёт туда строку)
 function makeEnv(crmRows, crmOpt, closingRows) {
   LOCK.busy = false; LOCK.tries = 0; LOCK.released = 0; LOCK.lastMs = null;
   const clients = makeSheet(crmRows, crmOpt);
   const bikes = makeSheet([[NMAX], [CB], ['HONDA CLICK 125CC 1111']]);
   const closing = makeSheet(closingRows || [CLOSING_HEADERS.slice()]);
+  CUR.closing = closing; CUR.closingFail = false;
   const sheets = { 'клиенты': clients, 'список мото': bikes };
   global.SpreadsheetApp = { openById: () => ({ getSheetByName: nm => sheets[nm] || null }) };
-  global.getBotTab_ = () => closing;
+  global.getBotTab_ = () => { if (CUR.closingFail) throw new Error('mock Bot Data unavailable'); return closing; };
   global.BOTDATA = { TABS: { CLOSING: 'закрытие' }, CLOSING_HEADERS: CLOSING_HEADERS };
   global.Logger = { log: () => {} };
   global.LockService = {
@@ -165,10 +167,27 @@ function acc(parts, over) {
   const o = Object.assign({ bid: BID, brow: 2, bike: '9011', day: DAY, crow: CROW }, over || {});
   const lits = CLOSE_ACCRUAL.PARTS.map(k => closeAccrualLit_(pp[k]));
   const id = o.op || closeAccrualOpId_(o.bid, o.brow, o.bike, o.day, o.crow, lits.map(x => (x === null ? '' : x)));
-  return { v: 1, close_op_id: id, booking_id: o.bid, booking_row: o.brow, date_start_day: o.day, closing_row: o.crow,
+  return { v: 2, close_op_id: id, booking_id: o.bid, booking_row: o.brow, date_start_day: o.day, closing_row: o.crow,
            parts: pp };
 }
+// Строка листа закрытия операции: booking_id и те же части в строке closing_row — лист «как при рождении карточки».
+// body() кладёт её в лист текущего окружения; кейсы ВЕРСИИ правят лист ПОСЛЕ body() (раздел 9).
+function closingLine(bid, pp, total) {
+  const r = [bid, CB, 'Пётр', '20.07.2026', '', pp.surcharge_days, pp.surcharge_fuel, pp.damage, pp.other,
+             total === undefined ? 0 : total, '', 'open', '', new Date(Date.UTC(2026, 6, 20, 10, 0, 0))];
+  while (r.length < 30) r.push('');
+  return r;
+}
+function seedClosing(a) {
+  if (!a || typeof a !== 'object' || !a.parts || typeof a.parts !== 'object' || !CUR.closing) return;
+  const crow = Number(a.closing_row);
+  if (!(crow >= 2 && crow < 100)) return;
+  const g = CUR.closing.grid;
+  while (g.length < crow) g.push(new Array(30).fill(''));
+  g[crow - 1] = closingLine(a.booking_id, a.parts);
+}
 function body(a, extra) {
+  seedClosing(a);
   return Object.assign({ bike: '9011', name: 'Пётр', date_start: '2026-07-10', km_end: 12500, accrual: a }, extra || {});
 }
 const A1 = '2,1', K = '2,11';
@@ -188,7 +207,10 @@ if (process.argv.includes('--stdin')) {
   const st = inp.crm || {};
   const env = makeEnv(st.grid || [HEADER], { formulas: st.formulas, fvals: st.fvals, notes: st.notes },
                       (inp.closing || {}).grid);
-  const res = inp.call === 'closing_upsert' ? closingUpsert_(inp.body) : closeBooking(inp.body);
+  // closing_get — для команды «закрытие» сквозного теста (правка доплаты, пока карточка ждёт)
+  const CALLS = { closing_upsert: closingUpsert_, closing_get: closingGet_, close_booking: closeBooking };
+  if (!CALLS[inp.call]) throw new Error('harness --stdin: неизвестный вызов ' + inp.call);
+  const res = CALLS[inp.call](inp.body);
   console.log(JSON.stringify({ res,
     crm: { grid: env.clients.grid, formulas: env.clients.formulas, fvals: env.clients.fvals, notes: env.clients.notes },
     closing: { grid: env.closing.grid }, lock: { tries: LOCK.tries, released: LOCK.released } }));
@@ -255,7 +277,7 @@ if (process.argv.includes('--stdin')) {
         c.grid[1][13] === 12500, J(r));
   check('acc.number.k-formula', c.formulas[K] === '=10000+500+1000', c.formulas[K]);
   const rc = r.accrual || {};
-  check('acc.number.receipt', rc.v === 1 && rc.status === 'done' && rc.op_id === a.close_op_id && rc.k_written === true &&
+  check('acc.number.receipt', rc.v === 2 && rc.status === 'done' && rc.op_id === a.close_op_id && rc.k_written === true &&
         rc.k_readback === '=10000+500+1000' && rc.note === 'DONE' && rc.base === 'number' && rc.addends === '+500+1000', J(rc));
   const note = c.notes[A1] || '';
   check('acc.number.note-prev-kept', note.indexOf(PREV_NOTE + '\n') === 0, J(note));
@@ -347,7 +369,8 @@ if (process.argv.includes('--stdin')) {
   check('acc.payload-mismatch.closing-row', r2.accrual.reason === 'payload_mismatch', J(r2.accrual));
 }
 {
-  const shapes = [{ v: 2 }, 'строка', { v: 1, close_op_id: 'co1-xyz' }];
+  // { v: 1 } — поле прежней версии (без сверки листа закрытия) не принимается: стоп до записей
+  const shapes = [{ v: 1 }, 'строка', { v: 2, close_op_id: 'co1-xyz' }];
   shapes.forEach((s, i) => {
     makeEnv([HEADER, crm({})]);
     const r = closeBooking(body(Object.assign({}, acc({ surcharge_days: '500' }), typeof s === 'object' ? s : {}),
@@ -508,6 +531,135 @@ if (process.argv.includes('--stdin')) {
   check('opid.independent', closeAccrualOpId_(BID, 2, ' 9011 ', DAY, 7, lits) === ref, ref);
   check('opid.lits', J(['500', 500, '0500', 0, '', null, undefined].map(closeAccrualLit_)) ===
         J(['500', '500', '500', '', '', '', '']), J(['500', 500, '0500', 0, '', null].map(closeAccrualLit_)));
+}
+
+// ═══ 9. ВЕРСИЯ записи листа закрытия (замечание приёмки 20.10): части операции — с листом СЕЙЧАС, под замком ═══
+// Карточка рождается на одном ответе closing_upsert, а «да» приходит позже: лист мог смениться повтором возврата или
+// командой «закрытие». Строка перечитывается по ТОЧНОМУ booking_id; разошлась — отказ ЦЕЛИКОМ до записей.
+function setPart(k, v, row) {                     // правка строки листа «после карточки» (мимо записи моста)
+  CUR.closing.grid[(row || CROW) - 1][CLOSING_HEADERS.indexOf(k)] = v;
+}
+{
+  // часть ДОБАВЛЕНА (прочее +300), пока карточка ждала: старые части не пишутся, лист — в ответе
+  const env = makeEnv([HEADER, crm({})], { notes: { [A1]: PREV_NOTE } });
+  const a = acc({ surcharge_days: '500', damage: '1000' });
+  const req = body(a);
+  setPart('other', '300');
+  const r = closeBooking(req);
+  const c = env.clients;
+  check('ver.added.refused-no-writes', r.ok === false && r.error === 'closing_changed' && r.row === 2 &&
+        c.writes.length === 0 && c.grid[1][0] === 'В аренде' && c.grid[1][13] === '' && c.grid[1][10] === 10000 &&
+        c.notes[A1] === PREV_NOTE && env.closing.writes.length === 0, J(r) + J(c.writes));
+  check('ver.added.receipt-stopped', r.accrual && r.accrual.v === 2 && r.accrual.op_id === a.close_op_id &&
+        r.accrual.status === 'stopped' && r.accrual.reason === 'closing_changed' && r.accrual.k_written === false, J(r.accrual));
+  const now = r.closing_now || {};
+  const nb = now.binding || {};
+  check('ver.added.closing-now', now.ok === true && now.row === CROW && J(now.components) ===
+        J({ surcharge_days: '500', surcharge_fuel: '', damage: '1000', other: '300' }) && nb.match === 'booking_id' &&
+        nb.booking_id === BID && nb.row === CROW && nb.booking && nb.booking.row === 2 && nb.booking.date_start === DAY,
+        J(now));
+  check('ver.added.lock-released', LOCK.tries === 1 && LOCK.released === 1, J(LOCK));
+  // новая карточка — НОВАЯ операция из листа сейчас: та же бронь, новые части → закрывает и начисляет новое
+  const a2 = acc({ surcharge_days: '500', damage: '1000', other: '300' });
+  check('ver.added.new-op-differs', a2.close_op_id !== a.close_op_id, a2.close_op_id);
+  const r2 = closeBooking(body(a2));
+  check('ver.added.new-op-done', r2.ok && r2.accrual.status === 'done' && c.formulas[K] === '=10000+500+1000+300' &&
+        c.grid[1][0] === 'Завершена', J(r2.accrual));
+}
+{
+  // часть УМЕНЬШЕНА (ущерб 1000 → 400): K не получает лишнего
+  const env = makeEnv([HEADER, crm({})]);
+  const req = body(acc({ surcharge_days: '500', damage: '1000' }));
+  setPart('damage', 400);
+  const r = closeBooking(req);
+  check('ver.reduced.refused-no-writes', r.ok === false && r.error === 'closing_changed' &&
+        env.clients.writes.length === 0 && env.clients.formulas[K] === undefined && r.closing_now.components.damage === 400,
+        J(r));
+  const r2 = closeBooking(body(acc({ surcharge_days: '500', damage: 400 })));
+  check('ver.reduced.new-op-done', r2.ok && r2.accrual.status === 'done' && env.clients.formulas[K] === '=10000+500+400',
+        env.clients.formulas[K]);
+}
+{
+  // доплату сняли совсем: отказ; в листе — ни одной части (новая карточка — уже без начисления)
+  const env = makeEnv([HEADER, crm({})]);
+  const req = body(acc({ damage: '1000' }));
+  setPart('damage', '');
+  const r = closeBooking(req);
+  check('ver.waived.refused', r.error === 'closing_changed' && env.clients.writes.length === 0 &&
+        J(r.closing_now.components) === J({ surcharge_days: '', surcharge_fuel: '', damage: '', other: '' }), J(r));
+}
+{
+  // у строки листа стёрли booking_id: строки этой брони нет — отказ; ПО БАЙКУ та же строка не подбирается
+  const env = makeEnv([HEADER, crm({})]);
+  const req = body(acc({ damage: '1000' }));
+  setPart('booking_id', '');
+  const r = closeBooking(req);
+  check('ver.row-gone.refused', r.error === 'closing_changed' && env.clients.writes.length === 0 &&
+        J(r.closing_now) === J({ ok: false, error: 'not_found' }), J(r));
+  check('ver.row-gone.no-bike-fallback', CUR.closing.grid[CROW - 1][1] === CB &&
+        CUR.closing.grid[CROW - 1][CLOSING_HEADERS.indexOf('status')] === 'open' && r.error === 'closing_changed',
+        J(r.closing_now));
+}
+{
+  // строка той же брони теперь в другом месте листа: номер строки — часть операции → отказ
+  const env = makeEnv([HEADER, crm({})]);
+  const req = body(acc({ damage: '1000' }));
+  const g = CUR.closing.grid;
+  while (g.length < CROW + 2) g.push(new Array(30).fill(''));
+  g[CROW + 1] = g[CROW - 1].slice();
+  g[CROW - 1] = new Array(30).fill('');
+  const r = closeBooking(req);
+  check('ver.row-moved.refused', r.error === 'closing_changed' && env.clients.writes.length === 0 &&
+        r.closing_now.row === CROW + 2, J(r.closing_now));
+}
+{
+  // повтор возврата БЕЗ правки доплат (настоящий upsert: топливо и штамп сменились) — версия = содержимое, начисляем
+  const env = makeEnv([HEADER, crm({})]);
+  const req = body(acc({ surcharge_days: '500', damage: '1000' }));
+  closingUpsert_({ booking_id: BID, bike: CB, fuel_level: 'full' });
+  const r = closeBooking(req);
+  check('ver.same-parts.reupsert-done', r.ok && r.accrual.status === 'done' && env.closing.n.setValues === 1 &&
+        env.clients.formulas[K] === '=10000+500+1000', J(r.accrual));
+  // в ячейке листа — число вместо строки цифр (так хранит Sheets): тот же литерал
+  const env2 = makeEnv([HEADER, crm({})]);
+  const req2 = body(acc({ surcharge_days: '500', damage: '1000' }));
+  setPart('surcharge_days', 500);
+  setPart('damage', 1000);
+  const r2 = closeBooking(req2);
+  check('ver.number-cell-same-lit', r2.ok && r2.accrual.status === 'done' && env2.clients.formulas[K] === '=10000+500+1000',
+        J(r2.accrual));
+}
+{
+  // лист закрытия не прочитан (Bot Data недоступна): закрытие идёт, начисление — стоп без единой записи K/примечания
+  const env = makeEnv([HEADER, crm({})], { notes: { [A1]: PREV_NOTE } });
+  const req = body(acc({ damage: '1000' }));
+  CUR.closingFail = true;
+  const r = closeBooking(req);
+  check('ver.closing-unread.stop', r.ok && r.closed && r.accrual.status === 'stopped' &&
+        /^closing_unread: /.test(r.accrual.reason) && env.clients.grid[1][0] === 'Завершена' &&
+        env.clients.n.setFormula === 0 && env.clients.notes[A1] === PREV_NOTE, J(r.accrual));
+}
+{
+  // лист правят ПОСЛЕ плана — между меткой IN_PROGRESS и записью K: K не пишем, исход partial
+  const env = makeEnv([HEADER, crm({})], { afterSetNote: (n) => { if (n === 1) setPart('damage', 400); } });
+  const r = closeBooking(body(acc({ surcharge_days: '500', damage: '1000' })));
+  check('ver.changed-at-prestate.partial', r.ok && r.accrual.status === 'partial' && r.accrual.reason === 'closing_changed' &&
+        r.accrual.k_written === false && env.clients.n.setFormula === 0 && env.clients.grid[1][10] === 10000 &&
+        /IN_PROGRESS/.test(env.clients.notes[A1]), J(r.accrual));
+}
+{
+  // closing_now — того же вида, что ответ closing_upsert: вызывающий судит новую карточку тем же кодом
+  makeEnv([HEADER, crm({})], {}, [CLOSING_HEADERS.slice(),
+    [BID, CB, 'Пётр', '20.07.2026', '', '500', '', '1000', '', 1500, '', 'open', '', '']]);
+  const up = closingUpsert_({ booking_id: BID, bike: CB, fuel_level: 'half' });
+  const now = closingReplyOf_(closingRowById_(BID));
+  const norm = o => { const b = Object.assign({}, o.binding); delete b.updated_at;
+    return J({ row: o.row, total_due: o.total_due, parts: CLOSE_ACCRUAL.PARTS.map(k => closeAccrualLit_(o.components[k])),
+               binding: b, keys: Object.keys(o.binding).sort() }); };
+  check('ver.reply-of-same-shape', now.ok === true && up.ok === true && norm(now) === norm(up) &&
+        typeof now.binding.updated_at === 'string' && now.binding.updated_at.length > 0, norm(now) + ' vs ' + norm(up));
+  check('ver.reply-of-not-found', J(closingReplyOf_(closingRowById_('bk-nope'))) === J({ ok: false, error: 'not_found' }) &&
+        closingRowById_('') === null, '');
 }
 
 const failed = cases.filter(c => !c.pass);

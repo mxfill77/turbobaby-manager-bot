@@ -17,11 +17,15 @@ TB-REVIEW-1910-2400 (1)–(5); сторона моста — tests/test_close_ac
        stopped / already_done / пустой K / текст в K; исключение после отправки и write_failed — «неизвестно»;
        lock_busy — «не записано»; стоп на карточке — закрытие идёт без начисления и говорит почему; два «да» двух
        операторов — один вызов; фото-пробег — прежние правила;
+       ВЕРСИЯ листа закрытия (замечание приёмки 20.10): доплату добавили повтором возврата / уменьшили командой
+       «закрытие» / строки не стало, пока карточка ждала, — «да» старых частей не пишет: отказ closing_changed до
+       записей, новая карточка НОВОЙ операцией, реплай на старую — «заменена»;
   (R)  рестарт: карточка с операцией через handoff_write/handoff_restore исполняет ТУ ЖЕ операцию; правленая запись
-       передачи — начисление не шлётся;
-  (L)  прежний путь ответа (INTAKE_CONFIRM_STRICT=0); (K) дело К4 (хранилище);
+       передачи — начисление не шлётся; лист сменился после рестарта — новая операция;
+  (L)  прежний путь ответа (INTAKE_CONFIRM_STRICT=0); (K) дело К4 (хранилище) — оба и со сменой листа;
   (E)  сквозной: `_handle_servicing` → НАСТОЯЩИЙ Closing.js (closing_upsert) → карточка → «да» → НАСТОЯЩИЙ
        closeBooking сборки (node-харнесс, листы в памяти) — K, примечание к A, квитанция; пустой K; фоллбэк по байку;
+       команда «закрытие» уменьшает часть — настоящий closeBooking отказывает до записей, новая операция пишет новое;
   (C)  настоящий BridgeClient._post: тело запроса — accrual, origin agent + билет, paid_total нет.
 Сеть запрещена подменой socket (rental_case_fakes), память Splinter и база дела — только во временном каталоге
 прогона (K4_TTMP). Данные синтетические.
@@ -124,9 +128,9 @@ def closing_reply(parts=None, match="booking_id", bid=BID, crow=5, booking="defa
                         "booking_why": "" if bk else "booking_not_found"}}
 
 
-def receipt(op, status="done", k="=10000+500+1000", base="number", k_written=True, reason="", note="DONE"):
-    return {"v": 1, "op_id": op, "status": status, "reason": reason, "base": base, "k_written": k_written,
-            "note": note, "addends": "+500+1000", "k_readback": k}
+def receipt(op, status="done", k="=10000+500+1000", base="number", k_written=True, reason="", note="DONE", v=None):
+    return {"v": S._ACC_V if v is None else v, "op_id": op, "status": status, "reason": reason, "base": base,
+            "k_written": k_written, "note": note, "addends": "+500+1000", "k_readback": k}
 
 
 # --------------------------------------------------------------------------------------------- подделки Telegram/моста
@@ -193,7 +197,9 @@ class FakeClaude(object):
 class Bridge(object):
     """Мост-подделка: дверь clients (живой формат), лист закрытия — заданный ответ, красные шаги с журналом.
     close_booking (метод клиента — путь без начисления) и _post (путь начисления, `_close_booking_accrual`)
-    записываются раздельно: какой из двух путей пошёл, видно по журналу."""
+    записываются раздельно: какой из двух путей пошёл, видно по журналу. _post, как closeBooking сборки под
+    замком, сверяет части операции с листом закрытия СЕЙЧАС (self.closing): разошлись — отказ closing_changed до
+    записей с листом в ответе (closing_now). Настоящий код этой сверки гоняют разделы (E) и харнесс моста."""
 
     def __init__(self, rows, closing=None, post_reply=None):
         self.rows = [dict(r) for r in rows]
@@ -235,6 +241,30 @@ class Bridge(object):
         self.calls.append(("closing_upsert", dict(k)))
         return dict(self.closing) if isinstance(self.closing, dict) else self.closing
 
+    def closing_get(self, **k):
+        self.calls.append(("closing_get", dict(k)))
+        cu = self.closing if isinstance(self.closing, dict) else {}
+        if not cu.get("ok"):
+            return {"ok": False, "error": "not_found"}
+        item = dict(cu.get("components") or {})
+        item.update(booking_id=(cu.get("binding") or {}).get("booking_id"), bike=BIKE, total_due=cu.get("total_due"),
+                    status="open", _row=cu.get("row"))
+        return {"ok": True, "item": item}
+
+    def _closing_changed(self, acc):
+        cu = self.closing if isinstance(self.closing, dict) else {}
+        comps = cu.get("components") or {}
+        same = (bool(cu.get("ok")) and (cu.get("binding") or {}).get("booking_id") == acc.get("booking_id")
+                and cu.get("row") == acc.get("closing_row")
+                and [S._acc_lit(comps.get(k)) for k in S._ACC_PARTS]
+                == [S._acc_lit((acc.get("parts") or {}).get(k)) for k in S._ACC_PARTS])
+        if same:
+            return None
+        return {"ok": False, "error": "closing_changed", "row": 21,
+                "closing_now": dict(cu) if cu.get("ok") else {"ok": False, "error": "not_found"},
+                "accrual": receipt(acc.get("close_op_id"), status="stopped", reason="closing_changed", k=None,
+                                   k_written=False, note=None)}
+
     def issue_write_ticket(self):
         self.tickets += 1
         return {"ok": True, "ticket": "t-closeaccrual"}
@@ -258,6 +288,9 @@ class Bridge(object):
         self.calls.append(("post_close_booking", dict(fields)))
         if self.post_reply is not None:
             return self.post_reply(fields)
+        changed = self._closing_changed(fields["accrual"])
+        if changed is not None:
+            return changed
         res = self._close(fields["bike"], fields["name"], fields.get("km_end"))
         if res.get("ok"):
             res["accrual"] = receipt(fields["accrual"]["close_op_id"])
@@ -335,7 +368,7 @@ def exp_op(parts=("500", "", "1000", ""), brow=21, crow=5, bid=BID, day=None):
 
 def exp_payload(km="35200", parts=("500", "", "1000", "")):
     return {"bike": BIKE, "name": NAME, "date_start": dt(-3), "km_end": km,
-            "accrual": {"v": 1, "close_op_id": exp_op(parts), "booking_id": BID, "booking_row": 21,
+            "accrual": {"v": 2, "close_op_id": exp_op(parts), "booking_id": BID, "booking_row": 21,
                         "date_start_day": DAY0, "closing_row": 5, "parts": dict(zip(S._ACC_PARTS, parts))}}
 
 
@@ -473,6 +506,9 @@ class P_Pure(Case):
         self.assertEqual(W(None), S._ACC_NO_RECEIPT)
         self.assertEqual(S._ACC_NO_RECEIPT, " Доплаты не записаны: Bridge их не подтвердил.")
         self.assertEqual(W(receipt("co1-0000000000000000")), S._ACC_NO_RECEIPT, "чужая операция — не квитанция")
+        self.assertEqual(S._ACC_V, 2)
+        self.assertEqual(W(receipt(op, v=1)), S._ACC_NO_RECEIPT,
+                         "квитанция поля прежней версии (мост без сверки листа закрытия под замком) — не квитанция")
         self.assertEqual(W(dict(receipt(op), status="ok")), S._ACC_NO_RECEIPT, "незнакомый статус")
         no_k = receipt(op)
         del no_k["k_readback"]
@@ -496,6 +532,34 @@ class P_Pure(Case):
         for st in ("partial", "unknown"):
             self.assertIn("повтор не делаю", W(receipt(op, status=st)))
             self.assertNotIn("Начислено к оплате", W(receipt(op, status=st)), "частичное — не «записаны»")
+        self.assertIn("записано частично (лист закрытия изменился во время закрытия)",
+                      W(receipt(op, status="partial", reason="closing_changed", k_written=False, note="IN_PROGRESS")))
+        self.assertIn("Доплаты не записаны: лист закрытия не прочитан — части не сверить.",
+                      W(receipt(op, status="stopped", reason="closing_unread: Exception: x", k_written=False)))
+
+    def test_p9_rebound_parts_only_from_closing_now(self):
+        """closing_changed (дело К4): новая цель берёт части ТОЛЬКО из листа сейчас; старая операция не переходит."""
+        tgt = {"action": "close", "bike": BIKE, "name": NAME, "date_start": dt(-3), "row": 21, "booking_id": BID,
+               "km": "35200", "due_total": 1500.0, "card": "c-old", "deposit_disp": "5 000 ฿",
+               "acc_op": exp_op(), "acc_bid": BID, "acc_brow": 21, "acc_ds": DAY0, "acc_crow": 5,
+               "acc_parts": ["500", "", "1000", ""]}
+        out = S._acc_rebound(tgt, closing_reply(parts={"damage": 400}), BIKE)
+        self.assertEqual(out["acc_parts"], ["500", "", "400", ""], "уменьшенная часть — из листа сейчас")
+        self.assertEqual(out["acc_op"], exp_op(("500", "", "400", "")))
+        self.assertNotEqual(out["acc_op"], tgt["acc_op"])
+        self.assertEqual(out["due_total"], 900.0)
+        self.assertNotIn("card", out)
+        self.assertEqual({k: out[k] for k in ("bike", "name", "row", "booking_id", "km", "deposit_disp")},
+                         {k: tgt[k] for k in ("bike", "name", "row", "booking_id", "km", "deposit_disp")})
+        for name, cu in (("other-booking", closing_reply(bid="bk-prev", parts={"damage": 400})),
+                         ("bike-fallback", closing_reply(match="bike", parts={"damage": 400})),
+                         ("not-found", {"ok": False, "error": "not_found"})):
+            with self.subTest(case=name):
+                o = S._acc_rebound(tgt, cu, BIKE)
+                self.assertEqual([k for k in o if k.startswith("acc_")], ["acc_stop"], o)
+        waived = S._acc_rebound(tgt, closing_reply(parts={"surcharge_days": "", "damage": ""}), BIKE)
+        self.assertEqual([k for k in waived if k.startswith("acc_")], [], "доплаты сняли — начислять нечего")
+        self.assertNotIn("due_total", waived)
 
 
 # ======================================================== (F) ручка ВЫКЛ / CLOSE_TRUTH=0: ровно путь CLOSETRUTH1910
@@ -673,15 +737,87 @@ class S_OnStrict(Case):
         self.assertEqual(len(b.red("post_close_booking")), 1, "второй оператор той же карточки — без вызова")
         self.assertEqual(len(b.red("close_booking")), 0)
 
-    def test_s14_repeat_return_keeps_operation(self):
-        """Повтор возврата, пока карточка ждёт: карточка не дублируется и операция прежняя (не чеканим новую)."""
+    def test_s14_repeat_return_added_part_reissues_new_operation(self):
+        """Повтор возврата с ДОБАВЛЕННОЙ доплатой, пока карточка ждёт (замечание приёмки 20.10: прежде этот тест звал
+        верным «операция прежняя», и «да» писал в K старые части). Карточка сразу не дублируется, но «да» на неё
+        старых частей не пишет: мост отказывает closing_changed ДО записей, рождается НОВАЯ карточка новой операцией,
+        и только её «да» начисляет — с частями листа сейчас."""
         b = Bridge([rent_row()])
-        ret_card(b)
-        op = S._RETURN_CLOSES[INTAKE]["acc_op"]
+        old = ret_card(b)
+        op0 = S._RETURN_CLOSES[INTAKE]["acc_op"]
         b.closing = closing_reply(parts={"other": "300"})
         run(S._return_close_card(Ctx(), b, BIKE, km="35200", total_due=1800, closing=b.closing))
-        self.assertEqual(len(cards()), 1)
-        self.assertEqual(S._RETURN_CLOSES[INTAKE]["acc_op"], op)
+        self.assertEqual(len(cards()), 1, "повтор возврата карточку не дублирует")
+        say(b, "да", reply=old)
+        self.assertEqual(len(b.red("post_close_booking")), 1)
+        self.assertEqual(b.rows[0]["status"], "В аренде", "мост ничего не записал")
+        self.assertEqual(texts()[-2], P + S._ACC_CHANGED.format(was="дни 500 · ущерб 1000"))
+        self.assertEqual(len(cards()), 2, "новая карточка")
+        new = cards()[-1]
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual((rec["status"], rec["acc_op"], rec["acc_parts"]),
+                         ("awaiting", exp_op(("500", "", "1000", "300")), ["500", "", "1000", "300"]))
+        self.assertNotEqual(rec["acc_op"], op0)
+        self.assertIn(" Начисление к оплате (это не оплата): доплаты дни 500 · ущерб 1000 · прочее 300 = 1 800 ฿",
+                      new.text)
+        say(b, "да", reply=new)
+        self.assertEqual(b.red("post_close_booking")[-1], exp_payload(parts=("500", "", "1000", "300")))
+        self.assertEqual(b.rows[0]["status"], "Завершена")
+        self.assertTrue(texts()[-1].startswith(P + "✅ Завершена, строка 21. Начислено к оплате"), texts()[-1])
+
+    def test_s15_closing_cmd_reduced_part_old_not_written(self):
+        """Команда «закрытие» УМЕНЬШАЕТ ущерб (1000 → 400), пока карточка ждёт: «да» не пишет старые 1000 — отказ
+        closing_changed, новая карточка с 400. «да» второго оператора реплаем на СТАРУЮ карточку — «заменена», моста
+        не зовём. Начисляет только новая карточка."""
+        b = Bridge([rent_row()])
+        old = ret_card(b)
+        b.closing = closing_reply(parts={"damage": "400"})           # лист после команды (подделка отдаёт его)
+        cmd = Msg("закрытие %s ущерб=400" % BIKE, chat_id=SERV, topic=TOPIC)
+        run(S._handle_closing_cmd(cmd, Ctx(), b, cmd.text))
+        self.assertEqual(b.red("closing_upsert")[-1].get("damage"), "400")
+        self.assertEqual(b.red("closing_get"), [{"booking_id": BID}], "лист читается по booking_id, не по байку")
+        say(b, "да", reply=old)
+        self.assertEqual(b.rows[0]["status"], "В аренде")
+        new = cards()[-1]
+        self.assertIsNot(new, old)
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["acc_parts"], ["500", "", "400", ""])
+        self.assertIn("доплаты дни 500 · ущерб 400 = 900 ฿", new.text)
+        say(b, "да", reply=old, uname=APPROVER2)
+        self.assertEqual(len(b.red("post_close_booking")), 1, "по заменённой карточке моста не зовём")
+        self.assertIn("заменена", texts()[-1])
+        say(b, "да", reply=new)
+        self.assertEqual([c["accrual"]["parts"]["damage"] for c in b.red("post_close_booking")], ["1000", "400"],
+                         "первый вызов (старые части) мост отверг, второй — части листа сейчас")
+        self.assertEqual(b.red("post_close_booking")[-1], exp_payload(parts=("500", "", "400", "")))
+        self.assertEqual(b.rows[0]["status"], "Завершена")
+
+    def test_s16_closing_row_gone_new_card_without_accrual(self):
+        """Строки листа этой брони больше нет: старые части не пишутся; новая карточка — без начисления, с причиной."""
+        b = Bridge([rent_row()])
+        old = ret_card(b)
+        b.closing = {"ok": False, "error": "not_found"}
+        say(b, "да", reply=old)
+        new = cards()[-1]
+        self.assertNotIn("acc_op", S._RETURN_CLOSES[INTAKE])
+        why = "строки листа закрытия этой брони сейчас не прочитать — состав доплат неизвестен"
+        self.assertIn(" Доплаты не начисляю: %s." % why, new.text)
+        self.assertTrue(new.text.endswith("Завершаю (Завершена + пробег 35200)? да / нет"), new.text)
+        say(b, "да", reply=new)
+        self.assertEqual(len(b.red("post_close_booking")), 1, "начисление не шлётся")
+        self.assertEqual([c["paid_total"] for c in b.red("close_booking")], [None])
+        self.assertEqual(texts()[-1], P + "✅ Завершена, строка 21. Доплаты не записаны: %s." % why)
+
+    def test_s17_said_km_carries_to_new_card(self):
+        """Фото-пробег: «да 35210» на карточку, лист сменился — новая карточка помнит пробег из ответа-согласия."""
+        b = Bridge([rent_row()])
+        old = ret_card(b, km="", km_photo="35200")
+        b.closing = closing_reply(parts={"damage": "400"})
+        say(b, "да 35210", reply=old)
+        self.assertEqual(b.red("post_close_booking")[0]["km_end"], "35210")
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual(rec["km"], "35210")
+        say(b, "да", reply=cards()[-1])
+        self.assertEqual(b.red("post_close_booking")[-1], exp_payload(km="35210", parts=("500", "", "400", "")))
 
 
 # ============================================================================================ (R) рестарт: та же операция
@@ -726,6 +862,25 @@ class R_Restart(Case):
             self.assertIn(k, d)
         self.assertEqual(d["acc_parts"], ["500", "", "1000", ""])
 
+    def test_r4_restored_card_closing_changed_new_operation(self):
+        """Рестарт, потом лист закрытия сменился: восстановленная карточка старых частей не пишет — новая операция."""
+        b = Bridge([rent_row()])
+        ret_card(b)
+        op0 = S._RETURN_CLOSES[INTAKE]["acc_op"]
+        restart_process()
+        b.closing = closing_reply(parts={"damage": "400"})
+        say(b, "да")                                         # без реплая: адресное уточнение по ждущей карточке
+        asks = [s for s in SENDS if "засчитываю только реплаем" in s.text]
+        self.assertTrue(asks, texts())
+        say(b, "да", reply=asks[-1])
+        self.assertEqual(b.rows[0]["status"], "В аренде", "старые части отвергнуты до записей")
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual(rec["acc_parts"], ["500", "", "400", ""])
+        self.assertNotEqual(rec["acc_op"], op0)
+        say(b, "да", reply=cards()[-1])
+        self.assertEqual(b.red("post_close_booking")[-1], exp_payload(parts=("500", "", "400", "")))
+        self.assertEqual(b.rows[0]["status"], "Завершена")
+
     def test_r3_tampered_restored_card_not_sent(self):
         b = Bridge([rent_row()])
         card = ret_card(b)
@@ -760,6 +915,20 @@ class L_OnLegacyReply(Case):
         ret_card(b)
         say(b, "да")
         self.assertEqual(texts()[-1], P + "✅ Завершена, строка 21." + S._ACC_NO_RECEIPT)
+
+    def test_l4_closing_changed_reissue(self):
+        """Прежний путь ответа: лист сменился после карточки — старые части не пишутся, новая карточка новой операции."""
+        b = Bridge([rent_row()])
+        ret_card(b)
+        b.closing = closing_reply(parts={"damage": "400"})
+        say(b, "да")
+        self.assertEqual(b.rows[0]["status"], "В аренде")
+        self.assertEqual(texts()[-2], P + S._ACC_CHANGED.format(was="дни 500 · ущерб 1000"))
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual((rec["status"], rec["acc_parts"]), ("awaiting", ["500", "", "400", ""]))
+        say(b, "да")
+        self.assertEqual(b.red("post_close_booking")[-1], exp_payload(parts=("500", "", "400", "")))
+        self.assertEqual(b.rows[0]["status"], "Завершена")
 
 
 # ============================================================================== (K) ручка ВКЛ, дело К4 (хранилище)
@@ -804,6 +973,25 @@ class K_OnCaseStore(Case):
         self.k4(b, "да", card)
         self.assertTrue(any(t.endswith(S._ACC_UNKNOWN) and "Исход закрытия неизвестен" in t for t in texts()), texts())
 
+    def test_k4_closing_changed_new_card_new_operation(self):
+        """Дело К4: лист сменился после карточки — ожидание отвечено, мост ничего не записал, НОВАЯ карточка дела с
+        частями листа сейчас; реплай на старую карточку моста не зовёт."""
+        b = Bridge([rent_row()])
+        card = ret_card(b)
+        b.closing = closing_reply(parts={"other": "300"})
+        self.k4(b, "да", card)
+        self.assertEqual(b.rows[0]["status"], "В аренде")
+        self.assertIn(P + S._ACC_CHANGED.format(was="дни 500 · ущерб 1000"), texts())
+        again = cards()[-1]
+        self.assertIsNot(again, card)
+        self.assertIn("доплаты дни 500 · ущерб 1000 · прочее 300 = 1 800 ฿", again.text)
+        self.assertIn("РЕПЛАЕМ", again.text)
+        self.k4(b, "да", card)
+        self.assertEqual(len(b.red("post_close_booking")), 1, "старая карточка дела не исполняется")
+        self.k4(b, "да", again)
+        self.assertEqual(b.red("post_close_booking")[-1], exp_payload(parts=("500", "", "1000", "300")))
+        self.assertEqual(b.rows[0]["status"], "Завершена")
+
 
 # ============================================ (E) сквозной: Splinter → НАСТОЯЩИЕ Closing.js / closeBooking сборки (node)
 def _grid(k=10000, note="выдал, шлем 1", closing_bid=BID, q="35000 Km, 05.07.2026"):
@@ -834,6 +1022,10 @@ class JSBridge(Bridge):
     def closing_upsert(self, **k):
         self.calls.append(("closing_upsert", dict(k)))
         return self._js("closing_upsert", k)
+
+    def closing_get(self, **k):
+        self.calls.append(("closing_get", dict(k)))
+        return self._js("closing_get", k)
 
     def close_booking(self, bike, name, date_start=None, km_end=None, paid_total=None):
         self.calls.append(("close_booking", {"bike": bike, "name": name, "date_start": date_start, "km_end": km_end,
@@ -918,6 +1110,44 @@ class E_EndToEnd(Case):
         do_return(b)
         say(b, "да", reply=cards()[-1])
         self.assertEqual(b.crm["formulas"]["21,11"], "=(H21*G21-500)+500+1000")
+
+    def test_e5_closing_cmd_reduces_part_real_bridge_refuses_then_new_op(self):
+        """Сквозной (замечание приёмки 20.10): карточка родилась на «ущерб 1000», команда «закрытие … ущерб=400»
+        (НАСТОЯЩИЙ closingUpsert_) правит лист, пока карточка ждёт. «да» на старую карточку — НАСТОЯЩИЙ closeBooking
+        перечитывает лист под замком и отказывает closing_changed: в CRM ни одной записи. Новая карточка — новая
+        операция с 400; её «да» пишет K = основа+500+400, а не +1000."""
+        crm, closing = _grid()
+        b = JSBridge([rent_row()], crm, closing)
+        do_return(b)
+        old = cards()[-1]
+        op0 = S._RETURN_CLOSES[INTAKE]["acc_op"]
+        self.assertIn(ACC_LINE, old.text)
+        cmd = Msg("закрытие %s ущерб=400" % BIKE, chat_id=SERV, topic=TOPIC)
+        run(S._handle_closing_cmd(cmd, Ctx(), b, cmd.text))
+        self.assertEqual(b.closing_sheet["grid"][1][7], "400", "команда правит лист закрытия настоящим кодом")
+        say(b, "да", reply=old)
+        row = b.crm["grid"][20]
+        self.assertEqual((row[0], row[10], row[13]), ("В аренде", 10000, ""), "мост ничего не записал")
+        self.assertNotIn("21,11", b.crm["formulas"])
+        self.assertEqual(b.crm["notes"].get("21,1"), "выдал, шлем 1")
+        self.assertIn(P + S._ACC_CHANGED.format(was="дни 500 · ущерб 1000"), texts())
+        new = cards()[-1]
+        self.assertIsNot(new, old)
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual(rec["acc_parts"], ["500", "", "400", ""])
+        self.assertNotEqual(rec["acc_op"], op0)
+        self.assertIn("доплаты дни 500 · ущерб 400 = 900 ฿", new.text)
+        say(b, "да", reply=old, uname=APPROVER2)              # второй оператор — по старой карточке
+        self.assertEqual(len(b.red("post_close_booking")), 1, "заменённая карточка моста не зовёт")
+        say(b, "да", reply=new)
+        self.assertEqual(len(b.red("post_close_booking")), 2)
+        row = b.crm["grid"][20]
+        self.assertEqual((row[0], row[13]), ("Завершена", 35300))
+        self.assertEqual(b.crm["formulas"]["21,11"], "=10000+500+400", "начислено по листу сейчас, не +1000")
+        note = b.crm["notes"]["21,1"]
+        self.assertIn("[TB %s DONE +500+400]" % rec["acc_op"], note)
+        self.assertNotIn(op0, note, "старая операция в примечание не попала")
+        self.assertIn("K = =10000+500+400", texts()[-1])
 
 
 # ================================================================== (C) настоящий BridgeClient._post: тело запроса

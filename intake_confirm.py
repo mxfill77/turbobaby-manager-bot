@@ -117,10 +117,11 @@ RED_NOT_WRITTEN = {
     "activate": frozenset({"bad_json", "no_ticket", "unknown_action", "missing_args", "bike_not_resolved",
                            "sheet_not_found", "booking_not_found"}),
     # CLOSEACCRUAL1910: lock_busy — замок закрытия с начислением не взят, мост не писал ничего
-    # (bridge_build_close_accrual/Booking.js, closeBooking — отказ ДО поиска строки)
+    # (bridge_build_close_accrual/Booking.js, closeBooking — отказ ДО поиска строки); closing_changed — части
+    # начисления разошлись с листом закрытия под замком, отказ ДО записей A/N/K/примечания (замечание приёмки 20.10)
     "close": frozenset({"bad_json", "no_ticket", "unknown_action", "missing_args", "bike_not_resolved",
                         "sheet_not_found", "not_active", "not_found", "ambiguous", "km_required", "bad_km_end",
-                        "odo_unverifiable", "odometer_back", "lock_busy"}),
+                        "odo_unverifiable", "odometer_back", "lock_busy", "closing_changed"}),
 }
 WRITTEN = "written"
 

@@ -366,6 +366,13 @@ function activateBooking(body) {
 //      начала E. Расхождение — начисление стоп до записей K/примечания (само закрытие A/N идёт). Слагаемыми
 //      бывают только целые числа ≥ 0 (число или строка цифр): строка, текст формулы, дробь, NaN — стоп,
 //      инъекции формулы в K нет;
+//      ВЕРСИЯ записи листа (замечание приёмки 20.10): части карточки фиксируются, когда она рождается, а лист
+//      закрытия живёт дальше (повтор возврата, команда «закрытие» правит доплату). Поэтому под замком, ДО записей,
+//      строка листа перечитывается по ТОЧНОМУ booking_id (closingRowById_, фоллбэка по байку нет): та же строка и
+//      те же четыре литерала — иначе отказ closing_changed ЦЕЛИКОМ (ни A/N, ни K, ни примечания), и в ответе лист
+//      как он есть (closing_now) — вызывающий рождает новую карточку новой операцией. Перед записью K лист
+//      перечитывается ещё раз (разошёлся — partial, K не пишем). closing_upsert замка не берёт: окно между
+//      последним чтением листа и setFormula не закрыто — это тоже НЕ атомарность;
 //  (2) K и примечание A — ДВЕ записи, атомарности у Apps Script нет. Шов: стабильный close_op_id (выводится
 //      из booking_id, строки брони, байка, дня начала, строки листа закрытия и точных частей; присланный id не
 //      сошёлся с выводом — payload_mismatch), замок скрипта, повторное чтение ТОЙ ЖЕ строки перед записью K,
@@ -383,8 +390,10 @@ function activateBooking(body) {
 //      считать доплаты НЕ записанными. Прежняя запись итога в K (paid_total) без явного paid_total_opt_in
 //      === true НЕ исполняется (paid_total_ignored): старый Splinter не воскресит перезапись K производной
 //      суммой; ни один нынешний вызывающий opt-in не ставит.
+// Версия поля V: 2 — «части сверены с листом закрытия под замком». Поле другой версии — стоп bad_accrual до
+// записей: сборка без сверки листа (V 1) и Splinter с V 2 друг друга не примут молча.
 var CLOSE_ACCRUAL = {
-  V: 1,
+  V: 2,
   PARTS: ['surcharge_days', 'surcharge_fuel', 'damage', 'other'],     // порядок слагаемых — постоянный
   LABEL: { surcharge_days: 'дни', surcharge_fuel: 'топливо', damage: 'ущерб', other: 'прочее' },
   LOCK_MS: 10000,
@@ -453,6 +462,14 @@ function closeAccrualKText_(k) {
 
 function closeAccrualJoin_(prev, line) { return prev ? prev + '\n' + line : line; }
 
+/** Лист закрытия СЕЙЧАС (closingRowById_) — та же строка crow и те же четыре литерала, что у операции? */
+function closeAccrualSameClosing_(cl, crow, lits) {
+  if (!cl || cl.row !== crow) return false;
+  for (var i = 0; i < CLOSE_ACCRUAL.PARTS.length; i++)
+    if (closeAccrualLit_(cl.cur[CLOSE_ACCRUAL.PARTS[i]]) !== lits[i]) return false;
+  return true;
+}
+
 /** Строка метки в примечании. Начисление, а не оплата — словами. */
 function closeAccrualLine_(pl, state) {
   var parts = [];
@@ -471,6 +488,8 @@ function closeAccrualLine_(pl, state) {
  * 'already' (метка DONE/NOTE_ONLY этой операции — повторно не добавляем) | 'recover' (метка IN_PROGRESS и K уже
  * РОВНО ожидаемый — дописать DONE, слагаемые не добавлять) | 'partial' (IN_PROGRESS, а K не ожидаемый — ни
  * одной записи, исход называем).
+ * Стоп 'closing_changed' (лист закрытия разошёлся с частями операции) — особый: closeBookingRun_ по нему отказывает
+ * закрытию ЦЕЛИКОМ до записей; pl.closing — найденная строка листа (или null) для ответа closing_now.
  */
 function closeAccrualPlan_(sheet, rowN, p) {
   var a = p.accrual;
@@ -499,6 +518,13 @@ function closeAccrualPlan_(sheet, rowN, p) {
   if (op !== a.close_op_id) return stop('payload_mismatch');
   pl.op = op;
   pl.id0 = id0;
+  pl.crow = crow;
+  // (1) ВЕРСИЯ: части операции — с листом закрытия СЕЙЧАС, под замком; строка — по ТОЧНОМУ booking_id брони,
+  // которую закрываем. Лист не прочитан — стоп начисления (закрытие идёт, как при прочих стопах); прочитан и
+  // разошёлся — closing_changed (отказ закрытию целиком, новая карточка у вызывающего)
+  var cl;
+  try { cl = closingRowById_(id0.bid); } catch (eC) { return stop('closing_unread: ' + String(eC)); }
+  if (!closeAccrualSameClosing_(cl, crow, lits)) { pl.closing = cl; return stop('closing_changed'); }
   pl.note0 = String(sheet.getRange(rowN, BOOKING.COL.STATUS).getNote() || '');
   pl.k0 = closeAccrualK_(sheet, rowN);
   var marks = closeAccrualMarks_(pl.note0);
@@ -567,8 +593,12 @@ function closeAccrualApply_(sheet, rowN, pl) {
         var id1 = closeAccrualIdent_(sheet, rowN), k1 = closeAccrualK_(sheet, rowN);
         var same = id1.bid === pl.id0.bid && id1.day === pl.id0.day && id1.bike === pl.id0.bike &&
                    (pl.base === 'formula' ? k1.f === pl.k0.f : (k1.f === '' && k1.v === pl.k0.v));
+        // лист закрытия — ещё раз, вплотную к записи K (closing_upsert замка не берёт и мог пройти после плана)
+        var sameCl = same && closeAccrualSameClosing_(closingRowById_(pl.id0.bid), pl.crow, pl.lits);
         if (!same) {
           rc.status = 'partial'; rc.reason = 'prestate_changed';
+        } else if (!sameCl) {
+          rc.status = 'partial'; rc.reason = 'closing_changed';
         } else {
           stage = 'k_write';
           sheet.getRange(rowN, BOOKING.COL.INITIAL_PAY).setFormula(pl.formula);
@@ -614,7 +644,7 @@ function closeAccrualApply_(sheet, rowN, pl) {
  *       date_start (опц. — матч строки по ДНЮ, как activateBooking);
  *       paid_total (опц. — итог оплаты → K) — CLOSEACCRUAL1910: пишется ТОЛЬКО при paid_total_opt_in === true
  *         и без accrual; иначе не пишется и ответ говорит paid_total_ignored: true;
- *       accrual (опц., CLOSEACCRUAL1910) — начисление доплат листа закрытия: {v:1, close_op_id, booking_id,
+ *       accrual (опц., CLOSEACCRUAL1910) — начисление доплат листа закрытия: {v:2, close_op_id, booking_id,
  *         booking_row, date_start_day, closing_row, parts:{surcharge_days, surcharge_fuel, damage, other}};
  *         весь заход — под замком скрипта; квитанция — поле accrual ответа (см. блок CLOSEACCRUAL выше).
  * ДЕЙСТВИЯ над найденной строкой: A='Завершена'; N=km_end (ОБЯЗАТЕЛЕН — fail-closed,
@@ -622,6 +652,8 @@ function closeAccrualApply_(sheet, rowN, pl) {
  * НЕ трогаем; F НЕ меняем (дата возврата уже стоит с брони).
  * Ошибки: missing_args / bike_not_resolved / sheet_not_found;
  *   lock_busy (CLOSEACCRUAL1910) — замок закрытия с начислением не взят за LOCK_MS: ни одной записи;
+ *   closing_changed (CLOSEACCRUAL1910) — части начисления разошлись с листом закрытия СЕЙЧАС (строка по точному
+ *     booking_id): ни одной записи, closing_now — лист как он есть (вид ответа closing_upsert) для новой карточки;
  *   not_active — по bike+name(+date_start) найдена только "Бронь" (сначала выдача);
  *   not_found — подходящей строки нет вовсе;
  *   ambiguous — две и более "В аренде" по этому bike+name, а date_start не сузил до одной;
@@ -747,6 +779,17 @@ function closeBookingRun_(p, hasAcc) {
   if (hasAcc) {
     try { plan = closeAccrualPlan_(sheet, rowN, p); }
     catch (eP) { plan = { act: 'stop', reason: 'plan_unread: ' + String(eP), op: null, base: null, adds: '', lits: [] }; }
+  }
+  if (plan && plan.act === 'stop' && plan.reason === 'closing_changed') {
+    // ВЕРСИЯ (замечание приёмки 20.10): карточку подтверждали на ДРУГИХ доплатах — не пишем НИЧЕГО (ни A/N, ни K,
+    // ни примечания), отдаём лист как он есть; вызывающий рождает новую карточку новой операцией. Отказ ДО записей
+    // — для вызывающего «не записано», как lock_busy
+    var now;
+    try { now = closingReplyOf_(plan.closing); } catch (eN) { now = { ok: false, error: 'closing_unread', message: String(eN) }; }
+    return { ok: false, error: 'closing_changed', row: rowN, closing_now: now,
+             message: 'лист закрытия этой брони изменился после карточки — ничего не писал, нужна новая карточка',
+             accrual: { v: CLOSE_ACCRUAL.V, op_id: plan.op, status: 'stopped', reason: 'closing_changed', base: null,
+                        k_written: false, note: null, addends: plan.adds || '', k_readback: null } };
   }
   try {
   // --- запись: ТОЛЬКО A+N (+K по переданному); формульные G/I/J/W и дату F не трогаем ---

@@ -7,7 +7,9 @@
   * синтаксис файлов сборки; харнесс зелёный и несёт ключевые случаи (части и привязка closing_upsert; основа K
     число / формула / пусто / текст / ошибка; стоп до записей на нечисловой части, чужой брони, чужом id; та же
     операция дважды; повтор после сбоя между K и примечанием; сбой записи K; правка листа между записями; замок
-    занят / снят; paid_total только opt-in);
+    занят / снят; paid_total только opt-in; ВЕРСИЯ листа закрытия — замечание приёмки 20.10: часть добавлена /
+    уменьшена / снята, строки этой брони нет, строка переехала → отказ closing_changed целиком до записей с листом
+    в ответе; тот же состав при новом штампе — начисляем; лист правят после плана — partial без записи K);
   * паспорт сборки — правило ТРЁХ состояний `tests/build_states.py` (состояние «а», база == зеркало @88);
   * прежний набор tests/booking_gs_harness.js на СБОРКЕ: всё прежнее зелёное, кроме ровно одного случая
     close.paid-written — запись итога в K без opt-in снята намеренно (условие (5));
@@ -125,7 +127,16 @@ def test_harness_covers_key_cases():
             # (5) paid_total
             "paid.ignored-without-opt-in", "paid.written-with-opt-in", "paid.opt-in-only-boolean",
             "paid.ignored-with-accrual",
-            "opid.independent", "opid.lits"):
+            "opid.independent", "opid.lits",
+            # ВЕРСИЯ записи листа закрытия (замечание приёмки 20.10): часть добавлена / уменьшена / снята, строки нет,
+            # строка переехала — отказ целиком до записей и лист в ответе; тот же состав — начисляем; правка листа
+            # после плана — partial без записи K; лист не прочитан — стоп начисления
+            "ver.added.refused-no-writes", "ver.added.receipt-stopped", "ver.added.closing-now",
+            "ver.added.new-op-differs", "ver.added.new-op-done", "ver.reduced.refused-no-writes",
+            "ver.reduced.new-op-done", "ver.waived.refused", "ver.row-gone.refused", "ver.row-gone.no-bike-fallback",
+            "ver.row-moved.refused", "ver.same-parts.reupsert-done", "ver.number-cell-same-lit",
+            "ver.closing-unread.stop", "ver.changed-at-prestate.partial", "ver.reply-of-same-shape",
+            "ver.reply-of-not-found"):
         assert need in names, f"нет кейса {need}"
 
 
@@ -159,8 +170,8 @@ def test_build_rest_of_booking_is_mirror():
     added = set(new) - set(old)
     assert added == {"CLOSE_ACCRUAL", "closeAccrualLit_", "closeAccrualDay_", "closeAccrualOpId_",
                      "closeAccrualMarks_", "closeAccrualNorm_", "closeAccrualIdent_", "closeAccrualK_",
-                     "closeAccrualKText_", "closeAccrualJoin_", "closeAccrualLine_", "closeAccrualPlan_",
-                     "closeAccrualApply_", "closeBookingRun_"}, sorted(added)
+                     "closeAccrualKText_", "closeAccrualJoin_", "closeAccrualSameClosing_", "closeAccrualLine_",
+                     "closeAccrualPlan_", "closeAccrualApply_", "closeBookingRun_"}, sorted(added)
     assert set(old) - set(new) == set()
     for name in old:
         if name == "closeBooking":
@@ -169,10 +180,13 @@ def test_build_rest_of_booking_is_mirror():
 
 
 def test_build_rest_of_closing_is_mirror():
-    """Closing.js: поиск строки (фоллбэк по байку) и чтения — побайтно зеркало; добавлен только closingBookingOf_."""
+    """Closing.js: поиск строки (фоллбэк по байку) и чтения — побайтно зеркало; добавлены только чтения начисления:
+    closingBookingOf_ (бронь CRM строки), closingRowById_ и closingReplyOf_ (строка по ТОЧНОМУ booking_id и её ответ
+    вида closing_upsert — для сверки версии под замком closeBooking)."""
     old = _top_chunks(_read(os.path.join(MIRROR, "Closing.js")))
     new = _top_chunks(_read(os.path.join(BUILD, "Closing.js")))
-    assert set(new) - set(old) == {"closingBookingOf_"}, sorted(set(new) - set(old))
+    assert set(new) - set(old) == {"closingBookingOf_", "closingRowById_", "closingReplyOf_"}, \
+        sorted(set(new) - set(old))
     for name in ("closingNum_", "CLOSING_CLOSED", "closingFind_", "closingGet_", "closingList_"):
         assert _strip_trailing_comment(new[name]) == _strip_trailing_comment(old[name]), f"Closing.js: {name} изменён"
 
@@ -216,19 +230,46 @@ MUTANTS = [
      "binding(found.row, 'booking_id')"),
     ("closing-parts-from-total", "Closing.js", "damage: rec.damage, other: rec.other };",
      "damage: total, other: rec.other };"),
+    # ВЕРСИЯ записи листа закрытия (замечание приёмки 20.10); пятое поле — кейс харнесса, который ОБЯЗАН покраснеть
+    # (мутант пойман именно сверкой версии, а не побочным эффектом)
+    ("version-skip", "Booking.js", "if (!closeAccrualSameClosing_(cl, crow, lits)) {", "if (false) {",
+     "ver.reduced.refused-no-writes"),
+    ("version-parts-not-compared", "Booking.js",
+     "    if (closeAccrualLit_(cl.cur[CLOSE_ACCRUAL.PARTS[i]]) !== lits[i]) return false;", "    ;",
+     "ver.added.refused-no-writes"),
+    ("version-row-not-compared", "Booking.js", "if (!cl || cl.row !== crow) return false;", "if (!cl) return false;",
+     "ver.row-moved.refused"),
+    ("version-changed-close-runs", "Booking.js",
+     "if (plan && plan.act === 'stop' && plan.reason === 'closing_changed') {", "if (false) {",
+     "ver.added.refused-no-writes"),
+    ("version-prestate-skip", "Booking.js",
+     "var sameCl = same && closeAccrualSameClosing_(closingRowById_(pl.id0.bid), pl.crow, pl.lits);",
+     "var sameCl = true;", "ver.changed-at-prestate.partial"),
+    ("version-row-by-bike", "Closing.js",
+     "return closingFind_(getBotTab_(BOTDATA.TABS.CLOSING), BOTDATA.CLOSING_HEADERS, bid, '', '');",
+     "return closingFind_(getBotTab_(BOTDATA.TABS.CLOSING), BOTDATA.CLOSING_HEADERS, '', 'CB 300CC R 9011', '');",
+     "ver.row-gone.refused"),
 ]
 
 
 def test_mutants_killed():
-    assert len(MUTANTS) >= 12
-    alive = []
-    for name, fname, old, new in MUTANTS:
+    assert len(MUTANTS) >= 18
+    alive, wrong = [], []
+    for name, fname, old, new, *want in MUTANTS:
         src = _read(os.path.join(BUILD, fname))
         assert src.count(old) == 1, f"мутант {name}: «было» встречается {src.count(old)} раз — мутант не о том"
         code, out, err = _node([HARNESS, "--mutant"], stdin=json.dumps({fname: src.replace(old, new)}))
         if code == 0:
             alive.append(name)
+        elif want:
+            try:
+                red = {c["name"] for c in json.loads(out)["cases"] if not c["pass"]}
+            except (ValueError, KeyError):
+                red = set()                       # харнесс упал целиком — нужный кейс не назван
+            if want[0] not in red:
+                wrong.append((name, want[0], sorted(red)[:5]))
     assert not alive, f"мутанты выжили (харнесс их не видит): {alive}"
+    assert not wrong, f"мутант пойман не тем кейсом: {wrong}"
 
 
 def test_mirror_untouched():
