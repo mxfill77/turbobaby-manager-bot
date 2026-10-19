@@ -8928,13 +8928,16 @@ def _rc_source(ref, t0, t1):
     return {"name": _RC_CLIENTS, "ref": str(ref), "method": "door", "read_at": float(t1), "observed_at": float(t0)}
 
 
-def _rc_pick(bridge, bike, purpose):
+def _rc_pick(bridge, bike, purpose, on_day=None):
     """К4 шаг 5 (RENTAL_CASE_PICK): аренда байка по цели — rental_case_rules.pick (DESIGN §3.3; found только при
     ровно одном кандидате, без max/[-1]/окна вокруг «сегодня»). → {"code": found|unknown|error, "row", "ask",
     "reason", "candidates", "rows"}; error — дверь не прочитана или модуль не загрузился (прежнее «не нашёл»).
     handover: «бронь» со стартом в день момента; бронь УЖЕ активирована сегодня («в аренде» со стартом сегодня,
     ровно одна) — та же выдача после ручной активации, found с already_active (иначе каждая повторная фраза
-    выдачи давала бы ⚠️, а вкладка состояния теряла клиента; толкование интегратора, записано в отчёте)."""
+    выдачи давала бы ⚠️, а вкладка состояния теряла клиента; толкование интегратора, записано в отчёте).
+    HOFACTS v2 (20.10): `on_day` — ЯВНЫЙ целевой день ISO (местный день сообщения выдачи, `_ho_target_day`) → query
+    on_day у pick (rental_case_rules: on_day важнее дня момента) и тот же день в ветке already_active; None — прежний
+    день t0 чтения двери (путь К4 без HANDOVER_FACTS не меняется)."""
     out = {"code": "error", "row": None, "ask": "", "reason": "", "candidates": [], "rows": None}
     try:
         R = _rc_rules()
@@ -8946,6 +8949,8 @@ def _rc_pick(bridge, bike, purpose):
         params = R.PARAMS_DEFAULT
         plate = R.plate_of_row({"bike": bike})
         q = {"purpose": purpose, "intent": None, "plate": plate}
+        if on_day:
+            q["on_day"] = on_day          # HOFACTS v2: ЦЕЛЕВОЙ день, а не день t0 чтения (фраза до полуночи — её день)
         if purpose == "cash":
             q["cash_day"] = R.day_of_moment(t0, params["TZ_H"]).isoformat()   # день прихода = сейчас
         pk = R.pick(rows, q, t0, params)
@@ -8953,7 +8958,7 @@ def _rc_pick(bridge, bike, purpose):
             out.update(code="found", row=pk.get("row"), candidates=pk.get("candidates") or [])
             return out
         if purpose == "handover" and pk.get("reason") == "rental_not_found" and plate:
-            today = R.day_of_moment(t0, params["TZ_H"]).isoformat()
+            today = on_day or R.day_of_moment(t0, params["TZ_H"]).isoformat()
             act = []
             for r in rows:
                 c = R.classify(r, t0, params)
@@ -9591,10 +9596,10 @@ def _closing_resolve_booking(bridge, bike, purpose="return"):
     При нескольких кандидатах — свежайшая date_start. Нет → (None, '', '').
     К4 шаг 5 (RENTAL_CASE_PICK): аренда по цели `purpose` (return — лист закрытия на возврате, handover — вкладка
     состояния на выдаче) через rental_case_rules.pick; не однозначно → (None, '', '') — прежний путь «не найдена».
-    HOFACTS1910 (HANDOVER_FACTS): purpose=handover — тот же pick(handover) и без RENTAL_CASE_PICK (хранилище К4 не
-    нужно), чтобы вкладка состояния получила клиента той же строки, что и карточка; прочие цели флаг не трогает.
-    При OFF `purpose` не читается."""
-    if _rc_on("RENTAL_CASE_PICK") or (_handover_facts_on() and purpose == "handover"):
+    При OFF `purpose` не читается.
+    HOFACTS v2 (HANDOVER_FACTS): на выдаче вкладку состояния пишет `_ho_flow` после сверки `_ho_state_recheck` (тот же
+    pick(handover) с тем же целевым днём, что у карточки, и та же строка) — сюда ветка флага не заходит."""
+    if _rc_on("RENTAL_CASE_PICK"):
         pk = _rc_pick(bridge, bike, purpose)
         r = pk.get("row") if pk.get("code") == "found" else None
         if r is None:
@@ -9614,22 +9619,48 @@ def _closing_resolve_booking(bridge, bike, purpose="return"):
     return (last.get("booking_id") or None, last.get("name") or "", last.get("date_end") or "")
 
 
-# HOFACTS1910 (19.10.2026, карта цикла: этап handover, пробелы 1–2): карточка выдачи проверяет факты — только чтение.
-# Флаг HANDOVER_FACTS (по умолчанию ВЫКЛ; читается `_rc_on` на каждый вызов — откат снятием флага, без рестарта):
-#   (1) строка брони — по ТОЧНОМУ дню выдачи готовым rental_case_rules.pick (`_rc_pick(…, "handover")`, без хранилища
-#       К4) и в карточке активации, и во вкладке состояния (`_closing_resolve_booking`): прежние cand[-1] и
-#       max(date_start) отдавали будущую бронь другого клиента того же байка, записанную ниже сегодняшней;
-#       не однозначно — прежний ⚠️ «руками» с вопросом pick;
-#   (2) строка договора — contract_find по байку и сроку выбранной строки → contract_ref.versions, в потоке под потолком
-#       `_HO_FACTS_BUDGET_S`: сбой и таймаут — «неизвестно», карточка дольше потолка не ждёт;
-#   (3) строка залога — CRM S выбранной строки (как у карточки приёма).
-# Найденное исключение — первой строкой карточки (после подписи). Слова «да/нет», маршрут APPROVEFIX, id карточки,
-# билет и activate_booking не меняются. Разбор и слова — чистый `handover_facts` (лениво, только в ветке флага).
+# HOFACTS1910 (19.10.2026, карта цикла: этап handover, пробелы 1–2; v2 20.10 — правило владельца 19.10 23:3x, границы
+# Codex TB-NIGHT-1910-2305 / TB-REVIEW-1910-2400): карточка выдачи проверяет факты — только чтение.
+# Флаг HANDOVER_FACTS (по умолчанию ВЫКЛ; читается `_rc_on` на каждый вызов). В ПРОДЕ окружение процесса — один
+# load_dotenv() на старте bot.py, поэтому откат = снять флаг в .env И перезапустить процесс (ждущие карточки переносит
+# restart_handoff); «без рестарта» флаг переключается только в тестах, где его ставят в os.environ.
+#   (1) ЦЕЛЕВОЙ день выдачи — местный (TZ_H) день СООБЩЕНИЯ (`_ho_target_day`: msg.date, а не UTC-дата `_msg_date` и не
+#       t0 чтения двери): фраза до местной полуночи, разобранная после неё (хвост очереди после рестарта), остаётся
+#       днём выдачи; тот же день — у карточки, у сверки перед вкладкой состояния и у сверки перед «да»;
+#   (2) строка брони — по этому дню готовым rental_case_rules.pick (`_rc_pick(…, "handover", on_day)`, без хранилища
+#       К4); не однозначно на этот день — прежний ⚠️ «руками» с вопросом pick; дверь clients не прочитана — «CRM не
+#       прочитан — неизвестно», а не «брони не нашёл»;
+#   (3) брони на целевой день нет, а на другой день есть — карточка РУЧНАЯ (без «да / нет», без ожидания и билета):
+#       бот сам ±N не выбирает и дат не меняет; позже брони — переоформить договор и бронь, оплата с исходной даты,
+#       если перенос не согласован заранее; раньше — переоформить на фактические даты; броней несколько — адресный
+#       вопрос с их перечнем, «последней» не бывает;
+#   (4) строка договора — ДОРОГОЙ `_contract_ref_report` (binding_of_crm → contract_find по точным байку и сроку →
+#       versions; аргументы двери собирает она), в потоке под потолком `_HO_FACTS_BUDGET_S`: сбой и таймаут —
+#       «неизвестно», карточка дольше потолка не ждёт;
+#   (5) строка залога — CRM S выбранной строки словами «записан в CRM … получение не сверено»;
+#   (6) вкладка состояния — ПОСЛЕ карточки и только когда повторное чтение дало ТУ ЖЕ бронь (`handover_facts.ident`:
+#       строка, booking_id, номер, срок, имя); не та или точной строки нет — записи нет, честная строка. «Да» перед
+#       билетом так же перечитывает бронь карточки (и записи, восстановленной рестартом), а строку, которую перевёл
+#       мост, сверяет со строкой карточки.
+# Найденное исключение — первой строкой карточки (после подписи). Слова «да/нет», маршрут APPROVEFIX и id карточки
+# не меняются. Разбор и слова — чистый `handover_facts` (лениво, только в ветке флага).
 F_HANDOVER_FACTS = "HANDOVER_FACTS"
 _HO_FACTS_BUDGET_S = 8.0     # потолок чтения реестра на одну карточку выдачи (GET к Apps Script — секунды)
 # сбор фактов сломался сам (модуль не загрузился, разбор упал) — карточка всё равно уходит, но не молча: факты
 # «неизвестны», и это исключение (пустая карточка читалась бы как «всё сошлось»)
 W_HO_FACTS_BROKEN = "⚠️ Исключение: факты карточки не собраны (%s) — договор и залог неизвестны"
+# (2) дверь clients не прочитана — «неизвестно», а не «брони нет» (прежний путь звал это «брони не нашёл»)
+W_HO_CRM_UNREAD = ("🐀 Splinter\n⚠️ ВЫДАЧА %s: CRM не прочитан (%s) — бронь неизвестна, а не «брони нет»; "
+                   "активируй руками (Бронь→В аренде).")
+# (6) перед записью вкладки состояния перечитана не та бронь, что на карточке
+W_HO_STATE_RECHECK = ("🐀 Splinter\n⚠️ ВЫДАЧА %s: перед записью вкладки состояния бронь строка %s перечитана иначе "
+                      "(%s) — вкладку состояния не трогал; сверь карточку с CRM.")
+# (6) перед билетом «да» перечитана не та бронь (уже активна, CRM не прочитан) — ни билета, ни записи
+W_HO_YES_RECHECK = ("⚠️ Бронь карточки выдачи {card} перечитана иначе ({why}) — не активирую, в CRM ничего не "
+                    "записал. Повтори выдачу — придёт новая карточка.")
+# (6) мост перевёл в «В аренде» не ту строку, что на карточке — громко, вместо «✅ В аренде»
+W_HO_ROW_DIFF = ("⚠️ В аренде переведена строка {got}, а на карточке была строка {want} — проверь CRM руками "
+                 "(повтор не делаю).")
 
 
 def _handover_facts_on():
@@ -9637,19 +9668,59 @@ def _handover_facts_on():
     return _rc_on(F_HANDOVER_FACTS)
 
 
-def _ho_contract_read(bridge, row):
-    """HOFACTS1910, в потоке: строка брони → исход contract_ref.versions. Не больше одного contract_find (ни одного,
-    если у строки нет номера байка или срока), под общим бюджетом карточки; исключение вызова — исход «неизвестно»."""
-    import handover_facts as _hf   # лениво: только в ветке флага
-    args = _hf.find_args(row)
-    if args is None:
-        return _hf.no_term()
+def _ho_target_day(msg):
+    """HOFACTS v2 (1): целевой день выдачи → 'YYYY-MM-DD' — местный (TZ_H rental_case_rules) день `msg.date`
+    сообщения выдачи (Telegram даёт UTC; без зоны — считаем UTC). Не `_msg_date` (это UTC-дата) и не t0 чтения двери.
+    Даты нет или она не разобрана — день сейчас (прежний день чтения), с журналом."""
+    R = _rc_rules()
+    tz = R.PARAMS_DEFAULT["TZ_H"]
+    d = getattr(msg, "date", None)
     try:
-        with bridge_client.card_budget(_HO_FACTS_BUDGET_S, label="карточки выдачи"):
-            found = bridge.contract_find(**args)
+        if d is not None:
+            if getattr(d, "tzinfo", None) is None:
+                import datetime as _dt
+                d = d.replace(tzinfo=_dt.timezone.utc)
+            return R.day_of_moment(d.timestamp(), tz).isoformat()
+        log.warning("  → ВЫДАЧА: у сообщения нет даты — целевой день = сегодня (день чтения)")
     except Exception as e:  # noqa: BLE001
-        return _hf.unread(type(e).__name__)
-    return _hf.versions_of(row, found)
+        log.warning(f"  → ВЫДАЧА: дата сообщения не разобрана ({type(e).__name__}) — целевой день = сегодня")
+    return R.day_of_moment(_time.time(), tz).isoformat()
+
+
+class _HoFindTap(object):
+    """HOFACTS v2 (4): мост для `_contract_ref_report` на карточке выдачи — пропускает к настоящему мосту РОВНО
+    contract_find и запоминает его ответ (сбой — тем же отображением, что у `_contract_ref_report`: {"ok": False,
+    "error": класс}, и дальше ей же). Аргументы двери собирает `_contract_ref_report`, а не карточка: дорога одна."""
+
+    def __init__(self, bridge):
+        self._bridge = bridge
+        self.called = False
+        self.found = None
+
+    def contract_find(self, **kw):
+        self.called = True
+        try:
+            self.found = self._bridge.contract_find(**kw)
+        except Exception as e:  # noqa: BLE001
+            self.found = {"ok": False, "error": type(e).__name__}
+            raise
+        return self.found
+
+    def _call(self, action, **kw):
+        # строка брони у карточки уже есть: второго чтения CRM этой дорогой нет (и `_contract_ref_report` его не
+        # просит, когда ей дана строка)
+        raise RuntimeError("clients этой дорогой не читается: строка брони уже выбрана")
+
+
+def _ho_contract_read(bridge, row):
+    """HOFACTS1910, в потоке: строка брони → исход contract_ref.versions. Чтение — `_contract_ref_report(row=…)` (не
+    больше одного contract_find; ни одного, если у строки нет номера байка или срока) под общим бюджетом карточки;
+    исход — `handover_facts.from_report` из того же ответа двери."""
+    import handover_facts as _hf   # лениво: только в ветке флага
+    tap = _HoFindTap(bridge)
+    with bridge_client.card_budget(_HO_FACTS_BUDGET_S, label="карточки выдачи"):
+        words = _contract_ref_report(tap, row=row)
+    return _hf.from_report(row, tap.called, tap.found, words)
 
 
 async def _ho_facts(bridge, cand):
@@ -9675,28 +9746,42 @@ async def _ho_facts(bridge, cand):
                 "contract": None, "deposit": None}
 
 
-def _handover_resolve_activation(bridge, bike):
+def _handover_resolve_activation(bridge, bike, on_day=None):
     """O3-3a: кандидат на активацию при выдаче. Последняя строка CRM по байку со статусом
     Бронь/В аренде → dict {row, name, date_start, date_end, status} или None (брони нет).
     status=="в аренде" → активировать нечего (уже активна) — решает вызыватель.
     К4 шаг 5 (RENTAL_CASE_PICK): pick(handover) — «бронь» со стартом в день выдачи; не однозначно →
     {"rc_unknown": True, "ask", "reason"} (вызыватель: прежний ⚠️ с конкретным вопросом).
-    HOFACTS1910 (HANDOVER_FACTS): тот же pick(handover) и без RENTAL_CASE_PICK (хранилище К4 не нужно); в ответе ещё
-    `crm` — строка двери clients целиком (контакты и срок — для сверки договора, S — для залога)."""
+    HOFACTS1910 (HANDOVER_FACTS): тот же pick(handover) и без RENTAL_CASE_PICK (хранилище К4 не нужно), по ЦЕЛЕВОМУ
+    дню `on_day`; в ответе ещё `crm` — строка двери clients целиком (контакты и срок — для сверки договора, S — для
+    залога) и `on_day`. HOFACTS v2: дверь не прочитана → {"rc_unread": True, "reason"} (а не None «брони нет»); брони на
+    этот день нет, а на другие есть → в {"rc_unknown"} ещё `mismatch` (handover_facts.day_mismatch) и `crm` её строки.
+    Без флага `on_day` не читается."""
     _facts = _handover_facts_on()
     if _rc_on("RENTAL_CASE_PICK") or _facts:
-        pk = _rc_pick(bridge, bike, "handover")
+        pk = _rc_pick(bridge, bike, "handover", on_day=(on_day if _facts else None))
         if pk.get("code") == "error":
+            if _facts:
+                return {"rc_unread": True, "reason": pk.get("reason") or "", "row": None}
             return None
         if pk.get("code") != "found":
-            return {"rc_unknown": True, "ask": pk.get("ask") or "", "reason": pk.get("reason") or "", "row": None}
+            out = {"rc_unknown": True, "ask": pk.get("ask") or "", "reason": pk.get("reason") or "", "row": None}
+            if _facts and pk.get("reason") == "rental_not_found":
+                import handover_facts as _hf   # лениво: только в ветке флага
+                mm = _hf.day_mismatch(pk.get("candidates"), on_day)
+                if mm is not None:
+                    out.update(mismatch=mm, on_day=on_day)
+                    no = (mm.get("cand") or {}).get("row")
+                    if no is not None:
+                        out["crm"] = next((r for r in pk.get("rows") or [] if r.get("row") == no), None)
+            return out
         r = pk.get("row") or {}
         out = {"row": r.get("row"), "name": r.get("name") or "",
                "date_start": str(r.get("date_start") or ""),
                "date_end": str(r.get("date_end") or ""),
                "status": str(r.get("status", "")).strip().lower()}
         if _facts:
-            out["crm"] = r
+            out.update(crm=r, on_day=on_day)
         return out
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
@@ -9715,40 +9800,87 @@ def _handover_resolve_activation(bridge, bike):
             "status": str(last.get("status", "")).strip().lower()}
 
 
-async def _handover_activation_card(context, bridge, bike):
+async def _ho_hand_card(context, bridge, bike, cand):
+    """HOFACTS v2 (3): брони на целевой день нет, а на другой день есть — РУЧНАЯ карточка во «Входящие»: без «да / нет»,
+    без ожидания в `_HANDOVER_ACTIVATIONS` и без билета (реплай «да» на неё ничего не исполняет); даты бот не меняет и
+    бронь «±N» не выбирает. Одна бронь — правило владельца словами (`handover_facts.mismatch_line`) и факты её строки
+    (договор, залог: полезный остаток карточки); несколько — адресный вопрос с перечнем (`many_line`). Анти-спам —
+    прежний кулдаун ⚠️ по байку: на повторе фразы реестр не перечитывается."""
+    import handover_facts as _hf   # лениво: только в ветке флага
+    mm = cand.get("mismatch") or {}
+    on_day = cand.get("on_day")
+    if _time.time() - _HO_ACT_WARN_TS.get(bike, 0) < _HO_ACT_WARN_COOLDOWN:
+        return
+    if mm.get("kind") == "many":
+        log.info(f"  → ВЫДАЧА {bike}: брони на {on_day} нет, броней на другие дни {len(mm.get('cands') or [])} — "
+                 f"адресный вопрос, бронь не выбираю, активация и даты — руками")
+        await _rc_warn(context, _HO_ACT_WARN_TS, bike, _HO_ACT_WARN_COOLDOWN,
+                       "🐀 Splinter\n" + _hf.many_line(bike, on_day, mm.get("cands")))
+        return
+    c = mm.get("cand") or {}
+    row = cand.get("crm") if isinstance(cand.get("crm"), dict) else None
+    lines = []
+    if row is not None:
+        facts = await _ho_facts(bridge, {"crm": row})
+        lines = list(facts.get("lines") or []) or ([facts["head"]] if facts.get("head") else [])
+    src = row or {}
+    dates = (str(src.get("date_start") or c.get("start_day") or "") + " — "
+             + str(src.get("date_end") or c.get("end_day") or "")).strip(" —")
+    log.info(f"  → ВЫДАЧА {bike}: брони на {on_day} нет — бронь строка {c.get('row')} с {c.get('start_day')} "
+             f"({mm.get('kind')}, {mm.get('days')} дн.): ручная карточка, без «да», даты не меняю")
+    await _rc_warn(context, _HO_ACT_WARN_TS, bike, _HO_ACT_WARN_COOLDOWN,
+                   "🐀 Splinter\n"
+                   + _hf.W_HAND_HEAD % (bike, c.get("name") or "—", _hf.dm(on_day), c.get("row"), dates or "даты —")
+                   + "\n" + _hf.mismatch_line(mm) + "\n"
+                   + "".join(ln + "\n" for ln in lines)
+                   + _hf.W_HAND_TAIL)
+
+
+async def _handover_activation_card(context, bridge, bike, on_day=None):
     """O3-3a: на handover-контексте предложить активацию брони (Бронь→В аренде) карточкой
     в INTAKE_CHAT (там авторизаторы INTAKE_APPROVERS). Сама активация — ТОЛЬКО после «да»,
     красным шагом 4.2 в _handle_intake. Брони нет → ⚠️ «активируй руками» (handover не падает).
-    HOFACTS1910 (HANDOVER_FACTS): строка — по точному дню выдачи, в карточке строки договора и залога, исключение —
-    первой строкой; при ВЫКЛ текст и путь прежние байт-в-байт."""
-    cand = _handover_resolve_activation(bridge, bike)
+    HOFACTS1910 (HANDOVER_FACTS): строка — по точному ЦЕЛЕВОМУ дню `on_day`, в карточке строки договора и залога,
+    исключение — первой строкой; при ВЫКЛ текст и путь прежние байт-в-байт. HOFACTS v2: → строка двери clients, о
+    которой карточка (или её молчание: та же уже ждёт «да», уже «В аренде», ушла путём К4) — по ней `_ho_flow` сверяет
+    запись вкладки состояния; None — точной строки нет (ручная карточка, ⚠️, CRM не прочитан). При ВЫКЛ — всегда None."""
+    cand = _handover_resolve_activation(bridge, bike, on_day=on_day)
     now = _time.time()
+    if cand is not None and cand.get("rc_unread"):
+        # HOFACTS v2 (2): дверь clients не прочитана — «неизвестно», а не «брони нет»; кулдаун ⚠️ по байку прежний
+        log.info(f"  → ВЫДАЧА {bike}: CRM не прочитан ({cand.get('reason')}) — ⚠️ «неизвестно», активация руками")
+        await _rc_warn(context, _HO_ACT_WARN_TS, bike, _HO_ACT_WARN_COOLDOWN,
+                       W_HO_CRM_UNREAD % (bike, cand.get("reason") or "?"))
+        return None
+    if cand is not None and cand.get("mismatch"):
+        await _ho_hand_card(context, bridge, bike, cand)   # HOFACTS v2 (3): день выдачи против брони — руками
+        return None
     if cand is not None and cand.get("rc_unknown"):
         # К4 шаг 5 (RENTAL_CASE_PICK): бронь не выбрана однозначно — прежний путь ⚠️ «руками», с конкретным вопросом
         log.info(f"  → ВЫДАЧА {bike}: бронь не выбрана ({cand.get('reason')}) — ⚠️ с вопросом, активация руками")
         await _rc_warn(context, _HO_ACT_WARN_TS, bike, _HO_ACT_WARN_COOLDOWN,
                        f"🐀 Splinter\n⚠️ ВЫДАЧА {bike}: {cand.get('ask') or 'бронь не выбрана однозначно'} — "
                        f"активируй руками (Бронь→В аренде).")
-        return
+        return None
     if cand is None:
         # анти-спам: повторные handover-фразы по тому же байку не дублируют ⚠️ чаще кулдауна
         if now - _HO_ACT_WARN_TS.get(bike, 0) < _HO_ACT_WARN_COOLDOWN:
-            return
+            return None
         _HO_ACT_WARN_TS[bike] = now
         log.info(f"  → ВЫДАЧА {bike}: брони в CRM не нашёл — ⚠️ во Входящие, активация руками")
         await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
                     text=f"🐀 Splinter\n⚠️ ВЫДАЧА {bike}: брони в CRM не нашёл (байк/имя/дата) — "
                          f"активируй руками (Бронь→В аренде).")
-        return
+        return None
     if cand.get("status") == "в аренде":
         log.info(f"  → ВЫДАЧА {bike}: строка {cand.get('row')} уже «В аренде» — активация не нужна")
-        return
+        return cand.get("crm")
     if _rc_cases_on() and await _rc_activation_card(context, bridge, bike, cand):
-        return   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
+        return cand.get("crm")   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
     prev = _HANDOVER_ACTIVATIONS.get(INTAKE_CHAT)
     if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
             and now - prev.get("ts", 0) <= _HO_ACT_TTL):
-        return   # та же бронь уже ждёт «да» — карточку не дублируем
+        return cand.get("crm")   # та же бронь уже ждёт «да» — карточку не дублируем
     facts = None
     if _handover_facts_on():
         # HOFACTS1910: договор и залог выбранной строки — до записи ожидания (повтор фразы реестр не перечитывает:
@@ -9758,13 +9890,22 @@ async def _handover_activation_card(context, bridge, bike):
         prev = _HANDOVER_ACTIVATIONS.get(INTAKE_CHAT)
         if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
                 and now - prev.get("ts", 0) <= _HO_ACT_TTL):
-            return
+            return cand.get("crm")
         log.info(f"  → ВЫДАЧА {bike}: факты карточки (строка {cand.get('row')}) — договор {facts.get('contract')}, "
                  f"исключения: {', '.join(facts.get('exceptions') or []) or 'нет'}")
     _HANDOVER_ACTIVATIONS[INTAKE_CHAT] = rec = {
         "bike": bike, "name": cand["name"], "date_start": cand["date_start"],
         "row": cand.get("row"), "ts": now, "status": "awaiting",
     }
+    if facts is not None:
+        # HOFACTS v2 (6): целевой день и тождество строки карточки — по ним «да» перед билетом перечитает ту же бронь
+        rec["on_day"] = cand.get("on_day")
+        try:
+            import handover_facts as _hf   # лениво: только в ветке флага
+            rec["ident"] = _hf.ident(cand.get("crm"))
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"  → ВЫДАЧА {bike}: тождество строки карточки не собрано ({type(e).__name__}) — «да» сверит "
+                        f"строку, имя и начало срока")
     _card_ids_carry(rec, prev)   # APPROVEFIX1610: реплай на заменённую карточку не исполняет новую
     dates = (cand["date_start"] + " — " + cand["date_end"]).strip(" —")
     log.info(f"  → ВЫДАЧА {bike}: карточка активации во Входящие (строка {cand.get('row')}, "
@@ -9784,6 +9925,92 @@ async def _handover_activation_card(context, bridge, bike):
                                  + "".join(ln + "\n" for ln in facts.get("lines") or [])
                                  + "Активирую (Бронь→В аренде)? да / нет"))
     _card_note_ids(rec, [sent])  # APPROVEFIX1610: id карточки — «да» засчитывается реплаем на неё
+    return cand.get("crm")
+
+
+def _ho_state_recheck(bridge, bike, on_day, shown):
+    """HOFACTS v2 (6): перед записью вкладки состояния — повторное чтение двери тем же pick(handover) с тем же целевым
+    днём; годится только ТА ЖЕ бронь, что у карточки (`handover_facts.ident`: строка, booking_id, номер, срок, имя).
+    → (строка | None, почему нет)."""
+    import handover_facts as _hf   # лениво: только в ветке флага
+    pk = _rc_pick(bridge, bike, "handover", on_day=on_day)
+    if pk.get("code") == "error":
+        return None, "CRM не перечитан"
+    if pk.get("code") != "found":
+        return None, "бронь на этот день больше не выбирается однозначно"
+    row = pk.get("row") or {}
+    if _hf.ident(row) != _hf.ident(shown):
+        return None, "другая строка, срок или клиент"
+    return row, ""
+
+
+def _ho_yes_recheck(bridge, rec):
+    """HOFACTS v2 (6): перед билетом «да» карточки выдачи — та же ли бронь. Повторное чтение pick(handover) с целевым
+    днём карточки (у записи без него — восстановленной рестартом или заведённой до флага — день её ts); годится found,
+    не «уже в аренде» и `handover_facts.same_as_card`. → "" — можно писать; иначе слова «почему нет». Сбой самой
+    сверки — тоже «нет»: вслепую не пишем."""
+    try:
+        import handover_facts as _hf   # лениво: только в ветке флага
+        R = _rc_rules()
+        day = rec.get("on_day") or R.day_of_moment(float(rec.get("ts") or _time.time()),
+                                                   R.PARAMS_DEFAULT["TZ_H"]).isoformat()
+        pk = _rc_pick(bridge, rec.get("bike") or "", "handover", on_day=day)
+        if pk.get("code") == "error":
+            return "CRM не перечитан"
+        if pk.get("code") != "found":
+            return "бронь на этот день больше не выбирается однозначно"
+        if pk.get("already_active"):
+            return "бронь уже «В аренде»"
+        if not _hf.same_as_card(rec, pk.get("row")):
+            return "другая строка, срок или клиент"
+        return ""
+    except Exception as e:  # noqa: BLE001
+        return f"сверка не собрана ({type(e).__name__})"
+
+
+def _ho_row_diff(res, rec):
+    """HOFACTS v2 (6): строка, которую мост перевёл в «В аренде», против строки карточки → слова расхождения | ""
+    (одна из них неизвестна — судить не о чем, прежний ответ)."""
+    got, want = (res or {}).get("row"), (rec or {}).get("row")
+    if got is None or want is None or str(got) == str(want):
+        return ""
+    return W_HO_ROW_DIFF.format(got=got, want=want)
+
+
+async def _ho_flow(context, bridge, bike, msg, ev_msg_id):
+    """HOFACTS v2: выдача при HANDOVER_FACTS — целевой день один раз → карточка (точная строка дня) → повторное чтение
+    ТОЙ ЖЕ брони → вкладка состояния. Прежний порядок (вкладка ДО карточки, своим отдельным выбором строки) — только
+    при ВЫКЛ. Свои try: сбой карточки выдачу не роняет (вкладка тогда не пишется — точной строки нет), сбой записи —
+    тоже."""
+    on_day = _ho_target_day(msg)
+    shown = None
+    try:
+        shown = await _handover_activation_card(context, bridge, bike, on_day=on_day)
+    except Exception as e:
+        log.warning(f"  → карточка активации выдачи не удалась: {e}")
+    if not isinstance(shown, dict):
+        log.info(f"  → state выдача {bike}: точной строки брони на {on_day} нет — вкладку состояния не трогаю")
+        return
+    try:
+        row, why = _ho_state_recheck(bridge, bike, on_day, shown)
+        if row is None:
+            log.warning(f"  → state выдача {bike}: бронь строка {shown.get('row')} перечитана иначе ({why}) — "
+                        f"вкладку состояния не трогаю")
+            await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                        text=W_HO_STATE_RECHECK % (bike, shown.get("row"), why))
+            return
+        _bid = row.get("booking_id") or None
+        _bname = row.get("name") or ""
+        _bend = row.get("date_end") or ""
+        _bk = (bridge.find_bike(bike) or {}).get("name") or bike   # каноничное имя = ключ вкладки
+        bridge.state_set(bike=_bk, status="в аренде", client=_bname,
+                         date_due=_bend, booking_id=(_bid or ""),
+                         last_event_msg_id=ev_msg_id)
+        log.info(f"  → state выдача (handover-ctx): bike={_bk} status=в аренде "
+                 f"booking_id={_bid} client={_bname or '-'} date_due={_bend or '-'} | строка {row.get('row')} "
+                 f"сверена с карточкой (день {on_day})")
+    except Exception as e:
+        log.warning(f"  → state выдача не удалась: {e}")
 
 
 def _return_resolve_close(bridge, bike):
@@ -12118,7 +12345,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
     # вкладке состояния. Зеркало ветки возврата выше (_ret_ctx). Источник деталей = CRM
     # (_closing_resolve_booking), текст = только триггер. Защита от дубля = простой upsert по bike
     # (идемпотентно, без гейта на смену статуса). guard: пустой bike → пропуск + лог (не пишем мусор).
-    if _ho_ctx and bike:
+    # HOFACTS v2 (HANDOVER_FACTS): целевой день — местный день сообщения; карточка → сверка той же брони → вкладка
+    # состояния (`_ho_flow`). Ниже, при ВЫКЛ, — прежний путь байт-в-байт.
+    if _ho_ctx and bike and _handover_facts_on():
+        await _ho_flow(context, bridge, bike, msg, _ev_msg_id)
+    elif _ho_ctx and bike:
         try:
             _bid, _bname, _bend = _closing_resolve_booking(bridge, bike, purpose="handover")   # purpose — К4, при OFF не читается
             _bk = (bridge.find_bike(bike) or {}).get("name") or bike   # каноничное имя = ключ вкладки
@@ -13254,6 +13485,16 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
             sent_d = await say(_CR_KM_DOUBT.format(km=km, ref=_ref, where="карточку"))
             _cr_note_dead(chat_id, [getattr(sent_d, "message_id", None)])
             return
+    if kind == "activate" and _handover_facts_on():
+        # HOFACTS v2 (6): перед билетом — та же ли бронь, что на карточке (и у записи, восстановленной рестартом):
+        # не та / уже активна / CRM не прочитан — ни билета, ни вызова моста, карточка снята
+        _why = _ho_yes_recheck(bridge, rec)
+        if _why:
+            rec["status"] = "stale"
+            log.warning(f"  → карточка {word} {rec.get('bike')} строка {rec.get('row')}: бронь перечитана иначе "
+                        f"({_why}) — не активирую (@{who})")
+            await say(W_HO_YES_RECHECK.format(card=card, why=_why))
+            return
     # YES — КРАСНЫЙ шаг под токен-замком 4.2: билет → флаг отправки → ровно один вызов
     rec["status"] = "approved"                  # в пути: повторный ответ не исполнит
     if kind == "close":
@@ -13282,7 +13523,13 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
         _row = res.get("row") or rec.get("row")
         if kind == "activate":
             log.info(f"  → ВЫДАЧА: бронь активирована (строка {_row}, @{who}) {rec['bike']}")
-            await say(f"✅ В аренде, строка {_row}.")
+            _diff = _ho_row_diff(res, rec) if _handover_facts_on() else ""   # HOFACTS v2 (6): не та строка — громко
+            if _diff:
+                log.warning(f"  → ВЫДАЧА: мост перевёл строку {res.get('row')}, на карточке {rec.get('row')} "
+                            f"{rec['bike']}")
+                await say(_diff)
+            else:
+                await say(f"✅ В аренде, строка {_row}.")
         else:
             log.info(f"  → ПРИЁМ: аренда завершена (строка {_row}, @{who}) {rec['bike']} km_end={km_end or '-'} "
                      f"paid={rec.get('paid_total') if rec.get('paid_total') is not None else '-'}")
@@ -13633,6 +13880,17 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
         tid = getattr(msg, "message_thread_id", None)
         if any(w in low for w in ("да", "ок", "активируй", "подтвержд")):
             _who = msg.from_user.username if msg.from_user else "?"
+            if _handover_facts_on():
+                # HOFACTS v2 (6): перед билетом — та же ли бронь, что на карточке (как на строгом пути)
+                _why = _ho_yes_recheck(bridge, act)
+                if _why:
+                    act["status"] = "stale"
+                    log.warning(f"  → ВЫДАЧА: бронь карточки перечитана иначе ({_why}) — не активирую (@{_who}) "
+                                f"{act['bike']}")
+                    await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                                text="🐀 Splinter\n" + W_HO_YES_RECHECK.format(
+                                    card=_card_name("activate", act), why=_why))
+                    return
             # --- КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write) ---
             try:
                 ticket = (bridge.issue_write_ticket() or {}).get("ticket")
@@ -13645,8 +13903,9 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                 act["status"] = "activated"
                 _row = res.get("row") or act.get("row")
                 log.info(f"  → ВЫДАЧА: бронь активирована (строка {_row}, @{_who}) {act['bike']}")
+                _diff = _ho_row_diff(res, act) if _handover_facts_on() else ""   # HOFACTS v2 (6): не та строка
                 await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
-                            text=f"🐀 Splinter\n✅ В аренде, строка {_row}.")
+                            text=("🐀 Splinter\n" + _diff) if _diff else f"🐀 Splinter\n✅ В аренде, строка {_row}.")
             else:
                 act["status"] = "error"
                 _err = res.get("error") or "?"
