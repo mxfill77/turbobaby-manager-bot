@@ -206,23 +206,51 @@ def _close_accrual_on():
 # вне словаря читатель решит молча, а выпуск такого решения не доказывает — слово НЕИЗВЕСТНО, скрипт рестарта — стоп.
 _FLAG_WORDS_STRICT = ("0", "", "нет", "no", "off", "false", "1", "да", "yes", "on", "true")   # _intake_confirm_strict_on
 _FLAG_WORDS_RC = ("1", "true", "yes", "on", "0", "", "no", "off", "false", "нет")           # _rc_on («да» — не его слово)
+# RC2010: ручки отрезков 19.10 в той же строке. CLOSE_TRUTH и CLOSE_ACCRUAL читаются формой STRICT (слово вне выкл-списка
+# = ВКЛ) — словарь тот же; HANDOVER_FACTS — `_rc_on` (вне вкл-списка = ВЫКЛ).
+_FLAG_WORDS_TRUTH = _FLAG_WORDS_STRICT      # _close_truth_on, _close_accrual_on
 
 
-def _flag_word(name, on, known):
+def _flag_word(name, on, known, off_why=None):
     """Слово ручки для строки старта: ВКЛ / ВЫКЛ — решение самого читателя (`on`); НЕИЗВЕСТНО — значение задано, но
-    не из словаря читателя (`known`). Само значение не возвращается никогда."""
+    не из словаря читателя (`known`). Само значение не возвращается никогда.
+    RC2010: строка говорит, что ДЕЙСТВУЕТ. Слово вне словаря читатель решает молча (CLOSE_TRUTH и STRICT — как ВКЛ,
+    `_rc_on` — как ВЫКЛ): слово остаётся НЕИЗВЕСТНО (выпуск такого решения не доказывает, скрипт рестарта — стоп), а
+    рядом — действующее значение. `off_why` — слово из словаря, но действует ВЫКЛ по другой причине (зависимость ручки
+    или незагруженный модуль): пишется рядом, чтобы «ВЫКЛ» при заданном вкл-слове не читалось как опечатка. В словах
+    нет « · » и «=» — разделители строки, по которым её режут читатели вне процесса."""
     raw = _os_env(name, None)
     if raw is not None and str(raw).strip().lower() not in known:
-        return "НЕИЗВЕСТНО (задан)"
+        return "НЕИЗВЕСТНО (задан; действует %s)" % ("ВКЛ" if on else "ВЫКЛ")
+    if raw is not None and not on and off_why:
+        return "ВЫКЛ (задан; %s)" % off_why
     return ("ВКЛ" if on else "ВЫКЛ") + (" (задан)" if raw is not None else " (не задан)")
+
+
+def _accrual_off_why():
+    """Почему CLOSE_ACCRUAL не действует при вкл-слове: только поверх CLOSE_TRUTH (`_close_accrual_on`)."""
+    raw = str(_os_env("CLOSE_ACCRUAL", _CLOSE_ACCRUAL_DEFAULT)).strip().lower()
+    if raw not in ("0", "", "нет", "no", "off", "false") and not _close_truth_on():
+        return "только поверх CLOSE_TRUTH"
+    return None
 
 
 def release_flags_line():
     """Строка «🧩 флаги выпуска» для лога старта (bot.py). ВКЛ/ВЫКЛ берутся у тех же функций, что читают ручки в работе
-    (`_intake_confirm_strict_on`, `_rc_on`), — строка не может разойтись с поведением процесса."""
-    return ("🧩 флаги выпуска: INTAKE_CONFIRM_STRICT=%s · %s=%s"
+    (`_intake_confirm_strict_on`, `_rc_on`), — строка не может разойтись с поведением процесса.
+    RC2010: ещё три ручки отрезков 19.10 — CLOSE_TRUTH (`_close_truth_on`, умолчание ВКЛ), CLOSE_ACCRUAL
+    (`_close_accrual_on`: только поверх CLOSE_TRUTH, умолчание ВЫКЛ), HANDOVER_FACTS (`_handover_facts_on`, умолчание
+    ВЫКЛ) — тоже словом ДЕЙСТВУЮЩЕГО решения. Новые ручки стоят в КОНЦЕ строки: прежние читатели по ключу (« · »)
+    работают как были, а шаблон с якорем `$` (старый SC_FLAGS_RE скрипта рестарта) на этой строке не сходится — стоп,
+    а не ложное «доказано» без трёх новых ручек."""
+    _ho_on = _handover_facts_on()       # при ВКЛ — тот же ленивый импорт rental_case_rules, что и в работе
+    _ho_why = "rental_case_rules не загрузился" if (_rc_on(F_HANDOVER_FACTS) and not _ho_on) else None
+    return ("🧩 флаги выпуска: INTAKE_CONFIRM_STRICT=%s · %s=%s · CLOSE_TRUTH=%s · CLOSE_ACCRUAL=%s · %s=%s"
             % (_flag_word("INTAKE_CONFIRM_STRICT", _intake_confirm_strict_on(), _FLAG_WORDS_STRICT),
-               F_CONTRACT_REF_GEN, _flag_word(F_CONTRACT_REF_GEN, _rc_on(F_CONTRACT_REF_GEN), _FLAG_WORDS_RC)))
+               F_CONTRACT_REF_GEN, _flag_word(F_CONTRACT_REF_GEN, _rc_on(F_CONTRACT_REF_GEN), _FLAG_WORDS_RC),
+               _flag_word("CLOSE_TRUTH", _close_truth_on(), _FLAG_WORDS_TRUTH),
+               _flag_word("CLOSE_ACCRUAL", _close_accrual_on(), _FLAG_WORDS_TRUTH, _accrual_off_why()),
+               F_HANDOVER_FACTS, _flag_word(F_HANDOVER_FACTS, _ho_on, _FLAG_WORDS_RC, _ho_why)))
 
 
 def _bike_position_on():
