@@ -99,11 +99,12 @@ OWNER_ID = 504608015                 # APPROVER_IDS по умолчанию — 
 TZ = datetime.timedelta(hours=7)
 P = "🐀 Splinter\n"
 DUE_LINE = " К доплате по листу закрытия: 1 500 ฿ — в CRM не пишу."
-# r2 (приёмка 20.10): обещание про K — с условием; ветку (K формулой / только примечание) судит мост по K под замком
+# r2 (приёмка 20.10): обещание про K — с условием; ветку (K формулой / только примечание) судит мост по K под замком.
+# RC2010: дробное число в K мост судит как текст (ветка number — только целое) — карточка называет и его.
 ACC_LINE = (" Начисление к оплате (это не оплата): доплаты дни 500 · ущерб 1000 = 1 500 ฿ — расшифровку запишу в "
-            "примечание к A; в K допишу формулой к основной сумме (+500+1000), только если основа в K известна (число "
-            "или формула с числом), а пустой K, текст или ошибку в K не трогаю — тогда начисление только "
-            "примечанием к A.")
+            "примечание к A; в K допишу формулой к основной сумме (+500+1000), только если основа в K известна (целое "
+            "число или формула с числом), а пустой K, текст, дробное число или ошибку в K не трогаю — тогда начисление "
+            "только примечанием к A.")
 ACC_UNCONDITIONAL = "— допишу в K формулой к основной сумме"   # слова r1: безусловное обещание, ложное при пустом K
 ACC_TAIL = "Завершаю (Завершена + пробег 35200 + начисление доплат)? да / нет"
 
@@ -582,7 +583,9 @@ class P_Pure(Case):
         self.assertEqual(line, ACC_LINE)
         self.assertNotIn(ACC_UNCONDITIONAL, line)
         self.assertIn("только если основа в K известна", line)
-        self.assertIn("пустой K, текст или ошибку в K не трогаю — тогда начисление только примечанием к A", line)
+        self.assertIn("пустой K, текст, дробное число или ошибку в K не трогаю — тогда начисление только примечанием "
+                      "к A", line)
+        self.assertIn("(целое число или формула с числом)", line, "RC2010: дробь в K мост судит как текст")
         self.assertIn("расшифровку запишу в примечание к A", line, "примечание — в любой ветке")
         self.assertEqual(tail, ACC_TAIL)
         self.assertNotIn("оплачено", line.lower())
@@ -1082,6 +1085,27 @@ class R_Rollback(Case):
                                            "data": {k: close0[k] for k in ext_keys}}])
         self.assertEqual(RH.CLOSE_KEYS, rev_rh(OLD_REV, OLD_RH_BLOB).CLOSE_KEYS, "белый список записи — 947953e")
 
+    def test_r10_white_lists_equal_947953e_for_all_kinds_ext_disjoint(self):
+        """RC2010 (замечание приёмки): белые списки записей — РОВНО 947953e у ВСЕХ трёх видов (брони, выдачи,
+        закрытия: те же поля в том же порядке), а поля раздела ext у каждого вида с ними не пересекаются и не
+        повторяются. Поле, добавленное в KEYS любого вида, снова роняло бы весь файл передачи у 947953e."""
+        OLD = rev_rh(OLD_REV, OLD_RH_BLOB)
+        self.assertEqual(RH.KINDS, OLD.KINDS)
+        self.assertEqual(RH.WAITING, OLD.WAITING)
+        self.assertEqual(sorted(RH.KEYS), sorted(OLD.KEYS))
+        for kind in OLD.KINDS:
+            self.assertEqual(RH.KEYS[kind], OLD.KEYS[kind], "белый список %s — 947953e" % kind)
+        self.assertEqual((RH.INTAKE_KEYS, RH.HANDOVER_KEYS, RH.CLOSE_KEYS),
+                         (OLD.INTAKE_KEYS, OLD.HANDOVER_KEYS, OLD.CLOSE_KEYS))
+        self.assertEqual(sorted(RH.EXT_KEYS), sorted(RH.KINDS), "раздел ext знает ровно три вида")
+        for kind in RH.KINDS:
+            ext = RH.EXT_KEYS[kind]
+            self.assertEqual(set(ext) & set(RH.KEYS[kind]), set(), "ext и белый список %s пересеклись" % kind)
+            self.assertEqual(set(ext) & set(OLD.KEYS[kind]), set(), "ext %s пересёкся со списком 947953e" % kind)
+            self.assertEqual(len(set(ext)), len(ext), "поле ext %s повторено" % kind)
+        self.assertEqual(RH.EXT_KEYS[RH.KIND_CLOSE], RH.CLOSE_EXT_KEYS)
+        self.assertEqual((RH.EXT_KEYS[RH.KIND_INTAKE], RH.EXT_KEYS[RH.KIND_HANDOVER]), ((), ()))
+
     def test_r8_ext_section_guarded_and_old_reader_unaffected(self):
         """Раздел ext сверяется этим кодом (сумма, тело, белый список, место, дубль, пересечение с записью) — иначе
         файл не наш, как у записи вне контракта; 947953e на тех же файлах принимает все три карточки (раздела не
@@ -1379,13 +1403,17 @@ class E_EndToEnd(Case):
     def test_e6_card_promise_holds_in_every_k_branch(self):
         """r2 (приёмка 20.10): карточка рождается, не зная K, — у числа, пустого и текстового K она ОДНА и та же, с
         условием; НАСТОЯЩИЙ closeBooking выбирает ветку по K под замком, и ответ после «да» называет ту, что вышла:
-        число — K формулой; пусто / текст — K не тронут, начисление только примечанием к A (как карточка и сказала)."""
+        число — K формулой; пусто / текст — K не тронут, начисление только примечанием к A (как карточка и сказала).
+        RC2010 (замечание приёмки): дробное число в K (1500.5) мост судит как текст — та же карточка, K не тронут,
+        только примечание к A; карточка эту ветку называет словами «дробное число»."""
         seen = set()
         for k, k_after, words in ((10000, None, "Начислено к оплате (это не оплата): K = =10000+500+1000"),
                                   ("", "", "Доплаты дни 500 · ущерб 1000 начислены к оплате только примечанием к A: "
                                            "основная сумма в K не подтверждена (K пуст) — K не трогал."),
                                   ("оплатил", "оплатил", "В K не целое число — K не трогал; доплаты дни 500 · ущерб "
-                                                         "1000 начислены к оплате только примечанием к A.")):
+                                                         "1000 начислены к оплате только примечанием к A."),
+                                  (1500.5, 1500.5, "В K не целое число — K не трогал; доплаты дни 500 · ущерб "
+                                                   "1000 начислены к оплате только примечанием к A.")):
             with self.subTest(k=k):
                 reset()
                 os.environ["CLOSE_TRUTH"] = os.environ["CLOSE_ACCRUAL"] = "1"
@@ -1405,7 +1433,8 @@ class E_EndToEnd(Case):
                     self.assertNotIn("21,11", b.crm["formulas"])
                     self.assertIn("NOTE_ONLY +500+1000", b.crm["notes"]["21,1"])
                 self.assertIn(words, texts()[-1])
-        self.assertEqual(len(seen), 1, "карточка K не знает — у всех трёх K она одна и та же: %r" % seen)
+                self.assertIn("дробное число", card.text)
+        self.assertEqual(len(seen), 1, "карточка K не знает — у всех четырёх K она одна и та же: %r" % seen)
 
     def test_e4_formula_base_grouped(self):
         crm, closing = _grid(k="")
