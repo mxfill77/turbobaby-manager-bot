@@ -22,6 +22,10 @@ TB-REVIEW-1910-2400 (1)–(5); сторона моста — tests/test_close_ac
        записей, новая карточка НОВОЙ операцией, реплай на старую — «заменена»;
   (R)  рестарт: карточка с операцией через handoff_write/handoff_restore исполняет ТУ ЖЕ операцию; правленая запись
        передачи — начисление не шлётся; лист сменился после рестарта — новая операция;
+       ОТКАТ (r2, приёмка 20.10): файл передачи нового кода читает НАСТОЯЩИЙ restart_handoff 947953e (git show во
+       временный модуль, блоб сверен) руками того же splinter (их исходник сверен с 947953e) — принимает и
+       восстанавливает брони, выдачи, закрытия; писатель 08e2ead…fbd0a22 (поля прямо в записи) им отвергался ЦЕЛИКОМ;
+       раздел ext — сумма, привязка, версия; остаток риска (откат и обратно) закреплён тестом, чтобы его было видно;
   (L)  прежний путь ответа (INTAKE_CONFIRM_STRICT=0); (K) дело К4 (хранилище) — оба и со сменой листа;
   (E)  сквозной: `_handle_servicing` → НАСТОЯЩИЙ Closing.js (closing_upsert) → карточка → «да» → НАСТОЯЩИЙ
        closeBooking сборки (node-харнесс, листы в памяти) — K, примечание к A, квитанция; пустой K; фоллбэк по байку;
@@ -30,8 +34,11 @@ TB-REVIEW-1910-2400 (1)–(5); сторона моста — tests/test_close_ac
 Сеть запрещена подменой socket (rental_case_fakes), память Splinter и база дела — только во временном каталоге
 прогона (K4_TTMP). Данные синтетические.
 """
+import ast
 import asyncio
 import datetime
+import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -92,8 +99,12 @@ OWNER_ID = 504608015                 # APPROVER_IDS по умолчанию — 
 TZ = datetime.timedelta(hours=7)
 P = "🐀 Splinter\n"
 DUE_LINE = " К доплате по листу закрытия: 1 500 ฿ — в CRM не пишу."
-ACC_LINE = (" Начисление к оплате (это не оплата): доплаты дни 500 · ущерб 1000 = 1 500 ฿ — допишу в K формулой к "
-            "основной сумме (+500+1000), расшифровку — в примечание к A.")
+# r2 (приёмка 20.10): обещание про K — с условием; ветку (K формулой / только примечание) судит мост по K под замком
+ACC_LINE = (" Начисление к оплате (это не оплата): доплаты дни 500 · ущерб 1000 = 1 500 ฿ — расшифровку запишу в "
+            "примечание к A; в K допишу формулой к основной сумме (+500+1000), только если основа в K известна (число "
+            "или формула с числом), а пустой K, текст или ошибку в K не трогаю — тогда начисление только "
+            "примечанием к A.")
+ACC_UNCONDITIONAL = "— допишу в K формулой к основной сумме"   # слова r1: безусловное обещание, ложное при пустом K
 ACC_TAIL = "Завершаю (Завершена + пробег 35200 + начисление доплат)? да / нет"
 
 
@@ -561,6 +572,26 @@ class P_Pure(Case):
         self.assertEqual([k for k in waived if k.startswith("acc_")], [], "доплаты сняли — начислять нечего")
         self.assertNotIn("due_total", waived)
 
+    def test_p10_card_promise_about_k_is_conditional(self):
+        """r2 (приёмка 20.10): карточка K не знает (ветку судит мост под замком при «да»), поэтому обещание «допишу в K»
+        — только с условием «если основа в K известна», а пустой/текстовый K назван веткой «только примечание к A».
+        Слова r1 («— допишу в K формулой к основной сумме» без условия) ложны при пустом и текстовом K."""
+        rec = {"bike": BIKE, "acc_op": exp_op(), "acc_bid": BID, "acc_brow": 21, "acc_ds": DAY0, "acc_crow": 5,
+               "acc_parts": ["500", "", "1000", ""]}
+        line, tail = S._acc_card_lines(rec, 1500.0, "", "Завершаю (Завершена + пробег 35200)? да / нет")
+        self.assertEqual(line, ACC_LINE)
+        self.assertNotIn(ACC_UNCONDITIONAL, line)
+        self.assertIn("только если основа в K известна", line)
+        self.assertIn("пустой K, текст или ошибку в K не трогаю — тогда начисление только примечанием к A", line)
+        self.assertIn("расшифровку запишу в примечание к A", line, "примечание — в любой ветке")
+        self.assertEqual(tail, ACC_TAIL)
+        self.assertNotIn("оплачено", line.lower())
+        os.environ["CLOSE_ACCRUAL"] = "1"
+        t = dict(rec, action="close", name=NAME, row=21, km="35200", due_total=1500.0, deposit_disp="5 000 ฿")
+        k4 = S._rc_card_text("close", t)                       # карточка дела К4 — те же слова
+        self.assertIn(ACC_LINE, k4)
+        self.assertNotIn(ACC_UNCONDITIONAL, k4)
+
 
 # ======================================================== (F) ручка ВЫКЛ / CLOSE_TRUTH=0: ровно путь CLOSETRUTH1910
 class F_Off(Case):
@@ -891,6 +922,249 @@ class R_Restart(Case):
                                           "не сошлись с её операцией.")
 
 
+# ================================================== (R) ОТКАТ через штатный рестарт на 947953e и обратно (r2, 20.10)
+# Повод (приёмка 20.10): CLOSE_KEYS вырос (km_photo, due_total, acc_*), а verify() 947953e отвергает ВЕСЬ файл передачи,
+# если у одной записи поле вне его белого списка (restart_handoff.py:105@947953e): откат кода через штатный рестарт
+# терял бы ВСЕ ждущие карточки — брони, выдачи, закрытия. Доказательство — НАСТОЯЩИМ кодом 947953e: модуль берётся
+# `git show` во временный каталог прогона (блоб сверен с закреплённым), руки splinter сверены с 947953e побайтно.
+OLD_REV = "947953e"                                          # код, на который откатывается полоса
+OLD_RH_BLOB = "4187bb824440e8a168dab818d48362639a9b4326"     # git rev-parse 947953e:restart_handoff.py
+INLINE_REV = "fbd0a22"                                       # писатель r1: поля сверх списка — прямо в записи
+INLINE_RH_BLOB = "e14867b73bc0727e45cca364ff233412bcc72019"  # git rev-parse fbd0a22:restart_handoff.py
+HANDS = ("_handoff_path", "_handoff_dump", "_handoff_read", "handoff_restore", "handoff_write")
+DRAFT_CHAT, HO_CHAT = -100777001, -100777002                # синтетические места передачи
+_REV_MODS = {}
+
+
+def _git_show(rev, path):
+    p = subprocess.run(["git", "-C", ROOT, "show", "%s:%s" % (rev, path)], capture_output=True, timeout=120)
+    assert p.returncode == 0, "git show %s:%s — %s" % (rev, path, p.stderr.decode("utf-8", "replace")[-500:])
+    return p.stdout
+
+
+def rev_rh(rev, blob):
+    """НАСТОЯЩИЙ restart_handoff ревизии `rev`: из git во временный модуль (каталог прогона K4_TTMP), блоб сверен."""
+    if rev not in _REV_MODS:
+        src = _git_show(rev, "restart_handoff.py")
+        got = hashlib.sha1(b"blob %d\0" % len(src) + src).hexdigest()
+        assert got == blob, "restart_handoff.py@%s: блоб %s, закреплён %s" % (rev, got, blob)
+        path = os.path.join(tempfile.mkdtemp(prefix="rh_%s_" % rev, dir=TTMP), "restart_handoff_%s.py" % rev)
+        with open(path, "wb") as f:
+            f.write(src)
+        spec = importlib.util.spec_from_file_location("restart_handoff_%s" % rev, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _REV_MODS[rev] = mod
+    return _REV_MODS[rev]
+
+
+def _hands(src):
+    return {n.name: ast.get_source_segment(src, n) for n in ast.parse(src).body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in HANDS}
+
+
+def hands_same_as(rev):
+    """Руки передачи в splinter (файл, метка, перенос carry) — побайтно те же, что у `rev`: подмена S._rh модулем
+    `rev` даёт ровно процесс `rev` на шаге остановки/старта, а не похожий на него."""
+    old = _hands(_git_show(rev, "splinter.py").decode("utf-8"))
+    with open(S.__file__, encoding="utf-8") as f:
+        new = _hands(f.read())
+    assert sorted(old) == sorted(HANDS) == sorted(new), (sorted(old), sorted(new))
+    diff = [n for n in HANDS if old[n] != new[n]]
+    assert not diff, "руки передачи разошлись с %s: %s — подмена модуля уже не процесс %s" % (rev, diff, rev)
+
+
+def restart_with(rh):
+    """Штатный рестарт: остановку пишет текущий S._rh (уходящий процесс), новый процесс решает модулем `rh`.
+    → итог восстановления (строка журнала)."""
+    S.handoff_write()
+    for d in (S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES):
+        d.clear()
+    for name in ("_CR_NOTES", "_CR_FORGOT", "_IC_DEAD_ASKS"):
+        getattr(S, name, {}).clear()
+    S._HANDOFF_SEEN.update(applied_sha=None, unapplied=False, carry=[])
+    time.sleep(0.05)
+    S._CR_LIFE_T0 = time.time()
+    S._rh = rh
+    return S.handoff_restore()
+
+
+def handoff_file():
+    with open(S._handoff_path(), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def waiting_cards():
+    """Ждущие карточки ДРУГИХ видов рядом с карточкой закрытия — откат обязан сохранить и их. → (бронь, выдача)."""
+    now = time.time()
+    S._INTAKE_DRAFTS[DRAFT_CHAT] = {"model": "Honda Click 125", "client": NAME, "date_start": "25.10",
+                                    "date_end": "28.10", "status": "awaiting_approval", "ts": now,
+                                    "ic_msg_ids": [11, 12], "raw_extra": "не передаётся"}
+    S._HANDOVER_ACTIVATIONS[HO_CHAT] = {"bike": BIKE, "name": NAME, "date_start": dt(-3), "row": 21, "ts": now,
+                                        "status": "awaiting"}
+    return dict(S._INTAKE_DRAFTS[DRAFT_CHAT]), dict(S._HANDOVER_ACTIVATIONS[HO_CHAT])
+
+
+class R_Rollback(Case):
+    def tearDown(self):
+        S._rh = RH
+        super(R_Rollback, self).tearDown()
+
+    def test_r5_rollback_947953e_accepts_new_handoff_restores_all_cards(self):
+        """Новый код остановлен штатно с ждущими бронью, выдачей и карточкой закрытия С ОПЕРАЦИЕЙ начисления и
+        фото-подсказкой; стартует 947953e (его restart_handoff, руки сверены) — файл принят, все три карточки на местах
+        в том виде, что знает 947953e. Поля сверх его списка лежат в разделе ext, который он не читает."""
+        OLD = rev_rh(OLD_REV, OLD_RH_BLOB)
+        hands_same_as(OLD_REV)
+        b = Bridge([rent_row()])
+        ret_card(b, km="", km_photo="35200")
+        close0 = dict(S._RETURN_CLOSES[INTAKE])
+        self.assertTrue(close0.get("acc_op") and close0.get("km_photo") and close0.get("due_total"), close0)
+        draft0, ho0 = waiting_cards()
+        out = restart_with(OLD)
+        obj = handoff_file()
+        self.assertEqual(out, "применена (sha %s): брони 1 · выдачи 1 · закрытия 1 · занятых мест 0"
+                         % obj["sha256"][:8])
+        for e in obj["entries"]:
+            self.assertLessEqual(set(e["data"]), set(OLD.KEYS[e["kind"]]), e)
+        self.assertEqual([x["kind"] for x in obj["ext"]["entries"]], ["close"])
+        self.assertEqual(OLD.verify(obj)[1], "ok")
+        self.assertEqual(S._INTAKE_DRAFTS[DRAFT_CHAT], {k: v for k, v in draft0.items() if k in OLD.INTAKE_KEYS})
+        self.assertEqual(S._HANDOVER_ACTIVATIONS[HO_CHAT], ho0)
+        self.assertEqual(S._RETURN_CLOSES[INTAKE], {k: close0[k] for k in OLD.CLOSE_KEYS if k in close0})
+        self.assertIsNone(S._RETURN_CLOSES[INTAKE]["paid_total"], "итог листа не стал «оплачено» и у 947953e")
+
+    def test_r6_back_and_forward_residual_risk_is_visible(self):
+        """ОСТАТОК РИСКА (назван в restart_handoff и в коммите), закреплён, чтобы его было видно: 947953e раздела ext
+        не знает и при своей остановке пишет файл без него. Код, вернувшийся вперёд, получает карточку закрытия в виде
+        ДО РУЧЕК: операции начисления нет, «да» закрывает аренду без начисления и этого не называет. Брони и выдачи
+        проходят оба рестарта. Исправят остаток — этот тест переписывается вместе с ним."""
+        OLD = rev_rh(OLD_REV, OLD_RH_BLOB)
+        hands_same_as(OLD_REV)
+        b = Bridge([rent_row()])
+        ret_card(b)
+        draft0, ho0 = waiting_cards()
+        self.assertTrue(restart_with(OLD).startswith("применена"))         # вперёд → откат
+        out = restart_with(RH)                                             # откат → вперёд: остановку писал 947953e
+        self.assertTrue(out.startswith("применена") and "брони 1 · выдачи 1 · закрытия 1" in out, out)
+        self.assertNotIn("ext", handoff_file(), "файл писал 947953e — раздела нет")
+        self.assertEqual(S._HANDOVER_ACTIVATIONS[HO_CHAT], ho0)
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual([k for k in rec if k.startswith("acc_") or k in ("km_photo", "due_total")], [], rec)
+        say(b, "да")                                         # без реплая: адресное уточнение по ждущей карточке
+        asks = [s for s in SENDS if "засчитываю только реплаем" in s.text]
+        self.assertTrue(asks, texts())
+        say(b, "да", reply=asks[-1])
+        self.assertEqual(b.red("post_close_booking"), [], "операции нет — начисление не шлётся")
+        self.assertEqual([c["paid_total"] for c in b.red("close_booking")], [None])
+        self.assertEqual(texts()[-1], P + "✅ Завершена, строка 21.", "остаток: обещание карточки не названо")
+
+    def test_r7_new_code_restores_ext_fields_file_shape(self):
+        """Вперёд → вперёд: поля сверх списка 947953e — только в разделе ext (своя версия, привязка к сумме тела), в
+        записи их нет; восстановление возвращает их в карточку — та же операция, та же подсказка фото."""
+        b = Bridge([rent_row()])
+        ret_card(b, km="", km_photo="35200")
+        close0 = dict(S._RETURN_CLOSES[INTAKE])
+        ext_keys = [k for k in RH.CLOSE_EXT_KEYS if k in close0]
+        self.assertEqual(set(ext_keys), set(RH.CLOSE_EXT_KEYS) - {"acc_stop"})
+        waiting_cards()
+        out = restart_with(RH)
+        self.assertTrue(out.startswith("применена") and "брони 1 · выдачи 1 · закрытия 1" in out, out)
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual({k: rec.get(k) for k in ext_keys}, {k: close0[k] for k in ext_keys})
+        obj = handoff_file()
+        (ce,) = [e for e in obj["entries"] if e["kind"] == "close"]
+        self.assertEqual(set(ce["data"]) & set(RH.CLOSE_EXT_KEYS), set(), ce)
+        self.assertLessEqual(set(ce["data"]), set(RH.CLOSE_KEYS))
+        sec = obj["ext"]
+        self.assertEqual((sec["version"], sec["of"]), (RH.EXT_VERSION, obj["sha256"]))
+        self.assertEqual(sec["entries"], [{"kind": "close", "chat_id": INTAKE,
+                                           "data": {k: close0[k] for k in ext_keys}}])
+        self.assertEqual(RH.CLOSE_KEYS, rev_rh(OLD_REV, OLD_RH_BLOB).CLOSE_KEYS, "белый список записи — 947953e")
+
+    def test_r8_ext_section_guarded_and_old_reader_unaffected(self):
+        """Раздел ext сверяется этим кодом (сумма, тело, белый список, место, дубль, пересечение с записью) — иначе
+        файл не наш, как у записи вне контракта; 947953e на тех же файлах принимает все три карточки (раздела не
+        читает). Незнакомая версия раздела — пропуск, не отказ. Без полей сверх списка — файл тот же, что у 947953e."""
+        OLD = rev_rh(OLD_REV, OLD_RH_BLOB)
+        b = Bridge([rent_row()])
+        ret_card(b, km="", km_photo="35200")
+        waiting_cards()
+        e = RH.select(S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES)
+        obj = RH.pack(e, written_at=1.0, pid=7)
+        self.assertEqual(RH.verify(obj), (e, "ok"))
+        self.assertEqual(json.loads(json.dumps(e)), e, "pack не меняет записи процесса (их же держит carry)")
+
+        def ext_sum(o):                     # сумма раздела верная — ловить обязан контракт, а не сумма
+            o["ext"]["sha256"] = RH.digest({k: o["ext"][k] for k in ("version", "of", "entries")})
+
+        def mut(f):
+            o = json.loads(json.dumps(obj))
+            f(o)
+            return o
+
+        x0 = lambda o: o["ext"]["entries"][0]
+        cases = (
+            ("сумма", lambda o: x0(o)["data"].__setitem__("acc_parts", ["900", "", "1000", ""]),
+             "контрольная сумма раздела ext не сошлась"),
+            ("чужое тело", lambda o: (o["ext"].__setitem__("of", "0" * 64), ext_sum(o)), "от другого тела"),
+            ("паспорт", lambda o: (x0(o)["data"].__setitem__("passport_ocr", "AB1234567"), ext_sum(o)),
+             "в разделе ext поле вне белого списка (close)"),
+            ("поле записи", lambda o: (x0(o)["data"].__setitem__("paid_total", 1500), ext_sum(o)),
+             "в разделе ext поле вне белого списка (close)"),
+            ("объект", lambda o: (x0(o)["data"].__setitem__("acc_parts", {"x": 1}), ext_sum(o)),
+             "в разделе ext поле вне белого списка (close)"),
+            ("без карточки", lambda o: (x0(o).__setitem__("chat_id", 777), ext_sum(o)), "без своей карточки"),
+            ("дубль", lambda o: (o["ext"]["entries"].append(dict(x0(o))), ext_sum(o)), "две записи раздела ext"),
+            ("не словарь", lambda o: o.__setitem__("ext", []), "раздел ext не словарь"),
+            ("нет списка", lambda o: (o["ext"].__setitem__("entries", None), ext_sum(o)), "нет списка записей"),
+        )
+        for name, f, word in cases:
+            with self.subTest(case=name):
+                o = mut(f)
+                got, why = RH.verify(o)
+                self.assertIsNone(got, why)
+                self.assertIn(word, why)
+                old_got, old_why = OLD.verify(o)
+                self.assertEqual((old_why, len(old_got or ())), ("ok", 3), "947953e раздела не читает — карточки целы")
+        # поле и в записи, и в разделе: сумма тела и привязка пересчитаны — ловит контракт пересечения
+        o = mut(lambda o: [x for x in o["entries"] if x["kind"] == "close"][0]["data"].__setitem__("km_photo", "1"))
+        o["sha256"] = RH.digest({k: o[k] for k in ("version", "written_at", "pid", "count", "entries")})
+        o["ext"]["of"] = o["sha256"]
+        ext_sum(o)
+        self.assertEqual(RH.verify(o), (None, "поле и в записи, и в разделе ext (close)"))
+        # незнакомая версия раздела — пропуск, а не отказ (новое поле раздела = новая версия раздела)
+        o = mut(lambda o: (o["ext"].__setitem__("version", RH.EXT_VERSION + 1), ext_sum(o)))
+        got, why = RH.verify(o)
+        self.assertTrue(why.startswith("ok: раздел ext версии 2 не прочитан"), why)
+        self.assertEqual(len(got), 3)
+        (ce,) = [x for x in got if x["kind"] == "close"]
+        self.assertEqual([k for k in ce["data"] if k in RH.CLOSE_EXT_KEYS], [])
+        # без полей сверх списка 947953e (брони, выдачи, закрытие до ручек) — раздела нет, файл тот же, что у 947953e
+        plain = RH.select(S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS,
+                          {INTAKE: {k: v for k, v in S._RETURN_CLOSES[INTAKE].items() if k in RH.CLOSE_KEYS}})
+        self.assertEqual(RH.pack(plain, written_at=1.0, pid=7), OLD.pack(plain, written_at=1.0, pid=7))
+        self.assertNotIn("ext", RH.pack(plain, written_at=1.0, pid=7))
+
+    def test_r9_inline_writer_fbd0a22_was_rejected_whole_by_947953e(self):
+        """Дефект, который закрывает r2, — НАСТОЯЩИМ кодом обеих ревизий: писатель 08e2ead…fbd0a22 клал поля прямо в
+        запись, и verify 947953e отвергал ВЕСЬ файл — откат терял все ждущие карточки, а не одно закрытие. Новый
+        писатель на тех же карточках — принят. Новый читатель переходный файл принимает (поля в записи — его)."""
+        OLD = rev_rh(OLD_REV, OLD_RH_BLOB)
+        INL = rev_rh(INLINE_REV, INLINE_RH_BLOB)
+        b = Bridge([rent_row()])
+        ret_card(b, km="", km_photo="35200")
+        waiting_cards()
+        e_inl = INL.select(S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES)
+        inl = INL.pack(e_inl, written_at=1.0, pid=7)
+        self.assertEqual(OLD.verify(inl), (None, "в записи поле вне белого списка (close)"))
+        self.assertEqual(RH.verify(inl), (e_inl, "ok"))
+        e = RH.select(S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES)
+        self.assertEqual(e, e_inl, "те же карточки, те же поля — разница только в укладке файла")
+        got, why = OLD.verify(RH.pack(e, written_at=1.0, pid=7))
+        self.assertEqual((why, len(got)), ("ok", 3))
+
+
 # ============================================================== (L) ручка ВКЛ, прежний путь ответа (STRICT=0)
 class L_OnLegacyReply(Case):
     def setUp(self):
@@ -1101,6 +1375,37 @@ class E_EndToEnd(Case):
         self.assertEqual(b.crm["grid"][20][10], 10000, "K не тронут")
         self.assertEqual(b.crm["notes"].get("21,1"), "выдал, шлем 1", "примечание не тронуто")
         self.assertIn("Доплаты не записаны:", texts()[-1])
+
+    def test_e6_card_promise_holds_in_every_k_branch(self):
+        """r2 (приёмка 20.10): карточка рождается, не зная K, — у числа, пустого и текстового K она ОДНА и та же, с
+        условием; НАСТОЯЩИЙ closeBooking выбирает ветку по K под замком, и ответ после «да» называет ту, что вышла:
+        число — K формулой; пусто / текст — K не тронут, начисление только примечанием к A (как карточка и сказала)."""
+        seen = set()
+        for k, k_after, words in ((10000, None, "Начислено к оплате (это не оплата): K = =10000+500+1000"),
+                                  ("", "", "Доплаты дни 500 · ущерб 1000 начислены к оплате только примечанием к A: "
+                                           "основная сумма в K не подтверждена (K пуст) — K не трогал."),
+                                  ("оплатил", "оплатил", "В K не целое число — K не трогал; доплаты дни 500 · ущерб "
+                                                         "1000 начислены к оплате только примечанием к A.")):
+            with self.subTest(k=k):
+                reset()
+                os.environ["CLOSE_TRUTH"] = os.environ["CLOSE_ACCRUAL"] = "1"
+                crm, closing = _grid(k=k, note="")
+                b = JSBridge([rent_row()], crm, closing)
+                do_return(b)
+                card = cards()[-1]
+                self.assertIn(ACC_LINE, card.text)
+                self.assertNotIn(ACC_UNCONDITIONAL, card.text)
+                seen.add(card.text.split("\n")[1])
+                say(b, "да", reply=card)
+                self.assertEqual(b.crm["grid"][20][0], "Завершена")
+                if k_after is None:
+                    self.assertEqual(b.crm["formulas"].get("21,11"), "=10000+500+1000")
+                else:
+                    self.assertEqual(b.crm["grid"][20][10], k_after, "K не тронут")
+                    self.assertNotIn("21,11", b.crm["formulas"])
+                    self.assertIn("NOTE_ONLY +500+1000", b.crm["notes"]["21,1"])
+                self.assertIn(words, texts()[-1])
+        self.assertEqual(len(seen), 1, "карточка K не знает — у всех трёх K она одна и та же: %r" % seen)
 
     def test_e4_formula_base_grouped(self):
         crm, closing = _grid(k="")

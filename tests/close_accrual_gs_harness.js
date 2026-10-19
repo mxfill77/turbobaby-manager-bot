@@ -8,8 +8,9 @@
  * ЗЕРКАЛО ПРОДА `bridge_prod/`. После выкладки и сведения зеркала харнесс сам начнёт судить зеркало.
  *
  * Мок ячейки держит ЗНАЧЕНИЕ, ФОРМУЛУ и ПРИМЕЧАНИЕ раздельно (как Sheets: setValue A не трогает примечание A) и
- * умеет сбой по номеру вызова (setNote / setFormula / setValue) и крюк после записи примечания (правка листа
- * «человеком» между записями). Замок — мок LockService: занятость задаётся, взятия и снятия считаются.
+ * умеет сбой по номеру вызова (setNote / setFormula / setValue) и крюки после записи примечания и после записи
+ * значения (правка листа «человеком» между записями; afterSetValue — между планом начисления и его записями, на
+ * записи A/N закрытия). Замок — мок LockService: занятость задаётся, взятия и снятия считаются.
  *
  * `--mutant`: исходники подменяются JSON-объектом {имя файла: текст} со stdin, затем идёт весь набор (мутанты).
  * `--stdin`: один заход по JSON со stdin — {mode:'opid', vectors:[…]} → id операции; {mode:'call', crm, closing,
@@ -88,7 +89,11 @@ function makeSheet(rows, opt) {
   function cell(r, c) {
     const key = r + ',' + c;
     return {
-      setValue(v) { bump('setValue'); ensureRow(r); grid[r - 1][c - 1] = v; delete formulas[key]; writes.push(['setValue', r, c, v]); },
+      setValue(v) {
+        bump('setValue'); ensureRow(r); grid[r - 1][c - 1] = v; delete formulas[key];
+        writes.push(['setValue', r, c, v]);
+        if (opt.afterSetValue) opt.afterSetValue(n.setValue, api);   // правка «человеком» между планом и начислением
+      },
       getValue() { ensureRow(r); return formulas[key] !== undefined ? (fvals[key] !== undefined ? fvals[key] : 0) : grid[r - 1][c - 1]; },
       getFormula() { return formulas[key] || ''; },
       setFormula(f) {
@@ -660,6 +665,37 @@ function setPart(k, v, row) {                     // правка строки �
         typeof now.binding.updated_at === 'string' && now.binding.updated_at.length > 0, norm(now) + ' vs ' + norm(up));
   check('ver.reply-of-not-found', J(closingReplyOf_(closingRowById_('bk-nope'))) === J({ ok: false, error: 'not_found' }) &&
         closingRowById_('') === null, '');
+}
+
+// ═══ 10. охрана, которой харнесс не видел (приёмка 20.10): два выживших мутанта обязаны покраснеть ═══
+{
+  // «человек» правит примечание A между ПЛАНОМ (только чтение) и записями начисления — пока идут записи A/N закрытия.
+  // Начисление — стоп note_changed_before_write без единой записи K и примечания; правка человека цела; закрытие
+  // прошло.
+  // Обе ветки плана, которые пишут: 'write' (число в K) и 'note_only' (K пуст).
+  const EDIT = PREV_NOTE + ' / правка человека';
+  [['write', {}, 10000], ['note-only', { k: '' }, '']].forEach(([nm, o, k0]) => {
+    const env = makeEnv([HEADER, crm(o)], { notes: { [A1]: PREV_NOTE },
+      afterSetValue: (n, sh) => { if (n === 1) sh.notes[A1] = EDIT; } });
+    const r = closeBooking(body(acc({ surcharge_days: '500' })));
+    const c = env.clients;
+    check('acc.note-changed-before-write.' + nm, r.ok === true && r.closed === true && c.grid[1][0] === 'Завершена' &&
+          r.accrual.status === 'stopped' && r.accrual.reason === 'note_changed_before_write' &&
+          r.accrual.k_written === false && c.n.setNote === 0 && c.n.setFormula === 0 && c.notes[A1] === EDIT &&
+          c.grid[1][10] === k0 && c.formulas[K] === undefined, J(r.accrual) + J(c.writes));
+  });
+}
+{
+  // отрицательная основа K (возврат/скидка числом) — это число, а не текст: «=-500+500», без скобок, как у любого
+  // числа; знак основы сохранён; примечание называет прежний K
+  const env = makeEnv([HEADER, crm({ k: -500 })], { notes: { [A1]: PREV_NOTE } });
+  const a = acc({ surcharge_days: '500' });
+  const r = closeBooking(body(a));
+  const note = env.clients.notes[A1] || '';
+  check('acc.number.negative-base', r.ok === true && r.accrual.status === 'done' && r.accrual.base === 'number' &&
+        r.accrual.k_written === true && env.clients.formulas[K] === '=-500+500' &&
+        r.accrual.k_readback === '=-500+500' && note === PREV_NOTE + '\n[TB ' + a.close_op_id + ' DONE +500] доплаты ' +
+        '(начислено к оплате, не оплата): дни 500; K было: -500 → =-500+500', J(r.accrual) + J(note));
 }
 
 const failed = cases.filter(c => !c.pass);

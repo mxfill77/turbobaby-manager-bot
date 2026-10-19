@@ -9,7 +9,9 @@
     операция дважды; повтор после сбоя между K и примечанием; сбой записи K; правка листа между записями; замок
     занят / снят; paid_total только opt-in; ВЕРСИЯ листа закрытия — замечание приёмки 20.10: часть добавлена /
     уменьшена / снята, строки этой брони нет, строка переехала → отказ closing_changed целиком до записей с листом
-    в ответе; тот же состав при новом штампе — начисляем; лист правят после плана — partial без записи K);
+    в ответе; тот же состав при новом штампе — начисляем; лист правят после плана — partial без записи K;
+    r2, приёмка 20.10: примечание A правят между планом и записями — стоп note_changed_before_write без единой записи
+    K и примечания, в обеих пишущих ветках; отрицательная основа K — число, «=-500+500»);
   * паспорт сборки — правило ТРЁХ состояний `tests/build_states.py` (состояние «а», база == зеркало @88);
   * прежний набор tests/booking_gs_harness.js на СБОРКЕ: всё прежнее зелёное, кроме ровно одного случая
     close.paid-written — запись итога в K без opt-in снята намеренно (условие (5));
@@ -136,7 +138,10 @@ def test_harness_covers_key_cases():
             "ver.reduced.new-op-done", "ver.waived.refused", "ver.row-gone.refused", "ver.row-gone.no-bike-fallback",
             "ver.row-moved.refused", "ver.same-parts.reupsert-done", "ver.number-cell-same-lit",
             "ver.closing-unread.stop", "ver.changed-at-prestate.partial", "ver.reply-of-same-shape",
-            "ver.reply-of-not-found"):
+            "ver.reply-of-not-found",
+            # r2 (приёмка 20.10): охрана, которой харнесс не видел — два выживших мутанта
+            "acc.note-changed-before-write.write", "acc.note-changed-before-write.note-only",
+            "acc.number.negative-base"):
         assert need in names, f"нет кейса {need}"
 
 
@@ -249,11 +254,26 @@ MUTANTS = [
      "return closingFind_(getBotTab_(BOTDATA.TABS.CLOSING), BOTDATA.CLOSING_HEADERS, bid, '', '');",
      "return closingFind_(getBotTab_(BOTDATA.TABS.CLOSING), BOTDATA.CLOSING_HEADERS, '', 'CB 300CC R 9011', '');",
      "ver.row-gone.refused"),
+    # r2 (приёмка 20.10): мутанты, ЖИВШИЕ на харнессе fbd0a22 (проба до правки: харнесс зелёный на каждом), — у каждого
+    # свой кейс раздела 10, который обязан покраснеть
+    ("note-changed-before-write-skip", "Booking.js",
+     "} else if ((pl.act === 'note_only' || pl.act === 'write') && String(cell.getNote() || '') !== pl.note0) {",
+     "} else if (false) {", "acc.note-changed-before-write.write"),
+    ("note-changed-before-write-only-write", "Booking.js",
+     "} else if ((pl.act === 'note_only' || pl.act === 'write') && String(cell.getNote() || '') !== pl.note0) {",
+     "} else if ((pl.act === 'write') && String(cell.getNote() || '') !== pl.note0) {",
+     "acc.note-changed-before-write.note-only"),
+    ("number-base-negative-as-text", "Booking.js",
+     "Math.floor(k0.v) === k0.v && Math.abs(k0.v) < 1e15) {",
+     "Math.floor(k0.v) === k0.v && k0.v >= 0 && k0.v < 1e15) {", "acc.number.negative-base"),
+    ("number-base-sign-dropped", "Booking.js",
+     "pl.formula = '=' + String(k0.v) + pl.adds;", "pl.formula = '=' + String(Math.abs(k0.v)) + pl.adds;",
+     "acc.number.negative-base"),
 ]
 
 
 def test_mutants_killed():
-    assert len(MUTANTS) >= 18
+    assert len(MUTANTS) >= 24
     alive, wrong = [], []
     for name, fname, old, new, *want in MUTANTS:
         src = _read(os.path.join(BUILD, fname))
