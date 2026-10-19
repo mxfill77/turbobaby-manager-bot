@@ -26,6 +26,10 @@ wf_2fc46177 у 003f626.
       двери);
   (C) флаг ВЫКЛ в отдельном процессе: модулей handover_facts / contract_ref / rental_case_rules в процессе нет, тексты
       карточек и записи — прежние байт-в-байт.
+v3 (20.10, замечания приёмки v2): повтор фразы при ждущей карточке сверяет вкладку со строкой ЖДУЩЕЙ карточки (b27);
+rental_case_rules не грузится при ВКЛ — путь ровно как при ВЫКЛ (b28); байк сейчас «В аренде» — вопрос без совета
+переоформить (a10, b29, проба Q1); ручная карточка под своим ключом кулдауна (b30, проба P4); отказ «да» при уже
+активной брони (b31, мутант M04); залог «7,00» / «7.00» — «не разобран» (a9).
 
 Сеть запрещена подменой socket (rental_case_fakes), память Splinter — во временном каталоге прогона (TMP/K4_TTMP).
 Хранилище К4 не открывается (RENTAL_CASE_DB не задан). Данные синтетические.
@@ -348,6 +352,7 @@ def reset():
         d.clear()
     S._RC_STORE = None
     S._HO_FACTS_BUDGET_S = BUDGET0
+    S._HO_RULES_SAID["why"] = ""
     for f in FLAGS:
         os.environ.pop(f, None)
     os.environ.pop("INTAKE_CONFIRM_STRICT", None)
@@ -601,6 +606,46 @@ class A_Pure(unittest.TestCase):
         self.assertTrue(H.same_as_card(bare, a))
         self.assertFalse(H.same_as_card(bare, row_b()))
         self.assertFalse(H.same_as_card({"row": None, "name": NAME_A, "date_start": a["date_start"]}, a))
+
+    def test_a9_deposit_zero_cents_after_short_integer_is_ambiguous(self):
+        """v3 (6): нулевые копейки после одной–трёх цифр («7,00» / «7.00») — это и «7» с копейками, и «7,000» с
+        потерянной цифрой группы: уверенного «7 ฿» нет, «не разобран ⚠️». От четырёх значащих цифр — целое, как в v2."""
+        H = hf()
+        unparsed = ("💰 Залог по брони: в CRM записан не числом и не «паспорт» — не разобран ⚠️", "залог не разобран")
+        for raw in ("7,00", "7.00", " 7,00 ", "70,00", "700.00", "700,00", "7,0", "7.0", "0,00", "0700,00"):
+            self.assertEqual(H.deposit_fact(raw), unparsed, repr(raw))
+            self.assertEqual(H.deposit_value(raw), ("unparsed", None), repr(raw))
+        for raw in ("7000,00", "7000.00", "7000.0", "07000,00", "7,000.00", "7.000,00"):
+            self.assertEqual(H.deposit_fact(raw), (DEP_MONEY_7000, None), repr(raw))
+        self.assertEqual(H.deposit_fact("20000.00"),
+                         ("💰 Залог по брони (записан в CRM): 20 000 ฿" + NOT_CHECKED, None))
+        for raw in ("7,00", "7.00"):
+            ln = H.facts(row_a(deposit_raw=raw), self._res(SIGNED_A))
+            self.assertEqual(ln["head"], "⚠️ Исключение: залог не разобран", raw)
+            self.assertFalse(any("7 ฿" in x for x in ln["lines"]), ln)
+
+    def test_a10_bike_rented_now_is_busy_not_reregister(self):
+        """v3 (3): брони на день нет, а байк СЕЙЧАС «В аренде» — исход busy при любой брони на другой день (позже,
+        раньше, несколько): совета переоформить нет, вопрос называет текущую аренду и брони. Без текущей — как в v2."""
+        H = hf()
+        cur = [{"row": 690, "name": NAME_C, "start_day": "2026-10-19", "end_day": "2026-10-22"}]
+        for cands in ([{"row": 720, "start_day": "2026-10-23", "name": NAME_B}],
+                      [{"row": 700, "start_day": "2026-10-18", "name": NAME_A}],
+                      [{"row": 700, "start_day": "2026-10-18", "name": NAME_A},
+                       {"row": 720, "start_day": "2026-10-23", "name": NAME_B}]):
+            mm = H.day_mismatch(cands, "2026-10-20", current=cur)
+            self.assertEqual((mm["kind"], mm["current"], mm["cands"]), ("busy", cur, cands))
+        mm = H.day_mismatch([{"row": 720, "start_day": "2026-10-23", "name": NAME_B}], "2026-10-20", current=cur)
+        line = H.busy_line("X 1", "2026-10-20", mm)
+        self.assertEqual(line, "⚠️ ВЫДАЧА X 1: брони на 20.10 нет, а байк сейчас «В аренде»: строка 690 с 19.10 по "
+                               "22.10 (%s) — эта аренда ещё идёт или байк уже вернули? Брони этого байка: строка 720 с "
+                               "23.10 (%s). Кому выдаётся байк, решает человек: сам не активирую и даты не меняю."
+                         % (NAME_C, NAME_B))
+        self.assertNotIn("переоформ", line)
+        self.assertNotIn("оплата", line)
+        self.assertEqual(H.day_mismatch([{"row": 720, "start_day": "2026-10-23"}], "2026-10-20", current=[])["kind"],
+                         "early", "текущей аренды нет — прежний исход v2")
+        self.assertIsNone(H.day_mismatch([], "2026-10-20", current=cur), "броней нет — прежний ⚠️ pick, не busy")
 
 
 # ===================================================================================== (B) карточка выдачи в Splinter
@@ -1065,6 +1110,173 @@ class B_Card(unittest.TestCase):
         self.assertEqual((pk["code"], pk["row"]["row"], pk.get("already_active")), ("found", 690, True),
                          "already_active — по целевому дню, а не по дню t0")
         self.assertEqual(S._rc_pick(act, BIKE, "handover", on_day=day(-3))["code"], "unknown")
+
+    # ------------------------------------------------------------------------- v3: замечания приёмки v2 (20.10)
+    def test_b27_dedup_state_recheck_against_waiting_card_row(self):
+        """v3 (1): та же бронь уже ждёт «да», а CRM между фразами поправили (имя) → повтор фразы карточку не дублирует,
+        и вкладка состояния сверяется со строкой ЖДУЩЕЙ карточки (её видел человек): записи с новым именем нет,
+        честная строка. Та же проверка — у второго дедупа (карточка легла, пока читался реестр). Запись без своей
+        строки (как после рестарта): совпала по строке, имени и началу — пишем; не совпала — нет, честная строка."""
+        self.on()
+        b = Bridge([row_a(), row_b()])
+        do_handover(b)
+        self.assertEqual([s["client"] for s in b.states], [NAME_A])
+        self.assertEqual(S._HANDOVER_ACTIVATIONS[INTAKE]["crm"]["name"], NAME_A, "строка карточки — в записи")
+        b.rows[0]["name"] = "Анна Изменена"
+        do_handover(b)
+        self.assertEqual(len(cards()), 1, intake_texts())
+        self.assertEqual([s["client"] for s in b.states], [NAME_A], "вкладка записала то, чего на карточке не было")
+        self.assertEqual(intake_texts()[-1], P + "⚠️ ВЫДАЧА %s: перед записью вкладки состояния бронь строка 700 "
+                                                 "перечитана иначе (другая строка, срок или клиент) — вкладку "
+                                                 "состояния не трогал; сверь карточку с CRM." % BIKE)
+        self.assertEqual(len(b.finds), 1, "повтор фразы реестр не перечитывает")
+
+        # второй дедуп: пока читался реестр, легла карточка той же строки с другим booking_id — сверка против неё
+        reset()
+        self.on()
+        other = row_a(booking_id="bk-a-old")
+
+        def concurrent(**k):
+            sent = run(rec_send(None, chat_id=INTAKE, text="карточка соседней фразы"))
+            S._HANDOVER_ACTIVATIONS[INTAKE] = {"bike": BIKE, "name": NAME_A, "date_start": other["date_start"],
+                                               "row": 700, "ts": time.time(), "status": "awaiting",
+                                               "msg_ids": [sent.message_id], "crm": other,
+                                               "ident": hf().ident(other), "on_day": day(0)}
+            return SIGNED_A
+        b2 = Bridge([row_a(), row_b()], contract=concurrent)
+        do_handover(b2)
+        self.assertEqual(cards(), [], "та же строка уже ждёт — вторая карточка не уходит")
+        self.assertEqual(b2.states, [])
+        self.assertTrue(any("бронь строка 700 перечитана иначе" in t for t in intake_texts()), intake_texts())
+
+        # запись без своей строки (рестарт): совпала — пишем, не совпала — нет и честная строка
+        for name, want_states in ((NAME_A, [NAME_A]), ("Анна Другая", [])):
+            reset()
+            self.on()
+            sent = run(rec_send(None, chat_id=INTAKE, text="карточка до рестарта"))
+            S._HANDOVER_ACTIVATIONS[INTAKE] = {"bike": BIKE, "name": name, "date_start": row_a()["date_start"],
+                                               "row": 700, "ts": time.time(), "status": "awaiting",
+                                               "msg_ids": [sent.message_id]}
+            b3 = Bridge([row_a(), row_b()])
+            do_handover(b3)
+            self.assertEqual(cards(), [], name)
+            self.assertEqual([s["client"] for s in b3.states], want_states, name)
+            said = [t for t in intake_texts() if "перечитана иначе" in t]
+            self.assertEqual(len(said), 0 if want_states else 1, intake_texts())
+
+    def test_b28_rules_import_failure_flag_on_is_exactly_off_path(self):
+        """v3 (2): флаг ВКЛ, а rental_case_rules не грузится → сбой не выходит из обработчика, а путь ровно как при
+        ВЫКЛ: прежняя карточка (байт-в-байт), прежняя вкладка состояния, «да» — прежним путём. `_ho_target_day` сам
+        не бросает (None — день чтения)."""
+        def run_case(flag):
+            reset()
+            if flag:
+                self.on()
+            b = Bridge([row_a(), row_b()])
+            do_handover(b)
+            cs = cards()
+            if cs:
+                say_yes(b, cs[0])
+            return (intake_texts(), [(s["client"], s["date_due"], s["booking_id"]) for s in b.states], b.activated,
+                    b.tickets, b.finds, sorted(S._HANDOVER_ACTIVATIONS.get(INTAKE) or {}))
+
+        def boom():
+            raise ImportError("синтетический сбой импорта")
+        real = S._rc_rules
+        S._rc_rules = boom
+        try:
+            self.assertIsNone(S._ho_target_day(Msg("x")), "целевой день без правил — None, а не исключение")
+            os.environ["HANDOVER_FACTS"] = "1"
+            self.assertIs(S._handover_facts_on(), False, "флаг ВКЛ без правил — ветка флага не исполнима")
+            on = run_case(True)
+            off = run_case(False)
+        finally:
+            S._rc_rules = real
+        self.assertEqual(on, off)
+        texts, states, activated, tickets, finds, keys = on
+        self.assertEqual([t for t in texts if "Активирую" in t], [old_card(row_b())])
+        self.assertEqual(states, [(NAME_B, row_b()["date_end"], "bk-b")])
+        self.assertEqual((activated, tickets, finds), ([{"bike": BIKE, "name": NAME_B,
+                                                          "date_start": row_b()["date_start"]}], 1, []))
+        self.assertEqual(keys, sorted(["bike", "name", "date_start", "row", "ts", "status", "msg_ids"]))
+        self.on()
+        self.assertIs(S._handover_facts_on(), True, "правила снова грузятся — флаг снова ВКЛ")
+
+    def test_b29_bike_rented_now_future_booking_no_reregister_advice(self):
+        """v3 (3), проба Q1: байк «В аренде» со вчера у клиента C, бронь B через 3 дн., фраза выдачи сегодня → ручная
+        карточка называет текущую аренду (строка 690, срок, имя) и брони и спрашивает человека; совета переоформить
+        нет, реестр не читается, ни ожидания «да», ни билета, ни записей. То же, когда бронь была раньше (поздний)."""
+        self.on()
+        c_now = row_c(status="В аренде")
+        b = Bridge([c_now, row_b()])
+        do_handover(b)
+        self.assertEqual(cards(), [], intake_texts())
+        self.assertEqual(intake_texts(), [
+            P + "⚠️ ВЫДАЧА %s: брони на %s нет, а байк сейчас «В аренде»: строка 690 с %s по %s (%s) — эта аренда ещё "
+                "идёт или байк уже вернули? Брони этого байка: строка 720 с %s (%s). Кому выдаётся байк, решает "
+                "человек: сам не активирую и даты не меняю." % (BIKE, dm(0), dm(-1), dm(2), NAME_C, dm(3), NAME_B)])
+        self.assertNotIn("переоформ", intake_texts()[0])
+        self.assertEqual((b.finds, b.states, b.activated, b.tickets, b.reads), ([], [], [], 0, 1))
+        self.assertNotIn(INTAKE, S._HANDOVER_ACTIVATIONS)
+        say_yes(b, SENDS[-1])
+        self.assertEqual((b.activated, b.tickets), ([], 0))
+        reset()
+        self.on()
+        late = Bridge([c_now, row_a(date_start=dt(-2, "09:00"), date_end=dt(3))])
+        do_handover(late)
+        self.assertEqual(len(intake_texts()), 1, intake_texts())
+        self.assertIn("байк сейчас «В аренде»: строка 690", intake_texts()[0])
+        self.assertNotIn("переоформ", intake_texts()[0])
+        self.assertNotIn("оплата", intake_texts()[0])
+        self.assertEqual((late.finds, late.states), ([], []))
+
+    def test_b30_hand_card_not_silenced_by_other_warning_cooldown(self):
+        """v3 (4), проба P4: ⚠️ «CRM не прочитан» минуту назад не глушит ручную карточку правила владельца (свой ключ
+        кулдауна), а ручная карточка — следующее ⚠️ другого рода; повтор той же ручной карточки глушится, как прежде."""
+        self.on()
+        b = Bridge([row_b()], fail_reads={1, 3})
+        do_handover(b)                                   # чтение 1 — обрыв: ⚠️ «CRM не прочитан»
+        do_handover(b)                                   # чтение 2 — ручная карточка «раньше брони»
+        self.assertTrue(intake_texts()[0].startswith(P + "⚠️ ВЫДАЧА %s: CRM не прочитан" % BIKE), intake_texts())
+        self.assertEqual(len(hand_cards()), 1, intake_texts())
+        self.assertIn("Выдача раньше брони на 3 дн.", hand_cards()[0].text)
+        do_handover(b)                                   # чтение 3 — обрыв: СВОЁ ⚠️ ещё в кулдауне (прежнее правило)
+        self.assertEqual(len([t for t in intake_texts() if "CRM не прочитан" in t]), 1,
+                         "в кулдауне своего ⚠️ — повтора нет")
+        S._HO_ACT_WARN_TS.pop(BIKE, None)
+        do_handover(b)                                   # чтение 4 — та же ручная карточка: свой кулдаун
+        self.assertEqual((len(hand_cards()), len(b.finds)), (1, 1), "повтор той же ручной карточки — кулдаун")
+        reset()
+        self.on()
+        b2 = Bridge([row_b()], fail_reads={2})
+        do_handover(b2)                                  # ручная карточка
+        do_handover(b2)                                  # обрыв: ⚠️ «CRM не прочитан» — не заглушено
+        self.assertEqual(len(hand_cards()), 1, intake_texts())
+        self.assertEqual(len([t for t in intake_texts() if "CRM не прочитан" in t]), 1, intake_texts())
+
+    def test_b31_yes_refused_when_booking_already_active(self):
+        """v3 (5): после карточки бронь активировали руками («В аренде») → «да» реплаем: сверка видит already_active —
+        ни билета, ни activate_booking, карточка снята, слова «бронь уже «В аренде»». То же на прежних ветках «да»."""
+        for strict in (True, False):
+            reset()
+            self.on()
+            if not strict:
+                os.environ["INTAKE_CONFIRM_STRICT"] = "0"
+            b = Bridge([row_a(), row_b()])
+            do_handover(b)
+            cs = cards()
+            self.assertEqual(len(cs), 1, intake_texts())
+            b.rows[0]["status"] = "В аренде"
+            if strict:
+                say_yes(b, cs[0])
+            else:
+                run(S._handle_intake(Msg("да", chat_id=INTAKE, uname=APPROVER), Ctx(), b, None))
+            self.assertEqual((b.activated, b.tickets), ([], 0), strict)
+            self.assertEqual(S._HANDOVER_ACTIVATIONS[INTAKE]["status"], "stale", strict)
+            self.assertEqual(intake_texts()[-1],
+                             P + "⚠️ Бронь карточки выдачи %s, строка 700 перечитана иначе (бронь уже «В аренде») — "
+                                 "не активирую, в CRM ничего не записал. Повтори выдачу — придёт новая карточка."
+                             % BIKE, strict)
 
 
 # ================================================================================== (C) флаг ВЫКЛ — отдельный процесс
