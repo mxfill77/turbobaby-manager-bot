@@ -263,10 +263,15 @@ _RX_PLATE = re.compile(r"(?i)[a-zа-яё]{2,}\s+\d{4}\s*$")
 
 
 def unit_like(name, units):
-    """Слово двери «model» + юниты модели → похоже на юнит (имя с номером), а не на модель?"""
+    """Слово двери «model» + юниты модели → похоже на юнит (имя с номером), а не на модель?
+    RC2010 (храповик слепых читателей): пустое слово — не юнит; это честный ответ предиката, а не промах чтения (в
+    строке цены `K.quote` пустое слово и так заменяется моделью парка). Разбор непустого — `_unit_like_norm`."""
     n = B.qnorm(name)
-    if not n:
-        return False
+    return bool(n) and _unit_like_norm(n, units)
+
+
+def _unit_like_norm(n, units):
+    """Непустое нормализованное слово двери `n` + юниты модели → похоже на юнит?"""
     if _RX_PLATE.search(n):
         return True
     for u in units or ():
@@ -840,9 +845,11 @@ def _loose_free(part, p, parts, i):
     hit = alt.group() if alt else (alls or anys).group() if (alls or anys) and _RX_OBJECT.search(part) else None
     if hit is None and _RX_ALSO.search(part) and words:
         hit = words[0]
-    if hit is None or _infer(parts, i)[0] == B.BUSY:
-        return []
-    return [(None, "unsure", U_WORD % label_of(hit))]
+    # RC2010 (храповик слепых читателей): условие то же, что «hit is None or … == BUSY → []», записано утвердительно —
+    # «нечего сказать» здесь честный ответ разбора, а не промах чтения
+    if hit is not None and _infer(parts, i)[0] != B.BUSY:
+        return [(None, "unsure", U_WORD % label_of(hit))]
+    return []
 
 
 def avail_check(text, facts, bikes, today=None):
