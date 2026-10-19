@@ -920,8 +920,9 @@ class T07Approvals(K4SplCase):
         card = self.ret_card(b)
         self.assertIn("35200", card.text)
         intake(b, "да", reply_to=card)
+        # CLOSETRUTH1910 (CLOSE_TRUTH ВКЛ по умолчанию): итог листа закрытия в K «оплачено» не пишется
         self.assertEqual(b.red("close_booking"), [{"bike": BIKE, "name": "Иван Текущий", "date_start": dt(-3),
-                                                   "km_end": "35200", "paid_total": 1500.0}])
+                                                   "km_end": "35200", "paid_total": None}])
         self.assertTrue(any("✅ Завершена" in t for t in intake_texts()), intake_texts())
         self.assertEqual(self.state_of("readback"), ["answered"])
 

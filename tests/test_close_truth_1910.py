@@ -17,12 +17,13 @@
   (E)  ручка ВКЛ, сквозной путь `_handle_servicing`: фото-пробег в km карточки не попадает, текстовый — попадает;
   (L)  ручка ВКЛ, прежний путь ответа (INTAKE_CONFIRM_STRICT=0) — те же два правила;
   (K)  ручка ВКЛ, дело К4: то же, плюс цель ожидания, рождённая до ручки с paid_total;
-  (O)  ручка ВЫКЛ (не задана и «0»): текст карточки и вызов моста — дословно прежние (947953e), включая записанные
+  (O)  ручка ВЫКЛ («0», «off» — откат): текст карточки и вызов моста — дословно прежние (947953e), включая записанные
        КАК ПРЕЖНЕЕ поведение отката дефекты (paid_total=1500.0; фото-пробег идёт в km_end по «да»).
 
-Умолчание ручки — ВЫКЛ (`splinter._CLOSE_TRUTH_DEFAULT`): закреплённые наборы tests/test_return_close.py и
-tests/test_rental_case_integ_spl.py держат paid_total=1500.0, а их правка — решение владельца. Сеть запрещена подменой
-socket (rental_case_fakes), память Splinter и база дела — только во временном каталоге прогона. Данные синтетические.
+Умолчание ручки — ВКЛ (`splinter._CLOSE_TRUTH_DEFAULT`): ручка не задана → путь правды (P1, D1); закреплённые наборы
+tests/test_return_close.py и tests/test_rental_case_integ_spl.py по слову владельца ждут paid_total=None, их блобы
+перезакреплены в tests/test_contractref_accept.py. Сеть запрещена подменой socket (rental_case_fakes), память Splinter
+и база дела — только во временном каталоге прогона. Данные синтетические.
 """
 import asyncio
 import datetime
@@ -308,8 +309,8 @@ class P_Pure(Case):
     truth = None
 
     def test_p1_knob_words_and_default(self):
-        self.assertEqual(S._CLOSE_TRUTH_DEFAULT, "0", "умолчание ВЫКЛ до слова владельца о закреплённых наборах")
-        self.assertFalse(S._close_truth_on(), "ручка не задана → ВЫКЛ")
+        self.assertEqual(S._CLOSE_TRUTH_DEFAULT, "1", "умолчание ВКЛ (слово владельца о закреплённых наборах)")
+        self.assertTrue(S._close_truth_on(), "ручка не задана → ВКЛ")
         for v in ("1", "on", "yes", "true", "да", "ON"):
             os.environ["CLOSE_TRUTH"] = v
             self.assertTrue(S._close_truth_on(), v)
@@ -318,6 +319,8 @@ class P_Pure(Case):
             self.assertFalse(S._close_truth_on(), repr(v))
 
     def test_p3_paid_arg_on_off(self):
+        self.assertEqual(S._close_paid_arg(1500.0), (None, True), "умолчание ВКЛ — не шлём")
+        os.environ["CLOSE_TRUTH"] = "0"
         self.assertEqual(S._close_paid_arg(1500.0), (1500.0, False), "ВЫКЛ — значение как есть")
         self.assertEqual(S._close_paid_arg(None), (None, False))
         os.environ["CLOSE_TRUTH"] = "1"
@@ -574,6 +577,25 @@ class K_OnCaseStore(Case):
         self.assertIn(P + "✅ Завершена, строка 21." + S._CLOSE_PAID_NOTE, texts())
 
 
+# ================================================== (D) ручка НЕ задана: умолчание ВКЛ — путь правды, а не откат
+class D_DefaultOn(Case):
+    truth = None
+
+    def test_d1_unset_knob_is_truth_path(self):
+        self.assertNotIn("CLOSE_TRUTH", os.environ)
+        b = Bridge([rent_row()])
+        do_return(b, RET_PARSE, VIS_KM)
+        cs = cards()
+        self.assertEqual(len(cs), 1, texts())
+        self.assertIn(PHOTO_LINE, cs[0].text)
+        self.assertIn(DUE_LINE, cs[0].text)
+        self.assertNotIn("оплачено", cs[0].text.lower(), cs[0].text)
+        say(b, "да", reply=cs[0])
+        self.assertEqual(b.red("close_booking"), [], "умолчание: фото-пробег без числа в мост не идёт")
+        say(b, "да 35210", reply=cs[0])
+        self.assertEqual(b.red("close_booking"), exp_close("35210"), "умолчание: paid_total=None, K не пишем")
+
+
 # ============================================================== (O) ручка ВЫКЛ: дословно прежнее (947953e), откат
 OLD_CARD = (P + "📥 ПРИЁМ: CB 300CC R 9011 вернулся от Иван Тест, строка 21. Пробег на сдаче: 35200. "
             "Итог закрытия: 1 500 ฿.\n💰 Верни депозит: 5 000 ฿\n"
@@ -587,10 +609,9 @@ class O_OffLegacy(Case):
     truth = None
 
     def _both(self):
-        for v in (None, "0", "off"):
+        for v in ("0", "off"):          # умолчание ВКЛ: откат — только явным словом
             reset()
-            if v is not None:
-                os.environ["CLOSE_TRUTH"] = v
+            os.environ["CLOSE_TRUTH"] = v
             yield v
 
     def test_o1_card_text_verbatim_and_paid_written(self):

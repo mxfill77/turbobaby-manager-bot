@@ -463,7 +463,7 @@ class B_Close(Case):
                 say(b, text, reply=card)
                 self.assertEqual(b.red("close_booking"), [{"bike": BIKE_A, "name": "Иван Тест",
                                                            "date_start": dt(-3), "km_end": km,
-                                                           "paid_total": 1500.0}])
+                                                           "paid_total": None}])  # CLOSETRUTH1910: K не пишем
 
     def test_b4_km_missing_on_card_reply_number_closes(self):
         b = Bridge([rent_row()])
@@ -750,7 +750,8 @@ def _exp_act():
 
 
 def _exp_close(km):
-    return [{"bike": BIKE_A, "name": "Иван Тест", "date_start": dt(-3), "km_end": km, "paid_total": 1500.0}]
+    # CLOSETRUTH1910 (CLOSE_TRUTH ВКЛ по умолчанию): итог листа закрытия в K «оплачено» не пишется
+    return [{"bike": BIKE_A, "name": "Иван Тест", "date_start": dt(-3), "km_end": km, "paid_total": None}]
 
 
 def _writes(b):

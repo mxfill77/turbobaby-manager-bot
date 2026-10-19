@@ -100,9 +100,10 @@ def test_happy_path_yes():
     assert S._RETURN_CLOSES[INTAKE]["status"] == "awaiting"
     assert getattr(b, "closing", None), "closing-путь (лист закрытия) должен отработать как раньше"
     run(S._handle_intake(yes("да", uname="deramor"), Ctx(), b, None))
+    # CLOSETRUTH1910 (ручка CLOSE_TRUTH ВКЛ по умолчанию): итог листа закрытия — сумма ДОПЛАТ, в K «оплачено» не пишется
     assert b.closed == [{"bike": BIKE, "name": "Иван Тест", "date_start": DATE_START,
-                         "km_end": "35200", "paid_total": 1500.0}], \
-        f"close должен уйти с date_start/km_end/paid_total: {b.closed}"
+                         "km_end": "35200", "paid_total": None}], \
+        f"close должен уйти с date_start/km_end, без paid_total: {b.closed}"
     assert b.tickets == 1, "красный шаг — строго под билетом 4.2"
     assert any("✅ Завершена" in t and "строка 21" in t for t in intake_sends()), f"{SENDS}"
     assert S._RETURN_CLOSES[INTAKE]["status"] == "closed"

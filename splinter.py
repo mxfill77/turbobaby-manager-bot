@@ -166,13 +166,11 @@ def _intake_confirm_strict_on():
     return str(_os_env("INTAKE_CONFIRM_STRICT", "1")).strip().lower() not in ("0", "", "нет", "no", "off", "false")
 
 
-# CLOSETRUTH1910: умолчание ручки правды приёма. Задание отрезка — ВКЛ, но два ЗАКРЕПЛЁННЫХ набора
-# (tests/test_return_close.py:99-105, tests/test_rental_case_integ_spl.py:924; блобы в tests/test_contractref_accept.py
-# PINS) держат ровно ту запись, которую ручка снимает (paid_total=1500.0 из итога листа закрытия). Править закреплённое
-# исполнитель не вправе — умолчание ВЫКЛ до слова владельца; переключение = эта строка «1» + перезакрепление двух блобов
-# + то же ожидание в незакреплённом tests/test_approvefix_1610.py (_exp_close, test_b3) — замер 19.10: при ВКЛ падают
-# ровно эти места и ровно на paid_total (None вместо 1500.0), km_end везде прежний.
-_CLOSE_TRUTH_DEFAULT = "0"
+# CLOSETRUTH1910: умолчание ручки правды приёма — ВКЛ (задание отрезка; слово владельца о перезакреплении двух
+# закреплённых наборов: tests/test_return_close.py:103-105 и tests/test_rental_case_integ_spl.py:924 ждут теперь
+# paid_total=None, их блобы в tests/test_contractref_accept.py PINS обновлены этим же выпуском). Откат — `CLOSE_TRUTH=0`
+# в окружении процесса: путь байт-в-байт прежний (947953e), включая запись итога листа закрытия в K «оплачено».
+_CLOSE_TRUTH_DEFAULT = "1"
 
 
 def _close_truth_on():
@@ -180,7 +178,7 @@ def _close_truth_on():
     сумма ДОПЛАТ) больше не уходит в close_booking.paid_total и колонку K «оплачено» не перезаписывает: на карточке —
     строка «к доплате N ฿ — в CRM не пишу»; (2) пробег сдачи на карточке — только из ТЕКСТА (`_km_for_record` →
     `intake_confirm.km_arg`, одни цифры), пробег с ФОТО — подсказкой, и без числа в ответе моста не зовём.
-    `CLOSE_TRUTH=0` (и умолчание `_CLOSE_TRUTH_DEFAULT`) → путь байт-в-байт прежний (947953e). Что писать в
+    Ручка не задана → `_CLOSE_TRUTH_DEFAULT` (ВКЛ); `CLOSE_TRUTH=0` → путь байт-в-байт прежний (947953e). Что писать в
     «оплачено» вообще — вопрос владельца, здесь не решён: снята только неверная запись."""
     return str(_os_env("CLOSE_TRUTH", _CLOSE_TRUTH_DEFAULT)).strip().lower() not in ("0", "", "нет", "no", "off",
                                                                                       "false")
