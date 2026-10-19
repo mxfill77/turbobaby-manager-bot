@@ -213,9 +213,10 @@ PINS = {
     # APPROVEFIX1610 (16.10): стенд «да/нет» реплаем на карточку выдачи/приёма (id карточки сохраняется при отправке)
     "tests/test_handover_activation.py": "2aebad2045e14a10b154c8fb8bad51a83a35ffc7",
     "tests/test_never_silent.py": "a51f5e706dc642bfb145422881a8f08b830743d0",
-    "tests/test_rental_case_integ_spl.py": "7791dad8e8c0aff3c9858c59ea89af44d4b057f5",  # APPROVEFIX1610: то же
+    # CLOSETRUTH1910 (19.10): CLOSE_TRUTH ВКЛ — итог листа закрытия не пишется в K «оплачено» (paid_total=None)
+    "tests/test_rental_case_integ_spl.py": "2175b7abc08b68ca604a99749c1bb2ce06f91da8",  # было 7791dad8 (APPROVEFIX1610)
     "tests/test_rental_case_integ_wa.py": "8f5db518a9cd1ddf077b925209083778b14b5a72",
-    "tests/test_return_close.py": "72d32649cf6f04b3ceae26583858b1be1ec6ad22",  # APPROVEFIX1610: то же
+    "tests/test_return_close.py": "8e59c9d1d484b173c693269fd35a7cf0cfb469f3",  # было 72d32649 (APPROVEFIX1610)
     "tests/test_wa_agent_attach.py": "c54b01f18ee14c7461f742ebf0a1408a6abad796",
     "tests/test_wa_agent_svc.py": "154b2d34bee7d61107d49956ebc1c633bef9a341",
     "tests/test_wa_attach_basis.py": "4921ac2f533b780046c9f18a62155df11fd7361c",

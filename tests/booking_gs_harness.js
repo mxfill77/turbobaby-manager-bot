@@ -14,7 +14,9 @@ const path = require('path');
 // MIRROR.json). Рабочая папка /root/turbobaby-bridge-gs обезврежена 10.08.2026 и ОТСТАЁТ от
 // прода — харнесс, читающий её, проверял бы не тот код, что живёт в мосте.
 const GS_DIR = path.join(__dirname, '..', 'bridge_prod');
-const BOOKING_JS = path.join(GS_DIR, 'Booking.js');
+// CLOSEACCRUAL1910: tests/test_close_accrual_gs.py гоняет ЭТОТ ЖЕ набор по сборке bridge_build_close_accrual/
+// (переменная окружения BOOKING_JS_UNDER_TEST — путь к файлу); без неё — зеркало прода, как прежде.
+const BOOKING_JS = process.env.BOOKING_JS_UNDER_TEST || path.join(GS_DIR, 'Booking.js');
 const NMAX = 'NMAX 155CC GREEN-B PHUKET 4957';
 const CB = 'CB 300CC R 9011';
 
