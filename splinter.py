@@ -9591,8 +9591,10 @@ def _closing_resolve_booking(bridge, bike, purpose="return"):
     При нескольких кандидатах — свежайшая date_start. Нет → (None, '', '').
     К4 шаг 5 (RENTAL_CASE_PICK): аренда по цели `purpose` (return — лист закрытия на возврате, handover — вкладка
     состояния на выдаче) через rental_case_rules.pick; не однозначно → (None, '', '') — прежний путь «не найдена».
+    HOFACTS1910 (HANDOVER_FACTS): purpose=handover — тот же pick(handover) и без RENTAL_CASE_PICK (хранилище К4 не
+    нужно), чтобы вкладка состояния получила клиента той же строки, что и карточка; прочие цели флаг не трогает.
     При OFF `purpose` не читается."""
-    if _rc_on("RENTAL_CASE_PICK"):
+    if _rc_on("RENTAL_CASE_PICK") or (_handover_facts_on() and purpose == "handover"):
         pk = _rc_pick(bridge, bike, purpose)
         r = pk.get("row") if pk.get("code") == "found" else None
         if r is None:
@@ -9612,23 +9614,90 @@ def _closing_resolve_booking(bridge, bike, purpose="return"):
     return (last.get("booking_id") or None, last.get("name") or "", last.get("date_end") or "")
 
 
+# HOFACTS1910 (19.10.2026, карта цикла: этап handover, пробелы 1–2): карточка выдачи проверяет факты — только чтение.
+# Флаг HANDOVER_FACTS (по умолчанию ВЫКЛ; читается `_rc_on` на каждый вызов — откат снятием флага, без рестарта):
+#   (1) строка брони — по ТОЧНОМУ дню выдачи готовым rental_case_rules.pick (`_rc_pick(…, "handover")`, без хранилища
+#       К4) и в карточке активации, и во вкладке состояния (`_closing_resolve_booking`): прежние cand[-1] и
+#       max(date_start) отдавали будущую бронь другого клиента того же байка, записанную ниже сегодняшней;
+#       не однозначно — прежний ⚠️ «руками» с вопросом pick;
+#   (2) строка договора — contract_find по байку и сроку выбранной строки → contract_ref.versions, в потоке под потолком
+#       `_HO_FACTS_BUDGET_S`: сбой и таймаут — «неизвестно», карточка дольше потолка не ждёт;
+#   (3) строка залога — CRM S выбранной строки (как у карточки приёма).
+# Найденное исключение — первой строкой карточки (после подписи). Слова «да/нет», маршрут APPROVEFIX, id карточки,
+# билет и activate_booking не меняются. Разбор и слова — чистый `handover_facts` (лениво, только в ветке флага).
+F_HANDOVER_FACTS = "HANDOVER_FACTS"
+_HO_FACTS_BUDGET_S = 8.0     # потолок чтения реестра на одну карточку выдачи (GET к Apps Script — секунды)
+# сбор фактов сломался сам (модуль не загрузился, разбор упал) — карточка всё равно уходит, но не молча: факты
+# «неизвестны», и это исключение (пустая карточка читалась бы как «всё сошлось»)
+W_HO_FACTS_BROKEN = "⚠️ Исключение: факты карточки не собраны (%s) — договор и залог неизвестны"
+
+
+def _handover_facts_on():
+    """HOFACTS1910: флаг HANDOVER_FACTS — правило `_rc_on` (1/true/yes/on; иначе ВЫКЛ), на каждый вызов."""
+    return _rc_on(F_HANDOVER_FACTS)
+
+
+def _ho_contract_read(bridge, row):
+    """HOFACTS1910, в потоке: строка брони → исход contract_ref.versions. Не больше одного contract_find (ни одного,
+    если у строки нет номера байка или срока), под общим бюджетом карточки; исключение вызова — исход «неизвестно»."""
+    import handover_facts as _hf   # лениво: только в ветке флага
+    args = _hf.find_args(row)
+    if args is None:
+        return _hf.no_term()
+    try:
+        with bridge_client.card_budget(_HO_FACTS_BUDGET_S, label="карточки выдачи"):
+            found = bridge.contract_find(**args)
+    except Exception as e:  # noqa: BLE001
+        return _hf.unread(type(e).__name__)
+    return _hf.versions_of(row, found)
+
+
+async def _ho_facts(bridge, cand):
+    """HOFACTS1910: факты карточки выдачи → handover_facts.facts ({"head", "lines", "exceptions", …}). Чтение реестра —
+    в потоке (цикл событий им не держится) с потолком `_HO_FACTS_BUDGET_S`; дольше — «неизвестно», а не ожидание.
+    Исключения наружу не идут: сломанный сбор — W_HO_FACTS_BROKEN первой строкой, карточка не теряется."""
+    import asyncio as _aio
+    try:
+        import handover_facts as _hf   # лениво: только в ветке флага
+        row = cand.get("crm") or {}
+        budget = _HO_FACTS_BUDGET_S
+        try:
+            res = await _aio.wait_for(_aio.to_thread(_ho_contract_read, bridge, row), timeout=budget)
+        except _aio.TimeoutError:
+            res = _hf.timeout(budget)
+        except Exception as e:  # noqa: BLE001
+            res = _hf.unread(type(e).__name__)
+        return _hf.facts(row, res)
+    except Exception as e:  # noqa: BLE001
+        why = type(e).__name__        # только имя класса: текст исключения мог унести клетку строки клиента
+        log.warning(f"  → ВЫДАЧА: факты карточки не собраны ({why})")
+        return {"head": W_HO_FACTS_BROKEN % why, "lines": [], "exceptions": ["факты не собраны"],
+                "contract": None, "deposit": None}
+
+
 def _handover_resolve_activation(bridge, bike):
     """O3-3a: кандидат на активацию при выдаче. Последняя строка CRM по байку со статусом
     Бронь/В аренде → dict {row, name, date_start, date_end, status} или None (брони нет).
     status=="в аренде" → активировать нечего (уже активна) — решает вызыватель.
     К4 шаг 5 (RENTAL_CASE_PICK): pick(handover) — «бронь» со стартом в день выдачи; не однозначно →
-    {"rc_unknown": True, "ask", "reason"} (вызыватель: прежний ⚠️ с конкретным вопросом)."""
-    if _rc_on("RENTAL_CASE_PICK"):
+    {"rc_unknown": True, "ask", "reason"} (вызыватель: прежний ⚠️ с конкретным вопросом).
+    HOFACTS1910 (HANDOVER_FACTS): тот же pick(handover) и без RENTAL_CASE_PICK (хранилище К4 не нужно); в ответе ещё
+    `crm` — строка двери clients целиком (контакты и срок — для сверки договора, S — для залога)."""
+    _facts = _handover_facts_on()
+    if _rc_on("RENTAL_CASE_PICK") or _facts:
         pk = _rc_pick(bridge, bike, "handover")
         if pk.get("code") == "error":
             return None
         if pk.get("code") != "found":
             return {"rc_unknown": True, "ask": pk.get("ask") or "", "reason": pk.get("reason") or "", "row": None}
         r = pk.get("row") or {}
-        return {"row": r.get("row"), "name": r.get("name") or "",
-                "date_start": str(r.get("date_start") or ""),
-                "date_end": str(r.get("date_end") or ""),
-                "status": str(r.get("status", "")).strip().lower()}
+        out = {"row": r.get("row"), "name": r.get("name") or "",
+               "date_start": str(r.get("date_start") or ""),
+               "date_end": str(r.get("date_end") or ""),
+               "status": str(r.get("status", "")).strip().lower()}
+        if _facts:
+            out["crm"] = r
+        return out
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -9649,7 +9718,9 @@ def _handover_resolve_activation(bridge, bike):
 async def _handover_activation_card(context, bridge, bike):
     """O3-3a: на handover-контексте предложить активацию брони (Бронь→В аренде) карточкой
     в INTAKE_CHAT (там авторизаторы INTAKE_APPROVERS). Сама активация — ТОЛЬКО после «да»,
-    красным шагом 4.2 в _handle_intake. Брони нет → ⚠️ «активируй руками» (handover не падает)."""
+    красным шагом 4.2 в _handle_intake. Брони нет → ⚠️ «активируй руками» (handover не падает).
+    HOFACTS1910 (HANDOVER_FACTS): строка — по точному дню выдачи, в карточке строки договора и залога, исключение —
+    первой строкой; при ВЫКЛ текст и путь прежние байт-в-байт."""
     cand = _handover_resolve_activation(bridge, bike)
     now = _time.time()
     if cand is not None and cand.get("rc_unknown"):
@@ -9678,6 +9749,18 @@ async def _handover_activation_card(context, bridge, bike):
     if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
             and now - prev.get("ts", 0) <= _HO_ACT_TTL):
         return   # та же бронь уже ждёт «да» — карточку не дублируем
+    facts = None
+    if _handover_facts_on():
+        # HOFACTS1910: договор и залог выбранной строки — до записи ожидания (повтор фразы реестр не перечитывает:
+        # дедуп выше); чтение реестра — в потоке под потолком, и за это время та же карточка могла уже лечь
+        facts = await _ho_facts(bridge, cand)
+        now = _time.time()
+        prev = _HANDOVER_ACTIVATIONS.get(INTAKE_CHAT)
+        if (prev and prev.get("status") == "awaiting" and prev.get("row") == cand.get("row")
+                and now - prev.get("ts", 0) <= _HO_ACT_TTL):
+            return
+        log.info(f"  → ВЫДАЧА {bike}: факты карточки (строка {cand.get('row')}) — договор {facts.get('contract')}, "
+                 f"исключения: {', '.join(facts.get('exceptions') or []) or 'нет'}")
     _HANDOVER_ACTIVATIONS[INTAKE_CHAT] = rec = {
         "bike": bike, "name": cand["name"], "date_start": cand["date_start"],
         "row": cand.get("row"), "ts": now, "status": "awaiting",
@@ -9686,10 +9769,20 @@ async def _handover_activation_card(context, bridge, bike):
     dates = (cand["date_start"] + " — " + cand["date_end"]).strip(" —")
     log.info(f"  → ВЫДАЧА {bike}: карточка активации во Входящие (строка {cand.get('row')}, "
              f"клиент {cand['name'] or '—'})")
-    sent = await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
-                       text=(f"🐀 Splinter\n🏍 ВЫДАЧА: {bike} → {cand['name'] or '—'}, "
-                             f"бронь строка {cand.get('row')} ({dates or 'даты —'}).\n"
-                             f"Активирую (Бронь→В аренде)? да / нет"))
+    if facts is None:
+        sent = await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                           text=(f"🐀 Splinter\n🏍 ВЫДАЧА: {bike} → {cand['name'] or '—'}, "
+                                 f"бронь строка {cand.get('row')} ({dates or 'даты —'}).\n"
+                                 f"Активирую (Бронь→В аренде)? да / нет"))
+    else:
+        # HOFACTS1910: исключение — первой строкой (после подписи), факты — под строкой выдачи; последняя строка и
+        # слова «да / нет» прежние
+        sent = await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
+                           text=("🐀 Splinter\n" + (facts["head"] + "\n" if facts.get("head") else "")
+                                 + f"🏍 ВЫДАЧА: {bike} → {cand['name'] or '—'}, "
+                                   f"бронь строка {cand.get('row')} ({dates or 'даты —'}).\n"
+                                 + "".join(ln + "\n" for ln in facts.get("lines") or [])
+                                 + "Активирую (Бронь→В аренде)? да / нет"))
     _card_note_ids(rec, [sent])  # APPROVEFIX1610: id карточки — «да» засчитывается реплаем на неё
 
 
