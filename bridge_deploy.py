@@ -76,6 +76,16 @@ MIRROR_SYNC_ENV = "MIRROR_SYNC"       # «0» — ветка мертва ДО �
 PULLED_BY = ("bridge_deploy.py после удачного redeploy "
              "(отпечаток deploy/bridge_prod_recon.py, read-only GET к Apps Script API)")
 
+# ── потолок полного гейта (RC2010, 20.10.2026) ────────────────────────────────
+# Прежде гейт ограничивался 180 с, а полный гейт 19.10 шёл 977.9 с (389 пунктов, строка «✅ ГЕЙТ (полный): 389
+# тестов зелёные (977.9с)» журнала цепочки 947953e): маршрут падал трассировкой TimeoutExpired на шаге [2/6] — до
+# выкладки, то есть безопасно, но не работал вовсе. Теперь потолок взят от замера с запасом ×2.45 (набор растёт:
+# у RC2010 394 пункта) и задаётся ручкой; не уложился — это НЕ зелёный гейт: выкладка не начинается, код 5.
+GATE_TIMEOUT_ENV = "BRIDGE_GATE_TIMEOUT_S"
+GATE_TIMEOUT_MEASURED_S = 977.9            # замер полного гейта 19.10
+GATE_TIMEOUT_DEFAULT_S = 2400              # ≥ 1800 с; ≈ 2.45 × замер
+HARNESS_TIMEOUT_S = 60                     # потолок одного Node-харнесса (как был)
+
 
 # ────────────────────────── цель выкладки: годна или нет ──────────────────────
 
@@ -121,23 +131,76 @@ def target_refusal(target):
 
 # ─────────────────────────── шаги оранжевого цикла ───────────────────────────
 
-def _gate_ok():
-    """Полный прогон gate.py (не селективный). Возвращает (ok, out_str)."""
-    r = subprocess.run(
-        [PY, os.path.join(ROOT, "gate.py"), "--for", "clasp"],
-        capture_output=True, text=True, timeout=180, cwd=ROOT,
-    )
-    return r.returncode == 0, (r.stdout + r.stderr).strip()
+def gate_timeout(env=None):
+    """Потолок полного гейта в секундах → (секунды, пояснение|None).
+
+    Ручка `BRIDGE_GATE_TIMEOUT_S` — целое число секунд > 0. Не задана → `GATE_TIMEOUT_DEFAULT_S`. Задана мусором
+    (не число, ноль, отрицательное) → тоже умолчание, но не молча: пояснение печатается рядом с потолком. Слишком
+    малый потолок безопасен: он приводит только к отказу ДО выкладки (код 5), а не к выкладке без гейта."""
+    env = os.environ if env is None else env
+    raw = env.get(GATE_TIMEOUT_ENV)
+    if raw is None or not str(raw).strip():
+        return GATE_TIMEOUT_DEFAULT_S, None
+    try:
+        v = int(str(raw).strip())
+    except ValueError:
+        v = 0
+    if v <= 0:
+        return GATE_TIMEOUT_DEFAULT_S, ("%s задан не целым числом секунд > 0 — беру умолчание %d с"
+                                        % (GATE_TIMEOUT_ENV, GATE_TIMEOUT_DEFAULT_S))
+    return v, None
+
+
+def _out_text(x):
+    """Вывод процесса строкой: у TimeoutExpired на POSIX он байтами даже при text=True."""
+    if x is None:
+        return ""
+    if isinstance(x, bytes):
+        return x.decode("utf-8", "replace")
+    return str(x)
+
+
+def _gate_ok(timeout=None):
+    """Полный прогон gate.py (не селективный). Возвращает (ok, out_str, timed_out).
+
+    timed_out=True — гейт не уложился в потолок или не запустился: исход гейта НЕИЗВЕСТЕН, и это не зелёный. Сам
+    gate.py при этом убит (`subprocess.run` на потолке зовёт kill); тест-файл, который он гнал, доживает свой потолок
+    gate.py (90 с) и выкладки не касается."""
+    if timeout is None:
+        timeout = gate_timeout()[0]
+    try:
+        r = subprocess.run(
+            [PY, os.path.join(ROOT, "gate.py"), "--for", "clasp"],
+            capture_output=True, text=True, timeout=timeout, cwd=ROOT,
+        )
+    except subprocess.TimeoutExpired as e:
+        tail = (_out_text(e.stdout) + _out_text(e.stderr)).strip()[-400:]
+        return False, ("гейт не уложился в %d с (замер полного гейта 19.10 — %.1f с; ручка %s)%s"
+                       % (timeout, GATE_TIMEOUT_MEASURED_S, GATE_TIMEOUT_ENV,
+                          ("; хвост вывода:\n" + tail) if tail else "")), True
+    except OSError as e:
+        return False, "гейт не запустился (%s: %s)" % (type(e).__name__, e), True
+    return r.returncode == 0, (r.stdout + r.stderr).strip(), False
 
 
 def _node_harnesses_ok():
-    """Прогнать все tests/*_harness.js. Возвращает (ok, list_of_failed)."""
+    """Прогнать все tests/*_harness.js. Возвращает (ok, list_of_failed).
+
+    RC2010: харнесс, не уложившийся в потолок или не запустившийся (нет node), — провал этого харнесса, а не
+    трассировка мимо кода 2."""
     harnesses = sorted(glob.glob(os.path.join(TESTS_DIR, "*_harness.js")))
     fails = []
     for h in harnesses:
-        r = subprocess.run(
-            ["node", h], capture_output=True, text=True, timeout=60, cwd=ROOT,
-        )
+        try:
+            r = subprocess.run(
+                ["node", h], capture_output=True, text=True, timeout=HARNESS_TIMEOUT_S, cwd=ROOT,
+            )
+        except subprocess.TimeoutExpired:
+            fails.append(os.path.basename(h) + ": не уложился в %d с" % HARNESS_TIMEOUT_S)
+            continue
+        except OSError as e:
+            fails.append(os.path.basename(h) + ": не запустился (%s)" % type(e).__name__)
+            continue
         if r.returncode != 0:
             fails.append(os.path.basename(h) + ": " + (r.stderr or r.stdout)[:120])
     return not fails, fails
@@ -365,6 +428,8 @@ def deploy(target=None, mirror_dir=None):
       4 — ПРОД ВЫЛОЖЕН, А ЗЕРКАЛО НЕ СВЕДЕНО (отпечаток не снят / снимок неполон / нужен
           ход владельца). Прод при этом жив и смок пройден — но нулём такое звать нельзя:
           молча отставшее зеркало и есть мина, которую следующая сборка выложит поверх прода.
+      5 — ИСХОД ГЕЙТА НЕИЗВЕСТЕН (RC2010): гейт не уложился в потолок `gate_timeout()` или не
+          запустился. Выкладка не начата — ни харнессов, ни clasp; это не зелёный и не красный.
     """
     print("=== bridge_deploy: оранжевый цикл clasp redeploy ===")
 
@@ -379,9 +444,17 @@ def deploy(target=None, mirror_dir=None):
         return 3
     print(f"[1/6] Цель выкладки: {target} ✅")
 
-    # [2/6] Полный гейт
-    print("[2/6] gate.py (полный сьют)…")
-    ok, out = _gate_ok()
+    # [2/6] Полный гейт. RC2010: потолок — от замера полного гейта (а не 180 с), и не уложившийся гейт
+    # останавливает выкладку словами и кодом 5, а не трассировкой.
+    g_timeout, g_note = gate_timeout()
+    print(f"[2/6] gate.py (полный сьют, потолок {g_timeout} с)…")
+    if g_note:
+        print(f"⚠️ {g_note}")
+    ok, out, timed_out = _gate_ok(timeout=g_timeout)
+    if timed_out:
+        print(f"⛔ ИСХОД ГЕЙТА НЕИЗВЕСТЕН — выкладка НЕ начата (ни харнессов, ни clasp): {out}")
+        print(f"   Повтори, когда гейт уложится, или подними потолок ручкой {GATE_TIMEOUT_ENV}=<секунды>.")
+        return 5
     if not ok:
         print(f"❌ ГЕЙТ КРАСНЫЙ — деплой заблокирован.\n{out}")
         return 2
