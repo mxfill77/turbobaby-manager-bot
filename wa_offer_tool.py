@@ -21,15 +21,36 @@ WA_AGENT_OFFER, по умолчанию выкл).
 может проверить другую модель или другие даты; offer — не больше OFFER_MAX вызовов на сверку (дальше отказ «предел», двери
 нет); повтор той же пары — ответ из кеша сверки, двери нет.
 
+СВЕЖЕСТЬ (r3). «Свободно» и цена — ответ двери цены в МОМЕНТ ВЫЗОВА (`at`; вызов идёт после последнего входящего:
+новое входящее обрывает сверку), снимок лишь называет юнит, который дверь сверяет. «Занято» — только по снимку таблицы
+(дверь не зовётся), поэтому оно судится по ВРЕМЕНИ СНИМКА (`read_at`), а не по времени вызова: снимок прочитан раньше
+последнего входящего клиента (или время снимка неизвестно) — «занято» не факт, а «неизвестно» (`W_OLD_BUSY`), и
+`accepted` такой факт не принимает. У «свободно» от такого снимка — только число свободных юнитов, и его модели не
+называют (`FREE_OLD_LINE`). Освежить снимок принудительно `wa_book_read.Snapshot` не умеет (перечитывает не чаще TTL),
+модуль закреплён — новой двери ради этого нет.
+
 СУД. Факты offer в `results` сверки НЕ кладутся (тождество факта `fact_key` их не знает): аренды, оплаты, итога «к оплате»
 и денежных ролей они не дают. Опора денег, суток и дат черновика — исход цены вызова вместе с ценами принятых фактов offer
 (`judged_price`: `K.price_set`; процент скидки двери снимается `without_known_discount` тем же путём). Принятый факт
-(FACT, прочитан не раньше последнего входящего клиента) снимает причину «наличие и брони — агент их не видит» (и её пересказ
-моделью дословно) — только если КАЖДАЯ модель, которую черновик назвал свободной, проверена offer как свободная
-(`avail_mismatch`, приёмка OFFER1910): занятое, непроверенное, не из парка или «свободен» без модели при занятом — причина
-остаётся, и к ней «наличие в тексте не совпадает с проверкой — решает человек». Просьба о брони — «бронь оформляет
-человек» остаётся. Не факт — «наличие не проверено — решает человек»; ворота человека — их причины `K.handoff`. Брони не
-пишутся, клиенту — только по «Отправить» человека.
+(`accepted`, см. СВЕЖЕСТЬ) снимает причину «наличие и брони — агент их не видит» (и её пересказ моделью дословно) — только
+если текст черновика сверен с фактами ЦЕЛИКОМ (`avail_check`, r3 — закрыто наглухо): КАЖДАЯ модель парка, названная где
+угодно в тексте, проверена offer, и исход совпал со сказанным о ней; КАЖДЫЙ диапазон дат текста — даты принятого факта; в
+тексте нет слов брони. Разобрано и не совпало (занятое названо свободным и наоборот, непроверенная модель, другие даты,
+«свободен» без модели при занятом) — причина остаётся, и к ней «наличие в тексте не совпадает с проверкой — решает
+человек»; сказанное о модели не разобрано — причина остаётся без новых слов (строка журнала). Слова брони в черновике
+(«заброн…», «оформ…», reserved, booked for you) — причина остаётся и к ней «бронь оформляет человек» при ЛЮБОМ входящем
+клиента; просьба клиента о брони — «бронь оформляет человек» тоже. Не факт — «наличие не проверено — решает человек»;
+ворота человека — их причины `K.handoff`. Брони не пишутся, клиенту — только по «Отправить» человека.
+
+ДЕЛО (К4). offer — стадия запроса (inquiry), ДО брони, и он БЕЗ ДЕЛА: к делу аренды и его версии (`WA_AGENT_CASE`,
+`CaseLink`) факт offer не привязан сознательно. Котировка «модель + даты» — не факт об аренде: у запроса дела ещё нет
+(или оно о другой, прежней аренде клиента), в `results` факта нет, поэтому `T.case_plan` его не видит и в дело ничего не
+пишется; судит факт только причины ЭТОГО черновика. Привязка самого черновика к делу (`res["case"]`) — прежняя, по фактам
+сверки.
+
+ЮНИТ. Подтверждённый юнит (имя с номером: «PCX 160CC WHITE PHUKET 3011») — только в журнал сверки сотруднику; в строках
+модели его нет. Строку цены собирает `K.quote` со словом двери «model»; слово, похожее на юнит (`unit_like`), заменяется
+моделью парка (формат живого ответа — см. `unit_like`).
 
 КОПИЯ. Цикл сверки (`wa_agent_tools.run`) и черновик со сверкой (`ModelAdapter._draft_tools`) закреплены блобами в семи
 наборах — их не трогаем. Поэтому `run` и `OfferMixin._draft_tools` здесь — копии родителей с помеченными правками
@@ -43,7 +64,9 @@ WA_AGENT_OFFER, по умолчанию выкл).
 
 ПОДКЛЮЧЕНИЕ. `with_offer(cls)` → класс «примесь + cls» (один на cls); служба (`wa_agent_svc.offer_of`) меняет класс уже
 собранного адаптера. Флаг выключен — модуль не импортируется вовсе: system, user, блок инструментов и класс адаптера
-байт-в-байт прежние."""
+байт-в-байт прежние. С OFFER-OFFPIN1910 (r3) служба выключает offer КОДОМ: `build()` даёт `offer_of` свою карту «0»,
+WA_AGENT_OFFER в окружении не читается (живой offer не обходит порядок BOOKCTX ON → наблюдение → PRICE_ON); включение —
+одна явная правка строки `build()` и коммит по слову владельца."""
 import datetime
 import hashlib
 import inspect
@@ -73,6 +96,11 @@ HEAD = "OFFER — НАЛИЧИЕ И ЦЕНА ПО ТВОЕМУ ЗАПРОСУ (�
 BUSY_LINE = ("НАЛИЧИЕ (таблица броней, снимок %d мин назад; прочитаны все юниты модели): %s, %s — %s: заняты все %d. "
              "Можно сказать, что на эти даты этой модели нет. Другую модель или другие даты можно проверить вызовом "
              "offer; свободной называй только проверенную, её цену — только из её строки «ЦЕНА».")
+# «свободно» при снимке старше последнего входящего (r3): дверь сверила юнит сейчас, число свободных — из старого снимка
+FREE_OLD_LINE = ("НАЛИЧИЕ (дверь цены — сейчас; таблица броней — снимок %d мин назад, раньше последнего сообщения "
+                 "клиента): %s, %s — %s: свободный юнит сверен дверью цены. Можно сказать, что на эти даты байк есть; "
+                 "сколько свободно — не называй. Бронь не обещай и не оформляй — её делает человек; «забронировано» не "
+                 "говори.")
 NOT_LINE = "НАЛИЧИЕ: НЕИЗВЕСТНО — %s. Не говори ни «есть», ни «нет», ни «свободен»; %s"
 FACT_NOTE = ("Наличие этих пар проверил код: причину «%s» в handoff не переноси; бронь по-прежнему оформляет человек."
              % K.REASON_WORDS[K.R_AVAILABILITY])
@@ -97,6 +125,8 @@ W_MANY = "названо несколько моделей (%s) — один в�
 W_GATE_HUMAN = "считает человек: %s"
 W_GATE_UNKNOWN = "цена и наличие не проверены: %s"
 W_CACHED = "повтор той же пары — ответ из кеша сверки, дверь не звана"
+W_OLD_BUSY = ("таблица броней прочитана %d мин назад — раньше последнего сообщения клиента (или время снимка неизвестно): "
+              "«занято» не подтверждено")
 
 # ── журнал (числа и слова; юнит — сотруднику) ───────────────────────────────────────────────────────────────────
 L_SUM = "вызовов %d: факт %d (свободно %d, занято %d), не факт %d (предел %d), дверь цены %d, кеш %d"
@@ -186,19 +216,53 @@ def term_of(model, ds, de):
     return term
 
 
+def snap_fresh(read_at, since):
+    """Снимок прочитан не раньше последнего входящего клиента? Входящего нет (время неизвестно) — не судим (как
+    `T.stale`); времени снимка нет — нет (старый снимок свежим не делает ничто)."""
+    if since is None:
+        return True
+    return isinstance(read_at, (int, float)) and not isinstance(read_at, bool) and read_at >= since
+
+
 def accepted(offers, since=None):
-    """Ответы offer → принятые: FACT, прочитанные не раньше последнего входящего клиента (`T.stale`), каждая пара один
-    раз (повтор из кеша — та же пара)."""
+    """Ответы offer → принятые: FACT, вызов не раньше последнего входящего клиента (`T.stale`: «свободно» и цена — ответ
+    двери в момент вызова); «занято» — ещё и СНИМОК не раньше него (`snap_fresh` по `read_at`, r3: «занято» дверью не
+    сверяется, время вызова старый снимок свежим не делает); каждая пара один раз (повтор из кеша — та же пара)."""
     out, seen = [], set()
     for r in offers or ():
         if r.get("outcome") != T.FACT or T.stale(r, since):
             continue
         o = r.get("offer") or {}
+        if o.get("avail") == B.BUSY and not snap_fresh(r.get("read_at"), since):
+            continue
         key = (o.get("model"), o.get("date_from"), o.get("date_to"))
         if key not in seen:
             seen.add(key)
             out.append(r)
     return out
+
+
+# Слово двери «model» идёт в строку цены (`K.quote`: `model=q.get("model") or model`). По копии моста в дереве
+# (bridge_prod/QuotePrice.js:270–271) это имя модели прайса («HONDA PCX 160»), а юнит — отдельное поле `bike`; совпадает ли
+# с копией ЖИВОЙ скрипт — НЕИЗВЕСТНО (UNKNOWN: живой ответ двери не читался). Поэтому слово, похожее на юнит (имя юнита
+# модели, хвост его имени за ключом модели — номер — или «… PHUKET 3011» в конце), в строку цены не идёт: вместо него —
+# модель парка. Прочее — как было.
+_RX_PLATE = re.compile(r"(?i)[a-zа-яё]{2,}\s+\d{4}\s*$")
+
+
+def unit_like(name, units):
+    """Слово двери «model» + юниты модели → похоже на юнит (имя с номером), а не на модель?"""
+    n = B.qnorm(name)
+    if not n:
+        return False
+    if _RX_PLATE.search(n):
+        return True
+    for u in units or ():
+        toks = B.qnorm(u).split()
+        tail = toks[len(B.model_key(u).split()):]                  # за ключом модели: цвет, город, номер
+        if n.split() == toks or (tail and tail[-1] in n.split()):
+            return True
+    return False
 
 
 def judged_price(price, facts):
@@ -224,19 +288,23 @@ def judged_info(info, price, facts):
     return dict(info, price=price, terms=terms)
 
 
-def offer_reasons(reasons, offers, facts, ask, mismatch=()):
+def offer_reasons(reasons, offers, facts, ask, mismatch=(), unsure=(), promise=False):
     """Причины кода + ответы offer этой сверки → причины ({reason, words, why}); прежние — в прежнем порядке, новые — в
-    конце, ключ причины один раз. Принятый факт и наличие текста с ним совпало (`mismatch` пуст) — «наличие и брони —
-    агент их не видит» снята, просьба о брони — «бронь оформляет человек»; не совпало — прежняя остаётся (как без
-    флага), и в конце — «наличие в тексте не совпадает с проверкой»; ворота человека и скидка без числа у цен offer —
-    причины `K.handoff`; ответ не факт (кроме ворот человека) — «наличие не проверено — решает человек»."""
+    конце, ключ причины один раз. Принятый факт и текст с фактами сверен целиком (`mismatch` и `unsure` пусты, слов брони
+    в тексте нет — `promise` ложь) — «наличие и брони — агент их не видит» снята, просьба о брони — «бронь оформляет
+    человек»; иначе прежняя остаётся (как без флага): не совпало — в конце «наличие в тексте не совпадает с проверкой»,
+    не разобрано — без новых слов; слова брони в тексте черновика — «бронь оформляет человек» при любом входящем (r3);
+    ворота человека и скидка без числа у цен offer — причины `K.handoff`; ответ не факт (кроме ворот человека) —
+    «наличие не проверено — решает человек»."""
     out = [dict(r) for r in reasons or ()]
     if not offers:
         return out
-    if facts and not mismatch:
+    if facts and not mismatch and not unsure and not promise:
         out = [r for r in out if r.get("reason") != K.R_AVAILABILITY]
         if B.book_intent(ask):
             out.append({"reason": B.R_BOOKING, "words": B.W_BOOKING, "why": "просьба о брони"})
+    if promise:
+        out.append({"reason": B.R_BOOKING, "words": B.W_BOOKING, "why": "offer: слова брони в тексте черновика"})
     quotes = [r["offer"]["quote"] for r in offers if isinstance((r.get("offer") or {}).get("quote"), dict)]
     out += K.handoff("", K.price_set(quotes))
     unknown = [r for r in offers if r.get("outcome") != T.FACT and not (r.get("offer") or {}).get("gate")]
@@ -256,36 +324,56 @@ def _norm(s):
     return re.sub(r"[^0-9a-zа-яё]+", "", str(s or "").lower())
 
 
-def without_avail_words(words, facts, mismatch=()):
-    """Принятый факт offer и наличие текста с ним совпало → слова «наличие и брони — агент их не видит» сняты и у
-    пересказа модели (дословного); иначе (фактов нет или `mismatch` не пуст) как есть."""
-    if not facts or mismatch:
+def without_avail_words(words, facts, held=()):
+    """Принятый факт offer и текст с ним сверен целиком → слова «наличие и брони — агент их не видит» сняты и у
+    пересказа модели (дословного); иначе (фактов нет или причина удержана — `held`: расхождение, не сверено, слова брони)
+    как есть."""
+    if not facts or held:
         return words
     gone = _norm(K.REASON_WORDS[K.R_AVAILABILITY])
     return [w for w in words if _norm(w) != gone]
 
 
-# ── «свободен» в тексте черновика против фактов offer (приёмка OFFER1910) ─────────────────────────────────────────
-# Принятый факт снимает «агент их не видит» только тогда, когда КАЖДАЯ модель, которую черновик назвал свободной, имеет
-# принятый факт «свободно» и ни одного «занято»: иначе снятие спрятало бы от сотрудника черновик, назвавший свободным
-# занятое или непроверенное (модель отвечает сама — по сценарию это не держится). Разбор слов грубый и сомнение отдаёт
-# человеку: часть предложения, где модель названа занятой («PCX 160 занят»), — не «свободно»; всё прочее в предложении
-# со словом «свободно» — названо свободным. Обратного («свободное названо занятым») слой не судит.
+# ── наличие в тексте черновика против фактов offer (приёмка OFFER1910 r2; r3 — закрыто наглухо) ─────────────────────
+# Принятый факт снимает «агент их не видит» только тогда, когда текст черновика СВЕРЕН с фактами ЦЕЛИКОМ: иначе снятие
+# спрятало бы от сотрудника черновик, назвавший свободным занятое, непроверенное или на другие даты (модель отвечает сама
+# — по сценарию это не держится). r2 судил только предложения со словом «свободно»: «We have NMAX 155», «можем предложить
+# NMAX 155», «NMAX 155 ждёт вас», «…, but NMAX 155 is.», «…, а NMAX 155 — да.» и та же модель на другие даты снимали
+# причину. r3 судит КАЖДОЕ упоминание модели и КАЖДЫЙ диапазон дат текста:
+#   · модель парка — исход сказанного о ней (часть предложения со словом «свободно» или «занято»; часть без слова — по
+#     соседней: «NMAX 155 — нет»; после «но», «а», but — обратный прежней части со словом; иначе как у прежней, иначе
+#     как у следующей) совпал с ЕЁ принятыми фактами; даты в её части (или в части предложения без модели и без слова)
+#     — факт ЭТОЙ модели на ЭТИ даты; фактов модели нет — «не проверен»; слова наличия о ней нет — судит сказанное о
+#     ней в другом месте текста (совпало — сверено, не совпало — уже расхождение), а нигде нет — не сверено;
+#   · диапазон дат в части без модели со словом наличия — факт на эти даты у моделей предложения с этим исходом; моделей
+#     в предложении нет — факт на эти даты у любой модели;
+#   · сокращение к нескольким моделям — названо свободным: расхождение, иначе не сверено; похожее на модель не из
+#     парка судится только названным свободным (суммы и слова английского текста на модель похожи);
+#   · «свободно» без модели и без дат при занятом среди фактов — расхождение.
+# Исходы: «расхождение» — разобрано и не совпало (причина остаётся, и к ней «не совпадает с проверкой»); «не сверено» —
+# не разобрано (причина остаётся без новых слов, строка журнала). Разбор слов грубый и сомнение отдаёт человеку.
 
 # деление на предложения — то же, что у судьи денег (`K.money_claims`); имени нет — модуль не собирается (служба: «не
 # засчитан», адаптер прежний), а не падает черновик
 _sentences = K._sentences
-# части предложения: запятая, скобки, тире между пробелами (не «10–15»), «но», «а», «однако», but, however
-_RX_CLAUSE = re.compile(r"(?i)[,()]|\s[—–-]\s|\s(?:но|а|однако|зато|but|however|whereas)\s")
+# части предложения: запятая, скобки, тире между пробелами (не «10–15»), «и», «но», «а», «однако», and, but, however;
+# разделитель внутри диапазона дат («10 - 15 ноября») части не делит
+_RX_CLAUSE = re.compile(r"(?i)[,()]|\s[—–-]\s|\s(?:и|но|а|однако|зато|and|but|however|whereas)\s")
+_RX_CONTRAST = re.compile(r"(?i)\s(?:но|а|однако|зато|but|however|whereas)\s")       # после него — обратное прежнему
 _RX_NEG = re.compile(r"(?i)(?:(?<![а-яёa-z])(?:не|нет|ни|not|no)|n['’]t)\s+$")      # отрицание прямо перед словом
 # слово «свободно» — само по себе, и без модели рядом (слово «занято» с отрицанием — тоже: «не занят», not booked)
 _RX_FREE = re.compile(
     r"(?i)(?<![а-яё])свобод\w*|(?<![а-яё])в\s+наличии|(?<![а-яё])доступ(?:ен|на|но|ны)(?![а-яё])|"
     r"(?<![a-z])(?:available|in\s+stock|vacant)(?![a-z])")
-# слабое слово («есть», free): «свободно» — только с моделью, байком или вариантом рядом или в голой части («Да, есть»)
-_RX_WEAK = re.compile(r"(?i)(?<![а-яё])(?:есть|име(?:ется|ются))(?![а-яё])|(?<![a-z])free(?![a-z])")
+# слабое слово («есть», free; r3 — и предложение модели: «можем предложить», «ждёт вас», we have, can offer): «свободно»
+# — только с моделью, байком или вариантом рядом или в голой части («Да, есть»)
+_RX_WEAK = re.compile(
+    r"(?i)(?<![а-яё])(?:есть|име(?:ется|ются)|(?:можем|могу|могли\s+бы)\s+предложить|предлага(?:ем|ю)|"
+    r"жд(?:ёт|ет|ут)\s+вас)(?![а-яё])|"
+    r"(?<![a-z])(?:free|we\s+have(?!\s+(?:no|none|nothing)(?![a-z]))|we['’]ve\s+got(?!\s+(?:no|none|nothing)(?![a-z]))|"
+    r"(?:we\s+)?can\s+offer|(?:is|are)\s+waiting\s+for\s+you|ready\s+for\s+you)(?![a-z])")
 _RX_BUSY = re.compile(r"(?i)(?<![а-яё])(?:занят\w*|нет|нету|недоступ\w*|забронирован\w*)(?![а-яё])|"
-                      r"(?<![a-z])(?:busy|booked|taken|unavailable|sold\s+out)(?![a-z])")
+                      r"(?<![a-z])(?:busy|booked|taken|unavailable|sold\s+out|out\s+of\s+stock)(?![a-z])")
 _RX_GEN = re.compile(r"(?i)свободн(?:ых|ого|ой)$")                 # «свободных … нет» — нет
 _RX_NET = re.compile(r"(?i)(?<![а-яё])нет(?![а-яё])")
 _RX_OBJECT = re.compile(r"(?i)вариант|байк|скутер|мотоцикл|мопед|модел|(?<![а-яё])друг(?:ой|ая|ие|ую|их|ое)(?![а-яё])|"
@@ -294,26 +382,62 @@ _BARE = frozenset(
     "конечно даты дату числа число время срок сроки сейчас пока этих этот эту sure still these those dates date days "
     "period time there января февраля марта апреля июня июля августа сентября октября ноября декабря january february "
     "march april june july august september october november december".split())
-_NOT_MODEL = frozenset(("thb", "baht", "usd", "eur", "rub", "km"))     # «THB 400» — сумма, а не модель
+# «THB 400», «price is 400 THB» — сумма, а не модель: слово перед числом из этого списка или за числом валюта
+_NOT_MODEL = frozenset((
+    "thb", "baht", "usd", "eur", "rub", "km", "is", "are", "was", "be", "for", "per", "from", "only", "just", "at",
+    "about", "around", "of", "to", "by", "and", "or", "plus", "price", "prices", "total", "deposit", "cost", "costs",
+    "rate", "fee", "pay", "paid", "approx", "extra", "over", "under", "than", "with", "within", "the", "it", "all", "now"))
+_RX_MONEY_AFTER = re.compile(r"(?i)\s*(?:฿|\$|thb|baht|бат|руб|₽|usd|eur|km|км)")
+# дни без месяца после предлога («на 18–22», for 18-22) — диапазон, если за ним не сумма, не время, не счёт
+_RX_DASH_DAYS = re.compile(
+    r"(?i)(?<![а-яёa-z])(?:на|с|from|for|on)\s+(\d{1,2})\s*[-–—]\s*(\d{1,2})(?!\d|[.,:/]\d)"
+    r"(?!\s*(?:%|฿|\$|бат|руб|thb|baht|usd|час|ч(?![а-яё])|мин|сут|дн|ден|ноч|day|night|h(?![a-z])|km|км|тыс|"
+    r"k(?![a-z])|человек|чел|раз|шт|pcs|people|person))")
+# слова брони в тексте ЧЕРНОВИКА (r3): агент брони не делает — «бронь оформляет человек» при любом входящем клиента.
+# Разбор грубый: «забронирован» о чужой брони и «оформление» — тоже (сомнение — человеку)
+_RX_BOOK_SAID = re.compile(
+    r"(?i)(?<![а-яё])(?:заброн|бронир|оформ)\w*|(?<![а-яё])брон(?:ь|ю|и|ей)(?![а-яё])|"
+    r"(?<![a-z])reserv(?:ed|ation)(?![a-z])|(?<![a-z])booked\s+(?:it\s+|this\s+|them\s+)?for\s+you|"
+    r"(?<![a-z])(?:i|we)(?:['’]ve|['’]ll|\s+have|\s+will|\s+can)?\s+(?:book|reserv)\w*|"
+    r"(?<![a-z])booking\s+(?:is\s+)?confirmed")
 M_BUSY = "%s — по проверке занят"
 M_BOTH = "%s — по проверке занят на одни из дат"
+M_FREE = "%s — по проверке свободен, а назван занятым"
+M_FREE_SOME = "%s — по проверке свободен на одни из дат, а назван занятым"
 M_UNCHECKED = "%s — не проверен"
+M_DATES = "%s на %s — не проверен"
+M_DATES_ANY = "даты %s — не проверены"
+M_DATES_DIFF = "даты %s — по проверке исход другой"
 M_FOREIGN = "«%s» — не из парка"
 M_ALIAS = "«%s» — модель не определена"
 M_BARE = "«свободно» без модели — а по проверке есть занятое"
+U_UNCHECKED = "%s — не проверен (о наличии слова нет)"
+U_STANCE = "%s — не разобрано, свободен или занят"
+U_ALIAS = "«%s» — модель не определена (о наличии слова нет)"
 R_AVAIL_MISMATCH = "offer_avail_mismatch"
 W_AVAIL_MISMATCH = "наличие в тексте не совпадает с проверкой — решает человек"
 L_MISMATCH = ("наличие в тексте не совпадает с проверкой: %%s — «%s» не снята, причина «%s»"
               % (K.REASON_WORDS[K.R_AVAILABILITY], W_AVAIL_MISMATCH))
+L_UNSURE = "наличие в тексте не сверено с проверкой: %%s — «%s» не снята" % K.REASON_WORDS[K.R_AVAILABILITY]
+L_BOOK_SAID = ("слова брони в тексте черновика — «%s» не снята, причина «%s»"
+               % (K.REASON_WORDS[K.R_AVAILABILITY], B.W_BOOKING))
 
 
-def _parts(s, a, b):
-    """Предложение s[a:b] → [(начало, конец)] частей (`_RX_CLAUSE`)."""
-    out, at = [], a
+def book_said(text):
+    """Слова брони в тексте черновика (`_RX_BOOK_SAID`): «бронь оформляет человек» — при любом входящем клиента (r3)."""
+    return _RX_BOOK_SAID.search(str(text or "")) is not None
+
+
+def _parts(s, a, b, keep=()):
+    """Предложение s[a:b] → [(начало, конец, разделитель перед частью)] (`_RX_CLAUSE`; у первой — ""); разделитель
+    внутри места из keep (диапазон дат) часть не делит."""
+    out, at, sep = [], a, ""
     for m in _RX_CLAUSE.finditer(s, a, b):
-        out.append((at, m.start()))
-        at = m.end()
-    out.append((at, b))
+        if any(x <= m.start() < y for x, y in keep):
+            continue
+        out.append((at, m.start(), sep))
+        at, sep = m.end(), m.group()
+    out.append((at, b, sep))
     return out
 
 
@@ -350,49 +474,141 @@ def _mentions(s, bikes):
     hits = [(h[0], h[1], h[2], h[3]) for h in M.model_hits(s, bikes)]
     foreign = [(m.start(), m.end(), False, m.group()) for m in _RX_MODEL_LIKE.finditer(s)
                if not any(h[0] < m.end() and m.start() < h[1] for h in hits)
-               and re.sub(r"[^a-z]", "", m.group().lower()) not in _NOT_MODEL]
+               and re.sub(r"[^a-z]", "", m.group().lower()) not in _NOT_MODEL
+               and not _RX_MONEY_AFTER.match(s, m.end())]
     return sorted(hits + foreign)
 
 
-def avail_mismatch(text, facts, bikes):
-    """Текст черновика + принятые факты offer + парк снимка → [почему наличие текста не совпало с проверкой] (пусто —
-    совпало или фактов нет). Названа свободной (в предложении со словом «свободно», кроме части, где модель названа
-    занятой без «свободно») — модель совпадает только при факте «свободно» и ни одном «занято»; не проверена, не из
-    парка, сокращение к нескольким — не совпадает. «Свободно», а свободной не названа ни одна модель предложения, —
-    совпадает, только если занятого среди фактов нет."""
+def _ranges(s, today):
+    """Диапазоны дат текста → [(начало, конец, (выдача, возврат) | None, (день, день) | None, слова)] по месту: с
+    месяцем — даты (`M.find_ranges`, год — от today), без месяца («с 10 по 15», «на 18–22») — только числа дней."""
+    out = []
+    for r in M.find_ranges(s, today):
+        if r["ds"] is not None:
+            out.append((r["a"], r["b"], (r["ds"], r["de"]), None, r["label"]))
+        else:
+            d = [int(x) for x in re.findall(r"\d{1,2}", s[r["a"]:r["b"]])]
+            out.append((r["a"], r["b"], None, tuple(d[:2]), r["label"]))
+    for m in _RX_DASH_DAYS.finditer(s):
+        a, b, d1, d2 = m.start(1), m.end(2), int(m.group(1)), int(m.group(2))
+        if 1 <= d1 < d2 <= 31 and not any(g[0] < b and a < g[1] for g in out):
+            out.append((a, b, None, (d1, d2), "%d–%d (месяц не назван)" % (d1, d2)))
+    return sorted(out)
+
+
+def _windows(o):
+    """Факт offer → окна дат, которые он проверил: (с, по) факта; у «свободно» срока на минимум класса — ещё (с, по
+    клиента): оно внутри проверенного («занято» на минимум о более коротком сроке клиента не говорит)."""
+    out = [(day_arg(o.get("date_from")), day_arg(o.get("date_to")))]
+    if o.get("avail") == B.FREE and o.get("asked_to") and o.get("asked_to") != o.get("date_to"):
+        out.append((out[0][0], day_arg(o.get("asked_to"))))
+    return [w for w in out if w[0] is not None and w[1] is not None]
+
+
+def _covers(g, o):
+    """Диапазон текста (`_ranges`) — окно факта offer? Без месяца — по числам дней."""
+    return any((g[2] is not None and g[2] == w) or (g[3] is not None and g[3] == (w[0].day, w[1].day))
+               for w in _windows(o))
+
+
+def _infer(parts, i):
+    """Модель в части без слова наличия → исход сказанного о ней (B.FREE | B.BUSY | None): следующая часть без модели
+    со словом наличия («NMAX 155 — нет»); иначе ближайшая прежняя часть со словом — после «но», «а», but между ними
+    обратный ей («…, but NMAX 155 is», «…, а NMAX 155 — да»), без них тот же («XMAX 300 тоже»); иначе ближайшая
+    следующая; слова наличия в предложении нет — None."""
+    nxt = parts[i + 1] if i + 1 < len(parts) else None
+    if nxt is not None and not nxt["named"] and nxt["mark"]:
+        return nxt["mark"]
+    j = next((k for k in range(i - 1, -1, -1) if parts[k]["mark"]), None)
+    if j is not None:
+        if any(_RX_CONTRAST.fullmatch(parts[k]["sep"]) for k in range(j + 1, i + 1)):
+            return B.BUSY if parts[j]["mark"] == B.FREE else B.FREE
+        return parts[j]["mark"]
+    return next((p["mark"] for p in parts[i + 1:] if p["mark"]), None)
+
+
+def _judge(model, word, st, dates, by):
+    """Упоминание (модель | None — сокращение | False — не из парка; исход сказанного; диапазоны его дат) + принятые
+    факты по моделям → ("ok" | "bad" | "unsure" | "pending", почему): "bad" — расхождение, "unsure" — не сверено,
+    "pending" — слова наличия о модели нет (судит другое её упоминание со словом; такого нет — не сверено)."""
+    if model is False:
+        return ("bad", M_FOREIGN % label_of(word)) if st == B.FREE else ("ok", "")
+    if model is None:
+        return ("bad", M_ALIAS % label_of(word)) if st == B.FREE else ("unsure", U_ALIAS % label_of(word))
+    facts = by.get(model) or []
     if not facts:
-        return []
-    got = {}
+        return ("bad", M_UNCHECKED % model) if st else ("unsure", U_UNCHECKED % model)
+    for g in dates or ():
+        got = {o.get("avail") for o in facts if _covers(g, o)}
+        if not got:
+            return "bad", M_DATES % (model, g[4])
+        if st and got != {st}:
+            return "bad", (M_BUSY if st == B.FREE else M_FREE) % model
+    if st is None:
+        return "pending", U_STANCE % model
+    got = {o.get("avail") for o in facts}
+    if dates or got == {st}:
+        return "ok", ""
+    if st == B.FREE:
+        return "bad", (M_BOTH if B.FREE in got else M_BUSY) % model
+    return "bad", (M_FREE_SOME if B.BUSY in got else M_FREE) % model
+
+
+def _judge_any(g, st, facts):
+    """Диапазон дат в предложении без модели → ("ok" | "bad", почему): факт на эти даты у любой модели (со словом наличия
+    — и исход тот же)."""
+    got = {(r.get("offer") or {}).get("avail") for r in facts if _covers(g, r.get("offer") or {})}
+    if not got:
+        return "bad", M_DATES_ANY % g[4]
+    if st and got != {st}:
+        return "bad", M_DATES_DIFF % g[4]
+    return "ok", ""
+
+
+def avail_check(text, facts, bikes, today=None):
+    """Текст черновика + принятые факты offer + парк снимка → (расхождение, не сверено): списки «почему» по порядку, без
+    повторов (см. шапку раздела). Оба пусты — текст с фактами сверен целиком; фактов нет — оба пусты (снимать нечего).
+    today — «сегодня» сверки (год дат без года); нет — по часам Пхукета."""
+    if not facts:
+        return [], []
+    today = today or B.local_now(time.time()).date()
+    by = {}
     for r in facts:
         o = r.get("offer") or {}
-        got.setdefault(o.get("model"), set()).add(o.get("avail"))
-    busy_any = any(B.BUSY in v for v in got.values())
+        by.setdefault(o.get("model"), []).append(o)
+    busy_any = any(o.get("avail") == B.BUSY for v in by.values() for o in v)
     s = str(text or "")
-    ments, out = _mentions(s, bikes), []
+    ments, rngs, seen = _mentions(s, bikes), _ranges(s, today), []          # seen: (модель | None, исход, почему)
     for a, b in _sentences(s):
+        sr = [g for g in rngs if a <= g[0] < b]
         parts = []
-        for c0, c1 in _parts(s, a, b):
+        for c0, c1, sep in _parts(s, a, b, [(g[0], g[1]) for g in sr]):
             named = [x for x in ments if c0 <= x[0] < c1]
-            parts.append((named, _marks(s[c0:c1], bool(named))))
-        if not any(free for _n, (free, _busy) in parts):
-            continue
-        claimed = [x for named, (free, busy) in parts if free or not busy for x in named]
-        if not claimed and busy_any:
-            out.append(M_BARE)
-        out += [w for w in (_verdict(model, word, got) for _a, _b, model, word in claimed) if w]
-    return list(dict.fromkeys(out))
-
-
-def _verdict(model, word, got):
-    """Модель, названная свободной, + исходы фактов по моделям → почему не совпало | None (совпало)."""
-    if model is False:
-        return M_FOREIGN % label_of(word)
-    if model is None:
-        return M_ALIAS % label_of(word)
-    av = got.get(model, set())
-    if B.BUSY in av:
-        return (M_BOTH if B.FREE in av else M_BUSY) % model
-    return None if B.FREE in av else M_UNCHECKED % model
+            free, busy = _marks(s[c0:c1], bool(named))
+            parts.append({"sep": sep, "named": named, "rngs": [g for g in sr if c0 <= g[0] < c1],
+                          "mark": B.FREE if free else B.BUSY if busy else None})
+        fleet = list(dict.fromkeys(x[2] for p in parts for x in p["named"] if x[2]))
+        loose = [g for p in parts if not p["named"] and not p["mark"] for g in p["rngs"]]   # даты ничьей части
+        stances = []
+        for i, p in enumerate(parts):
+            for x in p["named"]:
+                st = p["mark"] or _infer(parts, i)
+                stances.append(st)
+                seen.append((x[2],) + _judge(x[2], x[3], st, p["rngs"] or loose, by))
+            if p["named"]:
+                continue
+            for g in p["rngs"]:                       # даты в части без модели — у моделей предложения или у любой
+                if fleet:
+                    seen += [(m,) + _judge(m, m, p["mark"], [g], by) for m in fleet]
+                else:
+                    seen.append((None,) + _judge_any(g, p["mark"], facts))
+        if busy_any and B.FREE not in stances and any(p["mark"] == B.FREE and not p["named"] and not p["rngs"]
+                                                       for p in parts):
+            seen.append((None, "bad", M_BARE))
+    said = {m for m, v, _w in seen if v in ("ok", "bad") and m}    # о модели разобрано другое упоминание
+    bad = [w for _m, v, w in seen if v == "bad"]
+    unsure = [w for m, v, w in seen if v == "unsure" or (v == "pending" and m not in said)]
+    return list(dict.fromkeys(bad)), list(dict.fromkeys(unsure))
 
 
 def _mins(age):
@@ -403,10 +619,11 @@ def _mins(age):
 
 class Offers(object):
     """Вызовы offer ОДНОЙ сверки: предел, кеш пар, общая дверь цены (ответ на (юнит, даты) читается один раз), ответы по
-    порядку. Двери — у адаптера: `book` (снимок), `door` (quote_price), `no_price_models`."""
+    порядку. Двери — у адаптера: `book` (снимок), `door` (quote_price), `no_price_models`. since — время последнего
+    входящего клиента (r3: «занято» по снимку раньше него — не факт; см. СВЕЖЕСТЬ в шапке)."""
 
-    def __init__(self, adapter, today=None, limit=OFFER_MAX):
-        self.adapter, self.today, self.limit = adapter, today, limit
+    def __init__(self, adapter, today=None, limit=OFFER_MAX, since=None):
+        self.adapter, self.today, self.limit, self.since = adapter, today, limit, since
         self.results, self.cache, self.memo = [], {}, {}
         self.calls = self.door_calls = self.cached = self.over = 0
         self.bikes = None                                            # парк последнего служащего снимка (`avail_mismatch`)
@@ -443,9 +660,9 @@ class Offers(object):
 
     @staticmethod
     def _res(outcome, at, reason="", offer=None, facts=None, read_at=None, ref="", window=""):
-        o = {"model": None, "asked": "", "date_from": None, "date_to": None, "days": None, "min": None, "client": None,
-             "avail": None, "units": 0, "free": 0, "busy": 0, "unchecked": 0, "unit": None, "age": None,
-             "door_calls": 0, "quote": None, "gate": None, "code": None, "line": "", "cached": False}
+        o = {"model": None, "asked": "", "date_from": None, "date_to": None, "asked_to": None, "days": None, "min": None,
+             "client": None, "avail": None, "units": 0, "free": 0, "busy": 0, "unchecked": 0, "unit": None, "age": None,
+             "snap_old": None, "door_calls": 0, "quote": None, "gate": None, "code": None, "line": "", "cached": False}
         o.update(offer or {})
         res = T.result(OFFER_TOOL, outcome, SOURCE, ref=ref, at=at, window=window, reason=reason, facts=facts,
                        read_at=at if read_at is None else read_at)
@@ -456,7 +673,8 @@ class Offers(object):
         a = self.adapter
         asked = label_of(args.get("model"))
         ds, de = day_arg(args.get("date_from")), day_arg(args.get("date_to"))
-        base = {"asked": asked, "date_from": ds.isoformat() if ds else None, "date_to": de.isoformat() if de else None}
+        base = {"asked": asked, "date_from": ds.isoformat() if ds else None, "date_to": de.isoformat() if de else None,
+                "asked_to": de.isoformat() if de else None}                   # конец, названный моделью (до минимума)
         if ds is None or de is None:
             return self._res(T.REFUSED, at, W_DATES, dict(base, code="dates"))
         if de <= ds:
@@ -516,25 +734,35 @@ class Offers(object):
             seen.append(u)
             return self.door(u, s, e)
         avail = B.free_bikes(model, units, term["ds"], term["de"], rows, age, why, B.local_now(now), door)
+        old = not snap_fresh(taken, self.since)       # r3: снимок раньше последнего входящего (или время неизвестно)
         o = dict(base, avail=avail["outcome"], free=avail["free"], busy=avail["busy"], unchecked=avail["unchecked"],
-                 line=avail["line"], unit=None)
+                 line=avail["line"], unit=None, snap_old=old)
         if avail["outcome"] == B.UNKNOWN:
             o["door_calls"] = self.door_calls - before
             return self._res(T.UNKNOWN, at, avail["why"], dict(o, code="avail"), read_at=taken, ref=ref,
                              window=window)
+        if avail["outcome"] == B.BUSY and old:     # r3: «занято» — только снимок, а он старше входящего: не факт
+            return self._res(T.UNKNOWN, at, W_OLD_BUSY % _mins(age), dict(o, avail=None, code="old_busy"),
+                             read_at=taken, ref=ref, window=window)
         q = None
         if avail["outcome"] == B.FREE:
             unit = seen[0]
-            q = M.mark_minimum(K.quote(model, term["ds"], term["de"], door,
+
+            def quote_door(u, s, e):              # r3: слово двери «model», похожее на юнит, — в строку модель парка
+                got = door(u, s, e)
+                return dict(got, model=model) if isinstance(got, dict) and unit_like(got.get("model"), units) else got
+            q = M.mark_minimum(K.quote(model, term["ds"], term["de"], quote_door,
                                        lambda m: [unit] + [u for u in units if u != unit], a.no_price_models), term)
             o.update(unit=unit, quote=q)
+            if old:                                   # r3: число свободных — из старого снимка, модели не называется
+                o["line"] = FREE_OLD_LINE % (_mins(age), model, avail["date_start"], avail["date_end"])
         else:
             o["line"] = BUSY_LINE % (_mins(age), model, avail["date_start"], avail["date_end"], avail["units"])
         o["door_calls"] = self.door_calls - before
         fact = {"kind": "offer", "model": model, "date_start": o["date_from"], "date_end": o["date_to"],
                 "days": o["days"], "min_days": o["min"], "client_days": o["client"], "avail": avail["outcome"],
                 "unit": o["unit"], "units": avail["units"], "free": avail["free"], "busy": avail["busy"],
-                "age": age, "read_at": taken, "door_at": at,
+                "age": age, "read_at": taken, "door_at": at, "snap_old": old,
                 "price_outcome": q["outcome"] if q else None, "day_price": q["day_price"] if q else None,
                 "total": q["total"] if q else None, "deposit": q["deposit"] if q else None,
                 "discount": q["discount"] if q else None, "currency": "THB"}
@@ -591,7 +819,8 @@ class Journal(T.Journal):
             o = r["offer"]
             f = {"model": o["model"], "date_start": o["date_from"], "date_end": o["date_to"], "avail": o["avail"],
                  "unit": o["unit"], "units": o["units"], "free": o["free"], "busy": o["busy"],
-                 "snapshot_min": _mins(o["age"]), "door_calls": o["door_calls"], "cached": o["cached"]}
+                 "snapshot_min": _mins(o["age"]), "snapshot_old": bool(o["snap_old"]), "door_calls": o["door_calls"],
+                 "cached": o["cached"]}
             q = o["quote"] or {}
             f.update({k: q[k] for k in ("day_price", "total", "deposit", "discount") if q.get(k) is not None})
             out.append("  offer факт %s" % json.dumps(f, ensure_ascii=False))
@@ -693,7 +922,7 @@ class OfferMixin:
         # закрывающего события (признак правилу класса; блоков в сведениях нет — один обмен `before`, как в первой части)
         topic = T.pay_topic(info.get("question"), *(info.get("before") or ("", "")), blocks=info.get("blocks"),
                             now=info.get("judged"))
-        offer = Offers(self, info.get("today"))           # OFFER: вызовы offer этой сверки
+        offer = Offers(self, info.get("today"), since=info.get("last_in"))   # OFFER: вызовы offer этой сверки (r3: since)
         with M.door_budget(T.MAX_SEC - T.FALLBACK_SEC):        # плечо моста не переживёт срок сверки (AGENTDEDUP0410)
             out = run(self.call, system, user, self._tool_doors(number, upto_id), offer, number=number,
                       clock=self.clock, fresh=(lambda: self.fresh(number, upto_id)) if self.fresh else None,
@@ -745,13 +974,19 @@ class OfferMixin:
             self.log("модель: ответ не JSON или без текста — черновика нет (сверка %s, вызовов %d)"
                      % (out["state"], out["calls"]))
             return None
-        # OFFER: причины кода — с поправкой ответов offer (принятый факт снимает «агент их не видит», только если каждая
-        # модель, названная в тексте свободной, проверена свободной: иначе причина остаётся и «не совпадает с проверкой»)
-        mismatch = avail_mismatch(got["text"], facts_o, offer.bikes)
+        # OFFER: причины кода — с поправкой ответов offer (принятый факт снимает «агент их не видит», только если текст
+        # сверен с фактами целиком и слов брони в нём нет: иначе причина остаётся; не совпало — «не совпадает с
+        # проверкой», слова брони — «бронь оформляет человек»)
+        mismatch, unsure = avail_check(got["text"], facts_o, offer.bikes, info.get("today"))
+        promise = bool(offers) and book_said(got["text"])
         if mismatch:
             self.log(LOG_HEAD + L_MISMATCH % "; ".join(mismatch))
+        if unsure:
+            self.log(LOG_HEAD + L_UNSURE % "; ".join(unsure))
+        if promise:
+            self.log(LOG_HEAD + L_BOOK_SAID)
         words = [r["words"] for r in offer_reasons(info["code_reasons"], offers, facts_o, info.get("question"),
-                                                   mismatch)]
+                                                   mismatch, unsure, promise)]
         if got["lang"] not in ("ru", "en") and K.REASON_WORDS[K.R_LANGUAGE] not in words:
             words.append(K.REASON_WORDS[K.R_LANGUAGE])
         # K3-FIX шаг 3g (правило класса): тема оплаты открыта, а оплата кодом не подтверждена (принятые факты ЭТОЙ сверки;
@@ -771,7 +1006,7 @@ class OfferMixin:
                 if why_t in T.PT_OPEN else "не нужна"))
         for w in reversed(reasons):                             # «сверка не завершена» — самой первой
             words = K.reason_first(words, w)
-        words = without_avail_words(words, facts_o, mismatch)   # OFFER: пересказ «агент их не видит» при факте снят
+        words = without_avail_words(words, facts_o, mismatch or unsure or promise)   # OFFER: пересказ при факте снят
         self.log("модель: черновик %d симв. со сверкой (%s, вызовов %d, %.1f с), причин %d"
                  % (len(got["text"]), out["state"], out["calls"], out["sec"], len(words)))
         # проверка чисел кодом для низа карточки (WACARDUI0510): опора та же, что у судьи сверки — «ЦЕНА» ∪ факты

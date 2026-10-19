@@ -9,6 +9,12 @@ WA_AGENT_OFFER.
 выкл — модуля в процессе нет, класс и блок инструментов прежние; модель offer не звала — черновик и журнал равны
 родительским. Каждый случай — с близнецом.
 
+r3: причина «агент их не видит» снимается, только если текст сверен с фактами ЦЕЛИКОМ (каждая модель парка где угодно в
+тексте и каждый диапазон дат; «We have NMAX 155», «можем предложить», «…, but X is», другие даты — не снимают); слова брони
+в черновике — «бронь оформляет человек» при любом входящем; «занято» по снимку старше последнего входящего — не факт;
+слово двери «model», похожее на юнит, в строку цены не идёт; служба выключает offer КОДОМ (OFFER-OFFPIN1910) — окружение
+WA_AGENT_OFFER=1 ничего не включает.
+
 Стенд: адаптер `wa_agent_model.ModelAdapter` со сборкой-подменой (как у `test_wa_agent_tools`), поддельные снимок броней,
 дверь цены (живой формат QuotePrice.js: available, days, day_price, total, deposit, скидка словами в text) и модель по
 сценарию; служба — мир `test_wa_agent_model.World`. «Сегодня» — 21.09.2026 по Пхукету, номер выдуманный. Сети нет, модели
@@ -37,30 +43,44 @@ PROBE_MARK = "OFFER_PROBE "
 NEW_MODULE = "wa_offer_tool"
 
 
+# окружение процесса пробы (OFFER-OFFPIN1910): offer ВКЛ вместе со сверкой, бронями и ценой через ход — служба читает его
+# сама (`build(environ=None)` → os.environ), прочих WA_AGENT_* в процессе нет
+PROBE_ENV = {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1", "WA_AGENT_OFFER": "1",
+             "WA_AGENT_PRICE_CARRY": "1"}
+
+
 def _probe():
-    """Отдельный процесс: служба БЕЗ засчитанного флага (не запрошен; «0»; 1 без сверки) — модуля выпуска в процессе нет,
-    класс адаптера прежний, блок инструментов сверки без строки offer, строка старта — только у «не засчитан»."""
+    """Отдельный процесс: служба БЕЗ засчитанного offer — модуля выпуска в процессе нет, класс адаптера прежний (ни
+    примеси offer, ни цены через ход), блок инструментов сверки без строки offer, строки старта об offer нет. Прогоны:
+    флаг не запрошен; «0»; 1 без сверки; и ВКЛ окружением (OFFER-OFFPIN1910) — картой прогона (1, true + цена через ход) и
+    самим окружением процесса (`PROBE_ENV`): выкл кодом, строки старта те же, что без флага. Адаптер — свой на прогон."""
     import test_wa_agent_model as TM
     import test_wa_book_read as TB
     import wa_agent_svc as S
     import wa_agent_tools as T
-    w, br = TM.World(), TB.Bridge([])
-    br.tx_find, br.contract_find, br.contract_pdf = (lambda **k: {}), (lambda **k: {}), (lambda **k: {})
+    w = TM.World()
     env = {"queue_db": w.qpath, "agent_db": w.dbpath, "mirror_db": "", "tg_token": "", "show_chat": ""}
     seen = []
-    model, _ = S.make_model(env, bridge=br, call=lambda s, u: (seen.append(u) or json.dumps(
-        {"text": "Здравствуйте!", "lang": "ru", "handoff": [], "why": "x"}), {}), book=True, tools=True)
-    runs = []
-    for i, environ in enumerate(({"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1"},
-                                 {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1",
-                                  "WA_AGENT_OFFER": "0"},
-                                 {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_OFFER": "1"})):
-        lines = []
-        S.build(dict(env, agent_db=w.dbpath + str(i)), environ=environ, model=model, line=lines.append)
-        runs.append({"offer": [ln for ln in lines if "WA_AGENT_OFFER" in ln], "type": type(model).__name__,
-                     "n": len(lines)})
+
+    def make():
+        br = TB.Bridge([])
+        br.tx_find, br.contract_find, br.contract_pdf = (lambda **k: {}), (lambda **k: {}), (lambda **k: {})
+        return S.make_model(env, bridge=br, call=lambda s, u: (seen.append(u) or json.dumps(
+            {"text": "Здравствуйте!", "lang": "ru", "handoff": [], "why": "x"}), {}), book=True, tools=True)[0]
+    base = {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1"}
+    runs, model = [], None
+    for i, environ in enumerate((base, dict(base, WA_AGENT_OFFER="0"),
+                                 {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_OFFER": "1"},
+                                 dict(base, WA_AGENT_OFFER="1"),
+                                 dict(base, WA_AGENT_OFFER="true", WA_AGENT_PRICE_CARRY="1"),
+                                 None)):
+        model, lines, db = make(), [], w.dbpath + str(i)
+        S.build(dict(env, agent_db=db), environ=environ, model=model, line=lines.append)
+        runs.append({"offer": [ln for ln in lines if "WA_AGENT_OFFER" in ln or ln.startswith("наличие и цена по запросу")],
+                     "type": type(model).__name__, "n": len(lines), "lines": [ln.replace(db, "<db>") for ln in lines],
+                     "env": None if environ is not None else {k: os.environ.get(k) for k in sorted(PROBE_ENV)}})
     rid = w.put(TM.T0, "а свободен?")
-    model.draft(TM.NUM, rid)
+    model.draft(TM.NUM, rid)                        # адаптер последнего прогона — включённого окружением процесса
     print(PROBE_MARK + json.dumps({"runs": runs, "mods": sorted(m for m in sys.modules if m == NEW_MODULE),
                                    "offer_in_block": any("offer {" in u for u in seen),
                                    "block_head": all(u.startswith(T.TOOLS_BLOCK % T.MAX_CALLS + "\n\nСЕГОДНЯ")
@@ -139,17 +159,19 @@ class Book:
 
 
 class Door:
-    """Дверь цены живого формата: available, days, ставка 400/сут, депозит 3000, скидка за срок словами в text."""
+    """Дверь цены живого формата: available, days, ставка 400/сут, депозит 3000, скидка за срок словами в text; name —
+    слово поля «model» ответа (по умолчанию ключ модели юнита)."""
 
-    def __init__(self, available=True, discount=0, fail=None, ok=True):
+    def __init__(self, available=True, discount=0, fail=None, ok=True, name=None):
         self.available, self.discount, self.fail, self.ok, self.calls = available, discount, fail, ok, []
+        self.name = name
 
     def __call__(self, unit, ds, de):
         self.calls.append((unit, ds, de))
         if self.fail is not None:
             raise self.fail
         days = (datetime.date.fromisoformat(de) - datetime.date.fromisoformat(ds)).days
-        model = B.model_key(unit)
+        model = self.name or B.model_key(unit)
         disc = "" if self.discount is None else "скидка за срок %d%%, " % self.discount
         return {"ok": self.ok, "available": self.available, "days": days, "day_price": 400, "total": 400 * days,
                 "deposit": 3000, "season": {"label": "P3"}, "model": model,
@@ -250,6 +272,28 @@ def test_o1_tools_block_line_only_addition():
     assert s.seen[0] == s0.seen[0].replace(head, head + "\n" + O.OFFER_BLOCK, 1), (s.seen[0][:300], s0.seen[0][:300])
 
 
+def test_o1_door_model_like_unit_not_echoed():
+    """r3 (юнит — сотруднику, клиенту — модель): слово двери «model», похожее на юнит (имя юнита, его номер, «… PHUKET
+    3011»), в строку цены модели не идёт — вместо него модель парка; близнец — имя модели прайса («HONDA PCX 160», так
+    по копии моста в дереве) — как было. Юнит — по-прежнему в журнале."""
+    for name in ("PCX 160 1234", "PCX 160CC WHITE PHUKET 3011", "Honda PCX 160 1234"):
+        s = Script(offer(PCX), final(FREE_TEXT))
+        a, _d = adapter(s, door=Door(name=name))
+        a.draft(NUMBER, 5)
+        block = offer_block(s.seen[1])
+        assert "ЦЕНА: 2026-11-10, 2026-11-15 — PCX 160: 5 сут." in block, (name, block)
+        assert "1234" not in s.seen[1] and "3011" not in s.seen[1] and "PHUKET" not in s.seen[1], (name, block)
+        assert [ln for ln in a.lines if "offer факт" in ln and '"unit": "PCX 160 1234"' in ln], a.lines
+    s0 = Script(offer(PCX), final(FREE_TEXT))
+    adapter(s0, door=Door(name="HONDA PCX 160"))[0].draft(NUMBER, 5)
+    assert "ЦЕНА: 2026-11-10, 2026-11-15 — HONDA PCX 160: 5 сут." in offer_block(s0.seen[1]), offer_block(s0.seen[1])
+    units = ["PCX 160 1234", "PCX 160 5678"]
+    for name, want in (("PCX 160 1234", True), ("pcx 160 5678", True), ("PCX 160CC WHITE PHUKET 3011", True),
+                       ("HONDA PCX 160", False), ("PCX 160", False), ("YAMAHA XMAX300 2020-2022", False),
+                       ("YAMAHA XMAX 300 NEW 2023-", False), ("", False), (None, False)):
+        assert O.unit_like(name, units) is want, (name, want)
+
+
 # ══ О2: занято → альтернатива ═════════════════════════════════════════════════════════════════════════════════
 
 def test_o2_busy_then_alternative():
@@ -318,6 +362,65 @@ def test_o2_unchecked_model_called_free_keeps_reason():
     out = adapter(Script(offer(PCX), final("PCX 160 свободен, XMAX 300 тоже.", [AVAIL_WORDS])))[0].draft(NUMBER, 5)
     assert AVAIL_WORDS in out["handoff"] and O.W_AVAIL_MISMATCH in out["handoff"], out["handoff"]
     out0 = adapter(Script(offer(PCX), final("PCX 160 свободен.", [AVAIL_WORDS])))[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS not in out0["handoff"] and O.W_AVAIL_MISMATCH not in out0["handoff"], out0["handoff"]
+
+
+R3_FREE_TEXTS = ("We have NMAX 155 for these dates.", "Также можем предложить NMAX 155.", "NMAX 155 ждёт вас.",
+                 "PCX 160 isn't available, but NMAX 155 is.", "PCX 160 занят, а NMAX 155 — да.")
+
+
+def test_r3_free_claim_without_free_word_keeps_reason():
+    """r3 (замечание major, закрыто наглухо): «свободно» без слова «свободно» — «We have NMAX 155», «можем предложить»,
+    «ждёт вас», «…, but NMAX 155 is.», «…, а NMAX 155 — да.» — рядом с принятым фактом PCX 160: NMAX 155 не проверен —
+    «агент их не видит» на месте и «не совпадает с проверкой» (r2 причину снимал). Близнец: NMAX 155 проверен свободным —
+    снята, расхождения нет."""
+    for text in R3_FREE_TEXTS:
+        a, _d = adapter(Script(offer(PCX), final(text)), rows=BUSY_PCX)
+        out = a.draft(NUMBER, 5)
+        assert offers(a)[0]["facts"][0]["avail"] == B.BUSY, (text, offers(a)[0]["reason"])
+        assert AVAIL_WORDS in out["handoff"] and O.W_AVAIL_MISMATCH in out["handoff"], (text, out["handoff"])
+        assert O.LOG_HEAD + O.L_MISMATCH % (O.M_UNCHECKED % "NMAX 155") in a.lines, (text, a.lines)
+        out2 = adapter(Script(offer(PCX), offer(NMAX), final(text)), rows=BUSY_PCX)[0].draft(NUMBER, 5)
+        assert AVAIL_WORDS not in out2["handoff"] and O.W_AVAIL_MISMATCH not in out2["handoff"], (text, out2["handoff"])
+
+
+def test_r3_other_dates_keep_reason():
+    """r3: та же модель на ДРУГИЕ даты — проверено 10–15 ноября, в тексте «с 18 по 22 ноября» — причина на месте и
+    расхождение «на 18–22 не проверен»; даты без модели в соседнем предложении — тоже; близнец — даты проверки."""
+    for text, why in (("PCX 160 свободен с 18 по 22 ноября.", O.M_DATES % ("PCX 160", "с 18.11 по 22.11")),
+                      ("PCX 160 свободен. Аренда с 18 по 22 ноября — 2 000 ฿.", O.M_DATES_ANY % "с 18.11 по 22.11")):
+        a, _d = adapter(Script(offer(PCX), final(text)))
+        out = a.draft(NUMBER, 5)
+        assert AVAIL_WORDS in out["handoff"] and O.W_AVAIL_MISMATCH in out["handoff"], (text, out["handoff"])
+        assert O.LOG_HEAD + O.L_MISMATCH % why in a.lines, (text, a.lines)
+    out0 = adapter(Script(offer(PCX), final("PCX 160 свободен с 10 по 15 ноября.")))[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS not in out0["handoff"] and O.W_AVAIL_MISMATCH not in out0["handoff"], out0["handoff"]
+
+
+def test_r3_book_words_in_draft_keep_reason():
+    """r3: в тексте ЧЕРНОВИКА слова брони («забронировал», «оформим бронь», I've booked … for you) при входящем БЕЗ просьбы
+    о брони — «агент их не видит» не снята, «бронь оформляет человек» добавлена, строка журнала; близнец без слов брони —
+    снята, «бронь оформляет человек» нет. Модель offer не звала — как родитель (О6)."""
+    assert not B.book_intent(Q)
+    for text in ("PCX 160 свободен, забронировал его для вас.", "PCX 160 свободен — оформим бронь?",
+                 "PCX 160 is available, I've booked it for you."):
+        a, _d = adapter(Script(offer(PCX), final(text)))
+        out = a.draft(NUMBER, 5)
+        assert AVAIL_WORDS in out["handoff"] and B.W_BOOKING in out["handoff"], (text, out["handoff"])
+        assert O.W_AVAIL_MISMATCH not in out["handoff"] and O.LOG_HEAD + O.L_BOOK_SAID in a.lines, (text, a.lines)
+    out0 = adapter(Script(offer(PCX), final("PCX 160 свободен.")))[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS not in out0["handoff"] and B.W_BOOKING not in out0["handoff"], out0["handoff"]
+
+
+def test_r3_unsure_keeps_reason_without_words():
+    """r3: о модели в тексте нет слова наличия (и нигде больше) — «не сверено»: «агент их не видит» на месте, слов
+    расхождения нет, строка журнала «не сверено»; близнец — о той же модели сказано «свободен» в другом предложении."""
+    text = "PCX 160 свободен. Цена NMAX 155 — 400 ฿ в сутки."
+    a, _d = adapter(Script(offer(PCX), offer(NMAX), final(text)))
+    out = a.draft(NUMBER, 5)
+    assert AVAIL_WORDS in out["handoff"] and O.W_AVAIL_MISMATCH not in out["handoff"], out["handoff"]
+    assert O.LOG_HEAD + O.L_UNSURE % (O.U_STANCE % "NMAX 155") in a.lines, a.lines
+    out0 = adapter(Script(offer(PCX), offer(NMAX), final(text + " NMAX 155 тоже свободен.")))[0].draft(NUMBER, 5)
     assert AVAIL_WORDS not in out0["handoff"] and O.W_AVAIL_MISMATCH not in out0["handoff"], out0["handoff"]
 
 
@@ -456,16 +559,71 @@ def test_o4_same_pair_cached_one_door():
 
 
 def test_o4_stale_fact_not_support():
-    """(в) факт, прочитанный раньше последнего входящего клиента, — не опора: сумма без опоры, «агент их не видит» на
-    месте (новое входящее — новая сверка и новый offer)."""
+    """(в) вызов offer раньше последнего входящего клиента — не опора: сумма без опоры, «агент их не видит» на месте
+    (порядок искусственный: новое входящее обрывает сверку, `fresh`; живой порядок — `test_o4_old_snapshot_*`)."""
     s = Script(offer(PCX), final(FREE_TEXT))
     a, _d = adapter(s, last_in=T0 + 5)
     out = a.draft(NUMBER, 5)
     assert offers(a)[0]["outcome"] == T.FACT and O.accepted(offers(a), T0 + 5) == []
     assert K.MONEY_CLAIM_WORDS in out["handoff"] and AVAIL_WORDS in out["handoff"], out["handoff"]
     s2 = Script(offer(PCX), final(FREE_TEXT))
-    out2 = adapter(s2, last_in=T0 - 5)[0].draft(NUMBER, 5)
+    out2 = adapter(s2, last_in=T0 - 90)[0].draft(NUMBER, 5)
     assert K.MONEY_CLAIM_WORDS not in out2["handoff"] and AVAIL_WORDS not in out2["handoff"], out2["handoff"]
+
+
+def test_o4_old_snapshot_busy_not_fact():
+    """r3, живой порядок: снимок таблицы прочитан в T0−60, клиент написал в T0−5, offer зван в T0. «Занято» — только по
+    снимку (дверь не зовётся), а он старше входящего — не факт: «неизвестно» со словами о снимке, модели нет строки «на
+    эти даты этой модели нет», «агент их не видит» на месте и «наличие не проверено». Близнец: входящее в T0−90 (до
+    снимка) — факт «занято», причина снята."""
+    text = "PCX 160 на эти даты занят."
+    s = Script(offer(PCX), final(text))
+    a, door = adapter(s, rows=BUSY_PCX, last_in=T0 - 5)
+    out = a.draft(NUMBER, 5)
+    r = offers(a)[0]
+    assert (r["outcome"], r["offer"]["code"], r["reason"], r["facts"]) == (T.UNKNOWN, "old_busy", O.W_OLD_BUSY % 1, []), r
+    assert door.calls == [] and r["read_at"] == T0 - 60.0 and r["at"] == T0, (door.calls, r["read_at"])
+    block = offer_block(s.seen[1])
+    assert O.NOT_LINE % (O.W_OLD_BUSY % 1, O.ADV_LATER) in block and "заняты все" not in block, block
+    assert AVAIL_WORDS in out["handoff"] and B.W_AVAIL_UNKNOWN in out["handoff"], out["handoff"]
+    assert not [ln for ln in a.lines if "offer факт" in ln], a.lines
+    a0, _d0 = adapter(Script(offer(PCX), final(text)), rows=BUSY_PCX, last_in=T0 - 90)
+    out0 = a0.draft(NUMBER, 5)
+    assert offers(a0)[0]["outcome"] == T.FACT and offers(a0)[0]["facts"][0]["avail"] == B.BUSY
+    assert AVAIL_WORDS not in out0["handoff"] and B.W_AVAIL_UNKNOWN not in out0["handoff"], out0["handoff"]
+
+
+def test_o4_old_snapshot_free_is_fact_without_counts():
+    """r3: «свободно» сверено дверью цены В МОМЕНТ ВЫЗОВА — при снимке старше входящего это факт (причина снята, цена —
+    опора), но число свободных из старого снимка модели не называется; в журнале — «снимок старше». Близнец: снимок
+    после входящего — строка с числом «свободно 2 из 2»."""
+    s = Script(offer(PCX), final(FREE_TEXT))
+    a, door = adapter(s, last_in=T0 - 5)
+    out = a.draft(NUMBER, 5)
+    r = offers(a)[0]
+    assert r["outcome"] == T.FACT and r["facts"][0]["snap_old"] is True and len(door.calls) == 1, r
+    block = offer_block(s.seen[1])
+    assert O.FREE_OLD_LINE % (1, "PCX 160", "2026-11-10", "2026-11-15") in block, block
+    assert "свободно 2 из 2" not in block and "ЦЕНА: 2026-11-10, 2026-11-15 — PCX 160" in block, block
+    assert AVAIL_WORDS not in out["handoff"] and K.MONEY_CLAIM_WORDS not in out["handoff"], out["handoff"]
+    assert [ln for ln in a.lines if "offer факт" in ln and '"snapshot_old": true' in ln], a.lines
+    s0 = Script(offer(PCX), final(FREE_TEXT))
+    adapter(s0, last_in=T0 - 90)[0].draft(NUMBER, 5)
+    assert "свободно 2 из 2" in offer_block(s0.seen[1]), offer_block(s0.seen[1])
+
+
+def test_o4_accepted_busy_on_snapshot_time_pure():
+    """`accepted`: «занято» — по времени СНИМКА (`read_at`) против последнего входящего; «свободно» — по времени вызова
+    (ответ двери); времени снимка нет — «занято» не принято; входящего нет — не судим (как `T.stale`)."""
+    busy = {"outcome": T.FACT, "at": T0, "read_at": T0 - 60, "offer": {"model": "PCX 160", "avail": B.BUSY,
+                                                                      "date_from": "2026-11-10", "date_to": "2026-11-15"}}
+    free = dict(busy, offer=dict(busy["offer"], avail=B.FREE))
+    blind = dict(busy, read_at=None)
+    assert O.accepted([busy], T0 - 5) == [] and O.accepted([busy], T0 - 90) == [busy] and O.accepted([busy]) == [busy]
+    assert O.accepted([free], T0 - 5) == [free] and O.accepted([free], T0 + 5) == []
+    assert O.accepted([blind], T0 - 5) == [] and O.accepted([blind]) == [blind]
+    assert O.snap_fresh(T0, T0) and not O.snap_fresh(T0 - 1, T0) and not O.snap_fresh(None, T0)
+    assert not O.snap_fresh(True, 0) and O.snap_fresh(None, None)
 
 
 def test_o4_over_limit_fallback_drops_offers():
@@ -588,6 +746,7 @@ def test_o6_no_offer_call_equals_parent():
                               [AVAIL_WORDS, "нужна скидка"])), {"terms": OTHER_TERM}),
         (lambda: Script({"text": "Hello", "handoff": [], "lang": "th", "why": "x"}), {"hint": True}),
         (lambda: Script(final("Здравствуйте, подскажу.")), {"conv": ("en", 3, 3)}),
+        (lambda: Script(final("Забронировал PCX 160 для вас, свободен.")), {}),   # r3: слова брони без offer
         (lambda: Script(final("Свободен, скидка за срок 0%, 2 800 бат.")), {"price": {
             "line": "2026-11-10, 2026-11-17 — PCX 160: 7 сут., 400 ฿ в сутки, итого 2 800 ฿ за срок; скидка за срок 0%.",
             "outcome": "number", "discount": 0, "days": 7, "date_start": "2026-11-10", "date_end": "2026-11-17"}}),
@@ -608,20 +767,27 @@ def test_o6_no_offer_call_equals_parent():
 
 
 def test_o6_flag_off_service_probe():
-    """(з) Флаг не запрошен, «0» или 1 без сверки: модуля выпуска в процессе нет, класс адаптера прежний, строки старта
-    нет (у «не засчитан» — есть), блок инструментов сверки без строки offer."""
+    """(з) + OFFER-OFFPIN1910: отдельный процесс, окружение которого САМО просит offer (WA_AGENT_OFFER=1 вместе с
+    WA_AGENT_TOOLS, WA_AGENT_BOOK_READ и WA_AGENT_PRICE_CARRY). Флаг не запрошен, «0», 1 без сверки, 1 и true картой
+    прогона, 1 окружением процесса — модуля выпуска в процессе нет ни в одном прогоне, класс адаптера прежний (ни
+    примеси offer, ни цены через ход), строки старта об offer нет (и «не засчитан» тоже: окружение не читается), строки
+    старта включённых прогонов те же, что у невключённого; блок инструментов сверки без строки offer."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("WA_AGENT_")}
+    env.update(PROBE_ENV, PYTHONIOENCODING="utf-8")
     p = subprocess.run([sys.executable, os.path.abspath(__file__), PROBE_ARG], capture_output=True, timeout=300,
-                       env=dict(os.environ, PYTHONIOENCODING="utf-8"), cwd=ROOT)
+                       env=env, cwd=ROOT)
     out = p.stdout.decode("utf-8", "replace")
     line = next((ln for ln in out.splitlines() if ln.startswith(PROBE_MARK)), None)
     assert p.returncode == 0 and line, (p.returncode, out[-800:], p.stderr.decode("utf-8", "replace")[-800:])
     got = json.loads(line[len(PROBE_MARK):])
     assert got["mods"] == [], got["mods"]
     runs = got["runs"]
-    assert [r["type"] for r in runs] == ["ModelAdapter"] * 3, runs
-    assert runs[0]["offer"] == [] and runs[1]["offer"] == [] and runs[0]["n"] == runs[1]["n"], runs
-    assert runs[2]["offer"] == ["наличие и цена по запросу модели (WA_AGENT_OFFER): не засчитан — флаг 1, но сверки "
-                                "Т4а нет (WA_AGENT_TOOLS выкл или адаптер не собран): инструмента offer нет"], runs[2]
+    assert [r["type"] for r in runs] == ["ModelAdapter"] * 6, [r["type"] for r in runs]
+    assert [r["offer"] for r in runs] == [[]] * 6, [r["offer"] for r in runs]
+    assert runs[5]["env"] == PROBE_ENV, runs[5]["env"]                        # окружение процесса и правда просило ВКЛ
+    assert runs[1]["lines"] == runs[0]["lines"] and runs[0]["n"] > 0, (runs[0]["lines"], runs[1]["lines"])
+    for r in runs[3:]:
+        assert r["lines"] == runs[0]["lines"], [x for x in r["lines"] if x not in runs[0]["lines"]]
     assert got["calls"] >= 1 and not got["offer_in_block"] and got["block_head"], got
 
 
@@ -676,18 +842,70 @@ def test_o7_parent_drift_refuses():
     assert O.drift() == [], O.drift()
 
 
-def test_o7_build_line_and_order_with_book_ctx():
-    """Служба: строка старта «вкл»; примесь надевается ПОСЛЕ наличия по переписке — класс «offer + bookctx + адаптер»."""
+def _svc_world():
     import test_wa_agent_model as TM
     import test_wa_book_read as TB
     import wa_agent_svc as S
-    w, br = TM.World(), TB.Bridge([])
-    br.tx_find, br.contract_find, br.contract_pdf = (lambda **k: {}), (lambda **k: {}), (lambda **k: {})
+    w = TM.World()
     env = {"queue_db": w.qpath, "agent_db": w.dbpath, "mirror_db": "", "tg_token": "", "show_chat": ""}
-    model, _ = S.make_model(env, bridge=br, call=lambda s, u: ("", {}), book=True, tools=True)
-    lines = []
-    S.build(env, environ={"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1",
-                          "WA_AGENT_BOOK_CTX": "1", "WA_AGENT_OFFER": "1"}, model=model, line=lines.append)
+
+    def make():
+        br = TB.Bridge([])
+        br.tx_find, br.contract_find, br.contract_pdf = (lambda **k: {}), (lambda **k: {}), (lambda **k: {})
+        return S.make_model(env, bridge=br, call=lambda s, u: ("", {}), book=True, tools=True)[0]
+    return S, w, env, make
+
+
+def test_o7_build_env_on_pinned_off():
+    """OFFER-OFFPIN1910: окружение просит ВКЛ («1», «true»; с наличием по переписке и ценой через ход и без) — `build()`
+    даёт `offer_of` свою карту «0»: `import wa_offer_tool` не исполнялся ни разу (подмена `__import__`), примеси нет,
+    строки старта об offer нет, строки старта те же, что без флага."""
+    import builtins
+    S, w, env, make = _svc_world()
+    on = {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1"}
+    real_import, asked = builtins.__import__, []
+
+    def spy(name, *a, **k):
+        if name.split(".")[0] == NEW_MODULE:
+            asked.append(name)
+        return real_import(name, *a, **k)
+    got = {}
+    for key, extra in (("off", {}), ("1", {S.F_OFFER: "1"}), ("true", {S.F_OFFER: "true"}),
+                       ("ctx", {S.F_BOOK_CTX: "1"}), ("ctx1", {S.F_BOOK_CTX: "1", S.F_OFFER: "1",
+                                                               S.F_PRICE_CARRY: "1"})):
+        model, lines = make(), []
+        builtins.__import__ = spy
+        try:
+            S.build(dict(env, agent_db=w.dbpath + key), environ=dict(on, **extra), model=model, line=lines.append)
+        finally:
+            builtins.__import__ = real_import
+        assert not any(c is O.OfferMixin for c in type(model).__mro__), (key, type(model).__mro__)
+        assert type(model).__name__ == ("BookCtxModelAdapter" if S.F_BOOK_CTX in extra else "ModelAdapter"), key
+        assert [ln for ln in lines if S.F_OFFER in ln or ln.startswith("наличие и цена по запросу")] == [], key
+        got[key] = lines
+    assert asked == [], asked
+    assert got["1"] == got["off"] and got["true"] == got["off"] and got["ctx1"] == got["ctx"], got
+
+
+def test_o7_build_line_and_order_explicit_on():
+    """Включение — только ЯВНОЙ подменой карты (как PRICECARRY-OFFPIN1810): `S.offer_of` на время `build` заменён
+    обёрткой, которая записывает карту службы (обязана быть ровно {флаг: «0»}) и зовёт ту же функцию с картой «1» (со
+    сверкой и бронями). Тогда строка старта «вкл» — после строки наличия по переписке, примесь надета ПОСЛЕ наличия по
+    переписке — класс «offer + bookctx + адаптер»."""
+    S, w, env, make = _svc_world()
+    model, lines, pins = make(), [], []
+    real = S.offer_of
+
+    def offer_on(pin, model):
+        pins.append(dict(pin))
+        return real({S.F_OFFER: "1", S.F_TOOLS: "1", S.F_BOOK: "1"}, model)
+    S.offer_of = offer_on
+    try:
+        S.build(env, environ={"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1",
+                              "WA_AGENT_BOOK_CTX": "1", "WA_AGENT_OFFER": "1"}, model=model, line=lines.append)
+    finally:
+        S.offer_of = real
+    assert pins == [{S.F_OFFER: "0"}], pins
     assert type(model).__name__ == "OfferBookCtxModelAdapter", type(model).__mro__
     got = [ln for ln in lines if "WA_AGENT_OFFER" in ln]
     assert len(got) == 1 and got[0].startswith("наличие и цена по запросу модели (WA_AGENT_OFFER): вкл — "), got
@@ -737,67 +955,169 @@ def test_o8_offer_reasons_mismatch_pure():
     assert O.without_avail_words([AVAIL_WORDS, "x"], got) == ["x"]
 
 
-def _f(model, avail):
-    return {"outcome": T.FACT, "offer": {"model": model, "avail": avail}}
+def _f(model, avail, ds="2026-11-10", de="2026-11-15", asked=None):
+    """Принятый факт offer для голденов: модель, исход, даты (по умолчанию пара PCX), конец клиента до минимума."""
+    return {"outcome": T.FACT, "offer": {"model": model, "avail": avail, "date_from": ds, "date_to": de,
+                                         "asked_to": asked or de}}
 
 
-PB, PF, NF = _f("PCX 160", B.BUSY), _f("PCX 160", B.FREE), _f("NMAX 155", B.FREE)
+PB, PF, NF, NB = _f("PCX 160", B.BUSY), _f("PCX 160", B.FREE), _f("NMAX 155", B.FREE), _f("NMAX 155", B.BUSY)
+PB18, PF18 = _f("PCX 160", B.BUSY, "2026-11-18", "2026-11-22"), _f("PCX 160", B.FREE, "2026-11-18", "2026-11-22")
+NF_MIN = _f("NMAX 155", B.FREE, asked="2026-11-12")     # клиент 10–12, проверен минимум класса 10–15
+NB_MIN = _f("NMAX 155", B.BUSY, asked="2026-11-12")
 BARE = [O.M_BARE]
+P, N = "PCX 160", "NMAX 155"
+# (текст, принятые факты, расхождение, не сверено) — `avail_check`; r2-голдены с датами фактов, поменялись два — помечены
 MISMATCH_GOLDENS = [
     # занятое названо свободным — RU, EN, слабое слово, «не занят», сокращение без кубатуры
-    ("PCX 160 на эти даты свободен.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 на 10–15 ноября свободен. Свободен NMAX 155: 400 ฿ в сутки.", [PB, NF], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 и NMAX 155 свободны.", [PB, NF], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 свободен. Да, PCX 160 свободен!", [PB], [O.M_BUSY % "PCX 160"]),          # одно расхождение — один раз
-    ("PCX 160 не занят.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 на эти даты не забронирован.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 is not booked.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("Нет занятых — PCX 160 ждёт вас.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 is available for these dates.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 есть на эти даты.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 в наличии.", [PB], [O.M_BUSY % "PCX 160"]),
-    ("pcx свободен", [PB], [O.M_BUSY % "PCX 160"]),
-    ("PCX 160 свободен с 10 по 15, на 18–22 нет.", [PF, PB], [O.M_BOTH % "PCX 160"]),
+    ("PCX 160 на эти даты свободен.", [PB], [O.M_BUSY % P], []),
+    ("PCX 160 на 10–15 ноября свободен. Свободен NMAX 155: 400 ฿ в сутки.", [PB, NF], [O.M_BUSY % P], []),
+    ("PCX 160 и NMAX 155 свободны.", [PB, NF], [O.M_BUSY % P], []),
+    ("PCX 160 свободен. Да, PCX 160 свободен!", [PB], [O.M_BUSY % P], []),          # одно расхождение — один раз
+    ("PCX 160 не занят.", [PB], [O.M_BUSY % P], []),
+    ("PCX 160 на эти даты не забронирован.", [PB], [O.M_BUSY % P], []),
+    ("PCX 160 is not booked.", [PB], [O.M_BUSY % P], []),
+    ("Нет занятых — PCX 160 ждёт вас.", [PB], [O.M_BUSY % P], []),
+    ("PCX 160 is available for these dates.", [PB], [O.M_BUSY % P], []),
+    ("PCX 160 есть на эти даты.", [PB], [O.M_BUSY % P], []),
+    ("PCX 160 в наличии.", [PB], [O.M_BUSY % P], []),
+    ("pcx свободен", [PB], [O.M_BUSY % P], []),
+    # r3 (было M_BOTH при фактах без дат): у каждого окна текста свой факт — «свободен с 10 по 15» и «на 18–22 нет»
+    # совпали; без дат в тексте при «свободно» на одни даты и «занято» на другие — по-прежнему расхождение
+    ("PCX 160 свободен с 10 по 15, на 18–22 нет.", [PF, PB18], [], []),
+    ("PCX 160 свободен.", [PF, PB18], [O.M_BOTH % P], []),
     # не проверена, не из парка, не определена
-    ("PCX 160 свободен, XMAX 300 тоже.", [PF], [O.M_UNCHECKED % "XMAX 300"]),
-    ("Vespa 150 свободна.", [PF], [O.M_FOREIGN % "Vespa 150"]),
-    ("CB свободен.", [PF], [O.M_ALIAS % "CB"]),
+    ("PCX 160 свободен, XMAX 300 тоже.", [PF], [O.M_UNCHECKED % "XMAX 300"], []),
+    ("Vespa 150 свободна.", [PF], [O.M_FOREIGN % "Vespa 150"], []),
+    ("CB свободен.", [PF], [O.M_ALIAS % "CB"], []),
     # «свободно» без модели при занятом
-    ("Да, свободен!", [PB], BARE),
-    ("Да, есть!", [PB], BARE),
-    ("Да, на эти даты есть.", [PB], BARE),
-    ("Yes, it's free.", [PB], BARE),
-    ("PCX 160 занят, но есть другие варианты.", [PB], BARE),
-    ("PCX 160 занят до 9 ноября, а с 10 по 15 свободен.", [PB], BARE),
+    ("Да, свободен!", [PB], BARE, []),
+    ("Да, есть!", [PB], BARE, []),
+    ("Да, на эти даты есть.", [PB], BARE, []),
+    ("Yes, it's free.", [PB], BARE, []),
+    ("PCX 160 занят, но есть другие варианты.", [PB], BARE, []),
+    # r3 (было BARE): «с 10 по 15 свободен» в части без модели — о PCX 160 своего предложения, а он на 10–15 занят
+    ("PCX 160 занят до 9 ноября, а с 10 по 15 свободен.", [PB], [O.M_BUSY % P], []),
     # совпало: занятое названо занятым, альтернатива проверена, «свободно» без модели при одном свободном
-    ("PCX 160 на эти даты занят.", [PB], []),
-    ("PCX 160 на 10–15 ноября занят. Свободен NMAX 155: 400 ฿ в сутки, итого 2 000 ฿.", [PB, NF], []),
-    ("PCX 160 занят, но свободен NMAX 155.", [PB, NF], []),
-    ("PCX 160: занят, NMAX 155: свободен.", [PB, NF], []),
-    ("PCX 160 занят, есть другой вариант — NMAX 155.", [PB, NF], []),
-    ("PCX 160 isn't available, but NMAX 155 is free.", [PB, NF], []),
-    ("PCX 160 unavailable, NMAX 155 available.", [PB, NF], []),
-    ("PCX 160 не свободен на эти даты.", [PB], []),
-    ("Свободных PCX 160 на эти даты нет.", [PB], []),
-    ("PCX 160 нет в наличии.", [PB], []),
-    ("PCX 160 недоступен.", [PB], []),
-    ("PCX 160 is not available for these dates.", [PB], []),
-    ("PCX 160 занят, доставка есть.", [PB], []),
-    ("Free delivery. PCX 160 is booked.", [PB], []),
-    ("Коллега проверит наличие и вернётся.", [PB], []),
-    ("Да, свободен!", [PF], []),
-    ("THB 400 в сутки, PCX 160 свободен.", [PF], []),
-    (FREE_TEXT, [PF], []),
-    ("PCX 160 свободен.", [], []),                                   # фактов нет — снимать нечего
+    ("PCX 160 на эти даты занят.", [PB], [], []),
+    ("PCX 160 на 10–15 ноября занят. Свободен NMAX 155: 400 ฿ в сутки, итого 2 000 ฿.", [PB, NF], [], []),
+    ("PCX 160 занят, но свободен NMAX 155.", [PB, NF], [], []),
+    ("PCX 160: занят, NMAX 155: свободен.", [PB, NF], [], []),
+    ("PCX 160 занят, есть другой вариант — NMAX 155.", [PB, NF], [], []),
+    ("PCX 160 isn't available, but NMAX 155 is free.", [PB, NF], [], []),
+    ("PCX 160 unavailable, NMAX 155 available.", [PB, NF], [], []),
+    ("PCX 160 не свободен на эти даты.", [PB], [], []),
+    ("Свободных PCX 160 на эти даты нет.", [PB], [], []),
+    ("PCX 160 нет в наличии.", [PB], [], []),
+    ("PCX 160 недоступен.", [PB], [], []),
+    ("PCX 160 is not available for these dates.", [PB], [], []),
+    ("PCX 160 занят, доставка есть.", [PB], [], []),
+    ("Free delivery. PCX 160 is booked.", [PB], [], []),
+    ("Коллега проверит наличие и вернётся.", [PB], [], []),
+    ("Да, свободен!", [PF], [], []),
+    ("THB 400 в сутки, PCX 160 свободен.", [PF], [], []),
+    (FREE_TEXT, [PF], [], []),
+    ("PCX 160 свободен.", [], [], []),                               # фактов нет — снимать нечего
+    # ── r3: «свободно» без слова «свободно» (r2 пропускал): we have, можем предложить, ждёт вас, «…, but X is», «а X — да»
+    ("We have NMAX 155 for these dates.", [PF], [O.M_UNCHECKED % N], []),
+    ("We have NMAX 155 for these dates.", [PF, NB], [O.M_BUSY % N], []),
+    ("We have NMAX 155 for these dates.", [PF, NF], [], []),
+    ("Также можем предложить NMAX 155.", [PF], [O.M_UNCHECKED % N], []),
+    ("Также можем предложить NMAX 155.", [PB, NB], [O.M_BUSY % N], []),
+    ("Также можем предложить NMAX 155.", [PB, NF], [], []),
+    ("NMAX 155 ждёт вас.", [PF], [O.M_UNCHECKED % N], []),
+    ("NMAX 155 ждёт вас.", [NB], [O.M_BUSY % N], []),
+    ("NMAX 155 ждёт вас.", [NF], [], []),
+    ("PCX 160 isn't available, but NMAX 155 is.", [PB], [O.M_UNCHECKED % N], []),
+    ("PCX 160 isn't available, but NMAX 155 is.", [PB, NB], [O.M_BUSY % N], []),
+    ("PCX 160 isn't available, but NMAX 155 is.", [PB, NF], [], []),
+    ("PCX 160 занят, а NMAX 155 — да.", [PB], [O.M_UNCHECKED % N], []),
+    ("PCX 160 занят, а NMAX 155 — да.", [PB, NB], [O.M_BUSY % N], []),
+    ("PCX 160 занят, а NMAX 155 — да.", [PB, NF], [], []),
+    ("PCX 160 свободен, а NMAX 155 — нет.", [PF, NF], [O.M_FREE % N], []),
+    ("PCX 160 свободен, а NMAX 155 — нет.", [PF, NB], [], []),
+    ("PCX 160 is booked, but we can offer NMAX 155.", [PB], [O.M_UNCHECKED % N], []),
+    ("PCX 160 is booked, but we can offer NMAX 155.", [PB, NF], [], []),
+    ("PCX 160 занят, NMAX 155 — свободен.", [PB, NF], [], []),        # слово в следующей части без модели — о NMAX
+    ("PCX 160 занят и NMAX 155 свободен.", [PB, NF], [], []),         # «и» делит части: у каждой модели своё слово
+    ("PCX 160 is available, daily 400 THB.", [PF], [], []),           # за числом валюта — сумма, не модель
+    # ── r3: обратное — проверено «свободно», а названо занятым
+    ("PCX 160 на эти даты занят.", [PF], [O.M_FREE % P], []),
+    ("PCX 160 на 10–15 ноября занят.", [PF], [O.M_FREE % P], []),
+    ("PCX 160 занят.", [PF, PB18], [O.M_FREE_SOME % P], []),
+    # ── r3: та же модель на ДРУГИЕ даты; даты без модели — у любого факта; без месяца — по числам дней
+    ("PCX 160 свободен с 18 по 22 ноября.", [PF], [O.M_DATES % (P, "с 18.11 по 22.11")], []),
+    ("PCX 160 is available from 18 to 22 November.", [PF], [O.M_DATES % (P, "с 18.11 по 22.11")], []),
+    ("PCX 160 свободен с 18 по 22.", [PF], [O.M_DATES % (P, "с 18 по 22 (месяц не назван)")], []),
+    ("PCX 160 свободен на 18–22.", [PF], [O.M_DATES % (P, "18–22 (месяц не назван)")], []),
+    ("PCX 160 свободен. С 18 по 22 ноября — 2 000 ฿.", [PF], [O.M_DATES_ANY % "с 18.11 по 22.11"], []),
+    ("PCX 160 свободен. С 18 по 22 ноября свободно.", [PF, _f(N, B.BUSY, "2026-11-18", "2026-11-22")],
+     [O.M_DATES_DIFF % "с 18.11 по 22.11"], []),
+    ("PCX 160 свободен с 10 по 15 ноября.", [PF], [], []),
+    ("PCX 160 свободен на 10–15.", [PF], [], []),
+    ("PCX 160 свободен на 10 - 15 ноября.", [PF], [], []),         # тире с пробелами внутри диапазона части не делит
+    ("PCX 160 свободен. С 10 по 15 ноября — 2 000 ฿.", [PF], [], []),
+    ("PCX 160 свободен с 18 по 22 ноября.", [PF, PF18], [], []),
+    ("PCX 160 на 10–15 ноября занят, свободен с 18 по 22 ноября.", [PB, PF18], [], []),
+    ("PCX 160 на 10–15 ноября занят, свободен с 18 по 22 ноября.", [PB, PB18], [O.M_BUSY % P], []),
+    ("PCX 160 на 1-2 дня свободен.", [PF], [], []),                  # «на 1-2 дня» — счёт суток, а не даты
+    # даты в части без модели и без слова наличия — о модели предложения: её «свободен» судится на эти даты
+    ("PCX 160 свободен, аренда с 18 по 22 ноября.", [PF, PB18], [O.M_BUSY % P], []),
+    ("PCX 160 свободен, аренда с 18 по 22 ноября.", [PB, PF18], [], []),
+    # ── r3: срок на минимум класса — «свободно» минимума покрывает короткий срок клиента, «занято» минимума — нет
+    ("NMAX 155 свободен с 10 по 12 ноября.", [NF_MIN], [], []),
+    ("NMAX 155 на 10–12 ноября занят.", [NB_MIN], [O.M_DATES % (N, "с 10.11 по 12.11")], []),
+    # ── r3: не сверено — о модели нет слова наличия (и нигде больше), сокращение без слова, «we have no»
+    ("Цена NMAX 155 — 400 ฿ в сутки.", [PF], [], [O.U_UNCHECKED % N]),
+    ("Цена NMAX 155 — 400 ฿ в сутки.", [PF, NF], [], [O.U_STANCE % N]),
+    ("PCX 160 свободен. PCX 160 стоит 400 ฿ в сутки.", [PF], [], []),
+    ("Про CB уточню.", [PF], [], [O.U_ALIAS % "CB"]),
+    ("We have no PCX 160 for these dates.", [PB], [], [O.U_STANCE % P]),
+    ("PCX 160 is available, the price is 400 THB per day.", [PF], [], []),     # «is 400 THB» — сумма, не модель
 ]
 
 
-def test_o8_avail_mismatch_goldens():
-    """`avail_mismatch`: каждая модель, названная свободной, — только при факте «свободно» и без «занято»."""
-    bad = [(t, want, got) for t, facts, want in MISMATCH_GOLDENS
-           for got in [O.avail_mismatch(t, facts, BIKES)] if got != want]
+def test_o8_avail_check_goldens():
+    """`avail_check` (r3): каждая модель парка в тексте и каждый диапазон дат — с принятым фактом и тем же исходом;
+    расхождение и «не сверено» — раздельно."""
+    bad = [(t, want, got) for t, facts, *want in MISMATCH_GOLDENS
+           for got in [list(O.avail_check(t, facts, BIKES, TODAY))] if got != want]
     assert not bad, bad
-    assert O.avail_mismatch("PCX 160 свободен.", [PF], None) == [O.M_FOREIGN % "PCX 160"], "парка нет — не сверено"
+    assert O.avail_check("PCX 160 свободен.", [PF], None, TODAY) == ([O.M_FOREIGN % P], []), "парка нет — не сверено"
+    # «сегодня» не передано — по часам Пхукета, а не «дат нет»: другие даты по-прежнему расхождение
+    assert O.avail_check("PCX 160 свободен с 18 по 22 ноября.", [PF], BIKES)[0] == [O.M_DATES % (P, "с 18.11 по 22.11")]
+
+
+BOOK_SAID = [("Забронировал PCX 160 для вас.", True), ("PCX 160 забронирован на эти даты.", True),
+             ("Оформим бронь на PCX 160.", True), ("Ваша бронь подтверждена.", True), ("Бронирую PCX 160.", True),
+             ("PCX 160 reserved for you.", True), ("I've booked PCX 160 for you.", True),
+             ("We can book it for you.", True), ("Your booking is confirmed.", True), ("PCX 160 is reserved.", True),
+             ("I'll reserve it.", True),
+             ("PCX 160 свободен.", False), ("PCX 160 is booked.", False), ("Free delivery.", False),
+             ("Коллега проверит наличие и вернётся.", False), (FREE_TEXT, False), ("", False), (None, False)]
+
+
+def test_r3_book_said_goldens():
+    """Слова брони в тексте черновика (r3): заброн*/бронир*/оформ*/бронь, reserved, booked for you, I/we book."""
+    bad = [(t, want) for t, want in BOOK_SAID if O.book_said(t) is not want]
+    assert not bad, bad
+
+
+def test_r3_offer_reasons_unsure_and_promise_pure():
+    """`offer_reasons`: «не сверено» — «агент их не видит» не снята, новых слов нет; слова брони в тексте — не снята и
+    «бронь оформляет человек» (один раз, и при просьбе клиента о брони); ответов offer нет — причины прежние."""
+    got = [{"outcome": T.FACT, "offer": {"model": "PCX 160", "avail": B.FREE, "quote": None, "gate": None}}]
+    base = K.handoff(Q, None)
+    out = O.offer_reasons(base, got, got, Q, [], ["NMAX 155 — не разобрано, свободен или занят"])
+    assert out == base, out
+    out = O.offer_reasons(base, got, got, Q, promise=True)
+    assert [r["reason"] for r in out] == [r["reason"] for r in base] + [B.R_BOOKING], out
+    assert out[-1] == {"reason": B.R_BOOKING, "words": B.W_BOOKING, "why": "offer: слова брони в тексте черновика"}
+    ask = "а свободен? хочу забронировать"
+    out = O.offer_reasons(K.handoff(ask, None), got, got, ask, promise=True)
+    assert [r["reason"] for r in out].count(B.R_BOOKING) == 1 and K.R_AVAILABILITY in [r["reason"] for r in out], out
+    assert O.offer_reasons(base, [], [], Q, promise=True) == base
+    assert O.without_avail_words([AVAIL_WORDS], got, True) == [AVAIL_WORDS]
 
 
 def test_o8_judged_price_same_object_without_facts():
