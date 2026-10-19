@@ -120,6 +120,17 @@
                     ни импорта `wa_price_carry`, ни строки старта, класс адаптера прежний. С PRICECARRY-OFFPIN1810 —
                     выкл КОДОМ: `build()` даёт `price_carry_of` свою карту «0», значение в окружении не читается и не
                     включает ничего; включение — отдельной правкой кода.
+  WA_AGENT_OFFER — наличие и цена по запросу модели (OFFER1910, отрезок inquiry-to-booking, `wa_offer_tool`): в сверке
+                    Т4а модель сама зовёт инструмент offer {model, date_from, date_to} по паре, которую поняла из
+                    переписки; код сверяет модель с живым парком и даты, ворота цены прежние (от 30 суток, стык сезонов —
+                    «считает человек»; снимка или двери нет — «неизвестно»), дальше те же `free_bikes` и `K.quote` —
+                    один вызов двери цены на пару; занято — модель может проверить другую модель или даты, не больше 3
+                    вызовов offer на сверку. Факт — с источником, временем снимка и подтверждённым юнитом (юнит — только
+                    в журнал сотруднику); цены факта — опора суда денег. Засчитывается ТОЛЬКО вместе с WA_AGENT_TOOLS,
+                    WA_AGENT_BOOK_READ и адаптером модели с дверью цены. Примесь надевается в `build()` на уже выбранный
+                    класс адаптера (после примесей наличия и цены); `make_model` и `models_of` не тронуты. Брони не
+                    пишутся, клиенту — только по «Отправить». По умолчанию выкл: ни импорта `wa_offer_tool`, ни строки
+                    старта, класс адаптера и блок инструментов прежние.
 НАСТРОЙКА WA_AGENT_LESSON_ADMINS — id Telegram через запятую: кто переводит урок в действующие и откатывает.
   Нет — владелец (те же id, что splinter.OWNER_IDS); битая — только владелец; исход — строкой на старте.
 НАСТРОЙКА WA_AGENT_GREET_SHA256 — отпечаток текста автоприветствия WhatsApp Business (WAGREETECHO0210):
@@ -204,6 +215,7 @@ F_HINTS = "WA_AGENT_HINTS"                # пояснение → правил�
 F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чтение: наличие и конец аренды (WABOOKTOOLS0210)
 F_BOOK_CTX = "WA_AGENT_BOOK_CTX"          # наличие по переписке (BOOKCTX1610); по умолчанию выкл; не в FLAGS
 F_PRICE_CARRY = "WA_AGENT_PRICE_CARRY"    # цена через ход (PRICECARRY1610); по умолчанию выкл; не в FLAGS
+F_OFFER = "WA_AGENT_OFFER"                # наличие и цена по запросу модели (OFFER1910); по умолчанию выкл; не в FLAGS
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
 F_ATTACH = "WA_AGENT_ATTACH"              # PDF договора второй частью «Отправить» (NIGHT0710-B3v); не в FLAGS
@@ -1105,6 +1117,42 @@ def price_carry_of(environ, model):
                   "модель сменилась — расчёт не вызван, число не называется; клиенту — только по «Отправить»")
 
 
+def offer_of(environ, model):
+    """OFFER1910: флаг WA_AGENT_OFFER → (засчитан? | None, слова строки старта | None). Правило флага — одно со всеми
+    выключателями (`flag_on`). Не запрошен — (None, None): ни импорта `wa_offer_tool`, ни строки, класс адаптера и блок
+    инструментов прежние. Засчитывается только при сверке Т4а (WA_AGENT_TOOLS: `model.tools`), бронях
+    (WA_AGENT_BOOK_READ: `model.book`) и двери цены с парком (`model.door`, `model.fleet`). Засчитан — у уже собранного
+    адаптера (`ModelAdapter`, `ContractStateAdapter`, с примесями наличия и цены или без) класс меняется на «примесь +
+    прежний» (`with_offer`): `make_model` и `models_of` не тронуты. Модуль не собрался или копия сверки не сверена с
+    родителем — адаптер прежний, слова «не засчитан»."""
+    if not wa_agent_tg.flag_on(environ.get(F_OFFER)):
+        return None, None
+    if model is None or not wa_agent_tg.flag_on(environ.get(F_TOOLS)) or getattr(model, "tools", None) is None:
+        return False, ("не засчитан — флаг 1, но сверки Т4а нет (%s выкл или адаптер не собран): инструмента offer нет"
+                       % F_TOOLS)
+    if not wa_agent_tg.flag_on(environ.get(F_BOOK)) or getattr(model, "book", None) is None:
+        return False, "не засчитан — флаг 1, но брони (%s) выключены: наличие не читается" % F_BOOK
+    if getattr(model, "door", None) is None or getattr(model, "fleet", None) is None:
+        return False, "не засчитан — флаг 1, но у модели нет двери цены (%s выкл или адаптер не собран)" % F_DRAFTS
+    try:
+        import wa_offer_tool
+    except Exception as e:                                           # noqa: BLE001
+        # подкласс ImportError (ModuleNotFoundError и пр.) — словом «ImportError»: модуль не собрался
+        return False, "не засчитан — модуль offer не собран (%s) — адаптер прежний" % (
+            "ImportError" if isinstance(e, ImportError) else type(e).__name__)
+    try:
+        cls = wa_offer_tool.with_offer(type(model))
+    except wa_offer_tool.ParentDrift as e:                           # копия цикла или черновика разошлась с родителем
+        return False, "не засчитан — копия сверки Т4а не сверена (%s) — адаптер прежний" % e
+    except Exception as e:                                           # noqa: BLE001
+        return False, "не засчитан — примесь offer не надета (%s) — адаптер прежний" % type(e).__name__
+    model.__class__ = cls
+    return True, ("вкл — в сверке Т4а модель сама зовёт offer {model, date_from, date_to}: модель — по живому парку, "
+                  "даты — кодом, ворота цены прежние, наличие и цена — один вызов двери цены на пару; занято — другая "
+                  "модель или даты, не больше %d вызовов на сверку; юнит — только в журнал; бронь не пишется, клиенту — "
+                  "только по «Отправить»" % wa_offer_tool.OFFER_MAX)
+
+
 def close_signed_orphans(core, now, line):
     """WA_AGENT_ATTACH не засчитан, ядро прежнее (`wa_agent.Core`), а в базе ждут черновики подписи (kind='signed',
     pending или отложенные ритмом): «Отправить» прежнего ядра отправил бы шаблон «Направляем ваш подписанный договор» без
@@ -1222,6 +1270,10 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     _pc, pc_words = price_carry_of({F_PRICE_CARRY: "0"}, model)
     if pc_words:
         line("цена через ход (%s): %s" % (F_PRICE_CARRY, pc_words))
+    # наличие и цена по запросу модели (OFFER1910): флаг не запрошен — ни строки, ни импорта, класс адаптера прежний
+    _of, of_words = offer_of(environ, model)
+    if of_words:
+        line("наличие и цена по запросу модели (%s): %s" % (F_OFFER, of_words))
     # кэш промпта (WAAGENTCACHE0210): срок несёт адаптер, его собрал make_model; здесь — только строка старта
     ttl = getattr(model, "cache", None)
     line("кэш промпта (%s): %s" % (F_CACHE, "вкл, срок %s — инструкция и узлы знаний впереди с отметкой кэша" % ttl
