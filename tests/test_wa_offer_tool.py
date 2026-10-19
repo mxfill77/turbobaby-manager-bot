@@ -4,7 +4,8 @@ WA_AGENT_OFFER.
 
 Клиент: «PCX 160 с 10 по 15 ноября сколько?» → «а свободен?» — модель сама зовёт offer {PCX 160, 2026-11-10, 2026-11-15}:
 наличие и цена одним вызовом двери цены, факт с источником и подтверждённым юнитом (юнит — только журналу). Занято —
-модель проверяет альтернативу; ворота, снимок, дверь, модель и даты — не факт и причина человеку; предел 3 вызова; флаг
+модель проверяет альтернативу; черновик назвал свободным занятое или непроверенное — «агент их не видит» не снимается и
+причина «не совпадает с проверкой»; ворота, снимок, дверь, модель и даты — не факт и причина человеку; предел 3 вызова; флаг
 выкл — модуля в процессе нет, класс и блок инструментов прежние; модель offer не звала — черновик и журнал равны
 родительским. Каждый случай — с близнецом.
 
@@ -253,7 +254,8 @@ def test_o1_tools_block_line_only_addition():
 
 def test_o2_busy_then_alternative():
     """(б) PCX 160 занят на все юниты → FACT «занято» без двери, строка разрешает проверить альтернативу; модель зовёт
-    offer NMAX на те же даты → свободно, дверь одна; текст с ценой альтернативы — с опорой; занятое свободным не названо."""
+    offer NMAX на те же даты → свободно, дверь одна; текст с ценой альтернативы — с опорой; занятое свободным не названо —
+    это проверяет код (`avail_mismatch`), а не сценарий модели: близнец, назвавший PCX 160 свободным, причину не снимает."""
     text = "PCX 160 на 10–15 ноября занят. Свободен NMAX 155: 400 ฿ в сутки, итого 2 000 ฿, депозит 3 000 ฿."
     s = Script(offer(PCX), offer(NMAX), final(text))
     a, door = adapter(s, rows=BUSY_PCX)
@@ -271,10 +273,52 @@ def test_o2_busy_then_alternative():
     assert want in block1 and "ЦЕНА: " not in block1 and "฿" not in block1 and "коллега подберёт" not in block1, block1
     assert "NMAX 155, 2026-11-10 — 2026-11-15: свободно 1 из 1" in offer_block(s.seen[2]), offer_block(s.seen[2])
     assert K.MONEY_CLAIM_WORDS not in out["handoff"] and AVAIL_WORDS not in out["handoff"], out["handoff"]
+    assert O.W_AVAIL_MISMATCH not in out["handoff"] and not [ln for ln in a.lines if "не совпадает" in ln], a.lines
     # близнец: сумма не из факта (2 800) — «денежное утверждение без опоры»
     s2 = Script(offer(PCX), offer(NMAX), final(text.replace("2 000", "2 800")))
     out2 = adapter(s2, rows=BUSY_PCX)[0].draft(NUMBER, 5)
     assert K.MONEY_CLAIM_WORDS in out2["handoff"], out2["handoff"]
+    # близнец (приёмка): тот же ход, но занятый PCX 160 назван свободным — «агент их не видит» не снята, расхождение
+    s3 = Script(offer(PCX), offer(NMAX), final(text.replace("занят", "свободен")))
+    a3, _d3 = adapter(s3, rows=BUSY_PCX)
+    out3 = a3.draft(NUMBER, 5)
+    assert AVAIL_WORDS in out3["handoff"] and O.W_AVAIL_MISMATCH in out3["handoff"], out3["handoff"]
+    assert O.LOG_HEAD + O.L_MISMATCH % (O.M_BUSY % "PCX 160") in a3.lines, a3.lines
+
+
+def test_o2_busy_called_free_keeps_reason():
+    """Приёмка (замечание major): offer сказал «занято», а черновик назвал ту же модель свободной («PCX 160 на эти даты
+    свободен») → причины как без флага («агент их не видит» на месте) плюс «наличие в тексте не совпадает с проверкой»,
+    строка журнала с моделью. Близнецы: флаг выкл — «агент их не видит»; «занят» — снята, расхождения нет."""
+    text = "PCX 160 на эти даты свободен."
+    a, door = adapter(Script(offer(PCX), final(text)), rows=BUSY_PCX)
+    out = a.draft(NUMBER, 5)
+    assert offers(a)[0]["facts"][0]["avail"] == B.BUSY and door.calls == [], offers(a)[0]
+    assert [ln for ln in a.lines if "не совпадает" in ln] == [O.LOG_HEAD + O.L_MISMATCH % (O.M_BUSY % "PCX 160")], a.lines
+    out0 = adapter(Script(offer(PCX), final(text)), rows=BUSY_PCX, mixin=False)[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS in out0["handoff"], out0["handoff"]
+    assert out["handoff"] == out0["handoff"] + [O.W_AVAIL_MISMATCH], (out["handoff"], out0["handoff"])
+    a1, _d1 = adapter(Script(offer(PCX), final("PCX 160 на эти даты занят.")), rows=BUSY_PCX)
+    out1 = a1.draft(NUMBER, 5)
+    assert AVAIL_WORDS not in out1["handoff"] and O.W_AVAIL_MISMATCH not in out1["handoff"], out1["handoff"]
+    assert not [ln for ln in a1.lines if "не совпадает" in ln], a1.lines
+    # клиент о наличии не спрашивал (причины кода «агент их не видит» нет) — расхождение всё равно причина
+    out2 = adapter(Script(offer(PCX), final(text)), rows=BUSY_PCX, reasons=[])[0].draft(NUMBER, 5)
+    assert O.W_AVAIL_MISMATCH in out2["handoff"], out2["handoff"]
+    # «свободен» без модели при занятом — тоже расхождение; при одном свободном факте — нет
+    out3 = adapter(Script(offer(PCX), final("Да, свободен!")), rows=BUSY_PCX)[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS in out3["handoff"] and O.W_AVAIL_MISMATCH in out3["handoff"], out3["handoff"]
+    out4 = adapter(Script(offer(PCX), final("Да, свободен!")))[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS not in out4["handoff"] and O.W_AVAIL_MISMATCH not in out4["handoff"], out4["handoff"]
+
+
+def test_o2_unchecked_model_called_free_keeps_reason():
+    """Свободной названа модель, которую offer не проверял (XMAX 300 при факте PCX 160 «свободно»), — причина не
+    снимается; пересказ модели «агент их не видит» тоже остаётся; близнец — только проверенная модель."""
+    out = adapter(Script(offer(PCX), final("PCX 160 свободен, XMAX 300 тоже.", [AVAIL_WORDS])))[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS in out["handoff"] and O.W_AVAIL_MISMATCH in out["handoff"], out["handoff"]
+    out0 = adapter(Script(offer(PCX), final("PCX 160 свободен.", [AVAIL_WORDS])))[0].draft(NUMBER, 5)
+    assert AVAIL_WORDS not in out0["handoff"] and O.W_AVAIL_MISMATCH not in out0["handoff"], out0["handoff"]
 
 
 def test_o2_busy_numbers_are_not_support():
@@ -677,6 +721,83 @@ def test_o8_offer_reasons_pure():
     assert [r["reason"] for r in O.offer_reasons(base, got[1:], [], Q)] == [K.R_AVAILABILITY, K.R_DISCOUNT,
                                                                            K.R_LONG_TERM, B.R_AVAIL_UNKNOWN]
     assert O.offer_reasons(base, [], [], Q) == base
+
+
+def test_o8_offer_reasons_mismatch_pure():
+    """Расхождение текста с фактом: «наличие и брони» не снята (порядок прежний), «бронь оформляет человек» не
+    добавлена (её покрывает прежняя), «не совпадает» — в конце с причиной; пересказ модели остаётся."""
+    got = [{"outcome": T.FACT, "offer": {"model": "PCX 160", "avail": B.BUSY, "quote": None, "gate": None}}]
+    base = K.handoff("а свободен? хочу забронировать", None)
+    out = O.offer_reasons(base, got, got, "хочу забронировать", ["PCX 160 — по проверке занят"])
+    assert [r["reason"] for r in out] == [r["reason"] for r in base] + [O.R_AVAIL_MISMATCH], out
+    assert out[-1] == {"reason": O.R_AVAIL_MISMATCH, "words": O.W_AVAIL_MISMATCH,
+                       "why": "offer: PCX 160 — по проверке занят"}, out[-1]
+    assert [r["reason"] for r in O.offer_reasons(base, got, got, "хочу забронировать")] == [B.R_BOOKING], base
+    assert O.without_avail_words([AVAIL_WORDS, "x"], got, ["m"]) == [AVAIL_WORDS, "x"]
+    assert O.without_avail_words([AVAIL_WORDS, "x"], got) == ["x"]
+
+
+def _f(model, avail):
+    return {"outcome": T.FACT, "offer": {"model": model, "avail": avail}}
+
+
+PB, PF, NF = _f("PCX 160", B.BUSY), _f("PCX 160", B.FREE), _f("NMAX 155", B.FREE)
+BARE = [O.M_BARE]
+MISMATCH_GOLDENS = [
+    # занятое названо свободным — RU, EN, слабое слово, «не занят», сокращение без кубатуры
+    ("PCX 160 на эти даты свободен.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 на 10–15 ноября свободен. Свободен NMAX 155: 400 ฿ в сутки.", [PB, NF], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 и NMAX 155 свободны.", [PB, NF], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 свободен. Да, PCX 160 свободен!", [PB], [O.M_BUSY % "PCX 160"]),          # одно расхождение — один раз
+    ("PCX 160 не занят.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 на эти даты не забронирован.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 is not booked.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("Нет занятых — PCX 160 ждёт вас.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 is available for these dates.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 есть на эти даты.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 в наличии.", [PB], [O.M_BUSY % "PCX 160"]),
+    ("pcx свободен", [PB], [O.M_BUSY % "PCX 160"]),
+    ("PCX 160 свободен с 10 по 15, на 18–22 нет.", [PF, PB], [O.M_BOTH % "PCX 160"]),
+    # не проверена, не из парка, не определена
+    ("PCX 160 свободен, XMAX 300 тоже.", [PF], [O.M_UNCHECKED % "XMAX 300"]),
+    ("Vespa 150 свободна.", [PF], [O.M_FOREIGN % "Vespa 150"]),
+    ("CB свободен.", [PF], [O.M_ALIAS % "CB"]),
+    # «свободно» без модели при занятом
+    ("Да, свободен!", [PB], BARE),
+    ("Да, есть!", [PB], BARE),
+    ("Да, на эти даты есть.", [PB], BARE),
+    ("Yes, it's free.", [PB], BARE),
+    ("PCX 160 занят, но есть другие варианты.", [PB], BARE),
+    ("PCX 160 занят до 9 ноября, а с 10 по 15 свободен.", [PB], BARE),
+    # совпало: занятое названо занятым, альтернатива проверена, «свободно» без модели при одном свободном
+    ("PCX 160 на эти даты занят.", [PB], []),
+    ("PCX 160 на 10–15 ноября занят. Свободен NMAX 155: 400 ฿ в сутки, итого 2 000 ฿.", [PB, NF], []),
+    ("PCX 160 занят, но свободен NMAX 155.", [PB, NF], []),
+    ("PCX 160: занят, NMAX 155: свободен.", [PB, NF], []),
+    ("PCX 160 занят, есть другой вариант — NMAX 155.", [PB, NF], []),
+    ("PCX 160 isn't available, but NMAX 155 is free.", [PB, NF], []),
+    ("PCX 160 unavailable, NMAX 155 available.", [PB, NF], []),
+    ("PCX 160 не свободен на эти даты.", [PB], []),
+    ("Свободных PCX 160 на эти даты нет.", [PB], []),
+    ("PCX 160 нет в наличии.", [PB], []),
+    ("PCX 160 недоступен.", [PB], []),
+    ("PCX 160 is not available for these dates.", [PB], []),
+    ("PCX 160 занят, доставка есть.", [PB], []),
+    ("Free delivery. PCX 160 is booked.", [PB], []),
+    ("Коллега проверит наличие и вернётся.", [PB], []),
+    ("Да, свободен!", [PF], []),
+    ("THB 400 в сутки, PCX 160 свободен.", [PF], []),
+    (FREE_TEXT, [PF], []),
+    ("PCX 160 свободен.", [], []),                                   # фактов нет — снимать нечего
+]
+
+
+def test_o8_avail_mismatch_goldens():
+    """`avail_mismatch`: каждая модель, названная свободной, — только при факте «свободно» и без «занято»."""
+    bad = [(t, want, got) for t, facts, want in MISMATCH_GOLDENS
+           for got in [O.avail_mismatch(t, facts, BIKES)] if got != want]
+    assert not bad, bad
+    assert O.avail_mismatch("PCX 160 свободен.", [PF], None) == [O.M_FOREIGN % "PCX 160"], "парка нет — не сверено"
 
 
 def test_o8_judged_price_same_object_without_facts():
