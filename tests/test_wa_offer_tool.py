@@ -15,6 +15,12 @@ r3: причина «агент их не видит» снимается, то�
 слово двери «model», похожее на юнит, в строку цены не идёт; служба выключает offer КОДОМ (OFFER-OFFPIN1910) — окружение
 WA_AGENT_OFFER=1 ничего не включает.
 
+r3 приёмка (наглухо без лазеек): «занято» без области отрицания («никто не занял», no one has booked, «нет проблем»,
+«ваш») — не сверено, а не совпало; даты любой записью («с 18-го по 22-е», from the 18th, between, through, «с завтра»),
+одна дата, срок словами и год; «свободно» о «других», «всех», any и моделях вне парка («Нмакс», Forza, ADV) — причина
+остаётся; верные черновики живого вида — снимают; обещание брони словами (let me book, «закреплю») — «бронь оформляет
+человек».
+
 Стенд: адаптер `wa_agent_model.ModelAdapter` со сборкой-подменой (как у `test_wa_agent_tools`), поддельные снимок броней,
 дверь цены (живой формат QuotePrice.js: available, days, day_price, total, deposit, скидка словами в text) и модель по
 сценарию; служба — мир `test_wa_agent_model.World`. «Сегодня» — 21.09.2026 по Пхукету, номер выдуманный. Сети нет, модели
@@ -299,7 +305,7 @@ def test_o1_door_model_like_unit_not_echoed():
 def test_o2_busy_then_alternative():
     """(б) PCX 160 занят на все юниты → FACT «занято» без двери, строка разрешает проверить альтернативу; модель зовёт
     offer NMAX на те же даты → свободно, дверь одна; текст с ценой альтернативы — с опорой; занятое свободным не названо —
-    это проверяет код (`avail_mismatch`), а не сценарий модели: близнец, назвавший PCX 160 свободным, причину не снимает."""
+    это проверяет код (`avail_check`), а не сценарий модели: близнец, назвавший PCX 160 свободным, причину не снимает."""
     text = "PCX 160 на 10–15 ноября занят. Свободен NMAX 155: 400 ฿ в сутки, итого 2 000 ฿, депозит 3 000 ฿."
     s = Script(offer(PCX), offer(NMAX), final(text))
     a, door = adapter(s, rows=BUSY_PCX)
@@ -422,6 +428,42 @@ def test_r3_unsure_keeps_reason_without_words():
     assert O.LOG_HEAD + O.L_UNSURE % (O.U_STANCE % "NMAX 155") in a.lines, a.lines
     out0 = adapter(Script(offer(PCX), offer(NMAX), final(text + " NMAX 155 тоже свободен.")))[0].draft(NUMBER, 5)
     assert AVAIL_WORDS not in out0["handoff"] and O.W_AVAIL_MISMATCH not in out0["handoff"], out0["handoff"]
+
+
+BUSY_NMAX = [row("NMAX 155 7001", "Бронь", "2026-11-09 10:00", "2026-11-16 10:00")]
+
+
+def test_r3a_closed_text_full_path():
+    """r3 приёмка — живой путь черновика (`_draft_tools`): NMAX 155 по проверке занят, а текст «Нет проблем, NMAX 155
+    ваш», «No one has booked», «hasn't been booked yet», «нет ограничений»; PCX 160 свободен 10–15 ноября, а текст «с
+    18-го по 22-е ноября», «с 18 ноября», «а также все остальные модели», «Нмакс тоже свободен» — «агент их не видит» на
+    месте (разобрано и не совпало — и «не совпадает с проверкой»), строка журнала. Близнецы — прямое «занято» и даты
+    проверки — снята."""
+    cases = [                                       # (вызов offer, строки снимка, текст черновика, расхождение?)
+        (NMAX, BUSY_NMAX, "Нет проблем, NMAX 155 ваш на эти даты.", False),
+        (NMAX, BUSY_NMAX, "No one has booked the NMAX 155 for those dates.", False),
+        (NMAX, BUSY_NMAX, "NMAX 155 hasn't been booked yet, so it's yours.", False),
+        (NMAX, BUSY_NMAX, "Для NMAX 155 нет ограничений на эти даты.", False),
+        (PCX, [], "PCX 160 свободен с 18-го по 22-е ноября.", True),
+        (PCX, [], "PCX 160 свободен с 18 ноября.", False),
+        (PCX, [], "PCX 160 свободен, а также все остальные модели.", False),
+        (PCX, [], "PCX 160 свободен, Нмакс тоже свободен.", False),
+    ]
+    for args, rows, text, mm in cases:
+        a, _d = adapter(Script(offer(args), final(text)), rows=rows)
+        out = a.draft(NUMBER, 5)
+        assert [r["outcome"] for r in offers(a)] == [T.FACT], (text, offers(a)[0]["reason"])
+        assert AVAIL_WORDS in out["handoff"], (text, out["handoff"])
+        assert (O.W_AVAIL_MISMATCH in out["handoff"]) is mm, (text, out["handoff"])
+        head = O.LOG_HEAD + (O.L_MISMATCH if mm else O.L_UNSURE).split(":")[0]
+        assert [ln for ln in a.lines if ln.startswith(head)], (text, a.lines)
+    for args, rows, text in ((NMAX, BUSY_NMAX, "NMAX 155 на эти даты занят."),
+                             (NMAX, BUSY_NMAX, "Нет, NMAX 155 на эти даты занят."),
+                             (PCX, [], "PCX 160 свободен с 10-го по 15-е ноября."),
+                             (PCX, [], "PCX 160 свободен с 10 ноября."),
+                             (PCX, [], "Да, свободен на ваши даты!")):
+        out = adapter(Script(offer(args), final(text)), rows=rows)[0].draft(NUMBER, 5)
+        assert AVAIL_WORDS not in out["handoff"] and O.W_AVAIL_MISMATCH not in out["handoff"], (text, out["handoff"])
 
 
 def test_o2_busy_numbers_are_not_support():
@@ -995,9 +1037,11 @@ MISMATCH_GOLDENS = [
     ("Да, есть!", [PB], BARE, []),
     ("Да, на эти даты есть.", [PB], BARE, []),
     ("Yes, it's free.", [PB], BARE, []),
-    ("PCX 160 занят, но есть другие варианты.", [PB], BARE, []),
-    # r3 (было BARE): «с 10 по 15 свободен» в части без модели — о PCX 160 своего предложения, а он на 10–15 занят
-    ("PCX 160 занят до 9 ноября, а с 10 по 15 свободен.", [PB], [O.M_BUSY % P], []),
+    # r3 приёмка (было BARE): «другие» рядом со «свободно» — о непроверенных моделях при любом факте
+    ("PCX 160 занят, но есть другие варианты.", [PB], [O.M_OTHERS % "другие"], []),
+    # r3 (было BARE): «с 10 по 15 свободен» в части без модели — о PCX 160 своего предложения, а он на 10–15 занят;
+    # r3 приёмка: и «до 9 ноября» — одна дата не начало и не конец факта — не сверено
+    ("PCX 160 занят до 9 ноября, а с 10 по 15 свободен.", [PB], [O.M_BUSY % P], [O.U_DATE % "9 ноября"]),
     # совпало: занятое названо занятым, альтернатива проверена, «свободно» без модели при одном свободном
     ("PCX 160 на эти даты занят.", [PB], [], []),
     ("PCX 160 на 10–15 ноября занят. Свободен NMAX 155: 400 ฿ в сутки, итого 2 000 ฿.", [PB, NF], [], []),
@@ -1088,17 +1132,173 @@ def test_o8_avail_check_goldens():
     assert O.avail_check("PCX 160 свободен с 18 по 22 ноября.", [PF], BIKES)[0] == [O.M_DATES % (P, "с 18.11 по 22.11")]
 
 
+# ── r3 приёмка: суд текста наглухо (blocker — стойка без области отрицания; major — даты и «свободно» о непроверенном)
+U_N = [O.U_STANCE % N]                                   # «NMAX 155 — не разобрано, свободен или занят»
+PFT = _f(P, B.FREE, "2026-09-22", "2026-09-25")          # проверено «с завтра по 25 сентября» (сегодня 21.09)
+NF18 = _f(N, B.FREE, "2026-11-18", "2026-11-22")
+# (текст, принятые факты, расхождение, не сверено). Замечание blocker: 12 фраз, снимавших причину при NMAX 155 «занято»
+# (B1, B2, B6, B7, F1–F8), — каждая со своим фактом «занято»; ещё пять своих; близнецы — прямое «занято» снимает
+STANCE_GOLDENS = [
+    ("Нет проблем, NMAX 155 ваш на эти даты.", [NB], [], U_N),                        # B1
+    ("NMAX 155 — нет проблем, он ваш.", [NB], [], U_N),                               # B2
+    ("Нет, NMAX 155 никто не занял.", [NB], [], U_N),                                 # B6
+    ("Nobody has taken the NMAX 155 yet.", [NB], [], U_N),                            # B7
+    ("No one has booked the NMAX 155 for those dates.", [NB], [], U_N),               # F1
+    ("NMAX 155 hasn't been booked yet, so it's yours.", [NB], [], U_N),               # F2
+    ("NMAX 155 is not yet booked.", [NB], [], U_N),                                   # F3
+    ("Для NMAX 155 нет ограничений на эти даты.", [NB], [], U_N),                     # F4
+    ("NMAX 155 на эти даты — нет проблем.", [NB], [], U_N),                           # F5
+    ("Нет причин волноваться — NMAX 155 ваш.", [NB], [], U_N),                        # F6
+    ("Нет, NMAX 155 никто ещё не взял.", [NB], [], U_N),                              # F7
+    ("Nothing is booked on the NMAX 155 for these dates.", [NB], [], U_N),            # F8
+    ("No problem, the NMAX 155 is yours.", [NB], [], U_N),
+    ("NMAX 155 никем не занят на эти даты.", [NB], [], U_N),
+    ("Без проблем, NMAX 155 на эти даты.", [NB], [], U_N),
+    ("NMAX 155 к вашим услугам на эти даты.", [NB], [], U_N),
+    ("NMAX 155 is not booked by anyone.", [NB], [O.M_BUSY % N], []),                 # «не забронирован» — свободно
+    ("PCX 160 занят, но NMAX 155 — без проблем.", [PB, NB], [], U_N),                 # оборот, а не «но» → «свободно»
+    ("PCX 160 свободен. Готово, PCX 160 ваш на эти даты.", [PF], [], [O.U_STANCE % P]),   # «ваш» — обещание
+    ("Для NMAX 155 на эти даты нет минимального срока.", [NB], [], U_N),             # «нет» не в голой части
+    ("We have NMAX 155 booked for those dates.", [NB], [], U_N),                     # «свободно» и «занято» в части
+    # близнецы: прямое «занято» без другого отрицания, голое «нет», «нет проблем» в соседнем предложении
+    ("NMAX 155 на эти даты занят.", [NB], [], []),
+    ("NMAX 155 is booked for those dates.", [NB], [], []),
+    ("Нет, NMAX 155 на эти даты занят.", [NB], [], []),
+    ("NMAX 155 — нет.", [NB], [], []),
+    ("На эти даты NMAX 155 нет.", [NB], [], []),
+    ("К сожалению, NMAX 155 нет на эти даты.", [NB], [], []),
+    ("NMAX 155 is not available for those dates.", [NB], [], []),
+    ("NMAX 155 sold out for those dates.", [NB], [], []),
+    ("NMAX 155 на эти даты уже заняли.", [NB], [], []),
+    ("Нет проблем! NMAX 155 на эти даты занят.", [NB], [], []),
+    ("NMAX 155 свободен на ваши даты.", [NF], [], []),
+]
+# замечание major (даты): проверено PCX 160 «свободно» 10–15 ноября — другие даты любой записью не снимают причину;
+# близнецы — даты проверки той же записью снимают
+DATE_GOLDENS = [
+    ("PCX 160 свободен с 18-го по 22-е ноября.", [PF], [O.M_DATES % (P, "с 18.11 по 22.11")], []),
+    ("PCX 160 свободен с 18-го по 22-е.", [PF], [O.M_DATES % (P, "с 18 по 22 (месяц не назван)")], []),
+    ("PCX 160 is available from the 18th to the 22nd.", [PF], [O.M_DATES % (P, "18–22 (месяц не назван)")], []),
+    ("PCX 160 is free between November 18 and 22.", [PF], [O.M_DATES % (P, "с 18.11 по 22.11")], []),
+    ("PCX 160 is available Nov 18th through 22nd.", [PF], [O.M_DATES % (P, "с 18.11 по 22.11")], []),
+    ("PCX 160 is free from November 18 through 22.", [PF], [O.M_DATES % (P, "с 18.11 по 22.11")], []),
+    ("PCX 160 свободен с завтра по 25 сентября.", [PF], [O.M_DATES % (P, "с 22.09 по 25.09")], []),
+    ("PCX 160 свободен между 18 и 22 ноября.", [PF], [O.M_DATES % (P, "с 18.11 по 22.11")], []),
+    ("PCX 160 свободен от 18 до 22.", [PF], [O.M_DATES % (P, "18–22 (месяц не назван)")], []),
+    ("PCX 160 свободен с 18 ноября.", [PF], [], [O.U_DATE % "18 ноября"]),
+    ("PCX 160 свободен с 18 ноября на неделю.", [PF], [], [O.U_DATE % "18 ноября", O.U_PERIOD % "неделю"]),
+    ("PCX 160 свободен до 22 ноября.", [PF], [], [O.U_DATE % "22 ноября"]),
+    ("PCX 160 свободен до 22-го.", [PF], [], [O.U_DATE % "22-го"]),
+    ("PCX 160 свободен на 5 дней с 18 ноября.", [PF], [], [O.U_DATE % "18 ноября"]),
+    ("PCX 160 is available starting November 18.", [PF], [], [O.U_DATE % "November 18"]),
+    ("PCX 160 свободен 18 и 19 ноября.", [PF], [], [O.U_DATE % "19 ноября"]),
+    ("PCX 160 свободен 18.11.", [PF], [], [O.U_DATE % "18.11"]),
+    ("PCX 160 свободен завтра.", [PF], [], [O.U_DATE % "завтра"]),
+    ("PCX 160 свободен в декабре.", [PF], [], [O.U_PERIOD % "декабре"]),
+    ("PCX 160 свободен на следующей неделе.", [PF], [], [O.U_PERIOD % "неделе"]),
+    ("PCX 160 свободен на эти выходные.", [PF], [], [O.U_PERIOD % "выходные"]),
+    ("PCX 160 свободен в субботу.", [PF], [], [O.U_PERIOD % "субботу"]),
+    ("PCX 160 свободен с 10 по 15 ноября 2027 года.", [PF], [], [O.U_YEAR % "2027"]),
+    ("PCX 160 свободен с 18 ноября, NMAX 155 тоже.", [PF, NF18], [], [O.U_DATE % "18 ноября"]),   # дата — о PCX 160
+    ("Без проблем с 10 по 15 ноября.", [PF], [], [O.U_DATES % "с 10.11 по 15.11"]),
+    # близнецы
+    ("NMAX 155 свободен до 12 ноября.", [NF_MIN], [], []),                            # конец клиента до минимума
+    ("PCX 160 свободен с 10-го по 15-е ноября.", [PF], [], []),
+    ("PCX 160 is available from the 10th to the 15th.", [PF], [], []),
+    ("PCX 160 is available from the 10th to the 15th of November.", [PF], [], []),
+    ("PCX 160 is free between November 10 and 15.", [PF], [], []),
+    ("PCX 160 is free Nov 10th through 15th.", [PF], [], []),
+    ("PCX 160 свободен с завтра по 25 сентября.", [PFT], [], []),
+    ("PCX 160 свободен с завтра.", [PFT], [], []),
+    ("PCX 160 свободен с 10 ноября.", [PF], [], []),
+    ("PCX 160 свободен до 15 ноября.", [PF], [], []),
+    ("PCX 160 свободен с 10 по 15 ноября 2026 года.", [PF], [], []),
+    ("PCX 160 свободен. Выдача 10.11 в 10:00, возврат 15.11.", [PF], [], []),
+    ("PCX 160 свободен. Цена в неделю — 2 500 ฿.", [PF], [], []),               # «в неделю» — цена, не срок
+]
+# замечание major («свободно» о непроверенном): проверено только PCX 160 «свободно» — «другие», «все», any, модель
+# кириллицей или без кубатуры не из парка не снимают причину; близнецы — голое «свободно», проверенные модели
+OTHERS_GOLDENS = [
+    ("PCX 160 свободен, есть и другие свободные скутеры.", [PF], [O.M_OTHERS % "другие"], []),
+    ("PCX 160 is free, and we also have other bikes available.", [PF], [O.M_OTHERS % "other"], []),
+    ("All our scooters are available for these dates.", [PF], [O.M_OTHERS % "All"], []),
+    ("PCX 160 свободен, а также все остальные модели.", [PF], [], [O.U_WORD % "остальные"]),
+    ("PCX 160 свободен, другие модели тоже свободны.", [PF], [O.M_OTHERS % "другие"], []),
+    ("Any model is available for these dates.", [PF], [], [O.U_WORD % "Any"]),
+    ("PCX 160 свободен, Нмакс тоже свободен.", [PF], [], [O.U_WORD % "нмакс"]),
+    ("PCX 160 свободен. Иксмакс 300 тоже свободен.", [PF], [], [O.U_WORD % "иксмакс"]),
+    ("PCX 160 свободен, ADV тоже свободен.", [PF], [], [O.U_WORD % "ADV"]),
+    ("PCX 160 свободен, Forza тоже свободна.", [PF], [], [O.U_WORD % "forza"]),
+    ("PCX 160 или Нмакс свободны на эти даты.", [PF], [], [O.U_WORD % "нмакс"]),
+    ("PCX 160 свободен, Нмакс тоже.", [PF], [], [O.U_WORD % "нмакс"]),
+    ("PCX 160 свободен; другие скутеры тоже.", [PF], [], [O.U_WORD % "другие"]),
+    ("PCX 160 is free, and so is the ADV.", [PF], [], [O.U_WORD % "ADV"]),
+    ("PCX 160 занят. Зато свободны другие модели.", [PB], [O.M_OTHERS % "другие"], []),
+    ("К сожалению, PCX 160 занят, а Нмакс свободен.", [PB], [], [O.U_WORD % "нмакс"]),
+    # близнецы
+    ("Да, свободен на ваши даты!", [PF], [], []),
+    ("Свободен 🙂 Цена 400 ฿ в сутки.", [PF], [], []),
+    ("PCX 160 свободен, NMAX 155 тоже свободен.", [PF, NF], [], []),
+    ("PCX 160 занят. Могу проверить другие модели.", [PB], [], []),
+    ("PCX 160 занят, есть другой вариант — NMAX 155.", [PB, NF], [], []),
+    ("PCX 160 is free. Free delivery in Rawai!", [PF], [], []),
+]
+# верные черновики живого вида снимают причину (обратная сторона «наглухо»: сомнение — только при сомнении)
+FAITHFUL = [
+    ("Да, PCX 160 на 10–15 ноября свободен! Стоимость — 400 ฿ в сутки.", [PF]),
+    ("Отличные новости, PCX 160 на эти даты свободен. Выдача 10 ноября, возврат 15 ноября.", [PF]),
+    ("Good news! The PCX 160 is available from November 10 to 15.", [PF]),
+    ("Yes, the PCX 160 is available for your dates — 400 THB per day, 2,000 THB in total.", [PF]),
+    ("К сожалению, PCX 160 на эти даты занят, но свободен NMAX 155 — 400 ฿ в сутки.", [PB, NF]),
+    ("Sorry, the PCX 160 is not available on those dates. We can offer the NMAX 155 instead.", [PB, NF]),
+    ("PCX 160 занят. Есть NMAX 155 — он свободен на ваши даты.", [PB, NF]),
+    ("Sorry, PCX 160 is fully booked for these dates. I can check other models for you.", [PB]),
+    ("PCX 160 свободен, шлем и замок в комплекте.", [PF]),
+    ("PCX 160 свободен. Выдача с 10:00, возврат до 10:00.", [PF]),
+    ("PCX 160 свободен на 5 суток с 10 ноября.", [PF]),
+    ("Оба свободны: PCX 160 и NMAX 155.", [PF, NF]),
+    ("PCX 160 — нет, на эти даты занят.", [PB]),
+    ("Не переживайте: PCX 160 свободен на эти даты.", [PF]),
+    ("PCX 160 is available. Please send a photo of your passport and license.", [PF]),
+]
+
+
+def test_r3a_avail_check_closed_goldens():
+    """r3 приёмка — «наглухо» без лазеек: стойка с отрицанием вне соседства, «нет проблем», «ваш» — не сверено, а не
+    «занято»; даты любой записью, одна дата, срок словами, год; «свободно» о других, всех, любой и моделях вне парка;
+    верные черновики живого вида — снимают. Каждый — с близнецом."""
+    bad = [(t, want, got) for t, facts, *want in STANCE_GOLDENS + DATE_GOLDENS + OTHERS_GOLDENS
+           for got in [list(O.avail_check(t, facts, BIKES, TODAY))] if got != want]
+    assert not bad, bad
+    kept = [(t, got) for t, facts in FAITHFUL for got in [O.avail_check(t, facts, BIKES, TODAY)] if got != ([], [])]
+    assert not kept, kept
+    # «нет» в части с моделью и словами не голое — исход не «занято», соседняя часть его не наследует
+    assert O._marks("Нет проблем") == O.UNSURE and O._marks("нет") == B.BUSY and O._marks("на эти даты нет") == B.BUSY
+    assert O._marks("NMAX 155 нет", [(0, 8)]) == B.BUSY and O._marks("NMAX 155 нет") == O.UNSURE
+    parts = [{"named": [], "mark": O.UNSURE, "sep": ""}, {"named": [1], "mark": None, "sep": " но "}]
+    assert O._infer(parts, 1) == (O.UNSURE, 0), "«не разобрано» не обращается после «но»"
+
+
 BOOK_SAID = [("Забронировал PCX 160 для вас.", True), ("PCX 160 забронирован на эти даты.", True),
              ("Оформим бронь на PCX 160.", True), ("Ваша бронь подтверждена.", True), ("Бронирую PCX 160.", True),
              ("PCX 160 reserved for you.", True), ("I've booked PCX 160 for you.", True),
              ("We can book it for you.", True), ("Your booking is confirmed.", True), ("PCX 160 is reserved.", True),
              ("I'll reserve it.", True),
+             # r3 приёмка: обещание брони словами
+             ("Закреплю PCX 160 за вами.", True), ("Оставлю его за вами.", True), ("PCX 160 отложу для вас.", True),
+             ("Подтверждаю на 10–15 ноября.", True), ("Он ваш на эти даты!", True), ("Let me book it for you.", True),
+             ("Want me to book it?", True), ("Would you like me to reserve it?", True), ("I'll hold it for you.", True),
+             ("PCX 160 is secured for you.", True), ("Confirmed for 10–15 November.", True), ("Booking it now.", True),
+             ("It's yours for these dates!", True),
              ("PCX 160 свободен.", False), ("PCX 160 is booked.", False), ("Free delivery.", False),
-             ("Коллега проверит наличие и вернётся.", False), (FREE_TEXT, False), ("", False), (None, False)]
+             ("Коллега проверит наличие и вернётся.", False), (FREE_TEXT, False), ("", False), (None, False),
+             ("I'll keep you posted.", False), ("Your dates are fine.", False), ("We can check other dates.", False),
+             ("Ваш вопрос передам коллеге.", False)]
 
 
 def test_r3_book_said_goldens():
-    """Слова брони в тексте черновика (r3): заброн*/бронир*/оформ*/бронь, reserved, booked for you, I/we book."""
+    """Слова брони в тексте черновика (r3): заброн*/бронир*/оформ*/бронь, reserved, booked for you, I/we book; r3
+    приёмка — и обещание словами (закреплю, оставлю за вами, let me book, I'll hold, it's yours); близнецы — нет."""
     bad = [(t, want) for t, want in BOOK_SAID if O.book_said(t) is not want]
     assert not bad, bad
 

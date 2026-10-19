@@ -38,9 +38,21 @@ WA_AGENT_OFFER, по умолчанию выкл).
 тексте нет слов брони. Разобрано и не совпало (занятое названо свободным и наоборот, непроверенная модель, другие даты,
 «свободен» без модели при занятом) — причина остаётся, и к ней «наличие в тексте не совпадает с проверкой — решает
 человек»; сказанное о модели не разобрано — причина остаётся без новых слов (строка журнала). Слова брони в черновике
-(«заброн…», «оформ…», reserved, booked for you) — причина остаётся и к ней «бронь оформляет человек» при ЛЮБОМ входящем
-клиента; просьба клиента о брони — «бронь оформляет человек» тоже. Не факт — «наличие не проверено — решает человек»;
-ворота человека — их причины `K.handoff`. Брони не пишутся, клиенту — только по «Отправить» человека.
+(«заброн…», «оформ…», reserved, booked for you; с приёмки r3 — и «закреплю», «оставлю за вами», let me book, I'll hold,
+it's yours) — причина остаётся и к ней «бронь оформляет человек» при ЛЮБОМ входящем клиента; просьба клиента о брони —
+«бронь оформляет человек» тоже. Не факт — «наличие не проверено — решает человек»; ворота человека — их причины
+`K.handoff`. Брони не пишутся, клиенту — только по «Отправить» человека.
+
+СУД ТЕКСТА — НАГЛУХО (приёмка r3). Сомнение разбора — «не сверено», а не «сверено»: «занято» совпадает с фактом
+«занято» только прямым словом (занят, недоступен, нет в наличии, not available, booked, sold out) без другого
+отрицания в той же части; голое «нет» — только в голой части («NMAX 155 — нет»); отрицание где угодно ещё в части
+(никто, ничего, ещё не, no one, nothing, yet, hasn't been), «нет проблем / ограничений / причин», no problem, слова
+владения (ваш, yours, берите) — «не разобрано», и соседняя часть этот исход не наследует обратным. «Свободно» в части
+без модели парка сверено, только если часть голая («Да, свободен!»): «другие», «все», other, all — расхождение, иное
+слово (любой, any, «Нмакс», Forza, ADV) — не сверено, при занятом или свободном факте одинаково. Даты — каждое похожее на
+дату место текста: диапазон любого вида (и «с 18-го по 22-е», «from the 18th to the 22nd», «between November 18 and
+22», «с завтра по 25 сентября») — даты факта; одна дата — начало или конец факта; день недели, неделя, выходные, месяц
+словом, год не год факта — не сверено.
 
 ДЕЛО (К4). offer — стадия запроса (inquiry), ДО брони, и он БЕЗ ДЕЛА: к делу аренды и его версии (`WA_AGENT_CASE`,
 `CaseLink`) факт offer не привязан сознательно. Котировка «модель + даты» — не факт об аренде: у запроса дела ещё нет
@@ -350,15 +362,32 @@ def without_avail_words(words, facts, held=()):
 #   · сокращение к нескольким моделям — названо свободным: расхождение, иначе не сверено; похожее на модель не из
 #     парка судится только названным свободным (суммы и слова английского текста на модель похожи);
 #   · «свободно» без модели и без дат при занятом среди фактов — расхождение.
+# r3 приёмка — сомнение человеку, а не «сверено» (замечания: 12 фраз занятого «ваш»/«никто не занял»/«нет проблем»,
+# 16 видов дат и 10 фраз «свободно» о непроверенном снимали причину):
+#   · исход части бывает ещё «НЕ РАЗОБРАНО» (UNSURE). «Занято» — только прямое слово («занят», «недоступен», «нет в
+#     наличии», not available, booked, sold out) без другого отрицания в части; голое «нет» — «занято» только в голой
+#     части («NMAX 155 — нет», «на эти даты нет»). Отрицание где угодно ещё в части (никто, ничего, ещё не, nobody, no
+#     one, nothing, yet, hasn't been), обороты «нет проблем / ограничений / причин / вопросов», no problem, слова
+#     владения (ваш, yours, берите), «свободно» и «занято» в одной части — «не разобрано»; соседняя часть такой исход
+#     берёт как есть — не обратный и не «занято»;
+#   · «свободно» в части без модели парка, не отданное модели предложения, сверено, только если часть голая: «другие»,
+#     «все», «остальные», other, all — расхождение; иное слово (любой, any, «Нмакс», Forza, ADV) — не сверено; часть
+#     без своего слова с «тоже» или «другие модели», взявшая «свободно» у соседней, — не сверено;
+#   · даты — КАЖДОЕ похожее на дату место. Диапазон («с 18-го по 22-е», «from the 18th to the 22nd», «between November
+#     18 and 22», «Nov 18th through 22nd», «с завтра по 25 сентября») — как выше; одна дата («с 18 ноября», «до 22-го»,
+#     starting November 18) — начало или конец факта моделей своей части (иначе предложения, иначе любого), иначе не
+#     сверено; день недели, неделя, выходные, месяц словом, год не год факта — не сверено.
 # Исходы: «расхождение» — разобрано и не совпало (причина остаётся, и к ней «не совпадает с проверкой»); «не сверено» —
 # не разобрано (причина остаётся без новых слов, строка журнала). Разбор слов грубый и сомнение отдаёт человеку.
 
 # деление на предложения — то же, что у судьи денег (`K.money_claims`); имени нет — модуль не собирается (служба: «не
 # засчитан», адаптер прежний), а не падает черновик
 _sentences = K._sentences
-# части предложения: запятая, скобки, тире между пробелами (не «10–15»), «и», «но», «а», «однако», and, but, however;
-# разделитель внутри диапазона дат («10 - 15 ноября») части не делит
-_RX_CLAUSE = re.compile(r"(?i)[,()]|\s[—–-]\s|\s(?:и|но|а|однако|зато|and|but|however|whereas)\s")
+UNSURE = "unsure"                                # исход части: не разобрано, свободно или занято (r3 приёмка)
+# части предложения: запятая, скобки, двоеточие (не «10:00»), тире между пробелами (не «10–15»), «и», «или», «но», «а»
+# (не «а также»), «однако», and, or, but, however; разделитель внутри диапазона дат («10 - 15 ноября») части не делит
+_RX_CLAUSE = re.compile(r"(?i)[,()]|:(?!\d)|\s[—–-]\s|\s(?:и|или|либо|но|а(?!\s+(?:также|так\s+же|ещё|еще)(?![а-яё]))|"
+                        r"однако|зато|and|or|but|however|whereas)\s")
 _RX_CONTRAST = re.compile(r"(?i)\s(?:но|а|однако|зато|but|however|whereas)\s")       # после него — обратное прежнему
 _RX_NEG = re.compile(r"(?i)(?:(?<![а-яёa-z])(?:не|нет|ни|not|no)|n['’]t)\s+$")      # отрицание прямо перед словом
 # слово «свободно» — само по себе, и без модели рядом (слово «занято» с отрицанием — тоже: «не занят», not booked)
@@ -372,34 +401,118 @@ _RX_WEAK = re.compile(
     r"жд(?:ёт|ет|ут)\s+вас)(?![а-яё])|"
     r"(?<![a-z])(?:free|we\s+have(?!\s+(?:no|none|nothing)(?![a-z]))|we['’]ve\s+got(?!\s+(?:no|none|nothing)(?![a-z]))|"
     r"(?:we\s+)?can\s+offer|(?:is|are)\s+waiting\s+for\s+you|ready\s+for\s+you)(?![a-z])")
-_RX_BUSY = re.compile(r"(?i)(?<![а-яё])(?:занят\w*|нет|нету|недоступ\w*|забронирован\w*)(?![а-яё])|"
+# прямое слово «занято» (r3 приёмка: голое «нет» — отдельно, `_RX_NET`, только в голой части)
+_RX_BUSY = re.compile(r"(?i)(?<![а-яё])(?:заня(?:т|л)\w*|недоступ\w*|забронирован\w*)(?![а-яё])|"
                       r"(?<![a-z])(?:busy|booked|taken|unavailable|sold\s+out|out\s+of\s+stock)(?![a-z])")
 _RX_GEN = re.compile(r"(?i)свободн(?:ых|ого|ой)$")                 # «свободных … нет» — нет
-_RX_NET = re.compile(r"(?i)(?<![а-яё])нет(?![а-яё])")
+_RX_NET = re.compile(r"(?i)(?<![а-яё])нету?(?![а-яё])")
+# отрицание вне слова наличия (r3 приёмка): в части — «не разобрано» («никто не занял», no one has booked, not yet)
+_RX_NEGATOR = re.compile(
+    r"(?i)(?<![а-яё])(?:не|нет|нету|ни|никто|никого|никому|никем|ничего|ничто|ничем|никак\w*|никогда|нигде|некому|"
+    r"нечего)(?![а-яё])|(?<![a-z])(?:not|no|nobody|nothing|none|never|neither|nor|yet)(?![a-z])|n['’]t(?![a-z])")
+_RX_IDIOM = re.compile(
+    r"(?i)(?<![а-яё])(?:нет|без|никаких)\s+(?:проблем|ограничени|причин|вопрос|сомнени|препятстви|забот)\w*|"
+    r"(?<![а-яё])не\s+(?:проблема|вопрос)(?![а-яё])|"
+    r"(?<![a-z])(?:no\s+(?:problems?|worries|issues?|doubts?|restrictions?|reasons?)|not\s+a\s+problem)(?![a-z])")
+# слова владения: «ваш», yours, «берите» — обещание байка, а не наличие («на ваши даты», «ваш запрос» — не они)
+_RX_OWN = re.compile(
+    r"(?i)(?<![а-яё])ваш(?:и|а|е|его|ей|у|им|ими|их|ем)?(?![а-яё])"
+    r"(?!\s+(?:дат|срок|числ|период|поездк|отпуск|приезд|прил[её]т|визит|вопрос|запрос|сообщени)\w*)|"
+    r"(?<![а-яё])(?:бери|берите|забирай|забирайте)(?![а-яё])|"
+    r"(?<![a-z])(?:yours|your\s+(?:bike|scooter|motorbike|moped|ride))(?![a-z])")
 _RX_OBJECT = re.compile(r"(?i)вариант|байк|скутер|мотоцикл|мопед|модел|(?<![а-яё])друг(?:ой|ая|ие|ую|их|ое)(?![а-яё])|"
                         r"(?<![a-z])(?:bikes?|scooters?|motorbikes?|mopeds?|options?|models?|other)(?![a-z])")
+# «свободно» о моделях вне парка и вне проверки (r3 приёмка): другие/остальные — альтернативы, все/all, любой/any
+_RX_ALT = re.compile(r"(?i)(?<![а-яё])(?:друг(?:ой|ая|ое|ие|ую|их|им|ими)|остальн\w*)(?![а-яё])|"
+                     r"(?<![a-z])(?:others?|rest)(?![a-z])")
+_RX_ALL = re.compile(r"(?i)(?<![а-яё])все(?![а-яё])|(?<![a-z])all(?![a-z])")
+_RX_ANY = re.compile(r"(?i)(?<![а-яё])(?:люб(?:ой|ая|ое|ые|ую|ых|ого)|кажд\w*)(?![а-яё])|(?<![a-z])(?:any|every)\w*")
+_RX_ALSO = re.compile(r"(?i)(?<![а-яё])(?:тоже|также|так\s+же)(?![а-яё])|"
+                      r"(?<![a-z])(?:too|also|as\s+well|so\s+(?:is|are|do|does))(?![a-z])")
+_RX_LATER = re.compile(r"(?i)(?<![а-яё])(?:провер|уточн|узна|подбер|посмотр|поищ)\w*|"   # «другие модели проверю»
+                       r"(?<![a-z])(?:check|confirm|find|look|see)\w*")
+_RX_RENT = re.compile(r"(?i)(?<![а-яё])(?:аренд|прокат)\w*|(?<![a-z])rent\w*")
+_RX_CAPS = re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,3}(?![A-Za-z])")                  # «ADV», «CB» — сокращение модели
+_CAPS_OK = frozenset(("THB", "USD", "EUR", "RUB", "OK", "GPS", "ABS", "USB", "SIM"))
 _BARE = frozenset(
     "конечно даты дату числа число время срок сроки сейчас пока этих этот эту sure still these those dates date days "
     "period time there января февраля марта апреля июня июля августа сентября октября ноября декабря january february "
     "march april june july august september october november december".split())
+_BARE_NET = _BARE | frozenset(("сожалению",))                    # «к сожалению нет» — голое «нет»
+_FILLER = _BARE | frozenset(                                      # слова голой части со «свободно» (r3 приёмка)
+    "тоже также ещё еще уже отлично хорошо ваши ваших весь вся целиком полностью your also right currently great "
+    "good news okay well here whole entire fully trip stay visit поездку поездки цена цену цены стоимость стоит сутки "
+    "суток итого депозит price prices rate daily total deposit".split())
 # «THB 400», «price is 400 THB» — сумма, а не модель: слово перед числом из этого списка или за числом валюта
 _NOT_MODEL = frozenset((
     "thb", "baht", "usd", "eur", "rub", "km", "is", "are", "was", "be", "for", "per", "from", "only", "just", "at",
     "about", "around", "of", "to", "by", "and", "or", "plus", "price", "prices", "total", "deposit", "cost", "costs",
     "rate", "fee", "pay", "paid", "approx", "extra", "over", "under", "than", "with", "within", "the", "it", "all", "now"))
 _RX_MONEY_AFTER = re.compile(r"(?i)\s*(?:฿|\$|thb|baht|бат|руб|₽|usd|eur|km|км)")
+_NOT_COUNT = (r"(?!\s*(?:%|฿|\$|бат|руб|thb|baht|usd|час|ч(?![а-яё])|мин|сут|дн|ден|ноч|day|night|h(?![a-z])|km|км|"
+              r"тыс|k(?![a-z])|человек|чел|раз|шт|pcs|people|person))")
 # дни без месяца после предлога («на 18–22», for 18-22) — диапазон, если за ним не сумма, не время, не счёт
 _RX_DASH_DAYS = re.compile(
-    r"(?i)(?<![а-яёa-z])(?:на|с|from|for|on)\s+(\d{1,2})\s*[-–—]\s*(\d{1,2})(?!\d|[.,:/]\d)"
-    r"(?!\s*(?:%|฿|\$|бат|руб|thb|baht|usd|час|ч(?![а-яё])|мин|сут|дн|ден|ноч|day|night|h(?![a-z])|km|км|тыс|"
-    r"k(?![a-z])|человек|чел|раз|шт|pcs|people|person))")
-# слова брони в тексте ЧЕРНОВИКА (r3): агент брони не делает — «бронь оформляет человек» при любом входящем клиента.
-# Разбор грубый: «забронирован» о чужой брони и «оформление» — тоже (сомнение — человеку)
+    r"(?i)(?<![а-яёa-z])(?:на|с|from|for|on)\s+(\d{1,2})\s*[-–—]\s*(\d{1,2})(?!\d|[.,:/]\d)" + _NOT_COUNT)
+# дни без месяца словами (r3 приёмка): «from the 18th to the 22nd», «с 18 до 22», «от 18 до 22» (суффиксы сняты `_dated`)
+_RX_WORD_DAYS = re.compile(
+    r"(?i)(?<![а-яёa-z])(?:from|с|со|от)\s+(?:the\s+)?(\d{1,2})\s*(?:to|till|until|до|по)\s+(?:the\s+)?(\d{1,2})"
+    r"(?!\d|[.,:/]\d)" + _NOT_COUNT)
+# ── похожее на дату вне диапазона (r3 приёмка) ──
+_ORD = r"(-?(?:го|ого|ое|е)|st|nd|rd|th)"
+_RX_ORD = re.compile(r"(?i)(?<!\d)(\d{1,2})" + _ORD + r"(?![а-яёa-z])")             # «18-го», «22-е», 18th, 22nd
+_MON_RU = (r"(?:январ|феврал|апрел|июн|июл|сентябр|октябр|ноябр|декабр)(?:ь|я|е|ю|ём|ем)|март(?:а|е|у|ом)?|"
+           r"ма(?:й|я|е|ю|ем)|август(?:а|е|у|ом)?")
+_MON_EN = r"january|february|march|april|june|july|august|september|october|november|december"
+_MON_ANY = (r"(?:" + _MON_RU + "|" + _MON_EN + r"|may|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec|янв|фев|мар|апр|"
+            r"авг|сент?|окт|нояб?|дек)\.?(?![а-яёa-z])")
+_MON_NUM = {k: i for i, ks in enumerate((("янв", "jan"), ("фев", "feb"), ("мар", "mar"), ("апр", "apr"),
+                                         ("мая", "май", "мае", "маю", "may"), ("июн", "jun"), ("июл", "jul"),
+                                         ("авг", "aug"), ("сен", "sep"), ("окт", "oct"), ("ноя", "nov"),
+                                         ("дек", "dec")), 1) for k in ks}
+_RX_ISO_DAY = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
+_RX_NUM_DAY = re.compile(r"(?i)(?<![\d.,/])(\d{1,2})[./](\d{1,2})(?:[./](\d{4}|\d{2}))?(?!\d|[.,/]\d)"
+                         r"(?!\s*(?:%|฿|\$|бат|руб|thb|baht|km|км|кг|kg|л(?![а-яё])|час|ч(?![а-яё])|мин|h(?![a-z])))")
+_RX_DAY_MON = re.compile(r"(?i)(?<!\d)(\d{1,2})\s+(?:of\s+)?(" + _MON_ANY + ")")
+_RX_MON_DAY = re.compile(r"(?i)(?<![а-яёa-z])(" + _MON_ANY + r")\s+(\d{1,2})(?!\d|[.:]\d)")
+_RX_REL_DAY = re.compile(r"(?i)(?<![а-яё-])(послезавтра|завтра|сегодня)(?![а-яё])|"
+                         r"(?<![a-z])(day\s+after\s+tomorrow|tomorrow|today|tonight)(?![a-z])")
+_RX_PREP_DAY = re.compile(
+    r"(?i)(?<![а-яёa-z])(?:с|со|до|по|от|после|since|from|until|till|til|between|starting|after|before)\s+(?:the\s+)?"
+    r"(\d{1,2})(?!\d)(?=\s*(?:$|[,;!?)\]—–-]|\.(?!\d)|(?:по|до|и|или|to|till|until|and|or|of|on|in|в|на|числ\w*)"
+    r"(?![а-яёa-z])|" + _MON_ANY + "))")
+_RX_VAGUE = re.compile(
+    r"(?i)(?<![а-яё])(?:понедельник\w*|вторник\w*|сред[ауы]|четверг\w*|пятниц\w*|суббот\w*|воскресень\w*|недел\w*|"
+    r"выходн\w*|месяц\w*|" + _MON_RU + r")(?![а-яё])|(?<![a-z])(?:monday|tuesday|wednesday|thursday|friday|saturday|"
+    r"sunday|weekdays?|weekends?|weeks?|months?|" + _MON_EN + r")(?![a-z])|"
+    r"(?<![a-z])(?:jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\.")
+# «в неделю», «за месяц», per week — цена за срок, а не срок (только у слов недели и месяца: «в декабре» — срок)
+_RX_PER = re.compile(r"(?i)(?:(?<![а-яё])(?:в|за|раз\s+в)|(?<![a-z])(?:per|each|every))\s+$")
+_RX_UNIT = re.compile(r"(?i)недел|месяц|week|month")
+_RX_YEAR = re.compile(r"(?<![\d.,/-])(20[2-3]\d)(?![\d,/-]|\.\d)"
+                      r"(?!\s*(?:฿|\$|thb|baht|бат|руб|₽|usd|eur|%|km|км|тыс|k(?![a-z])))", re.I)
+# «through», «thru» — «till»; «between X and Y», «между X и Y» — «X to Y»; «to the 15» — «to 15» (`_dated`, длина и
+# места те же)
+_RX_THROUGH = re.compile(r"(?i)(?<![a-z])(?:through|thru)(?![a-z])")
+_RX_THE = re.compile(r"(?i)(?<![a-z])(from|to|till|until|and)(\s+)the(?=\s+\d)")
+_RX_BETWEEN = re.compile(r"(?i)(?<![a-zа-яё])(between|между)(\s[^.!?;\n]{0,24}?\d{1,2}[^.!?;\n]{0,12}?\s)(and|и)"
+                         r"(?=\s+(?:the\s+)?\d)")
+# слова брони в тексте ЧЕРНОВИКА (r3): агент брони не делает — «бронь оформляет человек» при любом входящем клиента;
+# r3 приёмка — и обещание словами: «закреплю», «оставлю за вами», «отложу», let me book, want me to reserve, I'll hold,
+# secured for you, «он ваш», it's yours. Разбор грубый: «забронирован» о чужой брони и «оформление» — тоже (сомнение —
+# человеку)
 _RX_BOOK_SAID = re.compile(
-    r"(?i)(?<![а-яё])(?:заброн|бронир|оформ)\w*|(?<![а-яё])брон(?:ь|ю|и|ей)(?![а-яё])|"
+    r"(?i)(?<![а-яё])(?:заброн|бронир|оформ|закреп)\w*|(?<![а-яё])брон(?:ь|ю|и|ей)(?![а-яё])|"
+    r"(?<![а-яё])(?:отлож|придерж)(?:у|им|ил|ила|или|ен|ено|ена)(?![а-яё])|"
+    r"(?<![а-яё])оставл(?:ю|им)\s+(?:(?:его|её|ее|их)\s+)?(?:за\s+вами|для\s+вас)|"
+    r"(?<![а-яё])подтвержда(?:ю|ем)(?![а-яё])|(?<![а-яё])(?:он|она|оно)\s+ваш(?:а|е)?(?![а-яё])|"
     r"(?<![a-z])reserv(?:ed|ation)(?![a-z])|(?<![a-z])booked\s+(?:it\s+|this\s+|them\s+)?for\s+you|"
     r"(?<![a-z])(?:i|we)(?:['’]ve|['’]ll|\s+have|\s+will|\s+can)?\s+(?:book|reserv)\w*|"
-    r"(?<![a-z])booking\s+(?:is\s+)?confirmed")
+    r"(?<![a-z])(?:let\s+me|(?:want|like)\s+me\s+to|shall\s+i|should\s+i)\s+(?:book|reserv|hold|secur|lock)\w*|"
+    r"(?<![a-z])(?:i|we)(?:['’]ll|\s+will|\s+can)\s+(?:hold|secure|lock)(?![a-z])|"
+    r"(?<![a-z])(?:hold|holding|keep|keeping|save|saving)\s+(?:it|this|them|one)\s+for\s+you|"
+    r"(?<![a-z])secured\s+for\s+you|(?<![a-z])booking\s+(?:is\s+)?confirmed|(?<![a-z])booking\s+(?:it|this|them)(?![a-z])|"
+    r"(?<![a-z])confirmed\s+for(?![a-z])|(?<![a-z])(?:it['’]s|is|are)\s+(?:all\s+)?yours(?![a-z])")
 M_BUSY = "%s — по проверке занят"
 M_BOTH = "%s — по проверке занят на одни из дат"
 M_FREE = "%s — по проверке свободен, а назван занятым"
@@ -411,9 +524,16 @@ M_DATES_DIFF = "даты %s — по проверке исход другой"
 M_FOREIGN = "«%s» — не из парка"
 M_ALIAS = "«%s» — модель не определена"
 M_BARE = "«свободно» без модели — а по проверке есть занятое"
+M_OTHERS = "«свободно» о моделях «%s» — их проверки нет"
 U_UNCHECKED = "%s — не проверен (о наличии слова нет)"
 U_STANCE = "%s — не разобрано, свободен или занят"
 U_ALIAS = "«%s» — модель не определена (о наличии слова нет)"
+U_FOREIGN = "«%s» — не из парка (не разобрано, свободен или занят)"
+U_WORD = "«свободно» рядом со словом «%s» — модель не определена"
+U_DATES = "даты %s — не разобрано, свободно или занято"
+U_DATE = "«%s» — дата не сверена с проверкой"
+U_PERIOD = "«%s» — срок словами не сверен с проверкой"
+U_YEAR = "год %s — не год проверки"
 R_AVAIL_MISMATCH = "offer_avail_mismatch"
 W_AVAIL_MISMATCH = "наличие в тексте не совпадает с проверкой — решает человек"
 L_MISMATCH = ("наличие в тексте не совпадает с проверкой: %%s — «%s» не снята, причина «%s»"
@@ -441,36 +561,76 @@ def _parts(s, a, b, keep=()):
     return out
 
 
-def _bare(part):
-    """Часть без слов длиннее трёх букв, кроме слабого слова, согласия, дат и сроков («Да, есть», «на эти даты есть»)."""
+def _bare(part, allow=_BARE):
+    """Часть без слов длиннее трёх букв, кроме слабого слова и слов allow — согласия, дат и сроков («Да, есть», «на эти
+    даты есть»)."""
     return not [w for w in re.findall(r"[a-zа-яё]+", part.lower())
-                if len(w) >= 4 and w not in _BARE and not _RX_WEAK.fullmatch(w)]
+                if len(w) >= 4 and w not in allow and not _RX_WEAK.fullmatch(w)]
 
 
-def _marks(part, named):
-    """Часть предложения → (свободно, занято). Слово «свободно» без отрицания — свободно; с отрицанием («не свободен»,
-    «нет в наличии», «свободных … нет») — занято; слово «занято» без отрицания — занято, с отрицанием («не занят», «не
-    забронирован», not booked) — свободно; слабое слово — свободно, только если в части названа модель, байк или вариант
-    или часть голая."""
+def _blank(text, spans):
+    """Текст с местами spans, заменёнными пробелами (длина и места прочего те же)."""
+    for a, b in spans:
+        text = text[:a] + " " * (b - a) + text[b:]
+    return text
+
+
+def _inside(at, spans):
+    return any(a <= at < b for a, b in spans)
+
+
+def _marks(part, named=()):
+    """Часть предложения (named — места моделей в ней) → исход сказанного: B.FREE | B.BUSY | UNSURE | None (слова
+    наличия нет). Слово «свободно» без отрицания — свободно; с отрицанием прямо перед ним («не свободен», «нет в
+    наличии», «свободных … нет») — занято; прямое слово «занято» без отрицания — занято, с отрицанием прямо перед ним
+    («не занят», not booked) — свободно; голое «нет» — занято только в голой части («NMAX 155 — нет»); слабое слово —
+    свободно, только если в части названа модель, байк или вариант или часть голая. «Не разобрано» (r3 приёмка) —
+    отрицание где угодно ещё в части (никто, ничего, ещё не, nobody, no one, nothing, yet, hasn't been, «нет» не голой
+    части), обороты «нет проблем», no problem, слова владения (ваш, yours, берите), «свободно» вместе с «занято»."""
     free = busy = False
+    used = []                                       # отрицания, ставшие частью слова наличия: другим отрицанием не судятся
     for m in _RX_FREE.finditer(part):
-        if _RX_NEG.search(part[:m.start()]) or (_RX_GEN.search(m.group()) and _RX_NET.search(part, m.end())):
+        n = _RX_NEG.search(part[:m.start()])
+        g = _RX_NET.search(part, m.end()) if _RX_GEN.search(m.group()) else None
+        if n or g:
             busy = True
+            used.append((n or g).span())
         else:
             free = True
     for m in _RX_BUSY.finditer(part):
-        if _RX_NEG.search(part[:m.start()]):
+        n = _RX_NEG.search(part[:m.start()])
+        if n:
             free = True
+            used.append(n.span())
         else:
             busy = True
+    if _bare(_blank(part, named), _BARE_NET):       # голое «нет»: «NMAX 155 — нет», «на эти даты нет»
+        for m in _RX_NET.finditer(part):
+            if not _inside(m.start(), used):
+                busy = True
+                used.append(m.span())
     if not free and any(not _RX_NEG.search(part[:m.start()]) for m in _RX_WEAK.finditer(part)):
         free = bool(named or _RX_OBJECT.search(part) or _bare(part))
-    return free, busy
+    if (free and busy) or _RX_IDIOM.search(part) or _RX_OWN.search(part) or \
+            any(not _inside(m.start(), used) for m in _RX_NEGATOR.finditer(part)):
+        return UNSURE
+    return B.FREE if free else B.BUSY if busy else None
+
+
+def _content(part):
+    """Слова части «свободно» без модели парка, которые не служебные (r3 приёмка): от четырёх букв вне `_FILLER`, слов
+    наличия, байка и аренды — «Нмакс», Forza; сокращение заглавными («ADV») — тоже. Пусто — часть голая."""
+    t = part
+    for rx in (_RX_FREE, _RX_BUSY, _RX_WEAK, _RX_OBJECT, _RX_RENT, _RX_ALSO, _RX_NEGATOR, _RX_ALT, _RX_ALL, _RX_ANY):
+        t = rx.sub(" ", t)
+    return [w for w in re.findall(r"[a-zа-яё]+", t.lower()) if len(w) >= 4 and w not in _FILLER] + \
+        [w for w in _RX_CAPS.findall(t) if w not in _CAPS_OK]
 
 
 def _mentions(s, bikes):
     """Модели в тексте → [(начало, конец, модель | None | False, слово)]: модель парка (`M.model_hits`; None —
-    сокращение к нескольким), False — похожее на модель не из парка (сумма «THB 400» — не модель)."""
+    сокращение к нескольким), False — похожее на модель не из парка (сумма «THB 400» — не модель). Модель кириллицей
+    («Нмакс») и без кубатуры не из парка («Forza», «ADV») моделью не находится — их судит `_loose_free` (r3 приёмка)."""
     hits = [(h[0], h[1], h[2], h[3]) for h in M.model_hits(s, bikes)]
     foreign = [(m.start(), m.end(), False, m.group()) for m in _RX_MODEL_LIKE.finditer(s)
                if not any(h[0] < m.end() and m.start() < h[1] for h in hits)
@@ -479,20 +639,80 @@ def _mentions(s, bikes):
     return sorted(hits + foreign)
 
 
+def _dated(s):
+    """Текст → он же для разбора дат, длина и места те же (r3 приёмка): суффиксы порядковых («18-го», «22-е», 18th) —
+    пробелы, through/thru — till, «to the 15» — «to 15», «between X and Y» и «между X и Y» — «X to Y» и «X - Y»."""
+    t = _RX_ORD.sub(lambda m: m.group(1) + " " * len(m.group(2)), s)
+    t = _RX_THROUGH.sub(lambda m: "till".ljust(len(m.group())), t)
+    t = _RX_THE.sub(lambda m: m.group(1) + m.group(2) + "   ", t)
+    return _RX_BETWEEN.sub(lambda m: " " * len(m.group(1)) + m.group(2) + ("to " if len(m.group(3)) == 3 else "-"), t)
+
+
 def _ranges(s, today):
     """Диапазоны дат текста → [(начало, конец, (выдача, возврат) | None, (день, день) | None, слова)] по месту: с
-    месяцем — даты (`M.find_ranges`, год — от today), без месяца («с 10 по 15», «на 18–22») — только числа дней."""
+    месяцем — даты (`M.find_ranges` по `_dated`, год — от today, начало словом «с завтра» — от today), без месяца («с 10
+    по 15», «на 18–22», «from the 18th to the 22nd») — только числа дней."""
+    t = _dated(s)
     out = []
-    for r in M.find_ranges(s, today):
+    for r in M.find_ranges(t, today, today):
         if r["ds"] is not None:
             out.append((r["a"], r["b"], (r["ds"], r["de"]), None, r["label"]))
         else:
-            d = [int(x) for x in re.findall(r"\d{1,2}", s[r["a"]:r["b"]])]
+            d = [int(x) for x in re.findall(r"\d{1,2}", t[r["a"]:r["b"]])]
             out.append((r["a"], r["b"], None, tuple(d[:2]), r["label"]))
-    for m in _RX_DASH_DAYS.finditer(s):
-        a, b, d1, d2 = m.start(1), m.end(2), int(m.group(1)), int(m.group(2))
-        if 1 <= d1 < d2 <= 31 and not any(g[0] < b and a < g[1] for g in out):
-            out.append((a, b, None, (d1, d2), "%d–%d (месяц не назван)" % (d1, d2)))
+    for rx in (_RX_DASH_DAYS, _RX_WORD_DAYS):
+        for m in rx.finditer(t):
+            a, b, d1, d2 = m.start(1), m.end(2), int(m.group(1)), int(m.group(2))
+            if 1 <= d1 < d2 <= 31 and not any(g[0] < b and a < g[1] for g in out):
+                out.append((a, b, None, (d1, d2), "%d–%d (месяц не назван)" % (d1, d2)))
+    return sorted(out)
+
+
+def _near(today, d, mo, y=None):
+    """День и месяц (год — если назван) → date | None; без года — ближайшая будущая (сегодня включительно)."""
+    try:
+        if y is not None:
+            y = int(y)
+            return datetime.date(y + 2000 if y < 100 else y, int(mo), int(d))
+        got = datetime.date(today.year, int(mo), int(d))
+        return got if got >= today else datetime.date(today.year + 1, int(mo), int(d))
+    except (ValueError, TypeError):
+        return None
+
+
+def _points(s, rngs, today):
+    """Похожее на дату вне диапазонов `_ranges` (r3 приёмка) → [(начало, конец, вид, значение, слова)] по месту: "day"
+    — дата (день с месяцем, дд.мм, ГГГГ-ММ-ДД, сегодня, завтра), "dom" — только число дня («18-го», 18th, «с 18», «до
+    22», from 18), "vague" — срок словами (день недели, неделя, выходные, месяц словом; «в неделю» — цена, не срок),
+    "year" — год."""
+    t, taken, out = _dated(s), [(g[0], g[1]) for g in rngs], []
+
+    def put(a, b, kind, value):
+        if value is None or any(x < b and a < y for x, y in taken):
+            return
+        taken.append((a, b))
+        out.append((a, b, kind, value, s[a:b].strip().rstrip(".")))
+    for m in _RX_ISO_DAY.finditer(t):
+        put(m.start(), m.end(), "day", _near(today, m.group(3), m.group(2), m.group(1)))
+    for m in _RX_NUM_DAY.finditer(t):
+        put(m.start(), m.end(), "day", _near(today, m.group(1), m.group(2), m.group(3)))
+    for m in _RX_DAY_MON.finditer(t):
+        put(m.start(), m.end(), "day", _near(today, m.group(1), _MON_NUM.get(m.group(2).lower()[:3])))
+    for m in _RX_MON_DAY.finditer(t):
+        put(m.start(), m.end(), "day", _near(today, m.group(2), _MON_NUM.get(m.group(1).lower()[:3])))
+    for m in _RX_REL_DAY.finditer(t):
+        w = m.group().lower()
+        put(m.start(), m.end(), "day", today + datetime.timedelta(
+            days=2 if w.startswith(("после", "day")) else 1 if w.startswith(("завтра", "tomorrow")) else 0))
+    for m in _RX_ORD.finditer(s):
+        put(m.start(), m.end(), "dom", int(m.group(1)) if 1 <= int(m.group(1)) <= 31 else None)
+    for m in _RX_PREP_DAY.finditer(t):
+        put(m.start(), m.end(1), "dom", int(m.group(1)) if 1 <= int(m.group(1)) <= 31 else None)
+    for m in _RX_VAGUE.finditer(t):
+        per = _RX_UNIT.match(m.group()) and _RX_PER.search(t[:m.start()])
+        put(m.start(), m.end(), "vague", None if per else True)
+    for m in _RX_YEAR.finditer(t):
+        put(m.start(), m.end(), "year", int(m.group(1)))
     return sorted(out)
 
 
@@ -511,41 +731,53 @@ def _covers(g, o):
                for w in _windows(o))
 
 
+def _ends(o):
+    """Факт offer → его концы: начало, конец, конец клиента (до минимума класса)."""
+    return {d for d in (day_arg(o.get("date_from")), day_arg(o.get("date_to")), day_arg(o.get("asked_to"))) if d}
+
+
 def _infer(parts, i):
-    """Модель в части без слова наличия → исход сказанного о ней (B.FREE | B.BUSY | None): следующая часть без модели
-    со словом наличия («NMAX 155 — нет»); иначе ближайшая прежняя часть со словом — после «но», «а», but между ними
-    обратный ей («…, but NMAX 155 is», «…, а NMAX 155 — да»), без них тот же («XMAX 300 тоже»); иначе ближайшая
-    следующая; слова наличия в предложении нет — None."""
+    """Модель в части без слова наличия → (исход сказанного о ней: B.FREE | B.BUSY | UNSURE | None, номер части, у
+    которой он взят | None): следующая часть без модели со словом наличия («NMAX 155 — нет»); иначе ближайшая прежняя
+    часть со словом — после «но», «а», but между ними обратный ей («…, but NMAX 155 is», «…, а NMAX 155 — да»), без них
+    тот же («XMAX 300 тоже»); иначе ближайшая следующая; слова наличия в предложении нет — None. «Не разобрано» берётся
+    как есть (r3 приёмка): ни обратного, ни «занято» у такой части нет."""
     nxt = parts[i + 1] if i + 1 < len(parts) else None
     if nxt is not None and not nxt["named"] and nxt["mark"]:
-        return nxt["mark"]
+        return nxt["mark"], i + 1
     j = next((k for k in range(i - 1, -1, -1) if parts[k]["mark"]), None)
     if j is not None:
-        if any(_RX_CONTRAST.fullmatch(parts[k]["sep"]) for k in range(j + 1, i + 1)):
-            return B.BUSY if parts[j]["mark"] == B.FREE else B.FREE
-        return parts[j]["mark"]
-    return next((p["mark"] for p in parts[i + 1:] if p["mark"]), None)
+        mark = parts[j]["mark"]
+        if mark != UNSURE and any(_RX_CONTRAST.fullmatch(parts[k]["sep"]) for k in range(j + 1, i + 1)):
+            mark = B.BUSY if mark == B.FREE else B.FREE
+        return mark, j
+    k = next((k for k in range(i + 1, len(parts)) if parts[k]["mark"]), None)
+    return (None, None) if k is None else (parts[k]["mark"], k)
 
 
 def _judge(model, word, st, dates, by):
     """Упоминание (модель | None — сокращение | False — не из парка; исход сказанного; диапазоны его дат) + принятые
     факты по моделям → ("ok" | "bad" | "unsure" | "pending", почему): "bad" — расхождение, "unsure" — не сверено,
-    "pending" — слова наличия о модели нет (судит другое её упоминание со словом; такого нет — не сверено)."""
+    "pending" — слова наличия о модели нет (судит другое её упоминание со словом; такого нет — не сверено). Исход «не
+    разобрано» (r3 приёмка) — не сверено, даже когда даты совпали."""
     if model is False:
-        return ("bad", M_FOREIGN % label_of(word)) if st == B.FREE else ("ok", "")
+        return ("bad", M_FOREIGN % label_of(word)) if st == B.FREE else \
+            ("unsure", U_FOREIGN % label_of(word)) if st == UNSURE else ("ok", "")
     if model is None:
         return ("bad", M_ALIAS % label_of(word)) if st == B.FREE else ("unsure", U_ALIAS % label_of(word))
     facts = by.get(model) or []
     if not facts:
-        return ("bad", M_UNCHECKED % model) if st else ("unsure", U_UNCHECKED % model)
+        return ("bad", M_UNCHECKED % model) if st in (B.FREE, B.BUSY) else ("unsure", U_UNCHECKED % model)
     for g in dates or ():
         got = {o.get("avail") for o in facts if _covers(g, o)}
         if not got:
             return "bad", M_DATES % (model, g[4])
-        if st and got != {st}:
+        if st in (B.FREE, B.BUSY) and got != {st}:
             return "bad", (M_BUSY if st == B.FREE else M_FREE) % model
     if st is None:
         return "pending", U_STANCE % model
+    if st == UNSURE:
+        return "unsure", U_STANCE % model
     got = {o.get("avail") for o in facts}
     if dates or got == {st}:
         return "ok", ""
@@ -555,20 +787,66 @@ def _judge(model, word, st, dates, by):
 
 
 def _judge_any(g, st, facts):
-    """Диапазон дат в предложении без модели → ("ok" | "bad", почему): факт на эти даты у любой модели (со словом наличия
-    — и исход тот же)."""
+    """Диапазон дат в предложении без модели → ("ok" | "bad" | "unsure", почему): факт на эти даты у любой модели (со
+    словом наличия — и исход тот же; «не разобрано» — не сверено)."""
     got = {(r.get("offer") or {}).get("avail") for r in facts if _covers(g, r.get("offer") or {})}
     if not got:
         return "bad", M_DATES_ANY % g[4]
-    if st and got != {st}:
+    if st in (B.FREE, B.BUSY) and got != {st}:
         return "bad", M_DATES_DIFF % g[4]
+    if st == UNSURE:
+        return "unsure", U_DATES % g[4]
     return "ok", ""
+
+
+def _judge_point(q, models, by, facts):
+    """Похожее на дату вне диапазонов (`_points`) + модели его части (иначе предложения; нет — любые факты) → ("ok" |
+    "unsure", почему): дата — начало или конец (конец клиента) факта этих моделей, число дня — их число, год — их год;
+    срок словами — всегда не сверено."""
+    kind, word = q[2], label_of(q[4])
+    if kind == "vague":
+        return "unsure", U_PERIOD % word
+    pool = [o for m in models for o in by.get(m) or ()] if models else [r.get("offer") or {} for r in facts]
+    ends = {d for o in pool for d in _ends(o)}
+    ok = (q[3] in ends if kind == "day" else q[3] in {d.day for d in ends} if kind == "dom" else
+          q[3] in {d.year for d in ends})
+    if ok:
+        return "ok", ""
+    return "unsure", (U_YEAR if kind == "year" else U_DATE) % word
+
+
+def _loose_free(part, p, parts, i):
+    """Часть без модели парка → [(None, исход, почему)] о «свободно» в ней (r3 приёмка). Своё «свободно», не отданное
+    модели предложения: «другие», «все», «остальные», other, all — расхождение; иное слово (любой, any, «Нмакс», Forza,
+    ADV) — не сверено; голая часть — пусто (её судит M_BARE). Отданное модели («PCX 160 — свободен», «есть другой
+    вариант — NMAX 155») судится с моделью, но иное слово в нём («PCX 160 или Нмакс свободны») — всё равно не сверено.
+    Без своего слова наличия — с «другие модели», «все модели», любой, any или «тоже» при ином слове — не сверено, если
+    предложение не говорит «занято» («другие модели проверю» — не она)."""
+    words = _content(part)
+    if p["lent"]:
+        return [(None, "unsure", U_WORD % label_of(words[0]))] if p["mark"] == B.FREE and words else []
+    alt, alls, anys = _RX_ALT.search(part), _RX_ALL.search(part), _RX_ANY.search(part)
+    if p["mark"] == B.FREE:
+        if alt or alls:
+            return [(None, "bad", M_OTHERS % label_of((alt or alls).group()))]
+        if anys or words:
+            return [(None, "unsure", U_WORD % label_of(anys.group() if anys else words[0]))]
+        p["bare_free"] = True
+        return []
+    if p["mark"] is not None or _RX_LATER.search(part):
+        return []
+    hit = alt.group() if alt else (alls or anys).group() if (alls or anys) and _RX_OBJECT.search(part) else None
+    if hit is None and _RX_ALSO.search(part) and words:
+        hit = words[0]
+    if hit is None or _infer(parts, i)[0] == B.BUSY:
+        return []
+    return [(None, "unsure", U_WORD % label_of(hit))]
 
 
 def avail_check(text, facts, bikes, today=None):
     """Текст черновика + принятые факты offer + парк снимка → (расхождение, не сверено): списки «почему» по порядку, без
     повторов (см. шапку раздела). Оба пусты — текст с фактами сверен целиком; фактов нет — оба пусты (снимать нечего).
-    today — «сегодня» сверки (год дат без года); нет — по часам Пхукета."""
+    today — «сегодня» сверки (год дат без года, начало «с завтра»); нет — по часам Пхукета."""
     if not facts:
         return [], []
     today = today or B.local_now(time.time()).date()
@@ -579,22 +857,27 @@ def avail_check(text, facts, bikes, today=None):
     busy_any = any(o.get("avail") == B.BUSY for v in by.values() for o in v)
     s = str(text or "")
     ments, rngs, seen = _mentions(s, bikes), _ranges(s, today), []          # seen: (модель | None, исход, почему)
+    pts = _points(s, rngs, today)
     for a, b in _sentences(s):
         sr = [g for g in rngs if a <= g[0] < b]
         parts = []
         for c0, c1, sep in _parts(s, a, b, [(g[0], g[1]) for g in sr]):
             named = [x for x in ments if c0 <= x[0] < c1]
-            free, busy = _marks(s[c0:c1], bool(named))
-            parts.append({"sep": sep, "named": named, "rngs": [g for g in sr if c0 <= g[0] < c1],
-                          "mark": B.FREE if free else B.BUSY if busy else None})
+            parts.append({"sep": sep, "named": named, "rngs": [g for g in sr if c0 <= g[0] < c1], "a": c0, "b": c1,
+                          "mark": _marks(s[c0:c1], [(x[0] - c0, min(x[1], c1) - c0) for x in named]), "lent": False})
         fleet = list(dict.fromkeys(x[2] for p in parts for x in p["named"] if x[2]))
         loose = [g for p in parts if not p["named"] and not p["mark"] for g in p["rngs"]]   # даты ничьей части
         stances = []
         for i, p in enumerate(parts):
             for x in p["named"]:
-                st = p["mark"] or _infer(parts, i)
+                st = p["mark"]
+                if not st:
+                    st, k = _infer(parts, i)
+                    if k is not None:
+                        parts[k]["lent"] = True           # «свободно» этой части судится с моделью, а не само
                 stances.append(st)
                 seen.append((x[2],) + _judge(x[2], x[3], st, p["rngs"] or loose, by))
+        for i, p in enumerate(parts):
             if p["named"]:
                 continue
             for g in p["rngs"]:                       # даты в части без модели — у моделей предложения или у любой
@@ -602,9 +885,14 @@ def avail_check(text, facts, bikes, today=None):
                     seen += [(m,) + _judge(m, m, p["mark"], [g], by) for m in fleet]
                 else:
                     seen.append((None,) + _judge_any(g, p["mark"], facts))
-        if busy_any and B.FREE not in stances and any(p["mark"] == B.FREE and not p["named"] and not p["rngs"]
-                                                       for p in parts):
+            seen += _loose_free(s[p["a"]:p["b"]], p, parts, i)
+        if busy_any and B.FREE not in stances and any(p.get("bare_free") and not p["rngs"] for p in parts):
             seen.append((None, "bad", M_BARE))
+        for q in pts:                                 # похожее на дату вне диапазонов — у моделей своей части
+            if a <= q[0] < b:
+                p = next((p for p in parts if p["a"] <= q[0] < p["b"]), None)
+                own = [x[2] for x in p["named"] if x[2]] if p else []
+                seen.append((None,) + _judge_point(q, own or fleet, by, facts))
     said = {m for m, v, _w in seen if v in ("ok", "bad") and m}    # о модели разобрано другое упоминание
     bad = [w for _m, v, w in seen if v == "bad"]
     unsure = [w for m, v, w in seen if v == "unsure" or (v == "pending" and m not in said)]
@@ -626,7 +914,7 @@ class Offers(object):
         self.adapter, self.today, self.limit, self.since = adapter, today, limit, since
         self.results, self.cache, self.memo = [], {}, {}
         self.calls = self.door_calls = self.cached = self.over = 0
-        self.bikes = None                                            # парк последнего служащего снимка (`avail_mismatch`)
+        self.bikes = None                                            # парк последнего служащего снимка (`avail_check`)
 
     def door(self, unit, ds, de):
         """Общая дверь цены вызова: (юнит, даты) → ответ двери, прочитанный один раз; исключение — то же, повторно."""
