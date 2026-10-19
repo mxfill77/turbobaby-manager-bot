@@ -1,0 +1,34 @@
+{
+ "added": [],
+ "base_prod_version": 88,
+ "base_sha256": {
+  "Booking.js": "a95bbdc9ba6b720b19dab81fc400bebf116e372bb1f0cc841f8a0ec4fc45c64b",
+  "Closing.js": "8fce3a78e21d92e478d64e60f3b415459904e749767ef2808a24be115652f8f9"
+ },
+ "build_sha256": {
+  "Booking.js": "8676bd49d0b97883941b4414e8770471109f30a4ce01234e52815d56841d983c",
+  "Closing.js": "8914dc3e8da0c499f2e08ced39a86ee42a495c52a10e435aeb455c1d91c55b85"
+ },
+ "changed": [
+  "Booking.js",
+  "Closing.js"
+ ],
+ "unchanged": [],
+ "script_id": "12iXPDU_wxcyslItPW6X41ODuoVxx2smmlQBfhSwI6Lt42MTrYbv9HhOJ",
+ "база": "bridge_prod/ (зеркало задеплоенной версии @88, паспорт MIRROR.json)",
+ "выкладке_подлежат": [
+  "Booking.js",
+  "Closing.js"
+ ],
+ "выложено": "НЕТ. Состояние «а» правила трёх состояний (tests/build_states.py): база == зеркало @88, файлы == build_sha256. Bridge.js не меняется: маршруты close_booking и closing_upsert отдают тело вызова целиком (bridge_prod/Bridge.js:367-368, 388-389).",
+ "не_каталог_выкладки": "настроек проекта (.clasp.json) здесь НЕТ намеренно: из репозитория залить прод нельзя. Выкладка собирает свой каталог вне репо и СНАЧАЛА снимает свежий отпечаток прода (deploy/bridge_prod_diff.py).",
+ "перед_выкладкой": [
+  "deploy/bridge_prod_diff.py — свежий отпечаток: прод не ушёл с @88, HEAD == @88 (иначе собрать заново поверх нового HEAD)",
+  "порядок контуров — Splinter с CLOSE_ACCRUAL ВЫКЛ (умолчание) раньше моста; ручку CLOSE_ACCRUAL=1 — только ПОСЛЕ выкладки моста и естественного чтения назад (ответ closing_upsert несёт components/binding)",
+  "после выкладки — bridge_deploy.py шаг [7/7] сведёт зеркало сам; выкладка мимо него — свести зеркало заходом и коммитом"
+ ],
+ "почему_отдельный_каталог": "bridge_build/, bridge_build_contract/, bridge_build_tx_find/ — следы выложенных сборок соседних дверей (состояния «б»/«в»); перестройка там ломала бы их суд. bridge_deploy.py принимает каталог аргументом, поэтому сборка живёт рядом.",
+ "смешанные_версии": "старый мост @88 + новый Splinter: поле accrual игнорируется, квитанции нет → Splinter говорит «Доплаты не записаны: Bridge их не подтвердил»; ответ closing_upsert без components/binding → начисление стоп ещё на карточке. Новый мост + старый Splinter (или CLOSE_TRUTH=0): paid_total без paid_total_opt_in === true НЕ пишется в K (paid_total_ignored) — производная перезапись K не воскресает.",
+ "тема": "CLOSEACCRUAL1910 — начисление доплат листа закрытия в K формулой «основа+доплаты» и расшифровка примечанием к A (решение владельца 19.10.2026 23:3x; условия Codex TB-REVIEW-1910-2400). closing_upsert отдаёт части и привязку; closeBooking — шов начисления под замком с меткой IN_PROGRESS/DONE и квитанцией; paid_total — только opt-in.",
+ "что_это": "КАТАЛОГ СБОРКИ ЗАХОДА. Здесь лежит НЕ прод, а то, что заход предлагает выложить. Истина о проде — bridge_prod/ (зеркало под паспортом MIRROR.json); править его запрещено замком tests/test_bridge_prod_mirror.py, поэтому стройка идёт сюда."
+}

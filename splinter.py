@@ -184,6 +184,22 @@ def _close_truth_on():
                                                                                       "false")
 
 
+# CLOSEACCRUAL1910: умолчание ручки начисления доплат — ВЫКЛ (задание: новый мост ещё не выложен; порядок выкладки —
+# сначала мост bridge_build_close_accrual/, потом CLOSE_ACCRUAL=1). ВЫКЛ = ровно путь CLOSETRUTH1910.
+_CLOSE_ACCRUAL_DEFAULT = "0"
+
+
+def _close_accrual_on():
+    """Ручка CLOSEACCRUAL1910 (решение владельца 19.10 23:3x: доплаты — в K формулой «основа+доплаты», расшифровка —
+    примечанием к A; это НАЧИСЛЕНИЕ к оплате, не оплата). ВКЛ только поверх CLOSE_TRUTH: при откате CLOSE_TRUTH=0
+    начисления нет никогда — у K в одном заходе один писатель. ВЫКЛ (умолчание) → K не трогаем, «к доплате» на
+    карточке — путь CLOSETRUTH1910 байт-в-байт. Блок — у `_close_card_parts` (раздел CLOSEACCRUAL1910)."""
+    if not _close_truth_on():
+        return False
+    return str(_os_env("CLOSE_ACCRUAL", _CLOSE_ACCRUAL_DEFAULT)).strip().lower() not in ("0", "", "нет", "no", "off",
+                                                                                         "false")
+
+
 # Строка флагов выпуска (INTAKECONFIRM1610, Codex TB-REL-CDA1AD9-STOP-1610-0431, причина 1): скрипт рестарта доказывает
 # ЭФФЕКТИВНЫЕ значения двух ручек словом самого процесса — после load_dotenv в bot.py, тем же чтением, что и в работе.
 # Значений окружения в строке нет: на ручку одно слово и «задан / не задан». Словари — ровно слова читателей: значение
@@ -9096,6 +9112,8 @@ def _rc_card_text(action, t):
     if _close_truth_on():
         km = str(t.get("km") or "").strip()
         km_line, due_line, tail = _close_card_parts(km, str(t.get("km_photo") or "").strip(), t.get("due_total"))
+        if _close_accrual_on() and (t.get("acc_op") or t.get("acc_stop")):
+            due_line, tail = _acc_card_lines(t, t.get("due_total"), due_line, tail)   # CLOSEACCRUAL1910
         dep = t.get("deposit_disp")
         dep_line = (f"\n💰 Верни депозит: {dep}" if dep else "\n💰 Депозит: не указан ⚠️")
         return (f"🐀 Splinter\n📥 ПРИЁМ: {t.get('bike')} вернулся от {t.get('name') or '—'}, "
@@ -9228,10 +9246,12 @@ async def _rc_activation_card(context, bridge, bike, cand):
     return True
 
 
-async def _rc_close_card(context, bridge, bike, cand, km, paid, due=None, km_photo=""):
+async def _rc_close_card(context, bridge, bike, cand, km, paid, due=None, km_photo="", acc=None, acc_stop=None):
     """К4 шаги 6–7 на карточке приёма. True — путь К4 разобрал карточку сам.
     CLOSETRUTH1910: due (доплата листа закрытия, только текст) и km_photo (пробег с фото, только подсказка) ложатся в
-    цель ожидания лишь когда переданы — при ручке ВЫКЛ цель дела байт-в-байт прежняя."""
+    цель ожидания лишь когда переданы — при ручке ВЫКЛ цель дела байт-в-байт прежняя.
+    CLOSEACCRUAL1910: acc (поля acc_* операции начисления) / acc_stop (причина стопа) — тоже лишь когда переданы; цель
+    живёт в хранилище дела, поэтому операция переживает рестарт вместе с ней."""
     c = _rc_case_for(bridge, bike, "return", cand.get("row"))
     if not _rc_on("RENTAL_CASE_APPROVALS"):
         return False
@@ -9254,7 +9274,13 @@ async def _rc_close_card(context, bridge, bike, cand, km, paid, due=None, km_pho
         target["due_total"] = due
     if km_photo:
         target["km_photo"] = km_photo
-    log.info(f"  → ПРИЁМ {bike}: карточка закрытия (дело {c['case_id']}) во Входящие через хранилище")
+    if acc:
+        target.update(acc)
+    elif acc_stop:
+        target["acc_stop"] = acc_stop
+    log.info(f"  → ПРИЁМ {bike}: карточка закрытия (дело {c['case_id']}) во Входящие через хранилище"
+             + (f" | CLOSE_ACCRUAL: операция {acc.get('acc_op')}" if acc else
+                (f" | CLOSE_ACCRUAL: стоп — {acc_stop}" if acc_stop else "")))
     await _rc_request_card(context, st, "close", c["case_id"], c.get("ver"), _rc_card_text("close", target), target)
     return True
 
@@ -9463,22 +9489,31 @@ async def _rc_execute(msg, context, bridge, st, out, text):
             await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
             return
         _paid, _paid_cut = _close_paid_arg(tgt.get("paid_total"))   # CLOSETRUTH1910: при ручке — None всегда
-        res, exc, sent = _rc_red(bridge, lambda: bridge.close_booking(bike=tgt.get("bike"), name=tgt.get("name"),
-                                                                      date_start=(tgt.get("date_start") or None),
-                                                                      km_end=_km, paid_total=_paid))
+        _acc, _acc_why = _acc_payload(tgt)                           # CLOSEACCRUAL1910: при ручке ВЫКЛ — (None, None)
+        if _acc is not None:
+            res, exc, sent = _rc_red(bridge, lambda: _close_booking_accrual(
+                bridge, bike=tgt.get("bike"), name=tgt.get("name"), date_start=(tgt.get("date_start") or None),
+                km_end=_km, accrual=_acc))
+        else:
+            res, exc, sent = _rc_red(bridge, lambda: bridge.close_booking(bike=tgt.get("bike"), name=tgt.get("name"),
+                                                                          date_start=(tgt.get("date_start") or None),
+                                                                          km_end=_km, paid_total=_paid))
         err = res.get("error")
         out_w = intake_confirm.red_outcome(res, sent, "close")
         if out_w == intake_confirm.WRITTEN:
             _row = res.get("row") or tgt.get("row")
             written({"ok": True, "row": _row, "written_at": _time.time()})
             log.info(f"  → ПРИЁМ: аренда завершена через дело аренды (строка {_row}, @{who}) {tgt.get('bike')} "
-                     f"km_end={_km or '-'}" + (" | paid_total карточки снят (CLOSE_TRUTH)" if _paid_cut else ""))
-            await say(f"✅ Завершена, строка {_row}." + (_CLOSE_PAID_NOTE if _paid_cut else ""))
+                     f"km_end={_km or '-'}" + (" | paid_total карточки снят (CLOSE_TRUTH)" if _paid_cut else "")
+                     + (f" | CLOSE_ACCRUAL {_acc['close_op_id']}: {res.get('accrual')}" if _acc is not None else ""))
+            await say(f"✅ Завершена, строка {_row}." + (_CLOSE_PAID_NOTE if _paid_cut else "")
+                      + _close_ok_tail(res, _acc, _acc_why))
             _rc_readback(bridge, st, rb, tgt, _time.time())
         elif out_w == intake_confirm.UNKNOWN:
             _err = type(exc).__name__ if exc is not None else (str(err or "") or "?")
             written({"unknown": _err})
-            await say(f"⚠️ Исход закрытия неизвестен ({_err}) — проверь CRM; повтор не делаю.")
+            await say(f"⚠️ Исход закрытия неизвестен ({_err}) — проверь CRM; повтор не делаю."
+                      + (_ACC_UNKNOWN if _acc is not None else ""))
         elif sent and err in ("unknown_action", "km_required"):
             # прежде карточка оставалась живой; ожидание уже answered — даём НОВУЮ карточку того же закрытия
             written({"error": str(err)})
@@ -9756,7 +9791,8 @@ def _return_resolve_close(bridge, bike):
                 "date_start": str(r.get("date_start") or ""),
                 "status": str(r.get("status", "")).strip().lower(),
                 "deposit_raw": r.get("deposit_raw"),
-                "deposit": r.get("deposit")}
+                "deposit": r.get("deposit"),
+                "booking_id": str(r.get("booking_id") or "").strip()}   # CLOSEACCRUAL1910: привязка листа закрытия
     try:
         cl = bridge._call("clients", filter="all").get("data", {})
         rows = cl.get("clients", []) if isinstance(cl, dict) else (cl or [])
@@ -9772,7 +9808,8 @@ def _return_resolve_close(bridge, bike):
             "date_start": str(last.get("date_start") or ""),
             "status": str(last.get("status", "")).strip().lower(),
             "deposit_raw": last.get("deposit_raw"),
-            "deposit": last.get("deposit")}
+            "deposit": last.get("deposit"),
+            "booking_id": str(last.get("booking_id") or "").strip()}   # CLOSEACCRUAL1910: привязка листа закрытия
 
 
 def _return_deposit_disp(raw, parsed):
@@ -9848,7 +9885,260 @@ def _close_card_parts(km, km_photo, due):
     return km_line, due_line, tail
 
 
-async def _return_close_card(context, bridge, bike, km="", total_due=None, km_photo=""):
+# ===================== CLOSEACCRUAL1910: начисление доплат в K + примечание к A (ручка CLOSE_ACCRUAL) =====================
+# Решение владельца 19.10.2026 23:3x: «Там можно доплаты тогда писать ставить перед основной суммой = и доплаты через +
+# например 10000+500+1000 И писать в примечание в столбец A этой строки». Это НАЧИСЛЕНИЕ к оплате, а не квитанция о
+# деньгах: карточка и ответ говорят «начисление / начислено к оплате (не оплата)». Минимальный шов этого изменения,
+# условия Codex TB-REVIEW-1910-2400:
+#   (1) части доплат — ТОЛЬКО из свежего ответа closing_upsert этой аренды: components + binding (строка листа, КАК
+#       найдена, booking_id и бронь CRM этого id: строка, день начала). Нет привязки / чужая бронь / не целое число /
+#       сумма частей ≠ итогу — начисление стоп ДО записей (само закрытие идёт), карточка называет причину. total_due
+#       на части не раскладываем; closing_get по байку не зовём;
+#   (2)–(4) запись K и примечания, метка IN_PROGRESS/DONE, пустой/текстовый K — на стороне моста (сборка
+#       bridge_build_close_accrual/Booking.js, closeBooking); здесь — тот же вывод стабильного close_op_id
+#       (`_acc_op_id` == closeAccrualOpId_), и он живёт с карточкой (память, restart_handoff.CLOSE_KEYS, цель дела К4);
+#   (5) квитанция начисления в ответе обязательна: старый мост поле молча игнорирует — без квитанции «Доплаты не
+#       записаны: Bridge их не подтвердил». partial / unknown не повторяются и не откатываются: исход называется.
+_ACC_PARTS = ("surcharge_days", "surcharge_fuel", "damage", "other")      # порядок слагаемых — как у моста
+_ACC_LABEL = {"surcharge_days": "дни", "surcharge_fuel": "топливо", "damage": "ущерб", "other": "прочее"}
+_ACC_STATUSES = ("done", "already_done", "stopped", "partial", "unknown")
+_ACC_NO_RECEIPT = " Доплаты не записаны: Bridge их не подтвердил."
+_ACC_UNKNOWN = " Начисление доплат — исход неизвестен вместе с закрытием: проверь K и примечание к A; повтор не делаю."
+_ACC_REASON = {
+    "bad_accrual": "мост не принял поле начисления", "bad_component": "часть доплаты не целое число",
+    "no_addends": "доплат нет", "binding_mismatch": "строка CRM — не та аренда (бронь / строка / день начала)",
+    "payload_mismatch": "состав доплат не совпал с операцией карточки",
+    "other_accrual_recorded": "у строки уже записано другое начисление",
+    "note_changed_before_write": "примечание к A правили во время закрытия", "lock_busy": "замок закрытия занят",
+    "in_progress_found": "у строки висит незавершённая метка этой операции", "prestate_changed":
+        "строку или K правили между записями", "note_changed": "примечание правили между записями",
+    "note_done_unconfirmed": "метка DONE не подтвердилась", "note_readback_mismatch": "примечание не прочиталось назад",
+    "k_readback_mismatch": "K прочитан назад не тем",
+}
+
+
+def _acc_int(v):
+    """Номер строки → int ≥ 1 или None (bool и дробь — None)."""
+    if isinstance(v, bool):
+        return None
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 1 else None
+
+
+def _acc_lit(v):
+    """Часть доплаты → литерал слагаемого: '' (нет / ноль), строка цифр, None (не целое число ≥ 0 — стоп). То же
+    правило, что closeAccrualLit_ моста: число или строка ОДНИХ цифр; формула, дробь, «1e3», «-5», «500 ฿» — нет.
+    Пустая ячейка части — не промах разбора, а «части нет» (ноль слагаемых); промах разбора — только None."""
+    if v is None or (isinstance(v, str) and v == ""):
+        n = 0                                       # части нет — слагаемого нет
+    elif isinstance(v, bool):
+        return None
+    elif isinstance(v, int):
+        n = v
+    elif isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")) or not v.is_integer():
+            return None
+        n = int(v)
+    elif isinstance(v, str) and _re_lang.fullmatch(r"[0-9]{1,9}", v):
+        n = int(v)
+    else:
+        return None
+    if n < 0 or n >= 10 ** 9:
+        return None
+    return str(n) if n else ""
+
+
+def _acc_day(s):
+    """День начала брони → 'ГГГГ-ММ-ДД' или None. Дверь clients отдаёт E как 'ГГГГ-ММ-ДД ЧЧ:ММ'; вид листа
+    'ДД.ММ.ГГГГ' тоже принят. Мост считает свой день по ячейке сам (closeAccrualDay_) — разойдутся, стоп у моста."""
+    import datetime as _dt_acc
+    t = str(s or "").strip()
+    m = _re_lang.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:$|[ T])", t)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = _re_lang.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:$|[ ,])", t)
+        if not m:
+            return None
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return _dt_acc.date(y, mo, d).isoformat()
+    except ValueError:
+        return None
+
+
+def _acc_op_id(bid, brow, bike, day, crow, lits):
+    """close_op_id — тот же вывод, что closeAccrualOpId_ моста: 'co1-' + 16 hex sha256 канона
+    co1|booking_id|строка брони|байк (как шлётся в close_booking, обрезан, строчными)|день начала|строка листа|4 части."""
+    canon = "|".join(["co1", str(bid), str(brow), str(bike or "").strip().lower(), str(day), str(crow)]
+                     + [str(x) for x in lits])
+    return "co1-" + _hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
+
+
+def _acc_from_closing(cu, cand, bike, due=None):
+    """Свежий ответ closing_upsert ЭТОЙ аренды → (поля карточки acc_* | None, причина стопа | None). (None, None) —
+    начислять нечего (доплат нет). Условие (1) Codex 2400: привязка — по booking_id той брони CRM, которую
+    карточка закрывает (строка и день начала совпали), строка листа найдена по booking_id или дописана с ним;
+    фоллбэк листа «последняя open по байку» не годится никогда. due — итог «к доплате» карточки: ответа листа нет, а
+    итог есть — стоп с причиной; нет ни того, ни другого — начислять нечего."""
+    if not isinstance(cu, dict) or not cu.get("ok"):
+        return (None, "лист закрытия не ответил — состав доплат неизвестен") if due is not None else (None, None)
+    comps = cu.get("components")
+    if not isinstance(comps, dict):
+        try:
+            t = float(cu.get("total_due"))
+        except (TypeError, ValueError):
+            t = 0.0
+        # старый мост (@88): в ответе только ok/row/total_due — итог на части не делим
+        return (None, "мост не прислал состав доплат (старая версия) — итог на части не делю") if t > 0 else (None, None)
+    lits = []
+    for k in _ACC_PARTS:
+        if k not in comps:
+            return None, f"в ответе листа нет части «{_ACC_LABEL[k]}»"
+        lit = _acc_lit(comps.get(k))
+        if lit is None:
+            return None, f"доплата «{_ACC_LABEL[k]}» не целое число ≥ 0 — формулой не пишу"
+        lits.append(lit)
+    if not any(lits):
+        return None, None
+    try:
+        total = float(cu.get("total_due"))
+    except (TypeError, ValueError):
+        return None, "итог листа не число — части не сверить"
+    if total != float(sum(int(x) for x in lits if x)):
+        return None, "сумма частей не равна итогу листа"
+    b = cu.get("binding")
+    if not isinstance(b, dict):
+        return None, "в ответе листа нет привязки к аренде"
+    if b.get("match") not in ("booking_id", "new"):
+        return None, "строка листа закрытия найдена по байку, а не по брони — может быть чужой аренды"
+    bid = str(b.get("booking_id") or "").strip()
+    want = str((cand or {}).get("booking_id") or "").strip()
+    if not bid or not want:
+        return None, "у аренды нет booking_id — привязать лист закрытия нечем"
+    if bid != want:
+        return None, "строка листа закрытия — от другой брони"
+    crow = _acc_int(b.get("row"))
+    if crow is None or crow < 2 or crow != _acc_int(cu.get("row")):
+        return None, "строка листа закрытия не названа"
+    if plateFromName_(b.get("bike")) != plateFromName_(bike):
+        return None, "байк строки листа закрытия — другой"
+    bk = b.get("booking") if isinstance(b.get("booking"), dict) else None
+    if bk is None:
+        return None, f"бронь строки листа в CRM не найдена ({b.get('booking_why') or '?'})"
+    brow = _acc_int((cand or {}).get("row"))
+    if brow is None or _acc_int(bk.get("row")) != brow:
+        return None, "бронь строки листа — другая строка CRM"
+    day = _acc_day((cand or {}).get("date_start"))
+    if not day or str(bk.get("date_start") or "") != day:
+        return None, "день начала брони листа не совпал с арендой"
+    return {"acc_op": _acc_op_id(bid, brow, bike, day, crow, lits), "acc_bid": bid, "acc_brow": brow, "acc_ds": day,
+            "acc_crow": crow, "acc_parts": lits}, None
+
+
+def _acc_label(parts):
+    return " · ".join(f"{_ACC_LABEL[k]} {x}" for k, x in zip(_ACC_PARTS, parts or ()) if x)
+
+
+def _acc_card_lines(t, due, due_line, tail):
+    """CLOSEACCRUAL1910: строки карточки приёма при ручке → (строка доплаты, последняя строка). Начисление — словами
+    «начисление к оплате (это не оплата)»; стоп — «к доплате … в CRM не пишу» с причиной. Без полей acc_* — как было."""
+    r = t if isinstance(t, dict) else {}
+    if r.get("acc_op") and not r.get("acc_stop"):
+        parts = list(r.get("acc_parts") or ())
+        total = sum(int(x) for x in parts if x)
+        line = (f" Начисление к оплате (это не оплата): доплаты {_acc_label(parts)} = {_fmt(total)} ฿ — допишу в K "
+                f"формулой к основной сумме (+{'+'.join(x for x in parts if x)}), расшифровку — в примечание к A.")
+        return line, tail.replace(")?", " + начисление доплат)?", 1)
+    if r.get("acc_stop"):
+        why = r.get("acc_stop")
+        if due is not None:
+            return f" К доплате по листу закрытия: {_fmt(due)} ฿ — в CRM не пишу (доплаты не начисляю: {why}).", tail
+        return f" Доплаты не начисляю: {why}.", tail
+    return due_line, tail
+
+
+def _acc_payload(rec):
+    """Карточка → (поле accrual для closeBooking | None, причина «не записываю» | None). Только при ручке. Карточка без
+    полей acc_* (рождена до ручки) — (None, None): путь CLOSETRUTH1910. id карточки обязан выводиться из её же полей:
+    запись из передачи/хранилища могла разойтись с собой — тогда не шлём и говорим."""
+    if not _close_accrual_on() or not isinstance(rec, dict):
+        return None, None
+    if rec.get("acc_stop"):
+        return None, str(rec.get("acc_stop"))
+    if not rec.get("acc_op"):
+        return None, None
+    parts = rec.get("acc_parts")
+    if (not isinstance(parts, (list, tuple)) or len(parts) != len(_ACC_PARTS)
+            or any(_acc_lit(x) != x for x in parts)
+            or _acc_op_id(rec.get("acc_bid"), rec.get("acc_brow"), rec.get("bike"), rec.get("acc_ds"),
+                          rec.get("acc_crow"), parts) != rec.get("acc_op")):
+        return None, "поля начисления карточки не сошлись с её операцией"
+    return {"v": 1, "close_op_id": rec["acc_op"], "booking_id": rec["acc_bid"], "booking_row": rec["acc_brow"],
+            "date_start_day": rec["acc_ds"], "closing_row": rec["acc_crow"],
+            "parts": dict(zip(_ACC_PARTS, parts))}, None
+
+
+def _close_booking_accrual(bridge, *, bike, name, date_start, km_end, accrual):
+    """close_booking с полем accrual (CLOSEACCRUAL1910). Поля — как у BridgeClient.close_booking (опциональные — только
+    при наличии), paid_total с начислением не шлётся никогда: K в этом заходе судит только начисление. Отдельной
+    обёрткой над `_post`, а не новым аргументом закреплённого bridge_client.close_booking (блоб в
+    tests/test_contractref_accept.py PINS): при ручке ВЫКЛ вызов моста — прежний `bridge.close_booking`."""
+    fields = {"bike": bike, "name": name}
+    if date_start:
+        fields["date_start"] = date_start
+    if km_end is not None:
+        fields["km_end"] = km_end
+    fields["accrual"] = accrual
+    return bridge._post("close_booking", **fields)
+
+
+def _acc_receipt_words(res, payload, why):
+    """Ответ моста на WRITTEN-закрытие → хвост ответа сотрудникам о начислении. Квитанция обязательна (условие (5)):
+    нет её, не тот op_id, незнакомый статус, нет k_readback — «не подтвердил». «Оплачено» здесь не бывает."""
+    if payload is None:
+        return f" Доплаты не записаны: {why}." if why else ""
+    rc = res.get("accrual") if isinstance(res, dict) else None
+    if (not isinstance(rc, dict) or rc.get("op_id") != payload.get("close_op_id")
+            or rc.get("status") not in _ACC_STATUSES or "k_readback" not in rc):
+        return _ACC_NO_RECEIPT
+    lbl = _acc_label([payload["parts"].get(k, "") for k in _ACC_PARTS])
+    kb = rc.get("k_readback")
+    st, base = rc.get("status"), rc.get("base")
+    reason = str(rc.get("reason") or "")
+    rw = _ACC_REASON.get(reason.split(":")[0], reason or "?")
+    if st == "done" and rc.get("k_written"):
+        return (f" Начислено к оплате (это не оплата): K = {kb} — основная сумма + доплаты {lbl}; расшифровка — в "
+                f"примечании к A.")
+    if st == "done" and base == "empty":
+        return (f" Доплаты {lbl} начислены к оплате только примечанием к A: основная сумма в K не подтверждена "
+                f"(K пуст) — K не трогал.")
+    if st == "done":
+        what = "формула без числового значения" if base == "error" else "не целое число"
+        return (f" ⚠️ В K {what} — K не трогал; доплаты {lbl} начислены к оплате только примечанием к A. "
+                f"Проверь K руками.")
+    if st == "already_done":
+        return f" Доплаты этой операции уже начислены раньше — второй раз не добавлял (K = {kb})."
+    if st == "stopped":
+        return f" Доплаты не записаны: {rw}. K и примечание к A не трогал."
+    if st == "partial":
+        return f" ⚠️ Начисление доплат записано частично ({rw}) — проверь K и примечание к A; повтор не делаю."
+    return f" ⚠️ Начисление доплат: исход неизвестен ({rw}) — проверь K и примечание к A; повтор не делаю."
+
+
+def _close_ok_tail(res, payload, why):
+    """Хвост «✅ Завершена»: квитанция начисления (при ручке) и пометка моста о неисполненном paid_total (новый мост
+    без opt-in K не пишет — при откате CLOSE_TRUTH=0 карточка обещала «оплачено», говорим, что его не записали)."""
+    tail = _acc_receipt_words(res, payload, why) if (payload is not None or why) else ""
+    if isinstance(res, dict) and res.get("paid_total_ignored"):
+        tail += " «Оплачено» мост в K не записал (paid_total_ignored)."
+    return tail
+
+
+async def _return_close_card(context, bridge, bike, km="", total_due=None, km_photo="", closing=None):
     """O3-3b фаза II: на return-контексте предложить закрытие аренды (В аренде→Завершена)
     карточкой в INTAKE_CHAT (авторизаторы INTAKE_APPROVERS). Само закрытие — ТОЛЬКО после «да»,
     красным шагом 4.2 в _handle_intake. Строки «В аренде» нет → ⚠️ «заверши руками» (возврат
@@ -9857,7 +10147,10 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None, km_ph
     total_due — итог листа закрытия (в K уйдёт ТОЛЬКО числовой > 0).
     CLOSETRUTH1910 (ручка CLOSE_TRUTH): km — только число из ТЕКСТА, ровно одно и одними цифрами
     (`intake_confirm.km_arg`); km_photo — пробег с ФОТО: при пустом km — подсказка «не подтверждено», в km_end не идёт;
-    total_due — строка «к доплате … — в CRM не пишу», в paid_total не идёт. Ручка ВЫКЛ → km_photo не читается."""
+    total_due — строка «к доплате … — в CRM не пишу», в paid_total не идёт. Ручка ВЫКЛ → km_photo не читается.
+    CLOSEACCRUAL1910 (ручка CLOSE_ACCRUAL поверх CLOSE_TRUTH): closing — свежий ответ closing_upsert этой аренды; из него
+    (`_acc_from_closing`) — части доплат и привязка в поля acc_* карточки (или причина acc_stop). Ручка ВЫКЛ → closing
+    не читается, карточка — путь CLOSETRUTH1910."""
     truth = _close_truth_on()
     if truth:
         km = intake_confirm.km_arg(str(km or ""))[0] or ""
@@ -9891,7 +10184,9 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None, km_ph
             pass
         if truth:
             # CLOSETRUTH1910: итог листа закрытия — только в текст карточки дела («к доплате»), paid_total — None
-            if await _rc_close_card(context, bridge, bike, cand, km, None, due=_p, km_photo=km_photo):
+            _ka = _acc_from_closing(closing, cand, bike, _p) if _close_accrual_on() else (None, None)
+            if await _rc_close_card(context, bridge, bike, cand, km, None, due=_p, km_photo=km_photo,
+                                    acc=_ka[0], acc_stop=_ka[1]):
                 return   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
         elif await _rc_close_card(context, bridge, bike, cand, km, _p):
             return   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
@@ -9918,9 +10213,19 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None, km_ph
     if truth:
         rec["km_photo"] = km_photo   # подсказка, не пробег: «да» без числа по ней не закрывает (_close_km_photo_only)
         rec["due_total"] = _due
+    _acc, _acc_stop = (None, None)
+    if truth and _close_accrual_on():
+        # CLOSEACCRUAL1910: части и привязка — из свежего ответа листа ЭТОЙ аренды; операция живёт с карточкой
+        _acc, _acc_stop = _acc_from_closing(closing, cand, bike, _due)
+        if _acc:
+            rec.update(_acc)
+        elif _acc_stop:
+            rec["acc_stop"] = _acc_stop
     _card_ids_carry(rec, prev)   # APPROVEFIX1610: реплай на заменённую карточку не исполняет новую
     if truth:
         km_line, due_line, tail = _close_card_parts(km, km_photo, _due)
+        if _acc or _acc_stop:
+            due_line, tail = _acc_card_lines(rec, _due, due_line, tail)
     else:
         km_line = (f"Пробег на сдаче: {km}." if km
                    else "Пробег на сдаче: не увидел — ответь «да <цифра пробега>».")
@@ -9935,7 +10240,9 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None, km_ph
              f"клиент {cand['name'] or '—'}, km={km or '-'}, итог={_paid if _paid is not None else '-'}, "
              f"депозит={_dep or 'не указан'})"
              + (f" | CLOSE_TRUTH: к доплате={_due if _due is not None else '-'} (в K не пишу), "
-                f"фото-км={km_photo or '-'} (не подтверждён)" if truth else ""))
+                f"фото-км={km_photo or '-'} (не подтверждён)" if truth else "")
+             + (f" | CLOSE_ACCRUAL: операция {_acc['acc_op']} доплаты +{'+'.join(x for x in _acc['acc_parts'] if x)}"
+                if _acc else (f" | CLOSE_ACCRUAL: стоп — {_acc_stop}" if _acc_stop else "")))
     sent = await _send(context, chat_id=INTAKE_CHAT, bilingual=False,
                        text=(f"🐀 Splinter\n📥 ПРИЁМ: {bike} вернулся от {cand['name'] or '—'}, "
                              f"строка {cand.get('row')}. {km_line}{due_line}{dep_line}\n" + tail))
@@ -12139,7 +12446,8 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
                 # только число ТЕКСТА (то же одно правило записи `_km_for_record`), фото — подсказкой km_photo
                 await _return_close_card(context, bridge, bike, km=_km_for_record(parsed, vis),
                                          total_due=(_cu or {}).get("total_due"),
-                                         km_photo=str((vis or {}).get("mileage") or ""))
+                                         km_photo=str((vis or {}).get("mileage") or ""),
+                                         closing=_cu)   # CLOSEACCRUAL1910: части и привязка — только при ручке
             else:
                 await _return_close_card(context, bridge, bike, km=str(mileage or ""),
                                          total_due=(_cu or {}).get("total_due"))
@@ -13299,9 +13607,11 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
     # YES — КРАСНЫЙ шаг под токен-замком 4.2: билет → флаг отправки → ровно один вызов
     rec["status"] = "approved"                  # в пути: повторный ответ не исполнит
     _paid, _paid_cut = None, False
+    _acc, _acc_why = None, None
     if kind == "close":
         km_end = km or (str(rec.get("km") or "").strip() or None)
         _paid, _paid_cut = _close_paid_arg(rec.get("paid_total"))   # CLOSETRUTH1910: при ручке — None всегда
+        _acc, _acc_why = _acc_payload(rec)                           # CLOSEACCRUAL1910: при ручке ВЫКЛ — (None, None)
     sent, res, exc, no_ticket = False, None, None, None
     try:
         _tk = bridge.issue_write_ticket()
@@ -13314,6 +13624,10 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
                 if kind == "activate":
                     res = bridge.activate_booking(bike=rec["bike"], name=rec["name"],
                                                   date_start=(rec.get("date_start") or None))
+                elif _acc is not None:
+                    res = _close_booking_accrual(bridge, bike=rec["bike"], name=rec["name"],
+                                                 date_start=(rec.get("date_start") or None), km_end=km_end,
+                                                 accrual=_acc)
                 else:
                     res = bridge.close_booking(bike=rec["bike"], name=rec["name"],
                                                date_start=(rec.get("date_start") or None),
@@ -13330,8 +13644,10 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
         else:
             log.info(f"  → ПРИЁМ: аренда завершена (строка {_row}, @{who}) {rec['bike']} km_end={km_end or '-'} "
                      f"paid={_paid if _paid is not None else '-'}"
-                     + (" | paid_total карточки снят (CLOSE_TRUTH)" if _paid_cut else ""))
-            await say(f"✅ Завершена, строка {_row}." + (_CLOSE_PAID_NOTE if _paid_cut else ""))
+                     + (" | paid_total карточки снят (CLOSE_TRUTH)" if _paid_cut else "")
+                     + (f" | CLOSE_ACCRUAL {_acc['close_op_id']}: {res.get('accrual')}" if _acc is not None else ""))
+            await say(f"✅ Завершена, строка {_row}." + (_CLOSE_PAID_NOTE if _paid_cut else "")
+                      + _close_ok_tail(res, _acc, _acc_why))
         return
     if out == intake_confirm.UNKNOWN:
         if exc is not None:
@@ -13341,8 +13657,9 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
         else:
             _err = str(res.get("error") or "") or "?"
         rec["status"] = "write_unknown"
-        log.warning(f"  → карточка {word}: исход записи НЕИЗВЕСТЕН ({_err}) {rec['bike']}")
-        await say(_CR_UNKNOWN[kind].format(err=_err))
+        log.warning(f"  → карточка {word}: исход записи НЕИЗВЕСТЕН ({_err}) {rec['bike']}"
+                    + (f" | CLOSE_ACCRUAL {_acc['close_op_id']}: неизвестно" if _acc is not None else ""))
+        await say(_CR_UNKNOWN[kind].format(err=_err) + (_ACC_UNKNOWN if _acc is not None else ""))
         return
     # NOT_WRITTEN: вызова не было (билет/исключение до отправки) или мост отказал ДО записи
     if not sent:
@@ -13736,13 +14053,19 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                             text="🐀 Splinter\n" + _CR_KM_PHOTO.format(km=ret.get("km_photo"), where=""))
                 return
             _paid, _paid_cut = _close_paid_arg(ret.get("paid_total"))   # CLOSETRUTH1910: при ручке — None всегда
+            _acc, _acc_why = _acc_payload(ret)                           # CLOSEACCRUAL1910: при ручке ВЫКЛ — (None, None)
             # --- КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write) ---
             try:
                 ticket = (bridge.issue_write_ticket() or {}).get("ticket")
                 with bridge_client.agent_write(ticket):
-                    res = bridge.close_booking(bike=ret["bike"], name=ret["name"],
-                                               date_start=(ret.get("date_start") or None),
-                                               km_end=_km, paid_total=_paid)
+                    if _acc is not None:
+                        res = _close_booking_accrual(bridge, bike=ret["bike"], name=ret["name"],
+                                                     date_start=(ret.get("date_start") or None), km_end=_km,
+                                                     accrual=_acc)
+                    else:
+                        res = bridge.close_booking(bike=ret["bike"], name=ret["name"],
+                                                   date_start=(ret.get("date_start") or None),
+                                                   km_end=_km, paid_total=_paid)
             except Exception as e:
                 res = {"ok": False, "error": "exception", "message": str(e)}
             if res.get("ok"):
@@ -13750,9 +14073,12 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                 _row = res.get("row") or ret.get("row")
                 log.info(f"  → ПРИЁМ: аренда завершена (строка {_row}, @{_who}) {ret['bike']} "
                          f"km_end={_km or '-'} paid={_paid if _paid is not None else '-'}"
-                         + (" | paid_total карточки снят (CLOSE_TRUTH)" if _paid_cut else ""))
+                         + (" | paid_total карточки снят (CLOSE_TRUTH)" if _paid_cut else "")
+                         + (f" | CLOSE_ACCRUAL {_acc['close_op_id']}: {res.get('accrual')}" if _acc is not None
+                            else ""))
                 await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
-                            text=f"🐀 Splinter\n✅ Завершена, строка {_row}." + (_CLOSE_PAID_NOTE if _paid_cut else ""))
+                            text=f"🐀 Splinter\n✅ Завершена, строка {_row}." + (_CLOSE_PAID_NOTE if _paid_cut else "")
+                                 + _close_ok_tail(res, _acc, _acc_why))
             elif res.get("error") == "unknown_action":
                 # Bridge ещё без деплоя фазы I (конверт close_booking ждёт деплоя владельцем) — карточку
                 # НЕ гасим: статус остаётся awaiting, после деплоя то же «да» закроет аренду штатно.
@@ -13787,7 +14113,10 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                 log.warning(f"  → ПРИЁМ: закрытие НЕ прошло ({_err}: {_emsg}) {ret['bike']}")
                 await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
                             text=f"🐀 Splinter\n❌ Закрытие не прошло: {_err}. {_emsg}\n"
-                                 f"Статус в CRM не менял — заверши руками.")
+                                 f"Статус в CRM не менял — заверши руками."
+                                 # CLOSEACCRUAL1910: исключение/write_failed после отправки — начисление НЕ «не было»
+                                 + (_ACC_UNKNOWN if _acc is not None and intake_confirm.red_outcome(
+                                     res, True, "close") == intake_confirm.UNKNOWN else ""))
             return
 
 

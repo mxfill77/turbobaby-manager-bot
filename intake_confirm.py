@@ -116,9 +116,11 @@ _NUMBER = r"(?<![0-9])(?:[0-9]{1,3}(?:[" + _KM_SEP + r"][0-9]{3})+|[0-9]+)(?![0-
 RED_NOT_WRITTEN = {
     "activate": frozenset({"bad_json", "no_ticket", "unknown_action", "missing_args", "bike_not_resolved",
                            "sheet_not_found", "booking_not_found"}),
+    # CLOSEACCRUAL1910: lock_busy — замок закрытия с начислением не взят, мост не писал ничего
+    # (bridge_build_close_accrual/Booking.js, closeBooking — отказ ДО поиска строки)
     "close": frozenset({"bad_json", "no_ticket", "unknown_action", "missing_args", "bike_not_resolved",
                         "sheet_not_found", "not_active", "not_found", "ambiguous", "km_required", "bad_km_end",
-                        "odo_unverifiable", "odometer_back"}),
+                        "odo_unverifiable", "odometer_back", "lock_busy"}),
 }
 WRITTEN = "written"
 

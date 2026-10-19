@@ -29,7 +29,12 @@ INTAKE_KEYS = ("model", "client", "contacts", "date_start", "date_end", "date_st
                "experience", "deposit_type", "delivery_name", "delivery_url", "helmets",
                "status", "ts", "ic_msg_ids", "ic_edit_asked", "passport_photo", "rc_exp_id", "rc_card_ref")
 HANDOVER_KEYS = ("bike", "name", "date_start", "row", "ts", "status")
-CLOSE_KEYS = ("bike", "name", "date_start", "row", "km", "paid_total", "ts", "status")
+# CLOSETRUTH1910 / CLOSEACCRUAL1910: подсказка пробега с фото и «к доплате» карточки (km_photo, due_total) и операция
+# начисления доплат (acc_*: id, booking_id, строка брони, день начала, строка листа закрытия, четыре части; acc_stop —
+# причина стопа) переходят вместе с карточкой: восстановленная карточка исполняет ТУ ЖЕ операцию, а не чеканит новую.
+# Поля пишутся только у карточек, рождённых при ручках, — прежний вид записи (без них) проверку проходит как раньше.
+CLOSE_KEYS = ("bike", "name", "date_start", "row", "km", "paid_total", "ts", "status",
+              "km_photo", "due_total", "acc_op", "acc_bid", "acc_brow", "acc_ds", "acc_crow", "acc_parts", "acc_stop")
 WAITING = {KIND_INTAKE: "awaiting_approval", KIND_HANDOVER: "awaiting", KIND_CLOSE: "awaiting"}
 KEYS = {KIND_INTAKE: INTAKE_KEYS, KIND_HANDOVER: HANDOVER_KEYS, KIND_CLOSE: CLOSE_KEYS}
 
