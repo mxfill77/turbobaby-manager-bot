@@ -9,7 +9,8 @@
 (RENTAL_CASE_APPROVALS=1, временная база).
 
 Разделы:
-  (P)  чистые части: слова ручки, `_close_paid_arg`, `_close_km_photo_only`, `_close_card_parts`;
+  (P)  чистые части: слова ручки, `_close_paid_arg`, `_close_km_photo_only`, `_close_card_parts`,
+       `_close_km_unproven` (RC2010);
   (T)  ручка ВКЛ, строгий путь: доплата — только текстом «к доплате … — в CRM не пишу», paid_total=None во всех
        вызовах; пробег с фото — подсказка, «да» без числа — ни билета, ни вызова, карточка жива; «да <пробег>» —
        один вызов с этим числом; Р2 сверяет число ответа с фото-подсказкой; пробег текста — только `km_arg`;
@@ -17,6 +18,10 @@
   (E)  ручка ВКЛ, сквозной путь `_handle_servicing`: фото-пробег в km карточки не попадает, текстовый — попадает;
   (L)  ручка ВКЛ, прежний путь ответа (INTAKE_CONFIRM_STRICT=0) — те же два правила;
   (K)  ручка ВКЛ, дело К4: то же, плюс цель ожидания, рождённая до ручки с paid_total;
+  (H)  RC2010 (Codex TB-CHECK-2010-0742 Q1): km карточки без метки происхождения km_src="text" — карточка 947953e
+       (OCR фото в km, km_photo нет), ждущая в памяти, восстановленная НАСТОЯЩИМ handoff_write/handoff_restore и цель
+       дела К4: при ручке «да» без числа — ни билета, ни моста, «да 35200» — закрывает; на всех трёх путях ответа.
+       Новая карточка с пробегом из текста — «да» закрывает (и после рестарта); ручка ВЫКЛ — прежнее;
   (O)  ручка ВЫКЛ («0», «off» — откат): текст карточки и вызов моста — дословно прежние (947953e), включая записанные
        КАК ПРЕЖНЕЕ поведение отката дефекты (paid_total=1500.0; фото-пробег идёт в km_end по «да»).
 
@@ -84,6 +89,8 @@ DUE_LINE = " К доплате по листу закрытия: 1 500 ฿ — �
 PHOTO_LINE = ("Пробег на сдаче: с фото прочитано 35200 — не подтверждено; закрыть: «да 35200» "
               "(или «да <верный пробег>»).")
 PHOTO_TAIL = "Завершаю (Завершена + пробег из ответа)? да <пробег> / нет"
+UNPROVEN_LINE = ("Пробег на сдаче: на карточке 35200 — откуда число, не доказано (карточка прежнего вида), не "
+                 "подтверждено; закрыть: «да 35200» (или «да <верный пробег>»).")
 
 
 def local_now():
@@ -292,6 +299,10 @@ def photo_note(where):
     return P + S._CR_KM_PHOTO.format(km="35200", where=where)
 
 
+def unproven_note(where):
+    return P + S._CR_KM_UNPROVEN.format(km="35200", where=where)
+
+
 class Case(unittest.TestCase):
     truth = "1"                      # значение CLOSE_TRUTH для класса; None — ручка не задана
 
@@ -346,6 +357,26 @@ class P_Pure(Case):
                           "Завершаю (Завершена)? да / нет"))
         for parts in (S._close_card_parts("35200", "", 1500.0), S._close_card_parts("", "35200", 99.0)):
             self.assertNotIn("оплачено", "".join(parts).lower())
+
+    def test_p6_km_unproven_needs_positive_text_marker(self):
+        """RC2010: km без метки km_src="text" при ручке не доказан; метка — только положительная; ручка ВЫКЛ — откат."""
+        os.environ["CLOSE_TRUTH"] = "1"
+        self.assertTrue(S._close_km_unproven({"km": "35200"}), "карточка 947953e: km без метки")
+        self.assertTrue(S._close_km_unproven({"km": "35200", "km_photo": ""}))
+        self.assertTrue(S._close_km_unproven({"km": "35200", "km_src": "photo"}), "доказывает только «text»")
+        self.assertTrue(S._close_km_unproven({"km": "35200", "km_src": ""}))
+        self.assertFalse(S._close_km_unproven({"km": "35200", "km_src": "text"}), "km из текста — новый путь")
+        self.assertFalse(S._close_km_unproven({"km": "", "km_photo": "35200"}), "фото-подсказка — своя проверка")
+        self.assertFalse(S._close_km_unproven({"km": ""}), "пробега нет — подтверждать нечего (km_required моста)")
+        self.assertFalse(S._close_km_unproven(None))
+        os.environ["CLOSE_TRUTH"] = "0"
+        self.assertFalse(S._close_km_unproven({"km": "35200"}), "откат: путь 947953e байт-в-байт")
+        self.assertEqual(S._close_card_parts("35200", "", None, km_unproven=True), (UNPROVEN_LINE, "", PHOTO_TAIL))
+        self.assertEqual(S._close_card_parts("35200", "", None, km_unproven=False),
+                         S._close_card_parts("35200", "", None))
+        import restart_handoff as RH
+        self.assertIn("km_src", RH.CLOSE_EXT_KEYS, "метка едет разделом ext передачи")
+        self.assertNotIn("km_src", RH.CLOSE_KEYS, "белый список записи — 947953e")
 
 
 # ============================================================================== (T) ручка ВКЛ, строгий путь (по умолч.)
@@ -566,15 +597,211 @@ class K_OnCaseStore(Case):
         self.assertEqual(b.red("close_booking"), exp_close("35300"))
 
     def test_k3_target_born_before_knob_does_not_write_k(self):
-        """Цель ожидания, рождённая прежним кодом с paid_total (живёт в хранилище через рестарт): K не пишем."""
+        """Цель ожидания, рождённая прежним кодом с paid_total (живёт в хранилище через рестарт): K не пишем.
+        RC2010 (Codex TB-CHECK-2010-0742 Q1): у такой цели нет и метки происхождения km (km_src) — её km мог быть OCR
+        фото 947953e. «Да» без числа её не исполняет (ни билета, ни моста; новая карточка), «да <пробег>» —
+        исполняет."""
         b = Bridge([rent_row()])
         cand = S._return_resolve_close(b, BIKE)
         run(S._rc_close_card(Ctx(), b, BIKE, cand, "35200", 1500.0))
         card = cards()[-1]
         self.assertNotIn("оплачено", card.text.lower(), "при ручке «оплачено» не обещается и старой цели")
+        self.assertIn(UNPROVEN_LINE, card.text, "при ручке карточка не обещает «да» с km без метки")
+        self.assertTrue(card.text.endswith(PHOTO_TAIL + S._RC_REPLY_HINT), card.text)
         self.k4(b, "да", card)
+        self.assertEqual(b.red("close_booking"), [], "К4: km без метки происхождения ушёл в мост без числа")
+        self.assertEqual(b.tickets, 0)
+        self.assertIn(unproven_note(" реплаем на новую карточку ниже"), texts())
+        again = cards()[-1]
+        self.assertIsNot(again, card, "новая карточка того же закрытия")
+        self.assertIn(UNPROVEN_LINE, again.text)
+        self.k4(b, "да 35200", again)
         self.assertEqual(b.red("close_booking"), exp_close("35200"))
         self.assertIn(P + "✅ Завершена, строка 21." + S._CLOSE_PAID_NOTE, texts())
+
+
+# ===================== (H) RC2010: km карточки без метки происхождения — старая/восстановленная карточка 947953e
+# Codex TB-CHECK-2010-0742 Q1: карточка 947953e несёт km = `parsed.mileage or vis.mileage` (сырой OCR фото неотличим
+# от числа текста) и не несёт km_photo — проверка фото-подсказки её не ловила, «да» без числа клал OCR в N как
+# подтверждённый. Форма такой карточки здесь рождается НАСТОЯЩИМ путём отката (CLOSE_TRUTH=0 — путь 947953e байт-в-байт,
+# раздел O) из OCR фото: `RET_PARSE` без пробега в тексте, `VIS_KM` — 35200 с фото.
+def restart_process():
+    """Штатный рестарт Splinter (как в tests/test_close_accrual_1910.py): handoff_write → память процесса пропадает →
+    handoff_restore. Передача — в каталоге прогона (RESTART_HANDOFF_STATE выше)."""
+    S.handoff_write()
+    for d in (S._INTAKE_DRAFTS, S._HANDOVER_ACTIVATIONS, S._RETURN_CLOSES):
+        d.clear()
+    for name in ("_CR_NOTES", "_CR_FORGOT", "_IC_DEAD_ASKS"):
+        getattr(S, name, {}).clear()
+    S._HANDOFF_SEEN.update(applied_sha=None, unapplied=False, carry=[])
+    time.sleep(0.05)
+    S._CR_LIFE_T0 = time.time()
+    out = S.handoff_restore()
+    assert out.startswith("применена"), out
+
+
+def handoff_file():
+    with open(S._handoff_path(), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def old_ocr_card(b):
+    """Карточка приёма формы 947953e: рождена путём отката из OCR фото → km="35200", km_photo и km_src нет."""
+    os.environ["CLOSE_TRUTH"] = "0"
+    do_return(b, RET_PARSE, VIS_KM)
+    cs = cards()
+    assert len(cs) == 1, texts()
+    return cs[-1]
+
+
+def via_ask(b, text):
+    """Ответ восстановленной карточке (её id реплая передача не несёт): «да» без реплая → адресное уточнение → ответ
+    реплаем на него."""
+    asks = [s for s in SENDS if "засчитываю только реплаем" in s.text]
+    if not asks:
+        say(b, "да")
+        asks = [s for s in SENDS if "засчитываю только реплаем" in s.text]
+    assert asks, texts()
+    return say(b, text, reply=asks[-1])
+
+
+class H_UnprovenKm(Case):
+    def test_h1_old_pending_card_plain_yes_does_not_close(self):
+        """Ждущая карточка 947953e (OCR в km), ручку включили: «да» — ни билета, ни моста; «да 35200» — закрывает."""
+        b = Bridge([rent_row()])
+        card = old_ocr_card(b)
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual((rec["km"], "km_photo" in rec, "km_src" in rec), ("35200", False, False), rec)
+        os.environ["CLOSE_TRUTH"] = "1"
+        for text in ("да", "закрывай", "да, закрывай"):
+            with self.subTest(text=text):
+                say(b, text, reply=card)
+                self.assertEqual(b.red("close_booking"), [], "OCR 947953e ушёл в N как подтверждённый: %r" % text)
+                self.assertEqual(b.tickets, 0, "билет 4.2 не выписывается")
+                self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "awaiting", "карточка жива")
+                self.assertEqual(texts()[-1], unproven_note(" реплаем на карточку"))
+        say(b, "да 35200", reply=card)
+        self.assertEqual(b.red("close_booking"), exp_close("35200"))
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "closed")
+        self.assertIn(P + "✅ Завершена, строка 21." + S._CLOSE_PAID_NOTE, texts(), "paid_total 947953e снят")
+
+    def test_h2_old_card_through_real_handoff_roundtrip(self):
+        """Та же карточка через НАСТОЯЩИЙ handoff_write/handoff_restore: раздела ext у неё нет (файл — вида 947953e),
+        после восстановления при ручке «да» не закрывает, «да 35200» — закрывает."""
+        b = Bridge([rent_row()])
+        old_ocr_card(b)
+        restart_process()
+        self.assertNotIn("ext", handoff_file(), "у карточки 947953e полей сверх списка нет — раздела нет")
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual((rec["km"], rec["status"], "km_src" in rec), ("35200", "awaiting", False), rec)
+        os.environ["CLOSE_TRUTH"] = "1"
+        via_ask(b, "да")
+        self.assertEqual((b.red("close_booking"), b.tickets), ([], 0), "восстановленная: OCR не подтверждён «да»")
+        self.assertEqual(texts()[-1], unproven_note(" реплаем на карточку"))
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "awaiting")
+        via_ask(b, "да 35200")
+        self.assertEqual(b.red("close_booking"), exp_close("35200"))
+        self.assertIn(P + "✅ Завершена, строка 21." + S._CLOSE_PAID_NOTE, texts())
+
+    def test_h3_new_text_card_keeps_plain_yes_also_after_handoff(self):
+        """Новый путь ТЕКСТА цел: карточка нового кода с пробегом из текста помечена km_src="text", метка переживает
+        handoff_write/handoff_restore разделом ext, и «да» без числа закрывает с этим пробегом."""
+        b = Bridge([rent_row()])
+        do_return(b, dict(RET_PARSE, mileage="35 300"), VIS_KM)
+        self.assertEqual(len(cards()), 1, texts())
+        self.assertEqual(S._RETURN_CLOSES[INTAKE].get("km_src"), "text")
+        restart_process()
+        obj = handoff_file()
+        self.assertEqual([x["data"].get("km_src") for x in obj["ext"]["entries"]], ["text"], obj.get("ext"))
+        (ce,) = [e for e in obj["entries"] if e["kind"] == "close"]
+        self.assertNotIn("km_src", ce["data"], "в записи — только белый список 947953e")
+        rec = S._RETURN_CLOSES[INTAKE]
+        self.assertEqual((rec["km"], rec.get("km_src")), ("35300", "text"), rec)
+        via_ask(b, "да")
+        self.assertEqual(b.red("close_booking"), exp_close("35300"))
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "closed")
+
+    def test_h4_legacy_reply_path_old_card(self):
+        """Прежний путь ответа (INTAKE_CONFIRM_STRICT=0): карточка 947953e — «да» не закрывает, «да 35200» — закрывает;
+        новая текстовая карточка — «да» закрывает."""
+        os.environ["INTAKE_CONFIRM_STRICT"] = "0"
+        b = Bridge([rent_row()])
+        old_ocr_card(b)
+        os.environ["CLOSE_TRUTH"] = "1"
+        say(b, "да")
+        self.assertEqual((b.red("close_booking"), b.tickets), ([], 0))
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "awaiting")
+        self.assertEqual(texts()[-1], unproven_note(""))
+        say(b, "да 35200")
+        self.assertEqual(b.red("close_booking"), exp_close("35200"))
+        reset()
+        os.environ.update(CLOSE_TRUTH="1", INTAKE_CONFIRM_STRICT="0")
+        b = Bridge([rent_row()])
+        do_return(b, dict(RET_PARSE, mileage="35 300"), VIS_KM)
+        say(b, "да")
+        self.assertEqual(b.red("close_booking"), exp_close("35300"), "текстовая карточка — прежний «да»")
+
+    def test_h5_off_old_card_plain_yes_closes_as_before(self):
+        """CLOSE_TRUTH=0: прежнее поведение (947953e) — и в памяти, и после handoff_restore «да» закрывает с km карточки
+        и пишет итог листа в K (дефект отката записан как прежнее, раздел O)."""
+        b = Bridge([rent_row()])
+        card = old_ocr_card(b)
+        say(b, "да", reply=card)
+        self.assertEqual(b.red("close_booking"), exp_close("35200", 1500.0))
+        reset()
+        b = Bridge([rent_row()])
+        old_ocr_card(b)
+        restart_process()
+        via_ask(b, "да")
+        self.assertEqual(b.red("close_booking"), exp_close("35200", 1500.0))
+
+
+class H_UnprovenKmCaseStore(Case):
+    """Дело К4 (RENTAL_CASE_APPROVALS=1, временная база — как раздел K): цель ожидания формы 947953e — из того же OCR
+    пути отката; живёт в хранилище дела, то есть переживает рестарт сама."""
+
+    def setUp(self):
+        super(H_UnprovenKmCaseStore, self).setUp()
+        os.environ["RENTAL_CASE_APPROVALS"] = "1"
+        import rental_case
+        d = tempfile.mkdtemp(prefix="closetruth_h_%s_" % self._testMethodName[5:20], dir=TTMP)
+        p = os.path.join(d, "rental_case.sqlite")
+        rental_case.Store.create(p)
+        os.environ["RENTAL_CASE_DB"] = p
+
+    def k4(self, b, text, reply):
+        return say(b, text, reply=reply, uname=OWNER, uid=OWNER_ID)
+
+    def test_h6_k4_old_target_plain_yes_new_card_then_number(self):
+        b = Bridge([rent_row()])
+        card = old_ocr_card(b)
+        self.assertIn("Пробег на сдаче: 35200.", card.text, "карточка 947953e обещала «да» с OCR")
+        os.environ["CLOSE_TRUTH"] = "1"
+        self.k4(b, "да", card)
+        self.assertEqual((b.red("close_booking"), b.tickets), ([], 0), "К4: OCR 947953e ушёл в мост без числа")
+        self.assertIn(unproven_note(" реплаем на новую карточку ниже"), texts())
+        again = cards()[-1]
+        self.assertIsNot(again, card)
+        self.assertIn(UNPROVEN_LINE, again.text)
+        self.k4(b, "да", again)
+        self.assertEqual((b.red("close_booking"), b.tickets), ([], 0), "и новая карточка «да» без числа не исполняет")
+        self.k4(b, "да 35200", cards()[-1])
+        self.assertEqual(b.red("close_booking"), exp_close("35200"))
+        self.assertIn(P + "✅ Завершена, строка 21." + S._CLOSE_PAID_NOTE, texts())
+
+    def test_h7_k4_new_text_target_plain_yes(self):
+        b = Bridge([rent_row()])
+        do_return(b, dict(RET_PARSE, mileage="35 300"), VIS_KM)
+        card = cards()[-1]
+        self.assertIn("Пробег на сдаче: 35300.", card.text)
+        self.k4(b, "да", card)
+        self.assertEqual(b.red("close_booking"), exp_close("35300"), "К4: текстовая цель — прежний «да»")
+
+    def test_h8_k4_off_old_target_plain_yes_as_before(self):
+        b = Bridge([rent_row()])
+        card = old_ocr_card(b)
+        self.k4(b, "да", card)
+        self.assertEqual(b.red("close_booking"), exp_close("35200", 1500.0), "откат: путь 947953e")
 
 
 # ================================================== (D) ручка НЕ задана: умолчание ВКЛ — путь правды, а не откат

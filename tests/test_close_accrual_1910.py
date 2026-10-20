@@ -1040,12 +1040,16 @@ class R_Rollback(Case):
     def test_r6_back_and_forward_residual_risk_is_visible(self):
         """ОСТАТОК РИСКА (назван в restart_handoff и в коммите), закреплён, чтобы его было видно: 947953e раздела ext
         не знает и при своей остановке пишет файл без него. Код, вернувшийся вперёд, получает карточку закрытия в виде
-        ДО РУЧЕК: операции начисления нет, «да» закрывает аренду без начисления и этого не называет. Брони и выдачи
-        проходят оба рестарта. Исправят остаток — этот тест переписывается вместе с ним."""
+        ДО РУЧЕК: операции начисления нет, «да <пробег>» закрывает аренду без начисления и этого не называет. Брони и
+        выдачи проходят оба рестарта. Исправят остаток — этот тест переписывается вместе с ним.
+        RC2010 (Codex TB-CHECK-2010-0742 Q1): вместе с разделом пропадает и метка происхождения пробега (km_src) — km
+        такой карточки от OCR 947953e не отличить, поэтому «да» без числа её больше НЕ закрывает (ни билета, ни моста),
+        закрывает только «да <пробег>»; остаток про начисление — прежний."""
         OLD = rev_rh(OLD_REV, OLD_RH_BLOB)
         hands_same_as(OLD_REV)
         b = Bridge([rent_row()])
         ret_card(b)
+        self.assertEqual(S._RETURN_CLOSES[INTAKE].get("km_src"), "text", "вперёд: km из текста помечен")
         draft0, ho0 = waiting_cards()
         self.assertTrue(restart_with(OLD).startswith("применена"))         # вперёд → откат
         out = restart_with(RH)                                             # откат → вперёд: остановку писал 947953e
@@ -1053,13 +1057,21 @@ class R_Rollback(Case):
         self.assertNotIn("ext", handoff_file(), "файл писал 947953e — раздела нет")
         self.assertEqual(S._HANDOVER_ACTIVATIONS[HO_CHAT], ho0)
         rec = S._RETURN_CLOSES[INTAKE]
-        self.assertEqual([k for k in rec if k.startswith("acc_") or k in ("km_photo", "due_total")], [], rec)
+        self.assertEqual([k for k in rec if k.startswith("acc_") or k in ("km_photo", "due_total", "km_src")], [],
+                         rec)
+        self.assertEqual(rec["km"], "35200")
         say(b, "да")                                         # без реплая: адресное уточнение по ждущей карточке
         asks = [s for s in SENDS if "засчитываю только реплаем" in s.text]
         self.assertTrue(asks, texts())
+        tickets0 = b.tickets
         say(b, "да", reply=asks[-1])
+        self.assertEqual((b.red("close_booking"), b.red("post_close_booking"), b.tickets), ([], [], tickets0),
+                         "RC2010: km без метки происхождения — «да» без числа не закрывает")
+        self.assertEqual(texts()[-1], P + S._CR_KM_UNPROVEN.format(km="35200", where=" реплаем на карточку"))
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "awaiting", "карточка жива")
+        say(b, "да 35200", reply=asks[-1])
         self.assertEqual(b.red("post_close_booking"), [], "операции нет — начисление не шлётся")
-        self.assertEqual([c["paid_total"] for c in b.red("close_booking")], [None])
+        self.assertEqual([(c["km_end"], c["paid_total"]) for c in b.red("close_booking")], [("35200", None)])
         self.assertEqual(texts()[-1], P + "✅ Завершена, строка 21.", "остаток: обещание карточки не названо")
 
     def test_r7_new_code_restores_ext_fields_file_shape(self):
@@ -1069,7 +1081,10 @@ class R_Rollback(Case):
         ret_card(b, km="", km_photo="35200")
         close0 = dict(S._RETURN_CLOSES[INTAKE])
         ext_keys = [k for k in RH.CLOSE_EXT_KEYS if k in close0]
-        self.assertEqual(set(ext_keys), set(RH.CLOSE_EXT_KEYS) - {"acc_stop"})
+        # RC2010: km_src — метка km из ТЕКСТА; у фото-карточки числа текста нет, и метки нет (её перенос с текстовой
+        # карточкой — tests/test_close_truth_1910.py, раздел H)
+        self.assertNotIn("km_src", close0)
+        self.assertEqual(set(ext_keys), set(RH.CLOSE_EXT_KEYS) - {"acc_stop", "km_src"})
         waiting_cards()
         out = restart_with(RH)
         self.assertTrue(out.startswith("применена") and "брони 1 · выдачи 1 · закрытия 1" in out, out)

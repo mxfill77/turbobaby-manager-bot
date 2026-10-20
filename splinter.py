@@ -9136,7 +9136,9 @@ def _rc_card_text(action, t):
     """Текст карточки activate/close — слово в слово прежний (_handover_activation_card / _return_close_card)
     плюс строка «ответ — реплаем» (APPROVAL_REPLY_REQUIRED=UNKNOWN: исполняет только реплай, CONTRACT §4.7 п.1).
     CLOSETRUTH1910: при ручке CLOSE_TRUTH строки приёма — `_close_card_parts` (те же, что у карточки в памяти):
-    «оплачено» не обещается никогда, даже цели, рождённой до ручки с paid_total, — его не пошлёт и исполнение."""
+    «оплачено» не обещается никогда, даже цели, рождённой до ручки с paid_total, — его не пошлёт и исполнение.
+    RC2010: km цели без метки происхождения (`_close_km_unproven`) — карточка не обещает «да» с ним: исполнение его без
+    числа в ответе не примет."""
     if action == "activate":
         dates = (str(t.get("date_start") or "") + " — " + str(t.get("date_end") or "")).strip(" —")
         return (f"🐀 Splinter\n🏍 ВЫДАЧА: {t.get('bike')} → {t.get('name') or '—'}, "
@@ -9144,7 +9146,8 @@ def _rc_card_text(action, t):
                 f"Активирую (Бронь→В аренде)? да / нет" + _RC_REPLY_HINT)
     if _close_truth_on():
         km = str(t.get("km") or "").strip()
-        km_line, due_line, tail = _close_card_parts(km, str(t.get("km_photo") or "").strip(), t.get("due_total"))
+        km_line, due_line, tail = _close_card_parts(km, str(t.get("km_photo") or "").strip(), t.get("due_total"),
+                                                    km_unproven=_close_km_unproven(t))
         if _close_accrual_on() and (t.get("acc_op") or t.get("acc_stop")):
             due_line, tail = _acc_card_lines(t, t.get("due_total"), due_line, tail)   # CLOSEACCRUAL1910
         dep = t.get("deposit_disp")
@@ -9279,12 +9282,15 @@ async def _rc_activation_card(context, bridge, bike, cand):
     return True
 
 
-async def _rc_close_card(context, bridge, bike, cand, km, paid, due=None, km_photo="", acc=None, acc_stop=None):
+async def _rc_close_card(context, bridge, bike, cand, km, paid, due=None, km_photo="", acc=None, acc_stop=None,
+                         km_src=""):
     """К4 шаги 6–7 на карточке приёма. True — путь К4 разобрал карточку сам.
     CLOSETRUTH1910: due (доплата листа закрытия, только текст) и km_photo (пробег с фото, только подсказка) ложатся в
     цель ожидания лишь когда переданы — при ручке ВЫКЛ цель дела байт-в-байт прежняя.
     CLOSEACCRUAL1910: acc (поля acc_* операции начисления) / acc_stop (причина стопа) — тоже лишь когда переданы; цель
-    живёт в хранилище дела, поэтому операция переживает рестарт вместе с ней."""
+    живёт в хранилище дела, поэтому операция переживает рестарт вместе с ней.
+    RC2010: km_src ("text" — km из текста сотрудника) — тоже лишь когда передан; цель без метки (рождённая до ручки или
+    кодом 947953e) при ручке «да» без числа не исполняет (`_close_km_unproven`)."""
     c = _rc_case_for(bridge, bike, "return", cand.get("row"))
     if not _rc_on("RENTAL_CASE_APPROVALS"):
         return False
@@ -9307,6 +9313,8 @@ async def _rc_close_card(context, bridge, bike, cand, km, paid, due=None, km_pho
         target["due_total"] = due
     if km_photo:
         target["km_photo"] = km_photo
+    if km_src:
+        target["km_src"] = km_src
     if acc:
         target.update(acc)
     elif acc_stop:
@@ -9521,6 +9529,16 @@ async def _rc_execute(msg, context, bridge, st, out, text):
             again = dict((k, v) for k, v in tgt.items() if k != "card")
             await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
             return
+        if not _said_km and _close_km_unproven(tgt):
+            # RC2010: km цели без метки «из текста» (цель 947953e / рождённая до ручки) — так же, как фото-подсказка
+            # выше: ожидание отвечено, моста не зовём, новая карточка того же закрытия ждёт «да <пробег>»
+            written({"error": "km_unconfirmed"})
+            log.info(f"  → ПРИЁМ: пробег карточки {tgt.get('km')} без метки происхождения, числа в ответе нет — моста "
+                     f"не зову, новая карточка (@{who}) {tgt.get('bike')}")
+            await say(_CR_KM_UNPROVEN.format(km=tgt.get("km"), where=" реплаем на новую карточку ниже"))
+            again = dict((k, v) for k, v in tgt.items() if k != "card")
+            await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
+            return
         _paid, _paid_cut = _close_paid_arg(tgt.get("paid_total"))   # CLOSETRUTH1910: при ручке — None всегда
         _acc, _acc_why = _acc_payload(tgt)                           # CLOSEACCRUAL1910: при ручке ВЫКЛ — (None, None)
         if _acc is not None:
@@ -9557,6 +9575,7 @@ async def _rc_execute(msg, context, bridge, st, out, text):
             again = _acc_rebound(tgt, res.get("closing_now"), tgt.get("bike"))
             if _said_km:
                 again["km"] = str(_said_km)      # пробег, названный в ответе-согласии, — полем новой карточки
+                again["km_src"] = _KM_SRC_TEXT   # RC2010: и он из текста — метка происхождения
             await _rc_request_card(context, st, "close", case_id, ver, _rc_card_text("close", again), again)
         elif sent and err in ("unknown_action", "km_required"):
             # прежде карточка оставалась живой; ожидание уже answered — даём НОВУЮ карточку того же закрытия
@@ -10319,6 +10338,18 @@ def _return_deposit_disp(raw, parsed):
 _CR_KM_PHOTO = ("❓ Пробег на сдаче не подтверждён: с фото прочитано {km} — это непроверенное число. Не закрываю, "
                 "статус в CRM не менял. Закрыть: «да {km}»{where} (или «да <верный пробег>»).")
 _CLOSE_PAID_NOTE = " «Оплачено» в CRM не трогал: итог листа закрытия — это доплата, а не оплата."
+# RC2010 (Codex TB-CHECK-2010-0742 Q1, остаток шва TRUTH): ПРОИСХОЖДЕНИЕ пробега карточки. Карточка 947953e (в памяти —
+# из передачи restart_handoff, в хранилище дела К4 — цель, рождённая до ручки) несёт km = слияние
+# `parsed.mileage or vis.mileage`: сырой OCR фото в ней от числа текста не отличить, а km_photo у неё нет —
+# `_close_km_photo_only` её не ловит, и «да» без числа клал бы этот km в N как подтверждённый. Метка положительная:
+# km_src="text" ставит только этот код и только карточке, чей km взят из ТЕКСТА сотрудника (при CLOSE_TRUTH —
+# `_km_for_record` → `intake_confirm.km_arg`, либо число ответа-согласия). Нет метки — происхождение не доказано: при
+# ручке «да» без числа моста не зовёт ни на одном из трёх путей ответа, закрывает «да <пробег>». Метка едет разделом
+# `ext` передачи (restart_handoff.CLOSE_EXT_KEYS), как km_photo; белый список записи 947953e не тронут.
+_KM_SRC_TEXT = "text"
+_CR_KM_UNPROVEN = ("❓ Пробег на сдаче не подтверждён: на карточке {km}, но откуда это число (текст сотрудника или "
+                   "фото) — не доказано: карточка прежнего вида. Не закрываю, статус в CRM не менял. "
+                   "Закрыть: «да {km}»{where} (или «да <верный пробег>»).")
 
 
 def _close_paid_arg(paid):
@@ -10338,10 +10369,26 @@ def _close_km_photo_only(rec) -> bool:
     return not str(r.get("km") or "").strip() and bool(str(r.get("km_photo") or "").strip())
 
 
-def _close_card_parts(km, km_photo, due):
+def _close_km_unproven(rec) -> bool:
+    """RC2010: у карточки есть km, а метки «из текста» (km_src="text") нет → при ручке «да» без числа моста не зовёт,
+    закрывает «да <пробег>». В отличие от `_close_km_photo_only` судит и РУЧКУ: карточки без метки рождает и откат
+    (CLOSE_TRUTH=0 метку не ставит) — там путь байт-в-байт прежний (947953e). Пустой km сюда не относится: «да» без
+    числа уходит без пробега, и мост отказывает km_required, как прежде."""
+    if not _close_truth_on():
+        return False
+    r = rec if isinstance(rec, dict) else {}
+    return bool(str(r.get("km") or "").strip()) and r.get("km_src") != _KM_SRC_TEXT
+
+
+def _close_card_parts(km, km_photo, due, km_unproven=False):
     """CLOSE_TRUTH: строки карточки приёма — одним кодом для карточки в памяти и карточки дела К4.
-    → (строка пробега, строка доплаты, последняя строка «Завершаю (…)? …»). «Оплачено» здесь не бывает."""
-    if km:
+    → (строка пробега, строка доплаты, последняя строка «Завершаю (…)? …»). «Оплачено» здесь не бывает.
+    RC2010: km_unproven (`_close_km_unproven` цели) — km карточки без метки происхождения: карточка не обещает, что
+    «да» закроет с ним, и просит число так же, как при фото-подсказке."""
+    if km and km_unproven:
+        km_line = (f"Пробег на сдаче: на карточке {km} — откуда число, не доказано (карточка прежнего вида), не "
+                   f"подтверждено; закрыть: «да {km}» (или «да <верный пробег>»).")
+    elif km:
         km_line = f"Пробег на сдаче: {km}."
     elif km_photo:
         km_line = (f"Пробег на сдаче: с фото прочитано {km_photo} — не подтверждено; "
@@ -10349,9 +10396,9 @@ def _close_card_parts(km, km_photo, due):
     else:
         km_line = "Пробег на сдаче: не увидел — ответь «да <цифра пробега>»."
     due_line = (f" К доплате по листу закрытия: {_fmt(due)} ฿ — в CRM не пишу." if due is not None else "")
-    if km:
+    if km and not km_unproven:
         tail = f"Завершаю (Завершена + пробег {km})? да / нет"
-    elif km_photo:
+    elif km_photo or km:
         tail = "Завершаю (Завершена + пробег из ответа)? да <пробег> / нет"
     else:
         tail = "Завершаю (Завершена)? да / нет"
@@ -10695,6 +10742,8 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None, km_ph
     CLOSETRUTH1910 (ручка CLOSE_TRUTH): km — только число из ТЕКСТА, ровно одно и одними цифрами
     (`intake_confirm.km_arg`); km_photo — пробег с ФОТО: при пустом km — подсказка «не подтверждено», в km_end не идёт;
     total_due — строка «к доплате … — в CRM не пишу», в paid_total не идёт. Ручка ВЫКЛ → km_photo не читается.
+    RC2010: при ручке непустой km получает метку km_src="text" — вызывающие при ручке дают сюда только число текста
+    (`_km_for_record`) или число ответа-согласия (`_acc_reissue`); без метки «да» без числа не закрывает.
     CLOSEACCRUAL1910 (ручка CLOSE_ACCRUAL поверх CLOSE_TRUTH): closing — свежий ответ closing_upsert этой аренды; из него
     (`_acc_from_closing`) — части доплат и привязка в поля acc_* карточки (или причина acc_stop). Ручка ВЫКЛ → closing
     не читается, карточка — путь CLOSETRUTH1910."""
@@ -10733,7 +10782,7 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None, km_ph
             # CLOSETRUTH1910: итог листа закрытия — только в текст карточки дела («к доплате»), paid_total — None
             _ka = _acc_from_closing(closing, cand, bike, _p) if _close_accrual_on() else (None, None)
             if await _rc_close_card(context, bridge, bike, cand, km, None, due=_p, km_photo=km_photo,
-                                    acc=_ka[0], acc_stop=_ka[1]):
+                                    acc=_ka[0], acc_stop=_ka[1], km_src=(_KM_SRC_TEXT if km else "")):
                 return   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
         elif await _rc_close_card(context, bridge, bike, cand, km, _p):
             return   # К4 шаги 6–7: дело + карточка через хранилище (RENTAL_CASE_APPROVALS)
@@ -10760,6 +10809,8 @@ async def _return_close_card(context, bridge, bike, km="", total_due=None, km_ph
     if truth:
         rec["km_photo"] = km_photo   # подсказка, не пробег: «да» без числа по ней не закрывает (_close_km_photo_only)
         rec["due_total"] = _due
+        if km:
+            rec["km_src"] = _KM_SRC_TEXT   # RC2010: km — из текста (`_km_for_record` / ответ-согласие), не OCR
     _acc, _acc_stop = (None, None)
     if truth and _close_accrual_on():
         # CLOSEACCRUAL1910: части и привязка — из свежего ответа листа ЭТОЙ аренды; операция живёт с карточкой
@@ -14094,7 +14145,8 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
     """Реплай на карточку выдачи (kind="activate") или приёма ("close"): смысл → исход. Ровно один вызов моста на
     согласие; отказ, вопрос, условие, правка — ни одного. Пробег сдачи — `intake_confirm.km_arg` целиком из ответа либо
     проверенное поле карточки (`rec["km"]`), не «первое число в тексте». CLOSETRUTH1910: подсказка с фото
-    (`rec["km_photo"]`) проверенным полем не является — «да» без числа на такой карточке моста не зовёт."""
+    (`rec["km_photo"]`) проверенным полем не является — «да» без числа на такой карточке моста не зовёт. RC2010: и km
+    карточки без метки происхождения km_src="text" (`_close_km_unproven`) проверенным полем при ручке не считается."""
     chat_id = msg.chat_id
     tid = getattr(msg, "message_thread_id", None)
     who = msg.from_user.username if msg.from_user else "?"
@@ -14163,6 +14215,14 @@ async def _card_reply_strict(kind, rec, msg, context, bridge, text, now):
         log.info(f"  → карточка {word} {rec.get('bike')}: пробег только с фото ({rec.get('km_photo')}), числа в ответе "
                  f"нет — без вызова моста (@{who})")
         sent_p = await say(_CR_KM_PHOTO.format(km=rec.get("km_photo"), where=" реплаем на карточку"))
+        _cr_note_dead(chat_id, [getattr(sent_p, "message_id", None)])
+        return
+    if kind == "close" and km is None and _close_km_unproven(rec):
+        # RC2010: km карточки без метки «из текста» (карточка 947953e из передачи restart_handoff или рождённая до
+        # ручки) — как фото-подсказка выше: числа в ответе нет — ни билета, ни моста, карточка жива; «да <пробег>»
+        log.info(f"  → карточка {word} {rec.get('bike')}: пробег карточки {rec.get('km')} без метки происхождения, "
+                 f"числа в ответе нет — без вызова моста (@{who})")
+        sent_p = await say(_CR_KM_UNPROVEN.format(km=rec.get("km"), where=" реплаем на карточку"))
         _cr_note_dead(chat_id, [getattr(sent_p, "message_id", None)])
         return
     # YES — КРАСНЫЙ шаг под токен-замком 4.2: билет → флаг отправки → ровно один вызов
@@ -14640,6 +14700,14 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
                          f"моста {ret['bike']}")
                 await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
                             text="🐀 Splinter\n" + _CR_KM_PHOTO.format(km=ret.get("km_photo"), where=""))
+                return
+            if not _m and _close_km_unproven(ret):
+                # RC2010: km карточки без метки «из текста» (карточка 947953e из передачи или рождённая до ручки) —
+                # числа в ответе нет — моста не зовём, карточка жива (status awaiting): закроет «да <пробег>»
+                log.info(f"  → ПРИЁМ: пробег карточки {ret.get('km')} без метки происхождения, числа в ответе нет — "
+                         f"без вызова моста {ret['bike']}")
+                await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                            text="🐀 Splinter\n" + _CR_KM_UNPROVEN.format(km=ret.get("km"), where=""))
                 return
             _paid, _paid_cut = _close_paid_arg(ret.get("paid_total"))   # CLOSETRUTH1910: при ручке — None всегда
             _acc, _acc_why = _acc_payload(ret)                           # CLOSEACCRUAL1910: при ручке ВЫКЛ — (None, None)
