@@ -22,6 +22,10 @@
        (OCR фото в km, km_photo нет), ждущая в памяти, восстановленная НАСТОЯЩИМ handoff_write/handoff_restore и цель
        дела К4: при ручке «да» без числа — ни билета, ни моста, «да 35200» — закрывает; на всех трёх путях ответа.
        Новая карточка с пробегом из текста — «да» закрывает (и после рестарта); ручка ВЫКЛ — прежнее;
+  (W)  RC2010 (Codex TB-CHECK-2010-0748): прежний путь ответа (INTAKE_CONFIRM_STRICT=0) при ручке берёт число ответа
+       правилом строгого пути — `km_arg` (ровно одно число целиком) при согласии в остальном ответе и Р2 `km_doubt` —
+       до билета: «да 35200 89» и «да, строка 21» не закрывают (переспрос словами строгого пути), «да 35200» —
+       закрывает; ручка ВЫКЛ — прежние «первые 2–7 цифр без пробелов»;
   (O)  ручка ВЫКЛ («0», «off» — откат): текст карточки и вызов моста — дословно прежние (947953e), включая записанные
        КАК ПРЕЖНЕЕ поведение отката дефекты (paid_total=1500.0; фото-пробег идёт в km_end по «да»).
 
@@ -802,6 +806,85 @@ class H_UnprovenKmCaseStore(Case):
         card = old_ocr_card(b)
         self.k4(b, "да", card)
         self.assertEqual(b.red("close_booking"), exp_close("35200", 1500.0), "откат: путь 947953e")
+
+
+# ===================== (W) RC2010: прежний путь ответа (STRICT=0) — число ответа правилом целого числа строгого пути
+# Codex TB-CHECK-2010-0748: ветка 5 `_handle_intake` убирала пробелы и брала первые 2–7 цифр — «да 35200 89» становилось
+# 3520089, «да, строка 21» — пробегом 21. При ручке число ответа — `intake_confirm.km_arg` (ровно одно целиком) при
+# согласии в остальном ответе (`decide_action`, как у строгого пути) и Р2 `km_doubt` — до билета; иначе переспрос
+# словами строгого пути (`_CR_ASK["close"]`), ни билета, ни моста. По одному верному и одному неверному примеру на класс.
+def ask_words():
+    return P + S._CR_ASK["close"]
+
+
+class W_LegacyWholeNumber(Case):
+    def setUp(self):
+        super(W_LegacyWholeNumber, self).setUp()
+        os.environ["INTAKE_CONFIRM_STRICT"] = "0"
+
+    def assert_no_close(self, b, want_text, why):
+        self.assertEqual((b.red("close_booking"), b.tickets), ([], 0), why)
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "awaiting", "карточка жива: %s" % why)
+        self.assertEqual(texts()[-1], want_text, why)
+
+    def test_w1_old_unproven_card_two_numbers_and_row_number_then_whole_km(self):
+        """Карточка 947953e (OCR в km, метки нет): «да 35200 89» и «да, строка 21» — не закрывают (не склейка 3520089 и
+        не пробег 21); «да 35200» — закрывает с 35200."""
+        b = Bridge([rent_row()])
+        old_ocr_card(b)
+        os.environ["CLOSE_TRUTH"] = "1"
+        say(b, "да 35200 89")
+        self.assert_no_close(b, ask_words(), "два числа — не пробег (прежде 3520089)")
+        say(b, "да, строка 21")
+        self.assert_no_close(b, ask_words(), "число рядом с другим словом — не пробег (прежде km 21)")
+        say(b, "да, доплатил 40000")
+        self.assert_no_close(b, ask_words(), "М6 (test_approvefix_1610 F2): деньги — не пробег")
+        say(b, "да 35200")
+        self.assertEqual(b.red("close_booking"), exp_close("35200"))
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "closed")
+        self.assertIn(P + "✅ Завершена, строка 21." + S._CLOSE_PAID_NOTE, texts())
+
+    def test_w2_number_far_below_photo_hint_is_km_doubt(self):
+        """Р2 как у строгого пути: «да 3520» против фото-подсказки 35200 — переспрос без билета; повтор того же числа —
+        закрытие с ним. Число одного порядка («да 35300») — закрывает сразу."""
+        b = Bridge([rent_row()])
+        ret_card(b, km="", km_photo="35200")
+        say(b, "да 3520")
+        self.assert_no_close(b, P + S._CR_KM_DOUBT.format(km="3520", ref="35200", where="карточку"),
+                             "разный порядок с фото-подсказкой")
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["km_doubt"], "3520")
+        say(b, "да 3520")
+        self.assertEqual(b.red("close_booking"), exp_close("3520"), "повтор того же числа — подтверждение")
+        reset()
+        os.environ.update(CLOSE_TRUTH="1", INTAKE_CONFIRM_STRICT="0")
+        b = Bridge([rent_row()])
+        ret_card(b, km="", km_photo="35200")
+        say(b, "да 35300")
+        self.assertEqual(b.red("close_booking"), exp_close("35300"))
+
+    def test_w3_new_text_card_plain_yes_still_closes(self):
+        """Путь ТЕКСТА цел: на новой карточке с пробегом из текста неверное число — переспрос, карточка жива; «да» без
+        числа закрывает с пробегом карточки."""
+        b = Bridge([rent_row()])
+        ret_card(b)
+        self.assertEqual(S._RETURN_CLOSES[INTAKE].get("km_src"), "text")
+        say(b, "да 35200 89")
+        self.assert_no_close(b, ask_words(), "два числа и на текстовой карточке — не пробег")
+        say(b, "да")
+        self.assertEqual(b.red("close_booking"), exp_close("35200"))
+        self.assertEqual(S._RETURN_CLOSES[INTAKE]["status"], "closed")
+
+    def test_w4_off_old_two_to_seven_digits_unchanged(self):
+        """CLOSE_TRUTH=0: прежний разбор 947953e — пробелы прочь, первые 2–7 цифр (дефект записан КАК ПРЕЖНЕЕ поведение
+        отката): «да 35200 89» → 3520089, «да, строка 21» → 21; «да 35200» → 35200."""
+        for text, km in (("да 35200 89", "3520089"), ("да, строка 21", "21"), ("да 35200", "35200")):
+            with self.subTest(text=text):
+                reset()
+                os.environ.update(CLOSE_TRUTH="0", INTAKE_CONFIRM_STRICT="0")
+                b = Bridge([rent_row()])
+                ret_card(b)
+                say(b, text)
+                self.assertEqual(b.red("close_booking"), exp_close(km, 1500.0))
 
 
 # ================================================== (D) ручка НЕ задана: умолчание ВКЛ — путь правды, а не откат

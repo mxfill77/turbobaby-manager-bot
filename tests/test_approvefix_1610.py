@@ -1613,10 +1613,21 @@ class F_KnobOffLegacy(Case):
         self.assertEqual(texts()[-1], P + "✅ В аренде, строка 17.")
 
     def test_f2_m2_m6_defects_close(self):
-        b = Bridge([rent_row()])
-        ret_card(b)
-        say(b, "да, доплатил 40000")                                   # ДЕФЕКТ М6: деньги — пробегом
-        self.assertEqual([c["km_end"] for c in b.red("close_booking")], ["40000"])
+        # RC2010 (Codex TB-CHECK-2010-0748): при CLOSE_TRUTH (умолчание ВКЛ) число ответа ветки 5 судится правилом
+        # строгого пути — М6 там закрыт (tests/test_close_truth_1910.py, раздел W); прежний разбор 13b4188 — откат
+        # CLOSE_TRUTH=0. На 13b4188 ручки нет — значение не влияет, раздел зелёный и там.
+        was = os.environ.get("CLOSE_TRUTH")
+        os.environ["CLOSE_TRUTH"] = "0"
+        try:
+            b = Bridge([rent_row()])
+            ret_card(b)
+            say(b, "да, доплатил 40000")                               # ДЕФЕКТ М6: деньги — пробегом
+            self.assertEqual([c["km_end"] for c in b.red("close_booking")], ["40000"])
+        finally:
+            if was is None:
+                os.environ.pop("CLOSE_TRUTH", None)
+            else:
+                os.environ["CLOSE_TRUTH"] = was
         reset()
         os.environ["INTAKE_CONFIRM_STRICT"] = "0"
         b = Bridge([rent_row()])

@@ -177,7 +177,9 @@ def _close_truth_on():
     """Ручка CLOSETRUTH1910 (отрезок RETURN/CLOSE TRUTH карты цикла 19.10). ВКЛ → (1) итог листа закрытия (total_due —
     сумма ДОПЛАТ) больше не уходит в close_booking.paid_total и колонку K «оплачено» не перезаписывает: на карточке —
     строка «к доплате N ฿ — в CRM не пишу»; (2) пробег сдачи на карточке — только из ТЕКСТА (`_km_for_record` →
-    `intake_confirm.km_arg`, одни цифры), пробег с ФОТО — подсказкой, и без числа в ответе моста не зовём.
+    `intake_confirm.km_arg`, одни цифры), пробег с ФОТО — подсказкой, и без числа в ответе моста не зовём;
+    (3) RC2010: число в ответе «да» и на прежнем пути (INTAKE_CONFIRM_STRICT=0) — правилом строгого пути
+    (`km_arg` + `decide_action`, Р2 `km_doubt`) до билета, а не «первые 2–7 цифр без пробелов».
     Ручка не задана → `_CLOSE_TRUTH_DEFAULT` (ВКЛ); `CLOSE_TRUTH=0` → путь байт-в-байт прежний (947953e). Что писать в
     «оплачено» вообще — вопрос владельца, здесь не решён: снята только неверная запись."""
     return str(_os_env("CLOSE_TRUTH", _CLOSE_TRUTH_DEFAULT)).strip().lower() not in ("0", "", "нет", "no", "off",
@@ -14690,9 +14692,38 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             return
         if any(w in low for w in ("да", "ок", "заверш", "закрывай", "подтвержд")):
             _who = msg.from_user.username if msg.from_user else "?"
-            # цифра в ответе авторизатора = правка/добор пробега на сдаче («да 35200» — перекрывает контекст)
-            _m = _re_lang.search(r"\d{2,7}", text.replace(" ", ""))
-            _km = (_m.group(0) if _m else "") or ret.get("km") or None
+            if _close_truth_on():
+                # RC2010 (Codex TB-CHECK-2010-0748): число ответа — тем же правилом целого числа, что строгий путь
+                # (`_card_reply_strict`), а не «пробелы прочь и первые 2–7 цифр» (там «да 35200 89» → 3520089, а
+                # «да, строка 21» — пробег 21). Пробег из ответа — только ровно одно число ЦЕЛИКОМ
+                # (`intake_confirm.km_arg`), а весь остальной ответ — согласие (`decide_action`, как у строгого пути:
+                # роль числа km_arg не судит). Любая иная цифра в ответе (два числа, одна цифра, восемь и больше,
+                # число рядом с другим словом) — переспрос «да <пробег>» словами строгого пути: ни билета, ни моста,
+                # карточка жива. Р2 (`km_doubt` против km / km_photo карточки) — тоже до билета, как там же. Ответ
+                # без цифр — прежний путь ниже. Здесь _m — само число ответа (строка) или None.
+                _said = _ic_strip_bot(text, context)
+                _m, _rest = intake_confirm.km_arg(_said)
+                if any(ch.isdigit() for ch in _said) and (
+                        _m is None or intake_confirm.decide_action(_rest, "close") != intake_confirm.YES):
+                    log.info(f"  → ПРИЁМ: в ответе не одно целое число пробега при согласии — не закрываю, без вызова "
+                             f"моста (@{_who}) {ret['bike']}")
+                    await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                                text="🐀 Splinter\n" + _CR_ASK["close"])
+                    return
+                _ref = intake_confirm.km_arg(str(ret.get("km") or ret.get("km_photo") or ""))[0]
+                if _m is not None and intake_confirm.km_doubt(_m, _ref) and ret.get("km_doubt") != _m:
+                    # Р2: число ответа и показание карточки разного порядка, то же число не повторено — переспрос
+                    ret["km_doubt"] = _m
+                    log.info(f"  → ПРИЁМ: пробег {_m} против показания карточки {_ref} — разный порядок, переспрос "
+                             f"без вызова моста (@{_who}) {ret['bike']}")
+                    await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                                text="🐀 Splinter\n" + _CR_KM_DOUBT.format(km=_m, ref=_ref, where="карточку"))
+                    return
+                _km = _m or ret.get("km") or None
+            else:
+                # цифра в ответе авторизатора = правка/добор пробега на сдаче («да 35200» — перекрывает контекст)
+                _m = _re_lang.search(r"\d{2,7}", text.replace(" ", ""))
+                _km = (_m.group(0) if _m else "") or ret.get("km") or None
             if not _km and _close_km_photo_only(ret):
                 # CLOSETRUTH1910: пробег карточки — только подсказка с фото, числа в ответе нет — моста не зовём,
                 # карточка жива (status awaiting): закроет «да <пробег>»
