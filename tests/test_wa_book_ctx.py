@@ -76,19 +76,20 @@ DAY = datetime.date(2026, 9, 21)               # «сегодня» и день 
 C1 = "PCX 160 с 10 по 15 октября сколько?"
 U1 = "PCX 160 на 5 суток — 2000 бат"
 Q = "а свободен?"
-LIVE = [{"name": n} for n in ("PCX 160CC WHITE PHUKET 3011", "PCX 160CC BLACK PHUKET 3012",
-                              "ADV 350CC BLACK PHUKET 5849", "XADV 750CC GREY PHUKET 4290",
-                              "NMAX 155CC BLUE PHUKET 6001", "CB 300CC R 9011", "CB 650R RED PHUKET 9012",
-                              "XMAX 300CC NEW BLUE PHUKET 4321")]
+LIVE = [{"name": n, "status": "ДОМА"} for n in ("PCX 160CC WHITE PHUKET 3011", "PCX 160CC BLACK PHUKET 3012",
+                                                "ADV 350CC BLACK PHUKET 5849", "XADV 750CC GREY PHUKET 4290",
+                                                "NMAX 155CC BLUE PHUKET 6001", "CB 300CC R 9011",
+                                                "CB 650R RED PHUKET 9012", "XMAX 300CC NEW BLUE PHUKET 4321")]
+# RCFIX2010: у байка парка статус формулы столбца B (живой формат ReadFleet.js:91-95) — без него юнит не «свободно»
 BASE = "cbe1322"                               # прод 556e744 + FORMID
 PINS = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
-        "wa_agent_model.py": "868b0c4b3abd75d6f4fca6b1c7021d0f121db3ce",
+        "wa_agent_model.py": "7c58cca9c7e32b6eb929f861dc631170bebea855",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка)
         "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",
         "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3",
         "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
         "bridge_client.py": "71d290387c95dc283a477f1c44ab4e4c9bedb665",
-        "wa_book_read.py": "7329698d797d5b045692f4a9889e830c081ce78d",
-        "wa_agent_tg.py": "4f83f9be2819306775e48612d13f7bffa1d209ae",
+        "wa_book_read.py": "5a90fddccbf973f362ba66c52792326b3708d091",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно»)
+        "wa_agent_tg.py": "c3fbd7157977671cdba877eddfa8db41564607f9",  # RCFIX2010: было 4f83f9be (поля модели — одной строкой)
         "contract_ask.py": "be132d7a099dbb84edadca636989cb16dd19c607"}
 PROD_MAKE_MODEL = ["env", "line", "bridge", "call", "lessons", "book", "cache", "tools", "hints", "cstate"]
 L1 = BC.LOG_HEAD + "история не та — ответ родителя"
@@ -660,7 +661,8 @@ def test_k16_signatures():
     assert params(M.price_pairs) == ["ask", "ctx", "today", "bikes", "ask_day"]
     assert params(M.ModelAdapter._book) == ["self", "number", "ask", "today", "now", "ask_day"]
     assert params(M.ModelAdapter._history) == ["self", "number", "upto_id"]
-    assert params(B.free_bikes) == ["model", "units", "ds", "de", "rows", "age", "why", "now_local", "door"]
+    # RCFIX2010 (видимая правка пина): + bikes — парк того же снимка, статус «В ремонте» не «свободно»
+    assert params(B.free_bikes) == ["model", "units", "ds", "de", "rows", "age", "why", "now_local", "door", "bikes"]
     assert params(S.make_model) == PROD_MAKE_MODEL and params(S.models_of) == ["env", "environ", "line"]
     assert params(S.book_ctx_of) == ["environ", "model"]
     src = inspect.getsource(S.make_model) + inspect.getsource(S.models_of) + inspect.getsource(S.main)

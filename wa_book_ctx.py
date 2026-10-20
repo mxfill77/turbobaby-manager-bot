@@ -432,7 +432,7 @@ class BookCtxMixin:
                 got.append((model, code, w, ds, de, None, SIEVE_LINE % (w, adv)))
                 continue
             units = M.units_of(model, bikes)
-            r = B.free_bikes(model, units, ds, de, rows, age, why, now_local, self.door)
+            r = B.free_bikes(model, units, ds, de, rows, age, why, now_local, self.door, bikes=bikes)
             if r["outcome"] in (B.FREE, B.BUSY) and own_booking(number, rows, units, ds, de):
                 r, code = B._avail_unknown(dict(r), W_OWN), "own_booking"
             elif r["outcome"] == B.BUSY and talk:

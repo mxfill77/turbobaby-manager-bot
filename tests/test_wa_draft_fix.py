@@ -70,7 +70,7 @@ class LiveBridge(TM.FakeBridge):
 
     def fleet(self):
         self.fleets += 1
-        return {"ok": True, "data": {"bikes": [{"name": n} for n in self.units]}}
+        return {"ok": True, "data": {"bikes": [{"name": n, "status": "ДОМА"} for n in self.units]}}   # RCFIX2010
 
     def door(self, unit, ds, de):
         self.doors.append((unit, ds, de))

@@ -416,6 +416,14 @@ def wa_emoji(tg) -> str:
 
 # ── компактная карточка (WACARDCOMPACT0310): чистые функции ───────────────────────────────
 
+def one_line(s):
+    """Поле модели (why, перевод, причина, предложение черновика) → одна строка (RCFIX2010, Codex
+    TB-REVIEW-2010-1520 п.2): каждый разрыв, который признаёт `str.splitlines`, — пробел. Поле остаётся буквальным
+    текстом после префикса кода и строку карточки не начинает — метки «🔎 …», «• …» ставит только рендер. Таблицы
+    знаков нет; строка без разрывов — как есть."""
+    return " ".join(str(s or "").splitlines())
+
+
 def card_actions(hand):
     """Причины «нужен человек» → [действия сотрудника] по категориям, без повторов, в порядке причин.
     Причина без категории — её слова как есть (не длиннее REASON_SHOW_MAX)."""
@@ -426,7 +434,7 @@ def card_actions(hand):
             if key in seen:
                 continue
             seen.add(key)
-            words = str(w).strip()
+            words = one_line(str(w).strip())
             acts.append(CARD_ACTIONS.get(cat) or (words if len(words) <= REASON_SHOW_MAX
                                                   else words[:REASON_SHOW_MAX - 1] + "…"))
     return acts
@@ -496,7 +504,7 @@ def card_details(hand, link):
     """Подробности — режутся первыми: тема клиента и ПОЛНЫЙ список оснований."""
     lines = ["тема: " + link if link else "темы в показе нет"]
     if hand:
-        lines.append("основания (%d): %s" % (len(hand), "; ".join(str(w) for w in hand)))
+        lines.append("основания (%d): %s" % (len(hand), "; ".join(one_line(str(w)) for w in hand)))
     return "\n".join(lines)
 
 
@@ -519,7 +527,7 @@ def card_trans(extra):
     версии — «перевод — к версии N»; перевода нет — «перевода нет: модель не дала» (WACARDQ0410)."""
     if not extra or extra.get("q_lang") in (None, "", "ru"):
         return "", ""
-    q_ru, a_ru = extra.get("q_ru"), extra.get("a_ru")
+    q_ru, a_ru = one_line(extra.get("q_ru")), one_line(extra.get("a_ru"))
     if q_ru or a_ru:
         return W_TR_HEAD, W_TR_Q + (q_ru or W_TR_EMPTY) + "\n" + W_TR_A + (a_ru or W_TR_EMPTY)
     if extra.get("tr_ver"):
@@ -542,7 +550,7 @@ def card_check(claims, checked=None):
     подтверждена, а черновик говорит о деньгах, — строка сверки человеком с этими предложениями дословно (первой)."""
     lines = []
     if checked and not checked.get("pay") and checked.get("said"):
-        lines.append(W_PAY_SAID + " " + " · ".join("«%s»" % x for x in checked["said"])
+        lines.append(W_PAY_SAID + " " + " · ".join("«%s»" % one_line(str(x)) for x in checked["said"])
                      + (W_PAY_MORE % checked["more"] if checked.get("more") else ""))
     if claims is None:
         return "\n".join(lines + [W_CHECK_NONE])
@@ -600,6 +608,7 @@ def card_texts(top, answer, notes, details, room=CARD_ROOM, msg_max=TG_TEXT_MAX,
     if not agent:
         return _card_texts(top, answer, notes, details, room, msg_max, question, trans)
     why, check = agent
+    why = why if why is None else one_line(why)          # RCFIX2010: обрезка ниже считается по однострочному why
 
     def build(keep=None):
         block = agent_block(why, check, keep)

@@ -93,9 +93,12 @@ HEAD0 = CS.HEAD_START                                              # «ДОГО�
 HEAD_T = (T.TOOLS_BLOCK % T.MAX_CALLS) + "\n\n"                    # голова хода сверки Т4а перед user
 DATE_ANY = re.compile(r"\d{1,4}[./-]\d{1,2}(?:[./-]\d{2,4})?")      # любая дата: в блоке — только «ДД.ММ»
 FROZEN = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",       # блобы a1dcbe5 (CASEPDF1510)
-          "wa_agent_model.py": "868b0c4b3abd75d6f4fca6b1c7021d0f121db3ce",
+          "wa_agent_model.py": "7c58cca9c7e32b6eb929f861dc631170bebea855",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка)
           "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",
           "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3"}
+# RCFIX2010 (20.10, класс 1 Codex TB-REVIEW-2010-1520 п.1): wa_agent_model.py перепинен (bikes= в free_bikes);
+# блоб a1dcbe5 — прежний, сверка с git идёт по нему (тот же приём, что 9af5017 на срезе offer-b)
+AT_A1DCBE5 = dict(FROZEN, **{"wa_agent_model.py": "868b0c4b3abd75d6f4fca6b1c7021d0f121db3ce"})
 
 
 class Script:
@@ -547,7 +550,7 @@ def test_11_frozen_blobs_equal_a1dcbe5():
     if not all(got.values()):
         print("  ПРОПУЩЕНО: объекта a1dcbe5 нет — сверка с git не сделана (это НЕ зелёное)")
         return
-    assert got == FROZEN, got
+    assert got == AT_A1DCBE5, got
 
 
 def test_11_core_without_cstate_no_table_no_reads():

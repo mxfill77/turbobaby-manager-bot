@@ -303,18 +303,24 @@ def _avail_unknown(res, why):
     return res
 
 
-def free_bikes(model, units, ds, de, rows, age, why, now_local, door):
-    """Модель на даты → словарь исхода (см. шапку). Дверь цены — НЕ БОЛЕЕ ОДНОГО раза и только перед «свободен»."""
+def free_bikes(model, units, ds, de, rows, age, why, now_local, door, bikes=None):
+    """Модель на даты → словарь исхода (см. шапку). Дверь цены — НЕ БОЛЕЕ ОДНОГО раза и только перед «свободен».
+    bikes — парк того же снимка (RCFIX2010, `fleet_status` в конце модуля): юнит, свободный по календарю, но не
+    «ДОМА»/«В аренде» по таблице «Байки», — «не проверено»; None — прежнее правило (только календарь)."""
     res = _avail_base(model, ds, de, units, age)
     if rows is None:
         return _avail_unknown(res, "таблица броней не прочитана (%s)" % (why or "причина не названа"))
+    if bikes is not None and (age is None or age > MAX_AGE):     # RCFIX2010: статус парка старого снимка не служит
+        return _avail_unknown(res, W_STALE)
     if not model or not units:
         return _avail_unknown(res, "модель не названа точно или её нет в парке")
     if ds is None or de is None or de <= ds:
         return _avail_unknown(res, "срок не разобран")
-    free = []
+    free, held = [], 0
     for u in units:
         st, _ = unit_state(u, rows, ds, de, now_local)
+        if st == UNIT_FREE and bikes is not None and fleet_status(u, bikes) != FS_OK:
+            st, held = UNIT_UNCHECKED, held + 1                   # RCFIX2010: дверь на нём не зовётся
         res[st] += 1
         if st == UNIT_FREE:
             free.append(u)
@@ -338,7 +344,8 @@ def free_bikes(model, units, ds, de, rows, age, why, now_local, door):
                         % (_mins(age), model, res["date_start"], res["date_end"], res["free"], res["units"]))
         return res
     if res["unchecked"]:
-        return _avail_unknown(res, "свободных по таблице нет, но не проверено юнитов: %d" % res["unchecked"])
+        return _avail_unknown(res, held_why(held, res) if held else
+                              "свободных по таблице нет, но не проверено юнитов: %d" % res["unchecked"])
     res.update(outcome=BUSY, why="",
                line="НАЛИЧИЕ (таблица броней, снимок %d мин назад; прочитаны все юниты модели): %s, %s — %s: "
                     "заняты все %d. Можно сказать, что на эти даты этой модели нет; другие модели и даты не "
@@ -430,3 +437,43 @@ def adjust_reasons(reasons, avail, rental, ask):
         elif rental["expired"]:
             out.append({"reason": R_RENTAL_EXPIRED, "words": W_RENTAL_EXPIRED, "why": "срок прошёл"})
     return out
+
+
+# ------------------------------- статус юнита в таблице парка (RCFIX2010) -------------------------------
+# Codex TB-REVIEW-2010-1520-OFFSCOPE п.1: дверь цены (QuotePrice.js:227-246) и снимок судят наличие ТОЛЬКО календарём
+# листа «клиенты» — байк «В ремонте» без брони был «свободно». Статус уже лежит в снимке парка: у байка `status` —
+# формула столбца B «Байки», обрезанная строка без штампа времени (bridge_prod/ReadFleet.js:10, :91-95). Семантика —
+# копия OFFER r5 (`wa_offer_tool.fleet_state`, 27c04a9): со словом «ремонт» — ремонт («В ремонте», «Требует ремонта» =
+# `summary.repair`, ReadFleet.js:137); «ДОМА» / «В аренде» (:135-136) — OK: сомнения не добавляют, готовности не
+# доказывают («свободно» — по-прежнему только ответ двери); иное («У Гоши», пусто, поля нет, не строка) и имя в парке не
+# ровно один раз — не распознан. Привязка юнита к строке парка — `qnorm`, как у двери и снимка. Блок в конце модуля,
+# чтобы не сдвигать строки, на которые ссылаются rental_case_adapters.py и rental_case_rules.py.
+FLEET_OK = frozenset(("дома", "в аренде"))       # статус формулы в нижнем регистре, пробелы сведены
+REPAIR_STEM = "ремонт"
+FS_OK, FS_REPAIR, FS_UNKNOWN = "ok", "repair", "unknown"
+W_STALE = "снимок старше %d мин или его возраст неизвестен — статус парка не служит" % (MAX_AGE // 60)
+W_HELD = ("по таблице «Байки» у %d из %d юнитов модели ремонт или статус не распознан, а дверь цены видит только "
+          "календарь — готовность не подтверждена")
+W_HELD_REST = "; прочие заняты по таблице броней: %d"
+W_HELD_MORE = "; не проверено по таблице броней: %d"
+
+
+def fleet_status(unit, bikes):
+    """Юнит + парк снимка → FS_OK | FS_REPAIR | FS_UNKNOWN (см. выше): статус ровно одной строки парка с его
+    именем."""
+    want = qnorm(unit)
+    hits = [b for b in bikes or () if isinstance(b, dict) and qnorm(b.get("name")) == want]
+    st = hits[0].get("status") if want and len(hits) == 1 else None
+    if not isinstance(st, str):
+        return FS_UNKNOWN
+    s = " ".join(st.lower().split())
+    if REPAIR_STEM in s:
+        return FS_REPAIR
+    return FS_OK if s in FLEET_OK else FS_UNKNOWN
+
+
+def held_why(held, res):
+    """Свободных OK-юнитов нет, а «не проверено» из-за таблицы парка есть → почему «неизвестно» (не «заняты все»)."""
+    rest = res["unchecked"] - held
+    return (W_HELD % (held, res["units"]) + (W_HELD_MORE % rest if rest else "")
+            + (W_HELD_REST % res["busy"] if res["busy"] else ""))

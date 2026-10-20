@@ -177,13 +177,13 @@ B_HEAD = "• версия: в базе нет (карточки подписи 
 # закреплённые файлы: блобы 556e744 (`git ls-tree 556e744 …`) — выпуск их НЕ трогает (§2.2, §8.4)
 PINS = {
     "wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
-    "wa_agent_model.py": "868b0c4b3abd75d6f4fca6b1c7021d0f121db3ce",
+    "wa_agent_model.py": "7c58cca9c7e32b6eb929f861dc631170bebea855",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка)
     "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",
     "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3",
     "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
     "bridge_client.py": "71d290387c95dc283a477f1c44ab4e4c9bedb665",
-    "wa_book_read.py": "7329698d797d5b045692f4a9889e830c081ce78d",
-    "wa_agent_tg.py": "4f83f9be2819306775e48612d13f7bffa1d209ae",
+    "wa_book_read.py": "5a90fddccbf973f362ba66c52792326b3708d091",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно»)
+    "wa_agent_tg.py": "c3fbd7157977671cdba877eddfa8db41564607f9",  # RCFIX2010: было 4f83f9be (поля модели — одной строкой)
     "contract_ask.py": "be132d7a099dbb84edadca636989cb16dd19c607",
     "bridge_prod/Archive.js": "3cd8451d609cc100d97be821fa6da884f0d3402b",
     "bridge_prod/Booking.js": "352ffdd9458873c064bf7acef796e6b55d1b29db",
@@ -221,12 +221,12 @@ PINS = {
     "tests/test_wa_agent_svc.py": "154b2d34bee7d61107d49956ebc1c633bef9a341",
     "tests/test_wa_attach_basis.py": "4921ac2f533b780046c9f18a62155df11fd7361c",
     "tests/test_wa_attach_casepdf.py": "af18c24cc9fdb002b2aac055930239113ccfb4ba",
-    "tests/test_wa_attach_casepdf_accept.py": "6ec6e3714a72615d8403b40b8438fa296df2cb31",
+    "tests/test_wa_attach_casepdf_accept.py": "65c1496de968da87d453edb43fa04dacf1bf5e54",  # RCFIX2010: было 6ec6e371 (перепин wa_agent_model.py)
     "tests/test_wa_attach_casepdf_fix.py": "ee04bebd3c8a5821f1f3be3d0a33efe8ee6bf632",
     "tests/test_wa_attach_casestate.py": "b4529669fed3c5faeaecbc8a0c6b1c06ac291222",
-    "tests/test_wa_attach_casestate_accept.py": "6a2fc49576ae2d4c19461309706c7075bc72b791",
+    "tests/test_wa_attach_casestate_accept.py": "75ebdd2adbaf04ef0059a02405caf4693734e3f8",  # RCFIX2010: было 6a2fc495 (перепин wa_agent_model.py)
     "tests/test_wa_attach_contract_ask.py": "f2241554c670821aac31ae6dde9f829c50ca24ae",
-    "tests/test_wa_attach_cstate.py": "5015c4b008d094f5758e5031b9edde87f3c3ee69",
+    "tests/test_wa_attach_cstate.py": "f38806758cf94bd6899a4f2df511d420cef30e37",  # RCFIX2010: было 5015c4b0 (перепин wa_agent_model.py)
     "tests/test_wa_attach_expect.py": "4fdac0749eb21f3391596587a108746b3b936b3b",
     "tests/test_wa_attach_svc.py": "d69add04e17cb652663e668a768f5a230dbd02a1",
     "tests/test_wa_signed_card.py": "d92bf213f14e4394382a05d90b69a83452138e4c",

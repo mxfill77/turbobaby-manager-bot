@@ -1617,7 +1617,7 @@ class ModelAdapter(wa_agent.Model):
         if want_avail:
             model = B.find_model(ask, bikes) if bikes else None     # ключ модели — живые имена парка
             units = units_of(model, bikes) if model else []
-            avail = B.free_bikes(model, units, dates[0], dates[1], rows, age, why, now_local, self.door)
+            avail = B.free_bikes(model, units, dates[0], dates[1], rows, age, why, now_local, self.door, bikes=bikes)
         if want_end:
             rental = B.rental_end(number, rows, age, why, now_local, model_of_name)
         words = "брони: снимок %s, чтений %d" % ("нет" if age is None else "%d мин" % (age // 60), self.book.reads)

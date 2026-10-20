@@ -49,6 +49,12 @@ class Bridge(TM.FakeBridge):
         self.rows, self.available, self.door_reply = list(rows) + [other], available, door_reply
         self.client_calls, self.fail = [], False
 
+    def fleet(self):
+        """Парк живого формата (bridge_prod/ReadFleet.js:91-95): у каждого байка статус формулы столбца B «Байки» —
+        здесь «ДОМА». RCFIX2010: без статуса юнит не «свободно» (wa_book_read.fleet_status)."""
+        self.fleets += 1
+        return {"ok": True, "bikes": [dict(b, status="ДОМА") for b in TM.FLEET["bikes"]]}
+
     def quote_price(self, unit, ds, de):
         return self.door(unit, ds, de)
 
@@ -193,9 +199,9 @@ def test_avail_model_not_in_fleet_unknown():
 def test_live_fleet_name_format():
     """Имена живого парка вида «PCX 160CC WHITE PHUKET 3011» (как FLEET_NAMES test_suggest): + модель находится по
     словам клиента, юниты — все цвета, и адаптер даёт факт; − чужая модель не цепляется (XADV ≠ ADV, Forza нет)."""
-    live = [{"name": n} for n in ("PCX 160CC WHITE PHUKET 3011", "PCX 160CC BLACK PHUKET 3012",
-                                  "ADV 350CC BLACK PHUKET 5849", "XADV 750CC GREY PHUKET 4290",
-                                  "MT-03 BLUE PHUKET 7788", "CB 300CC R 9011")]
+    live = [{"name": n, "status": "ДОМА"} for n in ("PCX 160CC WHITE PHUKET 3011", "PCX 160CC BLACK PHUKET 3012",
+                                                    "ADV 350CC BLACK PHUKET 5849", "XADV 750CC GREY PHUKET 4290",
+                                                    "MT-03 BLUE PHUKET 7788", "CB 300CC R 9011")]
     assert B.find_model(ASK_FREE, live) == "PCX 160CC"
     assert WM.units_of("PCX 160CC", live) == ["PCX 160CC WHITE PHUKET 3011", "PCX 160CC BLACK PHUKET 3012"]
     assert B.find_model("is XADV 750 free 5-12 Nov?", live) == "XADV 750CC"
