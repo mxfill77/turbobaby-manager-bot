@@ -47,11 +47,12 @@ def _install(wa_value):
     """Подменить ВСЕ зонды здоровья на зелёные, кроме WA — он отдаёт заданное значение."""
     names = ("check_service", "check_bridge", "check_auditor", "check_polling",
              "check_log_health", "check_brain_latency", "check_api_credit",
-             "check_commit", "check_wa_webhook", "_read_log_lines")
+             "check_commit", "check_wa_webhook", "_read_log_lines", "_read_run")
     for n in names:
         _ORIG.setdefault(n, getattr(H, n))
 
     H._read_log_lines = lambda *a, **kw: []
+    H._read_run = lambda *a, **kw: None       # RCFIX2010 C: без живого `systemctl show`; polling судит заглушка ниже
     H.check_service   = lambda *a, **kw: (True, "active", None, None)
     H.check_bridge    = lambda *a, **kw: (True, "ok")
     H.check_auditor   = lambda *a, **kw: (True, "ok")

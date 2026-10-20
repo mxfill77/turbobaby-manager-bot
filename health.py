@@ -11,14 +11,23 @@
   • Splinter   — systemctl active/running + uptime + счётчик рестартов;
   • Bridge     — ping-экшен (alive + версия), живой запрос;
   • Аудитор    — маркеры старт-лога (Auditor ✅ + Auditor LLM ✅);
-  • Polling    — «Bot polling started» в старт-логе;
+  • Polling    — ТЕКУЩИЙ запуск юнита (MainPID + ExecMainStartTimestamp, два чтения вокруг чтения
+                 журнала): его строка «🚦 вход выпуска» (OK release|truth_off) и РОВНО ОДНА его строка
+                 «Bot polling started». Строка прошлого запуска не доказательство; простой (вход
+                 MISMATCH/UNKNOWN), нет polling текущего запуска, граница не прочитана / сменилась —
+                 ❌ (RCFIX2010 C, Codex TB-QA-2110-0006-PARKSEEN, вариант B). Запуск моложе 300 с — ❌
+                 НЕИЗВЕСТНО и со строкой polling: bot.py печатает её ДО app.run_polling (:1778–1779),
+                 и цикл падений после неё (NRestarts растёт) иначе давал «✅ ВСЁ ОК». Цена: прогон в
+                 первые 300 с после любого рестарта — ❌ с пушем (таймер после загрузки — OnBootSec=10min);
   • Лог        — свежесть последней строки (инфо: бот event-driven, тишина ≠ смерть)
                  + ошибки/Traceback ПОСЛЕ старта сервиса;
   • Прод       — последний коммит (что сейчас в проде).
 
-Exit 0 = ок/предупреждение, 1 = есть проблема (лежит компонент).
-Пуш идёт через notify.py (личка Филиппа). Предупреждение (⚠️ ошибки в логе) пушем НЕ дёргает —
-только реальный ❌. Авто-проверка по расписанию (systemd timer) зовёт `health.py --push`.
+Exit 0 = ок/предупреждение, 1 = есть проблема (лежит компонент, простой Splinter или запуск не
+доказан — НЕИЗВЕСТНО). Пуш идёт через notify.py (личка Филиппа), ОДИН вызов за прогон, без повтора:
+«отправлен» печатается только при ответе Telegram ok, иначе — «доставка не подтверждена». Предупреждение
+(⚠️ ошибки в логе) пушем НЕ дёргает — только реальный ❌. Авто-проверка по расписанию (systemd timer,
+такт 4 ч) зовёт `health.py --push`.
 """
 import os
 import re
@@ -31,6 +40,32 @@ import urllib.error
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(ROOT, "splinter.log")
 OK, BAD, INFO, WARN = "✅", "❌", "ℹ️ ", "⚠️ "
+
+# === RCFIX2010 C · PARKSEEN (Codex TB-QA-2110-0006-PARKSEEN, вариант B): polling ТЕКУЩЕГО запуска ==============
+# Прежде «Bot polling started» искался последним совпадением по ВСЕМУ неротированному splinter.log: строка прошлого
+# запуска проходила, а простой текущего (bot.main: вход выпуска MISMATCH/UNKNOWN → одна строка [ERROR] и
+# _park_until_stop) давал «⚠️ РАБОТАЕТ, но 1 ошибок», code 0 и ни одного пуша. Теперь polling судится в границе
+# запуска: MainPID + ExecMainStartTimestamp юнита (два чтения вокруг чтения журнала), строка входа выпуска ЭТОГО запуска
+# и его polling. health splinter НЕ импортирует: копии ниже сверяет с splinter тест (tests/test_rcfix2010_health.py).
+_UNIT = "splinter"
+_ENTRY_HEAD = "🚦 вход выпуска: "                       # = splinter._ENTRY_HEAD (splinter.py:287)
+_ENTRY_STATES = ("release", "truth_off")                # = имена splinter.RELEASE_ENTRY_STATES (splinter.py:283–286)
+_ENTRY_KEYS = ("INTAKE_CONFIRM_STRICT", "CONTRACT_REF_GEN", "CLOSE_TRUTH", "CLOSE_ACCRUAL", "HANDOVER_FACTS")
+#                                                       # = splinter.RELEASE_FLAG_KEYS (splinter.py:279)
+_ENTRY_PARK_TAIL = "обработчики не зарегистрированы, опрос не начат — процесс ждёт остановки"
+_START_SKEW_S = 300     # вход и polling — не позже старта + 300 с (= SC_START_SKEW библиотеки рестарта RC2010)
+_FUTURE_SKEW_S = 120    # метка журнала впереди часов больше чем на 120 с → пояс журнала не UTC, НЕИЗВЕСТНО
+_RUN_PROPS = ("MainPID", "ExecMainStartTimestamp", "NRestarts", "ActiveState", "SubState")
+# Строгие шаблоны на ВСЮ строку журнала (формат bot.py:71–74 «%(asctime)s [%(levelname)s] %(name)s: %(message)s»,
+# логгер «turbobaby» bot.py:79): якорь на префикс логгера отсекает цитаты внутри чужих сообщений и продолжения
+# без метки.
+_LOG_TS = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}"
+_POLL_RE = re.compile(r"^" + _LOG_TS + r" \[INFO\] turbobaby: Bot polling started\. Press Ctrl\+C to stop\.$")
+_ENTRY_RE = re.compile(r"^" + _LOG_TS + r" \[([A-Z]+)\] turbobaby:   " + re.escape(_ENTRY_HEAD) + r"(.*)$")
+_ENTRY_OK_RE = re.compile(r"^OK — состояние (" + "|".join(_ENTRY_STATES) + r") · "
+                          + " · ".join(re.escape(k) + " OK" for k in _ENTRY_KEYS) + r"$")
+_ENTRY_PARK_RE = re.compile(r"^(MISMATCH|UNKNOWN) — .*; " + re.escape(_ENTRY_PARK_TAIL) + r"$")
+_ENTRY_BAD_KEY_RE = re.compile(r"(" + "|".join(re.escape(k) for k in _ENTRY_KEYS) + r") (MISMATCH|UNKNOWN)")
 
 # Ранний детектор деградации Brain-доков (износ Google-Doc → рост latency чтения).
 # ПЕР-ДОКОВЫЙ порог: журналы (cc_log/review) должны читаться ~1с → порог 10с ловит ранний износ;
@@ -96,6 +131,48 @@ def check_service():
     return ok, detail, start_dt, nrestarts
 
 
+def _read_run():
+    """RCFIX2010 C: граница ТЕКУЩЕГО запуска юнита одним `systemctl show` → {pid, start, start_raw, nrestarts, active,
+    sub} или None, когда её нельзя доказать: systemctl не запустился / код ≠ 0 / нет любого из ключей / MainPID не
+    число > 0 / метка не вида «Ddd YYYY-MM-DD HH:MM:SS UTC» (пояс ≠ UTC прежде молча считался UTC) / NRestarts не
+    число. Ключи разбираются по имени, а не по порядку строк: systemd печатает их в своём порядке. Промах — только
+    None, а не пустое: «границы нет» не должно читаться как «граница пустая»."""
+    try:
+        r = subprocess.run(["systemctl", "show", _UNIT, "--property=" + ",".join(_RUN_PROPS)],
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    props = {}
+    for line in (r.stdout or "").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            props[k.strip()] = v.strip()
+    if any(k not in props for k in _RUN_PROPS):
+        return None
+    pid, raw, nr = props["MainPID"], props["ExecMainStartTimestamp"], props["NRestarts"]
+    parts = raw.split()
+    if not (pid.isdigit() and int(pid) > 0 and nr.isdigit() and len(parts) == 4 and parts[3] == "UTC"):
+        return None
+    try:
+        start = datetime.datetime.strptime(parts[1] + " " + parts[2], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc)
+    except Exception:
+        return None
+    return {"pid": int(pid), "start": start, "start_raw": raw, "nrestarts": int(nr),
+            "active": props["ActiveState"], "sub": props["SubState"]}
+
+
+def _run_key(run):
+    return (run["pid"], run["start_raw"], run["nrestarts"], run["active"], run["sub"])
+
+
+def _run_word(run):
+    return ("PID " + str(run["pid"]) + ", старт " + run["start"].strftime("%Y-%m-%d %H:%M:%S") + " UTC, рестартов "
+            + str(run["nrestarts"]))
+
+
 def check_bridge(attempts=3):
     """Ping Bridge. Bridge временами флапает (таймауты) — ретраим до `attempts` раз,
     чтобы авто-проверка по расписанию НЕ будила Филиппа ложным «Bridge не отвечает»."""
@@ -159,9 +236,102 @@ def check_auditor(lines):
     return False, "нет ✅ в старт-логе: " + ", ".join(miss)
 
 
-def check_polling(lines):
-    p = _last_match(lines, "Bot polling started")
-    return (bool(p), "Bot polling started" if p else "нет «Bot polling started» в логе")
+def _run_verdict(lines, run0, run1, now):
+    """RCFIX2010 C: вердикт ТЕКУЩЕГО запуска → (OK | PARKED | NO_POLL | UNKNOWN, слова). Чистая: только строки журнала,
+    два чтения границы (до и после чтения журнала) и «сейчас».
+    Сегмент запуска — строки, чья действующая метка ≥ старта юнита (продолжения без своей метки наследуют метку
+    родителя, как в check_log_health). В нём ровно одна строка «🚦 вход выпуска» не позже старт + 300 с:
+      · [INFO] «OK — состояние release|truth_off · <пять ручек OK>» и после неё РОВНО ОДНА строка polling не позже
+        старт + 300 с, и запуску не меньше 300 с → OK (строка polling печатается ДО app.run_polling, bot.py:1778–1779:
+        падение initialize/get_me/post_init приходит после неё, поэтому молодой запуск с polling — не доказательство);
+      · [ERROR] «MISMATCH|UNKNOWN — …; <хвост простоя>» и polling в запуске нет → PARKED (простой);
+      · нет строки входа (и polling) при запуске старше 300 с, либо вход OK без polling → NO_POLL.
+    Всё прочее — UNKNOWN: граница не прочитана или сменилась, запуск моложе 300 с, метки впереди часов или за окном
+    (пояс журнала не UTC?), два входа / два polling, polling раньше входа или при простое, polling без строки входа,
+    строка входа не по грамматике или уровень не сходится с вердиктом. Старый журнал UNKNOWN не спасает никогда."""
+    if run0 is None or run1 is None:
+        return "UNKNOWN", "граница запуска не прочитана (systemctl show: нет MainPID / старта в UTC)"
+    if _run_key(run0) != _run_key(run1):
+        return "UNKNOWN", ("граница запуска сменилась во время чтения журнала (" + _run_word(run0) + " → "
+                           + _run_word(run1) + ")")
+    who = _run_word(run1)
+    if run1["active"] != "active":
+        return "UNKNOWN", "юнит " + run1["active"] + "/" + run1["sub"] + " — текущий запуск не доказан (" + who + ")"
+    start = run1["start"]
+    skew = datetime.timedelta(seconds=_START_SKEW_S)
+    ahead = now + datetime.timedelta(seconds=_FUTURE_SKEW_S)
+    if start > ahead:
+        return "UNKNOWN", "старт юнита впереди часов (" + who + ")"
+    young = (now - start) < skew
+    entries, polls = [], []
+    cur = None
+    for raw in lines:
+        ln = raw.rstrip("\r\n")
+        ts = _parse_log_ts(ln)
+        if ts is not None:
+            cur = ts
+        if cur is None or cur < start:
+            continue
+        if cur > ahead:
+            return "UNKNOWN", ("метка журнала " + cur.strftime("%Y-%m-%d %H:%M:%S") + " впереди часов — пояс журнала "
+                               "не UTC? (" + who + ")")
+        if ts is None:
+            continue                       # продолжение без своей метки: ни входом, ни polling оно не бывает
+        m = _ENTRY_RE.match(ln)
+        if m:
+            entries.append((ts, m.group(1), m.group(2)))
+        elif _POLL_RE.match(ln):
+            polls.append((ts, len(entries)))
+    if len(entries) > 1:
+        return "UNKNOWN", ("граница неоднозначна: строк «вход выпуска» в текущем запуске " + str(len(entries))
+                           + " (" + who + ")")
+    if not entries:
+        if polls:
+            return "UNKNOWN", ("polling текущего запуска без строки «вход выпуска» — кортеж выпуска не доказан (код "
+                               "процесса старше выпуска?) (" + who + ")")
+        if young:
+            return "UNKNOWN", "запуск моложе 300 с — строки «вход выпуска» ещё нет (" + who + ")"
+        return "NO_POLL", "нет строки «вход выпуска» и polling текущего запуска (" + who + ")"
+    ets, lvl, rest = entries[0]
+    if ets > start + skew:
+        return "UNKNOWN", ("строка «вход выпуска» позже старта больше чем на 300 с — пояс журнала не UTC или долгий "
+                           "импорт (" + who + ")")
+    mo = _ENTRY_OK_RE.match(rest)
+    mp = _ENTRY_PARK_RE.match(rest)
+    if mp and lvl == "ERROR":
+        if polls:
+            return "UNKNOWN", ("противоречие: вход выпуска " + mp.group(1) + ", а polling в том же запуске есть ("
+                               + who + ")")
+        bad = ["%s %s" % kv for kv in _ENTRY_BAD_KEY_RE.findall(rest)]
+        return "PARKED", ("ПРОСТОЙ Splinter: вход выпуска " + mp.group(1) + " текущего запуска (" + who + ")"
+                          + ((": " + ", ".join(bad)) if bad else "") + " — обработчиков и опроса нет, бот молчит")
+    if not (mo and lvl == "INFO"):
+        return "UNKNOWN", ("строка «вход выпуска» не по грамматике или уровень " + lvl + " не сходится с вердиктом ("
+                           + who + ")")
+    if any(n_before == 0 for _t, n_before in polls):
+        return "UNKNOWN", "противоречие: polling раньше строки «вход выпуска» того же запуска (" + who + ")"
+    if len(polls) > 1:
+        return "UNKNOWN", "граница неоднозначна: polling в текущем запуске " + str(len(polls)) + " (" + who + ")"
+    if not polls:
+        if young:
+            return "UNKNOWN", "запуск моложе 300 с — polling ещё нет (" + who + ")"
+        return "NO_POLL", "вход выпуска OK (" + mo.group(1) + "), но нет polling текущего запуска (" + who + ")"
+    if polls[0][0] > start + skew:
+        return "UNKNOWN", "polling позже старта больше чем на 300 с — пояс журнала не UTC? (" + who + ")"
+    if young:   # verify3 x1/x1b/x5: цикл падений после строки polling и строки чужого процесса той же секунды
+        return "UNKNOWN", "запуск моложе 300 с — устойчивость запуска не доказана (" + who + ")"
+    return "OK", "вход выпуска OK (" + mo.group(1) + ") · Bot polling started · " + who
+
+
+def check_polling(lines, run0=None, run1=None, now=None):
+    """Polling ТЕКУЩЕГО запуска (RCFIX2010 C) → (ok, слова), форма прежняя. Без границы запуска — НЕИЗВЕСТНО:
+    строка «Bot polling started» прошлого запуска больше не доказательство."""
+    status, why = _run_verdict(lines, run0, run1, now if now is not None else _utcnow())
+    if status == "OK":
+        return True, why
+    if status == "UNKNOWN":
+        return False, "запуск не доказан — НЕИЗВЕСТНО: " + why
+    return False, why
 
 
 def check_log_health(lines, start_dt):
@@ -431,14 +601,17 @@ def _credit_episode_should_push(warn):
 
 def build_report():
     """Собрать отчёт здоровья. Вернуть (report, summary, code, brain_warn, credit_warn).
-    code: 0 = ок/предупреждение, 1 = реальная проблема (лежит компонент).
+    code: 0 = ок/предупреждение, 1 = реальная проблема (лежит компонент, простой Splinter, текущий запуск не доказан).
     brain_warn: ранняя деградация чтения Brain-дока (>10с/ошибка) — повод для пуша.
     credit_warn: ранний детектор «кредит платного ключа на нуле / ключ отозван» — повод для пуша."""
+    # RCFIX2010 C: граница запуска читается ДО и ПОСЛЕ журнала — смена процесса за время чтения даёт НЕИЗВЕСТНО.
+    run0 = _read_run()
     lines = _read_log_lines()
+    run1 = _read_run()
     svc_ok, svc_d, start_dt, _ = check_service()
     br_ok, br_d = check_bridge()
     au_ok, au_d = check_auditor(lines)
-    pl_ok, pl_d = check_polling(lines)
+    pl_ok, pl_d = check_polling(lines, run0, run1)
     log_ok, log_d, errors = check_log_health(lines, start_dt)
     brain_warn, brain_d = check_brain_latency()
     credit_warn, credit_d = check_api_credit()
@@ -478,7 +651,8 @@ def build_report():
     if not au_ok:
         problems.append("аудитор не подтверждён")
     if not pl_ok:
-        problems.append("нет polling")
+        # RCFIX2010 C: слова вердикта текущего запуска (простой / нет polling / НЕИЗВЕСТНО), а не прежнее «нет polling».
+        problems.append(pl_d)
     # WA-0 — 06.09.2026. Наблюдение за вебхуком было ЗДЕСЬ И РАНЬШЕ (проба рукопожатия +
     # вотчдог), а вот РЕАКЦИИ не было: строка «❌ WA webhook» печаталась в тело отчёта, но в
     # `problems` не попадала, поэтому сводка оставалась «✅ ВСЁ ОК», code=0 и пуш не уходил —
@@ -522,12 +696,21 @@ def main(argv):
     # Дедуп кредит-warning (Поправка А): ОДИН пуш на эпизод, не повторяем пока не восстановится.
     credit_first = _credit_episode_should_push(credit_warn)
     if push_always or (push and (code != 0 or brain_warn or credit_first)):
+        # RCFIX2010 C: ОДИН вызов за прогон, повтора нет. notify сводит «точно не отправлено» и «ответ потерян»
+        # (таймаут, сеть) в один False (notify.py:140–146), поэтому «отправлен» — только при True (Telegram ok); иначе
+        # доставка НЕИЗВЕСТНА, а не достоверный отказ: слепой повтор дал бы дубль. Следующая попытка — следующий прогон
+        # таймера.
         try:
             from notify import notify
             ok = notify(report, force=True)   # боевой health-алерт — тест-мут не глушит
-            print("[push] " + ("отправлен" if ok else "НЕ отправлен"))
         except Exception as e:
-            print("[push] ошибка: " + type(e).__name__ + " " + str(e))
+            print("[push] доставка не подтверждена (НЕ отправлен или ответ потерян — неизвестно): ошибка "
+                  + type(e).__name__ + " " + str(e) + " — повтора нет")
+        else:
+            if ok is True:
+                print("[push] отправлен (Telegram ok)")
+            else:
+                print("[push] доставка не подтверждена (НЕ отправлен или ответ потерян — неизвестно) — повтора нет")
     return code
 
 
