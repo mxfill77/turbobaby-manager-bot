@@ -45,6 +45,10 @@ import splinter
 import devbot
 import spend_ledger
 
+# RCFIX2010 п.4 (Codex TB-QA-2010C-ENV-2011): какие ручки выпуска заданы окружением ЮНИТА — только имена, ДО load_dotenv
+# (после него ключ .env неотличим от ключа юнита); значения не читаются. Судит вход выпуска в main().
+_UNIT_FLAG_KEYS = splinter.release_unit_keys()
+
 # === Загружаем конфиг ===
 load_dotenv()
 
@@ -98,8 +102,10 @@ log.info(f"  Инфо-кнопки: ✅ закрепов из memory.db загр
 # Флаги выпуска (INTAKECONFIRM1610, Codex TB-REL-CDA1AD9-STOP-1610-0431): эффективные значения ручек словом процесса,
 # после load_dotenv; строку требует скрипт рестарта. Сбой — «НЕ ПРОЧИТАНЫ», и скрипт рестарта останавливается.
 try:
-    log.info("  " + splinter.release_flags_line())
+    _RELEASE_WORDS = splinter.release_flags_words()     # RCFIX2010 п.4: этот же снимок судит вход выпуска в main()
+    log.info("  " + splinter.release_flags_line(_RELEASE_WORDS))
 except Exception as e:  # noqa: BLE001
+    _RELEASE_WORDS = None                                # не прочитаны → вход выпуска UNKNOWN, обработчиков не будет
     log.warning(f"  🧩 флаги выпуска: НЕ ПРОЧИТАНЫ ({type(e).__name__})")
 
 # LLM-надзор за логикой ответов: включается только если заданы старт-группы в .env.
@@ -1633,7 +1639,30 @@ async def cmd_bike(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"✅ Тема привязана к {bike}.")
 
 
+def _park_until_stop():
+    """RCFIX2010 п.4: вход выпуска не допустил — БЕЗОПАСНЫЙ ПРОСТОЙ до остановки, а не выход. Юнит splinter стоит на
+    Restart=always (10 с): выход дал бы вечный цикл стартов, а простой — один процесс с устойчивым PID и одной строкой
+    [ERROR]. Обработчиков сигналов ещё нет (они ставятся в on_startup, до него не доходим), поэтому SIGTERM действует по
+    умолчанию — systemctl stop / restart работают. Ни Telegram, ни мост, ни передача карточек не трогаются: post_init и
+    post_stop не подключены, файл передачи остаётся для следующего правильного старта."""
+    import threading
+    _ev = threading.Event()
+    try:
+        while not _ev.wait(3600):
+            pass
+    except KeyboardInterrupt:
+        return
+
+
 def main():
+    # RCFIX2010 п.4: ВХОД ВЫПУСКА — первым оператором, до Application.builder / post_init / add_handler / job_queue /
+    # run_polling и до первого побочного эффекта процесса (handoff_restore, мост и Telegram — в post_init и позже).
+    entry_state, entry_line = splinter.release_entry(_RELEASE_WORDS, _UNIT_FLAG_KEYS)
+    if entry_state is None:
+        log.error("  " + entry_line)
+        _park_until_stop()
+        return
+    log.info("  " + entry_line)
     if not BOT_TOKEN:
         log.error("BOT_TOKEN не задан в .env")
         return

@@ -89,7 +89,7 @@ PINS = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
         "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
         "bridge_client.py": "71d290387c95dc283a477f1c44ab4e4c9bedb665",
         "wa_book_read.py": "5a90fddccbf973f362ba66c52792326b3708d091",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно»)
-        "wa_agent_tg.py": "c3fbd7157977671cdba877eddfa8db41564607f9",  # RCFIX2010: было 4f83f9be (поля модели — одной строкой)
+        "wa_agent_tg.py": "6bcbe4ce4574224c2ce4e63e29a78698e91d2877",  # RCFIX2010 D3: было c3fbd715 (метка, _num)
         "contract_ask.py": "be132d7a099dbb84edadca636989cb16dd19c607"}
 PROD_MAKE_MODEL = ["env", "line", "bridge", "call", "lessons", "book", "cache", "tools", "hints", "cstate"]
 L1 = BC.LOG_HEAD + "история не та — ответ родителя"

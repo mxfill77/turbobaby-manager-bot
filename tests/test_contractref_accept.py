@@ -183,7 +183,7 @@ PINS = {
     "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
     "bridge_client.py": "71d290387c95dc283a477f1c44ab4e4c9bedb665",
     "wa_book_read.py": "5a90fddccbf973f362ba66c52792326b3708d091",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно»)
-    "wa_agent_tg.py": "c3fbd7157977671cdba877eddfa8db41564607f9",  # RCFIX2010: было 4f83f9be (поля модели — одной строкой)
+    "wa_agent_tg.py": "6bcbe4ce4574224c2ce4e63e29a78698e91d2877",  # RCFIX2010 D3: было c3fbd715 (метка, _num)
     "contract_ask.py": "be132d7a099dbb84edadca636989cb16dd19c607",
     "bridge_prod/Archive.js": "3cd8451d609cc100d97be821fa6da884f0d3402b",
     "bridge_prod/Booking.js": "352ffdd9458873c064bf7acef796e6b55d1b29db",

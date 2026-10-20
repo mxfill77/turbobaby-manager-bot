@@ -237,22 +237,113 @@ def _accrual_off_why():
     return None
 
 
-def release_flags_line():
+def release_flags_words():
+    """RCFIX2010 п.4: слова пяти ручек выпуска — пары (имя, слово) в порядке строки флагов. ОДНО чтение и для строки
+    «🧩 флаги выпуска», и для входа выпуска (`release_entry`): bot.py печатает и судит один и тот же снимок. Вызовы и
+    порядок вычисления — прежние у `release_flags_line` (HANDOVER_FACTS первым — тот же ленивый импорт rental_case_rules,
+    что и в работе)."""
+    _ho_on = _handover_facts_on()       # при ВКЛ — тот же ленивый импорт rental_case_rules, что и в работе
+    _ho_why = "rental_case_rules не загрузился" if (_rc_on(F_HANDOVER_FACTS) and not _ho_on) else None
+    return (("INTAKE_CONFIRM_STRICT", _flag_word("INTAKE_CONFIRM_STRICT", _intake_confirm_strict_on(), _FLAG_WORDS_STRICT)),
+            (F_CONTRACT_REF_GEN, _flag_word(F_CONTRACT_REF_GEN, _rc_on(F_CONTRACT_REF_GEN), _FLAG_WORDS_RC)),
+            ("CLOSE_TRUTH", _flag_word("CLOSE_TRUTH", _close_truth_on(), _FLAG_WORDS_TRUTH)),
+            ("CLOSE_ACCRUAL", _flag_word("CLOSE_ACCRUAL", _close_accrual_on(), _FLAG_WORDS_TRUTH, _accrual_off_why())),
+            (F_HANDOVER_FACTS, _flag_word(F_HANDOVER_FACTS, _ho_on, _FLAG_WORDS_RC, _ho_why)))
+
+
+def release_flags_line(words=None):
     """Строка «🧩 флаги выпуска» для лога старта (bot.py). ВКЛ/ВЫКЛ берутся у тех же функций, что читают ручки в работе
     (`_intake_confirm_strict_on`, `_rc_on`), — строка не может разойтись с поведением процесса.
     RC2010: ещё три ручки отрезков 19.10 — CLOSE_TRUTH (`_close_truth_on`, умолчание ВКЛ), CLOSE_ACCRUAL
     (`_close_accrual_on`: только поверх CLOSE_TRUTH, умолчание ВЫКЛ), HANDOVER_FACTS (`_handover_facts_on`, умолчание
     ВЫКЛ) — тоже словом ДЕЙСТВУЮЩЕГО решения. Новые ручки стоят в КОНЦЕ строки: прежние читатели по ключу (« · »)
     работают как были, а шаблон с якорем `$` (старый SC_FLAGS_RE скрипта рестарта) на этой строке не сходится — стоп,
-    а не ложное «доказано» без трёх новых ручек."""
-    _ho_on = _handover_facts_on()       # при ВКЛ — тот же ленивый импорт rental_case_rules, что и в работе
-    _ho_why = "rental_case_rules не загрузился" if (_rc_on(F_HANDOVER_FACTS) and not _ho_on) else None
-    return ("🧩 флаги выпуска: INTAKE_CONFIRM_STRICT=%s · %s=%s · CLOSE_TRUTH=%s · CLOSE_ACCRUAL=%s · %s=%s"
-            % (_flag_word("INTAKE_CONFIRM_STRICT", _intake_confirm_strict_on(), _FLAG_WORDS_STRICT),
-               F_CONTRACT_REF_GEN, _flag_word(F_CONTRACT_REF_GEN, _rc_on(F_CONTRACT_REF_GEN), _FLAG_WORDS_RC),
-               _flag_word("CLOSE_TRUTH", _close_truth_on(), _FLAG_WORDS_TRUTH),
-               _flag_word("CLOSE_ACCRUAL", _close_accrual_on(), _FLAG_WORDS_TRUTH, _accrual_off_why()),
-               F_HANDOVER_FACTS, _flag_word(F_HANDOVER_FACTS, _ho_on, _FLAG_WORDS_RC, _ho_why)))
+    а не ложное «доказано» без трёх новых ручек.
+    RCFIX2010 п.4: строка собирается из `release_flags_words()` или из уже снятых слов (`words` — тот же снимок, что судит
+    `release_entry`); вид байт-в-байт прежний: «имя=слово» через « · »."""
+    if words is None:
+        words = release_flags_words()
+    return "🧩 флаги выпуска: " + " · ".join("%s=%s" % (k, w) for k, w in words)
+
+
+# RCFIX2010 п.4 (Codex TB-QA-2010C-ENV-2011): ВХОД ВЫПУСКА. Ручки, впервые читаемые этой вершиной (CLOSE_TRUTH,
+# CLOSE_ACCRUAL, HANDOVER_FACTS), и две прежние доказываются словом процесса ДО бизнес-обработчиков: bot.main() первым
+# оператором сверяет слова строки флагов с КОНЕЧНЫМ перечнем состояний; иное или неизвестное → обработчики не
+# регистрируются, опрос не начинается, наружу одна строка статуса. Перечень — ровно шаблоны библиотеки рестарта
+# srv_splinter_checks_rc2010.sh (sha 4afe3e88…, SC_FLAGS_RE_RELEASE / SC_FLAGS_RE_TRUTH_OFF) на словах `_flag_word`:
+#   release   — шаг 4 выпуска (умолчания RC2010) и СНЯТИЕ R0 (второй drop-in CLOSE_TRUTH=1 → «ВКЛ (задан)»);
+#   truth_off — R0 (drop-in CLOSE_TRUTH=0 → «ВЫКЛ (задан)»), и ключ CLOSE_TRUTH задан ОКРУЖЕНИЕМ ЮНИТА, а не строкой .env.
+# hofacts_on библиотеки сюда НЕ входит: его не включает ни один шаг пакета. Новое состояние (CLOSE_ACCRUAL после моста,
+# HANDOVER_FACTS) — только правкой этого перечня, то есть новой вершиной. Обхода нет: ни ручки отключения, ни подстановки
+# значений в окружение — проверка только читает.
+RELEASE_FLAG_KEYS = ("INTAKE_CONFIRM_STRICT", "CONTRACT_REF_GEN", "CLOSE_TRUTH", "CLOSE_ACCRUAL", "HANDOVER_FACTS")
+_RE_ON = ("ВКЛ (задан)", "ВКЛ (не задан)")
+_RE_OFF = ("ВЫКЛ (задан)", "ВЫКЛ (не задан)")
+# (имя, допустимые слова по ключам RELEASE_FLAG_KEYS, ключи, которые обязаны быть заданы окружением юнита)
+RELEASE_ENTRY_STATES = (
+    ("release", (_RE_ON, _RE_OFF, _RE_ON, _RE_OFF, _RE_OFF), ()),
+    ("truth_off", (_RE_ON, _RE_OFF, ("ВЫКЛ (задан)",), _RE_OFF, _RE_OFF), ("CLOSE_TRUTH",)),
+)
+_ENTRY_HEAD = "🚦 вход выпуска: "
+_ENTRY_LIST = "перечень выпуска release | truth_off"
+
+
+def release_unit_keys(environ=None):
+    """RCFIX2010 п.4: какие ручки выпуска заданы окружением, ДАННЫМ процессу (systemd: Environment= юнита и drop-in'ов), —
+    только ИМЕНА, значения не читаются. bot.py зовёт ДО load_dotenv: после него ключ .env неотличим от ключа юнита."""
+    env = os.environ if environ is None else environ
+    return frozenset(k for k in RELEASE_FLAG_KEYS if k in env)
+
+
+def _entry_flag_status(i, key, word, unit_keys):
+    """OK — слово ручки допускает хоть одно состояние перечня (с его источником); UNKNOWN — слова нет или НЕИЗВЕСТНО;
+    иначе MISMATCH (решено, но не из перечня: вкл-слово CLOSE_ACCRUAL / HANDOVER_FACTS, «только поверх CLOSE_TRUTH»,
+    «rental_case_rules не загрузился», CLOSE_TRUTH выключен не окружением юнита)."""
+    if not isinstance(word, str) or not word or word.startswith("НЕИЗВЕСТНО"):
+        return "UNKNOWN"
+    for _name, allowed, unit_bound in RELEASE_ENTRY_STATES:
+        if word in allowed[i] and (key not in unit_bound or key in unit_keys):
+            return "OK"
+    return "MISMATCH"
+
+
+def release_entry(words, unit_keys):
+    """RCFIX2010 п.4: вход выпуска → (имя состояния | None, строка статуса). Чистая: окружения не читает, значений не видит
+    — только слова `release_flags_words()` (тот же снимок, что в строке флагов) и имена ключей юнита (`release_unit_keys`,
+    сняты до load_dotenv). None → bot.main() не регистрирует обработчиков и не начинает опрос.
+    Строка: на ручку имя и одно слово OK / MISMATCH / UNKNOWN, итог — OK с именем состояния, MISMATCH или UNKNOWN (UNKNOWN
+    сильнее). Значений окружения, слов ручек и строк, которые считают читатели журнала вне процесса («🧩 флаги выпуска:»,
+    «Bot polling started», «🔁 передача карточек:», «Traceback»), в ней нет. Любой сбой самой проверки — UNKNOWN."""
+    try:
+        keys = None if words is None else tuple(k for k, _ in words)
+        got = {} if words is None else dict(words)
+        unit = frozenset(unit_keys or ())
+        per = [_entry_flag_status(i, k, got.get(k) if keys is not None and keys.count(k) == 1 else None, unit)
+               for i, k in enumerate(RELEASE_FLAG_KEYS)]
+        why = []
+        if words is None:
+            why.append("флаги выпуска не прочитаны")
+        elif keys != RELEASE_FLAG_KEYS:
+            why.append("набор ручек не тот")
+        state = None
+        if not why:
+            for name, allowed, unit_bound in RELEASE_ENTRY_STATES:
+                if all(got[k] in allowed[i] for i, k in enumerate(RELEASE_FLAG_KEYS)) and set(unit_bound) <= unit:
+                    state = name
+                    break
+        if state is None and got.get("CLOSE_TRUTH") == "ВЫКЛ (задан)" and "CLOSE_TRUTH" not in unit:
+            why.append("CLOSE_TRUTH выключен не окружением юнита (truth_off — только drop-in R0)")
+        if state is None and not why and "UNKNOWN" not in per and "MISMATCH" not in per:
+            why.append("сочетание не из перечня")
+        body = " · ".join("%s %s" % (k, s) for k, s in zip(RELEASE_FLAG_KEYS, per))
+        if state is not None:
+            return state, "%sOK — состояние %s · %s" % (_ENTRY_HEAD, state, body)
+        verdict = "UNKNOWN" if (words is None or keys != RELEASE_FLAG_KEYS or "UNKNOWN" in per) else "MISMATCH"
+        return None, ("%s%s — %s%s; %s; обработчики не зарегистрированы, опрос не начат — процесс ждёт остановки"
+                      % (_ENTRY_HEAD, verdict, body, "".join("; " + w for w in why), _ENTRY_LIST))
+    except Exception as e:  # noqa: BLE001
+        return None, ("%sUNKNOWN — сбой проверки (%s); %s; обработчики не зарегистрированы, опрос не начат — процесс ждёт "
+                      "остановки" % (_ENTRY_HEAD, type(e).__name__, _ENTRY_LIST))
 
 
 def _bike_position_on():

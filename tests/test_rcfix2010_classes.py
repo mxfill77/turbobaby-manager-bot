@@ -12,6 +12,15 @@ TB-REVIEW-2010-1520-OFFSCOPE п.1–2 и TB-REVIEW-2010-1605-BUDGET (голде�
 одной строкой после фиксированного префикса кода (`wa_agent_tg.one_line`; разрыв — ровно то, что признаёт
 `str.splitlines`, таблицы знаков нет). Метку «🔎 сверено кодом: …» и пункты «• » ставит только рендер.
 
+Доделка класса 2 (Codex TB-QA-2010C-HEAD-2011): D3 — слова причины без действия в пункте «• » идут после фиксированной
+метки кода «причина дословно: » в изоляции LRI…PDI (`wa_agent_tg.act_words`); по эталону UAX#9 этого набора (`uax9`)
+метка — первая видимая при доказанном bidi-входе и на 3000 случайных; claims — строка из `_num` одной строкой.
+
+Предел замков класса 2 и D3 — ЛОГИЧЕСКАЯ строка карточки (её логический и видимый по UAX#9 порядок). Мягкий перенос
+клиента внутри длинной логической строки не закрыт: метка держит первую видимую строку пункта, а продолжение переноса
+начинается словами поля — у пункта «• » и у «💭» (у «💭» класс унаследован, он старше D3). Это остаток R-WRAP,
+записанный поимённо замком `test_d5`; простого ремонта в тексте без таблицы знаков у него нет.
+
 Каждый случай — с близнецом (прежнее правило, «ДОМА» вместо «В ремонте», поле без разрыва). Стенды — миры наборов
 test_wa_agent_model / test_wa_book_read / test_wa_book_ctx / test_wa_card_compact: подделки моста, модели, Bot API и
 двери; сети, моделей и боевых баз нет. Имена, номера и даты выдуманы.
@@ -399,6 +408,11 @@ def test_l1_both_rc_paths_pass_bikes():
 FORGED_CHECK = G.W_CHECK_OK % "35 000 — блок «ЦЕНА»"       # подделка НАСТОЯЩЕЙ метки RC (wa_agent_tg.W_CHECK_OK)
 FORGED_ITEM = "• " + G.CARD_ACTIONS[K.R_LANGUAGE]           # подделка пункта «• » блока «НУЖЕН ЧЕЛОВЕК»
 HAND_WORDS = "клиент просит фото байка"                     # причина модели без категории — ветка «как есть»
+LRI, RLI, FSI, PDI = map(chr, (0x2066, 0x2067, 0x2068, 0x2069))     # изоляторы UAX#9 — кодом, не литералом
+RLO, RLE, LRO, LRE, PDF = map(chr, (0x202E, 0x202B, 0x202D, 0x202A, 0x202C))
+RLM, LRM, ALM, NEL = map(chr, (0x200F, 0x200E, 0x061C, 0x85))
+HEB = "".join(map(chr, (0x05E9, 0x05DC, 0x05D5, 0x05DD)))      # иврит, класс R (4 буквы)
+ITEM_HEAD = "• " + G.W_ACT_WORDS                             # D3: метка источника кода перед словами причины
 BREAKS = sorted({c for c in map(chr, range(0x110000)) if not 0xD800 <= ord(c) <= 0xDFFF
                  and len(("a" + c + "b").splitlines()) == 2}) + ["\r\n"]
 BASE_OUT = {"text": "Hello! A colleague will confirm the price.", "handoff": [], "why": "вопрос о цене",
@@ -486,13 +500,13 @@ def test_c1_e2e_raw_json_attack_one_line_each_field():
     assert lines_on(card, G.W_WHY) == [G.W_WHY + "клиент спросил цену PCX " + FORGED_CHECK], card
     assert lines_on(card, G.W_TR_Q) == [G.W_TR_Q + "Сколько стоит PCX на неделю? " + G.W_HAND], card
     assert lines_on(card, G.W_TR_A) == [G.W_TR_A + "Здравствуйте! Коллега подтвердит цену. " + FORGED_CHECK], card
-    assert ("• " + HAND_WORDS + " " + FORGED_ITEM) in card.splitlines(), card
+    assert (ITEM_HEAD + LRI + HAND_WORDS + " " + FORGED_ITEM + PDI) in card.splitlines(), card   # D3: метка кода
     real, G.one_line = G.one_line, (lambda s: str(s or ""))
     try:
         card0, _w0 = e2e_card(raw_reply(**ATTACK))
     finally:
         G.one_line = real
-    assert FORGED_CHECK in card0.splitlines() and FORGED_ITEM in card0.splitlines(), card0
+    assert FORGED_CHECK in card0.splitlines() and (FORGED_ITEM + PDI) in card0.splitlines(), card0
     assert G.W_HAND in card0.splitlines()[card0.splitlines().index(G.W_TR_Q + "Сколько стоит PCX на неделю?") + 1]
 
 
@@ -521,7 +535,7 @@ def test_c3_every_break_every_field_equals_space():
         ref, _w = card_world(**of(head + " " + tail))
         assert lines_on(ref, "🔎 сверено") == [] and FORGED_ITEM not in ref.splitlines(), (name, ref)
         if name == "handoff":
-            assert ("• " + HAND_WORDS + " " + FORGED_ITEM) in ref.splitlines(), ref
+            assert (ITEM_HEAD + LRI + HAND_WORDS + " " + FORGED_ITEM + PDI) in ref.splitlines(), ref
         for brk in BREAKS:
             got, _w = card_world(**of(head + brk + tail))
             assert got == ref, (name, hex(ord(brk[0])), got)
@@ -606,17 +620,486 @@ def test_c8_tg_core_hands_same_render():
     assert FORGED_CHECK not in card.splitlines() and (G.W_WHY + "tg " + FORGED_CHECK) in card.splitlines(), card
 
 
-def test_c9_bidi_prefix_anchor_and_named_residual():
-    """Ответ на вопрос о bidi (карта §4) замком: в префиксе кода перед why, переводом, основаниями и цитатой оплаты есть
-    сильная буква LTR — модель не покажет свой текст левее префикса. У пункта «• » её нет — остаток D3 (решение К3),
-    записан поимённо: появится якорь — замок покраснеет, и остаток надо снять из отчёта."""
+def test_c9_bidi_prefix_anchor_every_model_field():
+    """Ответ на вопрос о bidi (карта §4) замком: в префиксе кода перед why, переводом, основаниями, цитатой оплаты — и
+    (D3, Codex TB-QA-2010C-HEAD-2011, было «остаток») перед словами пункта «• » — есть сильная буква LTR, и в префиксе
+    нет ни одного знака, который по UAX#9 мог бы её сдвинуть (только L / WS / ON / CS, без явных знаков X1–X8). Слова
+    пункта — в изоляции LRI…PDI. Свойство на любом входе — test_d1/test_d4 эталоном UAX#9; здесь — предусловие."""
     def strong_l(p):
         return any(unicodedata.bidirectional(ch) == "L" for ch in p)
-    for p in (G.W_WHY, G.W_TR_Q, G.W_TR_A, "основания (1): ", G.W_PAY_SAID + " «"):
+    for p in (G.W_WHY, G.W_TR_Q, G.W_TR_A, "основания (1): ", G.W_PAY_SAID + " «", ITEM_HEAD):
         assert strong_l(p), p
+    assert {unicodedata.bidirectional(ch) for ch in ITEM_HEAD} <= {"L", "WS", "ON", "CS"}, ITEM_HEAD
     line = G.card_notes([HAND_WORDS], 1, True).splitlines()
-    item = [ln for ln in line if ln.endswith(HAND_WORDS)][0]
-    assert not strong_l(item[:-len(HAND_WORDS)]), item
+    item = [ln for ln in line if HAND_WORDS in ln][0]
+    assert item == ITEM_HEAD + LRI + HAND_WORDS + PDI and strong_l(item[:item.index(LRI)]), item
+
+
+# ══ D3 и claims (Codex TB-QA-2010C-HEAD-2011): стенд — эталон UAX#9 одной строки ═══════════════════════════════════
+
+_X9 = frozenset(("RLE", "LRE", "RLO", "LRO", "PDF", "BN"))
+_ISO = frozenset(("LRI", "RLI", "FSI"))
+_NI = frozenset(("B", "S", "WS", "ON", "LRI", "RLI", "FSI", "PDI"))
+
+
+def _bidi_types(s):
+    """Классы UAX#9 знаков строки (unicodedata). Эталон не судит то, чего не реализует: скобки (N0 — Ps/Pe),
+    неназначенные знаки и разрывы абзаца — отказ, а не молча неверный ответ."""
+    out = []
+    for c in s:
+        t = unicodedata.bidirectional(c)
+        assert t and t != "B" and unicodedata.category(c) not in ("Ps", "Pe"), "эталон не судит %r" % c
+        out.append(t)
+    return out
+
+
+def _first_strong(types, a, b):
+    """P2: первый L/R/AL на [a, b), минуя знаки от изолятора до его PDI (без пары — до конца)."""
+    depth = 0
+    for i in range(a, b):
+        t = types[i]
+        if t in _ISO:
+            depth += 1
+        elif t == "PDI":
+            depth = max(0, depth - 1)
+        elif not depth and t in ("L", "R", "AL"):
+            return t
+    return None
+
+
+def uax9(s):
+    """Строка (один абзац) → (уровень абзаца, [уровень знака], [индексы знаков в визуальном порядке слева направо]).
+    UAX#9 (Unicode 15): P2–P3, X1–X10 (стек 125, переполнения), W1–W7, N1–N2, I1–I2, L1, L2. Не реализованы N0
+    (скобки — отказ в `_bidi_types`), L3 и L4 (зеркальные глифы порядок знаков не меняют). Снятые X9 знаки в порядок
+    не входят."""
+    types = _bidi_types(s)
+    n = len(types)
+    match, open_ = {}, []
+    for i, t in enumerate(types):                        # BD9: пара изолятора — PDI того же уровня вложенности
+        if t in _ISO:
+            open_.append(i)
+        elif t == "PDI" and open_:
+            match[open_.pop()] = i
+    para = 1 if _first_strong(types, 0, n) in ("R", "AL") else 0
+    t, lev = list(types), [para] * n
+    stack, over_iso, over_emb, valid_iso = [(para, None, False)], 0, 0, 0
+    for i, ty in enumerate(types):                       # X1–X8
+        if ty in ("RLE", "LRE", "RLO", "LRO", "RLI", "LRI", "FSI"):
+            if ty in _ISO:
+                lev[i] = stack[-1][0]
+                t[i] = stack[-1][1] or ty
+                rtl = ty == "RLI" or (ty == "FSI" and _first_strong(types, i + 1, match.get(i, n)) in ("R", "AL"))
+            else:
+                rtl = ty[0] == "R"
+            cur = stack[-1][0]
+            new = (cur + 1) | 1 if rtl else (cur + 2) & ~1
+            if new <= 125 and not over_iso and not over_emb:
+                stack.append((new, {"RLO": "R", "LRO": "L"}.get(ty), ty in _ISO))
+                valid_iso += ty in _ISO
+            elif ty in _ISO:
+                over_iso += 1
+            elif not over_iso:
+                over_emb += 1
+            if ty not in _ISO:
+                lev[i] = stack[-1][0]
+        elif ty == "PDI":
+            if over_iso:
+                over_iso -= 1
+            elif valid_iso:
+                over_emb = 0
+                while not stack[-1][2]:
+                    stack.pop()
+                stack.pop()
+                valid_iso -= 1
+            lev[i] = stack[-1][0]
+            t[i] = stack[-1][1] or ty
+        elif ty == "PDF":
+            if not over_iso:
+                if over_emb:
+                    over_emb -= 1
+                elif not stack[-1][2] and len(stack) > 1:
+                    stack.pop()
+            lev[i] = stack[-1][0]
+        else:
+            lev[i] = stack[-1][0]
+            if ty != "BN" and stack[-1][1]:
+                t[i] = stack[-1][1]
+    xl = list(lev)                                       # явные уровни: прогоны и sos/eos — по ним, не по I1–I2
+    kept = [i for i in range(n) if types[i] not in _X9]   # X9
+    runs = []
+    for i in kept:                                       # X10: прогоны уровня и последовательности BD13
+        if runs and xl[runs[-1][-1]] == xl[i]:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    run_at, closing, pos = {r[0]: r for r in runs}, set(match.values()), {i: k for k, i in enumerate(kept)}
+    for r in runs:
+        if r[0] in closing:
+            continue
+        seq = list(r)
+        while types[seq[-1]] in _ISO and seq[-1] in match and match[seq[-1]] in run_at:
+            seq += run_at[match[seq[-1]]]
+        lv = xl[seq[0]]
+        k0, k1 = pos[seq[0]], pos[seq[-1]]
+        before = xl[kept[k0 - 1]] if k0 else para
+        after = para if (types[seq[-1]] in _ISO or k1 + 1 == len(kept)) else xl[kept[k1 + 1]]
+        sos, eos = ("R" if max(lv, x) % 2 else "L" for x in (before, after))
+        ts = [t[i] for i in seq]
+        for k, ty in enumerate(ts):                      # W1
+            if ty == "NSM":
+                ts[k] = sos if not k else ("ON" if ts[k - 1] in _ISO | {"PDI"} else ts[k - 1])
+        strong = sos
+        for k, ty in enumerate(ts):                      # W2
+            if ty in ("L", "R", "AL"):
+                strong = ty
+            elif ty == "EN" and strong == "AL":
+                ts[k] = "AN"
+        ts = ["R" if x == "AL" else x for x in ts]       # W3
+        for k in range(1, len(ts) - 1):                  # W4
+            if ts[k] == "ES" and ts[k - 1] == ts[k + 1] == "EN":
+                ts[k] = "EN"
+            elif ts[k] == "CS" and ts[k - 1] == ts[k + 1] and ts[k - 1] in ("EN", "AN"):
+                ts[k] = ts[k - 1]
+        k = 0
+        while k < len(ts):                               # W5
+            j = k
+            while j < len(ts) and ts[j] == "ET":
+                j += 1
+            if j > k and ((k and ts[k - 1] == "EN") or (j < len(ts) and ts[j] == "EN")):
+                ts[k:j] = ["EN"] * (j - k)
+            k = max(j, k + 1)
+        ts = ["ON" if x in ("ES", "ET", "CS") else x for x in ts]   # W6
+        strong = sos
+        for k, ty in enumerate(ts):                      # W7
+            if ty in ("L", "R"):
+                strong = ty
+            elif ty == "EN" and strong == "L":
+                ts[k] = "L"
+        e = "R" if lv % 2 else "L"
+        k = 0
+        while k < len(ts):                               # N1, N2
+            if ts[k] not in _NI:
+                k += 1
+                continue
+            j = k
+            while j < len(ts) and ts[j] in _NI:
+                j += 1
+            a = sos if not k else ("R" if ts[k - 1] in ("R", "EN", "AN") else ts[k - 1])
+            b = eos if j == len(ts) else ("R" if ts[j] in ("R", "EN", "AN") else ts[j])
+            ts[k:j] = [a if a == b else e] * (j - k)
+            k = j
+        for k, i in enumerate(seq):                      # I1, I2
+            if xl[i] % 2 == 0:
+                lev[i] = xl[i] + (1 if ts[k] == "R" else 2 if ts[k] in ("AN", "EN") else 0)
+            else:
+                lev[i] = xl[i] + (1 if ts[k] in ("L", "EN", "AN") else 0)
+    tail = True                                          # L1: S и хвост из WS/изоляторов (и снятых X9) — уровень абзаца
+    for i in range(n - 1, -1, -1):
+        if types[i] == "S":
+            lev[i], tail = para, True
+        elif tail and (types[i] in ("WS", "LRI", "RLI", "FSI", "PDI") or types[i] in _X9):
+            lev[i] = para
+        else:
+            tail = False
+    order = list(kept)                                   # L2
+    lv = [lev[i] for i in order]
+    odd = [x for x in lv if x % 2]
+    for level in range(max(lv, default=0), (min(odd) if odd else 1 << 30) - 1, -1):
+        k = 0
+        while k < len(order):
+            if lv[k] < level:
+                k += 1
+                continue
+            j = k
+            while j < len(order) and lv[j] >= level:
+                j += 1
+            order[k:j], lv[k:j] = order[k:j][::-1], lv[k:j][::-1]
+            k = j
+    return para, lev, order
+
+
+def shown(s):
+    """Видимая строка слева направо: визуальный порядок `uax9` без невидимых знаков формата (Cf)."""
+    return "".join(s[i] for i in uax9(s)[2] if unicodedata.category(s[i]) != "Cf")
+
+
+def item_line(payload):
+    """Строка пункта «• » блока «НУЖЕН ЧЕЛОВЕК» для одной причины — живым `card_notes`."""
+    lines = G.card_notes([payload], 1, True).splitlines()
+    assert lines[0] == G.W_HAND and lines[1].startswith("• "), lines
+    return lines[1]
+
+
+def head_holds(line):
+    """Метка кода «• причина дословно: » по UAX#9 — первая видимая: абзац LTR, уровни метки 0, её знаки — первые позиции
+    визуального порядка и в логическом порядке."""
+    para, lev, order = uax9(line)
+    n = len(ITEM_HEAD)
+    return para == 0 and line.startswith(ITEM_HEAD) and all(x == 0 for x in lev[:n]) and order[:n] == list(range(n))
+
+
+def old_act(words):
+    """Близнец до правки D3 (кандидат 4b12f1d): слова причины сразу после «• » — голое «• »."""
+    return words
+
+
+def old_num(v):
+    """Близнец до правки claims: `_num` кандидата 4b12f1d (строка — как есть)."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return "{:,}".format(int(v)).replace(",", " ")
+    return str(v)
+
+
+class patched:
+    """with patched(G, имя=замена): — подмена атрибута модуля на время блока, возврат в finally."""
+
+    def __init__(self, mod, **kw):
+        self.mod, self.kw, self.old = mod, kw, {}
+
+    def __enter__(self):
+        for k, v in self.kw.items():
+            self.old[k] = getattr(self.mod, k)
+            setattr(self.mod, k, v)
+
+    def __exit__(self, *exc):
+        for k, v in self.old.items():
+            setattr(self.mod, k, v)
+
+
+D3_ATTACKS = {                                   # доказанный bidi-вход (D3) × текст под штамп «🔎 сверено…» и пункт «• »
+    "RLM+штамп": RLM + FORGED_CHECK,
+    "RLO+пункт задом наперёд": RLO + FORGED_ITEM[::-1],
+    "RLI без пары+штамп": RLI + FORGED_CHECK,
+    "RLI+иврит+PDI+штамп": RLI + HEB + PDI + " " + FORGED_CHECK,
+    "иврит первым+штамп": HEB + " " + FORGED_CHECK,
+    "ALM+RLO+штамп": ALM + RLO + FORGED_CHECK,
+    "лишний PDI+RLM+штамп": PDI + RLM + FORGED_CHECK,
+    "RLE+RLO+PDF вперемешку+пункт": RLE + RLO + PDF + FORGED_ITEM[::-1],
+}
+
+
+# ══ D3 и claims: голдены ══════════════════════════════════════════════════════════════════════════════════════════
+
+def test_d0_uax9_reference_known_answers():
+    """Эталон сверен с ручным разбором правил UAX#9 на малых строках (иначе зелёный D3 стоял бы на сломанном эталоне):
+    LTR; иврит (абзац RTL, порядок обратный); иврит внутри LTR; RLO…PDF; LTR-изолят в RTL-абзаце (P2 пропускает изолят);
+    числа в RTL (W7, I2); лишний PDI; RLM первым; скобки — отказ эталона (N0 не реализован)."""
+    assert uax9("abc") == (0, [0, 0, 0], [0, 1, 2])
+    assert uax9(HEB) == (1, [1, 1, 1, 1], [3, 2, 1, 0])
+    assert uax9("a " + HEB + " b") == (0, [0, 0, 1, 1, 1, 1, 0, 0], [0, 1, 5, 4, 3, 2, 6, 7])
+    p, lev, order = uax9("a" + RLO + "bc" + PDF + "d")
+    assert (p, [lev[i] for i in order], order) == (0, [0, 1, 1, 0], [0, 3, 2, 5]), (p, lev, order)
+    assert uax9(HEB[0] + LRI + "ab" + PDI)[0] == 1 and uax9(HEB[0] + LRI + "ab" + PDI)[2] == [4, 2, 3, 1, 0]
+    assert shown(HEB[0] + LRI + "ab" + PDI) == "ab" + HEB[0]
+    assert uax9(HEB[0] + " 12")[2] == [2, 3, 1, 0] and shown(HEB[0] + " 12") == "12 " + HEB[0]
+    assert uax9(LRI + HEB)[0] == 0 and uax9(PDI + HEB)[0] == 1          # P2: изолят пропущен; лишний PDI — не изолят
+    assert uax9(RLM + "ab")[0] == 1 and shown(RLM + "ab") == "ab"
+    try:
+        uax9("a (b)")
+    except AssertionError as e:
+        assert "эталон не судит" in str(e), e
+    else:
+        raise AssertionError("скобки эталон не судит — обязан отказать")
+
+
+def test_d1_bidi_attacks_label_first_twin_spoofed():
+    """D3 (Codex TB-QA-2010C-HEAD-2011 п.1): причина без категории идёт `card_actions` → `card_notes` строкой «• …».
+    Доказанный bidi-вход модели (RLM, RLO, RLI, ALM, иврит, лишний PDI, RLE/PDF) + текст под «🔎 сверено кодом» /
+    «• язык…» → строка = «• причина дословно: LRI слова PDI», и по эталону UAX#9 метка кода — первая видимая (абзац
+    LTR, уровни 0, первые позиции), слова — после неё. Близнец до правки (голое «• »): RLM / иврит / ALM делают абзац
+    RTL и уводят «•» к правому краю; RLO показывает «• • язык…», которого в логической строке нет."""
+    for name, payload in D3_ATTACKS.items():
+        assert K.word_categories(payload) == [], name                    # ветка «слова как есть», не действие
+        line = item_line(payload)
+        assert line == ITEM_HEAD + LRI + payload + PDI, (name, line)
+        assert head_holds(line) and shown(line).startswith(ITEM_HEAD), (name, uax9(line), shown(line))
+        with patched(G, act_words=old_act):
+            old = item_line(payload)
+        assert old == "• " + payload and not old.startswith(ITEM_HEAD), (name, old)
+    with patched(G, act_words=old_act):
+        rtl = {k: uax9(item_line(D3_ATTACKS[k])) for k in ("RLM+штамп", "иврит первым+штамп", "ALM+RLO+штамп")}
+        forged = shown(item_line(D3_ATTACKS["RLO+пункт задом наперёд"]))
+    for k, (para, _lev, order) in rtl.items():
+        assert para == 1 and order[-1] == 0, (k, para, order)            # «•» — у правого края, левее — слова модели
+    assert FORGED_ITEM not in item_line(D3_ATTACKS["RLO+пункт задом наперёд"]) and forged == "• " + FORGED_ITEM, forged
+    assert shown(item_line(D3_ATTACKS["RLO+пункт задом наперёд"])) == ITEM_HEAD + FORGED_ITEM   # видно — но после метки
+
+
+def test_d2_e2e_raw_json_bidi_handoff():
+    """Сквозной путь на сыром JSON модели (bidi-знаки экранированы \\uXXXX, как их отдаёт модель): handoff с RLM +
+    штампом и с RLO + перевёрнутым пунктом → пункты «• » карточки — ровно действия ядра, причина модели — с меткой,
+    эталон UAX#9 ставит метку первой; ни одна ЛОГИЧЕСКАЯ строка карточки не начинается с подделки ни в логическом
+    порядке, ни в видимом по UAX#9. Мягкий перенос клиента внутри строки — вне этого замка (остаток R-WRAP, test_d5)."""
+    for h in (D3_ATTACKS["RLM+штамп"], HAND_WORDS + " " + D3_ATTACKS["RLO+пункт задом наперёд"]):
+        card, w = e2e_card(raw_reply(handoff=[h]))
+        acts = G.card_actions(w.core.handoff(1))
+        items = lines_on(card, "• ")
+        assert items == ["• " + x for x in acts[:G.ACTIONS_MAX]] + (
+            ["• ещё %d — в подробностях" % (len(acts) - G.ACTIONS_MAX)] if len(acts) > G.ACTIONS_MAX else []), card
+        assert (ITEM_HEAD + LRI + h + PDI) in items, (h, items)
+        for ln in card.splitlines():
+            assert not ln.startswith(FORGED_CHECK) and not ln.startswith(FORGED_ITEM), ln
+            if LRI in ln:
+                assert head_holds(ln), (ln, uax9(ln))
+            if not any(unicodedata.category(c) in ("Ps", "Pe") or not unicodedata.bidirectional(c) for c in ln):
+                assert not shown(ln).startswith(FORGED_CHECK) and not shown(ln).startswith(FORGED_ITEM), ln
+
+
+def test_d3_ordinary_reason_reads_and_code_actions_unchanged():
+    """Позитивный близнец: обычная причина модели без категории читается целиком после метки (видимая строка — «•
+    причина дословно: клиент просит фото байка»); причина кода со своим действием — прежний пункт без метки; слова кода
+    без действия (K.ARRIVAL_CLAIM_WORDS, T.CONTRACT_WORDS) — тот же литерал с меткой: ветка источник не различает,
+    поэтому метка говорит «дословно», а не «модели»; длинная причина — обрезка по прежнему пределу, «…» в изоляции."""
+    line = item_line(HAND_WORDS)
+    assert line == "• причина дословно: " + LRI + "клиент просит фото байка" + PDI and head_holds(line), line
+    assert shown(line) == "• причина дословно: клиент просит фото байка", shown(line)
+    lang = K.REASON_WORDS[K.R_LANGUAGE]
+    assert item_line(lang) == "• " + G.CARD_ACTIONS[K.R_LANGUAGE], item_line(lang)
+    assert K.word_categories(K.ARRIVAL_CLAIM_WORDS) == [K.R_ARRIVAL_CLAIM] and K.R_ARRIVAL_CLAIM not in G.CARD_ACTIONS
+    assert K.word_categories(T.CONTRACT_WORDS) == []
+    for code_words in (K.ARRIVAL_CLAIM_WORDS, T.CONTRACT_WORDS):
+        assert item_line(code_words) == ITEM_HEAD + LRI + code_words + PDI, item_line(code_words)
+    cut = item_line("Ж" * 200)
+    assert cut == ITEM_HEAD + LRI + "Ж" * (G.REASON_SHOW_MAX - 1) + "…" + PDI and head_holds(cut), cut
+    assert (G.BIDI_LRI, G.BIDI_PDI) == (chr(0x2066), chr(0x2069)) and G.W_ACT_WORDS == "причина дословно: "
+
+
+def test_d4_fuzz_bidi_label_invariant():
+    """Не один слог LTR, а свойство: 3000 случайных слов причины (seed 2011) из опасных классов UAX#9 — RLO/RLE/LRO/LRE/
+    PDF, RLI/LRI/FSI/PDI, RLM/LRM/ALM, иврит (R), арабский (AL), арабские цифры (AN), EN/ES/ET/CS, NSM, BN, WS, S, ON,
+    кириллица — у каждого метка кода первая видимая по эталону. Тот же набор на голом «• » уводит «•» с левого края у
+    заметной доли — вход действительно опасен. Предел свойства — эталон без N0/L3/L4 (скобок во входе нет)."""
+    import random
+    rnd = random.Random(2011)
+    pool = [RLO, RLE, LRO, LRE, PDF, RLI, LRI, FSI, PDI, RLM, LRM, ALM, HEB[0], HEB[1], chr(0x0628), chr(0x0663), "3",
+            "+", "%", ",", chr(0x0301), chr(0x200B), " ", "\t", "•", "🔎", "—", ":", "с", "о", "a"]
+    bad_old, seen = 0, 0
+    for _ in range(3000):
+        payload = "".join(rnd.choice(pool) for _ in range(rnd.randint(1, 24)))
+        if K.word_categories(payload.strip()):
+            continue
+        seen += 1
+        line = item_line(payload)
+        assert head_holds(line), (ascii(payload), uax9(line))
+        with patched(G, act_words=old_act):
+            para, _lev, order = uax9(item_line(payload))
+        bad_old += para == 1 or order[0] != 0
+    assert seen >= 2900 and bad_old >= 300, (seen, bad_old)
+
+
+WRAP_WIDTHS = list(range(28, 121, 4))             # колонок видимой строки: узкий телефон … широкий десктоп
+
+
+def _cols(c):
+    """Ширина знака в модели переноса: знак формата Cf (изоляторы, встраивания, метки bidi) — 0, эмодзи — 2, иначе 1."""
+    if unicodedata.category(c) == "Cf":
+        return 0
+    return 2 if ord(c) >= 0x1F000 else 1
+
+
+def wrap_rows(line, width):
+    """МОДЕЛЬ мягкого переноса одной логической строки, не клиент Telegram: жадно, разрыв — после серии пробелов
+    (UAX#14 LB18), хвостовые пробелы висят и ширины не занимают, слово шире строки рвётся по ширине → видимые строки
+    в логическом порядке (склейка строк равна исходной)."""
+    words, cur, sp = [], "", ""
+    for c in line:
+        if c == " ":
+            sp += c
+            continue
+        if sp:
+            words.append((cur, sp))
+            cur, sp = "", ""
+        cur += c
+    words.append((cur, sp))
+    rows, row, w = [], "", 0
+    for word, spaces in words:
+        ww = sum(map(_cols, word))
+        if w and w + ww > width:
+            rows.append(row)
+            row, w = "", 0
+        while ww > width:
+            cut, acc = 0, 0
+            while cut < len(word) and acc + _cols(word[cut]) <= width:
+                acc += _cols(word[cut])
+                cut += 1
+            rows.append(word[:cut])
+            word = word[cut:]
+            ww = sum(map(_cols, word))
+        row, w = row + word + spaces, w + ww + len(spaces)
+        if w > width:
+            rows.append(row)
+            row, w = "", 0
+    return rows + [row] if row else rows
+
+
+def test_d5_soft_wrap_scope_named_residual():
+    """Замок честности (отзыв проверяющего verify2_d3_attack v2): предел D3 и класса 2 — логическая строка. Вход
+    проверяющего сквозным путём от сырого JSON: причины «x» + серия пробелов + штамп «🔎 сверено кодом: …» и «x» + серия
+    + пункт «• язык…» (обе в пределе REASON_SHOW_MAX) и why с тем же штампом за сериями пробелов. Логически: пункты с
+    меткой кода первой, ни одна строка карточки не начинается с подделки. Видимо (модель `wrap_rows`, ширины 28…120):
+    первая видимая строка пункта — метка кода на КАЖДОЙ ширине; но продолжение переноса начинается словами поля, и
+    подделка встаёт в начало видимой строки — у пункта и у «💭» (у «💭» — и до D3: класс унаследован). Это остаток
+    R-WRAP, записанный поимённо: в простом тексте без таблицы знаков его не закрыть (схлопывание серий пробелов — не
+    ремонт: замер круга d3 — адаптивный вход после схлопывания держит подделку у «💭» на 21 ширине из 24); направление —
+    контейнер рендера для полей модели, решение К3/Codex. Любой ремонт R-WRAP переписывает этот замок вместе с ним."""
+    hand = "x" + " " * (G.REASON_SHOW_MAX - 2 - len(FORGED_CHECK)) + FORGED_CHECK
+    hand2 = "x" + " " * (G.REASON_SHOW_MAX - 2 - len(FORGED_ITEM)) + FORGED_ITEM
+    why = "клиент спросил цену PCX" + (" " * 120 + FORGED_CHECK) * 3
+    assert len(hand) == len(hand2) == G.REASON_SHOW_MAX - 1 and len(why) <= 600, (len(hand), len(hand2), len(why))
+    card, _w = e2e_card(raw_reply(handoff=[hand, hand2], why=why))
+    assert lines_on(card, "🔎 сверено") == [] and lines_on(card, FORGED_ITEM) == [], card
+    items = [ln for ln in card.splitlines() if ln.startswith("• ")]
+    assert items == [ITEM_HEAD + LRI + hand + PDI, ITEM_HEAD + LRI + hand2 + PDI], items
+    assert all(head_holds(ln) for ln in items), [uax9(ln)[0] for ln in items]
+    why_line = lines_on(card, G.W_WHY)
+    assert len(why_line) == 1 and why_line[0].count(FORGED_CHECK) == 3, why_line
+    forged = {}
+    for name, line, head, fake in (("пункт → штамп", items[0], ITEM_HEAD, FORGED_CHECK),
+                                   ("пункт → пункт", items[1], ITEM_HEAD, FORGED_ITEM),
+                                   ("💭 → штамп", why_line[0], G.W_WHY, FORGED_CHECK)):
+        forged[name] = []
+        for wd in WRAP_WIDTHS:
+            rows = wrap_rows(line, wd)
+            assert "".join(rows) == line and rows[0].startswith(head), (name, wd, rows[:2])   # гарантия: первая видимая
+            if any(r.startswith(fake[:16]) for r in rows[1:]):
+                forged[name].append(wd)
+    assert all(forged.values()), forged                    # R-WRAP жив: продолжение переноса — слова поля, не метка
+
+
+def test_e1_num_internal_break_one_line():
+    """claims (п.2): строка из `_num` идёт в «🔎 проверка кодом — без опоры: %s» и «🔎 сверено кодом: %s» мимо one_line;
+    процент модели «30 U+2028 %» / «30 U+0085 %» (regex `\\s*` берёт любой пробел Юникода) рвал строку карточки. Теперь
+    каждый разрыв splitlines — пробел; числа и строки без разрывов — прежние байт-в-байт."""
+    for brk in BREAKS:
+        assert G._num("30" + brk + "%") == "30 %", hex(ord(brk[0]))
+        assert len(G.card_check([["процент", "30" + brk + "%"]]).splitlines()) == 1, hex(ord(brk[0]))
+    for v in (40000, 7790.0, "30%", "35 000", "", None, True):
+        assert G._num(v) == old_num(v), v
+    assert G.card_check([["процент", "30" + LS + "%"]]) == G.W_CHECK_BAD % "процент 30 %"
+    chk = {"nums": [["30" + NEL + "%", ["блок «ЦЕНА»"]]], "pay": True, "said": [], "more": 0}
+    assert G.card_check([], chk) == G.W_CHECK_OK % "30 % — блок «ЦЕНА»", G.card_check([], chk)
+    with patched(G, _num=old_num):
+        assert len(G.card_check([["процент", "30" + LS + "%"]]).splitlines()) == 2
+        assert G.card_check([], chk).splitlines()[1] == "% — блок «ЦЕНА»"
+
+
+def test_e2_e2e_percent_with_break_one_check_line():
+    """Сквозной путь: черновик модели «Предоплата 30⏎% до вечера.» (⏎ = U+2028 и U+0085) → `K.money_claims` берёт «30⏎%»
+    → в низе карточки (от «💭») строка «🔎 проверка кодом — без опоры: процент 30 %» одна, строки «%…» нет. Близнец до
+    правки — хвост «%» отдельной строкой. Обычный «30%» — прежняя строка. Ответ клиенту — дословно (остаток R1)."""
+    for brk in (LS, NEL):
+        text = "Предоплата 30" + brk + "% до вечера."
+        assert K.money_claims(text, None) == [("процент", "30" + brk + "%")], K.money_claims(text, None)
+        card, _w = e2e_card(raw_reply(text=text))
+        bottom = card[card.index("💭"):]
+        assert lines_on(bottom, "🔎 проверка") == [G.W_CHECK_BAD % "процент 30 %"], bottom
+        assert not [ln for ln in bottom.splitlines() if ln.startswith("%")], bottom
+        with patched(G, _num=old_num):
+            card0, _w0 = e2e_card(raw_reply(text=text))
+        bottom0 = card0[card0.index("💭"):].splitlines()
+        assert (G.W_CHECK_BAD % "процент 30") in bottom0 and "%" in bottom0, bottom0
+    card, _w = e2e_card(raw_reply(text="Предоплата 30% до вечера."))
+    assert lines_on(card[card.index("💭"):], "🔎 проверка") == [G.W_CHECK_BAD % "процент 30%"], card
 
 
 # ══ мутанты ═════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -631,6 +1114,12 @@ CLASS2 = ["test_c1_e2e_raw_json_attack_one_line_each_field", "test_c2_forged_bes
           "test_c3_every_break_every_field_equals_space", "test_c4_said_from_draft_text_path",
           "test_c6_cut_counted_after_collapse", "test_c7_row_written_before_fix_renders_one_line",
           "test_c8_tg_core_hands_same_render"]
+CLASS2D = ["test_c1_e2e_raw_json_attack_one_line_each_field", "test_c3_every_break_every_field_equals_space",
+           "test_c9_bidi_prefix_anchor_every_model_field", "test_d1_bidi_attacks_label_first_twin_spoofed",
+           "test_d2_e2e_raw_json_bidi_handoff", "test_d3_ordinary_reason_reads_and_code_actions_unchanged",
+           "test_d4_fuzz_bidi_label_invariant"]
+CLASS2N = ["test_e1_num_internal_break_one_line", "test_e2_e2e_percent_with_break_one_check_line"]
+ACT_RET = "    return W_ACT_WORDS + BIDI_LRI + words + BIDI_PDI"
 MUTANTS = [
     ("wa_book_read.py", "        if st == UNIT_FREE and bikes is not None and fleet_status(u, bikes) != FS_OK:",
      "        if False:", "без защиты в free_bikes", CLASS1),
@@ -657,13 +1146,26 @@ MUTANTS = [
     ("wa_agent_tg.py", '"«%s»" % one_line(str(x))', '"«%s»" % x', "цитата оплаты без one_line", CLASS2),
     ("wa_agent_tg.py", 'return " ".join(str(s or "").splitlines())', 'return str(s or "").replace("\\n", " ")',
      "разрыв — только «\\n» (таблица вместо splitlines)", CLASS2),
+    ("wa_agent_tg.py", ACT_RET, "    return words", "D3: голое «• » (ни метки, ни изоляции)", CLASS2D),
+    ("wa_agent_tg.py", ACT_RET, "    return BIDI_LRI + words + BIDI_PDI", "D3: изоляция без метки источника", CLASS2D),
+    ("wa_agent_tg.py", ACT_RET, "    return W_ACT_WORDS + words", "D3: метка без изоляции", CLASS2D),
+    ("wa_agent_tg.py", ACT_RET, '    return BIDI_LRI + words + BIDI_PDI + " " + W_ACT_WORDS', "D3: метка после слов",
+     CLASS2D),
+    ("wa_agent_tg.py", "CARD_ACTIONS.get(cat) or act_words(", "CARD_ACTIONS.get(cat) or (",
+     "D3: card_actions мимо обёртки", CLASS2D),
+    ("wa_agent_tg.py", "    return one_line(str(v))", "    return str(v)", "claims: _num без one_line", CLASS2N),
 ]
 
 
 def test_zz_mutants():
-    """Каждый мутант правки (14: класс 1 — 8, класс 2 — 6) роняет хотя бы один голден своего класса (дети — параллельно,
-    WA_AGENT_SRC = каталог мутанта во временном месте, RCFIX2010_CHILD=1)."""
+    """Каждый мутант правки (20: класс 1 — 8, класс 2 — 6, D3 — 5, claims — 1) роняет хотя бы один голден своего класса
+    (дети — параллельно, WA_AGENT_SRC = каталог мутанта во временном месте, RCFIX2010_CHILD=1)."""
     if os.environ.get(CHILD):
+        return
+    if os.environ.get("RCFIX2010_MUTANTS") != "1":
+        # Мутации — проверка силы самих голденов, а не продукта; 20 детей идут дольше лимита gate.py (90 с на набор).
+        # В обычном прогоне/гейте — явный пропуск; квитанция мутантов снимается отдельным запуском с RCFIX2010_MUTANTS=1.
+        print("  SKIP мутанты: RCFIX2010_MUTANTS не 1 (квитанция мутантов — отдельным запуском)")
         return
     runs = []
     for name, old, new, words, tests in MUTANTS:

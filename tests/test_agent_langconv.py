@@ -102,7 +102,8 @@ def c_21_ru_conv_en_answer_caught(M):
     assert "ЯЗЫК РАЗГОВОРА: английский" not in user, user[-900:]
     assert "ПЕРЕВОД ДЛЯ СОТРУДНИКА" in user, user[-900:]           # вопрос по-английски — перевод как был
     assert LANG in hand, hand
-    assert "• " + LANG in card.split(G.W_HAND, 1)[1], card[-600:]
+    # TB-QA-2010C-HEAD-2011 D3: слова причины без действия — после метки кода, в изоляции LRI…PDI (было «• » + LANG)
+    assert "• " + G.W_ACT_WORDS + chr(0x2066) + LANG + chr(0x2069) in card.split(G.W_HAND, 1)[1], card[-600:]
     log = logged(lines)
     assert log == ["модель: язык ответа en, язык разговора ru (3 из 4) — причина «нужен человек»"], log
     assert "NMAX" not in log[0] and "colleague" not in log[0], log

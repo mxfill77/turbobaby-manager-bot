@@ -91,7 +91,8 @@ def c_18_synthetic_caught(M):
     assert hand[:1] == [ARR] and HAND_M[0] in hand, hand
     assert "wa:send:1:1" in kb, kb                                        # не запирается (решение 12:39)
     notes = card.split(G.W_HAND, 1)[1]
-    assert notes.lstrip("\n").startswith("• " + ARR), notes[:200]
+    # TB-QA-2010C-HEAD-2011 D3: слова причины без действия — после метки кода, в изоляции LRI…PDI (было «• » + ARR)
+    assert notes.lstrip("\n").startswith("• " + G.W_ACT_WORDS + chr(0x2066) + ARR + chr(0x2069)), notes[:200]
     log = [x for x in lines if "срок или приезд без опоры" in x]
     assert len(log) == 1 and "часа-двух" not in log[0] and "Сотрудник" not in log[0], log
 

@@ -193,6 +193,12 @@ CARD_ACTIONS = {
     K.R_DAYS_CLAIM: K.DAYS_CLAIM_WORDS,                                                   # WADAYS0410
 }
 W_HAND = "🙋 НУЖЕН ЧЕЛОВЕК — сделайте:"
+# D3 (Codex TB-QA-2010C-HEAD-2011 п.1): причина без действия в CARD_ACTIONS — её слова дословно ПОСЛЕ метки кода, в
+# изоляции LRI…PDI (UAX#9 X5a/X6a). Метка — сильные LTR-буквы до полезной части: по P2–P3 абзац строки LTR, уровни
+# метки 0, по L2 она первая видимая при любом bidi-входе. «Дословно», а не «модели»: эта ветка не различает источник —
+# сюда же идут слова кода без действия (K.ARRIVAL_CLAIM_WORDS, K.LANG_CONV_WORDS, T.CONTRACT_WORDS…).
+W_ACT_WORDS = "причина дословно: "
+BIDI_LRI, BIDI_PDI = chr(0x2066), chr(0x2069)      # LEFT-TO-RIGHT ISOLATE / POP DIRECTIONAL ISOLATE — кодом
 W_DOOR_CLOSED = "⛔ отправка выключена — ответьте клиенту сами"
 W_SEND_HAND = "«Отправить» открыто — сначала проверьте пометку выше"     # версия модели с причинами (WACARDUI0510)
 W_SEND_OPEN = "исправлено человеком — «Отправить» открыто"
@@ -424,9 +430,16 @@ def one_line(s):
     return " ".join(str(s or "").splitlines())
 
 
+def act_words(words):
+    """Слова причины без действия → пункт «НУЖЕН ЧЕЛОВЕК» (D3): фиксированная метка кода, затем слова в изоляции
+    LRI…PDI. Метка стоит ДО полезной части, поэтому её не сдвигает никакой bidi-знак слов; изоляция закрывает незакрытые
+    встраивания слов на своём PDI. Таблицы знаков нет: слова не чистятся и не правятся."""
+    return W_ACT_WORDS + BIDI_LRI + words + BIDI_PDI
+
+
 def card_actions(hand):
     """Причины «нужен человек» → [действия сотрудника] по категориям, без повторов, в порядке причин.
-    Причина без категории — её слова как есть (не длиннее REASON_SHOW_MAX)."""
+    Причина без действия — её слова дословно (не длиннее REASON_SHOW_MAX) после метки кода `act_words` (D3)."""
     acts, seen = [], set()
     for w in hand or ():
         for cat in K.word_categories(w) or [None]:
@@ -435,8 +448,8 @@ def card_actions(hand):
                 continue
             seen.add(key)
             words = one_line(str(w).strip())
-            acts.append(CARD_ACTIONS.get(cat) or (words if len(words) <= REASON_SHOW_MAX
-                                                  else words[:REASON_SHOW_MAX - 1] + "…"))
+            acts.append(CARD_ACTIONS.get(cat) or act_words(words if len(words) <= REASON_SHOW_MAX
+                                                           else words[:REASON_SHOW_MAX - 1] + "…"))
     return acts
 
 
@@ -536,10 +549,11 @@ def card_trans(extra):
 
 
 def _num(v):
-    """Число проверки — разрядами через пробел (40 000); прочее — как есть («30%»)."""
+    """Число проверки — разрядами через пробел (40 000); прочее — одной строкой (`one_line`, Codex TB-QA-2010C-HEAD-2011
+    п.2: процент модели «30\\u2028%» иначе рвал строку «🔎 …»); без разрывов — как есть («30%»)."""
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         return "{:,}".format(int(v)).replace(",", " ")
-    return str(v)
+    return one_line(str(v))
 
 
 def card_check(claims, checked=None):
