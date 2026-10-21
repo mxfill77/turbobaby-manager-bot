@@ -956,6 +956,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 and _looks_like_txn(msg.text)):
             await splinter.handle(update, context, bridge, claude)
             return
+        # INTAKEOWNER2110 (ручка INTAKE_PASSPORT_STRICT): во «Входящих» реплай на сообщение ждущей карточки — ответ
+        # карточке, его разбирает приём брони (роль, привязка, слова), а не мозг; живой случай 21.10 15:47Z — «да»
+        # владельца реплаем на сводку ушло в мозг, бронь не встала. Без ручки и без такого реплая — прежний путь.
+        if splinter.intake_reply_to_card(msg):
+            await splinter.handle(update, context, bridge, claude)
+            return
         # Владелец обращается к Splinter напрямую (тег/ответ/ждём ответа) → диалог-мозг
         if _owner_addresses_bot(msg, context):
             wallet = splinter.group_label(chat_id)

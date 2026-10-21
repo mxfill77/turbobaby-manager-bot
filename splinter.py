@@ -166,6 +166,16 @@ def _intake_confirm_strict_on():
     return str(_os_env("INTAKE_CONFIRM_STRICT", "1")).strip().lower() not in ("0", "", "нет", "no", "off", "false")
 
 
+def _intake_passport_strict_on():
+    """Ручка INTAKEOWNER2110 (`INTAKE_PASSPORT_STRICT`; по умолчанию ВЫКЛ — приём байт-в-байт прежний; в проде
+    включается drop-in'ом юнита). Норма владельца 21.10: бронь только с распознанным паспортом, ФИО в D — по паспорту
+    (Codex TB-OWNER-2110-SPLINTER-INTAKE-REPAIR п.1–4): реплай владельца на сообщение ждущей карточки — в приём брони,
+    а не в мозг; «да» без распознанного или с чужим паспортом бронь не пишет; паспорт привязан к карточке, а не к
+    чату; повтор того же фото не даёт второй строки «паспорта». Работает только вместе со строгим подтверждением."""
+    return (_intake_confirm_strict_on()
+            and str(_os_env("INTAKE_PASSPORT_STRICT", "0")).strip().lower() in ("1", "true", "yes", "on", "да"))
+
+
 # CLOSETRUTH1910: умолчание ручки правды приёма — ВКЛ (задание отрезка; слово владельца о перезакреплении двух
 # закреплённых наборов: tests/test_return_close.py:103-105 и tests/test_rental_case_integ_spl.py:924 ждут теперь
 # paid_total=None, их блобы в tests/test_contractref_accept.py PINS обновлены этим же выпуском). Откат — `CLOSE_TRUTH=0`
@@ -9543,6 +9553,14 @@ async def _rc_execute(msg, context, bridge, st, out, text):
             written({"error": "draft_mismatch"})
             await say("❌ Не исполняю: черновик этой карточки уже сменился — пришли карточку заново.")
             return
+        if _intake_passport_strict_on():
+            # INTAKEOWNER2110: личность паспортом — до билета и сети (иначе отказ двери в `call()` после «отправлено»
+            # читался бы «неизвестно»); исполнение отмечено как не записанное
+            _ok, _nm, _why = _intake_identity(d)
+            if not _ok:
+                written({"error": "identity_not_proven"})
+                await say(_why)
+                return
         d["status"] = "approved"
         res, exc, sent = _rc_red(bridge, lambda: bridge.create_booking(**_intake_booking_fields(d)))
         out_w = intake_confirm.outcome(res, sent)       # APPROVEFIX1610: три исхода, словарь брони — свой
@@ -13577,6 +13595,7 @@ def _intake_summary(d, availability, delivery_status) -> str:
         f"Доставка: {deliv_line}\n"
         f"Шлемы: {d.get('helmets', '—')} · паспорт-фото: {'да' if d.get('passport_photo') else 'нет'}\n"
         f"{_intake_passport_line(d)}"
+        f"{_intake_identity_line(d)}"
         f"Наличие: {availability}\n"
         "\nСтавлю бронь? да / нет / правки"
     )
@@ -13596,6 +13615,58 @@ def _intake_passport_line(d) -> str:
     return "⚠️ Паспорт НЕ распознан — проверьте фото\n"
 
 
+# ── INTAKEOWNER2110: ворота личности брони (ручка INTAKE_PASSPORT_STRICT) ──────────────────────────────────────────
+# Стоят в САМОЙ двери записи — у всех трёх путей create_booking (строгий, прежний, К4), так что старая карточка,
+# поднятая из памяти или перенесённая рестартом, их не обходит. «Да» конфликт не снимает. Строки клиентов не правятся
+# и не сливаются: ворота только не дают записать новую.
+IDN_NO_PASSPORT = ("⛔ Бронь не ставлю: к этой карточке нет распознанного паспорта (не прислан, не распознан или не "
+                   "привязан однозначно). Пришлите фото паспорта ЭТОГО клиента сразу после карточки — распознаю и "
+                   "пришлю сводку заново.")
+IDN_CONFLICT = ("⛔ Бронь не ставлю: ФИО в паспорте «{ocr}» не совпадает с «Клиент: {card}» в карточке. Проверьте, "
+                "чей это паспорт: пришлите карточку с ФИО как в паспорте или паспорт этого клиента. «Да» конфликт "
+                "не снимает.")
+IDN_AMBIGUOUS = ("⚠️ Паспорт не привязан: {why}. Не знаю, чей он, — пришлите фото паспорта ЭТОГО клиента сразу "
+                 "после его карточки (одна карточка — один паспорт).")
+_IDN_RU_LAT = str.maketrans({"а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+                             "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p",
+                             "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch",
+                             "ш": "sh", "щ": "shch", "ъ": "ie", "ы": "y", "ь": "", "э": "e", "ю": "iu", "я": "ia"})
+
+
+class IntakeIdentityError(RuntimeError):
+    """Дверь записи брони: личность клиента не установлена паспортом (INTAKEOWNER2110). Бросается ДО билета и сети."""
+
+
+def _idn_tokens(s):
+    """ФИО → слова латиницей (кириллица — транслитерацией ICAO, как в загранпаспорте РФ), от 2 букв."""
+    t = str(s or "").lower().translate(_IDN_RU_LAT)
+    return [w for w in _re_lang.findall(r"[a-z]+", t) if len(w) >= 2]
+
+
+def _intake_identity(d):
+    """Черновик брони → (ok, ФИО_для_D | None, слова_отказа). ok — к ЭТОЙ карточке привязан паспорт с OCR «ok» и ФИО,
+    и каждое слово «Клиент» карточки есть среди слов ФИО паспорта (порядок не важен). Сомнение — не ok: «Стас» против
+    «Stanislav», пустой «Клиент», другой человек — конфликт словами, а не догадка."""
+    pp = d.get("passport_ocr") if isinstance(d, dict) else None
+    pp = pp if isinstance(pp, dict) else {}
+    full = str((pp.get("fields") or {}).get("full_name") or "").strip()
+    if not d.get("passport_photo") or pp.get("ocr_status") != "ok" or not full:
+        return False, None, IDN_NO_PASSPORT
+    card = str(d.get("client") or "").strip()
+    have, want = set(_idn_tokens(full)), _idn_tokens(card)
+    if not want or any(w not in have for w in want):
+        return False, None, IDN_CONFLICT.format(ocr=full, card=card or "—")
+    return True, full, ""
+
+
+def _intake_identity_line(d) -> str:
+    """Строка сводки при ручке: чем кончится «да» по паспорту (пусто, если ручка выкл или личность установлена)."""
+    if not _intake_passport_strict_on():
+        return ""
+    ok, _nm, why = _intake_identity(d)
+    return "" if ok else (why + "\n")
+
+
 def _intake_booking_fields(d):
     """Поля create_booking из распарсенной карточки — прежняя сборка ветки «да» (3) _handle_intake, вынесена без
     изменений, чтобы путь К4 (шаг 7) звал мост теми же полями."""
@@ -13610,8 +13681,15 @@ def _intake_booking_fields(d):
     if d.get("experience"):    note_bits.append("опыт: " + str(d["experience"]))
     if d.get("delivery_name"): note_bits.append("доставка: " + str(d["delivery_name"]))
     if d.get("term"):          note_bits.append("срок: " + str(d["term"]))
+    name = d.get("client") or "—"
+    if _intake_passport_strict_on():
+        # INTAKEOWNER2110: дверь записи — ФИО в D только по паспорту ЭТОЙ карточки; нет личности — записи нет
+        ok, full, why = _intake_identity(d)
+        if not ok:
+            raise IntakeIdentityError(why)
+        name = full
     return dict(
-        bike=d.get("model"), name=(d.get("client") or "—"),
+        bike=d.get("model"), name=name,
         date_start=d.get("date_start"), date_end=d.get("date_end"),
         deposit=deposit, helmets=d.get("helmets"),
         contacts=d.get("contacts"), note=(" | ".join(note_bits) or None),
@@ -13940,6 +14018,13 @@ async def _intake_reply_strict(d, msg, context, bridge, text, now):
         d["status"] = "rejected"
         await _say(_IC_REJECT)
         return
+    # INTAKEOWNER2110: личность паспортом — до статуса, билета и сети; карточка остаётся ждущей (паспорт или правка)
+    if _intake_passport_strict_on():
+        _ok, _nm, _why = _intake_identity(d)
+        if not _ok:
+            log.info(f"  🆕 INTAKE: «да» без распознанного или совпавшего паспорта — бронь не ставлю (@{_who})")
+            await _say(_why)
+            return
     # YES — КРАСНАЯ запись в CRM через токен-замок 4.2 (issue ticket → agent_write → create_booking), ровно один вызов
     d["status"] = "approved"
     sent, res, exc, no_ticket = False, None, None, None
@@ -14527,6 +14612,139 @@ async def _intake_route_reply(msg, context, bridge, text, now):
         _cr_note_dead(chat_id, [getattr(sent_multi, "message_id", None)])
 
 
+# ── INTAKEOWNER2110: привязка паспорта к карточке и маршрут ответа владельца (ручка INTAKE_PASSPORT_STRICT) ──────────
+_IDN_SEEN = {}   # chat_id → {message_id фото: ts}: повтор события не зовёт OCR и не пишет вторую строку «паспорта»
+_IDN_PRE = {}    # chat_id → [{"ts", "rec", "ids"}]: паспорта ДО карточки, у каждого свой OCR; карточка берёт ровно один
+
+
+def intake_reply_to_card(msg) -> bool:
+    """Для bot.py: во «Входящих» при ручке реплай на сообщение ждущей карточки брони (сводка, её фото, привязанное
+    уточнение), карточки выдачи/приёма (в т.ч. заменённой) или на пояснение к ним — ответ карточке. Его разбирает приём
+    брони (роль и аккаунт `_intake_can_approve`, привязка, слова — там же, где у менеджеров), а не мозг. Без реплая и
+    реплаем на постороннее — False: прежний путь. Сбой — False."""
+    try:
+        chat_id = getattr(msg, "chat_id", None)
+        if not _intake_passport_strict_on() or GROUPS.get(chat_id) != "intake":
+            return False
+        d = _INTAKE_DRAFTS.get(chat_id)
+        bk = d if (d and d.get("status") == "awaiting_approval") else None
+        kind, _rec = _card_route(msg, bk, _HANDOVER_ACTIVATIONS.get(chat_id), _RETURN_CLOSES.get(chat_id))
+        return kind != "none" or bool(_cr_reply_dead(msg))
+    except Exception:
+        return False
+
+
+def _idn_seen(chat_id, ids, now) -> bool:
+    """Повтор того же события фото (те же message_id в пределах часа) → True; иначе запомнить и False."""
+    seen = _IDN_SEEN.setdefault(chat_id, {})
+    for k in [k for k, t in seen.items() if now - t > 3600]:
+        seen.pop(k, None)
+    if ids and all(i in seen for i in ids):
+        return True
+    for i in ids:
+        seen[i] = now
+    return False
+
+
+def _intake_passport_save_rec(d, rec, bridge):
+    """Строка «паспорта» по записи OCR ЭТОГО фото (а не по буферу чата) — как `_intake_passport_save`. 4.2."""
+    if not rec or not rec.get("file_id"):
+        return
+    key = f"{d.get('model','')}|{d.get('client','')}|{d.get('date_start','')}"
+    f = rec.get("fields") or {}
+    try:
+        with bridge_client.agent_write((bridge.issue_write_ticket() or {}).get("ticket")):
+            bridge.save_passport(booking_key=key, bike=d.get("model"), name=d.get("client"),
+                                 date_start=d.get("date_start"), drive_file_id=rec.get("file_id"),
+                                 ocr_status=rec.get("ocr_status"), **f)
+    except Exception as e:
+        log.warning(f"  🆕 INTAKE: save_passport не прошёл: {e}")
+
+
+def _idn_bind_ok(d, rec, bridge) -> bool:
+    """Паспорт привязан к карточке. Личность установлена → ФИО карточки — паспортное (D — по паспорту; прежнее — в
+    `client_card`), строка «паспорта» — ОДИН раз на файл. Не установлена → ничего не пишем: чужой паспорт под этим
+    клиентом не сохраняется, сводка назовёт конфликт."""
+    ok, full, _why = _intake_identity(d)
+    if not ok:
+        return False
+    if d.get("client") != full:
+        d.setdefault("client_card", d.get("client"))
+        d["client"] = full
+    saved = d.setdefault("passport_saved", [])
+    fid = rec.get("file_id") if isinstance(rec, dict) else None
+    if fid and fid not in saved:
+        _intake_passport_save_rec(d, rec, bridge)
+        saved.append(fid)
+    return True
+
+
+async def _intake_photo_strict(msg, photo_msgs, context, bridge, now):
+    """Фото паспорта при ручке: повтор события — молча; иначе OCR и привязка к ЖДУЩЕЙ свежей карточке (окно 5 мин).
+    К карточке уже привязан распознанный паспорт — второй не перезаписывает его и не сохраняется (уточнение). Карточки
+    нет — фото в очередь «до карточки» со своим OCR (буфер не затирается)."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+
+    async def say(body):
+        return await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False,
+                           message_thread_id=tid)
+
+    ids = [i for i in (getattr(m, "message_id", None) for m in photo_msgs) if i is not None]
+    if _idn_seen(chat_id, ids, now):
+        log.info("  🆕 INTAKE: повтор события фото паспорта — OCR и строка «паспорта» не повторяются")
+        return
+    ok_ocr, _fields = await _intake_passport_ocr(photo_msgs[0], chat_id, context, bridge)
+    rec = dict(_INTAKE_PASSPORT.get(chat_id) or {}, src_ids=ids)    # запись ЭТОГО фото (только что положена)
+    d = _INTAKE_DRAFTS.get(chat_id)
+    fresh = bool(d) and now - d.get("ts", 0) <= 300
+    if fresh and d.get("status") == "write_unknown":
+        await say(_IC_PHOTO_UNKNOWN)           # исход записи неизвестен — фото карточку не взводит (как прежде)
+        return
+    if fresh and d.get("status") in ("new", "incomplete", "awaiting_approval"):
+        prev = d.get("passport_ocr") if d.get("passport_photo") else None
+        if isinstance(prev, dict) and prev.get("ocr_status") == "ok" and prev.get("file_id") != rec.get("file_id"):
+            log.info("  🆕 INTAKE: второй распознанный паспорт к той же карточке — не привязываю и не сохраняю")
+            await say(IDN_AMBIGUOUS.format(why="к этой карточке уже привязан распознанный паспорт, пришёл ещё один"))
+            return
+        d["passport_photo"] = True
+        d["passport_ocr"] = rec
+        _ic_note_ids(d, photo_msgs)
+        _idn_bind_ok(d, rec, bridge)
+        await _intake_finalize(d, msg, context, bridge)   # сводка назовёт нераспознанность или конфликт ФИО
+        return
+    pre = [p for p in (_IDN_PRE.get(chat_id) or []) if now - p.get("ts", 0) <= 300]
+    pre.append({"ts": now, "rec": rec, "ids": ids})
+    _IDN_PRE[chat_id] = pre[-5:]
+    await say("📎 Паспорт получен и распознан — привяжу к карточке, если она придёт следующей." if ok_ocr else
+              "📎 Паспорт получен, но не распознался — пришлите карточку/перефото.")
+
+
+async def _intake_card_strict(msg, context, bridge, claude, text, now):
+    """Карточка брони при ручке: паспорт «до карточки» привязывается, только если он ОДИН свежий (окно 5 мин); два и
+    больше — не привязан ни один, уточнение. Дальше — прежняя сводка (с конфликтом ФИО или нераспознанностью словами)."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+    parsed = _intake_parse(claude, text)
+    draft = dict(parsed)
+    draft.update(ts=now, passport_photo=False, status="new")
+    pre = [p for p in (_IDN_PRE.pop(chat_id, None) or []) if now - p.get("ts", 0) <= 300]
+    _IC_PRE_PHOTOS.pop(chat_id, None)
+    _INTAKE_DRAFTS[chat_id] = draft
+    _ic_note_ids(draft, [msg])
+    if len(pre) == 1:
+        draft["passport_photo"] = True
+        draft["passport_ocr"] = pre[0]["rec"]
+        draft["ic_msg_ids"] += [i for i in (pre[0].get("ids") or []) if i is not None]
+        _idn_bind_ok(draft, pre[0]["rec"], bridge)
+    log.info(f"  🆕 INTAKE: карточка — модель={draft.get('model')} клиент={draft.get('client')}"
+             + (f" · паспортов до карточки {len(pre)} — не привязываю" if len(pre) > 1 else ""))
+    await _intake_finalize(draft, msg, context, bridge)
+    if len(pre) > 1:
+        await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                    text="🐀 Splinter\n" + IDN_AMBIGUOUS.format(why="до карточки пришло %d фото паспорта" % len(pre)))
+
+
 async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     """Приём карточек брони (этап A): карточка → пакет/наличие → резюме+approve. CRM read-only.
     photo_msgs — пачка фото (альбом склеен по media_group_id) → один «паспорт получен» + один finalize."""
@@ -14538,6 +14756,11 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
     now = _time.time()
     if _rc_on("RENTAL_CASE_APPROVALS"):
         await _rc_tick(context, bridge)   # К4 шаг 7: такт — публикация планов карточек, чтение назад (pending_checks)
+
+    # INTAKEOWNER2110 (ручка INTAKE_PASSPORT_STRICT): фото паспорта — к конкретной карточке, без буфера на весь чат
+    if has_photo and not _intake_is_card(text) and _intake_passport_strict_on():
+        await _intake_photo_strict(msg, photo_msgs, context, bridge, now)
+        return
 
     # 1) Фото паспорта отдельным сообщением → OCR (B2) + связать с карточкой (окно 5 мин, обе стороны)
     if has_photo and not _intake_is_card(text):
@@ -14627,6 +14850,9 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
         return
 
     # 2) Карточка брони
+    if _intake_is_card(text) and _intake_passport_strict_on():
+        await _intake_card_strict(msg, context, bridge, claude, text, now)    # INTAKEOWNER2110
+        return
     if _intake_is_card(text):
         parsed = _intake_parse(claude, text)
         draft = dict(parsed)
