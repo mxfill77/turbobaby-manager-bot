@@ -8031,7 +8031,7 @@ _HB_TEST_HOME = ["CB 300CC R 9011", "FORZA 350 5050", "NINJA 400 8080"]   # мо
 
 
 def _hb_put(data):
-    _HB_SEQ[0] += 1
+    _life_label_next(_HB_SEQ)
     tok = _HB_SEQ[0]
     _HB_TOKENS[tok] = data
     if len(_HB_TOKENS) > 200:                       # держим последние 200 (как _SVC_TOKENS)
@@ -8309,7 +8309,7 @@ _O3_KIND_MARK = {      # kind → (TH, RU) КОРОТКАЯ пометка в к
 
 
 def _o3_put(data):
-    _O3_SEQ[0] += 1
+    _life_label_next(_O3_SEQ)
     tok = _O3_SEQ[0]
     _O3_TOKENS[tok] = data
     if len(_O3_TOKENS) > 200:                 # держим последние 200 (как _HB_TOKENS)
@@ -11066,7 +11066,7 @@ def _svc_undo_remember(chat_id, topic_id, bike, plate, by, odo, positions, blind
         _SVC_UNDO_LAST[(chat_id, topic_id)] = None
         return None
     try:
-        _SVC_UNDO_SEQ[0] += 1
+        _life_label_next(_SVC_UNDO_SEQ)
         tok = _SVC_UNDO_SEQ[0]
         key = (chat_id, topic_id)
         _SVC_UNDO[tok] = undo_last.act(tok, _time.time(), chat_id, topic_id, bike, plate, by, odo,
@@ -12675,7 +12675,7 @@ def _act_addressee(msg, context):
 
 async def _act_gate_ask(context, msg, photo_msgs, claude, *, door, v, bike):
     """Одно сообщение RU+TH: что видно, верно ли понято, кто берёт. Кнопки → повтор двери."""
-    _ACT_GATE_SEQ[0] += 1
+    _life_label_next(_ACT_GATE_SEQ)
     n = _ACT_GATE_SEQ[0]
     now = _time.time()
     for k in [k for k, p in _ACT_GATE_PENDING.items() if now - p["ts"] > _ACT_GATE_TTL]:
@@ -15081,3 +15081,28 @@ async def handle(update, context, bridge, claude, album_msgs=None):
     # менеджер, и лишняя реплика бота видна клиенту.
     if mode == "servicing":
         await _reply_floor_speak(context, msg, crashed=_crashed, spoke_before=_spoke_before)
+
+
+# ── K-FIX r2 (21.10.2026, Codex TB-OWNER-2110-DISK-P0-ADD1 / TB-REVIEW-2110-KFIX-R2-LIMITS) ─────────────────────────
+# Метки кнопок без памяти на диске (`_ACT_GATE_SEQ`, `_SVC_UNDO_SEQ`, `_HB_SEQ`, `_O3_SEQ`, bot.py `_audit_seq`) раньше
+# начинались с 0 в каждой жизни процесса: ненажатая кнопка прошлой жизни попадала на ожидание новой с тем же номером
+# (у ворот — дверь по чужому сообщению). Теперь у жизни свой БЛОК: затравка B = ((1 << 40) | 40 случайных бит) << 20,
+# метки B + 1 … B + 2^20 − 1. Две независимые жизни совпадают блоком с вероятностью 2^-40 на пару (для N жизней — не
+# больше N(N − 1)/2^41): это инженерный предел случайной коллизии, а не гарантия. Метки 947953e (с 1) лежат ниже 2^60 —
+# другое пространство. Определено В КОНЦЕ модуля, чтобы ссылки splinter.py:N выше не съехали.
+_LIFE_LOW = (1 << 20) - 1
+
+
+def _life_label_seed():
+    """Затравка нового блока жизни: [2^60, 2^61), кратна 2^20 (то же выражение стоит у самих счётчиков)."""
+    return ((1 << 40) | int.from_bytes(os.urandom(5), "big")) << 20
+
+
+def _life_label_next(seq):
+    """Следующая метка счётчика `seq` ([int]). Блок исчерпан (младшие 20 бит — все единицы) → НОВЫЙ случайный блок с
+    предупреждением в журнале, а не молчаливый переход в соседний: метка всегда в блоке, который выдала эта жизнь."""
+    if (seq[0] & _LIFE_LOW) == _LIFE_LOW:
+        seq[0] = _life_label_seed()
+        log.warning("  → метки кнопок: блок жизни исчерпан (2^20 − 1 меток) — взят новый случайный блок")
+    seq[0] += 1
+    return seq[0]

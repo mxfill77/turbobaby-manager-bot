@@ -167,7 +167,7 @@ async def post_audit_card(context, card: dict):
             return
         _audit_high_dedup.add(fp)
 
-    _audit_seq[0] += 1
+    splinter._life_label_next(_audit_seq)
     token = _audit_seq[0]
     _audit_cards[token] = card
     sev = (card.get("severity") or "").upper()

@@ -419,6 +419,59 @@ def test_kfix_all_label_counters_seeded_per_life():
         and any(c.startswith("svc:undo:") for c in found), found
 
 
+def test_kfix_label_never_leaves_life_block():
+    """K-FIX r2 (Codex TB-REVIEW-2110-KFIX-R2-LIMITS): блок жизни существует, пока счётчик в младших 20 битах. Метки
+    выдаёт ТОЛЬКО `splinter._life_label_next` (AST: у пяти счётчиков нет «X[0] += 1», вызовов — ровно по одному, в bot.py
+    — `splinter._life_label_next(_audit_seq)`). Граница: последняя метка блока B + 2^20 − 1 выдаётся в своём блоке;
+    следующая — первая метка НОВОГО случайного блока (младшие биты = 1, [2^60, 2^61), номер блока ≠ B), с предупреждением
+    в журнале, а не B + 2^20 (соседний блок). Затравка + первое увеличение = B + 1. Живой путь: ворота с счётчиком на
+    границе выдают кнопку с меткой нового блока и находят по ней своё ожидание."""
+    import logging as _logging
+    import re as _re
+    srcs = {f: open(os.path.join(ROOT, f), encoding="utf-8").read() for f in ("splinter.py", "bot.py")}
+    for nm in ("_HB_SEQ", "_O3_SEQ", "_SVC_UNDO_SEQ", "_ACT_GATE_SEQ"):
+        assert not _re.search(r"\b%s\[0\]\s*\+=" % nm, srcs["splinter.py"]), nm
+        assert srcs["splinter.py"].count("_life_label_next(%s)" % nm) == 1, nm
+    assert not _re.search(r"\b_audit_seq\[0\]\s*\+=", srcs["bot.py"])
+    assert srcs["bot.py"].count("splinter._life_label_next(_audit_seq)") == 1
+    b = S._life_label_seed()
+    assert 2 ** 60 <= b < 2 ** 61 and b % (1 << 20) == 0, b
+    seq = [b]
+    assert S._life_label_next(seq) == b + 1                       # затравка + первое увеличение
+    seq = [b + (1 << 20) - 2]
+    assert S._life_label_next(seq) == b + (1 << 20) - 1           # последняя метка блока — в своём блоке
+
+    class _H(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.msgs = []
+
+        def emit(self, rec):
+            self.msgs.append(rec.getMessage())
+    h = _H()
+    S.log.addHandler(h)
+    try:
+        nxt = S._life_label_next(seq)
+    finally:
+        S.log.removeHandler(h)
+    assert nxt != b + (1 << 20) and nxt >> 20 != b >> 20, (b, nxt)     # не соседний и не свой исчерпанный
+    assert nxt & ((1 << 20) - 1) == 1 and 2 ** 60 <= nxt < 2 ** 61, nxt
+    assert any("блок жизни исчерпан" in m for m in h.msgs), h.msgs
+    # живой путь ворот: счётчик на последней метке блока → кнопка с меткой нового блока, нажатие находит своё ожидание
+    parse = {"type": "event", "event_type": "repair", "mileage": 20000, "works": ["подшипники"]}
+    S._ACT_GATE_PENDING.clear()
+    S._ACT_GATE_SEQ[0] = b + (1 << 20) - 1
+    ctx, br = _Ctx(), _Bridge()
+    _texts, calls, ctx, br = _run(_Msg("подшипники проверить после 20 000", user=OWNER),
+                                  _Claude(parse), env=ON, ctx=ctx, br=br)
+    (n,) = list(S._ACT_GATE_PENDING)
+    assert n >> 20 != b >> 20 and n & ((1 << 20) - 1) == 1, (b, n)
+    _press(f"svc:agy:{n}", OWNER, ctx, br, ON)
+    assert n not in S._ACT_GATE_PENDING and _writes(br.calls), br.calls
+    S._ACT_GATE_PENDING.clear()
+    S._ACT_GATE_SEQ[0] = S._life_label_seed()
+
+
 def _press(data, user, ctx, br, env):
     class _Q:
         from_user = _User(user)
