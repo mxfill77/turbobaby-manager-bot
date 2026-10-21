@@ -220,7 +220,10 @@ class B_Binding(Base):
 class Z_Source(unittest.TestCase):
     def test_three_write_paths_guarded(self):
         src = inspect.getsource(S)
-        self.assertEqual(src.count("bridge.create_booking("), 3)
+        # AUTOBOOK2210: четвёртый путь — автобронь; ворота личности у него — `_autobook_check` и сама дверь полей
+        self.assertEqual(src.count("bridge.create_booking("), 4)
+        self.assertIn("_intake_identity(d)", inspect.getsource(S._autobook_check))
+        self.assertIn("_intake_booking_fields(d)", inspect.getsource(S._intake_autobook_write))
         for fn in (S._intake_reply_strict,):
             self.assertIn("_intake_identity(d)", inspect.getsource(fn))
         self.assertIn('written({"error": "identity_not_proven"})', src)
