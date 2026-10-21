@@ -98,7 +98,9 @@ FROZEN = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",       # б�
           "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6"}  # PROMPT2110: было d338a3c2
 # RCFIX2010 (20.10, класс 1 Codex TB-REVIEW-2010-1520 п.1): wa_agent_model.py перепинен (bikes= в free_bikes);
 # блоб a1dcbe5 — прежний, сверка с git идёт по нему (тот же приём, что 9af5017 на срезе offer-b)
-AT_A1DCBE5 = dict(FROZEN, **{"wa_agent_model.py": "868b0c4b3abd75d6f4fca6b1c7021d0f121db3ce"})
+# PROMPT2110: перепинен и wa_agent_knowledge.py (голос «мы» в строках блоков) — у a1dcbe5 прежний блоб d338a3c2
+AT_A1DCBE5 = dict(FROZEN, **{"wa_agent_model.py": "868b0c4b3abd75d6f4fca6b1c7021d0f121db3ce",
+                             "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3"})
 
 
 class Script:
