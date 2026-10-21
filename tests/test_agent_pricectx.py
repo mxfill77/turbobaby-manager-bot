@@ -268,7 +268,7 @@ def c_old_paths_kept(M):
 def c_prompt_rule_and_card(M):
     """Правило 11 в SYSTEM_PROMPT и в варианте с бронями; причина «скидка неизвестна» — своя категория."""
     for p in (M.SYSTEM_PROMPT, M.SYSTEM_PROMPT_BOOK):
-        assert RULE11 in p and "скидку за срок уточнит коллега" in p, p[-900:]
+        assert RULE11 in p and "скидку за срок уточним" in p, p[-900:]    # PROMPT2110: голос «мы»
     assert K.word_categories(K.DISCOUNT_UNKNOWN_WORDS) == [K.R_DISCOUNT_UNKNOWN], \
         K.word_categories(K.DISCOUNT_UNKNOWN_WORDS)
 

@@ -180,7 +180,7 @@ def door_discount(q):
 def _human(res, reason, why):
     res.update(outcome=PRICE_HUMAN, reason=reason, why=why,
                line="Эту цену считает человек: %s. Числа цены не называть — ни точного, ни «от», "
-                    "ни диапазона, ни среднего; скажи, что коллега вернётся с точной суммой."
+                    "ни диапазона, ни среднего; скажи, что проверим и напишем точную сумму."
                     % REASON_WORDS[reason])
     return res
 
@@ -188,7 +188,7 @@ def _human(res, reason, why):
 def _unknown(res, why):
     res.update(outcome=PRICE_UNKNOWN, reason=None, why=why,
                line="Цена НЕИЗВЕСТНА: проверить было нечем. Числа цены не называть — ни точного, "
-                    "ни «от», ни диапазона, ни по памяти; скажи, что уточнишь у коллег.")
+                    "ни «от», ни диапазона, ни по памяти; скажи, что уточним.")
     return res
 
 
@@ -249,7 +249,7 @@ def quote(model, date_start, date_end, door, units, no_price_models=()):
     dep = ("депозит %s ฿" % _money(res["deposit"])) if res["deposit"] is not None \
         else "депозит — уточнит человек"
     disc = ("скидка за срок %d%%" % res["discount"]) if res["discount"] is not None else \
-        "скидка за срок неизвестна (дверь её не назвала: числом не называй, скажи, что уточнит коллега)"
+        "скидка за срок неизвестна (дверь её не назвала: числом не называй, скажи, что уточним)"
     res["line"] = "%s, %s — %s: %d сут., %s ฿ в сутки, итого %s ฿ за срок; %s; %s." % (
         res["date_start"], res["date_end"], res["model"], days, _money(day), _money(total), disc, dep)
     return res
@@ -753,10 +753,10 @@ def node_block(node, now=None):
     age = node_age(node, now)
     if age is None:
         return ("УЗЕЛ %s: НЕИЗВЕСТНО — не прочитан (%s). Не отвечай по памяти о том, что в нём; "
-                "где нужен он — «уточню у коллег»." % (node.get("name"), node.get("why") or "причина не названа"))
+                "где нужен он — «уточним»." % (node.get("name"), node.get("why") or "причина не названа"))
     if node_stale(node, now):
         return ("УЗЕЛ %s: НЕИЗВЕСТНО: снимок старше %d мин, %s. Не отвечай по памяти о том, что в нём; "
-                "где нужен он — «уточню у коллег»." % (node["name"], node["max_stale"] // 60,
+                "где нужен он — «уточним»." % (node["name"], node["max_stale"] // 60,
                                                        node.get("why") or "не освежён"))
     return "УЗЕЛ %s (снят %d мин назад, %d симв.):\n%s" % (
         node["name"], int(age // 60), node["len"], node["text"])
