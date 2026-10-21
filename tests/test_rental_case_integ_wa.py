@@ -139,7 +139,7 @@ BASE_BLOBS = {
     "wa_agent_tools": "9d6825640f0efefb758d3cad78d64fefbddc4757",
 }
 BASE_TOOLS = ("history", "rental", "cash", "contract", "contract_pdf", "delivery", "rules")
-BASE_TOOLS_BLOCK_SHA = "c61983bf92afa1e8e9a079f1a0077240f0d726b71915277cfbafc82d6a78cb40"  # DELIVERY2210: было 175b2208
+BASE_TOOLS_BLOCK_SHA = "175b220824b649ce151ae7f463ac864166265b26e9ccd13d42032a93d850d3d1"  # DELIVERY2210: было 175b2208 · DELIVERY2210: было c61983bf
 BASE_TOOLS_BLOCK8_SHA = "eb159874fd54433fdac8f637bd7ea24a7fcc32f2db761d117eb97ad0f2e664ad"
 SKIP_WORDS = "ПРОПУЩЕНО: блоб основы слияния не прочитан git (%s) — голден не сверен, это НЕ зелёное"
 

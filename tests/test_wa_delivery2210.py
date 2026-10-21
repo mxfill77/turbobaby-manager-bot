@@ -60,7 +60,17 @@ def test_wiring_price_is_anchor_and_door():
     assert r["outcome"] == T.FACT and r["facts"][0]["zone"] == "Раваи", r
     r = T._read("delivery", {"place": "Rawai"}, {})
     assert r["outcome"] == T.UNKNOWN and "двери delivery нет" in r["reason"], r
-    assert 'delivery {"place"' in T.TOOLS_BLOCK
+    assert "delivery {} — доставка;" in T.TOOLS_BLOCK          # строка инструмента прежняя (замки TOOLS_BLOCK)
+    assert not [n for n in vars(T) if n in ("ZONE_ALIASES", "SHORT", "POINT")], "выражения доставки — не в модуле судей"
+
+
+def test_place_from_history_newest_wins():
+    hist = [{"who": "клиент", "text": "Живём на Патонге"}, {"who": "мы", "text": "Отлично"},
+            {"who": "клиент", "text": "Ой, переехали в Rawai, сможете туда?"}, {"who": "клиент", "text": "спасибо"}]
+    r = T._read("delivery", {}, {"delivery": lambda **k: LIVE, "history": lambda: hist})
+    assert r["outcome"] == T.FACT and r["facts"][0]["zone"] == "Раваи", r            # новое место отменяет прежнее
+    r = T._read("delivery", {}, {"delivery": lambda **k: LIVE, "history": lambda: [{"who": "клиент", "text": "привет"}]})
+    assert r["outcome"] == T.UNKNOWN and "не названо" in r["reason"], r
 
 
 def main():

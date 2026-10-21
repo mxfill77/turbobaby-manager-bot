@@ -90,7 +90,7 @@ W_NO_MOD = "не засчитан — модуль цены через ход н
 PINS = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
         "wa_agent_model.py": "38ec261976b7e912e25a14129b68c1df05445e45",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9 · WAFIX2210: было b95d3a86 · DELIVERY2210: было 29fcf235
         "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
-        "wa_agent_tools.py": "2115dfd59818c24fef39bf61a870364357bcd20a",  # DELIVERY2210: было fb70716d
+        "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
         "wa_book_read.py": "ba866980d22c75c005e40510b1271453aac74a25",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно») · PROMPT2110: было 5a90fddc
         "wa_book_ctx.py": "4db150f276359b1cb07d5816041fc25db03912e0",  # RCFIX2010: было 3a507747 (free_bikes с парком снимка)
         "wa_agent_cstate.py": "86d46669854237a1d258e970227eccd8d7e775d7",

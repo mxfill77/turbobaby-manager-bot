@@ -178,7 +178,7 @@ B_HEAD = "• версия: в базе нет (карточки подписи 
 PINS = {
     "wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
     "wa_agent_model.py": "38ec261976b7e912e25a14129b68c1df05445e45",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9 · WAFIX2210: было b95d3a86 · DELIVERY2210: было 29fcf235
-    "wa_agent_tools.py": "2115dfd59818c24fef39bf61a870364357bcd20a",  # DELIVERY2210: было fb70716d
+    "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
     "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
     "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
     "bridge_client.py": "71d290387c95dc283a477f1c44ab4e4c9bedb665",
@@ -215,24 +215,24 @@ PINS = {
     "tests/test_never_silent.py": "a51f5e706dc642bfb145422881a8f08b830743d0",
     # CLOSETRUTH1910 (19.10): CLOSE_TRUTH ВКЛ — итог листа закрытия не пишется в K «оплачено» (paid_total=None)
     "tests/test_rental_case_integ_spl.py": "2175b7abc08b68ca604a99749c1bb2ce06f91da8",  # было 7791dad8 (APPROVEFIX1610)
-    "tests/test_rental_case_integ_wa.py": "aaa101e1ea9f709d07a4b52a6b4888cc327f07f6",  # DELIVERY2210: было 8f5db518
+    "tests/test_rental_case_integ_wa.py": "f0c857c19678a4a6df94d592bccb943680241a48",  # DELIVERY2210: было 8f5db518 · DELIVERY2210: было aaa101e1
     "tests/test_return_close.py": "8e59c9d1d484b173c693269fd35a7cf0cfb469f3",  # было 72d32649 (APPROVEFIX1610)
     "tests/test_wa_agent_attach.py": "c54b01f18ee14c7461f742ebf0a1408a6abad796",
     "tests/test_wa_agent_svc.py": "154b2d34bee7d61107d49956ebc1c633bef9a341",
     "tests/test_wa_attach_basis.py": "4921ac2f533b780046c9f18a62155df11fd7361c",
     "tests/test_wa_attach_casepdf.py": "af18c24cc9fdb002b2aac055930239113ccfb4ba",
-    "tests/test_wa_attach_casepdf_accept.py": "d24e059a807a52b6a766a38859022be972d9cfa1",  # RCFIX2010: было 6ec6e371 (перепин wa_agent_model.py) · PROMPT2110: было 65c1496d (перепин трёх файлов) · WAFIX2210: было 7178a4ba · DELIVERY2210: было 99e4d831
+    "tests/test_wa_attach_casepdf_accept.py": "660b6c624f03681be0ba2d6837a812cd4945fe80",  # RCFIX2010: было 6ec6e371 (перепин wa_agent_model.py) · PROMPT2110: было 65c1496d (перепин трёх файлов) · WAFIX2210: было 7178a4ba · DELIVERY2210: было 99e4d831 · DELIVERY2210: было d24e059a
     "tests/test_wa_attach_casepdf_fix.py": "ee04bebd3c8a5821f1f3be3d0a33efe8ee6bf632",
     "tests/test_wa_attach_casestate.py": "b4529669fed3c5faeaecbc8a0c6b1c06ac291222",
-    "tests/test_wa_attach_casestate_accept.py": "8c433d7fa52044edd1096cd9dd1d5487905a48bf",  # RCFIX2010: было 6a2fc495 (перепин wa_agent_model.py) · PROMPT2110: было 75ebdd2a (перепин трёх файлов) · WAFIX2210: было 95dc0dea · DELIVERY2210: было 1cb15e16
+    "tests/test_wa_attach_casestate_accept.py": "39588525cd71a240bd2ed45b421ec807caff5a6e",  # RCFIX2010: было 6a2fc495 (перепин wa_agent_model.py) · PROMPT2110: было 75ebdd2a (перепин трёх файлов) · WAFIX2210: было 95dc0dea · DELIVERY2210: было 1cb15e16 · DELIVERY2210: было 8c433d7f
     "tests/test_wa_attach_contract_ask.py": "f2241554c670821aac31ae6dde9f829c50ca24ae",
-    "tests/test_wa_attach_cstate.py": "d1369092efd177fe7b458667e3b24d444101581b",  # RCFIX2010: было 5015c4b0 (перепин wa_agent_model.py) · PROMPT2110: было f3880675 (перепин трёх файлов и AT_A1DCBE5) · WAFIX2210: было a874424d · DELIVERY2210: было 55017738
+    "tests/test_wa_attach_cstate.py": "7c1beb27eb93e45f1c263ea4eeadf7c50e65ce55",  # RCFIX2010: было 5015c4b0 (перепин wa_agent_model.py) · PROMPT2110: было f3880675 (перепин трёх файлов и AT_A1DCBE5) · WAFIX2210: было a874424d · DELIVERY2210: было 55017738 · DELIVERY2210: было d1369092
     "tests/test_wa_attach_expect.py": "4fdac0749eb21f3391596587a108746b3b936b3b",
     "tests/test_wa_attach_svc.py": "d69add04e17cb652663e668a768f5a230dbd02a1",
     "tests/test_wa_signed_card.py": "d92bf213f14e4394382a05d90b69a83452138e4c",
     "tests/test_wa_signed_card_accept.py": "7653b5373d8b75c7747b972e4816d958475a36de",
 }
-TOOLS_BLOCK_SHA = "c61983bf92afa1e8e9a079f1a0077240f0d726b71915277cfbafc82d6a78cb40"  # DELIVERY2210: было 175b2208
+TOOLS_BLOCK_SHA = "175b220824b649ce151ae7f463ac864166265b26e9ccd13d42032a93d850d3d1"  # DELIVERY2210: было 175b2208 · DELIVERY2210: было c61983bf
 ATTACH_IMPORTS = {"base64", "hashlib", "re", "zlib", "wa_agent", "wa_agent_tools"}
 PROD_ATTACH_KW = {"attach", "pdf_fetch", "contract_find", "signed", "signed_lookback_h", "signed_budget", "ask_of",
                   "autosend", "cstate", "claim_of"}
