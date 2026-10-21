@@ -10,7 +10,9 @@
   history  — переписка (очередь и архив WA);            rental   — аренда (снимок броней, номер WhatsApp);
   cash     — касса (`bridge_client.tx_find`);           contract — договор (`contract_find`);
   contract_pdf — метаданные подписанного PDF (`contract_pdf`; содержимое отбрасывается — отправка PDF это Т4б);
-  delivery — Delivery: двери нет, исход всегда «неизвестно»;  rules — правила (узел мозга business_rules).
+  delivery — зона и цена доставки (`delivery_zones_get` моста, DELIVERY2210): по названию района или по точке из
+             полной ссылки Google Maps; двери нет / не нашлось однозначно — «неизвестно»;
+  rules — правила (узел мозга business_rules).
 
 Ответ каждого инструмента: tool · outcome · source · ref · at (начало нашего запроса) · read_at (время данных; у
 снимков — время снимка) · source_version (+ source_version_basis) · version (мёртвое, пусто) · window · reason · facts.
@@ -455,6 +457,98 @@ def rules_result(node, at=None):
         "kind": "rules", "len": len(text), "rule_0310": "03.10.2026-1" in text}])
 
 
+# ── DELIVERY2210: доставка по зонам владельца (`delivery_zones_get` моста) ────────────────────────────────────────────
+# Живой формат зоны — ПОЗИЦИОННЫЙ список [name, lat, lon, price, radius_km] (CLAUDE.md ПК: dict-only резолвер ронял все
+# 16 зон). Место клиента → зона: точка из ПОЛНОЙ ссылки Google Maps / «lat, lon» — ближайший центр в пределах радиуса;
+# иначе название района — по списку написаний зоны (RU/EN; зона без списка — её имя). Две зоны сразу, короткая ссылка,
+# точка вне зон, пусто — «неизвестно» со словами, не факт. Факт несёт `price` — опора чисел черновика (`known_amounts`).
+ZONE_ALIASES = {
+    "Раваи": ("раваи", "равай", "rawai"), "Чалонг": ("чалонг", "chalong"),
+    "Пхукет-таун": ("пхукет-таун", "пхукет таун", "phuket town", "old town", "олд таун", "старый город"),
+    "Кейп Панва": ("панва", "panwa"), "Паклок": ("паклок", "pa khlok", "paklok", "pa klok"),
+    "Таланг восток": ("таланг восток", "thalang east"), "Таланг север": ("таланг север", "thalang north"),
+    "Майкхао": ("майкхао", "май кхао", "mai khao", "maikhao"), "Аэропорт": ("аэропорт", "airport"),
+    "Найтон": ("найтон", "nai thon", "naithon"), "Сурин": ("сурин", "surin"), "Камала": ("камала", "kamala"),
+    "Банг Тао": ("банг тао", "бангтао", "bang tao", "bangtao", "лагуна", "laguna"),
+    "Патонг": ("патонг", "patong"), "Карон": ("карон", "karon"), "Ката": ("ката", "kata"),
+}
+_DLV_SRC = "зоны доставки владельца (delivery_zones_get)"
+_DLV_SHORT = re.compile(r"(?i)maps\.app\.goo\.gl|goo\.gl/maps")
+_DLV_PT = (re.compile(r"@(-?\d{1,2}\.\d{3,}),(-?\d{1,3}\.\d{3,})"),
+           re.compile(r"(?i)[?&](?:q|ll|query|destination|center)=(-?\d{1,2}\.\d{3,})(?:,|%2C)\s*(-?\d{1,3}\.\d{3,})"),
+           re.compile(r"(?<![\d.])(\d{1,2}\.\d{3,}),\s*(\d{2,3}\.\d{3,})(?![\d.])"))
+
+
+def _dlv_zones(raw):
+    """Ответ двери → [(name, lat, lon, price, radius)] только из верных позиционных строк."""
+    zs = raw.get("zones") if isinstance(raw, dict) else None
+    out = []
+    for z in zs if isinstance(zs, list) else []:
+        if isinstance(z, (list, tuple)) and len(z) >= 5 and str(z[0] or "").strip():
+            try:
+                out.append((str(z[0]).strip(), float(z[1]), float(z[2]), float(z[3]), float(z[4])))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _dlv_km(a, b, c, d):
+    import math
+    r = 6371.0
+    p1, p2 = math.radians(a), math.radians(c)
+    dp, dl = math.radians(c - a), math.radians(d - b)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def _dlv_point(place):
+    for rx in _DLV_PT:
+        m = rx.search(place)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if 7.4 <= lat <= 8.4 and 98.1 <= lon <= 98.6:          # Пхукет; иное — не точка Пхукета
+                return lat, lon
+    return None
+
+
+def delivery_result(raw, at=None, args=None):
+    """Зоны + место клиента (`args["place"]`) → FACT {kind delivery, zone, price, how, km?} | UNKNOWN со словами."""
+    zones = _dlv_zones(raw)
+    if not zones:
+        return result("delivery", UNKNOWN, _DLV_SRC, at=at, reason="зоны доставки не прочитаны — неизвестно")
+    place = str((args or {}).get("place") or "").strip()
+    if not place:
+        return result("delivery", UNKNOWN, _DLV_SRC, at=at,
+                      reason="место клиента не названо — спроси район или ссылку Google Maps")
+    pt = _dlv_point(place)
+    if pt:
+        near = sorted((_dlv_km(pt[0], pt[1], z[1], z[2]), z) for z in zones)
+        km, z = near[0]
+        if km <= z[4]:
+            return result("delivery", FACT, _DLV_SRC, at=at, facts=[{
+                "kind": "delivery", "zone": z[0], "price": int(round(z[3])), "how": "точка", "km": round(km, 1)}])
+        return result("delivery", UNKNOWN, _DLV_SRC, at=at,
+                      reason="точка вне зон доставки (ближайшая «%s», %.1f км) — цену назовёт человек" % (z[0], km))
+    if _DLV_SHORT.search(place):
+        return result("delivery", UNKNOWN, _DLV_SRC, at=at,
+                      reason="короткая ссылка Google Maps — точку не вижу; спроси район или полную ссылку")
+    low = place.lower().replace("ё", "е")
+    hits = []
+    for z in zones:
+        names = ZONE_ALIASES.get(z[0]) or (z[0].lower(),)
+        if any(re.search(r"(?<![a-zа-я])%s(?![a-zа-я])" % re.escape(a), low) for a in names):
+            hits.append(z)
+    if len(hits) == 1:
+        z = hits[0]
+        return result("delivery", FACT, _DLV_SRC, at=at, facts=[{
+            "kind": "delivery", "zone": z[0], "price": int(round(z[3])), "how": "район"}])
+    if len(hits) > 1:
+        return result("delivery", UNKNOWN, _DLV_SRC, at=at,
+                      reason="место подходит к нескольким зонам (%s) — уточни район" % ", ".join(z[0] for z in hits))
+    return result("delivery", UNKNOWN, _DLV_SRC, at=at,
+                  reason="район не найден среди зон доставки — спроси ссылку Google Maps или скажи, что уточним")
+
+
 # ------------------------------- вызов двери -------------------------------
 
 _PHONE = re.compile(r"\+?\d[\d\s()-]{7,}\d")
@@ -579,7 +673,7 @@ def _read(tool, args, doors, clock=time.time, ctx=None):
     case_on = CASE_TOOL in (doors or {})          # флаг WA_AGENT_CASE (К4): дверь дела есть только при нём
     if tool not in TOOLS and not (case_on and tool == CASE_TOOL):
         return result(tool, REFUSED, at=at, reason="неизвестный инструмент")
-    if tool == "delivery" or door is None:
+    if door is None:
         return result(tool, UNKNOWN, at=at, reason="двери %s нет — неизвестно" % tool)
     ctx = ctx or {}
     call_args, words, sent = args or {}, "", {}
@@ -623,6 +717,8 @@ def _read(tool, args, doors, clock=time.time, ctx=None):
         return case_result(raw, at)
     if case_on and tool == "rental":              # К4: аренду выбрал resolve дела, а не фильтр активных строк
         return rental_case_result(raw, at)
+    if tool == "delivery":                        # DELIVERY2210: зоны владельца → зона и цена по месту клиента
+        return delivery_result(raw, at, call_args)
     parse = {"cash": cash_result, "rental": rental_result, "history": history_result, "rules": rules_result}[tool]
     return parse(raw, at)
 
@@ -659,6 +755,8 @@ def fact_key(f):
         return ("rental", "", str(f.get("bike") or ""), str(f.get("date_start") or ""), str(f.get("date_end") or ""))
     if k == "pdf":
         return ("pdf", str(f.get("id") or ""))
+    if k == "delivery":                           # DELIVERY2210: одна зона — один факт
+        return ("delivery", str(f.get("zone") or ""))
     if str(k or "").startswith(CASE_TOOL):        # К4: ("case", case_id, case_ver, вид, id) — CONTRACT_K4 §8.3
         return ("case", str(f.get("case_id") or ""), str(f.get("case_ver") or ""), str(k), case_item_id(f))
     return (str(k),)
@@ -2861,7 +2959,8 @@ class Journal:
 
 def _fact_ref(f):
     keep = ("kind", "row", "msg_id", "link", "at", "booking_id", "role", "amount", "currency", "signed_at",
-            "pdf_id", "id", "size", "sha256", "items", "rule_0310", "case_id", "case_ver")   # case_* — только К4
+            "pdf_id", "id", "size", "sha256", "items", "rule_0310", "case_id", "case_ver",   # case_* — только К4
+            "zone", "price", "how", "km")                                                     # DELIVERY2210
     return {k: f[k] for k in keep if k in f and f[k] is not None}
 
 
@@ -2871,7 +2970,7 @@ TOOLS_BLOCK = """ИНСТРУМЕНТЫ (только чтение). Прежд�
 Один ответ = РОВНО один JSON. Вызов инструмента: {"tool": "<имя>", "args": {…}}. Имена и вход:
 history {} — переписка; rental {} — аренда по номеру клиента; cash {"bike": "...", "booking_id": "...", "date_from": "ГГГГ-ММ-ДД", "date_to": "ГГГГ-ММ-ДД"} — касса;
 contract {} — подписанный договор ЭТОГО обращения: номер клиента и срок аренды код подставит сам, фильтры не нужны (чужой номер, байк или период — отказ с причиной); contract_pdf {"file_id": "<pdf_id из факта contract>"} — метаданные PDF;
-delivery {} — доставка; rules {} — правила владельца.
+delivery {"place": "<район, отель или ссылка Google Maps клиента>"} — зона и цена доставки по зонам владельца; rules {} — правила владельца.
 Не больше %d вызовов. Когда хватит — итоговый черновик обычным JSON ответа (text, handoff, lang, why).
 Суммы, разности и сдачу не считай сам — их посчитает код (блок «РАСЧЁТ КОДА»). Оплату не подтверждай без кассы и договора."""
 

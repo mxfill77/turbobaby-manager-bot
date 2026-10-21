@@ -1853,7 +1853,8 @@ class ModelAdapter(wa_agent.Model):
             return self.knowledge.snap.get("business_rules")
 
         doors = {"history": history, "rental": rental, "rules": rules}
-        doors.update({k: v for k, v in (self.tools or {}).items() if k in ("cash", "contract", "contract_pdf")})
+        doors.update({k: v for k, v in (self.tools or {}).items()
+                      if k in ("cash", "contract", "contract_pdf", "delivery")})       # delivery — DELIVERY2210
         if self.case is not None:
             # К4 (WA_AGENT_CASE, DESIGN_K4 §11 шаг 3): аренда — `resolve(client)` дела с контактом от кода вместо
             # фильтра активных строк выше; дело — инструмент `case` (только чтение). Выкл — словарь прежний

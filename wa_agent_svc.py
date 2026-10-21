@@ -879,8 +879,10 @@ def make_model(env, line=None, bridge=None, call=None, lessons=False, book=False
         book=wa_book_read.Snapshot(lambda: bridge.clients(filter="all"), bridge.fleet) if book else None,
         cache=cache,
         # WA_AGENT_TOOLS (AGENTLOOPA0310): двери чтения кассы и договоров; выкл — None, черновик как в 9c4aac6
-        tools={"cash": bridge.tx_find, "contract": bridge.contract_find,
-               "contract_pdf": bridge.contract_pdf} if tools else None)
+        tools=dict({"cash": bridge.tx_find, "contract": bridge.contract_find, "contract_pdf": bridge.contract_pdf},
+                   # DELIVERY2210: зоны доставки (только чтение); мост без двери — инструмент прежний «неизвестно»
+                   **({"delivery": (lambda _b=bridge, **_k: _b.delivery_zones_get())}
+                      if callable(getattr(bridge, "delivery_zones_get", None)) else {})) if tools else None)
     if cstate_fail:
         model.cstate_fail = cstate_fail             # CSTATE1510: блок не собран — назовёт строка старта
     return model, ""
