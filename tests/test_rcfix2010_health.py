@@ -71,6 +71,26 @@ Splinter.
       ожидания по счёту и по п.2 (сброс остановкой называется остановкой; цена вставленной строки остановки записана);
       b13 — слова посылки: строка загрузки без входа или запись позже окна — первой причиной пояс/часы (cost W6/W7);
       a13 — _read_log линеен: одна строка 16 МБ без \\n и журнал только с \\r — порядок r3;
+      r6 (verify7: attack M1, regress, cost): b14 — СЧЁТ ПО ОКНУ [старт − 2 с, …) мимо сброса по месту: записей
+      загрузки или входа больше одной → НЕИЗВЕСТНО (repro verify7 А «граница окна» и Б «часы» на build_report()/main(),
+      варианты, где ловит только счёт входов / только окно Δ, граница Δ); вставка ОДИНОЧНОЙ лишней записи загрузки /
+      входа / polling через логгеры до 200 знаков (bot.py:1134, splinter.py:2452) и без обрезки (splinter.py:12197) —
+      не OK (ловит счёт, а не длина; это защита только от одиночной лишней записи — r7, b18), пределы записаны; b15 —
+      ЦЕНА (5) счёта числами: сетка g × f двойного рестарта, сетка
+      RestartSec × падение, шаги часов, «до следующего рестарта»; b16 — запись только точного формата bot.py:73
+      (уровень — пять имён logging, имя — точечный идентификатор): живые формы 69k/70a и все фикстуры — записи, иные
+      раскладки — метка неизвестной формы; b9/b10/b11/a13 — пары, добивающие выжившие мутанты regress r5 (v10/v11 сброс
+      при любой метке, v15 слова остановки, v16 граница первой секунды, v24–v26 размеры чтения); a12 — допуск пика
+      памяти 1,2× readlines;
+      r7 (verify8: regress MAJOR K3/K4, attack MAJOR-1): b17 — строку с меткой неизвестной формы до начала сегмента
+      (pend) снимает ТОЛЬКО запись истории — метка < старт − 2 с и по месту до первой записи с меткой ≥ старта:
+      K3 (вставленная сообщением запись остановки с меткой старт − 1 с — журнал repro verify8 и та же вставка внутри
+      своего сообщения после начала сегмента) и K4 (шаг часов −30 с после начала сегмента) на build_report()/main()
+      → ❌ code 1, один пуш (r6 — «✅ ВСЁ ОК»); пары без вставки и шага — НЕИЗВЕСТНО теми же словами, что у r6; остаток
+      (запись < старт − 2 с до первой записи сегмента) записан; b18 — ПРЕДЕЛ (2в) записан как известный, а не закрыт:
+      пара «вход + polling», вставленная вторым живым писателем при текущем «после 94» / «после строк загрузки», —
+      ✅ (ложное зелёное: 12 из 294 сетки i1 verify8, всего ✅ 42 = (2в) 12 + (1) 24 + (2б) 6); A1 verify8 на
+      build_report()/main() — «✅ ВСЁ ОК», code 0, пушей 0; пары — ❌;
   C — доставка: notify True → «отправлен (Telegram ok)»; False / None / исключение → «доставка не подтверждена (НЕ
       отправлен … неизвестно) … повтора нет»; вызов ровно один; код возврата прежний; настоящего notify нет;
   D — замки: копии health ↔ splinter (_ENTRY_HEAD, имена RELEASE_ENTRY_STATES, RELEASE_FLAG_KEYS); формат и строки
@@ -80,8 +100,10 @@ Splinter.
       шкале; пара: сервер и журнал бота оба в +07 — пояс журнала не UTC → НЕИЗВЕСТНО;
   Z — мутанты (RCFIX2010_MUTANTS=1, как в test_rcfix2010_tuple.py): каждый роняет хотя бы одну проверку своего места,
       нулевой зелёный; у каждого правила r4/r5 — свой мутант (п.1 r4 ×3, п.2 r4 ×4, правило метки r3 и метка только у
-      записи, счёт строк загрузки ×3, порядок внутри процесса ×2, слова ×2, чтение ×3); число — в печати
-      test_zz_mutants.
+      записи, счёт строк загрузки ×3, порядок внутри процесса ×2, слова ×2, чтение ×3); r6 — счёт по окну ×7 (окно
+      снято, Δ = 0 / 1 / 3 с, счёт входов снят / сброшен строкой загрузки / со старта), запись точного формата ×3,
+      выжившие regress r5 ×6 (v10/v11, v15, v16, v24, v25, v26); r7 — pend снимает только запись истории ×2 (снимает
+      и после начала сегмента / и записью в окне Δ); число — в печати test_zz_mutants.
 Сети, systemctl, Telegram, мозга и боевых файлов нет: notify — заглушка в sys.modules (плюс NOTIFY_COUNT_FILE во
 временном каталоге — проверяется, что он так и не появился), dotenv и bridge_client — заглушки (настоящий файл окружения
 не читается), файл эпизода кредита health — во временном каталоге. h3: пути модуля health (LOG, .wa_watchdog_fails,
@@ -1306,6 +1328,8 @@ NEVER = re.compile(r"(?!)")
 # B10_GRID то же для штатной остановки (+life ≤ +60 с) — без правил r4 каждое сочетание зелёное.
 Q1_GRID = tuple((k / 4.0, d, life) for k in (1, 4, 8, 22, 56) for d in (-60, -1, 0, 1) for life in (30, 60, 119))
 B10_GRID = tuple((k / 4.0, d, life) for k in (1, 4, 8, 22, 56) for d in (-60, -1, 0, 1) for life in (30, 50, 60))
+# r6: d = 4 — строка загрузки (старт − 3,088 с) и вход (старт − 2,997 с) прошлого вне окна счёта [старт − 2 с, …)
+B9_GRID = Q1_GRID + tuple((hp, 4, life) for hp, d, life in Q1_GRID if d == 1)
 
 
 def test_b9_boot_line_starts_new_process():
@@ -1321,10 +1345,17 @@ def test_b9_boot_line_starts_new_process():
     поэтому его строка загрузки стоит по своей метке на старт − d + 0,912 с. При d ≤ 0 она в окне текущего запуска
     вместе со строкой загрузки текущего — две строки, НЕИЗВЕСТНО «писали несколько процессов» (было «нет строки»; оба —
     ❌ code 1). При d = 1 она на 0,088 с раньше старта — счёт 1, исход r4. Цена (предел (5) _run_verdict): НОРМАЛЬНЫЙ
-    текущий запуск после такого прошлого при d ≤ 0 — тоже НЕИЗВЕСТНО (r3 — «граница неоднозначна», r4 — ✅)."""
+    текущий запуск после такого прошлого при d ≤ 0 — тоже НЕИЗВЕСТНО (r3 — «граница неоднозначна», r4 — ✅).
+
+    r6 (verify7 M1) — окно счёта на 2 с раньше старта: строка загрузки прошлого (старт − d + 0,912 с) в окне при d ≤ 2,
+    то есть и при d = 1 (было: счёт 1, исход r4) — НЕИЗВЕСТНО по счёту; исход r4/r5 «строки загрузки прошлого в окне нет»
+    теперь у d = 4 (строка загрузки на старт − 3,088 с, вход — на старт − 2,997 с, обе вне окна): ПРОСТОЙ / OK / «нет
+    строки». Пара «сброс при ЛЮБОЙ метке» (мутанты regress r5 v10/v11): строка загрузки текущего с меткой раньше
+    старт − 2 с ниже по месту входа и polling чужого процесса в сегменте — без посылки NO_POLL, а не OK."""
     hung = boot(T_B, words_of())
     who = "PID %d, старт %s UTC, рестартов 0" % (PID_B, dt(T_B).strftime("%Y-%m-%d %H:%M:%S"))
-    two = "в окне текущего запуска 2 строк загрузки — писали несколько процессов (второй писатель / смена пояса)"
+    two = ("в окне текущего запуска 2 строк загрузки — писали несколько процессов (второй писатель / смена пояса / "
+           "двойной рестарт / шаг часов)")
     # точный пример verify5 Q1 (прошлый +01 прожил 60 с и штатно остановлен) на build_report()/main()
     lines = history() + shift_ts(short_prev(3600, 60), 1) + hung
     r = build(lines, B())
@@ -1333,11 +1364,11 @@ def test_b9_boot_line_starts_new_process():
     assert rc == 1 and len(calls) == 1 and two in calls[0]["text"], (rc, calls)
     with mock.patch.object(H, "_BOOT_RE", NEVER), mock.patch.object(H, "_SHUT_RE", NEVER):
         assert build(lines, B()).summary == "✅ ВСЁ ОК"                # контрфакт r3: без границ процесса — зелёное
-    # убитый прошлый (строки остановки нет): атаку закрывает строка загрузки текущего (сброс по месту, при d ≤ 0 — и счёт)
+    # убитый прошлый (строки остановки нет): атаку закрывает строка загрузки текущего (сброс по месту, при d ≤ 1 — и счёт)
     without, by = 0, {"UNKNOWN": 0, "NO_POLL": 0}
-    for hp, d, life in Q1_GRID:
+    for hp, d, life in B9_GRID:
         prev = shift_ts(short_prev(int(hp * 3600) + d, life, clean=False), hp)
-        in_window = d <= 0                                            # строка загрузки прошлого: старт − d + 0,912 с
+        in_window = d <= 2                     # r6: строка загрузки прошлого — старт − d + 0,912 с ≥ старт − 2 с ⇔ d ≤ 2,9
         for name, cur in (("завис после строк загрузки", hung), ("завис после bot.py:94", L(T_B + 0.912, INFO,
                                                                                                BOOT_LINE))):
             st, why = verdict(history() + prev + cur)
@@ -1346,32 +1377,48 @@ def test_b9_boot_line_starts_new_process():
             else:
                 assert st == "NO_POLL" and "нет строки «вход выпуска» и polling" in why, (hp, d, life, name, st, why)
             by[st] += 1
-            with mock.patch.object(H, "_BOOT_RE", NEVER):
-                without += verdict(history() + prev + cur)[0] == "OK"
-        # пары: текущий простой — ПРОСТОЙ (d = 1) / НЕИЗВЕСТНО по счёту (d ≤ 0); текущий норма — OK (d = 1) / НЕИЗВЕСТНО
-        # по счёту (d ≤ 0, цена (5); r3: «граница неоднозначна: строк «вход выпуска» 2», F5 «смена пояса +1 → UTC»)
+            if d <= 1:                                                # сетка Q1 verify5: без правила — зелёное
+                with mock.patch.object(H, "_BOOT_RE", NEVER):
+                    without += verdict(history() + prev + cur)[0] == "OK"
+        # пары: текущий простой — ПРОСТОЙ (d = 4) / НЕИЗВЕСТНО по счёту (d ≤ 1); текущий норма — OK (d = 4) / НЕИЗВЕСТНО
+        # по счёту (d ≤ 1, цена (5); r3: «граница неоднозначна: строк «вход выпуска» 2», F5 «смена пояса +1 → UTC»)
         st, why = verdict(history() + prev + run_park(T_B, words_of(**{STRICT: "0"})))
         assert (st, two in why) == (("UNKNOWN", True) if in_window else ("PARKED", False)), (hp, d, life, st, why)
         st, why = verdict(history() + prev + run_ok(T_B))
         assert (st, two in why) == (("UNKNOWN", True) if in_window else ("OK", False)), (hp, d, life, st, why)
-        with mock.patch.object(H, "_BOOT_RE", NEVER):
-            st, why = verdict(history() + prev + run_ok(T_B))
-            assert st == "UNKNOWN" and "граница неоднозначна" in why, (hp, d, life, st, why)
+        if in_window:                       # без строк загрузки: вход прошлого (старт − d + 1,003 с) и вход текущего
+            with mock.patch.object(H, "_BOOT_RE", NEVER):
+                st, why = verdict(history() + prev + run_ok(T_B))
+                assert st == "UNKNOWN" and "граница неоднозначна: строк «вход выпуска» в окне" in why, (hp, d, life, st,
+                                                                                                         why)
     assert without == 2 * len(Q1_GRID), (without, len(Q1_GRID))       # без правила — каждое сочетание зелёное
-    assert by == {"UNKNOWN": 2 * 45, "NO_POLL": 2 * 15}, by          # d ∈ {−60, −1, 0} — 45 сочетаний, d = 1 — 15
+    assert by == {"UNKNOWN": 2 * 60, "NO_POLL": 2 * 15}, by          # d ∈ {−60, −1, 0, 1} — 60 сочетаний, d = 4 — 15
     # строка загрузки по МЕСТУ, а не по метке: текущий целиком на 2 с раньше старта (шаг часов) — не зелёное
     prev = shift_ts(short_prev(3600, 60, clean=False), 1)
     st, why = verdict(history() + prev + boot(T_B - 2, words_of()))
     assert st != "OK", (st, why)
+    # r6 · regress r5 v10/v11 (сброс только в сегменте / только при метке ≥ старта): чужой процесс с медленным main —
+    # строка загрузки на старт − 3,0 с (вне окна), вход OK и polling в сегменте; ниже по месту строка загрузки текущего с
+    # меткой старт − 5 с (часы шагнули назад) — по месту это НОВЫЙ процесс при любой метке: без посылки — «нет строки», а
+    # не OK по чужим входу и polling; с посылкой — НЕИЗВЕСТНО (строка загрузки текущего вне окна посылки)
+    ok_line = S().release_entry(words_of(), frozenset())[1]
+    alien = L(T_B - 3.0, INFO, BOOT_LINE) + L(T_B + 0.003, INFO, "  " + ok_line) + L(T_B + 0.247, INFO, POLL)
+    lines = history() + alien + L(T_B - 5.0, INFO, BOOT_LINE)
+    with mock.patch.object(H, "_premise_gap", lambda *a, **k: None):
+        st, why = verdict(lines)
+        assert st == "NO_POLL" and "нет строки «вход выпуска» и polling текущего запуска" in why, (st, why)
+    st, why = verdict(lines)
+    assert st == "UNKNOWN" and "посылка «журнал в UTC» для текущего запуска не подтверждена" in why, (st, why)
     # норма, затем строка загрузки с меткой за 30 с до старта ниже по месту — не зелёное. r5 (verify6 a3): строка загрузки
     # с меткой раньше старта НИЖЕ записей текущего запуска — сразу НЕИЗВЕСТНО (её закрыли бы и сброс по месту, и посылка),
     # поэтому мутанты verify6 m01/m14 («сброс только в сегменте / только при метке ≥ старта») эта пара не различает
     st, why = verdict(history() + run_ok(T_B) + L(T_B - 30, INFO, BOOT_LINE))
     assert st == "UNKNOWN" and ("строка загрузки bot.py:94 с меткой 2026-10-21 05:59:30 раньше старта юнита стоит ниже "
                                 "строки загрузки текущего запуска") in why, (st, why)
-    print("    · строка загрузки начинает процесс: точный Q1 → ❌ code 1, один пуш (r5 — по счёту строк загрузки); убитый "
-          "прошлый %d×2 → %r (без правила — %d зелёных); норма после него — ✅ при d = 1, НЕИЗВЕСТНО при d ≤ 0 (цена"
-          " (5))" % (len(Q1_GRID), by, without))
+    print("    · строка загрузки начинает процесс: точный Q1 → ❌ code 1, один пуш (r5/r6 — по счёту); убитый прошлый "
+          "%d×2 → %r (без правила — %d зелёных из %d); норма после него — ✅ при d = 4, НЕИЗВЕСТНО при d ≤ 1 (цена (5), "
+          "r6 — окно на 2 с раньше старта); сброс при любой метке (v10/v11) — NO_POLL"
+          % (len(B9_GRID), by, without, 2 * len(Q1_GRID)))
 
 
 def test_b10_scheduler_stop_ends_process():
@@ -1435,6 +1482,14 @@ def test_b10_scheduler_stop_ends_process():
     # граница правила: остановка без polling выше — ничего; не строгая запись (чужой логгер, цитата, продолжение) — не
     # остановка; собственная остановка текущего ниже его polling — процесс завершается: не зелёное
     assert verdict(history() + stop_line(T_B + 0.5) + run_ok(T_B))[0] == "OK"
+    # r6 · regress r5 v15: остановка ВЫШЕ строки загрузки — прежнего процесса, и её слова сбрасываются вместе с его входом
+    # и polling: чужой процесс (строка загрузки и вход вне окна, polling и остановка в сегменте), ниже — строка загрузки
+    # текущего, текущий завис — слова «нет строки», а не «после polling стоит строка остановки»
+    ok_line = S().release_entry(words_of(), frozenset())[1]
+    lines = (history() + L(T_B - 2.5, INFO, BOOT_LINE) + L(T_B - 2.4, INFO, "  " + ok_line) + L(T_B + 0.1, INFO, POLL)
+             + stop_line(T_B + 0.5) + L(T_B + 0.912, INFO, BOOT_LINE))
+    st, why = verdict(lines)
+    assert (st, why) == ("NO_POLL", "нет строки «вход выпуска» и polling текущего запуска (%s)" % who), (st, why)
     for extra in (L(T_B + 600, INFO, "Splinter [ops] " + SHUT, name="splinter"),
                   L(T_B + 600, INFO, SHUT, name="devbot"), L(T_B + 600, INFO, "[-100] Ф (HQ) → мозг: лог:\n" + SHUT),
                   [SHUT + "\n"], L(T_B + 600, WARNING, SHUT, name="apscheduler.scheduler"),
@@ -1524,6 +1579,12 @@ def test_b11_stamp_prefix_rule_r3_restored():
                    + run_ok(T_B))[0] == "OK"
     for text in ("бронь:\n2026-10-21 09:00 выдача", "бронь:\n21.10.2026 09:00:00 выдача"):
         assert verdict(norm + _msg(T_B + 3600, text))[0] == "OK", text
+    # r6 · regress r5 v16 (граница «в текущем запуске» — включительно): та же строка с ПРОШЛОЙ датой сразу после строки
+    # загрузки, в первую секунду запуска (действующая метка = старт) — уже текущий запуск: НЕИЗВЕСТНО, а не OK
+    cur = run_ok(T_B)
+    first = cur[:1] + _msg(T_B + 0.95, "бронь:\n2026-10-20 09:00:00 выдача") + cur[1:]
+    st, why = verdict(history() + utc + first)
+    assert st == "UNKNOWN" and "неизвестной формы «2026-10-20 09:00:00 выдача» в текущем запуске" in why, (st, why)
     # перед сегментом с датой ≥ старта и без записи истории после неё (F5 «прошлый убит сразу после сообщения») — r3
     lines = (history() + _until(prev_run(T_B - 3600, T_B + 10), T_B - 60)
              + _msg(T_B - 30, "бронь:\n2026-10-25 09:00:00 выдача") + run_ok(T_B))
@@ -1577,11 +1638,19 @@ def test_b12_boot_count_second_writer():
     писатель / смена пояса)». Пределы (1) — записаны проверкой: строка загрузки в окне ОДНА и чужая — текущий своей не
     написал (завис до bot.py:94), а вход и polling — второго писателя или одного/нескольких убитых прошлых восточнее (из
     которых строка загрузки в окне только у одного). Строгость шаблона (verify6 m06): текст bot.py:94 в сообщении — не
-    строка загрузки. Подделка: запись загрузки — 110 знаков, а строка-продолжение bot.py:572 (text[:100]) — не длиннее 99.
-    Нормальные запуски — без новых тревог: цикл рестартов (NRestarts > 0, промежуток ≥ 10 с), прошлый в UTC, прошлый
-    стартовал в ту же секунду (x5), шаг часов назад ≤ 120 с, 70a (test_b10)."""
+    строка загрузки. Нормальные запуски — без новых тревог: цикл рестартов (NRestarts > 0, промежуток ≥ 10 с), прошлый в
+    UTC, шаг часов назад ≤ 120 с, 70a (test_b10).
+
+    r6 (verify7 regress замечание 3, cost MAJOR) — два утверждения r5 сняты как неверные. (а) «Подделать запись загрузки
+    сообщением нельзя (110 > 99)» — верно только для bot.py:572 (text[:100]); через bot.py:1134 и splinter.py:2452 (до 200
+    знаков) и splinter.py:12197 (без обрезки) запись загрузки вставляется; ЛИШНЮЮ запись (у текущего своя есть) ловит
+    счёт по окну (→ НЕИЗВЕСТНО), а не длина: test_b14; недостающую — нет (пределы (1), (2в), r7: test_b18). Здесь
+    осталась только граница одного логгера bot.py:572. (б) «прошлый стартовал
+    за 1 с (x5) — норма без новых тревог» — верно только в точке, где старт текущего ровно на границе секунды и окно
+    счёта начиналось со старта; в r6 эта форма — цена (5) (двойной рестарт), записана числами в test_b15."""
     who = "PID %d, старт %s UTC, рестартов 0" % (PID_B, dt(T_B).strftime("%Y-%m-%d %H:%M:%S"))
-    two = "в окне текущего запуска 2 строк загрузки — писали несколько процессов (второй писатель / смена пояса)"
+    two = ("в окне текущего запуска 2 строк загрузки — писали несколько процессов (второй писатель / смена пояса / "
+           "двойной рестарт / шаг часов)")
     park = run_park(T_B, words_of(**{STRICT: "0"}))
     second = run_ok(T_B + 30)
     # А: MainPID в простое, через 30 с второй экземпляр (вход OK, polling) убит — build_report()/main(): ❌ code 1, пуш
@@ -1645,7 +1714,9 @@ def test_b12_boot_count_second_writer():
     for text in (BOOT_LINE.strip(), BOOT_LINE, "лог:\n" + BOOT_LINE, "смотри: " + BOOT_LINE.strip()):
         st, why = verdict(norm + _msg(T_B + 3600, text))
         assert st == "OK", (text, st, why)
-    # подделка: полную запись загрузки сообщением bot.py:572 не вставить — 23 + 19 + 68 = 110 > 99
+    # граница ОДНОГО логгера: через bot.py:572 (text[:100]) полную запись загрузки не вставить — 23 + 19 + 68 = 110 > 99.
+    # Это не защита: через логгеры до 200 знаков и без обрезки она вставляется; лишнюю ловит счёт по окну (test_b14),
+    # недостающие записи вставка восполняет — пределы (1) / (2в) (r7, test_b18)
     src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
     assert src.count('→ мозг: {text[:100]}")') == 1, "bot.py:572 больше не режет текст до 100 знаков"
     rec94 = L(T_B + 3570, INFO, BOOT_LINE)[0].rstrip("\n")
@@ -1664,7 +1735,6 @@ def test_b12_boot_count_second_writer():
     loop += run_ok(s)
     normal = {"цикл рестартов, NRestarts 3": (loop, B(nrestarts=3)),
               "прошлый в UTC прожил сутки": (history() + prev_run(T_B - 86400, T_B) + run_ok(T_B), B()),
-              "прошлый стартовал за 1 с (x5)": (history() + run_ok(T_B - 1.0, post=False) + run_ok(T_B), B()),
               "шаг часов назад 119 с в текущем": (history() + run_ok(T_B) + L(T_B + 600, INFO, "тик", name="splinter")
                                                   + L(T_B + 481, INFO, "тик-2", name="splinter"), B()),
               # фазз B build7 (образец ложной тревоги первой редакции правила a3): прошлый в +02 прожил 60 с и убит — его
@@ -1675,16 +1745,18 @@ def test_b12_boot_count_second_writer():
     for name, (ls, runs) in normal.items():
         r = build(ls, runs)
         assert r.code == 0 and r.row("Polling").startswith("✅ Polling"), (name, r.summary)
-    # ПРЕДЕЛ (2б), записан (как r3/r4; фазз B build7 — 1 из 40000): текущий встал между входом и polling, а сообщение
-    # bot.py:572 вставило полную строку polling (84 знака ≤ text[:100]) со штампом в окне и после строки загрузки — OK
+    # ПРЕДЕЛ (2б), записан: текущий встал между входом и polling, а сообщение bot.py:572 вставило полную строку polling
+    # (84 знака ≤ text[:100]) со штампом в окне и после строки загрузки — OK. Класс общий с r3; на отдельном журнале исходы
+    # могут разойтись: сброс по строке загрузки снимает случайную тревогу r3 (фазз B build7 seed 20261032: прошлый +02 убит,
+    # его polling в окне, вставлена строка polling — r3 «polling раньше строки вход», r4/r5 — OK; verify7 regress зам. 2)
     poll_rec = L(T_B + 2, INFO, POLL)[0].rstrip("\n")
     assert len(poll_rec) == 84, len(poll_rec)
     ls = history() + run_ok(T_B, poll_at=None, post=False) + _msg(T_B + 60, "лог:\n" + poll_rec)
     assert verdict(ls)[0] == "OK"                                        # предел (2б): ложное зелёное, не тревога
     assert verdict(history() + run_ok(T_B, poll_at=None, post=False))[0] == "NO_POLL"
     print("    · счёт строк загрузки: второй писатель А/Б → ❌ code 1, один пуш; сетка a2 %r (предел (1): %r); P1 два/три "
-          "убитых → НЕИЗВЕСТНО; текст bot.py:94 в сообщении — норма; запись загрузки 110 > 99; нормальные запуски %d — ✅"
-          % (seen, limit, len(normal)))
+          "убитых → НЕИЗВЕСТНО; текст bot.py:94 в сообщении — норма; через bot.py:572 запись загрузки не вставить (110 > "
+          "99); нормальные запуски %d — ✅" % (seen, limit, len(normal)))
 
 
 def test_b13_premise_words_first_cause():
@@ -1711,6 +1783,567 @@ def test_b13_premise_words_first_cause():
     assert st == "UNKNOWN" and (head + "пояс журнала не UTC или шаг часов (запись позже окна: процесс, вышедший до "
                                 "старта, по UTC так поздно не пишет)") in why and "+3601 с" in why, (st, why)
     print("    · слова посылки: W6/W7 — первой пояс/часы; W1/W3 — первой «не дошёл»; запись позже окна — пояс/часы")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# r6 · verify7 (attack M1, regress зам. 3/4/5, cost MAJOR): счёт по окну мимо сброса, вставки через длинные логгеры, цена
+# счёта числами, запись — только точный формат bot.py:73.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _t_of(ln):
+    """Момент записи по её метке (UTC, с мс) или None у продолжения."""
+    m = _STAMP_RE.match(ln)
+    if not m:
+        return None
+    return (_dt.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC).timestamp()
+            + int(ln[20:23]) / 1000.0)
+
+
+def by_time(*procs):
+    """Строки нескольких процессов, дописанные в один файл (O_APPEND): место = порядок времени записи, продолжения — за
+    родителем (форма — verify7 repro_v7_boot_edge_second_writer.by_time)."""
+    ev = []
+    for k, lines in enumerate(procs):
+        last = None
+        for i, ln in enumerate(lines):
+            t = _t_of(ln)
+            last = t if t is not None else last
+            ev.append((last, k, i, ln))
+    ev.sort(key=lambda e: (e[0], e[1], e[2]))
+    return [e[3] for e in ev]
+
+
+def second_slow(x0, de, dp):
+    """Второй экземпляр бота (verify7 repro): строка загрузки x0 + 0,912, вход OK через de, polling через dp после входа,
+    «Scheduler started», убит."""
+    te = x0 + 0.912 + de
+    return (L(x0 + 0.912, INFO, BOOT_LINE) + L(te, INFO, "  " + S().release_entry(words_of(), frozenset())[1])
+            + L(te + dp, INFO, POLL) + L(te + dp + 0.5, INFO, "Scheduler started", name="apscheduler.scheduler"))
+
+
+def _starts_in_window(lines, s0, back=2):
+    """Независимо от health: записей начала процесса (запись загрузки bot.py:94 / «🚦 вход выпуска» логгера turbobaby) с
+    меткой-секундой ≥ s0 − back."""
+    n = 0
+    for ln in lines:
+        t = _t_of(ln)
+        body = ln.rstrip("\n")
+        if t is not None and int(t) >= s0 - back and (body.endswith(" [INFO] turbobaby: " + BOOT_LINE)
+                                                      or "] turbobaby:   🚦 вход выпуска: " in body):
+            n += 1
+    return n
+
+
+def test_b14_window_count_m1_and_insertions():
+    """r6 · verify7 attack M1 (MAJOR): сброс по месту (п.1 r4) ослабил проверку r3 «несколько входов в текущем запуске» —
+    r5 считал только строки загрузки с меткой ≥ старта, и строка загрузки, ушедшая на долю секунды раньше старта, сбросом
+    отдавала текущему запуску чужие вход / polling. r6: СЧЁТ ПО ОКНУ [старт − 2 с, …) мимо сброса — записей загрузки
+    больше одной → НЕИЗВЕСТНО «писали несколько процессов», записей входа больше одной → НЕИЗВЕСТНО «граница
+    неоднозначна» (правило r3). Точные примеры repro_v7_boot_edge_second_writer А («граница окна») и Б («часы») на
+    build_report()/main() → ❌ code 1, один пуш (r5 — «✅ ВСЁ ОК» / «⚠️ РАБОТАЕТ», code 0, пушей 0); А′ — ловит только счёт
+    входов (строка загрузки чужого на старт − 2,5 с, вне окна), Б′ — только окно Δ (текущий без входа, шаг часов −1 с;
+    контрфакт Δ = 0 — OK); граница Δ: шаг −2,0 с — в окне, −3,0 с — вне (предел (1), общий с r3).
+    r6 · verify7 regress зам. 3 / cost: ЗАПИСИ загрузки (110 знаков), входа и polling вставляются через логгеры до 200
+    знаков (bot.py:1134 «Transcribed», splinter.py:2452 raw[:200]) и без обрезки (splinter.py:12197) — их пишет только
+    процесс, который опрашивает: текущий-норма или второй писатель. ОДИНОЧНАЯ вставленная запись не даёт OK, когда
+    текущий написал свою строку загрузки и не опрашивает: лишняя запись загрузки / входа в окне — счёт, лишний polling —
+    «два polling», polling при простое — противоречие. Это защита только от одиночной ЛИШНЕЙ записи, а не от вставки
+    вообще (r7 · verify8 attack MAJOR-1): пара «вход + polling» при текущем «после 94» / «после строк загрузки» — OK,
+    предел (2в), записан числом в test_b18. Пределы записаны и здесь: (2б) — вставленная строка polling при текущем
+    между входом и polling (класс r3); (1) — текущий до bot.py:94, а splinter.py:12197 вставил загрузку + вход +
+    polling одним сообщением."""
+    who = "PID %d, старт %s UTC, рестартов 0" % (PID_B, dt(T_B).strftime("%Y-%m-%d %H:%M:%S"))
+    two = ("в окне текущего запуска 2 строк загрузки — писали несколько процессов (второй писатель / смена пояса / "
+           "двойной рестарт / шаг часов)")
+    ent2 = "граница неоднозначна: строк «вход выпуска» в окне текущего запуска 2 — писали несколько процессов"
+    s0 = T_B
+    prev = history() + prev_run(s0 - 3600, s0)
+    cur_a = run_ok(s0, poll_at=None, post=False)                       # вход OK без polling (verify6 вариант Б)
+    # А: второй за 0,9 с до юнита — его строка загрузки на старт − 0,001 с, вход на + 0,090 (выше строки загрузки
+    # текущего), polling на + 1,090 (ниже входа текущего)
+    a = prev + by_time(second_slow(s0 - 0.913, 0.091, 1.0), cur_a)
+    # Б: шаг часов −1,0 с сразу после fork: строка загрузки текущего на старт − 0,088 с, вход ПРОСТОЯ на + 0,003; второй
+    # через 30 с (загрузка, вход OK, polling) убит
+    b = prev + run_park(s0 - 1.0, words_of(**{STRICT: "0"})) + _stray(s0 + 30, "убит")
+    for name, ls in (("А граница окна", a), ("Б часы", b)):
+        assert _starts_in_window(ls, s0) >= 3, name                    # две записи загрузки и вход в окне
+        st, why = verdict(ls)
+        assert st == "UNKNOWN" and why.startswith(two) and why.endswith("(%s)" % who), (name, st, why)
+        r = build(ls, B())
+        assert r.code == 1 and r.summary.startswith("❌ ПРОБЛЕМА: запуск не доказан — НЕИЗВЕСТНО: " + two), (name,
+                                                                                                         r.summary)
+        rc, _out, calls = run_main(ls, B())
+        assert rc == 1 and len(calls) == 1 and two in calls[0]["text"], (name, rc, calls)
+    # А′: строка загрузки чужого вне окна (старт − 2,5 с), его вход в сегменте выше строки загрузки текущего, polling ниже
+    # входа текущего — строк загрузки в окне 1, ловит только счёт входов (r3 «два входа»)
+    a1 = prev + by_time(second_slow(s0 - 3.412, 2.59, 1.0), cur_a)
+    st, why = verdict(a1)
+    assert st == "UNKNOWN" and why.startswith(ent2) and why.endswith("(%s)" % who), (st, why)
+    # Б′: шаг часов −1,0 с, текущий завис после строк загрузки (входа нет), второй через 30 с — ловит только окно Δ
+    b1 = prev + boot(s0 - 1.0, words_of()) + _stray(s0 + 30, "убит")
+    st, why = verdict(b1)
+    assert st == "UNKNOWN" and why.startswith(two), (st, why)
+    with mock.patch.object(H, "_WIN_BACK_S", 0):                       # контрфакт r5: окно со старта — зелёное
+        assert verdict(b1)[0] == "OK"
+    # граница Δ = 2 с: шаг −2,0 с — строка загрузки текущего на старт − 1,088 с (секунда старт − 2) в окне; −3,0 с — на
+    # старт − 2,088 с вне окна: предел (1), r3 там тоже OK (вход текущего не написан, вход второго один)
+    for d, want in ((2.0, "UNKNOWN"), (3.0, "OK")):
+        st, why = verdict(prev + boot(s0 - d, words_of()) + _stray(s0 + 30, "убит"))
+        assert st == want, (d, st, why)
+    # пары: без второго писателя — не OK (вход без polling — NO_POLL; простой — ПРОСТОЙ)
+    assert verdict(prev + cur_a)[0] == "NO_POLL"
+    assert verdict(prev + run_park(s0 - 1.0, words_of(**{STRICT: "0"})))[0] == "PARKED"
+    # ---- вставки через длинные логгеры
+    bot_src = open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    spl_src = open(os.path.join(ROOT, "splinter.py"), encoding="utf-8").read()
+    assert bot_src.count('log.info(f"Transcribed: {transcribed[:200]}")') == 1, "bot.py:1134 изменился"
+    assert spl_src.count('log.warning(f"Splinter: не смог распарсить JSON: {raw[:200]}")') == 1, "splinter.py:2452"
+    assert spl_src.count("log.info(f\"  → история ТО {bike} вид={k}: «{v['text']}» \"") == 1, "splinter.py:12197"
+    ok_line = S().release_entry(words_of(), frozenset())[1]
+
+    def rec(t, msg):
+        return L(t, INFO, msg)[0].rstrip("\n")
+
+    def say(t, via, text):
+        if via == "bot.py:1134":
+            return L(t, INFO, "Transcribed: " + text[:200])
+        if via == "splinter.py:2452":
+            return L(t, WARNING, "Splinter: не смог распарсить JSON: " + text[:200], name="splinter")
+        return L(t, INFO, "  → история ТО B-17 вид=масло: «" + text + "» источник=фото (OCR)", name="splinter")
+
+    vias = ("bot.py:1134", "splinter.py:2452", "splinter.py:12197")
+    kinds = {"загрузка": lambda t: rec(t, BOOT_LINE), "вход": lambda t: rec(t, "  " + ok_line),
+             "polling": lambda t: rec(t, POLL)}
+    lens = {k: len(f(s0)) for k, f in kinds.items()}
+    assert lens["загрузка"] == 110 and lens["polling"] == 84 and 100 < lens["вход"] < 199, lens  # в text[:100] не входят
+
+    def text_of(via, recs):
+        return ("x\n" + "\n".join(recs) + "\ny") if via == "splinter.py:12197" else "\n" + "\n".join(recs)
+
+    for via in vias:                                                   # вставленная запись — целая строка журнала
+        for k, f in kinds.items():
+            ls = say(s0 + 60, via, text_of(via, [f(s0 + 50)]))
+            assert f(s0 + 50) + "\n" in ls, (via, k, ls)
+    n_cur = n_sec = 0
+    # (а) пишет сам текущий-норма (опрашивает): сообщение на + 260 с, метка вставленной записи — + 250 с (в окне посылки);
+    # то же через час (метка за 30 с до сообщения) — НЕИЗВЕСТНО по посылке (запись начала последней по месту вне окна)
+    for via in vias:
+        for k, f in kinds.items():
+            ls = prev + run_ok(s0) + say(s0 + 260, via, text_of(via, [f(s0 + 250)]))
+            st, why = verdict(ls)
+            want = {"загрузка": two, "вход": ent2, "polling": "граница неоднозначна: polling в текущем запуске 2"}[k]
+            assert st == "UNKNOWN" and why.startswith(want), (via, k, st, why)
+            st, why = verdict(prev + run_ok(s0) + say(s0 + 3600, via, text_of(via, [f(s0 + 3570)])))
+            assert st == "UNKNOWN", (via, k, st, why)
+            n_cur += 1
+    # (б) пишет второй писатель (стартовал за 110 мин до юнита — его записи начала вне окна), текущий не опрашивает
+    curs = {"вход OK без polling": cur_a, "простой MISMATCH": run_park(s0, words_of(**{STRICT: "0"})),
+            "завис после строк загрузки": boot(s0, words_of()), "завис после bot.py:94": L(s0 + 0.912, INFO, BOOT_LINE)}
+    lim2b = 0
+    for via in vias:
+        for k, f in kinds.items():
+            for cname, c in curs.items():
+                ls = history() + run_ok(s0 - 6600) + c + say(s0 + 60, via, text_of(via, [f(s0 + 50)]))
+                st, why = verdict(ls)
+                n_sec += 1
+                if k == "polling" and cname == "вход OK без polling":
+                    assert st == "OK", (via, cname, st, why)            # ПРЕДЕЛ (2б), класс r3: ложное зелёное
+                    lim2b += 1
+                    continue
+                assert st != "OK", (via, k, cname, st, why)
+                if k == "загрузка":
+                    assert why.startswith(two), (via, cname, why)
+                if k == "вход" and cname in ("вход OK без polling", "простой MISMATCH"):
+                    assert why.startswith(ent2), (via, cname, why)
+    assert (n_cur, n_sec, lim2b) == (9, 36, 3), (n_cur, n_sec, lim2b)
+    # (в) ПРЕДЕЛ (1), записан: текущий завис ДО bot.py:94 (своих записей начала нет), второй писатель вставил загрузку,
+    # вход и polling ОДНИМ сообщением splinter.py:12197 (без обрезки; в 200 знаков три записи не входят) — OK
+    trio = [kinds["загрузка"](s0 + 50), kinds["вход"](s0 + 50.1), kinds["polling"](s0 + 50.2)]
+    assert len(text_of("bot.py:1134", trio)) > 200, len(text_of("bot.py:1134", trio))
+    ls = history() + run_ok(s0 - 6600) + hung_before_94() + say(s0 + 60, "splinter.py:12197",
+                                                                text_of("splinter.py:12197", trio))
+    assert verdict(ls)[0] == "OK"
+    print("    · счёт по окну: repro verify7 А/Б → ❌ code 1, один пуш; А′ (только входы), Б′ (только Δ; Δ = 0 — OK), "
+          "граница Δ 2,0/3,0 с; вставки длинными логгерами: текущий %d + второй %d → не OK, кроме предела (2б) %d; "
+          "предел (1) splinter.py:12197 — записан" % (n_cur, n_sec, lim2b))
+
+
+G_GRID = (0.90, 0.95, 0.98, 1.00, 1.02, 1.05, 1.10, 1.20, 1.30, 1.50, 1.70, 1.80, 1.90, 2.00, 2.50, 3.00, 5.00)
+F_GRID = (0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 0.90, 0.99)
+
+
+def _p1(a, k):
+    """Прошлый P1 (verify7 cost p1_lines): стартовал в a, остановлен в k; до «Scheduler started» (a + 1,702) обработчиков
+    сигналов нет — SIGTERM без строки остановки (bot.py:1642–1655), после — штатная остановка в k."""
+    out = _until(run_ok(a), k)
+    if k >= a + 1.702:
+        out += stop_line(k)
+    return out
+
+
+def _p2(t0):
+    """Текущий P2 — норма (verify7 cost p2_normal): Memory() (70a:164), строки загрузки, вход OK, polling, post_init."""
+    return L(t0 + 0.475, INFO, MEM_LINE, name="memory") + run_ok(t0)
+
+
+def _shift_after(lines, t_from, back):
+    """Записи с меткой ≥ t_from сдвинуты на −back с: часы шагнули назад в момент t_from (verify7 cost _shift_after)."""
+    out = []
+    for ln in lines:
+        t = _t_of(ln)
+        if t is not None and t >= t_from - 1e-6:
+            ms = int(round((t - back) * 1000))
+            ln = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ms // 1000)) + ",%03d" % (ms % 1000) + ln[23:]
+        out.append(ln)
+    return out
+
+
+def test_b15_price5_window_count_numbers():
+    """r6 · verify7 cost MAJOR + задание r6 п.4: ЦЕНА (5) счёта по окну названа проверками с числами. Нормальный текущий
+    запуск — ❌ НЕИЗВЕСТНО до СЛЕДУЮЩЕГО рестарта (fail-closed, пуш каждый такт), когда прошлый процесс написал запись
+    загрузки или входа с меткой-секундой ≥ старт − 2 с (ожидание считается по журналу независимо от health:
+    _starts_in_window):
+      (а) двойной рестарт — второй `systemctl restart` вскоре после первого (ручной рестарт RestartSec не ждёт):
+          сетка g × f verify7 cost (17 промежутков 0,90…5,00 с × 9 долей секунды старта P2; systemd видит старт целой
+          секундой) — r6 ❌ в 135 из 153 (r5 — 57, r3 — 45, r4 — 0): при g = 0,95…3,00 с — все, g = 0,90 с (P1 не дошёл
+          до bot.py:94) и g = 5,00 с — ✅; следующий рестарт через час снимает все 135;
+      (б) RestartSec × падение после polling (сетка N1e verify7: RestartSec 0,1 / 0,5 / 1,0 / 10 с × падение через
+          0,05…30 с × доля секунды старта): ❌ при RestartSec 0,1 с — 14 из 20, 0,5 с — 13, 1,0 с — 12, 10 с — 0;
+      (в) шаг часов назад в окне загрузки текущего (правила a3-2 и посылки r5, не новое r6): между bot.py:94 и входом —
+          ❌ с 0,1 с, между входом и polling — с 0,5 с, после polling — только больше 120 с.
+    Предел посылки «10 с» (bot.py:1644) — только слова, юнита в репозитории нет."""
+    tab = {}
+    alarms = cleared = 0
+    for g in G_GRID:
+        for f in F_GRID:
+            a, k = T_B + f - g, T_B + f - 0.03
+            p1 = _p1(a, k)
+            ls = history() + prev_run(T_B - 86400, a - 5) + p1 + _p2(T_B + f)
+            r = run_of(props_of(PID_B, T_B + f))
+            assert r["start"] == dt(T_B), r                            # systemd: «… 06:00:00 UTC» при любой доле f
+            st, why = H._run_verdict(ls, r, r, dt(NOW))
+            want = "UNKNOWN" if _starts_in_window(p1, T_B) else "OK"
+            assert st == want and (st == "OK" or "писали несколько процессов" in why), (g, f, st, why)
+            tab[(g, f)] = st
+            if st != "OK":
+                alarms += 1
+                s1 = T_B + 3600                                        # следующий рестарт через час: P3 — норма
+                ls2 = _until(ls, s1 - 10) + stop_line(s1 - 5) + run_ok(s1)
+                r2 = run_of(props_of(PID_B + 1, s1))
+                cleared += H._run_verdict(ls2, r2, r2, dt(s1 + 3600))[0] == "OK"
+    by_g = {g: sum(tab[(g, f)] != "OK" for f in F_GRID) for g in G_GRID}
+    assert (alarms, cleared, len(tab)) == (135, 135, 153), (alarms, cleared, by_g)
+    assert by_g[0.90] == 0 and by_g[5.00] == 0 and all(by_g[g] == 9 for g in G_GRID if 0.95 <= g <= 3.0), by_g
+    # точный пример на build_report()/main(): второй restart через 1,30 с, P2 в 06:00:00,500 — ❌ code 1, один пуш
+    a, k = T_B + 0.5 - 1.3, T_B + 0.5 - 0.03
+    ls = history() + prev_run(T_B - 86400, a - 5) + _p1(a, k) + _p2(T_B + 0.5)
+    p = props_of(PID_B, T_B + 0.5)
+    rep = build(ls, [p, p, p])
+    assert rep.code == 1 and "писали несколько процессов" in rep.summary, rep.summary
+    rc, _o, calls = run_main(ls, [p, p, p])
+    assert rc == 1 and len(calls) == 1, (rc, calls)
+    # (б) RestartSec × падение после polling
+    rs = {}
+    for rsec in (0.1, 0.5, 1.0, 10.0):
+        for c in (0.05, 0.2, 0.5, 2.0, 30.0):
+            for uf in (0.05, 0.3, 0.6, 0.95):
+                u = T_B + uf
+                crash = u - rsec
+                p0 = crash - c - 1.247
+                pv = _until(run_ok(p0), crash) + CRASH_TB
+                ls = history() + pv + _p2(u)
+                r = run_of(props_of(PID_B, u, nrestarts=3))
+                st, why = H._run_verdict(ls, r, r, dt(NOW))
+                want = "UNKNOWN" if _starts_in_window(pv, T_B) else "OK"
+                assert st == want, (rsec, c, uf, st, why)
+                rs[rsec] = rs.get(rsec, 0) + (st != "OK")
+    assert rs == {0.1: 14, 0.5: 13, 1.0: 12, 10.0: 0}, rs
+    # (в) шаг часов назад (правила a3-2 и посылки r5 — общая цена, r6 её не меняет)
+    steps = {}
+    for where, t_from in (("между bot.py:94 и входом", T_B + 0.99), ("между входом и polling", T_B + 1.1),
+                          ("после polling", T_B + 1.3)):
+        for back in (0.01, 0.1, 0.5, 0.9, 2.0, 30.0, 119.0, 121.0):
+            ls = history() + prev_run(T_B - 3600, T_B) + _shift_after(_p2(T_B), t_from, back)
+            steps[(where, back)] = verdict(ls)[0]
+    U, N, O = "UNKNOWN", "NO_POLL", "OK"
+    want = {"между bot.py:94 и входом": (O, U, U, U, U, U, U, U), "между входом и polling": (O, O, U, U, N, N, N, U),
+            "после polling": (O, O, O, O, O, O, O, U)}
+    got = {w: tuple(steps[(w, b)] for b in (0.01, 0.1, 0.5, 0.9, 2.0, 30.0, 119.0, 121.0)) for w in want}
+    assert got == want, got
+    print("    · цена (5) r6: двойной рестарт g × f — ❌ %d из %d (по g: %r), следующий рестарт снимает %d; RestartSec × "
+          "падение — %r; шаг часов — %r" % (alarms, len(tab), by_g, cleared, rs, got))
+
+
+def _layout(lines, form):
+    """Те же записи в другой раскладке с той же меткой (текстовое преобразование записи «метка [УРОВЕНЬ] имя: сообщение»;
+    продолжения — как есть)."""
+    out = []
+    for ln in lines:
+        m = _FULL_RE.match(ln.rstrip("\n"))
+        if not m:
+            out.append(ln)
+            continue
+        ts, ms, lvl, name, msg = m.groups()
+        head = ts + "," + ms
+        out.append({"имя:номер": "%s [%s] %s:94: %s", "[I]": "%s [%s] %s: %s", "[info]": "%s [%s] %s: %s",
+                    "префикс потока перед именем": "%s [%s] [MainThread] %s: %s", "имя.<module>": "%s [%s] %s.<module>: %s",
+                    "уровень WARN": "%s [%s] %s: %s", "%(module)s": "%s [%s] %s: %s",
+                    "префикс потока в сообщении": "%s [%s] %s: [MainThread] %s"}[form]
+                   % (head, {"[I]": lvl[:1], "[info]": lvl.lower(),
+                             "уровень WARN": lvl.replace("WARNING", "WARN").replace("INFO", "WARN")}.get(form, lvl),
+                      "bot" if form == "%(module)s" else name, msg) + "\n")
+    return out
+
+
+def test_b16_record_exact_bot_format():
+    """r6 · verify7 attack N1c/N2 и cost/attack замечание к _REC_RE (health.py r5:91 — «\\S+: », любой [A-Z]+): запись —
+    только ТОЧНЫЙ формат bot.py:73 «%(asctime)s [%(levelname)s] %(name)s: %(message)s»: уровень — одно из пяти имён
+    logging, имя — точечный идентификатор Python. Иная раскладка с той же меткой — метка неизвестной формы (правило r3):
+    в текущем запуске НЕИЗВЕСТНО при любом прошлом (убитый +01 Q1, второй писатель после), в истории — не мешает.
+    Живые формы 69k:194 и 70a:163–169 и все фикстуры этого набора — записи. Контрфакт — _REC_RE r5: «[I]» и «имя:номер»
+    при убитом прошлом в окне — OK там, где текущий завис после строк загрузки (атака N1c/N2: «[I]» — r5 ✅ при r3 ❌; там,
+    где текущий успел написать вход, при прежнем _REC_RE его вход «[E]»/«[I]» — запись, и её ловит ещё счёт входов r6:
+    _ENTRY_RE уровень не сужает). Пределы, записаны: раскладки,
+    которые грамматикой записи не отличить от bot.py:73 («%(module)s», «%(name)s.%(funcName)s» внутри функций, префикс
+    потока В сообщении), — записи; их записи загрузки и входа не опознаются, и при убитом прошлом в окне текущий в такой
+    раскладке — OK (предел (1)/(3))."""
+    live69k = "2026-09-19 06:21:39,214 [INFO] turbobaby: Bot polling started. Press Ctrl+C to stop."  # 69k:194, bot.py:1778
+    t70 = _dt.datetime(2026, 9, 21, 12, 22, 9, tzinfo=UTC).timestamp()
+    live70a = (stop_line(t70 + 0.577) + L(t70 + 1.475, INFO, MEM_LINE, name="memory") + L(t70 + 1.493, INFO, BOOT_LINE)
+               + L(t70 + 1.506, INFO, POLL))                           # 70a:163–169, имена логгеров — из кода
+    assert H._REC_RE.match(live69k) and H._POLL_RE.match(live69k), live69k
+    assert all(H._REC_RE.match(x) for x in live70a) and H._SHUT_RE.match(live70a[0].rstrip("\n")), live70a
+    assert H._BOOT_RE.match(live70a[2].rstrip("\n")) and H._POLL_RE.match(live70a[3].rstrip("\n")), live70a
+    fixtures = (history() + run_old(T_A) + run_ok(T_B, errors=3) + run_park(T_B, words_of(**{STRICT: "0"}))
+                + prev_run(T_B - 3600, T_B) + _stray(T_B + 30, "жив") + hung_before_94() + _p2(T_B))
+    stamped = [x for x in fixtures if _STAMP_RE.match(x)]
+    assert stamped and all(H._REC_RE.match(x) for x in stamped), [x for x in stamped if not H._REC_RE.match(x)][:3]
+    names = ("turbobaby", "splinter", "memory", "auditor", "claude_client", "bridge_client", "httpx", "__main__", "root",
+             "telegram.ext.Application", "telegram.ext._updater", "apscheduler.executors.default", "py.warnings")
+    for name in names:
+        for lvl in (logging.DEBUG, INFO, WARNING, ERROR, logging.CRITICAL):
+            x = L(T_B + 10, lvl, "x", name=name)[0]
+            assert H._REC_RE.match(x), x
+    # иные раскладки с той же меткой — не записи; в текущем запуске — НЕИЗВЕСТНО «метка неизвестной формы»
+    alien = ("имя:номер", "[I]", "[info]", "префикс потока перед именем", "имя.<module>", "уровень WARN")
+    killed = shift_ts(short_prev(3600, 60, clean=False), 1)                    # Q1 точный, убит: его вход/polling в окне
+    curs = {"простой": run_park(T_B, words_of(**{STRICT: "0"})), "вход без polling": run_ok(T_B, poll_at=None,
+                                                                                            post=False),
+            "завис после строк загрузки": boot(T_B, words_of()), "норма": run_ok(T_B)}
+    broad = re.compile(r"^" + H._LOG_TS + r" \[[A-Z]+\] \S+: ", re.ASCII)       # _REC_RE r5
+    n, broad_ok = 0, {}
+    for form in alien:
+        sample = _layout(L(T_B + 1, INFO, "x"), form)[0]
+        assert not H._REC_RE.match(sample) and H._STAMPISH_RE.match(sample), (form, sample)
+        for cname, c in curs.items():
+            for pname, ls in (("убитый +01", history() + killed + _layout(c, form)),
+                              ("второй писатель", history() + _layout(c, form) + _stray(T_B + 30, "убит"))):
+                st, why = verdict(ls)
+                assert st == "UNKNOWN" and "строка с меткой неизвестной формы" in why, (form, cname, pname, st, why)
+                n += 1
+                if cname != "норма":
+                    with mock.patch.object(H, "_REC_RE", broad):
+                        broad_ok[form] = broad_ok.get(form, 0) + (verdict(ls)[0] == "OK")
+        # в ИСТОРИИ (прошлый процесс писал такой раскладкой) — не мешает
+        assert verdict(_layout(history(), form) + run_ok(T_B))[0] == "OK", form
+    assert broad_ok["[I]"] > 0 and broad_ok["имя:номер"] > 0, broad_ok         # контрфакт r5: ложные зелёные
+    # ПРЕДЕЛ, записан: грамматикой записи неотличимые раскладки — записи; при убитом прошлом в окне — OK
+    for form in ("%(module)s", "префикс потока в сообщении"):
+        sample = _layout(L(T_B + 1, INFO, "x"), form)[0]
+        assert H._REC_RE.match(sample), (form, sample)
+        st, why = verdict(history() + killed + _layout(curs["простой"], form))
+        assert st == "OK", (form, st, why)                                     # предел (1)/(3): ложное зелёное
+    print("    · запись — точный формат bot.py:73: живые 69k/70a и %d записей фикстур — записи; %d раскладок × 4 × 2 = %d "
+          "→ НЕИЗВЕСТНО; контрфакт _REC_RE r5 — OK %r; предел «%%(module)s» / префикс в сообщении — записан"
+          % (len(stamped), len(alien), n, broad_ok))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# r7 · verify8 (regress MAJOR K3/K4, attack MAJOR-1): pend снимает только запись истории до начала сегмента; предел 2в.
+# ---------------------------------------------------------------------------------------------------------------------
+
+def _with_block(lines, block):
+    """Сообщение block (первая строка — запись, дальше продолжения и вставленные в текст записи) пишется в файл ОДНОЙ
+    записью: целиком по месту своей первой строки — перед первой строкой lines с меткой позже неё (by_time ставит
+    вставленную запись по её собственной метке, то есть не туда, куда её кладёт процесс)."""
+    t0 = _t_of(block[0])
+    i = next((k for k, ln in enumerate(lines) if (_t_of(ln) or -1.0) > t0), len(lines))
+    return lines[:i] + block + lines[i:]
+
+
+def test_b17_pend_cleared_only_by_history_before_segment():
+    """r7 · verify8 regress MAJOR (K3/K4, регресс r6): строку с меткой неизвестной формы ДО начала сегмента с
+    собственной датой ≥ старта (pend) снимает ТОЛЬКО запись ИСТОРИИ: метка < старт − 2 с (_WIN_BACK_S — запись в окне
+    [старт − 2 с, старт) может быть записью текущего запуска, как у счёта) и по месту ДО первой записи с меткой
+    ≥ старта. Как только сегмент начался, такая строка — строка текущего запуска: НЕИЗВЕСТНО. r6 снимал её ЛЮБОЙ
+    последующей записью с меткой < старта: правило метки молчало, а вход и polling второго экземпляра шли за MainPID —
+    «✅ ВСЁ ОК», code 0, пушей 0 при текущем без опроса. Текущий пишет отличимой раскладкой («имя:номер» / «[I]» —
+    метка неизвестной формы, test_b16) и вошёл OK без polling; второй экземпляр (bot.py:73, жив) — через 5 с:
+      K3 — второй вставил сообщением splinter.py:12197 полную запись остановки с меткой старт − 1 с: журнал repro
+           verify8 дословно (by_time ставит вставленную запись по её метке — ДО первой записи второго, в окне Δ) и та же
+           вставка ВНУТРИ своего сообщения после начала сегмента (метка старт − 1 с и старт − 30 с);
+      K4 — без вставки: шаг системных часов назад на 30 с на старт + 26 с, первая запись второго после шага — на
+           старт − 3 с (после начала сегмента).
+    r7: ❌ НЕИЗВЕСТНО «строка с меткой неизвестной формы … в текущем запуске», code 1, один пуш. Пары — как r6: без
+    вставки и без шага — НЕИЗВЕСТНО теми же словами; запись истории до сегмента снимает по-прежнему (x3 в истории — ✅,
+    test_b11). Остаток, записан (у r5 и r6 тот же, у r3 — для «имя:номер»; сеткой не измерен): запись с меткой
+    < старт − 2 с ниже такой строки и ДО первой записи сегмента по журналу — история и снимает её (журнал K3 с меткой
+    вставки старт − 3 с — OK)."""
+    who = "PID %d, старт %s UTC, рестартов 0" % (PID_B, dt(T_B).strftime("%Y-%m-%d %H:%M:%S"))
+    s0 = T_B
+    hist = history() + prev_run(s0 - 3600, s0)
+    words = "❌ ПРОБЛЕМА: запуск не доказан — НЕИЗВЕСТНО: строка с меткой неизвестной формы"
+
+    def k4_lines():                                                   # второй через 5 с (жив) и его запись на + 27 с
+        return by_time(_stray(s0 + 5, "жив"), L(s0 + 27, INFO, "Splinter [ops] тик", name="splinter"))
+
+    def ins_msg(back):                                                # splinter.py:12197, v['text'] без обрезки
+        return L(s0 + 47.9, INFO, "  → история ТО B-17 вид=масло: «x\n" + stop_line(s0 - back)[0].rstrip("\n")
+                 + "\ny» источник=фото (OCR)", name="splinter")
+
+    n = 0
+    for form in ("имя:номер", "[I]"):
+        cur = _layout(run_ok(s0, poll_at=None, post=False), form)    # вход OK, polling нет
+        stamped = [x for x in cur if _STAMP_RE.match(x)]
+        assert stamped and not any(H._REC_RE.match(x) for x in stamped), form   # не записи: метка неизвестной формы
+        pend_words = H._unparsed_words(cur[0].rstrip("\n"), who)
+        sec5 = _stray(s0 + 5, "жив")
+        cases = {"K3 журнал repro verify8 (вставка до первой записи второго, в окне Δ)": (by_time(sec5, ins_msg(1)),
+                                                                                          False),
+                 "K3 вставка внутри сообщения, метка старт − 1 с": (_with_block(sec5, ins_msg(1)), True),
+                 "K3 вставка внутри сообщения, метка старт − 30 с": (_with_block(sec5, ins_msg(30)), True),
+                 "K4 шаг часов −30 с на старт + 26 с": (_shift_after(k4_lines(), s0 + 26, 30.0), True)}
+        for name, (tail, after_seg) in cases.items():
+            ts = [t for t in (_t_of(x) for x in tail) if t is not None]
+            first = next(i for i, t in enumerate(ts) if t >= s0)
+            low = [t for t in ts if t < s0]
+            assert len(low) == 1 and (ts.index(low[0]) > first) == after_seg, (form, name)    # посылка случая
+            assert after_seg or low[0] >= s0 - 2, (form, name)                                  # до сегмента — в окне Δ
+            ls = hist + cur + tail
+            st, why = verdict(ls)
+            assert st == "UNKNOWN" and why == pend_words, (form, name, st, why)
+            r = build(ls, B())
+            assert r.code == 1 and words in r.summary, (form, name, r.summary)
+            rc, _o, calls = run_main(ls, B())
+            assert rc == 1 and len(calls) == 1 and "строка с меткой неизвестной формы" in calls[0]["text"], (form, name,
+                                                                                                           rc, calls)
+            n += 1
+        # пары — как r6: без вставки / без шага — НЕИЗВЕСТНО теми же словами
+        for name, tail in (("без вставки", sec5), ("без шага", k4_lines())):
+            st, why = verdict(hist + cur + tail)
+            assert st == "UNKNOWN" and why == pend_words, (form, name, st, why)
+        # ОСТАТОК, записан: журнал K3 с меткой вставки старт − 3 с — до первой записи сегмента и вне окна Δ: по журналу
+        # запись истории, снимает строку — OK при текущем без опроса (по месту — шаг часов назад до начала сегмента)
+        assert verdict(hist + cur + by_time(sec5, ins_msg(3)))[0] == "OK", form
+    assert n == 8, n
+    print("    · pend снимает только запись истории до начала сегмента: K3 (журнал repro и вставка в сообщении −1 / "
+          "−30 с), K4 (шаг −30 с) × 2 раскладки = %d → ❌ code 1, один пуш; пары без вставки и шага — те же слова; "
+          "остаток (запись < старт − 2 с до первой записи сегмента) — OK, записан" % n)
+
+
+def test_b18_limit_2v_inserted_entry_poll_pair():
+    """r7 · verify8 attack MAJOR-1 (решение К3: назвать ПРЕДЕЛОМ, новыми правилами не закрывать): ПРЕДЕЛ (2в) записан
+    как ИЗВЕСТНЫЙ — проверка требует зелёного там, где оно ложное, и упадёт, если класс сдвинется (тогда переписать
+    предел, а не проверку). Второй ЖИВОЙ писатель, который опрашивает (у него работают обработчики bot.py:1134,
+    splinter.py:2452, splinter.py:12197; его записи начала — за 110 мин, вне окна), вставляет ПАРУ записей «вход OK +
+    polling» со штампами в окне посылки: двумя сообщениями до 200 знаков (вход — 187 знаков, polling — 84, вместе в 200
+    не входят) или одним сообщением splinter.py:12197 без обрезки. Текущий написал строку загрузки bot.py:94 и встал до
+    main() («после 94» / «после строк загрузки»): сброс по его строке загрузки отдаёт сегменту ровно один вход и один
+    polling, в счёте по окну их по одному → ✅ при текущем без опроса. Сетка — i1 verify8 (test_v8_health_attack) на
+    фикстурах набора: 3 логгера × 7 сочетаний вставки × 7 «плохих» состояний текущего × 2 штампа (+ 50 / + 290 с) = 294
+    журнала; ✅ — 42: (2в) 12, (1) 24 (текущий до bot.py:94 или не написал ничего: пара / тройка), (2б) 6 (текущий между
+    входом и polling, вставлен polling). Точные примеры verify8: A1 (два сообщения bot.py:1134) на build_report()/main()
+    — «✅ ВСЁ ОК», code 0, пушей 0; A5 (метки вставок на 1 мс позже своих сообщений — не назад) — OK. Пары — ❌: без
+    вставки, вставлен только вход,
+    текущий «вход OK без polling» + та же пара (счёт входов 2), тройка с записью загрузки (счёт загрузок 2). Вывод:
+    журнал, куда пишется внешний текст, от второго живого писателя со вставками полностью не защищается; счёт по окну и
+    грамматика записи защищают только от ОДИНОЧНОЙ лишней записи."""
+    s0 = T_B
+    ok_line = S().release_entry(words_of(), frozenset())[1]
+    two = ("в окне текущего запуска 2 строк загрузки — писали несколько процессов (второй писатель / смена пояса / "
+           "двойной рестарт / шаг часов)")
+    ent2 = "граница неоднозначна: строк «вход выпуска» в окне текущего запуска 2 — писали несколько процессов"
+
+    def rec(t, msg):
+        return L(t, INFO, msg)[0].rstrip("\n")
+
+    def say(t, via, text):                                            # формы test_b14 (сверены там же с кодом)
+        if via == "bot.py:1134":
+            return L(t, INFO, "Transcribed: " + text[:200])
+        if via == "splinter.py:2452":
+            return L(t, WARNING, "Splinter: не смог распарсить JSON: " + text[:200], name="splinter")
+        return L(t, INFO, "  → история ТО B-17 вид=масло: «" + text + "» источник=фото (OCR)", name="splinter")
+
+    def text_of(via, recs):
+        return ("x\n" + "\n".join(recs) + "\ny") if via == "splinter.py:12197" else "\n" + "\n".join(recs)
+
+    def insert(t_msg, via, recs):
+        """Одним сообщением, если влезает (200 знаков / без обрезки), иначе — по записи на сообщение (t, t + 1, …)."""
+        full = text_of(via, recs)
+        if via == "splinter.py:12197" or len(full) <= 200:
+            out, nm = say(t_msg, via, full), 1
+        else:
+            out, nm = [], len(recs)
+            for k, r_ in enumerate(recs):
+                assert len(text_of(via, [r_])) <= 200, (via, r_[:40])
+                out += say(t_msg + k, via, text_of(via, [r_]))
+        assert all(r_ + "\n" in out for r_ in recs), (via, [r_[:40] for r_ in recs])
+        return out, nm
+
+    kinds = {"загрузка": lambda t: rec(t, BOOT_LINE), "вход": lambda t: rec(t, "  " + ok_line),
+             "polling": lambda t: rec(t, POLL)}
+    combos = (("загрузка",), ("вход",), ("polling",), ("вход", "polling"), ("загрузка", "вход", "polling"),
+              ("загрузка", "polling"), ("вход", "вход", "polling"))
+    states = {"до 94 (Memory)": hung_before_94(s0), "ничего": [], "после 94": L(s0 + 0.912, INFO, BOOT_LINE),
+              "после строк загрузки": boot(s0, words_of()), "вход OK без polling": run_ok(s0, poll_at=None, post=False),
+              "простой MISMATCH": run_park(s0, words_of(**{STRICT: "0"})), "простой UNKNOWN": run_park(s0, None)}
+    vias = ("bot.py:1134", "splinter.py:2452", "splinter.py:12197")
+    second = history() + run_ok(s0 - 6600)                           # второй писатель: стартовал за 110 мин, опрашивает
+    green, msgs, n = {}, {}, 0
+    for via in vias:
+        for kc in combos:
+            for st_name, cur in states.items():
+                for t_ins in (s0 + 50, s0 + 290):
+                    ins, nm = insert(t_ins + 10, via, [kinds[k](t_ins + 0.1 * i) for i, k in enumerate(kc)])
+                    msgs[(via, kc)] = nm
+                    st, why = verdict(second + cur + ins)
+                    n += 1
+                    if st != "OK":
+                        continue
+                    cls = ("2б" if st_name == "вход OK без polling" and kc == ("polling",) else
+                           "1" if st_name in ("до 94 (Memory)", "ничего") else
+                           "2в" if st_name in ("после 94", "после строк загрузки") and kc == ("вход", "polling") else
+                           None)
+                    green[cls] = green.get(cls, 0) + 1
+    assert n == 294 and green == {"2в": 12, "1": 24, "2б": 6}, (n, green)       # ПРЕДЕЛ, записан числом
+    pair_msgs = {k[0]: v for k, v in msgs.items() if k[1] == ("вход", "polling")}
+    assert pair_msgs == {"bot.py:1134": 2, "splinter.py:2452": 2, "splinter.py:12197": 1}, pair_msgs
+    # точные примеры verify8 на build_report()/main()
+    base = history() + run_ok(s0 - 6600) + prev_run(s0 - 3600, s0)
+    cur94 = L(s0 + 0.912, INFO, BOOT_LINE)
+    e, p = kinds["вход"](s0 + 50.0), kinds["polling"](s0 + 50.1)
+    a1 = base + cur94 + insert(s0 + 60, "bot.py:1134", [e, p])[0]
+    r = build(a1, B())
+    assert r.code == 0 and r.summary == "✅ ВСЁ ОК", r.summary                  # ПРЕДЕЛ (2в): ложное зелёное
+    rc, _o, calls = run_main(a1, B())
+    assert rc == 0 and not calls, (rc, calls)
+    a5 = base + cur94 + insert(s0 + 60, "bot.py:1134", [kinds["вход"](s0 + 60.001), kinds["polling"](s0 + 61.001)])[0]
+    assert verdict(a5)[0] == "OK"                                    # метки вставок не назад — то же зелёное
+    # пары — ❌
+    pairs = {"без вставки": (base + cur94, "NO_POLL", "нет строки «вход выпуска» и polling текущего запуска"),
+             "вставлен только вход": (base + cur94 + insert(s0 + 60, "bot.py:1134", [e])[0], "NO_POLL",
+                                      "вход выпуска OK (release), но нет polling текущего запуска"),
+             "текущий «вход OK без polling» + та же пара": (base + run_ok(s0, poll_at=None, post=False)
+                                                            + insert(s0 + 60, "bot.py:1134", [e, p])[0], "UNKNOWN",
+                                                            ent2),
+             "тройка загрузка + вход + polling": (base + cur94 + insert(s0 + 60, "splinter.py:12197",
+                                                                         [kinds["загрузка"](s0 + 49.9), e, p])[0],
+                                                  "UNKNOWN", two)}
+    for name, (ls, want, w) in pairs.items():
+        st, why = verdict(ls)
+        assert st == want and why.startswith(w), (name, st, why)
+    print("    · ПРЕДЕЛ (2в) записан: сетка i1 verify8 %d журналов — ✅ %r; сообщений на пару %r; A1 — «✅ ВСЁ ОК» "
+          "code 0 без пуша, A5 — OK; пары %d — ❌" % (n, green, pair_msgs, len(pairs)))
 
 
 def _ref_read_log(blob):
@@ -1758,9 +2391,36 @@ def test_a12_read_log_chunked_equals_whole():
             tracemalloc.stop()
             del out
     size = os.path.getsize(path)
-    assert peaks["_read_log"] <= peaks["_read_log_lines"], {k: round(v / size, 3) for k, v in peaks.items()}
-    print("    · чтение кусками: %d разборов = r3 посимвольно; пик на %.1f МБ: _read_log %.2f×, readlines %.2f×"
-          % (n, size / 2 ** 20, peaks["_read_log"] / size, peaks["_read_log_lines"] / size))
+    # r6 · verify7 regress зам. 5: допуск 1,2× пика readlines. Оба строят ОДИН И ТОТ ЖЕ список str (равенство — выше), и
+    # разница пиков — только переходный буфер _read_log: один блок ≤ 8 КиБ и его байтовые строки (десятки КиБ на 4 МБ,
+    # < 0,02× readlines). На ПК пик 2,26× против 2,27× размера — запас 0,4%, и на другом аллокаторе / версии Python ворот
+    # сервера проверка падала бы от шума, а не от регресса. Регресс, ради которого она стоит, — разбор файла целиком
+    # (r3 — 7,0× размера; мутант «журнал одним куском» — сверх 1,2×, Z) — за порогом с запасом.
+    ratio = peaks["_read_log"] / max(peaks["_read_log_lines"], 1)
+    assert ratio <= 1.2, ({k: round(v / size, 3) for k, v in peaks.items()}, round(ratio, 3))
+    print("    · чтение кусками: %d разборов = r3 посимвольно; пик на %.1f МБ: _read_log %.2f×, readlines %.2f× (отношение "
+          "%.3f ≤ 1,2)" % (n, size / 2 ** 20, peaks["_read_log"] / size, peaks["_read_log_lines"] / size, ratio))
+
+
+class _Sized:
+    """Файл журнала, записывающий размер каждого f.read(n): замок удвоения куска _read_log (regress r5 v24–v26)."""
+
+    def __init__(self, f, sizes):
+        self._f, self.sizes = f, sizes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self._f.close()
+        return False
+
+    def read(self, n=-1):
+        self.sizes.append(n)
+        return self._f.read(n)
+
+    def fileno(self):
+        return self._f.fileno()
 
 
 def test_a13_read_log_linear_on_long_lines():
@@ -1769,21 +2429,42 @@ def test_a13_read_log_linear_on_long_lines():
     у r3 (квадрат по длине строки). r5 ищет перевод строки только в новом куске, хвост копится списком и склеивается
     один раз. Здесь: одна строка 16 МБ без \\n, журнал 8 МБ только с \\r, та же строка 4 МБ посреди живого журнала —
     разбор посимвольно равен разбору r3 целиком (_ref_read_log), время — порядка r3: потолок 1,5 с с запасом на
-    параллельный прогон мутантов (r4 на той же строке — 13,5 с; склейка хвоста на каждом куске — мутант ниже)."""
+    параллельный прогон мутантов (r4 на той же строке — 13,5 с; склейка хвоста на каждом куске — мутант ниже).
+
+    r6 · verify7 regress зам. 4 (v24–v26 выжили): размеры f.read закреплены. Пока перевода строки нет, кусок удваивается
+    от _READ_CHUNK до _READ_GROW_MAX и не выше (16 МБ без \\n — 14 чтений: 8 КиБ…4 МиБ, затем по 4 МиБ; без удвоения —
+    2049); на первом b"\\n" кусок сбрасывается к 8 КиБ (хвост живого журнала после строки 4 МБ — снова по 8 КиБ); живой
+    журнал, где b"\\n" есть в каждом куске, читается только по 8 КиБ."""
     path = os.path.join(TMP, "long_line.log")
     live = "".join(history() + run_ok(T_B)).encode("utf-8")
     cases = {"одна строка 16 МБ без \\n": b"x" * (16 << 20),
              "только \\r, 8 МБ": b"2026-10-21 06:00:00,000 [INFO] x: y\r" * ((8 << 20) // 37),
              "строка 4 МБ посреди живого журнала": live + b"2026-10-21 06:30:00,000 [INFO] splinter: dump " + b"y" * (
-                 4 << 20) + b"\n" + live}
-    times = {}
+                 4 << 20) + b"\n" + live * max(1, (6 << 20) // len(live)),
+             "живой журнал ×40": live * 40}
+    times, reads = {}, {}
     for name, blob in cases.items():
         with open(path, "wb") as f:
             f.write(blob)
-        with mock.patch.object(H, "LOG", path):
+        sizes = []
+        with mock.patch.object(H, "LOG", path), \
+                mock.patch.object(H, "open", lambda p, *a, **k: _Sized(_guard_open(p, *a, **k), sizes)):
             t0 = time.perf_counter()
             got = H._read_log()
             t_read = time.perf_counter() - t0
+        reads[name] = (len(sizes), max(sizes), sizes[-1])
+        grow = [H._READ_CHUNK << i for i in range(10)]                 # 8 КиБ … 4 МиБ
+        assert grow[-1] == H._READ_GROW_MAX, (grow[-1], H._READ_GROW_MAX)
+        if name in ("одна строка 16 МБ без \\n", "только \\r, 8 МБ"):   # ни одного b"\n": удвоение до потолка
+            assert sizes[:10] == grow and set(sizes[10:]) == {H._READ_GROW_MAX}, (name, sizes[:12], len(sizes))
+            assert len(sizes) <= 16, (name, len(sizes))
+        elif name == "живой журнал ×40":
+            assert set(sizes) == {H._READ_CHUNK}, (name, sorted(set(sizes)))
+        else:                    # строка 4 МБ: удвоение не выше потолка, затем сброс — 6 МБ живого хвоста по 8 КиБ
+            last_big = max(i for i, s in enumerate(sizes) if s > H._READ_CHUNK)
+            tail_reads = len(sizes) - 1 - last_big
+            assert max(sizes) <= H._READ_GROW_MAX and sizes[-1] == H._READ_CHUNK, (name, max(sizes), sizes[-3:])
+            assert tail_reads >= 100 and set(sizes[last_big + 1:]) == {H._READ_CHUNK}, (name, tail_reads, last_big)
         t0 = time.perf_counter()
         ref = _ref_read_log(blob)
         t_ref = time.perf_counter() - t0
@@ -2118,6 +2799,15 @@ MUTANTS = (
      "метка неизвестной формы до сегмента не замечается (n2b)", ("test_b8_unknown_stamp_form_is_unknown",)),
     ("            pend = None                    # за меткой", "            pass                           # за меткой",
      "запись истории не снимает метку неизвестной формы (ложная тревога)", ("test_b8_unknown_stamp_form_is_unknown",)),
+    # r7 · verify8 regress K3/K4 — pend снимает только запись истории: метка < старт − 2 с и до начала сегмента
+    ("        if rec and ts is not None and ts < start - win and not seg:\n",
+     "        if rec and ts is not None and ts < start - win:\n",
+     "pend снимается записью < старта и после начала сегмента (r6, verify8 K4 / K3 в сообщении)",
+     ("test_b17_pend_cleared_only_by_history_before_segment",)),
+    ("        if rec and ts is not None and ts < start - win and not seg:\n",
+     "        if rec and ts is not None and ts < start and not seg:\n",
+     "pend снимается записью в окне [старт − 2 с, старт) (r6, verify8 K3 — журнал repro)",
+     ("test_b17_pend_cleared_only_by_history_before_segment",)),
     # h3 · verify4 r4 — строка Аудитор при непрочитанном журнале
     ("    if log_err is not None:     # h3 · verify4 r4", "    if False:     # h3 · verify4 r4",
      "строка Аудитор при непрочитанном журнале — «нет ✅»", ("test_a11_auditor_row_unread_journal",)),
@@ -2135,17 +2825,56 @@ MUTANTS = (
      ("test_b8_unknown_stamp_form_is_unknown", "test_b11_stamp_prefix_rule_r3_restored")),
     ("        ts = _parse_log_ts(ln) if rec else None", "        ts = _parse_log_ts(ln)",
      "метку даёт и продолжение «,ммм» (cost N1/N2)", ("test_b11_stamp_prefix_rule_r3_restored",)),
-    # r5 · verify6 — счёт строк загрузки в окне текущего запуска
+    # r5 · verify6 — счёт строк загрузки в окне текущего запуска; r6 · verify7 M1 — по окну [старт − 2 с, …) мимо сброса
     ("    if boots > 1:", "    if False:", "счёт строк загрузки снят (второй писатель А/Б, P1)",
-     ("test_b12_boot_count_second_writer", "test_b9_boot_line_starts_new_process")),
-    ("            if ts >= start:\n                boots += 1", "            if True:\n                boots += 1",
-     "строки загрузки считаются по всему журналу, а не в окне", ("test_a3_normal_current_run_as_before",
-                                                                 "test_b12_boot_count_second_writer")),
+     ("test_b12_boot_count_second_writer", "test_b9_boot_line_starts_new_process",
+      "test_b14_window_count_m1_and_insertions")),
+    ("        if rec and ts is not None and ts >= start - win:\n", "        if rec and ts is not None:\n",
+     "записи начала считаются по всему журналу, а не в окне", ("test_a3_normal_current_run_as_before",
+                                                               "test_b12_boot_count_second_writer")),
+    ("_WIN_BACK_S = 2\n", "_WIN_BACK_S = 0\n", "окно счёта со старта (r5): запись раньше старта на долю секунды не в счёте",
+     ("test_b14_window_count_m1_and_insertions", "test_b15_price5_window_count_numbers")),
+    ("_WIN_BACK_S = 2\n", "_WIN_BACK_S = 1\n", "окно счёта Δ = 1 с", ("test_b14_window_count_m1_and_insertions",
+                                                                       "test_b15_price5_window_count_numbers")),
+    ("_WIN_BACK_S = 2\n", "_WIN_BACK_S = 3\n", "окно счёта Δ = 3 с (цена шире названной)",
+     ("test_b14_window_count_m1_and_insertions", "test_b15_price5_window_count_numbers")),
+    ("    if entries_w > 1:", "    if False:", "счёт входов по окну снят (r5: «два входа» — только после сброса)",
+     ("test_b14_window_count_m1_and_insertions", "test_b1_ambiguity_and_contradictions")),
+    ("            shut = None                    # r5: остановка выше строки загрузки — прежнего процесса\n",
+     "            shut = None                    # r5: остановка выше строки загрузки — прежнего процесса\n"
+     "            entries_w = 0\n", "счёт входов сбрасывается строкой загрузки (r5 по месту, verify7 M1)",
+     ("test_b14_window_count_m1_and_insertions",)),
+    ("            elif _ENTRY_RE.match(ln):\n                entries_w += 1",
+     "            elif _ENTRY_RE.match(ln) and ts >= start:\n                entries_w += 1",
+     "счёт входов со старта, а не с старт − 2 с", ("test_b15_price5_window_count_numbers",)),
+    # r6 · verify7 N1c/N2 — запись только точного формата bot.py:73
+    ('_REC_RE = re.compile(r"^" + _LOG_TS + r" \\[(?:" + "|".join(_LEVELS) + r")\\] " + _NAME + r": ", re.ASCII)',
+     '_REC_RE = re.compile(r"^" + _LOG_TS + r" \\[[A-Z]+\\] \\S+: ", re.ASCII)', "запись — любой [A-Z]+ и \\S+ (r5)",
+     ("test_b16_record_exact_bot_format",)),
+    ('r" \\[(?:" + "|".join(_LEVELS) + r")\\] "', 'r" \\[[A-Z]+\\] "', "уровень записи — любой [A-Z]+ («[I]»)",
+     ("test_b16_record_exact_bot_format",)),
+    ('+ _NAME + r": ", re.ASCII)', '+ r"\\S+: ", re.ASCII)', "имя записи — любой \\S+ («имя:номер»)",
+     ("test_b16_record_exact_bot_format",)),
+    # r6 · verify7 regress — выжившие мутанты r5 (v10/v11, v15, v16, v24–v26)
+    ("            entries, polls = [], []        # r4 · verify5 Q1: строка загрузки bot.py:94 по МЕСТУ — начало НОВОГО\n",
+     "            if ts >= start:                # мутант regress r5 v10/v11\n                entries, polls = [], []\n",
+     "сброс строкой загрузки только при её метке ≥ старта (v10/v11)", ("test_b9_boot_line_starts_new_process",)),
+    ("            shut = None                    # r5: остановка выше",
+     "            pass                           # r5: остановка выше",
+     "остановка выше строки загрузки не сбрасывается — слова (v15)", ("test_b10_scheduler_stop_ends_process",)),
+    ("                if cur is not None and cur >= start:\n", "                if cur is not None and cur > start:\n",
+     "метка неизвестной формы в первую секунду запуска — история (v16)", ("test_b11_stamp_prefix_rule_r3_restored",)),
+    ("                    size = _READ_CHUNK\n                else:", "                    pass\n                else:",
+     "кусок не сбрасывается к 8 КиБ на «\\n» (v24)", ("test_a13_read_log_linear_on_long_lines",)),
+    ("size = min(size * 2, _READ_GROW_MAX)", "size = size * 2", "удвоение куска без потолка (v25)",
+     ("test_a13_read_log_linear_on_long_lines",)),
+    ("size = min(size * 2, _READ_GROW_MAX)", "size = _READ_CHUNK", "без удвоения куска (v26)",
+     ("test_a13_read_log_linear_on_long_lines",)),
     ('_BOOT_RE = re.compile(r"^" + _LOG_TS + r" \\[INFO\\] turbobaby: " + re.escape(_BOOT_MSG) + r"$", re.ASCII)',
      '_BOOT_RE = re.compile(r".*" + re.escape(_BOOT_MSG.strip()), re.ASCII)',
      "строка загрузки подстрокой (verify6 m06)", ("test_b12_boot_count_second_writer",)),
     # r5 · verify6 a3 — порядок внутри процесса
-    ("        if rec and ts is not None and ts < start and boots > 0 and _BOOT_RE.match(ln):\n",
+    ("        if rec and ts is not None and ts < start and boots_in > 0 and _BOOT_RE.match(ln):\n",
      "        if False:\n", "строка загрузки раньше старта ниже записей текущего — не замечается (a3)",
      ("test_b12_boot_count_second_writer",)),
     ("        if boot_ts is not None and (ts, ln[20:23]) < boot_ts and (m or _POLL_RE.match(ln)):\n",
