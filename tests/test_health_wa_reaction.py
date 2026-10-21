@@ -19,10 +19,20 @@ None, то есть подняло бы тревогу на каждой маш�
 
 Сети здесь нет: все зонды `health` подменены, `build_report` не делает ни одного обращения
 наружу (проверяется отдельно — счётчиком вызовов подменённых зондов).
+
+Боевых файлов и процессов тоже нет (RCFIX2010 C h3): на сервере REPO — живое дерево, и `health.LOG`
+указывает на боевой `splinter.log`. Поэтому подменены ВСЕ читатели, которых зовёт `build_report`
+(журнал — `_read_log` с r2 и прежний `_read_log_lines`, граница systemd — `_read_run`), `LOG` уведён
+во временный каталог, а `open` и `subprocess.run` внутри `health` — сторожа: попытка открыть файл или
+запустить процесс мимо подмен записывается и роняет проверку (7). Там же замок: каждая функция
+`health`, которую зовёт `build_report`, либо подменена здесь, либо чистая.
 """
 
+import ast
 import os
 import sys
+import tempfile
+import types
 
 REPO = "/root/turbobaby-manager-bot"
 sys.path.insert(0, REPO)
@@ -41,17 +51,35 @@ def ok(cond, label):
 
 _ORIG = {}
 _probe_calls = {"n": 0}
+_TMP = tempfile.mkdtemp(prefix="health_wa_reaction_")
+_LIVE = {"open": [], "run": []}            # попытки health открыть файл / запустить процесс мимо подмен
+# Чем подменены читатели build_report (замок (7)): всё, что открывает файл, запускает процесс или ходит в сеть.
+_PATCHED = ("check_service", "check_bridge", "check_auditor", "check_polling",
+            "check_log_health", "check_brain_latency", "check_api_credit",
+            "check_commit", "check_wa_webhook", "_read_log_lines", "_read_log", "_read_run")
+_PURE = ("_recheck_run", "_utcnow")          # зовутся build_report, но ничего не читают
+
+
+def _guard_open(path, *a, **kw):
+    _LIVE["open"].append(str(path))
+    raise PermissionError(13, "тест: health не открывает файлы в этом тесте", str(path))
+
+
+def _guard_run(cmd, *a, **kw):
+    _LIVE["run"].append(list(cmd) if isinstance(cmd, (list, tuple)) else [str(cmd)])
+    raise FileNotFoundError(2, "тест: живой процесс из health запрещён", str(cmd))
 
 
 def _install(wa_value):
     """Подменить ВСЕ зонды здоровья на зелёные, кроме WA — он отдаёт заданное значение."""
-    names = ("check_service", "check_bridge", "check_auditor", "check_polling",
-             "check_log_health", "check_brain_latency", "check_api_credit",
-             "check_commit", "check_wa_webhook", "_read_log_lines", "_read_run")
-    for n in names:
+    for n in _PATCHED + ("LOG", "subprocess"):
         _ORIG.setdefault(n, getattr(H, n))
 
+    H.LOG = os.path.join(_TMP, "splinter.log")             # не боевой журнал, даже если читатель не подменён
+    H.open = _guard_open                                   # имя модуля health заслоняет builtins.open
+    H.subprocess = types.SimpleNamespace(run=_guard_run)   # _run / _read_run / рестарт WA — мимо подмен не пройдут
     H._read_log_lines = lambda *a, **kw: []
+    H._read_log = lambda *a, **kw: ([], None)  # RCFIX2010 C r2: build_report читает журнал ЭТИМ читателем
     H._read_run = lambda *a, **kw: None       # RCFIX2010 C: без живого `systemctl show`; polling судит заглушка ниже
     H.check_service   = lambda *a, **kw: (True, "active", None, None)
     H.check_bridge    = lambda *a, **kw: (True, "ok")
@@ -71,6 +99,8 @@ def _install(wa_value):
 def _restore():
     for n, fn in _ORIG.items():
         setattr(H, n, fn)
+    if H.__dict__.get("open") is _guard_open:
+        del H.open
 
 
 try:
@@ -116,6 +146,22 @@ try:
     print("\n(6) сеть не трогалась")
     ok(_probe_calls["n"] >= 4, "зонд WA звался подменённым во всех прогонах: "
                                + str(_probe_calls["n"]))
+
+    # ── (7) ни боевого журнала, ни systemd: каждый читатель build_report подменён ─────
+    print("\n(7) боевые файлы и процессы не трогались (на сервере LOG = боевой splinter.log)")
+    ok(_LIVE["open"] == [], "open внутри health не звался ни разу: " + repr(_LIVE["open"][:3]))
+    ok(_LIVE["run"] == [], "subprocess.run внутри health не звался ни разу: " + repr(_LIVE["run"][:3]))
+    ok(H.LOG.startswith(_TMP), "LOG на время прогона — во временном каталоге: " + H.LOG)
+    tree = ast.parse(src)
+    defs = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    br = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_report"][0]
+    called = {n.func.id for n in ast.walk(br) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id in defs}
+    ok("_read_log" in called and "_read_run" in called, "build_report зовёт _read_log и _read_run: "
+                                                        + ", ".join(sorted(called)))
+    ok(not (called - set(_PATCHED) - set(_PURE)),
+       "каждая функция health из build_report подменена здесь или чистая; лишние: "
+       + repr(sorted(called - set(_PATCHED) - set(_PURE))))
 finally:
     _restore()
 
