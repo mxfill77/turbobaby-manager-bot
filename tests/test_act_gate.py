@@ -318,6 +318,56 @@ def test_yes_button_on_gate_question_runs_the_door():
     assert any("20000" in json.dumps(kw) for nm, kw in br.calls if nm in WRITES), br.calls
 
 
+def test_kfix_old_life_button_does_not_hit_new_life_pending():
+    """K-FIX 21.10 (находка K синтеза O3, `rcfix2010/out/intake_o3/final/O3_SPEC.md` §12): счётчик меток ворот
+    начинался с 0 в каждой жизни процесса, кнопка несёт голый номер (`svc:agy:{n}`), а `_act_gate_button` ищет ожидание
+    только по номеру. Ненажатая кнопка прошлой жизни (TTL 6 ч, клавиатура снимается лишь нажатием) после рестарта
+    попадала на ожидание новой жизни с тем же номером — «верно» доверенного запускало дверь по ЧУЖОМУ сообщению.
+    Теперь номер новой жизни затравлен временем: малые номера прошлой жизни (947953e, старт с 0) → «устарело».
+    Контроль: прежняя затравка 0 — та же старая кнопка пишет по чужому сообщению."""
+    parse = {"type": "event", "event_type": "repair", "mileage": 20000, "works": ["подшипники"]}
+    out = {}
+    for seed in ("время", "ноль (до K-FIX)"):
+        S._ACT_GATE_PENDING.clear()
+        if seed != "время":
+            S._ACT_GATE_SEQ[0] = 0
+        ctx, br = _Ctx(), _Bridge()
+        _texts, calls, ctx, br = _run(_Msg("подшипники проверить после 20 000", user=OWNER),
+                                      _Claude(parse), env=ON, ctx=ctx, br=br)
+        assert not _writes(calls) and len(S._ACT_GATE_PENDING) == 1, (seed, calls)
+        n = max(S._ACT_GATE_PENDING)
+        for old in range(1, 6):                     # метки прошлой жизни 947953e: 1…5
+            _press(f"svc:agy:{old}", OWNER, ctx, br, ON)
+        out[seed] = (n, n in S._ACT_GATE_PENDING, bool(_writes(br.calls)))
+    S._ACT_GATE_PENDING.clear()
+    S._ACT_GATE_SEQ[0] = int(__import__("time").time())
+    n, alive, wrote = out["время"]
+    assert n > 10 ** 9 and alive and not wrote, out
+    n0, alive0, wrote0 = out["ноль (до K-FIX)"]
+    assert n0 == 1 and not alive0 and wrote0, ("контроль: без K-FIX старая кнопка обязана попасть в чужое", out)
+
+
+def test_kfix_all_label_counters_seeded_from_time():
+    """K-FIX 21.10: все пять счётчиков меток без памяти на диске затравлены временем при импорте — AST, без
+    исполнения: splinter.py `_HB_SEQ`, `_O3_SEQ`, `_SVC_UNDO_SEQ`, `_ACT_GATE_SEQ` = `[int(_time.time())]`,
+    bot.py `_audit_seq` = `[int(_wall())]` (`from time import … time as _wall`). `_SVC_SEQ` живёт на диске (max)."""
+    want = {"splinter.py": ({"_HB_SEQ", "_O3_SEQ", "_SVC_UNDO_SEQ", "_ACT_GATE_SEQ"}, "int(_time.time())"),
+            "bot.py": ({"_audit_seq"}, "int(_wall())")}
+    for fname, (names, expr) in want.items():
+        src = open(os.path.join(ROOT, fname), encoding="utf-8").read()
+        tree = ast.parse(src)
+        got = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
+                    and node.targets[0].id.endswith(("_SEQ", "_seq")):
+                got[node.targets[0].id] = ast.get_source_segment(src, node.value)
+        for nm in names:
+            assert got.get(nm) == "[%s]" % expr, (fname, nm, got.get(nm))
+        zero = sorted(k for k, v in got.items() if v == "[0]" and k != "_SVC_SEQ")
+        assert not zero, (fname, "счётчик меток с нуля без памяти на диске", zero)
+    assert "time as _wall" in open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+
+
 def _press(data, user, ctx, br, env):
     class _Q:
         from_user = _User(user)
