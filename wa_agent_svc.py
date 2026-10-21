@@ -218,6 +218,7 @@ F_BOOK = "WA_AGENT_BOOK_READ"             # брони только на чте�
 F_BOOK_CTX = "WA_AGENT_BOOK_CTX"          # наличие по переписке (BOOKCTX1610); по умолчанию выкл; не в FLAGS
 F_PRICE_CARRY = "WA_AGENT_PRICE_CARRY"    # цена через ход (PRICECARRY1610); по умолчанию выкл; не в FLAGS
 F_OFFER = "WA_AGENT_OFFER"                # наличие и цена по запросу модели (OFFER1910); по умолчанию выкл; не в FLAGS
+F_INTAKE_CARD = "WA_AGENT_INTAKE_CARD"    # A2INTAKE2210: карточка «🆕 БРОНЬ» во «Входящие» из дела WA; по умолчанию выкл
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
 F_ATTACH = "WA_AGENT_ATTACH"              # PDF договора второй частью «Отправить» (NIGHT0710-B3v); не в FLAGS
@@ -1121,6 +1122,25 @@ def price_carry_of(environ, model):
                   "модель сменилась — расчёт не вызван, число не называется; клиенту — только по «Отправить»")
 
 
+def intake_card_of(environ, journal=None, transport=None):
+    """A2INTAKE2210 (пакет Codex A2 v2): флаг WA_AGENT_INTAKE_CARD → (засчитан? | None, слова строки старта | None).
+    Не запрошен → (None, None): ни импорта, ни строки, ничего не меняется. Запрошен, но нет постоянного журнала
+    карточек или транспорта userbot ПК (не подключены в этом выпуске) → (False, слова): ничего не готовится и не
+    отправляется. Модуль `wa_intake_card` — prepare/commit/reconcile, см. его шапку."""
+    if not wa_agent_tg.flag_on((environ or {}).get(F_INTAKE_CARD)):
+        return None, None
+    if journal is None or transport is None:
+        return False, ("не засчитан — флаг 1, но журнал карточек или транспорт userbot не подключены: карточки "
+                       "«🆕 БРОНЬ» не готовятся и не отправляются")
+    try:
+        import wa_intake_card  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        return False, "не засчитан — модуль карточки не собран (%s)" % type(e).__name__
+    return True, ("вкл — карточка «🆕 БРОНЬ» только при OFFER-факте, явном согласии на него (id входящего), фото "
+                  "паспорта этого дела и месте доставки; высокий сезон 15.12–15.03 или «high» — причина «нужна "
+                  "предоплата» сотруднику; одно дело — одна карточка; сомнение — UNKNOWN и сверка")
+
+
 def offer_of(environ, model):
     """OFFER1910: флаг WA_AGENT_OFFER → (засчитан? | None, слова строки старта | None). Правило флага — одно со всеми
     выключателями (`flag_on`). Не запрошен — (None, None): ни импорта `wa_offer_tool`, ни строки, класс адаптера и блок
@@ -1281,6 +1301,11 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
     _of, of_words = offer_of(environ, model)
     if of_words:
         line("наличие и цена по запросу модели (%s): %s" % (F_OFFER, of_words))
+    # A2INTAKE2210: карточка брони во «Входящие» — флаг не запрошен: ни строки, ни импорта; журнал и транспорт в этом
+    # выпуске не подключены — запрошенный флаг честно «не засчитан»
+    _ic, ic_words = intake_card_of(environ)
+    if ic_words:
+        line("карточка брони во «Входящие» (%s): %s" % (F_INTAKE_CARD, ic_words))
     # кэш промпта (WAAGENTCACHE0210): срок несёт адаптер, его собрал make_model; здесь — только строка старта
     ttl = getattr(model, "cache", None)
     line("кэш промпта (%s): %s" % (F_CACHE, "вкл, срок %s — инструкция и узлы знаний впереди с отметкой кэша" % ttl
