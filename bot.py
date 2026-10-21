@@ -23,7 +23,7 @@ import re
 import signal
 import tempfile
 from datetime import time as dtime, datetime
-from time import monotonic as _mono, time as _wall
+from time import monotonic as _mono
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -120,7 +120,7 @@ else:
 # Хранилище карточек аудита {token: card} + счётчик (callback_data ограничен 64 байтами,
 # поэтому в кнопку кладём короткий токен, а не сам fix). pending — ожидание ✏️-правки.
 _audit_cards = {}
-_audit_seq = [int(_wall())]   # K-FIX 21.10: от времени — «aud:*:n» прошлой жизни не примет чужую карточку
+_audit_seq = [((1 << 40) | int.from_bytes(os.urandom(5), "big")) << 20]   # K-FIX r2: «aud:*:n» прошлой жизни — мимо
 _audit_pending_edit = {}   # {audit_chat_id: token} — ждём текст нового правила от Филиппа
 # Дедуп contradiction/high в инбокс: fingerprint = (chat_id, topic_id, detail[:80])
 _audit_high_dedup: set = set()

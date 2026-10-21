@@ -323,49 +323,100 @@ def test_kfix_old_life_button_does_not_hit_new_life_pending():
     начинался с 0 в каждой жизни процесса, кнопка несёт голый номер (`svc:agy:{n}`), а `_act_gate_button` ищет ожидание
     только по номеру. Ненажатая кнопка прошлой жизни (TTL 6 ч, клавиатура снимается лишь нажатием) после рестарта
     попадала на ожидание новой жизни с тем же номером — «верно» доверенного запускало дверь по ЧУЖОМУ сообщению.
-    Теперь номер новой жизни затравлен временем: малые номера прошлой жизни (947953e, старт с 0) → «устарело».
-    Контроль: прежняя затравка 0 — та же старая кнопка пишет по чужому сообщению."""
+    K-FIX r2 (Codex TB-OWNER-2110-DISK-P0-ADD1): затравка временем жизнь не различала — старая жизнь с T выдала T+1…T+5,
+    новая с T+2 выдаёт T+3, и старая третья кнопка находит новое ожидание. Теперь номер жизни — случайные 40 бит со
+    старшим битом, сдвинутые на 20: блок жизни [B, B + 2^20), B ∈ [2^60, 2^61). Две жизни пересекаются только при
+    совпадении номера жизни. Сценарии — две жизни подряд на ОДНОМ процессе теста (рестарт = сброс ожидания и новая
+    затравка тем же выражением исходника), старая метка нажимается в новой жизни:
+      «время T / T+2» (r1, контроль) и «ноль» (до K-FIX, контроль) — старая метка равна новой, пишет по чужому;
+      «номер жизни» (r2) — две затравки исходным выражением: старая метка → «устарело», записей нет, новое ожидание
+      цело; малые метки 947953e (1…5) — тоже мимо."""
     parse = {"type": "event", "event_type": "repair", "mileage": 20000, "works": ["подшипники"]}
-    out = {}
-    for seed in ("время", "ноль (до K-FIX)"):
+    seed_expr = _seed_exprs()["splinter.py"]["_ACT_GATE_SEQ"]
+    t = int(__import__("time").time())
+
+    def life(seed):                                  # рестарт: память ожиданий пуста, счётчик — затравка жизни
         S._ACT_GATE_PENDING.clear()
-        if seed != "время":
-            S._ACT_GATE_SEQ[0] = 0
+        S._ACT_GATE_SEQ[0] = seed
         ctx, br = _Ctx(), _Bridge()
         _texts, calls, ctx, br = _run(_Msg("подшипники проверить после 20 000", user=OWNER),
                                       _Claude(parse), env=ON, ctx=ctx, br=br)
-        assert not _writes(calls) and len(S._ACT_GATE_PENDING) == 1, (seed, calls)
-        n = max(S._ACT_GATE_PENDING)
-        for old in range(1, 6):                     # метки прошлой жизни 947953e: 1…5
-            _press(f"svc:agy:{old}", OWNER, ctx, br, ON)
-        out[seed] = (n, n in S._ACT_GATE_PENDING, bool(_writes(br.calls)))
+        assert not _writes(calls) and len(S._ACT_GATE_PENDING) == 1, calls
+        return max(S._ACT_GATE_PENDING), ctx, br
+
+    out = {}
+    for name, seeds in (("время T / T+2 (r1)", (t + 2, t + 2)), ("ноль (до K-FIX)", (0, 0)),
+                        ("номер жизни (r2)", (eval(seed_expr, {"os": os})[0], eval(seed_expr, {"os": os})[0]))):
+        n_old, _c, _b = life(seeds[0])                # старая жизнь: метка n_old осталась в чате ненажатой
+        n_new, ctx, br = life(seeds[1])               # новая жизнь: своё ожидание
+        _press(f"svc:agy:{n_old}", OWNER, ctx, br, ON)
+        smalls = name.startswith("номер")
+        if smalls:
+            for old in range(1, 6):                   # метки жизни 947953e: 1…5
+                _press(f"svc:agy:{old}", OWNER, ctx, br, ON)
+        out[name] = (n_old, n_new, n_new in S._ACT_GATE_PENDING, bool(_writes(br.calls)))
     S._ACT_GATE_PENDING.clear()
-    S._ACT_GATE_SEQ[0] = int(__import__("time").time())
-    n, alive, wrote = out["время"]
-    assert n > 10 ** 9 and alive and not wrote, out
-    n0, alive0, wrote0 = out["ноль (до K-FIX)"]
-    assert n0 == 1 and not alive0 and wrote0, ("контроль: без K-FIX старая кнопка обязана попасть в чужое", out)
+    S._ACT_GATE_SEQ[0] = eval(seed_expr, {"os": os})[0]
+    for name in ("время T / T+2 (r1)", "ноль (до K-FIX)"):
+        n_old, n_new, alive, wrote = out[name]
+        assert n_old == n_new and not alive and wrote, ("контроль: старая метка обязана попасть в чужое", name, out)
+    n_old, n_new, alive, wrote = out["номер жизни (r2)"]
+    assert n_old != n_new and alive and not wrote, out
+    assert n_old >> 20 != n_new >> 20 and 2 ** 60 <= n_old < 2 ** 61 and 2 ** 60 <= n_new < 2 ** 61, out
 
 
-def test_kfix_all_label_counters_seeded_from_time():
-    """K-FIX 21.10: все пять счётчиков меток без памяти на диске затравлены временем при импорте — AST, без
-    исполнения: splinter.py `_HB_SEQ`, `_O3_SEQ`, `_SVC_UNDO_SEQ`, `_ACT_GATE_SEQ` = `[int(_time.time())]`,
-    bot.py `_audit_seq` = `[int(_wall())]` (`from time import … time as _wall`). `_SVC_SEQ` живёт на диске (max)."""
-    want = {"splinter.py": ({"_HB_SEQ", "_O3_SEQ", "_SVC_UNDO_SEQ", "_ACT_GATE_SEQ"}, "int(_time.time())"),
-            "bot.py": ({"_audit_seq"}, "int(_wall())")}
-    for fname, (names, expr) in want.items():
+_LIFE_SEED = '[((1 << 40) | int.from_bytes(os.urandom(5), "big")) << 20]'
+
+
+def _seed_exprs():
+    """{файл: {имя счётчика *_SEQ/*_seq верхнего уровня: исходный текст значения}} — AST, без импорта."""
+    res = {}
+    for fname in ("splinter.py", "bot.py"):
         src = open(os.path.join(ROOT, fname), encoding="utf-8").read()
-        tree = ast.parse(src)
         got = {}
-        for node in tree.body:
+        for node in ast.parse(src).body:
             if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) \
                     and node.targets[0].id.endswith(("_SEQ", "_seq")):
                 got[node.targets[0].id] = ast.get_source_segment(src, node.value)
+        res[fname] = got
+    return res
+
+
+def test_kfix_all_label_counters_seeded_per_life():
+    """K-FIX r2: все пять счётчиков меток без памяти на диске затравлены номером жизни (AST): splinter.py `_HB_SEQ`,
+    `_O3_SEQ`, `_SVC_UNDO_SEQ`, `_ACT_GATE_SEQ` и bot.py `_audit_seq` = `_LIFE_SEED`; счётчиков с нуля нет (`_SVC_SEQ`
+    живёт на диске, max). Значение: 2000 затравок — все в [2^60, 2^61), кратны 2^20, номера жизни попарно различны.
+    Предел Telegram: КАЖДЫЙ шаблон callback_data этих меток из исходника с максимальной меткой (2^61 − 1) и самыми
+    длинными подстановками ({kind} — длиннейший из `_MAND_KINDS`, {i} — «99») — не больше 64 байт."""
+    import re as _re
+    seeds = _seed_exprs()
+    want = {"splinter.py": {"_HB_SEQ", "_O3_SEQ", "_SVC_UNDO_SEQ", "_ACT_GATE_SEQ"}, "bot.py": {"_audit_seq"}}
+    for fname, names in want.items():
         for nm in names:
-            assert got.get(nm) == "[%s]" % expr, (fname, nm, got.get(nm))
-        zero = sorted(k for k, v in got.items() if v == "[0]" and k != "_SVC_SEQ")
+            assert seeds[fname].get(nm) == _LIFE_SEED, (fname, nm, seeds[fname].get(nm))
+        zero = sorted(k for k, v in seeds[fname].items() if v == "[0]" and k != "_SVC_SEQ")
         assert not zero, (fname, "счётчик меток с нуля без памяти на диске", zero)
-    assert "time as _wall" in open(os.path.join(ROOT, "bot.py"), encoding="utf-8").read()
+    vals = [eval(_LIFE_SEED, {"os": os})[0] for _ in range(2000)]
+    assert all(2 ** 60 <= v < 2 ** 61 and v % (1 << 20) == 0 for v in vals), "вне блока"
+    assert len({v >> 20 for v in vals}) == len(vals), "номер жизни повторился"
+    pat = _re.compile(r'callback_data=f"((?:svc:ag[ymn]|svc:undo|delivery:[a-z]+|o3:[a-z]+|aud:[a-z]+):'
+                      r'\{(?:tok|n|token)\}[^"]*)"')
+    big = str(2 ** 61 - 1)
+    kind = max(S._MAND_KINDS, key=len)
+    found = []
+    for fname in ("splinter.py", "bot.py"):
+        for m in pat.finditer(open(os.path.join(ROOT, fname), encoding="utf-8").read()):
+            cb = m.group(1)
+            for ph in ("{tok}", "{n}", "{token}"):
+                cb = cb.replace(ph, big)
+            cb = cb.replace("{kind}", kind).replace("{i}", "99")
+            assert "{" not in cb, (fname, m.group(1))
+            assert len(cb.encode("utf-8")) <= 64, (fname, cb, len(cb.encode("utf-8")))
+            found.append(cb)
+    assert len(found) >= 20, found
+    assert any(c.startswith("svc:agy:") for c in found) and any(c.startswith("aud:ok:") for c in found) \
+        and any(c.startswith("o3:vid:") for c in found) and any(c.startswith("delivery:pick:") for c in found) \
+        and any(c.startswith("svc:undo:") for c in found), found
 
 
 def _press(data, user, ctx, br, env):

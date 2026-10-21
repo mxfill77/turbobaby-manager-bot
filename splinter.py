@@ -8015,7 +8015,7 @@ async def handle_service_button(update, context, bridge) -> None:
 # ============================================================
 DELIVERY_CHAT_ID = -1002445921469
 _HB_TOKENS = {}   # token(int) -> {chat,msg_id,bike,client,date_due,booking_id,handed,candidates,test}
-_HB_SEQ = [int(_time.time())]   # K-FIX 21.10: номер от времени — метка прошлой жизни не совпадёт с меткой новой
+_HB_SEQ = [((1 << 40) | int.from_bytes(os.urandom(5), "big")) << 20]   # K-FIX r2: блок 2^20 меток случайной жизни
 
 # --- ТЕСТ-РЕЖИМ табло выдачи: обкатка в HQ без тайцев, на ВЫДУМАННЫХ бронях (реальный CRM не читаем). ---
 # Вернуть в боевой Delivery: HB_TEST_MODE = False + restart. Delivery командой /board в тест-режиме НЕ трогается.
@@ -8289,7 +8289,7 @@ O3_TEST_CHAT_ID = -1003853365891             # HQ / TurboControl (тестова
 NARYADY_TOPIC = None                         # topic_id темы «🔧 Наряды» в группе ОБСЛУЖИВАНИЯ (-1002751134848).
                                              #   Задать ПОСЛЕ создания темы; None → board без темы (в тесте — HQ).
 _O3_TOKENS = {}                              # tok(int) -> draft {bike,plate,current_km,overdue_kinds,kinds,from_where,when}
-_O3_SEQ = [int(_time.time())]   # K-FIX 21.10: номер от времени — метка прошлой жизни не совпадёт с меткой новой
+_O3_SEQ = [((1 << 40) | int.from_bytes(os.urandom(5), "big")) << 20]   # K-FIX r2: блок 2^20 меток случайной жизни
 _O3_BOARD = {"chat": None, "msg": None}      # заголовок board (для o3_task board_chat/board_msg)
 
 _O3_FROM_LABEL = {"office": ("ที่ออฟฟิศ", "в офисе"), "client": ("ที่ลูกค้า", "у клиента"),
@@ -11046,7 +11046,7 @@ _SVC_DEDUP_WIN_SEC = int(os.getenv("SERVICE_DEDUP_WIN_MIN", "60")) * 60
 # платит ни одного лишнего обращения к мосту.
 _SVC_UNDO = {}                  # tok(int) -> запись акта (undo_last.act)
 _SVC_UNDO_LAST = {}             # (chat, topic) -> tok ПОСЛЕДНЕГО акта темы (замок «только последняя»)
-_SVC_UNDO_SEQ = [int(_time.time())]   # свой счётчик токенов (своя память, не _SVC_TOKENS); K-FIX 21.10: от времени
+_SVC_UNDO_SEQ = [((1 << 40) | int.from_bytes(os.urandom(5), "big")) << 20]   # свой счётчик (не _SVC_TOKENS); K-FIX r2
 
 
 def _svc_undo_on():
@@ -12621,7 +12621,7 @@ def _act_trusted(msg):
 _TOPIC_FEED = {}           # (chat_id, topic_id) -> [ {ts, author, tags, works} ] — последние 20
 _TOPIC_FEED_MAX = 20
 _ACT_GATE_PENDING = {}     # n -> {msg, photo_msgs, claude, door, bike, author, ts}
-_ACT_GATE_SEQ = [int(_time.time())]   # K-FIX 21.10: старая метка «svc:ag*:n» новой жизни → «устарело», не чужая дверь
+_ACT_GATE_SEQ = [((1 << 40) | int.from_bytes(os.urandom(5), "big")) << 20]   # K-FIX r2: метка прошлой жизни → «устарело»
 _ACT_GATE_TTL = 6 * 3600
 
 
