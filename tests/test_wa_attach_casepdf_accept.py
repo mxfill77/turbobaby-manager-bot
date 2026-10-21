@@ -665,7 +665,7 @@ def test_compat_event_card_same_with_autosend_flag():
 
 FROZEN = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",          # git-блобы f678739 (`git rev-parse`)
           "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",
-          "wa_agent_model.py": "7c58cca9c7e32b6eb929f861dc631170bebea855"}  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка)
+          "wa_agent_model.py": "b95d3a861f87075f684ba10b7d97e40e411d44a9"}  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9
 
 
 def _blob(path):

@@ -123,9 +123,9 @@ EXPECT_COLS = {"number", "opened_at", "why", "upto_id", "due_at", "checked_at", 
 HEAD = T.TOOLS_BLOCK % T.MAX_CALLS + "\n\n"            # голова каждого хода сверки (`T.run`): блок инструментов + user
 # блобы a1dcbe5 (`git rev-parse a1dcbe5:<файл>`): закреплённые файлы выпуск НЕ трогает
 PINS = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
-        "wa_agent_model.py": "7c58cca9c7e32b6eb929f861dc631170bebea855",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка)
+        "wa_agent_model.py": "b95d3a861f87075f684ba10b7d97e40e411d44a9",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9
         "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",
-        "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3",
+        "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
         "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0"}
 TOOLS_BLOCK_SHA = "175b220824b649ce151ae7f463ac864166265b26e9ccd13d42032a93d850d3d1"   # = integ_wa BASE_TOOLS_BLOCK_SHA
 SVC_ON = {"WA_AGENT_DRAFTS": "1", "WA_AGENT_CARDS": "1", "WA_SEND": "1", "WA_AGENT_TOOLS": "1",

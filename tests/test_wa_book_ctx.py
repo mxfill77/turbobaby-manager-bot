@@ -83,12 +83,12 @@ LIVE = [{"name": n, "status": "ДОМА"} for n in ("PCX 160CC WHITE PHUKET 3011
 # RCFIX2010: у байка парка статус формулы столбца B (живой формат ReadFleet.js:91-95) — без него юнит не «свободно»
 BASE = "cbe1322"                               # прод 556e744 + FORMID
 PINS = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
-        "wa_agent_model.py": "7c58cca9c7e32b6eb929f861dc631170bebea855",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка)
+        "wa_agent_model.py": "b95d3a861f87075f684ba10b7d97e40e411d44a9",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9
         "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",
-        "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3",
+        "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
         "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
         "bridge_client.py": "71d290387c95dc283a477f1c44ab4e4c9bedb665",
-        "wa_book_read.py": "5a90fddccbf973f362ba66c52792326b3708d091",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно»)
+        "wa_book_read.py": "ba866980d22c75c005e40510b1271453aac74a25",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно») · PROMPT2110: было 5a90fddc
         "wa_agent_tg.py": "6bcbe4ce4574224c2ce4e63e29a78698e91d2877",  # RCFIX2010 D3: было c3fbd715 (метка, _num)
         "contract_ask.py": "be132d7a099dbb84edadca636989cb16dd19c607"}
 PROD_MAKE_MODEL = ["env", "line", "bridge", "call", "lessons", "book", "cache", "tools", "hints", "cstate"]

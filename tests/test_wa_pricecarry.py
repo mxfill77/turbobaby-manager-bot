@@ -88,10 +88,10 @@ W_NO_MODEL = "не засчитан — флаг 1, но у модели нет 
 W_NO_MOD = "не засчитан — модуль цены через ход не собран (ImportError) — адаптер прежний"
 # блобы закреплённых файлов на 13b4188 (git rev-parse 13b4188:<файл>): родитель примеси тот же, что в базе
 PINS = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
-        "wa_agent_model.py": "7c58cca9c7e32b6eb929f861dc631170bebea855",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка)
-        "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3",
+        "wa_agent_model.py": "b95d3a861f87075f684ba10b7d97e40e411d44a9",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9
+        "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
         "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",
-        "wa_book_read.py": "5a90fddccbf973f362ba66c52792326b3708d091",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно»)
+        "wa_book_read.py": "ba866980d22c75c005e40510b1271453aac74a25",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно») · PROMPT2110: было 5a90fddc
         "wa_book_ctx.py": "4db150f276359b1cb07d5816041fc25db03912e0",  # RCFIX2010: было 3a507747 (free_bikes с парком снимка)
         "wa_agent_cstate.py": "86d46669854237a1d258e970227eccd8d7e775d7",
         "wa_history.py": "0ed8f882d026045089fb4a8227a46c839fe29460"}
