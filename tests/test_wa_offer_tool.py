@@ -12,8 +12,8 @@ WA_AGENT_OFFER.
 r3: причина «агент их не видит» снимается, только если текст сверен с фактами ЦЕЛИКОМ (каждая модель парка где угодно в
 тексте и каждый диапазон дат; «We have NMAX 155», «можем предложить», «…, but X is», другие даты — не снимают); слова брони
 в черновике — «бронь оформляет человек» при любом входящем; «занято» по снимку старше последнего входящего — не факт;
-слово двери «model», похожее на юнит, в строку цены не идёт; служба выключает offer КОДОМ (OFFER-OFFPIN1910) — окружение
-WA_AGENT_OFFER=1 ничего не включает.
+слово двери «model», похожее на юнит, в строку цены не идёт; служба выключала offer КОДОМ (OFFER-OFFPIN1910), с
+OFFER-ON2110 (слово владельца 21.10) флаг снова решает окружение службы (drop-in systemd).
 
 r3 приёмка (наглухо без лазеек): «занято» без области отрицания («никто не занял», no one has booked, «нет проблем»,
 «ваш») — не сверено, а не совпало; даты любой записью («с 18-го по 22-е», from the 18th, between, through, «с завтра»),
@@ -49,17 +49,17 @@ PROBE_MARK = "OFFER_PROBE "
 NEW_MODULE = "wa_offer_tool"
 
 
-# окружение процесса пробы (OFFER-OFFPIN1910): offer ВКЛ вместе со сверкой, бронями и ценой через ход — служба читает его
+# окружение процесса пробы (OFFER-ON2110): offer ВКЛ вместе со сверкой, бронями и ценой через ход — служба читает его
 # сама (`build(environ=None)` → os.environ), прочих WA_AGENT_* в процессе нет
 PROBE_ENV = {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1", "WA_AGENT_OFFER": "1",
              "WA_AGENT_PRICE_CARRY": "1"}
 
 
 def _probe():
-    """Отдельный процесс: служба БЕЗ засчитанного offer — модуля выпуска в процессе нет, класс адаптера прежний (ни
-    примеси offer, ни цены через ход), блок инструментов сверки без строки offer, строки старта об offer нет. Прогоны:
-    флаг не запрошен; «0»; 1 без сверки; и ВКЛ окружением (OFFER-OFFPIN1910) — картой прогона (1, true + цена через ход) и
-    самим окружением процесса (`PROBE_ENV`): выкл кодом, строки старта те же, что без флага. Адаптер — свой на прогон."""
+    """Отдельный процесс (OFFER-ON2110): прогоны — флаг не запрошен; «0»; 1 без сверки; и ВКЛ окружением — картой
+    прогона (1, true + цена через ход) и самим окружением процесса (`PROBE_ENV`). Печатает классы адаптеров, строки
+    старта, модули выпуска в процессе и блок инструментов сверки последнего (включённого) адаптера; судит тест o6.
+    Адаптер — свой на прогон."""
     import test_wa_agent_model as TM
     import test_wa_book_read as TB
     import wa_agent_svc as S
@@ -808,12 +808,12 @@ def test_o6_no_offer_call_equals_parent():
         assert got[0][0] is None or got[0][0]["handoff"] or opt.get("hint"), got[0][0]
 
 
-def test_o6_flag_off_service_probe():
-    """(з) + OFFER-OFFPIN1910: отдельный процесс, окружение которого САМО просит offer (WA_AGENT_OFFER=1 вместе с
-    WA_AGENT_TOOLS, WA_AGENT_BOOK_READ и WA_AGENT_PRICE_CARRY). Флаг не запрошен, «0», 1 без сверки, 1 и true картой
-    прогона, 1 окружением процесса — модуля выпуска в процессе нет ни в одном прогоне, класс адаптера прежний (ни
-    примеси offer, ни цены через ход), строки старта об offer нет (и «не засчитан» тоже: окружение не читается), строки
-    старта включённых прогонов те же, что у невключённого; блок инструментов сверки без строки offer."""
+def test_o6_flag_env_service_probe():
+    """(з) + OFFER-ON2110: отдельный процесс, окружение которого САМО просит offer (WA_AGENT_OFFER=1 вместе с
+    WA_AGENT_TOOLS, WA_AGENT_BOOK_READ и WA_AGENT_PRICE_CARRY). Флаг не запрошен и «0» — класс прежний, строки старта об
+    offer нет; 1 без сверки — «не засчитан» одной строкой, класс прежний; 1 и true картой прогона и 1 окружением процесса —
+    примесь offer (цена через ход по-прежнему выкл кодом), ровно одна строка старта «вкл», прочие строки старта те же,
+    что у невключённого; модуль выпуска в процессе есть; в блоке инструментов сверки — строка offer."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("WA_AGENT_")}
     env.update(PROBE_ENV, PYTHONIOENCODING="utf-8")
     p = subprocess.run([sys.executable, os.path.abspath(__file__), PROBE_ARG], capture_output=True, timeout=300,
@@ -822,15 +822,20 @@ def test_o6_flag_off_service_probe():
     line = next((ln for ln in out.splitlines() if ln.startswith(PROBE_MARK)), None)
     assert p.returncode == 0 and line, (p.returncode, out[-800:], p.stderr.decode("utf-8", "replace")[-800:])
     got = json.loads(line[len(PROBE_MARK):])
-    assert got["mods"] == [], got["mods"]
+    assert got["mods"] == [NEW_MODULE], got["mods"]
     runs = got["runs"]
-    assert [r["type"] for r in runs] == ["ModelAdapter"] * 6, [r["type"] for r in runs]
-    assert [r["offer"] for r in runs] == [[]] * 6, [r["offer"] for r in runs]
+    assert [r["type"] for r in runs] == ["ModelAdapter"] * 3 + ["OfferModelAdapter"] * 3, [r["type"] for r in runs]
+    assert runs[0]["offer"] == [] and runs[1]["offer"] == [], (runs[0]["offer"], runs[1]["offer"])
+    assert len(runs[2]["offer"]) == 1 and "не засчитан" in runs[2]["offer"][0] and "сверки Т4а нет" in runs[2]["offer"][0], \
+        runs[2]["offer"]
+    for r in runs[3:]:
+        assert len(r["offer"]) == 1 and r["offer"][0].startswith("наличие и цена по запросу модели (WA_AGENT_OFFER): вкл — "), \
+            r["offer"]
+        assert [x for x in r["lines"] if x not in r["offer"]] == runs[0]["lines"], \
+            [x for x in r["lines"] if x not in runs[0]["lines"]]
     assert runs[5]["env"] == PROBE_ENV, runs[5]["env"]                        # окружение процесса и правда просило ВКЛ
     assert runs[1]["lines"] == runs[0]["lines"] and runs[0]["n"] > 0, (runs[0]["lines"], runs[1]["lines"])
-    for r in runs[3:]:
-        assert r["lines"] == runs[0]["lines"], [x for x in r["lines"] if x not in runs[0]["lines"]]
-    assert got["calls"] >= 1 and not got["offer_in_block"] and got["block_head"], got
+    assert got["calls"] >= 1 and got["offer_in_block"], got
 
 
 # ══ О7: служба ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -898,56 +903,53 @@ def _svc_world():
     return S, w, env, make
 
 
-def test_o7_build_env_on_pinned_off():
-    """OFFER-OFFPIN1910: окружение просит ВКЛ («1», «true»; с наличием по переписке и ценой через ход и без) — `build()`
-    даёт `offer_of` свою карту «0»: `import wa_offer_tool` не исполнялся ни разу (подмена `__import__`), примеси нет,
-    строки старта об offer нет, строки старта те же, что без флага."""
+def test_o7_build_env_decides():
+    """OFFER-ON2110 (замок OFFER-OFFPIN1910 снят словом владельца 21.10): флаг решает окружение службы. Не запрошен —
+    `import wa_offer_tool` не исполнялся (подмена `__import__`), примеси нет, строки старта об offer нет. «1»/«true» со
+    сверкой и бронями — примесь offer на выбранном классе адаптера (после наличия по переписке), ровно одна строка старта
+    «вкл», прочие строки старта те же, что без флага; цена через ход (PRICE_CARRY) по-прежнему выкл кодом."""
     import builtins
     S, w, env, make = _svc_world()
     on = {"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1"}
-    real_import, asked = builtins.__import__, []
+    real_import, asked = builtins.__import__, {}
 
     def spy(name, *a, **k):
         if name.split(".")[0] == NEW_MODULE:
-            asked.append(name)
+            asked[cur[0]] = asked.get(cur[0], 0) + 1
         return real_import(name, *a, **k)
-    got = {}
+    got, cur = {}, [None]
+    want = {"off": "ModelAdapter", "1": "OfferModelAdapter", "true": "OfferModelAdapter", "ctx": "BookCtxModelAdapter",
+            "ctx1": "OfferBookCtxModelAdapter"}
     for key, extra in (("off", {}), ("1", {S.F_OFFER: "1"}), ("true", {S.F_OFFER: "true"}),
                        ("ctx", {S.F_BOOK_CTX: "1"}), ("ctx1", {S.F_BOOK_CTX: "1", S.F_OFFER: "1",
                                                                S.F_PRICE_CARRY: "1"})):
-        model, lines = make(), []
+        model, lines, cur[0] = make(), [], key
         builtins.__import__ = spy
         try:
             S.build(dict(env, agent_db=w.dbpath + key), environ=dict(on, **extra), model=model, line=lines.append)
         finally:
             builtins.__import__ = real_import
-        assert not any(c is O.OfferMixin for c in type(model).__mro__), (key, type(model).__mro__)
-        assert type(model).__name__ == ("BookCtxModelAdapter" if S.F_BOOK_CTX in extra else "ModelAdapter"), key
-        assert [ln for ln in lines if S.F_OFFER in ln or ln.startswith("наличие и цена по запросу")] == [], key
-        got[key] = lines
-    assert asked == [], asked
+        assert type(model).__name__ == want[key], (key, type(model).__mro__)
+        assert any(c is O.OfferMixin for c in type(model).__mro__) == (S.F_OFFER in extra), key
+        offer = [ln for ln in lines if S.F_OFFER in ln or ln.startswith("наличие и цена по запросу")]
+        if S.F_OFFER in extra:
+            assert len(offer) == 1 and offer[0].startswith("наличие и цена по запросу модели (WA_AGENT_OFFER): вкл — "), \
+                (key, offer)
+        else:
+            assert offer == [], (key, offer)
+        assert not [ln for ln in lines if ln.startswith("цена через ход")], key            # PRICE_CARRY выкл кодом
+        got[key] = [ln for ln in lines if ln not in offer]
+    assert "off" not in asked and "ctx" not in asked and asked.get("1") and asked.get("ctx1"), asked
     assert got["1"] == got["off"] and got["true"] == got["off"] and got["ctx1"] == got["ctx"], got
 
 
 def test_o7_build_line_and_order_explicit_on():
-    """Включение — только ЯВНОЙ подменой карты (как PRICECARRY-OFFPIN1810): `S.offer_of` на время `build` заменён
-    обёрткой, которая записывает карту службы (обязана быть ровно {флаг: «0»}) и зовёт ту же функцию с картой «1» (со
-    сверкой и бронями). Тогда строка старта «вкл» — после строки наличия по переписке, примесь надета ПОСЛЕ наличия по
-    переписке — класс «offer + bookctx + адаптер»."""
+    """OFFER-ON2110: окружение службы со сверкой, бронями, наличием по переписке и offer — строка старта «вкл» после
+    строки наличия по переписке, примесь надета ПОСЛЕ наличия по переписке — класс «offer + bookctx + адаптер»."""
     S, w, env, make = _svc_world()
-    model, lines, pins = make(), [], []
-    real = S.offer_of
-
-    def offer_on(pin, model):
-        pins.append(dict(pin))
-        return real({S.F_OFFER: "1", S.F_TOOLS: "1", S.F_BOOK: "1"}, model)
-    S.offer_of = offer_on
-    try:
-        S.build(env, environ={"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1",
-                              "WA_AGENT_BOOK_CTX": "1", "WA_AGENT_OFFER": "1"}, model=model, line=lines.append)
-    finally:
-        S.offer_of = real
-    assert pins == [{S.F_OFFER: "0"}], pins
+    model, lines = make(), []
+    S.build(env, environ={"WA_AGENT_DRAFTS": "1", "WA_AGENT_BOOK_READ": "1", "WA_AGENT_TOOLS": "1",
+                          "WA_AGENT_BOOK_CTX": "1", "WA_AGENT_OFFER": "1"}, model=model, line=lines.append)
     assert type(model).__name__ == "OfferBookCtxModelAdapter", type(model).__mro__
     got = [ln for ln in lines if "WA_AGENT_OFFER" in ln]
     assert len(got) == 1 and got[0].startswith("наличие и цена по запросу модели (WA_AGENT_OFFER): вкл — "), got
