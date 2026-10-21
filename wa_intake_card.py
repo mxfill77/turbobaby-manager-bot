@@ -113,11 +113,9 @@ def money_words(total):
 
 def _digits_have(text, total):
     """Our outgoing message names exactly this total (digits after removing spaces/commas/dots-as-separators)."""
-    want = str(int(total)) if float(total).is_integer() else None
-    if want is None:
-        return False
+    whole = float(total).is_integer()
     flat = re.sub(r"(?<=\d)[\s\u00a0\u202f,.](?=\d{3}\b)", "", str(text or ""))
-    return want in re.findall(r"\d+", flat)
+    return whole and str(int(total)) in re.findall(r"\d+", flat)
 
 
 _RESERVED = re.compile(r"฿|🆕|стоимость|источник согласия|бронь", re.I)
@@ -301,10 +299,10 @@ class InMemoryJournal(object):
 
     def cas(self, key, expected_rev, record):
         cur = self.rows.get(key)
-        if (cur is None and expected_rev is not None) or (cur is not None and cur["rev"] != expected_rev):
-            return False
-        self.rows[key] = json.loads(json.dumps(record))
-        return True
+        fresh = (cur is None and expected_rev is None) or (cur is not None and cur["rev"] == expected_rev)
+        if fresh:
+            self.rows[key] = json.loads(json.dumps(record))
+        return fresh
 
 
 class SqliteJournal(object):
