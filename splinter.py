@@ -176,6 +176,14 @@ def _intake_passport_strict_on():
             and str(_os_env("INTAKE_PASSPORT_STRICT", "0")).strip().lower() in ("1", "true", "yes", "on", "да"))
 
 
+def _intake_autobook_on():
+    """Ручка AUTOBOOK2210 (`INTAKE_AUTOBOOK`; по умолчанию ВЫКЛ — приём байт-в-байт прежний). Слово владельца 22.10:
+    агент ставит бронь сам, без «да», когда паспорт этого клиента распознан и ФИО совпало, байк свободен на даты по
+    двери цены и стоимость согласована; предоплату не ждём там, где она не нужна. Только поверх INTAKE_PASSPORT_STRICT."""
+    return (_intake_passport_strict_on()
+            and str(_os_env("INTAKE_AUTOBOOK", "0")).strip().lower() in ("1", "true", "yes", "on", "да"))
+
+
 # CLOSETRUTH1910: умолчание ручки правды приёма — ВКЛ (задание отрезка; слово владельца о перезакреплении двух
 # закреплённых наборов: tests/test_return_close.py:103-105 и tests/test_rental_case_integ_spl.py:924 ждут теперь
 # paid_total=None, их блобы в tests/test_contractref_accept.py PINS обновлены этим же выпуском). Откат — `CLOSE_TRUTH=0`
@@ -693,6 +701,13 @@ INTAKE_SYSTEM = """Тебе дают КАРТОЧКУ БРОНИ из служе
   "helmets": "<число шлемов>"
 }
 Контакты — собери ВСЕ части (username + все телефоны). Верни ТОЛЬКО JSON."""
+
+# AUTOBOOK2210: при ручке INTAKE_AUTOBOOK разбор карточки несёт ещё согласованную стоимость (без ручки — прежний промпт
+# байт-в-байт). Вставка не нашлась ровно один раз → None: автобронь честно скажет, что стоимость не разбирается.
+_AB_HELMETS = '  "helmets": "<число шлемов>"\n}'
+INTAKE_SYSTEM_AB = (INTAKE_SYSTEM.replace(_AB_HELMETS, '  "helmets": "<число шлемов>",\n  "price_total": "<согласованная '
+                                          'с клиентом стоимость за весь срок числом в батах; пусто, если в карточке её '
+                                          'нет>"\n}') if INTAKE_SYSTEM.count(_AB_HELMETS) == 1 else None)
 
 # Черновики intake в памяти: {chat_id: {поля, ts, passport_photo, status}}. Один активный на группу.
 _INTAKE_DRAFTS = {}
@@ -13473,7 +13488,8 @@ def _intake_is_card(text) -> bool:
 
 
 def _intake_parse(claude, text) -> dict:
-    return _parse_json(claude.quick(INTAKE_SYSTEM, text, max_tokens=500, model="MAIN",
+    system = INTAKE_SYSTEM_AB if (_intake_autobook_on() and INTAKE_SYSTEM_AB) else INTAKE_SYSTEM
+    return _parse_json(claude.quick(system, text, max_tokens=500, model="MAIN",
                               tag="intake", expect_json=True)) or {}
 
 
@@ -13696,6 +13712,148 @@ def _intake_booking_fields(d):
     )
 
 
+# ── AUTOBOOK2210: автобронь по слову владельца 22.10 (ручка INTAKE_AUTOBOOK) ──────────────────────────────────────────
+# Условия (все сразу): личность паспортом (`_intake_identity`), согласованная стоимость в карточке, даты разобраны и
+# бронь не на сегодня, срок не задевает высокий сезон 15.12–15.03 (там предоплата — «на 2 недели вперёд», «на месяцы
+# с 15 декабря … 100%»; первый срез такие брони сам не ставит), доставка не вне Пхукета, дверь цены: ЭТОТ байк
+# свободен на даты и сезон не «high». Иначе — прежняя сводка и «да» человека. Отмена — пока руками в CRM (двери
+# отмены у моста нет; «отмена» реплаем — следующий выпуск моста).
+_AB_HIGH_FROM, _AB_HIGH_TO = (12, 15), (3, 15)
+
+
+def _ab_high_season(ds, de) -> bool:
+    """Срок [ds, de) задевает высокий сезон 15.12–15.03 любого года."""
+    import datetime as _dt
+    for y in range(ds.year - 1, de.year + 1):
+        hs = _dt.date(y, *_AB_HIGH_FROM)
+        he = _dt.date(y + 1, *_AB_HIGH_TO)
+        if ds < he and de > hs:
+            return True
+    return False
+
+
+def _ab_money(v):
+    """Стоимость из карточки → число ฿ > 0 | None («12 600», «12,600 ฿», «12600»)."""
+    s = _re_lang.sub(r"[\s,_฿]|бат\w*|thb|baht", "", str(v or "").lower())
+    try:
+        x = float(s)
+    except ValueError:
+        return None
+    return x if x > 0 else None
+
+
+def _autobook_check(d, bridge, deliv):
+    """Черновик полной карточки → (ok, почему_нет, ответ_двери | None). Дверь цены зовётся последней и только при
+    выполненных прочих условиях (одно чтение, ничего не пишет)."""
+    import datetime as _dt
+    ok, _nm, _why = _intake_identity(d)
+    if not ok:
+        return False, "личность паспортом не установлена", None
+    if INTAKE_SYSTEM_AB is None:
+        return False, "разбор согласованной стоимости не настроен", None
+    if _ab_money(d.get("price_total")) is None:
+        return False, "в карточке нет согласованной стоимости", None
+    try:
+        ds = _dt.date.fromisoformat(str(d.get("date_start_iso") or ""))
+        de = _dt.date.fromisoformat(str(d.get("date_end_iso") or ""))
+    except ValueError:
+        return False, "даты не распознаны", None
+    if de <= ds:
+        return False, "даты не распознаны", None
+    today = _dt.datetime.now(_BKK_TZ).date() if _BKK_TZ else None
+    if today is None or ds <= today:
+        return False, "бронь на сегодня или раньше — только по «да»", None
+    if _ab_high_season(ds, de):
+        return False, "срок задевает высокий сезон 15.12–15.03 — нужна предоплата, бронь по «да»", None
+    if deliv == "out":
+        return False, "доставка вне Пхукета", None
+    try:
+        q = bridge.quote_price(bike=d.get("model"), date_start=ds.isoformat(), date_end=de.isoformat())
+    except Exception as e:  # noqa: BLE001
+        return False, "дверь цены не ответила (%s)" % type(e).__name__, None
+    if not isinstance(q, dict) or q.get("ok") is False:
+        return False, "дверь цены не ответила", None
+    if q.get("available") is not True:
+        return False, "байк на эти даты не свободен по двери цены", q
+    season = q.get("season") if isinstance(q.get("season"), dict) else {}
+    if season.get("label") == "high":
+        return False, "дверь цены говорит «высокий сезон» — нужна предоплата, бронь по «да»", q
+    return True, "", q
+
+
+async def _intake_autobook_write(d, msg, context, bridge, summary, q):
+    """Автобронь: сводка (последняя строка — «ставлю сам»), затем ровно один create_booking под токен-замком 4.2 —
+    те же три исхода, что у «да» (`intake_confirm.outcome`); «неизвестно» не равно «не записано», повтора нет."""
+    chat_id = msg.chat_id
+    tid = getattr(msg, "message_thread_id", None)
+
+    async def say(body):
+        return await _send(context, chat_id=chat_id, text="🐀 Splinter\n" + body, bilingual=False,
+                           message_thread_id=tid)
+
+    head = summary.replace("\nСтавлю бронь? да / нет / правки",
+                           "\n🤖 Условия автоброни выполнены — ставлю бронь сам.")
+    s_msg = await _send(context, chat_id=chat_id, text=head, bilingual=False, message_thread_id=tid)
+    _ic_note_ids(d, [s_msg])
+    price = _ab_money(d.get("price_total"))
+    price_w = f"{int(round(price)):,}".replace(",", " ")
+    door_w = ("" if not isinstance(q, dict) or q.get("total") in (None, "")
+              else " (по прайсу двери %s ฿)" % f"{int(round(float(q.get('total')))):,}".replace(",", " "))
+    d["status"], d["autobook"] = "approved", True
+    sent, res, exc, no_ticket = False, None, None, None
+    try:
+        fields = _intake_booking_fields(d)
+        fields["note"] = ((fields.get("note") + " | ") if fields.get("note") else "") + f"автобронь: согласовано {price_w} ฿"
+        _tk = bridge.issue_write_ticket()
+        ticket = _tk.get("ticket") if isinstance(_tk, dict) else None
+        if not ticket:
+            no_ticket = str(_tk.get("error") or "") if isinstance(_tk, dict) else ""
+        else:
+            with bridge_client.agent_write(ticket):
+                sent = True
+                res = bridge.create_booking(**fields)
+    except Exception as e:  # noqa: BLE001
+        exc = e
+    out = intake_confirm.outcome(res, sent)
+    if out == intake_confirm.BOOKED:
+        d["status"] = "booked"
+        _row = res.get("row")
+        _bid = res.get("booking_id")
+        _pl = plateFromName_(res.get("bike") or d.get("model") or "")
+        if _bid and _pl:
+            _RECENT_BOOKINGS[_pl] = {"booking_id": str(_bid), "row": _row, "ts": _time.time()}
+        log.info(f"  🆕 INTAKE: АВТОБРОНЬ записана (строка {_row}) {d.get('model')}")
+        await say(f"✅ Бронь записана автоматически, строка {_row}, статус «Бронь». ФИО — по паспорту: {d.get('client')}. "
+                  f"Согласовано {price_w} ฿{door_w}. Отменить: пока вручную в CRM (строка {_row}); «отмена» реплаем — "
+                  "со следующим выпуском моста.")
+        if _rc_cases_on():
+            _rc_case_after_booking(bridge, res)
+        return
+    if out == intake_confirm.DUPLICATE:
+        await say(f"⚠️ Уже есть такая бронь (строка {res.get('row')}) — автобронь не ставлю.")
+        return
+    if out == intake_confirm.NOT_WRITTEN:
+        if not sent and exc is not None:
+            _err, _emsg = "exception", f"до отправки: {type(exc).__name__}: {exc}"
+        elif not sent:
+            _err, _emsg = "no_ticket", _IC_NO_TICKET + (f" ({no_ticket})" if no_ticket else "")
+        else:
+            _err, _emsg = str(res.get("error") or "?"), str(res.get("message") or "")
+        d["status"] = "write_failed"
+        log.warning(f"  🆕 INTAKE: автобронь НЕ записана ({_err}: {_emsg}) {d.get('model')}")
+        await say(_IC_NOT_WRITTEN.format(err=_err, tail=(" " + _emsg) if _emsg else ""))
+        return
+    if exc is not None:
+        _err = type(exc).__name__
+    elif not isinstance(res, dict):
+        _err = "нет ответа"
+    else:
+        _err = str(res.get("error") or "") or "?"
+    d["status"] = "write_unknown"
+    log.warning(f"  🆕 INTAKE: исход АВТОБРОНИ НЕИЗВЕСТЕН ({_err}) {d.get('model')}")
+    await say(_IC_UNKNOWN.format(err=_err))
+
+
 async def _intake_finalize(draft, msg, context, bridge):
     """Ре-валидация пакета → если неполный, сказать чего не хватает; если полный — резюме+approve."""
     chat_id = msg.chat_id
@@ -13714,6 +13872,19 @@ async def _intake_finalize(draft, msg, context, bridge):
     if _rc_on("RENTAL_CASE_APPROVALS"):
         # К4 шаг 7: карточка брони — ожидание approval/booking в хранилище (без дела; дело — после create_booking)
         await _rc_booking_card(draft, msg, context, _intake_summary(draft, avail, deliv))
+        return
+    if _intake_autobook_on():
+        # AUTOBOOK2210: все условия владельца выполнены — бронь пишется сама; нет — прежняя сводка «да / нет / правки»
+        # и причина словами (что именно не дало автоброни)
+        ab_ok, ab_why, ab_q = _autobook_check(draft, bridge, deliv)
+        summary = _intake_summary(draft, avail, deliv)
+        if ab_ok:
+            await _intake_autobook_write(draft, msg, context, bridge, summary, ab_q)
+            return
+        log.info(f"  🆕 INTAKE: автобронь не ставлю — {ab_why}")
+        sent = await _send(context, chat_id=chat_id, bilingual=False, message_thread_id=tid,
+                           text=summary + "\n🤖 Автобронь не ставлю: " + ab_why + ".")
+        _ic_note_ids(draft, [sent])
         return
     sent = await _send(context, chat_id=chat_id, text=_intake_summary(draft, avail, deliv),
                        bilingual=False, message_thread_id=tid)
