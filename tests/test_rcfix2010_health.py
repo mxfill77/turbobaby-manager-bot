@@ -2346,6 +2346,49 @@ def test_b18_limit_2v_inserted_entry_poll_pair():
           "code 0 без пуша, A5 — OK; пары %d — ❌" % (n, green, pair_msgs, len(pairs)))
 
 
+def test_b19_pend_strict_boundary_and_seg_not_reset_by_boot():
+    """r7 · правка сборки (Codex TB-ACCEPT-2110-HEALTH-R7-C; verify9 regress §4 MINOR 5): закреплены ровно два уже
+    различённых случая — журналы v9_mut_probe verify9 дословно (P1, P3), обе отличимые раскладки текущего («имя:номер»,
+    «[I]» — метка неизвестной формы, test_b16), текущий вошёл OK без polling, второй экземпляр жив с + 5 с:
+      x03 — граница записи истории СТРОГАЯ (ts < старт − 2,000 с): запись с меткой ровно старт − 2,000 с до первой
+            записи сегмента pend не снимает — НЕИЗВЕСТНО; на старт − 2,001 с — история, OK (остаток test_b17);
+      x07 — строка загрузки по месту признак сегмента НЕ сбрасывает: сегмент начат тиком второго на + 10 с, затем его
+            сообщение splinter.py:12197 со вставкой «загрузка − 10 с + история − 30 с + вход + polling» — НЕИЗВЕСТНО.
+    Мутанты x03 («≤») и x07 (seg = False на строке загрузки) дают на этих журналах OK — их держит test_zz_mutants."""
+    s0 = T_B
+    who = "PID %d, старт %s UTC, рестартов 0" % (PID_B, dt(s0).strftime("%Y-%m-%d %H:%M:%S"))
+    entry = "  " + S().release_entry(words_of(), frozenset())[1]
+    hist = history() + prev_run(s0 - 3600, s0)
+
+    def rec(t, msg, name="turbobaby"):
+        return L(t, INFO, msg, name=name)[0].rstrip("\n")
+
+    n = 0
+    for form in ("имя:номер", "[I]"):
+        cur = _layout(run_ok(s0, poll_at=None, post=False), form)
+        pend_words = H._unparsed_words(cur[0].rstrip("\n"), who)
+        sec5 = _stray(s0 + 5, "жив")
+        # x03: строгая граница
+        for off, want in ((2.0, "UNKNOWN"), (2.001, "OK")):
+            st, why = verdict(hist + cur + L(s0 - off, INFO, "Splinter [ops] тик", name="splinter") + sec5)
+            assert st == want, (form, off, st, why)
+            assert want == "OK" or why == pend_words, (form, off, why)
+            n += 1
+        # x07: строка загрузки по месту не сбрасывает seg
+        sec_old = _until(_stray(s0 - 6590, "жив"), s0 + 40)
+        assert any(abs((_t_of(x) or 0) - (s0 + 10)) < 0.01 for x in sec_old), "тик второго на старт + 10 с"
+        msg = L(s0 + 47.9, INFO, "  → история ТО B-17 вид=масло: «x\n" + "\n".join(
+            [rec(s0 - 10, BOOT_LINE), rec(s0 - 30, "Splinter [ops] тик", name="splinter"), rec(s0 + 47.0, entry),
+             rec(s0 + 47.1, POLL)]) + "\ny» источник=фото (OCR)", name="splinter")
+        st, why = verdict(hist + by_time(sec_old, cur) + msg)
+        assert st == "UNKNOWN" and why == pend_words, (form, "x07", st, why)
+        n += 1
+    assert n == 6, n
+    print("    · pend: граница истории строгая (старт − 2,000 с → НЕИЗВЕСТНО, − 2,001 с → OK) и строка загрузки не "
+          "сбрасывает сегмент (вставка «загрузка + история + вход + polling» после тика второго → НЕИЗВЕСТНО) × 2 "
+          "раскладки = %d" % n)
+
+
 def _ref_read_log(blob):
     """Разбор журнала r3 дословно (health.py@r3:273–277): весь файл одним куском."""
     parts = blob.decode("utf-8", "surrogateescape").replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -2899,6 +2942,15 @@ MUTANTS = (
     ("                    tail.append(chunk)\n                    size = min(size * 2, _READ_GROW_MAX)",
      '                    tail = [b"".join(tail) + chunk]',
      "хвост склеивается на каждом куске 8 КиБ (квадрат r4)", ("test_a13_read_log_linear_on_long_lines",)),
+    # r7 · правка сборки (Codex TB-ACCEPT-2110-HEALTH-R7-C; verify9 regress §4): x03 / x07
+    ("        if rec and ts is not None and ts < start - win and not seg:\n",
+     "        if rec and ts is not None and ts <= start - win and not seg:\n",
+     "граница записи истории включительно (verify9 x03)", ("test_b19_pend_strict_boundary_and_seg_not_reset_by_boot",)),
+    ("            shut = None                    # r5: остановка выше строки загрузки — прежнего процесса\n",
+     "            shut = None                    # r5: остановка выше строки загрузки — прежнего процесса\n"
+     "            seg = False\n",
+     "строка загрузки сбрасывает признак сегмента (verify9 x07)",
+     ("test_b19_pend_strict_boundary_and_seg_not_reset_by_boot",)),
     ("            if ok is True:\n", "            if True:\n", "неизвестная доставка печатается как «отправлен»",
      ("test_c2_unknown_delivery_no_retry",)),
     ("            ok = notify(report, force=True)   # боевой health-алерт — тест-мут не глушит\n",
