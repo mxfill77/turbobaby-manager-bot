@@ -204,6 +204,9 @@ def label_of(value):
 F_FLEET_LIST = "WA_AGENT_FLEET_LIST"             # окружение читает служба (wa_agent_svc.offer_of), не этот модуль
 FLEET_LIST_MAX = 400
 FLEET_LIST_ON = False                           # выставляет wa_agent_svc.offer_of по ручке; умолчание — прежний текст
+FLEET_BLOCK = (" Клиент спрашивает, какие модели есть, или модель ещё не выбрана — зови offer с \"model\": \"\" (даты — если клиент их назвал): код "
+               "вернёт перечень моделей текущего парка; наличие и цену называй только по offer конкретной модели на даты. "
+               "Модели из автоприветствия или рекламы — не наличие: предлагай только модели из этого перечня.")
 
 
 def fleet_tail(bikes):
@@ -219,7 +222,7 @@ def model_of(value, bikes):
     "many"; модели нет (в том числе модель с кубатурой не из парка рядом с моделью парка) — "fleet"."""
     s = str(value or "").strip()
     if not s:
-        return None, "no_model", W_NO_MODEL
+        return None, "no_model", W_NO_MODEL + fleet_tail(bikes)
     hits = M.model_hits(s, bikes)
     amb = [h for h in hits if h[2] is None]
     if amb:
@@ -989,6 +992,12 @@ class Offers(object):
         ds, de = day_arg(args.get("date_from")), day_arg(args.get("date_to"))
         base = {"asked": asked, "date_from": ds.isoformat() if ds else None, "date_to": de.isoformat() if de else None,
                 "asked_to": de.isoformat() if de else None}                   # конец, названный моделью (до минимума)
+        if FLEET_LIST_ON and not str(args.get("model") or "").strip() and getattr(a, "book", None) is not None:
+            # FLEETLIST2210: «какие модели есть» — перечень текущего парка без дат; это не факт наличия и не цена
+            _rows, bikes0, _age, _why = a.book.get(clock())
+            tail = fleet_tail(bikes0)
+            if tail:
+                return self._res(T.UNKNOWN, at, W_NO_MODEL + tail, dict(base, code="no_model"))
         if ds is None or de is None:
             return self._res(T.REFUSED, at, W_DATES, dict(base, code="dates"))
         if de <= ds:
@@ -1170,7 +1179,7 @@ def run(call, system, user, doors, offer, number="", clock=time.time, fresh=None
     tools_block = T.TOOLS_BLOCK % max_calls
     if T.CASE_TOOL in doors:                      # К4 (WA_AGENT_CASE): строка инструмента дела; выкл — блок прежний
         tools_block += "\n" + T.CASE_BLOCK
-    tools_block += "\n" + OFFER_BLOCK                                # OFFER: строка инструмента
+    tools_block += "\n" + OFFER_BLOCK + (FLEET_BLOCK if FLEET_LIST_ON else "")   # OFFER: строка; FLEETLIST2210 — по ручке
     head = tools_block + "\n\n" + user
 
     def out(state, raw=None, usage=None):
