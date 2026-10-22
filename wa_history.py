@@ -390,6 +390,18 @@ def with_sent(items, sent):
 
 
 GREET_WORDS = "автоприветствие"        # эхо-автоприветствие в истории агента (WAGREETECHO0210)
+# GREETTEXT2210 (Codex TB-AGENT-CRITERIA-2210-OWNER-REVIEW): при ручке WA_AGENT_GREET_TEXT=1 модель видит ТЕКСТ
+# отправленного автоприветствия с происхождением — как рекламный автотекст, не персональное обещание и не источник
+# наличия. Ручка не задана — строка модели прежняя байт-в-байт («· мы · автоприветствие»).
+F_GREET_TEXT = "WA_AGENT_GREET_TEXT"
+GREET_TEXT_MAX = 600
+GREET_TEXT_HEAD = ("автоприветствие (рекламный автотекст WhatsApp Business, ушёл сам; не персональное обещание — "
+                   "модели, наличие и цены только по текущему парку и двери): ")
+
+
+def greet_text_on(environ=None):
+    v = (os.environ if environ is None else environ).get(F_GREET_TEXT, "0")
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "да")
 
 
 def read_greets(agent_db, num):
@@ -429,7 +441,7 @@ def with_greets(items, greets):
         key = marks.get(it["key"])
         if key:
             seen.add(key)
-            it = dict(it, who="мы", text=GREET_WORDS, word=None, file=None, auto=True)
+            it = dict(it, who="мы", text=GREET_WORDS, word=None, file=None, auto=True, auto_text=it.get("text"))
         out.append(it)
     for rid, wamid, ts in greets or ():
         key = wamid or ("row:%d" % int(rid))
@@ -505,6 +517,9 @@ def model_line(it) -> str:
     """Строка для модели: «ДД.ММ.ГГГГ ЧЧ:ММ · клиент|мы: текст»; медиа — словом: «[фото] подпись»;
     автоприветствие — «ДД.ММ.ГГГГ ЧЧ:ММ · мы · автоприветствие» (WAGREETECHO0210)."""
     if it.get("auto"):
+        body = " ".join(str(it.get("auto_text") or "").split())[:GREET_TEXT_MAX]
+        if body and greet_text_on():
+            return "%s · мы · %s%s" % (pk_full(it["ts"]), GREET_TEXT_HEAD, body)
         return "%s · мы · %s" % (pk_full(it["ts"]), GREET_WORDS)
     body = it["text"] or ""
     if it["word"]:
