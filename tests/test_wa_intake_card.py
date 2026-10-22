@@ -43,11 +43,14 @@ def world(case_key="case-A", **kw):
             "date_to": fact["date_end"], "number": "SYN-NUMBER-0001", "client": "Synthetic Client"}
     msgs = [{"id": 101, "who": "клиент", "ts": T0 - 100, "text": "synthetic ask"},
             {"id": 102, "who": "мы", "ts": T0 + 10, "text": "SYN итого %s ฿ за 7 суток" % (W.money_words(total)[:-2] if total else "?")},
-            {"id": 103, "who": "клиент", "ts": T0 + 50, "text": "synthetic accept phrase"}]
+            {"id": 103, "who": "клиент", "ts": T0 + 50, "text": "synthetic accept phrase"},
+            # A2WIRING2210 п.2: фото назначено паспортом ответом на НАШУ просьбу (в конце — индексы [0..2] прежние)
+            {"id": 98, "who": "мы", "ts": T0 - 300, "text": "SYN пришлите фото паспорта"},
+            {"id": 99, "who": "клиент", "ts": T0 - 200, "text": ""}]
     consent = {"case_key": case_key, "offer_key": W.offer_key(fact), "decision": W.C_ACCEPT, "source_msg_id": 103,
                "offer_msg_id": 102, "agreed_total": total, "decided_by": "employee"}
     media = {"case_key": case_key, "media_id": "SYN-MEDIA-%s" % case_key, "role": "passport", "downloaded": True,
-             "msg_id": 99}
+             "msg_id": 99, "request_msg_id": 98}
     return dict(case=case, offers=[rec], consent=consent, media=media, delivery={"district": "SYN-District"},
                 messages=msgs, cfg=CFG, now=T0 + 60, today=TODAY)
 
@@ -339,11 +342,13 @@ class Commit(unittest.TestCase):
         tr.mode["media"] = "ok"
         W.commit(prep(world()), j, tr, clk)                       # no blind resend of text or media
         self.assertEqual(tr.calls, ["text", "media"])
-        tr.rb = {"text_msg_id": o["text_msg_id"], "media_msg_id": None}
+        tr.rb = {"text_msg_id": o["text_msg_id"], "media_msg_id": None}     # A2WIRING2210: без доказательства — UNKNOWN
+        self.assertEqual(W.reconcile("case-A", j, tr, clk)["state"], W.UNKNOWN)
+        tr.rb["absence_proven"] = True
         o = W.reconcile("case-A", j, tr, clk)
         self.assertEqual((o["state"], o["stage"]), (W.FAILED, "media"))
         W.commit(prep(world()), j, tr, clk)
-        self.assertEqual(tr.calls, ["text", "media", "readback"])
+        self.assertEqual(tr.calls, ["text", "media", "readback", "readback"])
 
     def test_definitive_media_refusal_is_failed_partial(self):
         j, tr = W.InMemoryJournal(), FakeTransport(media="refuse")
@@ -375,7 +380,9 @@ class Commit(unittest.TestCase):
         self.assertEqual(W.reconcile("case-A", j, tr, clk)["state"], W.UNKNOWN)
         tr.rb = {"bogus": 1}
         self.assertEqual(W.reconcile("case-A", j, tr, clk)["state"], W.UNKNOWN)
-        tr.rb = {"text_msg_id": None, "media_msg_id": None}
+        tr.rb = {"text_msg_id": None, "media_msg_id": None}             # пусто без доказательства — UNKNOWN
+        self.assertEqual(W.reconcile("case-A", j, tr, clk)["state"], W.UNKNOWN)
+        tr.rb = {"text_msg_id": None, "media_msg_id": None, "absence_proven": True}
         self.assertEqual(W.reconcile("case-A", j, tr, clk)["state"], W.FAILED)
         tr.mode["text"] = "ok"
         self.assertEqual(W.commit(prep(world()), j, tr, clk)["state"], W.MEDIA_SENT)
@@ -394,6 +401,99 @@ class Commit(unittest.TestCase):
         self.assertTrue(j.cas("case-A", None, rec))
         self.assertFalse(j.cas("case-A", None, rec))
         self.assertFalse(j.cas("case-A", 7, dict(rec, rev=8)))
+
+
+def event_world(case_key="case-A", **kw):
+    """A2WIRING2210 п.4: тот же мир в режиме событийной актуальности — без чисел сроков, с разбором до последнего
+    входа, версией дела и свежей сверкой двери после последнего входа."""
+    w = world(case_key, **kw)
+    w["cfg"] = W.Config(validity=W.VALIDITY_EVENT)
+    w["consent"].update(reviewed_upto=103, case_version=w["case"]["case_version"])
+    w["case"]["revalidation"] = {"offer_key": w["consent"]["offer_key"], "at": T0 + 55, "source": "offer door"}
+    return w
+
+
+class EventValidity(unittest.TestCase):
+    """Критерии Codex TB-A2-WIRING-2210-0742: accept на то же предложение; изменились цена/период — отказ; новый вход
+    требует пересмотра; паспорт не смешивается с чужим делом; неполный readback после send→crash — без дубля."""
+
+    def test_same_offer_accept_ready_without_numbers(self):
+        p = prep(event_world())
+        self.assertTrue(p.ok, p.reasons)
+        self.assertEqual((p.validity["mode"], p.validity["consent_msg_id"], p.validity["offer_msg_id"],
+                          p.validity["revalidated_at"], p.validity["quoted_at"]), ("event", 103, 102, T0 + 55, T0))
+        self.assertIn("кандидат", p.validity["passport"])
+
+    def test_caps_mode_still_needs_both_numbers_and_inf_is_not_a_bypass(self):
+        for cfg in (W.Config(), W.Config(offer_to_consent_max_sec=float("inf"), consent_max_age_sec=float("inf"))):
+            w = world(); w["cfg"] = cfg
+            self.assertEqual(prep(w).reasons, [W.R_NOT_CONFIGURED])
+        w = event_world(); w["cfg"] = W.Config(validity=W.VALIDITY_EVENT, consent_max_age_sec=float("nan"))
+        self.assertEqual(prep(w).reasons, [W.R_NOT_CONFIGURED])
+        w = event_world(); w["cfg"] = W.Config(validity=W.VALIDITY_EVENT, consent_max_age_sec=5)
+        self.assertTrue(any("устарели" in r for r in prep(w).reasons))
+
+    def test_changed_conditions_on_revalidation_refuse(self):
+        w = event_world(); w["case"]["revalidation"]["offer_key"] = "другой-OFFER"
+        self.assertTrue(any("другие условия" in r for r in prep(w).reasons))
+        w = event_world(); w["case"]["revalidation"] = None
+        self.assertTrue(any("нет свежей сверки" in r for r in prep(w).reasons))
+        w = event_world(); w["case"]["revalidation"]["at"] = T0 + 40           # раньше последнего входа (103 @ +50)
+        self.assertTrue(any("старше последнего входа" in r for r in prep(w).reasons))
+
+    def test_new_input_needs_review_then_reviewed_later_photo_ok(self):
+        w = event_world()
+        w["messages"].append({"id": 104, "who": "клиент", "ts": T0 + 56, "text": ""})
+        self.assertTrue(any("новый вход" in r for r in prep(w).reasons))
+        w["consent"]["reviewed_upto"] = 104
+        w["case"]["revalidation"]["at"] = T0 + 57
+        self.assertTrue(prep(w).ok, prep(w).reasons)
+
+    def test_case_version_moved_needs_review(self):
+        w = event_world(); w["case"]["case_version"] = 4
+        self.assertTrue(any("другой версии дела" in r for r in prep(w).reasons))
+
+    def test_unknown_order_is_not_permission(self):
+        w = event_world(); w["messages"][0]["ts"] = None
+        self.assertTrue(any("порядок входящих" in r for r in prep(w).reasons))
+
+    def test_passport_bound_to_our_request_only(self):
+        w = event_world(); w["media"]["request_msg_id"] = None
+        self.assertTrue(any("не привязано" in r for r in prep(w).reasons))
+        w = event_world(); w["media"]["msg_id"] = 102                       # наше сообщение — не фото клиента
+        self.assertTrue(any("не привязано" in r for r in prep(w).reasons))
+        w = event_world(); w["messages"][3]["ts"] = T0 - 100                 # просьба после фото
+        self.assertTrue(any("порядок просьбы" in r for r in prep(w).reasons))
+        w = event_world(); w["media"]["case_key"] = "case-B"
+        self.assertTrue(any("другого дела" in r for r in prep(w).reasons))
+
+    def test_two_clients_do_not_overwrite(self):
+        j, clk = W.InMemoryJournal(), Clock()
+        a, b = prep(event_world("case-A")), prep(event_world("case-B"))
+        self.assertNotEqual(a.digest, b.digest)
+        W.commit(a, j, FakeTransport(), clk)
+        W.commit(b, j, FakeTransport(), clk)
+        self.assertEqual({j.get("case-A")["digest"], j.get("case-B")["digest"]}, {a.digest, b.digest})
+
+    def test_send_crash_incomplete_readback_no_second_send(self):
+        j, clk = W.InMemoryJournal(), Clock()
+        tr = FakeTransport(text="raise")
+        self.assertEqual(W.commit(prep(event_world()), j, tr, clk)["state"], W.UNKNOWN)
+        for rb in ({"text_msg_id": None, "media_msg_id": None}, {"text_msg_id": None, "media_msg_id": None,
+                                                                 "absence_proven": False}, {"text_msg_id": 7,
+                                                                                            "media_msg_id": None}):
+            tr.rb = rb
+            self.assertEqual(W.reconcile("case-A", j, tr, clk)["state"], W.UNKNOWN, rb)
+        tr.mode["text"] = "ok"
+        self.assertEqual(W.commit(prep(event_world()), j, tr, clk)["state"], W.UNKNOWN)
+        self.assertEqual(tr.calls.count("text"), 1)
+
+    def test_both_parts_found_is_transport_state_not_booking(self):
+        j, clk, tr = W.InMemoryJournal(), Clock(), FakeTransport()
+        o = W.commit(prep(event_world()), j, tr, clk)
+        tr.rb = {"text_msg_id": o["text_msg_id"], "media_msg_id": o["media_msg_id"]}
+        self.assertEqual(W.reconcile("case-A", j, tr, clk)["state"], "posted")
+        self.assertIs(W.ACCEPTED, W.POSTED)
 
 
 if __name__ == "__main__":
