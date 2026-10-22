@@ -101,7 +101,8 @@ FROZEN = {"wa_agent.py": "0fe89a0c59ac2a4c055ee0de260f5d41d948c97d",       # б�
 # PROMPT2110: перепинен и wa_agent_knowledge.py (голос «мы» в строках блоков) — у a1dcbe5 прежний блоб d338a3c2
 AT_A1DCBE5 = dict(FROZEN, **{"wa_agent_model.py": "868b0c4b3abd75d6f4fca6b1c7021d0f121db3ce",
                              "wa_agent_knowledge.py": "d338a3c23fcfa7f8180a6ed75b38a93e6e4200d3",
-                             "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3"})   # DELIVERY2210
+                             "wa_agent_tools.py": "fb70716d09b8b2812c08d40f2b0d66ff18ead9e3",   # DELIVERY2210
+                             "wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8"})        # OFFERSENT2210
 
 
 class Script:
