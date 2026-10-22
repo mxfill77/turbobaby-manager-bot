@@ -1,0 +1,291 @@
+{
+ "readback_booked": {
+  "action": "booking_by_id",
+  "ok": true,
+  "found": true,
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "readback": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Бронь",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": false
+  },
+  "_status": 200
+ },
+ "cancelled": {
+  "action": "cancel_booking",
+  "ok": true,
+  "outcome": "cancelled",
+  "applied": true,
+  "status_after": "Отмена",
+  "marker": "автоотмена: 00000000-0000-4000-8000-000000000001 2026-10-21T19:10:51.161Z by tg:1001 @synth_owner",
+  "after": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "readback": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "row": 2,
+  "status_before": "Бронь",
+  "before": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Бронь",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": false
+  },
+  "by": "tg:1001 @synth_owner",
+  "_status": 200
+ },
+ "booking_a": {
+  "action": "create_booking",
+  "ok": true,
+  "saved": true,
+  "row": 2,
+  "status": "Бронь",
+  "bike": "NMAX 155CC TEST 0001",
+  "name": "SYNTH CLIENT ONE",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "formulas_copied": 0,
+  "formula_src_row": null,
+  "_status": 200
+ },
+ "already": {
+  "action": "cancel_booking",
+  "ok": true,
+  "outcome": "already",
+  "applied": false,
+  "status_after": "Отмена",
+  "after": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "readback": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "row": 2,
+  "status_before": "Отмена",
+  "before": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "by": "tg:1001 @synth_owner",
+  "_status": 200
+ },
+ "readback_cancelled": {
+  "action": "booking_by_id",
+  "ok": true,
+  "found": true,
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "readback": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "_status": 200
+ },
+ "door_off": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "door_off",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "message": "cancel door is OFF",
+  "_status": 200
+ },
+ "not_auto": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "not_auto",
+  "status_after": "Бронь",
+  "booking_id": "00000000-0000-4000-8000-000000000003",
+  "row": 4,
+  "status_before": "Бронь",
+  "before": {
+   "row": 4,
+   "booking_id": "00000000-0000-4000-8000-000000000003",
+   "status": "Бронь",
+   "bike": "PCX 160 TEST 0003",
+   "auto": false,
+   "cancel_marked": false
+  },
+  "by": "tg:1001 @synth_owner",
+  "_status": 200
+ },
+ "not_eligible": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "not_eligible",
+  "status_after": "В аренде",
+  "booking_id": "00000000-0000-4000-8000-000000000002",
+  "row": 3,
+  "status_before": "В аренде",
+  "before": {
+   "row": 3,
+   "booking_id": "00000000-0000-4000-8000-000000000002",
+   "status": "В аренде",
+   "bike": "NMAX 155CC TEST 0002",
+   "auto": true,
+   "cancel_marked": false
+  },
+  "by": "tg:1001 @synth_owner",
+  "_status": 200
+ },
+ "booking_changed": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "booking_changed",
+  "status_after": "Бронь",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "row": 2,
+  "status_before": "Бронь",
+  "before": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Бронь",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": false
+  },
+  "by": "tg:1001 @synth_owner",
+  "_status": 200
+ },
+ "cancelled_elsewhere": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "cancelled_elsewhere",
+  "status_after": "Отмена",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "row": 2,
+  "status_before": "Отмена",
+  "before": {
+   "row": 2,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": false
+  },
+  "by": "tg:1001 @synth_owner",
+  "_status": 200
+ },
+ "booking_not_found": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "booking_not_found",
+  "booking_id": "00000000-0000-4000-8000-00000000ffff",
+  "_status": 200
+ },
+ "missing_args": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "missing_args",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "message": "booking_id (uuid) и by обязательны",
+  "_status": 200
+ },
+ "lock_busy": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "lock_busy",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "_status": 200
+ },
+ "ambiguous": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "ambiguous",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "rows": [
+   2,
+   4
+  ],
+  "_status": 200
+ },
+ "no_ticket": {
+  "ok": false,
+  "error": "no_ticket",
+  "action": "cancel_booking",
+  "_status": 403,
+  "message": "agent-запись без валидного билета отклонена (токен-замок 4.2)"
+ },
+ "cancelled_moved": {
+  "action": "cancel_booking",
+  "ok": true,
+  "outcome": "cancelled",
+  "applied": true,
+  "status_after": "Отмена",
+  "marker": "автоотмена: 00000000-0000-4000-8000-000000000001 2026-10-21T19:10:51.173Z by tg:1001 @synth_owner",
+  "after": {
+   "row": 3,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "readback": {
+   "row": 3,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Отмена",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": true
+  },
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "row": 3,
+  "status_before": "Бронь",
+  "before": {
+   "row": 3,
+   "booking_id": "00000000-0000-4000-8000-000000000001",
+   "status": "Бронь",
+   "bike": "NMAX 155CC TEST 0001",
+   "auto": true,
+   "cancel_marked": false
+  },
+  "by": "tg:1001 @synth_owner",
+  "row_hint": 2,
+  "_status": 200
+ },
+ "write_failed": {
+  "action": "cancel_booking",
+  "ok": false,
+  "error": "write_failed",
+  "outcome": "unknown",
+  "booking_id": "00000000-0000-4000-8000-000000000001",
+  "row": 2,
+  "status_before": "Бронь",
+  "message": "Error: synthetic write fault",
+  "_status": 200
+ }
+}

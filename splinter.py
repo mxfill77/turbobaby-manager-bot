@@ -53,6 +53,7 @@ import addressee       # пол: ответ на сообщение бота с 
 import caption_intent  # подпись к фото: короткое указание — заявка, а не совет помыть (24.09, XADV 2478)
 import bike_position   # положение байка: совет C и фраза о депозите в J — только на возврате (25.09)
 import intake_confirm  # ответ на карточку брони: согласие только явное; исход записи — три слова (16.10)
+import autobook_cancel  # «отмена» реплаем на сообщение автоброни (A1AUTOCANCEL2210, ручка по умолчанию ВЫКЛ)
 import act_gate        # одно место перед действием: адресат, лента темы, переспрос до «да» (27.09)
 import park_verdict    # готовый словарь происхождения пробега: своё / подстановка / неизвестно
 import topic_feed as _tfeed   # лента темы обслуживания на диске + контекст мозгу (01.10, SPLTOPICFEED0110)
@@ -182,6 +183,28 @@ def _intake_autobook_on():
     двери цены и стоимость согласована; предоплату не ждём там, где она не нужна. Только поверх INTAKE_PASSPORT_STRICT."""
     return (_intake_passport_strict_on()
             and str(_os_env("INTAKE_AUTOBOOK", "0")).strip().lower() in ("1", "true", "yes", "on", "да"))
+
+
+def _intake_autobook_cancel_on():
+    """Ручка A1AUTOCANCEL2210 (`INTAKE_AUTOBOOK_CANCEL`; по умолчанию ВЫКЛ) — только поверх INTAKE_AUTOBOOK. Пока
+    выключена, текст «Отменить: пока вручную в CRM» прежний байт-в-байт и реплай «отмена» ничего не вызывает."""
+    return _intake_autobook_on() and autobook_cancel.cancel_on(_os_env("INTAKE_AUTOBOOK_CANCEL", "0"))
+
+
+_AB_CANCEL_STORE = None
+
+
+def _ab_cancel_store():
+    """Хранилище связи «сообщение автоброни → booking_id» (одно JSON-файло рядом с модулем, атомарная замена;
+    процесс Splinter один). Создаётся только при включённой ручке; у прогона тестов файл свой на процесс в /tmp.
+    Брони, поставленные до включения, связи не имеют — их отмена вручную в CRM."""
+    global _AB_CANCEL_STORE
+    if _AB_CANCEL_STORE is None and _intake_autobook_cancel_on():
+        p = os.getenv("AUTOBOOK_CANCEL_STATE") or (
+            f"/tmp/autobook_cancel_state_test_{os.getpid()}.json" if any(os.getenv(m) for m in _HINT_TEST_MARKS)
+            else os.path.join(os.path.dirname(os.path.abspath(__file__)), "autobook_cancel_state.json"))
+        _AB_CANCEL_STORE = autobook_cancel.JsonFileStore(p)
+    return _AB_CANCEL_STORE
 
 
 # CLOSETRUTH1910: умолчание ручки правды приёма — ВКЛ (задание отрезка; слово владельца о перезакреплении двух
@@ -13823,9 +13846,18 @@ async def _intake_autobook_write(d, msg, context, bridge, summary, q):
         if _bid and _pl:
             _RECENT_BOOKINGS[_pl] = {"booking_id": str(_bid), "row": _row, "ts": _time.time()}
         log.info(f"  🆕 INTAKE: АВТОБРОНЬ записана (строка {_row}) {d.get('model')}")
-        await say(f"✅ Бронь записана автоматически, строка {_row}, статус «Бронь». ФИО — по паспорту: {d.get('client')}. "
-                  f"Согласовано {price_w} ฿{door_w}. Отменить: пока вручную в CRM (строка {_row}); «отмена» реплаем — "
-                  "со следующим выпуском моста.")
+        _abc = _ab_cancel_store() if autobook_cancel.valid_booking_id(_bid) else None
+        if _abc is None:
+            await say(f"✅ Бронь записана автоматически, строка {_row}, статус «Бронь». ФИО — по паспорту: {d.get('client')}. "
+                      f"Согласовано {price_w} ฿{door_w}. Отменить: пока вручную в CRM (строка {_row}); «отмена» реплаем — "
+                      "со следующим выпуском моста.")
+        else:
+            ok_msg = await say(f"✅ Бронь записана автоматически, строка {_row}, статус «Бронь». ФИО — по паспорту: "
+                               f"{d.get('client')}. Согласовано {price_w} ฿{door_w}. " + autobook_cancel.ON_TAIL)
+            if not autobook_cancel.register_booked(_abc, chat_id=chat_id, thread_id=tid, message=ok_msg, res=res,
+                                                   bot_id=getattr(getattr(context, "bot", None), "id", None),
+                                                   now=_time.time()):
+                await say(autobook_cancel.REGISTER_FAILED.format(row=_row))
         if _rc_cases_on():
             _rc_case_after_booking(bridge, res)
         return
@@ -14690,6 +14722,19 @@ async def _intake_route_reply(msg, context, bridge, text, now):
     или не новее `_CR_FORGOT`), — пояснение `_CR_NOTE_ORIGIN` без привязки, а не адресный вопрос."""
     if not _intake_can_approve(msg):
         return
+    _abc = _ab_cancel_store()
+    if _abc is not None:
+        # A1AUTOCANCEL2210: «отмена» реплаем на связанное сообщение автоброни — один cancel_booking под билетом 4.2;
+        # после «неизвестно» — только чтение. Не та реплика / не связанное сообщение — прежний маршрут ниже.
+        _cr = await autobook_cancel.handle_reply(
+            msg, text, store=_abc, bridge=bridge,
+            say=lambda body: _send(context, chat_id=msg.chat_id, text="🐀 Splinter\n" + body, bilingual=False,
+                                   message_thread_id=getattr(msg, "message_thread_id", None)),
+            can_approve=_intake_can_approve, chat_is_intake=lambda c: GROUPS.get(c) == "intake",
+            agent_write=bridge_client.agent_write, bot_id=getattr(getattr(context, "bot", None), "id", None),
+            forwarded=_ic_forwarded)
+        if _cr.get("handled"):
+            return
     chat_id = msg.chat_id
     tid = getattr(msg, "message_thread_id", None)
     d = _INTAKE_DRAFTS.get(chat_id)
@@ -14797,6 +14842,10 @@ def intake_reply_to_card(msg) -> bool:
         chat_id = getattr(msg, "chat_id", None)
         if not _intake_passport_strict_on() or GROUPS.get(chat_id) != "intake":
             return False
+        _abc = _ab_cancel_store()
+        if (_abc is not None and autobook_cancel.is_cancel_text(getattr(msg, "text", None))
+                and autobook_cancel.lookup(_abc, msg) is not None):
+            return True
         d = _INTAKE_DRAFTS.get(chat_id)
         bk = d if (d and d.get("status") == "awaiting_approval") else None
         kind, _rec = _card_route(msg, bk, _HANDOVER_ACTIVATIONS.get(chat_id), _RETURN_CLOSES.get(chat_id))

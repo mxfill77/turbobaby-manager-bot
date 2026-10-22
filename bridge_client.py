@@ -770,6 +770,7 @@ class BridgeClient:
         "set_caps", "toggle_cap",                # блок капов «Календарь бронирования» Z3:AB15 (живая таблица)
         "add_transaction", "void_last",          # касса (проводки + отмена)
         "create_booking", "activate_booking", "close_booking",  # CRM «клиенты»
+        "cancel_booking",                        # A1AUTOCANCEL2210: отмена АВТОброни (Бронь → Отмена, строка не удаляется)
         "delete_event",                          # удаление
         "edit_event",                            # правка строки НА МЕСТЕ (затирает прежнее значение)
         "ocr_passport", "save_passport", "upload_passport_photo",  # B2: EdenAI + Drive + Bot Data
@@ -1180,6 +1181,24 @@ class BridgeClient:
         deposit (число или 'passport'), helmets, contacts, note, initial_pay, km.
         Долг по брони НЕ начисляется, пока не вызван activate_booking."""
         return self._post("create_booking", **fields)
+
+    def cancel_booking(self, booking_id: str, by: str, row_hint=None, expect=None) -> dict:
+        """A1AUTOCANCEL2210 (ручка Splinter INTAKE_AUTOBOOK_CANCEL, по умолчанию ВЫКЛ): отменить АВТОбронь по booking_id
+        (UUID колонки Y) — статус 'Бронь' → 'Отмена', строка не удаляется. Мутирующий POST: НЕ входит в
+        _IDEMPOTENT_POST_ACTIONS → retry_full=False, ровно одна отправка. Звать под agent_write(ticket) (замок 4.2).
+        by — только подпись для журнала, не полномочие; row_hint — подсказка. Двери в живом мосту @88 НЕТ: ответ
+        unknown_action = «не записано»."""
+        fields = {"booking_id": booking_id, "by": by}
+        if row_hint is not None:
+            fields["row_hint"] = row_hint
+        if expect:
+            fields["expect"] = dict(expect)
+        return self._post("cancel_booking", **fields)
+
+    def booking_by_id(self, booking_id: str) -> dict:
+        """A1AUTOCANCEL2210: только чтение брони по booking_id (GET). Маршрута doGet 'booking_by_id' в живом мосту @88
+        НЕТ — ответ без ok/того же booking_id даёт readback «unavailable», исход отмены остаётся НЕИЗВЕСТНО."""
+        return self._call("booking_by_id", booking_id=booking_id)
 
     def activate_booking(self, bike: str, name: str, date_start: Optional[str] = None) -> dict:
         """Активировать бронь: 'Бронь' → 'В аренде'. Вызывать после фото выдачи (этап 6).

@@ -68,6 +68,8 @@ svc_tokens.json
 works_persist_state.json
 # передача ждущих карточек Splinter при штатной остановке (restart_handoff; данные приложения, не в git)
 restart_handoff.json
+# связь «сообщение автоброни → booking_id» для «отмена» реплаем (A1AUTOCANCEL2210; рантайм-состояние, не код)
+autobook_cancel_state.json
 restart_handoff.json.tmp
 restart_handoff.json.applied
 restart_handoff.json.applied.tmp
