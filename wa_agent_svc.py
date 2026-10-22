@@ -1171,6 +1171,8 @@ def offer_of(environ, model):
     except Exception as e:                                           # noqa: BLE001
         return False, "не засчитан — примесь offer не надета (%s) — адаптер прежний" % type(e).__name__
     model.__class__ = cls
+    # FLEETLIST2210: отказ «модели нет в парке» с перечнем текущего парка — только при своей ручке (умолчание ВЫКЛ)
+    wa_offer_tool.FLEET_LIST_ON = wa_agent_tg.flag_on(environ.get(wa_offer_tool.F_FLEET_LIST))
     return True, ("вкл — в сверке Т4а модель сама зовёт offer {model, date_from, date_to}: модель — по живому парку, "
                   "даты — кодом, ворота цены прежние, наличие и цена — один вызов двери цены на пару; занято — другая "
                   "модель или даты, не больше %d вызовов на сверку; юнит — только в журнал; бронь не пишется, клиенту — "

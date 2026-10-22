@@ -198,6 +198,21 @@ def label_of(value):
     return K.mask(re.sub(r"\s+", " ", str(value or "")).strip())[0][:LABEL_MAX]
 
 
+# FLEETLIST2210 (Codex TB-AGENT-CRITERIA-2210-OWNER-REVIEW): при ручке WA_AGENT_FLEET_LIST=1 отказ «модели нет в парке»
+# несёт перечень моделей ТЕКУЩЕГО снимка парка (тот же `bikes`, что сверяет offer) — модель предлагает реальную
+# альтернативу, а не выдумку; наличие и цену альтернативы — только новым offer. Ручки нет — текст прежний байт-в-байт.
+F_FLEET_LIST = "WA_AGENT_FLEET_LIST"             # окружение читает служба (wa_agent_svc.offer_of), не этот модуль
+FLEET_LIST_MAX = 400
+FLEET_LIST_ON = False                           # выставляет wa_agent_svc.offer_of по ручке; умолчание — прежний текст
+
+
+def fleet_tail(bikes):
+    """Хвост отказа «нет в парке»: « · в парке сейчас: A, B, C (наличие и цену — только offer)» | "" (ручки нет/парк пуст)."""
+    names = sorted({m for m in (M.B.model_key((b or {}).get("name")) for b in (bikes or ())) if m})
+    tail = (" · в парке сейчас: %s (наличие и цену — только offer)" % ", ".join(names))[:FLEET_LIST_MAX]
+    return tail if (FLEET_LIST_ON and names) else ""   # «хвоста нет» — законное значение, не слепое чтение
+
+
 def model_of(value, bikes):
     """Слова модели о модели + парк снимка → (модель парка | None, код отсева | None, почему). Модель — ровно одна
     модель парка по ключу живых имён (`M.model_hits`); сокращение к нескольким моделям — "alias"; несколько моделей —
@@ -214,9 +229,9 @@ def model_of(value, bikes):
         return None, "many", W_MANY % " / ".join(models)
     foreign = [m for m in _RX_MODEL_LIKE.finditer(s) if not any(h[0] < m.end() and m.start() < h[1] for h in hits)]
     if not models or foreign:
-        return None, "fleet", W_FLEET % label_of(foreign[0].group(0) if foreign else s)
+        return None, "fleet", W_FLEET % label_of(foreign[0].group(0) if foreign else s) + fleet_tail(bikes)
     if not M.units_of(models[0], bikes):
-        return None, "fleet", W_FLEET % label_of(s)
+        return None, "fleet", W_FLEET % label_of(s) + fleet_tail(bikes)
     return models[0], None, ""
 
 
