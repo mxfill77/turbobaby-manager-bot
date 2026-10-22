@@ -26,7 +26,7 @@ def main():
     O.FLEET_LIST_ON = True                     # так её выставляет wa_agent_svc.offer_of при ручке WA_AGENT_FLEET_LIST=1
     on = O.model_of("Vespa 150", BIKES)
     check("ручка — отказ с перечнем парка", on[1] == "fleet" and on[2].startswith(O.W_FLEET % "Vespa 150")
-          and "в парке сейчас:" in on[2] and "только offer" in on[2], on)
+          and "в парке сейчас:" in on[2] and "только после своего offer" in on[2], on)
     names = sorted({O.M.B.model_key(b["name"]) for b in BIKES})
     check("перечень — модели снимка, без дублей юнитов", all(n in on[2] for n in names)
           and on[2].count(names[0]) == 1, (names, on[2]))
