@@ -765,6 +765,9 @@ class Core:
         # WA_AGENT_CASE (К4): None — выключен, ядро и база прежние; `wa_agent_tools.CaseLink` — ядро пишет в дело аренды
         # (роль wa) и судит версию дела на «Отправить» (шаг 4 DESIGN_K4 §11)
         self.case = case
+        # OFFERSENT2210 (WA_AGENT_OFFER_SENT): None — выключен, ядро прежнее; `wa_offer_sent.OfferSentRecorder` — факты
+        # offer черновика ждут отправки, ушедшая цена с WA-id — в журнал отправленных предложений (служба ставит после сборки)
+        self.offer_sent = None
         # WA_AGENT_HINTS (NIGHT0710-B2): выключен — «Исправить» и «Отправить» как раньше, правил из пояснений нет;
         # hint_hour — час суточного списка владельцу по Пхукету (24 — списка нет)
         self.hints = bool(hints)
@@ -1324,6 +1327,15 @@ class Core:
             return {"absent": True}
         return {"draft_id": row[0], "state": row[1], "wamid": row[2]}
 
+    def _offer_hook(self, name, *args):
+        """OFFERSENT2210: шаг журнала отправленных предложений; сбой — строка журнала службы, ядро идёт дальше."""
+        try:
+            n = getattr(self.offer_sent, name)(*args)
+            if n:
+                self.log("журнал предложений: %s → %d" % (name, n))
+        except Exception as e:                                       # noqa: BLE001
+            self.log("журнал предложений: сбой %s (%s)" % (name, type(e).__name__))
+
     def _case_sent(self, draft_id, wamid, now):
         """К4 круг 2 (C10): черновик уведомления дела (`notice_id`) ушёл — wamid ДВЕРИ ОТПРАВКИ (не статуса провайдера)
         записывается хранилищу как привязка отправки (`CaseLink.notice_sent` → `Store.record_notice_sent`) ДО любой
@@ -1643,6 +1655,8 @@ class Core:
             did = cur.lastrowid
             if self.case is not None:          # К4: черновик помнит дело и версию дела, на которые написан
                 self._case_bind_draft(did, out)
+            if self.offer_sent is not None:    # OFFERSENT2210: факты offer черновика ждут отправки (это ещё не журнал)
+                self._offer_hook("on_draft", did, number, getattr(self.model, "last", None), now)
             self.log("черновик %d (до строки %d, %d симв.%s)" % (
                 did, upto, len(text), ", нужен человек: причин %d" % len(hand) if hand else ""))
             if card and (card["q_ru"] or card["a_ru"]):
@@ -1871,6 +1885,8 @@ class Core:
             self._sent_out(wamid, number, text, VIA_AGENT, now)
             if self.case is not None:          # К4 круг 2 (C10): привязка отправки черновика уведомления — до доставки
                 self._case_sent(draft_id, wamid, now)
+            if self.offer_sent is not None:    # OFFERSENT2210: цена, названная в УШЕДШЕМ тексте, — в журнал с wamid
+                self._offer_hook("on_sent", draft_id, wamid, text, now)
         words = self._door_words(state, res)
         self._done(draft_id, "%s: %s, %s" % (words, who, hm_phuket(now)), now)
         return {"ok": state == SENT, "state": state, "words": words}

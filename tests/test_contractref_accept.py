@@ -176,7 +176,7 @@ B_HEAD = "• версия: в базе нет (карточки подписи 
 
 # закреплённые файлы: блобы 556e744 (`git ls-tree 556e744 …`) — выпуск их НЕ трогает (§2.2, §8.4)
 PINS = {
-    "wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
+    "wa_agent.py": "0fe89a0c59ac2a4c055ee0de260f5d41d948c97d",  # OFFERSENT2210: было 70695c7d
     "wa_agent_model.py": "38ec261976b7e912e25a14129b68c1df05445e45",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9 · WAFIX2210: было b95d3a86 · DELIVERY2210: было 29fcf235
     "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
     "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
@@ -221,12 +221,12 @@ PINS = {
     "tests/test_wa_agent_svc.py": "154b2d34bee7d61107d49956ebc1c633bef9a341",
     "tests/test_wa_attach_basis.py": "4921ac2f533b780046c9f18a62155df11fd7361c",
     "tests/test_wa_attach_casepdf.py": "af18c24cc9fdb002b2aac055930239113ccfb4ba",
-    "tests/test_wa_attach_casepdf_accept.py": "660b6c624f03681be0ba2d6837a812cd4945fe80",  # RCFIX2010: было 6ec6e371 (перепин wa_agent_model.py) · PROMPT2110: было 65c1496d (перепин трёх файлов) · WAFIX2210: было 7178a4ba · DELIVERY2210: было 99e4d831 · DELIVERY2210: было d24e059a
+    "tests/test_wa_attach_casepdf_accept.py": "0952f14a17041206ee5810396a440536fdebed70",  # RCFIX2010: было 6ec6e371 (перепин wa_agent_model.py) · PROMPT2110: было 65c1496d (перепин трёх файлов) · WAFIX2210: было 7178a4ba · DELIVERY2210: было 99e4d831 · DELIVERY2210: было d24e059a · OFFERSENT2210: было 660b6c62
     "tests/test_wa_attach_casepdf_fix.py": "ee04bebd3c8a5821f1f3be3d0a33efe8ee6bf632",
     "tests/test_wa_attach_casestate.py": "b4529669fed3c5faeaecbc8a0c6b1c06ac291222",
-    "tests/test_wa_attach_casestate_accept.py": "39588525cd71a240bd2ed45b421ec807caff5a6e",  # RCFIX2010: было 6a2fc495 (перепин wa_agent_model.py) · PROMPT2110: было 75ebdd2a (перепин трёх файлов) · WAFIX2210: было 95dc0dea · DELIVERY2210: было 1cb15e16 · DELIVERY2210: было 8c433d7f
+    "tests/test_wa_attach_casestate_accept.py": "db97b2b1beae5cdfd093049d52626124b1ad7e26",  # RCFIX2010: было 6a2fc495 (перепин wa_agent_model.py) · PROMPT2110: было 75ebdd2a (перепин трёх файлов) · WAFIX2210: было 95dc0dea · DELIVERY2210: было 1cb15e16 · DELIVERY2210: было 8c433d7f · OFFERSENT2210: было 39588525
     "tests/test_wa_attach_contract_ask.py": "f2241554c670821aac31ae6dde9f829c50ca24ae",
-    "tests/test_wa_attach_cstate.py": "7c1beb27eb93e45f1c263ea4eeadf7c50e65ce55",  # RCFIX2010: было 5015c4b0 (перепин wa_agent_model.py) · PROMPT2110: было f3880675 (перепин трёх файлов и AT_A1DCBE5) · WAFIX2210: было a874424d · DELIVERY2210: было 55017738 · DELIVERY2210: было d1369092
+    "tests/test_wa_attach_cstate.py": "ea88e2b5ff2a8b8cc81629875ebc00a69fb3320c",  # RCFIX2010: было 5015c4b0 (перепин wa_agent_model.py) · PROMPT2110: было f3880675 (перепин трёх файлов и AT_A1DCBE5) · WAFIX2210: было a874424d · DELIVERY2210: было 55017738 · DELIVERY2210: было d1369092 · OFFERSENT2210: было 7c1beb27
     "tests/test_wa_attach_expect.py": "4fdac0749eb21f3391596587a108746b3b936b3b",
     "tests/test_wa_attach_svc.py": "d69add04e17cb652663e668a768f5a230dbd02a1",
     "tests/test_wa_signed_card.py": "d92bf213f14e4394382a05d90b69a83452138e4c",

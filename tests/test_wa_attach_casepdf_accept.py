@@ -663,7 +663,7 @@ def test_compat_event_card_same_with_autosend_flag():
     assert snap(a) == snap(b) and a.door.sends == [(NUM, RU_TEXT)], (snap(a), snap(b))
 
 
-FROZEN = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",          # git-блобы f678739 (`git rev-parse`)
+FROZEN = {"wa_agent.py": "0fe89a0c59ac2a4c055ee0de260f5d41d948c97d",          # git-блобы f678739 (`git rev-parse`) · OFFERSENT2210: было 70695c7d
           "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
           "wa_agent_model.py": "38ec261976b7e912e25a14129b68c1df05445e45"}  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9 · WAFIX2210: было b95d3a86 · DELIVERY2210: было 29fcf235
 

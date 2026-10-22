@@ -82,7 +82,7 @@ LIVE = [{"name": n, "status": "ДОМА"} for n in ("PCX 160CC WHITE PHUKET 3011
                                                 "CB 650R RED PHUKET 9012", "XMAX 300CC NEW BLUE PHUKET 4321")]
 # RCFIX2010: у байка парка статус формулы столбца B (живой формат ReadFleet.js:91-95) — без него юнит не «свободно»
 BASE = "cbe1322"                               # прод 556e744 + FORMID
-PINS = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",
+PINS = {"wa_agent.py": "0fe89a0c59ac2a4c055ee0de260f5d41d948c97d",  # OFFERSENT2210: было 70695c7d
         "wa_agent_model.py": "38ec261976b7e912e25a14129b68c1df05445e45",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9 · WAFIX2210: было b95d3a86 · DELIVERY2210: было 29fcf235
         "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
         "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2

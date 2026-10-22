@@ -92,7 +92,7 @@ SIGNED_AT = "2026-10-14 19:04"
 HEAD0 = CS.HEAD_START                                              # «ДОГОВОР КЛИЕНТА — факты кода из базы агента»
 HEAD_T = (T.TOOLS_BLOCK % T.MAX_CALLS) + "\n\n"                    # голова хода сверки Т4а перед user
 DATE_ANY = re.compile(r"\d{1,4}[./-]\d{1,2}(?:[./-]\d{2,4})?")      # любая дата: в блоке — только «ДД.ММ»
-FROZEN = {"wa_agent.py": "70695c7dc669f2b4d14ff7c000763b915e6121e8",       # блобы a1dcbe5 (CASEPDF1510)
+FROZEN = {"wa_agent.py": "0fe89a0c59ac2a4c055ee0de260f5d41d948c97d",       # блобы a1dcbe5 (CASEPDF1510) · OFFERSENT2210: было 70695c7d
           "wa_agent_model.py": "38ec261976b7e912e25a14129b68c1df05445e45",  # RCFIX2010: было 868b0c4b (free_bikes с парком снимка) · PROMPT2110: было 7c58cca9 · WAFIX2210: было b95d3a86 · DELIVERY2210: было 29fcf235
           "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
           "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6"}  # PROMPT2110: было d338a3c2

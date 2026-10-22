@@ -219,6 +219,7 @@ F_BOOK_CTX = "WA_AGENT_BOOK_CTX"          # наличие по переписк
 F_PRICE_CARRY = "WA_AGENT_PRICE_CARRY"    # цена через ход (PRICECARRY1610); по умолчанию выкл; не в FLAGS
 F_OFFER = "WA_AGENT_OFFER"                # наличие и цена по запросу модели (OFFER1910); по умолчанию выкл; не в FLAGS
 F_INTAKE_CARD = "WA_AGENT_INTAKE_CARD"    # A2INTAKE2210: карточка «🆕 БРОНЬ» во «Входящие» из дела WA; по умолчанию выкл
+F_OFFER_SENT = "WA_AGENT_OFFER_SENT"      # OFFERSENT2210: журнал ОТПРАВЛЕННЫХ предложений (цена с WA-id); по умолчанию выкл
 F_CACHE = "WA_AGENT_CACHE"                # кэш промпта: срок «1h»/«5m» или выкл (WAAGENTCACHE0210)
 F_TOOLS = "WA_AGENT_TOOLS"                # инструменты чтения и журнал сверки (AGENTLOOPA0310); выкл — один вызов
 F_ATTACH = "WA_AGENT_ATTACH"              # PDF договора второй частью «Отправить» (NIGHT0710-B3v); не в FLAGS
@@ -1122,6 +1123,23 @@ def price_carry_of(environ, model):
                   "модель сменилась — расчёт не вызван, число не называется; клиенту — только по «Отправить»")
 
 
+def offer_sent_of(environ, core, agent_db):
+    """OFFERSENT2210: ручка WA_AGENT_OFFER_SENT → (поставлен? | None, слова строки старта | None). Не запрошена —
+    (None, None): ни импорта, ни строки, ядро прежнее. Запрошена — у ядра `offer_sent` = регистратор: ожидание
+    «черновик → отправка» и журнал отправленных — два JSON-файла рядом с базой агента."""
+    if not wa_agent_tg.flag_on(environ.get(F_OFFER_SENT)):
+        return None, None
+    try:
+        import wa_consent
+        import wa_offer_sent
+    except Exception as e:                                           # noqa: BLE001
+        return False, "не поставлен — модуль не собран (%s)" % type(e).__name__
+    base = os.path.dirname(os.path.abspath(agent_db))
+    core.offer_sent = wa_offer_sent.OfferSentRecorder(
+        os.path.join(base, "wa_offer_pending.json"), wa_consent.SentOfferJournal(os.path.join(base, "wa_offer_sent.json")))
+    return True, "вкл — факты offer черновика ждут отправки; ушедшая цена с WA-id → wa_offer_sent.json"
+
+
 def intake_card_of(environ, journal=None, transport=None):
     """A2INTAKE2210 (пакет Codex A2 v2): флаг WA_AGENT_INTAKE_CARD → (засчитан? | None, слова строки старта | None).
     Не запрошен → (None, None): ни импорта, ни строки, ничего не меняется. Запрошен, но нет постоянного журнала
@@ -1351,6 +1369,9 @@ def build(env, environ=None, model=None, http=None, send=None, react_send=None, 
                              log=line, drafts=drafts, greet=greet, pace=pace, lessons=lessons, lesson_admins=admins,
                              followup=follow, hints=hints, templates=templates, lang_of=wa_agent_tg.K.lang_of)
     tg.bind(core)
+    _osent, osent_words = offer_sent_of(environ, core, env["agent_db"])
+    if osent_words:
+        line("журнал отправленных предложений (%s): %s" % (F_OFFER_SENT, osent_words))
     if not attach:                              # SIGNEDCARD1410: карточка подписи без PDF-ядра не уходит — снять stale
         close_signed_orphans(core, clock(), line)
     # ожидание (WAUNANSWERED0210): выключено — объекта нет, ни таблицы, ни чтения, ни Telegram;
