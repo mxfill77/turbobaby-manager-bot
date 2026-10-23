@@ -167,35 +167,6 @@ def reply_to_of(msg):
     return getattr(r, "message_id", None)
 
 
-def message_media(msg):
-    """Private photo references for the CRM exporter. No network or file writes here."""
-    try:
-        photos = getattr(msg, "photo", None)
-        if not photos:
-            return []
-        photo = photos[-1]
-        file_id = getattr(photo, "file_id", None)
-        unique_id = getattr(photo, "file_unique_id", None)
-        if not isinstance(file_id, str) or not isinstance(unique_id, str):
-            return []
-        result = {"file_id": file_id, "file_unique_id": unique_id}
-        for field in ("width", "height", "file_size"):
-            value = getattr(photo, field, None)
-            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                result[field] = value
-        return [result]
-    except Exception:
-        return []
-
-
-def msg_edit_ts(msg):
-    try:
-        value = getattr(msg, "edit_date", None)
-        return value.timestamp() if value is not None else None
-    except Exception:
-        return None
-
-
 def msg_ts(msg):
     d = getattr(msg, "date", None)
     try:

@@ -1255,8 +1255,7 @@ def feed_incoming(msg, kind=None) -> bool:
                              mid=getattr(msg, "message_id", None), ts=_tfeed.msg_ts(msg),
                              role=_feed_role(getattr(msg, "from_user", None)),
                              reply_to=_tfeed.reply_to_of(msg), text=text or "",
-                             album=getattr(msg, "media_group_id", None),
-                             media=_tfeed.message_media(msg), edited_at=_tfeed.msg_edit_ts(msg))
+                             album=getattr(msg, "media_group_id", None))
     except Exception as e:
         log.warning(f"  🧵 лента темы: вход не записан ({e}) — сообщение идёт дальше")
         return False
@@ -2377,16 +2376,6 @@ def bike_from_topic(chat_id, topic_id):
     cached = _TOPIC_NAMES.get((chat_id, topic_id))
     if cached:
         return cached
-    # CRM may register a newly created topic while this process is running.
-    # A cache miss reads the existing DB only; no schema initialization or writes.
-    if chat_id == SERVICING_CHAT and _MEMORY is not None:
-        try:
-            persisted = _MEMORY.get_topic_bike(chat_id, topic_id)
-            if persisted:
-                _TOPIC_NAMES[(chat_id, topic_id)] = persisted
-                return persisted
-        except Exception:
-            log.warning("CRM topic mapping read failed; using the existing fallback")
     # topics_map.json — вторичный fallback (только обслуживание; на сервере может отсутствовать).
     if chat_id == SERVICING_CHAT:
         mapped = _load_topic_map().get(topic_id)
