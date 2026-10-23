@@ -25,7 +25,7 @@
       читает (ast: нет getenv / записи окружения; окружение после вызова то же);
   D — порядок по исходнику bot.py (ast): имена юнита — до load_dotenv; один снимок слов на строку и на вход; в main() вход —
       body[0], стоп — body[1] (простой и return), всё о регистрации и опросе — ниже стопа; в простое нет выхода;
-  E — инструментированный main(): допуск → регистрация ровно прежняя (22 обработчика, 5 ежедневных и 4 повторяющихся задач,
+  E — инструментированный main(): допуск → прежние 22 обработчика + наблюдатель правок CRM (23 всего), 5 ежедневных и 4 повторяющихся задач,
       run_polling последним), строка допуска — первым событием; стоп → события ровно [строка ERROR, простой];
   F — дети: настоящий импорт bot.py с окружением «юнита» и строкой «.env» (заглушка load_dotenv с правилом override=False):
       CLOSE_TRUTH=0 из юнита — truth_off; из .env — стоп при той же строке флагов, которую принял бы шаблон r7 truth_off;
@@ -710,7 +710,7 @@ EXPECTED_CALLS = (
                                                  ("^(approve|reject|check|next):", "on_devbot_button"),
                                                  ("^delivery:", "on_delivery_button"), ("^o3:", "on_o3_button"),
                                                  ("^info:", "on_info_button"))]
-    + [("add_handler", "msg", f) for f in ("on_forum_topic", "handle_voice", "handle_photo", "handle_text")]
+    + [("add_handler", "msg", f) for f in ("on_forum_topic", "capture_service_edit", "handle_voice", "handle_photo", "handle_text")]
     + [("run_daily", n, f) for n, f in (("daily_pulse", "scheduled_daily_pulse"),
                                         ("important_reminders", "scheduled_important_reminders"),
                                         ("audit_report", "scheduled_audit_report"),
@@ -747,6 +747,8 @@ def _rec_application(ev):
         job_queue = JQ()
 
         def add_handler(self, h, *a, **k):
+            if _cb_name(h.callback) == "capture_service_edit":
+                assert not a and k == {"group": -1}, (a, k)
             ev.append(("call",) + hdesc(h))
 
         def run_polling(self, *a, **k):
@@ -835,7 +837,7 @@ def assert_parked(ev, restore, key=None, word=None):
 def test_e1_release_starts_as_before():
     ev, restore = run_main_recorded(words_of(), frozenset())
     assert_started_as_before(ev, restore, "release")
-    assert len([c for c in _calls(ev) if c[0] == "add_handler"]) == 22
+    assert len([c for c in _calls(ev) if c[0] == "add_handler"]) == 23
 
 
 def test_e2_r0_modes_start_as_before():

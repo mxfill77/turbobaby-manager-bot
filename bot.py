@@ -1605,6 +1605,16 @@ def _servicing_caption_to_brain(msg, context, cap: str) -> bool:
     return len(rest) >= 3
 
 
+async def capture_service_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Observe edits for CRM only. Never replay operational/financial handlers."""
+    msg = getattr(update, "edited_message", None)
+    if msg is None or splinter.GROUPS.get(msg.chat_id) != "servicing":
+        return
+    if getattr(msg, "text", None) is None and not getattr(msg, "photo", None):
+        return
+    splinter.feed_incoming(msg)
+
+
 async def on_forum_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сервис-сообщение форума (создание/переименование темы) → сохраняем имя темы=байк
     в _TOPIC_NAMES + memory.db topic_bike. Ловит создание надёжно (раньше терялось на not msg.text)
@@ -1709,6 +1719,11 @@ def main():
     app.add_handler(MessageHandler(
         filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
         on_forum_topic))
+
+    # Edits are captured in their own group; original handlers keep update.message.
+    app.add_handler(MessageHandler(
+        filters.UpdateType.EDITED_MESSAGE & (filters.TEXT | filters.PHOTO),
+        capture_service_edit), group=-1)
 
     # Сообщения
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
