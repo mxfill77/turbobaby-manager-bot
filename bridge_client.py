@@ -87,6 +87,40 @@ if os.getenv("ORCH_TEST_MODE") == "1":
 # HTTP-коды редиректа script.google.com/exec → script.googleusercontent.com (echo-слой)
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
 
+# === ПАРЫ НОМЕРОВ «ТАБЛИЧКА ↔ ЗЕЛЁНАЯ КНИГА» (25.10.2026, PLATEALIAS2510) ===
+# Правило владельца 25.10: тема идёт по номеру, который висит на байке; расхождение с зелёной книгой —
+# предупреждение. Лист1 после 24.10 несёт книжные номера, поэтому у 5 байков номер темы и номер строки
+# разные. Пары — в plate_aliases.json рядом с модулем; файла нет или он битый → пар нет (прежний поиск).
+_PLATE_ALIASES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plate_aliases.json")
+_PLATE_ALIASES = None
+
+
+def _plate_alias_map():
+    """{номер: {парные номера}} из plate_aliases.json, читается один раз. Нет/битый файл → None."""
+    global _PLATE_ALIASES
+    if _PLATE_ALIASES is None:
+        try:
+            with open(_PLATE_ALIASES_FILE, encoding="utf-8") as fh:
+                pairs = json.load(fh).get("pairs") or []
+            m = {}
+            for p in pairs:
+                a, b = str(p.get("on_bike") or "").strip(), str(p.get("green_book") or "").strip()
+                if a and b and a != b:
+                    m.setdefault(a, set()).add(b)
+                    m.setdefault(b, set()).add(a)
+            _PLATE_ALIASES = m
+        except (OSError, ValueError, AttributeError):
+            _PLATE_ALIASES = False                  # не перечитывать на каждом вызове
+    return _PLATE_ALIASES or None
+
+
+def _plate_partners(plate_digits):
+    """Парные номера для номера байка (табличка ↔ книга), по возрастанию. Пары нет → пустой кортеж."""
+    m = _plate_alias_map()
+    if m is None:
+        return ()
+    return tuple(sorted(m.get(str(plate_digits or "").strip(), ())))
+
 # === ТОКЕН-ЗАМОК боевой записи (4.2) ===
 # origin записи: 'human' (по умолчанию — люди/кнопки, замок СПИТ) | 'agent' (автономный процесс).
 # Сегодня agent НЕ ставится нигде → все записи human → 0 отклонений. Будущий оркестратор/дев-бот
@@ -713,6 +747,16 @@ class BridgeClient:
             for b in bikes:
                 if plate(b.get("name", "")) == q_plate:
                     return b
+            # 1б) ПАРА «табличка ↔ зелёная книга» (25.10.2026, PLATEALIAS2510). Тема идёт по номеру,
+            # который ВИСИТ НА БАЙКЕ, Лист1 — пока по номеру из зелёной книги; у 5 байков они разные
+            # (тема 83 «…2478» против строки «…9286» и т.д., сверка фото 25.10). Без пары тема с
+            # номером таблички не находила свою строку вовсе. Мост v96 ту же пару знает сам — здесь
+            # только руки бота. Пара симметрична: когда Лист1 перейдёт на номер таблички, найдётся и
+            # старое название с книжным номером.
+            for alt in _plate_partners(q_plate):
+                for b in bikes:
+                    if plate(b.get("name", "")) == alt:
+                        return b
         # 2) запасной вариант — вхождение очищенного названия
         q = str(query).lower()
         for b in bikes:
