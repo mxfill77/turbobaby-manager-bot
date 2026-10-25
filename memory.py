@@ -263,6 +263,22 @@ class Memory:
         finally:
             conn.close()
 
+    def topic_bike_source(self, chat_id, topic_id):
+        """Откуда привязка тема→байк (`source`) → строка, либо None: строки нет. Только чтение.
+        Зовёт `splinter._plate_name_src` (PLATEWATCH2510 r2): имени из reply на создание темы и
+        прежней метке 'forum_created' сверка номера на байке не верит."""
+        if not (chat_id and topic_id):
+            return None
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT source FROM topic_bike WHERE chat_id=? AND topic_id=?",
+                (int(chat_id), int(topic_id))
+            ).fetchone()
+            return (row[0] or None) if row else None
+        finally:
+            conn.close()
+
     def all_topic_bikes(self) -> Dict:
         """{(chat_id, topic_id): bike_name} — для seed _TOPIC_NAMES при старте."""
         conn = self._conn()

@@ -1,4 +1,4 @@
-"""НОМЕР НА БАЙКЕ ↔ ИМЯ ТЕМЫ ↔ ЗЕЛЁНАЯ КНИГА (25.10.2026, PLATEWATCH2510).
+"""НОМЕР НА БАЙКЕ ↔ ИМЯ ТЕМЫ ↔ ЗЕЛЁНАЯ КНИГА (25.10.2026, PLATEWATCH2510; ревью r2 — 25.10).
 
 Правило владельца 25.10: имя темы обслуживания идёт за номером, ФИЗИЧЕСКИ стоящим на байке;
 расхождение с зелёной книгой — предупреждение. Повод — переход 24.10 на номера из зелёных книг,
@@ -6,19 +6,23 @@
 
 Предмет — четыре вещи:
   1  РЕШЕНИЕ `plate_watch` (чистое, импортов ноль): какое чтение годится, номер темы, предложение
-     имени, два чтения из РАЗНЫХ отправок за 14 суток, альбом = одна отправка, расхождение поровну,
-     висящая карточка, «Оставить», предупреждение раз в 7 суток;
-  2  ПРОМПТ снимка: поле `plate` — только табличка на САМОМ байке, `legible`, не угадывать;
-  3  ЖИВОЙ `splinter.handle` + кнопки `svc:plren` / `svc:plkeep`: 83 — карточка с предупреждением,
-     82 — ничего, 1190 — карточка с предупреждением, одно чтение и байк на фоне — ничего, в тему
-     байка от этой ветки не уходит НИ ОДНОГО сообщения, карточка переживает перезапуск, нажимает
-     только владелец (Пым — доверенный, но не владелец — получает отказ), «Переименовать» зовёт
-     `edit_forum_topic` и правит кэш и memory.db как событие переименования, PLATE_WATCH=0 — тишина;
+     имени, два НЕЗАВИСИМЫХ чтения (разные отправки и снимки, ≥ 6 ч) за 14 суток, все чтения окна
+     согласны, номер другого байка / на цифру от номера темы или книги / часть номера / объём — тишина,
+     имени бота не верим (дрейф) или тема привязана руками — тишина, висящая карточка, её проверка
+     в момент нажатия, «Оставить», предупреждение раз в 7 суток;
+  2  ПРОМПТ снимка: поле `plate` — только табличка на САМОМ байке; `PLATE_WATCH=0/false` — промпт
+     БЕЗ поля, байт-в-байт прежний;
+  3  ЖИВОЙ `splinter.handle` + кнопки `svc:plren` / `svc:plkeep`: 83 и 1190 — карточка, 82 — ничего,
+     в тему байка от ветки не уходит НИ ОДНОГО сообщения, сверка — фоновой задачей под одним замком
+     (одна карточка на две сверки, «Оставить» во время отправки не теряется), нажимает только
+     владелец и только на сообщении карточки, предупреждение без кнопок — в ленту, а не в инбокс,
+     битая память — тишина, TOPIC_NOT_MODIFIED — успех, `_bike_topic_id` находит тему по номеру;
   4  ДРЕЙФ ИМЕНИ ТЕМЫ: обычное сообщение (reply на сообщение создания) больше не возвращает теме
-     ПЕРВОЕ имя — живой случай 82, 21.10 09:23:30 UTC «5104» → «3902» через 0.8 с после фото.
+     ПЕРВОЕ имя — живой случай 82, 21.10 09:23:30 UTC «5104» → «3902»; у имени есть происхождение.
 
 Сеть, Telegram, мост, модель и memory.db — заглушки; зелёная книга — настоящий
-`greenbook_plates.json` из корня дерева. Память — во временном каталоге.
+`plate_watch_book.json` из корня дерева. Память и ВСЕ файлы состояния splinter — во временном
+каталоге (ревью r2 M2: сьют гонит живой `S.handle` с боевыми номерами тем 82, 83, 1190).
 """
 import ast
 import asyncio
@@ -31,26 +35,45 @@ import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # дерево, которое судим
 sys.path.insert(0, ROOT)
-os.environ["ACT_GATE"] = "0"            # предмет сьюта — номер темы; ворота судит tests/test_act_gate.py
+_TMP = tempfile.gettempdir()
+_RUN = f"{os.getpid()}_{int(time.time() * 1000)}"     # своё имя на прогон: прежний прогон с тем же pid не подмешается
+
+
+def _tmpf(tag, ext=".json"):
+    return os.path.join(_TMP, f"tb_plate_{tag}_{_RUN}{ext}")
+
+
+# Файлы состояния splinter — ВНЕ живого дерева, как у соседних сьютов того же дня (test_servicing_tidy,
+# test_service_receipt_cost): без этого прогон мимо гейта писал бы ленту тем 82/83/1190 в боевой topic_feed/.
 os.environ.setdefault("BRIDGE_URL", "http://x")
 os.environ.setdefault("BRIDGE_TOKEN", "x")
+os.environ.setdefault("PRETOOL_NOPUSH", "1")
+os.environ.setdefault("NOTIFY_COUNT_FILE", _tmpf("notify", ".txt"))
+os.environ.setdefault("TOPIC_FEED_DIR", os.path.join(_TMP, f"tb_plate_feed_{_RUN}"))
+os.environ.setdefault("MILEAGE_Q_STATE", _tmpf("mileage_q"))
+os.environ.setdefault("DECIDER_LIVE_STATE", _tmpf("dlive"))
+os.environ.setdefault("RESTART_HANDOFF_STATE", _tmpf("handoff"))
+os.environ.setdefault("AUTOBOOK_CANCEL_STATE", _tmpf("abc"))
+os.environ.setdefault("HINT_DEDUP_STATE", _tmpf("hint"))
+os.environ.setdefault("WORKS_PERSIST_STATE", _tmpf("works"))
+os.environ.setdefault("SVC_TOKENS_STATE", _tmpf("svc_tokens"))
+os.environ["TOPIC_DECIDER_LIVE"] = "0"
+os.environ["ACT_GATE"] = "0"            # предмет сьюта — номер темы; ворота судит tests/test_act_gate.py
 os.environ["PLATE_WATCH"] = "1"
-_TMP = tempfile.mkdtemp(prefix="tb_plate_watch_")
-os.environ["PLATE_WATCH_STATE"] = os.path.join(_TMP, "plate.json")
-os.environ["HINT_DEDUP_STATE"] = os.path.join(_TMP, "hint.json")
-os.environ["WORKS_PERSIST_STATE"] = os.path.join(_TMP, "works.json")
-os.environ["SVC_TOKENS_STATE"] = os.path.join(_TMP, "svc_tokens.json")
+os.environ["PLATE_WATCH_STATE"] = _tmpf("plate")
 
 import notify                # noqa: E402
 import plate_watch as PW     # noqa: E402
 import splinter as S         # noqa: E402
 
 DAY = 86400.0
+GAP = 7 * 3600.0             # больше PW.MIN_GAP_S: свидетели с разных заходов
 NOW = 1792915200.0           # 25.10.2026 00:00 UTC
 SERV = S.SERVICING_CHAT
 OWNER = ("turbophuket1", 6879003264)          # бизнес-аккаунт владельца (OWNER_IDS)
 PYM = ("pleummmm", 99001)                     # доверенный, но НЕ владелец
-with open(os.path.join(ROOT, "greenbook_plates.json"), encoding="utf-8") as _f:
+N83, N82, N1190 = "XADV 750CC GREY 9286", "XADV 750CC BLACK 5104", "XMAX 300CC NEW BROWN 8676"
+with open(os.path.join(ROOT, "plate_watch_book.json"), encoding="utf-8") as _f:
     BOOK = json.load(_f)
 
 
@@ -63,15 +86,35 @@ def _plate(d, legible=True, series=None):
             "plate": {"digits": d, "series": series, "province": "Phuket", "legible": legible}}
 
 
-def _st(topic, *reads):
-    """Память с чтениями: reads = (цифры, mid[, отправка[, возраст в сутках]])."""
-    st = PW.clean(None)
-    for r in reads:
+def _st(topic, *reads, base=NOW, st=None):
+    """Память с чтениями: reads = (цифры, mid[, отправка[, возраст в сутках[, file_unique_id]]]). Без возраста
+    чтения идут через GAP, последнее — в `base`."""
+    st = PW.clean(st)
+    n = len(reads)
+    for i, r in enumerate(reads):
         d, mid = r[0], r[1]
         grp = r[2] if len(r) > 2 else None
-        age = r[3] if len(r) > 3 else 0.0
-        st = PW.add_reading(st, topic, {"d": d}, mid, grp, NOW - age * DAY)
+        age = r[3] if len(r) > 3 and r[3] is not None else (n - 1 - i) * GAP / DAY
+        fu = r[4] if len(r) > 4 else None
+        st = PW.add_reading(st, topic, {"d": d}, mid, grp, base - age * DAY, fu=fu)
     return st
+
+
+def _v(st, topic, name, now=NOW, src=None, others=None):
+    return PW.verdict(st, topic, name, _book(topic), now, src=src, others=others)
+
+
+# ============================================================================================
+#  (0) СРЕДА СЬЮТА — ничего в живое дерево (ревью r2 M2)
+# ============================================================================================
+def test_suite_state_is_redirected():
+    for k in ("TOPIC_FEED_DIR", "MILEAGE_Q_STATE", "DECIDER_LIVE_STATE", "RESTART_HANDOFF_STATE",
+              "AUTOBOOK_CANCEL_STATE", "HINT_DEDUP_STATE", "WORKS_PERSIST_STATE", "SVC_TOKENS_STATE",
+              "PLATE_WATCH_STATE", "NOTIFY_COUNT_FILE"):
+        v = os.environ.get(k)
+        assert v and not os.path.abspath(v).startswith(ROOT + os.sep), (k, v)
+    assert os.environ.get("PRETOOL_NOPUSH") == "1" and os.environ.get("TOPIC_DECIDER_LIVE") == "0"
+    assert not os.path.abspath(S._dlive_path()).startswith(ROOT + os.sep), S._dlive_path()
 
 
 # ============================================================================================
@@ -84,6 +127,10 @@ def test_module_is_pure():
     assert imports == [], [ast.dump(n) for n in imports]
     used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     assert not used & {"open", "eval", "exec", "__import__", "input"}, used
+
+
+def test_engine_sizes_mirror_splinter():
+    assert PW.ENGINE_CC == frozenset(S._CC_PLATE), (PW.ENGINE_CC ^ frozenset(S._CC_PLATE))
 
 
 def test_reading_only_legible_digits():
@@ -114,15 +161,18 @@ def test_topic_plate_is_the_last_word():
 
 
 def test_greenbook_file_names_live_topics():
-    assert _book(83)["d"] == "9286" and _book(83)["series"] == "2กจ"
+    # своё имя файла, не прежнее greenbook_plates.json: неотслеживаемая копия того на сервере не остановит pull (S9)
+    assert S._PLATE_BOOK_FILE == os.path.join(ROOT, "plate_watch_book.json")
+    assert _book(83)["d"] == "9286" and _book(83)["series"] == "2กจ" and _book(83)["name"] == N83
     assert _book(1190)["d"] == "8676" and _book(82)["d"] == "5104"
     assert _book(62)["d"] == "5662" and _book(66)["d"] == "461"
     assert _book(999999) is None and PW.book_entry(None, 83) is None
+    assert PW.book_topic(BOOK, "9286") == 83 and PW.book_topic(BOOK, "2478") is None
 
 
 def test_live_83_two_readings_rename_with_warning():
     st = _st(83, ("2478", 4411), ("2478", 4520))
-    v = PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW)
+    v = _v(st, 83, N83)
     assert v["kind"] == PW.KIND_RENAME and v["why"] == PW.RENAME, v
     assert v["d"] == "2478" and v["g"] == "9286" and v["mids"] == [4411, 4520], v
     assert v["proposed"] == "XADV 750CC GREY 2478"
@@ -134,92 +184,213 @@ def test_live_83_two_readings_rename_with_warning():
 
 def test_live_82_same_everywhere_nothing():
     st = _st(82, ("5104", 900), ("5104", 901))
-    v = PW.verdict(st, 82, "XADV 750CC BLACK 5104", _book(82), NOW)
+    v = _v(st, 82, N82)
     assert v["kind"] is None and v["why"] == PW.SAME, v
 
 
 def test_live_1190_rename_with_warning():
     st = _st(1190, ("9315", 70), ("9315", 75))
-    v = PW.verdict(st, 1190, "XMAX 300CC NEW BROWN 8676", _book(1190), NOW)
+    v = _v(st, 1190, N1190)
     assert v["kind"] == PW.KIND_RENAME and v["proposed"] == "XMAX 300CC NEW BROWN 9315", v
     assert "⚠️ Номер на байке не совпадает с зелёной книгой (8676)" in PW.card_text(v, SERV)
 
 
 def test_bike_equals_book_says_so():
-    # тема 62 зовётся старым номером 5849, а на байке уже новый 5662 = книга
+    # тема 62 зовётся (по событию переименования) старым номером 5849, а на байке уже новый 5662 = книга
     st = _st(62, ("5662", 10), ("5662", 11))
-    v = PW.verdict(st, 62, "ADV 350CC BLACK 5849", _book(62), NOW)
+    v = _v(st, 62, "ADV 350CC BLACK 5849", src=PW.SRC_EVENT)
     text = PW.card_text(v, SERV)
     assert v["kind"] == PW.KIND_RENAME and "✅ Номер на байке совпадает с зелёной книгой (5662)" in text, text
     assert "не совпадает с зелёной книгой" not in text
 
 
-def test_single_reading_album_and_old_readings_are_few():
-    assert PW.verdict(_st(83, ("2478", 1)), 83, "XADV 750CC GREY 9286", _book(83), NOW)["why"] == PW.FEW
+def test_live_66_longer_plate_is_a_rename_not_a_partial_read():
+    """Ревью предлагало молчать, когда длина номера на байке не равна ни длине номера темы, ни книги. Живой случай
+    66 (на байке 9011, в книге и имени 461) это правило заглушило бы. Неполное/слипшееся чтение ловится точнее:
+    один номер — другой без одной цифры (286 ↔ 9286, 1461 ↔ 461), см. test_partial_merged_engine_are_silent."""
+    st = _st(66, ("9011", 1), ("9011", 2))
+    v = _v(st, 66, "CB 300CC R 461")
+    assert v["kind"] == PW.KIND_RENAME and v["proposed"] == "CB 300CC R 9011", v
+    assert S._plate_from_name(v["proposed"]) == "9011"
+
+
+def test_single_reading_album_close_and_same_photo_are_few():
+    assert _v(_st(83, ("2478", 1)), 83, N83)["why"] == PW.FEW
     album = _st(83, ("2478", 1, "alb"), ("2478", 2, "alb"), ("2478", 3, "alb"))
-    assert PW.verdict(album, 83, "XADV 750CC GREY 9286", _book(83), NOW)["why"] == PW.FEW
-    old = _st(83, ("2478", 1, None, 15), ("2478", 2))
-    assert PW.verdict(old, 83, "XADV 750CC GREY 9286", _book(83), NOW)["why"] == PW.FEW
+    assert _v(album, 83, N83)["why"] == PW.FEW
+    old = _st(83, ("2478", 1, None, 15), ("2478", 2, None, 0))
+    assert _v(old, 83, N83)["why"] == PW.FEW
     same_msg = PW.add_reading(_st(83, ("2478", 7)), 83, {"d": "2478"}, 7, None, NOW)   # повтор по «да»
-    assert PW.verdict(same_msg, 83, "XADV 750CC GREY 9286", _book(83), NOW)["why"] == PW.FEW
+    assert _v(same_msg, 83, N83)["why"] == PW.FEW
+    # ревью r2 S5: две отправки через 3 секунды — одна съёмка, а не два свидетеля
+    close = _st(83, ("2478", 1, None, 3 / DAY), ("2478", 2, None, 0))
+    assert _v(close, 83, N83)["why"] == PW.FEW
+    # тот же снимок, присланный повторно (пересылка) через сутки, — один свидетель
+    fwd = _st(83, ("2478", 1, None, 1.0, "FU1"), ("2478", 2, None, 0, "FU1"))
+    assert _v(fwd, 83, N83)["why"] == PW.FEW
+    two = _st(83, ("2478", 1, None, 1.0, "FU1"), ("2478", 2, None, 0, "FU2"))
+    assert _v(two, 83, N83)["kind"] == PW.KIND_RENAME
+    # альбом + тот же снимок в другой отправке: всё один свидетель
+    mixed = _st(83, ("2478", 1, "a", 1.0, "FU1"), ("2478", 2, "a", 1.0, "FU2"), ("2478", 3, None, 0, "FU2"))
+    assert _v(mixed, 83, N83)["why"] == PW.FEW
 
 
-def test_split_readings_are_not_guessed():
+def test_any_dissent_is_split():
     st = _st(83, ("2478", 1), ("2478", 2), ("2473", 3), ("2473", 4))
-    assert PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW)["why"] == PW.SPLIT
-    st = PW.add_reading(st, 83, {"d": "2478"}, 5, None, NOW)            # перевес — уже не догадка
-    assert PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW)["d"] == "2478"
+    assert _v(st, 83, N83)["why"] == PW.SPLIT
+    # ревью r2 S5 (проба 4): перевес 2:1 — уже не «сошлись», а сомнение
+    st = _st(83, ("2478", 1), ("2478", 2), ("2473", 3))
+    v = _v(st, 83, N83)
+    assert v["kind"] is None and v["why"] == PW.SPLIT and "2473" in v["detail"], v
+    # несогласное чтение вышло из окна — согласие вернулось
+    st = _st(83, ("2473", 3, None, 15), ("2478", 1, None, 1), ("2478", 2, None, 0))
+    assert _v(st, 83, N83)["kind"] == PW.KIND_RENAME
 
 
 def test_no_plate_in_topic_name_nothing():
     st = _st(83, ("2478", 1), ("2478", 2))
-    assert PW.verdict(st, 83, "XADV 750 GREY", _book(83), NOW)["why"] == PW.NO_TOPIC_PLATE
+    assert _v(st, 83, "XADV 750 GREY", src=PW.SRC_EVENT)["why"] == PW.NO_TOPIC_PLATE
+
+
+def test_neighbour_and_other_bike_numbers_are_silent():
+    """Ревью r2 M1: 4248 (тема 222) и 4246 (тема 381) — близнецы; принятый за 4246 номер 4248 дал бы теме 222
+    номер темы 381, и ТО из 222 ушли бы в строку 381."""
+    others = PW.fleet_numbers(BOOK, {}, 222)
+    assert others["4246"] == 381 and "4248" not in others
+    v = _v(_st(222, ("4246", 1), ("4246", 2)), 222, "XMAX 300CC GREEN 4248", others=others)
+    assert v["kind"] is None and v["why"] == PW.NEAR, v
+    # номер другого байка, не близнец: снят чужой байк (тема 70 FORZA 8950) в теме 83
+    o83 = PW.fleet_numbers(BOOK, {83: N83}, 83)
+    v = _v(_st(83, ("8950", 1), ("8950", 2)), 83, N83, others=o83)
+    assert v["kind"] is None and v["why"] == PW.OTHER_BIKE and "70" in v["detail"], v
+    # номер из ИМЕНИ другой темы (книги у неё нет)
+    o = PW.fleet_numbers(BOOK, {990001: "TEST 155CC 7777", 83: N83}, 83)
+    assert _v(_st(83, ("7777", 1), ("7777", 2)), 83, N83, others=o)["why"] == PW.OTHER_BIKE
+    # на одну цифру от КНИГИ (имя уже другое)
+    v = _v(_st(83, ("9288", 1), ("9288", 2)), 83, "XADV 750CC GREY 2478", src=PW.SRC_PLATE, others=o83)
+    assert v["why"] == PW.NEAR and "книги" in v["detail"], v
+
+
+def test_partial_merged_engine_are_silent():
+    # проба 2: первая цифра закрыта — «286» вместо 9286
+    assert _v(_st(83, ("286", 1), ("286", 2)), 83, N83)["why"] == PW.PARTIAL
+    # проба 3: цифра серии «1กว 461» слиплась с номером — «1461»
+    assert _v(_st(66, ("1461", 1), ("1461", 2)), 66, "CB 300CC R 461")["why"] == PW.PARTIAL
+    # средняя цифра потеряна
+    assert _v(_st(83, ("926", 1), ("926", 2)), 83, N83)["why"] == PW.PARTIAL
+    # проба 7: «300» — объём, не номер (и мост из имени его не возьмёт)
+    v = _v(_st(1190, ("300", 1), ("300", 2)), 1190, N1190)
+    assert v["why"] == PW.ENGINE and S._plate_from_name(PW.propose(N1190, "300")) is None, v
+
+
+def test_untrusted_names_are_silent():
+    """Ревью r2 M3: имя с прежней меткой 'forum_created' или из reply может быть дрейфом (82 — «…3902» при
+    названии «XADV 750CC BLACK 5104»). Такому имени сверка не верит: ни карточки, ни «совпадает»."""
+    drift = "XADV 750 BLACK 3902"
+    for src in ("forum_created", PW.SRC_REPLY, None):
+        v = _v(_st(82, ("5104", 1), ("5104", 2)), 82, drift, src=src)
+        assert v["kind"] is None and v["why"] == PW.UNTRUSTED and "5104" in v["detail"], (src, v)
+        v = _v(_st(82, ("3902", 1), ("3902", 2)), 82, drift, src=src)     # сценарий B: старая табличка
+        assert v["kind"] is None and v["why"] == PW.UNTRUSTED, (src, v)
+    # имя книги — верим при любой метке; событие темы после правки — верим и без книги
+    assert _v(_st(82, ("5104", 1), ("5104", 2)), 82, N82, src="forum_created")["why"] == PW.SAME
+    assert _v(_st(82, ("3902", 1), ("3902", 2)), 82, drift, src=PW.SRC_EVENT)["why"] == PW.WARN
+    assert PW.name_trusted("xadv 750cc  black 5104", None, _book(82))
+
+
+def test_manual_binding_is_silent():
+    v = _v(_st(83, ("2478", 1), ("2478", 2)), 83, N83, src=PW.SRC_MANUAL)
+    assert v["kind"] is None and v["why"] == PW.MANUAL, v
 
 
 def test_pending_card_and_ttl():
     st = _st(83, ("2478", 1), ("2478", 2))
-    v = PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW)
+    v = _v(st, 83, N83)
     st, n = PW.next_seq(st)
     st = PW.with_card(st, v, n, NOW, chat_id=SERV)
     assert PW.find_card(st, n)[1]["proposed"] == "XADV 750CC GREY 2478"
     st = PW.add_reading(st, 83, {"d": "2478"}, 3, None, NOW + 60)
-    assert PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW + 60)["why"] == PW.PENDING
+    assert _v(st, 83, N83, now=NOW + 60)["why"] == PW.PENDING
     later = NOW + PW.CARD_TTL_S + 60
-    st = PW.add_reading(PW.add_reading(st, 83, {"d": "2478"}, 8, None, later), 83, {"d": "2478"}, 9, None, later)
-    assert PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), later)["kind"] == PW.KIND_RENAME
+    st = PW.add_reading(PW.add_reading(st, 83, {"d": "2478"}, 8, None, later - GAP), 83, {"d": "2478"}, 9, None, later)
+    v = _v(st, 83, N83, now=later)
+    assert v["kind"] == PW.KIND_RENAME and v.get("drop_card"), v       # старая уходит, приходит свежая
+
+
+def test_card_dropped_and_refused_when_plate_fixed():
+    """Ревью r2 S2 (проба 5): карточка предлагала 2478; через 30 суток на байке верная 9286, чтения дают SAME —
+    карточка снимается сверкой и не исполняется нажатием."""
+    st = _st(83, ("2478", 1), ("2478", 2))
+    v = _v(st, 83, N83)
+    st, n = PW.next_seq(st)
+    st = PW.with_card(st, v, n, NOW)
+    card = PW.find_card(st, n)[1]
+    assert PW.card_valid(st, card, N83, _book(83), NOW + 60) == (True, "")
+    later = NOW + 30 * DAY
+    st = _st(83, ("9286", 3), ("9286", 4), base=later, st=st)
+    v2 = _v(st, 83, N83, now=later)
+    assert v2["why"] == PW.SAME and v2.get("drop_card"), v2
+    ok, why = PW.card_valid(st, card, N83, _book(83), later)
+    assert not ok and why == PW.CARD_OLD, why
+    ok, why = PW.card_valid(st, dict(card, ts=later), N83, _book(83), later)      # даже свежая — чтения не те
+    assert not ok and PW.SAME in why, why
+    ok, why = PW.card_valid(st, card, "XADV 750CC GREY 7777", _book(83), NOW + 60)
+    assert not ok and "7777" in why, why
 
 
 def test_declined_holds_until_name_or_digits_change():
     st = _st(83, ("2478", 1), ("2478", 2))
-    v = PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW)
+    v = _v(st, 83, N83)
     st, n = PW.next_seq(st)
     st = PW.with_card(st, v, n, NOW)
     st = PW.with_declined(st, PW.find_card(st, n)[1], NOW)
     assert PW.find_card(st, n) == (None, None)
-    assert PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW)["why"] == PW.DECLINED
-    assert PW.verdict(st, 83, "XADV 750CC GREY2 9286", _book(83), NOW)["kind"] == PW.KIND_RENAME
+    assert _v(st, 83, N83)["why"] == PW.DECLINED
+    assert _v(st, 83, "XADV 750CC GREY2 9286", src=PW.SRC_EVENT)["kind"] == PW.KIND_RENAME
 
 
 def test_warn_only_once_per_seven_days():
     # после переименования 83 зовётся по табличке 2478 — книга по-прежнему 9286
     st = _st(83, ("2478", 1), ("2478", 2))
-    v = PW.verdict(st, 83, "XADV 750CC GREY 2478", _book(83), NOW)
+    v = _v(st, 83, "XADV 750CC GREY 2478", src=PW.SRC_PLATE)
     assert v["kind"] == PW.KIND_WARN and v["why"] == PW.WARN, v
     text = PW.card_text(v, SERV)
     assert text.startswith("⚠️ Номер на байке не совпадает с зелёной книгой (9286)"), text
     assert "Предлагаю" not in text
     st = PW.with_warned(st, 83, NOW)
-    assert PW.verdict(st, 83, "XADV 750CC GREY 2478", _book(83), NOW + 6 * DAY)["why"] == PW.WARN_RECENT
-    st = PW.add_reading(PW.add_reading(st, 83, {"d": "2478"}, 5, None, NOW + 8 * DAY), 83, {"d": "2478"}, 6,
-                        None, NOW + 8 * DAY)
-    assert PW.verdict(st, 83, "XADV 750CC GREY 2478", _book(83), NOW + 8 * DAY)["kind"] == PW.KIND_WARN
+    assert _v(st, 83, "XADV 750CC GREY 2478", now=NOW + 6 * DAY, src=PW.SRC_PLATE)["why"] == PW.WARN_RECENT
+    st = _st(83, ("2478", 5), ("2478", 6), base=NOW + 8 * DAY, st=st)
+    assert _v(st, 83, "XADV 750CC GREY 2478", now=NOW + 8 * DAY, src=PW.SRC_PLATE)["kind"] == PW.KIND_WARN
 
 
 def test_off_and_broken_memory():
     st = _st(83, ("2478", 1), ("2478", 2))
-    assert PW.verdict(st, 83, "XADV 750CC GREY 9286", _book(83), NOW, on=False)["why"] == PW.OFF
+    assert PW.verdict(st, 83, N83, _book(83), NOW, on=False)["why"] == PW.OFF
     for bad in (None, "мусор", {"readings": "x", "cards": [1]}, {"readings": {"83": [None, {"d": "abc"}]}}):
-        assert PW.verdict(bad, 83, "XADV 750CC GREY 9286", _book(83), NOW)["why"] == PW.FEW, bad
+        assert _v(bad, 83, N83)["why"] == PW.FEW, bad
+
+
+def test_card_numbers_never_restart():
+    """Ревью r2 S3 (проба 6): память потеряна → счётчик с нуля выдавал новой карточке номер старой."""
+    _st0, n1 = PW.next_seq(PW.clean("garbage"), floor=int(NOW * 1000))
+    assert n1 == int(NOW * 1000)
+    st, n2 = PW.next_seq(_st0, floor=int(NOW * 1000))          # та же миллисекунда — всё равно новый
+    assert n2 == n1 + 1
+    _st1, n3 = PW.next_seq(PW.clean(None), floor=int((NOW + 1) * 1000))
+    assert n3 > n2
+    assert len(f"svc:{S._PLATE_BTN_KEEP}:{n3}".encode()) <= 64          # предел callback_data Telegram
+
+
+def test_card_words():
+    v = _v(_st(83, ("2478", 4411), ("2478", 4520)), 83, N83)
+    text = PW.card_text(v, SERV)
+    assert text.count("Зелёная книга") == 1, text
+    assert "служебная строка Telegram" in text and "v96" in text and "2478" in text, text     # ревью r2 S10
+    nb = PW.verdict(_st(990005, ("5678", 1), ("5678", 2)), 990005, "TEST 155CC 1234", None, NOW, src=PW.SRC_EVENT)
+    tnb = PW.card_text(nb, SERV)
+    assert nb["kind"] == PW.KIND_RENAME and tnb.count("записи нет") == 1 and "нечем" in tnb, tnb
+    assert "Сверить с зелёной книгой нечем — записи по теме нет." not in tnb
+    assert PW._seen_line({"d": "2478", "mids": []}, SERV) == "На байке: 2478"
 
 
 # ============================================================================================
@@ -235,14 +406,39 @@ def test_prompt_asks_plate_of_the_photographed_bike_only():
     assert extra.startswith("  disassembled:"), extra[:80]
 
 
+def test_prompt_without_plate_when_knob_off():
+    """Ревью r2 S8: выключенная ручка обязана откатывать и само поле промпта."""
+    for name in ("VISION_BIKE_SYSTEM_NOPLATE", "VISION_BIKE_SYSTEM_POS_NOPLATE"):
+        p = getattr(S, name)
+        assert "plate" not in p and "legible" not in p, name
+        assert "  dirt:" in p and "  kind:" in p and "  notes:" in p, name
+    assert S.VISION_BIKE_SYSTEM_NOPLATE == S.VISION_BIKE_SYSTEM.replace(S._VISION_PLATE_BLOCK, "")
+    assert "disassembled" in S.VISION_BIKE_SYSTEM_POS_NOPLATE
+    assert S._VISION_PLATE_BLOCK.startswith("  plate:") and S._VISION_PLATE_BLOCK.endswith("цифры\n")
+    prev = os.environ.get("PLATE_WATCH")
+    try:
+        for off in ("0", "false", "False", "off", "OFF", "нет", "no", ""):
+            os.environ["PLATE_WATCH"] = off
+            assert S._plate_watch_on() is False, repr(off)
+            assert S._vision_bike_prompt(False) == (S.VISION_BIKE_SYSTEM_NOPLATE, 400)
+            assert S._vision_bike_prompt(True) == (S.VISION_BIKE_SYSTEM_POS_NOPLATE, 400)
+        for on in ("1", "true", "yes"):
+            os.environ["PLATE_WATCH"] = on
+            assert S._plate_watch_on() is True, repr(on)
+            assert S._vision_bike_prompt(False) == (S.VISION_BIKE_SYSTEM, 500)
+            assert S._vision_bike_prompt(True) == (S.VISION_BIKE_SYSTEM_POS, 500)
+    finally:
+        os.environ["PLATE_WATCH"] = prev if prev is not None else "1"
+
+
 # ============================================================================================
 #  Заглушки мира для живого `splinter.handle` и кнопок
 # ============================================================================================
 class _Bot:
     username = "tb_plate_test_bot"
 
-    def __init__(self):
-        self.sent, self.renamed = [], []
+    def __init__(self, rename_error=None):
+        self.sent, self.renamed, self.rename_error = [], [], rename_error
 
     async def send_message(self, **kw):
         self.sent.append(kw)
@@ -250,6 +446,8 @@ class _Bot:
 
     async def edit_forum_topic(self, **kw):
         self.renamed.append(kw)
+        if self.rename_error:
+            raise Exception(self.rename_error)
         return True
 
     async def send_chat_action(self, **kw):
@@ -257,8 +455,8 @@ class _Bot:
 
 
 class _Ctx:
-    def __init__(self):
-        self.bot = _Bot()
+    def __init__(self, rename_error=None):
+        self.bot = _Bot(rename_error)
 
 
 class _User:
@@ -267,11 +465,11 @@ class _User:
 
 
 class _Msg:
-    def __init__(self, topic, mid, photo=True, text=None, group=None, reply_name=None, user=None):
+    def __init__(self, topic, mid, photo=True, text=None, group=None, reply_name=None, user=None, fu=None):
         self.chat_id = SERV
         self.text = text
         self.caption = None
-        self.photo = [object()] if photo else []
+        self.photo = ([types.SimpleNamespace(file_unique_id=fu)] if fu else [object()]) if photo else []
         self.message_id = mid
         self.message_thread_id = topic
         self.date = None
@@ -305,77 +503,114 @@ class _World:
 
 class _Claude:
     def __init__(self, vision):
-        self.vision_q = list(vision)
+        self.vision_q, self.systems, self.max_tokens = list(vision), [], []
 
     def quick(self, *a, **kw):
         return ""
 
     def vision(self, system, *a, **kw):
+        self.systems.append(system)
+        self.max_tokens.append(kw.get("max_tokens"))
         return json.dumps(self.vision_q.pop(0) if self.vision_q else {})
 
 
 class _Mem:
-    """memory.db-заглушка: та же форма вызовов, что у `memory.Memory`, без файла базы."""
+    """memory.db-заглушка: та же форма вызовов, что у `memory.Memory` (и тот же замок 'manual'), без файла базы."""
 
-    def __init__(self, names=None):
+    def __init__(self, names=None, sources=None):
         self.names, self.calls = dict(names or {}), []
+        self.sources = dict(sources or {})
 
     def set_topic_bike(self, chat_id, topic_id, name, source="auto"):
         self.calls.append((chat_id, topic_id, name, source))
+        if source != "manual" and self.sources.get((chat_id, topic_id)) == "manual":
+            return
         self.names[(chat_id, topic_id)] = name
+        self.sources[(chat_id, topic_id)] = source
 
     def get_topic_bike(self, chat_id, topic_id):
         return self.names.get((chat_id, topic_id), "")
+
+    def topic_bike_source(self, chat_id, topic_id):
+        return self.sources.get((chat_id, topic_id))
 
     def all_topic_bikes(self):
         return dict(self.names)
 
 
-CARDS = []
+CARDS, FEEDS = [], []
+SEND_DELAY = [0.0]
+CLOCK = [NOW]
 
 
 def _fake_send_card(text, buttons=None):
-    CARDS.append({"text": text, "buttons": buttons})
-    return 7000 + len(CARDS), notify.HQ_CHAT_ID
+    if SEND_DELAY[0]:
+        time.sleep(SEND_DELAY[0])
+    CARDS.append({"text": text, "buttons": buttons, "mid": 7000 + len(CARDS) + 1})
+    return CARDS[-1]["mid"], notify.HQ_CHAT_ID
+
+
+def _fake_send_feed(text):
+    FEEDS.append(text)
+    return True
 
 
 notify.send_card = _fake_send_card          # сеть не дёргаем ни при каких условиях
+notify.send_feed = _fake_send_feed
+S._plate_now = lambda: CLOCK[0]             # часы ветки — свои: свидетели разнесены часами
+_SEQ = [0]
 
 
 def _fresh(names=None, mem=None):
     """Чистая память номеров, подсказок и тем; memory.db — заглушка либо нет вовсе."""
-    os.environ["PLATE_WATCH_STATE"] = tempfile.mktemp(prefix="plate_", suffix=".json", dir=_TMP)
-    os.environ["HINT_DEDUP_STATE"] = tempfile.mktemp(prefix="hint_", suffix=".json", dir=_TMP)
+    _SEQ[0] += 1
+    os.environ["PLATE_WATCH_STATE"] = _tmpf(f"plate{_SEQ[0]}")
+    os.environ["HINT_DEDUP_STATE"] = _tmpf(f"hint{_SEQ[0]}")
     S._HINT_SEEN = None
     S._PLATE_STATE = None
+    S._PLATE_BROKEN = None
+    S._PLATE_TASKS.clear()
     S._TOPIC_NAMES.clear()
+    S._TOPIC_NAME_SRC.clear()
+    S._TOPIC_BIKE_OVERRIDE.clear()
     S._TOPIC_NAMES.update({(SERV, t): n for t, n in (names or {}).items()})
     S.set_memory(mem)
     CARDS.clear()
+    FEEDS.clear()
+    SEND_DELAY[0] = 0.0
+    CLOCK[0] = NOW
 
 
-def _photo(topic, mid, vision, ctx=None, group=None, reply_name=None, knob="1"):
+def _photo(topic, mid, vision, ctx=None, group=None, reply_name=None, knob="1", fu=None, step=GAP):
+    """Снимок в тему через живой `S.handle`; фоновая сверка дожидается; часы уходят вперёд на `step`."""
     prev = os.environ.get("PLATE_WATCH")
     os.environ["PLATE_WATCH"] = knob
     ctx = ctx or _Ctx()
+    claude = _Claude([vision])
     saved = S._download_photo
 
     async def _dl(pm):
         return b"\xff\xd8 test"
+
+    async def _go():
+        await S.handle(types.SimpleNamespace(message=_Msg(topic, mid, group=group, reply_name=reply_name, fu=fu)),
+                       ctx, _World(), claude)
+        await S._plate_drain()
     S._download_photo = _dl
     try:
-        asyncio.run(S.handle(types.SimpleNamespace(message=_Msg(topic, mid, group=group, reply_name=reply_name)),
-                             ctx, _World(), _Claude([vision])))
+        asyncio.run(_go())
     finally:
         S._download_photo = saved
         os.environ["PLATE_WATCH"] = prev if prev is not None else "1"
+        CLOCK[0] += step
+    ctx.claude = claude
     return ctx
 
 
 class _Q:
-    def __init__(self, data, user, text="карточка"):
+    def __init__(self, data, user, mid, text="карточка"):
         self.data, self.from_user = data, _User(*user)
-        self.message = types.SimpleNamespace(chat_id=notify.HQ_CHAT_ID, message_thread_id=1160, message_id=7001,
+        self.message = types.SimpleNamespace(chat_id=notify.HQ_CHAT_ID, message_thread_id=1160, message_id=mid,
                                              text=text, chat=types.SimpleNamespace(id=notify.HQ_CHAT_ID))
         self.answers, self.edits = [], []
 
@@ -389,9 +624,16 @@ class _Q:
         self.edits.append(("markup", kw))
 
 
-def _press(data, user, ctx=None):
+def _mid_of(data):
+    for c in CARDS:
+        if any(b[1] == data for row in (c["buttons"] or []) for b in row):
+            return c["mid"]
+    return 1
+
+
+def _press(data, user, ctx=None, mid=None):
     ctx = ctx or _Ctx()
-    q = _Q(data, user)
+    q = _Q(data, user, mid if mid is not None else _mid_of(data))
     asyncio.run(S.handle_service_button(types.SimpleNamespace(callback_query=q), ctx, _World()))
     return q, ctx
 
@@ -402,11 +644,16 @@ def _plate_texts(ctx):
     return [kw for kw in ctx.bot.sent if any(m in str(kw) for m in marks)]
 
 
+def _two(topic, d, mid=4411, **kw):
+    _photo(topic, mid, _plate(d), **kw)
+    _photo(topic, mid + 1, _plate(d), **kw)
+
+
 # ============================================================================================
 #  (3) ЖИВОЙ `splinter.handle` + кнопки
 # ============================================================================================
 def test_live_83_card_to_owner_only_and_nothing_into_topic():
-    _fresh({83: "XADV 750CC GREY 9286"})
+    _fresh({83: N83})
     c1 = _photo(83, 4411, _plate("2478", series="2กจ"))
     assert CARDS == [], "одно чтение — ничего"
     c2 = _photo(83, 4520, _plate("2478"))
@@ -421,80 +668,94 @@ def test_live_83_card_to_owner_only_and_nothing_into_topic():
     for c in (c1, c2):
         assert _plate_texts(c) == [], _plate_texts(c)
         assert not c.bot.renamed
-    # третье чтение того же номера — висящая карточка, второй нет
+        assert c.claude.systems == [S.VISION_BIKE_SYSTEM_POS] and c.claude.max_tokens == [500]
+    pend = PW.clean(S._PLATE_STATE)["cards"]["83"]
+    assert pend["msg"] == card["mid"] and pend["msg_chat"] == notify.HQ_CHAT_ID, pend
+    # третье чтение того же номера — висящая карточка, второй нет; ни одной заметки в ленту
     _photo(83, 4600, _plate("2478"))
-    assert len(CARDS) == 1, CARDS
+    assert len(CARDS) == 1 and FEEDS == [], (CARDS, FEEDS)
 
 
 def test_feature_hands_never_write_into_the_topic():
     """Код-уровень: руки ветки (`splinter._plate_*`) не зовут ни одной отправки в группу. Наружу —
-    только карточка владельцу (`notify.send_card`) и переименование темы по его нажатию."""
+    только карточка владельцу (`notify.send_card`), заметка в ленту (`notify.send_feed`) и
+    переименование темы по его нажатию."""
     tree = ast.parse(open(os.path.join(ROOT, "splinter.py"), encoding="utf-8").read())
     hands = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
              and n.name.startswith("_plate")]
     assert len(hands) >= 5, [h.name for h in hands]
     outward = {"send_message", "_send", "_send_retry", "_hint_send", "reply_text", "send_photo",
-               "_send_bilingual", "copy_message", "forward_message", "pin_chat_message"}
+               "_send_bilingual", "copy_message", "forward_message", "pin_chat_message", "send_inbox"}
     for h in hands:
-        used = {n.attr for n in ast.walk(h) if isinstance(n, ast.Attribute)} |                {n.id for n in ast.walk(h) if isinstance(n, ast.Name)}
+        used = {n.attr for n in ast.walk(h) if isinstance(n, ast.Attribute)} | \
+               {n.id for n in ast.walk(h) if isinstance(n, ast.Name)}
         assert not used & outward, (h.name, used & outward)
 
 
 def test_rename_survives_restart_owner_press_renames_topic():
-    mem = _Mem({(SERV, 83): "XADV 750CC GREY 9286"})
-    _fresh({83: "XADV 750CC GREY 9286"}, mem=mem)
-    _photo(83, 4411, _plate("2478"))
-    _photo(83, 4520, _plate("2478"))
+    mem = _Mem({(SERV, 83): N83}, {(SERV, 83): "forum_created"})
+    _fresh({83: N83}, mem=mem)
+    _two(83, "2478")
     ren = CARDS[0]["buttons"][0][0][1]
     S._PLATE_STATE = None                     # перезапуск: память номеров — только с диска
     q, ctx = _press(ren, OWNER)
     assert ctx.bot.renamed == [{"chat_id": SERV, "message_thread_id": 83, "name": "XADV 750CC GREY 2478"}], \
-        ctx.bot.renamed
+        (ctx.bot.renamed, q.answers)
     assert S._TOPIC_NAMES[(SERV, 83)] == "XADV 750CC GREY 2478"
-    assert mem.calls[-1] == (SERV, 83, "XADV 750CC GREY 2478", "forum_created"), mem.calls
+    assert mem.calls[-1] == (SERV, 83, "XADV 750CC GREY 2478", PW.SRC_PLATE), mem.calls
     assert S.bike_from_topic(SERV, 83) == "XADV 750CC GREY 2478"
-    assert any("Переименовано" in str(e) for e in q.edits), q.edits
+    assert any("✅ Переименовано" in str(e) and "бот зовёт байк так же" in str(e) for e in q.edits), q.edits
     assert not ctx.bot.sent, "в тему байка ничего"
+    # Лист1 зовёт байк по книге (9286) — тема для вопроса сотрудникам находится по номеру (ревью r2 S10)
+    assert S._bike_topic_id(SERV, N83) == 83
     # повтор нажатия — карточки уже нет
     q2, ctx2 = _press(ren, OWNER)
     assert not ctx2.bot.renamed and q2.answers and q2.answers[0][1].get("show_alert"), q2.answers
     # теперь тема = табличка 2478, книга 9286: предупреждение не раньше 7 суток (карточка его уже несла)
     _photo(83, 4700, _plate("2478"))
-    assert len(CARDS) == 1, CARDS
+    assert len(CARDS) == 1 and FEEDS == [], (CARDS, FEEDS)
 
 
 def test_non_owner_press_refused():
-    _fresh({83: "XADV 750CC GREY 9286"})
-    _photo(83, 4411, _plate("2478"))
-    _photo(83, 4520, _plate("2478"))
+    _fresh({83: N83})
+    _two(83, "2478")
     ren = CARDS[0]["buttons"][0][0][1]
     for who in (PYM, ("testmech", 99005)):
         q, ctx = _press(ren, who)
         assert not ctx.bot.renamed, who
         assert q.answers and q.answers[0][1].get("show_alert") and "владел" in q.answers[0][0], q.answers
         assert not q.edits, q.edits
-    assert S._TOPIC_NAMES[(SERV, 83)] == "XADV 750CC GREY 9286"
+    assert S._TOPIC_NAMES[(SERV, 83)] == N83
     q, ctx = _press(ren, OWNER)                # карточка жива и после чужих нажатий
-    assert ctx.bot.renamed, "владелец переименовал"
+    assert ctx.bot.renamed, ("владелец переименовал", q.answers)
+
+
+def test_press_on_another_message_refused():
+    """Ревью r2 S3: номер в кнопке — не адрес; кнопка с тем же номером на ДРУГОМ сообщении не исполняется."""
+    _fresh({83: N83})
+    _two(83, "2478")
+    ren = CARDS[0]["buttons"][0][0][1]
+    q, ctx = _press(ren, OWNER, mid=CARDS[0]["mid"] + 50)
+    assert not ctx.bot.renamed and q.answers[0][1].get("show_alert") and "не от этой карточки" in q.answers[0][0]
+    assert PW.find_card(S._PLATE_STATE, int(ren.rsplit(":", 1)[1]))[1] is not None     # карточка жива
+    q, ctx = _press(ren, OWNER)
+    assert ctx.bot.renamed
 
 
 def test_keep_press_silences_this_digits_for_this_name():
-    _fresh({83: "XADV 750CC GREY 9286"})
-    _photo(83, 4411, _plate("2478"))
-    _photo(83, 4520, _plate("2478"))
+    _fresh({83: N83})
+    _two(83, "2478")
     keep = CARDS[0]["buttons"][0][1][1]
     q, ctx = _press(keep, OWNER)
     assert not ctx.bot.renamed and any("Оставлено" in str(e) for e in q.edits), q.edits
-    assert S._TOPIC_NAMES[(SERV, 83)] == "XADV 750CC GREY 9286"
-    _photo(83, 4800, _plate("2478"))
-    _photo(83, 4801, _plate("2478"))
+    assert S._TOPIC_NAMES[(SERV, 83)] == N83
+    _two(83, "2478", mid=4800)
     assert len(CARDS) == 1, CARDS
 
 
 def test_rename_refused_when_topic_renamed_meanwhile():
-    _fresh({83: "XADV 750CC GREY 9286"})
-    _photo(83, 4411, _plate("2478"))
-    _photo(83, 4520, _plate("2478"))
+    _fresh({83: N83})
+    _two(83, "2478")
     ren = CARDS[0]["buttons"][0][0][1]
     S._TOPIC_NAMES[(SERV, 83)] = "XADV 750CC GREY 7777"     # кто-то переименовал руками
     q, ctx = _press(ren, OWNER)
@@ -502,38 +763,230 @@ def test_rename_refused_when_topic_renamed_meanwhile():
     assert S._TOPIC_NAMES[(SERV, 83)] == "XADV 750CC GREY 7777"
 
 
+def test_old_card_refused_after_plate_fixed():
+    """Ревью r2 S2: карточка предлагала 2478; через 30 суток на байке верная 9286 — сверка снимает карточку,
+    а нажатие не переименовывает тему в 2478."""
+    _fresh({83: N83})
+    _two(83, "2478")
+    ren = CARDS[0]["buttons"][0][0][1]
+    CLOCK[0] += 30 * DAY
+    _two(83, "9286", mid=5000)
+    assert PW.clean(S._PLATE_STATE)["cards"] == {}, S._PLATE_STATE
+    q, ctx = _press(ren, OWNER)
+    assert not ctx.bot.renamed and q.answers[0][1].get("show_alert"), q.answers
+    assert S._TOPIC_NAMES[(SERV, 83)] == N83 and len(CARDS) == 1
+
+
+def test_card_older_than_ttl_refused_at_press():
+    _fresh({83: N83})
+    _two(83, "2478")
+    ren = CARDS[0]["buttons"][0][0][1]
+    CLOCK[0] += PW.CARD_TTL_S + 3600          # сверок между не было — карточка в памяти, но старая
+    q, ctx = _press(ren, OWNER)
+    assert not ctx.bot.renamed and PW.CARD_OLD in q.answers[0][0], q.answers
+    assert any("Не переименовал" in str(e) for e in q.edits), q.edits
+
+
 def test_live_82_nothing():
-    _fresh({82: "XADV 750CC BLACK 5104"})
-    _photo(82, 900, _plate("5104"))
-    _photo(82, 901, _plate("5104"))
-    assert CARDS == []
+    _fresh({82: N82})
+    _two(82, "5104", mid=900)
+    assert CARDS == [] and FEEDS == []
 
 
 def test_live_1190_card_with_warning():
-    _fresh({1190: "XMAX 300CC NEW BROWN 8676"})
-    _photo(1190, 70, _plate("9315"))
-    _photo(1190, 75, _plate("9315"))
+    _fresh({1190: N1190})
+    _two(1190, "9315", mid=70)
     assert len(CARDS) == 1 and "⚠️ Номер на байке не совпадает с зелёной книгой (8676)" in CARDS[0]["text"], CARDS
     assert "«XMAX 300CC NEW BROWN 9315»" in CARDS[0]["text"]
 
 
-def test_background_bike_and_album_are_nothing():
-    _fresh({83: "XADV 750CC GREY 9286"})
+def test_live_neighbour_misread_no_card():
+    """Ревью r2 M1 живьём: 4248 (тема 222), дважды прочитанный как 4246 (номер темы 381)."""
+    names = {222: "XMAX 300CC GREEN 4248", 381: "XMAX 300CC GREY 4246"}
+    _fresh(names)
+    _two(222, "4246", mid=300)
+    assert CARDS == [] and FEEDS == []
+    _fresh(names)
+    _two(222, "8950", mid=310)                # снят чужой байк — FORZA темы 70
+    assert CARDS == [] and FEEDS == []
+    _fresh(names)
+    _two(222, "6157", mid=320)                # контроль: номер, которого в парке нет, — карточка
+    assert len(CARDS) == 1 and "«XMAX 300CC GREEN 6157»" in CARDS[0]["text"], CARDS
+
+
+def test_background_bike_album_and_same_photo_are_nothing():
+    _fresh({83: N83})
     _photo(83, 4411, _plate("5104", legible=False))          # чужой байк на фоне
     _photo(83, 4412, _plate("5104", legible=False))
     assert CARDS == []
     _photo(83, 4413, _plate("2478"), group="alb1")           # альбом — одна отправка
     _photo(83, 4414, _plate("2478"), group="alb1")
     assert CARDS == []
-
-
-def test_kill_switch_records_nothing():
-    _fresh({83: "XADV 750CC GREY 9286"})
-    _photo(83, 4411, _plate("2478"), knob="0")
-    _photo(83, 4520, _plate("2478"), knob="0")
-    assert CARDS == [] and PW.clean(S._PLATE_STATE)["readings"] == {}
-    _photo(83, 4600, _plate("2478"))                         # включили — прошлые не считались
+    _fresh({83: N83})
+    _photo(83, 4415, _plate("2478"), fu="AgADsame")          # тот же снимок дважды — один свидетель
+    _photo(83, 4416, _plate("2478"), fu="AgADsame")
     assert CARDS == []
+    _fresh({83: N83})
+    _photo(83, 4417, _plate("2478"), step=3)                 # две отправки через 3 секунды
+    _photo(83, 4418, _plate("2478"))
+    assert CARDS == []
+
+
+def test_kill_switch_records_nothing_and_drops_the_prompt_field():
+    for knob in ("0", "false"):
+        _fresh({83: N83})
+        c1 = _photo(83, 4411, _plate("2478"), knob=knob)
+        _photo(83, 4520, _plate("2478"), knob=knob)
+        assert CARDS == [] and PW.clean(S._PLATE_STATE)["readings"] == {}, knob
+        assert c1.claude.systems == [S.VISION_BIKE_SYSTEM_POS_NOPLATE] and c1.claude.max_tokens == [400], knob
+        _photo(83, 4600, _plate("2478"))                     # включили — прошлые не считались
+        assert CARDS == []
+
+
+def test_concurrent_ticks_send_one_card():
+    """Ревью r2 S1 (проба 9): две сверки одной темы одновременно — одна карточка, и она же висит."""
+    _fresh({83: N83})
+    S._plate_keep(_st(83, ("2478", 1), ("2478", 2), base=CLOCK[0]))
+    SEND_DELAY[0] = 0.3
+
+    async def two():
+        await asyncio.gather(S._plate_tick(SERV, 83), S._plate_tick(SERV, 83))
+    asyncio.run(two())
+    assert len(CARDS) == 1, CARDS
+    n = int(CARDS[0]["buttons"][0][0][1].rsplit(":", 1)[1])
+    assert PW.clean(S._PLATE_STATE)["cards"]["83"]["n"] == n
+
+
+def test_keep_and_reading_during_send_are_not_lost():
+    """Ревью r2 S1 (проба 10): «Оставить» по теме 1190 и новое чтение по 83, пришедшие, пока сверка 83 отправляет
+    карточку, переживают её запись: карточка 1190 не воскресает, отказ не теряется, чтение лежит."""
+    _fresh({83: N83, 1190: N1190})
+    t = CLOCK[0]
+    st = _st(1190, ("9315", 70), ("9315", 75), base=t)
+    st = _st(83, ("2478", 1), ("2478", 2), base=t, st=st)
+    v = PW.verdict(st, 1190, N1190, _book(1190), t, others=PW.fleet_numbers(BOOK, {}, 1190))
+    assert v["kind"] == PW.KIND_RENAME, v
+    st, n = PW.next_seq(st, floor=1)
+    st = PW.with_card_msg(PW.with_card(st, v, n, t, chat_id=SERV), 1190, n, 9001, notify.HQ_CHAT_ID)
+    S._plate_keep(st)
+    SEND_DELAY[0] = 0.3
+    qbox = []
+
+    async def race():
+        async def keep():
+            await asyncio.sleep(0.05)
+            q = _Q(f"svc:plkeep:{n}", OWNER, 9001)
+            qbox.append(q)
+            await S.handle_service_button(types.SimpleNamespace(callback_query=q), _Ctx(), _World())
+
+        async def note():
+            await asyncio.sleep(0.05)
+            assert S._plate_note(SERV, 83, _Msg(83, 777), _plate("2478"))
+        await asyncio.gather(S._plate_tick(SERV, 83), keep(), note())
+    asyncio.run(race())
+    fin = PW.clean(S._PLATE_STATE)
+    assert "1190" not in fin["cards"] and fin["declined"]["1190"]["d"] == "9315", fin
+    assert 777 in [r["mid"] for r in fin["readings"]["83"]], fin["readings"]["83"]
+    assert fin["cards"]["83"]["msg"] == CARDS[0]["mid"], fin["cards"]
+    assert any("Оставлено" in str(e) for e in qbox[0].edits), qbox[0].edits
+
+
+def test_reply_does_not_wait_for_the_card():
+    """Ревью r2 S11: сверка — фоновой задачей; медленная отправка карточки не держит ответ механику."""
+    _fresh({83: N83})
+    _photo(83, 4411, _plate("2478"))
+    SEND_DELAY[0] = 0.6
+    ctx, claude, saved = _Ctx(), _Claude([_plate("2478")]), S._download_photo
+    box = {}
+
+    async def _dl(pm):
+        return b"\xff\xd8 test"
+
+    async def go():
+        t0 = time.monotonic()
+        await S.handle(types.SimpleNamespace(message=_Msg(83, 4520)), ctx, _World(), claude)
+        box["took"], box["cards_before"], box["pending"] = time.monotonic() - t0, len(CARDS), len(S._PLATE_TASKS)
+        await S._plate_drain()
+    S._download_photo = _dl
+    try:
+        asyncio.run(go())
+    finally:
+        S._download_photo = saved
+    assert box["cards_before"] == 0 and box["pending"] >= 1 and box["took"] < 0.5, box
+    assert len(CARDS) == 1, CARDS
+
+
+def test_corrupt_memory_silences_and_keeps_the_file():
+    """Ревью r2 S3: файл памяти есть, но не читается → ни чтений, ни карточек до перезапуска; файл не трогаем."""
+    _fresh({83: N83})
+    path = os.environ["PLATE_WATCH_STATE"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{битый")
+    _two(83, "2478")
+    assert CARDS == [] and S._PLATE_BROKEN, S._PLATE_BROKEN
+    with open(path, encoding="utf-8") as f:
+        assert f.read() == "{битый"
+
+
+def test_drifted_name_gives_no_card():
+    """Ревью r2 M3 живьём: в memory.db у 82 уплывшее имя «…3902» с прежней меткой, Telegram зовёт тему «…5104»."""
+    drift = "XADV 750 BLACK 3902"
+    for d in ("5104", "3902"):                  # 3902 — старая табличка на байке: и «совпадает» тоже не говорим
+        _fresh({82: drift}, mem=_Mem({(SERV, 82): drift}, {(SERV, 82): "forum_created"}))
+        _two(82, d, mid=900)
+        assert CARDS == [] and FEEDS == [], (d, CARDS, FEEDS)
+    # контроль: то же уплывшее имя, но пришедшее событием переименования после правки, — сверка говорит
+    _fresh({82: drift}, mem=_Mem({(SERV, 82): drift}, {(SERV, 82): PW.SRC_EVENT}))
+    _two(82, "3902", mid=960)
+    assert CARDS == [] and len(FEEDS) == 1, (CARDS, FEEDS)
+
+
+def test_manual_binding_no_card_and_press_refused():
+    """Ревью r2 S6: /bike держит имя байка — карточки нет; привязка появилась после карточки — нажатие отказывает
+    словами, а не пишет «✅ Переименовано»."""
+    _fresh({83: N83})
+    S.set_topic_bike(SERV, 83, N83)
+    _two(83, "2478")
+    assert CARDS == []
+    _fresh({83: N83})
+    _two(83, "2478", mid=4430)
+    ren = CARDS[0]["buttons"][0][0][1]
+    S.set_topic_bike(SERV, 83, N83)
+    q, ctx = _press(ren, OWNER)
+    assert not ctx.bot.renamed and "/bike" in q.answers[0][0] and q.answers[0][1].get("show_alert"), q.answers
+    assert not any("✅" in str(e) for e in q.edits), q.edits
+
+
+def test_topic_not_modified_is_success():
+    _fresh({83: N83})
+    _two(83, "2478")
+    ren = CARDS[0]["buttons"][0][0][1]
+    q, ctx = _press(ren, OWNER, ctx=_Ctx(rename_error="Bad Request: TOPIC_NOT_MODIFIED"))
+    assert ctx.bot.renamed and S._TOPIC_NAMES[(SERV, 83)] == "XADV 750CC GREY 2478"
+    assert any("✅ Переименовано" in str(e) and "уже звалась так" in str(e) for e in q.edits), (q.edits, q.answers)
+    assert PW.clean(S._PLATE_STATE)["cards"] == {}
+
+
+def test_warning_goes_to_the_feed_not_the_inbox():
+    """Ревью r2 S7: «имя = номер на байке, но ≠ книге» — заметка без кнопок; в инбокс 1160 ей пути нет."""
+    _fresh({})
+    ren = _Msg(83, 4000, photo=False)
+    ren.forum_topic_edited = types.SimpleNamespace(name="XADV 750CC GREY 2478")
+    S._remember_topic_name(SERV, 83, ren)                     # событие переименования — имени верим
+    _two(83, "2478")
+    assert CARDS == [] and len(FEEDS) == 1 and "⚠️ Номер на байке не совпадает с зелёной книгой (9286)" in FEEDS[0]
+    _two(83, "2478", mid=4500)                                # неделю не повторяем
+    assert len(FEEDS) == 1, FEEDS
+
+
+def test_bike_topic_id_finds_topic_by_plate():
+    _fresh({83: "XADV 750CC GREY 2478", 1190: N1190})
+    assert S._bike_topic_id(SERV, N1190) == 1190                       # точное имя — как было
+    assert S._bike_topic_id(SERV, N83) == 83                           # номер книги → тема книги
+    assert S._bike_topic_id(SERV, "XADV 750 GREY 2478") == 83          # номер из имени
+    _fresh({83: "XADV 750CC GREY 2478", 990083: "TEST 155CC 2478"})
+    assert S._bike_topic_id(SERV, "XADV 750 GREY 2478") is None        # номер у двух тем — не гадаем
+    assert S._bike_topic_id(SERV, "NO NUMBER") is None
 
 
 # ============================================================================================
@@ -563,11 +1016,14 @@ def test_drift_missing_name_is_filled_and_events_stay_authoritative():
     _fresh({}, mem=mem)
     msg = _Msg(t, 13002, reply_name="XADV 750 BLACK 3902")
     assert S._remember_topic_name(SERV, t, msg) == "XADV 750 BLACK 3902"      # пусто → заполнить
-    assert mem.calls == [(SERV, t, "XADV 750 BLACK 3902", "forum_created")], mem.calls
+    # r2 (M3): заполнение из reply — своя метка, сверка номера ему не верит
+    assert mem.calls == [(SERV, t, "XADV 750 BLACK 3902", PW.SRC_REPLY)], mem.calls
+    assert S._plate_name_src(SERV, t) == PW.SRC_REPLY
     ren = _Msg(t, 13003, photo=False)
     ren.forum_topic_edited = types.SimpleNamespace(name="XADV 750 BLACK 5104")
     assert S._remember_topic_name(SERV, t, ren) == "XADV 750 BLACK 5104"      # переименование пишет всегда
-    assert mem.calls[-1] == (SERV, t, "XADV 750 BLACK 5104", "forum_created"), mem.calls
+    assert mem.calls[-1] == (SERV, t, "XADV 750 BLACK 5104", PW.SRC_EVENT), mem.calls
+    assert S._plate_name_src(SERV, t) == PW.SRC_EVENT
     created = _Msg(t2, 13004, photo=False)
     created.forum_topic_created = types.SimpleNamespace(name="NEW BIKE 1234")
     S._TOPIC_NAMES[(SERV, t2)] = "OLD 1"
@@ -575,6 +1031,11 @@ def test_drift_missing_name_is_filled_and_events_stay_authoritative():
     icon_only = _Msg(t, 13005, photo=False, reply_name="XADV 750 BLACK 3902")
     icon_only.forum_topic_edited = types.SimpleNamespace(name=None)          # сменили только значок
     assert S._remember_topic_name(SERV, t, icon_only) == "XADV 750 BLACK 5104"
+    # после перезапуска происхождение знает memory.db; ручная привязка там сильнее всего
+    S._TOPIC_NAME_SRC.clear()
+    assert S._plate_name_src(SERV, t) == PW.SRC_EVENT
+    mem.sources[(SERV, t)] = "manual"
+    assert S._plate_name_src(SERV, t) == PW.SRC_MANUAL
     S.set_memory(None)
 
 
