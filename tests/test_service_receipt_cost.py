@@ -599,7 +599,7 @@ def test_phase2_does_not_take_money_as_odometer():
         t = _topic()
         adv = []
 
-        async def _adv(context, bridge, chat_id, topic_id, bike, declared, done, odo):
+        async def _adv(context, bridge, chat_id, topic_id, bike, declared, done, odo, **kw):
             adv.append(str(odo))
         sp = {"status": "ждёт_факт", "declared": "oil", "done": "", "note": ""}
         with _patch(S, _sp_open=lambda *a, **k: sp, _sp_advance_to_confirm=_adv,
