@@ -333,7 +333,9 @@ def test_typed_cost_negatives_km_and_questions():
               "будет стоить 3000 бат?", "сколько стоит шина", "first service 1000", "колодки 45203"):
         assert C.parse_cost_text(t) is None, t
     assert C.parse_cost_text("45203", asked="cost+km") is None          # голое число на просьбу с пробегом — пробег
-    assert C.parse_cost_text("800", asked="cost")["total"] == 800        # голое число на просьбу о чеке — стоимость
+    # r2: голое число на просьбу о чеке — стоимость ТОЛЬКО при известном пробеге и вне окна одометра
+    assert C.parse_cost_text("800", asked="cost", odo_km=45203)["total"] == 800
+    assert C.parse_cost_text("800", asked="cost") is None                # пробег не известен — fail-closed
 
 
 def test_money_number_is_never_km():
@@ -419,9 +421,68 @@ def test_unsure_receipt_writes_nothing_then_digits_reply_writes_cost():
     assert br.events() == [], br.events()
     body = sent[-1]["text"]
     assert "Чек прочитал неуверенно" in body and "цифрами" in body and "PRASUTBIGBIKE" in body, body
-    took, sent2, _ = _cost(_Msg(text="1340", topic=t, reply_to=_BotMsg(body)), br)
+    # r2: пробег темы не известен — голое «1340» стоимостью не становится (fail-closed), строки нет
+    S._LAST_RECORDED_KM.pop((CHAT, t), None)
+    took0, sent0, _ = _cost(_Msg(text="1340", topic=t, reply_to=_BotMsg(body), mid=7011), br)
+    assert took0 is False and sent0 == [] and br.events() == [], br.events()
+    took, sent2, _ = _cost(_Msg(text="итого 1340", topic=t, reply_to=_BotMsg(body), mid=7012), br)
     assert took is True and [r["notes"] for r in br.events()] == ["стоимость: итого 1340 ฿"], br.events()
     assert "Записал стоимость" in sent2[-1]["text"], _texts(sent2)
+
+
+#: Подтверждение со строкой просьбы, которое пробега НЕ просит (сводка цикла): ответ на него — вид "cost".
+ASK_SUMMARY = "🐀 Splinter · 📌 TESTBIKE ADV160 9993\n🇹🇭 ✅ บันทึกครบแล้วครับ\n🇷🇺 ✅ Готово — текущий пробег 1631 км."
+
+
+def _reply_cost(text, odo=None, odo_row=None, mid=7401):
+    """Ответ реплаем на просьбу о чеке; `odo` — записанный пробег темы, `odo_row` — свой одометр в мосте."""
+    t = _topic("TESTBIKE ADV160 9993")
+    S._LAST_RECORDED_KM.pop((CHAT, t), None)
+    if odo is not None:
+        S._LAST_RECORDED_KM[(CHAT, t)] = (odo, time.time())
+    items = [odo_row] if odo_row else []
+    br = _bridge(**{OP_SVC_LIST: {"ok": True, "items": items}})
+    ask = _BotMsg(C.attach(ASK_SUMMARY, *C.ASK))
+    assert C.ask_kind(ask.text) == "cost"
+    took, sent, _ = _cost(_Msg(text=text, topic=t, reply_to=ask, mid=mid), br)
+    return took, sent, br
+
+
+def test_r2_bare_reply_is_cost_only_outside_odometer_window():
+    """r2, живой довод: ADV160 6470 стоит на 1631 км, замена масла 21.10 на 1200 км — «1650» в ответ на
+    просьбу о чеке есть пробег, а не «итого 1650 ฿». Окно одометра [пробег − 150, пробег + 3000]."""
+    took, sent, br = _reply_cost("1650", odo=1631)
+    assert took is False and sent == [] and br.events() == [], br.events()   # пробег — прежнему пути, без вопроса
+    took, sent, br = _reply_cost("450", odo=1631)
+    assert took is True and [r["notes"] for r in br.events()] == ["стоимость: итого 450 ฿"], br.events()
+    took, sent, br = _reply_cost("450")                                       # пробег не известен — fail-closed
+    assert took is False and sent == [] and br.events() == [], br.events()
+    took, sent, br = _reply_cost("29870", odo=29859)                          # близнец: и > 9999, и в окне
+    assert took is False and br.events() == [], br.events()
+    took, sent, br = _reply_cost("1650 бат", odo=1631)                        # признак денег — стоимость всегда
+    assert took is True and [r["notes"] for r in br.events()] == ["стоимость: итого 1650 ฿"], br.events()
+    took, sent, br = _reply_cost("итого 1650", odo=1631)                      # слово итога — тоже
+    assert took is True and br.events()[0]["notes"] == "стоимость: итого 1650 ฿", br.events()
+
+
+def test_r2_window_uses_own_odometer_and_edges():
+    """Источник пробега — тот же, что у строки чека: запись темы за сутки, иначе свой одометр байка не
+    старше суток. Края окна включительно; позиция с именем без слова цены в окне — тоже не стоимость."""
+    fresh = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    row = {"bike": "TESTBIKE ADV160 9993", "current_km": 1631, "updated_at": fresh}
+    took, _s, br = _reply_cost("1650", odo_row=row)
+    assert took is False and br.events() == [], br.events()
+    stale = dict(row, updated_at="2026-01-01T00:00:00.000Z")                 # одометр старше суток = не известен
+    took, _s, br = _reply_cost("450", odo_row=stale)
+    assert took is False and br.events() == [], br.events()
+    for n, inside in ((1481, True), (1480, False), (4631, True), (4632, False)):
+        assert bool(C.could_be_odometer(n, 1631)) is inside, n
+    assert C.could_be_odometer(1650, None) is None
+    assert C.parse_cost_text("колодки 1650", asked="cost", odo_km=1631) is None
+    assert C.parse_cost_text("колодки 450", asked="cost", odo_km=1631)["total"] == 450
+    assert C.parse_cost_text("работа 1650", asked="cost", odo_km=1631)["total"] == 1650   # слово цены
+    two =C.parse_cost_text("1. работа 300\n2. фильтр 250", asked="cost", odo_km=40000)
+    assert two["total"] == 550, two                                                         # «1.»/«2.» — не деньги
 
 
 def test_album_receipt_plus_dashboard_keeps_old_path_for_dashboard():

@@ -16107,8 +16107,15 @@ async def handle_service_cost(msg, context, bridge) -> bool:
         if not bike:
             return False
         asked = _svc_rcpt_reply_kind(msg) or ""
-        c = service_cost.parse_cost_text(text, asked=asked)
+        # r2: в ответ на просьбу механики шлют и ПРОБЕГ цифрами — число без признака денег в окне одометра темы
+        # (тот же источник, что у пробега строки чека) деньгами не становится; пробег не известен — голое число
+        # тоже не стоимость. Читаем одометр ТОЛЬКО для ответа на просьбу: прочий текст моста не трогает.
+        odo = _svc_rcpt_km(bridge, chat_id, topic_id, bike) if asked else None
+        c = service_cost.parse_cost_text(text, asked=asked, odo_km=odo)
         if c is None:
+            if asked:
+                log.info(f"  → ответ на просьбу о чеке «{text[:40]}» — не стоимость (пробег темы "
+                         f"{odo or 'не известен'}): отдаю прежнему пути")
             return False
         pure = bool(asked) or not (c["has_km"] or c["extra"] or _svc_cost_has_work(text, c))
         same = any(abs(t - float(c["total"])) < 0.5 for t in (_svc_rcpt_state(chat_id, topic_id)["totals"]))

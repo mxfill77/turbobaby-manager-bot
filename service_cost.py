@@ -243,7 +243,27 @@ def _segment(seg):
     return {"kind": "bare", "amount": amount, "marked": False, "extra": False}
 
 
-def parse_cost_text(text, asked=""):
+#: ОКНО ПРАВДОПОДОБНОГО ОДОМЕТРА (r2, 25.10.2026): число без признака денег, лежащее в
+#: [последний пробег − 150, последний пробег + 3000], может быть показанием одометра этого байка — и
+#: деньгами не становится. Механики отвечают боту пробегом цифрами постоянно, а у новых байков он
+#: мал (живьём ADV160 6470 на 1631 км, замена масла на 1200 км 21.10): «1650» в ответ на просьбу о
+#: чеке легло бы в историю «итого 1650 ฿» — ложная запись хуже пропущенной стоимости. Границы — те же,
+#: что у правдоподобия пробега со снимка (`topic_decider.PHOTO_DOWN_TOL` = 150, потолок роста без
+#: даты `PHOTO_UP_NO_DATE` = 3000): одна мера «похоже на этот одометр» на обе двери.
+ODO_BELOW = 150
+ODO_ABOVE = 3000
+
+
+def could_be_odometer(n, odo_km):
+    """Число может быть показанием одометра байка с последним известным пробегом `odo_km`?
+    Пробег не известен → ответа нет (None): решать за незнание вызывающий обязан сам."""
+    v, o = num(n), num(odo_km)
+    if v is None or o is None:
+        return None
+    return (o - ODO_BELOW) <= v <= (o + ODO_ABOVE)
+
+
+def parse_cost_text(text, asked="", odo_km=None):
     """Стоимость в тексте → dict или None.
 
     `asked` — что спрашивало сообщение бота, на которое это ответ: "" (не ответ на просьбу) ·
@@ -252,6 +272,10 @@ def parse_cost_text(text, asked=""):
       * валюта рядом или слово итога → деньги всегда;
       * без них — только слово цены («работа 300, фильтр 250») или ответ на просьбу, и сумма
         строки не больше 9999 (дальше начинаются одометры).
+    ОТВЕТ НА ПРОСЬБУ БЕЗ ПРИЗНАКА ДЕНЕГ И БЕЗ СЛОВА ЦЕНЫ (r2): число в окне одометра
+    (`could_be_odometer`, `odo_km` — последний известный пробег темы) деньгами не бывает; ГОЛОЕ число
+    деньгами становится только при ИЗВЕСТНОМ пробеге и вне окна — пробег не известен → не стоимость
+    (fail-closed: ложная запись хуже пропущенной стоимости).
     Вопрос и план («будет стоить», «сколько», «?») — не стоимость сделанного → None.
 
     Возврат: {items, total, total_explicit, currency, marked, has_km, extra, numbers}.
@@ -285,11 +309,16 @@ def parse_cost_text(text, asked=""):
     if marked:
         items = [r for r in items if r["marked"] or (r["price"] or 0) <= 99999]
     else:
-        small = all((r["price"] if "price" in r else r["amount"]) <= 9999 for r in items + bares)
+        amounts = [r["price"] if "price" in r else r["amount"] for r in items + bares]
+        small = all(a <= 9999 for a in amounts)
+        cost_word = bool(_COST_WORD.search(t))
+        odo_known = num(odo_km) is not None
+        near_odo = (not cost_word) and any(could_be_odometer(a, odo_km) for a in amounts)
         if asked == "cost":
-            accept = bool(items or bares) and small
+            # голое число — только при известном пробеге и вне его окна; позиция с именем — вне окна
+            accept = small and not near_odo and (bool(items) or (bool(bares) and (cost_word or odo_known)))
         elif asked == "cost+km":
-            accept = bool(items) and small
+            accept = bool(items) and small and not near_odo
             bares = []
         else:
             accept = bool(items) and small and bool(_COST_WORD.search(t))
