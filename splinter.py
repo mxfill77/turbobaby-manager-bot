@@ -117,6 +117,17 @@ _SPOKE = _ctxvars.ContextVar("splinter_spoke", default=0)
 #: Тот же довод, что у `_SPOKE` выше и у `_CARD_BUDGET` в `bridge_client`.
 _PHOTO_KIND = _ctxvars.ContextVar("splinter_photo_kind", default="")
 
+#: ЧИСЛО, КОТОРОЕ РАЗБОР УВЕРЕННО ПРОЧИТАЛ НА ЭТОМ снимке — третий свидетель пола (25.10.2026).
+#: Без него пол на приборку говорил «числа на нём разобрать не смог» и там, где число прочитано
+#: (conf=high), а записывать его не стали или записали молча: с 02.10 так 11 раз из 21, в том
+#: числе 25.10 14:01 по NINJA 400 6334 — «не смог разобрать» через секунду после записи 41973.
+#: Сбрасывается в `handle` на каждое сообщение — по тому же доводу, что `_PARSE_SEEN`.
+_PHOTO_KM = _ctxvars.ContextVar("splinter_photo_km", default="")
+
+#: ОПОРА, С КОТОРОЙ НЕ СОШЛОСЬ ЧИСЛО СНИМКА — решатель отверг чтение правилом «правдоподобие»
+#: (25.10.2026). Пол называет оба числа: «читаю 14932, а записано 41958 — не сходится». Сброс в `handle`.
+_PHOTO_REF_KM = _ctxvars.ContextVar("splinter_photo_ref_km", default="")
+
 #: Отправка идёт через `_hint_send` — событие ленты пишет он (как «вопрос бота» с видом подсказки),
 #: а `_send` второй строки не пишет (01.10.2026, SPLTOPICFEED0110). ContextVar по тому же доводу.
 _FEED_VIA_HINT = _ctxvars.ContextVar("splinter_feed_via_hint", default=False)
@@ -1523,11 +1534,18 @@ def decider_snapshot(msg, kind="text") -> dict:
     for ev in events:
         if ev.get("mid") is not None and ev.get("kind") != "vision":
             known[int(ev["mid"])] = ev.get("role")
-    last_km, _ = _ctx_last_confirmed_km(chat_id, topic_id, events)
+    last_km, last_ts = _ctx_last_confirmed_km(chat_id, topic_id, events)
+    # СНИМКИ ТЕМЫ (25.10.2026): число основания с них — чтение разбора, а не слово человека, и
+    # правило «правдоподобие» (`topic_decider.photo_km_doubt`) судит только такие числа.
+    photo_mids = {int(ev["mid"]) for ev in events
+                  if ev.get("mid") is not None and ev.get("kind") in ("photo", "vision")}
+    if kind == "photo" and getattr(msg, "message_id", None) is not None:
+        photo_mids.add(int(msg.message_id))
     facts = {"mid": getattr(msg, "message_id", None), "reply_to": reply_to,
              "role": _feed_role(getattr(msg, "from_user", None)), "trusted": _act_trusted(msg),
              "known": known, "last_km": odo_ceiling.km(last_km), "cur_km": None,
-             "ceiling": _odo_ceiling_limit(), "open_kinds": decider_open_kinds(chat_id, topic_id)}
+             "ceiling": _odo_ceiling_limit(), "open_kinds": decider_open_kinds(chat_id, topic_id),
+             "photo_mids": sorted(photo_mids), "last_km_ts": last_ts, "now": now}
     text = (getattr(msg, "text", None) if kind == "text" else getattr(msg, "caption", None)) or ""
     return {"chat": chat_id, "topic": topic_id, "bike": bike, "kind": kind, "facts": facts,
             "user": _tdec.user_prompt(ctx, facts, kind, len(text))}
@@ -1823,10 +1841,32 @@ async def _decider_execute(msg, context, bridge, snap, v, claude=None) -> str:
         if door == _tdec.DOOR_ODO:                                       # доверенный пробег — как сейчас
             _odo_confirmed(bridge, chat_id, topic_id, bike, it.get("км"),
                            sender=snap["facts"].get("role") or "?", source=f"решатель #{it.get('источник')}")
+            # Признак «был маркер замены» живёт в открытом вопросе о пробеге — берём его ДО того,
+            # как вопрос снят: прочие двери передают его в `_after_mileage` так же (`pend[3]`).
+            _pend = _PENDING_MILEAGE.get((chat_id, topic_id)) or ()
+            _oil_hint = bool(_pend[3]) if len(_pend) > 3 else False
             _PENDING_MILEAGE.pop((chat_id, topic_id), None)
             _mileage_q_forget(chat_id, topic_id, "решатель записал пробег")
             (_DLIVE["asks"].get(k) or {}).pop("пробег", None)
             _dlive_save()
+            # ХВОСТ ДВЕРИ — КАК У ВСЕХ ПРОЧИХ ДВЕРЕЙ ПРОБЕГА (25.10.2026). Каждый путь подтверждения
+            # после `_odo_confirmed` зовёт `_after_mileage`: ТО-трекер, срок масла, квитанция. Этот
+            # звал только первую половину — пробег ложился МОЛЧА, срок масла не проверялся, а пол
+            # ответа, не услышав ни слова, говорил «числа разобрать не смог» (25.10 14:01, NINJA 400
+            # 6334: записано 41973 — и тут же «не смог разобрать»). Сбой хвоста записи не отменяет.
+            try:
+                await _after_mileage(context, bridge, chat_id, topic_id, bike, str(it.get("км")), _oil_hint)
+            except Exception:
+                log.exception("  🧠 решатель (бой): хвост двери пробега (ТО-трекер/квитанция) упал")
+                # Пробег уже записан — человек обязан услышать именно это, а не «записывать не стал».
+                try:
+                    _b = f" ({bike})" if bike else ""
+                    _br = f" по {bike}" if bike else ""
+                    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                                text=(f"🐀 Splinter\n🇹🇭 ✅ บันทึกเลขไมล์{_b} {it.get('км')} กม. แล้วครับ\n"
+                                      f"🇷🇺 ✅ Пробег{_br} {it.get('км')} км записан."))
+                except Exception:
+                    log.exception("  🧠 решатель (бой): квитанция записи пробега не ушла")
             return _tdec.DOOR_ODO
         await _ask_mileage_confirm(context, chat_id, topic_id, bike, str(it.get("км")), bridge=bridge)
         _dlive_mark(chat_id, topic_id, (_MILEAGE_Q.get(_mileage_q_key(chat_id, topic_id)) or {}).get("msg_id"))
@@ -1930,6 +1970,12 @@ async def decider_live(msg, context, bridge, claude, kind="text") -> bool:
         if v["итог"].get("действие") not in _tdec.LIVE_ACTIONS:
             log.info(f"  🧠 решатель (бой): #{mid} → {v['итог'].get('действие')} в бою не исполняется — прежний путь")
             return False
+        if v.get("правило") == "правдоподобие":
+            # Чтение снимка отвергнуто — пол назовёт ОБА числа (прочитанное и опору), а не «не смог».
+            try:
+                _PHOTO_REF_KM.set(str(v["итог"].get("опора") or ""))
+            except Exception:
+                pass
         door = await _decider_execute(msg, context, bridge, snap, v, claude=claude)
         log.info(_tdec.live_say(v, mid, door) + _human_was(v))
         _tfeed.append(chat_id, topic_id, "decision", role="bot", reply_to=mid, text="", on=mid,
@@ -4100,6 +4146,13 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
         failed_out.extend(failed)
     _km_event_journal(chat_id, topic_id, km, ids=mids, works=written, bike=bike,
                       group=group_name, msg_date=msg_date)
+    # ЖУРНАЛ ПРИНЯТЫХ РАБОТ ЗАКРЫВАЕТСЯ ЛЮБОЙ НАСТОЯЩЕЙ ЗАПИСЬЮ (25.10.2026). Прежде его снимала одна
+    # дверь — выгрузка буфера; прямая запись (пробег в том же сообщении) и фаза 2 по кнопке Пыма
+    # работу клали, а позиция журнала оставалась открытой и протухала в «потеряна» — отсюда
+    # ERROR «потеряны 9» на каждом старте с 15.10. Снятие идемпотентно (повтор от двери буфера
+    # ничего не меняет); без чата снимать нечего — ключ журнала по теме чата.
+    if chat_id is not None:
+        _wl_settle(chat_id, topic_id, written, km)
     return written   # список работ, которые РЕАЛЬНО есть в истории (для пост-квитанции по факту)
 
 
@@ -11866,7 +11919,12 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
 
     kind = str(kind or "").strip().lower()
     if kind not in _SP_KIND_LABEL:
-        kind = "other"
+        # СЛОВА РАБОТЫ → ВИД (25.10.2026). Мозг кладёт сюда ключ («oil»), а решатель — слова
+        # («замена масла»), и слова молча становились «прочими работами»: три карточки «Сделано:
+        # прочие работы» на «Замена масла на 1200» (тема 13072, 21.10) и в темах 79/73. Тот же
+        # классификатор, что у перечней заявки и факта; не узнал — «прочие», как было.
+        _k = _service_kind(kind) if kind else ""
+        kind = _k if _k in _SP_KIND_LABEL else "other"
     sp = _sp_open(bridge, chat_id, topic_id, bike) or {}
     declared = _sp_merge_done(_sp_split(sp.get("declared")), [kind])
     done = _sp_merge_done(_sp_split(sp.get("done")), [kind])
@@ -12507,15 +12565,21 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     return written, failed
 
 
-async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note):
+async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note,
+                             label_kinds=None):
     """B4: заявка висит дольше TTL → ОДНА эскалация владельцу (notify) + тег Пыма в теме; пометить note=escalated.
-    После этого тайцам напоминания прекращаются (см. reminder). Запись в Лист1 НЕ трогаем."""
+    После этого тайцам напоминания прекращаются (см. reminder). Запись в Лист1 НЕ трогаем.
+
+    `label_kinds` — что НАЗВАТЬ в тексте (25.10.2026): у заявки, родившейся из сделанного, заявленного
+    нет, и текст выходил «Заявка на ТО (—) висит 7ч» (тема 13072, 21.10). Замок повторов по-прежнему
+    судит по `declared` — меняется только подпись."""
+    lk = label_kinds or declared
     # единицы времени по языку: 🇹🇭 «ชม.» (без кириллицы), 🇷🇺 «ч»
     age_ru = f"{int(age_h)}ч" if age_h is not None else "долго"
     age_th = f"{int(age_h)} ชม." if age_h is not None else "นาน"
     try:
         import notify
-        notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(declared)}) — заявка открыта {age_ru} без закрытия. "
+        notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(lk)}) — заявка открыта {age_ru} без закрытия. "
                       f"Глянь/закрой вручную или дожми подтверждение.", force=True)   # боевой прод-алерт
     except Exception:
         log.exception("  → B4 эскалация владельцу (notify) упала")
@@ -12527,9 +12591,9 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
                          state=("sp_escalate", declared),
                          chat_id=int(chat_id), topic_id=(int(topic_id) if topic_id else None),
                          text=(f"🐀 Splinter · 📌 {bike}\n"
-                               f"🇹🇭 ⚠️ งานเซอร์วิส ({_sp_labels_th(declared)}) ค้างนาน {age_th} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
+                               f"🇹🇭 ⚠️ งานเซอร์วิส ({_sp_labels_th(lk)}) ค้างนาน {age_th} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
                                f"{_SEP}\n"
-                               f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(declared)}) висит {age_ru} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
+                               f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(lk)}) висит {age_ru} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
     except Exception:
         log.exception(f"  → B4 эскалация в тему {bike} упала")
     try:
@@ -12578,7 +12642,8 @@ async def _sp_debt_voice(context, bridge, it, now):
     if closed is not None and closed.get("closed"):
         return
     if v["speak"] == service_debt.ESCALATE:
-        await _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note)
+        await _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note,
+                                 label_kinds=done)
         return
     # B5 + троттл `last_reminded_at` — те же, что у прежней ветки (персист между рестартами).
     _k = (str(chat_id), str(topic_id or ""), bike)
@@ -12663,9 +12728,11 @@ async def scheduled_service_pending_reminder(context, bridge):
         note = str(it.get("note") or "")
         # B4: TTL по возрасту заявки → одна эскалация владельцу/Пыму, дальше тайцам не долбим
         age_h = _sp_age_hours(it.get("created_at"), now)
+        _lk = declared or _sp_split(it.get("done"))     # что назвать: заявленное, а нет его — сделанное
         if age_h is not None and age_h >= _SP_REMIND_MAX_AGE_H:
             if "escalated" not in note:
-                await _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note)
+                await _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared, age_h, note,
+                                         label_kinds=_lk)
             continue
         # B5: in-memory анти-дубль (две близкие итерации в одном процессе — рестарт first=300 рядом с часовым тиком)
         _k = (str(chat_id), str(topic_id or ""), bike)
@@ -12695,9 +12762,9 @@ async def scheduled_service_pending_reminder(context, bridge):
                                 chat_id=int(chat_id),
                                 topic_id=(int(topic_id) if topic_id else None),
                                 text=(f"🐀 Splinter · 📌 {bike}\n"
-                                      f"🇹🇭 ⏳ {bike} แจ้งเข้าเซอร์วิส ({_sp_labels_th(declared)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
+                                      f"🇹🇭 ⏳ {bike} แจ้งเข้าเซอร์วิส ({_sp_labels_th(_lk)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
                                       f"{_SEP}\n"
-                                      f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(declared)}), результат не отписан — закончили?")) is HINT_SKIPPED:
+                                      f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(_lk)}), результат не отписан — закончили?")) is HINT_SKIPPED:
                 continue        # повтор подавлен → ни отметки времени, ни записи в заявку
             _SP_LAST_SENT[_k] = now
             bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
@@ -13073,6 +13140,9 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
         # Кладём РОВНО то, что назвал разбор; не назвал — пусто, и пол скажет «не узнал».
         try:
             _PHOTO_KIND.set(str(vis.get("kind") or "").strip().lower())
+            _pkm = str(vis.get("mileage") or "").replace(" ", "").replace(",", "")
+            _PHOTO_KM.set(_pkm if (_re_pl.fullmatch(r"\d{3,6}", _pkm)
+                                   and str(vis.get("mileage_confidence") or "").lower() == "high") else "")
         except Exception:
             pass
         if len(vis_list) > 1:
@@ -15652,11 +15722,18 @@ async def _reply_floor_speak(context, msg, crashed=False, spoke_before=0):
         if not _q.get("speak", True):
             log.info(f"  → ПОЛ ОТВЕТА: молчу по делу ({_q.get('why')}) — тема={topic_id}")
             return False
+    try:
+        _pkm = _PHOTO_KM.get()
+        _pref = _PHOTO_REF_KM.get()
+    except Exception:
+        _pkm, _pref = "", ""          # свидетеля нет → прежний текст «не смог разобрать»
     _ff = {
         "bike": bike,
         "crashed": bool(crashed),
         "photo": bool(getattr(msg, "photo", None)),
         "photo_kind": _pk,
+        "photo_km": _pkm,
+        "photo_ref_km": _pref,
     }
     if _talk and _seen:
         _ff["parse"] = _seen          # событие → правда «понял как замечание», а не «не понял»
@@ -15709,6 +15786,8 @@ async def handle(update, context, bridge, claude, album_msgs=None):
     # после разбора он либо вырос (мы говорили), либо нет — и тогда говорим сами.
     _spoke_before = _SPOKE.get()
     _PARSE_SEEN.set(reply_floor.PARSE_UNKNOWN)   # вердикт прошлого сообщения сюда не доезжает
+    _PHOTO_KM.set("")                            # и число прошлого снимка — тоже
+    _PHOTO_REF_KM.set("")
     _crashed = False
     try:
         if mode == "money":

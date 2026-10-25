@@ -125,12 +125,49 @@ def _is_mileage(what):
     return ask_kind(what) == "пробег"
 
 
+#: ПРАВДОПОДОБИЕ ПРОБЕГА СО СНИМКА (25.10.2026). Разбор приборки ошибается примерно в каждом
+#: четвёртом чтении (в октябре 15 из 52: подмена, потеря и перестановка цифр, число с чека), а
+#: уверенность ставит «high» всегда — она ничего не различает. Правила «убывание»/«потолок» ловили
+#: 2 из 15, а снимок доверенного ложился в учёт без вопроса (CB 650R 3503: 38892 вместо 36032 — и
+#: следом верное число Пыма отвергнуто как «убывание»). Проверка — ТОЛЬКО числа со снимка: число,
+#: набранное человеком, остаётся главным (это и есть путь исправления). Офлайн на ленте 02–25.10:
+#: поймано 14 из 15 ошибок, верных чтений остановлено 0 из 35.
+PHOTO_DOWN_TOL = 150        # ниже опоры больше чем на столько — снимку не верим
+PHOTO_UP_PER_DAY = 300      # выше опоры больше чем 150 + 300 км/сут — не верим (наблюдённый максимум 285)
+PHOTO_UP_NO_DATE = 3000     # у опоры нет даты — потолок роста
+
+
+def photo_km_doubt(km, ref, ref_ts=None, now=None):
+    """Число со снимка рядом с опорным пробегом — сомнительно? Возврат: причина или ''.
+    '' — правдоподобно ИЛИ сверять не с чем (нет опоры): тогда решают прежние правила."""
+    try:
+        km, ref = int(km), int(ref)
+    except (TypeError, ValueError):
+        return ""
+    if ref <= 0 or km <= 0:
+        return ""
+    if ref >= 1000 and len(str(km)) != len(str(ref)):
+        return f"со снимка {km}: {len(str(km))} знаков, а у записанного {ref} — {len(str(ref))}"
+    if km < ref - PHOTO_DOWN_TOL:
+        return f"со снимка {km} ниже записанного {ref}"
+    try:
+        days = (float(now) - float(ref_ts)) / 86400.0 if (ref_ts and now) else None
+    except (TypeError, ValueError):
+        days = None
+    limit = (PHOTO_DOWN_TOL + PHOTO_UP_PER_DAY * days) if (days is not None and days >= 0) else PHOTO_UP_NO_DATE
+    if km > ref + limit:
+        return f"со снимка {km} выше записанного {ref} на {km - ref} км"
+    return ""
+
+
 def rules(dec, facts):
     """Правила кодом поверх решения модели. `facts`:
       mid (int) · role (staff|pym|owner|bot) · trusted (bool, `_act_trusted` автора)
       known (dict mid → роль автора события ленты) · last_km (записанный пробег или None)
       cur_km (текущий из таблицы или None) · ceiling (порог км или 0)
       open_kinds (dict вид → mid открытого вопроса)
+      photo_mids (mid снимков: число основания с них — чтение разбора, а не слово человека)
+      last_km_ts (когда записан last_km, unix) · now (время входа, unix)
     Возврат: {"итог": действие, "правило": имя сработавшего ('' — пропущено как есть), "дверь": ''|…}."""
     a = dec.get("действие")
     if a == "записать":
@@ -147,6 +184,15 @@ def rules(dec, facts):
             if km is None or km <= 0:
                 return {"итог": {"действие": "ничего", "почему": "пробег без числа — запись отклонена"},
                         "правило": "нет_числа", "дверь": ""}
+            if src in set(facts.get("photo_mids") or ()):
+                # Опора — записанный пробег с датой; нет его — пробег из таблицы (без даты).
+                ref, ref_ts = facts.get("last_km"), facts.get("last_km_ts")
+                if ref is None:
+                    ref, ref_ts = facts.get("cur_km"), None
+                why = photo_km_doubt(km, ref, ref_ts, facts.get("now"))
+                if why:
+                    return {"итог": {"действие": "ничего", "почему": why, "опора": int(ref)},
+                            "правило": "правдоподобие", "дверь": ""}
             last = facts.get("last_km")
             if last is not None and km < int(last):
                 return {"итог": {"действие": "позвать", "кого": "Пым",

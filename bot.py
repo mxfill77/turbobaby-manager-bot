@@ -660,7 +660,7 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
                 pass
 
     memory.save_message(chat_id, None, "Bot", "assistant", answer, topic_id=_topic)
-    for chunk in chunk_text(answer, 4000):
+    for chunk in chunk_text(plain_answer(answer), 4000):
         _sent_ans = await msg.reply_text(chunk, parse_mode=None)
         # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): ответ мозга — тоже событие темы (только обслуживание)
         splinter.feed_bot_sent(chat_id, _topic, _sent_ans, chunk,
@@ -1325,6 +1325,20 @@ async def scheduled_important_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 
 # === UTILS ===
+
+_MD_BOLD = re.compile(r"\*\*(.+?)\*\*", re.S)
+_MD_RULE = re.compile(r"(?m)^[ \t]*-{3,}[ \t]*$\n?")
+
+
+def plain_answer(text: str) -> str:
+    """Разметка мозга → обычный текст (25.10.2026). Ответ уходит с `parse_mode=None`, и Telegram
+    показывал её как есть: «Текущий пробег: **41973 км**», строки «---» между блоками (тема
+    NINJA 400 6334, 25.10). Снимаются ровно две вещи — парные `**` и строка-линия `---`; слова и
+    числа не трогаются. Не строка → как есть."""
+    if not isinstance(text, str):
+        return text
+    return _MD_RULE.sub("", _MD_BOLD.sub(r"\1", text))
+
 
 def chunk_text(text: str, max_len: int = 4000):
     """Разбивает длинный текст на куски для Telegram."""
