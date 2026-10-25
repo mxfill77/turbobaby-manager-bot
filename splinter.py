@@ -20,6 +20,8 @@ import base64
 import html
 import logging
 import bridge_client   # токен-замок 4.2 (agent_write) для красной записи брони в CRM + паспорт B2
+import plate_alias     # пары номеров «табличка ↔ зелёная книга» в поиске байка (25.10.2026, PLATEALIAS2510)
+plate_alias.install(bridge_client.BridgeClient)   # bridge_client.py закреплён приёмкой WA — обёртка снаружи
 import wallet_cache    # §касса: персистентный fallback-кэш баланса (переживает рестарт splinter)
 import scan_result     # контракт читателя живого текста: пара «осмотрено/разобрано» + исход
 import fleet_cell      # контракт клетки Лист1: значение / пусто / не-число / нечитаемо

@@ -3,11 +3,12 @@
 
 Живой случай: по правилу владельца тема идёт по номеру, который висит на байке (тема 83 стала
 «XADV 750CC GREY 2478»), а Лист1 после 24.10 несёт номер из зелёной книги («XADV 750CC GREY 9286»).
-bridge_client.find_bike искал строку ТОЛЬКО по номеру из названия → тема не находила свою строку.
+BridgeClient.find_bike искал строку ТОЛЬКО по номеру из названия → тема не находила свою строку.
+Обёртка plate_alias ставится процессом Splinter на класс (bridge_client.py закреплён приёмкой WA).
 Проверяется: пара находит строку в обе стороны, без пары ничего не меняется, соседние номера
-(4246/4248) не путаются, нет файла пар → прежний поиск.
+(4246/4248) не путаются, нет файла пар → прежний поиск, splinter ставит обёртку при импорте,
+bridge_client.py не тронут.
 """
-import json
 import os
 import sys
 import tempfile
@@ -17,6 +18,7 @@ sys.path.insert(0, ROOT)
 os.environ.setdefault("PRETOOL_NOPUSH", "1")
 
 import bridge_client
+import plate_alias
 from bridge_client import BridgeClient
 
 res = []
@@ -39,6 +41,9 @@ FLEET_BOOK = [   # Лист1 после 24.10 — номера из зелёно
     {"name": "XADV 750CC BLACK 5104", "row": 34},
 ]
 
+ORIG = getattr(BridgeClient.find_bike, "__wrapped__", BridgeClient.find_bike)
+plate_alias.install(BridgeClient)
+
 
 def client(bikes):
     c = BridgeClient(url="http://x/exec", token="T", timeout=1)
@@ -46,16 +51,10 @@ def client(bikes):
     return c
 
 
-def use_aliases(path):
-    bridge_client._PLATE_ALIASES_FILE = path
-    bridge_client._PLATE_ALIASES = None
-
-
-REAL = os.path.join(ROOT, "plate_aliases.json")
+REAL = plate_alias.ALIASES_FILE
 
 print("(1) живой файл пар читается:")
-use_aliases(REAL)
-m = bridge_client._plate_alias_map() or {}
+m = plate_alias.alias_map(REAL) or {}
 ok(m.get("2478") == {"9286"} and m.get("9286") == {"2478"}, "83: 2478 ↔ 9286 (в обе стороны)")
 ok(all(p in m for p in ("9315", "5849")), "пары 1190 и 62 на месте")
 ok("7943" not in m and "9011" not in m and "1023" not in m and "461" not in m,
@@ -75,6 +74,7 @@ ok(c.find_bike("XADV 750CC BLACK 5104").get("row") == 34, "байк без па�
 ok(c.find_bike("XMAX 300CC GREY 4246").get("row") == 25, "4246 → своя строка, не 4248")
 ok(c.find_bike("XMAX 300CC GREEN 4248").get("row") == 24, "4248 → своя строка, не 4246")
 ok(c.find_bike("NMAX 155CC 9999") == {}, "неизвестный номер → пусто (пара ничего не выдумывает)")
+ok(c.find_bike("") == {}, "пустой запрос → пусто, как раньше")
 
 print("(4) Лист1 перейдёт на номер таблички — найдётся и старое книжное название:")
 FLEET_PHYS = [dict(b) for b in FLEET_BOOK]
@@ -84,14 +84,24 @@ ok(cp.find_bike("XADV 750CC GREY 9286").get("row") == 37, "«…9286» → ст�
 ok(cp.find_bike("XADV 750CC GREY 2478").get("row") == 37, "«…2478» → прямое совпадение")
 
 print("(5) файла пар нет / битый → прежнее поведение, без исключений:")
-use_aliases(os.path.join(tempfile.gettempdir(), "no_such_plate_aliases_%d.json" % os.getpid()))
+plate_alias.alias_map(os.path.join(tempfile.gettempdir(), "no_such_plate_aliases_%d.json" % os.getpid()))
 ok(client(FLEET_BOOK).find_bike("XADV 750CC GREY 2478") == {}, "нет файла → пары нет → пусто, как до правки")
 bad = os.path.join(tempfile.mkdtemp(prefix="plate_alias_t"), "bad.json")
 with open(bad, "w", encoding="utf-8") as f:
     f.write("{not json")
-use_aliases(bad)
+plate_alias.alias_map(bad)
 ok(client(FLEET_BOOK).find_bike("XADV 750CC GREY 2478") == {}, "битый файл → пусто, не падает")
-use_aliases(REAL)
+plate_alias.alias_map(REAL)
+
+print("(6) обёртка ставится один раз, splinter ставит её при импорте, bridge_client.py не тронут:")
+w1 = BridgeClient.find_bike
+plate_alias.install(BridgeClient)
+ok(BridgeClient.find_bike is w1, "повторный install ничего не меняет (одна обёртка)")
+ok(getattr(BridgeClient.find_bike, "__wrapped__", None) is ORIG, "под обёрткой — исходный метод bridge_client")
+src = open(os.path.join(ROOT, "splinter.py"), encoding="utf-8").read()
+ok("plate_alias.install(bridge_client.BridgeClient)" in src, "splinter ставит обёртку при импорте")
+ok("_plate_partners" not in open(os.path.join(ROOT, "bridge_client.py"), encoding="utf-8").read(),
+   "bridge_client.py без правки (закреплён приёмкой WA)")
 
 print("%d/%d" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)
