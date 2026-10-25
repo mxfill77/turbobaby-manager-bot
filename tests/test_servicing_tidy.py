@@ -725,7 +725,9 @@ def test_plain_answer_is_applied_to_brain_reply_before_chunking():
 def _brain_card(kind, km=KM):
     seen = []
 
-    async def _adv(context, bridge, chat_id, topic_id, bike, declared, done, odo):
+    # `**kw`: с HISTNAMES2510 дверь получает ещё слова заявки, новую ноту и день работы
+    # (`works=`, `note=`, `work_date=`) — предмет этого сьюта только вид, они не судятся здесь.
+    async def _adv(context, bridge, chat_id, topic_id, bike, declared, done, odo, **kw):
         seen.append((list(declared), list(done), odo))
     t = _topic()
     with _patch(S, _sp_advance_to_confirm=_adv, _sp_open=lambda *a, **k: {}):

@@ -1836,7 +1836,11 @@ async def _decider_execute(msg, context, bridge, snap, v, claude=None) -> str:
     if a == "записать":
         door = v.get("дверь") or ""
         if not _tdec._is_mileage(it.get("что")):                         # работа ТО — всегда кнопка Пыма (E2b)
-            await sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, it.get("что"), it.get("км"))
+            # Слова работы решателя («что») и само сообщение человека едут в заявку: из них
+            # история назовёт работу, а не напишет «прочие работы» (HISTNAMES2510).
+            await sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, it.get("что"), it.get("км"),
+                                        said=(getattr(msg, "text", None) or getattr(msg, "caption", None)),
+                                        msg_date=_msg_date_of(msg))
             return "кнопка Пыма (ТО-заявка)"
         if door == _tdec.DOOR_ODO:                                       # доверенный пробег — как сейчас
             _odo_confirmed(bridge, chat_id, topic_id, bike, it.get("км"),
@@ -3236,16 +3240,17 @@ def _should_ask_odometer(chat_id, topic_id, ignore_buffer=False):
     return True
 
 
-def msg_ask_odometer(bike, kinds=None):
+def msg_ask_odometer(bike, kinds=None, works=None):
     """Просьба прислать ЧЁТКОЕ фото одометра — для привязки пробега к работам. Текст ПО ФАКТУ работ
     (kinds), БЕЗ хардкода «масло». 🇹🇭 — тайские лейблы kinds (без кириллицы), 🇷🇺 — русские.
-    Без kinds → нейтрально. БЕЗ тега Пыма. Ничего в ТО не пишем — только просьба."""
+    Без kinds → нейтрально. БЕЗ тега Пыма. Ничего в ТО не пишем — только просьба.
+    `works` — слова механика: безрегистровая работа названа ими, а не ярлыком (HISTNAMES2510)."""
     b = f" {bike}" if bike else ""
     if kinds:
         return (
             f"🐀 Splinter\n"
-            f"🇹🇭 เพื่อบันทึก ({_sp_labels_th(kinds)}){b} — รบกวนถ่ายรูปเลขไมล์ (ODO) ให้ชัด ๆ หน่อยครับ 🙏\n"
-            f"🇷🇺 Для записи ({_sp_labels_ru(kinds)}){b} — пришлите, пожалуйста, ЧЁТКОЕ фото пробега (одометр, ODO) 🙏"
+            f"🇹🇭 เพื่อบันทึก ({_sp_labels_th(kinds, works)}){b} — รบกวนถ่ายรูปเลขไมล์ (ODO) ให้ชัด ๆ หน่อยครับ 🙏\n"
+            f"🇷🇺 Для записи ({_sp_labels_ru(kinds, works)}){b} — пришлите, пожалуйста, ЧЁТКОЕ фото пробега (одометр, ODO) 🙏"
         )
     return (
         f"🐀 Splinter\n"
@@ -3777,7 +3782,10 @@ def msg_bike_card(bike, cur_km, mand, rental, service=None, sp_open=None, sp_las
 
     hist_th, hist_ru = [], []
     if sp_last and sp_last.get("done"):
-        _dl_th = _sp_labels_th(sp_last["done"]); _dl_ru = _sp_labels_ru(sp_last["done"])
+        # «Последний сервис» называет безрегистровые работы словами закрытой заявки, а не ярлыком
+        # «прочие работы» (HISTNAMES2510); слов нет → ярлык, как было.
+        _dl_th = _hb(_sp_labels_th(sp_last["done"], sp_last.get("works")))
+        _dl_ru = _hb(_sp_labels_ru(sp_last["done"], sp_last.get("works")))
         _lo = str(sp_last.get("odo") or ""); _ld = str(sp_last.get("date") or "")
         hist_th.append(f"ล่าสุด: {_dl_th}" + (f" · {_lo} กม." if _lo else "") + (f" ({_ld})" if _ld else ""))
         hist_ru.append(f"Последний сервис: {_dl_ru}" + (f" · {_lo} км" if _lo else "") + (f" ({_ld})" if _ld else ""))
@@ -4071,7 +4079,8 @@ def _build_bike_card_body(bridge, chat_id, topic_id, bike, _cb=None):
             _done_last = [k for k in _sp_split(_c0.get("done")) if k not in _SP_COL_KINDS and k != "filter"]
             if _done_last:
                 sp_last = {"done": _done_last, "odo": str(_c0.get("odometer") or ""),
-                           "date": str(_c0.get("updated_at") or "")[:10]}
+                           "date": str(_c0.get("updated_at") or "")[:10],
+                           "works": _sp_works_from_note(_c0.get("note"))}
     except Exception:
         log.exception("  → карточка: чтение закрытых то_заявки упало")
     unread = None
@@ -4103,8 +4112,17 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
     uniq = list(dict.fromkeys(info_works))
     keys = _work_keys_distinct(uniq)
     written, mids, failed = [], [], []
+    # ДЕНЬ РАБОТЫ НА КАЖДОЙ СТРОКЕ (25.10.2026, HISTNAMES2510): в `msg_date` и хвостом « · ДД.ММ.ГГГГ»
+    # ПОСЛЕ километров — разбор карточки (`_SVC_HIST_RE`) смотрит только на «<работа> — <км> км».
+    # Дверь дня не принесла → день записи (сегодня по UTC): строка без дня не знает, когда была
+    # работа. Ключ `msg_id` дня НЕ содержит — повтор той же работы на том же км дедупится, как и был.
+    # `WORK_NAME=0` → строка байт-в-байт прежняя.
+    _on = _work_name_on()
+    if _on and not str(msg_date or "").strip():
+        msg_date = _today_utc()
     for w in uniq:
-        note = (f"{w} — {km} км" if km else f"{w}")[:200]
+        note = (work_name.note_line(w, km, msg_date) if _on
+                else (f"{w} — {km} км" if km else f"{w}")[:200])
         # A1 ИДЕМПОТЕНТНОСТЬ по КОНТЕНТУ: msg_id = info:{plate}:{ключ-работы}:{км}. Повторный прогон/повторное
         # фото на ту же работу+км даёт ТОТ ЖЕ ключ → Bridge.addEvent дедупит (botMsgExists_ по msg_id, BotData.js).
         # msg_id_base (per-сообщение) больше НЕ используем — он плодил новое событие на каждый прогон.
@@ -6559,7 +6577,9 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
         if _sp and str(_sp.get("status")) == "ждёт_факт":
             _declared = _sp_split(_sp.get("declared"))
             _done = _sp_split(_sp.get("done")) or list(_declared)   # B3: нет done → заявленное считаем сделанным
-            await _sp_advance_to_confirm(context, bridge, msg.chat_id, key[1], bike, _declared, _done, num)
+            await _sp_advance_to_confirm(context, bridge, msg.chat_id, key[1], bike, _declared, _done, num,
+                                         works=_sp_works_from_note(_sp.get("note")),
+                                         work_date=(_sp_work_date(_sp) or _msg_date_of(msg)))
             return True
     except Exception:
         log.exception("  → B1: довод заявки фото-одометром упал")
@@ -8002,7 +8022,9 @@ async def handle_service_button(update, context, bridge) -> None:
             if _sp and str(_sp.get("status")) == "ждёт_факт":
                 _declared = _sp_split(_sp.get("declared"))
                 _done = _sp_split(_sp.get("done")) or list(_declared)
-                await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, _declared, _done, mileage)
+                await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, _declared, _done, mileage,
+                                             works=_sp_works_from_note(_sp.get("note")),
+                                             work_date=_sp_work_date(_sp))
                 return
         except Exception:
             log.exception("  → B1(кнопка svc:mok): довод заявки фото-пробегом упал")
@@ -8069,7 +8091,9 @@ async def handle_service_button(update, context, bridge) -> None:
         done = data.get("done", []) or []
         odo = data.get("odo", "")
         cb = ("@" + q.from_user.username) if (q.from_user and q.from_user.username) else "trusted"
-        written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=cb)
+        # День работы едет в токене кнопки (HISTNAMES2510); у токена старше правки его нет → сегодня.
+        written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by=cb,
+                                               work_date=data.get("wdate"))
         # ДВЕРЬ 1 (кнопка). Верхняя граница переспросила → вопрос уже отправлен, квитанции быть
         # не должно: «не записано» рядом с вопросом читалось бы как отказ, а это ОЖИДАНИЕ ответа.
         if _sp_ceiling_asked(failed):
@@ -8080,7 +8104,8 @@ async def handle_service_button(update, context, bridge) -> None:
         # отрицательную ветку, а тайская печатала «บันทึกแล้ว» БЕЗУСЛОВНО: 13.08 в одной строке
         # механик читал успех, владелец — «ничего не записано» (байки 4957/37015 и 4724/20747).
         # Три исхода (записано · не записано · неизвестен) и имена работ — в `service_receipt`.
-        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL,
+        # Имена — те же слова механика, что легли в историю (`_svc_labels_take`, HISTNAMES2510).
+        rec = service_receipt.receipt(written, failed, odo, _svc_labels_take(chat_id, topic_id),
                                      ledger=_svc_ledger_take(chat_id, topic_id))
         # E1: подтверждение через _send_retry — запись (_sp_write_done) УЖЕ прошла и идемпотентна,
         # переотправка безопасна. Без retry ConnectTimeout «съедал» подтверждение → владелец дублировал «Да».
@@ -8203,8 +8228,9 @@ async def handle_service_button(update, context, bridge) -> None:
         # ceiling_ok=True — единственное место, где граница снимается. Прочие сторожа (trust,
         # km_decreasing на мосту, confirmed=true в коде Bridge) не ослаблены ни одним словом.
         written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo,
-                                               confirmed_by=cb, ceiling_ok=True)
-        rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL,
+                                               confirmed_by=cb, ceiling_ok=True,
+                                               work_date=data.get("wdate"))
+        rec = service_receipt.receipt(written, failed, odo, _svc_labels_take(chat_id, topic_id),
                                      ledger=_svc_ledger_take(chat_id, topic_id))
         await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
                           text=(f"🐀 Splinter · 📌 {bike}\n"
@@ -11716,12 +11742,95 @@ def _sp_split(s):
     return [k for k in str(s or "").split(",") if k]
 
 
-def _sp_labels_ru(kinds):
-    return ", ".join(_SP_KIND_LABEL.get(k, (k, k))[1] for k in kinds) or "—"
+def _sp_word_kind(w):
+    """Вид, к которому относятся СЛОВА механика (HISTNAMES2510). Правило то же, каким
+    `sp_confirm_from_brain` оформляет вид заявки и каким `card_works.merge` раскладывает слова
+    в «в работе»: живой `_service_kind`, а не узнал (в том числе фраза из нескольких работ с
+    «фильтром» внутри — «заменили моторное масло и топливный фильтр… цепь отрегулировали») —
+    «прочие». Иначе заявка «прочие» с такими словами не нашла бы у себя ни одного слова."""
+    try:
+        return _service_kind(w) or "other"
+    except Exception:
+        return "other"
 
 
-def _sp_labels_th(kinds):
-    return ", ".join(_SP_KIND_LABEL.get(k, (k, k))[0] for k in kinds) or "—"
+def _sp_kind_words(kind, works):
+    """Слова механика ЭТОГО вида — только для безрегистровых видов. Колоночный вид (кол. I/J/K/L)
+    называется своим ярлыком: человек подтверждает ровно тот регистр, который ляжет в Лист1."""
+    if not works or kind in _SP_COL_KINDS:
+        return []
+    return work_name.words_of(kind, works, _sp_word_kind)
+
+
+def _sp_labels_ru(kinds, works=None):
+    """Перечень работ по-русски. С `works` безрегистровый вид называется СЛОВАМИ механика, а не
+    ярлыком: «замена аккумулятора» вместо «прочие работы» (25.10.2026, HISTNAMES2510). Без слов —
+    ярлык, байт-в-байт как прежде."""
+    out = []
+    for k in kinds:
+        mine = _sp_kind_words(k, works)
+        out.extend(mine if mine else [_SP_KIND_LABEL.get(k, (k, k))[1]])
+    return ", ".join(dict.fromkeys(out) if works else out) or "—"
+
+
+def _sp_labels_th(kinds, works=None):
+    """Тайская половина того же перечня: слова механика — через словарь работ `_work_th`."""
+    out = []
+    for k in kinds:
+        mine = _sp_kind_words(k, works)
+        out.extend([_work_th(w) for w in mine] if mine else [_SP_KIND_LABEL.get(k, (k, k))[0]])
+    return ", ".join(dict.fromkeys(out) if works else out) or "—"
+
+
+def _sp_kind_labels(works):
+    """Словарь ярлыков для квитанции (`service_receipt`), где безрегистровый вид со словами
+    назван словами. Квитанция печатает то, что ей дали: модуль квитанции не тронут."""
+    labels = dict(_SP_KIND_LABEL)
+    for k in list(_SP_KIND_LABEL):
+        mine = _sp_kind_words(k, works)
+        if mine:
+            labels[k] = (", ".join(dict.fromkeys(_work_th(w) for w in mine)), ", ".join(mine))
+    return labels
+
+
+def _sp_unnamed_other(done, works):
+    """В сделанном есть «прочие работы», а слов для них нет ни одного — называть в истории нечем."""
+    return "other" in (done or []) and not _sp_kind_words("other", works)
+
+
+def _sp_wdate_from_note(note):
+    """День работы из ноты заявки (сегмент `WDATE:{ГГГГ-ММ-ДД}`), либо ''."""
+    m = _re_pl.search(r"WDATE:\{(\d{4}-\d{2}-\d{2})\}", str(note or ""))
+    return m.group(1) if m else ""
+
+
+def _sp_note_set_wdate(base_note, wdate):
+    """Встроить/обновить ДЕНЬ РАБОТЫ в ноту сегментом `WDATE:{…}`, сохранив прочие сегменты
+    (`WORKS`, `DEBT`, ` | escalated`). Дня нет → нота байт-в-байт прежняя.
+
+    ЗАЧЕМ ОТДЕЛЬНЫЙ СЕГМЕНТ (HISTNAMES2510): строка истории пишется по «да» доверенного, а оно
+    приходит часами и сутками позже самой работы (XADV 3902: работа названа 13.10, «да» — 21.10).
+    День, когда человек назвал работу, кроме ноты заявки не лежит нигде."""
+    d = str(wdate or "").strip()[:10]
+    if not _re_pl.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+        return str(base_note or "")
+    rest = _re_pl.sub(r"WDATE:\{.*?\}\s*\|?\s*", "", str(base_note or "")).strip(" |")
+    seg = "WDATE:{" + d + "}"
+    return (rest + " | " + seg) if rest else seg
+
+
+def _sp_work_date(sp):
+    """День работы заявки: названный (`WDATE`), иначе день рождения заявки, иначе ''."""
+    sp = sp or {}
+    return _sp_wdate_from_note(sp.get("note")) or (
+        str(sp.get("created_at") or "")[:10]
+        if _re_pl.match(r"\d{4}-\d{2}-\d{2}", str(sp.get("created_at") or "")) else "")
+
+
+def _today_utc():
+    """Сегодня по UTC «ГГГГ-ММ-ДД» — тот же счёт дней, что у `msg_date` (`str(msg.date.date())`)."""
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
 
 
 def _is_done_marker(text):
@@ -11841,46 +11950,115 @@ def _sp_open(bridge, chat_id, topic_id, bike):
         return None
 
 
-def msg_sp_intake_ack(bike, kinds):
+def msg_sp_intake_ack(bike, kinds, works=None):
     """Фаза 1: заявка принята — НИЧЕГО не пишем в ТО, ждём «готово»."""
     b = f" · 📌 {bike}" if bike else ""
     return (f"🐀 Splinter{b}\n"
-            f"🇹🇭 ✅ รับเรื่องแล้วครับ: {_sp_labels_th(kinds)} — เริ่มงานได้เลย แล้วแจ้งตอนเสร็จนะครับ\n"
+            f"🇹🇭 ✅ รับเรื่องแล้วครับ: {_sp_labels_th(kinds, works)} — เริ่มงานได้เลย แล้วแจ้งตอนเสร็จนะครับ\n"
             f"{_SEP}\n"
-            f"🇷🇺 ✅ Принял заявку на ТО: {_sp_labels_ru(kinds)}. Отпишись, когда закончишь — тогда зафиксируем.")
+            f"🇷🇺 ✅ Принял заявку на ТО: {_sp_labels_ru(kinds, works)}. Отпишись, когда закончишь — тогда зафиксируем.")
 
 
-def msg_sp_ask_done(bike, declared):
+def msg_sp_ask_done(bike, declared, works=None):
     """Фаза 2 без перечня факта: переспрос механику что сделал/не сделал."""
     b = f" · 📌 {bike}" if bike else ""
     return (f"🐀 Splinter{b}\n"
-            f"🇹🇭 จากที่แจ้งไว้ ({_sp_labels_th(declared)}) — ทำอะไรเสร็จบ้าง อะไรยังครับ? และเลขไมล์ตอนนี้เท่าไหร่?\n"
+            f"🇹🇭 จากที่แจ้งไว้ ({_sp_labels_th(declared, works)}) — ทำอะไรเสร็จบ้าง อะไรยังครับ? และเลขไมล์ตอนนี้เท่าไหร่?\n"
             f"{_SEP}\n"
-            f"🇷🇺 Из заявленного ({_sp_labels_ru(declared)}) — что сделал, что нет? И какой сейчас одометр?")
+            f"🇷🇺 Из заявленного ({_sp_labels_ru(declared, works)}) — что сделал, что нет? И какой сейчас одометр?")
 
 
-def msg_sp_confirm_pym(bike, done, notdone, odo):
-    """Фаза 2: запрос доверенному на подтверждение записи (кнопка)."""
+def msg_sp_ask_works(bike, odo=""):
+    """«Какие работы сделали?» — работа принята, а НАЗВАНИЯ у неё нет (25.10.2026, HISTNAMES2510).
+
+    Прежде такая работа шла Пыму карточкой «Сделано: прочие работы» и ложилась в историю
+    строкой «прочие работы — N км», из которой не узнать ничего (XADV 3902, 21.10). Теперь заявка
+    ждёт названия; пробег, если он уже назван, просим не повторять."""
     b = f" · 📌 {bike}" if bike else ""
-    nd = f"\n🇷🇺 Не сделано: {_sp_labels_ru(notdone)}" if notdone else ""
-    nd_th = f"\n🇹🇭 ยังไม่ได้ทำ: {_sp_labels_th(notdone)}" if notdone else ""
+    odo_s = str(odo or "").strip()
+    th_km = f" (เลขไมล์ {odo_s} กม. รับไว้แล้ว)" if odo_s else " และเลขไมล์ตอนนี้เท่าไหร่?"
+    ru_km = f" (одометр {odo_s} км уже есть)" if odo_s else " И какой сейчас одометр?"
     return (f"🐀 Splinter{b}\n"
-            f"🇹🇭 งาน {bike} เสร็จแล้ว ทำ: {_sp_labels_th(done)}{nd_th}\n"
+            f"🇹🇭 ทำงานอะไรไปบ้างครับ? บอกชื่องานให้หน่อย — จะบันทึกตามนั้น{th_km}\n"
+            f"{_SEP}\n"
+            f"🇷🇺 Какие работы сделали? Назовите словами — так и запишу в историю{ru_km}")
+
+
+def msg_sp_confirm_pym(bike, done, notdone, odo, works=None):
+    """Фаза 2: запрос доверенному на подтверждение записи (кнопка). С `works` безрегистровые
+    работы названы словами механика, а не ярлыком «прочие работы» (HISTNAMES2510)."""
+    b = f" · 📌 {bike}" if bike else ""
+    nd = f"\n🇷🇺 Не сделано: {_sp_labels_ru(notdone, works)}" if notdone else ""
+    nd_th = f"\n🇹🇭 ยังไม่ได้ทำ: {_sp_labels_th(notdone, works)}" if notdone else ""
+    return (f"🐀 Splinter{b}\n"
+            f"🇹🇭 งาน {bike} เสร็จแล้ว ทำ: {_sp_labels_th(done, works)}{nd_th}\n"
             f"🇹🇭 เลขไมล์ {odo} กม. — ถูกไหม? ยืนยันบันทึก? {PYM_HANDLE}\n"
             f"{_SEP}\n"
-            f"🇷🇺 По {bike} работы завершены. Сделано: {_sp_labels_ru(done)}{nd}\n"
+            f"🇷🇺 По {bike} работы завершены. Сделано: {_sp_labels_ru(done, works)}{nd}\n"
             f"🇷🇺 Одометр {odo} км — верно? Подтвердить запись? {PYM_HANDLE} (или пришли правильное число)")
 
 
-async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo):
+#: Пробег, названный при работе БЕЗ названия: заявка ушла ждать «какие работы сделали?», а число
+#: уже есть — переспрашивать его второй раз незачем. Память процесса (как `_SP_ASK_TS`): после
+#: рестарта число спросят ещё раз, и это вся цена.
+_SP_WORKS_ASK = {}
+_SP_WORKS_ASK_TTL_SEC = 48 * 3600
+
+
+async def _sp_ask_works(context, bridge, chat_id, topic_id, bike, declared, done, odo="", note=None):
+    """РАБОТА БЕЗ НАЗВАНИЯ НЕ ИДЁТ НИ В КАРТОЧКУ ПЫМУ, НИ В ИСТОРИЮ (25.10.2026, HISTNAMES2510).
+
+    Заявка остаётся ОТКРЫТОЙ (`ждёт_факт`, сделанное сохранено), механику один раз уходит
+    «какие работы сделали?» (замок повторов вида B + троттл `_sp_ask_ok`). Ответ ведёт
+    `handle_service_result`: слова лягут в ноту, и дальше — обычная кнопка Пыму с названием.
+    В Лист1 и в историю здесь не пишется НИЧЕГО."""
+    _extra = {"note": note} if note else {}
+    bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                  declared=_sp_join(declared or done), done=_sp_join(done),
+                                  status="ждёт_факт", **_extra)
+    odo_s = str(odo or "").strip()
+    if _re_pl.fullmatch(r"\d{3,6}", odo_s):
+        _SP_WORKS_ASK[(chat_id, topic_id)] = {"odo": odo_s, "ts": _time.time()}
+    if _sp_ask_ok(chat_id, topic_id):
+        await _hint_send(context, kind="B", bike=bike, state=("sp_ask_works", done),
+                         chat_id=chat_id, topic_id=topic_id, text=msg_sp_ask_works(bike, odo_s))
+    mark_awaiting(chat_id, topic_id)
+    log.info(f"  → ТО: работа без названия ({bike} done={done} odo={odo_s or '-'}) — в историю и "
+             f"Пыму НЕ идёт, спрашиваю «какие работы сделали?»")
+
+
+def _sp_works_ask_odo(chat_id, topic_id):
+    """Пробег, названный при работе без названия (см. `_SP_WORKS_ASK`), либо ''."""
+    rec = _SP_WORKS_ASK.get((chat_id, topic_id)) or {}
+    if rec and _time.time() - float(rec.get("ts") or 0) < _SP_WORKS_ASK_TTL_SEC:
+        return str(rec.get("odo") or "")
+    return ""
+
+
+async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo,
+                                 works=None, note=None, work_date=""):
     """B1: довести заявку до 'ждёт_подтверждения' и показать кнопку Пыму. Общий хвост фазы-2 —
     зовётся И из текстового ответа (handle_service_result), И из подтверждённого фото-одометра
-    (handle_mileage_confirm). САМ в Лист1 НЕ пишет: запись только по svc:done от доверенного (гейт сохранён)."""
+    (handle_mileage_confirm). САМ в Лист1 НЕ пишет: запись только по svc:done от доверенного (гейт сохранён).
+
+    `works` — дословные слова заявки (называют безрегистровые работы в карточке); не переданы и в
+    сделанном есть безрегистровый вид → читаются из той же заявки. `note` — новая нота, ложится
+    тем же upsert. `work_date` — день работы, едет в токен кнопки (строка истории получит его).
+    «Прочие работы» без единого слова кнопку НЕ получают — уходит «какие работы сделали?»."""
+    if works is None and any(k not in _SP_COL_KINDS for k in done):
+        works = _sp_words_said(bridge, chat_id, topic_id, bike)
+    if _work_name_on() and _sp_unnamed_other(done, works):
+        await _sp_ask_works(context, bridge, chat_id, topic_id, bike, declared, done, odo, note=note)
+        return
+    _SP_WORKS_ASK.pop((chat_id, topic_id), None)
     notdone = [k for k in declared if k not in done]
+    _extra = {"note": note} if note else {}
     bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
-                                  done=_sp_join(done), odometer=str(odo), status="ждёт_подтверждения")
+                                  done=_sp_join(done), odometer=str(odo), status="ждёт_подтверждения",
+                                  **_extra)
     tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike,
-                    "done": done, "odo": str(odo), "kind": "sp_done"})
+                    "done": done, "odo": str(odo), "kind": "sp_done",
+                    "wdate": str(work_date or "") or _today_utc()})
     rows = [[InlineKeyboardButton("✅ ยืนยันบันทึก / Подтвердить запись",
                                   callback_data=f"svc:done:{tok}")]]
     # ТРЕТИЙ ИСХОД (25.08.2026): до него у человека было ровно два — подтвердить всё на ТЕКУЩЕМ
@@ -11892,7 +12070,7 @@ async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, decla
                                           callback_data=f"svc:bodo:{tok2}")])
     kb = InlineKeyboardMarkup(rows)
     await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                text=msg_sp_confirm_pym(bike, done, notdone, odo), reply_markup=kb)
+                text=msg_sp_confirm_pym(bike, done, notdone, odo, works=works), reply_markup=kb)
     mark_awaiting(chat_id, topic_id)
     log.info(f"  → ТО фаза2 → подтверждение Пыму: {bike} done={done} odo={odo} (tok={tok})")
 
@@ -11936,7 +12114,7 @@ async def brain_mileage(context, bridge, chat_id, topic_id, bike, km, msg):
 
 
 async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, km=None,
-                                backdated=False):
+                                backdated=False, said=None, msg_date=""):
     """row12 (аудит 08.07): мозг вызвал set_service в servicing-теме — E2b-гейт запись блокирует,
     но работа НЕ должна теряться молча («Принято» без следа → Инфо молчал про редуктор). Оформляем
     ШТАТНУЮ то_заявку: есть одометр → сразу кнопка Пыму (_sp_advance_to_confirm; запись в Лист1
@@ -11944,7 +12122,18 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
     (B1 довезёт подтверждённым фото-одометром). Инфо-карточка видит заявку в «В работе» (sp_open).
     backdated=True (oil_last_km из set_service): запись задним числом → специальная карточка
     (одометр НЕ трогается), кнопка _write_oil_backdated.
-    Bot Data (то_заявки) = зелёная зона."""
+    Bot Data (то_заявки) = зелёная зона.
+
+    СЛОВА РАБОТЫ ХРАНЯТСЯ (25.10.2026, HISTNAMES2510). Решатель приносит сюда СЛОВА («чистка
+    тормозных цилиндров»), и до этой правки они жили ровно одну строку — до свёртки в вид: ни
+    один upsert заявки их не нёс, и при записи `_sp_words_said` находил пустоту → в историю
+    шло «прочие работы — 29859 км» (XADV 3902, 21.10). Теперь слова ложатся в ноту заявки
+    (`WORKS:{…}`, та же дверь, что у фазы 1) на ОБОИХ путях — с одометром и без, а с ними
+    день, когда их сказали (`WDATE`). Ключ мозга («oil», «wheel_paint») словами не является.
+    `said` — текст сообщения человека: «прочие» без единого слова назовутся им, если это
+    отчёт о работе, а не число, вопрос или план (`work_name.words_from_text`). Не назвались —
+    вместо карточки «Сделано: прочие работы» уходит «какие работы сделали?» (`_sp_ask_works`).
+    `msg_date` — день сообщения (`_msg_date_of`); пусто → сегодня по UTC."""
     # Спецпуть для задним-числом масла из мозга (oil_last_km в set_service). Проверка и ответ —
     # те же, что у прямого перехвата (`_oil_backdated_offer`): до 25.10.2026 этот вход выдавал
     # кнопку Пыму без сверки с кол.I, и кнопка на число ниже записанного была обречена (6334).
@@ -11955,7 +12144,9 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
                                        door="мозг E2b")
             return
 
-    kind = str(kind or "").strip().lower()
+    raw = str(kind or "").strip()
+    kind = raw.lower()
+    words = []
     if kind not in _SP_KIND_LABEL:
         # СЛОВА РАБОТЫ → ВИД (25.10.2026). Мозг кладёт сюда ключ («oil»), а решатель — слова
         # («замена масла»), и слова молча становились «прочими работами»: три карточки «Сделано:
@@ -11963,15 +12154,41 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
         # классификатор, что у перечней заявки и факта; не узнал — «прочие», как было.
         _k = _service_kind(kind) if kind else ""
         kind = _k if _k in _SP_KIND_LABEL else "other"
+        # Слова человека — кириллица или тайский; латинский ключ мозга («wheel_paint») словами
+        # не считается: в историю ушло бы имя переменной.
+        if _re_pl.search(r"[а-яёА-ЯЁ฀-๿]", raw):
+            words = [raw]
     sp = _sp_open(bridge, chat_id, topic_id, bike) or {}
+    if (kind == "other" and not words and _work_name_on()
+            and not _sp_kind_words("other", _sp_works_from_note(sp.get("note")))):
+        # Слов от решателя/мозга нет и в заявке «прочие» ещё не названы → слова самого
+        # сообщения, но ТОЛЬКО если они называют «прочие»: фраза другого вида вид заявки не меняет
+        # (иначе «масло в норме» стало бы заменой масла — ровно тот класс, что закрыт E2BMILEAGE2510).
+        _cand = work_name.words_from_text(said)
+        if _cand and _sp_word_kind(_cand[0]) == "other":
+            words = _cand
+            log.info(f"  → E2b-заявка: «прочие» названы словами сообщения: {words[0]!r}")
     declared = _sp_merge_done(_sp_split(sp.get("declared")), [kind])
     done = _sp_merge_done(_sp_split(sp.get("done")), [kind])
     odo = str(km or "").strip().replace(" ", "").replace(",", "")
     if not _re_pl.fullmatch(r"\d{3,6}", odo):
         odo = ""
+    _wd = str(msg_date or "")[:10] or _today_utc()
+    note = None
+    if words:
+        note = _sp_note_set_wdate(_sp_note_set_works(sp.get("note"), words), _wd)
+    work_date = _wd if words else (_sp_work_date(sp) or _wd)
+    all_words = _sp_works_from_note(note if note is not None else sp.get("note"))
     # Заявка уже ждёт Пыма с этой работой (и тем же одометром) → кнопку не дублируем.
     if (str(sp.get("status")) == "ждёт_подтверждения" and kind in _sp_split(sp.get("done"))
             and (not odo or str(sp.get("odometer") or "") == odo)):
+        if note and note != str(sp.get("note") or ""):
+            # Кнопку не дублируем, но слова не теряем: запись по уже висящей кнопке их найдёт.
+            try:
+                bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                              bike=bike, note=note)
+            except Exception:
+                log.exception("  → E2b-заявка: слова работы в ноту не легли")
         log.info(f"  → E2b-заявка: {bike} {kind} уже ждёт подтверждения — не дублирую")
         return
     if odo:
@@ -11987,17 +12204,25 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
                     )
             except (ValueError, TypeError):
                 pass
-        await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo)
+        await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo,
+                                     works=all_words, note=note, work_date=work_date)
         return
+    if _work_name_on() and _sp_unnamed_other(done, all_words):
+        # Без одометра и без названия: спрашиваем сразу и то и другое ОДНИМ сообщением.
+        await _sp_ask_works(context, bridge, chat_id, topic_id, bike, declared, done, "", note=note)
+        return
+    _extra = {"note": note} if note else {}
     bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
-                                  declared=_sp_join(declared), done=_sp_join(done), status="ждёт_факт")
+                                  declared=_sp_join(declared), done=_sp_join(done), status="ждёт_факт",
+                                  **_extra)
     if _sp_ask_ok(chat_id, topic_id):
         # ЗАМОК ПОВТОРОВ (вид A3). Состояние = перечень сделанного по заявке из мозга.
         await _hint_send(context, kind="A3", bike=bike, state=("e2b_ask_odo", done),
                          chat_id=chat_id, topic_id=topic_id,
-                         text=msg_ask_odometer(bike, kinds=done))
+                         text=msg_ask_odometer(bike, kinds=done, works=all_words))
     mark_awaiting(chat_id, topic_id)
-    log.info(f"  → E2b-заявка без одометра: {bike} {kind} → ждёт_факт")
+    log.info(f"  → E2b-заявка без одометра: {bike} {kind} → ждёт_факт"
+             + (f" (слова: {words})" if words else ""))
 
 
 async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declared, works_raw=None):
@@ -12018,7 +12243,7 @@ async def service_phase1_intake(context, bridge, chat_id, topic_id, bike, declar
     except Exception:
         log.exception("  → service_pending_upsert (фаза1) упал")
     await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                text=msg_sp_intake_ack(bike, declared))
+                text=msg_sp_intake_ack(bike, declared, works=works_raw))
     mark_awaiting(chat_id, topic_id)
     log.info(f"  → ТО фаза1: заявка {bike} declared={declared}")
 
@@ -12152,7 +12377,8 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             # ветка истории не спрашивала мост второй раз о том же самом.
             written, failed = await _sp_write_done(context, bridge, chat_id, topic_id, bike, done,
                                                    m.group(1), confirmed_by=cb,
-                                                   works=_sp_works_from_note(sp.get("note")))
+                                                   works=_sp_works_from_note(sp.get("note")),
+                                                   work_date=_sp_work_date(sp))
             # ДВЕРЬ 2 (голое число доверенного) — тот же выход, что у кнопки. Именно эта дверь
             # 14.08 случайно записала ВЕРНОЕ число там, где кнопка записала бы 367474.
             if _sp_ceiling_asked(failed):
@@ -12161,7 +12387,7 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
                 return True
             # ТА ЖЕ дверь, что у кнопки: здесь до 14.08 БЕЗУСЛОВНЫ были ОБЕ половины, а отказ
             # дописывался хвостом только по-русски — тайская молчала о нём вовсе.
-            rec = service_receipt.receipt(written, failed, m.group(1), _SP_KIND_LABEL,
+            rec = service_receipt.receipt(written, failed, m.group(1), _svc_labels_take(chat_id, topic_id),
                                          ledger=_svc_ledger_take(chat_id, topic_id))
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                         text=(f"🐀 Splinter · 📌 {bike}\n"
@@ -12187,16 +12413,25 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     if not odo:
         m = _re_pl.search(r"\b(\d{4,6})\b", str(text or ""))
         odo = m.group(1) if m else ""
-    # Z4: дословные работы из ответа → в note (для правдивой карточки «в работе»). Отдельный upsert по note;
-    # последующие upsert'ы статуса/done не передают note → pick('note') сохранит этот сегмент. Зелёная (Bot Data).
-    if works:
-        try:
-            bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
-                                          note=_sp_note_set_works(sp.get("note"), works))
-        except Exception:
-            log.exception("  → Z4 запись дословных работ в note упала")
     # B2: естественный маркер завершения (закончил/готово/да/เสร็จแล้ว/…), не только всё/เสร็จหมด.
     completed = _is_done_marker(text)
+    # Z4: дословные работы из ответа → в note (для правдивой карточки «в работе»). Отдельный upsert по note;
+    # последующие upsert'ы статуса/done не передают note → pick('note') сохранит этот сегмент. Зелёная (Bot Data).
+    # ДЕНЬ РАБОТЫ (HISTNAMES2510): отчёт о сделанном (слова или «готово») кладёт в ту же ноту день
+    # сообщения — строка истории получит его, сколько бы ни ждала «да» доверенного.
+    _day = _msg_date_of(msg) or _today_utc()
+    stored_works = _sp_works_from_note(sp.get("note"))
+    if works or completed:
+        _note_new = _sp_note_set_wdate(_sp_note_set_works(sp.get("note"), works) if works
+                                       else sp.get("note"), _day)
+        if _note_new != str(sp.get("note") or ""):
+            try:
+                bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
+                                              bike=bike, note=_note_new)
+            except Exception:
+                log.exception("  → Z4 запись дословных работ в note упала")
+    said_works = _sp_works_from_note(_sp_note_set_works(sp.get("note"), works)) if works else stored_works
+    work_date = _day if (works or completed) else (_sp_work_date(sp) or _day)
     # E4(b): видимость фазы-2 (закрываем слепое пятно — раньше переспросы были не видны в логе).
     log.info(f"  → ТО фаза2 разбор: status={status} works={works} done={done} odo={odo or '-'} "
              f"completed={completed} text={str(text)[:50]!r}")
@@ -12206,6 +12441,20 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
         named_declared = [k for k in done if k in declared]
         if not named_declared:
             done = _sp_merge_done(declared, done)
+    # ОТВЕТ НА «КАКИЕ РАБОТЫ СДЕЛАЛИ?» (HISTNAMES2510). «Прочие» без единого слова — это место
+    # под работу, у которой нет названия. Ответ назвал работы другого вида («чистка тормозных
+    # цилиндров» → колодки) → место отдаётся им, а не остаётся висеть рядом безымянным: иначе
+    # та же работа ушла бы Пыму дважды — названной и «прочими работами».
+    if (works and _work_name_on() and _sp_unnamed_other(done, said_works)
+            and any(k != "other" for k in done)):
+        done = [k for k in done if k != "other"]
+        declared = [k for k in declared if k != "other"] or list(done)
+        try:
+            bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
+                                          declared=_sp_join(declared), done=_sp_join(done))
+        except Exception:
+            log.exception("  → место «прочих» без названия не снялось")
+        log.info(f"  → ТО фаза2: «прочие» без названия отданы названным работам {works} ({bike})")
     # Нет ни перечня факта, ни маркера завершения → переспрашиваем механика (E4(a): троттл — не на каждое сообщение).
     if not done and not completed:
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
@@ -12217,7 +12466,7 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             await _hint_send(context, kind="B", bike=bike,
                              state=("sp_ask_done", declared, "ждёт_факт"),
                              chat_id=chat_id, topic_id=topic_id,
-                             text=msg_sp_ask_done(bike, declared))
+                             text=msg_sp_ask_done(bike, declared, works=stored_works))
             log.info("  → ТО фаза2: переспрос «что сделал»")
         else:
             log.info("  → ТО фаза2: переспрос «что сделал» ПОДАВЛЕН (троттл E4)")
@@ -12235,6 +12484,15 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             odo = _known["km"]
             log.info(f"  → ТО фаза2: переспрос одометра НЕ нужен — {_known['why']} ({bike})")
     if not odo:
+        # Пробег уже назвали вместе с работой без названия (`_sp_ask_works`) — второй раз не просим.
+        odo = _sp_works_ask_odo(chat_id, topic_id)
+        if odo:
+            log.info(f"  → ТО фаза2: одометр {odo} назван при работе без названия — не переспрашиваю")
+    if not odo and _work_name_on() and _sp_unnamed_other(done, said_works):
+        # Нет ни пробега, ни названия у «прочих» — один вопрос сразу о том и другом.
+        await _sp_ask_works(context, bridge, chat_id, topic_id, bike, declared, done, "")
+        return True
+    if not odo:
         # факт есть, пробега в ТЕКСТЕ нет → просим одометр; фото-одометр доведёт заявку через
         # handle_mileage_confirm (B1) — в статусе ждёт_факт. done сохраняем в строке заявки.
         bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""),
@@ -12245,14 +12503,16 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             await _hint_send(context, kind="A2", bike=bike,
                              state=("sp_ask_odo", (done or declared), "ждёт_факт"),
                              chat_id=chat_id, topic_id=topic_id,
-                             text=msg_ask_odometer(bike, kinds=(done or declared)))   # (b) текст по факту работ заявки
+                             text=msg_ask_odometer(bike, kinds=(done or declared),
+                                                   works=said_works))   # (b) текст по факту работ заявки
             log.info("  → ТО фаза2: переспрос одометра")
         else:
             log.info("  → ТО фаза2: переспрос одометра ПОДАВЛЕН (троттл E4)")
         mark_awaiting(chat_id, topic_id)
         return True
     # B1 (общий хвост): довести до 'ждёт_подтверждения' + кнопка Пыму (запись только по его «да»).
-    await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo)
+    await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, declared, done, odo,
+                                 works=said_works, work_date=work_date)
     return True
 
 
@@ -12296,9 +12556,10 @@ def _odo_ceiling_limit():
     return odo_ceiling.parse_limit(_os.getenv(odo_ceiling.LIMIT_ENV))
 
 
-async def _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_int):
+async def _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_int, work_date=""):
     """РУКИ верхней границы: спросить прибор о текущем пробеге и, если разрыв вверх больше порога,
     НЕ писать, а переспросить кнопкой. True = запись остановлена (вопрос уже отправлен).
+    `work_date` — день работы: едет в токен, чтобы запись по «да, число верное» его не потеряла.
 
     FAIL-SAFE В СТОРОНУ ЗАПИСИ, симметрично нижней границе: `_ask_mileage_confirm` при неизвестном
     прежнем числе floor не ставит и пропускает запись — здесь так же. Молчание моста не повод
@@ -12315,7 +12576,8 @@ async def _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_i
         log.warning(f"  🔒 верхняя граница {bike or '?'}: {odo_ceiling.say(v)}")
         tok = _svc_put({"kind": "codo", "chat": chat_id, "topic": topic_id, "bike": bike or "",
                         "done": list(done or []), "odo": str(odo_int),
-                        "cur": str(v.get("cur") or ""), "gap": str(v.get("gap") or "")})
+                        "cur": str(v.get("cur") or ""), "gap": str(v.get("gap") or ""),
+                        "wdate": str(work_date or "")})
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ ใช่ เลขถูกต้อง / Да, число верное",
                                  callback_data=f"svc:codo:{tok}"),
@@ -12370,6 +12632,19 @@ def _svc_ledger_take(chat_id, topic_id):
     return _SVC_LEDGER.pop((chat_id, topic_id), None)
 
 
+#: Слова механика, которыми `_sp_write_done` называл работы в истории, — для квитанции той же
+#: двери (тот же приём накопителя, что у `_SVC_LEDGER`). Квитанция говорит теми же словами, что
+#: легли в таблицу, а не «✅ Записано: прочие работы» (HISTNAMES2510).
+_SVC_SAID = {}
+
+
+def _svc_labels_take(chat_id, topic_id):
+    """Словарь ярлыков квитанции со словами механика; забирается РОВНО ОДИН РАЗ. Слов не было
+    (колоночная партия, слова не читались) → прежний словарь `_SP_KIND_LABEL` байт-в-байт."""
+    said = _SVC_SAID.pop((chat_id, topic_id), None)
+    return _sp_kind_labels(said) if said else _SP_KIND_LABEL
+
+
 def _sp_ledger_note(chat_id, topic_id, done, written, failed, info_written, info_lost,
                     expanded=()):
     """СТОРОЖ ПАРТИИ (класс 22.08.2026): принято N · записано M, и каждая потеря — поимённо.
@@ -12410,11 +12685,18 @@ def _sp_ledger_note(chat_id, topic_id, done, written, failed, info_written, info
 
 
 async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, confirmed_by="",
-                         ceiling_ok=False, works=None):
+                         ceiling_ok=False, works=None, work_date=None):
     """ШАГ 5 (КРАСНЫЙ): по «да» доверенного пишем СДЕЛАННЫЕ позиции. Сторож km_decreasing НЕ трогаем
     (он на стороне set_fleet_*). Каждая колоночная позиция: set_fleet_* (кол.I/J/K/L, confirmed=True)
     + service_upsert (синк «обслуживание» — закрывает разрыв _write_oil→обслуживание). Прочее → событие.
     Возвращает (written:list, failed:list).
+
+    ДЕНЬ РАБОТЫ И «ПРОЧИЕ» БЕЗ СЛОВ (25.10.2026, HISTNAMES2510). `work_date` — день, когда работу
+    назвали (нота заявки `WDATE`, токен кнопки); нет → сегодня по UTC. Он ложится в `msg_date`
+    строки истории и хвостом « · ДД.ММ.ГГГГ» после километров. «Прочие работы», для которых нет
+    НИ ОДНОГО слова, в историю НЕ пишутся ярлыком: позиция остаётся открытой заявкой, механику
+    уходит «какие работы сделали?» (`_sp_ask_works`), а строку положит следующая кнопка Пыма —
+    уже со словами. Ручка `WORK_NAME=0` возвращает прежний ярлык байт-в-байт.
 
     ВЕРХНЯЯ ГРАНИЦА ПРОБЕГА СТОИТ ЗДЕСЬ, А НЕ В ДВЕРЯХ (14.08.2026). Дверей записи две — кнопка
     Пыма (`handle_service_button`, ветка `done`) и голое число доверенного (`handle_service_result`,
@@ -12428,8 +12710,10 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
         odo_int = int(str(odo).replace(" ", "").replace(",", ""))
     except (ValueError, TypeError):
         return [], [("odo", "bad_odometer")]
+    _wd = str(work_date or "")[:10] or _today_utc()
     if not ceiling_ok:
-        stop = await _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_int)
+        stop = await _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_int,
+                                      work_date=_wd)
         if stop:
             return [], [("odo", odo_ceiling.ERR)]
     written, failed = [], []
@@ -12439,6 +12723,7 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     # разошлись на именованные работы: сторож обязан считать ИХ, а не вид целиком, иначе пятёрка
     # работ дала бы «принято 1» и потеря четырёх осталась бы невидимой.
     named_rows, named_lost, expanded = [], [], []
+    parked = []                      # «прочие» без единого слова: не пишутся, ждут названия
     for k in done:
         try:
             if k in _SP_COL_KINDS:
@@ -12516,16 +12801,14 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                 # (`info:{plate}:{ключ-работы}:{км}`), поэтому забор идемпотентности из шапки
                 # `work_name` цел: та же работа ДРУГИМИ словами даёт тот же `_work_key` → ту же
                 # строку, а РАЗНЫЕ работы — разные ключи → разные строки.
-                _mine = work_name.words_of(k, said, _service_kind) if _on else []
+                # Вид слов судится `_sp_word_kind` — тем же правилом, каким оформлена заявка: фраза,
+                # которую `_service_kind` не узнал, принадлежит «прочим» (HISTNAMES2510).
+                _mine = work_name.words_of(k, said, _sp_word_kind) if _on else []
                 if _mine:
                     _iw_fail = []
-                    try:
-                        import datetime as _dt
-                        _dnow = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
-                    except Exception:
-                        _dnow = ""   # даты нет → строка всё равно ложится (у неё есть recorded_at)
+                    # ДЕНЬ РАБОТЫ, а не день «да» (HISTNAMES2510): прежде здесь стояло СЕГОДНЯ по UTC.
                     _iw_ok = _write_info_works(bridge, "обслуживание", topic_id, bike, _mine,
-                                               odo_int, "", msg_date=_dnow, chat_id=chat_id,
+                                               odo_int, "", msg_date=_wd, chat_id=chat_id,
                                                failed_out=_iw_fail,
                                                sender=str(confirmed_by or ""))
                     named_rows.extend(_iw_ok)
@@ -12537,14 +12820,22 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
                         written.append(k)
                     else:
                         failed.append((k, "history_write_failed"))
+                elif _on and k == "other":
+                    # «ПРОЧИЕ РАБОТЫ» БЕЗ ЕДИНОГО СЛОВА В ИСТОРИЮ НЕ ИДУТ (25.10.2026, HISTNAMES2510).
+                    # Строка «прочие работы — 29859 км» (XADV 3902, 21.10) не говорит, ЧТО сделано,
+                    # — а это единственное, ради чего её читают. Позиция не пишется и не считается
+                    # потерянной: заявка остаётся открытой и ждёт названия (ниже, `_sp_ask_works`).
+                    parked.append(k)
+                    log.warning(f"  → история ТО {bike}: «прочие работы» без названия — строку НЕ "
+                                f"пишу, спрашиваю «какие работы сделали?» (odo={odo_int})")
                 else:
                     # Слов этого вида механик не сказал вовсе (вид опознан сканом свободного
-                    # текста) — ярлык, БАЙТ-В-БАЙТ прежняя строка и прежний ключ. Ярлык здесь не
-                    # подменяет слова: подменять нечего, а «прочие работы» называют себя
-                    # КАТЕГОРИЕЙ и никого за название не выдают (см. шапку `work_name`).
-                    v = work_name.history_note(k, said, odo_int, _SP_KIND_LABEL, _service_kind,
-                                               on=_on)
-                    bridge.add_event(group="обслуживание" + (f" / тема {topic_id}" if topic_id else ""),
+                    # текста) — ярлык вида, прежний ключ. У безрегистровых видов ярлык и есть имя
+                    # работы («тормозные колодки», «цепь»); с 25.10.2026 к нему добавлен день работы.
+                    v = work_name.history_note(k, said, odo_int, _SP_KIND_LABEL, _sp_word_kind,
+                                               on=_on, date=(_wd if _on else ""))
+                    bridge.add_event(msg_date=_wd,
+                                     group="обслуживание" + (f" / тема {topic_id}" if topic_id else ""),
                                      bike=bike, event_type="repair", mileage=str(odo_int),
                                      notes=v["text"], sender=str(confirmed_by or ""),
                                      msg_id=f"sp:{chat_id}:{topic_id}:{k}:{odo_int}")
@@ -12560,15 +12851,19 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     # писалось в регистры. Логика выгрузки одна на все три двери — `_km_door`.
     _info_written, _info_lost = _km_door(bridge, chat_id, topic_id, bike, odo_int,
                                          source=f"фаза 2 ({confirmed_by or 'trusted'})")
+    # «Прочие» без названия партией этой двери НЕ считаются: их не писали и не теряли — они ждут
+    # слов в открытой заявке. Сторож и закрытие видят ровно то, что дверь пыталась записать.
+    _batch = [k for k in done if k not in parked]
     # СТОРОЖ ПАРТИИ: принято N · записано M. Расходятся — квитанция назовёт каждую потерю.
     # Строки истории этой двери подмешиваются к работам буфера ТЕМ ЖЕ составом: у сторожа
     # позиция — РАБОТА, и происхождение работы (буфер или прямая дверь) на счёт не влияет.
     try:
-        _sp_ledger_note(chat_id, topic_id, done, written, failed,
+        _sp_ledger_note(chat_id, topic_id, _batch, written, failed,
                         list(_info_written) + named_rows, list(_info_lost) + named_lost,
                         expanded=expanded)
     except Exception:
         log.exception("  → сторож партии сбоил (квитанция уйдёт прежней)")
+    _SVC_SAID[(chat_id, topic_id)] = list(said or [])
     _tok = _svc_undo_remember(chat_id, topic_id, bike, plate, confirmed_by, odo_int,
                               undo_pos, undo_blind)
     if _tok:
@@ -12583,7 +12878,7 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     # самой заявки: «не сделано» ей законный исход, а не незакрытый хвост.
     # Ветка `else` — ОТКАТ (`SERVICE_DEBT=0`), прежний путь байт-в-байт, а не вторая дверь.
     if _service_debt_on():
-        _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=list(written), batch=list(done),
+        _sp_debt_close(bridge, chat_id, topic_id, bike, kinds=list(written), batch=list(_batch),
                        odometer=odo_int, row_terminal=True,
                        write={"landed": bool(written), "known": True,
                               "detail": (f"фаза 2 ({confirmed_by or 'trusted'}): записано "
@@ -12600,6 +12895,13 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): что легло в ТО по «да». Не бросает.
     feed_record(chat_id, topic_id, "ТО записано", km=str(odo_int), done=list(written),
                 failed=[k for k, _e in failed], source=f"фаза 2 {confirmed_by or ''}".strip(), bike=bike)
+    if parked:
+        # Заявка на безымянную работу ОСТАЁТСЯ ОТКРЫТОЙ (после закрытия партии выше — новая строка
+        # `ждёт_факт`), пробег запомнен, вопрос уходит один раз. Сбой здесь записи не отменяет.
+        try:
+            await _sp_ask_works(context, bridge, chat_id, topic_id, bike, parked, parked, odo_int)
+        except Exception:
+            log.exception("  → «какие работы сделали?» после записи не ушло")
     return written, failed
 
 
@@ -12612,12 +12914,13 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
     нет, и текст выходил «Заявка на ТО (—) висит 7ч» (тема 13072, 21.10). Замок повторов по-прежнему
     судит по `declared` — меняется только подпись."""
     lk = label_kinds or declared
+    _lw = _sp_works_from_note(note)       # слова заявки называют безрегистровые работы (HISTNAMES2510)
     # единицы времени по языку: 🇹🇭 «ชม.» (без кириллицы), 🇷🇺 «ч»
     age_ru = f"{int(age_h)}ч" if age_h is not None else "долго"
     age_th = f"{int(age_h)} ชม." if age_h is not None else "นาน"
     try:
         import notify
-        notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(lk)}) — заявка открыта {age_ru} без закрытия. "
+        notify.notify(f"🔧 ТО завис: {bike} ({_sp_labels_ru(lk, _lw)}) — заявка открыта {age_ru} без закрытия. "
                       f"Глянь/закрой вручную или дожми подтверждение.", force=True)   # боевой прод-алерт
     except Exception:
         log.exception("  → B4 эскалация владельцу (notify) упала")
@@ -12629,9 +12932,9 @@ async def _sp_escalate_stuck(context, bridge, chat_id, topic_id, bike, declared,
                          state=("sp_escalate", declared),
                          chat_id=int(chat_id), topic_id=(int(topic_id) if topic_id else None),
                          text=(f"🐀 Splinter · 📌 {bike}\n"
-                               f"🇹🇭 ⚠️ งานเซอร์วิส ({_sp_labels_th(lk)}) ค้างนาน {age_th} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
+                               f"🇹🇭 ⚠️ งานเซอร์วิส ({_sp_labels_th(lk, _lw)}) ค้างนาน {age_th} ยังไม่ปิด — {PYM_HANDLE} ช่วยปิด/ยืนยันหน่อยครับ 🙏\n"
                                f"{_SEP}\n"
-                               f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(lk)}) висит {age_ru} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
+                               f"🇷🇺 ⚠️ Заявка на ТО ({_sp_labels_ru(lk, _lw)}) висит {age_ru} без закрытия — {PYM_HANDLE}, закрой/подтверди вручную 🙏"))
     except Exception:
         log.exception(f"  → B4 эскалация в тему {bike} упала")
     try:
@@ -12705,10 +13008,10 @@ async def _sp_debt_voice(context, bridge, it, now):
                         chat_id=int(chat_id),
                         topic_id=(int(topic_id) if topic_id else None),
                         text=(f"🐀 Splinter · 📌 {bike}\n"
-                              f"🇹🇭 ⏳ งาน ({_sp_labels_th(done)}) ทำแล้วแต่ยังไม่ได้กดยืนยัน {_age_th} — "
+                              f"🇹🇭 ⏳ งาน ({_sp_labels_th(done, _sp_works_from_note(note))}) ทำแล้วแต่ยังไม่ได้กดยืนยัน {_age_th} — "
                               f"{PYM_HANDLE}/เจ้าของ กดปุ่มยืนยันหน่อยครับ 🙏\n"
                               f"{_SEP}\n"
-                              f"🇷🇺 ⏳ Работа ({_sp_labels_ru(done)}) сделана, но кнопку подтверждения "
+                              f"🇷🇺 ⏳ Работа ({_sp_labels_ru(done, _sp_works_from_note(note))}) сделана, но кнопку подтверждения "
                               f"не нажали {_age_ru} — {PYM_HANDLE}/владелец, подтвердите 🙏")) is HINT_SKIPPED:
         return
     _SP_LAST_SENT[_k] = now
@@ -12800,9 +13103,9 @@ async def scheduled_service_pending_reminder(context, bridge):
                                 chat_id=int(chat_id),
                                 topic_id=(int(topic_id) if topic_id else None),
                                 text=(f"🐀 Splinter · 📌 {bike}\n"
-                                      f"🇹🇭 ⏳ {bike} แจ้งเข้าเซอร์วิส ({_sp_labels_th(_lk)}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
+                                      f"🇹🇭 ⏳ {bike} แจ้งเข้าเซอร์วิส ({_sp_labels_th(_lk, _sp_works_from_note(note))}) แต่ยังไม่แจ้งผล — เสร็จหรือยังครับ?\n"
                                       f"{_SEP}\n"
-                                      f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(_lk)}), результат не отписан — закончили?")) is HINT_SKIPPED:
+                                      f"🇷🇺 ⏳ {bike} на ТО ({_sp_labels_ru(_lk, _sp_works_from_note(note))}), результат не отписан — закончили?")) is HINT_SKIPPED:
                 continue        # повтор подавлен → ни отметки времени, ни записи в заявку
             _SP_LAST_SENT[_k] = now
             bridge.service_pending_upsert(chat_id=str(chat_id), topic_id=str(topic_id or ""), bike=bike,
@@ -13675,7 +13978,10 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
                             log.info(f"  → «принял работы — пришли пробег» НЕ нужен — "
                                      f"{_known['why']} ({bike})")
                             await _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike,
-                                                         _decl_all, _done_all, _known["km"])
+                                                         _decl_all, _done_all, _known["km"],
+                                                         works=_sp_works_from_note(_sp0.get("note")),
+                                                         work_date=(_sp_work_date(_sp0)
+                                                                    or _msg_date_of(msg)))
                             return
                     except Exception:
                         log.exception("  → короткий путь по своему одометру не удался "

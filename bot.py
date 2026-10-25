@@ -792,9 +792,14 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
                     await splinter.brain_mileage(context, bridge, chat_id, _topic, force_bike,
                                                  it.get("km"), msg)
                     continue
+                # Текст человека и день сообщения — чтобы безымянные «прочие» назвались его
+                # словами, а строка истории получила день работы (HISTNAMES2510).
                 await splinter.sp_confirm_from_brain(context, bridge, chat_id, _topic, force_bike,
                                                      it.get("kind"), it.get("km"),
-                                                     it.get("backdated", False))
+                                                     it.get("backdated", False),
+                                                     said=(getattr(msg, "text", None)
+                                                           or getattr(msg, "caption", None)),
+                                                     msg_date=splinter._msg_date_of(msg))
             except Exception as e:
                 log.warning(f"  → заявка из E2b-блока не оформилась: {e}")
         claude.pending_service_confirm = []

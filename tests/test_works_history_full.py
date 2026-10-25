@@ -135,6 +135,15 @@ def notes_of(bus):
     return [r.get("notes") for r in bus.rows]
 
 
+#: С 25.10.2026 (HISTNAMES2510) у строки истории после км стоит день работы « · ДД.ММ.ГГГГ».
+#: `run` дня работы не передаёт → день записи по UTC. Голдены ниже несут его явно.
+DAY = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%d.%m.%Y")
+
+
+def row_note(work):
+    return f"{work} — {ODO} км · {DAY}"
+
+
 # ============================================================
 print("(1) АДРЕС: история идёт в «события», Лист1 в этой ветке не зовётся вовсе")
 # ============================================================
@@ -155,7 +164,7 @@ b = FakeBus()
 written, failed = run(b, ["oil", "other"], works=["замена моторного масла", "замена аккумулятора"])
 check("обе позиции получили исход", set(written) == {"oil", "other"} and not failed)
 check("регистровая ушла в Лист1", [n for n, _ in b.sheet1] == ["set_fleet_oil"])
-check("безрегистровая ушла в историю", notes_of(b) == [f"замена аккумулятора — {ODO} км"])
+check("безрегистровая ушла в историю", notes_of(b) == [row_note("замена аккумулятора")])
 check("слова чужого вида в чужую строку не попали",
       "масл" not in (notes_of(b)[0] or ""))
 
@@ -166,7 +175,9 @@ b = FakeBus()
 run(b, ["other"], works=["замена лампы ближнего света"])
 row = b.rows[0]
 check("пробег в строке", row.get("mileage") == str(ODO))
-check("слова человека в строке", row.get("notes") == f"замена лампы ближнего света — {ODO} км")
+check("слова человека в строке", row.get("notes") == row_note("замена лампы ближнего света"))
+check("день в строке совпадает с msg_date той же строки (один день, два места)",
+      str(row.get("notes")).endswith(" · " + ".".join(reversed(str(row.get("msg_date")).split("-")))))
 check("дата проставлена (YYYY-MM-DD)",
       len(str(row.get("msg_date") or "")) == 10 and str(row.get("msg_date"))[4] == "-")
 check("ярлык вида слова НЕ подменил", "прочие работы" not in str(row.get("notes")))
@@ -189,7 +200,7 @@ check("шина регистра НЕ получает (её адрес — ис
 b = FakeBus()
 run(b, ["tyre"], works=["замена передней шины"])
 check("шина легла историей своими словами",
-      notes_of(b) == [f"замена передней шины — {ODO} км"] and b.sheet1 == [])
+      notes_of(b) == [row_note("замена передней шины")] and b.sheet1 == [])
 check("перед/зад у шины — РАЗНЫЕ работы (уточнитель в ключе)",
       S._work_key("передняя шина") != S._work_key("задняя шина"))
 
@@ -204,7 +215,7 @@ b = FakeBus()
 written, failed = run(b, ["other"], works=FIVE)
 check("ПЯТЬ строк, не одна", len(b.rows) == 5)
 check("каждая строка несёт СВОЮ работу",
-      sorted(notes_of(b)) == sorted(f"{w} — {ODO} км" for w in FIVE))
+      sorted(notes_of(b)) == sorted(row_note(w) for w in FIVE))
 check("ключи строк РАЗНЫЕ (иначе мост схлопнул бы их в одну)",
       len({r.get("msg_id") for r in b.rows}) == 5)
 check("склейки «; » больше нет ни в одной строке",

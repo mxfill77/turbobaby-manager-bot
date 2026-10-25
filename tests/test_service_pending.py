@@ -215,7 +215,11 @@ def test_b3_bare_done_means_declared():
 # B1: подтверждённый ФОТО-одометр доводит заявку до подтверждения Пыму (запись — по гейту)
 def test_b1_photo_odometer_advances():
     reset(); S._SP_LAST_SENT.clear(); S._PENDING_MILEAGE.clear()
-    b = FakeBridge(); b.sp = {"declared": "pads", "done": "pads,other", "status": "ждёт_факт", "odometer": "", "bike": BIKE}
+    # Фикстура несёт слова «прочих» в ноте — так строку кладёт живая фаза 2 (B3 выше: «подшипник»
+    # → other + `WORKS:{…}`). С 25.10.2026 (HISTNAMES2510) «прочие» БЕЗ слов кнопку Пыму не получают:
+    # уходит «какие работы сделали?»; этот случай судит tests/test_history_names.py.
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "pads,other", "status": "ждёт_факт", "odometer": "", "bike": BIKE,
+                              "note": S._sp_note_set_works("", ["подшипник переднего колеса"])}
     S._PENDING_MILEAGE[(CHAT, TOPIC)] = ("24302", BIKE, None, False)
     handled = run(S.handle_mileage_confirm(Msg("да"), context=None, bridge=b, text="да"))
     assert handled is True
@@ -326,7 +330,9 @@ def test_e3_kind_validation():
 def test_e3_write_done_no_false_oil():
     # E3(d): done=[pads,other] → 2 события, set_fleet_oil НЕ зван (в кол I не пишем не-регламент).
     reset()
-    b = FakeBridge(); b.sp = {"declared": "pads", "done": "pads,other", "status": "ждёт_подтверждения", "odometer": "24302"}
+    # Слова «прочих» в ноте — как у живой фазы 2 (HISTNAMES2510: «прочие» без слов в историю не идут).
+    b = FakeBridge(); b.sp = {"declared": "pads", "done": "pads,other", "status": "ждёт_подтверждения", "odometer": "24302",
+                              "note": S._sp_note_set_works("", ["подшипник переднего колеса"])}
     written, failed = run(S._sp_write_done(None, b, CHAT, TOPIC, BIKE, ["pads", "other"], "24302", confirmed_by="@Pleummmm"))
     assert len(b.events) == 2, f"pads+other → 2 события, а {len(b.events)}"
     assert not b.oil_calls and not b.svc_calls, "set_fleet_* НЕ зван (только события)"
@@ -374,7 +380,11 @@ def test_ask_odometer_in_phase2_names_works_not_oil():
                                 claude=FakeClaude({"works": ["замена колодок"], "mileage": ""}), text="колодки заменил"))
     asks = [s for s in SENDS if "пробег" in s.lower() or "ODO" in s]
     assert asks, "переспрос одометра отправлен"
-    assert "тормозные колодки" in asks[-1] and "Вижу замену масла" not in asks[-1], asks[-1]
+    # ГОЛДЕН ПЕРЕВЁРНУТ 25.10.2026 (HISTNAMES2510): безрегистровая работа называется СЛОВАМИ
+    # механика («замена колодок»), а не ярлыком вида «тормозные колодки». Предмет теста цел —
+    # переспрос называет работы заявки, а не «масло».
+    assert "замена колодок" in asks[-1] and "Вижу замену масла" not in asks[-1], asks[-1]
+    assert "масл" not in asks[-1].split("🇷🇺", 1)[-1], asks[-1]
 
 
 # ============ J) КЛАСС-ФИКС кнопочных подтверждений (ConnectTimeout) ============
