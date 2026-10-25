@@ -1,0 +1,347 @@
+{
+ "about": "Номера из зелёных книг (เล่มทะเบียน), страница владельца. Источник — аудит 24.10.2026 (canonical-labels.json). VIN/рама сюда сознательно не входят. Табличка на байке может отличаться — это и есть предупреждение.",
+ "bikes": [
+  {
+   "sheet_row": 3,
+   "topic_id": 62,
+   "name": "ADV 350CC BLACK 5662",
+   "plate_digits": "5662",
+   "plate_series": "1กอ",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 4,
+   "topic_id": 64,
+   "name": "ADV 350CC GREY 440",
+   "plate_digits": "440",
+   "plate_series": null,
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 5,
+   "topic_id": 66,
+   "name": "CB 300CC R 461",
+   "plate_digits": "461",
+   "plate_series": "1กว",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 6,
+   "topic_id": 68,
+   "name": "CBR 650R 4505",
+   "plate_digits": "4505",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 7,
+   "topic_id": 69,
+   "name": "CLICK 125CC 5762",
+   "plate_digits": "5762",
+   "plate_series": "1กธ",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 8,
+   "topic_id": 70,
+   "name": "FORZA 300CC WHITE 8950",
+   "plate_digits": "8950",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 9,
+   "topic_id": 71,
+   "name": "MT-03 300CC BLUE 5068",
+   "plate_digits": "5068",
+   "plate_series": "1กว",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 10,
+   "topic_id": 73,
+   "name": "NINJA 400CC 6334",
+   "plate_digits": "6334",
+   "plate_series": "1กล",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 11,
+   "topic_id": 75,
+   "name": "NMAX 155CC BLACK GOLD 4255",
+   "plate_digits": "4255",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 12,
+   "topic_id": 76,
+   "name": "NMAX 155CC BLACK GOLD 4685",
+   "plate_digits": "4685",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 13,
+   "topic_id": 77,
+   "name": "NMAX 155CC BLACK GOLD 7530",
+   "plate_digits": "7530",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 14,
+   "topic_id": 78,
+   "name": "NMAX 155CC BLACK GREEN 4253",
+   "plate_digits": "4253",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 15,
+   "topic_id": 74,
+   "name": "NMAX 155CC BLACK 8952",
+   "plate_digits": "8952",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 16,
+   "topic_id": 79,
+   "name": "NMAX 155CC GREEN 4957",
+   "plate_digits": "4957",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 17,
+   "topic_id": 201,
+   "name": "NMAX 155CC GREY GOLD 6908",
+   "plate_digits": "6908",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 18,
+   "topic_id": 80,
+   "name": "NMAX 155CC GREY 5960",
+   "plate_digits": "5960",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 19,
+   "topic_id": 346,
+   "name": "NMAX 155CC RACE 7532",
+   "plate_digits": "7532",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 20,
+   "topic_id": 1051,
+   "name": "NMAX 155CC RED WHITE 9548",
+   "plate_digits": "9548",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 21,
+   "topic_id": 81,
+   "name": "VULCAN 650CC S 5065",
+   "plate_digits": "5065",
+   "plate_series": "1กว",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 22,
+   "topic_id": 721,
+   "name": "XMAX 300CC NEW RED GLOSS 5709",
+   "plate_digits": "5709",
+   "plate_series": null,
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 23,
+   "topic_id": 264,
+   "name": "XMAX 300CC BLUE 5773",
+   "plate_digits": "5773",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 24,
+   "topic_id": 222,
+   "name": "XMAX 300CC GREEN 4248",
+   "plate_digits": "4248",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 25,
+   "topic_id": 381,
+   "name": "XMAX 300CC GREY 4246",
+   "plate_digits": "4246",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 26,
+   "topic_id": 334,
+   "name": "XSR 155CC BLACK 8949",
+   "plate_digits": "8949",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 27,
+   "topic_id": 455,
+   "name": "XSR 155CC GREEN 1023",
+   "plate_digits": "1023",
+   "plate_series": "1กธ",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 28,
+   "topic_id": 85,
+   "name": "XMAX 300CC NEW BLACK 8969",
+   "plate_digits": "8969",
+   "plate_series": null,
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 29,
+   "topic_id": 243,
+   "name": "XMAX 300CC NEW BLUE 1813",
+   "plate_digits": "1813",
+   "plate_series": null,
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 30,
+   "topic_id": 63,
+   "name": "ADV 350CC DARK GREY 6895",
+   "plate_digits": "6895",
+   "plate_series": "3กส",
+   "province": "Chon Buri",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 31,
+   "topic_id": 119,
+   "name": "XMAX 300CC NEW RED GLOSS 4729",
+   "plate_digits": "4729",
+   "plate_series": "1กร",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 32,
+   "topic_id": 1190,
+   "name": "XMAX 300CC NEW BROWN 8676",
+   "plate_digits": "8676",
+   "plate_series": "1กย",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 33,
+   "topic_id": 65,
+   "name": "ADV 350CC RED 9890",
+   "plate_digits": "9890",
+   "plate_series": "1กส",
+   "province": "Samut Sakhon",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 34,
+   "topic_id": 82,
+   "name": "XADV 750CC BLACK 5104",
+   "plate_digits": "5104",
+   "plate_series": "2กก",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 35,
+   "topic_id": 2202,
+   "name": "XMAX 300CC NEW BLUE 4725",
+   "plate_digits": "4725",
+   "plate_series": "1กร",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 36,
+   "topic_id": 67,
+   "name": "CB 650R BLACK 3503",
+   "plate_digits": "3503",
+   "plate_series": "1กม",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 37,
+   "topic_id": 83,
+   "name": "XADV 750CC GREY 9286",
+   "plate_digits": "9286",
+   "plate_series": "2กจ",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 38,
+   "topic_id": 2582,
+   "name": "ADV 350CC LIGHT GREY 6004",
+   "plate_digits": "6004",
+   "plate_series": "2กง",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 39,
+   "topic_id": 2583,
+   "name": "ADV 350CC BLACK GOLD 372",
+   "plate_digits": "372",
+   "plate_series": "2กก",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  },
+  {
+   "sheet_row": 40,
+   "topic_id": 308,
+   "name": "XMAX 300CC NEW BLUE 4724",
+   "plate_digits": "4724",
+   "plate_series": "1กร",
+   "province": "Phuket",
+   "source": "green book owner page (audit 24.10.2026)"
+  }
+ ]
+}

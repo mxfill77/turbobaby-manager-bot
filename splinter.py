@@ -894,6 +894,8 @@ def bilingual_pin(claude, raw):
     return bilingual_from_ru(claude, _extract_ru(raw), head="")
 
 
+#: Поле `plate` (25.10.2026, PLATEWATCH2510): табличка САМОГО снятого байка → `plate_watch` сверяет её с именем
+#: темы и зелёной книгой. Байк на фоне не в счёт — его табличка у темы ничего не доказывает.
 VISION_BIKE_SYSTEM = """На фото — мотобайк, его приборная панель, колесо или деталь (приёмка/сдача/сервис).
 Извлеки данные и верни СТРОГО JSON:
   fuel: уровень топлива словом ("full"/"3/4"/"half"/"1/4"/"empty") или null если не видно
@@ -914,6 +916,14 @@ VISION_BIKE_SYSTEM = """На фото — мотобайк, его прибор�
      поверхностные царапины — это НЕ damage. Если видишь только грязь/пыль — damage:null.
   dirt: true если байк грязный/пыльный/в разводах/есть следы эксплуатации; иначе false.
      (грязь идёт сюда, а НЕ в damage)
+  plate: номерной знак, ЗАКРЕПЛЁННЫЙ на самом снятом байке, или null, если его таблички в кадре нет:
+     {digits: "только цифры номера, без серии", series: "серия с таблички, напр. 2กจ" | null,
+      province: "провинция с таблички" | null, legible: true | false}
+     - legible:true ТОЛЬКО если ВСЕ цифры номера читаются однозначно; хоть одна смазана/перекрыта/
+       бликует/под углом → legible:false
+     - табличка ДРУГОГО байка на фоне, снятая или лежащая отдельно табличка, номер на бумагах — НЕ сюда;
+       не уверен, что табличка на этом байке → plate:null
+     - НЕ угадывай и не дописывай цифры
   kind: "dashboard" | "wheel" | "bike" | "receipt" | "other"
   notes: короткая заметка на русском
 ВАЖНО: техника здесь — мотобайк/скутер. В notes и damage НИКОГДА не называй её «автомобиль/машина» — только «байк/мотоцикл/скутер».
@@ -2410,15 +2420,12 @@ def _topic_name_from_msg(msg):
 
 def _remember_topic_name(chat_id, topic_id, msg):
     """Запоминает название темы если оно встретилось — в память И в memory.db (write-through),
-    чтобы привязка пережила рестарт."""
-    name = _topic_name_from_msg(msg)
-    if name and topic_id:
-        _TOPIC_NAMES[(chat_id, topic_id)] = name
-        if _MEMORY is not None:
-            try:
-                _MEMORY.set_topic_bike(chat_id, topic_id, name, source="forum_created")
-            except Exception as e:
-                log.warning(f"persist topic_bike error: {e}")
+    чтобы привязка пережила рестарт. Создание/переименование темы пишут всегда; имя из reply на
+    создание (обычное сообщение) только ЗАПОЛНЯЕТ пустое — PLATEWATCH2510, разбор у `_topic_name_event`
+    в конце модуля (живой случай 82: «5104» → «3902» через 0.8 с после обычного фото, 21.10)."""
+    name, firm = _topic_name_event(msg)
+    if name and topic_id and (firm or not _topic_name_known(chat_id, topic_id, name)):
+        _store_topic_name(chat_id, topic_id, name)
     return _TOPIC_NAMES.get((chat_id, topic_id))
 
 
@@ -7942,6 +7949,11 @@ async def handle_service_button(update, context, bridge) -> None:
     if action in ("agy", "agm", "agn"):
         # ВОРОТА (27.09): ответ на «верно ли понял?» — своя память (`_ACT_GATE_PENDING`).
         await _act_gate_button(q, context, bridge, action, token)
+        return
+    if action in (_PLATE_BTN_REN, _PLATE_BTN_KEEP):
+        # НОМЕР НА БАЙКЕ (25.10, PLATEWATCH2510): кнопки карточки владельца — своя память на диске
+        # (`plate_watch_state.json`), номер в кнопке — номер карточки, а не метки ТО. Жмёт только владелец.
+        await _plate_button(q, context, action, token)
         return
 
     # МЕТКА СВЕРЯЕТСЯ С МЕСТОМ НАЖАТИЯ (25.08.2026). Адрес операции — чат, тема, байк, пробег —
@@ -13538,7 +13550,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
     vis = {}
     _rc_seen = []   # (фото, байты, разбор) — для чека в теме (SVCRECEIPT2510): снимок не качаем дважды
     if has_photo:
-        vis_list = []
+        vis_list, _pl_new = [], []   # _pl_new — снимки пачки с читаемой табличкой (PLATEWATCH2510)
         for pm in photo_msgs:
             img = await _download_photo(pm)
             if not img:
@@ -13562,7 +13574,13 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
             _remember_recent_photo(chat_id, v, pm, topic_id=topic_id)
             vis_list.append(v)
             _rc_seen.append((pm, img, v))
+            if _plate_note(chat_id, topic_id, pm, v):     # табличка на байке → память темы (PLATEWATCH2510)
+                _pl_new.append(pm)
         vis = _aggregate_album_vis(vis_list)
+        # НОМЕР НА БАЙКЕ ↔ ИМЯ ТЕМЫ ↔ ЗЕЛЁНАЯ КНИГА (25.10.2026, PLATEWATCH2510): сверка — ДО ранних выходов (чек,
+        # решатель): снимок, который заберут они, до сверки иначе не дошёл бы. Наружу — только карточка ВЛАДЕЛЬЦУ.
+        if _pl_new:
+            await _plate_tick(chat_id, topic_id)
         # Свидетель для пола ответа: он стоит снаружи этой функции и сам разбора не видит.
         # Кладём РОВНО то, что назвал разбор; не назвал — пусто, и пол скажет «не узнал».
         try:
@@ -16589,3 +16607,248 @@ def _life_label_next(seq):
         log.warning("  → метки кнопок: блок жизни исчерпан (2^20 − 1 меток) — взят новый случайный блок")
     seq[0] += 1
     return seq[0]
+
+
+# ── ИМЯ ТЕМЫ: ОБЫЧНОЕ СООБЩЕНИЕ ТОЛЬКО ДОПОЛНЯЕТ (25.10.2026, PLATEWATCH2510) ──────────────────────────────────────────
+# Живой случай: тему 82 переименовали в «XADV 750 BLACK 5104» 16.06 (событие forum_topic_edited легло в _TOPIC_NAMES и
+# memory.db), а 21.10 в 09:23:30 UTC — через 0.8 с после обычного фото @Pleummmm — имя бота вернулось к «XADV 750 BLACK
+# 3902». Причина — путь 2 `_topic_name_from_msg`: обычное сообщение форума может нести reply_to_message на сообщение
+# СОЗДАНИЯ темы, а в его forum_topic_created.name навсегда лежит ПЕРВОЕ имя. `_remember_topic_name` писал это имя и в
+# кэш, и в memory.db на ОБЫЧНЫХ сообщениях (bot.py — текст обслуживания, `_handle_servicing` — фото), то есть
+# переименование темы жило до первого такого сообщения. После перевода 24.10 всех тем на номера зелёных книг это
+# откатывало бы имена байков обратно, тема за темой.
+# Правило теперь: создание и переименование (событие на САМОМ сообщении) авторитетны и пишут всегда; имя из reply на
+# создание только ЗАПОЛНЯЕТ пустое место и никогда не переписывает известное. Правило memory.db «ручную привязку
+# (/bike, source='manual') авто-источник не затирает» не тронуто — оно живёт в memory.py.
+_TOPIC_NAME_KEPT_SAID = set()     # (чат, тема, предложенное имя): «не переписал» говорим в журнал ОДИН раз
+
+
+def _topic_name_event(msg):
+    """(имя, авторитетно ли). Создание/переименование на самом сообщении → (имя, True); reply на сообщение
+    создания → (ПЕРВОЕ имя темы, False); иначе (None, False). Смена одного значка (name=None) — не событие имени."""
+    fc = getattr(msg, "forum_topic_created", None)
+    if fc and getattr(fc, "name", None):
+        return fc.name, True
+    fe = getattr(msg, "forum_topic_edited", None)
+    if fe and getattr(fe, "name", None):
+        return fe.name, True
+    return _topic_name_from_msg(msg), False
+
+
+def _topic_name_known(chat_id, topic_id, offered):
+    """Известно ли имя темы (override · кэш · memory.db · карта тем) — тогда обычное сообщение его не трогает."""
+    known = bike_from_topic(chat_id, topic_id)
+    if known and known != offered and (chat_id, topic_id, offered) not in _TOPIC_NAME_KEPT_SAID:
+        _TOPIC_NAME_KEPT_SAID.add((chat_id, topic_id, offered))
+        log.info(f"  🧩 тема {topic_id}: первое имя «{offered}» из reply на создание не беру — знаю «{known}» "
+                 f"(обычное сообщение имя темы не переписывает)")
+    return bool(known)
+
+
+def _store_topic_name(chat_id, topic_id, name):
+    """Имя темы → кэш и memory.db (write-through). ОДНА дверь для события форума и кнопки «Переименовать тему»;
+    source='forum_created', как было, — ручную привязку в memory.db она не затирает."""
+    _TOPIC_NAMES[(chat_id, topic_id)] = name
+    if _MEMORY is not None:
+        try:
+            _MEMORY.set_topic_bike(chat_id, topic_id, name, source="forum_created")
+        except Exception as e:
+            log.warning(f"persist topic_bike error: {e}")
+
+
+# ── НОМЕР НА БАЙКЕ ↔ ИМЯ ТЕМЫ ↔ ЗЕЛЁНАЯ КНИГА (25.10.2026, PLATEWATCH2510) ─────────────────────────────────────────────
+# Правило владельца 25.10: имя темы идёт за номером, ФИЗИЧЕСКИ стоящим на байке; расхождение с зелёной книгой —
+# предупреждение. 24.10 все темы и Лист1 перевели на номера зелёных книг, а снимки показывают старые таблички: 83 (фото
+# 13.10) — 2478 при книге 9286, 1190 — 9315 при 8676, 62 — 5849 при 5662, 66 — 9011 при 461.
+# Решение — `plate_watch` (чистое, импортов ноль); здесь только руки:
+#   * снимок обслуживания → поле `plate` разбора (`VISION_BIKE_SYSTEM`) → чтение в память темы (`_plate_note`);
+#   * два чтения из разных отправок за 14 суток сошлись на номере, отличном от номера в имени темы → ОДНА карточка
+#     ВЛАДЕЛЬЦУ (`notify.send_card`: инбокс 1160, личка — фолбэк; та же дверь, что у карточки отмены ТО) с кнопками
+#     [Переименовать тему] [Оставить]; номер = имени темы, но ≠ книге → предупреждение без кнопок, раз в 7 суток;
+#   * нажимает ТОЛЬКО владелец (`is_owner_user`); «Переименовать» = `edit_forum_topic` + кэш и memory.db той же дверью,
+#     что у события переименования (`_store_topic_name`).
+# В ТЕМУ БАЙКА ЭТА ВЕТКА НЕ ПИШЕТ НИЧЕГО (страж — tests/test_plate_watch.py). Карточка переживает перезапуск: память
+# (чтения, висящая карточка, «Оставить», дата предупреждения) — `plate_watch_state.json` рядом с модулем.
+# Откат: `PLATE_WATCH=0` строкой файла настроек + рестарт splinter — чтения не копятся, новых карточек нет; кнопки уже
+# разосланных карточек по-прежнему исполняются (их видел и жмёт владелец); поле `plate` в промпте снимка остаётся и
+# ничего не решает.
+import plate_watch    # noqa: E402  номер на байке ↔ имя темы ↔ зелёная книга: решение без импортов
+
+_PLATE_STATE = None           # память в процессе; None = ещё не читали с диска
+_PLATE_SAID = False           # путь памяти называем в журнале ОДИН раз
+_PLATE_BOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "greenbook_plates.json")
+_PLATE_BTN_REN, _PLATE_BTN_KEEP = "plren", "plkeep"     # действия `svc:<действие>:<номер карточки>`
+
+
+def _plate_watch_on():
+    """Ручка `PLATE_WATCH` (дефолт 1). «0» → чтения таблички не копятся, карточек нет."""
+    return str(_os_env("PLATE_WATCH", "1")).strip() not in ("0", "", "нет", "no", "off")
+
+
+def _plate_state_path():
+    """Файл памяти. Явная подмена сильнее всего; признак прогона тестов уводит во временный каталог со СВОИМ
+    именем на процесс (урок замка подсказок: общая память одного прогона гейта утекала в следующий)."""
+    global _PLATE_SAID
+    p = os.getenv("PLATE_WATCH_STATE")
+    if not p:
+        p = (f"/tmp/plate_watch_state_test_{os.getpid()}.json"
+             if any(os.getenv(m) for m in _HINT_TEST_MARKS)
+             else os.path.join(os.path.dirname(os.path.abspath(__file__)), "plate_watch_state.json"))
+    if not _PLATE_SAID:
+        _PLATE_SAID = True
+        log.info(f"  🔢 номер на байке: память в {p}")
+    return p
+
+
+def _plate_load():
+    """Память с диска ОДИН раз за процесс. Файла нет / битый → пустая память: худшее — карточка придёт заново."""
+    global _PLATE_STATE
+    if _PLATE_STATE is None:
+        raw = None
+        try:
+            with open(_plate_state_path(), encoding="utf-8") as f:
+                raw = json.load(f)
+        except FileNotFoundError:
+            raw = None
+        except Exception as e:
+            log.warning(f"  🔢 память номеров тем не прочиталась ({type(e).__name__}) — начинаю с пустой")
+        _PLATE_STATE = plate_watch.clean(raw)
+    return _PLATE_STATE
+
+
+def _plate_keep(st):
+    """Память → процесс и диск (временный файл → os.replace: оборванная запись не бьёт прежнюю)."""
+    global _PLATE_STATE
+    _PLATE_STATE = st
+    try:
+        p = _plate_state_path()
+        with open(p + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False, default=str)
+        os.replace(p + ".tmp", p)
+    except Exception as e:
+        log.warning(f"  🔢 память номеров тем не записалась ({e}) — живёт до перезапуска")
+
+
+def _plate_book(topic_id):
+    """Строка зелёной книги темы (`greenbook_plates.json`) или None: файла нет, не читается, темы в нём нет."""
+    try:
+        with open(_PLATE_BOOK_FILE, encoding="utf-8") as f:
+            doc = json.load(f)
+    except Exception as e:
+        log.warning(f"  🔢 зелёная книга не прочиталась ({type(e).__name__}) — сверка с книгой молчит")
+        return None
+    return plate_watch.book_entry(doc, topic_id)
+
+
+def _plate_note(chat_id, topic_id, pm, vis):
+    """Чтение таблички со снимка → память темы. True = чтение легло. Только тема обслуживания; не бросает."""
+    if not (_plate_watch_on() and chat_id == SERVICING_CHAT and topic_id):
+        return False
+    try:
+        rd = plate_watch.reading(vis)
+        if rd is None:
+            return False
+        mid = getattr(pm, "message_id", None)
+        _plate_keep(plate_watch.add_reading(_plate_load(), topic_id, rd, mid,
+                                            getattr(pm, "media_group_id", None), _time.time()))
+        log.info(f"  🔢 табличка темы {topic_id}: {rd['d']} (сообщение {mid})")
+        return True
+    except Exception as e:
+        log.warning(f"  🔢 чтение таблички не легло ({type(e).__name__}: {e})")
+        return False
+
+
+async def _plate_tick(chat_id, topic_id):
+    """После чтений пачки: решение `plate_watch.verdict` → при нужде ОДНА карточка владельцу. Не бросает."""
+    import asyncio as _aio
+    try:
+        now = _time.time()
+        st = _plate_load()
+        v = plate_watch.verdict(st, topic_id, bike_from_topic(chat_id, topic_id) or "", _plate_book(topic_id), now,
+                                on=_plate_watch_on())
+        log.info(f"  🔢 номер темы {topic_id}: {v['why']} (на байке {v.get('d') or '—'}, в имени {v.get('t') or '—'}, "
+                 f"в книге {v.get('g') or '—'})")
+        if not v["kind"]:
+            return v
+        st, n = plate_watch.next_seq(st)
+        _plate_keep(st)                       # номер занят, даже если карточка не доедет
+        kb = ([[("Переименовать тему", f"svc:{_PLATE_BTN_REN}:{n}"), ("Оставить", f"svc:{_PLATE_BTN_KEEP}:{n}")]]
+              if v["kind"] == plate_watch.KIND_RENAME else None)
+        import notify
+        sent = await _aio.to_thread(notify.send_card, plate_watch.card_text(v, chat_id), buttons=kb)
+        if not sent:
+            log.warning(f"  🔢 карточка по теме {topic_id} владельцу НЕ доехала — спрошу на следующем чтении")
+            return v
+        if v["kind"] == plate_watch.KIND_RENAME:
+            st = plate_watch.with_card(st, v, n, now, chat_id=chat_id)
+        if v.get("g") and v["g"] != v["d"]:
+            st = plate_watch.with_warned(st, topic_id, now)     # карточка уже несла ⚠️ — неделю не повторяем
+        _plate_keep(st)
+        log.info(f"  🔢 карточка {n} владельцу по теме {topic_id}: {v['why']} → {v.get('proposed') or 'без переименования'}")
+        return v
+    except Exception as e:
+        log.warning(f"  🔢 сверка номера темы {topic_id} упала ({type(e).__name__}: {e}) — карточки нет")
+        return None
+
+
+async def _plate_card_done(q, line):
+    """Карточке — строка исхода, кнопки снять (правка без reply_markup снимает клавиатуру)."""
+    try:
+        old = getattr(getattr(q, "message", None), "text", "") or ""
+        await q.edit_message_text((old + "\n\n" + line).strip())
+    except Exception:
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+async def _plate_button(q, context, action, n):
+    """Кнопки карточки «номер на байке» (`svc:plren:N` / `svc:plkeep:N`). Нажимает ТОЛЬКО владелец."""
+    u = getattr(q, "from_user", None)
+    by = ("@" + u.username) if (u and getattr(u, "username", None)) else f"id{getattr(u, 'id', '?')}"
+    if not is_owner_user(u):
+        log.info(f"  🔢 кнопка «{action}» карточки {n} от {by} не принята — нажимает только владелец")
+        await _btn_answer(q, "Только владелец / เฉพาะเจ้าของเท่านั้นครับ", show_alert=True)
+        return
+    st = _plate_load()
+    _k, card = plate_watch.find_card(st, n)
+    if not card:
+        log.info(f"  🔢 кнопка «{action}» карточки {n} от {by}: карточки нет (отработана или заменена)")
+        await _btn_answer(q, "Карточка устарела — придёт новая, если номер снова не сойдётся", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    chat_id, topic_id = card.get("chat") or SERVICING_CHAT, int(card.get("topic"))
+    if action == _PLATE_BTN_KEEP:
+        _plate_keep(plate_watch.with_declined(st, card, _time.time()))
+        log.info(f"  🔢 тема {topic_id}: {by} оставил имя «{card.get('name')}» при номере на байке {card.get('d')}")
+        await _btn_answer(q, "Оставил")
+        await _plate_card_done(q, f"Оставлено: «{card.get('name')}» ({by})")
+        return
+    now_name = bike_from_topic(chat_id, topic_id) or ""
+    new = card.get("proposed")
+    if not new or now_name != card.get("name"):
+        # Имя темы сменилось после карточки — исполнять её нельзя: она предлагала правку ДРУГОГО имени.
+        _plate_keep(plate_watch.without_card(st, topic_id))
+        log.warning(f"  🔢 тема {topic_id}: карточка {n} предлагала правку «{card.get('name')}», а тема зовётся "
+                    f"«{now_name}» — не переименовываю")
+        await _btn_answer(q, f"Тема уже зовётся «{now_name}» — карточка устарела"[:190], show_alert=True)
+        await _plate_card_done(q, f"Не переименовал: тема уже зовётся «{now_name}»")
+        return
+    try:
+        await context.bot.edit_forum_topic(chat_id=chat_id, message_thread_id=topic_id, name=new)
+    except Exception as e:
+        log.warning(f"  🔢 тема {topic_id}: Telegram не дал переименовать ({type(e).__name__}: {e}) — карточка жива")
+        await _btn_answer(q, f"Telegram не дал переименовать: {e}"[:190], show_alert=True)
+        return
+    _store_topic_name(chat_id, topic_id, new)
+    _plate_keep(plate_watch.without_card(_plate_load(), topic_id))
+    log.info(f"  🔢 тема {topic_id} переименована по кнопке {by}: «{card.get('name')}» → «{new}» "
+             f"(на байке {card.get('d')}, в книге {card.get('g') or '—'})")
+    if (bike_from_topic(chat_id, topic_id) or "") != new:
+        log.warning(f"  🔢 тема {topic_id}: ручная привязка (/bike) держит прежнее имя — бот зовёт байк по ней")
+    await _btn_answer(q, "Переименовал")
+    await _plate_card_done(q, f"✅ Переименовано: «{new}» ({by})")

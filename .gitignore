@@ -77,6 +77,9 @@ restart_handoff.unapplied-*.json
 # открытый вопрос о пробеге + id сообщения: реплай узнаётся после рестарта splinter (рантайм-состояние; 01.10.2026)
 mileage_question_state.json
 mileage_question_state.json.tmp
+# номер на байке ↔ имя темы ↔ зелёная книга: чтения табличек и висящие карточки владельцу (PLATEWATCH2510; рантайм-состояние)
+plate_watch_state.json
+plate_watch_state.json.tmp
 _pcport185
 # scratch / throwaway
 _*.py
