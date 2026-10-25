@@ -14039,16 +14039,19 @@ async def _contract_sign_link_follow(context, bridge, chat_id, tid, doc_id, name
     r2 (ревью перед пушем): потолок WAIT_S — на ВСЁ ожидание: перед каждым чтением остаток сверяется с часами, и само
     чтение идёт под дедлайном остатка (`_sign_link_read`); итог называет фактически прошедшее время. Итоговая отправка
     — под try: сбой Telegram (Forbidden, ChatMigrated, …) только в журнал, строка «итог» пишется ПОСЛЕ отправки и
-    говорит, доставлено ли. Отмена задачи (остановка Splinter, `sign_link_drain`) во время ожидания — ОДНА короткая
-    попытка (без лестницы повторов, не дольше CANCEL_SEND_S) сказать «Splinter перезапускается», затем отмена уходит
-    выше. Не бросает ничего, кроме этой отмены. → решение `contract_sign_link.verdict` + delivered."""
+    говорит, доставлено ли. Отмена задачи (остановка Splinter, `sign_link_drain`), пока итог НЕ подтверждён
+    доставленным, — и в ожидании, и на итоговой отправке, когда её первая попытка уже упала и `_send_retry` спит перед
+    повтором (r3, проба верификатора probe_v2: TimedOut / RetryAfter), — ОДНА короткая попытка (без лестницы повторов,
+    не дольше CANCEL_SEND_S) сказать «Splinter перезапускается — ссылка будет в группе контрактов», строка «итог
+    отменено при остановке», затем отмена уходит выше. Не бросает ничего, кроме этой отмены.
+    → решение `contract_sign_link.verdict` + delivered."""
     import asyncio as _aio
     import time as _t
     import contract_sign_link as _csl
     sleep = sleep or _aio.sleep
     clock = clock or _t.monotonic
     tail = "…" + str(doc_id)[-6:]
-    stage = "wait"
+    stage, delivered = "wait", False
     try:
         try:
             t0, last, v = clock(), "", None
@@ -14076,7 +14079,6 @@ async def _contract_sign_link_follow(context, bridge, chat_id, tid, doc_id, name
             log.warning(f"  ✍️ ESIGNLINK: doc {tail} — {v['why']}")
             text = _csl.fail_text(name, v["why"])
         stage = "final"
-        delivered = False
         try:
             sent = await _send_retry(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
                                      no_preview=True, text=text)
@@ -14087,27 +14089,37 @@ async def _contract_sign_link_follow(context, bridge, chat_id, tid, doc_id, name
                  f"{'доставлено' if delivered else 'НЕ доставлено'}")
         return dict(v, delivered=delivered)
     except _aio.CancelledError:
-        if stage == "wait":               # итог ещё не уходил — сказать, что ссылки не будет, и отдать отмену
-            log.warning(f"  ✍️ ESIGNLINK: doc {tail} — ожидание прервано остановкой, говорю «{_csl.RESTART_WHY}»")
+        said = False
+        if not delivered:                 # итог не подтверждён — сказать, что ссылки не будет, и отдать отмену
+            where = "в ожидании" if stage == "wait" else "на итоговой отправке"
+            log.warning(f"  ✍️ ESIGNLINK: doc {tail} — прервано остановкой {where}, говорю «{_csl.RESTART_WHY}»")
             try:
-                await _aio.wait_for(_send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
-                                          no_preview=True, text=_csl.fail_text(name, _csl.RESTART_WHY)),
-                                    timeout=_csl.CANCEL_SEND_S)
+                sent = await _aio.wait_for(_send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                                                 no_preview=True, text=_csl.fail_text(name, _csl.RESTART_WHY)),
+                                           timeout=_csl.CANCEL_SEND_S)
+                said = sent is not None
             except (Exception, _aio.CancelledError) as e:  # noqa: BLE001 — одна попытка; отмена уходит выше всё равно
                 log.warning(f"  ✍️ ESIGNLINK: doc {tail} — «{_csl.RESTART_WHY}» не отправлено ({type(e).__name__})")
+        log.info(f"  ✍️ ESIGNLINK: doc {tail} — итог отменено при остановке (стадия {stage}); «{_csl.RESTART_WHY}» "
+                 f"{'доставлено' if said else 'НЕ доставлено'}")
         raise
 
 
 async def sign_link_drain(budget_s=None):
     """post_stop (`bot.on_stop`, ESIGNLINK2510 r2): живые досылки ссылки на подпись → отмена. PTB 22.7 обычные задачи
-    при остановке не ждёт, и досылка пропала бы молча; отменённая, каждая сама коротко говорит «Splinter
-    перезапускается» (`_contract_sign_link_follow`). Ждём их не дольше `contract_sign_link.STOP_WAIT_S` и не дольше
+    при остановке не ждёт, и досылка пропала бы молча. Отменённая досылка, чей итог ещё не подтверждён доставленным,
+    делает ОДНУ попытку (не дольше CANCEL_SEND_S) отправить «Splinter перезапускается — ссылка будет в группе
+    контрактов» (`_contract_sign_link_follow`); дошла ли фраза — её строка «итог отменено при остановке», а не обещание
+    здесь: попытка может не успеть в бюджет или упасть. Ждём их не дольше `contract_sign_link.STOP_WAIT_S` и не дольше
     остатка бюджета остановки `budget_s` (asyncio.wait — по таймауту задачи повторно НЕ отменяются, начатая фраза не
-    обрывается). → число отменённых (0 — живых не было; строка дренажа тогда прежняя). Не бросает."""
+    обрывается). Счёт — ОТДЕЛЬНОЙ строкой журнала логгера splinter с префиксом «✍️ ESIGNLINK: остановка» (r3):
+    машинная строка «🛑 дренаж остановки» не меняется ни при каком N — её DR_OK скрипта выкладки заякорен на «(sha …)$».
+    → число отменённых (0 — живых не было, строки нет). Не бросает."""
     import asyncio as _aio
     tasks = [t for t in list(_SIGN_LINK_TASKS) if not t.done()]
     if not tasks:
         return 0
+    done = None
     try:
         import contract_sign_link as _csl     # живые задачи есть → модуль уже загружен ручкой
         wait = float(_csl.STOP_WAIT_S)
@@ -14117,8 +14129,11 @@ async def sign_link_drain(budget_s=None):
             t.cancel()
         if wait > 0:
             await _aio.wait(tasks, timeout=wait)
+        done = sum(1 for t in tasks if t.done())
     except Exception as e:  # noqa: BLE001 — дренаж остановки не роняет остановку
         log.warning(f"  ✍️ ESIGNLINK: отмена досылок при остановке — сбой ({type(e).__name__}: {e})")
+    log.info(f"  ✍️ ESIGNLINK: остановка — отменено досылок ссылки на подпись: {len(tasks)}, завершились: "
+             f"{'неизвестно' if done is None else done}")
     return len(tasks)
 
 

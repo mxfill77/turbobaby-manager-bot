@@ -1540,16 +1540,15 @@ async def on_stop(app: Application):
         log.exception("  🛑 дренаж альбомов: сбой")
         drain = f"СБОЙ ({type(e).__name__})"
     h, n, sha = splinter.handoff_write()
-    # ESIGNLINK2510 r2: фоновые досылки ссылки на подпись PTB не ждёт — отменить (каждая скажет «Splinter
-    # перезапускается») и коротко дождаться в остатке бюджета. Живых нет → строка дренажа прежняя байт-в-байт.
-    links = 0
+    # ESIGNLINK2510: фоновые досылки ссылки на подпись PTB не ждёт — отменить (неподтверждённая скажет «Splinter
+    # перезапускается») и коротко дождаться в остатке бюджета. Счёт — своей строкой splinter («✍️ ESIGNLINK:
+    # остановка»); машинная строка ниже не меняется НИ ПРИ КАКОМ числе (r3: DR_OK скрипта выкладки заякорен на «(sha …)$»).
     try:
-        links = await splinter.sign_link_drain(deadline - _mono())
+        await splinter.sign_link_drain(deadline - _mono())
     except Exception:                                                # noqa: BLE001
-        log.exception("  🛑 досылки ссылки на подпись: сбой отмены")
+        log.exception("  ✍️ ESIGNLINK: отмена досылок при остановке — сбой")
     log.info(f"  🛑 дренаж остановки: от сигнала {since} с из {SHUTDOWN_BUDGET_SEC:.0f}; альбомы: {drain}; "
-             f"передача карточек: {h}" + (f" {n} (sha {sha})" if n is not None else "")
-             + (f"; досылки ссылки на подпись: отменено {links}" if links else ""))
+             f"передача карточек: {h}" + (f" {n} (sha {sha})" if n is not None else ""))
 
 
 async def _route_photos(context: ContextTypes.DEFAULT_TYPE, updates):

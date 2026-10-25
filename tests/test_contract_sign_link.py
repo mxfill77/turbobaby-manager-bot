@@ -675,15 +675,51 @@ def test_c04_cancel_restart_send_is_bounded():
     assert took is not None and took < 2.0 and SENDS == [], (took, SENDS)
 
 
-def test_c05_cancel_during_final_send_no_restart_phrase():
-    """Отмена, когда итог уже отправляется, — второй фразы «перезапускается» нет (итог мог уйти)."""
+def test_c04b_restart_phrase_one_attempt_no_ladder():
+    """Фраза «перезапускается» упала сетью (TimedOut) — ровно ОДНА попытка, без лестницы повторов _send_retry
+    (её пауза 1.5 с и вторая попытка уложились бы в CANCEL_SEND_S); отмена уходит выше сразу, «итог … НЕ доставлено»."""
+    from telegram.error import TimedOut
+    c = C()
+    SENDS.clear()
+    tries = []
+    start = len(LOGS.lines)
+
+    async def net(text):
+        tries.append(text)
+        raise TimedOut("t")
+
+    async def main():
+        t = await _blocked_follow(Bridge(finds=[snap("link_none")]))
+        SEND_HOOK[:] = [net]
+        t0 = asyncio.get_running_loop().time()
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            return asyncio.get_running_loop().time() - t0
+        return None
+
+    try:
+        took = asyncio.run(main())
+    finally:
+        SEND_HOOK[:] = []
+    assert took is not None and took < 1.0 and tries == [c.fail_text("N", c.RESTART_WHY)], (took, tries)
+    assert any("итог отменено при остановке (стадия wait)" in ln and "НЕ доставлено" in ln
+               for ln in LOGS.lines[start:]), LOGS.lines[start:]
+
+
+def test_c05_cancel_during_final_send_says_restart():
+    """r3: отмена, когда итог отправляется, но НЕ подтверждён доставленным (повисла его отправка), — фраза
+    «перезапускается» уходит одной попыткой, строка «итог отменено при остановке (стадия final)» в журнале."""
     c = C()
     SENDS.clear()
     started = []
+    start = len(LOGS.lines)
 
     async def hang(text):
         started.append(text)
-        await asyncio.sleep(3600)
+        if c.RESTART_WHY not in text:
+            await asyncio.sleep(3600)
 
     async def main():
         SEND_HOOK[:] = [hang]
@@ -704,7 +740,63 @@ def test_c05_cancel_during_final_send_no_restart_phrase():
         res = asyncio.run(main())
     finally:
         SEND_HOOK[:] = []
-    assert res == "cancelled" and len(started) == 1 and c.RESTART_WHY not in started[0], (res, started)
+    assert res == "cancelled" and len(started) == 2 and c.RESTART_WHY not in started[0], (res, started)
+    assert [s["text"] for s in SENDS] == [c.fail_text("N", c.RESTART_WHY)], SENDS
+    assert any("итог отменено при остановке (стадия final)" in ln and "доставлено" in ln and "НЕ доставлено" not in ln
+               for ln in LOGS.lines[start:]), LOGS.lines[start:]
+
+
+def _cancel_after_failed_first_attempt(exc_factory):
+    """Проба верификатора probe_v2: первая попытка итога упала, `_send_retry` спит перед повтором — тут остановка
+    (`sign_link_drain`, как bot.on_stop). → (отменено, задача отменена, попыток отправки, сообщения, строки журнала)."""
+    SENDS.clear()
+    calls, start = [], len(LOGS.lines)
+
+    async def fail_first(text):
+        calls.append(text)
+        if len(calls) == 1:
+            raise exc_factory()
+
+    async def main():
+        SEND_HOOK[:] = [fail_first]
+        t = asyncio.get_running_loop().create_task(
+            S._contract_sign_link_follow(None, Bridge(finds=[snap("link_new")]), INTAKE, None, DOC_N, "N", EDIT_MAKE))
+        S._SIGN_LINK_TASKS.add(t)
+        t.add_done_callback(S._SIGN_LINK_TASKS.discard)
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if calls:
+                break
+        await asyncio.sleep(0.1)
+        n = await S.sign_link_drain(8.0)
+        return n, t.cancelled()
+
+    try:
+        n, cancelled = asyncio.run(main())
+    finally:
+        SEND_HOOK[:] = []
+    return n, cancelled, list(calls), [s["text"] for s in SENDS], LOGS.lines[start:]
+
+
+def test_c09_cancel_after_timedout_first_attempt_says_restart():
+    """P1: TimedOut на первой попытке итога → _send_retry спит 1.5 с → остановка: фраза «перезапускается» ушла
+    (одна попытка), строка «итог отменено при остановке (стадия final)»; отмена переброшена."""
+    from telegram.error import TimedOut
+    c = C()
+    n, cancelled, calls, sends, lines = _cancel_after_failed_first_attempt(lambda: TimedOut("t"))
+    assert n == 1 and cancelled is True and len(calls) == 2, (n, cancelled, calls)
+    assert sends == [c.fail_text("N", c.RESTART_WHY)], sends
+    assert any("итог отменено при остановке (стадия final)" in ln for ln in lines), lines
+
+
+def test_c10_cancel_during_retry_after_says_restart():
+    """P2: RetryAfter(30) на первой попытке → _send_retry ждёт 31 с → остановка: та же фраза и строка «итог»."""
+    from telegram.error import RetryAfter
+    c = C()
+    n, cancelled, calls, sends, lines = _cancel_after_failed_first_attempt(lambda: RetryAfter(30))
+    assert n == 1 and cancelled is True and len(calls) == 2, (n, cancelled, calls)
+    assert sends == [c.fail_text("N", c.RESTART_WHY)], sends
+    assert any("итог отменено при остановке (стадия final)" in ln for ln in lines), lines
 
 
 def test_c06_stop_drain_cancels_live_tasks():
@@ -727,9 +819,22 @@ def test_c06_stop_drain_cancels_live_tasks():
     assert not S._SIGN_LINK_TASKS
 
 
-def test_c07_bot_on_stop_line_counts_cancelled():
-    """`bot.on_stop` (post_stop) отменяет досылки в бюджете остановки и дописывает число в строку дренажа; без живых
-    досылок строка прежняя — без хвоста. Отдельный процесс: импорт bot.py со заглушками, как в test_contract_ref_gen."""
+# DR_OK — ДОСЛОВНО шаблон шага 4б скрипта выкладки (lifecycle_fwd_bf85964_RC_r20.sh:358, принятый откат
+# srv_reld_rollback_3e378d5_r2.sh:409): «grep -a -c -E» по журналу; строка «🛑 дренаж остановки:» в окне — ровно одна.
+DR_OK = (r"🛑 дренаж остановки: от сигнала ([0-9]+\.[0-9]|неизвестно) с из [0-9]+; альбомы: таймеров [0-9]+, в обработке "
+         r"[0-9]+, из буфера [0-9]+ → доведено [0-9]+, не успели 0; передача карточек: записана 0 \(sha [0-9a-f][0-9a-f]"
+         r"[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]\)$")
+DR_ANY = "🛑 дренаж остановки:"
+SEP_LINE = "  ✍️ ESIGNLINK: остановка — отменено досылок ссылки на подпись: "
+
+
+def test_c07_bot_on_stop_drain_line_unchanged_and_separate_count():
+    """r3: `bot.on_stop` отменяет досылки в бюджете остановки; машинная строка дренажа при N > 0 — та же, что при N = 0
+    и что на main (DR_OK шага 4б проходит, строка «🛑 дренаж остановки:» за остановку ровно одна); число — ОТДЕЛЬНОЙ
+    строкой логгера splinter с префиксом, которого не ловят разборщики 🛑-строки (entry_read: логгер turbobaby и
+    STOP_HEAD; скрипт выкладки: DR_ANY). Отдельный процесс: импорт bot.py со заглушками, как в test_contract_ref_gen."""
+    import re
+    import entry_read
     p = subprocess.run([sys.executable, os.path.abspath(__file__), PROBE_STOP_ARG], cwd=ROOT, capture_output=True,
                        timeout=300, env=dict(os.environ))
     text = p.stdout.decode("utf-8", "replace")
@@ -737,8 +842,22 @@ def test_c07_bot_on_stop_line_counts_cancelled():
     assert p.returncode == 0 and len(got) == 1, (p.returncode, text[-1500:], p.stderr.decode("utf-8", "replace")[-1500:])
     out = json.loads(got[0][len(PROBE_STOP_MARK):])
     c = C()
-    assert out["with"].endswith("; досылки ссылки на подпись: отменено 1"), out
-    assert "досылки" not in out["without"] and out["without"].startswith("  🛑 дренаж остановки: "), out
+    for key in ("with", "without"):                                    # N = 1 и N = 0
+        recs = out[key]
+        stop = [r for r in recs if DR_ANY in r["msg"]]
+        assert len(stop) == 1 and stop[0]["logger"] == "turbobaby", (key, recs)
+        assert re.search(DR_OK, stop[0]["msg"]) and stop[0]["msg"].startswith(entry_read.STOP_HEAD), (key, stop)
+        assert "досылки" not in stop[0]["msg"] and "ESIGNLINK" not in stop[0]["msg"], (key, stop)
+    strip = lambda m: re.sub(r"от сигнала \S+ с|\(sha [0-9a-f]{8}\)", "", m)
+    assert strip([r for r in out["with"] if DR_ANY in r["msg"]][0]["msg"]) == \
+        strip([r for r in out["without"] if DR_ANY in r["msg"]][0]["msg"]), out   # тот же вид при любом N
+    sep = [r for r in out["with"] if r["msg"].startswith(SEP_LINE)]
+    assert len(sep) == 1 and sep[0]["msg"] == SEP_LINE + "1, завершились: 1" and sep[0]["logger"] == "splinter", out
+    assert not [r for r in out["without"] if "ESIGNLINK" in r["msg"]], out["without"]   # N = 0 — строки нет
+    for r in out["with"] + out["without"]:                             # ни одна строка досылок не похожа на 🛑-строку
+        if "ESIGNLINK" in r["msg"]:
+            assert DR_ANY not in r["msg"] and "🛑" not in r["msg"] and not r["msg"].startswith(
+                (entry_read.STOP_HEAD, entry_read.F_HEAD, entry_read.B_HEAD, entry_read.C_HEAD)), r
     assert out["sends"] == [c.fail_text("N", c.RESTART_WHY)] and out["cancelled"] is True, out
 
 
@@ -781,18 +900,26 @@ def probe_stop():
     _stub("prompts", SYSTEM_PROMPT="", daily_pulse_prompt=lambda *a, **k: "")
     import bot as B
 
-    def stop_line():
-        return next((ln for ln in reversed(LOGS.lines) if "🛑 дренаж остановки" in ln), "")
+    recs = []
+
+    class _Rec(logging.Handler):
+        def emit(self, record):
+            recs.append({"logger": record.name, "msg": record.getMessage()})
+
+    for _name in ("turbobaby", "splinter"):
+        logging.getLogger(_name).addHandler(_Rec())
 
     async def main():
         t = await _blocked_follow(Bridge(finds=[snap("link_none")]), "N")
         S._SIGN_LINK_TASKS.add(t)
         t.add_done_callback(S._SIGN_LINK_TASKS.discard)
         B._SHUTDOWN_T0 = B._mono()
+        k = len(recs)
         await B.on_stop(None)
-        with_ = stop_line()
+        with_ = recs[k:]
+        k = len(recs)
         await B.on_stop(None)
-        return with_, stop_line(), t.cancelled()
+        return with_, recs[k:], t.cancelled()
 
     SENDS.clear()
     with_, without, cancelled = asyncio.run(main())
