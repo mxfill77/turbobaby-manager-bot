@@ -898,6 +898,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             splinter.decider_shadow(msg, bridge=bridge, claude=claude)
             # ЛЕНИВО (Q1): гарантировать постоянную кнопку «ℹ️ Инфо» в этой теме (дедуп, O(1) после первого раза)
             await splinter.ensure_info_pin(context, chat_id, _tid_sv)
+            # ЧЕК/СТОИМОСТЬ ТЕКСТОМ (25.10.2026, SVCRECEIPT2510): «итого 1340 бат», «работа 300, фильтр 250», ответ
+            #     на просьбу о чеке → строка истории «чек» + ответ. Стоит ДО решателя, фазы 2 и вопросов о пробеге:
+            #     иначе висящий вопрос о пробеге взял бы «Total 2,290 bath» одометром 2290. Смешанное сообщение
+            #     (работа/пробег + цена) — строка стоимости пишется, сообщение идёт дальше. `SVC_RECEIPT=0` → no-op.
+            if msg.text and await splinter.handle_service_cost(msg, context, bridge):
+                return
             # РЕШАТЕЛЬ В БОЮ (01.10.2026, SPLLIVEMODE0110): флаг `TOPIC_DECIDER_LIVE` (по умолчанию выкл. →
             # строка не делает ничего). Сообщение НЕ к Splinter решается до перехватов; взял → перехваты
             # молчат. Обращение к Splinter, пауза темы, сбой модели → прежний путь ниже. Fail-safe внутри.

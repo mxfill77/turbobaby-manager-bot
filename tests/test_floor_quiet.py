@@ -277,7 +277,17 @@ def test_remark_is_written_as_event_and_not_answered():
 def test_named_photo_gets_no_word():
     for kind in ("wheel", "bike", "other", "receipt"):
         _fresh_hints()
-        sent, _, cl = _run(_Msg(photo=True), _Claude(vision=[{"kind": kind}]))
+        # ЧЕК (25.10.2026, SVCRECEIPT2510): у снимка чека теперь своя ветка — он разобран и ОТВЕЧЕН сам
+        # (`tests/test_service_receipt_cost.py`); «назван — молчим» для чека держится при выключенной ручке.
+        prev = os.environ.get("SVC_RECEIPT")
+        os.environ["SVC_RECEIPT"] = "0" if kind == "receipt" else (prev or "1")
+        try:
+            sent, _, cl = _run(_Msg(photo=True), _Claude(vision=[{"kind": kind}]))
+        finally:
+            if prev is None:
+                os.environ.pop("SVC_RECEIPT", None)
+            else:
+                os.environ["SVC_RECEIPT"] = prev
         assert sent == [], (kind, _texts(sent))
         assert cl.vision_calls == 1, kind
 

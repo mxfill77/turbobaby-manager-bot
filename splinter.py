@@ -1050,9 +1050,16 @@ async def _emit_summary(context, chat_id, topic_id, bike, skip_oil=False, reply_
         return None
     # КЛАСС-ФИКС кнопочных подтверждений: сводка-квитанция через _send_retry — ConnectTimeout (сетевой блип)
     # не оставляет владельца в тишине после нажатия кнопки. Действие уже выполнено, переотправка идемпотентна.
-    return await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
-                             text=msg_service_summary(bike, acc, skip_oil=skip_oil),
-                             reply_markup=reply_markup)
+    # ЧЕК (25.10.2026, SVCRECEIPT2510): записана работа (история · столбец · замена масла) → одна строка просьбы
+    # о чеке/стоимости, раз на визит; сводка одного пробега («ТО в норме») просьбы не несёт.
+    _rx = _svc_rcpt_extra(chat_id, topic_id,
+                          ask=bool(acc.get("works") or acc.get("cols") or acc.get("oil_written")))
+    _sent = await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                              text=_svc_rcpt_attach(msg_service_summary(bike, acc, skip_oil=skip_oil), _rx),
+                              reply_markup=reply_markup)
+    if _sent is not None:
+        _svc_rcpt_spent(chat_id, topic_id, _rx)
+    return _sent
 
 
 # Анти-спам для просьбы «пришли чёткое фото одометра» (масло без читаемого пробега):
@@ -3575,6 +3582,8 @@ def _parse_service_items(items, limit=6):
     out = []
     seen = set()
     for it in items or []:
+        if str(it.get("event_type") or "").strip().lower() == service_cost.EVENT_TYPE:
+            continue   # строка чека/стоимости (SVCRECEIPT2510) — не работа на пробеге, её «итого N ฿» не км
         m = _re_pl.match(_SVC_HIST_RE, str(it.get("notes") or "").strip(), _re_pl.IGNORECASE)
         if m:
             work = m.group(1).strip(); km = m.group(2)
@@ -5716,6 +5725,8 @@ def detect_oil_backdated_km(text):
         n = int(m.group(0).replace(" ", "").replace(" ", "").replace(",", ""))
     except (ValueError, TypeError):
         return None
+    if _svc_rcpt_on() and service_cost.is_money_km(t, n):
+        return None   # «замена масла была, 1200 бат» — цена, а не пробег замены (SVCRECEIPT2510)
     return n if 1000 <= n <= 999999 else None
 
 
@@ -5734,6 +5745,8 @@ def detect_mileage_correction(text):
         n = int(m.group(0).replace(" ", "").replace(" ", "").replace(",", ""))
     except (ValueError, TypeError):
         return None
+    if _svc_rcpt_on() and service_cost.is_money_km(t, n):
+        return None   # «не 980, а 1200 бат» — поправка цены, а не пробега (SVCRECEIPT2510)
     return n if 1000 <= n <= 999999 else None
 
 
@@ -6460,6 +6473,11 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
     oil_hint = pend[3] if len(pend) > 3 else False   # подсказка «был маркер замены»
     t = (text or "").strip().lower()
     m = _re_pl.search(r"\d{4,}", t.replace(" ", "").replace(",", ""))
+    if m and _svc_rcpt_on() and service_cost.is_money_km(text, m.group(0)):
+        # ЧИСЛО С «БАТ» — НЕ ОТВЕТ НА ВОПРОС О ПРОБЕГЕ (25.10.2026, SVCRECEIPT2510): «Total 2,290 bath» здесь
+        # стал бы одометром 2290. Берём первое число, НЕ названное деньгами; такого нет — это не ответ.
+        m = next((x for x in _re_pl.finditer(r"\d{4,}", t.replace(" ", "").replace(",", ""))
+                  if not service_cost.is_money_km(text, x.group(0))), None)
     if t in _CONFIRM_YES and _act_gate_on() and not _act_trusted(msg):
         # «ДА» НА ПРОБЕГ — ТОЛЬКО ОТ ДОВЕРЕННОГО (27.09.2026, #91 SPLINTERCHEK2709): «да» любого
         # записывало число, прочитанное зрением без контекста. Вопрос остаётся висеть.
@@ -7579,6 +7597,7 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=
         acc = _summary_acc(chat_id, topic_id)
         acc["current_km"] = str(km_int)
         acc["oil"] = {"km": km_int, "next": (km_int + _iv) if _iv else None, "status": "ok"}
+        acc["oil_written"] = True   # замена ЗАПИСАНА (не просто срок по пробегу) — сводка попросит чек (SVCRECEIPT2510)
         await _close_service_reminder(context, bridge, chat_id, topic_id, bike)   # снимает ВСЕ старые пины (unpin_all)
         _sum_msg = await _emit_summary(context, chat_id, topic_id, bike,
                                        reply_markup=_svc_undo_kb(_undo_tok))
@@ -8082,14 +8101,18 @@ async def handle_service_button(update, context, bridge) -> None:
         # Три исхода (записано · не записано · неизвестен) и имена работ — в `service_receipt`.
         rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL,
                                      ledger=_svc_ledger_take(chat_id, topic_id))
+        # ЧЕК (SVCRECEIPT2510): работа записана → к квитанции одна строка просьбы о чеке/стоимости (раз на визит).
+        _rx = _svc_rcpt_extra(chat_id, topic_id, ask=(rec["state"] == service_receipt.STATE_WRITTEN))
         # E1: подтверждение через _send_retry — запись (_sp_write_done) УЖЕ прошла и идемпотентна,
         # переотправка безопасна. Без retry ConnectTimeout «съедал» подтверждение → владелец дублировал «Да».
-        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
-                          text=(f"🐀 Splinter · 📌 {bike}\n"
-                                f"🇹🇭 {rec['th']}\n"
-                                f"{_SEP}\n"
-                                f"🇷🇺 {rec['ru']}"),
-                          reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
+        _sent = await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                                  text=_svc_rcpt_attach(f"🐀 Splinter · 📌 {bike}\n"
+                                                        f"🇹🇭 {rec['th']}\n"
+                                                        f"{_SEP}\n"
+                                                        f"🇷🇺 {rec['ru']}", _rx),
+                                  reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
+        if _sent is not None:
+            _svc_rcpt_spent(chat_id, topic_id, _rx)
         log.info(f"  → ТО фаза2 запись по «да» {cb}: written={written} failed={failed} odo={odo} "
                  f"исход={rec['state']}")
     elif action == "bodo":
@@ -8206,12 +8229,15 @@ async def handle_service_button(update, context, bridge) -> None:
                                                confirmed_by=cb, ceiling_ok=True)
         rec = service_receipt.receipt(written, failed, odo, _SP_KIND_LABEL,
                                      ledger=_svc_ledger_take(chat_id, topic_id))
-        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
-                          text=(f"🐀 Splinter · 📌 {bike}\n"
-                                f"🇹🇭 {rec['th']}\n"
-                                f"{_SEP}\n"
-                                f"🇷🇺 {rec['ru']}"),
-                          reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
+        _rx = _svc_rcpt_extra(chat_id, topic_id, ask=(rec["state"] == service_receipt.STATE_WRITTEN))   # SVCRECEIPT2510
+        _sent = await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                                  text=_svc_rcpt_attach(f"🐀 Splinter · 📌 {bike}\n"
+                                                        f"🇹🇭 {rec['th']}\n"
+                                                        f"{_SEP}\n"
+                                                        f"🇷🇺 {rec['ru']}", _rx),
+                                  reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
+        if _sent is not None:
+            _svc_rcpt_spent(chat_id, topic_id, _rx)
         log.info(f"  → ТО фаза2 запись по «да» верхней границы {cb}: written={written} "
                  f"failed={failed} odo={odo} исход={rec['state']}")
 
@@ -12163,12 +12189,14 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
             # дописывался хвостом только по-русски — тайская молчала о нём вовсе.
             rec = service_receipt.receipt(written, failed, m.group(1), _SP_KIND_LABEL,
                                          ledger=_svc_ledger_take(chat_id, topic_id))
+            _rx = _svc_rcpt_extra(chat_id, topic_id, ask=(rec["state"] == service_receipt.STATE_WRITTEN))
             await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=(f"🐀 Splinter · 📌 {bike}\n"
-                              f"🇹🇭 {rec['th']}\n"
-                              f"{_SEP}\n"
-                              f"🇷🇺 {rec['ru']}"),
+                        text=_svc_rcpt_attach(f"🐀 Splinter · 📌 {bike}\n"
+                                              f"🇹🇭 {rec['th']}\n"
+                                              f"{_SEP}\n"
+                                              f"🇷🇺 {rec['ru']}", _rx),
                         reply_markup=_svc_undo_kb(_SVC_UNDO_LAST.get((chat_id, topic_id))))
+            _svc_rcpt_spent(chat_id, topic_id, _rx)   # ЧЕК (SVCRECEIPT2510): строка ушла с квитанцией
             log.info(f"  → ТО фаза2 запись по числу-да {cb}: written={written} failed={failed} "
                      f"odo={m.group(1)} исход={rec['state']}")
             return True
@@ -12184,9 +12212,16 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     # E3(c): накопительно — НЕ теряем ранее распознанное (подшипник и т.п.); объединяем со stored done строки.
     done = _sp_merge_done(_sp_split(sp.get("done")), done)
     odo = parsed.get("mileage") or ""
+    _money = _svc_rcpt_on()   # ЧИСЛО С «БАТ» — НЕ ОДОМЕТР (25.10.2026, SVCRECEIPT2510): «Замена масла — 1200 бат»
+    if odo and _money and service_cost.is_money_km(text, odo):   # иначе уехало бы одометром в кнопку Пыму
+        log.info(f"  → ТО фаза2: разбор назвал одометром {odo}, а рядом валюта/итог — не беру")
+        odo = ""
     if not odo:
         m = _re_pl.search(r"\b(\d{4,6})\b", str(text or ""))
         odo = m.group(1) if m else ""
+        if odo and _money and service_cost.is_money_km(text, odo):
+            odo = next((x.group(1) for x in _re_pl.finditer(r"\b(\d{4,6})\b", str(text or ""))
+                        if not service_cost.is_money_km(text, x.group(1))), "")
     # Z4: дословные работы из ответа → в note (для правдивой карточки «в работе»). Отдельный upsert по note;
     # последующие upsert'ы статуса/done не передают note → pick('note') сохранит этот сегмент. Зелёная (Bot Data).
     if works:
@@ -13145,10 +13180,17 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
             _PARSE_SEEN.set(reply_floor.parse_seen(parsed))
         except Exception:
             pass
+        # ЧИСЛО С «БАТ» — НЕ ПРОБЕГ (25.10.2026, SVCRECEIPT2510): «Total 2,290 bath» разборщик вправе назвать
+        # пробегом 2290 — дальше оно легло бы в строку событий и в ТО-трекер. Число, названное деньгами, снимаем.
+        if parsed.get("mileage") and _svc_rcpt_on() and service_cost.is_money_km(text, parsed.get("mileage")):
+            log.info(f"  → разбор назвал пробегом {parsed.get('mileage')}, а рядом валюта/итог — это деньги, "
+                     f"пробегом не беру")
+            parsed = dict(parsed, mileage=None)
 
     # Разбираем фото через vision (топливо/пробег/повреждения). На альбом — каждое фото,
     # затем агрегируем в ОДИН вердикт (один ответ вместо дубля на каждое фото).
     vis = {}
+    _rc_seen = []   # (фото, байты, разбор) — для чека в теме (SVCRECEIPT2510): снимок не качаем дважды
     if has_photo:
         vis_list = []
         for pm in photo_msgs:
@@ -13173,6 +13215,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
             # Копим разбор в буфер недавних фото ЭТОЙ ТЕМЫ (для вопросов "проверь фото резины/пробега")
             _remember_recent_photo(chat_id, v, pm, topic_id=topic_id)
             vis_list.append(v)
+            _rc_seen.append((pm, img, v))
         vis = _aggregate_album_vis(vis_list)
         # Свидетель для пола ответа: он стоит снаружи этой функции и сам разбора не видит.
         # Кладём РОВНО то, что назвал разбор; не назвал — пусто, и пол скажет «не узнал».
@@ -13192,6 +13235,11 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
             feed_vision(chat_id, topic_id, photo_msgs, vis, len(vis_list))
             # РЕШАТЕЛЬ В ТЕНИ (SPLDECIDER0110): фото решается, когда разбор уже в ленте. Флаг выкл. → no-op.
             decider_shadow((photo_msgs or [msg])[0], bridge=bridge, claude=claude, kind="photo")
+            # ЧЕК В ТЕМЕ (25.10.2026, SVCRECEIPT2510) — раньше решателя: о чеках он не знает, а пачка из одних чеков
+            # прежнему разбору ничего не даёт. Ручка выкл. / повтор по «да» ворот → мимо, путь прежний.
+            if _svc_rcpt_on() and not _gate_ok and await _svc_receipt_branch(
+                    context, bridge, claude, msg, _rc_seen, parsed, text, chat_id, topic_id):
+                return
             # РЕШАТЕЛЬ В БОЮ (SPLLIVEMODE0110): фото — после разбора, одно решение на альбом (по первому
             # фото). Взял → прежний разбор дальше молчит. Флаг выкл. / сбой / пауза → прежний путь.
             if decider_live_on() and await decider_live((photo_msgs or [msg])[0], context, bridge, claude,
@@ -13682,8 +13730,14 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
                                       "(fail-safe: спрашиваем пробег, как спрашивали)")
         # ЗАМОК ПОВТОРОВ (вид I). Состояние = ПЕРЕЧЕНЬ работ: назвали другие работы — другое
         # состояние, квитанция уходит снова; тот же перечень второй раз — повтор.
-        await _hint_send(context, kind="I", bike=bike, state=("works", works),
-                         chat_id=chat_id, topic_id=topic_id, text=msg_work_receipt(bike, works))
+        # ЧЕК (25.10.2026, SVCRECEIPT2510): к квитанции — одна строка просьбы о чеке/стоимости (раз на визит);
+        # замок повторов судит состояние, а не текст, и подавленная квитанция просьбу не тратит.
+        _rx = _svc_rcpt_extra(chat_id, topic_id)
+        _wr = await _hint_send(context, kind="I", bike=bike, state=("works", works),
+                               chat_id=chat_id, topic_id=topic_id,
+                               text=_svc_rcpt_attach(msg_work_receipt(bike, works), _rx))
+        if _wr is not HINT_SKIPPED:
+            _svc_rcpt_spent(chat_id, topic_id, _rx)
         return
 
     # Масло-контекст, но БЕЗ чёткого пробега в ЭТОМ сообщении → САМ просим ЧЁТКОЕ фото одометра.
@@ -15846,6 +15900,314 @@ async def handle(update, context, bridge, claude, album_msgs=None):
     # менеджер, и лишняя реплика бота видна клиенту.
     if mode == "servicing":
         await _reply_floor_speak(context, msg, crashed=_crashed, spoke_before=_spoke_before)
+
+
+# ── ЧЕК И СТОИМОСТЬ ОБСЛУЖИВАНИЯ (25.10.2026, SVCRECEIPT2510) ─────────────────────────────────────────────────────────
+# Живые случаи группы «Обслуживание»: 01.10 11:19 XADV 750 GREY 2478 — фото чека PRASUTBIGBIKE (шина Pirelli 5,600.00,
+# болты 2 × 25.00, GRAND TOTAL 5,650.00, дата «01/10/2569»): разбор снимка назвал вид `receipt` — и всё, в истории байка
+# ни суммы, ни магазина, бот промолчал; 15.10 и 19.10 — чеки VULCAN на 1,340 и 450 — так же. Цена, набранная механиком
+# («Передняя шина — 980 бат»), терялась целиком, а вопрос о пробеге взял бы «Total 2,290 bath» одометром 2290. И ни
+# одно сообщение бота ПОСЛЕ работ чек не просило (единственное упоминание — `msg_service_due`, ДО работ).
+# Решение — `service_cost` (чистое, импорты `re` и `datetime`); здесь только руки:
+#   * просьба — ОДНА строка к подтверждению, которое бот и так шлёт (сводка цикла `_emit_summary`, квитанция фазы 2,
+#     «Принял работы»), один раз на тему за местный день; стоимость визита уже известна — не просим;
+#   * снимок чека → `VISION_SERVICE_RECEIPT` → ОДНА строка «событий» вида «чек» + ответ RU/TH; сомнение → ничего не
+#     пишем, называем прочитанное и просим итог цифрами;
+#   * стоимость текстом → та же строка; смешанное сообщение (работа/пробег + цена) идёт дальше прежним путём, а
+#     «стоимость записана» едет его подтверждением;
+#   * число рядом с «бат/บาท/฿/bath» пробегом не становится ни в одном детекторе пробега.
+# ДОВЕРИЕ — КАК У СЛОВ МЕХАНИКА В ИСТОРИИ: `_write_info_works` кладёт работу любого сотрудника темы без «да» доверенного
+# (Bot Data «события» — зелёная зона), поэтому чек и стоимость пишет любой сотрудник; Лист1 и деньги не трогаются.
+# Память просьбы живёт в процессе: рестарт = максимум одна лишняя просьба за день.
+# Определено В КОНЦЕ модуля (как K-FIX ниже), чтобы ссылки `splinter.py:N` выше не съехали.
+# Откат: `SVC_RECEIPT=0` строкой файла настроек + рестарт splinter — путь байт-в-байт прежний.
+import service_cost   # noqa: E402  чек/стоимость → строка истории «чек»; число с «бат» — не пробег
+
+#: Разбор снимка чека. Денежный `VISION_RECEIPT_SYSTEM` не годится: он знает одну сумму и не знает позиций.
+#: ДАТУ МОДЕЛЬ НЕ ПЕРЕСЧИТЫВАЕТ: приносит её КАК НАПЕЧАТАНА, буддийский год и порядок дд/мм считает код
+#: (`service_cost.be_date`) — одно правило, а не догадка модели на каждом снимке.
+VISION_SERVICE_RECEIPT = """На фото — чек/счёт мастерской или магазина запчастей (Таиланд) за обслуживание мотобайка.
+Прочитай его и верни СТРОГО JSON:
+  shop: название магазина/мастерской как напечатано (латиницей или по-тайски) или null
+  date: дата чека КАК НАПЕЧАТАНА, символ в символ (например "01/10/2569"), или null. Год НЕ пересчитывай.
+  items: позиции чека по строкам — [{name, name_orig, qty, unit_price, price}]:
+     name — коротко по-русски, что это; бренд и модель — латиницей как на чеке
+            (например "Pirelli Diablo Rosso Scooter", "болты", "работа", "грипсы Daytona GGD-Duel")
+     name_orig — как напечатано на чеке
+     qty — количество числом (не указано — 1); unit_price — цена за штуку; price — сумма строки
+  total: ИТОГО к оплате (GRAND TOTAL / รวมเงิน / ยอดสุทธิ / รวมทั้งสิ้น) числом или null
+  currency: "THB" | "EUR" | "USD" | null   (฿ / บาท = THB)
+  confidence: "high" | "low" — high ТОЛЬКО если итог и все суммы читаются однозначно
+  notes: короткая заметка на русском
+Числа — без разделителей тысяч: 5,650.00 → 5650. Строка «2 × 25.00 = 50.00» → qty 2, unit_price 25, price 50.
+Не угадывай: не видно — null и confidence:"low". Это НЕ приборная панель: пробег отсюда не бери.
+Верни ТОЛЬКО JSON."""
+
+_SVC_RCPT = {}          # (chat_id, topic_id) → {"day", "asked", "known", "totals", "ack"} — визит = тема × местный день
+_SVC_RCPT_KEEP = 400    # потолок памяти: на переполнении выметаются прошлые дни
+#: Виды работ, с которыми сообщение — ОТЧЁТ о работе, а не одна цена (ключи `_SP_KIND_LABEL` без «прочих»).
+_SVC_COST_WORK_KINDS = ("oil", "gear", "abs", "airfilter", "pads", "chain", "tyre")
+
+
+def _svc_rcpt_on():
+    """Ручка `SVC_RECEIPT` (дефолт 1). «0» → ни разбора чеков, ни просьбы, ни замков пробега."""
+    return service_cost.enabled(os.getenv(service_cost.FLAG_ENV))
+
+
+def _svc_rcpt_state(chat_id, topic_id):
+    """Память визита по теме за МЕСТНЫЙ день (Пхукет): просили ли чек, известна ли стоимость, какие итоги
+    уже легли, ждёт ли подтверждение строки «стоимость записана». Новый день — новая запись."""
+    day = _hb_phuket("%Y-%m-%d")
+    st = _SVC_RCPT.get((chat_id, topic_id))
+    if not st or st.get("day") != day:
+        st = {"day": day, "asked": False, "known": False, "totals": [], "ack": None}
+        _SVC_RCPT[(chat_id, topic_id)] = st
+        if len(_SVC_RCPT) > _SVC_RCPT_KEEP:
+            for k in [k for k, v in _SVC_RCPT.items() if v.get("day") != day]:
+                _SVC_RCPT.pop(k, None)
+    return st
+
+
+def _svc_rcpt_extra(chat_id, topic_id, ask=True):
+    """Строка к подтверждению: (тайская, русская) либо ("", ""). Сначала — «стоимость записана» для смешанного
+    сообщения; иначе — просьба о чеке, если работа записана (`ask`), стоимость визита не известна и сегодня по
+    теме ещё не просили. САМА НИЧЕГО НЕ ПОМЕЧАЕТ: пометку ставит `_svc_rcpt_spent` ПОСЛЕ отправки — подавленное
+    замком повторов или упавшее сообщение просьбу не тратит."""
+    if not _svc_rcpt_on():
+        return ("", "")
+    try:
+        st = _svc_rcpt_state(chat_id, topic_id)
+        if st.get("ack"):
+            return tuple(st["ack"])
+        if ask and not st.get("known") and not st.get("asked"):
+            return tuple(service_cost.ASK)
+    except Exception:
+        log.exception("  → чек: строка к подтверждению не собрана (fail-safe: подтверждение без неё)")
+    return ("", "")
+
+
+def _svc_rcpt_attach(text, extra):
+    """Приклеить строку к уже собранному тексту подтверждения; пустая строка — текст байт-в-байт прежний."""
+    if not extra or not (extra[0] or extra[1]):
+        return text
+    return service_cost.attach(text, extra[0], extra[1])
+
+
+def _svc_rcpt_spent(chat_id, topic_id, extra):
+    """Подтверждение со строкой УШЛО → строка потрачена: просьба — до конца дня, «записано» — сказано."""
+    if not extra or not (extra[0] or extra[1]):
+        return
+    try:
+        st = _svc_rcpt_state(chat_id, topic_id)
+        if st.get("ack") and tuple(st["ack"]) == tuple(extra):
+            st["ack"] = None
+        elif tuple(extra) == tuple(service_cost.ASK):
+            st["asked"] = True
+            log.info(f"  → чек: просьба о чеке/стоимости ушла с подтверждением (тема {topic_id}, день {st['day']})")
+    except Exception:
+        log.exception("  → чек: пометка строки не поставилась (худшее — ещё одна просьба)")
+
+
+def _svc_rcpt_known(chat_id, topic_id, total, ack=None):
+    """Стоимость визита легла (или уже лежала) — больше не просим; итог помним против второй строки."""
+    st = _svc_rcpt_state(chat_id, topic_id)
+    st["known"] = True
+    if total:
+        st["totals"].append(float(total))
+    if ack:
+        st["ack"] = tuple(ack)
+
+
+def _svc_rcpt_reply_kind(msg):
+    """Сообщение — ответ (реплай) на нашу просьбу о чеке? None · "cost" · "cost+km" (`service_cost.ask_kind`)."""
+    r = getattr(msg, "reply_to_message", None)
+    ru = getattr(r, "from_user", None) if r is not None else None
+    if ru is None or not getattr(ru, "is_bot", False):
+        return None
+    return service_cost.ask_kind(getattr(r, "text", None) or getattr(r, "caption", None) or "")
+
+
+def _svc_photo_uid(pm):
+    """`file_unique_id` самого крупного снимка: тот же снимок, присланный ещё раз, даёт тот же ключ строки."""
+    try:
+        ph = getattr(pm, "photo", None) or []
+        return str(getattr(ph[-1], "file_unique_id", None) or "")
+    except Exception:
+        return ""
+
+
+def _svc_rcpt_km(bridge, chat_id, topic_id, bike):
+    """Последний известный пробег темы — справкой в строку чека. Строка «чек» в учёт пробега не идёт ни одним
+    читателем (карточка разбирает только «<работа> — <км> км», одометр живёт в «обслуживании»), но и справка
+    берётся ТОЛЬКО из записанного человеком: запись трекера этой темы за сутки, иначе свой одометр байка не
+    старше суток. Сырое зрение сюда не идёт (правило записи 4957). Нет — None, строка ляжет без пробега."""
+    rec = _LAST_RECORDED_KM.get((chat_id, topic_id))
+    if rec and (_time.time() - float(rec[1] or 0)) <= 24 * 3600:
+        return str(rec[0])
+    try:
+        rows = [r for r in (bridge.service_list().get("items") or []) if _same_bike(r.get("bike"), bike)]
+        km, at = _odo_own_freshest(rows)
+        v = odo_fresh.verdict(km, at, _time.time(), 24 * 60)
+        if v.get("use"):
+            return v["km"]
+    except Exception:
+        log.exception("  → чек: пробег темы не прочитан (строка ляжет без пробега)")
+    return None
+
+
+def _svc_cost_write(bridge, msg, chat_id, topic_id, bike, rc, *, typed, key, km="", photos=0):
+    """ОДНА строка «событий» вида «чек». Ключ (`msg_id`) — из снимка или сообщения: повтор схлопывает мост.
+    Исход — из ответа мира: ("written" | "dup" | "failed", ошибка)."""
+    note = service_cost.receipt_note(rc, typed=typed)
+    u = getattr(msg, "from_user", None)
+    sender = ("@" + u.username) if (u and getattr(u, "username", None)) else ""
+    try:
+        r = bridge.add_event(msg_date=_msg_date_of(msg), group=group_label(chat_id)
+                             + (f" / тема {topic_id}" if topic_id else ""),
+                             bike=bike, event_type=service_cost.EVENT_TYPE, fuel="", mileage=str(km or ""),
+                             photos=photos, notes=note, msg_id=key, sender=sender) or {}
+    except Exception:
+        log.exception(f"  → чек: запись строки упала ({key})")
+        r = {"ok": False, "error": "exception"}
+    st = ("dup" if r.get("duplicate") else "written") if r.get("ok") else "failed"
+    log.info(f"  → чек в историю {bike}: «{note}» msg_id={key} км={km or '-'} → {st} "
+             f"(ok={r.get('ok')} saved={r.get('saved')} dup={r.get('duplicate')} error={r.get('error')})")
+    return st, str(r.get("error") or "")
+
+
+def _svc_cost_has_work(text, c):
+    """В сообщении со стоимостью есть ещё и РАБОТА — вид по живому классификатору (`_declared_kinds`, тот же, что
+    у заявки) или глагол сделанного («Замена ремня … — 850 бат»). Такое сообщение обязано дойти до двери работ."""
+    names = [i.get("name") for i in (c.get("items") or []) if i.get("name")]
+    try:
+        kinds = _declared_kinds(text, names, {})
+    except Exception:
+        kinds = []
+    return any(k in _SVC_COST_WORK_KINDS for k in kinds) or service_cost.work_verb(text)
+
+
+async def handle_service_cost(msg, context, bridge) -> bool:
+    """СТОИМОСТЬ ТЕКСТОМ в теме байка. Зовёт bot.py ПЕРВОЙ дверью группы «Обслуживание» — раньше решателя, фазы 2
+    и вопросов о пробеге: иначе «итого 1340 бат» съел бы висящий вопрос о пробеге одометром 1340.
+
+    True — сообщение целиком о стоимости (или ответ на нашу просьбу): строка записана/уже была, ответ ушёл.
+    Смешанное (работа · пробег · слова сверх цен) — строка стоимости пишется, «записано» едет подтверждением
+    работ, возврат False: дальше прежний путь, и работа в нём не теряется. Fail-safe: любой сбой → False."""
+    if not _svc_rcpt_on():
+        return False
+    try:
+        text = getattr(msg, "text", None) or ""
+        u = getattr(msg, "from_user", None)
+        if not text.strip() or getattr(msg, "photo", None) or u is None or getattr(u, "is_bot", False):
+            return False
+        chat_id, topic_id = msg.chat_id, getattr(msg, "message_thread_id", None)
+        if GROUPS.get(chat_id) != "servicing":
+            return False
+        bike = bike_from_topic(chat_id, topic_id) or ""
+        if not bike:
+            return False
+        asked = _svc_rcpt_reply_kind(msg) or ""
+        c = service_cost.parse_cost_text(text, asked=asked)
+        if c is None:
+            return False
+        pure = bool(asked) or not (c["has_km"] or c["extra"] or _svc_cost_has_work(text, c))
+        same = any(abs(t - float(c["total"])) < 0.5 for t in (_svc_rcpt_state(chat_id, topic_id)["totals"]))
+    except Exception:
+        log.exception("  → стоимость текстом: разбор упал (fail-safe: прежний путь)")
+        return False
+    log.info(f"  → стоимость текстом {bike}: итог {c['total']} позиций {len(c['items'])} "
+             f"{'целиком о стоимости' if pure else 'смешанное (работа/пробег/слова)'}"
+             + (f", ответ на просьбу ({asked})" if asked else ""))
+    if same:
+        # Тот же итог сегодня уже лёг по чеку: вторая строка о тех же деньгах удвоила бы расход визита.
+        log.info(f"  → стоимость {c['total']} уже записана по чеку сегодня — вторую строку не пишу")
+        if not pure:
+            return False
+        th, ru = service_cost.cost_reply(c, "same")
+    else:
+        outcome, err = _svc_cost_write(bridge, msg, chat_id, topic_id, bike, c, typed=True,
+                                       key=f"cost:{chat_id}:{getattr(msg, 'message_id', '')}")
+        if outcome in ("written", "dup"):
+            _svc_rcpt_known(chat_id, topic_id, c["total"], ack=None if pure else service_cost.ack_line(c))
+        if not pure:
+            return False
+        th, ru = service_cost.cost_reply(c, outcome, err)
+    try:
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=f"🐀 Splinter · 📌 {bike}\n🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}")
+    except Exception:
+        log.exception("  → стоимость текстом: ответ не ушёл (строка уже записана — повтор её не удвоит)")
+    return True
+
+
+async def _svc_receipt_branch(context, bridge, claude, msg, seen, parsed, text, chat_id, topic_id):
+    """Снимки чеков в пачке → разбор чека, строка истории, ответ. Кандидаты: вид `receipt` по разбору снимка; нет
+    таких — подпись называет чек (чек/ใบเสร็จ/receipt) или фото прислано ответом на нашу просьбу (тогда всё, кроме
+    приборки). True — пачка целиком из чеков и подпись не несёт ни работ, ни пробега: прежнему разбору сказать
+    нечего, а строку «photo» заменяет строка «чек». False — прежний путь идёт дальше (в пачке есть приборка/деталь)."""
+    def _kind(v):
+        return str((v or {}).get("kind") or "").strip().lower()
+    if not seen:
+        return False
+    cand = [(pm, img) for (pm, img, v) in seen if _kind(v) == "receipt"]
+    if not cand and (service_cost.caption_says_receipt(text) or _svc_rcpt_reply_kind(msg)):
+        cand = [(pm, img) for (pm, img, v) in seen if _kind(v) != reply_floor.DASHBOARD][:3]
+    if not cand:
+        return False
+    bike = (parsed or {}).get("bike") or bike_from_topic(chat_id, topic_id) or ""
+    if not bike:
+        log.info("  → чек на фото, но байк темы не известен — прежний путь")
+        return False
+    await _svc_receipt_photos(context, bridge, claude, msg, cand, bike, chat_id, topic_id, caption=text)
+    _more = bool((parsed or {}).get("works") or (parsed or {}).get("mileage"))
+    return len(cand) == len(seen) and not _more
+
+
+async def _svc_receipt_photos(context, bridge, claude, msg, items, bike, chat_id, topic_id, caption=""):
+    """Каждый снимок чека: `VISION_SERVICE_RECEIPT` → `service_cost.normalize_receipt` → уверенно — одна строка
+    «чек» (ключ = снимок), сомнение — ничего. Один ответ на всю пачку. Все снимки сомнительны, а подпись называет
+    сумму деньгами («1340 бат») — пишется сумма подписи: её набрал человек."""
+    try:
+        ref = msg.date.date() if getattr(msg, "date", None) else None
+    except Exception:
+        ref = None
+    plate = _plate_from_name(bike) or "?"
+    outs, km = [], None
+    for pm, img in items:
+        try:
+            v = _parse_json(claude.vision(VISION_SERVICE_RECEIPT, img, max_tokens=900))
+        except Exception:
+            log.exception("  → чек: разбор снимка упал")
+            v = {}
+        rc = service_cost.normalize_receipt(v, ref_date=ref)
+        log.info(f"  → чек со снимка {bike}: ok={rc['ok']} магазин={rc['shop'] or '-'} дата={rc['date'] or '-'} "
+                 f"позиций={len(rc['items'])} итог={rc['total']} ({rc['why'] or 'уверенно'})")
+        if not rc["ok"]:
+            outs.append({"state": "unsure", "rc": rc})
+            continue
+        if km is None:
+            km = _svc_rcpt_km(bridge, chat_id, topic_id, bike) or ""
+        uid = _svc_photo_uid(pm)
+        key = f"rcpt:{plate}:{uid}" if uid else f"rcpt:{chat_id}:{getattr(pm, 'message_id', '')}"
+        st, err = _svc_cost_write(bridge, msg, chat_id, topic_id, bike, rc, typed=False, key=key, km=km, photos=1)
+        outs.append({"state": st, "rc": rc, "error": err})
+        if st in ("written", "dup"):
+            _svc_rcpt_known(chat_id, topic_id, rc["total"])
+    if outs and all(o["state"] == "unsure" for o in outs):
+        c = service_cost.parse_cost_text(caption) if caption else None
+        if c is not None and c["marked"]:
+            st, err = _svc_cost_write(bridge, msg, chat_id, topic_id, bike, c, typed=True,
+                                      key=f"cost:{chat_id}:{getattr(msg, 'message_id', '')}", photos=1)
+            if st in ("written", "dup"):
+                _svc_rcpt_known(chat_id, topic_id, c["total"])
+            th, ru = service_cost.cost_reply(c, st, err)
+            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                        text=f"🐀 Splinter · 📌 {bike}\n🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}")
+            return
+        _svc_rcpt_state(chat_id, topic_id)["asked"] = True   # итог цифрами уже попросили — сводка не повторит
+    th, ru = service_cost.receipt_reply(outs)
+    await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                text=f"🐀 Splinter · 📌 {bike}\n🇹🇭 {th}\n{_SEP}\n🇷🇺 {ru}")
 
 
 # ── K-FIX r2 (21.10.2026, Codex TB-OWNER-2110-DISK-P0-ADD1 / TB-REVIEW-2110-KFIX-R2-LIMITS) ─────────────────────────
