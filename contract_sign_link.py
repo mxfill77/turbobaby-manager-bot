@@ -3,8 +3,9 @@
 
 ЗАЧЕМ. Слово владельца 25.10.2026: «надо что в контрактах вот такая ссылка приходила на подпись и остальные не надо
 … а то путаницу, и ссылочка на редактирования контракта рядом была». «Такая ссылка» — ссылка веб-приложения TB e-Sign
-(`…/exec?a=sign&d=<id документа>&k=<токен>&who=client`): её получает группа контрактов, токен — HMAC от секрета
-TB e-Sign, посчитать её здесь нельзя. С TB e-Sign 0.2.2 она лежит в реестре подписей (колонка «Ссылка клиенту на
+(`…/exec?a=sign&d=<id документа>&k=<токен>&who=client`; с TB e-Sign 0.2.3 — страница подписи вне Google
+`…/#d=<id документа>&k=<токен>`, см. «замок»): её получает группа контрактов, токен — HMAC от секрета TB e-Sign,
+посчитать её здесь нельзя. С TB e-Sign 0.2.2 она лежит в реестре подписей (колонка «Ссылка клиенту на
 подпись»), и дверь моста `contract_find` отдаёт её полем `sign_url`, а «Ссылку на документ» — полем `doc_url`.
 
 ПОЧЕМУ ДВА СООБЩЕНИЯ. Строка реестра появляется не сразу: сканер TB e-Sign берёт документ из папки договоров раз в
@@ -18,9 +19,14 @@ TB e-Sign, посчитать её здесь нельзя. С TB e-Sign 0.2.2 �
 стоп / ждать), тексты сообщений. Опрос и отправка — в `splinter.py` (`_contract_sign_link_follow`). Импорты — ровно
 `re` и `urllib.parse` (страж — ast в тесте).
 
-ЗАМОК ОТ ЧУЖОЙ ССЫЛКИ. Посылается только ссылка, у которой хост script.google.com, путь веб-приложения (…/macros/…/
-exec), `a=sign`, `who=client`, непустой `k` и `d` == id ЭТОГО документа; всё прочее (прямая ссылка BoldSign, ссылка
-агента, ссылка другого договора, пробелы внутри) — стоп с причиной, а не отправка. Ссылок у договора в реестре
+ЗАМОК ОТ ЧУЖОЙ ССЫЛКИ. Посылается только ссылка https одного из ТРЁХ видов (r4) и только для ЭТОГО документа:
+  · прежний — хост script.google.com, путь веб-приложения РОВНО /macros/s/<развёртывание>/exec (или
+    /a/macros/<домен>/s/<развёртывание>/exec), в query `a=sign`, `who=client`, непустой `k`, `d` == id документа;
+  · TB e-Sign 0.2.3 — страница подписи вне Google: https://mxfill77.github.io/turbobaby-sign/ или
+    https://sign.turbophuket.com/ (хост и путь — точное совпадение пары из SIGN_PAGES), query пуст, во фрагменте ровно
+    `#d=<id документа>&k=<24 строчных hex>`.
+Всё прочее (прямая ссылка BoldSign, ссылка агента, ссылка другого договора, github.io другого пользователя, похожий
+домен, http, query вместо фрагмента, пробелы внутри) — стоп с причиной, а не отправка. Ссылок у договора в реестре
 несколько разных — тоже стоп. Ручка в splinter — `CONTRACT_SIGN_LINK` (по умолчанию ВЫКЛ: ответ «договор готов»
 прежний байт-в-байт, модуль не импортируется).
 
@@ -60,6 +66,13 @@ STOP_ERRORS = {
     "unauthorized": "мост отказал в доступе",
 }
 
+# r4 (TB e-Sign 0.2.3 в бою с 26.10.2026 01:46): ссылка клиенту — страница подписи ВНЕ Google, документ и ключ во
+# ФРАГМЕНТЕ `#d=<id>&k=<токен>` (в браузере с несколькими учётными записями Google адрес script.google.com не
+# открывается). Адреса страницы — пары (хост, путь), сверка ТОЧНАЯ: GitHub Pages и свой домен (CNAME на ту же страницу).
+SIGN_PAGES = (("mxfill77.github.io", "/turbobaby-sign/"), ("sign.turbophuket.com", "/"))
+PAGE_TOKEN_LEN = 24                       # = TB e-Sign token_(): hex HMAC-SHA256, первые 24 знака
+_HEX_LOWER = frozenset("0123456789abcdef")
+
 _DOC_IN_URL = re.compile(r"/d/([-\w]{25,})")
 _BARE_ID = re.compile(r"^[-\w]{25,}$")
 
@@ -89,21 +102,48 @@ def _one(q, key):
 
 
 def sign_url_ok(url, doc_id):
-    """Ссылка — ссылка TB e-Sign клиенту на подпись ЭТОГО документа (см. «замок» в шапке модуля)."""
+    """Ссылка — ссылка TB e-Sign клиенту на подпись ЭТОГО документа одного из ТРЁХ видов (r4; см. «замок» в шапке
+    модуля): прежняя ссылка веб-приложения Apps Script (`_apps_script_ok`) или страница подписи вне Google на одном из
+    адресов SIGN_PAGES (`_page_ok`). Всё прочее — нет."""
     s = str(url or "").strip()
     if not s or not doc_id or any(ch.isspace() for ch in s):
         return False
     try:
         u = urlsplit(s)
         q = parse_qs(u.query, keep_blank_values=True)
+        f = parse_qs(u.fragment, keep_blank_values=True)
     except ValueError:
         return False
-    if u.scheme != "https" or u.netloc != "script.google.com" or u.fragment:
+    if u.scheme != "https":
         return False
-    if "/macros/" not in u.path or not u.path.endswith("/exec"):
+    if u.netloc == "script.google.com":
+        return _apps_script_ok(u.path, q, u.fragment, doc_id)
+    return _page_ok(u.netloc, u.path, u.query, f, doc_id)
+
+
+def _apps_script_ok(path, q, fragment, doc_id):
+    """Прежний вид (TB e-Sign до 0.2.3, и 0.2.3 с SIGN_PAGE_URL=off): путь РОВНО /macros/s/<развёртывание>/exec или
+    /a/macros/<домен>/s/<развёртывание>/exec (по сегментам, без «содержит»), фрагмента нет, в query a=sign,
+    who=client, d == id документа, k непуст — каждый по одному разу."""
+    parts = path.split("/")
+    head = parts[1:-3]
+    if fragment or len(parts) < 5 or parts[0] or parts[-1] != "exec" or parts[-3] != "s" or not parts[-2]:
+        return False
+    if head != ["macros"] and not (len(head) == 3 and head[0] == "a" and head[1] == "macros" and head[2]):
         return False
     return (_one(q, "a") == "sign" and _one(q, "who") == "client" and _one(q, "d") == doc_id
             and bool(_one(q, "k")))
+
+
+def _page_ok(netloc, path, query, f, doc_id):
+    """Вид TB e-Sign 0.2.3: страница подписи вне Google — пара (хост, путь) ТОЧНО из SIGN_PAGES, query пуст, во
+    фрагменте ровно d и k по одному разу: d == id документа, k — PAGE_TOKEN_LEN строчных hex (так их печатает
+    TB e-Sign: `token_()` — первые 24 знака hex HMAC-SHA256; другой k страница e-Sign всё равно отвергнет)."""
+    if (netloc, path) not in SIGN_PAGES or query:
+        return False
+    k = _one(f, "k") or ""
+    return (set(f) == {"d", "k"} and _one(f, "d") == doc_id and len(k) == PAGE_TOKEN_LEN
+            and set(k) <= _HEX_LOWER)
 
 
 def edit_url_ok(url, doc_id):

@@ -225,6 +225,69 @@ def test_a03_sign_url_ok_only_this_docs_esign_link(c=None):
     for u in bad:
         assert not c.sign_url_ok(u, DOC_N), u
     assert not c.sign_url_ok(good, "")
+    # r4: путь прежнего вида — по сегментам, без «содержит»
+    assert not c.sign_url_ok(good.replace("/macros/s/", "/evil/macros/s/"), DOC_N)
+    assert not c.sign_url_ok(good.replace("/exec?", "/exec/x?"), DOC_N)
+    assert not c.sign_url_ok(good.replace("/exec?", "/exec#d=%s&k=%s&" % (DOC_N, PAGE_K)), DOC_N)   # фрагмент — не тот вид
+
+
+# r4: вид TB e-Sign 0.2.3 (в бою с 26.10.2026 01:46) — страница подписи вне Google, документ и ключ во ФРАГМЕНТЕ.
+# Форма — дословно TB e-Sign signUrl_(): page + '#d=' + encodeURIComponent(docId) + '&k=' + token_(docId, 'client').
+PAGE_K = "0123456789abcdef01234567"                                       # 24 строчных hex, как печатает token_()
+PAGE_GH = "https://mxfill77.github.io/turbobaby-sign/"
+PAGE_OWN = "https://sign.turbophuket.com/"
+SIGN_HOSTS = ("script.google.com", "github.io", "sign.turbophuket.com")   # следы ссылки на подпись в тексте
+
+
+def page_link(doc_id=DOC_N, page=PAGE_GH, k=PAGE_K):
+    return "%s#d=%s&k=%s" % (page, doc_id, k)
+
+
+def test_a03b_sign_url_ok_page_forms(c=None):
+    """Три вида — и только они: прежний (Apps Script), GitHub Pages, свой домен; хост и путь — точное совпадение."""
+    c = c or C()
+    assert c.SIGN_PAGES == (("mxfill77.github.io", "/turbobaby-sign/"), ("sign.turbophuket.com", "/"))
+    assert c.PAGE_TOKEN_LEN == 24
+    for page in (PAGE_GH, PAGE_OWN):
+        assert c.sign_url_ok(page_link(page=page), DOC_N), page
+    other = "1LinkSent000000000000000000000000000000000002"
+    bad = [
+        page_link(page="https://evil.github.io/turbobaby-sign/"),          # github.io другого пользователя
+        page_link(page="https://mxfill77.github.io.evil.com/turbobaby-sign/"),
+        page_link(page="https://sign.turbophuket.com.evil.com/"),          # похожий домен
+        page_link(page="https://xsign.turbophuket.com/"),
+        page_link(page="https://turbophuket.com/"),
+        page_link(page="https://mxfill77.github.io@evil.com/turbobaby-sign/"),   # userinfo
+        page_link(page="https://mxfill77.github.io:8443/turbobaby-sign/"),       # порт
+        page_link(page="https://MXFILL77.github.io/turbobaby-sign/"),            # не тот вид записи хоста
+        page_link(page="https://mxfill77.github.io/turbobaby-sign"),              # путь без «/» — не точное совпадение
+        page_link(page="https://mxfill77.github.io/turbobaby-sign/x/"),
+        page_link(page="https://mxfill77.github.io/other/"),
+        page_link(page="https://mxfill77.github.io/"),
+        page_link(page="https://sign.turbophuket.com/turbobaby-sign/"),
+        page_link(page="http://mxfill77.github.io/turbobaby-sign/"),              # http
+        page_link(page="http://sign.turbophuket.com/"),
+        page_link(doc_id=other),                                                  # d чужого документа
+        page_link(doc_id=DOC_N + "X"),
+        page_link(k="g" * 24),                                                    # k не hex
+        page_link(k=PAGE_K.upper()),                                              # e-Sign печатает строчные
+        page_link(k=PAGE_K[:-1]),                                                 # 23
+        page_link(k=PAGE_K + "0"),                                                # 25
+        page_link(k=""),
+        PAGE_GH + "#d=%s" % DOC_N,                                                # без k
+        PAGE_GH + "#k=%s" % PAGE_K,                                               # без d
+        PAGE_GH,                                                                  # без фрагмента
+        PAGE_GH + "?d=%s&k=%s" % (DOC_N, PAGE_K),                                 # query вместо фрагмента
+        PAGE_OWN + "?d=%s&k=%s" % (DOC_N, PAGE_K),
+        PAGE_GH + "?x=1#d=%s&k=%s" % (DOC_N, PAGE_K),                             # лишний query при фрагменте
+        page_link() + "&who=client",                                              # лишний ключ во фрагменте
+        page_link() + "&d=" + DOC_N,                                              # d дважды
+        page_link().replace("#", " #"),
+        "https://script.google.com/#d=%s&k=%s" % (DOC_N, PAGE_K),                 # фрагмент на прежнем хосте
+    ]
+    for u in bad:
+        assert not c.sign_url_ok(u, DOC_N), u
+    assert not c.sign_url_ok(page_link(), "")
 
 
 def test_a04_offsets_bounded_schedule(c=None):
@@ -264,6 +327,15 @@ def test_a05_verdict_on_door_snapshots(c=None):
         assert v["act"] == "stop" and v.get("canceled") is True, (st, v)
     stale["items"][0]["status"] = "ОТПРАВЛЕН"                           # близнец: живой статус — ссылка уходит
     assert c.verdict(stale, doc_c)["act"] == "send"
+    # r4: реестр TB e-Sign 0.2.3 отдаёт ссылку страницы вне Google — она уходит; подделка той же формы — стоп
+    for page in (PAGE_GH, PAGE_OWN):
+        pg = json.loads(json.dumps(n))
+        pg["items"][0]["sign_url"] = page_link(page=page)
+        v = c.verdict(pg, DOC_N)
+        assert v["act"] == "send" and v["url"] == page_link(page=page) and v["edit"] == n["items"][0]["doc_url"], v
+    pg["items"][0]["sign_url"] = page_link(page="https://evil.github.io/turbobaby-sign/")
+    v = c.verdict(pg, DOC_N)
+    assert v["act"] == "stop" and "не похожа" in v["why"], v
 
 
 def test_a06_verdict_errors_stop_or_wait(c=None):
@@ -329,7 +401,8 @@ def test_a08_words(c=None):
 MUTANTS = [
     ("d-not-checked", 'and _one(q, "d") == doc_id', ""),
     ("who-not-checked", '_one(q, "who") == "client" and ', ""),
-    ("host-not-checked", 'u.netloc != "script.google.com" or ', ""),
+    # r4: «было» сдвинуто вслед за кодом (хост прежнего вида — развилка sign_url_ok), суть та же: хост «содержит»
+    ("host-not-checked", 'if u.netloc == "script.google.com":', 'if "script.google.com" in u.netloc:'),
     ("token-not-checked", '\n            and bool(_one(q, "k")))', ")"),
     ("two-urls-picks-first", "if len(urls) > 1:", "if False:"),
     ("alien-url-sent", "if urls and not sign_url_ok(urls[0], doc_id):", "if False:"),
@@ -347,8 +420,22 @@ MUTANTS = [
      "str(status)"),
     ("canceled-says-group", "    if v.get(\"canceled\"):\n        return canceled_text(name)\n", ""),
     ("timeout-says-ceiling", "spent_words(spent_s)", "spent_words(WAIT_S)"),
+    # r4: три вида ссылки — по мутанту на каждое правило
+    ("scheme-not-checked", '    if u.scheme != "https":\n        return False\n', ""),
+    ("old-path-contains", 'if head != ["macros"] and not (', 'if False and not ('),
+    ("page-host-contains", "if (netloc, path) not in SIGN_PAGES or query:",
+     "if not any(h in netloc for h, _p in SIGN_PAGES) or query:"),
+    ("page-path-ignored", "if (netloc, path) not in SIGN_PAGES or query:", "if netloc not in dict(SIGN_PAGES) or query:"),
+    ("page-query-allowed", "if (netloc, path) not in SIGN_PAGES or query:", "if (netloc, path) not in SIGN_PAGES:"),
+    ("page-d-not-checked", '_one(f, "d") == doc_id and ', ""),
+    ("page-k-len-ignored", "len(k) == PAGE_TOKEN_LEN", "len(k) > 0"),
+    ("page-k-hex-ignored", "\n            and set(k) <= _HEX_LOWER)", ")"),
+    ("page-k-any-case", "set(k) <= _HEX_LOWER)", "set(k.lower()) <= _HEX_LOWER)"),
+    ("page-extra-keys", 'set(f) == {"d", "k"} and ', ""),
+    ("page-host-list-widened", '("sign.turbophuket.com", "/"))', '("sign.turbophuket.com", "/"), ("evil.github.io", "/turbobaby-sign/"))'),
 ]
-A_TESTS = ("test_a02_doc_id_of", "test_a03_sign_url_ok_only_this_docs_esign_link", "test_a04_offsets_bounded_schedule",
+A_TESTS = ("test_a02_doc_id_of", "test_a03_sign_url_ok_only_this_docs_esign_link", "test_a03b_sign_url_ok_page_forms",
+           "test_a04_offsets_bounded_schedule",
            "test_a05_verdict_on_door_snapshots", "test_a06_verdict_errors_stop_or_wait", "test_a07_verdict_guards",
            "test_a08_words")
 
@@ -434,7 +521,7 @@ def test_b03_timeout_says_group_and_sends_no_link():
     assert len(b.args("contract_find")) == 4, b.calls
     last = sends[-1]["text"]
     assert len(sends) == 2 and c.TO_GROUP in last and "не дождался" in last, sends
-    assert "script.google.com" not in "".join(s["text"] for s in sends)
+    assert not any(h in "".join(s["text"] for s in sends) for h in SIGN_HOSTS)   # r4: ни одного вида ссылки
 
 
 def test_b04_old_bridge_stops_at_once():
@@ -456,7 +543,7 @@ def test_b06_signed_contract_no_sign_link():
     b = Bridge(make=dict(OK_MAKE, file_id=doc, url="https://docs.google.com/document/d/%s/edit" % doc), finds=[sig])
     sends, _r, _p, _l = intake(b, on=True)
     assert sends[-1]["text"] == C().signed_text(OK_MAKE["name"]), sends
-    assert "script.google.com" not in "".join(s["text"] for s in sends)
+    assert not any(h in "".join(s["text"] for s in sends) for h in SIGN_HOSTS)   # r4: ни одного вида ссылки
 
 
 def test_b07_read_failure_then_link():
@@ -938,7 +1025,27 @@ def test_c08_canceled_contract_via_command():
     b = Bridge(make=dict(OK_MAKE, file_id=doc, url="https://docs.google.com/document/d/%s/edit" % doc), finds=[cn])
     sends, _r, _p, _l = intake(b, on=True, offs=(0, 0, 0, 0))
     assert len(b.args("contract_find")) == 1 and sends[-1]["text"] == c.canceled_text(OK_MAKE["name"]), (b.calls, sends)
-    assert "script.google.com" not in "".join(s["text"] for s in sends)
+    assert not any(h in "".join(s["text"] for s in sends) for h in SIGN_HOSTS)   # r4: ни одного вида ссылки
+
+
+def test_c11_page_link_via_command():
+    """r4: реестр TB e-Sign 0.2.3 (колонка перестроена на страницу вне Google) — «договор» досылает ИМЕННО эту ссылку
+    рядом с правкой, без превью; подделка той же формы (github.io другого пользователя) не уходит — «ссылка будет в
+    группе контрактов». Ссылка с токеном в журнал не попадает."""
+    c = C()
+    for page in (PAGE_GH, PAGE_OWN):
+        n = snap("link_new")
+        n["items"][0]["sign_url"] = page_link(page=page)
+        b = Bridge(finds=[n])
+        sends, _r, _p, lines = intake(b, on=True, offs=(0, 0, 0))
+        assert sends[-1]["text"] == c.link_text(OK_MAKE["name"], page_link(page=page), n["items"][0]["doc_url"]), sends
+        assert sends[-1].get("no_preview") is True and "script.google.com" not in sends[-1]["text"], sends[-1]
+        assert not any(PAGE_K in ln for ln in lines), "ключ ссылки попал в журнал"
+    n = snap("link_new")
+    n["items"][0]["sign_url"] = page_link(page="https://evil.github.io/turbobaby-sign/")
+    sends, _r, _p, lines = intake(Bridge(finds=[n]), on=True, offs=(0, 0, 0))
+    assert c.TO_GROUP in sends[-1]["text"] and "github.io" not in "".join(s["text"] for s in sends), sends
+    assert not any(PAGE_K in ln for ln in lines), "ключ ссылки попал в журнал"
 
 
 def main():
