@@ -799,7 +799,7 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
                                                      it.get("backdated", False),
                                                      said=(getattr(msg, "text", None)
                                                            or getattr(msg, "caption", None)),
-                                                     msg_date=splinter._msg_date_of(msg))
+                                                     msg_date=splinter._work_day_local(msg))
             except Exception as e:
                 log.warning(f"  → заявка из E2b-блока не оформилась: {e}")
         claude.pending_service_confirm = []

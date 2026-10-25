@@ -219,9 +219,10 @@ def run_done(bridge, done, works=None):
 NOTE_9548 = S._sp_note_set_works("", SAID_9548)
 check("фикстура: сегмент WORKS собран живым кодом splinter", "замена аккумулятора" in NOTE_9548)
 
-#: День записи по UTC: `run_done` дня работы не передаёт, и с HISTNAMES2510 (25.10.2026) строка
-#: получает хвост « · ДД.ММ.ГГГГ» ПОСЛЕ километров — день, а не его отсутствие.
-TODAY = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%d.%m.%Y")
+#: День записи по Пхукету (UTC+7, r2): `run_done` дня работы не передаёт, и с HISTNAMES2510
+#: (25.10.2026) строка получает хвост « · ДД.ММ.ГГГГ» ПОСЛЕ километров — день, а не его отсутствие.
+_dt_ = __import__("datetime")
+TODAY = _dt_.datetime.now(_dt_.timezone(_dt_.timedelta(hours=7))).strftime("%d.%m.%Y")
 
 b = FakeBridge(note_text=NOTE_9548)
 written, failed = run_done(b, ["other"])

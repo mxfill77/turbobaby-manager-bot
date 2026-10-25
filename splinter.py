@@ -1847,7 +1847,7 @@ async def _decider_execute(msg, context, bridge, snap, v, claude=None) -> str:
             # история назовёт работу, а не напишет «прочие работы» (HISTNAMES2510).
             await sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, it.get("что"), it.get("км"),
                                         said=(getattr(msg, "text", None) or getattr(msg, "caption", None)),
-                                        msg_date=_msg_date_of(msg))
+                                        msg_date=_work_day_local(msg))
             return "кнопка Пыма (ТО-заявка)"
         if door == _tdec.DOOR_ODO:                                       # доверенный пробег — как сейчас
             _odo_confirmed(bridge, chat_id, topic_id, bike, it.get("км"),
@@ -4123,12 +4123,12 @@ def _write_info_works(bridge, group_name, topic_id, bike, info_works, km, msg_id
     written, mids, failed = [], [], []
     # ДЕНЬ РАБОТЫ НА КАЖДОЙ СТРОКЕ (25.10.2026, HISTNAMES2510): в `msg_date` и хвостом « · ДД.ММ.ГГГГ»
     # ПОСЛЕ километров — разбор карточки (`_SVC_HIST_RE`) смотрит только на «<работа> — <км> км».
-    # Дверь дня не принесла → день записи (сегодня по UTC): строка без дня не знает, когда была
+    # Дверь дня не принесла → день записи (сегодня по Пхукету, r2): строка без дня не знает, когда была
     # работа. Ключ `msg_id` дня НЕ содержит — повтор той же работы на том же км дедупится, как и был.
     # `WORK_NAME=0` → строка байт-в-байт прежняя.
     _on = _work_name_on()
     if _on and not str(msg_date or "").strip():
-        msg_date = _today_utc()
+        msg_date = _today_local()
     for w in uniq:
         note = (work_name.note_line(w, km, msg_date) if _on
                 else (f"{w} — {km} км" if km else f"{w}")[:200])
@@ -6597,7 +6597,7 @@ async def handle_mileage_confirm(msg, context, bridge, text) -> bool:
             _done = _sp_split(_sp.get("done")) or list(_declared)   # B3: нет done → заявленное считаем сделанным
             await _sp_advance_to_confirm(context, bridge, msg.chat_id, key[1], bike, _declared, _done, num,
                                          works=_sp_works_from_note(_sp.get("note")),
-                                         work_date=(_sp_work_date(_sp) or _msg_date_of(msg)))
+                                         work_date=(_sp_work_date(_sp) or _work_day_local(msg)))
             return True
     except Exception:
         log.exception("  → B1: довод заявки фото-одометром упал")
@@ -11846,17 +11846,58 @@ def _sp_note_set_wdate(base_note, wdate):
 
 
 def _sp_work_date(sp):
-    """День работы заявки: названный (`WDATE`), иначе день рождения заявки, иначе ''."""
+    """День работы заявки: названный (`WDATE`), иначе день рождения заявки (по Пхукету), иначе ''."""
     sp = sp or {}
-    return _sp_wdate_from_note(sp.get("note")) or (
-        str(sp.get("created_at") or "")[:10]
-        if _re_pl.match(r"\d{4}-\d{2}-\d{2}", str(sp.get("created_at") or "")) else "")
+    return _sp_wdate_from_note(sp.get("note")) or _local_day_of_iso(sp.get("created_at"))
 
 
-def _today_utc():
-    """Сегодня по UTC «ГГГГ-ММ-ДД» — тот же счёт дней, что у `msg_date` (`str(msg.date.date())`)."""
+# ДЕНЬ РАБОТЫ — ПО ПХУКЕТУ, А НЕ ПО UTC (25.10.2026, HISTNAMES2510 r2). Записи читают на Пхукете
+# (UTC+7, у бота Asia/Bangkok — `_BKK_TZ` выше): работа, сданная в 01:30 местного 14.10, по UTC
+# ещё 13.10, и строка истории назвала бы вчерашний день. Счёт дней по Пхукету живёт ТОЛЬКО в
+# дверях дня работы этой правки; прежний `_msg_date_of` (UTC) и его прежние вызовы не тронуты —
+# на него опираются другие пакеты. Таиланд без перехода на летнее время, поэтому запасной пояс,
+# если `zoneinfo` недоступен, — ровно +7.
+def _work_tz():
     import datetime as _dt
-    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    return _BKK_TZ or _dt.timezone(_dt.timedelta(hours=7))
+
+
+def _today_local():
+    """Сегодня по Пхукету «ГГГГ-ММ-ДД» — день работы, когда сообщение дня не принесло."""
+    import datetime as _dt
+    return _dt.datetime.now(_work_tz()).strftime("%Y-%m-%d")
+
+
+def _work_day_local(msg):
+    """День сообщения по Пхукету «ГГГГ-ММ-ДД» (Telegram отдаёт `msg.date` в UTC; наивное время
+    считаем UTC). Даты у сообщения нет → ''. Не бросает."""
+    import datetime as _dt
+    try:
+        d = getattr(msg, "date", None)
+        if not isinstance(d, _dt.datetime):
+            return ""
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone.utc)
+        return d.astimezone(_work_tz()).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _local_day_of_iso(raw):
+    """«2026-10-13T18:30:00Z» (`created_at` моста, UTC) → день по Пхукету; голая дата — как есть."""
+    import datetime as _dt
+    s = str(raw or "").strip()
+    if not _re_pl.match(r"\d{4}-\d{2}-\d{2}", s):
+        return ""
+    if len(s) <= 10:
+        return s[:10]
+    try:
+        d = _dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=_dt.timezone.utc)
+        return d.astimezone(_work_tz()).strftime("%Y-%m-%d")
+    except Exception:
+        return s[:10]
 
 
 def _is_done_marker(text):
@@ -12084,7 +12125,7 @@ async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, decla
                                   **_extra)
     tok = _svc_put({"chat": chat_id, "topic": topic_id, "bike": bike,
                     "done": done, "odo": str(odo), "kind": "sp_done",
-                    "wdate": str(work_date or "") or _today_utc()})
+                    "wdate": str(work_date or "") or _today_local()})
     rows = [[InlineKeyboardButton("✅ ยืนยันบันทึก / Подтвердить запись",
                                   callback_data=f"svc:done:{tok}")]]
     # ТРЕТИЙ ИСХОД (25.08.2026): до него у человека было ровно два — подтвердить всё на ТЕКУЩЕМ
@@ -12159,7 +12200,7 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
     `said` — текст сообщения человека: «прочие» без единого слова назовутся им, если это
     отчёт о работе, а не число, вопрос или план (`work_name.words_from_text`). Не назвались —
     вместо карточки «Сделано: прочие работы» уходит «какие работы сделали?» (`_sp_ask_works`).
-    `msg_date` — день сообщения (`_msg_date_of`); пусто → сегодня по UTC."""
+    `msg_date` — день сообщения по Пхукету (`_work_day_local`); пусто → сегодня по Пхукету."""
     # Спецпуть для задним-числом масла из мозга (oil_last_km в set_service). Проверка и ответ —
     # те же, что у прямого перехвата (`_oil_backdated_offer`): до 25.10.2026 этот вход выдавал
     # кнопку Пыму без сверки с кол.I, и кнопка на число ниже записанного была обречена (6334).
@@ -12199,7 +12240,7 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
     odo = str(km or "").strip().replace(" ", "").replace(",", "")
     if not _re_pl.fullmatch(r"\d{3,6}", odo):
         odo = ""
-    _wd = str(msg_date or "")[:10] or _today_utc()
+    _wd = str(msg_date or "")[:10] or _today_local()
     note = None
     if words:
         note = _sp_note_set_wdate(_sp_note_set_works(sp.get("note"), words), _wd)
@@ -12454,7 +12495,7 @@ async def handle_service_result(msg, context, bridge, claude, text) -> bool:
     # последующие upsert'ы статуса/done не передают note → pick('note') сохранит этот сегмент. Зелёная (Bot Data).
     # ДЕНЬ РАБОТЫ (HISTNAMES2510): отчёт о сделанном (слова или «готово») кладёт в ту же ноту день
     # сообщения — строка истории получит его, сколько бы ни ждала «да» доверенного.
-    _day = _msg_date_of(msg) or _today_utc()
+    _day = _work_day_local(msg) or _today_local()
     stored_works = _sp_works_from_note(sp.get("note"))
     if works or completed:
         _note_new = _sp_note_set_wdate(_sp_note_set_works(sp.get("note"), works) if works
@@ -12727,7 +12768,7 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
     Возвращает (written:list, failed:list).
 
     ДЕНЬ РАБОТЫ И «ПРОЧИЕ» БЕЗ СЛОВ (25.10.2026, HISTNAMES2510). `work_date` — день, когда работу
-    назвали (нота заявки `WDATE`, токен кнопки); нет → сегодня по UTC. Он ложится в `msg_date`
+    назвали (нота заявки `WDATE`, токен кнопки); нет → сегодня по Пхукету. Он ложится в `msg_date`
     строки истории и хвостом « · ДД.ММ.ГГГГ» после километров. «Прочие работы», для которых нет
     НИ ОДНОГО слова, в историю НЕ пишутся ярлыком: позиция остаётся открытой заявкой, механику
     уходит «какие работы сделали?» (`_sp_ask_works`), а строку положит следующая кнопка Пыма —
@@ -12745,7 +12786,7 @@ async def _sp_write_done(context, bridge, chat_id, topic_id, bike, done, odo, co
         odo_int = int(str(odo).replace(" ", "").replace(",", ""))
     except (ValueError, TypeError):
         return [], [("odo", "bad_odometer")]
-    _wd = str(work_date or "")[:10] or _today_utc()
+    _wd = str(work_date or "")[:10] or _today_local()
     if not ceiling_ok:
         stop = await _sp_ceiling_stop(context, bridge, chat_id, topic_id, bike, done, odo_int,
                                       work_date=_wd)
@@ -14029,7 +14070,7 @@ async def _handle_servicing(msg, context, bridge, claude, photo_msgs=None, _gate
                                                          _decl_all, _done_all, _known["km"],
                                                          works=_sp_works_from_note(_sp0.get("note")),
                                                          work_date=(_sp_work_date(_sp0)
-                                                                    or _msg_date_of(msg)))
+                                                                    or _work_day_local(msg)))
                             return
                     except Exception:
                         log.exception("  → короткий путь по своему одометру не удался "
