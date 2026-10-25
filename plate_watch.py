@@ -12,11 +12,18 @@
 
 ЧТО РЕШАЕТ МОДУЛЬ — и только это:
   * какое чтение таблички со снимка годится (`reading`): только `legible: true` и только цифры;
-  * какой номер у темы (`topic_plate`): ПОСЛЕДНЕЕ слово имени, если оно из цифр;
+  * какой номер у темы (`topic_plate`): ПОСЛЕДНЕЕ слово имени, если оно из цифр и не объём;
+  * какие номера заняты ДРУГИМИ байками парка (`fleet_numbers`): книга, прежние номера книги, все
+    номера из имён тем по правилу моста (`name_numbers`);
   * можно ли верить имени, которым бот зовёт тему (`name_trusted`);
-  * что делать с темой (`verdict`): карточка «переименовать», предупреждение без переименования
-    или ничего — и почему, словами; жива ли ещё висящая карточка (`card_valid`);
+  * что делать с темой (`verdict`): карточка «переименовать», предупреждение или заметка без
+    переименования, или ничего — и почему, словами; жива ли ещё висящая карточка (`card_valid`);
   * текст карточки (`card_text`) и мелкие правки памяти (`with_*`).
+
+КУДА ПЕРЕИМЕНОВАНИЕ ВООБЩЕ ДОПУСТИМО (ревью r3): только в номер ЭТОГО байка, который мост сведёт в
+его строку Лист1 — номер его зелёной книги либо его прежний номер из пары карты моста
+(`bridge_old_plates` в `plate_watch_book.json`). Любой другой номер — ошибка чтения, чужой байк или
+номер, которого мост не знает; кнопка там не предлагается, в ленту уходит заметка без кнопок.
 
 ПОРОГИ:
   * из слова задания 25.10: ДВА чтения из РАЗНЫХ отправок за 14 суток (`NEED`, `WINDOW_S`). Одно
@@ -27,16 +34,23 @@
     6 часов (`MIN_GAP_S`) — то есть с разных заходов к байку, а не две фотографии одной минуты при
     одном свете, чья ошибка в одной цифре одна и та же. Чтения окна обязаны сойтись ВСЕ: одно
     несогласное — уже сомнение (`SPLIT`);
-  * предупреждение «тема = байк, но не книга» — не чаще раза в 7 суток на тему (`WARN_EVERY_S`);
-  * висящая карточка держит тему 7 суток (`CARD_TTL_S`) и старше них не исполняется.
+  * предупреждение «тема = байк, но не книга» и заметка «номер не узнаю» — не чаще раза в 7 суток
+    на тему (`WARN_EVERY_S`, один счётчик на оба);
+  * висящая карточка держит тему 7 суток (`CARD_TTL_S`) и старше них не исполняется; карточка без
+    сообщения (отправка оборвалась) старше 2 минут (`CARD_SEND_S`) — мёртвая и место не держит;
+  * чтения окна НЕ обрезаются счётом (ревью r3): обрезка теряла несогласное чтение и склейку
+    свидетелей. Предохранитель диска — `KEEP_PER_TOPIC`: сверх него тема молчит, пока обрезанное
+    не выйдет из окна (`OVERFLOW`).
 
 НАПРАВЛЕНИЕ СОМНЕНИЯ — В МОЛЧАНИЕ, и это обратно замку подсказок НАМЕРЕННО. Там молчание лишало
 человека совета; здесь любая карточка предлагает переименовать тему, то есть сменить имя байка,
 которым бот пишет в Лист1, а владелец жмёт кнопки, не читая. Поэтому любая дырка даёт «ничего», а
 не карточку: чтение смазано · чтения расходятся · свидетели не независимы · номер — номер ДРУГОГО
-байка парка · номер на одну цифру от номера темы или книги · номер — часть номера темы или книги
-(или наоборот) · номер = объём двигателя · имени бота не верим (не сверено с названием темы) ·
-тема привязана руками (/bike) · в имени темы нет номера · память не читается. Не угадываем.
+байка парка (в том числе его прежний номер) · номер на одну цифру от номера темы или книги · номер —
+часть номера темы или книги (или наоборот) · номер = объём двигателя · номер не из книги этого байка
+и не из пары карты моста (заметка без кнопок) · имени бота не верим (не сверено с названием темы) ·
+тема привязана руками (/bike) · в имени темы нет номера · память не читается или переполнена. Не
+угадываем.
 
 ГРАНИЦА, КОТОРУЮ ДЕРЖИТ УСТРОЙСТВО: импортов НОЛЬ (страж в `tests/test_plate_watch.py`). Время,
 диск, сеть, Telegram и память приносят руки (`splinter._plate_*`).
@@ -62,16 +76,23 @@ BRIDGE_BLIND = "предложенное имя мост не узнает: но
 RENAME = "номер на байке не совпадает с именем темы"
 WARN = "номер на байке совпадает с именем темы, но не с зелёной книгой"
 CARD_OLD = "карточка старше 7 суток"
+NOT_BOOK = ("номер на байке не из зелёной книги этого байка и не из пары карты старых номеров моста — "
+            "не узнаю его, переименовать не предлагаю")
+NOT_ROUTED = ("номер на байке — прежний номер этого байка, но карта моста не переводит его в строку книги — "
+              "с таким именем записи ТО не нашли бы строку, переименовать не предлагаю")
+OVERFLOW = "чтений за 14 суток больше, чем держит память темы, — по обрезанной памяти не решаем"
 
 KIND_RENAME = "rename"
 KIND_WARN = "warn"
+KIND_NOTE = "note"              # заметка без кнопок в ленту: номер на байке есть, но переименовывать в него нельзя
 
 NEED = 2                        # независимых согласных чтений
 WINDOW_S = 14 * 86400           # окно согласия
 MIN_GAP_S = 6 * 3600            # два свидетеля — с разных заходов к байку (ревью r2, рассуждение)
-WARN_EVERY_S = 7 * 86400        # предупреждение без переименования — не чаще
+WARN_EVERY_S = 7 * 86400        # предупреждение / заметка без переименования — не чаще
 CARD_TTL_S = 7 * 86400          # сколько висящая карточка держит тему и сколько она исполнима
-KEEP_PER_TOPIC = 12             # чтений в памяти на тему (старше окна уходят и так)
+CARD_SEND_S = 120               # карточка без сообщения старше этого — отправка оборвалась (ревью r3; сеть 20+20 с)
+KEEP_PER_TOPIC = 400            # предохранитель диска, а НЕ окно: сверх него тема молчит (`OVERFLOW`, ревью r3)
 
 #: Объёмы двигателя парка — зеркало `splinter._CC_PLATE` (страж равенства — tests/test_plate_watch.py):
 #: «300» на снимке — скорее надпись объёма, чем номер, и мост такой номер из имени не возьмёт.
@@ -137,7 +158,9 @@ def topic_plate(name):
     """Номер темы — ПОСЛЕДНЕЕ слово имени, если оно из цифр («XADV 750 BLACK 5104» → «5104»).
 
     Именно последнее: «750» в середине — объём, а не номер. Имя без номера в конце («XADV 750
-    BLACK») — None, и тогда сравнивать не с чем."""
+    BLACK») — None, и тогда сравнивать не с чем. Объём последним словом («NMAX 155», «XMAX 300») —
+    тоже None (ревью r3): мост (`plateFromName_`, зеркало `splinter._plate_from_name`) такое имя
+    зовёт безномерным, и сверять номер на байке с объёмом нельзя."""
     if not isinstance(name, str):
         return None
     parts = name.split()
@@ -146,7 +169,27 @@ def topic_plate(name):
     last = parts[-1]
     if any(c not in _ASCII_DIGITS for c in last):
         return None
-    return digits(last)
+    d = digits(last)
+    return None if d in ENGINE_CC else d
+
+
+def name_numbers(name):
+    """ВСЕ номера имени по правилу моста → список: каждое число от трёх цифр, кроме объёма двигателя,
+    где бы в имени оно ни стояло (ревью r3). `plateFromName_` берёт из них последнее; для сверки «номер
+    другого байка» нужны все: «ADV350 6699 black new» несёт 6699 не последним словом, а мост найдёт
+    тему по нему. Числа длиннее четырёх цифр номером таблички не бывают (`digits`)."""
+    out, run = [], ""
+    for c in (name + " ") if isinstance(name, str) else "":
+        c = _THAI_DIGITS.get(c, c)
+        if c in _ASCII_DIGITS:
+            run += c
+            continue
+        if len(run) >= 3 and run not in ENGINE_CC:
+            d = digits(run)
+            if d and d not in out:
+                out.append(d)
+        run = ""
+    return out
 
 
 def propose(name, d):
@@ -157,9 +200,35 @@ def propose(name, d):
     return f"{head} {digits(d)}"
 
 
+def _plates(v):
+    """Список номеров из книги → номера без повторов (нечитаемое отбрасывается)."""
+    out = []
+    for x in v if isinstance(v, list) else []:
+        d = digits(x)
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def bridge_map(doc):
+    """Карта старых номеров моста (`bridge_old_plates`) → {прежний номер: номер книги}. Её пары мост сам
+    переводит в строку книги при записи в Лист1; иного знания о мосте у модуля нет."""
+    m = doc.get("bridge_old_plates") if isinstance(doc, dict) else None
+    out = {}
+    for k, val in (m.items() if isinstance(m, dict) else ()):
+        a, b = digits(k), digits(val)
+        if a and b and a != b:
+            out[a] = b
+    return out
+
+
 def book_entry(doc, topic_id):
-    """Строка зелёной книги по номеру темы из `plate_watch_book.json` → {d, series, province, name}
-    либо None (книги нет, темы в ней нет, номер не читается)."""
+    """Строка зелёной книги по номеру темы из `plate_watch_book.json` → {d, series, province, name, old,
+    old_unproven, routed} либо None (книги нет, темы в ней нет, номер не читается).
+
+    `old` — прежние регистрации ЭТОГО байка (страницы владельца), `old_unproven` — прежний номер без
+    доказательства, `routed` — те из `old`, которые карта моста переводит именно в номер этой книги:
+    только в них (и в номер книги) карточка вправе предложить переименовать тему (ревью r3)."""
     bikes = doc.get("bikes") if isinstance(doc, dict) else None
     if not isinstance(bikes, list):
         return None
@@ -175,8 +244,11 @@ def book_entry(doc, topic_id):
         d = digits(b.get("plate_digits"))
         if d is None:
             return None
+        old, bm = [o for o in _plates(b.get("old_plates")) if o != d], bridge_map(doc)
         return {"d": d, "series": _txt(b.get("plate_series")), "province": _txt(b.get("province")),
-                "name": _txt(b.get("name"))}
+                "name": _txt(b.get("name")), "old": old,
+                "old_unproven": [o for o in _plates(b.get("old_plates_unproven")) if o != d],
+                "routed": [o for o in old if bm.get(o) == d]}
     return None
 
 
@@ -197,10 +269,14 @@ def book_topic(doc, d):
 
 
 def fleet_numbers(doc, names, topic_id):
-    """Номера ДРУГИХ тем парка → {номер: тема}: номер из зелёной книги и номер из имени темы.
+    """Номера ДРУГИХ тем парка → {номер: тема}.
 
-    `names` — {тема: имя}, которыми бот зовёт темы (кэш, memory.db, карта тем). Своя тема не входит:
-    против неё сверка идёт отдельно (`t`, `g`)."""
+    Из зелёной книги — номер книги, прежние номера (`old_plates`, `old_plates_unproven`) и номера из
+    её имени; из карты моста — прежний номер, который мост сводит в строку другой темы; из `names`
+    ({тема: имя}, которыми бот зовёт темы: кэш, memory.db, карта тем) — ВСЕ номера имени по правилу
+    моста (`name_numbers`). Ревью r3: прежний номер чужого байка (2478 на байке темы 83) — именно тот,
+    что прочтут со снимка, присланного не в ту тему, а мост по нему пишет в строку ТОГО байка. Своя
+    тема не входит: против неё сверка идёт отдельно (`t`, `g`, `routed`)."""
     out = {}
     try:
         me = int(topic_id)
@@ -214,16 +290,24 @@ def fleet_numbers(doc, names, topic_id):
             tid = int(b.get("topic_id"))
         except (TypeError, ValueError):
             continue
-        d = digits(b.get("plate_digits"))
-        if d and tid != me:
-            out.setdefault(d, tid)
+        if tid == me:
+            continue
+        for d in ([digits(b.get("plate_digits"))] + _plates(b.get("old_plates"))
+                  + _plates(b.get("old_plates_unproven")) + name_numbers(b.get("name"))):
+            if d:
+                out.setdefault(d, tid)
+    for old, new in bridge_map(doc).items():
+        tid = book_topic(doc, new)
+        if tid is not None and tid != me:
+            out.setdefault(old, tid)
     for tid, name in (names or {}).items():
         try:
             tid = int(tid)
         except (TypeError, ValueError):
             continue
-        d = topic_plate(name)
-        if d and tid != me:
+        if tid == me:
+            continue
+        for d in name_numbers(name):
             out.setdefault(d, tid)
     return out
 
@@ -279,12 +363,12 @@ def clean(state):
     Чтение памяти с диска НЕ идёт через `clean` при сбое: руки отличают «файла нет» (пустая память)
     от «файл не читается» (ветка замолкает до перезапуска) — `splinter._plate_load`."""
     st = state if isinstance(state, dict) else {}
-    out = {"seq": 0, "readings": {}, "cards": {}, "warned": {}, "declined": {}}
+    out = {"seq": 0, "readings": {}, "cards": {}, "warned": {}, "declined": {}, "trunc": {}}
     try:
         out["seq"] = max(0, int(st.get("seq") or 0))
     except (TypeError, ValueError):
         out["seq"] = 0
-    for key in ("readings", "cards", "warned", "declined"):
+    for key in ("readings", "cards", "warned", "declined", "trunc"):
         src = st.get(key)
         if not isinstance(src, dict):
             continue
@@ -294,7 +378,7 @@ def clean(state):
                     if isinstance(v, list) else []
                 if rows:
                     out[key][str(k)] = rows
-            elif key == "warned":
+            elif key in ("warned", "trunc"):
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     out[key][str(k)] = float(v)
             elif isinstance(v, dict):
@@ -310,7 +394,12 @@ def _ts(r):
 def add_reading(state, topic_id, rd, mid, group, now, fu=None):
     """Положить чтение в память темы. Повтор ТОГО ЖЕ сообщения (повтор по «да» ворот) заменяет
     прежнее, а не добавляет второе; чтения старше окна уходят. `fu` — `file_unique_id` снимка:
-    один и тот же снимок, присланный дважды или пересланный, — один свидетель."""
+    один и тот же снимок, присланный дважды или пересланный, — один свидетель.
+
+    Внутри окна чтения НЕ обрезаются счётом (ревью r3): прежняя обрезка до 12 выкидывала несогласное
+    чтение (альбом из 12 ошибочных снимков вытеснял одно верное — и SPLIT становился RENAME) и рвала
+    склейку свидетелей по снимку. Сверх предохранителя `KEEP_PER_TOPIC` старые уходят, но тема
+    помечается (`trunc`) и молчит, пока обрезанное не выйдет из окна."""
     st = clean(state)
     if not isinstance(rd, dict) or digits(rd.get("d")) is None:
         return st
@@ -319,7 +408,13 @@ def add_reading(state, topic_id, rd, mid, group, now, fu=None):
             if r.get("mid") != mid and now - _ts(r) <= WINDOW_S]
     rows.append({"d": digits(rd["d"]), "series": rd.get("series"), "province": rd.get("province"),
                  "mid": mid, "grp": str(group if group else mid), "fu": fu or None, "ts": float(now)})
-    st["readings"][k] = rows[-KEEP_PER_TOPIC:]
+    if k in st["trunc"] and now - st["trunc"][k] > WINDOW_S:
+        st["trunc"].pop(k)                       # обрезанное вышло из окна — память темы снова полная
+    if len(rows) > KEEP_PER_TOPIC:
+        cut = rows[:-KEEP_PER_TOPIC]
+        st["trunc"][k] = max([st["trunc"].get(k, 0.0)] + [_ts(r) for r in cut])
+        rows = rows[-KEEP_PER_TOPIC:]
+    st["readings"][k] = rows
     return st
 
 
@@ -415,6 +510,10 @@ def _judge(st, topic_id, name, book, now, src, others):
          "t": topic_plate(name), "g": (book or {}).get("d"), "book": book, "mids": [], "proposed": None,
          "detail": ""}
     k = str(topic_id)
+    tr = st["trunc"].get(k)
+    if tr is not None and now - tr <= WINDOW_S:
+        v.update(why=OVERFLOW, detail=f"предохранитель {KEEP_PER_TOPIC} чтений")
+        return v
     rows = [r for r in st["readings"].get(k, []) if now - _ts(r) <= WINDOW_S]
     seen = sorted({digits(r.get("d")) for r in rows})
     if len(seen) > 1:
@@ -466,6 +565,22 @@ def _judge(st, topic_id, name, book, now, src, others):
     if other is not None:
         v.update(why=OTHER_BIKE, detail=f"номер {d} — у темы {other}")
         return v
+    # КУДА ПЕРЕИМЕНОВАНИЕ ДОПУСТИМО (ревью r3): номер книги этого байка или его прежний номер из пары карты моста.
+    # Иной номер ничем не привязан к байку темы, а после слепого нажатия записи ТО не нашли бы строку — и сама сверка
+    # потом молчала бы (верное чтение оказалось бы «на цифру от имени темы»). Такой номер — заметка без кнопок.
+    b = book or {}
+    if d != g and d not in (b.get("routed") or ()):
+        if d in (b.get("old") or ()):
+            v.update(why=NOT_ROUTED, detail=f"{d} → строка книги {g}: пары в карте моста нет")
+        else:
+            v.update(why=NOT_BOOK, detail=(f"{d}: прежний номер без доказательства" if d in (b.get("old_unproven") or ())
+                                           else f"{d}: в книге темы {g or 'записи нет'}"))
+        warned = st["warned"].get(k)
+        if warned is not None and now - warned < WARN_EVERY_S:
+            v["why"], v["detail"] = WARN_RECENT, f"{v['why']} ({v['detail']})"
+        else:
+            v["kind"] = KIND_NOTE
+        return v
     dec = st["declined"].get(k)
     if dec and dec.get("d") == d and dec.get("name") == name:
         v["why"] = DECLINED
@@ -484,7 +599,9 @@ def verdict(state, topic_id, name, book, now, on=True, src=None, others=None):
 
     Висящая карточка темы: та же правка (номер, имя, предложение) и моложе 7 суток → `PENDING`;
     иначе `drop_card=True` — нынешние чтения её не подтверждают (номер сменился, сошёлся с именем,
-    имени больше не верим), и руки её снимают, а решение идёт как без неё."""
+    имени больше не верим), и руки её снимают, а решение идёт как без неё. Карточка без сообщения
+    старше `CARD_SEND_S` — отправка оборвалась (исключение, отмена задачи на перезапуске): она место
+    не держит (`card_lost`, ревью r3), иначе тема молчала бы 7 суток, а её кнопка не исполнялась бы."""
     if not on:
         return {"kind": None, "why": OFF, "topic": topic_id, "name": name or "", "d": None,
                 "t": topic_plate(name), "g": (book or {}).get("d"), "book": book, "mids": [],
@@ -494,12 +611,15 @@ def verdict(state, topic_id, name, book, now, on=True, src=None, others=None):
     card = st["cards"].pop(k, None)
     v = _judge(st, topic_id, name, book, now, src, others)
     if card is not None:
+        lost = card.get("msg") is None and now - _ts(card) > CARD_SEND_S
         same = (v["kind"] == KIND_RENAME and v["d"] == card.get("d") and v["name"] == card.get("name")
                 and v["proposed"] == card.get("proposed"))
-        if same and now - _ts(card) <= CARD_TTL_S:
+        if same and not lost and now - _ts(card) <= CARD_TTL_S:
             v.update(kind=None, why=PENDING)
         else:
             v["drop_card"] = True
+            if lost:
+                v["card_lost"] = True
     return v
 
 
@@ -557,15 +677,29 @@ def card_text(v, chat_id=None):
             lines.append(f"⚠️ Номер на байке не совпадает с зелёной книгой ({g})")
         elif g is not None:
             lines.append(f"✅ Номер на байке совпадает с зелёной книгой ({g})")
-        # что сделает нажатие, кроме имени (ревью r2, S10)
+        # что сделает нажатие, кроме имени (ревью r2, S10). Про карту моста говорим то, что в ней ЕСТЬ (ревью r3):
+        # «сведёт в строку книги» — только когда пара карты для этого номера ведёт именно в эту книгу.
+        d = v.get("d")
+        routed = d in (((v.get("book") or {}).get("routed")) or ())
+        tail = "."
+        if g is not None and g != d:
+            tail = (f" и писать ТО в Лист1 по номеру {d} — карта старых номеров моста (v96) переводит {d} в строку "
+                    f"книги {g}." if routed else
+                    f" и писать ТО в Лист1 по номеру {d} — но пары {d} → {g} в карте старых номеров моста (v96) нет: "
+                    f"запись строку не найдёт.")
         lines.append("После переименования: в теме появится служебная строка Telegram о новом имени; бот "
-                     f"будет звать байк «{v.get('proposed')}»" + (
-                         f" и писать ТО в Лист1 по номеру {v.get('d')} — в строку книги {g} их сведёт только "
-                         f"карта старых номеров моста (v96); нет в ней {v.get('d')} — запись строку не найдёт."
-                         if g is not None and g != v.get("d") else "."))
+                     f"будет звать байк «{v.get('proposed')}»" + tail)
         lines.append("Переименовать тему — бот будет звать байк новым именем; Оставить — больше не спрошу "
                      "про этот номер при этом имени.")
         return "\n".join(lines)
+    if v.get("kind") == KIND_NOTE:
+        return "\n".join([f"🔢 На байке читается {v.get('d')} — переименовать тему не предлагаю",
+                          f"Тема {v.get('topic')}: «{v.get('name')}»",
+                          _seen_line(v, chat_id),
+                          _book_line(v),
+                          f"Почему: {v.get('why')}" + (f" ({v['detail']})" if v.get("detail") else ""),
+                          "Кнопок нет: сверить табличку руками (ошибка чтения, чужой байк или новый номер); "
+                          "напомню не раньше чем через 7 дней."])
     if v.get("kind") == KIND_WARN:
         return "\n".join([f"⚠️ Номер на байке не совпадает с зелёной книгой ({g})",
                           f"Тема {v.get('topic')}: «{v.get('name')}» — имя темы совпадает с номером на байке",

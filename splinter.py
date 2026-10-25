@@ -16686,14 +16686,18 @@ def _store_topic_name(chat_id, topic_id, name, source=_TOPIC_SRC_EVENT):
 #     ни на номер другого байка, а имени бота можно верить → ОДНА карточка ВЛАДЕЛЬЦУ (`notify.send_card`: инбокс 1160,
 #     личка — фолбэк; та же дверь, что у карточки отмены ТО) с кнопками [Переименовать тему] [Оставить]; номер = имени
 #     темы, но ≠ книге → заметка без кнопок в ЛЕНТУ (`notify.send_feed`, не в инбокс — r2 S7), раз в 7 суток;
+#     r3: кнопка — только когда номер = книге байка или его прежний номер из пары карты моста; иной номер (ошибка
+#     чтения, номер без пары) — тоже заметка без кнопок в ленту, тем же счётчиком раз в 7 суток;
 #   * нажимает ТОЛЬКО владелец (`is_owner_user`) и ТОЛЬКО на том сообщении, куда карточка легла (r2 S3); в момент
 #     нажатия карточка проверяется заново (`plate_watch.card_valid`, r2 S2); «Переименовать» = `edit_forum_topic` +
 #     кэш и memory.db той же дверью, что у события переименования (`_store_topic_name`, метка 'plate_rename').
 # В ТЕМУ БАЙКА ЭТА ВЕТКА НЕ ПИШЕТ НИЧЕГО (страж — tests/test_plate_watch.py). Карточка переживает перезапуск: память
 # (чтения, висящая карточка, «Оставить», дата предупреждения) — `plate_watch_state.json` рядом с модулем.
 # Откат: `PLATE_WATCH=0` (или false/off) строкой файла настроек + рестарт splinter — чтения не копятся, новых карточек
-# нет, промпт снимка уходит БЕЗ поля `plate` байт-в-байт прежним; кнопки уже разосланных карточек по-прежнему
-# исполняются (их видел и жмёт владелец) — после той же проверки в момент нажатия.
+# нет, промпт снимка уходит БЕЗ поля `plate` байт-в-байт прежним, `_bike_topic_id` не ищет тему по номеру (как до
+# 25.10); кнопка «Переименовать тему» уже разосланных карточек НЕ исполняется — карточка снимается со словами
+# (ревью r3: владелец жмёт не читая, а ручку тянут ровно тогда, когда карточки оказались неверны). «Оставить»
+# исполняется: снаружи оно не меняет ничего.
 _PLATE_STATE = None           # память в процессе; None = ещё не читали с диска
 _PLATE_BROKEN = None          # файл памяти ЕСТЬ, но не читается: причина словами → ветка молчит до перезапуска (r2 S3)
 _PLATE_SAID = False           # путь памяти называем в журнале ОДИН раз
@@ -16850,7 +16854,9 @@ def _bike_topic_by_plate(chat_id, bike):
     """Тема байка по НОМЕРУ, когда имя Лист1 и имя темы разошлись (ревью r2 S10): после «Переименовать тему» тема
     зовётся номером на байке, а Лист1 — номером книги, и точное совпадение имени (`_bike_topic_id`) темы не найдёт.
     Сначала номер из имени (ровно одна тема с ним), потом зелёная книга (её номер → её тема, если бот эту тему знает).
-    Иначе None — как было до правки."""
+    Иначе None — как было до правки. `PLATE_WATCH=0` → None всегда: ручка откатывает и этот поиск (ревью r3)."""
+    if not _plate_watch_on():
+        return None
     d = _plate_from_name(bike)
     if not d:
         return None
@@ -16944,21 +16950,30 @@ async def _plate_tick_locked(chat_id, topic_id):
     if v.get("drop_card"):
         old = plate_watch.clean(st)["cards"].get(str(topic_id)) or {}
         _plate_keep(plate_watch.without_card(st, topic_id, old.get("n")))
-        log.info(f"  🔢 карточка {old.get('n')} по теме {topic_id} снята: нынешние чтения её не подтверждают ({v['why']})")
+        log.info(f"  🔢 карточка {old.get('n')} по теме {topic_id} снята: "
+                 + ("отправка оборвалась — сообщения у карточки нет (r3)" if v.get("card_lost")
+                    else f"нынешние чтения её не подтверждают ({v['why']})"))
     if not v["kind"]:
         return v
-    if v["kind"] == plate_watch.KIND_WARN:
+    if v["kind"] in (plate_watch.KIND_WARN, plate_watch.KIND_NOTE):
         # заметка без кнопок — не вопрос владельцу, в инбокс 1160 ей пути нет (notify.send_inbox, правило 05.08)
         if await _aio.to_thread(notify.send_feed, plate_watch.card_text(v, chat_id)):
             _plate_keep(plate_watch.with_warned(_plate_load(), topic_id, now))
-            log.info(f"  🔢 предупреждение по теме {topic_id} — в ленту, без кнопок: {v['why']}")
+            log.info(f"  🔢 заметка по теме {topic_id} — в ленту, без кнопок: {v['why']}")
         else:
-            log.warning(f"  🔢 предупреждение по теме {topic_id} в ленту НЕ ушло — повторю на следующем чтении")
+            log.warning(f"  🔢 заметка по теме {topic_id} в ленту НЕ ушла — повторю на следующем чтении")
         return v
     st, n = plate_watch.next_seq(_plate_load(), floor=int(now * 1000))
     _plate_keep(plate_watch.with_card(st, v, n, now, chat_id=chat_id))     # место занято ДО отправки
     kb = [[("Переименовать тему", f"svc:{_PLATE_BTN_REN}:{n}"), ("Оставить", f"svc:{_PLATE_BTN_KEEP}:{n}")]]
-    sent = await _aio.to_thread(notify.send_card, plate_watch.card_text(v, chat_id), buttons=kb)
+    try:
+        sent = await _aio.to_thread(notify.send_card, plate_watch.card_text(v, chat_id), buttons=kb)
+    except BaseException as e:
+        # r3: отправка упала ИЛИ задачу отменили (перезапуск, self-update: CancelledError — не Exception) — место
+        # освобождается здесь же, иначе карточка без сообщения держала бы тему 7 суток, а её кнопка не исполнялась бы
+        _plate_keep(plate_watch.without_card(_plate_load(), topic_id, n))
+        log.warning(f"  🔢 карточка {n} по теме {topic_id}: отправка оборвалась ({type(e).__name__}) — место снято")
+        raise
     st = _plate_load()                        # память перечитана: чтения и нажатия за время отправки не теряются
     if not (isinstance(sent, (tuple, list)) and sent):
         _plate_keep(plate_watch.without_card(st, topic_id, n))
@@ -17019,6 +17034,15 @@ async def _plate_button_locked(q, context, action, n, by):
         await _btn_answer(q, "Эта кнопка не от этой карточки — не исполняю", show_alert=True)
         return
     chat_id, topic_id = card.get("chat") or SERVICING_CHAT, int(card.get("topic"))
+    if action == _PLATE_BTN_REN and not _plate_watch_on():
+        # r3: выключенная ручка РАЗОРУЖАЕТ разосланные карточки — владелец жмёт не читая, а ручку тянут ровно тогда,
+        # когда карточки оказались неверны. Карточка снимается, кнопки уходят; «Оставить» ниже исполняется как было.
+        _plate_keep(plate_watch.without_card(st, topic_id, n))
+        say = "Наблюдение за номером выключено (PLATE_WATCH=0) — не переименовываю"
+        log.warning(f"  🔢 тема {topic_id}: карточка {n} от {by} — {say}")
+        await _btn_answer(q, say, show_alert=True)
+        await _plate_card_done(q, f"Не переименовал: {say}")
+        return
     if action == _PLATE_BTN_KEEP:
         _plate_keep(plate_watch.with_declined(st, card, _plate_now()))
         log.info(f"  🔢 тема {topic_id}: {by} оставил имя «{card.get('name')}» при номере на байке {card.get('d')}")
