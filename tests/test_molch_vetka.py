@@ -154,6 +154,8 @@ def _fresh():
     os.environ["HINT_DEDUP_STATE"] = tempfile.mktemp(prefix="hint_", suffix=".json", dir=_TMP)
     os.environ["WORKS_PERSIST_STATE"] = tempfile.mktemp(prefix="works_", suffix=".json", dir=_TMP)
     S._HINT_SEEN = None
+    if hasattr(S, "_SVC_RCPT"):
+        S._SVC_RCPT.clear()   # память просьбы о чеке (SVCRECEIPT2510): раз на визит — каждый прогон свой визит
 
 
 def _run(msg, claude, *, album=None, env=None):
