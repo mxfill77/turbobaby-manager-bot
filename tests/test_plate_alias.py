@@ -103,5 +103,24 @@ ok("plate_alias.install(bridge_client.BridgeClient)" in src, "splinter став�
 ok("_plate_partners" not in open(os.path.join(ROOT, "bridge_client.py"), encoding="utf-8").read(),
    "bridge_client.py без правки (закреплён приёмкой WA)")
 
+print("(7) заглушка вместо класса (как в тестах соседей) → install молчит, импорт не падает:")
+stub = lambda *a, **k: None                                    # noqa: E731 — как _stub("bridge_client", BridgeClient=lambda…)
+try:
+    back = plate_alias.install(stub)
+    ok(back is stub and not hasattr(stub, "find_bike"), "лямбда-заглушка: ничего не сделано, исключения нет")
+except Exception as e:                                          # noqa: BLE001
+    ok(False, "install на заглушке бросил %r" % e)
+
+
+class NoFind:
+    pass
+
+
+try:
+    plate_alias.install(NoFind)
+    ok(not hasattr(NoFind, "find_bike"), "класс без find_bike: ничего не сделано, исключения нет")
+except Exception as e:                                          # noqa: BLE001
+    ok(False, "install на классе без find_bike бросил %r" % e)
+
 print("%d/%d" % (sum(res), len(res)))
 sys.exit(0 if all(res) else 1)

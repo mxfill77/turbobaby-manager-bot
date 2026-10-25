@@ -82,6 +82,13 @@ def wrap(find_bike):
 
 
 def install(cls):
-    """Поставить обёртку на `cls.find_bike` один раз (повторный вызов ничего не меняет)."""
-    cls.find_bike = wrap(cls.find_bike)
+    """Поставить обёртку на `cls.find_bike` один раз (повторный вызов ничего не меняет).
+
+    Не класс или нет метода `find_bike` (тесты подставляют `bridge_client.BridgeClient = lambda …`) →
+    ничего не делает и не бросает: импорт Splinter не должен падать из-за обёртки поиска."""
+    try:
+        if isinstance(cls, type) and callable(getattr(cls, "find_bike", None)):
+            cls.find_bike = wrap(cls.find_bike)
+    except Exception:                                 # noqa: BLE001 — обёртка не смеет ронять импорт
+        pass
     return cls
