@@ -18,7 +18,8 @@
   (4) ЗАПИСЬ   сквозь живые двери: история получает слова и день работы, квитанция — слова;
   (5) ЯРЛЫКА НЕТ «прочие» без единого слова в историю не идут: заявка открыта, «какие работы
                сделали?» уходит один раз; слова пришли — кнопка Пыму, и строка ложится;
-  (6) ОТКАТ    `WORK_NAME=0` → прежний ярлык байт-в-байт.
+  (7) ДЕНЬ     по Пхукету (Asia/Bangkok, UTC+7), а не по UTC: 13.10 18:30 UTC → 14.10 (r2);
+  (8) ОТКАТ    `WORK_NAME=0` → прежний ярлык байт-в-байт.
 
 Каждая проверка и каждое действие обёрнуты: на коде ДО правки (замер «до/после» через
 `git stash`) сьют не падает на первой отсутствующей функции, а честно считает красные.
@@ -342,11 +343,12 @@ check("VULCAN: строка истории — слова Пыма, км и де
 b2, b3 = FakeBridge(), FakeBridge()
 act(lambda: S._write_info_works(b2, "обслуживание", TOPIC, BIKE, [W_9548], "36474", "", msg_date="2026-08-14"))
 act(lambda: S._write_info_works(b3, "обслуживание", TOPIC, BIKE, [W_9548], "36474", ""))
-TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%d.%m.%Y")
+BKK = datetime.timezone(datetime.timedelta(hours=7))      # Пхукет: Asia/Bangkok, без летнего времени
+TODAY = datetime.datetime.now(BKK).strftime("%d.%m.%Y")
 check("_write_info_works: день сообщения в строке и в msg_date",
       lambda: b2.events[0]["notes"] == "замена аккумулятора — 36474 км · 14.08.2026"
       and b2.events[0]["msg_date"] == "2026-08-14")
-check("_write_info_works без дня → день записи, строка не остаётся без даты",
+check("_write_info_works без дня → день записи ПО ПХУКЕТУ, строка не остаётся без даты",
       lambda: b3.events[0]["notes"] == f"замена аккумулятора — 36474 км · {TODAY}")
 check("тот же ключ при другом дне — дедуп моста не сломан",
       lambda: b2.events[0]["msg_id"] == b3.events[0]["msg_id"])
@@ -413,20 +415,20 @@ class U:
 
 
 class Msg:
-    def __init__(self, text):
+    def __init__(self, text, date=None):
         self.text, self.caption, self.photo = text, None, None
         self.chat_id, self.message_thread_id = CHAT, TOPIC
-        self.date = datetime.datetime(2026, 10, 21, 9, 24, tzinfo=datetime.timezone.utc)
+        self.date = date or datetime.datetime(2026, 10, 21, 9, 24, tzinfo=datetime.timezone.utc)
         self.message_id, self.from_user, self.reply_to_message = 13069, U(), None
 
 
-def answer(b, words):
+def answer(b, words, date=None):
     SENDS.clear()
     try:
         S._SP_ASK_TS.clear()
     except Exception:
         pass
-    return act(lambda: run(S.handle_service_result(Msg(words[0]), Ctx(), b, FakeClaude(words), words[0])))
+    return act(lambda: run(S.handle_service_result(Msg(words[0], date), Ctx(), b, FakeClaude(words), words[0])))
 
 
 # Слова пришли → кнопка Пыму с названием и запомненным пробегом → строка ложится.
@@ -457,8 +459,53 @@ check("колоночный вид остаётся своим ярлыком (�
 check("слов нет → ярлык, как было", lambda: S._sp_labels_ru(["other"], []) == "прочие работы")
 
 
-# ═══════════════ (6) ОТКАТ ═══════════════
-print("\n(6) откат WORK_NAME=0: прежний ярлык байт-в-байт")
+# ═══════════════ (7) ДЕНЬ РАБОТЫ — ПО ПХУКЕТУ (r2) ═══════════════
+print("\n(7) день работы считается по Пхукету (Asia/Bangkok, UTC+7), а не по UTC")
+
+UTC = datetime.timezone.utc
+LATE = datetime.datetime(2026, 10, 13, 18, 30, tzinfo=UTC)     # 01:30 местного 14.10
+EARLY = datetime.datetime(2026, 10, 13, 16, 59, tzinfo=UTC)    # 23:59 местного 13.10
+
+check("сообщение 13.10 18:30 UTC → день работы 14.10 (местного)",
+      lambda: S._work_day_local(Msg("x", LATE)) == "2026-10-14"
+      and W.note_line(W_9548, 29859, S._work_day_local(Msg("x", LATE))).endswith(" · 14.10.2026"))
+check("сообщение 13.10 16:59 UTC → день работы 13.10 (местного)",
+      lambda: S._work_day_local(Msg("x", EARLY)) == "2026-10-13"
+      and W.note_line(W_9548, 29859, S._work_day_local(Msg("x", EARLY))).endswith(" · 13.10.2026"))
+check("наивное время сообщения считается UTC",
+      lambda: S._work_day_local(Msg("x", LATE.replace(tzinfo=None))) == "2026-10-14")
+check("прежний _msg_date_of НЕ тронут (UTC, на нём стоят другие пакеты)",
+      lambda: S._msg_date_of(Msg("x", LATE)) == "2026-10-13")
+check("«сегодня» по умолчанию — местное", lambda: S._today_local() == datetime.datetime.now(BKK).strftime("%Y-%m-%d"))
+check("день рождения заявки (created_at моста, UTC) — тоже по Пхукету",
+      lambda: S._local_day_of_iso("2026-10-13T18:30:00Z") == "2026-10-14"
+      and S._local_day_of_iso("2026-10-13T16:59:00Z") == "2026-10-13")
+
+# Сквозь живую дверь: ответ словами в 01:30 местного 14.10 → строка истории «· 14.10.2026».
+reset(); b = FakeBridge()
+brain(b, "other", 29859, said="29859")
+answer(b, [W_9548], date=LATE)
+check("ответ в 01:30 местного: WDATE в заявке — 14.10", lambda: "WDATE:{2026-10-14}" in note_of(b))
+b.events.clear()
+write(b, act(card_token))
+check("ответ в 01:30 местного: строка истории «· 14.10.2026», msg_date 2026-10-14",
+      lambda: b.events[0]["notes"] == "замена аккумулятора — 29859 км · 14.10.2026"
+      and b.events[0]["msg_date"] == "2026-10-14")
+reset(); b = FakeBridge()
+brain(b, "other", 29859, said="29859")
+answer(b, [W_9548], date=EARLY)
+b.events.clear()
+write(b, act(card_token))
+check("ответ в 23:59 местного 13.10: строка истории «· 13.10.2026»",
+      lambda: b.events[0]["notes"] == "замена аккумулятора — 29859 км · 13.10.2026")
+reset(); b = FakeBridge()
+brain(b, W_9548, None, day="")                          # сообщение дня не принесло
+check("дня у сообщения нет → WDATE = сегодня по Пхукету",
+      lambda: f"WDATE:{{{datetime.datetime.now(BKK).strftime('%Y-%m-%d')}}}" in note_of(b))
+
+
+# ═══════════════ (8) ОТКАТ ═══════════════
+print("\n(8) откат WORK_NAME=0: прежний ярлык байт-в-байт")
 os.environ["WORK_NAME"] = "0"
 try:
     reset(); b = FakeBridge(sp=LEGACY)

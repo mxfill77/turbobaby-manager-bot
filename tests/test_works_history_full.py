@@ -136,8 +136,9 @@ def notes_of(bus):
 
 
 #: С 25.10.2026 (HISTNAMES2510) у строки истории после км стоит день работы « · ДД.ММ.ГГГГ».
-#: `run` дня работы не передаёт → день записи по UTC. Голдены ниже несут его явно.
-DAY = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%d.%m.%Y")
+#: `run` дня работы не передаёт → день записи по Пхукету (UTC+7, r2). Голдены ниже несут его явно.
+_dt_ = __import__("datetime")
+DAY = _dt_.datetime.now(_dt_.timezone(_dt_.timedelta(hours=7))).strftime("%d.%m.%Y")
 
 
 def row_note(work):
