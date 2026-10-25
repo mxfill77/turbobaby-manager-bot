@@ -158,11 +158,46 @@ ok(len(msgs) == 1, "km > cur_odo: отправлено одно сообщени
 ok("24500" in msgs[0], "km > cur_odo: сообщение содержит km")
 ok(mks[0] is None, "km > cur_odo: кнопки НЕТ (сообщение об ошибке)")
 
-# km ≤ oil_last → ошибка
+# km < oil_last → ВОПРОС О ПРИЧИНЕ задним числом (25.10.2026, NINJA 400 6334). До правки здесь
+# стояло «ошибка, кнопки нет»: человеку отвечали «N=… не больше текущего oil_last=…» — внутренними
+# именами и без единого действия. Теперь — три числа, три причины и «старая замена — оставить».
+_KEY = (-100, 123)
+sp._ODO_LOWER_PENDING.pop(_KEY, None)
 r, msgs, mks = _run_bk("масло было на 24500", cur_km=30000, oil_last=25000)
-ok(r is True, "km ≤ oil_last: вернул True")
-ok(len(msgs) == 1, "km ≤ oil_last: одно сообщение")
-ok(mks[0] is None, "km ≤ oil_last: кнопки НЕТ (ошибка)")
+ok(r is True, "km < oil_last: вернул True")
+ok(len(msgs) == 1, "km < oil_last: одно сообщение")
+ok(mks[0] is not None, "km < oil_last: у вопроса есть кнопки")
+_labels = [b.text for row in mks[0].inline_keyboard for b in row] if mks[0] else []
+ok(len(_labels) == 4, f"km < oil_last: 3 причины + «старая замена» ({len(_labels)})")
+ok(any("Старая замена" in x and "25000" in x for x in _labels),
+   "km < oil_last: кнопка «Старая замена — оставить 25000»")
+ok(all(n in msgs[0] for n in ("25000", "24500", "500")), "km < oil_last: названы все три числа")
+ok("задним числом" in msgs[0] and "не трогаю" in msgs[0],
+   "km < oil_last: вопрос про замену задним числом, одометр не трогается")
+_low = sp._ODO_LOWER_PENDING.get(_KEY) or {}
+ok(_low.get("register") == "oil" and _low.get("odo_keep") is True,
+   "km < oil_last: вопрос открыт, метит в кол.I и помнит «одометр не трогать»")
+sp._ODO_LOWER_PENDING.pop(_KEY, None)
+
+# БЛИЗНЕЦ: km == oil_last → «уже записано», ни кнопок, ни вопроса
+r, msgs, mks = _run_bk("масло было на 25000", cur_km=30000, oil_last=25000)
+ok(r is True and len(msgs) == 1, "km == oil_last: одно сообщение")
+ok(mks[0] is None, "km == oil_last: кнопки НЕТ")
+ok("уже записана" in msgs[0], "km == oil_last: «уже записана в ТО»")
+ok(sp._ODO_LOWER_PENDING.get(_KEY) is None, "km == oil_last: вопрос о причине НЕ открыт")
+
+# ОТКАТ: ODO_LOWER=0 → прежнее сообщение об ошибке без кнопок
+_old_ol = os.environ.get("ODO_LOWER")
+os.environ["ODO_LOWER"] = "0"
+try:
+    r, msgs, mks = _run_bk("масло было на 24500", cur_km=30000, oil_last=25000)
+finally:
+    if _old_ol is None:
+        os.environ.pop("ODO_LOWER", None)
+    else:
+        os.environ["ODO_LOWER"] = _old_ol
+ok(r is True and len(msgs) == 1 and mks[0] is None, "ODO_LOWER=0: прежняя ошибка, кнопки НЕТ")
+ok(sp._ODO_LOWER_PENDING.get(_KEY) is None, "ODO_LOWER=0: вопрос не открыт")
 
 # ненадёжный пользователь → False
 r, msgs, mks = _run_bk("масло было на 24500", trusted=False)

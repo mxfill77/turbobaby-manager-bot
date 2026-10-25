@@ -5861,39 +5861,54 @@ def _odo_lower_on():
     return str(_os_env("ODO_LOWER", "1")).strip() not in ("0", "", "нет", "no", "off")
 
 
-def _odo_lower_kb(tok_by_reason):
-    """Три кнопки причин в порядке правила владельца. Четвёртой («просто да») здесь нет намеренно."""
+def _odo_lower_kb(tok_by_reason, keep_tok=None, recorded=None):
+    """Три кнопки причин в порядке правила владельца. Четвёртой («просто да») здесь нет намеренно.
+
+    `keep_tok` — только у замены масла задним числом: кнопка «Старая замена — оставить N». Это
+    не «просто да» и не причина понижения, а ответ, который НЕ ПОНИЖАЕТ НИЧЕГО (в ТО не пишется
+    ни строки), поэтому пояснения ей не нужно."""
     rows = []
     for key in odo_lower.REASON_ORDER:
         lbl = odo_lower.REASONS[key]
         rows.append([InlineKeyboardButton(f"{lbl['th']} / {lbl['ru']}",
                                           callback_data=f"svc:lowr:{tok_by_reason[key]}")])
+    if keep_tok is not None:
+        rows.append([InlineKeyboardButton(f"เก่ากว่า — คง {recorded} / Старая замена — оставить {recorded}",
+                                          callback_data=f"svc:lowk:{keep_tok}")])
     return InlineKeyboardMarkup(rows)
 
 
 async def _odo_lower_ask(context, chat_id, topic_id, bike, recorded, sent,
-                         oil_hint=False, source="", register=""):
+                         oil_hint=False, source="", register="", odo_keep=False):
     """Показать расхождение ЧИСЛОМ и дать выбор причины. Руки; решение — `odo_lower.ask`.
 
     `register` — если понижение метит в регистр Лист1 (сегодня только «oil»), запись пойдёт
-    веткой исправления моста с причиной и автором; пусто — понижение живёт в теме и в журнале."""
-    say = odo_lower.ask(bike, recorded, sent, source=source)
+    веткой исправления моста с причиной и автором; пусто — понижение живёт в теме и в журнале.
+
+    `odo_keep` — ЗАМЕНА МАСЛА ЗАДНИМ ЧИСЛОМ (25.10.2026): `sent` есть пробег прошлой замены, а не
+    одометр. Понижается ТОЛЬКО кол.I; одометр, вопрос о пробеге и счётчик убываний не трогаются
+    (`_odo_lower_commit`), а у вопроса есть ответ «старая замена — оставить»."""
+    say = odo_lower.ask(bike, recorded, sent, source=source, backdated=bool(odo_keep),
+                        confirmer=PYM_HANDLE if odo_keep else "")
     if say is None:                       # понижения нет — звать было не за чем
         return False
     _ODO_LOWER_PENDING[(chat_id, topic_id)] = {
         "bike": bike or "", "recorded": say["recorded"], "sent": say["sent"],
         "reason": "", "oil_hint": bool(oil_hint), "register": str(register or ""),
-        "ts": _time.time(),
+        "odo_keep": bool(odo_keep), "ts": _time.time(),
     }
     mark_awaiting(chat_id, topic_id)
     toks = {k: _svc_put({"kind": "odo_lower", "chat": chat_id, "topic": topic_id,
                          "bike": bike or "", "reason": k})
             for k in odo_lower.REASON_ORDER}
+    keep_tok = (_svc_put({"kind": "odo_lower_keep", "chat": chat_id, "topic": topic_id,
+                          "bike": bike or ""}) if odo_keep else None)
     await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                 text=f"🐀 Splinter\n🇹🇭 {say['th']}\n🇷🇺 {say['ru']}",
-                reply_markup=_odo_lower_kb(toks))
+                reply_markup=_odo_lower_kb(toks, keep_tok, say["recorded"]))
     log.info(f"  → ПОНИЖЕНИЕ: {bike} записано={say['recorded']} прислано={say['sent']} "
-             f"(−{say['drop']}) — жду причину и пояснение, регистр={register or 'нет'}")
+             f"(−{say['drop']}) — жду причину и пояснение, регистр={register or 'нет'}"
+             f"{' · задним числом, одометр не трогаю' if odo_keep else ''}")
     return True
 
 
@@ -5904,6 +5919,12 @@ async def _odo_lower_explanation(msg, context, bridge, text, low) -> bool:
     построению). Принято — понижение идёт, а слова человека уезжают вместе с числом."""
     key = (msg.chat_id, getattr(msg, "message_thread_id", None))
     who = _sender_from_user(getattr(msg, "from_user", None))
+    if low.get("odo_keep") and not _act_trusted(msg):
+        # Исправление кол.I задним числом подтверждает Пым или владелец (гейт E2b, см. кнопку
+        # причины). Чужой текст пояснением не считается и НЕ съедается: он идёт своим путём,
+        # а вопрос остаётся открытым для доверенного.
+        log.info(f"  → ПОНИЖЕНИЕ задним числом: текст от {who} — не доверенный, пояснением не считаю")
+        return False
     plan = odo_lower.plan(low.get("reason"), text, who)
     if not plan["ok"]:
         log.info(f"  → ПОНИЖЕНИЕ: пояснение не принято ({plan['state']}) — вопрос остаётся")
@@ -5922,23 +5943,41 @@ async def _odo_lower_commit(context, bridge, chat_id, topic_id, low, plan, who, 
     fail-closed: журнал не лёг → мост откатывает правку."""
     bike = low.get("bike") or ""
     recorded, sent = low.get("recorded"), low.get("sent")
+    # ЗАДНИМ ЧИСЛОМ (25.10.2026): `sent` — пробег прошлой замены масла, а не одометр. Поэтому ни
+    # одного следа «одометра» эта ветка не оставляет: вопрос о пробеге и мягкий гейт темы живут
+    # своей жизнью, счётчик убываний не растёт, строки аудита ОДО с этим числом в «события» нет
+    # (её `mileage` читался бы как показание приборки). Пояснение остаётся двумя следами —
+    # квитанцией сейчас и причиной+автором в ветке исправления моста (там след fail-closed).
+    odo_keep = bool(low.get("odo_keep"))
     _ODO_LOWER_PENDING.pop((chat_id, topic_id), None)
-    _SOFT_ODO_PENDING.pop((chat_id, topic_id), None)
-    _PENDING_MILEAGE.pop((chat_id, topic_id), None)
-    _mileage_q_forget(chat_id, topic_id, why="понижение с пояснением")
+    if not odo_keep:
+        _SOFT_ODO_PENDING.pop((chat_id, topic_id), None)
+        _PENDING_MILEAGE.pop((chat_id, topic_id), None)
+        _mileage_q_forget(chat_id, topic_id, why="понижение с пояснением")
     clear_awaiting(chat_id, topic_id)
-    _odo_drop_record(bike)
+    if not odo_keep:
+        _odo_drop_record(bike)
 
-    # (1) СЛЕД, КОТОРЫЙ ЧИТАЮТ ПОТОМ. Слова человека едут ДОСЛОВНО — ярлык причины их
-    # предваряет, а не заменяет (правило полноты истории 23.08).
-    _odo_audit_write(bridge, chat_id, topic_id, bike, sent, recorded, sender=who,
-                     outcome=f"понижение принято · {plan['line']}")
+        # (1) СЛЕД, КОТОРЫЙ ЧИТАЮТ ПОТОМ. Слова человека едут ДОСЛОВНО — ярлык причины их
+        # предваряет, а не заменяет (правило полноты истории 23.08).
+        _odo_audit_write(bridge, chat_id, topic_id, bike, sent, recorded, sender=who,
+                         outcome=f"понижение принято · {plan['line']}")
 
     # (2) РЕГИСТР ЛИСТ1 — только веткой исправления, то есть С ПРИЧИНОЙ И АВТОРОМ. Обычный путь
     # понижения не знает и знать не должен: пара «причина+автор» и есть то, что его открывает.
     failed = None
+    res = None
     if low.get("register") == "oil" and bridge is not None:
         plate = _plate_from_name(bike)
+        if not plate and odo_keep:
+            # Задним числом единственный смысл ответа — запись кол.I: без номера квитанция
+            # «исправлено» была бы ложью, поэтому номер ищем так же, как `_write_oil_backdated`.
+            try:
+                plate = _plate_from_name((bridge.find_bike(bike) or {}).get("name", ""))
+            except Exception:
+                plate = None
+            if not plate:
+                failed = {"error": "missing_number"}
         if plate:
             res = bridge.set_fleet_oil(number=plate, oil_km=sent, confirmed=True,
                                        fix_reason=plan["line"], fixed_by=who)
@@ -5947,8 +5986,10 @@ async def _odo_lower_commit(context, bridge, chat_id, topic_id, low, plan, who, 
             log.info(f"  → ПОНИЖЕНИЕ регистра: {plate} → {sent} ok={(res or {}).get('ok')}")
 
     # (3) ЗАМЕНА ОДОМЕТРА — СОБЫТИЕ, А НЕ ПРАВКА СТАРОЙ ЗАПИСИ (правило владельца 23.08):
-    # пробег начинается заново, и это отдельная строка истории байка.
-    if plan["writes_history"] and bridge is not None:
+    # пробег начинается заново, и это отдельная строка истории байка. Задним числом строки нет:
+    # `sent` там — пробег прошлой замены масла, а не показание нового одометра, и событие
+    # «одометр заменён на N» соврало бы числом. Причина всё равно уезжает в ветку исправления.
+    if plan["writes_history"] and bridge is not None and not odo_keep:
         try:
             bridge.add_event(msg_date=msg_date or "", group="сервис", bike=str(bike),
                              event_type="odometer_replaced", fuel="", mileage=str(sent),
@@ -5964,6 +6005,27 @@ async def _odo_lower_commit(context, bridge, chat_id, topic_id, low, plan, who, 
                           text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}\n"
                                 f"🇷🇺 Пояснение я сохранил: «{plan['explanation']}»"))
         return False
+
+    if odo_keep:
+        # Хвост успеха — как у `_write_oil_backdated`: ТО-трекер узнаёт только пробег замены
+        # (`last_service_km`), текущий одометр не передаётся вовсе. Имя байка — из ТОЙ ЖЕ
+        # расписки записи, лишнего вопроса мосту нет.
+        _canon = (res.get("bike_name") if isinstance(res, dict) else None) or bike
+        _iv = None
+        try:
+            _iv = _service_interval("oil", _canon, bridge) or _oil_interval(_canon)
+            bridge.service_upsert(bike=bike, service_type="oil",
+                                  last_service_km=sent, interval_km=_iv)
+        except Exception:
+            log.exception("  → ПОНИЖЕНИЕ задним числом: ТО-трекер не обновился (fail-safe)")
+        _next = (sent + int(_iv)) if _iv else None     # `sent` целое: его положил `odo_lower.ask`
+        rec = odo_lower.receipt(bike, recorded, sent, low.get("reason"), plan["explanation"], who,
+                                backdated=True, next_km=_next)
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
+                          text=f"🐀 Splinter\n🇹🇭 {rec['th']}\n🇷🇺 {rec['ru']}")
+        log.info(f"  → ПОНИЖЕНИЕ задним числом ПРИМЕНЕНО: {bike} кол.I {recorded}→{sent}, "
+                 f"одометр не тронут")
+        return True
 
     rec = odo_lower.receipt(bike, recorded, sent, low.get("reason"), plan["explanation"], who)
     await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
@@ -6574,14 +6636,51 @@ async def handle_oil_backdated_service(msg, context, bridge, text) -> bool:
     km = detect_oil_backdated_km(text)
     if km is None:
         return False
+    return await _oil_backdated_offer(context, bridge, chat_id, topic_id, bike, km,
+                                      door="перехват")
 
-    # Validation: N > prev oil_last, N ≤ current odometer (если известен)
+
+async def _oil_backdated_offer(context, bridge, chat_id, topic_id, bike, km, door=""):
+    """Замена масла задним числом на `km` → ОДНА проверка и ОДИН ответ для обоих входов.
+
+    ВХОДОВ ДВА, А ПРОВЕРКА БЫЛА У ОДНОГО (25.10.2026, NINJA 400 6334, 13:28). Прямой перехват
+    (`handle_oil_backdated_service`, доверенный пишет «масло было на N») сверял N с кол.I и с
+    одометром, а вход через мозг (`sp_confirm_from_brain(backdated=True)`: set_service с
+    `oil_last_km`) сразу выдавал Пыму кнопку «подтвердить запись в ТО (кол.I)?». В живом случае
+    кол.I уже держала 41958, прислано 41928: кнопка была обречена с рождения, мост отказал
+    `oil_decreasing`, и человек получил «понизить можно: выбери причину…» без выбора. Теперь
+    оба входа идут сюда, и исход зависит от чисел, а не от того, каким путём пришло сообщение.
+
+    Исходы:
+      • N больше текущего одометра темы → ошибка числа (замена не могла быть «в будущем»);
+      • N равно кол.I → «уже записано», ничего не пишем;
+      • N меньше кол.I → вопрос о причине задним числом (`_odo_lower_ask(odo_keep=True)`):
+        та же замена и кол.I неверна — понизить с пояснением; более старая — оставить как есть.
+        Тот же вопрос уже открыт (те же числа) → короткая ссылка на него, второго не задаём.
+        Ручка `ODO_LOWER=0` → прежнее сообщение об ошибке числа;
+      • иначе (больше кол.I или кол.I не прочитана) → кнопка Пыму, как раньше.
+    Кол.I не прочиталась — сверять нечем, и кнопка остаётся прежней: тогда мост сам сверит при
+    записи, а его отказ откроет тот же вопрос (`_write_oil_backdated` → `_oil_refusal`).
+
+    ДОВЕРИЕ НЕ ОСЛАБЕВАЕТ. Прежде запись кол.I с этого входа шла только кнопкой Пыма (гейт E2b);
+    у вопроса, пришедшего на её место, причину выбирает и пояснение пишет тоже только Пым или
+    владелец (кнопка `lowr`, `_odo_lower_explanation`). Иначе вышло бы, что ПОНИЗИТЬ кол.I
+    (мост пускает до 500 км без доверенного) проще, чем повысить. «Старая замена — оставить»
+    не пишет ничего и потому доступна любому."""
+    try:
+        km = int(str(km).replace(" ", "").replace(",", ""))
+    except (TypeError, ValueError):
+        return False
+
     fleet = {}
     try:
         fleet = bridge.find_bike(bike) or {}
     except Exception:
         pass
-    oil_last = fleet.get("oil_last_km")
+    try:
+        oil_last = int(str(fleet.get("oil_last_km") or 0).replace(" ", "").replace(",", "")) or None
+    except (TypeError, ValueError):
+        oil_last = None                                            # 0/пусто/не число — сверять нечем
 
     # Текущий одометр — из буфера фото темы (наиболее актуален в servicing)
     lm = last_mileage_in_topic(chat_id, topic_id)
@@ -6592,17 +6691,42 @@ async def handle_oil_backdated_service(msg, context, bridge, text) -> bool:
         except Exception:
             pass
 
-    if oil_last and km <= oil_last:
+    if cur_km is not None and km > cur_km:
+        reason = f"это больше текущего пробега байка ({cur_km} км)"
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=msg_oil_backdated_invalid(bike, km, reason))
+        log.info(f"  → backdated oil INVALID (N>odo) [{door}]: km={km} cur={cur_km}")
+        return True
+    if oil_last and km == oil_last:
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=msg_oil_backdated_already(bike, km))
+        log.info(f"  → backdated oil: {km} уже в кол.I [{door}] — ничего не пишу")
+        return True
+    if oil_last and km < oil_last:
+        if _odo_lower_on():
+            _open = pending_odo_lower_for(chat_id, topic_id)
+            if (_open and _open.get("odo_keep") and _open.get("recorded") == oil_last
+                    and _open.get("sent") == km):
+                # ТОТ ЖЕ вопрос уже на экране. Живой круг 6334: на пустой отказ Пым ответил
+                # «ยืนยัน», мозг снова позвал set_service — и всё пошло по второму и третьему разу.
+                # Второго такого же вопроса не задаём, коротко показываем на первый: его кнопки
+                # живы. Молчать нельзя (правило 1), поэтому ссылка — а не тишина.
+                await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                            text=msg_oil_backdated_pending(bike, oil_last, km))
+                log.info(f"  → backdated oil {km} < кол.I {oil_last} [{door}] — вопрос уже открыт, ссылка")
+                return True
+            try:
+                if await _odo_lower_ask(context, chat_id, topic_id, bike, oil_last, km,
+                                        register="oil", odo_keep=True):
+                    log.info(f"  → backdated oil {km} < кол.I {oil_last} [{door}] — вопрос о причине")
+                    return True
+            except Exception:
+                log.exception("  → backdated oil: вопрос о причине не открылся (fail-safe: слова)")
+                _ODO_LOWER_PENDING.pop((chat_id, topic_id), None)
         reason = f"N={km} не больше текущего oil_last={oil_last}"
         await _send(context, chat_id=chat_id, message_thread_id=topic_id,
                     text=msg_oil_backdated_invalid(bike, km, reason))
-        log.info(f"  → backdated oil INVALID (N≤oil_last): km={km} oil_last={oil_last}")
-        return True
-    if cur_km is not None and km > cur_km:
-        reason = f"N={km} > текущий одометр={cur_km}"
-        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                    text=msg_oil_backdated_invalid(bike, km, reason))
-        log.info(f"  → backdated oil INVALID (N>odo): km={km} cur={cur_km}")
+        log.info(f"  → backdated oil INVALID (N≤oil_last) [{door}]: km={km} oil_last={oil_last}")
         return True
 
     # Всё ок — показываем карточку Пыму для подтверждения записи в кол.I
@@ -6614,7 +6738,7 @@ async def handle_oil_backdated_service(msg, context, bridge, text) -> bool:
                        text=msg_oil_backdated_confirm(bike, km), reply_markup=kb)
     _remember_cycle_msg(chat_id, topic_id, sent)
     mark_awaiting(chat_id, topic_id)
-    log.info(f"  → backdated oil: переспрос Пыму {km} км (тема {topic_id})")
+    log.info(f"  → backdated oil: переспрос Пыму {km} км [{door}] (тема {topic_id})")
     return True
 
 
@@ -6900,6 +7024,33 @@ def msg_oil_backdated_confirm(bike, km):
         f"🇹🇭 📟 เปลี่ยนน้ำมัน{b_th} ที่ {km} กม. (ย้อนหลัง) — ยืนยันบันทึก ТО (col.I) ไหมครับ? {PYM_HANDLE} 🙏\n"
         f"{_SEP}\n"
         f"🇷🇺 📟 Замена масла{b_ru} задним числом на {km} км — подтвердить запись в ТО (кол.I)? {PYM_HANDLE}"
+    )
+
+
+def msg_oil_backdated_already(bike, km):
+    """Замена масла задним числом на N, а в кол.I уже ровно N — писать нечего."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 เปลี่ยนน้ำมัน{b_th} ที่ {km} กม. บันทึกใน ТО (col.I) อยู่แล้วครับ — ไม่ต้องทำอะไรเพิ่ม\n"
+        f"{_SEP}\n"
+        f"🇷🇺 📟 Замена масла{b_ru} на {km} км уже записана в ТО (кол.I) — ничего не меняю."
+    )
+
+
+def msg_oil_backdated_pending(bike, recorded, km):
+    """Тот же вопрос замены масла задним числом уже открыт — ссылка на него вместо второго."""
+    b_th = f" ({bike})" if bike else ""
+    b_ru = f" по {bike}" if bike else ""
+    return (
+        f"🐀 Splinter\n"
+        f"🇹🇭 📟 คำถามเรื่องเปลี่ยนน้ำมันย้อนหลัง{b_th} เปิดอยู่ด้านบนแล้วครับ: {PYM_HANDLE} "
+        f"กดเลือกเหตุผล (ผมจะแก้ ТО เป็น {km} กม.) หรือกด «เก่ากว่า» (ТО ยังคงเป็น {recorded} กม.)\n"
+        f"{_SEP}\n"
+        f"🇷🇺 📟 Вопрос по замене масла задним числом{b_ru} уже открыт выше: {PYM_HANDLE}, "
+        f"выбери причину кнопкой (исправлю ТО на {km} км) или нажми «Старая замена» "
+        f"(в ТО останется {recorded} км)."
     )
 
 
@@ -7392,45 +7543,60 @@ async def _write_oil(context, bridge, chat_id, topic_id, bike, km, confirmed_by=
         # ПОСЛЕ итога, чтобы кнопка была СВЕРХУ (Q2 — всегда видна). Любой unpin_all в теме → следом _repin_info.
         await _repin_info(context, chat_id, topic_id)
     else:
-        # ОТКАЗ ГОВОРИТ, ЧТО ДЕЛАТЬ (правило владельца 23.08). Прежние ветки называли числа, но
-        # не действие, а последняя печатала человеку внутренний код моста дословно.
-        #
-        # ДВЕРЬ САМА ОТКРЫВАЕТ ВОПРОС О ПРИЧИНЕ (23.08.2026, шаг 2 цели 120). Слова этого отказа
-        # уже обещали выбор — `reply_floor._SAY["oil_decreasing"]` дословно говорит «понизить
-        # можно: выбери причину и напиши пояснение своими словами», — а выбирать было НЕ ИЗ
-        # ЧЕГО: `_odo_lower_ask(register="oil")` был написан и покрыт тестом, но из этой ветки
-        # не звался, и живым `register="oil"` не приходил НИ ОТКУДА. Обещание без машины и есть
-        # тот класс, что уже ловили у карточек владельцу: обещанное обязано случаться.
-        #
-        # ЗАПИСАННОЕ ЧИСЛО БЕРЁТСЯ ИЗ ТОЙ ЖЕ РАСПИСКИ, из которой строкой выше прочитан флаг
-        # `ok` (`old_oil`), — у моста НЕ спрашиваем НИ ОДНОГО лишнего раза, тем же приёмом, что
-        # у `_svc_undo_remember_write`. Нет числа в расписке → `odo_lower.ask` не построит
-        # расхождения, вопрос не откроется, и человек получит прежние слова.
-        _res = res if isinstance(res, dict) else {}
-        _asked = False
-        if odo_lower.opens_question(_res.get("error")) and _odo_lower_on():
-            _rec = _res.get("old_oil")
-            if _rec is None:
-                _rec = _res.get("old_km")
-            try:
-                _asked = await _odo_lower_ask(context, chat_id, topic_id,
-                                              _res.get("bike_name") or bike, _rec, km_int,
-                                              source="кнопка записи", register="oil")
-            except Exception:
-                # Сорвался вопрос — человек всё равно услышит слова отказа. Правило 1 («никогда
-                # не молчать») сильнее нового удобства: молчание — единственный запрещённый исход.
-                log.exception("  → ПОНИЖЕНИЕ: не смог открыть вопрос о причине (fail-safe: слова)")
-                _ODO_LOWER_PENDING.pop((chat_id, topic_id), None)
-                _asked = False
-        if not _asked:
-            # ПРЕЖНИЙ ПУТЬ БАЙТ-В-БАЙТ: ручка `ODO_LOWER=0`, чужой код отказа, число не названо
-            # или понижения нет вовсе. Молчанием ни один из этих случаев не кончается.
-            detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
-            await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
-                              text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
-        # Открылся вопрос — он и ЕСТЬ ответ: те же три числа плюс выбор причины. Печатать рядом
-        # ещё и слова отказа значило бы сказать одно дважды, причём вторая копия снова обещала
-        # бы выбор, который уже на экране.
+        # ОТКАЗ ГОВОРИТ, ЧТО ДЕЛАТЬ (правило владельца 23.08) — одна дверь на обе двери масла.
+        await _oil_refusal(context, chat_id, topic_id, bike, res, km_int, plate,
+                           source="кнопка записи")
+
+
+async def _oil_refusal(context, chat_id, topic_id, bike, res, km_int, plate, *, source,
+                       odo_keep=False):
+    """Отказ записи кол.I → вопрос о причине (если отказ — понижение) или человеческие слова.
+
+    ОДНА ДВЕРЬ НА ОБЕ ДВЕРИ МАСЛА (25.10.2026, NINJA 400 6334). До этого ветка ниже жила только в
+    `_write_oil`, а вторая дверь (`_write_oil_backdated`) на том же отказе печатала голые слова
+    «понизить можно: выбери причину…» — и выбирать было не из чего: вопрос не открывался, ответа
+    человека не ждал никто. Ровно тот класс, который 23.08 лечили у первой двери, — лечение до
+    близнеца не доехало. Теперь двери зовут одну функцию, и разойтись им негде.
+
+    `odo_keep` — дверь задним числом: понижается только кол.I, одометр не трогается, и у вопроса
+    есть ответ «старая замена — оставить» (`_odo_lower_ask`).
+
+    ДВЕРЬ САМА ОТКРЫВАЕТ ВОПРОС О ПРИЧИНЕ (23.08.2026, шаг 2 цели 120). Слова этого отказа уже
+    обещали выбор — `reply_floor._SAY["oil_decreasing"]` дословно говорит «понизить можно: выбери
+    причину и напиши пояснение своими словами», — а выбирать было НЕ ИЗ ЧЕГО:
+    `_odo_lower_ask(register="oil")` был написан и покрыт тестом, но из `_write_oil` не звался, и
+    живым `register="oil"` не приходил НИ ОТКУДА. Обещание без машины и есть тот класс, что уже
+    ловили у карточек владельцу: обещанное обязано случаться.
+
+    ЗАПИСАННОЕ ЧИСЛО БЕРЁТСЯ ИЗ ТОЙ ЖЕ РАСПИСКИ, из которой вызывающий прочитал флаг `ok`
+    (`old_oil`), — у моста НЕ спрашиваем НИ ОДНОГО лишнего раза, тем же приёмом, что у
+    `_svc_undo_remember_write`. Нет числа в расписке → `odo_lower.ask` не построит расхождения,
+    вопрос не откроется, и человек получит прежние слова."""
+    _res = res if isinstance(res, dict) else {}
+    _asked = False
+    if odo_lower.opens_question(_res.get("error")) and _odo_lower_on():
+        _rec = _res.get("old_oil")
+        if _rec is None:
+            _rec = _res.get("old_km")
+        try:
+            _asked = await _odo_lower_ask(context, chat_id, topic_id,
+                                          _res.get("bike_name") or bike, _rec, km_int,
+                                          source=source, register="oil", odo_keep=odo_keep)
+        except Exception:
+            # Сорвался вопрос — человек всё равно услышит слова отказа. Правило 1 («никогда
+            # не молчать») сильнее нового удобства: молчание — единственный запрещённый исход.
+            log.exception("  → ПОНИЖЕНИЕ: не смог открыть вопрос о причине (fail-safe: слова)")
+            _ODO_LOWER_PENDING.pop((chat_id, topic_id), None)
+            _asked = False
+    if not _asked:
+        # ПРЕЖНИЙ ПУТЬ БАЙТ-В-БАЙТ: ручка `ODO_LOWER=0`, чужой код отказа, число не названо
+        # или понижения нет вовсе. Молчанием ни один из этих случаев не кончается.
+        detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
+        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,   # класс-фикс: ответ кнопки записи
+                          text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+    # Открылся вопрос — он и ЕСТЬ ответ: те же три числа плюс выбор причины. Печатать рядом
+    # ещё и слова отказа значило бы сказать одно дважды, причём вторая копия снова обещала
+    # бы выбор, который уже на экране.
 
 
 def _refuse_words(res, *, plate="", sent=None):
@@ -7506,11 +7672,10 @@ async def _write_oil_backdated(context, bridge, chat_id, topic_id, bike, oil_km,
                           reply_markup=_svc_undo_kb(_undo_tok))
         log.info(f"  → backdated ТО Oil ЗАПИСАНО: {bike} oil_km={km_int} next={_next}")
     else:
-        # Та же дверь слов отказа, что у первой двери масла: двум формулировкам об одном отказе
-        # разойтись негде по построению.
-        detail_ru, detail_th = _refuse_words(res, plate=plate, sent=km_int)
-        await _send_retry(context, chat_id=chat_id, message_thread_id=topic_id,
-                          text=(f"🐀 Splinter\n🇹🇭 ⚠️ {detail_th}\n🇷🇺 ⚠️ {detail_ru}"))
+        # Та же дверь отказа, что у первой двери масла (`_oil_refusal`): понижение открывает
+        # НАСТОЯЩИЙ вопрос о причине, а не слова, которые его только обещают (25.10.2026, 6334).
+        await _oil_refusal(context, chat_id, topic_id, bike, res, km_int, plate,
+                           source="кнопка записи задним числом", odo_keep=True)
 
 
 # Метки видов ТО группы B (TH, RU) — для кнопок/квитанций. kind → (тайский, русский).
@@ -8009,6 +8174,14 @@ async def handle_service_button(update, context, bridge) -> None:
         if not odo_lower.reason_ok(reason):
             await _btn_answer(q, "ไม่รู้จักเหตุผลนี้ · Причина не опознана", show_alert=True)
             return
+        if low.get("odo_keep") and not (_is_trusted_user(q.from_user) or is_owner_user(q.from_user)):
+            # ЗАДНИМ ЧИСЛОМ причину выбирает Пым или владелец (25.10.2026): ответ понижает кол.I, а
+            # запись ТО в теме обслуживания идёт только через доверенного (гейт E2b) — прежде вход
+            # через мозг держал это кнопкой Пыма, и вопрос вместо кнопки не вправе гейт ослабить.
+            # Кнопки живут: доверенный нажмёт сам.
+            await _btn_answer(q, f"ยืนยันโดย {PYM_HANDLE}/เจ้าของ · Выбирает {PYM_HANDLE} или владелец",
+                              show_alert=True)
+            return
         low["reason"] = reason
         _svc_drop(token)
         lbl = odo_lower.REASONS[reason]
@@ -8025,6 +8198,28 @@ async def handle_service_button(update, context, bridge) -> None:
                           f"🇷🇺 ✍️ Причина: {lbl['ru']} — теперь напиши пояснение своими словами, "
                           f"что случилось. Одного «да» не хватит: пояснение сохранится "
                           f"вместе с записью, его будут читать потом."))
+
+    elif action == "lowk":
+        # «Старая замена — оставить» на вопросе замены масла задним числом (25.10.2026). Записи
+        # эта ветка НЕ делает вовсе — закрывает вопрос и говорит вслух, что в ТО не легло ничего.
+        key = (chat_id, topic_id)
+        low = _ODO_LOWER_PENDING.get(key)
+        if not low or not low.get("odo_keep"):
+            await _btn_answer(q, "คำถามหมดอายุแล้ว · Вопрос уже закрыт", show_alert=True)
+            return
+        _ODO_LOWER_PENDING.pop(key, None)
+        clear_awaiting(chat_id, topic_id)
+        _svc_drop(token)
+        await _btn_answer(q, "คงไว้ตามเดิม · Оставляю как есть")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        rec = odo_lower.keep_receipt(low.get("bike") or bike, low.get("recorded"), low.get("sent"))
+        log.info(f"  → ПОНИЖЕНИЕ задним числом: «старая замена» — кол.I {low.get('recorded')} "
+                 f"оставлена, {low.get('sent')} не пишу ({_sender_from_user(q.from_user)})")
+        await _send(context, chat_id=chat_id, message_thread_id=topic_id,
+                    text=f"🐀 Splinter\n🇹🇭 {rec['th']}\n🇷🇺 {rec['ru']}")
 
     elif action == "sodo":
         # Мягкий гейт ODO ≤500 км: кнопка «Да, намеренно» от механика.
@@ -11659,18 +11854,14 @@ async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, 
     backdated=True (oil_last_km из set_service): запись задним числом → специальная карточка
     (одометр НЕ трогается), кнопка _write_oil_backdated.
     Bot Data (то_заявки) = зелёная зона."""
-    # Спецпуть для задним-числом масла из мозга (oil_last_km в set_service)
+    # Спецпуть для задним-числом масла из мозга (oil_last_km в set_service). Проверка и ответ —
+    # те же, что у прямого перехвата (`_oil_backdated_offer`): до 25.10.2026 этот вход выдавал
+    # кнопку Пыму без сверки с кол.I, и кнопка на число ниже записанного была обречена (6334).
     if backdated and kind == "oil" and km:
         odo_str = str(km).strip().replace(" ", "").replace(",", "")
         if _re_pl.fullmatch(r"\d{3,6}", odo_str):
-            tok = _svc_put({"kind": "oil_backdated", "chat": chat_id, "topic": topic_id,
-                            "bike": bike, "km": odo_str})
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-                "✅ ยืนยัน / Подтвердить", callback_data=f"svc:oilbk:{tok}")]])
-            await _send(context, chat_id=chat_id, message_thread_id=topic_id,
-                        text=msg_oil_backdated_confirm(bike, int(odo_str)), reply_markup=kb)
-            mark_awaiting(chat_id, topic_id)
-            log.info(f"  → E2b backdated oil: {bike} oil_km={odo_str} → кнопка Пыму")
+            await _oil_backdated_offer(context, bridge, chat_id, topic_id, bike, int(odo_str),
+                                       door="мозг E2b")
             return
 
     kind = str(kind or "").strip().lower()

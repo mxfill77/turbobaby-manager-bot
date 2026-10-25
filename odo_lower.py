@@ -246,11 +246,18 @@ def record_line(reason_key, explanation, who=""):
     return f"{label}: {words}{tail}" if words else f"{label}{tail}"
 
 
-def ask(bike, recorded, sent, source=""):
+def ask(bike, recorded, sent, source="", backdated=False, confirmer=""):
     """Расхождение ЧИСЛОМ + выбор причины. Возвращает `None`, ТОЛЬКО если понижения нет вовсе.
 
     Числа названы все три — сколько записано, сколько прислано, на сколько меньше, — потому что
-    правило владельца требует именно их, а не слова «меньше»."""
+    правило владельца требует именно их, а не слова «меньше».
+
+    `backdated` — ЗАМЕНА МАСЛА ЗАДНИМ ЧИСЛОМ (25.10.2026, NINJA 400 6334): присланное число —
+    пробег прошлой замены, а не одометр, и «меньше записанного» здесь не обязательно ошибка.
+    Смыслов два, и вопрос обязан назвать оба: та же замена и в кол.I записано неверно (понизить с
+    причиной, как всегда) — или более старая замена (в ТО не писать ничего). Слова про одометр
+    в этом вопросе были бы ложью: его эта ветка не трогает. `confirmer` — кто вправе выбрать
+    причину (руки зовут доверенного: запись ТО в теме обслуживания идёт только через него)."""
     d = diff(recorded, sent)
     if not d["lower"]:
         return None
@@ -259,6 +266,27 @@ def ask(bike, recorded, sent, source=""):
     src_ru = f" ({source})" if source else ""
     lines_ru = "\n".join(f"  {i + 1}) {REASONS[k]['ru']}" for i, k in enumerate(REASON_ORDER))
     lines_th = "\n".join(f"  {i + 1}) {REASONS[k]['th']}" for i, k in enumerate(REASON_ORDER))
+    if backdated:
+        rec, got, drop = d["recorded"], d["sent"], d["drop"]
+        who_ru = f"\nПричину выбирает и пояснение пишет {confirmer} или владелец." if confirmer else ""
+        who_th = f"\nเลือกเหตุผลและพิมพ์อธิบายโดย {confirmer} หรือเจ้าของครับ" if confirmer else ""
+        return {
+            "recorded": rec, "sent": got, "drop": drop,
+            "th": (f"📟 เปลี่ยนน้ำมันย้อนหลัง{b_th}: ใน ТО (col.I) บันทึกการเปลี่ยนไว้ที่ {rec} กม. "
+                   f"ที่ส่งมา {got} กม. — น้อยกว่า {drop} กม.{src_ru}\n"
+                   f"ถ้าเป็นการเปลี่ยนครั้งเดียวกันและ {rec} บันทึกผิด — เลือกเหตุผลแล้วพิมพ์อธิบาย"
+                   f"เป็นคำพูดของคุณ ผมจะแก้ ТО เป็น {got} กม. (เลขไมล์ปัจจุบันของรถไม่เปลี่ยน):\n"
+                   f"{lines_th}\n"
+                   f"ถ้าเป็นการเปลี่ยนครั้งก่อน (เก่ากว่า) — กด «เก่ากว่า» ТО ยังคงเป็น {rec} กม."
+                   f"{who_th}"),
+            "ru": (f"📟 Замена масла задним числом{b_ru}: в ТО (кол.I) записана замена на {rec} км, "
+                   f"прислано {got} км — меньше на {drop} км{src_ru}.\n"
+                   f"Если это та же замена и {rec} записано неверно — выбери причину и напиши "
+                   f"пояснение своими словами, исправлю ТО на {got} км (текущий пробег байка "
+                   f"не трогаю):\n{lines_ru}\n"
+                   f"Если это более старая замена — нажми «Старая замена»: в ТО останется {rec} км."
+                   f"{who_ru}"),
+        }
     return {
         "recorded": d["recorded"], "sent": d["sent"], "drop": d["drop"],
         "th": (f"📟 เลขไมล์{b_th} ที่บันทึกไว้ {d['recorded']} กม. "
@@ -301,11 +329,14 @@ def plan(reason_key, explanation, who=""):
     }
 
 
-def receipt(bike, recorded, sent, reason_key, explanation, who=""):
+def receipt(bike, recorded, sent, reason_key, explanation, who="", backdated=False, next_km=None):
     """Квитанция понижения: числа + причина + слова человека ДОСЛОВНО.
 
     Пояснение стоит в квитанции целиком не ради вежливости: человек обязан увидеть, ЧТО именно
-    сохранится и останется читаемым потом, — иначе «сохранено» проверить нечем."""
+    сохранится и останется читаемым потом, — иначе «сохранено» проверить нечем.
+
+    `backdated` — исправлена кол.I замены масла задним числом: «пробег понижен» здесь соврал бы,
+    одометр байка этой веткой не трогался. `next_km` — срок следующего ТО, если руки его знают."""
     d = diff(recorded, sent)
     label_ru = REASONS.get(str(reason_key or ""), {}).get("ru") or "причина не названа"
     label_th = REASONS.get(str(reason_key or ""), {}).get("th") or "ไม่ได้ระบุเหตุผล"
@@ -314,10 +345,42 @@ def receipt(bike, recorded, sent, reason_key, explanation, who=""):
     b_th = f" ({bike})" if bike else ""
     drop_ru = f" (меньше на {d['drop']} км)" if d["drop"] is not None else ""
     drop_th = f" (น้อยกว่า {d['drop']} กม.)" if d["drop"] is not None else ""
+    if backdated:
+        was = d["recorded"] if d["recorded"] is not None else recorded
+        now = d["sent"] if d["sent"] is not None else sent
+        nxt = _num(next_km)
+        next_ru = f" Следующее ТО на {nxt} км." if nxt else ""
+        next_th = f" ТО ครั้งถัดไปที่ {nxt} กม." if nxt else ""
+        return {
+            "th": (f"✅ แก้ ТО น้ำมัน{b_th} ย้อนหลังแล้วครับ: {now} กม.{drop_th} "
+                   f"เลขไมล์ปัจจุบันของรถไม่เปลี่ยน{next_th}\nเหตุผล: {label_th} — «{words}»"),
+            "ru": (f"✅ ТО масла{b_ru} исправлено задним числом: было {was} км, стало {now} км"
+                   f"{drop_ru}. Текущий пробег байка не трогал.{next_ru}\n"
+                   f"Причина: {label_ru} — «{words}». Пояснение сохранено вместе с записью."),
+        }
     return {
         "th": (f"✅ ลดเลขไมล์{b_th} แล้วครับ: {d['sent'] if d['sent'] is not None else sent} กม."
                f"{drop_th}\nเหตุผล: {label_th} — «{words}»"),
         "ru": (f"✅ Пробег{b_ru} понижен: было {d['recorded'] if d['recorded'] is not None else recorded} км, "
                f"стало {d['sent'] if d['sent'] is not None else sent} км{drop_ru}.\n"
                f"Причина: {label_ru} — «{words}». Пояснение сохранено вместе с записью."),
+    }
+
+
+def keep_receipt(bike, recorded, sent):
+    """«Старая замена — оставить»: в ТО не пишется НИЧЕГО, и квитанция говорит это вслух.
+
+    Только у вопроса замены масла задним числом: там «меньше записанного» законно значит «более
+    старая замена», и у человека обязан быть ответ, который ничего не понижает. Умолчание читалось
+    бы как «записал», то есть как ложное зелёное."""
+    b_ru = f" по {bike}" if bike else ""
+    b_th = f" ({bike})" if bike else ""
+    rec, got = _num(recorded), _num(sent)
+    rec = recorded if rec is None else rec
+    got = sent if got is None else got
+    return {
+        "th": (f"✅ คงไว้ตามเดิม{b_th}: ТО (col.I) เปลี่ยนน้ำมันที่ {rec} กม. "
+               f"ส่วน {got} กม. เป็นการเปลี่ยนครั้งก่อน ไม่บันทึกลง ТО ครับ"),
+        "ru": (f"✅ Оставил как есть{b_ru}: в ТО (кол.I) замена на {rec} км. "
+               f"{got} км — более старая замена, в ТО её не пишу."),
     }
