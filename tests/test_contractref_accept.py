@@ -181,7 +181,7 @@ PINS = {
     "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
     "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
     "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
-    "bridge_client.py": "9207eb7327ee5e55e2d5c1c1d20227c678de9ff9",
+    "bridge_client.py": "6101fa507c477d6157c2346fb504b8b004788511",  # ESIGNLINK2510: было 9207eb73 (contract_find(doc_id=…), docstring sign_url/doc_url)
     "wa_book_read.py": "ba866980d22c75c005e40510b1271453aac74a25",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно») · PROMPT2110: было 5a90fddc
     "wa_agent_tg.py": "6bcbe4ce4574224c2ce4e63e29a78698e91d2877",  # RCFIX2010 D3: было c3fbd715 (метка, _num)
     "contract_ask.py": "be132d7a099dbb84edadca636989cb16dd19c607",
@@ -208,7 +208,7 @@ PINS = {
     # существующие наборы — доказательство «флаг выкл — прежнее»: правок в них нет (§2.2, §8.4)
     "tests/k3_pdf_fixture.py": "dd52642ec712d7504c87be3d976f49b075a7b595",
     "tests/rental_case_fakes.py": "74f5e283f39a725e46b146f0be62050a56b3bf93",
-    "tests/test_agent_contract_bind.py": "35b0ad49446df70808cab958e05254e94de207d3",
+    "tests/test_agent_contract_bind.py": "f4c340ded1a86a20fa1029a90479570521b1d164",  # ESIGNLINK2510: было 35b0ad49 (ключи записи двери + sign_url, doc_url; случаи агента прежние)
     "tests/test_audit_button.py": "cde60fa41caa4a4ce6de7b6d408a289094b7fa29",
     # APPROVEFIX1610 (16.10): стенд «да/нет» реплаем на карточку выдачи/приёма (id карточки сохраняется при отправке)
     "tests/test_handover_activation.py": "2aebad2045e14a10b154c8fb8bad51a83a35ffc7",

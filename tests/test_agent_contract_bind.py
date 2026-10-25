@@ -356,7 +356,8 @@ def test_snapshots_come_from_door_code():
     assert {"one_rows_short_ivan", "one_unsigned_undated", "ambiguous", "incomplete", "one_other_client",
             "one_complete", "one_nick", "one_partial_neighbor", "pdf_b", "pdf_c"} <= set(snaps)
     keys = {"row", "doc_id", "client", "contract_date", "contract_date_raw", "created_raw", "date_src", "status",
-            "signed", "signed_at", "bike", "phone", "pdf_id", "matched_on", "pdf_ready"}
+            "signed", "signed_at", "bike", "phone", "pdf_id", "matched_on", "pdf_ready",
+            "sign_url", "doc_url"}   # ESIGNLINK2510: поля двери; агенту в факт не идут (contract_result их не берёт)
     for name, s in snaps.items():
         if s.get("pick"):
             assert set(s["pick"]) == keys, (name, sorted(s["pick"]))

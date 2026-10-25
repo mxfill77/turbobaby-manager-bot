@@ -4,10 +4,12 @@
  * node на мок-реестре и мок-Drive — тот же способ, что tx_find_gs_harness.js / botdata_gs_harness.js
  * (сервисы Apps Script зовутся только внутри функций → vm-загрузка + мок работает).
  *
- * Источники кода — правило srcOf: файл есть в КАТАЛОГЕ СБОРКИ ЗАХОДА `bridge_build_contract/` —
- * берём сборку, иначе ЗЕРКАЛО ПРОДА `bridge_prod/`. Судимые файлы — ContractDoor.js (новый) и
- * Bridge.js (маршруты GET `contract_find`/`contract_pdf`); Config.js (verifyToken) и BotData.js
- * (plateOf_) — из зеркала.
+ * Источники кода — правило srcOf: файл есть в КАТАЛОГЕ СБОРКИ ЗАХОДА — берём сборку, иначе ЗЕРКАЛО
+ * ПРОДА `bridge_prod/`. Судимые файлы — ContractDoor.js и Bridge.js (маршруты GET `contract_find`/
+ * `contract_pdf`); Config.js (verifyToken) и BotData.js (plateOf_) — из зеркала.
+ * Каталог сборки захода с ESIGNLINK2510 (25.10.2026) — `bridge_build_esign_link/` (поля sign_url/doc_url
+ * и фильтр doc_id, секция 21); прежний `bridge_build_contract/` — след выложенной сборки @88, он побайтно
+ * равен зеркалу, поэтому до ESIGNLINK2510 харнесс судил те же байты.
  *
  * `--stdin`: подмена исходников JSON-объектом {имя файла: текст} со stdin — так тест гоняет
  * МУТАНТОВ, не создавая файлов на диске.
@@ -32,7 +34,7 @@ const vm = require('vm');
 const path = require('path');
 const crypto = require('crypto');
 
-const GS_BUILD = path.join(__dirname, '..', 'bridge_build_contract');
+const GS_BUILD = path.join(__dirname, '..', 'bridge_build_esign_link');
 const GS_MIRROR = path.join(__dirname, '..', 'bridge_prod');
 
 function srcOf(name) {
@@ -526,8 +528,9 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
     && byRow(nr, 6).created_raw === '2026-09-16 11:00' && nr.outcome === 'one' && nr.checked.complete === true, J(nr.items));
 
   // П4: pick — полная запись (поля как в items) плюс pdf_ready
+  // ESIGNLINK2510: sign_url и doc_url — поля записи (пустые, когда колонок нет, как в этом реестре)
   const ITEM_KEYS = ['row', 'doc_id', 'client', 'contract_date', 'contract_date_raw', 'created_raw', 'date_src', 'status',
-    'signed', 'signed_at', 'bike', 'phone', 'pdf_id', 'matched_on'];
+    'signed', 'signed_at', 'bike', 'phone', 'pdf_id', 'sign_url', 'doc_url', 'matched_on'];
   const it6 = byRow(nr, 6);
   check('fix.pick-full-record', nr.pick && ITEM_KEYS.every(k => J(nr.pick[k]) === J(it6[k])) && nr.pick.pdf_ready === true
     && J(Object.keys(nr.pick).sort()) === J(ITEM_KEYS.concat(['pdf_ready']).sort()), J(nr.pick));
@@ -751,6 +754,119 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   check('levels.restored-twin', back.ok === true && back.folder_level === 1, J([back.ok, back.error, back.folder_level]));
 
   check('search.readonly-no-writes', WRITES.n === 0, J(WRITES.what));
+}
+
+// ── 21. ESIGNLINK2510: «Ссылка клиенту на подпись» и «Ссылка на документ» — необязательные поля; фильтр doc_id ──
+// Шапка — как у реестра TB e-Sign 0.2.2 (три новые колонки после «Байк»; прежняя «Ссылка «на подпись»» стоит на
+// месте и в двух строках ЗАПОЛНЕНА прямой ссылкой BoldSign — дверь её не берёт). id документов — длиной как у
+// Google (44), ссылки — формы TB e-Sign (`…/exec?a=sign&d=<id>&k=<токен>&who=client`); всё синтетика. Реестр до
+// 0.2.2 — прежние случаи 1–20 (в их шапке новой колонки нет) и вариант этой секции без трёх колонок.
+{
+  const HEADERS22 = HEADERS.concat(['Язык подписи', 'Ссылка клиенту на подпись', 'Версия документа (ушла в BoldSign)']);
+  const H22 = Object.fromEntries(HEADERS22.map((h, i) => [h, i]));
+  const row22 = o => { const r = new Array(HEADERS22.length).fill(''); for (const k in o) r[H22[k]] = o[k]; return r; };
+  const SIGN = id => 'https://script.google.com/macros/s/AKfycbTESTdeploy0000/exec?a=sign&d=' + id + '&k=tk' + id.slice(-6) + '&who=client';
+  const EDIT = id => 'https://docs.google.com/document/d/' + id + '/edit';
+  const BOLDSIGN = 'https://app.boldsign.com/document/sign/?documentId=bs-direct-0001';
+  const DOC_N = '1LinkNew0000000000000000000000000000000000001', DOC_S = '1LinkSent000000000000000000000000000000000002';
+  const DOC_P = '1LinkSigned0000000000000000000000000000000003', DOC_E = '1LinkEmpty00000000000000000000000000000000004';
+  const DOC_X = DOC_N + 'X';                                        // тот же префикс, другой документ
+  const ROWS4 = [
+    HEADERS22.slice(),
+    /* 2 */ row22({ 'ID документа': DOC_N, 'Клиент': 'Link New', 'Дата договора': '25-10-2026', 'Статус': 'НОВЫЙ',
+      'Телефон': '+66 81 999 0001', 'Байк': 'PCX 3101', 'Ссылка на документ': EDIT(DOC_N), 'Ссылка клиенту на подпись': SIGN(DOC_N) }),
+    /* 3 */ row22({ 'ID документа': DOC_S, 'Клиент': 'Link Sent', 'Дата договора': '25-10-2026', 'Статус': 'ОТПРАВЛЕН',
+      'Телефон': '+66 81 999 0002', 'Байк': 'PCX 3102', 'Ссылка на документ': EDIT(DOC_S), 'Ссылка «на подпись»': BOLDSIGN,
+      'Ссылка клиенту на подпись': '  ' + SIGN(DOC_S) + ' ' }),
+    /* 4 */ row22({ 'ID документа': DOC_P, 'Клиент': 'Link Signed', 'Дата договора': '24-10-2026', 'Статус': 'ПОДПИСАН',
+      'Подписан': '2026-10-24 18:00', 'Телефон': '+66 81 999 0003', 'Байк': 'PCX 3103', 'Ссылка на документ': EDIT(DOC_P),
+      'Ссылка клиенту на подпись': SIGN(DOC_P) }),                      // ячейка не очищена — дверь всё равно молчит
+    /* 5 */ row22({ 'ID документа': DOC_E, 'Клиент': 'Link Empty', 'Дата договора': '25-10-2026', 'Статус': 'НОВЫЙ',
+      'Телефон': '+66 81 999 0004', 'Байк': 'PCX 3104', 'Ссылка на документ': EDIT(DOC_E), 'Ссылка «на подпись»': BOLDSIGN }),
+    /* 6 */ row22({ 'ID документа': DOC_X, 'Клиент': 'Link Twin', 'Дата договора': '25-10-2026', 'Статус': 'НОВЫЙ',
+      'Телефон': '+66 81 999 0005', 'Байк': 'PCX 3105', 'Ссылка на документ': EDIT(DOC_X), 'Ссылка клиенту на подпись': SIGN(DOC_X) }),
+  ];
+  const blank = g => g.map(() => []);
+  const keep = SHEETS;
+  const sheet4 = makeSheet(ROWS4, blank(ROWS4), blank(ROWS4));
+  SHEETS = { 'Реестр': sheet4 };
+  const ALL_ON = { doc_id: true, sign_url: true, doc_url: true };
+
+  const n = safe(() => contractFind({ doc_id: DOC_N }));
+  SNAP.link_new = n;
+  check('link.by-doc-id', n.ok === true && J(rowsOf(n)) === J([2]) && J(n.items[0].matched_on) === J(['doc_id'])
+    && n.items[0].sign_url === SIGN(DOC_N) && n.items[0].doc_url === EDIT(DOC_N) && n.outcome === 'none_signed'
+    && n.filter && n.filter.doc_id === DOC_N, J(n).slice(0, 400));
+  check('link.columns-present', J(n.optional_columns) === J(ALL_ON), J(n.optional_columns));
+  const nu = safe(() => contractFind({ doc_id: EDIT(DOC_N) }));
+  check('link.by-doc-url', J(rowsOf(nu)) === J([2]) && nu.filter.doc_id === DOC_N && nu.items[0].sign_url === SIGN(DOC_N), J(nu).slice(0, 300));
+  // точное равенство: соседний id с тем же префиксом не находится, укороченный id — «нет»
+  check('link.doc-id-exact', J(rowsOf(n)) === J([2]) && J(rowsOf(safe(() => contractFind({ doc_id: DOC_X })))) === J([6]), '');
+  const pre = safe(() => contractFind({ doc_id: DOC_N.slice(0, -1) }));
+  SNAP.link_none = pre;
+  check('link.doc-id-prefix-none', pre.ok === true && pre.outcome === 'none' && J(pre.items) === '[]'
+    && pre.checked.rows_scanned === 5, J(pre).slice(0, 300));
+  // doc_id с другим фильтром — оба условия
+  check('link.doc-and-name', safe(() => contractFind({ doc_id: DOC_N, name: 'Link Sent' })).outcome === 'none'
+    && J(rowsOf(safe(() => contractFind({ doc_id: DOC_N, name: 'Link New' })))) === J([2]), '');
+  // отправленный: значение новой колонки (с обрезанными пробелами), а НЕ прямая ссылка BoldSign из прежней колонки
+  const s = safe(() => contractFind({ doc_id: DOC_S }));
+  check('link.sent-new-column', s.items && s.items[0].sign_url === SIGN(DOC_S) && !J(s).includes(BOLDSIGN), J(s.items));
+  // подписанный: ссылки на подпись нет даже при заполненной ячейке; ссылка на документ — есть
+  const p = safe(() => contractFind({ doc_id: DOC_P }));
+  SNAP.link_signed = p;
+  check('link.signed-no-sign-url', p.outcome === 'one' && p.pick && p.pick.sign_url === '' && p.items[0].sign_url === ''
+    && p.pick.doc_url === EDIT(DOC_P) && !J(p).includes(SIGN(DOC_P)), J(p.pick));
+  // пустая новая колонка при заполненной прежней — пусто, прежняя не подставляется
+  const e = safe(() => contractFind({ doc_id: DOC_E }));
+  SNAP.link_empty = e;
+  check('link.old-column-not-taken', e.items && e.items[0].sign_url === '' && e.items[0].doc_url === EDIT(DOC_E)
+    && !J(e).includes(BOLDSIGN), J(e.items));
+  // поиск по телефону тоже несёт поля (агенты и отчёты получают ту же ссылку)
+  const ph = safe(() => contractFind({ phone: '0819990001' }));
+  check('link.phone-carries-fields', J(rowsOf(ph)) === J([2]) && ph.items[0].sign_url === SIGN(DOC_N)
+    && J(ph.items[0].matched_on) === J(['phone']), J(ph.items));
+  // колонки ищутся по имени: обратный порядок — те же значения
+  const perm = HEADERS22.map((_, i) => i).reverse();
+  const shuf = g => g.map(r => perm.map(i => (r || [])[i]));
+  SHEETS = { 'Реестр': makeSheet(shuf(ROWS4), blank(ROWS4), blank(ROWS4)) };
+  const sh = safe(() => contractFind({ doc_id: DOC_S }));
+  check('link.headers-by-name', sh.ok === true && sh.items[0].sign_url === SIGN(DOC_S) && sh.items[0].doc_url === EDIT(DOC_S), J(sh).slice(0, 300));
+  // маршрут GET довозит doc_id до двери
+  SHEETS = { 'Реестр': sheet4 };
+  const rt = safe(() => JSON.parse(doGet({ parameter: { token: 'tok-test', action: 'contract_find', doc_id: DOC_N } }).getContent()));
+  check('link.route-doc-id', rt.action === 'contract_find' && rt.ok === true && J(rowsOf(rt)) === J([2])
+    && rt.items[0].sign_url === SIGN(DOC_N) && J(rt.optional_columns) === J(ALL_ON), J(rt).slice(0, 300));
+  // плохой id — отказ, а не тихий поиск по остальным фильтрам
+  check('link.bad-doc-id', safe(() => contractFind({ doc_id: 'abc' })).error === 'bad_doc_id'
+    && safe(() => contractFind({ doc_id: 'abc', name: 'Link New' })).error === 'bad_doc_id', '');
+
+  // реестр ДО 0.2.2 (шапка без трёх новых колонок): дверь не ломается, поля пустые, колонки названы отсутствующими
+  const old = ROWS4.map(r => r.slice(0, HEADERS.length));
+  SHEETS = { 'Реестр': makeSheet(old, blank(old), blank(old)) };
+  const o = safe(() => contractFind({ doc_id: DOC_N }));
+  SNAP.link_old_registry = o;
+  check('link.old-registry-works', o.ok === true && J(rowsOf(o)) === J([2]) && o.items[0].sign_url === ''
+    && o.items[0].doc_url === EDIT(DOC_N) && J(o.optional_columns) === J({ doc_id: true, sign_url: false, doc_url: true }), J(o).slice(0, 400));
+  // без «ID документа» и «Ссылка на документ»: поиск по телефону жив, фильтр doc_id — названный отказ, а не «нет»
+  const drop = ['ID документа', 'Ссылка на документ'].map(h => H[h]);
+  const bare = old.map(r => r.filter((_, i) => drop.indexOf(i) < 0));
+  SHEETS = { 'Реестр': makeSheet(bare, blank(bare), blank(bare)) };
+  const b1 = safe(() => contractFind({ phone: '0819990001' }));
+  check('link.no-optional-columns', b1.ok === true && J(rowsOf(b1)) === J([2]) && b1.items[0].sign_url === ''
+    && b1.items[0].doc_url === '' && b1.items[0].doc_id === ''
+    && J(b1.optional_columns) === J({ doc_id: false, sign_url: false, doc_url: false }), J(b1).slice(0, 300));
+  const b2 = safe(() => contractFind({ doc_id: DOC_N }));
+  SNAP.link_no_doc_column = b2;
+  check('link.no-doc-column-refused', b2.ok === false && b2.error === 'no_column' && J(b2.missing) === J(['ID документа'])
+    && !('items' in b2), J(b2).slice(0, 300));
+  // прежний реестр секций 1–20: новой колонки нет — поля пустые у каждой записи
+  SHEETS = keep;
+  const iv = safe(() => contractFind({ name: 'Ivan' }));
+  check('link.base-registry-empty', iv.ok === true && (iv.items || []).length === 2
+    && iv.items.every(x => x.sign_url === '' && x.doc_url === '')
+    && J(iv.optional_columns) === J({ doc_id: true, sign_url: false, doc_url: true }), J(iv.optional_columns));
+  check('link.readonly-no-writes', WRITES.n === 0, J(WRITES.what));
 }
 
 const failed = cases.filter(c => !c.pass);

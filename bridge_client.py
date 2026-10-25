@@ -1093,21 +1093,26 @@ class BridgeClient:
         return self._call("tx_find", **params)
 
     def contract_find(self, phone: str = "", name: str = "", bike: str = "", date_from: str = "",
-                      date_to: str = "", limit: Optional[int] = None) -> dict:
+                      date_to: str = "", limit: Optional[int] = None, doc_id: str = "") -> dict:
         """Договоры аренды из реестра подписей TB e-Sign — ТОЛЬКО ЧТЕНИЕ, GET (`_call`).
 
-        Фильтры (хотя бы один из phone/name/bike, иначе мост ответит `no_filter`): `phone` —
+        Фильтры (хотя бы один из phone/name/bike/doc_id, иначе мост ответит `no_filter`): `phone` —
         сравнение по последним 9 цифрам (колонки «Телефон» и «Ник»); `name` — слова имени в любом
-        порядке; `bike` — по номеру, как у `tx_find`; `date_from`/`date_to` — включительно по «Дата
+        порядке; `bike` — по номеру, как у `tx_find`; `doc_id` — id Google-документа (или ссылка на
+        него), точное равенство с «ID документа» (ESIGNLINK2510; мост до этой сборки параметр не
+        довозит и отвечает `no_filter`); `date_from`/`date_to` — включительно по «Дата
         договора»; «Документ создан» берётся ТОЛЬКО при ПУСТОЙ ячейке даты договора. `limit` — по
         умолчанию 20, потолок 100.
 
         → {ok, outcome, pick, reason, items:[запись], undated_items:[запись], checked:{rows_scanned,
         span_from, span_to, matched, signed, returned, truncated, undated, undated_signed,
-        date_unparsed, unread, complete}}. Запись: {row, doc_id, client, contract_date (день или
-        None — неизвестен), contract_date_raw, created_raw, date_src (contract_date | created |
-        unparsed | none), status, signed, signed_at, bike, phone, pdf_id, matched_on}; `pick` — та же
-        полная запись выбранного договора плюс `pdf_ready`.
+        date_unparsed, unread, complete}, optional_columns:{doc_id, sign_url, doc_url}}. Запись: {row,
+        doc_id, client, contract_date (день или None — неизвестен), contract_date_raw, created_raw,
+        date_src (contract_date | created | unparsed | none), status, signed, signed_at, bike, phone,
+        pdf_id, sign_url, doc_url, matched_on}; `pick` — та же полная запись выбранного договора плюс
+        `pdf_ready`. `sign_url` — «Ссылка клиенту на подпись» TB e-Sign (та же, что в группе
+        контрактов; у подписанного — пусто), `doc_url` — «Ссылка на документ» (правка договора);
+        колонок нет (реестр до TB e-Sign 0.2.2) — поля пустые, `optional_columns` называет, каких нет.
 
         `outcome`: `one` — ровно один подписанный, он в `pick`; `ambiguous` — подписанных в сроке
         несколько, выбрать нельзя (неизвестно, а не первый); `incomplete` — при сроке есть подходящий
@@ -1123,7 +1128,7 @@ class BridgeClient:
         «ПОДПИСАН». Мост без двери (до выкладки) отвечает `unknown_action` — это «реестр не
         просмотрен», а не «договоров нет»."""
         params = {}
-        for key, val in (("phone", phone), ("name", name), ("bike", bike),
+        for key, val in (("phone", phone), ("name", name), ("bike", bike), ("doc_id", doc_id),
                          ("date_from", date_from), ("date_to", date_to)):
             if str(val or "").strip():
                 params[key] = str(val).strip()

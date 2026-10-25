@@ -31,9 +31,10 @@ def snap(name, override=None):
 
 
 def source(name):
-    """Исходник моста так, как его берёт харнесс (srcOf): сборка bridge_build_contract/, иначе зеркало bridge_prod/."""
+    """Исходник моста так, как его берёт харнесс (srcOf): каталог сборки захода (ESIGNLINK2510 —
+    bridge_build_esign_link/; прежний bridge_build_contract/ побайтно равен зеркалу @88), иначе зеркало bridge_prod/."""
     root = os.path.dirname(HERE)
-    p = os.path.join(root, "bridge_build_contract", name)
+    p = os.path.join(root, "bridge_build_esign_link", name)
     if not os.path.exists(p):
         p = os.path.join(root, "bridge_prod", name)
     with open(p, encoding="utf-8") as fh:

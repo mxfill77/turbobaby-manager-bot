@@ -23,13 +23,21 @@ MIRROR88 (13.10.2026): дверь в проде с @85, переделана @86
 PDF в «Подписанные/ГГГГ/ММ»), дата договора ДД-ММ-ГГГГ — @88 (P5). Зеркало сведено к @88, каталог сборки
 переведён в состояние «выложено» (delivered_as_version 88, файлы == зеркалу) и судится ОБЩИМ правилом трёх
 состояний `tests/build_states.py`; харнесс — секции 19 (живые даты) и 20 (поиск и уровни папки), мутанты
-на правила @86 и P5."""
+на правила @86 и P5.
+
+ESIGNLINK2510 (25.10.2026): новая стройка двери — в СВОЁМ каталоге сборки `bridge_build_esign_link/` (состояние «а»
+поверх зеркала @88), `bridge_build_contract/` остаётся следом выложенной сборки и судится прежними тестами паспорта.
+Код двери (харнесс, мутанты, страж записей) берётся по правилу srcOf: каталог сборки захода → зеркало. Поля записи
+sign_url («Ссылка клиенту на подпись») и doc_url («Ссылка на документ») — необязательные колонки; фильтр doc_id;
+харнесс — секция 21, мутант на каждое правило; Bridge.js сборки отличается от зеркала РОВНО строкой маршрута
+contract_find (довозит doc_id)."""
 import ast
 import base64
 import difflib
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -37,7 +45,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_states                                                    # noqa: E402  (правило трёх состояний)
 
-BUILD = os.path.join(ROOT, "bridge_build_contract")
+BUILD = os.path.join(ROOT, "bridge_build_contract")          # след выложенной сборки @88 (паспорт)
+LINK_BUILD = os.path.join(ROOT, "bridge_build_esign_link")   # каталог сборки захода ESIGNLINK2510
 MIRROR = os.path.join(ROOT, "bridge_prod")
 HARNESS = os.path.join(ROOT, "tests", "contract_door_gs_harness.js")
 CLIENT = os.path.join(ROOT, "bridge_client.py")
@@ -55,6 +64,12 @@ def _read(path):
         return f.read()
 
 
+def src_path(name):
+    """Правило srcOf харнесса: файл есть в каталоге сборки захода — он, иначе зеркало прода."""
+    p = os.path.join(LINK_BUILD, name)
+    return p if os.path.exists(p) else os.path.join(MIRROR, name)
+
+
 def run_harness(override=None):
     args = ["node", HARNESS] + (["--stdin"] if override is not None else [])
     proc = subprocess.run(args, input=json.dumps(override) if override is not None else None,
@@ -69,10 +84,10 @@ def harness():
 
 
 def test_build_js_syntax():
-    for name in ("ContractDoor.js", "Bridge.js"):
-        proc = subprocess.run(["node", "--check", os.path.join(BUILD, name)],
-                              capture_output=True, text=True, timeout=30)
-        assert proc.returncode == 0, f"{name}: {proc.stderr}"
+    for path in [os.path.join(BUILD, n) for n in ("ContractDoor.js", "Bridge.js")] + \
+            [src_path(n) for n in ("ContractDoor.js", "Bridge.js")]:
+        proc = subprocess.run(["node", "--check", path], capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, f"{path}: {proc.stderr}"
 
 
 def test_harness_all_green():
@@ -81,7 +96,7 @@ def test_harness_all_green():
     res = json.loads(out)
     failed = [c for c in res["cases"] if not c["pass"]]
     assert not failed, json.dumps(failed, ensure_ascii=False, indent=1)
-    assert len(res["cases"]) >= 149, len(res["cases"])   # MIRROR88: 102 + секция 19 (33) + секция 20 (14)
+    assert len(res["cases"]) >= 167, len(res["cases"])   # MIRROR88: 149; ESIGNLINK2510: + секция 21 (18)
 
 
 def test_harness_covers_key_cases():
@@ -109,7 +124,13 @@ def test_harness_covers_key_cases():
                  "search.folder-ambiguous", "search.folder-trashed-ignored", "search.registry-ambiguous",
                  "search.ambiguous-pdf-refused", "search.lookup-failed-named",
                  "search.folder-lookup-failed-named", "levels.three-ok", "levels.four-refused",
-                 "levels.unreadable-refused", "levels.restored-twin", "search.readonly-no-writes"):
+                 "levels.unreadable-refused", "levels.restored-twin", "search.readonly-no-writes",
+                 # ESIGNLINK2510: ссылка клиенту на подпись и ссылка на документ — необязательные колонки, фильтр doc_id
+                 "link.by-doc-id", "link.columns-present", "link.by-doc-url", "link.doc-id-exact",
+                 "link.doc-id-prefix-none", "link.doc-and-name", "link.sent-new-column", "link.signed-no-sign-url",
+                 "link.old-column-not-taken", "link.phone-carries-fields", "link.headers-by-name",
+                 "link.route-doc-id", "link.bad-doc-id", "link.old-registry-works", "link.no-optional-columns",
+                 "link.no-doc-column-refused", "link.base-registry-empty", "link.readonly-no-writes"):
         assert need in names, f"нет кейса {need}: {sorted(names)}"
 
 
@@ -164,10 +185,67 @@ def test_build_only_adds_to_mirror():
     assert replaced == 1, replaced
 
 
+def test_link_build_passport():
+    """ESIGNLINK2510: каталог сборки захода — по правилу трёх состояний; до выкладки «а» (база == зеркало @88)."""
+    passport = json.loads(_read(os.path.join(LINK_BUILD, "BUILD.json")))
+    assert passport["changed"] == ["Bridge.js", "ContractDoor.js"], passport["changed"]
+    assert passport["added"] == [], passport["added"]
+    res = build_states.judge(LINK_BUILD, MIRROR)
+    assert not res["problems"], res
+    assert res["state"] in ("a", "b", "c"), res
+    assert not os.path.exists(os.path.join(LINK_BUILD, ".clasp.json"))
+
+
+def test_link_build_bridge_delta():
+    """Bridge.js сборки ESIGNLINK2510 против базы-зеркала: РОВНО одна строка — маршрут contract_find довозит doc_id,
+    прежние параметры на месте (правило невыложенной сборки; после выкладки файлы == зеркалу и сверять нечего)."""
+    res = build_states.judge(LINK_BUILD, MIRROR)
+    if res["state"] != "a":
+        return
+    old = _read(os.path.join(MIRROR, "Bridge.js")).splitlines()
+    new = _read(os.path.join(LINK_BUILD, "Bridge.js")).splitlines()
+    sm = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
+    diffs = [op for op in sm.get_opcodes() if op[0] != "equal"]
+    assert len(diffs) == 1, diffs
+    tag, i1, i2, j1, j2 = diffs[0]
+    assert tag == "replace" and i2 - i1 == 1 and j2 - j1 == 1, diffs
+    assert new[j1] == old[i1].replace("bike: params.bike,", "bike: params.bike, doc_id: params.doc_id,"), (old[i1], new[j1])
+    assert "contractFind({" in old[i1]
+
+
+def _js_functions(text):
+    """Верхнеуровневые функции файла моста: имя → текст от `function имя(` до закрывающей `}` в начале строки
+    (комментарии между функциями не в счёт — их правка не правка функции)."""
+    out, cur, name = {}, [], None
+    for line in text.splitlines():
+        m = re.match(r"^function (\w+)\(", line)
+        if m:
+            name, cur = m.group(1), []
+        if name:
+            cur.append(line)
+            if line == "}":
+                out[name] = "\n".join(cur)
+                name = None
+    return out
+
+
+def test_link_door_only_contract_find_changed():
+    """ContractDoor.js сборки: contractPdf и все помощники, кроме contractFind, побайтно прежние (ссылки нужны поиску,
+    PDF-дверь ими не пользуется)."""
+    res = build_states.judge(LINK_BUILD, MIRROR)
+    if res["state"] != "a":
+        return
+    old = _js_functions(_read(os.path.join(MIRROR, "ContractDoor.js")))
+    new = _js_functions(_read(os.path.join(LINK_BUILD, "ContractDoor.js")))
+    assert set(old) == set(new), set(old) ^ set(new)
+    changed = sorted(n for n in old if old[n] != new[n])
+    assert changed == ["contractFind"], changed
+
+
 def test_door_has_no_writes():
     """В новом файле нет ни одного пишущего вызова Apps Script (харнесс считает живые записи,
     здесь — страховка по тексту)."""
-    src = _read(os.path.join(BUILD, "ContractDoor.js"))
+    src = _read(src_path("ContractDoor.js"))
     for bad in ("setValue", "setValues", "appendRow", "insertSheet", "deleteRow", "setProperty",
                 "setTrashed", "moveTo", "createFile", "makeCopy", "setContent", "addEditor",
                 "UrlFetchApp", "MailApp", "GmailApp"):
@@ -221,6 +299,10 @@ def test_client_methods_are_get():
     f = _Fake()
     ns["contract_find"](f)
     assert f.calls == [("contract_find", {})], f.calls   # отказ no_filter выносит мост, клиент не гадает
+    f = _Fake()                                           # ESIGNLINK2510: id документа доезжает до моста как есть
+    ns["contract_find"](f, doc_id=" 1LinkNew0000000000000000000000000000000000001 ", limit=5)
+    assert f.calls == [("contract_find", {"doc_id": "1LinkNew0000000000000000000000000000000000001",
+                                          "limit": 5})], f.calls
     f = _Fake({"ok": False, "error": "not_in_registry"})
     out = ns["contract_pdf"](f, " pdfA0000000000000000000000001 ")
     assert f.calls == [("contract_pdf", {"id": "pdfA0000000000000000000000001"})], f.calls
@@ -304,8 +386,9 @@ MUTANTS = [
      "rows_scanned: data.length,", "rows_scanned: matched.length,"),
     ("rich-link-ignored", "ContractDoor.js",
      "pdfIds[i] = esignFileId_(link) || esignFileId_(", "pdfIds[i] = esignFileId_("),
+    # ESIGNLINK2510: «было» сдвинуто вслед за кодом (в условие добавлен фильтр doc_id), суть та же
     ("no-filter-allowed", "ContractDoor.js",
-     "if (!phone && !qWords.length && !plate) return", "if (false) return"),
+     "if (!phone && !qWords.length && !plate && !docId) return", "if (false) return"),
     # CONTRACTFIX0410: «было» двух прежних мутантов сдвинуто вслед за кодом (подстановка created
     # переехала в esignRowDate_, запись строки — в rec), суть мутации та же
     ("created-fallback-dropped", "ContractDoor.js",
@@ -382,6 +465,32 @@ MUTANTS = [
     ("p5-tail-garbage-accepted", "ContractDoor.js", r"(\d{4})(?:$|[ ,T])/)))", r"(\d{4})/)))"),
     ("p5-day-month-swapped", "ContractDoor.js",
      "{ y = m[4]; mo = m[3]; d = m[1]; }", "{ y = m[4]; mo = m[1]; d = m[3]; }"),
+    # ── ESIGNLINK2510: по мутанту на каждое правило ──
+    ("link-column-required", "ContractDoor.js",
+     "NEED: ['client', 'contract_date', 'status', 'signed_at', 'pdf', 'phone', 'bike'],",
+     "NEED: ['client', 'contract_date', 'status', 'signed_at', 'pdf', 'phone', 'bike', 'sign_url'],"),
+    ("link-old-column-taken", "ContractDoor.js",
+     "sign_url: 'Ссылка клиенту на подпись',", "sign_url: 'Ссылка «на подпись»',"),
+    ("link-signed-shows-url", "ContractDoor.js",
+     "c.sign_url !== undefined && !isSigned ?", "c.sign_url !== undefined ?"),
+    ("link-not-trimmed", "ContractDoor.js",
+     "String(r[c.sign_url] || '').trim() : ''", "String(r[c.sign_url] || '') : ''"),
+    ("link-doc-url-dropped", "ContractDoor.js",
+     "doc_url: c.doc_url !== undefined ?", "doc_url: false ?"),
+    ("link-doc-filter-ignored", "ContractDoor.js",
+     "if (String(r[c.doc_id] || '').trim() !== docId) continue;", "if (false) continue;"),
+    ("link-doc-filter-prefix", "ContractDoor.js",
+     "if (String(r[c.doc_id] || '').trim() !== docId) continue;",
+     "if (String(r[c.doc_id] || '').trim().indexOf(docId) !== 0) continue;"),
+    ("link-doc-url-not-parsed", "ContractDoor.js",
+     "docId = esignFileId_(docIn);", r"docId = /^[-\w]{25,}$/.test(docIn) ? docIn : '';"),
+    ("link-bad-doc-silent", "ContractDoor.js",
+     "if (!docId) return { ok: false, error: 'bad_doc_id',", "if (false) return { ok: false, error: 'bad_doc_id',"),
+    ("link-no-doc-column-silent", "ContractDoor.js",
+     "if (docId && c.doc_id === undefined) return", "if (false) return"),
+    ("link-columns-flag-lies", "ContractDoor.js",
+     "o[k] = c[k] !== undefined; return o;", "o[k] = true; return o;"),
+    ("link-route-drops-doc-id", "Bridge.js", "doc_id: params.doc_id,", "doc_id: '',"),
 ]
 
 
@@ -389,7 +498,7 @@ def test_mutants_killed():
     assert len(MUTANTS) >= 6
     alive = []
     for name, fname, old, new in MUTANTS:
-        src = _read(os.path.join(BUILD, fname))
+        src = _read(src_path(fname))
         assert src.count(old) == 1, f"мутант {name}: «было» встречается {src.count(old)} раз — мутант не о том"
         code, out, err = run_harness({fname: src.replace(old, new)})
         if code == 0:

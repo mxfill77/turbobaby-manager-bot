@@ -416,12 +416,15 @@ def _os_env(name, default=""):
     return os.getenv(name, default)
 
 
-async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group="", reply_markup=None, parse_mode=None):
+async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=True, group="", reply_markup=None, parse_mode=None,
+                no_preview=False):
     """Единая точка отправки сообщений Splinter в группы.
     Перед отправкой прогоняет текст через auditor.check_response_text — тот
     детерминированно ловит смешение RU/TH и пишет находки в журнал аудита.
     Сообщение отправляется в любом случае (вариант А: только журналируем, не глушим),
     чтобы тайцы не остались без уведомления из-за ложного срабатывания.
+    no_preview=True (ESIGNLINK2510) — без превью ссылок: превью Telegram открывает ссылку без человека, а ссылка
+    TB e-Sign на подпись по открытию отправляет договор в BoldSign. По умолчанию выкл — прежние вызовы не меняются.
     """
     if bilingual:
         text = _with_separator(text)   # единый разделитель 🇹🇭/🇷🇺 централизованно
@@ -442,6 +445,9 @@ async def _send(context, *, chat_id, text, message_thread_id=None, bilingual=Tru
         kw["reply_markup"] = reply_markup
     if parse_mode is not None:
         kw["parse_mode"] = parse_mode
+    if no_preview:
+        from telegram import LinkPreviewOptions   # Bot API 7.0: замена disable_web_page_preview (PTB ≥ 20.8)
+        kw["link_preview_options"] = LinkPreviewOptions(is_disabled=True)
     sent = await context.bot.send_message(**kw)
     # ЛЕНТА ТЕМЫ (01.10.2026, SPLTOPICFEED0110): своё сообщение бота в теме обслуживания — с id.
     # Через `_hint_send` строку пишет он сам (с видом подсказки). Не бросает.
@@ -14006,6 +14012,77 @@ F_CONTRACT_REF_GEN = "CONTRACT_REF_GEN"
 _CONTRACT_REF_UUID = _re_lang.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 W_CONTRACT_REF_BROKEN = "сверка с реестром не собрана (%s) — неизвестно, а не «договора нет»"
 
+# ESIGNLINK2510 (слово владельца 25.10.2026): «договор» отдаёт ТУ ЖЕ ссылку клиенту на подпись, что TB e-Sign шлёт в
+# группу контрактов, и рядом ссылку на правку документа. Ручка CONTRACT_SIGN_LINK (по умолчанию ВЫКЛ, `_rc_on` на каждый
+# вызов): выкл — ответ «✅ Договор готов: <url>» прежний байт-в-байт, модуль `contract_sign_link` не импортируется. Вкл —
+# сразу «договор готов» со ссылкой на правку, а ссылка на подпись — отдельным сообщением, когда строка документа появится
+# в реестре подписей (сканер TB e-Sign заводит её через ~1–2 мин): фоновый опрос `contract_find(doc_id=…)`, потолок
+# `contract_sign_link.WAIT_S`; не дождался — «ссылка будет в группе контрактов». Оба сообщения — без превью ссылок
+# (превью открывает ссылку без человека). Сама ссылка в журнал не пишется (в ней токен).
+F_CONTRACT_SIGN_LINK = "CONTRACT_SIGN_LINK"
+_SIGN_LINK_TASKS = set()          # живые фоновые досылки (ссылка на задачу, иначе её соберёт сборщик мусора)
+
+
+async def _contract_sign_link_follow(context, bridge, chat_id, tid, doc_id, name, edit_url, *, sleep=None, clock=None):
+    """Досылка ссылки на подпись: читает реестр по `contract_sign_link.offsets()` до первого решения и шлёт ОДНО
+    сообщение — две ссылки, «уже подписан» или причину с «ссылка будет в группе контрактов». Не бросает (кроме отмены
+    задачи). → решение `contract_sign_link.verdict` (для тестов и журнала)."""
+    import asyncio as _aio
+    import time as _t
+    import contract_sign_link as _csl
+    sleep = sleep or _aio.sleep
+    clock = clock or _t.monotonic
+    tail = "…" + str(doc_id)[-6:]
+    try:
+        t0, last, v = clock(), "", None
+        for at in _csl.offsets():
+            gap = t0 + at - clock()
+            if gap > 0:
+                await sleep(gap)
+            try:
+                resp = await _aio.to_thread(bridge.contract_find, doc_id=doc_id, limit=_csl.FIND_LIMIT)
+            except Exception as e:  # noqa: BLE001 — сбой чтения = «ещё не знаем», ждём до потолка
+                resp = {"ok": False, "error": type(e).__name__}
+            v = _csl.verdict(resp, doc_id)
+            log.info(f"  ✍️ ESIGNLINK: doc {tail} +{int(clock() - t0)}с → {v['act']}: {v['why']}")
+            if v["act"] != "wait":
+                break
+            last = v["why"]
+        else:
+            v = {"act": "stop", "why": _csl.timeout_why(last)}
+        text = _csl.text_for(v, name, edit_url)
+    except Exception as e:  # noqa: BLE001 — обещанное сообщение уходит и при сбое ожидания
+        v = {"act": "stop", "why": "сбой ожидания ссылки (%s)" % type(e).__name__}
+        log.warning(f"  ✍️ ESIGNLINK: doc {tail} — {v['why']}")
+        text = _csl.fail_text(name, v["why"])
+    log.info(f"  ✍️ ESIGNLINK: doc {tail} — итог {v['act']} ({v['why']})")
+    await _send_retry(context, chat_id=chat_id, message_thread_id=tid, bilingual=False, no_preview=True, text=text)
+    return v
+
+
+async def _contract_ready_with_links(context, bridge, chat_id, tid, res, reminder):
+    """Ручка CONTRACT_SIGN_LINK вкл: «договор готов» со ссылкой на правку сейчас + фоновая досылка ссылки на подпись.
+    → задача досылки | None (id документа не разобран — тогда сразу сказано «ссылка будет в группе контрактов»)."""
+    import asyncio as _aio
+    import contract_sign_link as _csl     # лениво: при выключенной ручке модуля в процессе нет
+    doc_id = _csl.doc_id_of(res.get("file_id"), res.get("url"))
+    await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False, no_preview=True,
+                text=_csl.ready_text(res.get("name"), res.get("url"), reminder, bool(doc_id)))
+    if not doc_id:
+        log.info("  ✍️ ESIGNLINK: id документа в ответе make_contract не разобран — ссылка будет в группе контрактов")
+        return None
+    try:
+        t = _aio.get_running_loop().create_task(
+            _contract_sign_link_follow(context, bridge, chat_id, tid, doc_id, res.get("name"), res.get("url")))
+    except Exception as e:  # noqa: BLE001 — досылку обещали: не запустилась — сказать сейчас
+        log.warning(f"  ✍️ ESIGNLINK: досылка не запущена ({type(e).__name__}: {e})")
+        await _send_retry(context, chat_id=chat_id, message_thread_id=tid, bilingual=False, no_preview=True,
+                          text=_csl.fail_text(res.get("name"), "ожидание не запустилось"))
+        return None
+    _SIGN_LINK_TASKS.add(t)
+    t.add_done_callback(_SIGN_LINK_TASKS.discard)
+    return t
+
 
 def _contract_ref_report(bridge, row=None, booking_id=None, booking_key=None, name=None, date_start=None):
     """Бронь → слова сотруднику о договорах в реестре подписей по её байку и сроку (CONTRACTREF1510, §5.3). Только чтение:
@@ -15054,8 +15131,12 @@ async def _handle_intake(msg, context, bridge, claude, photo_msgs=None):
             if (res.get("flags") or {}).get("km_request"):
                 reminder += "⚠️ Пробег под запрос — впиши вручную.\n"
             reminder += "Проверь перед печатью: топливо, время выдачи, пробег."
-            await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
-                        text=f"🐀 Splinter\n✅ Договор готов: {res.get('url')}\n{reminder}")
+            if _rc_on(F_CONTRACT_SIGN_LINK):
+                # ESIGNLINK2510: ссылка на правку сейчас, ссылка клиенту на подпись — досылкой из реестра TB e-Sign
+                await _contract_ready_with_links(context, bridge, chat_id, tid, res, reminder)
+            else:
+                await _send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                            text=f"🐀 Splinter\n✅ Договор готов: {res.get('url')}\n{reminder}")
         else:
             fail = f"🐀 Splinter\n❌ Договор не сделан: {res.get('error')}. {res.get('message','')}"
             if gen and res.get("error") == "no_passport":

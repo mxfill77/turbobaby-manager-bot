@@ -87,7 +87,7 @@ PINS = {"wa_agent.py": "0fe89a0c59ac2a4c055ee0de260f5d41d948c97d",  # OFFERSENT2
         "wa_agent_tools.py": "e58cfe791266d7d56519e292497160af1963bc3c",  # DELIVERY2210: было fb70716d · DELIVERY2210: было 2115dfd5
         "wa_agent_knowledge.py": "34fcc7858c39f9f1c705d79f617916cbf636dda6",  # PROMPT2110: было d338a3c2
         "rental_case.py": "3e3cba2f63461ae6fccf1a7d3f044da0c22cbca0",
-        "bridge_client.py": "9207eb7327ee5e55e2d5c1c1d20227c678de9ff9",
+        "bridge_client.py": "6101fa507c477d6157c2346fb504b8b004788511",  # ESIGNLINK2510: было 9207eb73 (contract_find(doc_id=…), docstring sign_url/doc_url)
         "wa_book_read.py": "ba866980d22c75c005e40510b1271453aac74a25",  # RCFIX2010: было 7329698d (ремонт по парку не «свободно») · PROMPT2110: было 5a90fddc
         "wa_agent_tg.py": "6bcbe4ce4574224c2ce4e63e29a78698e91d2877",  # RCFIX2010 D3: было c3fbd715 (метка, _num)
         "contract_ask.py": "be132d7a099dbb84edadca636989cb16dd19c607"}
