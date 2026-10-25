@@ -96,7 +96,7 @@ def test_harness_all_green():
     res = json.loads(out)
     failed = [c for c in res["cases"] if not c["pass"]]
     assert not failed, json.dumps(failed, ensure_ascii=False, indent=1)
-    assert len(res["cases"]) >= 167, len(res["cases"])   # MIRROR88: 149; ESIGNLINK2510: + секция 21 (18)
+    assert len(res["cases"]) >= 169, len(res["cases"])   # MIRROR88: 149; ESIGNLINK2510: + секция 21 (18 + 2 r2)
 
 
 def test_harness_covers_key_cases():
@@ -130,7 +130,9 @@ def test_harness_covers_key_cases():
                  "link.doc-id-prefix-none", "link.doc-and-name", "link.sent-new-column", "link.signed-no-sign-url",
                  "link.old-column-not-taken", "link.phone-carries-fields", "link.headers-by-name",
                  "link.route-doc-id", "link.bad-doc-id", "link.old-registry-works", "link.no-optional-columns",
-                 "link.no-doc-column-refused", "link.base-registry-empty", "link.readonly-no-writes"):
+                 "link.no-doc-column-refused", "link.base-registry-empty", "link.readonly-no-writes",
+                 # ESIGNLINK2510 r2: аннулированный договор — ссылки на подпись нет
+                 "link.canceled-no-sign-url", "link.canceled-case-space"):
         assert need in names, f"нет кейса {need}: {sorted(names)}"
 
 
@@ -231,13 +233,13 @@ def _js_functions(text):
 
 def test_link_door_only_contract_find_changed():
     """ContractDoor.js сборки: contractPdf и все помощники, кроме contractFind, побайтно прежние (ссылки нужны поиску,
-    PDF-дверь ими не пользуется)."""
+    PDF-дверь ими не пользуется); добавлен ровно один помощник — esignIsCanceled_ (r2: статус «АННУЛИРОВАН»)."""
     res = build_states.judge(LINK_BUILD, MIRROR)
     if res["state"] != "a":
         return
     old = _js_functions(_read(os.path.join(MIRROR, "ContractDoor.js")))
     new = _js_functions(_read(os.path.join(LINK_BUILD, "ContractDoor.js")))
-    assert set(old) == set(new), set(old) ^ set(new)
+    assert set(new) - set(old) == {"esignIsCanceled_"} and set(old) <= set(new), set(old) ^ set(new)
     changed = sorted(n for n in old if old[n] != new[n])
     assert changed == ["contractFind"], changed
 
@@ -471,8 +473,14 @@ MUTANTS = [
      "NEED: ['client', 'contract_date', 'status', 'signed_at', 'pdf', 'phone', 'bike', 'sign_url'],"),
     ("link-old-column-taken", "ContractDoor.js",
      "sign_url: 'Ссылка клиенту на подпись',", "sign_url: 'Ссылка «на подпись»',"),
+    # r2: «было» сдвинуто вслед за кодом (ссылку гасит linkDead — подписан ИЛИ аннулирован), суть та же
     ("link-signed-shows-url", "ContractDoor.js",
-     "c.sign_url !== undefined && !isSigned ?", "c.sign_url !== undefined ?"),
+     "var linkDead = isSigned || esignIsCanceled_(r[c.status]);", "var linkDead = esignIsCanceled_(r[c.status]);"),
+    ("link-canceled-shows-url", "ContractDoor.js",
+     "var linkDead = isSigned || esignIsCanceled_(r[c.status]);", "var linkDead = isSigned;"),
+    ("link-canceled-exact-case", "ContractDoor.js",
+     "return esignNorm_(status).toUpperCase() === ESIGN.CANCELED_STATUS;",
+     "return String(status) === ESIGN.CANCELED_STATUS;"),
     ("link-not-trimmed", "ContractDoor.js",
      "String(r[c.sign_url] || '').trim() : ''", "String(r[c.sign_url] || '') : ''"),
     ("link-doc-url-dropped", "ContractDoor.js",

@@ -118,8 +118,14 @@ REAL_SEND = S._send
 SENDS = []
 
 
+SEND_HOOK = []          # r2: подмена поведения отправки на один тест (поднять исключение / повиснуть)
+
+
 async def _rec_send(context, *, chat_id, text, message_thread_id=None, **k):
+    if SEND_HOOK:
+        await SEND_HOOK[0](text)
     SENDS.append(dict(k, text=text, chat_id=chat_id, thread=message_thread_id))
+    return types.SimpleNamespace(message_id=len(SENDS))     # как у Telegram: отправленное сообщение, не None
 
 
 S._send = _rec_send
@@ -224,7 +230,7 @@ def test_a03_sign_url_ok_only_this_docs_esign_link(c=None):
 def test_a04_offsets_bounded_schedule(c=None):
     c = c or C()
     o = c.offsets()
-    assert o[0] == 0 and o == sorted(set(o)) and o[-1] <= c.WAIT_S and len(o) <= 11, o
+    assert o[0] == 0 and o == sorted(set(o)) and o[-1] < c.WAIT_S and len(o) <= 11, o   # r2: чтению нужен остаток
     assert o[1] == c.FIRST_GAP_S and all(b - a == c.STEP_S for a, b in zip(o[1:], o[2:])), o
     assert c.WAIT_S <= 600, "ожидание дольше 10 минут — сотрудник уже ушёл в группу контрактов"
 
@@ -243,6 +249,21 @@ def test_a05_verdict_on_door_snapshots(c=None):
     assert o["act"] == "stop" and "0.2.2" in o["why"], o                 # реестр до 0.2.2 — не ждать
     nc = c.verdict(snap("link_no_doc_column"), DOC_N)
     assert nc["act"] == "stop" and "колонки" in nc["why"], nc
+    # r2: аннулированный (бронь отменена) — стоп «аннулирован», не ссылка и не ожидание; и тогда, когда дверь r1
+    # ещё отдаёт мёртвую ссылку из неочищенной ячейки (Splinter не полагается только на мост)
+    cn = snap("link_canceled")
+    doc_c = cn["items"][0]["doc_id"]
+    v = c.verdict(cn, doc_c)
+    assert v["act"] == "stop" and v.get("canceled") is True and v["why"] == c.CANCELED_WHY, v
+    stale = json.loads(json.dumps(cn))
+    stale["items"][0]["sign_url"] = n["items"][0]["sign_url"].replace(DOC_N, doc_c)
+    assert c.sign_url_ok(stale["items"][0]["sign_url"], doc_c)
+    for st in ("АННУЛИРОВАН", " аннулирован ", "Аннулирован"):
+        stale["items"][0]["status"] = st
+        v = c.verdict(stale, doc_c)
+        assert v["act"] == "stop" and v.get("canceled") is True, (st, v)
+    stale["items"][0]["status"] = "ОТПРАВЛЕН"                           # близнец: живой статус — ссылка уходит
+    assert c.verdict(stale, doc_c)["act"] == "send"
 
 
 def test_a06_verdict_errors_stop_or_wait(c=None):
@@ -293,6 +314,15 @@ def test_a08_words(c=None):
     assert t == ["🐀 Splinter", c.SIGN_LABEL + " «Имя»:", "U-SIGN", c.EDIT_LABEL + ":", "U-EDIT"], t
     assert c.fail_text("", "почему").endswith("почему — %s." % c.TO_GROUP)
     assert "TurboBaby" not in r + "\n".join(t)
+    # r2: аннулированный — свои слова (без «ссылка будет в группе»: её не будет); итог — по ФАКТИЧЕСКИ прошедшему
+    assert c.CANCELED_WHY == "договор аннулирован в TB e-Sign — ссылка на подпись не действует"
+    k = c.canceled_text("Имя")
+    assert k == "🐀 Splinter\n⚠️ Договор «Имя»: %s." % c.CANCELED_WHY and c.TO_GROUP not in k, k
+    assert c.text_for({"act": "stop", "why": c.CANCELED_WHY, "canceled": True}, "Имя") == k
+    assert c.timeout_why("x", 45) == "за 45 с не дождался (x)"
+    assert c.timeout_why("x", 270).startswith("за 5 мин") and c.timeout_why("x", 1800).startswith("за 30 мин")
+    assert c.timeout_why("", 300) == "за 5 мин не дождался (договора нет в реестре подписей)"
+    assert c.RESTART_WHY == "Splinter перезапускается" and 0 < c.CANCEL_SEND_S <= 10 and 0 < c.STOP_WAIT_S <= 15
 
 
 # мутант = (имя, было, стало): правка исходника contract_sign_link в памяти; обязан уронить хотя бы один тест раздела A
@@ -308,8 +338,15 @@ MUTANTS = [
     ("foreign-row-taken", ' and str(r.get("doc_id") or "").strip() == doc_id]', "]"),
     ("signed-not-seen", 'open_rows = [r for r in rows if r.get("signed") is not True]', "open_rows = rows"),
     ("foreign-edit-kept", 'edit if edit_url_ok(edit, doc_id) else ""', "edit"),
-    ("ceiling-tripled", "while step_s > 0 and t <= wait_s:", "while step_s > 0 and t <= wait_s * 3:"),
+    ("ceiling-tripled", "while step_s > 0 and t < wait_s:", "while step_s > 0 and t <= wait_s * 3:"),
     ("doc-id-from-junk", "if _BARE_ID.match(fid):", "if fid:"),
+    # r2
+    ("read-on-ceiling", "while step_s > 0 and t < wait_s:", "while step_s > 0 and t <= wait_s:"),
+    ("canceled-sent", 'open_rows = [r for r in open_rows if not is_canceled(r.get("status"))]', "pass"),
+    ("canceled-case-strict", '" ".join(str(status or "").replace("Ё", "Е").replace("ё", "е").split()).upper()',
+     "str(status)"),
+    ("canceled-says-group", "    if v.get(\"canceled\"):\n        return canceled_text(name)\n", ""),
+    ("timeout-says-ceiling", "spent_words(spent_s)", "spent_words(WAIT_S)"),
 ]
 A_TESTS = ("test_a02_doc_id_of", "test_a03_sign_url_ok_only_this_docs_esign_link", "test_a04_offsets_bounded_schedule",
            "test_a05_verdict_on_door_snapshots", "test_a06_verdict_errors_stop_or_wait", "test_a07_verdict_guards",
@@ -387,7 +424,7 @@ def test_b02_flag_on_ready_now_link_later():
     assert link.get("no_preview") is True and link["chat_id"] == INTAKE, link
     assert b.args("contract_find") == [{"doc_id": DOC_N, "limit": c.FIND_LIMIT}] * 3, b.calls
     assert not any(n["items"][0]["sign_url"] in ln for ln in lines), "ссылка с токеном попала в журнал"
-    assert any("ESIGNLINK" in ln and "итог send" in ln for ln in lines), lines
+    assert any("ESIGNLINK" in ln and "итог send" in ln and "сообщение доставлено" in ln for ln in lines), lines
 
 
 def test_b03_timeout_says_group_and_sends_no_link():
@@ -453,22 +490,30 @@ def test_b09_real_send_preview_off_only_when_asked():
     assert calls[1] == {"chat_id": INTAKE, "text": "b"}, calls[1]          # прежние вызовы — прежние ключи
 
 
+class Clock:
+    """Подставные часы досылки: sleep сдвигает время, а не ждёт."""
+
+    def __init__(self):
+        self.t, self.slept = 1000.0, []
+
+    def __call__(self):
+        return self.t
+
+    async def sleep(self, d):
+        self.slept.append(round(d, 6))
+        self.t += d
+
+
+def follow(bridge, ck=None, name="N"):
+    ck = ck or Clock()
+    return asyncio.run(S._contract_sign_link_follow(None, bridge, INTAKE, None, DOC_N, name, EDIT_MAKE,
+                                                    sleep=ck.sleep, clock=ck))
+
+
 def test_b10_real_schedule_and_ceiling():
     """Расписание — настоящее (без подмены offsets): первое чтение сразу, второе через минуту, дальше раз в 30 с;
-    без строки реестра — ровно до потолка WAIT_S, и одно итоговое сообщение."""
+    без строки реестра — до последнего чтения перед потолком WAIT_S, и одно итоговое сообщение."""
     c = C()
-
-    class Clock:
-        def __init__(self):
-            self.t, self.slept = 1000.0, []
-
-        def __call__(self):
-            return self.t
-
-        async def sleep(self, d):
-            self.slept.append(round(d, 6))
-            self.t += d
-
     SENDS.clear()
     ck = Clock()
     b = Bridge(finds=[snap("link_none"), snap("link_none"), snap("link_new")])
@@ -481,13 +526,299 @@ def test_b10_real_schedule_and_ceiling():
     b = Bridge(finds=[snap("link_none")])
     v = asyncio.run(S._contract_sign_link_follow(None, b, INTAKE, None, DOC_N, "N", EDIT_MAKE, sleep=ck.sleep, clock=ck))
     assert v["act"] == "stop" and len(b.args("contract_find")) == len(c.offsets()), (v, b.calls)
-    assert abs(sum(ck.slept) - c.offsets()[-1]) < 1e-6 and c.offsets()[-1] <= c.WAIT_S, ck.slept
+    assert abs(sum(ck.slept) - c.offsets()[-1]) < 1e-6 and c.offsets()[-1] < c.WAIT_S, ck.slept
     assert len(SENDS) == 1 and c.TO_GROUP in SENDS[0]["text"], SENDS
+    assert "за %s не дождался" % c.spent_words(c.offsets()[-1]) in SENDS[0]["text"], SENDS[0]["text"]
+
+
+# ═══ C · r2 (ревью перед пушем): потолок, итоговая отправка, отмена при остановке, аннулированный ═══════════════════
+
+class SlowBridge(Bridge):
+    """Мост, чьё чтение «длится» `cost` секунд подставных часов; honor — срезать длительность бюджетом чтения, как это
+    делает `bridge_client.card_budget` у настоящего клиента. Бюджет читается ИЗ ПОТОКА чтения (ContextVar)."""
+
+    def __init__(self, ck, cost, honor, **kw):
+        Bridge.__init__(self, **kw)
+        self.ck, self.cost, self.honor, self.budgets = ck, cost, honor, []
+
+    def contract_find(self, **kw):
+        cb = S.bridge_client.current_card_budget()
+        self.budgets.append(None if cb is None else round(cb.budget, 6))
+        spent = self.cost if not (self.honor and cb is not None) else min(self.cost, cb.budget)
+        self.ck.t += spent
+        return Bridge.contract_find(self, **kw)
+
+
+def test_c01_ceiling_holds_with_slow_bridge():
+    """Каждое чтение длится 200 с. Под дедлайном остатка (как настоящий клиент) — два чтения (бюджеты 300 и 100),
+    итог ровно на потолке и словами «за 5 мин»; мост дедлайн не соблюл (400 с) — второе чтение НЕ начинается,
+    итог называет фактические 7 мин, а не обещанные 5."""
+    c = C()
+    SENDS.clear()
+    ck = Clock()
+    b = SlowBridge(ck, 200, True, finds=[snap("link_none")])
+    v = follow(b, ck)
+    assert b.budgets == [c.WAIT_S, c.WAIT_S - 200], b.budgets
+    assert v["act"] == "stop" and len(b.args("contract_find")) == 2 and ck.t - 1000.0 == c.WAIT_S, (v, ck.t)
+    assert "за 5 мин не дождался" in SENDS[-1]["text"], SENDS
+    SENDS.clear()
+    ck = Clock()
+    b = SlowBridge(ck, 400, False, finds=[snap("link_none")])
+    v = follow(b, ck)
+    assert len(b.args("contract_find")) == 1 and "за 7 мин не дождался" in SENDS[-1]["text"], (b.calls, SENDS)
+
+
+def test_c02_final_send_failure_does_not_escape():
+    """Forbidden (бот удалён из чата) на итоговой отправке — задача не бросает, «итог» пишется ПОСЛЕ отправки со
+    словами «НЕ доставлено»; _send_retry вернул None (сеть трижды) — тоже «НЕ доставлено»."""
+    from telegram.error import Forbidden, TimedOut
+
+    async def boom(text):
+        raise Forbidden("bot was kicked")
+
+    SENDS.clear()
+    start = len(LOGS.lines)
+    SEND_HOOK[:] = [boom]
+    try:
+        v = follow(Bridge(finds=[snap("link_new")]))
+    finally:
+        SEND_HOOK[:] = []
+    lines = LOGS.lines[start:]
+    assert v["act"] == "send" and v["delivered"] is False and SENDS == [], (v, SENDS)
+    assert any("итоговое сообщение не отправлено (Forbidden" in ln for ln in lines), lines
+    i_fail = next(i for i, ln in enumerate(lines) if "итоговое сообщение не отправлено" in ln)
+    i_itog = next(i for i, ln in enumerate(lines) if "итог send" in ln)
+    assert i_fail < i_itog and "сообщение НЕ доставлено" in lines[i_itog], lines
+
+    async def net(text):
+        raise TimedOut("timed out")
+
+    start = len(LOGS.lines)
+    SEND_HOOK[:] = [net]
+    try:
+        v = follow(Bridge(finds=[snap("link_new")]))
+    finally:
+        SEND_HOOK[:] = []
+    assert v["delivered"] is False and any("сообщение НЕ доставлено" in ln for ln in LOGS.lines[start:]), v
+    SENDS.clear()
+    v = follow(Bridge(finds=[snap("link_new")]))                         # близнец: доставлено
+    assert v["delivered"] is True and len(SENDS) == 1, (v, SENDS)
+
+
+async def _blocked_follow(bridge, name="N"):
+    """Досылка, повисшая в ожидании (второе чтение через минуту, часы настоящие): → задача."""
+    t = asyncio.get_running_loop().create_task(
+        S._contract_sign_link_follow(None, bridge, INTAKE, None, DOC_N, name, EDIT_MAKE))
+    for _ in range(200):                                                # первое чтение прошло — задача спит
+        await asyncio.sleep(0.01)
+        if bridge.args("contract_find"):
+            break
+    await asyncio.sleep(0.05)
+    return t
+
+
+def test_c03_cancel_during_wait_says_restart_once_and_reraises():
+    c = C()
+    SENDS.clear()
+    calls = []
+
+    async def count(text):
+        calls.append(text)
+
+    async def main():
+        b = Bridge(finds=[snap("link_none")])
+        t = await _blocked_follow(b, "Имя")
+        SEND_HOOK[:] = [count]
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            return "cancelled", b
+        return "not-cancelled", b
+
+    try:
+        res, b = asyncio.run(main())
+    finally:
+        SEND_HOOK[:] = []
+    assert res == "cancelled", res                                      # отмена переброшена
+    assert [s["text"] for s in SENDS] == [c.fail_text("Имя", c.RESTART_WHY)], SENDS
+    assert SENDS[0].get("no_preview") is True and len(calls) == 1, (SENDS, calls)   # одна попытка, без повторов
+    assert len(b.args("contract_find")) == 1
+
+
+def test_c04_cancel_restart_send_is_bounded():
+    """Фраза «перезапускается» повисла — отмена всё равно уходит выше не позже CANCEL_SEND_S."""
+    c = C()
+    SENDS.clear()
+
+    async def hang(text):
+        await asyncio.sleep(3600)
+
+    async def main():
+        t = await _blocked_follow(Bridge(finds=[snap("link_none")]))
+        SEND_HOOK[:] = [hang]
+        t0 = asyncio.get_running_loop().time()
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            return asyncio.get_running_loop().time() - t0
+        return None
+
+    orig = c.CANCEL_SEND_S
+    c.CANCEL_SEND_S = 0.2
+    try:
+        took = asyncio.run(main())
+    finally:
+        c.CANCEL_SEND_S = orig
+        SEND_HOOK[:] = []
+    assert took is not None and took < 2.0 and SENDS == [], (took, SENDS)
+
+
+def test_c05_cancel_during_final_send_no_restart_phrase():
+    """Отмена, когда итог уже отправляется, — второй фразы «перезапускается» нет (итог мог уйти)."""
+    c = C()
+    SENDS.clear()
+    started = []
+
+    async def hang(text):
+        started.append(text)
+        await asyncio.sleep(3600)
+
+    async def main():
+        SEND_HOOK[:] = [hang]
+        t = asyncio.get_running_loop().create_task(
+            S._contract_sign_link_follow(None, Bridge(finds=[snap("link_new")]), INTAKE, None, DOC_N, "N", EDIT_MAKE))
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if started:
+                break
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "not-cancelled"
+
+    try:
+        res = asyncio.run(main())
+    finally:
+        SEND_HOOK[:] = []
+    assert res == "cancelled" and len(started) == 1 and c.RESTART_WHY not in started[0], (res, started)
+
+
+def test_c06_stop_drain_cancels_live_tasks():
+    """`sign_link_drain`: живые досылки отменены, каждая сказала «перезапускается»; живых нет → 0, ничего не шлётся."""
+    c = C()
+    SENDS.clear()
+
+    async def main():
+        ts = [await _blocked_follow(Bridge(finds=[snap("link_none")]), "A"),
+              await _blocked_follow(Bridge(finds=[snap("link_none")]), "B")]
+        for t in ts:
+            S._SIGN_LINK_TASKS.add(t)
+            t.add_done_callback(S._SIGN_LINK_TASKS.discard)
+        n = await S.sign_link_drain(5.0)
+        return n, [t.cancelled() for t in ts], await S.sign_link_drain(5.0)
+
+    n, cancelled, again = asyncio.run(main())
+    assert n == 2 and cancelled == [True, True] and again == 0, (n, cancelled, again)
+    assert sorted(s["text"] for s in SENDS) == sorted([c.fail_text("A", c.RESTART_WHY), c.fail_text("B", c.RESTART_WHY)])
+    assert not S._SIGN_LINK_TASKS
+
+
+def test_c07_bot_on_stop_line_counts_cancelled():
+    """`bot.on_stop` (post_stop) отменяет досылки в бюджете остановки и дописывает число в строку дренажа; без живых
+    досылок строка прежняя — без хвоста. Отдельный процесс: импорт bot.py со заглушками, как в test_contract_ref_gen."""
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), PROBE_STOP_ARG], cwd=ROOT, capture_output=True,
+                       timeout=300, env=dict(os.environ))
+    text = p.stdout.decode("utf-8", "replace")
+    got = [ln for ln in text.splitlines() if ln.startswith(PROBE_STOP_MARK)]
+    assert p.returncode == 0 and len(got) == 1, (p.returncode, text[-1500:], p.stderr.decode("utf-8", "replace")[-1500:])
+    out = json.loads(got[0][len(PROBE_STOP_MARK):])
+    c = C()
+    assert out["with"].endswith("; досылки ссылки на подпись: отменено 1"), out
+    assert "досылки" not in out["without"] and out["without"].startswith("  🛑 дренаж остановки: "), out
+    assert out["sends"] == [c.fail_text("N", c.RESTART_WHY)] and out["cancelled"] is True, out
+
+
+PROBE_STOP_ARG = "--probe-stop-drain"
+PROBE_STOP_MARK = "ESIGNLINK_STOP "
+
+
+def probe_stop():
+    """Отдельный процесс: bot.py со заглушками тяжёлых зависимостей; передача карточек — во временный каталог."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="esignlink_stop_")
+    os.environ["RESTART_HANDOFF_STATE"] = os.path.join(tmp, "restart_handoff.json")
+
+    def _stub(name, **attrs):
+        m = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(m, k, v)
+        sys.modules[name] = m
+
+    class _Mem:
+        def all_topic_bikes(self):
+            return {}
+
+        def all_info_pins(self):
+            return {}
+
+    class _Aud:
+        audit_groups = []
+
+        def __init__(self, *a, **k):
+            pass
+
+        def set_audit_config(self, *a, **k):
+            pass
+
+    _stub("dotenv", load_dotenv=lambda *a, **k: None)
+    _stub("claude_client", ClaudeClient=lambda *a, **k: types.SimpleNamespace())
+    _stub("memory", Memory=_Mem)
+    _stub("auditor", Auditor=_Aud)
+    _stub("prompts", SYSTEM_PROMPT="", daily_pulse_prompt=lambda *a, **k: "")
+    import bot as B
+
+    def stop_line():
+        return next((ln for ln in reversed(LOGS.lines) if "🛑 дренаж остановки" in ln), "")
+
+    async def main():
+        t = await _blocked_follow(Bridge(finds=[snap("link_none")]), "N")
+        S._SIGN_LINK_TASKS.add(t)
+        t.add_done_callback(S._SIGN_LINK_TASKS.discard)
+        B._SHUTDOWN_T0 = B._mono()
+        await B.on_stop(None)
+        with_ = stop_line()
+        await B.on_stop(None)
+        return with_, stop_line(), t.cancelled()
+
+    SENDS.clear()
+    with_, without, cancelled = asyncio.run(main())
+    out = {"with": with_, "without": without, "sends": [s["text"] for s in SENDS], "cancelled": cancelled}
+    sys.stdout.write(PROBE_STOP_MARK + json.dumps(out, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def test_c08_canceled_contract_via_command():
+    """«договор» по брони с аннулированным договором (make_contract пересобрал тот же документ): одно чтение, слова
+    «аннулирован», ссылки на подпись нет ни в одном сообщении."""
+    c = C()
+    cn = snap("link_canceled")
+    doc = cn["items"][0]["doc_id"]
+    b = Bridge(make=dict(OK_MAKE, file_id=doc, url="https://docs.google.com/document/d/%s/edit" % doc), finds=[cn])
+    sends, _r, _p, _l = intake(b, on=True, offs=(0, 0, 0, 0))
+    assert len(b.args("contract_find")) == 1 and sends[-1]["text"] == c.canceled_text(OK_MAKE["name"]), (b.calls, sends)
+    assert "script.google.com" not in "".join(s["text"] for s in sends)
 
 
 def main():
     if PROBE:
         return probe_off()
+    if PROBE_STOP_ARG in sys.argv[1:]:
+        return probe_stop()
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     bad = 0
     for k, fn in tests:

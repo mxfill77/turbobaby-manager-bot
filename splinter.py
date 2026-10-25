@@ -14023,41 +14023,103 @@ F_CONTRACT_SIGN_LINK = "CONTRACT_SIGN_LINK"
 _SIGN_LINK_TASKS = set()          # живые фоновые досылки (ссылка на задачу, иначе её соберёт сборщик мусора)
 
 
+def _sign_link_read(bridge, doc_id, limit, budget_s):
+    """В потоке: одно чтение реестра под общим дедлайном `bridge_client.card_budget` (ESIGNLINK2510 r2) — он режет
+    лестницу повторов клиента моста (попытки × плечи × паузы), иначе одно чтение длилось бы минуты и потолок ожидания
+    WAIT_S был бы словом. Бюджет открыт В ЭТОМ потоке (тот же приём, что `_ho_contract_read`); исход по дедлайну —
+    ответ {ok:false, error:'card_deadline'}, а не исключение."""
+    with bridge_client.card_budget(budget_s, label="ссылки на подпись"):
+        return bridge.contract_find(doc_id=doc_id, limit=limit)
+
+
 async def _contract_sign_link_follow(context, bridge, chat_id, tid, doc_id, name, edit_url, *, sleep=None, clock=None):
     """Досылка ссылки на подпись: читает реестр по `contract_sign_link.offsets()` до первого решения и шлёт ОДНО
-    сообщение — две ссылки, «уже подписан» или причину с «ссылка будет в группе контрактов». Не бросает (кроме отмены
-    задачи). → решение `contract_sign_link.verdict` (для тестов и журнала)."""
+    сообщение — две ссылки, «уже подписан», «аннулирован» или причину с «ссылка будет в группе контрактов».
+
+    r2 (ревью перед пушем): потолок WAIT_S — на ВСЁ ожидание: перед каждым чтением остаток сверяется с часами, и само
+    чтение идёт под дедлайном остатка (`_sign_link_read`); итог называет фактически прошедшее время. Итоговая отправка
+    — под try: сбой Telegram (Forbidden, ChatMigrated, …) только в журнал, строка «итог» пишется ПОСЛЕ отправки и
+    говорит, доставлено ли. Отмена задачи (остановка Splinter, `sign_link_drain`) во время ожидания — ОДНА короткая
+    попытка (без лестницы повторов, не дольше CANCEL_SEND_S) сказать «Splinter перезапускается», затем отмена уходит
+    выше. Не бросает ничего, кроме этой отмены. → решение `contract_sign_link.verdict` + delivered."""
     import asyncio as _aio
     import time as _t
     import contract_sign_link as _csl
     sleep = sleep or _aio.sleep
     clock = clock or _t.monotonic
     tail = "…" + str(doc_id)[-6:]
+    stage = "wait"
     try:
-        t0, last, v = clock(), "", None
-        for at in _csl.offsets():
-            gap = t0 + at - clock()
-            if gap > 0:
-                await sleep(gap)
+        try:
+            t0, last, v = clock(), "", None
+            for at in _csl.offsets():
+                gap = t0 + at - clock()
+                if gap > 0:
+                    await sleep(gap)
+                left = _csl.WAIT_S - (clock() - t0)
+                if left <= 0:                     # потолок вышел (чтения медленные) — новое не начинаем
+                    break
+                try:
+                    resp = await _aio.to_thread(_sign_link_read, bridge, doc_id, _csl.FIND_LIMIT, left)
+                except Exception as e:  # noqa: BLE001 — сбой чтения = «ещё не знаем», ждём до потолка
+                    resp = {"ok": False, "error": type(e).__name__}
+                v = _csl.verdict(resp, doc_id)
+                log.info(f"  ✍️ ESIGNLINK: doc {tail} +{int(clock() - t0)}с → {v['act']}: {v['why']}")
+                if v["act"] != "wait":
+                    break
+                last = v["why"]
+            if v is None or v["act"] == "wait":
+                v = {"act": "stop", "why": _csl.timeout_why(last, clock() - t0)}
+            text = _csl.text_for(v, name, edit_url)
+        except Exception as e:  # noqa: BLE001 — обещанное сообщение уходит и при сбое ожидания
+            v = {"act": "stop", "why": "сбой ожидания ссылки (%s)" % type(e).__name__}
+            log.warning(f"  ✍️ ESIGNLINK: doc {tail} — {v['why']}")
+            text = _csl.fail_text(name, v["why"])
+        stage = "final"
+        delivered = False
+        try:
+            sent = await _send_retry(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                                     no_preview=True, text=text)
+            delivered = sent is not None
+        except Exception as e:  # noqa: BLE001 — Forbidden / ChatMigrated / InvalidToken: задача не роняет цикл
+            log.warning(f"  ✍️ ESIGNLINK: doc {tail} — итоговое сообщение не отправлено ({type(e).__name__}: {e})")
+        log.info(f"  ✍️ ESIGNLINK: doc {tail} — итог {v['act']} ({v['why']}); сообщение "
+                 f"{'доставлено' if delivered else 'НЕ доставлено'}")
+        return dict(v, delivered=delivered)
+    except _aio.CancelledError:
+        if stage == "wait":               # итог ещё не уходил — сказать, что ссылки не будет, и отдать отмену
+            log.warning(f"  ✍️ ESIGNLINK: doc {tail} — ожидание прервано остановкой, говорю «{_csl.RESTART_WHY}»")
             try:
-                resp = await _aio.to_thread(bridge.contract_find, doc_id=doc_id, limit=_csl.FIND_LIMIT)
-            except Exception as e:  # noqa: BLE001 — сбой чтения = «ещё не знаем», ждём до потолка
-                resp = {"ok": False, "error": type(e).__name__}
-            v = _csl.verdict(resp, doc_id)
-            log.info(f"  ✍️ ESIGNLINK: doc {tail} +{int(clock() - t0)}с → {v['act']}: {v['why']}")
-            if v["act"] != "wait":
-                break
-            last = v["why"]
-        else:
-            v = {"act": "stop", "why": _csl.timeout_why(last)}
-        text = _csl.text_for(v, name, edit_url)
-    except Exception as e:  # noqa: BLE001 — обещанное сообщение уходит и при сбое ожидания
-        v = {"act": "stop", "why": "сбой ожидания ссылки (%s)" % type(e).__name__}
-        log.warning(f"  ✍️ ESIGNLINK: doc {tail} — {v['why']}")
-        text = _csl.fail_text(name, v["why"])
-    log.info(f"  ✍️ ESIGNLINK: doc {tail} — итог {v['act']} ({v['why']})")
-    await _send_retry(context, chat_id=chat_id, message_thread_id=tid, bilingual=False, no_preview=True, text=text)
-    return v
+                await _aio.wait_for(_send(context, chat_id=chat_id, message_thread_id=tid, bilingual=False,
+                                          no_preview=True, text=_csl.fail_text(name, _csl.RESTART_WHY)),
+                                    timeout=_csl.CANCEL_SEND_S)
+            except (Exception, _aio.CancelledError) as e:  # noqa: BLE001 — одна попытка; отмена уходит выше всё равно
+                log.warning(f"  ✍️ ESIGNLINK: doc {tail} — «{_csl.RESTART_WHY}» не отправлено ({type(e).__name__})")
+        raise
+
+
+async def sign_link_drain(budget_s=None):
+    """post_stop (`bot.on_stop`, ESIGNLINK2510 r2): живые досылки ссылки на подпись → отмена. PTB 22.7 обычные задачи
+    при остановке не ждёт, и досылка пропала бы молча; отменённая, каждая сама коротко говорит «Splinter
+    перезапускается» (`_contract_sign_link_follow`). Ждём их не дольше `contract_sign_link.STOP_WAIT_S` и не дольше
+    остатка бюджета остановки `budget_s` (asyncio.wait — по таймауту задачи повторно НЕ отменяются, начатая фраза не
+    обрывается). → число отменённых (0 — живых не было; строка дренажа тогда прежняя). Не бросает."""
+    import asyncio as _aio
+    tasks = [t for t in list(_SIGN_LINK_TASKS) if not t.done()]
+    if not tasks:
+        return 0
+    try:
+        import contract_sign_link as _csl     # живые задачи есть → модуль уже загружен ручкой
+        wait = float(_csl.STOP_WAIT_S)
+        if budget_s is not None:
+            wait = max(0.0, min(wait, float(budget_s)))
+        for t in tasks:
+            t.cancel()
+        if wait > 0:
+            await _aio.wait(tasks, timeout=wait)
+    except Exception as e:  # noqa: BLE001 — дренаж остановки не роняет остановку
+        log.warning(f"  ✍️ ESIGNLINK: отмена досылок при остановке — сбой ({type(e).__name__}: {e})")
+    return len(tasks)
 
 
 async def _contract_ready_with_links(context, bridge, chat_id, tid, res, reminder):

@@ -22,7 +22,13 @@ TB e-Sign, посчитать её здесь нельзя. С TB e-Sign 0.2.2 �
 exec), `a=sign`, `who=client`, непустой `k` и `d` == id ЭТОГО документа; всё прочее (прямая ссылка BoldSign, ссылка
 агента, ссылка другого договора, пробелы внутри) — стоп с причиной, а не отправка. Ссылок у договора в реестре
 несколько разных — тоже стоп. Ручка в splinter — `CONTRACT_SIGN_LINK` (по умолчанию ВЫКЛ: ответ «договор готов»
-прежний байт-в-байт, модуль не импортируется)."""
+прежний байт-в-байт, модуль не импортируется).
+
+r2 (ревью перед пушем): аннулированный договор (статус «АННУЛИРОВАН» — бронь отменена; TB e-Sign 0.2.2 ссылку
+клиента для него не воскрешает, но ячейку реестра не чистит) — стоп со словами «аннулирован», а не ссылка и не пять
+минут ожидания; потолок WAIT_S — на ВСЁ ожидание вместе с чтениями (дедлайн чтения — у splinter, `card_budget`),
+итог называет фактически прошедшее время; отмена задачи (рестарт Splinter) — одна короткая попытка сказать
+RESTART_WHY, без лестницы повторов (CANCEL_SEND_S)."""
 import re
 from urllib.parse import parse_qs, urlsplit
 
@@ -32,6 +38,11 @@ WAIT_S = 300        # потолок ожидания: строка реестр
 FIRST_GAP_S = 60    # после мгновенной проверки (пересобранный договор уже в реестре) следующая — через минуту
 STEP_S = 30         # дальше — раз в 30 с: ≤ 10 чтений реестра на договор
 FIND_LIMIT = 5      # строк одного документа больше одной быть не должно; 5 — чтобы увидеть дубли
+CANCEL_SEND_S = 5   # отмена задачи (остановка Splinter): одна попытка сказать об этом, не дольше стольких секунд
+STOP_WAIT_S = 8     # хук остановки ждёт отменённые досылки не дольше (и не дольше остатка бюджета остановки)
+CANCELED_STATUS = "АННУЛИРОВАН"   # = TB e-Sign ST.CANCELED (и дверь моста ESIGN.CANCELED_STATUS)
+CANCELED_WHY = "договор аннулирован в TB e-Sign — ссылка на подпись не действует"
+RESTART_WHY = "Splinter перезапускается"
 
 SIGN_LABEL = "✍️ Ссылка клиенту на подпись"
 EDIT_LABEL = "✏️ Редактировать договор"
@@ -54,9 +65,10 @@ _BARE_ID = re.compile(r"^[-\w]{25,}$")
 
 
 def offsets(wait_s=WAIT_S, first_gap_s=FIRST_GAP_S, step_s=STEP_S):
-    """Моменты чтения реестра от начала ожидания, с: 0, first_gap, first_gap+step, … не позже wait_s."""
+    """Моменты чтения реестра от начала ожидания, с: 0, first_gap, first_gap+step, … СТРОГО раньше wait_s (чтению на
+    самом потолке не осталось бы времени: его дедлайн — остаток до wait_s)."""
     out, t = [0], first_gap_s
-    while step_s > 0 and t <= wait_s:
+    while step_s > 0 and t < wait_s:
         out.append(t)
         t += step_s
     return out
@@ -112,9 +124,10 @@ def edit_url_ok(url, doc_id):
 def verdict(resp, doc_id):
     """Ответ `contract_find(doc_id=…)` → {"act": "send" | "signed" | "stop" | "wait", "why": слова[, "url", "edit"]}.
 
-    send — ровно одна годная ссылка у неподписанной строки ЭТОГО документа; signed — строки документа есть и все
-    подписаны (ссылка не нужна); stop — ждать бессмысленно (мост без поиска по документу, реестр без колонки
-    ссылки, ссылка не та, ссылок несколько); wait — строки ещё нет / ссылки в ней ещё нет / сбой чтения."""
+    send — ровно одна годная ссылка у живой (не подписанной и не аннулированной) строки ЭТОГО документа; signed —
+    строки документа есть и все подписаны (ссылка не нужна); stop — ждать бессмысленно (мост без поиска по документу,
+    реестр без колонки ссылки, ссылка не та, ссылок несколько; договор аннулирован — тогда ещё "canceled": True);
+    wait — строки ещё нет / ссылки в ней ещё нет / сбой чтения."""
     if not isinstance(resp, dict):
         return {"act": "wait", "why": "мост ответил не словарём"}
     if not resp.get("ok"):
@@ -134,6 +147,9 @@ def verdict(resp, doc_id):
     open_rows = [r for r in rows if r.get("signed") is not True]
     if not open_rows:
         return {"act": "signed", "why": "договор уже подписан"}
+    open_rows = [r for r in open_rows if not is_canceled(r.get("status"))]
+    if not open_rows:              # r2: аннулированный — ссылка его не воскресит, ждать нечего
+        return {"act": "stop", "why": CANCELED_WHY, "canceled": True}
     urls = sorted({str(r.get("sign_url") or "").strip() for r in open_rows} - {""})
     if len(urls) > 1:
         return {"act": "stop", "why": "в реестре у договора несколько разных ссылок на подпись"}
@@ -145,6 +161,11 @@ def verdict(resp, doc_id):
     edit = str(row.get("doc_url") or "").strip()
     return {"act": "send", "why": "ссылка из реестра подписей", "url": urls[0],
             "edit": edit if edit_url_ok(edit, doc_id) else ""}
+
+
+def is_canceled(status):
+    """«АННУЛИРОВАН» — без учёта регистра, пробелов и Ё (как дверь моста: esignNorm_ + toUpperCase)."""
+    return " ".join(str(status or "").replace("Ё", "Е").replace("ё", "е").split()).upper() == CANCELED_STATUS
 
 
 def _named(name):
@@ -183,9 +204,19 @@ def fail_text(name, why):
     return "🐀 Splinter\n⚠️ Ссылку клиенту на подпись%s не прислал: %s — %s." % (_named(name), why, TO_GROUP)
 
 
-def timeout_why(last, wait_s=WAIT_S):
-    minutes = max(1, int(round(wait_s / 60.0)))
-    return "за %d мин не дождался (%s)" % (minutes, last or "договора нет в реестре подписей")
+def spent_words(seconds):
+    """Фактически прошедшее время словами: «45 с», «5 мин» (минуты — до ближайшей целой)."""
+    sec = max(0.0, float(seconds or 0))
+    return "%d с" % int(sec + 0.5) if sec < 60 else "%d мин" % int(sec / 60.0 + 0.5)
+
+
+def timeout_why(last, spent_s=WAIT_S):
+    """Итог ожидания без решения: сколько ФАКТИЧЕСКИ прошло (а не обещанный потолок) и последняя причина."""
+    return "за %s не дождался (%s)" % (spent_words(spent_s), last or "договора нет в реестре подписей")
+
+
+def canceled_text(name):
+    return "🐀 Splinter\n⚠️ Договор%s: %s." % (_named(name), CANCELED_WHY)
 
 
 def text_for(v, name, edit_fallback=""):
@@ -194,4 +225,6 @@ def text_for(v, name, edit_fallback=""):
         return link_text(name, v["url"], v.get("edit") or edit_fallback)
     if v.get("act") == "signed":
         return signed_text(name)
+    if v.get("canceled"):
+        return canceled_text(name)
     return fail_text(name, v.get("why") or "причина не названа")

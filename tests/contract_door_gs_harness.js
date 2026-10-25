@@ -771,6 +771,8 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   const DOC_N = '1LinkNew0000000000000000000000000000000000001', DOC_S = '1LinkSent000000000000000000000000000000000002';
   const DOC_P = '1LinkSigned0000000000000000000000000000000003', DOC_E = '1LinkEmpty00000000000000000000000000000000004';
   const DOC_X = DOC_N + 'X';                                        // тот же префикс, другой документ
+  // ESIGNLINK2510 r2: аннулированный (бронь отменена) — TB e-Sign 0.2.2 ячейку ссылки НЕ чистит
+  const DOC_C = '1LinkCanceled00000000000000000000000000000005', DOC_C2 = '1LinkCanceledCase0000000000000000000000000006';
   const ROWS4 = [
     HEADERS22.slice(),
     /* 2 */ row22({ 'ID документа': DOC_N, 'Клиент': 'Link New', 'Дата договора': '25-10-2026', 'Статус': 'НОВЫЙ',
@@ -785,6 +787,10 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
       'Телефон': '+66 81 999 0004', 'Байк': 'PCX 3104', 'Ссылка на документ': EDIT(DOC_E), 'Ссылка «на подпись»': BOLDSIGN }),
     /* 6 */ row22({ 'ID документа': DOC_X, 'Клиент': 'Link Twin', 'Дата договора': '25-10-2026', 'Статус': 'НОВЫЙ',
       'Телефон': '+66 81 999 0005', 'Байк': 'PCX 3105', 'Ссылка на документ': EDIT(DOC_X), 'Ссылка клиенту на подпись': SIGN(DOC_X) }),
+    /* 7 */ row22({ 'ID документа': DOC_C, 'Клиент': 'Link Canceled', 'Дата договора': '25-10-2026', 'Статус': 'АННУЛИРОВАН',
+      'Телефон': '+66 81 999 0006', 'Байк': 'PCX 3106', 'Ссылка на документ': EDIT(DOC_C), 'Ссылка клиенту на подпись': SIGN(DOC_C) }),
+    /* 8 */ row22({ 'ID документа': DOC_C2, 'Клиент': 'Link Canceled Case', 'Дата договора': '25-10-2026', 'Статус': ' аннулирован ',
+      'Телефон': '+66 81 999 0007', 'Байк': 'PCX 3107', 'Ссылка на документ': EDIT(DOC_C2), 'Ссылка клиенту на подпись': SIGN(DOC_C2) }),
   ];
   const blank = g => g.map(() => []);
   const keep = SHEETS;
@@ -805,7 +811,7 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   const pre = safe(() => contractFind({ doc_id: DOC_N.slice(0, -1) }));
   SNAP.link_none = pre;
   check('link.doc-id-prefix-none', pre.ok === true && pre.outcome === 'none' && J(pre.items) === '[]'
-    && pre.checked.rows_scanned === 5, J(pre).slice(0, 300));
+    && pre.checked.rows_scanned === 7, J(pre).slice(0, 300));
   // doc_id с другим фильтром — оба условия
   check('link.doc-and-name', safe(() => contractFind({ doc_id: DOC_N, name: 'Link Sent' })).outcome === 'none'
     && J(rowsOf(safe(() => contractFind({ doc_id: DOC_N, name: 'Link New' })))) === J([2]), '');
@@ -822,6 +828,16 @@ check('readonly.no-writes', WRITES.n === 0, J(WRITES.what));
   SNAP.link_empty = e;
   check('link.old-column-not-taken', e.items && e.items[0].sign_url === '' && e.items[0].doc_url === EDIT(DOC_E)
     && !J(e).includes(BOLDSIGN), J(e.items));
+  // аннулированный: ссылки на подпись нет при заполненной ячейке (договор она не воскрешает), правка — есть;
+  // регистр и пробелы статуса не мешают; статус отдаётся как есть
+  const cn = safe(() => contractFind({ doc_id: DOC_C }));
+  SNAP.link_canceled = cn;
+  check('link.canceled-no-sign-url', cn.ok === true && J(rowsOf(cn)) === J([7]) && cn.items[0].sign_url === ''
+    && cn.items[0].doc_url === EDIT(DOC_C) && cn.items[0].status === 'АННУЛИРОВАН' && cn.items[0].signed === false
+    && cn.outcome === 'none_signed' && !J(cn).includes(SIGN(DOC_C)), J(cn.items));
+  const cc = safe(() => contractFind({ doc_id: DOC_C2 }));
+  check('link.canceled-case-space', cc.items && cc.items[0].sign_url === '' && cc.items[0].doc_url === EDIT(DOC_C2)
+    && !J(cc).includes(SIGN(DOC_C2)), J(cc.items));
   // поиск по телефону тоже несёт поля (агенты и отчёты получают ту же ссылку)
   const ph = safe(() => contractFind({ phone: '0819990001' }));
   check('link.phone-carries-fields', J(rowsOf(ph)) === J([2]) && ph.items[0].sign_url === SIGN(DOC_N)

@@ -30,9 +30,11 @@
  * поиска два НЕОБЯЗАТЕЛЬНЫХ поля — sign_url (колонка «Ссылка клиенту на подпись», TB e-Sign с 0.2.2: та же
  * ссылка, что уходит в группу контрактов; посчитать её вне TB e-Sign нельзя — токен HMAC) и doc_url
  * («Ссылка на документ» — сам Google-документ, им договор правят). Колонок нет (реестр до 0.2.2) — поля
- * пустые, дверь не ломается; есть ли колонки — в ответе (optional_columns). У подписанной строки sign_url
- * пуст ВСЕГДА, даже если в ячейке что-то осталось (подписанному договору ссылка на подпись не нужна, так же
- * судит и сам TB e-Sign). Колонка «Ссылка «на подпись»» (прежняя прямая ссылка) не берётся НИКОГДА.
+ * пустые, дверь не ломается; есть ли колонки — в ответе (optional_columns). У подписанной И у аннулированной
+ * строки sign_url пуст ВСЕГДА, даже если в ячейке что-то осталось: подписанному договору ссылка на подпись не
+ * нужна, а аннулированный (бронь отменена, статус «АННУЛИРОВАН») ссылка клиента не воскрешает — TB e-Sign 0.2.2
+ * отдаёт для обоих пустую ссылку (op=link → url ''), но ячейку реестра у аннулированного не чистит. doc_url
+ * остаётся у обоих. Колонка «Ссылка «на подпись»» (прежняя прямая ссылка) не берётся НИКОГДА.
  * Новый фильтр doc_id — точный id Google-документа (или ссылка на него) по колонке «ID документа»: так бот
  * находит строку только что сделанного договора.
  */
@@ -48,6 +50,8 @@ var ESIGN = {
   SIGNED_FOLDER_LEVELS: 3,
   SHEET: 'Реестр',
   SIGNED_STATUS: 'ПОДПИСАН',
+  // ESIGNLINK2510 r2: бронь отменена — ссылка клиента договор не воскрешает (TB e-Sign 0.2.2, ST.CANCELED)
+  CANCELED_STATUS: 'АННУЛИРОВАН',
   FIND_LIMIT_DEFAULT: 20,
   FIND_LIMIT_MAX: 100,
   PDF_MAX_BYTES: 15 * 1024 * 1024,
@@ -182,6 +186,11 @@ function esignNameMatch_(qWords, client) {
 
 function esignIsSigned_(status) {
   return esignNorm_(status).toUpperCase() === ESIGN.SIGNED_STATUS;
+}
+
+/** Аннулирован — РОВНО «АННУЛИРОВАН» (без учёта регистра и пробелов), как и «ПОДПИСАН» (ESIGNLINK2510 r2). */
+function esignIsCanceled_(status) {
+  return esignNorm_(status).toUpperCase() === ESIGN.CANCELED_STATUS;
 }
 
 /** Итератор Drive → массив (без дублей по id). */
@@ -348,8 +357,8 @@ function esignRegistry_(addr) {
  * Запись договора (items, undated_items, pick): row, doc_id, client, contract_date ('YYYY-MM-DD' или
  * null — день неизвестен), contract_date_raw, created_raw, date_src (contract_date|created|unparsed|
  * none), status, signed, signed_at, bike, phone, pdf_id, sign_url, doc_url, matched_on; у pick сверху
- * pdf_ready. sign_url — «Ссылка клиенту на подпись» ('' у подписанной строки и без колонки), doc_url —
- * «Ссылка на документ» ('' без колонки).
+ * pdf_ready. sign_url — «Ссылка клиенту на подпись» ('' у подписанной и у аннулированной строки и без
+ * колонки), doc_url — «Ссылка на документ» ('' без колонки).
  *
  * Срок задан, а день строки неизвестен (date_src unparsed/none) → строка НЕ выпадает молча: она в
  * undated_items и в счёте checked.undated. Среди таких есть подходящий ПОДПИСАННЫЙ → outcome
@@ -414,6 +423,7 @@ function contractFind(payload) {
     if (docId) { if (String(r[c.doc_id] || '').trim() !== docId) continue; on.push('doc_id'); }
     if (dt.src === 'unparsed') unparsed++;
     var isSigned = esignIsSigned_(r[c.status]);
+    var linkDead = isSigned || esignIsCanceled_(r[c.status]);
     var rec = {
       row: i + 2,
       doc_id: c.doc_id !== undefined ? String(r[c.doc_id] || '') : '',
@@ -428,8 +438,8 @@ function contractFind(payload) {
       bike: String(r[c.bike] || ''),
       phone: String(r[c.phone] || ''),
       pdf_id: reg.pdfIds[i],
-      // ESIGNLINK2510: подписанному — пусто всегда; колонки нет — пусто
-      sign_url: c.sign_url !== undefined && !isSigned ? String(r[c.sign_url] || '').trim() : '',
+      // ESIGNLINK2510: подписанному и аннулированному — пусто всегда; колонки нет — пусто
+      sign_url: c.sign_url !== undefined && !linkDead ? String(r[c.sign_url] || '').trim() : '',
       doc_url: c.doc_url !== undefined ? String(r[c.doc_url] || '').trim() : '',
       matched_on: on,
     };
