@@ -35,6 +35,9 @@ import os
 import sys
 import glob
 import time
+import atexit
+import shutil
+import tempfile
 import subprocess
 
 try:
@@ -123,8 +126,49 @@ def _child_env():
         if p and p not in seen:
             seen.add(p)
             path.append(p)
-    return dict(os.environ, PYTHONPATH=os.pathsep.join(path),
-                PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1")
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(path),
+               PRETOOL_NOPUSH="1", ORCH_TEST_MODE="1")
+    run_tmp = _run_tmp()
+    if run_tmp:
+        env["TMPDIR"] = run_tmp
+    return env
+
+
+# ── СВОЙ ВРЕМЕННЫЙ КАТАЛОГ НА ПРОГОН (25.10.2026, GATETMP2510) ─────────────────────────────────
+# ЖИВОЙ СЛУЧАЙ: /tmp сервера — tmpfs на 3871 МБ, и 25.10 17:15 он встал на 100%. Тесты кладут
+# свои mkdtemp-каталоги в /tmp и не убирают их: один полный прогон оставлял +589 МБ, за день
+# прибавилось 11 454 записи на 2.2 ГБ (wa_agent_model_t* один — 614 МБ). Гейт после этого
+# краснел на СЛУЧАЙНЫХ файлах (6/414, затем 14/414 — другие; каждый по отдельности зелёный),
+# а живой wa_agent писал «состояние не сохранено ([Errno 28] No space left on device)».
+#
+# Лечение — не уборка чужого, а свой загон: подпроцессы гейта получают TMPDIR = свежий каталог
+# под системным temp, и всё, что тесты создают через tempfile, живёт там и уходит вместе с ним
+# по выходу процесса гейта (atexit — и у gate_blame, который берёт тот же _child_env).
+# Каталог остаётся под /tmp, поэтому проверки вида «путь во временном корне» (`_TMP_ROOTS`
+# дирижёра, правила гарда) видят его как и прежде. Литеральные пути `/tmp/…_test_<pid>.json`
+# эта правка не трогает — они мелкие и не они забивали диск.
+# Не создался каталог (нет места, нет прав) → прежнее поведение: TMPDIR не ставим, гейт идёт.
+_RUN_TMP = None
+
+
+def _run_tmp():
+    """Каталог прогона: создаётся ОДИН раз на процесс гейта, удаляется по его выходу."""
+    global _RUN_TMP
+    if _RUN_TMP is None:
+        try:
+            _RUN_TMP = tempfile.mkdtemp(prefix="gate_run_")
+            atexit.register(_run_tmp_drop)
+        except OSError:
+            _RUN_TMP = ""
+    return _RUN_TMP
+
+
+def _run_tmp_drop():
+    """Убрать каталог прогона целиком. Только свой: путь создан этим процессом в _run_tmp."""
+    global _RUN_TMP
+    if _RUN_TMP:
+        shutil.rmtree(_RUN_TMP, ignore_errors=True)
+    _RUN_TMP = None
 
 
 def run_tests():
