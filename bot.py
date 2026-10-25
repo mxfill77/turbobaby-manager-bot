@@ -787,6 +787,11 @@ async def manager_reply(msg, context, context_note: str = "", bilingual: bool = 
     if sp_blocked and force_bike:
         for it in sp_blocked:
             try:
+                if it.get("kind") == "mileage":
+                    # Только пробег (25.10.2026): не работа ТО — дверь пробега, без карточки «масло».
+                    await splinter.brain_mileage(context, bridge, chat_id, _topic, force_bike,
+                                                 it.get("km"), msg)
+                    continue
                 await splinter.sp_confirm_from_brain(context, bridge, chat_id, _topic, force_bike,
                                                      it.get("kind"), it.get("km"),
                                                      it.get("backdated", False))

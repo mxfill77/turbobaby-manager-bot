@@ -246,8 +246,10 @@ def _make_client(force_mileage=None):
     return client
 
 
-# oil_last_km=24500 → backdated=True, km=24500
+# oil_last_km=24500 → backdated=True, km=24500. Слова человека — живая фраза голдена (а):
+# с 25.10.2026 «масло» в гейте E2b заводится только при слове о масле в самом сообщении.
 client = _make_client(force_mileage=24997)
+client._user_message = "Замена масла была на 24500"
 res_json = client._execute_tool("set_service",
                                 {"bike": "PCX160 AAA", "service_type": "oil", "oil_last_km": 24500})
 res = json.loads(res_json)
@@ -258,6 +260,7 @@ ok(item.get("km") == 24500, f"E2b: km=24500 (не force_mileage=24997), полу
 
 # current_km=24997 → backdated=False
 client2 = _make_client(force_mileage=None)
+client2._user_message = "поменял масло, пробег 24997"
 client2._execute_tool("set_service",
                       {"bike": "PCX160 AAA", "service_type": "oil", "current_km": 24997})
 item2 = client2.pending_service_confirm[0] if client2.pending_service_confirm else {}

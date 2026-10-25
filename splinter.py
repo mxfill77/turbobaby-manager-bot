@@ -11897,6 +11897,44 @@ async def _sp_advance_to_confirm(context, bridge, chat_id, topic_id, bike, decla
     log.info(f"  → ТО фаза2 → подтверждение Пыму: {bike} done={done} odo={odo} (tok={tok})")
 
 
+async def brain_mileage(context, bridge, chat_id, topic_id, bike, km, msg):
+    """Мозг упёрся в гейт E2b с ОДНИМ ПРОБЕГОМ, без работы (25.10.2026).
+
+    Прежде такой вызов уходил видом «oil» по умолчанию и рождал карточку «Сделано: моторное масло»
+    — несуществующая замена ложилась в кол.I по «да» доверенного (NINJA 400 6334 19.10 и 25.10,
+    NMAX 8952, CB 650R 3503, FORZA 8950). Теперь пробег идёт как пробег, теми же дверями, что у
+    решателя: доверенный (Пым/владелец) — `_odo_confirmed` + хвост `_after_mileage` (трекер, срок
+    масла, квитанция); не доверенный — вопрос Пыму `_ask_mileage_confirm`. Число ниже последнего
+    известного тоже уходит в вопрос: там живёт сторож убывания. Не бросает."""
+    odo = str(km or "").strip().replace(" ", "").replace(",", "")
+    if not bike or not _re_pl.fullmatch(r"\d{3,6}", odo):
+        log.info(f"  → пробег из мозга не оформлен: байк={bike!r} км={km!r}")
+        return
+    trusted = _act_trusted(msg) if msg is not None else False
+    last = (_LAST_RECORDED_KM.get((chat_id, topic_id)) or (None,))[0]
+    lower = False
+    try:
+        lower = last is not None and int(odo) < int(last)
+    except (TypeError, ValueError):
+        lower = False
+    if not trusted or lower:
+        await _ask_mileage_confirm(context, chat_id, topic_id, bike, odo, bridge=bridge)
+        log.info(f"  → пробег из мозга {odo} ({bike}): {'ниже записанного' if lower else 'не доверенный'} "
+                 f"— вопрос о пробеге")
+        return
+    _pend = _PENDING_MILEAGE.get((chat_id, topic_id)) or ()
+    _oil_hint = bool(_pend[3]) if len(_pend) > 3 else False
+    _odo_confirmed(bridge, chat_id, topic_id, bike, odo, sender=_sender_from_user(getattr(msg, "from_user", None)),
+                   source="мозг (пробег доверенного)", msg_date=_msg_date_of(msg))
+    _PENDING_MILEAGE.pop((chat_id, topic_id), None)
+    _mileage_q_forget(chat_id, topic_id, "мозг записал пробег доверенного")
+    try:
+        await _after_mileage(context, bridge, chat_id, topic_id, bike, odo, _oil_hint)
+    except Exception:
+        log.exception("  → пробег из мозга: хвост (ТО-трекер/квитанция) упал")
+    log.info(f"  → пробег из мозга {odo} ({bike}) записан: доверенный, без карточки работ")
+
+
 async def sp_confirm_from_brain(context, bridge, chat_id, topic_id, bike, kind, km=None,
                                 backdated=False):
     """row12 (аудит 08.07): мозг вызвал set_service в servicing-теме — E2b-гейт запись блокирует,

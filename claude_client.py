@@ -6,6 +6,7 @@ Claude API клиент.
 """
 
 import os
+import re
 import json
 import shutil
 import logging
@@ -490,10 +491,27 @@ class ClaudeClient:
                     # а ни заявки, ни кнопки не оставалось → Инфо не показывал редуктор. Теперь блок
                     # ставит работу в очередь: bot.py после ответа оформит то_заявку + кнопку Пыма
                     # (splinter.sp_confirm_from_brain). Сам гейт НЕ ослаблен: запись только по «да» Пыма.
-                    _kind = str(tool_input.get("service_type") or "oil").strip().lower()
+                    # ВИД РАБОТЫ — ПО СЛОВАМ ЧЕЛОВЕКА, А НЕ ПО УМОЛЧАНИЮ (25.10.2026). Прежде пустой
+                    # service_type превращался в «oil», и сообщение С ОДНИМ ПРОБЕГОМ («41920», «31973»)
+                    # рождало карточку «Сделано: моторное масло»: доверенный жал «да» — и в кол.I
+                    # ложилась несуществующая замена (перепись 01–25.10: NINJA 400 6334 дважды, NMAX 8952,
+                    # CB 650R 3503, FORZA 8950; кол.I NINJA ушла 38237 → 41958, срок масла — на 3721 км
+                    # позже). Теперь «масло» — только если о масле сказано в самом сообщении; модель,
+                    # поставившая «oil» сама, без слова человека («Эти работы на 37480», «บันทึก»), не
+                    # заводит работу. Сообщение с одним пробегом идёт видом «mileage» — дверью пробега
+                    # (`splinter.brain_mileage`): доверенный — запись с квитанцией, прочие — вопрос Пыму.
+                    _st = str(tool_input.get("service_type") or "").strip().lower()
+                    _said_oil = bool(re.search(r"масл|\boil\b|น้ำมัน", str(getattr(self, "_user_message", "") or ""),
+                                               re.IGNORECASE))
                     # oil_last_km = задний-числом км замены (класс A разбора 2478); приоритет над current_km
                     _oil_last = tool_input.get("oil_last_km")
-                    _backdated = bool(_oil_last and _kind == "oil")
+                    _backdated = bool(_oil_last and _st in ("", "oil") and _said_oil)
+                    if _backdated:
+                        _kind = "oil"
+                    elif _st and not (_st == "oil" and not _said_oil):
+                        _kind = _st
+                    else:
+                        _kind = "mileage"
                     _km = _oil_last if _backdated else (tool_input.get("current_km") or getattr(self, "_force_mileage", None))
                     _q = getattr(self, "pending_service_confirm", None)
                     if _q is None:
@@ -505,6 +523,13 @@ class ClaudeClient:
                         _q.append(_item)
                     log.info(f"  set_service: ЗАБЛОКИРОВАН в servicing-теме (E2b) — запись ТО только "
                              f"кнопкой Пыма; работа в очередь на заявку: kind={_kind} km={_km}")
+                    if _kind == "mileage":
+                        return json.dumps({
+                            "ok": False, "blocked": "service_gate",
+                            "ОБЯЗАТЕЛЬНО": ("Это только ПРОБЕГ, а не работа ТО: работу (масло и т.п.) не придумывай и "
+                                            "не называй. Пробег бот оформит сам — запишет или спросит подтверждение. "
+                                            "НЕ вызывай set_service здесь и не обещай кнопку. Ответь коротко: принял пробег."),
+                        }, ensure_ascii=False)
                     return json.dumps({
                         "ok": False, "blocked": "service_gate",
                         "ОБЯЗАТЕЛЬНО": ("Запись ТО/пробега в servicing-теме оформляется ТОЛЬКО кнопкой подтверждения "
@@ -639,6 +664,7 @@ class ClaudeClient:
         self._force_bike = force_bike or ""
         self._force_mileage = force_mileage
         self._force_mileage_conf = force_mileage_conf or ""
+        self._user_message = user_message if isinstance(user_message, str) else ""   # гейт E2b: «сказал ли человек про масло»
         self.last_actions = []   # для аудитора: [{tool,args,claimed}]
 
         for iteration in range(max_iterations):
