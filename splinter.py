@@ -11848,7 +11848,7 @@ def _sp_note_set_wdate(base_note, wdate):
 def _sp_work_date(sp):
     """День работы заявки: названный (`WDATE`), иначе день рождения заявки (по Пхукету), иначе ''."""
     sp = sp or {}
-    return _sp_wdate_from_note(sp.get("note")) or _local_day_of_iso(sp.get("created_at"))
+    return _sp_wdate_from_note(sp.get("note")) or _local_day_of_iso(sp.get("created_at")) or ""
 
 
 # ДЕНЬ РАБОТЫ — ПО ПХУКЕТУ, А НЕ ПО UTC (25.10.2026, HISTNAMES2510 r2). Записи читают на Пхукете
@@ -11884,11 +11884,13 @@ def _work_day_local(msg):
 
 
 def _local_day_of_iso(raw):
-    """«2026-10-13T18:30:00Z» (`created_at` моста, UTC) → день по Пхукету; голая дата — как есть."""
+    """«2026-10-13T18:30:00Z» (`created_at` моста, UTC) → день по Пхукету; голая дата — как есть.
+    Не дата → None, а не '': промах называется «не знаю», а не пустым днём (храповик слепых
+    читателей, `blind_readers`)."""
     import datetime as _dt
     s = str(raw or "").strip()
     if not _re_pl.match(r"\d{4}-\d{2}-\d{2}", s):
-        return ""
+        return None
     if len(s) <= 10:
         return s[:10]
     try:
